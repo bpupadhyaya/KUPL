@@ -1,2 +1,2 @@
 # KUPL
-Klassroom Universal Programming Language
+K - Universal Programming Language
