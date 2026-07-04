@@ -906,6 +906,23 @@ impl Interp {
                     }
                     return fs_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("json_parse", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    let s = match &v {
+                        Value::Str(s) => s.as_str().to_string(),
+                        other => other.to_string(),
+                    };
+                    return Ok(match crate::json::parse(&s) {
+                        Ok(j) => Value::ok(j),
+                        Err(e) => Value::err(Value::str(e)),
+                    });
+                }
+                ("json_stringify", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return crate::json::stringify(&v)
+                        .map(Value::str)
+                        .map_err(|m| Self::panic_flow(m, span));
+                }
                 ("Some", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     return Ok(Value::some(v));

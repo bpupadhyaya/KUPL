@@ -124,6 +124,21 @@ type UserId = new Str                                       // newtype
 - A **newtype** wraps one value (field `value`); it is a distinct type — an
   intentional bulwark against ID-mixup bugs.
 - No inheritance. No implicit conversions anywhere (use `.to_float()` etc.).
+- **Recursive** ADTs are supported: a variant may carry its own type
+  (`type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)`), directly or through
+  `List`/`Map`.
+
+### Prelude
+
+One ADT is provided without an import — the built-in **`Json`** type, for
+structured data (see STDLIB.md → Json):
+
+```kupl
+type Json = JNull | JBool(b: Bool) | JNum(n: Float) | JStr(s: Str)
+          | JArr(items: List[Json]) | JObj(fields: Map[Str, Json])
+```
+
+Use it with `json_parse` / `json_stringify` and ordinary `match`.
 
 ### Inference rules
 

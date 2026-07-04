@@ -13,10 +13,28 @@ pub struct Compiled {
     pub warnings: Vec<Diag>,
 }
 
+/// The standard prelude: types/constructors available to every program without
+/// an import. Currently the built-in `Json` ADT that `json_parse`/
+/// `json_stringify` produce and consume.
+pub const PRELUDE: &str =
+    "type Json = JNull | JBool(b: Bool) | JNum(n: Float) | JStr(s: Str) \
+     | JArr(items: List[Json]) | JObj(fields: Map[Str, Json])\n";
+
+/// Prepend the prelude's items to a parsed program so the checker, compiler,
+/// and every engine treat prelude types exactly like user declarations.
+pub fn inject_prelude(program: &mut Program) {
+    let (prelude, diags) = parser::parse(PRELUDE);
+    debug_assert!(diags.is_empty(), "prelude must parse cleanly: {diags:?}");
+    let mut items = prelude.items;
+    items.append(&mut program.items);
+    program.items = items;
+}
+
 /// Parse + check (types, then effects). Errors are returned; warnings ride
 /// along on success.
 pub fn compile(src: &str) -> Result<Compiled, Vec<Diag>> {
-    let (program, mut diags) = parser::parse(src);
+    let (mut program, mut diags) = parser::parse(src);
+    inject_prelude(&mut program);
     let (checked, check_diags) = check::check(&program);
     diags.extend(check_diags);
     // Effects only make sense on a program that parsed; skip if already broken.
@@ -218,13 +236,14 @@ fn report_panic_map(msg: &str, span: Span, map: &crate::loader::SourceMap) {
 
 /// Load (multi-file), type-check, effect-check. Prints errors itself.
 pub fn load_compile(path: &str) -> Result<(Compiled, crate::loader::SourceMap), i32> {
-    let (program, map) = match crate::loader::load(path) {
+    let (mut program, map) = match crate::loader::load(path) {
         Ok(ok) => ok,
         Err((diags, map)) => {
             print_diags_map(&diags, &map);
             return Err(1);
         }
     };
+    inject_prelude(&mut program);
     let (checked, mut diags) = check::check(&program);
     if !diags.iter().any(|d| d.severity == Severity::Error) {
         diags.extend(crate::effects::check_effects(&program));

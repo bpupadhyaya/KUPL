@@ -5,6 +5,7 @@
 //! deterministic component runtime, plus a REPL and an example-test runner.
 
 pub mod ai;
+pub mod json;
 pub mod ast;
 pub mod bytecode;
 pub mod cgen;

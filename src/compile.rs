@@ -1051,6 +1051,8 @@ impl<'s> FnCompiler<'s> {
                 ("append_file", 2) => Some(BUILTIN_APPEND_FILE),
                 ("delete_file", 1) => Some(BUILTIN_DELETE_FILE),
                 ("file_exists", 1) => Some(BUILTIN_FILE_EXISTS),
+                ("json_parse", 1) => Some(BUILTIN_JSON_PARSE),
+                ("json_stringify", 1) => Some(BUILTIN_JSON_STRINGIFY),
                 _ => None,
             };
             if let Some(which) = builtin {

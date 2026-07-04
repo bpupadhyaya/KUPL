@@ -78,6 +78,12 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       Shared builtin impl (interp+KVM) + cgen.rs C runtime → all engines run real
       file I/O; interp==KVM==native on the success path (OS error *text* is
       platform-dependent). (`examples/files.kupl`)
+- [x] **JSON** (it15) — built-in recursive `Json` ADT (via a prelude) +
+      `json_parse` / `json_stringify` (pure). Round-trips are stable (key order
+      preserved, ints without `.0`). Pairs with file I/O and the AI-native core.
+      Interp + KVM + `.kx` + bundle byte-identical; native reports a clear
+      "not yet supported" error (recursive ctor construction in C deferred).
+      Confirmed recursive ADTs work end-to-end. (`examples/json.kupl`)
 - [ ] **Native components + KIR** (audit #2) — typed SSA IR; components compile
       to native (per-component GC), so real apps run at native, not VM, speed
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first

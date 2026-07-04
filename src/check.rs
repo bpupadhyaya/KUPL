@@ -1417,6 +1417,19 @@ impl Checker {
                     self.unify(&Ty::Str, &t, args[0].value.span, "file path");
                     return Ty::Bool;
                 }
+                ("json_parse", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "json_parse argument");
+                    return Ty::Result(
+                        Box::new(Ty::Named("Json".into())),
+                        Box::new(Ty::Str),
+                    );
+                }
+                ("json_stringify", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Named("Json".into()), &t, args[0].value.span, "json_stringify argument");
+                    return Ty::Str;
+                }
                 ("Some", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
                     return Ty::Option(Box::new(self.uni.apply(&t)));

@@ -162,6 +162,13 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_APPEND_FILE => format!("regs[{dst}] = k_write_file(regs[{start}], regs[{start}+1], 1); (void){argc};"),
             BUILTIN_DELETE_FILE => format!("regs[{dst}] = k_delete_file(regs[{start}]); (void){argc};"),
             BUILTIN_FILE_EXISTS => format!("regs[{dst}] = k_file_exists(regs[{start}]); (void){argc};"),
+            BUILTIN_JSON_PARSE | BUILTIN_JSON_STRINGIFY => {
+                return Err(
+                    "json_parse/json_stringify are not yet supported by the native backend \
+                     — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
+                        .into(),
+                )
+            }
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {

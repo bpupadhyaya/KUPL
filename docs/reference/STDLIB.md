@@ -22,6 +22,8 @@ unless supervised.
 | `append_file(path, s)` | `(Str, Str) -> Result[Unit, Str]` — **uses `io.fs`** | creates if missing |
 | `delete_file(path)` | `(Str) -> Result[Unit, Str]` — **uses `io.fs`** | |
 | `file_exists(path)` | `(Str) -> Bool` — **uses `io.fs`** | any filesystem entry |
+| `json_parse(text)` | `(Str) -> Result[Json, Str]` | pure; `Err` on malformed input |
+| `json_stringify(j)` | `(Json) -> Str` | compact; object key order preserved |
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a
@@ -175,6 +177,27 @@ Insertion-ordered; equality is order-insensitive.
 | `.len()` | `-> Int` | |
 | `.is_empty()` | `-> Bool` | |
 | `.is_subset(other)` | `(Set[T]) -> Bool` | every element is in `other` |
+
+### Json
+
+A built-in ADT (available without an import, via the prelude) for structured
+data. `json_parse` / `json_stringify` convert to and from text; build and
+inspect values with ordinary constructors and `match`.
+
+```kupl
+type Json = JNull | JBool(b: Bool) | JNum(n: Float) | JStr(s: Str)
+          | JArr(items: List[Json]) | JObj(fields: Map[Str, Json])
+```
+
+- `json_parse(text) -> Result[Json, Str]` — `Err(message)` on malformed input.
+- `json_stringify(j) -> Str` — compact output; **object key order is
+  preserved** and whole numbers print without a decimal point (`1`, not `1.0`),
+  so `json_stringify(json_parse(s))` is stable.
+- Numbers parse to `JNum(Float)`. Objects are `JObj(Map[Str, Json])` (insertion
+  order kept, last key wins).
+- Runs on the interpreter, KVM, `.kx`, and bundles. The **native** backend
+  (`kupl native`) does not yet support the JSON builtins and reports a clear
+  error — use `kupl run`/`--vm`/`bundle` for JSON programs.
 
 ### Tensor
 

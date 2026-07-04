@@ -1,0 +1,61 @@
+// JSON — parsing and serializing structured data.
+//
+// KUPL has a built-in `Json` type (no import needed):
+//   Json = JNull | JBool(b: Bool) | JNum(n: Float) | JStr(s: Str)
+//        | JArr(items: List[Json]) | JObj(fields: Map[Str, Json])
+//
+// `json_parse(text) -> Result[Json, Str]` and `json_stringify(j) -> Str` do the
+// conversion. Object key order is preserved, so round-trips are stable.
+
+// Walk a Json value and describe it.
+fun describe(j: Json) -> Str {
+    match j {
+        JNull => "null"
+        JBool(b) => "bool({b})"
+        JNum(n) => "number({n})"
+        JStr(s) => "string({s})"
+        JArr(items) => "array of {items.len()}"
+        JObj(fields) => "object with keys {fields.keys()}"
+    }
+}
+
+// Pull one field out of a JSON object, if present.
+fun field(j: Json, key: Str) -> Option[Json] {
+    match j {
+        JObj(fields) => fields.get(key)
+        _ => None
+    }
+}
+
+fun main() uses io {
+    // Build a document programmatically and serialize it.
+    let doc = JObj(
+        Map()
+            .insert("name", JStr("KUPL"))
+            .insert("version", JNum(1.0))
+            .insert("tags", JArr([JStr("ai"), JStr("fast")]))
+            .insert("stable", JBool(true))
+    )
+    let text = json_stringify(doc)
+    print(text)
+
+    // Parse it back and inspect it.
+    match json_parse(text) {
+        Ok(j) => {
+            print(describe(j))
+            match field(j, "name") {
+                Some(JStr(name)) => print("name = {name}")
+                _ => print("no name")
+            }
+            // round-trips are stable
+            print(json_stringify(j) == text)
+        }
+        Err(e) => print("parse error: {e}")
+    }
+
+    // Malformed input is an ordinary Err, never a crash.
+    match json_parse("definitely not json") {
+        Ok(_) => print("unexpected")
+        Err(_) => print("malformed input handled gracefully")
+    }
+}

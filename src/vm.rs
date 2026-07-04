@@ -536,6 +536,20 @@ impl<'m> Vm<'m> {
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_JSON_PARSE => {
+                            let s = match &args[0] {
+                                Value::Str(s) => s.as_str().to_string(),
+                                other => other.to_string(),
+                            };
+                            set!(dst, match crate::json::parse(&s) {
+                                Ok(j) => Value::ok(j),
+                                Err(e) => Value::err(Value::str(e)),
+                            });
+                        }
+                        BUILTIN_JSON_STRINGIFY => match crate::json::stringify(&args[0]) {
+                            Ok(s) => set!(dst, Value::str(s)),
+                            Err(msg) => return Err(VmError { msg, span }),
+                        },
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1081,6 +1095,39 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_json_it15() {
+        // parse → stringify round-trips, key order preserved, ints without `.0`;
+        // interpreter and KVM must agree byte-for-byte (both use crate::json)
+        assert_eq!(
+            differential("fun probe() -> Str {\n    match json_parse(\"[1, 2, 3]\") {\n        Ok(j) => json_stringify(j)\n        Err(e) => e\n    }\n}\n"),
+            "[1,2,3]"
+        );
+        // build programmatically → stringify (no literal braces in source)
+        assert_eq!(
+            differential("fun probe() -> Str {\n    json_stringify(JObj(Map().insert(\"a\", JNum(1.0)).insert(\"b\", JBool(true))))\n}\n"),
+            "{\"a\":1,\"b\":true}"
+        );
+        // nested round-trip stability: stringify(parse(s)) == s
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    let s = json_stringify(JArr([JNull, JStr(\"x\"), JNum(2.5)]))\n    match json_parse(s) {\n        Ok(j) => json_stringify(j) == s\n        Err(_) => false\n    }\n}\n"),
+            "true"
+        );
+        // matching drives structural inspection
+        assert_eq!(
+            differential("fun probe() -> Int {\n    match json_parse(\"[10, 20, 30, 40]\") {\n        Ok(JArr(xs)) => xs.len()\n        Ok(_) => 0\n        Err(_) => 0 - 1\n    }\n}\n"),
+            "4"
+        );
+    }
+
+    #[test]
+    fn diff_json_malformed_is_err_it15() {
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    match json_parse(\"not json\") {\n        Ok(_) => false\n        Err(_) => true\n    }\n}\n"),
+            "true"
+        );
     }
 
     #[test]
