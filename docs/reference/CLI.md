@@ -49,9 +49,11 @@ Recommended for component apps.
 Compiles to **machine code**: bytecode → generated C → `$CC` (default `cc`)
 `-O2`. Compiles a `fun main()` program, or a **component `app`** — instance state,
 `on start`/port handlers, child components, `wire`s, `emit`, virtual-clock
-timers (`on every`/`on after`), and `supervise` restart-on-failure all compile
-to machine code. Only direct cross-component expose calls are not yet native
-(clear message; use `bundle`).
+timers (`on every`/`on after`), `supervise` restart-on-failure, and
+cross-component `expose` calls all compile to machine code — the full component
+model. (Effectful builtins — `ai fun`, JSON, sized ints, `f32` — still defer
+with a clear message; use `bundle`. KValue unboxing for tighter numeric loops is
+a future performance arc.)
 `--keep-c` keeps the generated `.c` beside the output for inspection.
 
 ### `kupl dis <file.kupl>`

@@ -1,3 +1,14 @@
+> **Progress:** slice 4 landed (it39) — native CROSS-COMPONENT EXPOSE CALLS.
+> A component Method call on a K_COMPONENT receiver dispatches to the target
+> instance's expose chunk (looked up in a per-component KExpose[] table, run with
+> that instance current — mirrors vm.rs Op::Method); Op::CallComp compiles to a
+> direct chunk call with the current instance threaded (mirrors push_frame).
+> check_native_component is now a no-op — NATIVE COMPONENTS ARE FEATURE-COMPLETE
+> for the bounded model: state, handlers, children, wires, emit, timers,
+> supervision, and exposes all compile to machine code. counter/todo/timers/di/
+> native-counter native stdout == `kupl run`. (Effectful builtins — ai fun, json,
+> sized ints, f32 — still defer; the KValue-unboxing KIR is a future perf arc.)
+>
 > **Progress:** slice 3 landed (it38) — native TIMERS + SUPERVISION. The C
 > runtime gains a virtual clock (k_vnow), per-instance armed timers, and
 > k_advance/k_run_timers(100) ported verbatim from vm.rs (the (time, instance,

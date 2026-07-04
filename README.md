@@ -255,7 +255,7 @@ component manifests; an LSP server; and four verified execution modes.
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~22,300 lines of dependency-free Rust, 161 tests, all engines differentially
+~22,400 lines of dependency-free Rust, 161 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

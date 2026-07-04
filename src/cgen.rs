@@ -82,14 +82,26 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             }
             let _ = writeln!(out, "}};");
         }
+        if !c.exposes.is_empty() {
+            // deterministic order: sort by expose name (the map's iteration order
+            // is not stable, and codegen output must be reproducible)
+            let mut exposes: Vec<(&String, &u16)> = c.exposes.iter().collect();
+            exposes.sort_by(|a, b| a.0.cmp(b.0));
+            let _ = writeln!(out, "static const KExpose COMP{ci}_E[] = {{");
+            for (name, chunk) in exposes {
+                let _ = writeln!(out, "    {{ \"{}\", {} }},", c_escape(name), chunk);
+            }
+            let _ = writeln!(out, "}};");
+        }
     }
     let _ = writeln!(out, "const KCompMeta COMPS[] = {{");
     for (ci, c) in module.components.iter().enumerate() {
         let handlers = if c.handlers.is_empty() { "0".to_string() } else { format!("COMP{ci}_H") };
         let timers = if c.timers.is_empty() { "0".to_string() } else { format!("COMP{ci}_T") };
+        let exposes = if c.exposes.is_empty() { "0".to_string() } else { format!("COMP{ci}_E") };
         let _ = writeln!(
             out,
-            "    {{ \"{}\", {}, {}, {}, {}, {}, {}, {}, {} }},",
+            "    {{ \"{}\", {}, {}, {}, {}, {}, {}, {}, {}, {}, {} }},",
             c_escape(&c.name),
             c.is_app as i32,
             c.nslots,
@@ -99,6 +111,8 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             c.handlers.len(),
             timers,
             c.timers.len(),
+            exposes,
+            c.exposes.len(),
         );
     }
     let _ = writeln!(out, "}};\n#define N_COMPS {}\n", module.components.len());
@@ -133,26 +147,13 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     Ok(out)
 }
 
-/// Reject the constructs the native component backend can't compile yet, with a
-/// clear message (rather than a runtime panic). State, handlers, children,
-/// wires, `emit`, timers, and supervision are supported; only direct
-/// cross-component expose calls (`CallComp`) defer. Scans EVERY component.
-fn check_native_component(module: &Module, _app_idx: usize) -> Result<(), String> {
-    for comp in &module.components {
-        let mut chunks = vec![comp.init_chunk as usize];
-        chunks.extend(comp.handlers.iter().map(|(_, c, _)| *c as usize));
-        chunks.extend(comp.exposes.values().map(|c| *c as usize));
-        for &ci in &chunks {
-            for op in &module.chunks[ci].code {
-                if matches!(op, Op::CallComp { .. }) {
-                    return Err(
-                        "cross-component expose calls are not yet supported by the native backend — use `kupl bundle`"
-                            .into(),
-                    );
-                }
-            }
-        }
-    }
+/// Validate an app for the native backend. As of it39 every component construct
+/// — state, handlers, children, wires, `emit`, timers, supervision, and
+/// cross-component expose calls — compiles, so there is nothing to defer at the
+/// component level. (Effectful builtins like `ai fun`/json still defer, but
+/// those are handled in `emit_c`/`emit_op`, not here.) Kept as the hook for any
+/// future component construct that needs a clear compile-time refusal.
+fn check_native_component(_module: &Module, _app_idx: usize) -> Result<(), String> {
     Ok(())
 }
 
@@ -394,10 +395,11 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             };
             format!("k_emit(\"{}\", {});", c_escape(p), val)
         }
-        CallComp { .. } => {
-            // direct cross-component expose calls — a later native slice
-            "k_panic(\"cross-component expose calls are not yet supported by the native backend (use kupl bundle)\");"
-                .to_string()
+        CallComp { dst, fun, start, argc } => {
+            // resolved cross-component call: run chunk `fun` with the CURRENT
+            // instance (vm.rs threads cur_inst through push_frame). argc silences
+            // an unused-var warning when zero.
+            format!("(void){argc}; regs[{dst}] = CHUNKS[{fun}](0, &regs[{start}]);")
         }
         // emit_c rejects modules with ai funs before reaching here
         CallAi { .. } => {
@@ -1263,8 +1265,10 @@ static KValue k_shuffle(KValue seed, KValue lst) {
     return k_list(out, (int)l->len);
 }
 
+static KValue k_expose_call(KValue recv, const char* name, KValue* args, int argc);
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     (void)argc;
+    if (recv.tag == K_COMPONENT) return k_expose_call(recv, name, args, argc);
     if (recv.tag == K_LIST) {
         KList* l = recv.as.list;
         if (!strcmp(name, "len")) return k_int(l->len);
@@ -1976,8 +1980,6 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return args[0];
         }
     }
-    if (recv.tag == K_COMPONENT)
-        k_panic("cross-component expose calls are not yet supported by the native backend (use kupl bundle)");
     k_panic("no such method");
     return k_unit();
 }
@@ -1992,9 +1994,11 @@ const COMPONENT_RUNTIME: &str = r#"
 /* --- component runtime (native component apps) --- */
 typedef struct { const char* port; int chunk; int has_param; } KHandler;
 typedef struct { int chunk; int every; long long interval_ms; } KTimerMeta;
+typedef struct { const char* name; int chunk; } KExpose;
 typedef struct { const char* name; int is_app; int nslots; int init_chunk; int restart_chunk;
                  const KHandler* handlers; int nhandlers;
-                 const KTimerMeta* timers; int ntimers; } KCompMeta;
+                 const KTimerMeta* timers; int ntimers;
+                 const KExpose* exposes; int nexposes; } KCompMeta;
 extern const KCompMeta COMPS[];
 static KValue k_component(int id) { KValue v; v.tag = K_COMPONENT; v.as.i = id; return v; }
 
@@ -2045,6 +2049,24 @@ static int k_instantiate(int comp_idx, KValue* props, int nprops) {
 
 static KValue k_state_get(int slot) { return k_insts[k_cur_inst].slots[slot]; }
 static void k_state_set(int slot, KValue v) { k_insts[k_cur_inst].slots[slot] = v; }
+
+/* call an expose on a component instance: run its chunk with THAT instance
+   current (so its state ops hit the right slots) — mirrors vm.rs Op::Method. */
+static KValue k_expose_call(KValue recv, const char* name, KValue* args, int argc) {
+    (void)argc;
+    int id = (int)recv.as.i;
+    const KCompMeta* cm = &COMPS[k_insts[id].comp];
+    for (int i = 0; i < cm->nexposes; i++) {
+        if (!strcmp(cm->exposes[i].name, name)) {
+            int saved = k_cur_inst; k_cur_inst = id;
+            KValue r = CHUNKS[cm->exposes[i].chunk](0, args);
+            k_cur_inst = saved;
+            return r;
+        }
+    }
+    fprintf(stderr, "panic: component `%s` does not expose `%s`\n", cm->name, name);
+    exit(101);
+}
 
 static void k_wire(int from, const char* out_port, int to, const char* in_port) {
     KInstance* s = &k_insts[from];
@@ -2327,30 +2349,24 @@ mod tests {
         assert_eq!(out, "", "supervised panics keep stdout clean: {out:?}");
     }
 
-    /// Direct cross-component expose calls are not yet supported — a clear
-    /// native runtime message (compile-time detection is a later slice).
+    /// Direct cross-component expose calls compile to native and dispatch to the
+    /// right instance's state — native stdout == the interpreter.
     #[test]
-    fn native_expose_call_message() {
+    fn native_expose_calls() {
         if !cc_available() {
             return;
         }
-        let src = "component S {\n    intent \"x\"\n    state v: Int = 7\n    expose fun get() -> Int { v }\n}\n\
-                   app A {\n    intent \"x\"\n    let s = S()\n    on start { print(\"{s.get()}\") }\n}\n";
-        let compiled = crate::run::compile(src).expect("program compiles");
-        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
-            .expect("module compiles");
-        let c = super::emit_c(&module).expect("compiles to C");
-        let base = std::env::temp_dir().join(format!("kupl-cgen-exp-{}", std::process::id()));
-        let cpath = base.with_extension("c");
-        let bin = base.with_extension("out");
-        std::fs::write(&cpath, &c).unwrap();
-        assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
-            .status().expect("cc runs").success());
-        let out = std::process::Command::new(&bin).output().expect("runs");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("expose calls are not yet supported"), "clear message: {err}");
-        let _ = std::fs::remove_file(&cpath);
-        let _ = std::fs::remove_file(&bin);
+        let src = "component Store {\n    intent \"x\"\n    state v: Int = 0\n    \
+                   expose fun get() -> Int { v }\n    expose fun put(n: Int) { v = n }\n}\n\
+                   app A {\n    intent \"x\"\n    let s = Store()\n    \
+                   on start {\n        s.put(41)\n        print(\"got {s.get() + 1}\")\n    }\n}\n";
+        assert_eq!(native_stdout(src, "exp"), "got 42\n");
+
+        // two independent instances keep separate state through their exposes
+        let two = "component Cell {\n    intent \"x\"\n    state v: Int = 0\n    \
+                   expose fun set(n: Int) { v = n }\n    expose fun get() -> Int { v }\n}\n\
+                   app A {\n    intent \"x\"\n    let a = Cell()\n    let b = Cell()\n    \
+                   on start {\n        a.set(10)\n        b.set(20)\n        print(\"{a.get()} {b.get()}\")\n    }\n}\n";
+        assert_eq!(native_stdout(two, "exp2"), "10 20\n");
     }
 }

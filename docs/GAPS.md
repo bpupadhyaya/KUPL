@@ -101,8 +101,10 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       timers, and `supervise` restart-on-failure (a C mirror of vm.rs, incl. a
       setjmp/longjmp panic landing pad). counter/todo/timers/native-counter
       native stdout == `kupl run`. Remaining: cross-component expose calls,
-      and the optional typed SSA IR (KValue unboxing for raw-register numeric
-      loops — a perf, not correctness, arc; deliberately deferred).
+      The only remaining piece is the OPTIONAL typed SSA IR / KIR (KValue
+      unboxing for raw-register numeric loops — a performance, not correctness,
+      arc; deliberately deferred). Effectful builtins (ai/json/sized/f32) inside
+      native components defer as they do for `fun main`.
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
 - [◐] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal (audit #3) —
       slices landed: bitwise Int methods + hex/binary/underscore literals (it17);
