@@ -20,6 +20,7 @@ pub mod loader;
 pub mod parser;
 pub mod repl;
 pub mod run;
+pub mod sdiff;
 pub mod token;
 pub mod types;
 pub mod value;

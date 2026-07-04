@@ -11,6 +11,8 @@ Usage:
   kupl bundle <file.kupl> [-o app]  Produce a self-contained executable (VM + module)
   kupl native <file.kupl> [-o app]  Compile to machine code via C (fun main; --keep-c)
   kupl dis <file.kupl>              Disassemble the compiled KVM bytecode
+  kupl diff <old.kupl> <new.kupl>   Semantic diff (interface vs implementation)
+  kupl new <name>                   Scaffold a new KUPL project
   kupl test <file.kupl>             Run `example` blocks + contract laws as tests
   kupl check <file.kupl> [--json]   Parse, type-check, and effect-check
   kupl fmt <file.kupl> [--write]    Print (or rewrite to) canonical form
@@ -64,6 +66,20 @@ fn main() -> ExitCode {
         Some("run") => with_path(&args, run::run_program),
         Some("dis") => with_path(&args, run::disassemble),
         Some("native") => with_path(&args, |path| run::native(path, &args)),
+        Some("diff") => match (args.get(1), args.get(2)) {
+            (Some(old), Some(new)) => kupl::sdiff::semantic_diff(old, new),
+            _ => {
+                eprintln!("usage: kupl diff <old.kupl> <new.kupl>");
+                2
+            }
+        },
+        Some("new") => match args.get(1) {
+            Some(name) => scaffold_project(name),
+            None => {
+                eprintln!("usage: kupl new <project-name>");
+                2
+            }
+        },
         Some("manifest") => with_path(&args, run::emit_manifest),
         Some("build") => with_file(&args, |src, file| {
             build_module(&args, src, file, false)
@@ -173,6 +189,42 @@ fn build_module(args: &[String], src: &str, file: &str, bundle: bool) -> i32 {
         if bundle { "bundled executable" } else { "compiled module" },
         bytes.len()
     );
+    0
+}
+
+/// `kupl new`: scaffold a project directory.
+fn scaffold_project(name: &str) -> i32 {
+    let root = std::path::Path::new(name);
+    if root.exists() {
+        eprintln!("error: {name} already exists");
+        return 1;
+    }
+    let main_src = format!(
+        "use util\n\napp Main {{\n    intent \"{name}: describe what this app is for.\"\n\n    let greeter = Greeter()\n    let starter = Starter()\n\n    wire starter.go -> greeter.hello\n}}\n\ncomponent Starter {{\n    intent \"Kicks things off at startup.\"\n\n    out go: Str\n\n    on start {{\n        emit go(\"{name}\")\n    }}\n}}\n\ncomponent Greeter {{\n    intent \"Greets whatever arrives.\"\n\n    in hello: Str\n\n    on hello(who) {{\n        print(greeting(who))\n    }}\n}}\n"
+    );
+    let util_src = "pub fun greeting(name: Str) -> Str {\n    \"hello from {name}!\"\n}\n";
+    let toml = format!(
+        "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\nentry = \"main.kupl\"\n"
+    );
+    let write = |p: &std::path::Path, c: &str| -> bool {
+        if let Err(e) = std::fs::write(p, c) {
+            eprintln!("error: cannot write {}: {e}", p.display());
+            return false;
+        }
+        true
+    };
+    if std::fs::create_dir_all(root).is_err() {
+        eprintln!("error: cannot create {name}/");
+        return 1;
+    }
+    if !write(&root.join("main.kupl"), &main_src)
+        || !write(&root.join("util.kupl"), util_src)
+        || !write(&root.join("kupl.toml"), &toml)
+    {
+        return 1;
+    }
+    println!("created {name}/ (main.kupl, util.kupl, kupl.toml)");
+    println!("  kupl run {name}/main.kupl");
     0
 }
 
