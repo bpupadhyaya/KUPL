@@ -205,12 +205,14 @@ fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
                 .ok_or_else(|| format!("unknown function `{name}` in constant"))?;
             format!("k_fun({idx})")
         }
-        Value::SizedInt(_) => {
-            return Err(
-                "sized integers (i8..u64) are not supported by the native backend yet \
-                 — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
-                    .to_string(),
-            )
+        Value::SizedInt(b) => {
+            // value fits its width (≤64 bits); build the __int128 from an i64/u64
+            let (v, w) = (b.0, b.1);
+            if w.is_signed() {
+                format!("k_sized((__int128)(long long){}LL, {})", v, w.tag())
+            } else {
+                format!("k_sized((__int128)(unsigned long long){}ULL, {})", v, w.tag())
+            }
         }
         Value::F32(_) => {
             return Err(
@@ -451,14 +453,17 @@ typedef struct { int64_t len; double* data; } KTensor;
 typedef struct { int64_t len; KValue* keys; KValue* vals; } KMap;
 typedef struct { int64_t len; KValue* items; } KSet;
 typedef struct { const char* type_name; const char* variant; int arity; const char** fields; } KCtorMeta;
+/* a fixed-width integer: the value is boxed (like the interpreter's i128 box) so
+   KValue stays small; width is the IntW tag 0..7 (i8,i16,i32,i64,u8,u16,u32,u64) */
+typedef struct { __int128 v; int width; } KSized;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT } tag;
     union {
         int64_t i; double f; int b;
         const char* s;
         KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
-        int32_t fun;
+        int32_t fun; KSized* sized;
         struct { int64_t lo, hi; int incl; } range;
     } as;
 };
@@ -486,6 +491,67 @@ static void* k_alloc(size_t n) {
 
 static KValue k_int(int64_t v)   { KValue x; x.tag = K_INT;   x.as.i = v; return x; }
 static KValue k_float(double v)  { KValue x; x.tag = K_FLOAT; x.as.f = v; return x; }
+
+/* ---- fixed-width integers (mirror value.rs IntW + interp raw_binary_op) ---- */
+static int k_iw_bits(int w) { switch (w % 4) { case 0: return 8; case 1: return 16; case 2: return 32; default: return 64; } }
+static int k_iw_signed(int w) { return w < 4; }
+static __int128 k_iw_max(int w) {
+    int bits = k_iw_bits(w);
+    return k_iw_signed(w) ? (((__int128)1 << (bits - 1)) - 1) : (((__int128)1 << bits) - 1);
+}
+static __int128 k_iw_min(int w) {
+    if (!k_iw_signed(w)) return 0;
+    return -((__int128)1 << (k_iw_bits(w) - 1));
+}
+static const char* k_iw_name(int w) {
+    static const char* n[] = { "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64" };
+    return n[w & 7];
+}
+static __int128 k_iw_wrap(int w, __int128 v) {
+    int bits = k_iw_bits(w);
+    __int128 m = (__int128)1 << bits;
+    __int128 r = v % m; if (r < 0) r += m;     /* rem_euclid */
+    if (k_iw_signed(w) && r > k_iw_max(w)) r -= m;
+    return r;
+}
+static __int128 k_iw_sat(int w, __int128 v) {
+    __int128 lo = k_iw_min(w), hi = k_iw_max(w);
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+static KValue k_sized(__int128 v, int w) {
+    KValue x; x.tag = K_SIZEDINT;
+    x.as.sized = (KSized*)k_alloc(sizeof(KSized));
+    x.as.sized->v = v; x.as.sized->width = w;
+    return x;
+}
+/* checked same-width arithmetic (op: 0+ 1- 2* 3/ 4%) — mirrors interp exactly */
+static KValue k_sized_arith(KValue a, KValue b, int op) {
+    if (a.as.sized->width != b.as.sized->width) k_panic("mismatched sized-int widths");
+    int w = a.as.sized->width;
+    __int128 x = a.as.sized->v, y = b.as.sized->v, r; const char* what;
+    switch (op) {
+        case 0: r = x + y; what = "addition"; break;
+        case 1: r = x - y; what = "subtraction"; break;
+        case 2: r = x * y; what = "multiplication"; break;
+        case 3: if (y == 0) k_panic("division by zero"); r = x / y; what = "division"; break;
+        default: if (y == 0) k_panic("remainder by zero"); r = x % y; what = "remainder"; break;
+    }
+    if (r < k_iw_min(w) || r > k_iw_max(w)) {
+        char buf[64]; snprintf(buf, sizeof buf, "integer overflow in %s", what); k_panic(buf);
+    }
+    return k_sized(r, w);
+}
+/* width tag (0..7) from a to_iN/to_uN method name, or -1 */
+static int k_width_of(const char* name) {
+    static const char* n[] = { "to_i8","to_i16","to_i32","to_i64","to_u8","to_u16","to_u32","to_u64" };
+    for (int i = 0; i < 8; i++) if (!strcmp(name, n[i])) return i;
+    return -1;
+}
+/* print a ≤64-bit __int128 into buf (signed or unsigned by value) */
+static void k_i128_print(char* buf, size_t n, __int128 x) {
+    if (x > (__int128)INT64_MAX) snprintf(buf, n, "%llu", (unsigned long long)x);
+    else snprintf(buf, n, "%lld", (long long)x);
+}
 static KValue k_bool(int v)      { KValue x; x.tag = K_BOOL;  x.as.b = !!v; return x; }
 static KValue k_unit(void)       { KValue x; x.tag = K_UNIT;  x.as.i = 0; return x; }
 static KValue k_str(const char* s) { KValue x; x.tag = K_STR; x.as.s = s; return x; }
@@ -673,6 +739,15 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
             snprintf(tmp, sizeof tmp, "<component #%lld>", (long long)v.as.i);
             kb_puts(b, tmp);
             break;
+        case K_SIZEDINT:
+            /* the stored value always fits its width (≤64 bits); print signed
+               widths with %lld and unsigned with %llu — matches value.rs {b.0} */
+            if (k_iw_signed(v.as.sized->width))
+                snprintf(tmp, sizeof tmp, "%lld", (long long)v.as.sized->v);
+            else
+                snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)v.as.sized->v);
+            kb_puts(b, tmp);
+            break;
         case K_RANGE:
             snprintf(tmp, sizeof tmp, "%lld..%s%lld", (long long)v.as.range.lo,
                      v.as.range.incl ? "=" : "", (long long)v.as.range.hi);
@@ -730,6 +805,8 @@ static KValue k_concat(KValue a, KValue b) {
 /* ---- operators (mirror interp raw_binary_op) ---- */
 
 static int k_eq(KValue a, KValue b) {
+    if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT)
+        return a.as.sized->width == b.as.sized->width && a.as.sized->v == b.as.sized->v;
     if (a.tag == K_MAP && b.tag == K_MAP) {
         if (a.as.map->len != b.as.map->len) return 0;
         for (int64_t i = 0; i < a.as.map->len; i++) {
@@ -804,6 +881,7 @@ static KValue k_add(KValue a, KValue b) {
         return k_int(r);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f + b.as.f);
+    if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 0);
     if (a.tag == K_STR && b.tag == K_STR) return k_concat(a, b);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 0);
     k_panic("invalid operand types"); return k_unit();
@@ -815,6 +893,7 @@ static KValue k_sub(KValue a, KValue b) {
         return k_int(r);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f - b.as.f);
+    if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 1);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 1);
     k_panic("invalid operand types"); return k_unit();
 }
@@ -825,6 +904,7 @@ static KValue k_mul(KValue a, KValue b) {
         return k_int(r);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f * b.as.f);
+    if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 2);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 2);
     k_panic("invalid operand types"); return k_unit();
 }
@@ -835,6 +915,7 @@ static KValue k_div(KValue a, KValue b) {
         return k_int(a.as.i / b.as.i);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f / b.as.f);
+    if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 3);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 3);
     k_panic("invalid operand types"); return k_unit();
 }
@@ -844,12 +925,14 @@ static KValue k_rem(KValue a, KValue b) {
         return k_int(a.as.i % b.as.i);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(fmod(a.as.f, b.as.f));
+    if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 4);
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
     double x, y; int is_str = 0; int c = 0;
     if (a.tag == K_INT && b.tag == K_INT) { x = 0; y = 0; c = (a.as.i < b.as.i) ? -1 : (a.as.i > b.as.i); }
     else if (a.tag == K_FLOAT && b.tag == K_FLOAT) { x = a.as.f; y = b.as.f; c = (x < y) ? -1 : (x > y); }
+    else if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) { __int128 p = a.as.sized->v, q = b.as.sized->v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_STR && b.tag == K_STR) { is_str = 1; int r = strcmp(a.as.s, b.as.s); c = (r < 0) ? -1 : (r > 0); }
     else { k_panic("invalid operand types"); }
     (void)is_str;
@@ -1269,6 +1352,72 @@ static KValue k_expose_call(KValue recv, const char* name, KValue* args, int arg
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     (void)argc;
     if (recv.tag == K_COMPONENT) return k_expose_call(recv, name, args, argc);
+    /* Int/sized -> a sized width (checked), mirrors interp shared_method */
+    if (recv.tag == K_INT || recv.tag == K_SIZEDINT) {
+        int tw = k_width_of(name);
+        if (tw >= 0) {
+            __int128 x = (recv.tag == K_INT) ? (__int128)recv.as.i : recv.as.sized->v;
+            if (x < k_iw_min(tw) || x > k_iw_max(tw)) {
+                char b0[96], num[48]; k_i128_print(num, sizeof num, x);
+                snprintf(b0, sizeof b0, "%s out of range for `%s`", num, k_iw_name(tw));
+                k_panic(b0);
+            }
+            return k_sized(x, tw);
+        }
+    }
+    if (recv.tag == K_SIZEDINT) {
+        __int128 a = recv.as.sized->v; int w = recv.as.sized->width;
+        if (!strcmp(name, "to_int")) {
+            if (a < INT64_MIN || a > INT64_MAX) {
+                char b0[80], num[48]; k_i128_print(num, sizeof num, a);
+                snprintf(b0, sizeof b0, "%s does not fit in Int (i64)", num); k_panic(b0);
+            }
+            return k_int((int64_t)a);
+        }
+        if (!strcmp(name, "to_str")) {
+            char num[48]; k_i128_print(num, sizeof num, a);
+            char* c = (char*)k_alloc(strlen(num) + 1); strcpy(c, num); return k_str(c);
+        }
+        if (!strcmp(name, "to_float")) return k_float((double)a);
+        int wsb = !strcmp(name,"wrapping_add")||!strcmp(name,"wrapping_sub")||!strcmp(name,"wrapping_mul")
+                ||!strcmp(name,"saturating_add")||!strcmp(name,"saturating_sub")||!strcmp(name,"saturating_mul")
+                ||!strcmp(name,"band")||!strcmp(name,"bor")||!strcmp(name,"bxor");
+        if (wsb) {
+            if (argc < 1 || args[0].tag != K_SIZEDINT || args[0].as.sized->width != w) {
+                char b0[64]; snprintf(b0, sizeof b0, "`%s` needs a `%s`", name, k_iw_name(w)); k_panic(b0);
+            }
+            __int128 rhs = args[0].as.sized->v, mask = ((__int128)1 << k_iw_bits(w)) - 1, r;
+            if (!strcmp(name,"wrapping_add")) r = k_iw_wrap(w, a + rhs);
+            else if (!strcmp(name,"wrapping_sub")) r = k_iw_wrap(w, a - rhs);
+            else if (!strcmp(name,"wrapping_mul")) r = k_iw_wrap(w, a * rhs);
+            else if (!strcmp(name,"saturating_add")) r = k_iw_sat(w, a + rhs);
+            else if (!strcmp(name,"saturating_sub")) r = k_iw_sat(w, a - rhs);
+            else if (!strcmp(name,"saturating_mul")) r = k_iw_sat(w, a * rhs);
+            else if (!strcmp(name,"band")) r = k_iw_wrap(w, (a & mask) & (rhs & mask));
+            else if (!strcmp(name,"bor")) r = k_iw_wrap(w, (a & mask) | (rhs & mask));
+            else r = k_iw_wrap(w, (a & mask) ^ (rhs & mask));
+            return k_sized(r, w);
+        }
+        if (!strcmp(name, "bnot")) {
+            __int128 mask = ((__int128)1 << k_iw_bits(w)) - 1;
+            return k_sized(k_iw_wrap(w, (a & mask) ^ mask), w);
+        }
+        if (!strcmp(name, "shl") || !strcmp(name, "shr")) {
+            if (argc < 1 || args[0].tag != K_INT) {
+                char b0[64]; snprintf(b0, sizeof b0, "`%s` needs an Int shift amount", name); k_panic(b0);
+            }
+            long long sh = args[0].as.i;
+            if (sh < 0 || sh >= k_iw_bits(w)) {
+                char b0[64]; snprintf(b0, sizeof b0, "shift amount must be in 0..=%d", k_iw_bits(w) - 1); k_panic(b0);
+            }
+            __int128 mask = ((__int128)1 << k_iw_bits(w)) - 1, r;
+            if (!strcmp(name, "shl")) r = k_iw_wrap(w, (a & mask) << sh);
+            else if (k_iw_signed(w)) r = k_iw_wrap(w, a >> sh);
+            else r = k_iw_wrap(w, (a & mask) >> sh);
+            return k_sized(r, w);
+        }
+        /* unmatched sized method falls through to the generic "no such method" */
+    }
     if (recv.tag == K_LIST) {
         KList* l = recv.as.list;
         if (!strcmp(name, "len")) return k_int(l->len);
@@ -2347,6 +2496,62 @@ mod tests {
         // [supervise] lines go to stderr. Just assert clean stdout + termination.
         let out = native_stdout(src, "sup");
         assert_eq!(out, "", "supervised panics keep stdout clean: {out:?}");
+    }
+
+    /// Compile a `fun main` program to native, run it, return stdout.
+    #[cfg(test)]
+    fn native_main_stdout(src: &str, tag: &str) -> String {
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-{tag}-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Sized integers compile to native and match the interpreter — arithmetic,
+    /// conversions, wrapping/saturating/bitwise/shift methods, and u64 values
+    /// above i64::MAX (computed via __int128).
+    #[test]
+    fn native_sized_integers() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(200u8 + 55u8)\n    print(0xFFu8)\n    print(1000i16 * 3i16)\n    \
+                   print((255u8).to_int() + 1)\n    print(42.to_u8())\n    \
+                   print((200u8).wrapping_add(100u8))\n    print((200u8).saturating_add(100u8))\n    \
+                   print((0xF0u8).band(0x0Fu8))\n    print((1u8).shl(4))\n    print((0i8 - 2i8).shr(1))\n    \
+                   print(18000000000000000000u64 + 1u64)\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "sz"),
+            "255\n255\n3000\n256\n42\n44\n255\n0\n16\n-1\n18000000000000000001\n"
+        );
+        // overflow panics with the interpreter's exact message (to stderr)
+        let compiled = crate::run::compile("fun main() uses io { print(200u8 + 100u8) }").unwrap();
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).unwrap();
+        let base = std::env::temp_dir().join(format!("kupl-cgen-of-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("integer overflow in addition"));
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
     }
 
     /// Direct cross-component expose calls compile to native and dispatch to the

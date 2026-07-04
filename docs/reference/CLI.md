@@ -51,9 +51,9 @@ Compiles to **machine code**: bytecode → generated C → `$CC` (default `cc`)
 `on start`/port handlers, child components, `wire`s, `emit`, virtual-clock
 timers (`on every`/`on after`), `supervise` restart-on-failure, and
 cross-component `expose` calls all compile to machine code — the full component
-model. (Effectful builtins — `ai fun`, JSON, sized ints, `f32` — still defer
-with a clear message; use `bundle`. KValue unboxing for tighter numeric loops is
-a future performance arc.)
+model. (Sized integers now compile; `ai fun`, JSON/CSV/HTTP builtins, and `f32` still
+defer with a clear message — use `bundle`. KValue unboxing for tighter numeric
+loops is a future performance arc.)
 `--keep-c` keeps the generated `.c` beside the output for inspection.
 
 ### `kupl dis <file.kupl>`

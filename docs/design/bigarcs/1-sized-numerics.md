@@ -1,3 +1,12 @@
+> **Native (it40):** sized integers (i8..i64/u8..u64) now COMPILE to machine
+> code — a K_SIZEDINT KValue (boxed __int128 + width) mirroring the interpreter's
+> i128 range-check/wrap/saturate semantics exactly, incl. u64 values above
+> i64::MAX and the overflow/out-of-range panic messages. Sized ints are on ALL
+> four engines. f32 native codegen is deferred: its non-integer Display needs a
+> shortest-round-trip float formatter to stay byte-identical with Rust — a
+> follow-up. So `kupl native` compiles sized-int programs; f32 programs still
+> defer with a clear message.
+
 > **Progress:** iter 1 landed (it27) — integer widths i8..u64 end-to-end on
 > interpreter + KVM + .kx (checked arithmetic matching i64; overflow panics).
 > **f32 (it28) + wrapping/saturating/bitwise + full conversion matrix (it29) landed** — the

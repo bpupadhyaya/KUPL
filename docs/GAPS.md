@@ -107,10 +107,12 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       native components defer as they do for `fun main`.
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
 - [◐] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal (audit #3) —
-      slices landed: bitwise Int methods + hex/binary/underscore literals (it17);
-      numeric formatting `.to_hex/.to_binary/.to_octal/.to_radix/.isqrt`,
-      `Float.format` + more math (it24). All engines incl. native. Full sized
-      types (i8…u64, f32) still to do.
+      sized ints i8…u64 fully landed across ALL engines: checked/wrapping/
+      saturating arithmetic, width-aware bitwise, full conversion matrix
+      (it27-29), and native codegen via a boxed __int128 KValue (it40). f32 runs
+      on interp/KVM/.kx (it28); native f32 codegen is pending a shortest-float
+      formatter. Bitwise Int methods + literals (it17); numeric formatting +
+      math (it24). Byte/Char, BigInt/Decimal still to do.
 - [x] Broader standard library (audit #3, it12) — ~40 methods across all core
       types, all engines byte-identical incl. native. List (is_empty/concat/
       unique/init/tail/product/min/max/flatten/count/flat_map/window/chunk); Str

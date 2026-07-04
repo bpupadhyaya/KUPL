@@ -1484,13 +1484,15 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
-    fn sized_int_native_defers_it27() {
-        let compiled = crate::run::compile("fun main() {\n    let x = 255u8\n    let _ = x\n}\n")
-            .expect("compiles");
+    fn sized_int_native_compiles_it40() {
+        // sized ints now compile to native (it40) — emit_c succeeds. (Runtime
+        // byte-identity vs the interpreter is covered by the cc-guarded tests in
+        // cgen.rs; here we just confirm the backend no longer defers.)
+        let compiled =
+            crate::run::compile("fun main() {\n    let x = 200u8 + 55u8\n    let _ = x\n}\n")
+                .expect("compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
-        let err = crate::cgen::emit_c(&module);
-        assert!(err.is_err(), "native should defer sized ints");
-        assert!(err.unwrap_err().contains("sized integers"), "clear error");
+        assert!(crate::cgen::emit_c(&module).is_ok(), "native should compile sized ints now");
     }
 
     #[test]
