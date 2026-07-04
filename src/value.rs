@@ -9,6 +9,7 @@ use crate::ast::Block;
 
 #[derive(Clone)]
 pub enum Value {
+    // (Debug is implemented manually below via Display)
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -28,6 +29,8 @@ pub enum Value {
     Component(usize),
     /// An expose function bound to a live instance (used by laws/tests).
     Bound(usize, Rc<String>),
+    /// A KVM closure: prototype index + captured values (captured by value).
+    VmClosure(u16, Rc<Vec<Value>>),
     Range(i64, i64, bool),
 }
 
@@ -82,6 +85,7 @@ impl Value {
             Value::Fun(_) => "fn".into(),
             Value::Component(_) => "component".into(),
             Value::Bound(..) => "fn".into(),
+            Value::VmClosure(..) => "fn".into(),
             Value::Range(..) => "Range".into(),
         }
     }
@@ -149,8 +153,15 @@ impl fmt::Display for Value {
             Value::Fun(name) => write!(f, "<fn {name}>"),
             Value::Component(id) => write!(f, "<component #{id}>"),
             Value::Bound(id, name) => write!(f, "<fn {name} of #{id}>"),
+            Value::VmClosure(proto, _) => write!(f, "<fn @{proto}>"),
             Value::Range(a, b, incl) => write!(f, "{a}..{}{b}", if *incl { "=" } else { "" }),
         }
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
     }
 }
 

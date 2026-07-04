@@ -5,10 +5,13 @@
 //! deterministic component runtime, plus a REPL and an example-test runner.
 
 pub mod ast;
+pub mod bytecode;
 pub mod check;
+pub mod compile;
 pub mod diag;
 pub mod effects;
 pub mod fmt;
+pub mod vm;
 pub mod interp;
 pub mod lexer;
 pub mod parser;

@@ -1,0 +1,501 @@
+//! The KVM: a register-based virtual machine executing KUPL bytecode.
+//!
+//! Semantics are defined by the tree-walking interpreter; the VM shares its
+//! operator (`raw_binary_op`) and method (`shared_method`) implementations, and
+//! differential tests in this module assert both engines agree.
+
+use std::rc::Rc;
+
+use crate::bytecode::*;
+use crate::diag::Span;
+use crate::interp::{raw_binary_op, shared_method};
+use crate::value::Value;
+
+#[derive(Debug)]
+pub struct VmError {
+    pub msg: String,
+    pub span: Span,
+}
+
+struct Frame {
+    chunk: u16,
+    ip: usize,
+    base: usize,
+    /// Register in the CALLER's frame that receives the return value.
+    dst: Reg,
+}
+
+pub struct Vm<'m> {
+    module: &'m Module,
+    stack: Vec<Value>,
+    frames: Vec<Frame>,
+}
+
+impl<'m> Vm<'m> {
+    pub fn new(module: &'m Module) -> Self {
+        Vm { module, stack: Vec::new(), frames: Vec::new() }
+    }
+
+    pub fn call_named(&mut self, name: &str, args: Vec<Value>) -> Result<Value, VmError> {
+        let Some(&idx) = self.module.funs.get(name) else {
+            return Err(VmError { msg: format!("no function `{name}`"), span: Span::default() });
+        };
+        let depth = self.frames.len();
+        self.push_frame(idx, &args, 0)?;
+        self.run(depth)
+    }
+
+    fn chunk(&self, idx: u16) -> &'m Chunk {
+        &self.module.chunks[idx as usize]
+    }
+
+    fn push_frame(&mut self, chunk_idx: u16, args: &[Value], dst: Reg) -> Result<(), VmError> {
+        let chunk = self.chunk(chunk_idx);
+        let expected = chunk.nparams as usize;
+        if args.len() != expected {
+            return Err(VmError {
+                msg: format!("`{}` takes {expected} argument(s), {} given", chunk.name, args.len()),
+                span: Span::default(),
+            });
+        }
+        let base = self.stack.len();
+        self.stack.resize(base + chunk.nregs as usize, Value::Unit);
+        for (i, a) in args.iter().enumerate() {
+            self.stack[base + chunk.ncaps as usize + i] = a.clone();
+        }
+        if self.frames.len() >= 10_000 {
+            return Err(VmError { msg: "stack overflow (10000 frames)".into(), span: Span::default() });
+        }
+        self.frames.push(Frame { chunk: chunk_idx, ip: 0, base, dst });
+        Ok(())
+    }
+
+    fn push_closure_frame(
+        &mut self,
+        proto: u16,
+        captures: &[Value],
+        args: &[Value],
+        dst: Reg,
+    ) -> Result<(), VmError> {
+        self.push_frame(proto, args, dst)?;
+        let base = self.frames.last().unwrap().base;
+        for (i, c) in captures.iter().enumerate() {
+            self.stack[base + i] = c.clone();
+        }
+        Ok(())
+    }
+
+    /// Call a callable value re-entrantly (used by Method callbacks).
+    fn call_value_nested(&mut self, f: Value, args: Vec<Value>) -> Result<Value, String> {
+        let depth = self.frames.len();
+        match f {
+            Value::Fun(name) => {
+                let Some(&idx) = self.module.funs.get(name.as_str()) else {
+                    return Err(format!("no function `{name}`"));
+                };
+                self.push_frame(idx, &args, 0).map_err(|e| e.msg)?;
+            }
+            Value::VmClosure(proto, caps) => {
+                self.push_closure_frame(proto, &caps, &args, 0).map_err(|e| e.msg)?;
+            }
+            other => return Err(format!("{} is not callable", other.type_name())),
+        }
+        self.run(depth).map_err(|e| e.msg)
+    }
+
+    /// Execute until the frame stack returns to `stop_depth`; the final `Ret`
+    /// value is returned to the caller.
+    fn run(&mut self, stop_depth: usize) -> Result<Value, VmError> {
+        macro_rules! frame {
+            () => {
+                self.frames.last_mut().unwrap()
+            };
+        }
+        loop {
+            let (chunk_idx, ip, base) = {
+                let f = frame!();
+                (f.chunk, f.ip, f.base)
+            };
+            let chunk = self.chunk(chunk_idx);
+            let op = chunk.code[ip].clone();
+            let span = chunk.spans[ip];
+            frame!().ip += 1;
+
+            macro_rules! reg {
+                ($r:expr) => {
+                    self.stack[base + $r as usize].clone()
+                };
+            }
+            macro_rules! set {
+                ($r:expr, $v:expr) => {
+                    self.stack[base + $r as usize] = $v
+                };
+            }
+            macro_rules! bin {
+                ($dst:expr, $a:expr, $b:expr, $op:expr) => {{
+                    let l = reg!($a);
+                    let r = reg!($b);
+                    match raw_binary_op($op, &l, &r) {
+                        Ok(v) => set!($dst, v),
+                        Err(msg) => return Err(VmError { msg, span }),
+                    }
+                }};
+            }
+
+            use crate::ast::BinOp as B;
+            match op {
+                Op::Const(dst, idx) => set!(dst, chunk.consts[idx as usize].clone()),
+                Op::Move(dst, src) => {
+                    let v = reg!(src);
+                    set!(dst, v);
+                }
+                Op::Add(d, a, b) => bin!(d, a, b, B::Add),
+                Op::Sub(d, a, b) => bin!(d, a, b, B::Sub),
+                Op::Mul(d, a, b) => bin!(d, a, b, B::Mul),
+                Op::Div(d, a, b) => bin!(d, a, b, B::Div),
+                Op::Rem(d, a, b) => bin!(d, a, b, B::Rem),
+                Op::Eq(d, a, b) => bin!(d, a, b, B::Eq),
+                Op::Ne(d, a, b) => bin!(d, a, b, B::Ne),
+                Op::Lt(d, a, b) => bin!(d, a, b, B::Lt),
+                Op::Le(d, a, b) => bin!(d, a, b, B::Le),
+                Op::Gt(d, a, b) => bin!(d, a, b, B::Gt),
+                Op::Ge(d, a, b) => bin!(d, a, b, B::Ge),
+                Op::Neg(d, a) => match reg!(a) {
+                    Value::Int(v) => match v.checked_neg() {
+                        Some(n) => set!(d, Value::Int(n)),
+                        None => return Err(VmError { msg: "integer overflow in negation".into(), span }),
+                    },
+                    Value::Float(v) => set!(d, Value::Float(-v)),
+                    other => {
+                        return Err(VmError {
+                            msg: format!("cannot negate {}", other.type_name()),
+                            span,
+                        })
+                    }
+                },
+                Op::Not(d, a) => match reg!(a) {
+                    Value::Bool(v) => set!(d, Value::Bool(!v)),
+                    other => {
+                        return Err(VmError { msg: format!("cannot `!` {}", other.type_name()), span })
+                    }
+                },
+                Op::Jump(t) => frame!().ip = t,
+                Op::JumpIfFalse(r, t) => match reg!(r) {
+                    Value::Bool(false) => frame!().ip = t,
+                    Value::Bool(true) => {}
+                    other => {
+                        return Err(VmError {
+                            msg: format!("condition must be Bool, found {}", other.type_name()),
+                            span,
+                        })
+                    }
+                },
+                Op::JumpIfTrue(r, t) => match reg!(r) {
+                    Value::Bool(true) => frame!().ip = t,
+                    Value::Bool(false) => {}
+                    other => {
+                        return Err(VmError {
+                            msg: format!("condition must be Bool, found {}", other.type_name()),
+                            span,
+                        })
+                    }
+                },
+                Op::Call { dst, fun, start, argc } => {
+                    let args: Vec<Value> =
+                        (0..argc).map(|i| reg!(start + i)).collect();
+                    self.push_frame(fun, &args, dst).map_err(|mut e| {
+                        e.span = span;
+                        e
+                    })?;
+                }
+                Op::CallBuiltin { dst, which, start, argc } => {
+                    let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    match which {
+                        BUILTIN_PRINT => {
+                            println!("{}", args[0]);
+                            set!(dst, Value::Unit);
+                        }
+                        BUILTIN_TO_STR => set!(dst, Value::str(args[0].to_string())),
+                        BUILTIN_PANIC => {
+                            return Err(VmError { msg: args[0].to_string(), span })
+                        }
+                        _ => return Err(VmError { msg: "unknown builtin".into(), span }),
+                    }
+                }
+                Op::CallValue { dst, f, start, argc } => {
+                    let callee = reg!(f);
+                    let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    match callee {
+                        Value::Fun(name) => {
+                            let Some(&idx) = self.module.funs.get(name.as_str()) else {
+                                return Err(VmError { msg: format!("no function `{name}`"), span });
+                            };
+                            self.push_frame(idx, &args, dst).map_err(|mut e| {
+                                e.span = span;
+                                e
+                            })?;
+                        }
+                        Value::VmClosure(proto, caps) => {
+                            self.push_closure_frame(proto, &caps, &args, dst).map_err(|mut e| {
+                                e.span = span;
+                                e
+                            })?;
+                        }
+                        other => {
+                            return Err(VmError {
+                                msg: format!("{} is not callable", other.type_name()),
+                                span,
+                            })
+                        }
+                    }
+                }
+                Op::Method { dst, recv, name, start, argc } => {
+                    let r = reg!(recv);
+                    let method = match &chunk.consts[name as usize] {
+                        Value::Str(s) => s.as_str().to_string(),
+                        _ => return Err(VmError { msg: "bad method name".into(), span }),
+                    };
+                    let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    let mut call = |f: Value, args: Vec<Value>| self.call_value_nested(f, args);
+                    match shared_method(&r, &method, args, &mut call) {
+                        Ok(v) => set!(dst, v),
+                        Err(msg) => return Err(VmError { msg, span }),
+                    }
+                }
+                Op::Ret(r) => {
+                    let value = reg!(r);
+                    let f = self.frames.pop().unwrap();
+                    self.stack.truncate(f.base);
+                    if self.frames.len() == stop_depth {
+                        return Ok(value);
+                    }
+                    let caller = self.frames.last().unwrap();
+                    let slot = caller.base + f.dst as usize;
+                    self.stack[slot] = value;
+                }
+                Op::MakeList { dst, start, len } => {
+                    let items: Vec<Value> = (0..len).map(|i| reg!(start + i)).collect();
+                    set!(dst, Value::List(Rc::new(items)));
+                }
+                Op::MakeCtor { dst, ctor, start, len } => {
+                    let meta = &self.module.ctors[ctor as usize];
+                    let fields: Vec<Value> = (0..len).map(|i| reg!(start + i)).collect();
+                    set!(
+                        dst,
+                        Value::Ctor {
+                            ty: Rc::new(meta.type_name.clone()),
+                            variant: Rc::new(meta.variant.clone()),
+                            fields: Rc::new(fields),
+                        }
+                    );
+                }
+                Op::GetField { dst, obj, idx } => match reg!(obj) {
+                    Value::Ctor { fields, .. } => match fields.get(idx as usize) {
+                        Some(v) => set!(dst, v.clone()),
+                        None => return Err(VmError { msg: "field index out of range".into(), span }),
+                    },
+                    other => {
+                        return Err(VmError {
+                            msg: format!("{} has no fields", other.type_name()),
+                            span,
+                        })
+                    }
+                },
+                Op::GetFieldNamed { dst, obj, name } => {
+                    let field = match &chunk.consts[name as usize] {
+                        Value::Str(s) => s.as_str().to_string(),
+                        _ => return Err(VmError { msg: "bad field name".into(), span }),
+                    };
+                    match reg!(obj) {
+                        Value::Ctor { variant, fields, ty } => {
+                            let position = self
+                                .module
+                                .ctor_field_names
+                                .get(variant.as_str())
+                                .and_then(|fs| fs.iter().position(|f| f == &field));
+                            match position.and_then(|i| fields.get(i)) {
+                                Some(v) => set!(dst, v.clone()),
+                                None => {
+                                    return Err(VmError {
+                                        msg: format!("`{ty}` value has no field `{field}`"),
+                                        span,
+                                    })
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(VmError {
+                                msg: format!("{} has no fields", other.type_name()),
+                                span,
+                            })
+                        }
+                    }
+                }
+                Op::TagIs { dst, obj, ctor } => {
+                    let meta = &self.module.ctors[ctor as usize];
+                    let is = matches!(reg!(obj), Value::Ctor { variant, .. } if *variant == meta.variant);
+                    set!(dst, Value::Bool(is));
+                }
+                Op::MakeClosure { dst, proto, start, ncaps } => {
+                    let caps: Vec<Value> = (0..ncaps).map(|i| reg!(start + i)).collect();
+                    set!(dst, Value::VmClosure(proto, Rc::new(caps)));
+                }
+                Op::MakeRange { dst, lo, hi, inclusive } => {
+                    match (reg!(lo), reg!(hi)) {
+                        (Value::Int(a), Value::Int(b)) => set!(dst, Value::Range(a, b, inclusive)),
+                        _ => return Err(VmError { msg: "range bounds must be Int".into(), span }),
+                    }
+                }
+                Op::IterLen(dst, x) => match reg!(x) {
+                    Value::Range(a, b, incl) => {
+                        let hi = if incl { b + 1 } else { b };
+                        set!(dst, Value::Int((hi - a).max(0)));
+                    }
+                    Value::List(items) => set!(dst, Value::Int(items.len() as i64)),
+                    other => {
+                        return Err(VmError {
+                            msg: format!("`for` needs a Range or List, found {}", other.type_name()),
+                            span,
+                        })
+                    }
+                },
+                Op::IterGet { dst, iter, idx } => {
+                    let i = match reg!(idx) {
+                        Value::Int(i) => i,
+                        _ => return Err(VmError { msg: "iterator index must be Int".into(), span }),
+                    };
+                    match reg!(iter) {
+                        Value::Range(a, _, _) => set!(dst, Value::Int(a + i)),
+                        Value::List(items) => match items.get(i as usize) {
+                            Some(v) => set!(dst, v.clone()),
+                            None => return Err(VmError { msg: "list index out of range".into(), span }),
+                        },
+                        other => {
+                            return Err(VmError {
+                                msg: format!("cannot iterate {}", other.type_name()),
+                                span,
+                            })
+                        }
+                    }
+                }
+                Op::ToStr(dst, src) => {
+                    let v = reg!(src);
+                    set!(dst, Value::str(v.to_string()));
+                }
+                Op::Concat(dst, a, b) => {
+                    let (l, r) = (reg!(a), reg!(b));
+                    set!(dst, Value::str(format!("{l}{r}")));
+                }
+                Op::Panic(idx) => {
+                    let msg = chunk.consts[idx as usize].to_string();
+                    return Err(VmError { msg, span });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interp::{Flow, Interp, ProgramDb};
+    use crate::value::Value;
+
+    /// Run `probe()` on both engines; assert both succeed with equal results.
+    fn differential(src: &str) -> String {
+        let compiled = crate::run::compile(src).expect("program must compile");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let f = Value::Fun(std::rc::Rc::new("probe".to_string()));
+        let iv = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v.to_string(),
+            Err(Flow::Panic { msg, .. }) => format!("panic: {msg}"),
+            Err(_) => "control-flow error".into(),
+        };
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module must compile");
+        let mut vm = Vm::new(&module);
+        let vv = match vm.call_named("probe", vec![]) {
+            Ok(v) => v.to_string(),
+            Err(e) => format!("panic: {}", e.msg),
+        };
+
+        assert_eq!(iv, vv, "interpreter and KVM disagree on:\n{src}");
+        iv
+    }
+
+    #[test]
+    fn diff_arithmetic() {
+        assert_eq!(differential("fun probe() -> Int {\n    (2 + 3) * 4 - 10 / 2 % 3\n}\n"), "18");
+    }
+
+    #[test]
+    fn diff_recursion_fib() {
+        let src = "fun fib(n: Int) -> Int {\n    if n < 2 {\n        n\n    } else {\n        fib(n - 1) + fib(n - 2)\n    }\n}\nfun probe() -> Int {\n    fib(15)\n}\n";
+        assert_eq!(differential(src), "610");
+    }
+
+    #[test]
+    fn diff_adt_match() {
+        let src = "type Shape = Circle(r: Float) | Rect(w: Float, h: Float)\nfun area(s: Shape) -> Float {\n    match s {\n        Circle(r) => 3.0 * r * r\n        Rect(w, h) => w * h\n    }\n}\nfun probe() -> Float {\n    area(Circle(r: 2.0)) + area(Rect(w: 3.0, h: 4.0))\n}\n";
+        assert_eq!(differential(src), "24.0");
+    }
+
+    #[test]
+    fn diff_lists_lambdas() {
+        let src = "fun probe() -> Int {\n    let xs = [1, 2, 3, 4, 5, 6]\n    xs.filter(fn n { n % 2 == 0 }).map(fn n { n * 10 }).sum()\n}\n";
+        assert_eq!(differential(src), "120");
+    }
+
+    #[test]
+    fn diff_closure_capture() {
+        let src = "fun probe() -> Int {\n    let base = 100\n    let add = fn n { n + base }\n    [1, 2, 3].map(add).sum()\n}\n";
+        assert_eq!(differential(src), "306");
+    }
+
+    #[test]
+    fn diff_string_interp() {
+        let src = "fun probe() -> Str {\n    let n = 6 * 7\n    \"answer is {n}!\"\n}\n";
+        assert_eq!(differential(src), "answer is 42!");
+    }
+
+    #[test]
+    fn diff_result_try() {
+        let src = "fun half(n: Int) -> Result[Int, Str] {\n    if n % 2 == 0 {\n        Ok(n / 2)\n    } else {\n        Err(\"odd: {n}\")\n    }\n}\nfun sum_halves(a: Int, b: Int) -> Result[Int, Str] {\n    let x = half(a)?\n    let y = half(b)?\n    Ok(x + y)\n}\nfun probe() -> Str {\n    let good = sum_halves(10, 4)\n    let bad = sum_halves(10, 3)\n    \"{good} then {bad}\"\n}\n";
+        assert_eq!(differential(src), "Ok(7) then Err(\"odd: 3\")");
+    }
+
+    #[test]
+    fn diff_loops_break_continue() {
+        let src = "fun probe() -> Int {\n    var total = 0\n    for i in 0..20 {\n        if i % 3 == 0 {\n            continue\n        }\n        if i > 10 {\n            break\n        }\n        total += i\n    }\n    var w = 0\n    while w < 5 {\n        total += 100\n        w += 1\n    }\n    total\n}\n";
+        assert_eq!(differential(src), "537");
+    }
+
+    #[test]
+    fn diff_records_and_options() {
+        let src = "type User = { name: Str, age: Int }\nfun probe() -> Str {\n    let users = [User(name: \"Ada\", age: 36), User(name: \"Alan\", age: 41)]\n    let found = users.find(fn u { u.age > 40 })\n    match found {\n        Some(u) => u.name\n        None => \"nobody\"\n    }\n}\n";
+        assert_eq!(differential(src), "Alan");
+    }
+
+    #[test]
+    fn diff_overflow_panics_identically() {
+        let src = "fun probe() -> Int {\n    9223372036854775807 + 1\n}\n";
+        assert_eq!(differential(src), "panic: integer overflow in addition");
+    }
+
+    #[test]
+    fn diff_higher_order_funs() {
+        let src = "fun twice(f: fn(Int) -> Int, x: Int) -> Int {\n    f(f(x))\n}\nfun inc(n: Int) -> Int {\n    n + 1\n}\nfun probe() -> Int {\n    twice(inc, 5) + twice(fn n { n * 2 }, 3)\n}\n";
+        assert_eq!(differential(src), "19");
+    }
+
+    #[test]
+    fn diff_expect_stmt() {
+        let src = "fun probe() -> Int {\n    expect 1 + 1 == 2\n    7\n}\n";
+        assert_eq!(differential(src), "7");
+    }
+}

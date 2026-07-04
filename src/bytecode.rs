@@ -1,0 +1,135 @@
+//! KVM bytecode: register-based, one `Chunk` per function.
+//!
+//! v0.4 uses a structured `Op` enum for clarity; the packed 32-bit encoding
+//! described in TOOLCHAIN.md §8 is a later, mechanical change once the op set
+//! stabilizes. Registers are frame-local (max 256/frame). Jump targets are
+//! absolute instruction indices, patched at compile time.
+
+use std::fmt::Write as _;
+
+use crate::diag::Span;
+use crate::value::Value;
+
+pub type Reg = u8;
+
+#[derive(Debug, Clone)]
+pub enum Op {
+    /// dst <- consts[idx]
+    Const(Reg, u16),
+    Move(Reg, Reg),
+
+    Add(Reg, Reg, Reg),
+    Sub(Reg, Reg, Reg),
+    Mul(Reg, Reg, Reg),
+    Div(Reg, Reg, Reg),
+    Rem(Reg, Reg, Reg),
+    Eq(Reg, Reg, Reg),
+    Ne(Reg, Reg, Reg),
+    Lt(Reg, Reg, Reg),
+    Le(Reg, Reg, Reg),
+    Gt(Reg, Reg, Reg),
+    Ge(Reg, Reg, Reg),
+    Neg(Reg, Reg),
+    Not(Reg, Reg),
+
+    Jump(usize),
+    JumpIfFalse(Reg, usize),
+    JumpIfTrue(Reg, usize),
+
+    /// dst <- chunks[fun](regs[start .. start+argc])
+    Call { dst: Reg, fun: u16, start: Reg, argc: u8 },
+    /// dst <- builtin(regs[start .. start+argc]); 0=print 1=to_str 2=panic
+    CallBuiltin { dst: Reg, which: u8, start: Reg, argc: u8 },
+    /// dst <- (regs[f])(regs[start .. start+argc]) — closures, fn refs
+    CallValue { dst: Reg, f: Reg, start: Reg, argc: u8 },
+    /// dst <- regs[recv].name(regs[start .. start+argc]) — builtin methods
+    Method { dst: Reg, recv: Reg, name: u16, start: Reg, argc: u8 },
+    Ret(Reg),
+
+    MakeList { dst: Reg, start: Reg, len: u8 },
+    /// dst <- ctors[ctor](regs[start .. start+len])
+    MakeCtor { dst: Reg, ctor: u16, start: Reg, len: u8 },
+    /// dst <- regs[obj].fields[idx]
+    GetField { dst: Reg, obj: Reg, idx: u8 },
+    /// dst <- regs[obj].field named consts[name] (records: resolved at runtime)
+    GetFieldNamed { dst: Reg, obj: Reg, name: u16 },
+    /// dst <- Bool: is regs[obj] an instance of ctors[ctor]?
+    TagIs { dst: Reg, obj: Reg, ctor: u16 },
+    /// dst <- closure over chunks[proto], capturing regs[start .. start+ncaps]
+    MakeClosure { dst: Reg, proto: u16, start: Reg, ncaps: u8 },
+    MakeRange { dst: Reg, lo: Reg, hi: Reg, inclusive: bool },
+
+    /// Iteration support: length of a List or Range; element at index.
+    IterLen(Reg, Reg),
+    IterGet { dst: Reg, iter: Reg, idx: Reg },
+
+    ToStr(Reg, Reg),
+    Concat(Reg, Reg, Reg),
+
+    /// Unconditional panic with message consts[idx].
+    Panic(u16),
+}
+
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub name: String,
+    /// Number of leading registers holding captures (lambdas only).
+    pub ncaps: u8,
+    /// Number of parameter registers (after captures).
+    pub nparams: u8,
+    /// Total registers this frame needs.
+    pub nregs: u16,
+    pub consts: Vec<Value>,
+    pub code: Vec<Op>,
+    /// Source span per instruction (for panics).
+    pub spans: Vec<Span>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CtorMeta {
+    pub type_name: String,
+    pub variant: String,
+    pub arity: u8,
+}
+
+/// A compiled program: all function chunks + the constructor table.
+#[derive(Debug, Clone, Default)]
+pub struct Module {
+    pub chunks: Vec<Chunk>,
+    pub ctors: Vec<CtorMeta>,
+    /// top-level function name -> chunk index
+    pub funs: std::collections::HashMap<String, u16>,
+    /// variant name -> ordered field names (for record field access by name)
+    pub ctor_field_names: std::collections::HashMap<String, Vec<String>>,
+}
+
+pub const BUILTIN_PRINT: u8 = 0;
+pub const BUILTIN_TO_STR: u8 = 1;
+pub const BUILTIN_PANIC: u8 = 2;
+
+impl Module {
+    pub fn disassemble(&self) -> String {
+        let mut out = String::new();
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "chunk #{i} {} (caps {}, params {}, regs {})",
+                chunk.name, chunk.ncaps, chunk.nparams, chunk.nregs
+            );
+            for (j, c) in chunk.consts.iter().enumerate() {
+                let _ = writeln!(out, "  const[{j}] = {c}");
+            }
+            for (pc, op) in chunk.code.iter().enumerate() {
+                let _ = writeln!(out, "  {pc:4}  {op:?}");
+            }
+            let _ = writeln!(out);
+        }
+        if !self.ctors.is_empty() {
+            let _ = writeln!(out, "ctors:");
+            for (i, ct) in self.ctors.iter().enumerate() {
+                let _ = writeln!(out, "  [{i}] {}::{}({})", ct.type_name, ct.variant, ct.arity);
+            }
+        }
+        out
+    }
+}

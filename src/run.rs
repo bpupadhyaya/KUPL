@@ -276,6 +276,59 @@ pub fn run_program(src: &str, file: &str) -> i32 {
     }
 }
 
+/// `kupl run --vm`: compile the functional core to KVM bytecode and execute
+/// `fun main` on the register VM.
+pub fn run_program_vm(src: &str, file: &str) -> i32 {
+    let compiled = match compile(src) {
+        Ok(c) => c,
+        Err(errors) => {
+            print_diags(&errors, src, file);
+            return 1;
+        }
+    };
+    print_diags(&compiled.warnings, src, file);
+    let module = match crate::compile::compile_module(&compiled.program, &compiled.checked) {
+        Ok(m) => m,
+        Err(diags) => {
+            print_diags(&diags, src, file);
+            return 1;
+        }
+    };
+    if !module.funs.contains_key("main") {
+        eprintln!("error: `kupl run --vm` needs a `fun main()` (components run on the interpreter for now)");
+        return 2;
+    }
+    let mut vm = crate::vm::Vm::new(&module);
+    match vm.call_named("main", vec![]) {
+        Ok(_) => 0,
+        Err(e) => {
+            report_panic(&e.msg, e.span, src, file);
+            101
+        }
+    }
+}
+
+/// `kupl dis`: disassemble the compiled module.
+pub fn disassemble(src: &str, file: &str) -> i32 {
+    let compiled = match compile(src) {
+        Ok(c) => c,
+        Err(errors) => {
+            print_diags(&errors, src, file);
+            return 1;
+        }
+    };
+    match crate::compile::compile_module(&compiled.program, &compiled.checked) {
+        Ok(m) => {
+            print!("{}", m.disassemble());
+            0
+        }
+        Err(diags) => {
+            print_diags(&diags, src, file);
+            1
+        }
+    }
+}
+
 /// `kupl test`: run every `example` block of every component.
 pub fn run_tests(src: &str, file: &str) -> i32 {
     let compiled = match compile(src) {

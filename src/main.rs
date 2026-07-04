@@ -5,7 +5,8 @@ use kupl::{repl, run};
 const USAGE: &str = "KUPL — K Universal Programming Language (v0.2)
 
 Usage:
-  kupl run <file.kupl>              Run the app (or `fun main()`) in a file
+  kupl run <file.kupl> [--vm]       Run the app / `fun main` (--vm: on the KVM bytecode VM)
+  kupl dis <file.kupl>              Disassemble the compiled KVM bytecode
   kupl test <file.kupl>             Run `example` blocks + contract laws as tests
   kupl check <file.kupl> [--json]   Parse, type-check, and effect-check
   kupl fmt <file.kupl> [--write]    Print (or rewrite to) canonical form
@@ -17,8 +18,11 @@ Usage:
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
+    let vm = args.iter().any(|a| a == "--vm");
     let code = match args.first().map(String::as_str) {
+        Some("run") if vm => with_file(&args, run::run_program_vm),
         Some("run") => with_file(&args, run::run_program),
+        Some("dis") => with_file(&args, run::disassemble),
         Some("test") => with_file(&args, run::run_tests),
         Some("check") => with_file(&args, |src, file| match run::compile(src) {
             Ok(c) => {

@@ -26,6 +26,8 @@ cargo build --release          # produces target/release/kupl
 
 kupl run examples/counter.kupl    # run an app (components, wiring, messages)
 kupl run examples/shapes.kupl     # run a pure functional program (fun main)
+kupl run --vm examples/shapes.kupl  # same program on the KVM bytecode VM
+kupl dis examples/shapes.kupl     # disassemble the compiled bytecode
 kupl test examples/counter.kupl   # run `example` blocks as tests
 kupl check examples/todo.kupl     # parse + type-check + effect-check
 kupl check --json broken.kupl     # machine-readable diagnostics (for AI/editors)

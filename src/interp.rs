@@ -702,19 +702,18 @@ impl Interp {
 }
 
 // ---------------- operators, patterns, builtin methods ----------------
+// The raw (span-free) semantics live here and are SHARED by the tree-walking
+// interpreter and the KVM — one implementation, no drift.
 
-fn binary_op(op: BinOp, l: Value, r: Value, span: Span) -> EvalResult {
+pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     use BinOp::*;
-    let overflow = |what: &str| Flow::Panic {
-        msg: format!("integer overflow in {what}"),
-        span,
-    };
+    let overflow = |what: &str| format!("integer overflow in {what}");
     match op {
         Eq => return Ok(Value::Bool(l == r)),
         Ne => return Ok(Value::Bool(l != r)),
         _ => {}
     }
-    match (&l, &r) {
+    match (l, r) {
         (Value::Int(a), Value::Int(b)) => {
             let (a, b) = (*a, *b);
             Ok(match op {
@@ -723,13 +722,13 @@ fn binary_op(op: BinOp, l: Value, r: Value, span: Span) -> EvalResult {
                 Mul => Value::Int(a.checked_mul(b).ok_or_else(|| overflow("multiplication"))?),
                 Div => {
                     if b == 0 {
-                        return Err(Flow::Panic { msg: "division by zero".into(), span });
+                        return Err("division by zero".into());
                     }
                     Value::Int(a.checked_div(b).ok_or_else(|| overflow("division"))?)
                 }
                 Rem => {
                     if b == 0 {
-                        return Err(Flow::Panic { msg: "remainder by zero".into(), span });
+                        return Err("remainder by zero".into());
                     }
                     Value::Int(a % b)
                 }
@@ -758,17 +757,18 @@ fn binary_op(op: BinOp, l: Value, r: Value, span: Span) -> EvalResult {
             Le => Ok(Value::Bool(a <= b)),
             Gt => Ok(Value::Bool(a > b)),
             Ge => Ok(Value::Bool(a >= b)),
-            _ => Err(Flow::Panic { msg: "invalid string operation".into(), span }),
+            _ => Err("invalid string operation".into()),
         },
-        _ => Err(Flow::Panic {
-            msg: format!(
-                "invalid operand types: {} and {}",
-                l.type_name(),
-                r.type_name()
-            ),
-            span,
-        }),
+        _ => Err(format!(
+            "invalid operand types: {} and {}",
+            l.type_name(),
+            r.type_name()
+        )),
     }
+}
+
+fn binary_op(op: BinOp, l: Value, r: Value, span: Span) -> EvalResult {
+    raw_binary_op(op, &l, &r).map_err(|msg| Flow::Panic { msg, span })
 }
 
 pub fn match_pattern(pat: &Pattern, value: &Value, env: &Env) -> bool {
@@ -797,38 +797,41 @@ pub fn match_pattern(pat: &Pattern, value: &Value, env: &Env) -> bool {
     }
 }
 
-fn builtin_method(
-    recv: Value,
+/// Callback used by function-taking methods (`map`, `filter`, `find`) to call
+/// back into whichever engine is running.
+pub type Caller<'a> = dyn FnMut(Value, Vec<Value>) -> Result<Value, String> + 'a;
+
+/// Builtin method semantics, shared by interpreter and KVM.
+pub fn shared_method(
+    recv: &Value,
     name: &str,
     args: Vec<Value>,
-    span: Span,
-    interp: &mut Interp,
-) -> EvalResult {
-    let panic = |msg: String| Flow::Panic { msg, span };
-    match (&recv, name) {
+    call: &mut Caller,
+) -> Result<Value, String> {
+    match (recv, name) {
         (Value::List(items), "len") => Ok(Value::Int(items.len() as i64)),
         (Value::List(items), "map") => {
-            let f = args.into_iter().next().ok_or_else(|| panic("`map` needs a function".into()))?;
+            let f = args.into_iter().next().ok_or("`map` needs a function")?;
             let mut out = Vec::with_capacity(items.len());
             for item in items.iter() {
-                out.push(interp.call_value(f.clone(), vec![item.clone()], span)?);
+                out.push(call(f.clone(), vec![item.clone()])?);
             }
             Ok(Value::List(Rc::new(out)))
         }
         (Value::List(items), "filter") => {
-            let f = args.into_iter().next().ok_or_else(|| panic("`filter` needs a function".into()))?;
+            let f = args.into_iter().next().ok_or("`filter` needs a function")?;
             let mut out = Vec::new();
             for item in items.iter() {
-                if let Value::Bool(true) = interp.call_value(f.clone(), vec![item.clone()], span)? {
+                if let Value::Bool(true) = call(f.clone(), vec![item.clone()])? {
                     out.push(item.clone());
                 }
             }
             Ok(Value::List(Rc::new(out)))
         }
         (Value::List(items), "find") => {
-            let f = args.into_iter().next().ok_or_else(|| panic("`find` needs a function".into()))?;
+            let f = args.into_iter().next().ok_or("`find` needs a function")?;
             for item in items.iter() {
-                if let Value::Bool(true) = interp.call_value(f.clone(), vec![item.clone()], span)? {
+                if let Value::Bool(true) = call(f.clone(), vec![item.clone()])? {
                     return Ok(Value::some(item.clone()));
                 }
             }
@@ -843,13 +846,13 @@ fn builtin_method(
                     Value::Int(v) => {
                         int_sum = int_sum
                             .checked_add(*v)
-                            .ok_or_else(|| panic("integer overflow in sum".into()))?
+                            .ok_or("integer overflow in sum")?
                     }
                     Value::Float(v) => {
                         is_float = true;
                         float_sum += v;
                     }
-                    other => return Err(panic(format!("cannot sum {}", other.type_name()))),
+                    other => return Err(format!("cannot sum {}", other.type_name())),
                 }
             }
             if is_float {
@@ -859,11 +862,11 @@ fn builtin_method(
             }
         }
         (Value::List(items), "contains") => {
-            let needle = args.into_iter().next().ok_or_else(|| panic("`contains` needs a value".into()))?;
+            let needle = args.into_iter().next().ok_or("`contains` needs a value")?;
             Ok(Value::Bool(items.iter().any(|v| *v == needle)))
         }
         (Value::List(items), "push") => {
-            let v = args.into_iter().next().ok_or_else(|| panic("`push` needs a value".into()))?;
+            let v = args.into_iter().next().ok_or("`push` needs a value")?;
             let mut out = items.as_ref().clone();
             out.push(v);
             Ok(Value::List(Rc::new(out)))
@@ -878,7 +881,7 @@ fn builtin_method(
         (Value::List(items), "join") => {
             let sep = match args.into_iter().next() {
                 Some(Value::Str(s)) => s.as_str().to_string(),
-                _ => return Err(panic("`join` needs a Str separator".into())),
+                _ => return Err("`join` needs a Str separator".into()),
             };
             let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
             Ok(Value::str(parts.join(&sep)))
@@ -886,11 +889,11 @@ fn builtin_method(
         (Value::Str(s), "len") => Ok(Value::Int(s.chars().count() as i64)),
         (Value::Str(s), "contains") => match args.into_iter().next() {
             Some(Value::Str(n)) => Ok(Value::Bool(s.contains(n.as_str()))),
-            _ => Err(panic("`contains` needs a Str".into())),
+            _ => Err("`contains` needs a Str".into()),
         },
         (Value::Str(s), "starts_with") => match args.into_iter().next() {
             Some(Value::Str(n)) => Ok(Value::Bool(s.starts_with(n.as_str()))),
-            _ => Err(panic("`starts_with` needs a Str".into())),
+            _ => Err("`starts_with` needs a Str".into()),
         },
         (Value::Str(s), "to_upper") => Ok(Value::str(s.to_uppercase())),
         (Value::Str(s), "to_lower") => Ok(Value::str(s.to_lowercase())),
@@ -899,14 +902,14 @@ fn builtin_method(
             Some(Value::Str(sep)) => Ok(Value::List(Rc::new(
                 s.split(sep.as_str()).map(Value::str).collect(),
             ))),
-            _ => Err(panic("`split` needs a Str separator".into())),
+            _ => Err("`split` needs a Str separator".into()),
         },
         (Value::Int(v), "to_str") => Ok(Value::str(v.to_string())),
         (Value::Int(v), "to_float") => Ok(Value::Float(*v as f64)),
         (Value::Int(v), "abs") => v
             .checked_abs()
             .map(Value::Int)
-            .ok_or_else(|| panic("integer overflow in abs".into())),
+            .ok_or_else(|| "integer overflow in abs".to_string()),
         (Value::Float(v), "to_str") => Ok(Value::str(v.to_string())),
         (Value::Float(v), "to_int") => Ok(Value::Int(*v as i64)),
         (Value::Float(v), "abs") => Ok(Value::Float(v.abs())),
@@ -916,12 +919,32 @@ fn builtin_method(
         (Value::Ctor { variant, .. }, "is_ok") => Ok(Value::Bool(variant.as_str() == "Ok")),
         (Value::Ctor { variant, .. }, "is_err") => Ok(Value::Bool(variant.as_str() == "Err")),
         (Value::Ctor { variant, fields, .. }, "unwrap_or") => {
-            let default = args.into_iter().next().ok_or_else(|| panic("`unwrap_or` needs a default".into()))?;
+            let default = args.into_iter().next().ok_or("`unwrap_or` needs a default")?;
             match variant.as_str() {
                 "Some" | "Ok" => Ok(fields.first().cloned().unwrap_or(Value::Unit)),
                 _ => Ok(default),
             }
         }
-        (other, _) => Err(panic(format!("{} has no method `{name}`", other.type_name()))),
+        (other, _) => Err(format!("{} has no method `{name}`", other.type_name())),
+    }
+}
+
+fn builtin_method(
+    recv: Value,
+    name: &str,
+    args: Vec<Value>,
+    span: Span,
+    interp: &mut Interp,
+) -> EvalResult {
+    let mut call = |f: Value, args: Vec<Value>| -> Result<Value, String> {
+        match interp.call_value(f, args, span) {
+            Ok(v) => Ok(v),
+            Err(Flow::Panic { msg, .. }) => Err(msg),
+            Err(_) => Err("invalid control flow in callback".into()),
+        }
+    };
+    match shared_method(&recv, name, args, &mut call) {
+        Ok(v) => Ok(v),
+        Err(msg) => Err(Flow::Panic { msg, span }),
     }
 }
