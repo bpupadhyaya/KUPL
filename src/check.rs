@@ -1800,6 +1800,22 @@ impl Checker {
             (Ty::IntW(_), "to_int") => Some((vec![], Ty::Int)),
             (Ty::IntW(_), "to_str") => Some((vec![], Ty::Str)),
             (Ty::IntW(_), "to_float") => Some((vec![], Ty::Float)),
+            (Ty::IntW(_), "to_i8") => Some((vec![], Ty::IntW(IntW::I8))),
+            (Ty::IntW(_), "to_i16") => Some((vec![], Ty::IntW(IntW::I16))),
+            (Ty::IntW(_), "to_i32") => Some((vec![], Ty::IntW(IntW::I32))),
+            (Ty::IntW(_), "to_i64") => Some((vec![], Ty::IntW(IntW::I64))),
+            (Ty::IntW(_), "to_u8") => Some((vec![], Ty::IntW(IntW::U8))),
+            (Ty::IntW(_), "to_u16") => Some((vec![], Ty::IntW(IntW::U16))),
+            (Ty::IntW(_), "to_u32") => Some((vec![], Ty::IntW(IntW::U32))),
+            (Ty::IntW(_), "to_u64") => Some((vec![], Ty::IntW(IntW::U64))),
+            (Ty::IntW(w), "wrapping_add") | (Ty::IntW(w), "wrapping_sub")
+            | (Ty::IntW(w), "wrapping_mul") | (Ty::IntW(w), "saturating_add")
+            | (Ty::IntW(w), "saturating_sub") | (Ty::IntW(w), "saturating_mul")
+            | (Ty::IntW(w), "band") | (Ty::IntW(w), "bor") | (Ty::IntW(w), "bxor") => {
+                Some((vec![Ty::IntW(*w)], Ty::IntW(*w)))
+            }
+            (Ty::IntW(w), "bnot") => Some((vec![], Ty::IntW(*w))),
+            (Ty::IntW(w), "shl") | (Ty::IntW(w), "shr") => Some((vec![Ty::Int], Ty::IntW(*w))),
             (Ty::F32, "to_float") => Some((vec![], Ty::Float)),
             (Ty::F32, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Float, "to_f32") => Some((vec![], Ty::F32)),

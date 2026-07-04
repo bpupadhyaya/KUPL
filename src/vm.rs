@@ -1202,6 +1202,40 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_sized_methods_it29() {
+        // wrapping
+        assert_eq!(differential("fun probe() -> u8 {\n    (200u8).wrapping_add(100u8)\n}\n"), "44");
+        assert_eq!(differential("fun probe() -> u8 {\n    (0u8).wrapping_sub(1u8)\n}\n"), "255");
+        assert_eq!(differential("fun probe() -> i8 {\n    (127i8).wrapping_add(1i8)\n}\n"), "-128");
+        // saturating
+        assert_eq!(differential("fun probe() -> u8 {\n    (200u8).saturating_add(100u8)\n}\n"), "255");
+        assert_eq!(differential("fun probe() -> u8 {\n    (0u8).saturating_sub(5u8)\n}\n"), "0");
+        assert_eq!(differential("fun probe() -> i8 {\n    (100i8).saturating_mul(2i8)\n}\n"), "127");
+        // bitwise
+        assert_eq!(differential("fun probe() -> u8 {\n    (0xF0u8).band(0x0Fu8)\n}\n"), "0");
+        assert_eq!(differential("fun probe() -> u8 {\n    (0xF0u8).bor(0x0Fu8)\n}\n"), "255");
+        assert_eq!(differential("fun probe() -> u8 {\n    (5u8).bnot()\n}\n"), "250");
+        assert_eq!(differential("fun probe() -> u8 {\n    (1u8).shl(4)\n}\n"), "16");
+        assert_eq!(differential("fun probe() -> u8 {\n    (255u8).shr(4)\n}\n"), "15");
+        assert_eq!(differential("fun probe() -> i8 {\n    (0i8 - 2i8).shr(1)\n}\n"), "-1");
+        // conversion matrix
+        assert_eq!(differential("fun probe() -> u16 {\n    (200u8).to_u16()\n}\n"), "200");
+        assert_eq!(
+            differential("fun probe() -> u8 {\n    (300u16).to_u8()\n}\n"),
+            "panic: 300 out of range for `u8`"
+        );
+        assert_eq!(
+            differential("fun probe() -> u8 {\n    (0i32 - 1i32).to_u8()\n}\n"),
+            "panic: -1 out of range for `u8`"
+        );
+        // shift out of range panics
+        assert_eq!(
+            differential("fun probe() -> u8 {\n    (1u8).shl(8)\n}\n"),
+            "panic: shift amount must be in 0..=7"
+        );
+    }
+
+    #[test]
     fn diff_f32_it28() {
         assert_eq!(differential("fun probe() -> f32 {\n    1.5f32 + 2.0f32\n}\n"), "3.5");
         assert_eq!(differential("fun probe() -> f32 {\n    1.0f32\n}\n"), "1.0");

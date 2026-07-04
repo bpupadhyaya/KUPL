@@ -1,6 +1,7 @@
 > **Progress:** iter 1 landed (it27) — integer widths i8..u64 end-to-end on
 > interpreter + KVM + .kx (checked arithmetic matching i64; overflow panics).
-> **f32 landed (it28).** wrapping/saturating/bitwise, the full conversion matrix, and native
+> **f32 (it28) + wrapping/saturating/bitwise + full conversion matrix (it29) landed** — the
+> sized-numerics user surface is complete. Native sized codegen
 > codegen are later slices. NOTE: the `Value` enum was already 32 bytes at
 > baseline (no discriminant niche), not 24 as this design assumed — sized ints
 > box their payload so the enum does not grow.

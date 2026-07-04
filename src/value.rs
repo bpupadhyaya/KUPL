@@ -46,6 +46,32 @@ impl IntW {
     pub fn check_range(self, v: i128) -> bool {
         v >= self.min() && v <= self.max()
     }
+    /// Width in bits.
+    pub fn bits(self) -> u32 {
+        match self {
+            IntW::I8 | IntW::U8 => 8,
+            IntW::I16 | IntW::U16 => 16,
+            IntW::I32 | IntW::U32 => 32,
+            IntW::I64 | IntW::U64 => 64,
+        }
+    }
+    pub fn is_signed(self) -> bool {
+        matches!(self, IntW::I8 | IntW::I16 | IntW::I32 | IntW::I64)
+    }
+    /// Reduce an arbitrary i128 into this width by modular wraparound.
+    pub fn wrap(self, v: i128) -> i128 {
+        let m = 1i128 << self.bits(); // 2^b
+        let r = v.rem_euclid(m); // 0..2^b
+        if self.is_signed() && r > self.max() {
+            r - m
+        } else {
+            r
+        }
+    }
+    /// Clamp an arbitrary i128 into this width's range.
+    pub fn saturate(self, v: i128) -> i128 {
+        v.clamp(self.min(), self.max())
+    }
     pub fn name(self) -> &'static str {
         match self {
             IntW::I8 => "i8",
@@ -97,6 +123,31 @@ impl IntW {
             "u64" => IntW::U64,
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod intw_tests {
+    use super::IntW;
+
+    #[test]
+    fn wrap_wraps_modularly() {
+        assert_eq!(IntW::U8.wrap(256), 0);
+        assert_eq!(IntW::U8.wrap(255), 255);
+        assert_eq!(IntW::U8.wrap(-1), 255);
+        assert_eq!(IntW::U8.wrap(300), 44);
+        assert_eq!(IntW::I8.wrap(128), -128);
+        assert_eq!(IntW::I8.wrap(-129), 127);
+        assert_eq!(IntW::I8.wrap(127), 127);
+    }
+
+    #[test]
+    fn saturate_clamps() {
+        assert_eq!(IntW::U8.saturate(300), 255);
+        assert_eq!(IntW::U8.saturate(-5), 0);
+        assert_eq!(IntW::I8.saturate(200), 127);
+        assert_eq!(IntW::I8.saturate(-200), -128);
+        assert_eq!(IntW::I8.saturate(42), 42);
     }
 }
 

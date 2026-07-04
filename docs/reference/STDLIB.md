@@ -212,8 +212,13 @@ on the native backend (`kupl run`/`--vm`/`bundle`).
 | Method | Signature | Notes |
 |---|---|---|
 | `.to_int()` | `-> Int` | to i64; panics if a `u64` exceeds `i64::MAX` |
-| `.to_str()` | `-> Str` | |
-| `.to_float()` | `-> Float` | |
+| `.to_str()` / `.to_float()` | `-> Str` / `-> Float` | |
+| `.to_i8()` … `.to_u64()` | `-> iN`/`uN` | checked conversion to another width; panics if out of range |
+| `.wrapping_add/sub/mul(other)` | `(same width) -> same` | modular wraparound; never panics |
+| `.saturating_add/sub/mul(other)` | `(same width) -> same` | clamps to the width's min/max |
+| `.band/.bor/.bxor(other)` | `(same width) -> same` | bitwise within the width |
+| `.bnot()` | `-> same` | bitwise complement within the width |
+| `.shl(n)` / `.shr(n)` | `(Int) -> same` | shift by `n` in `0..=bits-1`; `shr` is arithmetic for signed, logical for unsigned |
 | `.to_str()` | `-> Str` | |
 
 `f32` methods: `.to_float()` → `Float`, `.to_str()` → `Str`. Convert a `Float`

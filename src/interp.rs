@@ -1753,6 +1753,72 @@ pub fn shared_method(
         }
         (Value::SizedInt(b), "to_str") => Ok(Value::str(b.0.to_string())),
         (Value::SizedInt(b), "to_float") => Ok(Value::Float(b.0 as f64)),
+        // sized int -> another sized width (checked narrowing/widening)
+        (Value::SizedInt(b), "to_i8") | (Value::SizedInt(b), "to_i16")
+        | (Value::SizedInt(b), "to_i32") | (Value::SizedInt(b), "to_i64")
+        | (Value::SizedInt(b), "to_u8") | (Value::SizedInt(b), "to_u16")
+        | (Value::SizedInt(b), "to_u32") | (Value::SizedInt(b), "to_u64") => {
+            let target = IntW::from_name(&name[3..]).expect("width method");
+            if target.check_range(b.0) {
+                Ok(Value::SizedInt(Box::new((b.0, target))))
+            } else {
+                Err(format!("{} out of range for `{}`", b.0, target.name()))
+            }
+        }
+        // wrapping / saturating arithmetic + bitwise on sized ints (same width)
+        (Value::SizedInt(b), m)
+            if matches!(
+                m,
+                "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+                    | "saturating_add" | "saturating_sub" | "saturating_mul"
+                    | "band" | "bor" | "bxor"
+            ) =>
+        {
+            let (a, w) = (b.0, b.1);
+            let rhs = match args.into_iter().next() {
+                Some(Value::SizedInt(o)) if o.1 == w => o.0,
+                _ => return Err(format!("`{m}` needs a `{}`", w.name())),
+            };
+            let bits = w.bits();
+            let mask = (1i128 << bits) - 1;
+            let r = match m {
+                "wrapping_add" => w.wrap(a + rhs),
+                "wrapping_sub" => w.wrap(a - rhs),
+                "wrapping_mul" => w.wrap(a * rhs),
+                "saturating_add" => w.saturate(a + rhs),
+                "saturating_sub" => w.saturate(a - rhs),
+                "saturating_mul" => w.saturate(a * rhs),
+                "band" => w.wrap((a & mask) & (rhs & mask)),
+                "bor" => w.wrap((a & mask) | (rhs & mask)),
+                "bxor" => w.wrap((a & mask) ^ (rhs & mask)),
+                _ => unreachable!(),
+            };
+            Ok(Value::SizedInt(Box::new((r, w))))
+        }
+        (Value::SizedInt(b), "bnot") => {
+            let (a, w) = (b.0, b.1);
+            let mask = (1i128 << w.bits()) - 1;
+            Ok(Value::SizedInt(Box::new((w.wrap((a & mask) ^ mask), w))))
+        }
+        (Value::SizedInt(b), "shl") | (Value::SizedInt(b), "shr") => {
+            let (a, w) = (b.0, b.1);
+            let n = match args.into_iter().next() {
+                Some(Value::Int(n)) if (0..w.bits() as i64).contains(&n) => n as u32,
+                Some(Value::Int(_)) => {
+                    return Err(format!("shift amount must be in 0..={}", w.bits() - 1))
+                }
+                _ => return Err(format!("`{name}` needs an Int shift amount")),
+            };
+            let mask = (1i128 << w.bits()) - 1;
+            let r = if name == "shl" {
+                w.wrap((a & mask) << n)
+            } else if w.is_signed() {
+                w.wrap(a >> n) // arithmetic (sign-preserving)
+            } else {
+                w.wrap((a & mask) >> n) // logical (zero-fill)
+            };
+            Ok(Value::SizedInt(Box::new((r, w))))
+        }
         // f32 <-> Float
         (Value::F32(v), "to_float") => Ok(Value::Float(*v as f64)),
         (Value::F32(v), "to_str") => Ok(Value::str(Value::F32(*v).to_string())),
