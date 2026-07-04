@@ -949,6 +949,12 @@ impl Interp {
                     }
                     return regex_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("format_time", 1) | ("year_of", 1) | ("month_of", 1) | ("day_of", 1)
+                | ("hour_of", 1) | ("minute_of", 1) | ("second_of", 1) | ("weekday_of", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return time_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
+                }
+                ("now", 0) => return Ok(Value::Int(now_seconds())),
                 ("exit", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     let code = match v {
@@ -2116,6 +2122,35 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err(format!("unknown process builtin `{name}`")),
     }
+}
+
+/// Time/date builtins — shared by interpreter and KVM. All PURE (a timestamp
+/// in, a string or Int out); `now` is separate (wall clock, `io.time`).
+pub fn time_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let t = match &args[0] {
+        Value::Int(n) => *n,
+        _ => 0,
+    };
+    use crate::time as tm;
+    Ok(match name {
+        "format_time" => Value::str(tm::format_time(t)),
+        "year_of" => Value::Int(tm::year_of(t)),
+        "month_of" => Value::Int(tm::month_of(t)),
+        "day_of" => Value::Int(tm::day_of(t)),
+        "hour_of" => Value::Int(tm::hour_of(t)),
+        "minute_of" => Value::Int(tm::minute_of(t)),
+        "second_of" => Value::Int(tm::second_of(t)),
+        "weekday_of" => Value::Int(tm::weekday_of(t)),
+        _ => return Err(format!("unknown time builtin `{name}`")),
+    })
+}
+
+/// Current Unix epoch seconds (wall clock). Effect `io.time`.
+pub fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Regex builtins — shared by interpreter and KVM. Pure; a malformed pattern

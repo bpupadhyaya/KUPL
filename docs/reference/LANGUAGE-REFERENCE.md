@@ -276,9 +276,9 @@ pub fun broadcast(msg: Str) uses io {   // public: effects MUST be declared
   `db.read` does not cover `db.write`. Built-in effectful operations in
   v1.0-alpha: `print` / `eprint` (`io`); the file builtins `read_file` /
   `write_file` / `append_file` / `delete_file` / `file_exists` (`io.fs`); and
-  `args` / `env_var` (`io.env`); and `http_get` / `http_post` (`io.net`). The
+  `args` / `env_var` (`io.env`); `http_get` / `http_post` (`io.net`); and `now` (`io.time`). The
   sub-effects mean `uses io` covers all of them, while `uses io.fs` /
-  `uses io.env` / `uses io.net` are the precise capabilities.
+  `uses io.env` / `uses io.net` / `uses io.time` are the precise capabilities.
   (`json_parse`/`json_stringify` and the seeded-random builtins are pure — no
   effect.) Capability *values* — attenuable, passable file/network handles —
   are **[design]**.

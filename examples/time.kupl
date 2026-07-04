@@ -1,0 +1,37 @@
+// Time & date — Unix timestamps, UTC formatting, and calendar components.
+//
+//   now()                       -> Int   current Unix epoch seconds (io.time)
+//   format_time(epoch_secs)     -> Str   UTC "YYYY-MM-DD HH:MM:SS"
+//   year_of / month_of / day_of / hour_of / minute_of / second_of (epoch) -> Int
+//   weekday_of(epoch)           -> Int   0 = Sunday … 6 = Saturday
+//
+// Everything except `now()` is pure: same timestamp in, same result out — so
+// formatting and date math are fully reproducible. `now()` reads the wall clock
+// and carries the `io.time` effect.
+
+fun day_name(w: Int) -> Str {
+    let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    match names.get(w) {
+        Some(n) => n
+        None => "???"
+    }
+}
+
+// A log line stamped with an explicit time (pure — pass the timestamp in).
+fun log_line(at: Int, msg: Str) -> Str {
+    "[{format_time(at)}] {msg}"
+}
+
+fun main() uses io, io.time {
+    // fixed timestamps are fully deterministic
+    print(format_time(0))                       // 1970-01-01 00:00:00
+    print(format_time(1000000000))              // 2001-09-09 01:46:40
+    print(log_line(1000000000, "server started"))
+
+    let epoch = 1000000000
+    print("{day_name(weekday_of(epoch))} {day_of(epoch)}/{month_of(epoch)}/{year_of(epoch)}")
+
+    // the wall clock (value varies, so we just show the shape)
+    let t = now()
+    print("this year is after 2024: {year_of(t) > 2024}")
+}

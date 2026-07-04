@@ -184,6 +184,15 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
                         .into(),
                 )
             }
+            BUILTIN_FORMAT_TIME => format!("regs[{dst}] = k_format_time(regs[{start}]); (void){argc};"),
+            BUILTIN_YEAR_OF => format!("regs[{dst}] = k_year_of(regs[{start}]); (void){argc};"),
+            BUILTIN_MONTH_OF => format!("regs[{dst}] = k_month_of(regs[{start}]); (void){argc};"),
+            BUILTIN_DAY_OF => format!("regs[{dst}] = k_day_of(regs[{start}]); (void){argc};"),
+            BUILTIN_HOUR_OF => format!("regs[{dst}] = k_hour_of(regs[{start}]); (void){argc};"),
+            BUILTIN_MINUTE_OF => format!("regs[{dst}] = k_minute_of(regs[{start}]); (void){argc};"),
+            BUILTIN_SECOND_OF => format!("regs[{dst}] = k_second_of(regs[{start}]); (void){argc};"),
+            BUILTIN_WEEKDAY_OF => format!("regs[{dst}] = k_weekday_of(regs[{start}]); (void){argc};"),
+            BUILTIN_NOW => format!("regs[{dst}] = k_now(); (void){start}; (void){argc};"),
             BUILTIN_ENV_VAR => format!("regs[{dst}] = k_env_var(regs[{start}]); (void){argc};"),
             BUILTIN_ARGS => format!("regs[{dst}] = k_args(); (void){start}; (void){argc};"),
             BUILTIN_EPRINT => format!("regs[{dst}] = k_eprint(regs[{start}]); (void){argc};"),
@@ -277,6 +286,7 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 
 typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
@@ -820,6 +830,54 @@ static KValue k_eprint(KValue v) {
     fprintf(stderr, "%s\n", k_show(v));
     return k_unit();
 }
+
+/* ---- time/date; mirrors interp::time / src/time.rs exactly ---- */
+static int64_t k_floor_div(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    if ((a % b != 0) && ((a % b < 0) != (b < 0))) q -= 1;
+    return q;
+}
+static int64_t k_floor_mod(int64_t a, int64_t b) { return a - k_floor_div(a, b) * b; }
+static void k_civil(int64_t z, int64_t* y, int64_t* m, int64_t* d) {
+    z += 719468;
+    int64_t era = k_floor_div(z >= 0 ? z : z - 146096, 146097);
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t yy = yoe + era * 400;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    int64_t dd = doy - (153 * mp + 2) / 5 + 1;
+    int64_t mm = mp < 10 ? mp + 3 : mp - 9;
+    *y = mm <= 2 ? yy + 1 : yy;
+    *m = mm;
+    *d = dd;
+}
+static void k_tsplit(int64_t t, int64_t* days, int64_t* secs) {
+    *days = k_floor_div(t, 86400);
+    *secs = k_floor_mod(t, 86400);
+}
+static KValue k_format_time(KValue tv) {
+    int64_t days, secs, y, m, d;
+    k_tsplit(tv.as.i, &days, &secs);
+    k_civil(days, &y, &m, &d);
+    int64_t hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
+    char* buf = k_alloc(64);
+    if (y < 0)
+        snprintf(buf, 64, "-%04lld-%02lld-%02lld %02lld:%02lld:%02lld",
+                 (long long)(-y), (long long)m, (long long)d, (long long)hh, (long long)mm, (long long)ss);
+    else
+        snprintf(buf, 64, "%04lld-%02lld-%02lld %02lld:%02lld:%02lld",
+                 (long long)y, (long long)m, (long long)d, (long long)hh, (long long)mm, (long long)ss);
+    return k_str(buf);
+}
+static KValue k_year_of(KValue tv) { int64_t dy, s, y, m, d; k_tsplit(tv.as.i, &dy, &s); k_civil(dy, &y, &m, &d); return k_int(y); }
+static KValue k_month_of(KValue tv) { int64_t dy, s, y, m, d; k_tsplit(tv.as.i, &dy, &s); k_civil(dy, &y, &m, &d); return k_int(m); }
+static KValue k_day_of(KValue tv) { int64_t dy, s, y, m, d; k_tsplit(tv.as.i, &dy, &s); k_civil(dy, &y, &m, &d); return k_int(d); }
+static KValue k_hour_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int(s / 3600); }
+static KValue k_minute_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int((s % 3600) / 60); }
+static KValue k_second_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int(s % 60); }
+static KValue k_weekday_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int(k_floor_mod(dy + 4, 7)); }
+static KValue k_now(void) { return k_int((int64_t)time(0)); }
 
 /* ---- seeded random (xorshift64*); mirrors interp::SeedRng exactly ---- */
 static uint64_t k_rng_next(uint64_t* s) {

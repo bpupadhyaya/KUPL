@@ -7,6 +7,7 @@
 pub mod ai;
 pub mod json;
 pub mod regex;
+pub mod time;
 pub mod ast;
 pub mod bytecode;
 pub mod cgen;

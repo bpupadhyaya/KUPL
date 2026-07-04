@@ -190,6 +190,15 @@ pub const BUILTIN_RE_MATCH: u8 = 25;
 pub const BUILTIN_RE_FIND: u8 = 26;
 pub const BUILTIN_RE_FIND_ALL: u8 = 27;
 pub const BUILTIN_RE_REPLACE: u8 = 28;
+pub const BUILTIN_FORMAT_TIME: u8 = 29;
+pub const BUILTIN_YEAR_OF: u8 = 30;
+pub const BUILTIN_MONTH_OF: u8 = 31;
+pub const BUILTIN_DAY_OF: u8 = 32;
+pub const BUILTIN_HOUR_OF: u8 = 33;
+pub const BUILTIN_MINUTE_OF: u8 = 34;
+pub const BUILTIN_SECOND_OF: u8 = 35;
+pub const BUILTIN_WEEKDAY_OF: u8 = 36;
+pub const BUILTIN_NOW: u8 = 37;
 
 impl Module {
     pub fn disassemble(&self) -> String {

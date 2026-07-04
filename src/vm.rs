@@ -601,6 +601,25 @@ impl<'m> Vm<'m> {
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_FORMAT_TIME | BUILTIN_YEAR_OF | BUILTIN_MONTH_OF
+                        | BUILTIN_DAY_OF | BUILTIN_HOUR_OF | BUILTIN_MINUTE_OF
+                        | BUILTIN_SECOND_OF | BUILTIN_WEEKDAY_OF => {
+                            let name = match which {
+                                BUILTIN_FORMAT_TIME => "format_time",
+                                BUILTIN_YEAR_OF => "year_of",
+                                BUILTIN_MONTH_OF => "month_of",
+                                BUILTIN_DAY_OF => "day_of",
+                                BUILTIN_HOUR_OF => "hour_of",
+                                BUILTIN_MINUTE_OF => "minute_of",
+                                BUILTIN_SECOND_OF => "second_of",
+                                _ => "weekday_of",
+                            };
+                            match crate::interp::time_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
+                        BUILTIN_NOW => set!(dst, Value::Int(crate::interp::now_seconds())),
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1146,6 +1165,26 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_time_it22() {
+        // fixed epochs → deterministic UTC strings, identical on both engines
+        assert_eq!(differential("fun probe() -> Str {\n    format_time(0)\n}\n"), "1970-01-01 00:00:00");
+        assert_eq!(
+            differential("fun probe() -> Str {\n    format_time(1000000000)\n}\n"),
+            "2001-09-09 01:46:40"
+        );
+        // negative (pre-1970) epoch, floor-division correct
+        assert_eq!(differential("fun probe() -> Str {\n    format_time(0 - 1)\n}\n"), "1969-12-31 23:59:59");
+        // component extractors
+        assert_eq!(differential("fun probe() -> Int {\n    year_of(1000000000)\n}\n"), "2001");
+        assert_eq!(differential("fun probe() -> Int {\n    month_of(1000000000)\n}\n"), "9");
+        assert_eq!(differential("fun probe() -> Int {\n    day_of(1000000000)\n}\n"), "9");
+        assert_eq!(differential("fun probe() -> Int {\n    hour_of(1000000000)\n}\n"), "1");
+        assert_eq!(differential("fun probe() -> Int {\n    weekday_of(0)\n}\n"), "4");
+        // now() is nondeterministic, so only assert it's a plausible Int
+        assert_eq!(differential("fun probe() -> Bool {\n    now() > 1700000000\n}\n"), "true");
     }
 
     #[test]

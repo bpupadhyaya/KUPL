@@ -1482,6 +1482,18 @@ impl Checker {
                         _ => Ty::Str, // re_replace
                     };
                 }
+                ("format_time", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Int, &t, args[0].value.span, "format_time epoch");
+                    return Ty::Str;
+                }
+                ("year_of", 1) | ("month_of", 1) | ("day_of", 1) | ("hour_of", 1)
+                | ("minute_of", 1) | ("second_of", 1) | ("weekday_of", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Int, &t, args[0].value.span, "epoch seconds");
+                    return Ty::Int;
+                }
+                ("now", 0) => return Ty::Int,
                 ("eprint", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Unit;

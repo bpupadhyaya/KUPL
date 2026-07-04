@@ -31,6 +31,11 @@ unless supervised.
 | `random_ints(seed, count)` | `(Int, Int) -> List[Int]` | deterministic; `count ≤ 0` → empty |
 | `random_floats(seed, count)` | `(Int, Int) -> List[Float]` | each in `[0.0, 1.0)`; deterministic |
 | `shuffle(seed, xs)` | `(Int, List[T]) -> List[T]` | deterministic Fisher-Yates permutation |
+| `now()` | `() -> Int` — **uses `io.time`** | current Unix epoch seconds (wall clock) |
+| `format_time(epoch)` | `(Int) -> Str` | UTC `YYYY-MM-DD HH:MM:SS`; pure |
+| `year_of/month_of/day_of(epoch)` | `(Int) -> Int` | UTC calendar fields; pure |
+| `hour_of/minute_of/second_of(epoch)` | `(Int) -> Int` | UTC time fields; pure |
+| `weekday_of(epoch)` | `(Int) -> Int` | 0 = Sunday … 6 = Saturday; pure |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
 | `re_match(pat, text)` | `(Str, Str) -> Bool` | regex search (`^…$` for full match) |
@@ -57,6 +62,11 @@ native backend — use `kupl run`/`--vm`/`bundle`.
 `^`/`$`, alternation `|`, groups `(...)`, and `\`-escapes. `re_match` searches
 (anchor with `^…$` for a full match). A malformed pattern **panics** with a
 clear message. Not yet on the native backend (`kupl run`/`--vm`/`bundle`).
+
+**Time**: `format_time` and the `*_of` extractors are pure UTC calendar math
+(correct for negative/pre-1970 timestamps), byte-identical on every engine
+including native. Only `now()` reads the wall clock — it carries the `io.time`
+effect and is non-deterministic. No locale or leap seconds.
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

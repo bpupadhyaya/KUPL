@@ -1066,6 +1066,15 @@ impl<'s> FnCompiler<'s> {
                 ("re_find", 2) => Some(BUILTIN_RE_FIND),
                 ("re_find_all", 2) => Some(BUILTIN_RE_FIND_ALL),
                 ("re_replace", 3) => Some(BUILTIN_RE_REPLACE),
+                ("format_time", 1) => Some(BUILTIN_FORMAT_TIME),
+                ("year_of", 1) => Some(BUILTIN_YEAR_OF),
+                ("month_of", 1) => Some(BUILTIN_MONTH_OF),
+                ("day_of", 1) => Some(BUILTIN_DAY_OF),
+                ("hour_of", 1) => Some(BUILTIN_HOUR_OF),
+                ("minute_of", 1) => Some(BUILTIN_MINUTE_OF),
+                ("second_of", 1) => Some(BUILTIN_SECOND_OF),
+                ("weekday_of", 1) => Some(BUILTIN_WEEKDAY_OF),
+                ("now", 0) => Some(BUILTIN_NOW),
                 _ => None,
             };
             if let Some(which) = builtin {
