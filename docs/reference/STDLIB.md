@@ -17,6 +17,16 @@ unless supervised.
 | `tensor(xs)` | `(List[Float]) -> Tensor` | Int elements are accepted and widened |
 | `zeros(n)` | `(Int) -> Tensor` | n zeros; negative n panics |
 | `arange(n)` | `(Int) -> Tensor` | `[0.0, 1.0, …, n-1]` |
+| `read_file(path)` | `(Str) -> Result[Str, Str]` — **uses `io.fs`** | whole file as text; `Err` carries the OS message |
+| `write_file(path, s)` | `(Str, Str) -> Result[Unit, Str]` — **uses `io.fs`** | creates or truncates |
+| `append_file(path, s)` | `(Str, Str) -> Result[Unit, Str]` — **uses `io.fs`** | creates if missing |
+| `delete_file(path)` | `(Str) -> Result[Unit, Str]` — **uses `io.fs`** | |
+| `file_exists(path)` | `(Str) -> Bool` — **uses `io.fs`** | any filesystem entry |
+
+File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
+covers them; `uses io.fs` is the precise capability). The `Err` message is a
+human-readable OS description whose exact wording is engine/platform-dependent —
+match `Ok`/`Err` structurally rather than on the text.
 
 ## Built-in constructors
 

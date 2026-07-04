@@ -154,6 +154,11 @@ fn covers(declared: &str, used: &str) -> bool {
 fn builtin_effects(name: &str) -> Option<&'static str> {
     match name {
         "print" => Some("io"),
+        // file I/O — a sub-effect of `io`, so `uses io` covers it and
+        // `uses io.fs` is the precise capability
+        "read_file" | "write_file" | "append_file" | "delete_file" | "file_exists" => {
+            Some("io.fs")
+        }
         _ => None,
     }
 }

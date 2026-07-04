@@ -898,6 +898,14 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return tensor_builtin(name, &v).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("read_file", 1) | ("write_file", 2) | ("append_file", 2)
+                | ("delete_file", 1) | ("file_exists", 1) => {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        vals.push(self.eval(&a.value, env)?);
+                    }
+                    return fs_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("Some", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     return Ok(Value::some(v));
@@ -1908,6 +1916,49 @@ pub fn set_from_list(v: &Value) -> Result<Value, String> {
             Ok(Value::Set(Rc::new(out)))
         }
         other => Err(format!("Set(...) needs a List, found {}", other.type_name())),
+    }
+}
+
+/// File I/O builtins — shared by interpreter and KVM. Effect `io.fs`.
+///
+/// All return a `Result` value (KUPL has no exceptions): read/write/append/
+/// delete give `Result[Str|Unit, Str]` (the `Err` carries the OS message);
+/// `file_exists` gives a plain `Bool`. A wrong argument *type* is a checker
+/// error, so here we assume the types the checker guaranteed.
+pub fn fs_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let as_str = |v: &Value| -> String {
+        match v {
+            Value::Str(s) => s.as_str().to_string(),
+            other => other.to_string(),
+        }
+    };
+    match name {
+        "read_file" => Ok(match std::fs::read_to_string(as_str(&args[0])) {
+            Ok(contents) => Value::ok(Value::str(contents)),
+            Err(e) => Value::err(Value::str(e.to_string())),
+        }),
+        "write_file" => Ok(match std::fs::write(as_str(&args[0]), as_str(&args[1])) {
+            Ok(()) => Value::ok(Value::Unit),
+            Err(e) => Value::err(Value::str(e.to_string())),
+        }),
+        "append_file" => {
+            use std::io::Write;
+            let result = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(as_str(&args[0]))
+                .and_then(|mut f| f.write_all(as_str(&args[1]).as_bytes()));
+            Ok(match result {
+                Ok(()) => Value::ok(Value::Unit),
+                Err(e) => Value::err(Value::str(e.to_string())),
+            })
+        }
+        "delete_file" => Ok(match std::fs::remove_file(as_str(&args[0])) {
+            Ok(()) => Value::ok(Value::Unit),
+            Err(e) => Value::err(Value::str(e.to_string())),
+        }),
+        "file_exists" => Ok(Value::Bool(std::path::Path::new(&as_str(&args[0])).exists())),
+        _ => Err(format!("unknown file builtin `{name}`")),
     }
 }
 

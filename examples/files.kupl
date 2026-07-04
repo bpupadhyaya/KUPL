@@ -1,0 +1,46 @@
+// File I/O — reading and writing files.
+//
+// KUPL has no exceptions, so every fallible file operation returns a `Result`:
+// `read_file` gives `Result[Str, Str]`, and write/append/delete give
+// `Result[Unit, Str]` (the `Err` carries the OS error message). `file_exists`
+// is a plain `Bool`.
+//
+// These builtins carry the `io.fs` effect — a sub-effect of `io`. A function
+// that touches the filesystem must declare `uses io.fs` (or the broader
+// `uses io`), so file access is always explicit at the boundary.
+
+fun main() uses io.fs {
+    let path = "notes.txt"
+
+    // write returns Ok(()) or Err(message) — handle it with match
+    match write_file(path, "first line\nsecond line\n") {
+        Ok(_) => print("wrote {path}")
+        Err(e) => print("could not write: {e}")
+    }
+
+    print("exists? {file_exists(path)}")
+
+    // append more, then read the whole thing back
+    let _ = append_file(path, "third line\n")
+
+    match read_file(path) {
+        Ok(contents) => {
+            let lines = contents.lines()
+            print("{lines.len()} lines:")
+            for line in lines {
+                print("  {line}")
+            }
+        }
+        Err(e) => print("could not read: {e}")
+    }
+
+    // clean up
+    let _ = delete_file(path)
+    print("exists after delete? {file_exists(path)}")
+
+    // a missing file is an ordinary Err, not a crash
+    match read_file("does-not-exist.txt") {
+        Ok(_) => print("unexpected")
+        Err(_) => print("missing file handled gracefully")
+    }
+}

@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 79 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 81 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -207,6 +207,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/timers.kupl` | timers: `on every`/`on after` on a deterministic virtual clock (`advance`) |
 | `examples/tensors.kupl` | first-class tensors, elementwise ops, dot products |
 | `examples/parallel.kupl` | concurrency: `par` fork-join + `par_map`/`par_filter` iteration, incl. parallel AI fan-out |
+| `examples/files.kupl` | file I/O: `read_file`/`write_file`/`append_file`/`delete_file` (`io.fs` effect) |
 | `examples/multifile/` | `use`-based multi-file programs |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
@@ -241,7 +242,7 @@ component manifests; an LSP server; and four verified execution modes.
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~16,900 lines of dependency-free Rust, 79 tests, all engines differentially
+~17,000 lines of dependency-free Rust, 81 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

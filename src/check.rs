@@ -1395,6 +1395,28 @@ impl Checker {
                     self.unify(&Ty::Int, &t, args[0].value.span, "tensor size");
                     return Ty::Tensor;
                 }
+                ("read_file", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "file path");
+                    return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
+                ("write_file", 2) | ("append_file", 2) => {
+                    let p = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &p, args[0].value.span, "file path");
+                    let c = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&Ty::Str, &c, args[1].value.span, "file contents");
+                    return Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Str));
+                }
+                ("delete_file", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "file path");
+                    return Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Str));
+                }
+                ("file_exists", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "file path");
+                    return Ty::Bool;
+                }
                 ("Some", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
                     return Ty::Option(Box::new(self.uni.apply(&t)));

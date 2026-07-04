@@ -258,8 +258,11 @@ pub fun broadcast(msg: Str) uses io {   // public: effects MUST be declared
   must declare all effects it uses (K0301). A declared-but-unused effect
   warns (K0302).
 - Effect names are hierarchical: declaring `db` covers `db.read`; declaring
-  `db.read` does not cover `db.write`. The built-in effectful operation in
-  v1.0-alpha is `print` (`io`); capability *values* are **[design]**.
+  `db.read` does not cover `db.write`. Built-in effectful operations in
+  v1.0-alpha: `print` (`io`) and the file builtins `read_file` / `write_file` /
+  `append_file` / `delete_file` / `file_exists` (`io.fs`, so `uses io` covers
+  them and `uses io.fs` is the precise capability). Capability *values* —
+  attenuable, passable file/network handles — are **[design]**.
 - Recursion (incl. mutual) is fully supported. Functions are first-class:
   pass them by name or as lambdas; calls through variables are supported
   (their effects are not tracked in v1.0-alpha — documented limitation).

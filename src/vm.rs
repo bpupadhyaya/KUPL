@@ -522,6 +522,20 @@ impl<'m> Vm<'m> {
                         BUILTIN_PANIC => {
                             return Err(VmError { msg: args[0].to_string(), span })
                         }
+                        BUILTIN_READ_FILE | BUILTIN_WRITE_FILE | BUILTIN_APPEND_FILE
+                        | BUILTIN_DELETE_FILE | BUILTIN_FILE_EXISTS => {
+                            let name = match which {
+                                BUILTIN_READ_FILE => "read_file",
+                                BUILTIN_WRITE_FILE => "write_file",
+                                BUILTIN_APPEND_FILE => "append_file",
+                                BUILTIN_DELETE_FILE => "delete_file",
+                                _ => "file_exists",
+                            };
+                            match crate::interp::fs_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1067,6 +1081,43 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_file_io_roundtrip_it14() {
+        // write → exists → read → append → delete → gone, all via a fixed temp
+        // path; interpreter and KVM must agree byte-for-byte (both use fs_builtin)
+        let src = "fun probe() -> Str {\n\
+            let p = \"/tmp/kupl_difftest_it14.txt\"\n\
+            let _ = write_file(p, \"alpha\\nbeta\")\n\
+            let exists = file_exists(p)\n\
+            let n = match read_file(p) {\n\
+                Ok(c) => c.lines().len()\n\
+                Err(_) => 0 - 1\n\
+            }\n\
+            let _ = append_file(p, \"\\ngamma\")\n\
+            let n2 = match read_file(p) {\n\
+                Ok(c) => c.lines().len()\n\
+                Err(_) => 0 - 1\n\
+            }\n\
+            let _ = delete_file(p)\n\
+            let gone = file_exists(p)\n\
+            \"exists={exists} n={n} n2={n2} gone={gone}\"\n\
+        }\n";
+        assert_eq!(differential(src), "exists=true n=2 n2=3 gone=false");
+    }
+
+    #[test]
+    fn diff_file_read_missing_is_err_it14() {
+        // reading a missing file yields Err on both engines (message text may
+        // vary by platform, so we only observe the Ok/Err structure)
+        let src = "fun probe() -> Bool {\n\
+            match read_file(\"/nonexistent/kupl/xyz\") {\n\
+                Ok(_) => false\n\
+                Err(_) => true\n\
+            }\n\
+        }\n";
+        assert_eq!(differential(src), "true");
     }
 
     #[test]

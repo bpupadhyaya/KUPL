@@ -72,6 +72,12 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       work-stealing scheduler (execute on OS threads — needs Arc-based values),
       async I/O, and `await` actually suspending (evaluates synchronously
       today). Virtual clock (it9) preserved for deterministic tests.
+- [x] **File I/O** (it14) — `read_file`/`write_file`/`append_file`/`delete_file`
+      (→ `Result`) + `file_exists`, gated behind the `io.fs` effect. A core "any
+      software" capability (a universal language must touch the filesystem).
+      Shared builtin impl (interp+KVM) + cgen.rs C runtime → all engines run real
+      file I/O; interp==KVM==native on the success path (OS error *text* is
+      platform-dependent). (`examples/files.kupl`)
 - [ ] **Native components + KIR** (audit #2) — typed SSA IR; components compile
       to native (per-component GC), so real apps run at native, not VM, speed
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first

@@ -1046,6 +1046,11 @@ impl<'s> FnCompiler<'s> {
                 ("tensor", 1) => Some(BUILTIN_TENSOR),
                 ("zeros", 1) => Some(BUILTIN_ZEROS),
                 ("arange", 1) => Some(BUILTIN_ARANGE),
+                ("read_file", 1) => Some(BUILTIN_READ_FILE),
+                ("write_file", 2) => Some(BUILTIN_WRITE_FILE),
+                ("append_file", 2) => Some(BUILTIN_APPEND_FILE),
+                ("delete_file", 1) => Some(BUILTIN_DELETE_FILE),
+                ("file_exists", 1) => Some(BUILTIN_FILE_EXISTS),
                 _ => None,
             };
             if let Some(which) = builtin {

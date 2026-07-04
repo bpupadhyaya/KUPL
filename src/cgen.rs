@@ -157,6 +157,11 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_TENSOR => format!("regs[{dst}] = k_bt_tensor(regs[{start}]); (void){argc};"),
             BUILTIN_ZEROS => format!("regs[{dst}] = k_bt_zeros(regs[{start}]); (void){argc};"),
             BUILTIN_ARANGE => format!("regs[{dst}] = k_bt_arange(regs[{start}]); (void){argc};"),
+            BUILTIN_READ_FILE => format!("regs[{dst}] = k_read_file(regs[{start}]); (void){argc};"),
+            BUILTIN_WRITE_FILE => format!("regs[{dst}] = k_write_file(regs[{start}], regs[{start}+1], 0); (void){argc};"),
+            BUILTIN_APPEND_FILE => format!("regs[{dst}] = k_write_file(regs[{start}], regs[{start}+1], 1); (void){argc};"),
+            BUILTIN_DELETE_FILE => format!("regs[{dst}] = k_delete_file(regs[{start}]); (void){argc};"),
+            BUILTIN_FILE_EXISTS => format!("regs[{dst}] = k_file_exists(regs[{start}]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -241,6 +246,8 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <errno.h>
+#include <unistd.h>
 
 typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
@@ -729,6 +736,42 @@ static int k_ctor_variant_is(KValue v, const char* name) {
 }
 static KValue k_some(KValue v) { return k_ctor(0, &v, 1); }        /* ctor table order: Some, None, Ok, Err */
 static KValue k_none(void) { return k_ctor(1, 0, 0); }
+static KValue k_ok(KValue v) { return k_ctor(2, &v, 1); }
+static KValue k_err(KValue v) { return k_ctor(3, &v, 1); }
+
+/* ---- file I/O builtins (effect io.fs); mirror interp::fs_builtin.
+   The Ok/Err *structure* matches every engine; the Err message text is a
+   platform OS description and may differ from the interpreter's wording. ---- */
+static KValue k_read_file(KValue path) {
+    FILE* f = fopen(path.as.s, "rb");
+    if (!f) return k_err(k_str(strerror(errno)));
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n < 0) { fclose(f); return k_err(k_str(strerror(errno))); }
+    char* buf = k_alloc((size_t)n + 1);
+    size_t got = fread(buf, 1, (size_t)n, f);
+    buf[got] = 0;
+    fclose(f);
+    return k_ok(k_str(buf));
+}
+static KValue k_write_file(KValue path, KValue content, int append) {
+    FILE* f = fopen(path.as.s, append ? "ab" : "wb");
+    if (!f) return k_err(k_str(strerror(errno)));
+    const char* s = content.as.s;
+    size_t len = strlen(s);
+    size_t w = fwrite(s, 1, len, f);
+    fclose(f);
+    if (w != len) return k_err(k_str("write error"));
+    return k_ok(k_unit());
+}
+static KValue k_delete_file(KValue path) {
+    if (remove(path.as.s) != 0) return k_err(k_str(strerror(errno)));
+    return k_ok(k_unit());
+}
+static KValue k_file_exists(KValue path) {
+    return k_bool(access(path.as.s, F_OK) == 0);
+}
 
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     (void)argc;
