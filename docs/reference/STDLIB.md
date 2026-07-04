@@ -168,6 +168,9 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.band(x)` / `.bor(x)` / `.bxor(x)` | `(Int) -> Int` | bitwise and / or / xor |
 | `.bnot()` | `-> Int` | bitwise complement (`~`) |
 | `.shl(n)` | `(Int) -> Int` | left shift; `n` in `0..=63` (else panics) |
+| `.to_hex()` / `.to_binary()` / `.to_octal()` | `-> Str` | lowercase, no prefix; negatives get a leading `-` |
+| `.to_radix(base)` | `(Int) -> Str` | base `2..=36` (else panics) |
+| `.isqrt()` | `-> Int` | integer square root (floor); negative panics |
 | `.shr(n)` | `(Int) -> Int` | **arithmetic** right shift (sign-preserving) |
 | `.ushr(n)` | `(Int) -> Int` | **logical** right shift (zero-fill) |
 
@@ -189,6 +192,9 @@ literals are read as 64-bit patterns, so `0xFFFFFFFFFFFFFFFF` is `-1`.
 | `.clamp(lo, hi)` | `(Float, Float) -> Float` | `lo ≤ hi` required |
 | `.sign()` | `-> Float` | `1.0` / `-1.0` / preserves `0.0`, `-0.0`, `NaN` |
 | `.is_nan()` / `.is_infinite()` | `-> Bool` | |
+| `.log2()` / `.cbrt()` | `-> Float` | base-2 log / cube root |
+| `.atan2(x)` / `.hypot(x)` | `(Float) -> Float` | `atan2(self, x)` / `sqrt(self²+x²)` |
+| `.format(decimals)` | `(Int) -> Str` | fixed-point, rounded; `decimals` in `0..=100` |
 
 ### Option[T]
 

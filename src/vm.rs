@@ -1182,6 +1182,38 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_numeric_formatting_it24() {
+        // Int radix formatting (lowercase, sign on the magnitude)
+        assert_eq!(differential("fun probe() -> Str {\n    (255).to_hex()\n}\n"), "ff");
+        assert_eq!(differential("fun probe() -> Str {\n    (255).to_binary()\n}\n"), "11111111");
+        assert_eq!(differential("fun probe() -> Str {\n    (64).to_octal()\n}\n"), "100");
+        assert_eq!(differential("fun probe() -> Str {\n    (0 - 255).to_hex()\n}\n"), "-ff");
+        assert_eq!(differential("fun probe() -> Str {\n    (0).to_hex()\n}\n"), "0");
+        assert_eq!(differential("fun probe() -> Str {\n    (1000).to_radix(36)\n}\n"), "rs");
+        // to_radix out-of-range panics identically
+        assert_eq!(
+            differential("fun probe() -> Str {\n    (5).to_radix(40)\n}\n"),
+            "panic: `to_radix` base must be in 2..=36"
+        );
+        // isqrt
+        assert_eq!(differential("fun probe() -> Int {\n    (144).isqrt()\n}\n"), "12");
+        assert_eq!(differential("fun probe() -> Int {\n    (145).isqrt()\n}\n"), "12");
+        assert_eq!(differential("fun probe() -> Int {\n    (0).isqrt()\n}\n"), "0");
+        assert_eq!(
+            differential("fun probe() -> Int {\n    (0 - 4).isqrt()\n}\n"),
+            "panic: `isqrt` of a negative Int"
+        );
+        // Float.format at several precisions (round-half-to-even, both sides)
+        assert_eq!(differential("fun probe() -> Str {\n    (3.14159).format(2)\n}\n"), "3.14");
+        assert_eq!(differential("fun probe() -> Str {\n    (2.5).format(0)\n}\n"), "2");
+        assert_eq!(differential("fun probe() -> Str {\n    (1.0).format(3)\n}\n"), "1.000");
+        // transcendentals
+        assert_eq!(differential("fun probe() -> Float {\n    (3.0).hypot(4.0)\n}\n"), "5.0");
+        assert_eq!(differential("fun probe() -> Float {\n    (8.0).log2()\n}\n"), "3.0");
+        assert_eq!(differential("fun probe() -> Float {\n    (27.0).cbrt()\n}\n"), "3.0");
+    }
+
+    #[test]
     fn diff_encoding_it23() {
         // known vectors, identical on both engines
         assert_eq!(differential("fun probe() -> Str {\n    base64_encode(\"hello\")\n}\n"), "aGVsbG8=");

@@ -1719,6 +1719,23 @@ pub fn shared_method(
         (Value::Int(v), "sign") => Ok(Value::Int(v.signum())),
         (Value::Int(v), "is_even") => Ok(Value::Bool(v % 2 == 0)),
         (Value::Int(v), "is_odd") => Ok(Value::Bool(v % 2 != 0)),
+        (Value::Int(v), "to_hex") => Ok(Value::str(int_to_radix(*v, 16))),
+        (Value::Int(v), "to_binary") => Ok(Value::str(int_to_radix(*v, 2))),
+        (Value::Int(v), "to_octal") => Ok(Value::str(int_to_radix(*v, 8))),
+        (Value::Int(v), "to_radix") => match args.into_iter().next() {
+            Some(Value::Int(b)) if (2..=36).contains(&b) => {
+                Ok(Value::str(int_to_radix(*v, b as u32)))
+            }
+            Some(Value::Int(_)) => Err("`to_radix` base must be in 2..=36".into()),
+            _ => Err("`to_radix` needs an Int base".into()),
+        },
+        (Value::Int(v), "isqrt") => {
+            if *v < 0 {
+                Err("`isqrt` of a negative Int".into())
+            } else {
+                Ok(Value::Int(int_isqrt(*v)))
+            }
+        }
         (Value::Int(v), "band") => match args.into_iter().next() {
             Some(Value::Int(w)) => Ok(Value::Int(v & w)),
             _ => Err("`band` needs an Int".into()),
@@ -1772,6 +1789,23 @@ pub fn shared_method(
         },
         (Value::Float(v), "log") => Ok(Value::Float(v.ln())),
         (Value::Float(v), "log10") => Ok(Value::Float(v.log10())),
+        (Value::Float(v), "log2") => Ok(Value::Float(v.log2())),
+        (Value::Float(v), "cbrt") => Ok(Value::Float(v.cbrt())),
+        (Value::Float(v), "atan2") => match args.into_iter().next() {
+            Some(Value::Float(w)) => Ok(Value::Float(v.atan2(w))),
+            _ => Err("`atan2` needs a Float".into()),
+        },
+        (Value::Float(v), "hypot") => match args.into_iter().next() {
+            Some(Value::Float(w)) => Ok(Value::Float(v.hypot(w))),
+            _ => Err("`hypot` needs a Float".into()),
+        },
+        (Value::Float(v), "format") => match args.into_iter().next() {
+            Some(Value::Int(d)) if (0..=100).contains(&d) => {
+                Ok(Value::str(format!("{:.*}", d as usize, v)))
+            }
+            Some(Value::Int(_)) => Err("`format` decimals must be in 0..=100".into()),
+            _ => Err("`format` needs an Int number of decimals".into()),
+        },
         (Value::Float(v), "exp") => Ok(Value::Float(v.exp())),
         (Value::Float(v), "sin") => Ok(Value::Float(v.sin())),
         (Value::Float(v), "cos") => Ok(Value::Float(v.cos())),
@@ -1986,6 +2020,42 @@ pub fn shared_method(
         }
         (other, _) => Err(format!("{} has no method `{name}`", other.type_name())),
     }
+}
+
+/// Format an i64 in a given base (2..=36) — lowercase digits, a leading `-`
+/// on the magnitude for negatives. Shared with the cgen C mirror.
+fn int_to_radix(v: i64, base: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut n = v.unsigned_abs();
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut buf = Vec::new();
+    while n > 0 {
+        buf.push(DIGITS[(n % base as u64) as usize]);
+        n /= base as u64;
+    }
+    if v < 0 {
+        buf.push(b'-');
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap()
+}
+
+/// Integer square root (floor) of a non-negative i64.
+fn int_isqrt(v: i64) -> i64 {
+    let n = v as u64;
+    if n == 0 {
+        return 0;
+    }
+    let mut x = (n as f64).sqrt() as u64;
+    while x * x > n {
+        x -= 1;
+    }
+    while (x + 1) * (x + 1) <= n {
+        x += 1;
+    }
+    x as i64
 }
 
 /// Ordering for `List.min`/`max` — Int, Float, or Str elements only.

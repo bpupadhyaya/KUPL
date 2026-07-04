@@ -836,6 +836,29 @@ static KValue k_eprint(KValue v) {
     return k_unit();
 }
 
+/* ---- numeric formatting; mirrors interp int_to_radix / int_isqrt ---- */
+static KValue k_int_radix(int64_t v, int base) {
+    static const char* D = "0123456789abcdefghijklmnopqrstuvwxyz";
+    uint64_t n = v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v; /* magnitude, MIN-safe */
+    char tmp[70];
+    int i = 0;
+    if (n == 0) tmp[i++] = '0';
+    while (n > 0) { tmp[i++] = D[n % (uint64_t)base]; n /= (uint64_t)base; }
+    char* out = k_alloc((size_t)i + 2);
+    int o = 0;
+    if (v < 0) out[o++] = '-';
+    for (int k = i - 1; k >= 0; k--) out[o++] = tmp[k];
+    out[o] = 0;
+    return k_str(out);
+}
+static int64_t k_isqrt(uint64_t n) {
+    if (n == 0) return 0;
+    uint64_t x = (uint64_t)sqrt((double)n);
+    while (x * x > n) x--;
+    while ((x + 1) * (x + 1) <= n) x++;
+    return (int64_t)x;
+}
+
 /* ---- encodings & hash; mirrors src/encoding.rs exactly ---- */
 static const char* K_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static int k_valid_utf8(const unsigned char* b, size_t n) {
@@ -1504,6 +1527,18 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "sign")) return k_int(recv.as.i > 0 ? 1 : (recv.as.i < 0 ? -1 : 0));
         if (!strcmp(name, "is_even")) return k_bool(recv.as.i % 2 == 0);
         if (!strcmp(name, "is_odd")) return k_bool(recv.as.i % 2 != 0);
+        if (!strcmp(name, "to_hex")) return k_int_radix(recv.as.i, 16);
+        if (!strcmp(name, "to_binary")) return k_int_radix(recv.as.i, 2);
+        if (!strcmp(name, "to_octal")) return k_int_radix(recv.as.i, 8);
+        if (!strcmp(name, "to_radix")) {
+            int64_t b = args[0].as.i;
+            if (b < 2 || b > 36) k_panic("`to_radix` base must be in 2..=36");
+            return k_int_radix(recv.as.i, (int)b);
+        }
+        if (!strcmp(name, "isqrt")) {
+            if (recv.as.i < 0) k_panic("`isqrt` of a negative Int");
+            return k_int(k_isqrt((uint64_t)recv.as.i));
+        }
         if (!strcmp(name, "band")) return k_int(recv.as.i & args[0].as.i);
         if (!strcmp(name, "bor")) return k_int(recv.as.i | args[0].as.i);
         if (!strcmp(name, "bxor")) return k_int(recv.as.i ^ args[0].as.i);
@@ -1529,6 +1564,17 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "pow")) return k_float(pow(recv.as.f, args[0].as.f));
         if (!strcmp(name, "log")) return k_float(log(recv.as.f));
         if (!strcmp(name, "log10")) return k_float(log10(recv.as.f));
+        if (!strcmp(name, "log2")) return k_float(log2(recv.as.f));
+        if (!strcmp(name, "cbrt")) return k_float(cbrt(recv.as.f));
+        if (!strcmp(name, "atan2")) return k_float(atan2(recv.as.f, args[0].as.f));
+        if (!strcmp(name, "hypot")) return k_float(hypot(recv.as.f, args[0].as.f));
+        if (!strcmp(name, "format")) {
+            int64_t d = args[0].as.i;
+            if (d < 0 || d > 100) k_panic("`format` decimals must be in 0..=100");
+            char* buf = k_alloc(340 + (size_t)d);
+            snprintf(buf, 340 + (size_t)d, "%.*f", (int)d, recv.as.f);
+            return k_str(buf);
+        }
         if (!strcmp(name, "exp")) return k_float(exp(recv.as.f));
         if (!strcmp(name, "sin")) return k_float(sin(recv.as.f));
         if (!strcmp(name, "cos")) return k_float(cos(recv.as.f));

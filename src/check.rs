@@ -1755,6 +1755,11 @@ impl Checker {
                 Some((vec![Ty::Int], Ty::Int))
             }
             (Ty::Int, "bnot") => Some((vec![], Ty::Int)),
+            (Ty::Int, "to_hex") | (Ty::Int, "to_binary") | (Ty::Int, "to_octal") => {
+                Some((vec![], Ty::Str))
+            }
+            (Ty::Int, "to_radix") => Some((vec![Ty::Int], Ty::Str)),
+            (Ty::Int, "isqrt") => Some((vec![], Ty::Int)),
             (Ty::Float, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Float, "to_int") => Some((vec![], Ty::Int)),
             (Ty::Float, "abs") | (Ty::Float, "sqrt") => Some((vec![], Ty::Float)),
@@ -1762,9 +1767,10 @@ impl Checker {
                 Some((vec![], Ty::Float))
             }
             (Ty::Float, "log") | (Ty::Float, "log10") | (Ty::Float, "exp") | (Ty::Float, "sin")
-            | (Ty::Float, "cos") | (Ty::Float, "tan") | (Ty::Float, "sign") => {
-                Some((vec![], Ty::Float))
-            }
+            | (Ty::Float, "cos") | (Ty::Float, "tan") | (Ty::Float, "sign")
+            | (Ty::Float, "log2") | (Ty::Float, "cbrt") => Some((vec![], Ty::Float)),
+            (Ty::Float, "atan2") | (Ty::Float, "hypot") => Some((vec![Ty::Float], Ty::Float)),
+            (Ty::Float, "format") => Some((vec![Ty::Int], Ty::Str)),
             (Ty::Float, "clamp") => Some((vec![Ty::Float, Ty::Float], Ty::Float)),
             (Ty::Float, "is_nan") | (Ty::Float, "is_infinite") => Some((vec![], Ty::Bool)),
             (Ty::Float, "min") | (Ty::Float, "max") | (Ty::Float, "pow") => {
