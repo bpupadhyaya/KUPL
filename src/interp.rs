@@ -606,6 +606,10 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return Err(Self::panic_flow(v.to_string(), span));
                 }
+                ("tensor", 1) | ("zeros", 1) | ("arange", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return tensor_builtin(name, &v).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("Some", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     return Ok(Value::some(v));
@@ -785,6 +789,20 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             Ge => Value::Bool(a >= b),
             _ => unreachable!(),
         }),
+        (Value::Tensor(a), Value::Tensor(b)) => {
+            if a.len() != b.len() {
+                return Err(format!("tensor length mismatch ({} vs {})", a.len(), b.len()));
+            }
+            let zip = a.iter().zip(b.iter());
+            let data: Vec<f64> = match op {
+                Add => zip.map(|(x, y)| x + y).collect(),
+                Sub => zip.map(|(x, y)| x - y).collect(),
+                Mul => zip.map(|(x, y)| x * y).collect(),
+                Div => zip.map(|(x, y)| x / y).collect(),
+                _ => return Err("invalid tensor operation".into()),
+            };
+            Ok(Value::Tensor(std::rc::Rc::new(data)))
+        }
         (Value::Str(a), Value::Str(b)) => match op {
             Add => Ok(Value::str(format!("{a}{b}"))),
             Lt => Ok(Value::Bool(a < b)),
@@ -948,6 +966,58 @@ pub fn shared_method(
         (Value::Float(v), "to_int") => Ok(Value::Int(*v as i64)),
         (Value::Float(v), "abs") => Ok(Value::Float(v.abs())),
         (Value::Float(v), "sqrt") => Ok(Value::Float(v.sqrt())),
+        (Value::Tensor(d), "len") => Ok(Value::Int(d.len() as i64)),
+        (Value::Tensor(d), "get") => match args.into_iter().next() {
+            Some(Value::Int(i)) if i >= 0 && (i as usize) < d.len() => Ok(Value::Float(d[i as usize])),
+            Some(Value::Int(_)) => Err("tensor index out of range".into()),
+            _ => Err("`get` needs an Int index".into()),
+        },
+        (Value::Tensor(d), "sum") => Ok(Value::Float(d.iter().sum())),
+        (Value::Tensor(d), "mean") => {
+            if d.is_empty() {
+                return Err("mean of an empty tensor".into());
+            }
+            Ok(Value::Float(d.iter().sum::<f64>() / d.len() as f64))
+        }
+        (Value::Tensor(d), "max") => d
+            .iter()
+            .cloned()
+            .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.max(x))))
+            .map(Value::Float)
+            .ok_or_else(|| "max of an empty tensor".to_string()),
+        (Value::Tensor(d), "min") => d
+            .iter()
+            .cloned()
+            .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.min(x))))
+            .map(Value::Float)
+            .ok_or_else(|| "min of an empty tensor".to_string()),
+        (Value::Tensor(a), "dot") => match args.into_iter().next() {
+            Some(Value::Tensor(b)) => {
+                if a.len() != b.len() {
+                    return Err(format!("dot: length mismatch ({} vs {})", a.len(), b.len()));
+                }
+                Ok(Value::Float(a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()))
+            }
+            _ => Err("`dot` needs a Tensor".into()),
+        },
+        (Value::Tensor(d), "scale") => match args.into_iter().next() {
+            Some(Value::Float(k)) => Ok(Value::Tensor(Rc::new(d.iter().map(|x| x * k).collect()))),
+            _ => Err("`scale` needs a Float".into()),
+        },
+        (Value::Tensor(d), "map") => {
+            let f = args.into_iter().next().ok_or("`map` needs a function")?;
+            let mut out = Vec::with_capacity(d.len());
+            for x in d.iter() {
+                match call(f.clone(), vec![Value::Float(*x)])? {
+                    Value::Float(y) => out.push(y),
+                    other => return Err(format!("tensor map must return Float, got {}", other.type_name())),
+                }
+            }
+            Ok(Value::Tensor(Rc::new(out)))
+        }
+        (Value::Tensor(d), "to_list") => Ok(Value::List(Rc::new(
+            d.iter().map(|x| Value::Float(*x)).collect(),
+        ))),
         (Value::Ctor { variant, .. }, "is_some") => Ok(Value::Bool(variant.as_str() == "Some")),
         (Value::Ctor { variant, .. }, "is_none") => Ok(Value::Bool(variant.as_str() == "None")),
         (Value::Ctor { variant, .. }, "is_ok") => Ok(Value::Bool(variant.as_str() == "Ok")),
@@ -960,6 +1030,36 @@ pub fn shared_method(
             }
         }
         (other, _) => Err(format!("{} has no method `{name}`", other.type_name())),
+    }
+}
+
+/// tensor / zeros / arange — shared by interpreter and KVM.
+pub fn tensor_builtin(name: &str, arg: &Value) -> Result<Value, String> {
+    match (name, arg) {
+        ("tensor", Value::List(items)) => {
+            let mut data = Vec::with_capacity(items.len());
+            for it in items.iter() {
+                match it {
+                    Value::Float(f) => data.push(*f),
+                    Value::Int(i) => data.push(*i as f64),
+                    other => return Err(format!("tensor() needs Float elements, found {}", other.type_name())),
+                }
+            }
+            Ok(Value::Tensor(Rc::new(data)))
+        }
+        ("zeros", Value::Int(n)) => {
+            if *n < 0 {
+                return Err("zeros() needs a non-negative size".into());
+            }
+            Ok(Value::Tensor(Rc::new(vec![0.0; *n as usize])))
+        }
+        ("arange", Value::Int(n)) => {
+            if *n < 0 {
+                return Err("arange() needs a non-negative size".into());
+            }
+            Ok(Value::Tensor(Rc::new((0..*n).map(|i| i as f64).collect())))
+        }
+        _ => Err(format!("invalid argument for {name}()")),
     }
 }
 

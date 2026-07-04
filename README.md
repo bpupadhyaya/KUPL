@@ -31,6 +31,7 @@ kupl build examples/todo.kupl     # compile to a .kx bytecode module
 kupl run examples/todo.kx         # run the compiled module directly
 kupl bundle examples/counter.kupl -o counter-app   # self-contained executable
 kupl native examples/shapes.kupl -o shapes  # TRUE machine code via C (fun main)
+kupl run examples/tensors.kupl    # first-class tensors, native numeric kernels
 kupl dis examples/shapes.kupl     # disassemble the compiled bytecode
 kupl test examples/counter.kupl   # run `example` blocks as tests
 kupl check examples/todo.kupl     # parse + type-check + effect-check

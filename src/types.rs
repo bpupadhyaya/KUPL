@@ -21,6 +21,8 @@ pub enum Ty {
     Component(String),
     Fun(Vec<Ty>, Box<Ty>),
     Range,
+    /// Rank-1 f64 tensor (v0; dtype/shape parameters arrive with KIR).
+    Tensor,
     /// Inference variable.
     Var(u32),
 }
@@ -104,6 +106,7 @@ impl Unifier {
             | (Ty::Str, Ty::Str)
             | (Ty::Unit, Ty::Unit)
             | (Ty::Event, Ty::Event)
+            | (Ty::Tensor, Ty::Tensor)
             | (Ty::Range, Ty::Range) => Ok(()),
             (Ty::Named(x), Ty::Named(y)) if x == y => Ok(()),
             (Ty::Component(x), Ty::Component(y)) if x == y => Ok(()),
@@ -152,6 +155,7 @@ impl fmt::Display for Ty {
                 write!(f, ") -> {r}")
             }
             Ty::Range => write!(f, "Range"),
+            Ty::Tensor => write!(f, "Tensor"),
             Ty::Var(id) => write!(f, "?{id}"),
         }
     }

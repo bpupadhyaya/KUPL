@@ -917,6 +917,9 @@ impl<'s> FnCompiler<'s> {
                 ("print", 1) => Some(BUILTIN_PRINT),
                 ("to_str", 1) => Some(BUILTIN_TO_STR),
                 ("panic", 1) => Some(BUILTIN_PANIC),
+                ("tensor", 1) => Some(BUILTIN_TENSOR),
+                ("zeros", 1) => Some(BUILTIN_ZEROS),
+                ("arange", 1) => Some(BUILTIN_ARANGE),
                 _ => None,
             };
             if let Some(which) = builtin {

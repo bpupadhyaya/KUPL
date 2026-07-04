@@ -206,6 +206,7 @@ impl Checker {
                 "Str" => Ty::Str,
                 "Unit" => Ty::Unit,
                 "Event" => Ty::Event,
+                "Tensor" => Ty::Tensor,
                 other => {
                     if self.checked.types.contains_key(other) {
                         Ty::Named(other.to_string())
@@ -898,6 +899,10 @@ impl Checker {
                         let t = self.uni.apply(&lt);
                         let t = self.default_numeric(t);
                         let str_ok = *op == BinOp::Add && t == Ty::Str;
+                        let tensor_ok = t == Ty::Tensor && *op != BinOp::Rem;
+                        if tensor_ok {
+                            return t;
+                        }
                         if !t.is_numeric() && !str_ok {
                             self.err("K0235", format!("arithmetic needs Int or Float operands, found {t}"), expr.span);
                         }
@@ -1039,6 +1044,16 @@ impl Checker {
                     let t = self.infer_expr(&args[0].value, ctx);
                     self.unify(&Ty::Str, &t, args[0].value.span, "panic message");
                     return self.uni.fresh();
+                }
+                ("tensor", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::List(Box::new(Ty::Float)), &t, args[0].value.span, "tensor(...) argument");
+                    return Ty::Tensor;
+                }
+                ("zeros", 1) | ("arange", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Int, &t, args[0].value.span, "tensor size");
+                    return Ty::Tensor;
                 }
                 ("Some", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
@@ -1193,6 +1208,18 @@ impl Checker {
                 Some((vec![], Ty::Bool))
             }
             (Ty::Result(t, _), "unwrap_or") => Some((vec![(**t).clone()], (**t).clone())),
+            (Ty::Tensor, "len") => Some((vec![], Ty::Int)),
+            (Ty::Tensor, "get") => Some((vec![Ty::Int], Ty::Float)),
+            (Ty::Tensor, "sum") | (Ty::Tensor, "mean") | (Ty::Tensor, "max") | (Ty::Tensor, "min") => {
+                Some((vec![], Ty::Float))
+            }
+            (Ty::Tensor, "dot") => Some((vec![Ty::Tensor], Ty::Float)),
+            (Ty::Tensor, "scale") => Some((vec![Ty::Float], Ty::Tensor)),
+            (Ty::Tensor, "map") => Some((
+                vec![Ty::Fun(vec![Ty::Float], Box::new(Ty::Float))],
+                Ty::Tensor,
+            )),
+            (Ty::Tensor, "to_list") => Some((vec![], Ty::List(Box::new(Ty::Float)))),
             (Ty::Component(cname), _) => {
                 let sig = self.checked.components.get(cname).cloned().unwrap_or_default();
                 match sig.exposes.get(name) {

@@ -145,6 +145,9 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_PRINT => format!("k_print(regs[{start}]); regs[{dst}] = k_unit(); (void){argc};"),
             BUILTIN_TO_STR => format!("regs[{dst}] = k_to_str(regs[{start}]); (void){argc};"),
             BUILTIN_PANIC => format!("k_panic_v(regs[{start}]); (void){argc}; (void){dst};"),
+            BUILTIN_TENSOR => format!("regs[{dst}] = k_bt_tensor(regs[{start}]); (void){argc};"),
+            BUILTIN_ZEROS => format!("regs[{dst}] = k_bt_zeros(regs[{start}]); (void){argc};"),
+            BUILTIN_ARANGE => format!("regs[{dst}] = k_bt_arange(regs[{start}]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -222,14 +225,15 @@ typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
 typedef struct { int32_t ctor; KValue* fields; int32_t nfields; } KCtor;
 typedef struct { int32_t proto; int32_t ncaps; KValue* caps; } KClosure;
+typedef struct { int64_t len; double* data; } KTensor;
 typedef struct { const char* type_name; const char* variant; int arity; const char** fields; } KCtorMeta;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR } tag;
     union {
         int64_t i; double f; int b;
         const char* s;
-        KList* list; KCtor* ctor; KClosure* clo;
+        KList* list; KCtor* ctor; KClosure* clo; KTensor* ten;
         int32_t fun;
         struct { int64_t lo, hi; int incl; } range;
     } as;
@@ -283,6 +287,37 @@ static KValue k_closure(int proto, KValue* caps, int n) {
     c->caps = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
     memcpy(c->caps, caps, sizeof(KValue) * n);
     KValue x; x.tag = K_CLOSURE; x.as.clo = c; return x;
+}
+
+static KValue k_tensor_new(double* data, int64_t n) {
+    KTensor* t = k_alloc(sizeof(KTensor));
+    t->len = n; t->data = data;
+    KValue x; x.tag = K_TENSOR; x.as.ten = t; return x;
+}
+
+static KValue k_bt_tensor(KValue v) {
+    if (v.tag != K_LIST) k_panic("tensor() needs a List[Float]");
+    KList* l = v.as.list;
+    double* d = k_alloc(sizeof(double) * (l->len < 1 ? 1 : l->len));
+    for (int64_t i = 0; i < l->len; i++) {
+        KValue it = l->items[i];
+        if (it.tag == K_FLOAT) d[i] = it.as.f;
+        else if (it.tag == K_INT) d[i] = (double)it.as.i;
+        else k_panic("tensor() needs Float elements");
+    }
+    return k_tensor_new(d, l->len);
+}
+static KValue k_bt_zeros(KValue v) {
+    if (v.tag != K_INT || v.as.i < 0) k_panic("zeros() needs a non-negative size");
+    double* d = k_alloc(sizeof(double) * (v.as.i < 1 ? 1 : v.as.i));
+    for (int64_t i = 0; i < v.as.i; i++) d[i] = 0.0;
+    return k_tensor_new(d, v.as.i);
+}
+static KValue k_bt_arange(KValue v) {
+    if (v.tag != K_INT || v.as.i < 0) k_panic("arange() needs a non-negative size");
+    double* d = k_alloc(sizeof(double) * (v.as.i < 1 ? 1 : v.as.i));
+    for (int64_t i = 0; i < v.as.i; i++) d[i] = (double)i;
+    return k_tensor_new(d, v.as.i);
 }
 
 static int k_truthy(KValue v) {
@@ -363,6 +398,15 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
                      v.as.range.incl ? "=" : "", (long long)v.as.range.hi);
             kb_puts(b, tmp);
             break;
+        case K_TENSOR: {
+            kb_puts(b, "Tensor([");
+            for (int64_t i = 0; i < v.as.ten->len; i++) {
+                if (i) kb_puts(b, ", ");
+                k_fmt_float(b, v.as.ten->data[i]);
+            }
+            kb_puts(b, "])");
+            break;
+        }
     }
 }
 
@@ -408,8 +452,28 @@ static int k_eq(KValue a, KValue b) {
         case K_RANGE:
             return a.as.range.lo == b.as.range.lo && a.as.range.hi == b.as.range.hi
                 && a.as.range.incl == b.as.range.incl;
+        case K_TENSOR:
+            if (a.as.ten->len != b.as.ten->len) return 0;
+            for (int64_t i = 0; i < a.as.ten->len; i++)
+                if (a.as.ten->data[i] != b.as.ten->data[i]) return 0;
+            return 1;
         default: return 0;
     }
+}
+
+static KValue k_tensor_binop(KValue a, KValue b, int op) { /* 0:+ 1:- 2:* 3:/ */
+    KTensor *x = a.as.ten, *y = b.as.ten;
+    if (x->len != y->len) k_panic("tensor length mismatch");
+    double* d = k_alloc(sizeof(double) * (x->len < 1 ? 1 : x->len));
+    for (int64_t i = 0; i < x->len; i++) {
+        switch (op) {
+            case 0: d[i] = x->data[i] + y->data[i]; break;
+            case 1: d[i] = x->data[i] - y->data[i]; break;
+            case 2: d[i] = x->data[i] * y->data[i]; break;
+            default: d[i] = x->data[i] / y->data[i]; break;
+        }
+    }
+    return k_tensor_new(d, x->len);
 }
 
 static KValue k_add(KValue a, KValue b) {
@@ -420,6 +484,7 @@ static KValue k_add(KValue a, KValue b) {
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f + b.as.f);
     if (a.tag == K_STR && b.tag == K_STR) return k_concat(a, b);
+    if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 0);
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_sub(KValue a, KValue b) {
@@ -429,6 +494,7 @@ static KValue k_sub(KValue a, KValue b) {
         return k_int(r);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f - b.as.f);
+    if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 1);
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_mul(KValue a, KValue b) {
@@ -438,6 +504,7 @@ static KValue k_mul(KValue a, KValue b) {
         return k_int(r);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f * b.as.f);
+    if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 2);
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_div(KValue a, KValue b) {
@@ -447,6 +514,7 @@ static KValue k_div(KValue a, KValue b) {
         return k_int(a.as.i / b.as.i);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f / b.as.f);
+    if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 3);
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_rem(KValue a, KValue b) {
@@ -667,6 +735,58 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "to_int")) return k_int((int64_t)recv.as.f);
         if (!strcmp(name, "abs")) return k_float(fabs(recv.as.f));
         if (!strcmp(name, "sqrt")) return k_float(sqrt(recv.as.f));
+    }
+    if (recv.tag == K_TENSOR) {
+        KTensor* t = recv.as.ten;
+        if (!strcmp(name, "len")) return k_int(t->len);
+        if (!strcmp(name, "get")) {
+            if (args[0].tag != K_INT || args[0].as.i < 0 || args[0].as.i >= t->len)
+                k_panic("tensor index out of range");
+            return k_float(t->data[args[0].as.i]);
+        }
+        if (!strcmp(name, "sum") || !strcmp(name, "mean")) {
+            double s = 0;
+            for (int64_t i = 0; i < t->len; i++) s += t->data[i];
+            if (name[0] == 's') return k_float(s);
+            if (t->len == 0) k_panic("mean of an empty tensor");
+            return k_float(s / (double)t->len);
+        }
+        if (!strcmp(name, "max") || !strcmp(name, "min")) {
+            if (t->len == 0) k_panic("max/min of an empty tensor");
+            double m = t->data[0];
+            for (int64_t i = 1; i < t->len; i++) {
+                if (name[1] == 'a' ? t->data[i] > m : t->data[i] < m) m = t->data[i];
+            }
+            return k_float(m);
+        }
+        if (!strcmp(name, "dot")) {
+            if (args[0].tag != K_TENSOR || args[0].as.ten->len != t->len)
+                k_panic("dot: length mismatch");
+            double s = 0;
+            for (int64_t i = 0; i < t->len; i++) s += t->data[i] * args[0].as.ten->data[i];
+            return k_float(s);
+        }
+        if (!strcmp(name, "scale")) {
+            if (args[0].tag != K_FLOAT) k_panic("`scale` needs a Float");
+            double* d = k_alloc(sizeof(double) * (t->len < 1 ? 1 : t->len));
+            for (int64_t i = 0; i < t->len; i++) d[i] = t->data[i] * args[0].as.f;
+            return k_tensor_new(d, t->len);
+        }
+        if (!strcmp(name, "map")) {
+            double* d = k_alloc(sizeof(double) * (t->len < 1 ? 1 : t->len));
+            for (int64_t i = 0; i < t->len; i++) {
+                KValue x = k_float(t->data[i]);
+                KValue y = k_call(args[0], &x, 1);
+                if (y.tag != K_FLOAT) k_panic("tensor map must return Float");
+                d[i] = y.as.f;
+            }
+            return k_tensor_new(d, t->len);
+        }
+        if (!strcmp(name, "to_list")) {
+            KValue* out = k_alloc(sizeof(KValue) * (t->len < 1 ? 1 : t->len));
+            for (int64_t i = 0; i < t->len; i++) out[i] = k_float(t->data[i]);
+            return k_list(out, (int)t->len);
+        }
     }
     if (recv.tag == K_CTOR) {
         if (!strcmp(name, "is_some")) return k_bool(k_ctor_variant_is(recv, "Some"));

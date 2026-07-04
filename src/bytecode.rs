@@ -141,6 +141,9 @@ pub struct Module {
 pub const BUILTIN_PRINT: u8 = 0;
 pub const BUILTIN_TO_STR: u8 = 1;
 pub const BUILTIN_PANIC: u8 = 2;
+pub const BUILTIN_TENSOR: u8 = 3;
+pub const BUILTIN_ZEROS: u8 = 4;
+pub const BUILTIN_ARANGE: u8 = 5;
 
 impl Module {
     pub fn disassemble(&self) -> String {

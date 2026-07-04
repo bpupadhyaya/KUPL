@@ -1,0 +1,37 @@
+// First-class tensors: numeric kernels run as native loops in every engine
+// (interpreter, KVM, and machine code) — the seed of the GPU/TPU story.
+
+fun normalize(t: Tensor) -> Tensor {
+    let m = t.mean()
+    t.map(fn x { x - m })
+}
+
+fun main() {
+    let xs = arange(8)
+    let weights = tensor([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0])
+
+    print("xs        = {xs}")
+    print("weights   = {weights}")
+    print("sum       = {xs.sum()}, mean = {xs.mean()}")
+    print("min..max  = {xs.min()} .. {xs.max()}")
+
+    let weighted = xs * weights
+    print("xs * w    = {weighted}")
+    print("dot       = {xs.dot(weights)}")
+
+    let scaled = weighted.scale(0.1)
+    print("scaled    = {scaled}")
+
+    let centered = normalize(xs)
+    print("centered  = {centered}")
+    print("recheck   = {centered.mean()}")
+
+    let combo = (xs + weights).scale(2.0) - weights
+    print("combo     = {combo}")
+    print("as list   = {combo.to_list().first()}")
+
+    expect zeros(3).sum() == 0.0
+    expect xs.get(5) == 5.0
+    expect (xs + xs) == xs.scale(2.0)
+    print("all tensor expectations hold")
+}

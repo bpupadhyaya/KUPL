@@ -31,6 +31,8 @@ pub enum Value {
     Bound(usize, Rc<String>),
     /// A KVM closure: prototype index + captured values (captured by value).
     VmClosure(u16, Rc<Vec<Value>>),
+    /// A rank-1 tensor of f64 (shapes/dtypes arrive with KIR; ops are native loops).
+    Tensor(Rc<Vec<f64>>),
     Range(i64, i64, bool),
 }
 
@@ -86,6 +88,7 @@ impl Value {
             Value::Component(_) => "component".into(),
             Value::Bound(..) => "fn".into(),
             Value::VmClosure(..) => "fn".into(),
+            Value::Tensor(_) => "Tensor".into(),
             Value::Range(..) => "Range".into(),
         }
     }
@@ -106,6 +109,7 @@ impl PartialEq for Value {
             ) => t1 == t2 && v1 == v2 && f1 == f2,
             (Value::Component(a), Value::Component(b)) => a == b,
             (Value::Range(a, b, i), Value::Range(c, d, j)) => a == c && b == d && i == j,
+            (Value::Tensor(a), Value::Tensor(b)) => a == b,
             _ => false,
         }
     }
@@ -154,6 +158,16 @@ impl fmt::Display for Value {
             Value::Component(id) => write!(f, "<component #{id}>"),
             Value::Bound(id, name) => write!(f, "<fn {name} of #{id}>"),
             Value::VmClosure(proto, _) => write!(f, "<fn @{proto}>"),
+            Value::Tensor(data) => {
+                write!(f, "Tensor([")?;
+                for (i, x) in data.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", Value::Float(*x))?;
+                }
+                write!(f, "])")
+            }
             Value::Range(a, b, incl) => write!(f, "{a}..{}{b}", if *incl { "=" } else { "" }),
         }
     }

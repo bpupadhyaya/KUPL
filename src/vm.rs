@@ -376,6 +376,17 @@ impl<'m> Vm<'m> {
                             set!(dst, Value::Unit);
                         }
                         BUILTIN_TO_STR => set!(dst, Value::str(args[0].to_string())),
+                        BUILTIN_TENSOR | BUILTIN_ZEROS | BUILTIN_ARANGE => {
+                            let name = match which {
+                                BUILTIN_TENSOR => "tensor",
+                                BUILTIN_ZEROS => "zeros",
+                                _ => "arange",
+                            };
+                            match crate::interp::tensor_builtin(name, &args[0]) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
                         BUILTIN_PANIC => {
                             return Err(VmError { msg: args[0].to_string(), span })
                         }
