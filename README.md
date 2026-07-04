@@ -222,6 +222,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/sized.kupl` | sized numbers `i8`…`u64` + `f32` — literal suffixes, checked arithmetic, conversions |
 | `examples/multifile/` | `use`-based multi-file programs |
 | `examples/pkg/` | two local packages: an app depending on `greet` via `kupl.toml` |
+| `examples/native-showcase.kupl` | sized ints + parallel `par_map` + component exposes + wires — identical on interp, KVM, and **native** |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.

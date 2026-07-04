@@ -1,7 +1,7 @@
 # KUPL vs. the field — an honest audit
 
 **Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed 2026-07-04
-after enrichment iteration 20**.
+after enrichment iteration 40** (the four big arcs are done — see below).
 
 This document compares KUPL, **as actually implemented today**, against nine
 established languages: Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift,
@@ -12,6 +12,37 @@ between it and "as good or better than" the mainstream.
 The comparison is written by the KUPL project, so treat the framing with
 appropriate skepticism — but the ratings below are deliberately conservative,
 and every KUPL weakness is stated plainly.
+
+### What changed since the it20 refresh (the four big arcs)
+
+Between it20 and it40 KUPL closed its four largest audited gaps, all held
+byte-identical across the interpreter and KVM by differential tests:
+
+- **Sized numerics (it27–29, native it40)** — `i8…i64`/`u8…u64` and `f32`, with
+  checked/wrapping/saturating arithmetic, width-aware bitwise ops, and a full
+  conversion matrix. Sized ints now compile to native machine code too (via a
+  boxed `__int128`); `f32` runs on interp/KVM (native codegen pending a
+  shortest-float formatter).
+- **Package system (it30–32)** — `kupl.toml` local **path dependencies** with
+  **namespace isolation** (name-mangling, so two deps can't collide), exact
+  **version pinning**, and a **`kupl.lock`** for reproducibility. A real package
+  *manager*; what's still missing is a hosted *registry*.
+- **Real-thread concurrency (it33–35)** — `par_map`/`par_filter` over a **pure**
+  named function on a large list now execute across **real OS threads**, on both
+  the interpreter and the KVM, with results placed by input index so output is
+  deterministic and byte-identical to the sequential form. This is genuine
+  data parallelism, not a sequential placeholder.
+- **Native components (it36–39)** — the whole component model now compiles to
+  machine code: instance state, `on start`/port handlers, child components,
+  `wire`s, `emit`, the message-queue/drain loop, virtual-clock timers,
+  `supervise` restart-on-failure, and cross-component `expose` calls. A realistic
+  component app (`counter`/`todo`/`timers`/`di`) now runs at native speed, not
+  just VM speed.
+
+The scores below move accordingly: **concurrency 1→3**, **runtime performance
+2–3→3**, **universality 3→4**, **ecosystem 1→2**. What remains open is honest and
+named: native `f32`/JSON/`ai fun`, a hosted package registry, LSP completion/
+hover, a WASM target, and the KValue-unboxing perf IR (KIR).
 
 ### What changed since the first (it10) audit
 
@@ -38,11 +69,12 @@ Two things are true at once and must not be conflated:
   zero external dependencies, held byte-identical across engines by
   differential tests, plus a genuinely novel AI-native core no other language
   has.
-- **KUPL is young and narrow.** It has no package ecosystem, no true
-  parallelism yet (the concurrency constructs exist but execute sequentially),
-  and several headline capabilities (GPU kernels, a systems tier, sized
-  numerics) that are **designed but not yet built**. Its standard library is now
-  broad (file I/O, JSON, HTTP, regex, random, rich collections), but against
+- **KUPL is young and narrow.** It has a local package *manager* but no hosted
+  *registry* / third-party ecosystem; real data parallelism exists (`par_map`/
+  `par_filter` on OS threads) but there is no general async/await or coroutine
+  story yet; and several headline capabilities (GPU kernels, a systems tier) are
+  **designed but not yet built**. Its standard library is broad (file I/O, JSON,
+  HTTP, regex, random, rich collections, sized numerics), but against
   15–35-year-old languages with vast *third-party* ecosystems that is still a
   large gap, and this document does not pretend otherwise.
 
@@ -59,18 +91,20 @@ its design docs). They are impressionistic, not benchmarks.
 | Natural / readable syntax | 4 | 5 | 4 | 4 | 3 | 3 | 3 | 2 | 4 | 5 |
 | Fast to write | 4 | 5 | 4 | 4 | 3 | 3 | 3 | 2 | 4 | 5 |
 | Type & memory safety | 4 | 2 | 3 | 3 | 4 | 5 | 5 | 2 | 4 | 4 |
-| Runtime performance | 2–3 | 1 | 4 | 2 | 4 | 5 | 4 | 5 | 4 | 4 |
-| Concurrency / parallelism | 1 | 2 | 5 | 2 | 4 | 5 | 4 | 3 | 4 | 5 |
+| Runtime performance | 3 | 1 | 4 | 2 | 4 | 5 | 4 | 5 | 4 | 4 |
+| Concurrency / parallelism | 3 | 2 | 5 | 2 | 4 | 5 | 4 | 3 | 4 | 5 |
 | Scalability (large codebases) | 3 | 2 | 4 | 4 | 5 | 5 | 4 | 3 | 4 | 4 |
-| Universality (domains × hardware) | 3 | 4 | 3 | 3 | 4 | 5 | 3 | 5 | 3 | 4 |
+| Universality (domains × hardware) | 4 | 4 | 3 | 3 | 4 | 5 | 3 | 5 | 3 | 4 |
 | **AI-native (in the language)** | **5** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | Tooling & diagnostics | 4 | 3 | 4 | 4 | 4 | 5 | 3 | 3 | 4 | 4 |
-| Ecosystem & maturity | 1 | 5 | 5 | 5 | 5 | 5 | 4 | 5 | 4 | 5 |
+| Ecosystem & maturity | 2 | 5 | 5 | 5 | 5 | 5 | 4 | 5 | 4 | 5 |
 
 The two numbers that matter most for KUPL's thesis: it is **alone at 5 on
-AI-native** (a category the others simply don't compete in), and **alone at 1
-on ecosystem** (the thing it most conspicuously lacks). Everything else is a
-respectable-but-young 3–4 that will move with the roadmap.
+AI-native** (a category the others simply don't compete in), and **lowest on
+ecosystem** (the thing it most conspicuously lacks — now a 2, since a local
+package manager with isolation + lockfiles landed, but still no hosted
+registry). Everything else is a respectable-but-young 3–4 that moved up as the
+four big arcs closed.
 
 ## Criterion by criterion
 
@@ -115,34 +149,40 @@ borrow checker, no higher-kinded guarantees yet) and roughly level with
 Swift/Kotlin/Java on safety, well above Python/C++/TypeScript. The
 Rust-class **system tier** (ownership/borrowing) is **□ [design]**.
 
-### Runtime performance — KUPL 2–3
+### Runtime performance — KUPL 3
 
-The honest weak spot today. Pure `fun main` programs compile to native machine
-code via generated C (`kupl native`), which is competitive; but **components —
-KUPL's whole point — do not yet compile natively** and run on the interpreter
-or the register VM (`kupl bundle` ships the VM). So a realistic KUPL
-application today runs at bytecode-VM speed, not native speed. Rust, C++, Go,
-Java (JIT), Swift, and Kotlin (JVM/native) all beat it on component workloads.
-The design closes this — native components with per-component GC, and a typed
-SSA IR (**KIR**) — but that is **□ [design]**, so the current rating reflects
-the VM, not the vision.
+Much improved since it20. Pure `fun main` programs compile to native machine
+code via generated C (`kupl native`), and **as of it36–39 the whole component
+model compiles natively too** — instance state, handlers, children, wires,
+`emit`, the drain loop, timers, supervision, and `expose` calls (a C mirror of
+the VM, byte-identical to `kupl run`). So a realistic KUPL application now runs
+at native speed, not VM speed — the previous "components run on the VM" weak
+spot is closed. What keeps this a 3 rather than a 4–5 is that native values are
+still the **boxed 16-byte tagged `KValue`**: monomorphic numeric loops pay
+tag-dispatch instead of running in raw registers. The typed SSA IR (**KIR**)
+that would unbox them is a deliberate *future performance* arc (**□ [design]**),
+not a correctness gap. Rust, C++, and hand-tuned C still beat KUPL on tight
+numeric kernels; on component/actor workloads it is now competitive with
+compiled managed runtimes.
 
-### Concurrency / parallelism — KUPL 1
+### Concurrency / parallelism — KUPL 3
 
-The most important gap to be candid about. KUPL's runtime is a **single-threaded
-deterministic actor scheduler**: components are isolated actors with mailboxes,
-which is the *right foundation* for concurrency (Erlang-style), and the new
-virtual-clock timers add scheduling. A first step landed in it11: the **`par`
-structured fork-join** construct (independent branches → `List[T]`,
-deterministic, both engines) — the language seam where a real scheduler plugs
-in — but its **execution is still sequential**, and there is **no
-multi-threading, no true parallelism, and no async I/O yet**. `await` currently
-evaluates synchronously; a multi-threaded scheduler and async are **□ [design]**.
-Go (goroutines/channels), Rust (fearless concurrency), Kotlin (coroutines),
-Swift (actors/async-await), and the JVM all decisively beat KUPL here today. The
-actor isolation and supervision already in place mean the *model* is sound, and
-`par` now names the parallel work; the *parallel execution* is not there yet.
-This is the single biggest "as good or better" claim KUPL cannot make today.
+Substantially closed since it20, and no longer the headline weakness. KUPL's
+runtime is a **deterministic actor scheduler** (components are isolated actors
+with mailboxes — the right Erlang-style foundation) plus virtual-clock timers.
+As of **it33–35**, `par_map`/`par_filter` with a **pure** (effect-free) named
+function over a list of ≥256 elements execute across **real OS threads**, on
+both the interpreter and the KVM, via a `Send` portable-value boundary and
+`std::thread::scope`; results are placed by input index, so the output is
+deterministic and byte-identical to the sequential form (proven every run by the
+differential harness). That is genuine data parallelism — a real "runs on
+multiple cores" capability KUPL simply did not have before. What it still lacks:
+a general **async/await** story (`await` evaluates synchronously), coroutines,
+and a preemptive/work-stealing scheduler for arbitrary concurrent tasks. So Go
+(goroutines/channels), Rust (fearless concurrency), Kotlin (coroutines), and
+Swift (actors/async-await) still beat it for general concurrency; but for the
+common *data-parallel* case KUPL now competes, and the actor isolation +
+supervision mean the model scales cleanly.
 
 ### Scalability (large codebases) — KUPL 3
 
@@ -155,16 +195,20 @@ million-line codebases. Generics have no bounds (`[T: Ord]` is **□ [design]**)
 and there is a single flat namespace across `use`d files. Good foundations, not
 yet battle-tested.
 
-### Universality (domains × hardware) — KUPL 3 (design: 5)
+### Universality (domains × hardware) — KUPL 4 (design: 5)
 
 KUPL's universality claim is its most ambitious: one `component` model for UI,
 services, drivers, and ML pipelines, running on CPU/GPU/TPU/NPU. Today the
-*domain* universality is real (the same model expresses a todo app, a stateful
-agent, a contract-tested service), but the *hardware* universality is
-**□ [design]** — tensors are first-class (rank-1 f64 with native kernels) but
-GPU/kernel lowering, `at(gpu)` placement, and the systems/hardware tiers are
-not built. C++ and Rust are genuinely universal across hardware today; KUPL is
-universal across *domains* today and aspires to hardware universality.
+*domain* universality is real and now stronger: the same model expresses a todo
+app, a stateful agent, and a contract-tested service, **and the whole thing
+compiles to native machine code** (it36–39) with **fixed-width numerics**
+(`i8…u64`, it27–29/it40) for binary formats and interop — so KUPL reaches into
+systems/embedded-adjacent territory it could not at it20. The remaining gap is
+*hardware* universality: tensors are first-class (rank-1 f64 with native
+kernels), but GPU/kernel lowering, `at(gpu)` placement, and the systems tier
+(ownership/`low`/`asm`) are still **□ [design]**. C++ and Rust are genuinely
+universal across hardware today; KUPL is universal across *domains* today, now
+compiles them natively, and aspires to hardware universality.
 
 ### AI-native (in the language) — KUPL 5, everyone else 0
 
@@ -200,18 +244,21 @@ in a v1.0-alpha. It trails Rust only because rust-analyzer/clippy/the crates
 graph are mature; LSP hover/completion is still **□ [design]** (diagnostics
 ship today).
 
-### Ecosystem & maturity — KUPL 1
+### Ecosystem & maturity — KUPL 2
 
-The unavoidable truth: **KUPL has no package registry, no third-party
-libraries, and no production users.** Every language it is compared to has
-15–35 years of libraries, frameworks, hiring pools, and battle-testing. The
-*standard* library is now genuinely broad — file I/O, JSON, HTTP, regex,
-random, and rich collections mean many real programs need nothing beyond it
-(a Go-style batteries-included posture) — so the gap is squarely the
-*third-party* ecosystem and adoption, not the built-ins. `kupl pkg`, a package
-registry with enforced API-compat, and a conformance suite remain
-**□ [design]/roadmap**. No amount of language design substitutes for an
-ecosystem; this is the gap that only time and adoption close, and it stays at 1.
+Still the biggest gap, but no longer a zero on tooling. As of **it30–32** KUPL
+has a real package **manager**: `kupl.toml` local **path dependencies** with
+**namespace isolation** (name-mangling so two packages can't collide), exact
+**version pinning** (checked on load), and a **`kupl.lock`** with content hashes
+for reproducibility (`kupl pkg tree`/`lock`). The *standard* library is
+genuinely broad — file I/O, JSON, HTTP, regex, random, sized numerics, and rich
+collections mean many real programs need nothing beyond it (a Go-style
+batteries-included posture). What's still missing is the load-bearing part: a
+**hosted registry**, third-party libraries, and production users — every
+language here has 15–35 years of those. A registry with enforced API-compat and
+a conformance suite remain **□ [design]/roadmap**. No amount of language design
+substitutes for adoption; this is the gap that only time closes, now a 2 rather
+than a 1 because the *mechanism* (packages, isolation, locking) exists.
 
 ## Head to head
 

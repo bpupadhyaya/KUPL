@@ -4,6 +4,32 @@ Audited 2026-07-04 against: `docs/design/LANGUAGE.md` (incl. §12 open
 questions), the `[design]` markers in `docs/reference/LANGUAGE-REFERENCE.md`,
 and known limitations called out in commit messages. Checked off as landed.
 
+## Final stretch — prioritized shortlist (it42–50)
+
+The four big arcs (sized numerics, packages, real-thread concurrency, native
+components) are complete as of it40. Remaining work, ranked by value ÷ effort:
+
+1. **Native `f32`** (small, completes the native numeric surface) — the last
+   native numeric defer. Needs a shortest-round-trip float formatter in C that
+   matches Rust's `Display` (try increasing precision, parse back, take the
+   first that round-trips; decimal form only — Rust never uses scientific
+   notation for Display). Unblocks `kupl native examples/sized.kupl`.
+2. **Native JSON** (`json_parse`/`json_stringify` in C) — JSON is core to "any
+   software"; recursive `Ctor` construction already works natively, so this is
+   mostly porting `src/json.rs`'s parser/serializer to the C runtime. Lets
+   compiled binaries do JSON without falling back to `bundle`.
+3. **LSP hover / completion / go-to-definition** — diagnostics ship today; this
+   is the biggest IDE-parity gap vs Swift/Kotlin/Rust and a high-visibility win.
+4. **Flagship "any software" example(s)** — a non-trivial end-to-end program
+   (e.g. a small HTTP/JSON service, or a data pipeline) proving breadth, doubling
+   as documentation and a regression.
+5. **WASM target** / **stdlib breadth** / **KIR unboxing (perf)** — larger or
+   lower-marginal-value; revisit if the above land with iterations to spare.
+
+**Recommended for it42+:** native `f32` (1) first — small, finishes the numeric
+story, and makes `sized.kupl` fully native — then native JSON (2), then LSP
+completion (3). Everything stays byte-identical across engines.
+
 ## Tier 1 — language ergonomics (active)
 
 - [x] **Record update `with`** — `user with age: 36` (design §10 uses it; today K0223)

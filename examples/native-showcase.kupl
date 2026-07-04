@@ -1,0 +1,61 @@
+// Native showcase — compiles to machine code (`kupl native`) identically to
+// `kupl run` and `kupl run --vm`. It ties together the capabilities that landed
+// across the four big arcs: fixed-width integers, a pure kernel mapped in
+// PARALLEL (par_map, real threads on interp/KVM), component state behind
+// cross-component EXPOSE calls, and WIRES between components — all byte-identical
+// on every engine, including native.
+
+// A pure numeric kernel (no effects) — safe to run in parallel across threads.
+fun mix(c: Int) -> Int {
+    var acc = 0
+    var i = 0
+    while i < 16 {
+        acc = acc + (c * (i + 1)) % 97
+        i = i + 1
+    }
+    acc
+}
+
+// 8-bit channel state, reached through exposes (checked on set).
+component Channel {
+    intent "A single 8-bit color channel."
+    state v: u8 = 0u8
+    expose fun set(n: u8) { v = n }
+    expose fun get() -> u8 { v }
+}
+
+component Sink {
+    intent "Prints each brightness total it receives."
+    in brightness: Int
+    on brightness(b) {
+        print("brightness = {b}")
+    }
+}
+
+component Engine {
+    intent "Maps a pure kernel over a batch in parallel and emits the total."
+    out brightness: Int
+    on start {
+        var xs: List[Int] = []
+        var i = 0
+        while i < 300 {
+            xs = xs.push(i)
+            i = i + 1
+        }
+        emit brightness(xs.par_map(mix).sum())
+    }
+}
+
+app NativeShowcase {
+    intent "Wires the engine into a sink and exercises sized-int channel state."
+    let engine = Engine()
+    let sink = Sink()
+    let ch = Channel()
+
+    wire engine.brightness -> sink.brightness
+
+    on start {
+        ch.set(200u8)
+        print("channel = {ch.get()}")
+    }
+}
