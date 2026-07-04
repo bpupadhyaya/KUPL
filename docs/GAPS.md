@@ -75,7 +75,13 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       to native (per-component GC), so real apps run at native, not VM, speed
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
 - [ ] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal (audit #3)
-- [ ] Broader standard library (audit #3 — stdlib depth for real programs)
+- [x] Broader standard library (audit #3, it12) — ~40 methods across all core
+      types, all engines byte-identical incl. native. List (is_empty/concat/
+      unique/init/tail/product/min/max/flatten/count/flat_map/window/chunk); Str
+      (is_empty/reverse/lines/index_of/count/slice/pad_left/pad_right); Int (pow/
+      gcd/clamp/sign/is_even/is_odd); Float (log/log10/exp/sin/cos/tan/sign/
+      clamp/is_nan/is_infinite); Map (is_empty/get_or/merge/map_values); Set
+      (is_empty/is_subset)
 - [ ] System tier: ownership, `low`/`asm` (design §6; audit #4)
 - [ ] Capabilities as attenuable values (`cap.Http.limited_to(…)`)
 

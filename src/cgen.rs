@@ -847,6 +847,110 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return k_str(b.buf ? b.buf : "");
         }
+        if (!strcmp(name, "is_empty")) return k_bool(l->len == 0);
+        if (!strcmp(name, "init")) return k_list(l->items, (int)(l->len ? l->len - 1 : 0));
+        if (!strcmp(name, "tail")) return k_list(l->items + (l->len ? 1 : 0), (int)(l->len ? l->len - 1 : 0));
+        if (!strcmp(name, "concat")) {
+            KList* o = args[0].as.list;
+            KValue* out = k_alloc(sizeof(KValue) * (l->len + o->len < 1 ? 1 : l->len + o->len));
+            memcpy(out, l->items, sizeof(KValue) * l->len);
+            memcpy(out + l->len, o->items, sizeof(KValue) * o->len);
+            return k_list(out, (int)(l->len + o->len));
+        }
+        if (!strcmp(name, "unique")) {
+            KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+            int64_t n = 0;
+            for (int64_t i = 0; i < l->len; i++) {
+                int dup = 0;
+                for (int64_t j = 0; j < n; j++) if (k_eq(out[j], l->items[i])) { dup = 1; break; }
+                if (!dup) out[n++] = l->items[i];
+            }
+            return k_list(out, (int)n);
+        }
+        if (!strcmp(name, "product")) {
+            int64_t pi = 1; double pf = 1; int isf = 0;
+            for (int64_t i = 0; i < l->len; i++) {
+                KValue it = l->items[i];
+                if (it.tag == K_INT) {
+                    if (__builtin_mul_overflow(pi, it.as.i, &pi)) k_panic("integer overflow in product");
+                } else if (it.tag == K_FLOAT) { isf = 1; pf *= it.as.f; }
+                else k_panic("cannot multiply non-numeric");
+            }
+            return isf ? k_float(pf * (double)pi) : k_int(pi);
+        }
+        if (!strcmp(name, "min") || !strcmp(name, "max")) {
+            int wmin = name[1] == 'i';
+            if (l->len == 0) return k_none();
+            KValue best = l->items[0];
+            for (int64_t i = 1; i < l->len; i++) {
+                KValue it = l->items[i];
+                int lt;
+                if (it.tag == K_INT && best.tag == K_INT) lt = it.as.i < best.as.i;
+                else if (it.tag == K_FLOAT && best.tag == K_FLOAT) lt = it.as.f < best.as.f;
+                else if (it.tag == K_STR && best.tag == K_STR) lt = strcmp(it.as.s, best.as.s) < 0;
+                else { k_panic("`min`/`max` need Int, Float, or Str elements"); lt = 0; }
+                if (wmin ? lt : !lt && !k_eq(it, best)) best = it;
+            }
+            return k_some(best);
+        }
+        if (!strcmp(name, "flatten")) {
+            int64_t total = 0;
+            for (int64_t i = 0; i < l->len; i++) {
+                if (l->items[i].tag != K_LIST) k_panic("`flatten` needs a List of Lists");
+                total += l->items[i].as.list->len;
+            }
+            KValue* out = k_alloc(sizeof(KValue) * (total < 1 ? 1 : total));
+            int64_t n = 0;
+            for (int64_t i = 0; i < l->len; i++) {
+                KList* inner = l->items[i].as.list;
+                memcpy(out + n, inner->items, sizeof(KValue) * inner->len);
+                n += inner->len;
+            }
+            return k_list(out, (int)total);
+        }
+        if (!strcmp(name, "count")) {
+            int64_t n = 0;
+            for (int64_t i = 0; i < l->len; i++)
+                if (k_truthy(k_call(args[0], &l->items[i], 1))) n++;
+            return k_int(n);
+        }
+        if (!strcmp(name, "flat_map")) {
+            KValue subs[4096]; int ns = 0; int64_t total = 0;
+            for (int64_t i = 0; i < l->len && ns < 4096; i++) {
+                KValue r = k_call(args[0], &l->items[i], 1);
+                if (r.tag != K_LIST) k_panic("`flat_map` function must return a List");
+                subs[ns++] = r; total += r.as.list->len;
+            }
+            KValue* out = k_alloc(sizeof(KValue) * (total < 1 ? 1 : total));
+            int64_t n = 0;
+            for (int i = 0; i < ns; i++) {
+                KList* inner = subs[i].as.list;
+                memcpy(out + n, inner->items, sizeof(KValue) * inner->len);
+                n += inner->len;
+            }
+            return k_list(out, (int)total);
+        }
+        if (!strcmp(name, "window")) {
+            if (args[0].tag != K_INT || args[0].as.i < 1) k_panic("`window` needs a positive Int");
+            int64_t w = args[0].as.i;
+            if (l->len < w) return k_list((KValue*)0, 0);
+            int64_t cnt = l->len - w + 1;
+            KValue* out = k_alloc(sizeof(KValue) * cnt);
+            for (int64_t i = 0; i < cnt; i++) out[i] = k_list(l->items + i, (int)w);
+            return k_list(out, (int)cnt);
+        }
+        if (!strcmp(name, "chunk")) {
+            if (args[0].tag != K_INT || args[0].as.i < 1) k_panic("`chunk` needs a positive Int");
+            int64_t w = args[0].as.i;
+            int64_t cnt = (l->len + w - 1) / w;
+            KValue* out = k_alloc(sizeof(KValue) * (cnt < 1 ? 1 : cnt));
+            int64_t n = 0;
+            for (int64_t i = 0; i < l->len; i += w) {
+                int64_t len = l->len - i < w ? l->len - i : w;
+                out[n++] = k_list(l->items + i, (int)len);
+            }
+            return k_list(out, (int)cnt);
+        }
     }
     if (recv.tag == K_STR) {
         const char* s = recv.as.s;
@@ -959,6 +1063,101 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return k_list(parts, n);
         }
+        if (!strcmp(name, "is_empty")) return k_bool(s[0] == 0);
+        if (!strcmp(name, "reverse")) {
+            /* collect UTF-8 char boundaries, then emit in reverse */
+            const char* starts[8192]; int lens[8192]; int nc = 0;
+            const char* p = s;
+            while (*p && nc < 8192) {
+                int len = 1;
+                if ((*p & 0xF8) == 0xF0) len = 4;
+                else if ((*p & 0xF0) == 0xE0) len = 3;
+                else if ((*p & 0xE0) == 0xC0) len = 2;
+                starts[nc] = p; lens[nc] = len; nc++;
+                p += len;
+            }
+            size_t sl = strlen(s);
+            char* out = k_alloc(sl + 1);
+            size_t o = 0;
+            for (int i = nc - 1; i >= 0; i--) { memcpy(out + o, starts[i], (size_t)lens[i]); o += lens[i]; }
+            out[o] = 0;
+            return k_str(out);
+        }
+        if (!strcmp(name, "lines")) {
+            KValue parts[4096]; int n = 0;
+            const char* p = s;
+            while (*p && n < 4095) {
+                const char* q = strchr(p, '\n');
+                const char* end = q ? q : p + strlen(p);
+                const char* z = end;
+                if (z > p && z[-1] == '\r') z--;              /* strip trailing CR */
+                char* piece = k_alloc((size_t)(z - p) + 1);
+                memcpy(piece, p, (size_t)(z - p)); piece[z - p] = 0;
+                parts[n++] = k_str(piece);
+                if (!q) break;
+                p = q + 1;
+            }
+            return k_list(parts, n);
+        }
+        if (!strcmp(name, "index_of")) {
+            const char* q = strstr(s, args[0].as.s);
+            if (!q) return k_none();
+            int64_t idx = 0;
+            for (const char* p = s; p < q; p++) if ((*p & 0xC0) != 0x80) idx++;
+            return k_some(k_int(idx));
+        }
+        if (!strcmp(name, "count")) {
+            const char* sub = args[0].as.s;
+            size_t sublen = strlen(sub);
+            if (sublen == 0) k_panic("`count` needs a non-empty Str");
+            int64_t n = 0;
+            const char* p = s;
+            for (;;) { const char* q = strstr(p, sub); if (!q) break; n++; p = q + sublen; }
+            return k_int(n);
+        }
+        if (!strcmp(name, "slice")) {
+            int64_t a = args[0].as.i, b = args[1].as.i;
+            const char* starts[8192]; int lens[8192]; int nc = 0;
+            const char* p = s;
+            while (*p && nc < 8192) {
+                int len = 1;
+                if ((*p & 0xF8) == 0xF0) len = 4;
+                else if ((*p & 0xF0) == 0xE0) len = 3;
+                else if ((*p & 0xE0) == 0xC0) len = 2;
+                starts[nc] = p; lens[nc] = len; nc++;
+                p += len;
+            }
+            int64_t lo = a < 0 ? 0 : (a > nc ? nc : a);
+            int64_t amax = a < 0 ? 0 : a;
+            int64_t hi = b < amax ? amax : (b > nc ? nc : b);
+            KBuf buf = {0};
+            for (int64_t i = lo; i < hi; i++) {
+                char c[5]; memcpy(c, starts[i], (size_t)lens[i]); c[lens[i]] = 0;
+                kb_puts(&buf, c);
+            }
+            return k_str(buf.buf ? buf.buf : "");
+        }
+        if (!strcmp(name, "pad_left") || !strcmp(name, "pad_right")) {
+            int left = name[4] == 'l';
+            if (args[0].tag != K_INT) k_panic("`pad` needs an Int width");
+            int64_t width = args[0].as.i;
+            const char* fill = args[1].as.s;
+            char fc = fill[0] ? fill[0] : ' ';
+            int64_t cur = 0;
+            for (const char* p = s; *p; p++) if ((*p & 0xC0) != 0x80) cur++;
+            if (cur >= width || width > 100000000) return k_str(s);
+            int64_t pad = width - cur;
+            char* out = k_alloc(strlen(s) + (size_t)pad + 1);
+            if (left) {
+                for (int64_t i = 0; i < pad; i++) out[i] = fc;
+                strcpy(out + pad, s);
+            } else {
+                strcpy(out, s);
+                for (int64_t i = 0; i < pad; i++) out[strlen(s) + i] = fc;
+                out[strlen(s) + pad] = 0;
+            }
+            return k_str(out);
+        }
     }
     if (recv.tag == K_INT) {
         if (!strcmp(name, "to_str")) return k_to_str(recv);
@@ -969,6 +1168,29 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         }
         if (!strcmp(name, "min")) return k_int(recv.as.i < args[0].as.i ? recv.as.i : args[0].as.i);
         if (!strcmp(name, "max")) return k_int(recv.as.i > args[0].as.i ? recv.as.i : args[0].as.i);
+        if (!strcmp(name, "pow")) {
+            int64_t e = args[0].as.i;
+            if (e < 0) k_panic("`pow` needs a non-negative exponent");
+            int64_t r = 1, base = recv.as.i;
+            for (int64_t i = 0; i < e; i++)
+                if (__builtin_mul_overflow(r, base, &r)) k_panic("integer overflow in pow");
+            return k_int(r);
+        }
+        if (!strcmp(name, "gcd")) {
+            uint64_t a = recv.as.i < 0 ? (uint64_t)(-(recv.as.i + 1)) + 1 : (uint64_t)recv.as.i;
+            uint64_t b = args[0].as.i < 0 ? (uint64_t)(-(args[0].as.i + 1)) + 1 : (uint64_t)args[0].as.i;
+            while (b) { uint64_t t = b; b = a % b; a = t; }
+            return k_int((int64_t)a);
+        }
+        if (!strcmp(name, "clamp")) {
+            int64_t lo = args[0].as.i, hi = args[1].as.i;
+            if (lo > hi) k_panic("`clamp`: lo must not exceed hi");
+            int64_t v = recv.as.i;
+            return k_int(v < lo ? lo : (v > hi ? hi : v));
+        }
+        if (!strcmp(name, "sign")) return k_int(recv.as.i > 0 ? 1 : (recv.as.i < 0 ? -1 : 0));
+        if (!strcmp(name, "is_even")) return k_bool(recv.as.i % 2 == 0);
+        if (!strcmp(name, "is_odd")) return k_bool(recv.as.i % 2 != 0);
     }
     if (recv.tag == K_FLOAT) {
         if (!strcmp(name, "to_str")) return k_to_str(recv);
@@ -981,6 +1203,24 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "min")) return k_float(recv.as.f < args[0].as.f ? recv.as.f : args[0].as.f);
         if (!strcmp(name, "max")) return k_float(recv.as.f > args[0].as.f ? recv.as.f : args[0].as.f);
         if (!strcmp(name, "pow")) return k_float(pow(recv.as.f, args[0].as.f));
+        if (!strcmp(name, "log")) return k_float(log(recv.as.f));
+        if (!strcmp(name, "log10")) return k_float(log10(recv.as.f));
+        if (!strcmp(name, "exp")) return k_float(exp(recv.as.f));
+        if (!strcmp(name, "sin")) return k_float(sin(recv.as.f));
+        if (!strcmp(name, "cos")) return k_float(cos(recv.as.f));
+        if (!strcmp(name, "tan")) return k_float(tan(recv.as.f));
+        if (!strcmp(name, "sign")) {
+            double v = recv.as.f;
+            return k_float(v > 0 ? 1.0 : (v < 0 ? -1.0 : v));
+        }
+        if (!strcmp(name, "is_nan")) return k_bool(recv.as.f != recv.as.f);
+        if (!strcmp(name, "is_infinite")) return k_bool(isinf(recv.as.f));
+        if (!strcmp(name, "clamp")) {
+            double lo = args[0].as.f, hi = args[1].as.f;
+            if (lo > hi) k_panic("`clamp`: lo must not exceed hi");
+            double v = recv.as.f;
+            return k_float(v < lo ? lo : (v > hi ? hi : v));
+        }
     }
     if (recv.tag == K_MAP) {
         KMap* m = recv.as.map;
@@ -1015,6 +1255,31 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         }
         if (!strcmp(name, "keys")) return k_list(m->keys, (int)m->len);
         if (!strcmp(name, "values")) return k_list(m->vals, (int)m->len);
+        if (!strcmp(name, "is_empty")) return k_bool(m->len == 0);
+        if (!strcmp(name, "get_or")) {
+            for (int64_t i = 0; i < m->len; i++) if (k_eq(m->keys[i], args[0])) return m->vals[i];
+            return args[1];
+        }
+        if (!strcmp(name, "map_values")) {
+            KValue* ks = k_alloc(sizeof(KValue) * (m->len < 1 ? 1 : m->len));
+            KValue* vs = k_alloc(sizeof(KValue) * (m->len < 1 ? 1 : m->len));
+            for (int64_t i = 0; i < m->len; i++) { ks[i] = m->keys[i]; vs[i] = k_call(args[0], &m->vals[i], 1); }
+            return k_map_make(ks, vs, m->len);
+        }
+        if (!strcmp(name, "merge")) {
+            KMap* o = args[0].as.map;
+            KValue* ks = k_alloc(sizeof(KValue) * (m->len + o->len < 1 ? 1 : m->len + o->len));
+            KValue* vs = k_alloc(sizeof(KValue) * (m->len + o->len < 1 ? 1 : m->len + o->len));
+            memcpy(ks, m->keys, sizeof(KValue) * m->len);
+            memcpy(vs, m->vals, sizeof(KValue) * m->len);
+            int64_t n = m->len;
+            for (int64_t i = 0; i < o->len; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < n; j++) if (k_eq(ks[j], o->keys[i])) { vs[j] = o->vals[i]; found = 1; break; }
+                if (!found) { ks[n] = o->keys[i]; vs[n] = o->vals[i]; n++; }
+            }
+            return k_map_make(ks, vs, n);
+        }
     }
     if (recv.tag == K_SET) {
         KSet* st = recv.as.set;
@@ -1066,6 +1331,16 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_set_make(out, n);
         }
         if (!strcmp(name, "to_list")) return k_list(st->items, (int)st->len);
+        if (!strcmp(name, "is_empty")) return k_bool(st->len == 0);
+        if (!strcmp(name, "is_subset")) {
+            KSet* o = args[0].as.set;
+            for (int64_t i = 0; i < st->len; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < o->len; j++) if (k_eq(st->items[i], o->items[j])) { found = 1; break; }
+                if (!found) return k_bool(0);
+            }
+            return k_bool(1);
+        }
     }
     if (recv.tag == K_TENSOR) {
         KTensor* t = recv.as.ten;

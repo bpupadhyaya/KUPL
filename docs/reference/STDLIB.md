@@ -47,6 +47,17 @@ unless supervised.
 | `.first()` / `.last()` | `-> Option[T]` | |
 | `.reverse()` | `-> List[T]` | |
 | `.join(sep)` | `(Str) -> Str` | elements rendered with Display |
+| `.is_empty()` | `-> Bool` | |
+| `.concat(other)` | `(List[T]) -> List[T]` | appends another list |
+| `.unique()` | `-> List[T]` | drops later duplicates, preserves order |
+| `.init()` / `.tail()` | `-> List[T]` | all but the last / all but the first |
+| `.product()` | `-> T` | Int or Float lists; Int overflow panics |
+| `.min()` / `.max()` | `-> Option[T]` | Int/Float/Str elements; `None` if empty |
+| `.flatten()` | `List[List[T]] -> List[T]` | one level of nesting |
+| `.count(f)` | `(fn(T) -> Bool) -> Int` | how many satisfy `f` |
+| `.flat_map(f)` | `(fn(T) -> List[U]) -> List[U]` | map then flatten |
+| `.window(n)` | `(Int) -> List[List[T]]` | sliding windows of width n (n ≥ 1) |
+| `.chunk(n)` | `(Int) -> List[List[T]]` | consecutive chunks of size n (last may be shorter) |
 
 ### Str
 
@@ -64,6 +75,13 @@ unless supervised.
 | `.repeat(n)` | `(Int) -> Str` | n ≥ 0 |
 | `.parse_int()` | `-> Option[Int]` | `None` on any malformed input |
 | `.parse_float()` | `-> Option[Float]` | |
+| `.is_empty()` | `-> Bool` | |
+| `.reverse()` | `-> Str` | by characters, not bytes |
+| `.lines()` | `-> List[Str]` | splits on `\n`, strips a trailing `\r`; no trailing empty line |
+| `.index_of(sub)` | `(Str) -> Option[Int]` | character index of the first occurrence |
+| `.count(sub)` | `(Str) -> Int` | non-overlapping occurrences (non-empty `sub`) |
+| `.slice(start, end)` | `(Int, Int) -> Str` | substring by character index, clamped |
+| `.pad_left(width, fill)` / `.pad_right(width, fill)` | `(Int, Str) -> Str` | pad to `width` chars with the first char of `fill` |
 
 `+` concatenates two Str values; `"…{expr}…"` interpolation renders any value.
 
@@ -75,6 +93,11 @@ unless supervised.
 | `.to_float()` | `-> Float` | |
 | `.abs()` | `-> Int` | `Int.min.abs()` panics |
 | `.min(other)` / `.max(other)` | `(Int) -> Int` | |
+| `.pow(exp)` | `(Int) -> Int` | `exp ≥ 0`; overflow panics |
+| `.gcd(other)` | `(Int) -> Int` | greatest common divisor (non-negative) |
+| `.clamp(lo, hi)` | `(Int, Int) -> Int` | `lo ≤ hi` required |
+| `.sign()` | `-> Int` | `-1` / `0` / `1` |
+| `.is_even()` / `.is_odd()` | `-> Bool` | |
 
 ### Float
 
@@ -85,6 +108,11 @@ unless supervised.
 | `.abs()` / `.sqrt()` | `-> Float` | |
 | `.floor()` / `.ceil()` / `.round()` | `-> Float` | |
 | `.min(other)` / `.max(other)` / `.pow(exp)` | `(Float) -> Float` | |
+| `.log()` / `.log10()` / `.exp()` | `-> Float` | natural log / base-10 log / e^x |
+| `.sin()` / `.cos()` / `.tan()` | `-> Float` | radians |
+| `.clamp(lo, hi)` | `(Float, Float) -> Float` | `lo ≤ hi` required |
+| `.sign()` | `-> Float` | `1.0` / `-1.0` / preserves `0.0`, `-0.0`, `NaN` |
+| `.is_nan()` / `.is_infinite()` | `-> Bool` | |
 
 ### Option[T]
 
@@ -115,6 +143,10 @@ existing key keeps its position. Equality is order-insensitive.
 | `.contains_key(k)` | `(K) -> Bool` | |
 | `.keys()` / `.values()` | `-> List[K]` / `-> List[V]` | insertion order |
 | `.len()` | `-> Int` | |
+| `.is_empty()` | `-> Bool` | |
+| `.get_or(k, default)` | `(K, V) -> V` | value for `k`, or `default` |
+| `.merge(other)` | `(Map[K, V]) -> Map[K, V]` | `other`'s entries override |
+| `.map_values(f)` | `(fn(V) -> W) -> Map[K, W]` | transform values, keep keys/order |
 
 ### Set[T]
 
@@ -128,6 +160,8 @@ Insertion-ordered; equality is order-insensitive.
 | `.union(s)` / `.intersect(s)` / `.difference(s)` | `(Set[T]) -> Set[T]` | |
 | `.to_list()` | `-> List[T]` | insertion order |
 | `.len()` | `-> Int` | |
+| `.is_empty()` | `-> Bool` | |
+| `.is_subset(other)` | `(Set[T]) -> Bool` | every element is in `other` |
 
 ### Tensor
 

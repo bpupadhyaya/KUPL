@@ -1558,6 +1558,44 @@ impl Checker {
                 }
                 Some((vec![Ty::Str], Ty::Str))
             }
+            (Ty::List(_), "is_empty") => Some((vec![], Ty::Bool)),
+            (Ty::List(t), "concat") => Some((vec![Ty::List(t.clone())], Ty::List(t.clone()))),
+            (Ty::List(t), "unique") | (Ty::List(t), "init") | (Ty::List(t), "tail") => {
+                Some((vec![], Ty::List(t.clone())))
+            }
+            (Ty::List(t), "product") => {
+                let elem = self.default_numeric(self.uni.apply(t));
+                if !elem.is_numeric() {
+                    self.err("K0245", format!("`product` needs a List[Int] or List[Float], found List[{elem}]"), span);
+                }
+                Some((vec![], elem))
+            }
+            (Ty::List(t), "min") | (Ty::List(t), "max") => {
+                let elem = self.uni.apply(t);
+                if !matches!(elem, Ty::Int | Ty::Float | Ty::Str | Ty::Var(_)) {
+                    self.err("K0234", format!("cannot order values of type {elem}"), span);
+                }
+                Some((vec![], Ty::Option(t.clone())))
+            }
+            (Ty::List(t), "flatten") => {
+                let inner = self.uni.fresh();
+                self.unify(t, &Ty::List(Box::new(inner.clone())), span, "`flatten` element");
+                Some((vec![], Ty::List(Box::new(self.uni.apply(&inner)))))
+            }
+            (Ty::List(t), "count") => Some((
+                vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
+                Ty::Int,
+            )),
+            (Ty::List(t), "flat_map") => {
+                let u = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::List(Box::new(u.clone()))))],
+                    Ty::List(Box::new(u)),
+                ))
+            }
+            (Ty::List(t), "window") | (Ty::List(t), "chunk") => {
+                Some((vec![Ty::Int], Ty::List(Box::new(Ty::List(t.clone())))))
+            }
             (Ty::Str, "len") => Some((vec![], Ty::Int)),
             (Ty::Str, "contains") => Some((vec![Ty::Str], Ty::Bool)),
             (Ty::Str, "starts_with") => Some((vec![Ty::Str], Ty::Bool)),
@@ -1569,16 +1607,34 @@ impl Checker {
             (Ty::Str, "repeat") => Some((vec![Ty::Int], Ty::Str)),
             (Ty::Str, "parse_int") => Some((vec![], Ty::Option(Box::new(Ty::Int)))),
             (Ty::Str, "parse_float") => Some((vec![], Ty::Option(Box::new(Ty::Float)))),
+            (Ty::Str, "is_empty") => Some((vec![], Ty::Bool)),
+            (Ty::Str, "reverse") => Some((vec![], Ty::Str)),
+            (Ty::Str, "index_of") => Some((vec![Ty::Str], Ty::Option(Box::new(Ty::Int)))),
+            (Ty::Str, "count") => Some((vec![Ty::Str], Ty::Int)),
+            (Ty::Str, "slice") => Some((vec![Ty::Int, Ty::Int], Ty::Str)),
+            (Ty::Str, "pad_left") | (Ty::Str, "pad_right") => Some((vec![Ty::Int, Ty::Str], Ty::Str)),
+            (Ty::Str, "lines") => Some((vec![], Ty::List(Box::new(Ty::Str)))),
             (Ty::Int, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Int, "to_float") => Some((vec![], Ty::Float)),
             (Ty::Int, "abs") => Some((vec![], Ty::Int)),
-            (Ty::Int, "min") | (Ty::Int, "max") => Some((vec![Ty::Int], Ty::Int)),
+            (Ty::Int, "min") | (Ty::Int, "max") | (Ty::Int, "pow") | (Ty::Int, "gcd") => {
+                Some((vec![Ty::Int], Ty::Int))
+            }
+            (Ty::Int, "clamp") => Some((vec![Ty::Int, Ty::Int], Ty::Int)),
+            (Ty::Int, "sign") => Some((vec![], Ty::Int)),
+            (Ty::Int, "is_even") | (Ty::Int, "is_odd") => Some((vec![], Ty::Bool)),
             (Ty::Float, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Float, "to_int") => Some((vec![], Ty::Int)),
             (Ty::Float, "abs") | (Ty::Float, "sqrt") => Some((vec![], Ty::Float)),
             (Ty::Float, "floor") | (Ty::Float, "ceil") | (Ty::Float, "round") => {
                 Some((vec![], Ty::Float))
             }
+            (Ty::Float, "log") | (Ty::Float, "log10") | (Ty::Float, "exp") | (Ty::Float, "sin")
+            | (Ty::Float, "cos") | (Ty::Float, "tan") | (Ty::Float, "sign") => {
+                Some((vec![], Ty::Float))
+            }
+            (Ty::Float, "clamp") => Some((vec![Ty::Float, Ty::Float], Ty::Float)),
+            (Ty::Float, "is_nan") | (Ty::Float, "is_infinite") => Some((vec![], Ty::Bool)),
             (Ty::Float, "min") | (Ty::Float, "max") | (Ty::Float, "pow") => {
                 Some((vec![Ty::Float], Ty::Float))
             }
@@ -1601,6 +1657,18 @@ impl Checker {
             (Ty::Map(k, _), "keys") => Some((vec![], Ty::List(k.clone()))),
             (Ty::Map(_, v), "values") => Some((vec![], Ty::List(v.clone()))),
             (Ty::Map(_, _), "len") => Some((vec![], Ty::Int)),
+            (Ty::Map(_, _), "is_empty") => Some((vec![], Ty::Bool)),
+            (Ty::Map(k, v), "merge") => {
+                Some((vec![Ty::Map(k.clone(), v.clone())], Ty::Map(k.clone(), v.clone())))
+            }
+            (Ty::Map(k, v), "get_or") => Some((vec![(**k).clone(), (**v).clone()], (**v).clone())),
+            (Ty::Map(k, v), "map_values") => {
+                let w = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**v).clone()], Box::new(w.clone()))],
+                    Ty::Map(k.clone(), Box::new(w)),
+                ))
+            }
             (Ty::Set(t), "insert") | (Ty::Set(t), "remove") => {
                 Some((vec![(**t).clone()], Ty::Set(t.clone())))
             }
@@ -1610,6 +1678,8 @@ impl Checker {
                 Some((vec![Ty::Set(t.clone())], Ty::Set(t.clone())))
             }
             (Ty::Set(t), "to_list") => Some((vec![], Ty::List(t.clone()))),
+            (Ty::Set(_), "is_empty") => Some((vec![], Ty::Bool)),
+            (Ty::Set(t), "is_subset") => Some((vec![Ty::Set(t.clone())], Ty::Bool)),
             (Ty::Tensor, "len") => Some((vec![], Ty::Int)),
             (Ty::Tensor, "get") => Some((vec![Ty::Int], Ty::Float)),
             (Ty::Tensor, "sum") | (Ty::Tensor, "mean") | (Ty::Tensor, "max") | (Ty::Tensor, "min") => {

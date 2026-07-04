@@ -1070,6 +1070,41 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_stdlib_batch_it12() {
+        // new List/Str/Int/Float/Map/Set methods, identical on both engines
+        assert_eq!(differential("fun probe() -> List[Int] {\n    [3, 1, 2, 3, 1].unique()\n}\n"), "[3, 1, 2]");
+        assert_eq!(differential("fun probe() -> Int {\n    [2, 3, 4].product()\n}\n"), "24");
+        assert_eq!(differential("fun probe() -> Option[Int] {\n    [4, 1, 3].min()\n}\n"), "Some(1)");
+        assert_eq!(differential("fun probe() -> Option[Int] {\n    [4, 1, 3].max()\n}\n"), "Some(4)");
+        assert_eq!(differential("fun probe() -> List[Int] {\n    [[1, 2], [3]].flatten()\n}\n"), "[1, 2, 3]");
+        assert_eq!(differential("fun probe() -> Int {\n    [1, 2, 3, 4].count(fn n { n % 2 == 0 })\n}\n"), "2");
+        assert_eq!(differential("fun probe() -> List[Int] {\n    [1, 2, 3].flat_map(fn n { [n, n] })\n}\n"), "[1, 1, 2, 2, 3, 3]");
+        assert_eq!(differential("fun probe() -> Int {\n    [1, 2, 3, 4, 5].window(2).len()\n}\n"), "4");
+        assert_eq!(differential("fun probe() -> Int {\n    [1, 2, 3, 4, 5].chunk(2).len()\n}\n"), "3");
+        assert_eq!(differential("fun probe() -> Str {\n    \"ab\".pad_left(4, \"0\")\n}\n"), "00ab");
+        assert_eq!(differential("fun probe() -> Str {\n    \"hello\".reverse()\n}\n"), "olleh");
+        assert_eq!(differential("fun probe() -> Option[Int] {\n    \"hello\".index_of(\"ll\")\n}\n"), "Some(2)");
+        assert_eq!(differential("fun probe() -> Str {\n    \"hello\".slice(1, 4)\n}\n"), "ell");
+        assert_eq!(differential("fun probe() -> Int {\n    (12).gcd(18)\n}\n"), "6");
+        assert_eq!(differential("fun probe() -> Int {\n    (2).pow(10)\n}\n"), "1024");
+        assert_eq!(differential("fun probe() -> Int {\n    (7).clamp(0, 5)\n}\n"), "5");
+        assert_eq!(differential("fun probe() -> Bool {\n    (10).is_even()\n}\n"), "true");
+        assert_eq!(differential("fun probe() -> Int {\n    (0 - 3).sign()\n}\n"), "-1");
+        assert_eq!(differential("fun probe() -> Float {\n    (100.0).clamp(0.0, 50.0)\n}\n"), "50.0");
+        assert_eq!(differential("fun probe() -> Int {\n    Map().insert(\"a\", 1).get_or(\"z\", 99)\n}\n"), "99");
+        assert_eq!(differential("fun probe() -> Bool {\n    Set([1, 2]).is_subset(Set([1, 2, 3]))\n}\n"), "true");
+    }
+
+    #[test]
+    fn stdlib_batch_it12_overflow_panics() {
+        // product overflows checked-int → panic, same as sum
+        assert_eq!(
+            differential("fun probe() -> Int {\n    [9223372036854775807, 2].product()\n}\n"),
+            "panic: integer overflow in product"
+        );
+    }
+
+    #[test]
     fn diff_par_fork_join() {
         // structured fork-join: independent branches collected into a list,
         // deterministic branch order, identical on both engines

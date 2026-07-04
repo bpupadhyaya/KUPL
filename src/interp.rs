@@ -1355,6 +1355,132 @@ pub fn shared_method(
             let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
             Ok(Value::str(parts.join(&sep)))
         }
+        (Value::List(items), "is_empty") => Ok(Value::Bool(items.is_empty())),
+        (Value::List(items), "concat") => match args.into_iter().next() {
+            Some(Value::List(other)) => {
+                let mut out = items.as_ref().clone();
+                out.extend(other.iter().cloned());
+                Ok(Value::List(Rc::new(out)))
+            }
+            _ => Err("`concat` needs a List".into()),
+        },
+        (Value::List(items), "unique") => {
+            let mut out: Vec<Value> = Vec::new();
+            for it in items.iter() {
+                if !out.iter().any(|x| x == it) {
+                    out.push(it.clone());
+                }
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
+        (Value::List(items), "init") => {
+            let n = items.len().saturating_sub(1);
+            Ok(Value::List(Rc::new(items[..n].to_vec())))
+        }
+        (Value::List(items), "tail") => {
+            let start = if items.is_empty() { 0 } else { 1 };
+            Ok(Value::List(Rc::new(items[start..].to_vec())))
+        }
+        (Value::List(items), "product") => {
+            let mut int_prod: i64 = 1;
+            let mut float_prod: f64 = 1.0;
+            let mut is_float = false;
+            for item in items.iter() {
+                match item {
+                    Value::Int(v) => {
+                        int_prod = int_prod
+                            .checked_mul(*v)
+                            .ok_or("integer overflow in product")?
+                    }
+                    Value::Float(v) => {
+                        is_float = true;
+                        float_prod *= v;
+                    }
+                    other => return Err(format!("cannot multiply {}", other.type_name())),
+                }
+            }
+            if is_float {
+                Ok(Value::Float(float_prod * int_prod as f64))
+            } else {
+                Ok(Value::Int(int_prod))
+            }
+        }
+        (Value::List(items), "min") | (Value::List(items), "max") => {
+            let want_min = name == "min";
+            let mut best: Option<Value> = None;
+            for item in items.iter() {
+                let take = match &best {
+                    None => true,
+                    Some(b) => {
+                        let ord = list_order(b, item)?;
+                        if want_min {
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                        }
+                    }
+                };
+                if take {
+                    best = Some(item.clone());
+                }
+            }
+            Ok(best.map(Value::some).unwrap_or_else(Value::none))
+        }
+        (Value::List(items), "flatten") => {
+            let mut out = Vec::new();
+            for item in items.iter() {
+                match item {
+                    Value::List(inner) => out.extend(inner.iter().cloned()),
+                    other => return Err(format!("`flatten` needs a List of Lists, found {}", other.type_name())),
+                }
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
+        (Value::List(items), "count") => {
+            let f = args.into_iter().next().ok_or("`count` needs a function")?;
+            let mut n = 0i64;
+            for item in items.iter() {
+                if let Value::Bool(true) = call(f.clone(), vec![item.clone()])? {
+                    n += 1;
+                }
+            }
+            Ok(Value::Int(n))
+        }
+        (Value::List(items), "flat_map") => {
+            let f = args.into_iter().next().ok_or("`flat_map` needs a function")?;
+            let mut out = Vec::new();
+            for item in items.iter() {
+                match call(f.clone(), vec![item.clone()])? {
+                    Value::List(inner) => out.extend(inner.iter().cloned()),
+                    other => return Err(format!("`flat_map` function must return a List, got {}", other.type_name())),
+                }
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
+        (Value::List(items), "window") => match args.into_iter().next() {
+            Some(Value::Int(n)) if n >= 1 => {
+                let n = n as usize;
+                let mut out = Vec::new();
+                if items.len() >= n {
+                    for i in 0..=items.len() - n {
+                        out.push(Value::List(Rc::new(items[i..i + n].to_vec())));
+                    }
+                }
+                Ok(Value::List(Rc::new(out)))
+            }
+            _ => Err("`window` needs a positive Int".into()),
+        },
+        (Value::List(items), "chunk") => match args.into_iter().next() {
+            Some(Value::Int(n)) if n >= 1 => {
+                let n = n as usize;
+                let out: Vec<Value> = items
+                    .chunks(n)
+                    .map(|c| Value::List(Rc::new(c.to_vec())))
+                    .collect();
+                Ok(Value::List(Rc::new(out)))
+            }
+            _ => Err("`chunk` needs a positive Int".into()),
+        },
         (Value::Str(s), "len") => Ok(Value::Int(s.chars().count() as i64)),
         (Value::Str(s), "contains") => match args.into_iter().next() {
             Some(Value::Str(n)) => Ok(Value::Bool(s.contains(n.as_str()))),
@@ -1406,6 +1532,60 @@ pub fn shared_method(
             ))),
             _ => Err("`split` needs a Str separator".into()),
         },
+        (Value::Str(s), "is_empty") => Ok(Value::Bool(s.is_empty())),
+        (Value::Str(s), "reverse") => Ok(Value::str(s.chars().rev().collect::<String>())),
+        (Value::Str(s), "lines") => Ok(Value::List(Rc::new(
+            s.lines().map(Value::str).collect(),
+        ))),
+        (Value::Str(s), "index_of") => match args.into_iter().next() {
+            Some(Value::Str(sub)) => Ok(match s.find(sub.as_str()) {
+                // byte offset -> character index
+                Some(byte) => Value::some(Value::Int(s[..byte].chars().count() as i64)),
+                None => Value::none(),
+            }),
+            _ => Err("`index_of` needs a Str".into()),
+        },
+        (Value::Str(s), "count") => match args.into_iter().next() {
+            Some(Value::Str(sub)) if !sub.is_empty() => {
+                Ok(Value::Int(s.matches(sub.as_str()).count() as i64))
+            }
+            Some(Value::Str(_)) => Err("`count` needs a non-empty Str".into()),
+            _ => Err("`count` needs a Str".into()),
+        },
+        (Value::Str(s), "slice") => {
+            let mut it = args.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Int(a)), Some(Value::Int(b))) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let len = chars.len() as i64;
+                    let lo = a.clamp(0, len) as usize;
+                    let hi = b.clamp(a.max(0), len) as usize;
+                    Ok(Value::str(chars[lo..hi].iter().collect::<String>()))
+                }
+                _ => Err("`slice` needs two Int arguments".into()),
+            }
+        }
+        (Value::Str(s), "pad_left") | (Value::Str(s), "pad_right") => {
+            let left = name == "pad_left";
+            let mut it = args.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Int(width)), Some(Value::Str(ch))) => {
+                    let fill = ch.chars().next().unwrap_or(' ');
+                    let cur = s.chars().count() as i64;
+                    if cur >= width || width > 100_000_000 {
+                        Ok(Value::str(s.as_str().to_string()))
+                    } else {
+                        let pad: String = std::iter::repeat(fill).take((width - cur) as usize).collect();
+                        Ok(Value::str(if left {
+                            format!("{pad}{s}")
+                        } else {
+                            format!("{s}{pad}")
+                        }))
+                    }
+                }
+                _ => Err("`pad_left`/`pad_right` need an Int width and a Str fill".into()),
+            }
+        }
         (Value::Int(v), "to_str") => Ok(Value::str(v.to_string())),
         (Value::Int(v), "to_float") => Ok(Value::Float(*v as f64)),
         (Value::Int(v), "abs") => v
@@ -1420,6 +1600,42 @@ pub fn shared_method(
             Some(Value::Int(w)) => Ok(Value::Int((*v).max(w))),
             _ => Err("`max` needs an Int".into()),
         },
+        (Value::Int(v), "pow") => match args.into_iter().next() {
+            Some(Value::Int(e)) if e >= 0 && e <= u32::MAX as i64 => (*v)
+                .checked_pow(e as u32)
+                .map(Value::Int)
+                .ok_or_else(|| "integer overflow in pow".to_string()),
+            Some(Value::Int(_)) => Err("`pow` needs a non-negative exponent".into()),
+            _ => Err("`pow` needs an Int".into()),
+        },
+        (Value::Int(v), "gcd") => match args.into_iter().next() {
+            Some(Value::Int(w)) => {
+                let (mut a, mut b) = (v.unsigned_abs(), w.unsigned_abs());
+                while b != 0 {
+                    let t = b;
+                    b = a % b;
+                    a = t;
+                }
+                Ok(Value::Int(a as i64))
+            }
+            _ => Err("`gcd` needs an Int".into()),
+        },
+        (Value::Int(v), "clamp") => {
+            let mut it = args.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Int(lo)), Some(Value::Int(hi))) => {
+                    if lo > hi {
+                        Err("`clamp`: lo must not exceed hi".into())
+                    } else {
+                        Ok(Value::Int((*v).clamp(lo, hi)))
+                    }
+                }
+                _ => Err("`clamp` needs two Int arguments".into()),
+            }
+        }
+        (Value::Int(v), "sign") => Ok(Value::Int(v.signum())),
+        (Value::Int(v), "is_even") => Ok(Value::Bool(v % 2 == 0)),
+        (Value::Int(v), "is_odd") => Ok(Value::Bool(v % 2 != 0)),
         (Value::Float(v), "to_str") => Ok(Value::str(v.to_string())),
         (Value::Float(v), "to_int") => Ok(Value::Int(*v as i64)),
         (Value::Float(v), "abs") => Ok(Value::Float(v.abs())),
@@ -1439,6 +1655,34 @@ pub fn shared_method(
             Some(Value::Float(w)) => Ok(Value::Float(v.powf(w))),
             _ => Err("`pow` needs a Float".into()),
         },
+        (Value::Float(v), "log") => Ok(Value::Float(v.ln())),
+        (Value::Float(v), "log10") => Ok(Value::Float(v.log10())),
+        (Value::Float(v), "exp") => Ok(Value::Float(v.exp())),
+        (Value::Float(v), "sin") => Ok(Value::Float(v.sin())),
+        (Value::Float(v), "cos") => Ok(Value::Float(v.cos())),
+        (Value::Float(v), "tan") => Ok(Value::Float(v.tan())),
+        (Value::Float(v), "sign") => Ok(Value::Float(if *v > 0.0 {
+            1.0
+        } else if *v < 0.0 {
+            -1.0
+        } else {
+            *v // preserves 0.0 / -0.0 / NaN
+        })),
+        (Value::Float(v), "is_nan") => Ok(Value::Bool(v.is_nan())),
+        (Value::Float(v), "is_infinite") => Ok(Value::Bool(v.is_infinite())),
+        (Value::Float(v), "clamp") => {
+            let mut it = args.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Float(lo)), Some(Value::Float(hi))) => {
+                    if lo > hi {
+                        Err("`clamp`: lo must not exceed hi".into())
+                    } else {
+                        Ok(Value::Float(v.clamp(lo, hi)))
+                    }
+                }
+                _ => Err("`clamp` needs two Float arguments".into()),
+            }
+        }
         (Value::Map(pairs), "insert") => {
             let mut it = args.into_iter();
             let (k, v) = (
@@ -1477,6 +1721,38 @@ pub fn shared_method(
             pairs.iter().map(|(_, v)| v.clone()).collect(),
         ))),
         (Value::Map(pairs), "len") => Ok(Value::Int(pairs.len() as i64)),
+        (Value::Map(pairs), "is_empty") => Ok(Value::Bool(pairs.is_empty())),
+        (Value::Map(pairs), "get_or") => {
+            let mut it = args.into_iter();
+            let k = it.next().ok_or("`get_or` needs a key")?;
+            let default = it.next().ok_or("`get_or` needs a default")?;
+            Ok(pairs
+                .iter()
+                .find(|(pk, _)| *pk == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(default))
+        }
+        (Value::Map(pairs), "merge") => match args.into_iter().next() {
+            Some(Value::Map(other)) => {
+                let mut out = pairs.as_ref().clone();
+                for (k, v) in other.iter() {
+                    match out.iter_mut().find(|(pk, _)| pk == k) {
+                        Some(pair) => pair.1 = v.clone(),
+                        None => out.push((k.clone(), v.clone())),
+                    }
+                }
+                Ok(Value::Map(Rc::new(out)))
+            }
+            _ => Err("`merge` needs a Map".into()),
+        },
+        (Value::Map(pairs), "map_values") => {
+            let f = args.into_iter().next().ok_or("`map_values` needs a function")?;
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs.iter() {
+                out.push((k.clone(), call(f.clone(), vec![v.clone()])?));
+            }
+            Ok(Value::Map(Rc::new(out)))
+        }
         (Value::Set(items), "insert") => {
             let v = args.into_iter().next().ok_or("`insert` needs a value")?;
             if items.iter().any(|x| *x == v) {
@@ -1523,6 +1799,13 @@ pub fn shared_method(
             _ => Err("`difference` needs a Set".into()),
         },
         (Value::Set(items), "to_list") => Ok(Value::List(Rc::new(items.as_ref().clone()))),
+        (Value::Set(items), "is_empty") => Ok(Value::Bool(items.is_empty())),
+        (Value::Set(items), "is_subset") => match args.into_iter().next() {
+            Some(Value::Set(other)) => {
+                Ok(Value::Bool(items.iter().all(|x| other.iter().any(|y| y == x))))
+            }
+            _ => Err("`is_subset` needs a Set".into()),
+        },
         (Value::Tensor(d), "len") => Ok(Value::Int(d.len() as i64)),
         (Value::Tensor(d), "get") => match args.into_iter().next() {
             Some(Value::Int(i)) if i >= 0 && (i as usize) < d.len() => Ok(Value::Float(d[i as usize])),
@@ -1587,6 +1870,17 @@ pub fn shared_method(
             }
         }
         (other, _) => Err(format!("{} has no method `{name}`", other.type_name())),
+    }
+}
+
+/// Ordering for `List.min`/`max` — Int, Float, or Str elements only.
+fn list_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal)),
+        (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
+        _ => Err("`min`/`max` need Int, Float, or Str elements".into()),
     }
 }
 
