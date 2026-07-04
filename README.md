@@ -201,6 +201,13 @@ pure functions with **inferred + enforced effects** (`pub`/`expose` must declare
 multi-file modules; the canonical formatter; semantic diff; JSON diagnostics;
 component manifests; an LSP server; and four verified execution modes.
 
+## Reference documentation
+
+- [`docs/reference/LANGUAGE-REFERENCE.md`](docs/reference/LANGUAGE-REFERENCE.md) — the language reference manual (as implemented): lexical structure, types, expressions, statements, functions & effects, components, contracts, supervision, semantics
+- [`docs/reference/STDLIB.md`](docs/reference/STDLIB.md) — built-in functions, constructors, and every method on List/Str/Int/Float/Option/Result/Tensor
+- [`docs/reference/CLI.md`](docs/reference/CLI.md) — every `kupl` command, flags, exit codes, artifact formats
+- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (97 diagnostics, grouped by phase)
+
 ## Design documents
 
 - [`docs/design/VISION.md`](docs/design/VISION.md) — vision, the seven pillars, inspirations, non-goals
