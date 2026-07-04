@@ -14,8 +14,9 @@ components) are complete as of it40. Remaining work, ranked by value ÷ effort:
    surface complete (only ai/JSON/CSV/HTTP builtins defer).
 2. ~~**Native JSON**~~ — DONE (it43). json_parse + json_stringify ported to the
    C runtime, byte-identical to src/json.rs; examples/json.kupl is fully native.
-3. **LSP hover / completion / go-to-definition** — diagnostics ship today; this
-   is the biggest IDE-parity gap vs Swift/Kotlin/Rust and a high-visibility win.
+3. ~~**LSP hover / completion / go-to-definition**~~ — DONE (it44). The language
+   server now serves hover (signatures), go-to-definition, and completion on top
+   of diagnostics. Remaining IDE polish: rename, find-references, semantic tokens.
 4. **Flagship "any software" example(s)** — a non-trivial end-to-end program
    (e.g. a small HTTP/JSON service, or a data pipeline) proving breadth, doubling
    as documentation and a regression.

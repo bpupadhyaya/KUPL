@@ -42,6 +42,12 @@ impl Json {
             _ => None,
         }
     }
+    pub fn as_usize(&self) -> Option<usize> {
+        match self {
+            Json::Num(n) if *n >= 0.0 => Some(*n as usize),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse_json(src: &str) -> Result<Json, String> {
@@ -292,6 +298,207 @@ fn diagnostics_notification(path: &PathBuf, uri: &str, buffers: &HashMap<PathBuf
     )
 }
 
+// ---- language features: hover, definition, completion (read-only) ----
+
+/// Byte offset of an LSP (line, character) position — both 0-based. Character
+/// columns are treated as byte columns (correct for ASCII; a documented
+/// approximation for multi-byte lines).
+fn offset_at(text: &str, line: usize, character: usize) -> usize {
+    let mut off = 0usize;
+    for (n, l) in text.split_inclusive('\n').enumerate() {
+        if n == line {
+            return off + character.min(l.trim_end_matches('\n').len());
+        }
+        off += l.len();
+    }
+    off.min(text.len())
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The identifier token covering `offset`, as (name, start, end) byte offsets.
+fn ident_at(text: &str, offset: usize) -> Option<(String, usize, usize)> {
+    let b = text.as_bytes();
+    if offset > b.len() {
+        return None;
+    }
+    // walk left/right over identifier chars (ASCII-oriented; fine for KUPL names)
+    let mut start = offset;
+    while start > 0 && is_ident(b[start - 1] as char) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while end < b.len() && is_ident(b[end] as char) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    Some((text[start..end].to_string(), start, end))
+}
+
+/// Human-readable signature of a top-level item named `name`, if found.
+fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
+    use crate::ast::Item;
+    use crate::fmt::ty_str;
+    for item in &program.items {
+        match item {
+            Item::Fun(f) if f.name == name => {
+                let params: Vec<String> =
+                    f.params.iter().map(|p| format!("{}: {}", p.name, ty_str(&p.ty))).collect();
+                let ret = f.ret.as_ref().map(|r| format!(" -> {}", ty_str(r))).unwrap_or_default();
+                let eff = if f.effects.is_empty() {
+                    String::new()
+                } else {
+                    format!(" uses {}", f.effects.join(", "))
+                };
+                let kw = if f.ai.is_some() { "ai fun" } else { "fun" };
+                return Some(format!("{kw} {}({}){ret}{eff}", f.name, params.join(", ")));
+            }
+            Item::Type(t) if t.name == name => {
+                let variants: Vec<String> = t
+                    .variants
+                    .iter()
+                    .map(|v| {
+                        if v.fields.is_empty() {
+                            v.name.clone()
+                        } else {
+                            let fs: Vec<String> = v
+                                .fields
+                                .iter()
+                                .map(|p| format!("{}: {}", p.name, ty_str(&p.ty)))
+                                .collect();
+                            format!("{}({})", v.name, fs.join(", "))
+                        }
+                    })
+                    .collect();
+                return Some(format!("type {} = {}", t.name, variants.join(" | ")));
+            }
+            Item::Component(c) if c.name == name => {
+                let head = if c.is_app { "app" } else { "component" };
+                let intent =
+                    c.intent.as_ref().map(|i| format!("\n{i}")).unwrap_or_default();
+                return Some(format!("{head} {}{intent}", c.name));
+            }
+            Item::Contract(c) if c.name == name => {
+                let intent =
+                    c.intent.as_ref().map(|i| format!("\n{i}")).unwrap_or_default();
+                return Some(format!("contract {}{intent}", c.name));
+            }
+            _ => {}
+        }
+        // constructor of a type?
+        if let Item::Type(t) = item {
+            for v in &t.variants {
+                if v.name == name {
+                    let fs: Vec<String> = v
+                        .fields
+                        .iter()
+                        .map(|p| format!("{}: {}", p.name, ty_str(&p.ty)))
+                        .collect();
+                    let sig = if fs.is_empty() {
+                        v.name.clone()
+                    } else {
+                        format!("{}({})", v.name, fs.join(", "))
+                    };
+                    return Some(format!("{sig}   // constructor of {}", t.name));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The declaration range (l0, c0, l1, c1) of the top-level item named `name`,
+/// as 0-based LSP positions pointing at the NAME token.
+fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Option<(usize, usize, usize, usize)> {
+    use crate::ast::Item;
+    let span = program.items.iter().find_map(|item| match item {
+        Item::Fun(f) if f.name == name => Some(f.span),
+        Item::Type(t) if t.name == name => Some(t.span),
+        Item::Component(c) if c.name == name => Some(c.span),
+        Item::Contract(c) if c.name == name => Some(c.span),
+        Item::Type(t) => t.variants.iter().find(|v| v.name == name).map(|v| v.span),
+        _ => None,
+    })?;
+    // locate the name token within the declaration for a precise range
+    let decl_start = span.start as usize;
+    let name_off = text.get(decl_start..).and_then(|s| s.find(name)).map(|i| decl_start + i)?;
+    let (l0, c0) = crate::diag::line_col(text, name_off as u32);
+    let (l1, c1) = crate::diag::line_col(text, (name_off + name.len()) as u32);
+    Some((l0 - 1, c0 - 1, l1 - 1, c1 - 1))
+}
+
+/// Hover markdown for the symbol at an LSP position, or None.
+pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String> {
+    let off = offset_at(text, line, character);
+    let (name, _, _) = ident_at(text, off)?;
+    let (program, _diags) = crate::parser::parse(text);
+    let sig = item_signature(&program, &name)?;
+    Some(format!("```kupl\n{sig}\n```"))
+}
+
+/// Definition location (0-based range) for the symbol at an LSP position.
+pub fn resolve_definition(text: &str, line: usize, character: usize) -> Option<(usize, usize, usize, usize)> {
+    let off = offset_at(text, line, character);
+    let (name, _, _) = ident_at(text, off)?;
+    let (program, _diags) = crate::parser::parse(text);
+    item_definition(text, &program, &name)
+}
+
+/// A completion candidate: (label, LSP CompletionItemKind, detail).
+pub fn completions(text: &str) -> Vec<(String, u8, String)> {
+    use crate::ast::Item;
+    let (program, _diags) = crate::parser::parse(text);
+    let mut out: Vec<(String, u8, String)> = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Fun(f) => {
+                let sig = item_signature(&program, &f.name).unwrap_or_default();
+                out.push((f.name.clone(), 3, sig)); // 3 = Function
+            }
+            Item::Type(t) => {
+                out.push((t.name.clone(), 22, format!("type {}", t.name))); // 22 = Struct
+                for v in &t.variants {
+                    let sig = item_signature(&program, &v.name).unwrap_or_default();
+                    out.push((v.name.clone(), 4, sig)); // 4 = Constructor
+                }
+            }
+            Item::Component(c) => out.push((c.name.clone(), 7, format!("component {}", c.name))), // 7 = Class
+            Item::Contract(c) => out.push((c.name.clone(), 8, format!("contract {}", c.name))), // 8 = Interface
+            _ => {}
+        }
+    }
+    // language keywords (14 = Keyword)
+    for kw in [
+        "fun", "type", "component", "app", "contract", "match", "if", "else", "for", "while",
+        "let", "var", "return", "true", "false", "uses", "expose", "state", "on", "emit", "wire",
+    ] {
+        out.push((kw.to_string(), 14, String::new()));
+    }
+    out
+}
+
+/// Extract (uri, line, character) from a textDocument/position params object.
+fn position_of(params: &Json) -> Option<(&str, usize, usize)> {
+    let uri = params.get("textDocument")?.get("uri")?.str()?;
+    let pos = params.get("position")?;
+    let line = pos.get("line")?.as_usize()?;
+    let ch = pos.get("character")?.as_usize()?;
+    Some((uri, line, ch))
+}
+
+/// Current text of a document: the unsaved editor buffer if present, else disk.
+fn doc_text(uri: &str, buffers: &HashMap<PathBuf, String>) -> Option<String> {
+    let path = uri_to_path(uri)?;
+    if let Some(buf) = buffers.get(&path) {
+        return Some(buf.clone());
+    }
+    std::fs::read_to_string(&path).ok()
+}
+
 pub fn serve() -> i32 {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
@@ -312,7 +519,7 @@ pub fn serve() -> i32 {
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -380,6 +587,63 @@ pub fn serve() -> i32 {
                     }
                 }
             }
+            "textDocument/hover" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let (uri, line, ch) = position_of(p)?;
+                    let text = doc_text(uri, &buffers)?;
+                    let md = resolve_hover(&text, line, ch)?;
+                    Some(format!(
+                        "{{\"contents\":{{\"kind\":\"markdown\",\"value\":\"{}\"}}}}",
+                        json_escape(&md)
+                    ))
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/definition" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let (uri, line, ch) = position_of(p)?;
+                    let text = doc_text(uri, &buffers)?;
+                    let (l0, c0, l1, c1) = resolve_definition(&text, line, ch)?;
+                    Some(format!(
+                        "{{\"uri\":\"{}\",\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}}}}",
+                        json_escape(uri)
+                    ))
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/completion" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let items = (|| {
+                    let p = msg.get("params")?;
+                    let uri = p.get("textDocument")?.get("uri")?.str()?;
+                    let text = doc_text(uri, &buffers)?;
+                    Some(completions(&text))
+                })()
+                .unwrap_or_default();
+                let entries: Vec<String> = items
+                    .iter()
+                    .map(|(label, kind, detail)| {
+                        format!(
+                            "{{\"label\":\"{}\",\"kind\":{kind},\"detail\":\"{}\"}}",
+                            json_escape(label),
+                            json_escape(detail)
+                        )
+                    })
+                    .collect();
+                send(
+                    &mut stdout,
+                    &format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{{\"isIncomplete\":false,\"items\":[{}]}}}}",
+                        entries.join(",")
+                    ),
+                );
+            }
             _ => {
                 // politely answer unknown REQUESTS (those with an id)
                 if let Some(id) = id {
@@ -412,6 +676,55 @@ fn render_id(id: &Json) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // a small multi-item program for the language-feature tests
+    const PROG: &str = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+                        type Shape = Circle(r: Float) | Square(s: Float)\n\
+                        fun main() uses io {\n    print(add(1, 2))\n}\n";
+
+    #[test]
+    fn hover_shows_fun_signature() {
+        // position on `add` inside main's body (line 4, char ~10)
+        let line = PROG.lines().position(|l| l.contains("print(add")).unwrap();
+        let ch = PROG.lines().nth(line).unwrap().find("add").unwrap() + 1;
+        let h = resolve_hover(PROG, line, ch).expect("hover on add");
+        assert!(h.contains("fun add(a: Int, b: Int) -> Int"), "hover: {h}");
+        // hover on a type name
+        let tl = PROG.lines().position(|l| l.starts_with("type Shape")).unwrap();
+        let h2 = resolve_hover(PROG, tl, 6).expect("hover on Shape");
+        assert!(h2.contains("type Shape = Circle(r: Float) | Square(s: Float)"), "{h2}");
+    }
+
+    #[test]
+    fn definition_points_at_declaration() {
+        // definition of `add` from its call site -> the `fun add` line
+        let call_line = PROG.lines().position(|l| l.contains("print(add")).unwrap();
+        let ch = PROG.lines().nth(call_line).unwrap().find("add").unwrap() + 1;
+        let (l0, c0, _l1, _c1) = resolve_definition(PROG, call_line, ch).expect("definition");
+        assert_eq!(l0, 0, "add is declared on line 0");
+        assert_eq!(c0, 4, "the name starts after `fun `");
+    }
+
+    #[test]
+    fn completion_lists_names_and_keywords() {
+        let items = completions(PROG);
+        let labels: Vec<&str> = items.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert!(labels.contains(&"add"));
+        assert!(labels.contains(&"Shape"));
+        assert!(labels.contains(&"Circle")); // constructor
+        assert!(labels.contains(&"match")); // keyword
+        // `add` completion carries its signature detail and Function kind
+        let add = items.iter().find(|(l, _, _)| l == "add").unwrap();
+        assert_eq!(add.1, 3);
+        assert!(add.2.contains("-> Int"));
+    }
+
+    #[test]
+    fn offset_and_ident_at() {
+        assert_eq!(offset_at("ab\ncd", 1, 1), 4); // 'd'
+        let (n, _, _) = ident_at("let foo = 1", 5).unwrap();
+        assert_eq!(n, "foo");
+    }
 
     #[test]
     fn json_roundtrip() {
