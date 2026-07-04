@@ -379,7 +379,7 @@ Member kinds (the formatter enforces this order):
 | Member | Meaning |
 |---|---|
 | `intent "…"` | required natural-language purpose (missing → warning K0300) |
-| `prop name: T [= default]` | instantiation-time configuration, immutable; `requires` is accepted as a synonym |
+| `prop name: T [= default]` | instantiation-time configuration, immutable; `requires` is accepted as a synonym. `T` may be a contract type — see §8.1 (dependency injection) |
 | `in name: T` / `out name: T` | typed ports; `Event` = no payload |
 | `state name[: T] = init` | private mutable state; invisible outside |
 | `let child = Comp(args)` | child instance (positional or `name:` args against props) |
@@ -427,6 +427,37 @@ component MemoryStore fulfills KeyStore { … }
 - Every `law` runs against every fulfilling component under `kupl test`, with
   the contract's functions bound to a live instance. `forall` quantification
   is **[design]** — laws are concrete executable scenarios today.
+
+### 8.1 Contract types (dependency injection)
+
+A **contract name is a type**. A component can declare a prop (or a function
+parameter) of a contract type; **any component that fulfills the contract is
+assignable to it**, and calls on the value dispatch dynamically through the
+contract's exposed functions. This is dependency injection: a consumer depends
+on the interface, not on a concrete implementation.
+
+```kupl
+component Cache {
+    intent "Reads through to any injected KeyStore."
+    prop store: KeyStore                       // any component fulfilling KeyStore
+
+    expose fun recall(key: Str) -> Str {
+        match store.get(key) { Some(v) => v, None => "<miss>" }
+    }
+}
+
+let a = Cache(store: MemStore())               // inject one implementation
+let b = Cache(store: LoudStore())              // …or another — same consumer
+```
+
+- A contract type is accepted anywhere a type is: props, `let`/`var`
+  annotations, and function/expose parameters.
+- Passing a component that does **not** fulfill the contract is a type error
+  (K0200); calling a function not in the contract is K0247.
+- Dispatch is dynamic and runs identically on the interpreter and the KVM (the
+  value is a component instance; the method is resolved by name at the call).
+  Contract types compose with the native backend's existing component
+  limitation (native uses `kupl bundle`). See `examples/di.kupl`.
 
 ## 9. Failure and supervision
 

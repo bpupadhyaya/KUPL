@@ -19,6 +19,10 @@ pub enum Ty {
     Named(String),
     /// A reference to a component instance.
     Component(String),
+    /// An interface type: any component that `fulfills` this contract. Values
+    /// are component instances; dispatch is dynamic through the contract's
+    /// exposed functions.
+    Contract(String),
     Fun(Vec<Ty>, Box<Ty>),
     Range,
     /// Rank-1 f64 tensor (v0; dtype/shape parameters arrive with KIR).
@@ -115,6 +119,7 @@ impl Unifier {
             | (Ty::Range, Ty::Range) => Ok(()),
             (Ty::Named(x), Ty::Named(y)) if x == y => Ok(()),
             (Ty::Component(x), Ty::Component(y)) if x == y => Ok(()),
+            (Ty::Contract(x), Ty::Contract(y)) if x == y => Ok(()),
             (Ty::List(x), Ty::List(y)) => self.unify(&x.clone(), &y.clone()),
             (Ty::Set(x), Ty::Set(y)) => self.unify(&x.clone(), &y.clone()),
             (Ty::Map(xk, xv), Ty::Map(yk, yv)) => {
@@ -154,6 +159,7 @@ impl fmt::Display for Ty {
             Ty::Result(a, b) => write!(f, "Result[{a}, {b}]"),
             Ty::Named(n) => write!(f, "{n}"),
             Ty::Component(n) => write!(f, "{n}"),
+            Ty::Contract(n) => write!(f, "{n}"),
             Ty::Fun(ps, r) => {
                 write!(f, "fn(")?;
                 for (i, p) in ps.iter().enumerate() {
@@ -196,6 +202,8 @@ pub struct ComponentSig {
     pub out_ports: HashMap<String, Ty>,
     pub props: Vec<(String, Ty, bool)>, // name, ty, has_default
     pub exposes: HashMap<String, (Vec<Ty>, Ty)>,
+    /// Contracts this component `fulfills` — used for contract-type assignability.
+    pub fulfills: Vec<String>,
 }
 
 /// Signature of a contract: exposed function signatures with effects.

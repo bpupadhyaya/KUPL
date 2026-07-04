@@ -1052,6 +1052,71 @@ fun probe() -> Str {\n    kx_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_contract_typed_prop_dispatch() {
+        // A consumer with a contract-typed prop dispatches dynamically to
+        // whichever fulfilling component is injected — same on both engines.
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun put(k: Str, v: Str) -> Int\n    expose fun get(k: Str) -> Option[Str]\n}\n\
+component Mem fulfills Store {\n    intent \"mem\"\n    state m: Map[Str, Str] = Map()\n    expose fun put(k: Str, v: Str) -> Int {\n        m = m.insert(k, v)\n        m.len()\n    }\n    expose fun get(k: Str) -> Option[Str] {\n        m.get(k)\n    }\n}\n\
+component Prefix fulfills Store {\n    intent \"prefix\"\n    state m: Map[Str, Str] = Map()\n    expose fun put(k: Str, v: Str) -> Int {\n        m = m.insert(k, \"P:{v}\")\n        m.len()\n    }\n    expose fun get(k: Str) -> Option[Str] {\n        m.get(k)\n    }\n}\n\
+component Cache {\n    intent \"consumer\"\n    prop store: Store\n    expose fun remember(k: Str, v: Str) -> Int {\n        store.put(k, v)\n    }\n    expose fun recall(k: Str) -> Str {\n        match store.get(k) { Some(x) => x, None => \"<miss>\" }\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        let store = match it.instantiate("Prefix", &[], crate::diag::Span::default()) {
+            Ok(v) => v,
+            _ => panic!("store"),
+        };
+        let cache = match it.instantiate("Cache", &[(Some("store".into()), store)], crate::diag::Span::default()) {
+            Ok(Value::Component(id)) => id,
+            _ => panic!("cache"),
+        };
+        it.start_all().ok();
+        let ci = |it: &mut Interp, id: usize, m: &str, a: Vec<Value>| -> String {
+            let f = Value::Bound(id, std::rc::Rc::new(m.to_string()));
+            match it.call_value(f, a, crate::diag::Span::default()) {
+                Ok(v) => v.to_string(),
+                Err(Flow::Panic { msg, .. }) => format!("panic: {msg}"),
+                Err(_) => "flow".into(),
+            }
+        };
+        let mut ilog = Vec::new();
+        ilog.push(ci(&mut it, cache, "remember", vec![Value::str("a"), Value::str("x")]));
+        ilog.push(ci(&mut it, cache, "recall", vec![Value::str("a")]));
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let vstore = vm.instantiate_named("Prefix", vec![]).expect("store");
+        let vcache =
+            vm.instantiate_named("Cache", vec![Value::Component(vstore)]).expect("cache");
+        let cv = |vm: &mut Vm, id: usize, m: &str, a: Vec<Value>| -> String {
+            match vm.call_expose(id, m, a) {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("panic: {}", e.msg),
+            }
+        };
+        let mut vlog = Vec::new();
+        vlog.push(cv(&mut vm, vcache, "remember", vec![Value::str("a"), Value::str("x")]));
+        vlog.push(cv(&mut vm, vcache, "recall", vec![Value::str("a")]));
+
+        assert_eq!(ilog, vlog, "interpreter and KVM disagree on contract dispatch");
+        assert_eq!(vlog[1], "P:x"); // dispatched to Prefix's implementation
+    }
+
+    #[test]
+    fn contract_prop_rejects_non_fulfilling() {
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Option[Str]\n}\n\
+component NotAStore {\n    intent \"x\"\n    expose fun hello() -> Str { \"hi\" }\n}\n\
+component Cache {\n    intent \"c\"\n    prop store: Store\n    expose fun recall(k: Str) -> Option[Str] { store.get(k) }\n}\n\
+fun main() {\n    let c = Cache(store: NotAStore())\n    let _ = c\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(src).0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+    }
+
+    #[test]
     fn ai_fun_unknown_tool_is_rejected() {
         let src = "ai fun bad(q: Str) -> Str tools [nope] {\n    intent \"x\"\n}\n";
         let (_, diags) = crate::check::check(&crate::parser::parse(src).0);

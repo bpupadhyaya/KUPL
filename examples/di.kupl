@@ -1,0 +1,72 @@
+// Contract-typed requires — dependency injection through an interface.
+//
+// A `contract` is an interface: any component that `fulfills` it can be passed
+// where the contract type is expected. A consumer declares `prop store: KeyStore`
+// and calls `store.get(k)` / `store.put(k, v)`; the call dispatches dynamically
+// to whichever fulfilling component was injected. The consumer depends on the
+// interface, not any concrete implementation.
+
+contract KeyStore {
+    intent "Keyed string storage."
+
+    expose fun put(key: Str, value: Str) -> Int
+    expose fun get(key: Str) -> Option[Str]
+}
+
+component MemStore fulfills KeyStore {
+    intent "In-memory key-value store."
+
+    state entries: Map[Str, Str] = Map()
+
+    expose fun put(key: Str, value: Str) -> Int {
+        entries = entries.insert(key, value)
+        entries.len()
+    }
+    expose fun get(key: Str) -> Option[Str] {
+        entries.get(key)
+    }
+}
+
+component LoudStore fulfills KeyStore {
+    intent "A key-value store that prefixes stored values."
+
+    state entries: Map[Str, Str] = Map()
+
+    expose fun put(key: Str, value: Str) -> Int {
+        entries = entries.insert(key, "LOUD:{value}")
+        entries.len()
+    }
+    expose fun get(key: Str) -> Option[Str] {
+        entries.get(key)
+    }
+}
+
+// The consumer depends on the KeyStore contract, not on MemStore or LoudStore.
+component Cache {
+    intent "Reads through to any injected KeyStore."
+
+    prop store: KeyStore
+
+    expose fun remember(key: Str, value: Str) -> Int {
+        store.put(key, value)
+    }
+    expose fun recall(key: Str) -> Str {
+        match store.get(key) {
+            Some(v) => v,
+            None => "<miss>",
+        }
+    }
+}
+
+fun main() uses io {
+    // inject a plain store
+    let plain = Cache(store: MemStore())
+    plain.remember("a", "apple")
+    print(plain.recall("a"))
+    print(plain.recall("z"))
+
+    // inject a different implementation — same consumer, new behavior
+    let loud = Cache(store: LoudStore())
+    loud.remember("a", "apple")
+    print(loud.recall("a"))
+}

@@ -99,6 +99,31 @@ impl Checker {
         self.uni.apply(a)
     }
 
+    /// True when `actual` can flow into a slot expecting `expected` beyond
+    /// plain unification: a component that `fulfills` contract C is assignable
+    /// to `Contract(C)`, and to another contract it also fulfills.
+    fn contract_assignable(&self, expected: &Ty, actual: &Ty) -> bool {
+        let Ty::Contract(c) = self.uni.resolve(expected) else { return false };
+        match self.uni.resolve(actual) {
+            Ty::Component(x) => self
+                .checked
+                .components
+                .get(&x)
+                .is_some_and(|sig| sig.fulfills.iter().any(|f| f == &c)),
+            Ty::Contract(x) => x == c,
+            _ => false,
+        }
+    }
+
+    /// Like `unify`, but first admits contract assignability (fulfilling
+    /// component → contract type). Reports K0200 on a genuine mismatch.
+    fn check_assign(&mut self, expected: &Ty, actual: &Ty, span: Span, what: &str) {
+        if self.contract_assignable(expected, actual) {
+            return;
+        }
+        self.unify(expected, actual, span, what);
+    }
+
     // ---------------- pass 1: collect ----------------
 
     fn collect(&mut self, program: &Program) {
@@ -119,6 +144,10 @@ impl Checker {
         for item in &program.items {
             if let Item::Component(c) = item {
                 self.checked.components.insert(c.name.clone(), ComponentSig::default());
+            }
+            // register contract names early so contract-typed props/params resolve
+            if let Item::Contract(ct) = item {
+                self.checked.contracts.entry(ct.name.clone()).or_default();
             }
         }
         // now resolve type bodies
@@ -189,6 +218,7 @@ impl Checker {
                         let ret = f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
                         sig.exposes.insert(f.name.clone(), (params, ret));
                     }
+                    sig.fulfills = c.fulfills.clone();
                     self.checked.components.insert(c.name.clone(), sig);
                     if c.intent.is_none() {
                         self.warn(
@@ -205,8 +235,15 @@ impl Checker {
                         let ret = s.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
                         sig.sigs.insert(s.name.clone(), (params, ret, s.effects.clone()));
                     }
-                    if self.checked.contracts.insert(ct.name.clone(), sig).is_some() {
-                        self.err("K0260", format!("contract `{}` is defined more than once", ct.name), ct.span);
+                    // the name was pre-registered (empty); a non-empty existing
+                    // sig means a genuine redefinition
+                    match self.checked.contracts.get(&ct.name) {
+                        Some(existing) if !existing.sigs.is_empty() => {
+                            self.err("K0260", format!("contract `{}` is defined more than once", ct.name), ct.span);
+                        }
+                        _ => {
+                            self.checked.contracts.insert(ct.name.clone(), sig);
+                        }
                     }
                 }
             }
@@ -369,6 +406,8 @@ impl Checker {
                         Ty::Named(other.to_string())
                     } else if self.checked.components.contains_key(other) {
                         Ty::Component(other.to_string())
+                    } else if self.checked.contracts.contains_key(other) {
+                        Ty::Contract(other.to_string())
                     } else {
                         self.err("K0205", format!("unknown type `{other}`"), t.span);
                         self.uni.fresh()
@@ -597,7 +636,15 @@ impl Checker {
                 continue;
             };
             child_types.insert(child.name.clone(), child.component.clone());
-            self.check_ctor_args(&child.component, &sig, &child.args, child.span, c);
+            let mut cctx = Ctx {
+                scopes: Scopes::new(),
+                ret: Ty::Unit,
+                component: Some(c),
+                in_handler: false,
+                loop_depth: 0,
+            };
+            self.bind_component_env(c, &mut cctx);
+            self.check_ctor_args(&child.component, &sig, &child.args, child.span, &mut cctx);
         }
         for wire in &c.wires {
             let from_ty = self.wire_port_ty(&child_types, &wire.from, true, wire.span);
@@ -713,34 +760,29 @@ impl Checker {
         }
     }
 
+    /// Type-check constructor (prop) arguments against the component's prop
+    /// types, using the caller's own scope so argument expressions can refer to
+    /// locals/state in context. Contract-typed props admit any fulfilling
+    /// component (contract assignability).
     fn check_ctor_args(
         &mut self,
         comp_name: &str,
         sig: &ComponentSig,
         args: &[Arg],
         span: Span,
-        enclosing: &ComponentDecl,
+        ctx: &mut Ctx,
     ) {
-        let mut ctx = Ctx {
-            scopes: Scopes::new(),
-            ret: Ty::Unit,
-            component: Some(enclosing),
-            in_handler: false,
-            loop_depth: 0,
-        };
-        self.bind_component_env(enclosing, &mut ctx);
-
         let mut supplied: HashSet<String> = HashSet::new();
         for (i, arg) in args.iter().enumerate() {
             let target = match &arg.name {
                 Some(n) => sig.props.iter().find(|(pn, _, _)| pn == n).cloned(),
                 None => sig.props.get(i).cloned(),
             };
-            let arg_ty = self.infer_expr(&arg.value, &mut ctx);
+            let arg_ty = self.infer_expr(&arg.value, ctx);
             match target {
                 Some((pname, pty, _)) => {
                     supplied.insert(pname.clone());
-                    self.unify(&pty, &arg_ty, arg.value.span, &format!("prop `{pname}` of `{comp_name}`"));
+                    self.check_assign(&pty, &arg_ty, arg.value.span, &format!("prop `{pname}` of `{comp_name}`"));
                 }
                 None => {
                     self.err(
@@ -841,7 +883,7 @@ impl Checker {
                 let final_ty = match ty {
                     Some(t) => {
                         let ann = self.resolve_ty(t);
-                        self.unify(&ann, &init_ty, *span, &format!("`let {name}`"));
+                        self.check_assign(&ann, &init_ty, *span, &format!("`let {name}`"));
                         ann
                     }
                     None => self.uni.apply(&init_ty),
@@ -1330,16 +1372,9 @@ impl Checker {
                 self.check_named_args(name, &fields, args, span, ctx);
                 return Ty::Named(tyname);
             }
-            // component construction
+            // component construction (props checked in the caller's own scope)
             if let Some(sig) = self.checked.components.get(name).cloned() {
-                if let Some(enclosing) = ctx.component {
-                    self.check_ctor_args(name, &sig, args, span, enclosing);
-                } else {
-                    // constructing outside a component (e.g. REPL): still check props
-                    for arg in args {
-                        self.infer_expr(&arg.value, ctx);
-                    }
-                }
+                self.check_ctor_args(name, &sig, args, span, ctx);
                 return Ty::Component(name.clone());
             }
         }
@@ -1352,8 +1387,6 @@ impl Checker {
             }
             arg_tys.push(self.infer_expr(&a.value, ctx));
         }
-        let ret = self.uni.fresh();
-        let want = Ty::Fun(arg_tys, Box::new(ret.clone()));
         match self.uni.apply(&ct) {
             Ty::Fun(ps, _) if ps.len() != args.len() => {
                 self.err(
@@ -1361,12 +1394,24 @@ impl Checker {
                     format!("this function takes {} argument(s), {} given", ps.len(), args.len()),
                     span,
                 );
+                self.uni.fresh()
             }
+            // concrete function: check each argument with contract assignability
+            Ty::Fun(ps, r) => {
+                for (p, at) in ps.iter().zip(arg_tys.iter()) {
+                    self.check_assign(p, at, span, "function call");
+                }
+                self.uni.apply(&r)
+            }
+            // callee type not yet known (e.g. a type variable): fall back to
+            // whole-function unification to drive inference
             _ => {
+                let ret = self.uni.fresh();
+                let want = Ty::Fun(arg_tys, Box::new(ret.clone()));
                 self.unify(&want, &ct, span, "function call");
+                self.uni.apply(&ret)
             }
         }
-        self.uni.apply(&ret)
     }
 
     fn check_named_args(
@@ -1549,6 +1594,21 @@ impl Checker {
                     }
                 }
             }
+            // dynamic dispatch through a contract interface
+            (Ty::Contract(cname), _) => {
+                let sig = self.checked.contracts.get(cname).cloned().unwrap_or_default();
+                match sig.sigs.get(name) {
+                    Some((ps, r, _)) => Some((ps.clone(), r.clone())),
+                    None => {
+                        self.err(
+                            "K0247",
+                            format!("contract `{cname}` has no function named `{name}`"),
+                            span,
+                        );
+                        return self.uni.fresh();
+                    }
+                }
+            }
             (Ty::Var(_), _) => {
                 self.err(
                     "K0248",
@@ -1584,7 +1644,7 @@ impl Checker {
                     // before the body is checked (`xs.filter(fn e { e.key == k })`).
                     for (p, a) in params.iter().zip(args.iter()) {
                         let at = self.check_expr_expecting(a, p, ctx);
-                        self.unify(p, &at, a.span, &format!("argument to `.{name}`"));
+                        self.check_assign(p, &at, a.span, &format!("argument to `.{name}`"));
                     }
                 }
                 self.uni.apply(&ret)

@@ -40,8 +40,12 @@ and known limitations called out in commit messages. Checked off as landed.
 
 ## Tier 2 — component model completion
 
-- [ ] **Contract-typed requires** — `prop repo: TodoRepo` accepting any
-      fulfilling component (dynamic dispatch through the contract)
+- [x] **Contract-typed requires** — `prop repo: KeyStore` accepts any
+      fulfilling component; calls dispatch dynamically through the contract's
+      exposes (interpreter + KVM identical). Contract names are types on props,
+      params, and `let`/`var`; non-fulfilling injection is K0200. Also fixed a
+      pre-existing gap: props are now type-checked when constructing from a
+      top-level `fun`. (`examples/di.kupl`)
 - [ ] **`forall` in laws** — property testing with generated values (design §1)
 - [ ] **Timers** — `on every 5s`, `after 2s` (design §4); needs a virtual-time
       story for deterministic tests
