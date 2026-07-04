@@ -23,17 +23,37 @@ struct Frame {
     base: usize,
     /// Register in the CALLER's frame that receives the return value.
     dst: Reg,
+    /// Component instance this frame executes for (handlers/exposes/init).
+    inst: Option<usize>,
+}
+
+/// A live component instance: slots hold props, then state, then children.
+struct VmInstance {
+    comp: u16,
+    slots: Vec<Value>,
+    /// out port -> [(target instance, target in port)]
+    wires: std::collections::HashMap<String, Vec<(usize, String)>>,
 }
 
 pub struct Vm<'m> {
     module: &'m Module,
     stack: Vec<Value>,
     frames: Vec<Frame>,
+    instances: Vec<VmInstance>,
+    queue: std::collections::VecDeque<(usize, String, Value)>,
+    pub print_unwired: bool,
 }
 
 impl<'m> Vm<'m> {
     pub fn new(module: &'m Module) -> Self {
-        Vm { module, stack: Vec::new(), frames: Vec::new() }
+        Vm {
+            module,
+            stack: Vec::new(),
+            frames: Vec::new(),
+            instances: Vec::new(),
+            queue: std::collections::VecDeque::new(),
+            print_unwired: false,
+        }
     }
 
     pub fn call_named(&mut self, name: &str, args: Vec<Value>) -> Result<Value, VmError> {
@@ -41,7 +61,111 @@ impl<'m> Vm<'m> {
             return Err(VmError { msg: format!("no function `{name}`"), span: Span::default() });
         };
         let depth = self.frames.len();
-        self.push_frame(idx, &args, 0)?;
+        self.push_frame(idx, &args, 0, None)?;
+        self.run(depth)
+    }
+
+    /// Instantiate the app component, deliver `on start` to every instance in
+    /// creation order, then drain the message queue to quiescence.
+    pub fn run_app(&mut self, app: &str) -> Result<(), VmError> {
+        let Some(&idx) = self.module.component_names.get(app) else {
+            return Err(VmError { msg: format!("no component `{app}`"), span: Span::default() });
+        };
+        self.instantiate(idx, Vec::new())?;
+        for id in 0..self.instances.len() {
+            self.run_lifecycle(id, "@start")?;
+        }
+        self.drain()?;
+        Ok(())
+    }
+
+    fn run_lifecycle(&mut self, id: usize, key: &str) -> Result<(), VmError> {
+        let meta = &self.module.components[self.instances[id].comp as usize];
+        let handler = meta
+            .handlers
+            .iter()
+            .find(|(k, _, _)| k == key)
+            .map(|(_, chunk, has_param)| (*chunk, *has_param));
+        if let Some((chunk, _)) = handler {
+            self.call_chunk_nested(chunk, Vec::new(), Some(id))?;
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Result<(), VmError> {
+        while let Some((id, port, value)) = self.queue.pop_front() {
+            let meta = &self.module.components[self.instances[id].comp as usize];
+            let handler = meta
+                .handlers
+                .iter()
+                .find(|(k, _, _)| *k == port)
+                .map(|(_, chunk, has_param)| (*chunk, *has_param));
+            if let Some((chunk, has_param)) = handler {
+                let args = if has_param { vec![value] } else { Vec::new() };
+                self.call_chunk_nested(chunk, args, Some(id))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Create an instance: fill props (running default chunks for gaps is the
+    /// compiler's job — args arrive complete), zero the state, run the init chunk.
+    fn instantiate(&mut self, comp_idx: u16, props: Vec<Value>) -> Result<usize, VmError> {
+        let meta = &self.module.components[comp_idx as usize];
+        let init = meta.init_chunk;
+        let mut slots = props;
+        slots.resize(meta.nslots as usize, Value::Unit);
+        let id = self.instances.len();
+        self.instances.push(VmInstance {
+            comp: comp_idx,
+            slots,
+            wires: std::collections::HashMap::new(),
+        });
+        self.call_chunk_nested(init, Vec::new(), Some(id))?;
+        Ok(id)
+    }
+
+    /// Instantiate a component by name (props must be complete). Public for
+    /// tests and future law-running on the VM.
+    pub fn instantiate_named(&mut self, name: &str, props: Vec<Value>) -> Result<usize, VmError> {
+        let Some(&idx) = self.module.component_names.get(name) else {
+            return Err(VmError { msg: format!("no component `{name}`"), span: Span::default() });
+        };
+        let id = self.instantiate(idx, props)?;
+        self.run_lifecycle(id, "@start")?;
+        self.drain()?;
+        Ok(id)
+    }
+
+    /// Call an exposed function on a live instance.
+    pub fn call_expose(&mut self, id: usize, name: &str, args: Vec<Value>) -> Result<Value, VmError> {
+        let meta = &self.module.components[self.instances[id].comp as usize];
+        let Some(&chunk) = meta.exposes.get(name) else {
+            return Err(VmError {
+                msg: format!("component `{}` does not expose `{name}`", meta.name),
+                span: Span::default(),
+            });
+        };
+        let v = self.call_chunk_nested(chunk, args, Some(id))?;
+        self.drain()?;
+        Ok(v)
+    }
+
+    /// Send a message to an instance's in port and drain to quiescence.
+    pub fn send(&mut self, id: usize, port: &str, value: Value) -> Result<(), VmError> {
+        self.queue.push_back((id, port.to_string(), value));
+        self.drain()
+    }
+
+    /// Run a chunk to completion re-entrantly and return its value.
+    fn call_chunk_nested(
+        &mut self,
+        chunk: u16,
+        args: Vec<Value>,
+        inst: Option<usize>,
+    ) -> Result<Value, VmError> {
+        let depth = self.frames.len();
+        self.push_frame(chunk, &args, 0, inst)?;
         self.run(depth)
     }
 
@@ -49,7 +173,13 @@ impl<'m> Vm<'m> {
         &self.module.chunks[idx as usize]
     }
 
-    fn push_frame(&mut self, chunk_idx: u16, args: &[Value], dst: Reg) -> Result<(), VmError> {
+    fn push_frame(
+        &mut self,
+        chunk_idx: u16,
+        args: &[Value],
+        dst: Reg,
+        inst: Option<usize>,
+    ) -> Result<(), VmError> {
         let chunk = self.chunk(chunk_idx);
         let expected = chunk.nparams as usize;
         if args.len() != expected {
@@ -66,7 +196,7 @@ impl<'m> Vm<'m> {
         if self.frames.len() >= 10_000 {
             return Err(VmError { msg: "stack overflow (10000 frames)".into(), span: Span::default() });
         }
-        self.frames.push(Frame { chunk: chunk_idx, ip: 0, base, dst });
+        self.frames.push(Frame { chunk: chunk_idx, ip: 0, base, dst, inst });
         Ok(())
     }
 
@@ -76,8 +206,9 @@ impl<'m> Vm<'m> {
         captures: &[Value],
         args: &[Value],
         dst: Reg,
+        inst: Option<usize>,
     ) -> Result<(), VmError> {
-        self.push_frame(proto, args, dst)?;
+        self.push_frame(proto, args, dst, inst)?;
         let base = self.frames.last().unwrap().base;
         for (i, c) in captures.iter().enumerate() {
             self.stack[base + i] = c.clone();
@@ -88,15 +219,16 @@ impl<'m> Vm<'m> {
     /// Call a callable value re-entrantly (used by Method callbacks).
     fn call_value_nested(&mut self, f: Value, args: Vec<Value>) -> Result<Value, String> {
         let depth = self.frames.len();
+        let inst = self.frames.last().and_then(|f| f.inst);
         match f {
             Value::Fun(name) => {
                 let Some(&idx) = self.module.funs.get(name.as_str()) else {
                     return Err(format!("no function `{name}`"));
                 };
-                self.push_frame(idx, &args, 0).map_err(|e| e.msg)?;
+                self.push_frame(idx, &args, 0, None).map_err(|e| e.msg)?;
             }
             Value::VmClosure(proto, caps) => {
-                self.push_closure_frame(proto, &caps, &args, 0).map_err(|e| e.msg)?;
+                self.push_closure_frame(proto, &caps, &args, 0, inst).map_err(|e| e.msg)?;
             }
             other => return Err(format!("{} is not callable", other.type_name())),
         }
@@ -112,9 +244,9 @@ impl<'m> Vm<'m> {
             };
         }
         loop {
-            let (chunk_idx, ip, base) = {
+            let (chunk_idx, ip, base, cur_inst) = {
                 let f = frame!();
-                (f.chunk, f.ip, f.base)
+                (f.chunk, f.ip, f.base, f.inst)
             };
             let chunk = self.chunk(chunk_idx);
             let op = chunk.code[ip].clone();
@@ -203,7 +335,7 @@ impl<'m> Vm<'m> {
                 Op::Call { dst, fun, start, argc } => {
                     let args: Vec<Value> =
                         (0..argc).map(|i| reg!(start + i)).collect();
-                    self.push_frame(fun, &args, dst).map_err(|mut e| {
+                    self.push_frame(fun, &args, dst, None).map_err(|mut e| {
                         e.span = span;
                         e
                     })?;
@@ -230,16 +362,17 @@ impl<'m> Vm<'m> {
                             let Some(&idx) = self.module.funs.get(name.as_str()) else {
                                 return Err(VmError { msg: format!("no function `{name}`"), span });
                             };
-                            self.push_frame(idx, &args, dst).map_err(|mut e| {
+                            self.push_frame(idx, &args, dst, None).map_err(|mut e| {
                                 e.span = span;
                                 e
                             })?;
                         }
                         Value::VmClosure(proto, caps) => {
-                            self.push_closure_frame(proto, &caps, &args, dst).map_err(|mut e| {
-                                e.span = span;
-                                e
-                            })?;
+                            self.push_closure_frame(proto, &caps, &args, dst, cur_inst)
+                                .map_err(|mut e| {
+                                    e.span = span;
+                                    e
+                                })?;
                         }
                         other => {
                             return Err(VmError {
@@ -256,6 +389,26 @@ impl<'m> Vm<'m> {
                         _ => return Err(VmError { msg: "bad method name".into(), span }),
                     };
                     let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    // expose call on a component instance
+                    if let Value::Component(id) = r {
+                        let meta = &self.module.components[self.instances[id].comp as usize];
+                        let Some(&expose_chunk) = meta.exposes.get(&method) else {
+                            return Err(VmError {
+                                msg: format!("component `{}` does not expose `{method}`", meta.name),
+                                span,
+                            });
+                        };
+                        let v = self
+                            .call_chunk_nested(expose_chunk, args, Some(id))
+                            .map_err(|mut e| {
+                                if e.span == Span::default() {
+                                    e.span = span;
+                                }
+                                e
+                            })?;
+                        set!(dst, v);
+                        continue;
+                    }
                     let mut call = |f: Value, args: Vec<Value>| self.call_value_nested(f, args);
                     match shared_method(&r, &method, args, &mut call) {
                         Ok(v) => set!(dst, v),
@@ -386,6 +539,64 @@ impl<'m> Vm<'m> {
                     let (l, r) = (reg!(a), reg!(b));
                     set!(dst, Value::str(format!("{l}{r}")));
                 }
+                Op::StateGet(dst, slot) => {
+                    let Some(id) = cur_inst else {
+                        return Err(VmError { msg: "state access outside a component".into(), span });
+                    };
+                    let v = self.instances[id].slots[slot as usize].clone();
+                    set!(dst, v);
+                }
+                Op::StateSet(slot, src) => {
+                    let Some(id) = cur_inst else {
+                        return Err(VmError { msg: "state access outside a component".into(), span });
+                    };
+                    let v = reg!(src);
+                    self.instances[id].slots[slot as usize] = v;
+                }
+                Op::MakeInstance { dst, comp, start, argc } => {
+                    let props: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    let id = self.instantiate(comp, props).map_err(|mut e| {
+                        if e.span == Span::default() {
+                            e.span = span;
+                        }
+                        e
+                    })?;
+                    set!(dst, Value::Component(id));
+                }
+                Op::WireOp { from, out_port, to, in_port } => {
+                    let (Value::Component(src), Value::Component(dst_id)) = (reg!(from), reg!(to))
+                    else {
+                        return Err(VmError { msg: "wire endpoints must be components".into(), span });
+                    };
+                    let out_name = chunk.consts[out_port as usize].to_string();
+                    let in_name = chunk.consts[in_port as usize].to_string();
+                    self.instances[src]
+                        .wires
+                        .entry(out_name)
+                        .or_default()
+                        .push((dst_id, in_name));
+                }
+                Op::EmitOp { port, payload } => {
+                    let Some(id) = cur_inst else {
+                        return Err(VmError { msg: "`emit` outside a component".into(), span });
+                    };
+                    let value = match payload {
+                        Some(r) => reg!(r),
+                        None => Value::Unit,
+                    };
+                    let port_name = chunk.consts[port as usize].to_string();
+                    let targets = self.instances[id].wires.get(&port_name).cloned().unwrap_or_default();
+                    if targets.is_empty() {
+                        if self.print_unwired {
+                            let comp = &self.module.components[self.instances[id].comp as usize].name;
+                            println!("{comp}.{port_name} = {value}");
+                        }
+                    } else {
+                        for (dst_id, dport) in targets {
+                            self.queue.push_back((dst_id, dport, value.clone()));
+                        }
+                    }
+                }
                 Op::Panic(idx) => {
                     let msg = chunk.consts[idx as usize].to_string();
                     return Err(VmError { msg, span });
@@ -497,5 +708,98 @@ mod tests {
     fn diff_expect_stmt() {
         let src = "fun probe() -> Int {\n    expect 1 + 1 == 2\n    7\n}\n";
         assert_eq!(differential(src), "7");
+    }
+
+    /// Components: drive the same instance on both engines via sends + exposes.
+    #[test]
+    fn diff_component_state_machine() {
+        let src = r#"
+type Entry = { key: Str, value: Str }
+
+component Store {
+    intent "Keyed store with a sent-in default."
+
+    in preload: Str
+
+    state entries: List[Entry] = []
+    state loads: Int = 0
+
+    on preload(key) {
+        entries = entries.push(Entry(key: key, value: "preloaded:{key}"))
+        loads += 1
+    }
+
+    expose fun put(key: Str, value: Str) -> Int {
+        entries = entries.filter(fn e { e.key != key }).push(Entry(key: key, value: value))
+        entries.len()
+    }
+
+    expose fun get(key: Str) -> Str {
+        match entries.find(fn e { e.key == key }) {
+            Some(e) => e.value
+            None => "missing"
+        }
+    }
+
+    expose fun stats() -> Str {
+        "{entries.len()} entries, {loads} loads"
+    }
+}
+"#;
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let inst = interp
+            .instantiate("Store", &[], crate::diag::Span::default())
+            .ok()
+            .and_then(|v| match v {
+                Value::Component(id) => Some(id),
+                _ => None,
+            })
+            .expect("instantiates");
+        interp.start_all().ok();
+        let call_i = |interp: &mut Interp, id: usize, name: &str, args: Vec<Value>| -> String {
+            let f = Value::Bound(id, std::rc::Rc::new(name.to_string()));
+            match interp.call_value(f, args, crate::diag::Span::default()) {
+                Ok(v) => v.to_string(),
+                Err(Flow::Panic { msg, .. }) => format!("panic: {msg}"),
+                Err(_) => "flow".into(),
+            }
+        };
+        interp.send(inst, "preload", Value::str("alpha")).unwrap_or(());
+        let mut i_log = Vec::new();
+        i_log.push(call_i(&mut interp, inst, "put", vec![Value::str("k"), Value::str("v1")]));
+        i_log.push(call_i(&mut interp, inst, "put", vec![Value::str("k"), Value::str("v2")]));
+        i_log.push(call_i(&mut interp, inst, "get", vec![Value::str("k")]));
+        i_log.push(call_i(&mut interp, inst, "get", vec![Value::str("alpha")]));
+        i_log.push(call_i(&mut interp, inst, "get", vec![Value::str("nope")]));
+        i_log.push(call_i(&mut interp, inst, "stats", vec![]));
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let id = vm.instantiate_named("Store", vec![]).expect("instantiates");
+        vm.send(id, "preload", Value::str("alpha")).expect("send");
+        let call_v = |vm: &mut Vm, id: usize, name: &str, args: Vec<Value>| -> String {
+            match vm.call_expose(id, name, args) {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("panic: {}", e.msg),
+            }
+        };
+        let mut v_log = Vec::new();
+        v_log.push(call_v(&mut vm, id, "put", vec![Value::str("k"), Value::str("v1")]));
+        v_log.push(call_v(&mut vm, id, "put", vec![Value::str("k"), Value::str("v2")]));
+        v_log.push(call_v(&mut vm, id, "get", vec![Value::str("k")]));
+        v_log.push(call_v(&mut vm, id, "get", vec![Value::str("alpha")]));
+        v_log.push(call_v(&mut vm, id, "get", vec![Value::str("nope")]));
+        v_log.push(call_v(&mut vm, id, "stats", vec![]));
+
+        assert_eq!(i_log, v_log, "interpreter and KVM disagree on component behavior");
+        assert_eq!(v_log[2], "v2");
+        assert_eq!(v_log[3], "preloaded:alpha");
+        assert_eq!(v_log[5], "2 entries, 1 loads"); // alpha + k (v2 overwrote v1)
     }
 }

@@ -78,13 +78,49 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
         module,
         ctor_idx,
         ctor_fields,
+        comp_props: HashMap::new(),
         diags: Vec::new(),
         fun_names: funs.iter().map(|f| f.name.clone()).collect(),
     };
 
+    // components: register names first (constructions may be mutually recursive)
+    let comps: Vec<&ComponentDecl> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Component(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    for (i, c) in comps.iter().enumerate() {
+        shared.module.component_names.insert(c.name.clone(), i as u16);
+    }
+
+    // phase A: prop default chunks + prop tables (needed by any construction site)
+    for c in &comps {
+        let mut props = Vec::new();
+        for p in &c.props {
+            let default = p.default.as_ref().map(|d| {
+                let mut fc = FnCompiler::new(&mut shared, &format!("{}::default::{}", c.name, p.name), 0, 0);
+                let r = fc.expr(d);
+                fc.emit(Op::Ret(r), p.span);
+                let chunk = fc.finish();
+                shared.module.chunks.push(chunk);
+                (shared.module.chunks.len() - 1) as u16
+            });
+            props.push((p.name.clone(), default));
+        }
+        shared.comp_props.insert(c.name.clone(), props);
+    }
+
     for (i, f) in funs.iter().enumerate() {
         let chunk = compile_fun(&mut shared, f);
         shared.module.chunks[i] = chunk;
+    }
+
+    for c in &comps {
+        let meta = compile_component(&mut shared, c);
+        shared.module.components.push(meta);
     }
 
     if shared.diags.is_empty() {
@@ -94,12 +130,132 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
     }
 }
 
+/// Compile a component: slot layout (props, state, children), default chunks,
+/// init chunk (state inits + children + wires), handler chunks, expose chunks.
+fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
+    // slot layout
+    let mut slots: HashMap<String, u8> = HashMap::new();
+    let mut slot = 0u8;
+    for p in &c.props {
+        slots.insert(p.name.clone(), slot);
+        slot += 1;
+    }
+    for s in &c.state {
+        slots.insert(s.name.clone(), slot);
+        slot += 1;
+    }
+    for child in &c.children {
+        slots.insert(child.name.clone(), slot);
+        slot += 1;
+    }
+    let comp_ctx = CompCtx { slots: slots.clone() };
+    let props = shared.comp_props.get(&c.name).cloned().unwrap_or_default();
+
+    // init chunk: state inits, children, wires (instance is current)
+    let init_chunk = {
+        let mut fc = FnCompiler::new(shared, &format!("{}::init", c.name), 0, 0);
+        fc.comp = Some(comp_ctx.clone());
+        for s in &c.state {
+            let r = fc.expr(&s.init);
+            fc.emit(Op::StateSet(slots[&s.name], r), s.span);
+        }
+        for child in &c.children {
+            let r = fc.instance_expr(&child.component, &child.args, child.span);
+            fc.emit(Op::StateSet(slots[&child.name], r), child.span);
+        }
+        for w in &c.wires {
+            let from = fc.slot_reg(&w.from.0, w.span);
+            let to = fc.slot_reg(&w.to.0, w.span);
+            let out_port = fc.const_idx(Value::str(w.from.1.clone()));
+            let in_port = fc.const_idx(Value::str(w.to.1.clone()));
+            fc.emit(Op::WireOp { from, out_port, to, in_port }, w.span);
+        }
+        let u = fc.const_reg(Value::Unit, c.span);
+        fc.emit(Op::Ret(u), c.span);
+        let chunk = fc.finish();
+        shared.module.chunks.push(chunk);
+        (shared.module.chunks.len() - 1) as u16
+    };
+
+    // handlers
+    let mut handlers = Vec::new();
+    for h in &c.handlers {
+        let (key, label) = match &h.trigger {
+            Trigger::Start => ("@start".to_string(), "start".to_string()),
+            Trigger::Stop => ("@stop".to_string(), "stop".to_string()),
+            Trigger::Port(p) => (p.clone(), p.clone()),
+        };
+        let has_param = h.param.is_some();
+        let mut fc = FnCompiler::new(
+            shared,
+            &format!("{}::on {}", c.name, label),
+            0,
+            if has_param { 1 } else { 0 },
+        );
+        fc.comp = Some(comp_ctx.clone());
+        if let Some(p) = &h.param {
+            fc.bind_local(p);
+        }
+        fc.block(&h.body);
+        let u = fc.const_reg(Value::Unit, h.span);
+        fc.emit(Op::Ret(u), h.span);
+        let chunk = fc.finish();
+        shared.module.chunks.push(chunk);
+        handlers.push((key, (shared.module.chunks.len() - 1) as u16, has_param));
+    }
+
+    // exposes
+    let mut exposes = HashMap::new();
+    for f in &c.exposes {
+        let mut fc = FnCompiler::new(
+            shared,
+            &format!("{}::{}", c.name, f.name),
+            0,
+            f.params.len() as u8,
+        );
+        fc.comp = Some(comp_ctx.clone());
+        for p in &f.params {
+            fc.bind_local(&p.name);
+        }
+        let last = fc.block(&f.body);
+        let r = last.unwrap_or_else(|| fc.const_reg(Value::Unit, f.span));
+        fc.emit(Op::Ret(r), f.span);
+        let chunk = fc.finish();
+        shared.module.chunks.push(chunk);
+        exposes.insert(f.name.clone(), (shared.module.chunks.len() - 1) as u16);
+    }
+
+    ComponentMeta {
+        name: c.name.clone(),
+        is_app: c.is_app,
+        props,
+        nslots: slot,
+        init_chunk,
+        handlers,
+        exposes,
+        out_ports: c
+            .ports
+            .iter()
+            .filter(|p| p.dir == PortDir::Out)
+            .map(|p| p.name.clone())
+            .collect(),
+    }
+}
+
 struct Shared {
     module: Module,
     ctor_idx: HashMap<String, u16>,
     ctor_fields: HashMap<String, Vec<String>>,
+    /// component name -> props (name, optional default chunk) — built before bodies
+    comp_props: HashMap<String, Vec<(String, Option<u16>)>>,
     diags: Vec<Diag>,
     fun_names: HashSet<String>,
+}
+
+/// Component compilation context: name -> instance slot (props, state, children).
+#[derive(Clone)]
+struct CompCtx {
+    slots: HashMap<String, u8>,
 }
 
 fn compile_fun(shared: &mut Shared, f: &FunDecl) -> Chunk {
@@ -116,6 +272,8 @@ fn compile_fun(shared: &mut Shared, f: &FunDecl) -> Chunk {
 struct FnCompiler<'s> {
     shared: &'s mut Shared,
     chunk: Chunk,
+    /// Some(...) while compiling inside a component (state/prop/child slots)
+    comp: Option<CompCtx>,
     /// scope stack of (name, reg)
     scopes: Vec<Vec<(String, Reg)>>,
     next: u16,
@@ -140,12 +298,82 @@ impl<'s> FnCompiler<'s> {
                 code: Vec::new(),
                 spans: Vec::new(),
             },
+            comp: None,
             scopes: vec![Vec::new()],
             next: 0,
             loops: Vec::new(),
             pending_continues: Vec::new(),
             too_large: false,
         }
+    }
+
+    /// Load a component slot (state/prop/child) — or a local — into a register.
+    fn slot_reg(&mut self, name: &str, span: Span) -> Reg {
+        if let Some(r) = self.lookup(name) {
+            return r;
+        }
+        if let Some(ctx) = &self.comp {
+            if let Some(&s) = ctx.slots.get(name) {
+                let dst = self.alloc(span);
+                self.emit(Op::StateGet(dst, s), span);
+                return dst;
+            }
+        }
+        self.err("K0240", format!("unknown name `{name}` (KVM)"), span);
+        0
+    }
+
+    /// Construct a component instance: args ordered to prop order, defaults
+    /// filled by calling the prop's default chunk.
+    fn instance_expr(&mut self, comp_name: &str, args: &[Arg], span: Span) -> Reg {
+        let Some(&comp_idx) = self.shared.module.component_names.get(comp_name) else {
+            self.err("K0208", format!("unknown component `{comp_name}` (KVM)"), span);
+            return self.const_reg(Value::Unit, span);
+        };
+        let props = self.shared.comp_props.get(comp_name).cloned().unwrap_or_default();
+        let mut supplied: Vec<Option<Expr>> = vec![None; props.len()];
+        for (i, a) in args.iter().enumerate() {
+            let idx = match &a.name {
+                Some(n) => props.iter().position(|(pn, _)| pn == n).unwrap_or(i),
+                None => i,
+            };
+            if idx < supplied.len() {
+                supplied[idx] = Some(a.value.clone());
+            }
+        }
+        let temps: Vec<Reg> = props
+            .iter()
+            .zip(supplied)
+            .map(|((pname, default), s)| match s {
+                Some(e) => self.expr(&e),
+                None => match default {
+                    Some(chunk) => {
+                        let dst = self.alloc(span);
+                        self.emit(Op::Call { dst, fun: *chunk, start: 0, argc: 0 }, span);
+                        dst
+                    }
+                    None => {
+                        self.err(
+                            "K0216",
+                            format!("missing required prop `{pname}` for `{comp_name}`"),
+                            span,
+                        );
+                        self.const_reg(Value::Unit, span)
+                    }
+                },
+            })
+            .collect();
+        let start = self.next as Reg;
+        for t in temps {
+            let r = self.alloc(span);
+            self.emit(Op::Move(r, t), span);
+        }
+        let dst = self.alloc(span);
+        self.emit(
+            Op::MakeInstance { dst, comp: comp_idx, start, argc: props.len() as u8 },
+            span,
+        );
+        dst
     }
 
     fn finish(mut self) -> Chunk {
@@ -247,29 +475,52 @@ impl<'s> FnCompiler<'s> {
                     self.err("K0803", "unsupported assignment target on KVM", *span);
                     return None;
                 };
-                let Some(local) = self.lookup(name) else {
-                    self.err(
-                        "K0803",
-                        format!("cannot assign to `{name}` on KVM (captured or component state)"),
-                        *span,
-                    );
+                if let Some(local) = self.lookup(name) {
+                    match op {
+                        AssignOp::Set => {
+                            self.emit(Op::Move(local, rhs), *span);
+                        }
+                        other => {
+                            let bin = match other {
+                                AssignOp::Add => Op::Add(local, local, rhs),
+                                AssignOp::Sub => Op::Sub(local, local, rhs),
+                                AssignOp::Mul => Op::Mul(local, local, rhs),
+                                AssignOp::Div => Op::Div(local, local, rhs),
+                                AssignOp::Set => unreachable!(),
+                            };
+                            self.emit(bin, *span);
+                        }
+                    }
                     return None;
-                };
-                match op {
-                    AssignOp::Set => {
-                        self.emit(Op::Move(local, rhs), *span);
-                    }
-                    other => {
-                        let bin = match other {
-                            AssignOp::Add => Op::Add(local, local, rhs),
-                            AssignOp::Sub => Op::Sub(local, local, rhs),
-                            AssignOp::Mul => Op::Mul(local, local, rhs),
-                            AssignOp::Div => Op::Div(local, local, rhs),
-                            AssignOp::Set => unreachable!(),
-                        };
-                        self.emit(bin, *span);
-                    }
                 }
+                // component state slot
+                let slot = self.comp.as_ref().and_then(|c| c.slots.get(name.as_str()).copied());
+                if let Some(slot) = slot {
+                    match op {
+                        AssignOp::Set => {
+                            self.emit(Op::StateSet(slot, rhs), *span);
+                        }
+                        other => {
+                            let t = self.alloc(*span);
+                            self.emit(Op::StateGet(t, slot), *span);
+                            let bin = match other {
+                                AssignOp::Add => Op::Add(t, t, rhs),
+                                AssignOp::Sub => Op::Sub(t, t, rhs),
+                                AssignOp::Mul => Op::Mul(t, t, rhs),
+                                AssignOp::Div => Op::Div(t, t, rhs),
+                                AssignOp::Set => unreachable!(),
+                            };
+                            self.emit(bin, *span);
+                            self.emit(Op::StateSet(slot, t), *span);
+                        }
+                    }
+                    return None;
+                }
+                self.err(
+                    "K0803",
+                    format!("cannot assign to `{name}` on KVM (captured variable)"),
+                    *span,
+                );
                 None
             }
             Stmt::Expr(e) => Some(self.expr(e)),
@@ -357,12 +608,14 @@ impl<'s> FnCompiler<'s> {
                 }
                 None
             }
-            Stmt::Emit { span, .. } => {
-                self.err(
-                    "K0802",
-                    "components are not yet supported by the KVM backend (run without --vm)",
-                    *span,
-                );
+            Stmt::Emit { port, arg, span } => {
+                if self.comp.is_none() {
+                    self.err("K0225", "`emit` is only valid inside a component", *span);
+                    return None;
+                }
+                let payload = arg.as_ref().map(|e| self.expr(e));
+                let port_idx = self.const_idx(Value::str(port.clone()));
+                self.emit(Op::EmitOp { port: port_idx, payload }, *span);
                 None
             }
         }
@@ -429,6 +682,13 @@ impl<'s> FnCompiler<'s> {
             ExprKind::Ident(name) => {
                 if let Some(r) = self.lookup(name) {
                     return r;
+                }
+                if let Some(ctx) = &self.comp {
+                    if let Some(&s) = ctx.slots.get(name.as_str()) {
+                        let dst = self.alloc(span);
+                        self.emit(Op::StateGet(dst, s), span);
+                        return dst;
+                    }
                 }
                 if self.shared.fun_names.contains(name) {
                     return self.const_reg(Value::Fun(std::rc::Rc::new(name.clone())), span);
@@ -573,6 +833,9 @@ impl<'s> FnCompiler<'s> {
                         captures.len() as u8,
                         params.len() as u8,
                     );
+                    // lambdas inside a component see live state via the
+                    // caller's instance context
+                    lc.comp = self.comp.clone();
                     for (n, _) in &captures {
                         lc.bind_local(n);
                     }
@@ -657,6 +920,13 @@ impl<'s> FnCompiler<'s> {
                 let dst = self.alloc(span);
                 self.emit(Op::MakeCtor { dst, ctor: idx, start, len: ordered.len() as u8 }, span);
                 return dst;
+            }
+            // component construction
+            if self.lookup(name).is_none()
+                && self.shared.module.component_names.contains_key(name.as_str())
+            {
+                let comp_name = name.clone();
+                return self.instance_expr(&comp_name, args, span);
             }
             // direct call to a top-level fun
             if self.lookup(name).is_none() {

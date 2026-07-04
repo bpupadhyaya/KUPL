@@ -73,6 +73,6 @@ minimal LLM prompts.
 Next phases (see `docs/design/TOOLCHAIN.md`): contracts & laws, KIR, the KVM
 bytecode VM, native compilation, and the tensor/kernel hardware story.
 
-Status: v0.2 — interpreter, REPL, formatter, effect checking, AI tooling
+Status: v0.5 — interpreter, REPL, formatter, effects, contracts+laws, KVM bytecode VM (functional core + full component apps, differentially tested)
 (2026-07-03); design proposal in `docs/design/`. The pre-2026 Scala/Java
 scaffold lives in `attic/`.

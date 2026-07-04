@@ -294,12 +294,21 @@ pub fn run_program_vm(src: &str, file: &str) -> i32 {
             return 1;
         }
     };
-    if !module.funs.contains_key("main") {
-        eprintln!("error: `kupl run --vm` needs a `fun main()` (components run on the interpreter for now)");
-        return 2;
-    }
+    let app = compiled.program.items.iter().find_map(|item| match item {
+        Item::Component(c) if c.is_app => Some(c.name.clone()),
+        _ => None,
+    });
     let mut vm = crate::vm::Vm::new(&module);
-    match vm.call_named("main", vec![]) {
+    vm.print_unwired = true;
+    let outcome = match app {
+        Some(name) => vm.run_app(&name).map(|_| Value::Unit),
+        None if module.funs.contains_key("main") => vm.call_named("main", vec![]),
+        None => {
+            eprintln!("error: no `app` or `fun main()` found in {file}");
+            return 2;
+        }
+    };
+    match outcome {
         Ok(_) => 0,
         Err(e) => {
             report_panic(&e.msg, e.span, src, file);

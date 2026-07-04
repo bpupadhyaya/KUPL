@@ -66,6 +66,18 @@ pub enum Op {
     ToStr(Reg, Reg),
     Concat(Reg, Reg, Reg),
 
+    // ---- component ops (execute with a current-instance context) ----
+    /// dst <- current instance slot (props then state)
+    StateGet(Reg, u8),
+    /// current instance slot <- regs[src]
+    StateSet(u8, Reg),
+    /// dst <- new instance of components[comp]; props from regs[start..start+argc]
+    MakeInstance { dst: Reg, comp: u16, start: Reg, argc: u8 },
+    /// wire regs[from].out consts[out_port] -> regs[to].in consts[in_port]
+    WireOp { from: Reg, out_port: u16, to: Reg, in_port: u16 },
+    /// emit on the current instance's out port consts[port]
+    EmitOp { port: u16, payload: Option<Reg> },
+
     /// Unconditional panic with message consts[idx].
     Panic(u16),
 }
@@ -92,6 +104,23 @@ pub struct CtorMeta {
     pub arity: u8,
 }
 
+/// A compiled component: slot layout + chunk indices for its behavior.
+#[derive(Debug, Clone)]
+pub struct ComponentMeta {
+    pub name: String,
+    pub is_app: bool,
+    /// prop name + optional default-value chunk (no params, no instance)
+    pub props: Vec<(String, Option<u16>)>,
+    /// total instance slots: props, then state, then children
+    pub nslots: u8,
+    /// runs with the instance current: state inits, children, wires
+    pub init_chunk: u16,
+    /// port name -> (chunk, has_param); "@start"/"@stop" for lifecycle
+    pub handlers: Vec<(String, u16, bool)>,
+    pub exposes: std::collections::HashMap<String, u16>,
+    pub out_ports: Vec<String>,
+}
+
 /// A compiled program: all function chunks + the constructor table.
 #[derive(Debug, Clone, Default)]
 pub struct Module {
@@ -101,6 +130,8 @@ pub struct Module {
     pub funs: std::collections::HashMap<String, u16>,
     /// variant name -> ordered field names (for record field access by name)
     pub ctor_field_names: std::collections::HashMap<String, Vec<String>>,
+    pub components: Vec<ComponentMeta>,
+    pub component_names: std::collections::HashMap<String, u16>,
 }
 
 pub const BUILTIN_PRINT: u8 = 0;
