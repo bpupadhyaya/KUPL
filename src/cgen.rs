@@ -66,23 +66,35 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     }
     let _ = writeln!(out, "}};\n#define N_CTORS {}\n", module.ctors.len());
 
-    // component metadata: name, is_app, nslots, init chunk, @start handler chunk
+    // component metadata: per-component handler tables, then the COMPS[] table
+    for (ci, c) in module.components.iter().enumerate() {
+        if c.handlers.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "static const KHandler COMP{ci}_H[] = {{");
+        for (port, chunk, has_param) in &c.handlers {
+            let _ = writeln!(
+                out,
+                "    {{ \"{}\", {}, {} }},",
+                c_escape(port),
+                chunk,
+                *has_param as i32
+            );
+        }
+        let _ = writeln!(out, "}};");
+    }
     let _ = writeln!(out, "const KCompMeta COMPS[] = {{");
-    for c in &module.components {
-        let start = c
-            .handlers
-            .iter()
-            .find(|(port, _, _)| port == "@start")
-            .map(|(_, chunk, _)| *chunk as i32)
-            .unwrap_or(-1);
+    for (ci, c) in module.components.iter().enumerate() {
+        let handlers = if c.handlers.is_empty() { "0".to_string() } else { format!("COMP{ci}_H") };
         let _ = writeln!(
             out,
-            "    {{ \"{}\", {}, {}, {}, {} }},",
+            "    {{ \"{}\", {}, {}, {}, {}, {} }},",
             c_escape(&c.name),
             c.is_app as i32,
             c.nslots,
             c.init_chunk,
-            start,
+            handlers,
+            c.handlers.len(),
         );
     }
     let _ = writeln!(out, "}};\n#define N_COMPS {}\n", module.components.len());
@@ -99,14 +111,16 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             );
         }
         Entry::App(app_idx) => {
-            // instantiate the app (runs its init chunk), then run its @start
-            // handler with that instance current; no queue to drain in slice 1.
+            // instantiate the app (which creates children in creation order),
+            // run @start for every instance (parents before children), then
+            // drain the message queue to quiescence — mirrors vm.rs::run_app.
             let _ = writeln!(
                 out,
                 "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    \
-                 int app = k_instantiate({app_idx});\n    \
-                 int sc = COMPS[{app_idx}].start_chunk;\n    \
-                 if (sc >= 0) {{ k_cur_inst = app; CHUNKS[sc](0, 0); }}\n    \
+                 k_print_unwired = 1;\n    \
+                 k_instantiate({app_idx}, 0, 0);\n    \
+                 for (int id = 0; id < k_ninsts; id++) k_run_lifecycle(id, \"@start\");\n    \
+                 k_drain();\n    \
                  return 0;\n}}"
             );
         }
@@ -114,23 +128,28 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     Ok(out)
 }
 
-/// Reject the constructs the single-component-app slice can't compile yet, with
-/// a clear message (rather than a runtime panic). Children/wires/emit appear as
-/// ops in the component's init/handler chunks; timers are metadata.
-fn check_native_component(module: &Module, idx: usize) -> Result<(), String> {
-    let comp = &module.components[idx];
-    if !comp.timers.is_empty() {
-        return Err("timers are not yet supported by the native backend — use `kupl bundle`".into());
-    }
-    let mut chunks = vec![comp.init_chunk as usize];
-    chunks.extend(comp.handlers.iter().map(|(_, c, _)| *c as usize));
-    for &ci in &chunks {
-        for op in &module.chunks[ci].code {
-            if matches!(op, Op::MakeInstance { .. } | Op::WireOp { .. } | Op::EmitOp { .. } | Op::CallComp { .. }) {
-                return Err(
-                    "child components / wires / emit are not yet supported by the native backend — use `kupl bundle`"
-                        .into(),
-                );
+/// Reject the constructs the native component backend can't compile yet, with a
+/// clear message (rather than a runtime panic). Children, wires, and `emit` are
+/// supported; timers and direct cross-component expose calls (`CallComp`) are
+/// not. Scans EVERY component (children are reachable from the app).
+fn check_native_component(module: &Module, _app_idx: usize) -> Result<(), String> {
+    for comp in &module.components {
+        if !comp.timers.is_empty() {
+            return Err(
+                "timers are not yet supported by the native backend — use `kupl bundle`".into(),
+            );
+        }
+        let mut chunks = vec![comp.init_chunk as usize];
+        chunks.extend(comp.handlers.iter().map(|(_, c, _)| *c as usize));
+        chunks.extend(comp.exposes.values().map(|c| *c as usize));
+        for &ci in &chunks {
+            for op in &module.chunks[ci].code {
+                if matches!(op, Op::CallComp { .. }) {
+                    return Err(
+                        "cross-component expose calls are not yet supported by the native backend — use `kupl bundle`"
+                            .into(),
+                    );
+                }
             }
         }
     }
@@ -352,10 +371,32 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
         Concat(d, a, b) => format!("regs[{d}] = k_concat(regs[{a}], regs[{b}]);"),
         StateGet(dst, slot) => format!("regs[{dst}] = k_state_get({slot});"),
         StateSet(slot, src) => format!("k_state_set({slot}, regs[{src}]);"),
-        MakeInstance { .. } | WireOp { .. } | EmitOp { .. } | CallComp { .. } => {
-            // deferred: child components, wires, emit, and cross-component calls
-            // (single-component apps compile; multi-component apps use kupl bundle)
-            "k_panic(\"child components / wires / emit are not yet supported by the native backend (use kupl bundle)\");"
+        MakeInstance { dst, comp, start, argc, policy } => {
+            // props are argc consecutive registers from `start`
+            format!(
+                "{{ int _id = k_instantiate({comp}, &regs[{start}], {argc}); k_insts[_id].restart_on_failure = ({policy} == 1); regs[{dst}] = k_component(_id); }}"
+            )
+        }
+        WireOp { from, out_port, to, in_port } => {
+            let out = str_const(chunk, *out_port)?;
+            let inn = str_const(chunk, *in_port)?;
+            format!(
+                "k_wire((int)regs[{from}].as.i, \"{}\", (int)regs[{to}].as.i, \"{}\");",
+                c_escape(out),
+                c_escape(inn)
+            )
+        }
+        EmitOp { port, payload } => {
+            let p = str_const(chunk, *port)?;
+            let val = match payload {
+                Some(r) => format!("regs[{r}]"),
+                None => "k_unit()".to_string(),
+            };
+            format!("k_emit(\"{}\", {});", c_escape(p), val)
+        }
+        CallComp { .. } => {
+            // direct cross-component expose calls — a later native slice
+            "k_panic(\"cross-component expose calls are not yet supported by the native backend (use kupl bundle)\");"
                 .to_string()
         }
         // emit_c rejects modules with ai funs before reaching here
@@ -409,7 +450,7 @@ typedef struct { int64_t len; KValue* items; } KSet;
 typedef struct { const char* type_name; const char* variant; int arity; const char** fields; } KCtorMeta;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT } tag;
     union {
         int64_t i; double f; int b;
         const char* s;
@@ -615,6 +656,10 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
         }
         case K_CLOSURE: kb_puts(b, "<fn>"); break;
         case K_FUN: kb_puts(b, "<fn>"); break;
+        case K_COMPONENT:
+            snprintf(tmp, sizeof tmp, "<component #%lld>", (long long)v.as.i);
+            kb_puts(b, tmp);
+            break;
         case K_RANGE:
             snprintf(tmp, sizeof tmp, "%lld..%s%lld", (long long)v.as.range.lo,
                      v.as.range.incl ? "=" : "", (long long)v.as.range.hi);
@@ -1925,36 +1970,112 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
 }
 "#;
 
-/// Component runtime (single-component apps): instance slots + `@start`. Emitted
-/// after RUNTIME; references CHUNKS (declared in RUNTIME) and COMPS (emitted per
-/// module). k_state_get/set operate on the current instance's slots.
+/// Component runtime (native component apps): instances, state, wires, the
+/// message queue, and drain — a structural mirror of `vm.rs`. Emitted after
+/// RUNTIME; references CHUNKS (declared in RUNTIME) and COMPS (emitted per
+/// module). Byte-identity hinges on reproducing vm.rs orderings exactly:
+/// creation-order instance ids, @start order, FIFO queue, wire push-order.
 const COMPONENT_RUNTIME: &str = r#"
-/* --- component runtime (native single-component apps) --- */
-typedef struct { const char* name; int is_app; int nslots; int init_chunk; int start_chunk; } KCompMeta;
+/* --- component runtime (native component apps) --- */
+typedef struct { const char* port; int chunk; int has_param; } KHandler;
+typedef struct { const char* name; int is_app; int nslots; int init_chunk;
+                 const KHandler* handlers; int nhandlers; } KCompMeta;
 extern const KCompMeta COMPS[];
+static KValue k_component(int id) { KValue v; v.tag = K_COMPONENT; v.as.i = id; return v; }
 
-typedef struct { int comp; KValue* slots; int nslots; } KInstance;
+typedef struct { const char* out_port; int to; const char* in_port; } KWire;
+typedef struct { int comp; KValue* slots; int nslots;
+                 KWire* wires; int nwires; int restart_on_failure; } KInstance;
 static KInstance* k_insts = 0;
 static int k_ninsts = 0;
 static int k_cur_inst = -1;
+static int k_print_unwired = 0;
 
-static int k_instantiate(int comp_idx) {
+/* FIFO message queue (grow-only; head advances — arena model, bounded runs) */
+typedef struct { int id; const char* port; KValue value; } KMsg;
+static KMsg* k_queue = 0;
+static int k_qhead = 0, k_qlen = 0, k_qcap = 0;
+static void k_enqueue(int id, const char* port, KValue v) {
+    if (k_qlen == k_qcap) { k_qcap = k_qcap ? k_qcap * 2 : 16;
+        k_queue = (KMsg*)realloc(k_queue, sizeof(KMsg) * k_qcap); }
+    k_queue[k_qlen].id = id; k_queue[k_qlen].port = port; k_queue[k_qlen].value = v; k_qlen++;
+}
+
+static int k_instantiate(int comp_idx, KValue* props, int nprops) {
     k_insts = (KInstance*)realloc(k_insts, sizeof(KInstance) * (k_ninsts + 1));
-    int id = k_ninsts++;
+    int id = k_ninsts++;                 /* id assigned BEFORE init runs (DFS pre-order) */
     int ns = COMPS[comp_idx].nslots;
     k_insts[id].comp = comp_idx;
     k_insts[id].nslots = ns;
     k_insts[id].slots = (KValue*)malloc(sizeof(KValue) * (ns > 0 ? ns : 1));
-    for (int i = 0; i < ns; i++) k_insts[id].slots[i] = k_unit();
+    for (int i = 0; i < ns; i++) k_insts[id].slots[i] = (i < nprops) ? props[i] : k_unit();
+    k_insts[id].wires = 0; k_insts[id].nwires = 0; k_insts[id].restart_on_failure = 0;
     int saved = k_cur_inst;
     k_cur_inst = id;
-    CHUNKS[COMPS[comp_idx].init_chunk](0, 0);
+    CHUNKS[COMPS[comp_idx].init_chunk](0, 0);   /* children created here get higher ids */
     k_cur_inst = saved;
     return id;
 }
 
 static KValue k_state_get(int slot) { return k_insts[k_cur_inst].slots[slot]; }
 static void k_state_set(int slot, KValue v) { k_insts[k_cur_inst].slots[slot] = v; }
+
+static void k_wire(int from, const char* out_port, int to, const char* in_port) {
+    KInstance* s = &k_insts[from];
+    s->wires = (KWire*)realloc(s->wires, sizeof(KWire) * (s->nwires + 1));
+    s->wires[s->nwires].out_port = out_port;
+    s->wires[s->nwires].to = to;
+    s->wires[s->nwires].in_port = in_port;
+    s->nwires++;
+}
+
+/* emit on the CURRENT instance's out port: fan out to wired targets in push
+   order; if none and print_unwired, print "{comp}.{port} = {value}". */
+static void k_emit(const char* port, KValue value) {
+    KInstance* inst = &k_insts[k_cur_inst];
+    int found = 0;
+    for (int i = 0; i < inst->nwires; i++) {
+        if (!strcmp(inst->wires[i].out_port, port)) {
+            found = 1;
+            k_enqueue(inst->wires[i].to, inst->wires[i].in_port, value);
+        }
+    }
+    if (!found && k_print_unwired) {
+        printf("%s.%s = %s\n", COMPS[inst->comp].name, port, k_show(value));
+    }
+}
+
+/* drain the queue to quiescence: pop front, dispatch by first-match handler */
+static void k_drain(void) {
+    while (k_qhead < k_qlen) {
+        KMsg m = k_queue[k_qhead++];
+        KInstance* inst = &k_insts[m.id];
+        const KCompMeta* cm = &COMPS[inst->comp];
+        for (int i = 0; i < cm->nhandlers; i++) {
+            if (!strcmp(cm->handlers[i].port, m.port)) {
+                int saved = k_cur_inst;
+                k_cur_inst = m.id;
+                if (cm->handlers[i].has_param) { KValue a = m.value; CHUNKS[cm->handlers[i].chunk](0, &a); }
+                else CHUNKS[cm->handlers[i].chunk](0, 0);
+                k_cur_inst = saved;
+                break;   /* linear first-match */
+            }
+        }
+    }
+}
+
+/* run a named lifecycle handler (@start/@stop) on an instance, if present */
+static void k_run_lifecycle(int id, const char* key) {
+    const KCompMeta* cm = &COMPS[k_insts[id].comp];
+    for (int i = 0; i < cm->nhandlers; i++) {
+        if (!strcmp(cm->handlers[i].port, key)) {
+            int saved = k_cur_inst; k_cur_inst = id;
+            CHUNKS[cm->handlers[i].chunk](0, 0);
+            k_cur_inst = saved;
+            return;
+        }
+    }
+}
 "#;
 
 #[cfg(test)]
@@ -1999,16 +2120,47 @@ mod tests {
         let _ = std::fs::remove_file(&bin);
     }
 
-    /// Multi-component constructs (children/wires/emit) defer with a clear error,
-    /// never a crash or bad C.
+    /// A multi-component app (children + wires + emit) compiles to native and
+    /// matches the interpreter, exercising the message queue and drain.
     #[test]
-    fn native_multi_component_defers() {
-        let src = "component Child {\n    out v: Int\n    on start { emit v(1) }\n}\n\
-                   app A {\n    let c = Child()\n    on start { }\n}\n";
+    fn native_multi_component_wires() {
+        if !cc_available() {
+            return;
+        }
+        // Driver emits three ticks into Sink via a wire; Sink accumulates + prints.
+        let src = "component Sink {\n    in tick: Int\n    state total: Int = 0\n    \
+                   on tick(n) {\n        total = total + n\n        print(\"total={total}\")\n    }\n}\n\
+                   component Driver {\n    out pulse: Int\n    \
+                   on start {\n        emit pulse(10)\n        emit pulse(20)\n        emit pulse(30)\n    }\n}\n\
+                   app A {\n    let sink = Sink()\n    let driver = Driver()\n    \
+                   wire driver.pulse -> sink.tick\n}\n";
         let compiled = crate::run::compile(src).expect("program compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
             .expect("module compiles");
-        let err = super::emit_c(&module).expect_err("native must defer child components");
-        assert!(err.contains("not yet supported"), "clear defer message: {err}");
+        let c = super::emit_c(&module).expect("multi-component app compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-mc-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "total=10\ntotal=30\ntotal=60\n");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Timers still defer with a clear error (a later native slice).
+    #[test]
+    fn native_timers_defer() {
+        let src = "app A {\n    state n: Int = 0\n    on every 1s { n = n + 1 }\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let err = super::emit_c(&module).expect_err("native must defer timers");
+        assert!(err.contains("timers are not yet supported"), "clear defer message: {err}");
     }
 }

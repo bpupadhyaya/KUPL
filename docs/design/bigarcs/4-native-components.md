@@ -1,3 +1,13 @@
+> **Progress:** slice 2 landed (it37) — native MULTI-COMPONENT apps. The C
+> runtime now mirrors vm.rs: KInstance wires (append-order), a FIFO message
+> queue, k_wire/k_emit/k_drain, and props-aware k_instantiate. MakeInstance/
+> WireOp/EmitOp compile to real calls; app main() instantiates the app, runs
+> @start for every instance (parents before children), and drains to
+> quiescence. Byte-identity holds: creation-order ids, @start order, FIFO
+> dispatch, wire push-order, and the print_unwired format all mirror vm.rs —
+> counter/todo/native-counter native output == `kupl run`. Timers, supervision,
+> and cross-component `CallComp` expose calls still defer with a clear error.
+>
 > **Progress:** slice 1 landed (it36) — native SINGLE-COMPONENT apps. `kupl
 > native` now compiles an `app` with instance state + an `on start` handler to
 > machine code (a KCompMeta COMPS[] table, a KInstance runtime with

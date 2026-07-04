@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 158 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 159 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -255,7 +255,7 @@ component manifests; an LSP server; and four verified execution modes.
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~21,800 lines of dependency-free Rust, 158 tests, all engines differentially
+~22,000 lines of dependency-free Rust, 159 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and
