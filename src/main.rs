@@ -8,7 +8,8 @@ Usage:
   kupl run <file.kupl> [--vm]       Run the app / `fun main` (--vm: on the KVM bytecode VM)
   kupl run <file.kx>                Run a compiled .kx module on the KVM
   kupl build <file.kupl> [-o f.kx]  Compile to a .kx bytecode module
-  kupl bundle <file.kupl> [-o app]  Produce a self-contained native executable
+  kupl bundle <file.kupl> [-o app]  Produce a self-contained executable (VM + module)
+  kupl native <file.kupl> [-o app]  Compile to machine code via C (fun main; --keep-c)
   kupl dis <file.kupl>              Disassemble the compiled KVM bytecode
   kupl test <file.kupl>             Run `example` blocks + contract laws as tests
   kupl check <file.kupl> [--json]   Parse, type-check, and effect-check
@@ -62,6 +63,7 @@ fn main() -> ExitCode {
         Some("run") if vm => with_path(&args, run::run_program_vm),
         Some("run") => with_path(&args, run::run_program),
         Some("dis") => with_path(&args, run::disassemble),
+        Some("native") => with_path(&args, |path| run::native(path, &args)),
         Some("manifest") => with_path(&args, run::emit_manifest),
         Some("build") => with_file(&args, |src, file| {
             build_module(&args, src, file, false)

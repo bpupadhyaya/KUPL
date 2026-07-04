@@ -457,6 +457,61 @@ pub fn emit_manifest(path: &str) -> i32 {
     0
 }
 
+/// `kupl native`: emit C from the bytecode and compile with the system cc.
+pub fn native(path: &str, args: &[String]) -> i32 {
+    let Ok((compiled, map)) = load_compile(path) else { return 1 };
+    let module = match crate::compile::compile_module(&compiled.program, &compiled.checked) {
+        Ok(m) => m,
+        Err(diags) => {
+            print_diags_map(&diags, &map);
+            return 1;
+        }
+    };
+    let c_src = match crate::cgen::emit_c(&module) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let out = args
+        .iter()
+        .position(|a| a == "-o")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| path.trim_end_matches(".kupl").to_string());
+    let c_path = format!("{out}.c");
+    if let Err(e) = std::fs::write(&c_path, &c_src) {
+        eprintln!("error: cannot write {c_path}: {e}");
+        return 1;
+    }
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = std::process::Command::new(&cc)
+        .args(["-O2", "-o", &out, &c_path])
+        .status();
+    let keep_c = args.iter().any(|a| a == "--keep-c");
+    match status {
+        Ok(s) if s.success() => {
+            if !keep_c {
+                let _ = std::fs::remove_file(&c_path);
+            }
+            println!(
+                "native executable: {out}{}",
+                if keep_c { format!(" (C source: {c_path})") } else { String::new() }
+            );
+            0
+        }
+        Ok(s) => {
+            eprintln!("error: {cc} failed with {s} (C source kept at {c_path})");
+            1
+        }
+        Err(e) => {
+            eprintln!("error: cannot run {cc}: {e} (C source kept at {c_path})");
+            1
+        }
+    }
+}
+
 /// Execute an already-compiled module: the first `app`, else `fun main`.
 pub fn run_module(module: &crate::bytecode::Module, origin: &str) -> i32 {
     let mut vm = crate::vm::Vm::new(module);

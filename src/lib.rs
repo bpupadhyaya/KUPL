@@ -6,6 +6,7 @@
 
 pub mod ast;
 pub mod bytecode;
+pub mod cgen;
 pub mod check;
 pub mod compile;
 pub mod diag;

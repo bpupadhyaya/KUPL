@@ -30,6 +30,7 @@ kupl run --vm examples/shapes.kupl  # same program on the KVM bytecode VM
 kupl build examples/todo.kupl     # compile to a .kx bytecode module
 kupl run examples/todo.kx         # run the compiled module directly
 kupl bundle examples/counter.kupl -o counter-app   # self-contained executable
+kupl native examples/shapes.kupl -o shapes  # TRUE machine code via C (fun main)
 kupl dis examples/shapes.kupl     # disassemble the compiled bytecode
 kupl test examples/counter.kupl   # run `example` blocks as tests
 kupl check examples/todo.kupl     # parse + type-check + effect-check
@@ -78,6 +79,6 @@ minimal LLM prompts.
 Next phases (see `docs/design/TOOLCHAIN.md`): contracts & laws, KIR, the KVM
 bytecode VM, native compilation, and the tensor/kernel hardware story.
 
-Status: v0.6 — interpreter, REPL, formatter, effects, contracts+laws, KVM bytecode VM (functional core + full component apps, differentially tested), .kx modules, self-contained executables (kupl bundle)
+Status: v0.8 — interpreter, REPL, formatter, effects, contracts+laws, KVM bytecode VM (functional core + full component apps + supervision, differentially tested), .kx modules, self-contained executables (kupl bundle), native machine-code compilation via C (kupl native), multi-file modules, component manifests
 (2026-07-03); design proposal in `docs/design/`. The pre-2026 Scala/Java
 scaffold lives in `attic/`.
