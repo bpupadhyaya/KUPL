@@ -16,6 +16,12 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     let Some(&main_idx) = module.funs.get("main") else {
         return Err("`kupl native` needs a `fun main()` (component apps: use `kupl bundle`)".into());
     };
+    if !module.ai_funs.is_empty() {
+        return Err(format!(
+            "`ai fun {}` is not supported by the native backend yet — use `kupl run`, `kupl run --vm`, or `kupl bundle`",
+            module.ai_funs[0].name
+        ));
+    }
 
     let mut out = String::new();
     out.push_str(RUNTIME);
@@ -197,6 +203,10 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
         | CallComp { .. } => {
             "k_panic(\"components are not supported by the native backend v0 (use kupl bundle)\");"
                 .to_string()
+        }
+        // emit_c rejects modules with ai funs before reaching here
+        CallAi { .. } => {
+            "k_panic(\"ai funs are not supported by the native backend yet\");".to_string()
         }
         Panic(idx) => {
             let m = str_const(chunk, *idx)?;

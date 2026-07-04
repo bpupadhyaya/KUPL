@@ -209,7 +209,12 @@ impl Parser {
                 Ok(None) => {}
                 Err(d) => {
                     self.diags.push(d);
+                    let before = self.pos;
                     self.synchronize();
+                    // never loop without progress (e.g. a stray top-level `}`)
+                    if self.pos == before && !matches!(self.peek(), Tok::Eof) {
+                        self.bump();
+                    }
                 }
             }
         }
@@ -219,6 +224,13 @@ impl Parser {
 
     fn parse_item(&mut self) -> PResult<Option<Item>> {
         let is_pub = self.eat(&Tok::KwPub);
+        // `ai` is a soft keyword: only special directly before `fun`.
+        if matches!(self.peek(), Tok::Ident(n) if n == "ai")
+            && matches!(self.peek_at(1), Tok::KwFun)
+        {
+            self.bump();
+            return Ok(Some(Item::Fun(self.parse_ai_fun(is_pub)?)));
+        }
         match self.peek() {
             Tok::KwFun | Tok::KwAsync => Ok(Some(Item::Fun(self.parse_fun(is_pub)?))),
             Tok::KwType => Ok(Some(Item::Type(self.parse_type_decl()?))),
@@ -297,7 +309,67 @@ impl Parser {
         };
         let body = self.parse_block()?;
         let span = start.merge(body.span);
-        Ok(FunDecl { name, type_params, params, ret, effects, body, is_pub, span })
+        Ok(FunDecl { name, type_params, params, ret, effects, body, is_pub, ai: None, span })
+    }
+
+    /// `ai fun name(params) -> T { intent "..." [model "..."] }`
+    fn parse_ai_fun(&mut self, is_pub: bool) -> PResult<FunDecl> {
+        let start = self.expect(Tok::KwFun)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(Tok::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(Tok::RParen)?;
+        let mut effects = Vec::new();
+        if self.eat(&Tok::KwUses) {
+            loop {
+                let (eff, _) = self.expect_ident()?;
+                effects.push(eff);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        let ret = if self.eat(&Tok::Arrow) { Some(self.parse_ty()?) } else { None };
+        self.expect(Tok::LBrace)?;
+        self.skip_newlines();
+        let bad_body = |span| {
+            Diag::error(
+                "K0119",
+                "an `ai fun` body is `intent \"...\"` optionally followed by `model \"...\"`",
+                span,
+            )
+        };
+        if !self.at(&Tok::KwIntent) {
+            return Err(bad_body(self.span()));
+        }
+        self.bump();
+        let intent = match self.bump() {
+            Tok::Str(parts) => str_parts_text(&parts),
+            _ => return Err(bad_body(self.prev_span())),
+        };
+        self.skip_newlines();
+        let mut model = None;
+        if matches!(self.peek(), Tok::Ident(n) if n == "model") {
+            self.bump();
+            model = match self.bump() {
+                Tok::Str(parts) => Some(str_parts_text(&parts)),
+                _ => return Err(bad_body(self.prev_span())),
+            };
+            self.skip_newlines();
+        }
+        let end = self.expect(Tok::RBrace).map_err(|_| bad_body(self.span()))?;
+        let span = start.merge(end);
+        Ok(FunDecl {
+            name,
+            type_params: Vec::new(),
+            params,
+            ret,
+            effects,
+            body: Block { stmts: Vec::new(), span },
+            is_pub,
+            ai: Some(AiDecl { intent, model }),
+            span,
+        })
     }
 
     fn parse_params(&mut self) -> PResult<Vec<Param>> {
@@ -1501,6 +1573,34 @@ app Main {
     #[test]
     fn parse_lambda_and_methods() {
         let p = ok("fun f(xs: List[Int]) -> List[Int] {\n    xs.filter(fn x { x > 1 }).map(fn x { x * 2 })\n}\n");
+        assert_eq!(p.items.len(), 1);
+    }
+
+    #[test]
+    fn parse_ai_fun() {
+        let p = ok("ai fun haiku(topic: Str) -> Str {\n    intent \"Write a haiku.\"\n    model \"claude-opus-4-8\"\n}\n");
+        match &p.items[0] {
+            Item::Fun(f) => {
+                let ai = f.ai.as_ref().expect("is an ai fun");
+                assert_eq!(ai.intent, "Write a haiku.");
+                assert_eq!(ai.model.as_deref(), Some("claude-opus-4-8"));
+                assert_eq!(f.params.len(), 1);
+            }
+            other => panic!("expected fun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ai_is_still_an_ordinary_identifier() {
+        let p = ok("fun f(ai: Int) -> Int {\n    let ai = ai + 1\n    ai\n}\n");
+        assert_eq!(p.items.len(), 1);
+    }
+
+    #[test]
+    fn stray_top_level_brace_terminates() {
+        // regression: error recovery must always make progress
+        let (p, diags) = parse("}\n}\nfun f() -> Int {\n    1\n}\n");
+        assert!(!diags.is_empty());
         assert_eq!(p.items.len(), 1);
     }
 }

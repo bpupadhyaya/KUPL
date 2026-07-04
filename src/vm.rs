@@ -376,6 +376,17 @@ impl<'m> Vm<'m> {
                         e
                     })?;
                 }
+                Op::CallAi { dst, info } => {
+                    let Some(meta) = self.module.ai_funs.get(info as usize) else {
+                        return Err(VmError { msg: "unknown ai fun".into(), span });
+                    };
+                    let args: Vec<Value> =
+                        (0..chunk.nparams).map(|i| reg!(chunk.ncaps + i)).collect();
+                    match crate::ai::ai_call(meta, &args) {
+                        Ok(v) => set!(dst, v),
+                        Err(msg) => return Err(VmError { msg, span }),
+                    }
+                }
                 Op::CallBuiltin { dst, which, start, argc } => {
                     let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
                     match which {
@@ -889,5 +900,54 @@ component Store {
         assert_eq!(v_log[2], "v2");
         assert_eq!(v_log[3], "preloaded:alpha");
         assert_eq!(v_log[5], "2 entries, 1 loads"); // alpha + k (v2 overwrote v1)
+    }
+
+    #[test]
+    fn diff_ai_fun_mock_provider() {
+        // Deterministic mock responses; per-fun vars avoid cross-test races.
+        std::env::set_var("KUPL_AI_MOCK_DIFF_SUMMARIZE", "  a short summary  ");
+        std::env::set_var(
+            "KUPL_AI_MOCK_DIFF_JUDGE",
+            "{\"value\":{\"label\":\"positive\",\"score\":0.75}}",
+        );
+        std::env::set_var("KUPL_AI_MOCK_DIFF_BROKEN", "this is not json");
+        let src = "type Verdict = { label: Str, score: Float }\n\
+ai fun diff_summarize(text: Str) -> Str {\n    intent \"Summarize.\"\n}\n\
+ai fun diff_judge(text: Str) -> Result[Verdict, Str] {\n    intent \"Judge.\"\n}\n\
+ai fun diff_broken(text: Str) -> Result[Int, Str] {\n    intent \"Count.\"\n}\n\
+fun probe() -> Str {\n\
+    let s = diff_summarize(\"x\")\n\
+    let judged = match diff_judge(\"x\") {\n        Ok(v) => \"{v.label}:{v.score}\"\n        Err(e) => \"err\"\n    }\n\
+    let broken = match diff_broken(\"x\") {\n        Ok(n) => \"ok\"\n        Err(e) => \"captured\"\n    }\n\
+    \"{s}|{judged}|{broken}\"\n\
+}\n";
+        assert_eq!(differential(src), "a short summary|positive:0.75|captured");
+    }
+
+    #[test]
+    fn ai_fun_kx_roundtrip() {
+        std::env::set_var("KUPL_AI_MOCK_KX_HAIKU", "one two three");
+        let src = "ai fun kx_haiku(topic: Str) -> Str {\n    intent \"Haiku.\"\n}\n\
+fun probe() -> Str {\n    kx_haiku(\"t\")\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let bytes = crate::kx::encode(&module);
+        let decoded = crate::kx::decode(&bytes).expect("decodes");
+        assert_eq!(module.ai_funs, decoded.ai_funs);
+        let mut vm = Vm::new(&decoded);
+        let v = vm.call_named("probe", vec![]).expect("runs");
+        assert_eq!(v.to_string(), "one two three");
+    }
+
+    #[test]
+    fn ai_fun_native_backend_rejects() {
+        let src = "ai fun nat_x(t: Str) -> Str {\n    intent \"X.\"\n}\n\
+fun main() {\n    print(nat_x(\"t\"))\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let err = crate::cgen::emit_c(&module).expect_err("native must reject ai funs");
+        assert!(err.contains("not supported by the native backend"), "{err}");
     }
 }

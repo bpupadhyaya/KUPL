@@ -244,6 +244,27 @@ impl<'a> Lexer<'a> {
                             }
                             Some(b'{') => depth += 1,
                             Some(b'}') => depth -= 1,
+                            // nested string literal: skip it whole, so quotes
+                            // and braces inside it don't confuse the scan —
+                            // `"{xs.join(", ")}"` works without escaping
+                            Some(b'"') => loop {
+                                match self.bump() {
+                                    None | Some(b'\n') => {
+                                        self.diags.push(Diag::error(
+                                            "K0007",
+                                            "unterminated `{` interpolation in string",
+                                            self.span_from(expr_start),
+                                        ));
+                                        depth = 0;
+                                        break;
+                                    }
+                                    Some(b'\\') => {
+                                        self.bump();
+                                    }
+                                    Some(b'"') => break,
+                                    _ => {}
+                                }
+                            },
                             _ => {}
                         }
                     }
@@ -455,6 +476,20 @@ mod tests {
                 assert_eq!(parts[0], StrPart::Text("hi ".into()));
                 assert!(matches!(&parts[1], StrPart::Expr(s, _) if s == "name"));
                 assert_eq!(parts[2], StrPart::Text("!".into()));
+            }
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpolation_with_nested_string() {
+        // quotes inside an interpolation are a nested literal, no escaping:
+        let (toks, diags) = lex("\"keywords: {ks.join(\", \")}\"");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &toks[0].tok {
+            Tok::Str(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[1], StrPart::Expr(s, _) if s == "ks.join(\", \")"));
             }
             other => panic!("expected string, got {other:?}"),
         }

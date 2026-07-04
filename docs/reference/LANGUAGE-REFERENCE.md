@@ -214,6 +214,64 @@ pub fun broadcast(msg: Str) uses io {   // public: effects MUST be declared
   pass them by name or as lambdas; calls through variables are supported
   (their effects are not tracked in v1.0-alpha — documented limitation).
 
+### 6.1 AI-native functions (`ai fun`)
+
+An `ai fun` is a **typed prompt function**: the body is an intent, not code.
+Calling it sends the intent plus the rendered arguments to an LLM provider
+and converts the response to the declared return type.
+
+```kupl
+type Sentiment = { label: Str, score: Float }
+
+ai fun haiku(topic: Str) -> Str {
+    intent "Write a haiku about the topic."
+}
+
+ai fun classify(review: Str) -> Result[Sentiment, Str] {
+    intent "Classify the sentiment with a confidence between 0 and 1."
+    model "claude-opus-4-8"          // optional per-function override
+}
+```
+
+Rules:
+
+- The **return type drives structured output**. `-> Str` returns the model's
+  text. Any other supported type is requested as JSON (with a machine-derived
+  JSON Schema) and parsed into a real KUPL value. Supported: `Str`, `Int`,
+  `Float`, `Bool`, `List[T]`, `Option[T]`, and record types whose fields are
+  supported (K0271 otherwise; a return type is required — K0270).
+- Declaring `-> Result[T, Str]` makes the call **total**: provider failures,
+  refusals, and malformed responses come back as `Err(message)`. Any other
+  return type panics on failure (supervision applies, §9).
+- An `ai fun` performs the **`ai` effect**; the keyword itself is the
+  boundary declaration. Callers are checked as usual: a `pub fun` that calls
+  one must declare `uses ai`.
+- Arguments are rendered into the prompt as `name: value` lines using
+  Display form; the intent should refer to parameters by name.
+- `ai fun`s are declared at the top level (components call them freely) and
+  cannot be generic. Bodies allow exactly `intent "…"` and an optional
+  `model "…"` (K0119).
+
+**Providers** are selected at run time — the program text stays portable:
+
+| `KUPL_AI_PROVIDER` | Endpoint | Auth / model |
+|---|---|---|
+| `anthropic` (default) | Anthropic Messages API | `ANTHROPIC_API_KEY`; model `claude-opus-4-8` unless overridden; structured output uses native JSON-schema enforcement |
+| `openai` | any OpenAI-compatible `/v1/chat/completions` (`KUPL_AI_BASE_URL`) | `OPENAI_API_KEY`; `KUPL_AI_MODEL` required |
+| `ollama` | local OpenAI-compatible endpoint (default `http://localhost:11434`) | no key; `KUPL_AI_MODEL` required |
+| `mock` | none — deterministic | response text from `KUPL_AI_MOCK_<FUN_NAME>` or `KUPL_AI_MOCK` |
+
+If `KUPL_AI_MOCK`/`KUPL_AI_MOCK_<FUN_NAME>` is set, the mock provider is used
+regardless of `KUPL_AI_PROVIDER` — this is how `ai fun`s are tested: examples
+and differential tests run byte-identical on every engine with no network.
+For structured shapes the mock text (and any provider's reply) may be either
+the documented wire form `{"value": <payload>}` or the bare payload; markdown
+code fences are stripped. `KUPL_AI_MODEL` overrides the default model for any
+provider; a `model "…"` clause in the function wins over both.
+
+`ai fun`s run on the interpreter, the KVM, and inside `.kx`/bundles. The
+native backend rejects programs containing them with a clear error (planned).
+
 ## 7. Components
 
 The component is the universal unit. Every instance is an isolated actor:
@@ -324,7 +382,7 @@ component MemoryStore fulfills KeyStore { … }
 | REPL | `kupl repl` | expressions, definitions, live redefinition |
 | Interpreter | `kupl run` | everything (reference semantics) |
 | KVM bytecode VM | `kupl run --vm`, `.kx`, `bundle` | everything |
-| Native (C) | `kupl native` | `fun main` programs (components **[design]** for native) |
+| Native (C) | `kupl native` | `fun main` programs (components and `ai fun` **[design]** for native) |
 
 The interpreter defines the semantics; the VM and native backend are held to
 it by differential tests. Known intentional VM/native limits: assignment to a

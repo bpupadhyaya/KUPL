@@ -29,6 +29,8 @@ pub struct ProgramDb {
     pub contracts: HashMap<String, Rc<ContractDecl>>,
     /// variant name -> (type name, field names)
     pub ctors: HashMap<String, (String, Vec<String>)>,
+    /// `ai fun` runtime signatures (from the checker).
+    pub ai_funs: HashMap<String, Rc<crate::ai::AiFunMeta>>,
 }
 
 impl ProgramDb {
@@ -57,7 +59,12 @@ impl ProgramDb {
                 (name.clone(), (ty.clone(), fields.iter().map(|(n, _)| n.clone()).collect()))
             })
             .collect();
-        ProgramDb { funs, components, contracts, ctors }
+        let ai_funs = checked
+            .ai_funs
+            .iter()
+            .map(|(name, meta)| (name.clone(), Rc::new(meta.clone())))
+            .collect();
+        ProgramDb { funs, components, contracts, ctors, ai_funs }
     }
 }
 
@@ -770,6 +777,15 @@ impl Interp {
                 ),
                 span,
             ));
+        }
+        if decl.ai.is_some() {
+            let Some(meta) = self.db.ai_funs.get(&decl.name).cloned() else {
+                return Err(Self::panic_flow(
+                    format!("ai fun `{}` has no runtime signature", decl.name),
+                    span,
+                ));
+            };
+            return crate::ai::ai_call(&meta, &args).map_err(|m| Self::panic_flow(m, span));
         }
         let scope = base_env.child();
         for (p, a) in decl.params.iter().zip(args) {

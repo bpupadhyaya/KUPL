@@ -16,6 +16,20 @@ and known limitations called out in commit messages. Checked off as landed.
       (checker-level instantiation; engines are ready)
 - [x] **Map[K, V] and Set[T]** collections (design §3)
 
+## Tier 1.5 — AI-native core (active)
+
+- [x] **`ai fun` typed prompt functions** — intent-bodied functions whose
+      return type drives structured output (JSON Schema derived from the
+      type); `Result[T, Str]` captures failures; implicit `ai` effect;
+      provider-agnostic runtime (anthropic / openai-compatible / ollama /
+      deterministic mock via `KUPL_AI_MOCK*`); interpreter + KVM + `.kx`
+      (native rejects with a clear error)
+- [ ] **Agent components** — conversation state in a component; `ai` handlers
+      with tool use (expose KUPL functions as tools to the model)
+- [ ] **Prompt-context builders** — `kupl context` output as a first-class
+      value; embeddings + similarity as stdlib
+- [ ] **`ai fun` on the native backend** (libcurl or platform HTTP)
+
 ## Tier 2 — component model completion
 
 - [ ] **Contract-typed requires** — `prop repo: TodoRepo` accepting any

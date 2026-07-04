@@ -86,6 +86,11 @@ pub enum Op {
 
     /// Unconditional panic with message consts[idx].
     Panic(u16),
+
+    /// dst <- ai_funs[info](frame params). The entire body of a compiled
+    /// `ai fun` chunk: reads the frame's parameter registers, performs the
+    /// provider call, converts the response per the stored shape.
+    CallAi { dst: Reg, info: u16 },
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +145,8 @@ pub struct Module {
     pub ctor_field_names: std::collections::HashMap<String, Vec<String>>,
     pub components: Vec<ComponentMeta>,
     pub component_names: std::collections::HashMap<String, u16>,
+    /// `ai fun` runtime signatures, indexed by `Op::CallAi`.
+    pub ai_funs: Vec<crate::ai::AiFunMeta>,
 }
 
 pub const BUILTIN_PRINT: u8 = 0;

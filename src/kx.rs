@@ -11,7 +11,7 @@ use crate::bytecode::*;
 use crate::diag::Span;
 use crate::value::Value;
 
-pub const KX_MAGIC: &[u8; 8] = b"KUPLKX01";
+pub const KX_MAGIC: &[u8; 8] = b"KUPLKX02";
 /// Trailer magic at the very end of a bundled executable.
 pub const BUNDLE_MAGIC: &[u8; 8] = b"KUPLBNDL";
 
@@ -133,7 +133,54 @@ pub fn encode(m: &Module) -> Vec<u8> {
         }
     }
 
+    w.u32(m.ai_funs.len() as u32);
+    for a in &m.ai_funs {
+        w.s(&a.name);
+        w.s(&a.intent);
+        match &a.model {
+            Some(model) => {
+                w.u8(1);
+                w.s(model);
+            }
+            None => w.u8(0),
+        }
+        w.u32(a.params.len() as u32);
+        for p in &a.params {
+            w.s(p);
+        }
+        encode_shape(&mut w, &a.shape);
+        w.u8(a.wraps_result as u8);
+    }
+
     w.buf
+}
+
+fn encode_shape(w: &mut W, shape: &crate::ai::AiShape) {
+    use crate::ai::AiShape::*;
+    match shape {
+        Str => w.u8(0),
+        Int => w.u8(1),
+        Float => w.u8(2),
+        Bool => w.u8(3),
+        List(inner) => {
+            w.u8(4);
+            encode_shape(w, inner);
+        }
+        Option(inner) => {
+            w.u8(5);
+            encode_shape(w, inner);
+        }
+        Record { ty, variant, fields } => {
+            w.u8(6);
+            w.s(ty);
+            w.s(variant);
+            w.u32(fields.len() as u32);
+            for (name, s) in fields {
+                w.s(name);
+                encode_shape(w, s);
+            }
+        }
+    }
 }
 
 fn encode_const(w: &mut W, v: &Value) {
@@ -356,6 +403,11 @@ fn encode_op(w: &mut W, op: &Op) {
             w.u8(*start);
             w.u8(*argc);
         }
+        CallAi { dst, info } => {
+            w.u8(43);
+            w.u8(*dst);
+            w.u16(*info);
+        }
         WithField { dst, obj, name, value } => {
             w.u8(40);
             w.u8(*dst);
@@ -523,7 +575,46 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         });
     }
 
+    let nai = r.u32()?;
+    for _ in 0..nai {
+        let name = r.s()?;
+        let intent = r.s()?;
+        let model = if r.u8()? != 0 { Some(r.s()?) } else { None };
+        let nparams = r.u32()?;
+        let mut params = Vec::with_capacity(nparams as usize);
+        for _ in 0..nparams {
+            params.push(r.s()?);
+        }
+        let shape = decode_shape(&mut r)?;
+        let wraps_result = r.u8()? != 0;
+        m.ai_funs.push(crate::ai::AiFunMeta { name, intent, model, params, shape, wraps_result });
+    }
+
     Ok(m)
+}
+
+fn decode_shape(r: &mut R) -> DecodeResult<crate::ai::AiShape> {
+    use crate::ai::AiShape::*;
+    Ok(match r.u8()? {
+        0 => Str,
+        1 => Int,
+        2 => Float,
+        3 => Bool,
+        4 => List(Box::new(decode_shape(r)?)),
+        5 => Option(Box::new(decode_shape(r)?)),
+        6 => {
+            let ty = r.s()?;
+            let variant = r.s()?;
+            let n = r.u32()?;
+            let mut fields = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let name = r.s()?;
+                fields.push((name, decode_shape(r)?));
+            }
+            Record { ty, variant, fields }
+        }
+        t => return Err(format!("unknown ai shape tag {t}")),
+    })
 }
 
 fn decode_const(r: &mut R) -> DecodeResult<Value> {
@@ -593,6 +684,7 @@ fn decode_op(r: &mut R) -> DecodeResult<Op> {
         39 => Panic(r.u16()?),
         40 => WithField { dst: r.u8()?, obj: r.u8()?, name: r.u16()?, value: r.u8()? },
         42 => CallComp { dst: r.u8()?, fun: r.u16()?, start: r.u8()?, argc: r.u8()? },
+        43 => CallAi { dst: r.u8()?, info: r.u16()? },
         t => return Err(format!("unknown opcode {t}")),
     })
 }

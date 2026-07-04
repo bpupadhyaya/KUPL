@@ -112,12 +112,19 @@ Prints the toolchain version.
 | Variable | Used by | Meaning |
 |---|---|---|
 | `CC` | `kupl native` | C compiler to invoke (default `cc`) |
+| `KUPL_AI_PROVIDER` | `ai fun` calls | `anthropic` (default) · `openai` · `ollama` · `mock` |
+| `ANTHROPIC_API_KEY` | anthropic provider | API key for the Messages API |
+| `OPENAI_API_KEY` | openai provider | bearer token (optional for ollama) |
+| `KUPL_AI_MODEL` | `ai fun` calls | model id; required for openai/ollama, overrides the anthropic default (`claude-opus-4-8`) |
+| `KUPL_AI_BASE_URL` | `ai fun` calls | endpoint base override (e.g. a proxy, or a remote Ollama) |
+| `KUPL_AI_MOCK` | `ai fun` calls | canned response text — forces the deterministic mock provider (no network) |
+| `KUPL_AI_MOCK_<FUN>` | `ai fun` calls | per-function canned response (fun name upper-cased); wins over `KUPL_AI_MOCK` |
 
 ## Artifact formats
 
 | Format | Produced by | Notes |
 |---|---|---|
-| `.kx` | `build` | binary module: chunks, constants, ctor table, component metadata; magic `KUPLKX01`, little-endian |
+| `.kx` | `build` | binary module: chunks, constants, ctor table, component metadata, ai-fun signatures; magic `KUPLKX02`, little-endian |
 | bundle | `bundle` | `[kupl binary][.kx][u64 length]["KUPLBNDL"]` — the runtime detects its own trailer at startup |
 | `.c` / executable | `native` | generated C embeds a ~400-line runtime mirroring interpreter semantics |
 | `.kman` JSON | `manifest` | printed to stdout |

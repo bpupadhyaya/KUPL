@@ -243,6 +243,10 @@ pub fn run_program(path: &str) -> i32 {
         _ => None,
     });
     let db = ProgramDb::build(&compiled.program, &compiled.checked);
+    if app.is_none() && !db.funs.contains_key("main") {
+        eprintln!("error: no `app` or `fun main()` found in {file}");
+        return 2;
+    }
     let mut interp = Interp::new(db);
     interp.print_unwired = true;
 

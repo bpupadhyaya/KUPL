@@ -42,6 +42,7 @@ Severity: **E** = error, **W** = warning.
 | K0116 | E | unexpected token in contract body |
 | K0117 | E | expected `restart` after the child name in `supervise` |
 | K0118 | E | unknown restart policy (use `on_failure` or `never`) |
+| K0119 | E | an `ai fun` body is `intent "…"` optionally followed by `model "…"` |
 
 ## K02xx — Type & semantic checker
 
@@ -110,6 +111,8 @@ Severity: **E** = error, **W** = warning.
 | K0263 | E | exposed signature does not match the contract |
 | K0264 | E | exposed effects exceed the contract's budget |
 | K0265 | E | `supervise` references unknown child |
+| K0270 | E | `ai fun` must declare a return type (it defines the structured output) |
+| K0271 | E | `ai fun` return type not representable as structured output (unsupported/recursive/multi-variant type) |
 
 ## K03xx — Effects & style
 

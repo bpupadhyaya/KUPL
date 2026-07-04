@@ -31,6 +31,21 @@ component Counter {
 }
 ```
 
+AI is part of the language, not a library. An `ai fun` is a typed prompt
+function — its return type drives structured output, parsed into real values:
+
+```kupl
+type Sentiment = { label: Str, score: Float }
+
+ai fun classify(review: Str) -> Result[Sentiment, Str] {
+    intent "Classify the sentiment with a confidence between 0 and 1."
+}
+```
+
+Runs against Anthropic, any OpenAI-compatible endpoint, or Ollama — selected
+by environment, not code — and against a deterministic mock provider for
+tests (see `docs/reference/LANGUAGE-REFERENCE.md` §6.1).
+
 ---
 
 ## Installation
@@ -64,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 43 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 55 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -180,6 +195,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | File | Shows |
 |---|---|
 | `examples/counter.kupl` | components, typed ports, wiring, `example` tests |
+| `examples/ai.kupl` | `ai fun` typed prompt functions: text, structured records, lists, `Result` capture |
 | `examples/shapes.kupl` | functional core: ADTs, `match`, records, `Option`/`Result` + `?`, lambdas |
 | `examples/todo.kupl` | a small app: store + reporter, expose functions, message flow |
 | `examples/contracts.kupl` | contracts with executable `law`s (`kupl test` runs them) |
@@ -198,7 +214,7 @@ pure functions with **inferred + enforced effects** (`pub`/`expose` must declare
 `uses io` etc.); ADTs with exhaustive `match`, records, newtypes,
 `Option`/`Result` + `?`, lambdas, string interpolation; checked 64-bit integers
 (overflow panics, never wraps); first-class tensors with native numeric kernels;
-multi-file modules; the canonical formatter; semantic diff; JSON diagnostics;
+multi-file modules; `ai fun` typed prompt functions with structured output and a provider-agnostic runtime (Anthropic, OpenAI-compatible, Ollama, deterministic mock); the canonical formatter; semantic diff; JSON diagnostics;
 component manifests; an LSP server; and four verified execution modes.
 
 ## Reference documentation
@@ -206,7 +222,7 @@ component manifests; an LSP server; and four verified execution modes.
 - [`docs/reference/LANGUAGE-REFERENCE.md`](docs/reference/LANGUAGE-REFERENCE.md) — the language reference manual (as implemented): lexical structure, types, expressions, statements, functions & effects, components, contracts, supervision, semantics
 - [`docs/reference/STDLIB.md`](docs/reference/STDLIB.md) — built-in functions, constructors, and every method on List/Str/Int/Float/Option/Result/Tensor
 - [`docs/reference/CLI.md`](docs/reference/CLI.md) — every `kupl` command, flags, exit codes, artifact formats
-- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (97 diagnostics, grouped by phase)
+- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (100 diagnostics, grouped by phase)
 
 ## Design documents
 
@@ -218,7 +234,7 @@ component manifests; an LSP server; and four verified execution modes.
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~12,400 lines of dependency-free Rust, 43 tests, all engines differentially
+~14,300 lines of dependency-free Rust, 55 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

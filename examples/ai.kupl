@@ -1,0 +1,40 @@
+// ai fun — typed prompt functions. The return type drives structured output:
+// -> Str returns the model's text; any other supported type is requested as
+// JSON and parsed into a real KUPL value. Declaring -> Result[T, Str] captures
+// provider failures as Err instead of panicking.
+//
+// Providers: KUPL_AI_PROVIDER = anthropic (default) | openai | ollama | mock.
+// Deterministic runs (no network) for this example:
+//
+//   export KUPL_AI_MOCK_HAIKU="Code compiles at last / four engines, one behavior / the tests stay green"
+//   export KUPL_AI_MOCK_CLASSIFY='{"value":{"label":"positive","score":0.98}}'
+//   export KUPL_AI_MOCK_KEYWORDS='{"value":["kupl","ai","types"]}'
+//   kupl run examples/ai.kupl
+
+type Sentiment = { label: Str, score: Float }
+
+ai fun haiku(topic: Str) -> Str {
+    intent "Write a haiku about the topic. Respond with only the haiku."
+}
+
+ai fun classify(review: Str) -> Result[Sentiment, Str] {
+    intent "Classify the sentiment of the review as positive, negative, or neutral, with a confidence score between 0 and 1."
+}
+
+ai fun keywords(text: Str) -> Result[List[Str], Str] {
+    intent "Extract the 3 most important keywords from the text, lowercase."
+}
+
+fun main() uses io, ai {
+    print(haiku("a programming language"))
+
+    match classify("This language is a joy to use!") {
+        Ok(s) => print("sentiment: {s.label} ({s.score})"),
+        Err(e) => print("classification failed: {e}"),
+    }
+
+    match keywords("KUPL is an AI-first language with strong types") {
+        Ok(ks) => print("keywords: {ks.join(", ")}"),
+        Err(e) => print("keyword extraction failed: {e}"),
+    }
+}

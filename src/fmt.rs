@@ -74,6 +74,9 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
     if f.is_pub {
         out.push_str("pub ");
     }
+    if f.ai.is_some() {
+        out.push_str("ai ");
+    }
     out.push_str(&format!("fun {}", f.name));
     if !f.type_params.is_empty() {
         out.push_str(&format!("[{}]", f.type_params.join(", ")));
@@ -94,6 +97,18 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
         out.push_str(&format!(" -> {}", ty_str(r)));
     }
     out.push(' ');
+    if let Some(ai) = &f.ai {
+        out.push_str("{\n");
+        indent(out, level + 1);
+        out.push_str(&format!("intent \"{}\"\n", escape_str(&ai.intent)));
+        if let Some(model) = &ai.model {
+            indent(out, level + 1);
+            out.push_str(&format!("model \"{}\"\n", escape_str(model)));
+        }
+        indent(out, level);
+        out.push_str("}\n");
+        return;
+    }
     fmt_block(out, &f.body, level);
     out.push('\n');
 }

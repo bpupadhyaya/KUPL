@@ -4,6 +4,7 @@
 //! lexer → parser → type/effect checker → tree-walking interpreter with a
 //! deterministic component runtime, plus a REPL and an example-test runner.
 
+pub mod ai;
 pub mod ast;
 pub mod bytecode;
 pub mod cgen;

@@ -114,7 +114,11 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
     }
 
     for (i, f) in funs.iter().enumerate() {
-        let chunk = compile_fun(&mut shared, f);
+        let chunk = if f.ai.is_some() {
+            compile_ai_fun(&mut shared, f, checked)
+        } else {
+            compile_fun(&mut shared, f)
+        };
         shared.module.chunks[i] = chunk;
     }
 
@@ -307,6 +311,32 @@ fn compile_fun(shared: &mut Shared, f: &FunDecl) -> Chunk {
     let r = last.unwrap_or_else(|| fc.const_reg(Value::Unit, f.span));
     fc.emit(Op::Ret(r), f.span);
     fc.finish()
+}
+
+/// An `ai fun` chunk is a single `CallAi` over the parameter registers — the
+/// runtime signature (intent, model, shape) lives in `module.ai_funs`.
+fn compile_ai_fun(shared: &mut Shared, f: &FunDecl, checked: &Checked) -> Chunk {
+    let info = shared.module.ai_funs.len() as u16;
+    let meta = checked.ai_funs.get(&f.name).cloned().unwrap_or(crate::ai::AiFunMeta {
+        name: f.name.clone(),
+        intent: f.ai.as_ref().map(|a| a.intent.clone()).unwrap_or_default(),
+        model: f.ai.as_ref().and_then(|a| a.model.clone()),
+        params: f.params.iter().map(|p| p.name.clone()).collect(),
+        shape: crate::ai::AiShape::Str,
+        wraps_result: false,
+    });
+    shared.module.ai_funs.push(meta);
+    let nparams = f.params.len() as u8;
+    let dst = nparams; // params live in 0..nparams; result goes right after
+    Chunk {
+        name: f.name.clone(),
+        ncaps: 0,
+        nparams,
+        nregs: nparams as u16 + 1,
+        consts: Vec::new(),
+        code: vec![Op::CallAi { dst, info }, Op::Ret(dst)],
+        spans: vec![f.span, f.span],
+    }
 }
 
 struct FnCompiler<'s> {

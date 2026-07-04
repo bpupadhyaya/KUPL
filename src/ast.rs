@@ -57,7 +57,16 @@ pub struct FunDecl {
     pub effects: Vec<String>,
     pub body: Block,
     pub is_pub: bool,
+    /// `ai fun` — a typed prompt function; the body is the AiDecl, not code.
+    pub ai: Option<AiDecl>,
     pub span: Span,
+}
+
+/// Body of an `ai fun`: `{ intent "..."  model "..." }` (model optional).
+#[derive(Debug, Clone)]
+pub struct AiDecl {
+    pub intent: String,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]

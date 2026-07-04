@@ -70,6 +70,10 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
     for (key, info) in &funs {
         let mut eff = EffectSet::new();
         let mut calls = Vec::new();
+        // `ai fun` performs the `ai` effect; the keyword itself declares it.
+        if info.decl.ai.is_some() {
+            eff.insert("ai".to_string());
+        }
         walk_block(&info.decl.body, &mut |expr| {
             collect_expr(expr, info.component, &funs, &mut eff, &mut calls);
         });
@@ -104,7 +108,11 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
     // ---- enforce boundary explicitness ----
     for (key, info) in &funs {
         let used = inferred.get(key).cloned().unwrap_or_default();
-        let declared: Vec<&str> = info.decl.effects.iter().map(String::as_str).collect();
+        let mut declared: Vec<&str> = info.decl.effects.iter().map(String::as_str).collect();
+        // the `ai` keyword on the signature IS the boundary declaration
+        if info.decl.ai.is_some() && !declared.contains(&"ai") {
+            declared.push("ai");
+        }
         if info.must_declare {
             let missing: Vec<&String> = used
                 .iter()

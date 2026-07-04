@@ -20,6 +20,8 @@ pub struct Checked {
     pub funs: HashMap<String, (Vec<Ty>, Ty, Vec<u32>)>,
     pub components: HashMap<String, ComponentSig>,
     pub contracts: HashMap<String, ContractSig>,
+    /// `ai fun` signatures: everything the runtime needs to execute the call.
+    pub ai_funs: HashMap<String, crate::ai::AiFunMeta>,
 }
 
 pub fn check(program: &Program) -> (Checked, Vec<Diag>) {
@@ -209,6 +211,58 @@ impl Checker {
                 }
             }
         }
+        self.collect_ai_funs(program);
+    }
+
+    /// Third pass: `ai fun` signatures. Runs after every type is resolved so
+    /// return shapes can reference records declared anywhere in the program.
+    fn collect_ai_funs(&mut self, program: &Program) {
+        let records: std::collections::HashMap<String, (String, Vec<(String, Ty)>)> = self
+            .checked
+            .types
+            .values()
+            .filter(|t| t.variants.len() == 1)
+            .map(|t| {
+                (t.name.clone(), (t.variants[0].name.clone(), t.variants[0].fields.clone()))
+            })
+            .collect();
+        for item in &program.items {
+            let Item::Fun(f) = item else { continue };
+            let Some(ai) = &f.ai else { continue };
+            let Some(ret) = &f.ret else {
+                self.err(
+                    "K0270",
+                    format!(
+                        "`ai fun {}` must declare a return type — it defines the structured output",
+                        f.name
+                    ),
+                    f.span,
+                );
+                continue;
+            };
+            let ret_ty = self.resolve_ty(ret);
+            let ret_ty = self.uni.apply(&ret_ty);
+            let (target, wraps_result) = match &ret_ty {
+                Ty::Result(t, e) if **e == Ty::Str => ((**t).clone(), true),
+                other => (other.clone(), false),
+            };
+            match crate::ai::build_shape(&target, &records, &mut Vec::new()) {
+                Ok(shape) => {
+                    self.checked.ai_funs.insert(
+                        f.name.clone(),
+                        crate::ai::AiFunMeta {
+                            name: f.name.clone(),
+                            intent: ai.intent.clone(),
+                            model: ai.model.clone(),
+                            params: f.params.iter().map(|p| p.name.clone()).collect(),
+                            shape,
+                            wraps_result,
+                        },
+                    );
+                }
+                Err(msg) => self.err("K0271", format!("`ai fun {}`: {msg}", f.name), ret.span),
+            }
+        }
     }
 
     fn resolve_ty(&mut self, t: &TyExpr) -> Ty {
@@ -274,6 +328,8 @@ impl Checker {
     fn check_bodies(&mut self, program: &Program) {
         for item in &program.items {
             match item {
+                // ai fun bodies are prompts, not code — nothing to body-check
+                Item::Fun(f) if f.ai.is_some() => {}
                 Item::Fun(f) => self.check_fun(f, None),
                 Item::Type(_) => {}
                 Item::Component(c) => self.check_component(c),
