@@ -5,9 +5,8 @@ general-purpose programming language with a complete toolchain: REPL, interprete
 virtual machine, bytecode compiler, and native machine-code compiler.
 
 KUPL is **open source and free forever**. Anybody can join, fork, modify, and
-distribute it. The proprietary **Builder** — a human-AI collaborative visual
-development environment — is built on top of KUPL, but the language itself never
-depends on Builder.
+distribute it. Visual, AI-collaborative development environments can be built
+on top of KUPL, but the language itself never depends on any of them.
 
 ---
 
@@ -63,7 +62,7 @@ per situation: exploration, scripting, deployment, maximum performance.
 
 ### 4. Visual layer ready
 The compiler emits a **component manifest** (ports, props, contracts, intent,
-examples) for every component. Builder renders manifests as a palette and
+examples) for every component. Visual tools render manifests as a palette and
 canvas; wiring drawn visually is exactly `wire` statements in source. Code is
 always the single source of truth — visual editing is just another editor.
 
@@ -90,16 +89,16 @@ library. Vendor-neutral, platform-independent. Governance goal: a small spec,
 a reference implementation, and a conformance test suite so forks stay
 compatible by choice.
 
-## Relationship to Builder
+## The visual layer
 
-Builder (proprietary, planned at `pvt/builder`) is the AI-age Visual Basic:
-a human-AI collaborative environment where the developer can *demonstrate*
-what they want by composing visual and non-visual components when prompting
-falls short, and the AI fills in everything else — with complete KUPL code
-generated behind the scenes, always editable by hand. KUPL's obligations to
-Builder are exactly: component manifests, canonical form, semantic diff,
-structured diagnostics, and hot-swappable components in the VM. Nothing in
-Builder is required to use KUPL.
+KUPL is designed so that visual builders can sit on top of it: human-AI
+collaborative environments where a developer can *demonstrate* what they
+want by composing visual and non-visual
+components when prompting falls short, and the AI fills in everything else,
+with complete KUPL code generated behind the scenes, always editable by hand.
+KUPL's obligations to such tools are exactly: component manifests, canonical
+form, semantic diff, structured diagnostics, and hot-swappable components in
+the VM. No visual tool is ever required to use KUPL.
 
 ## Inspirations (steal the best from everywhere)
 
@@ -112,10 +111,10 @@ Builder is required to use KUPL.
 | Haskell/Koka | pure-by-default functions, effect rows, inference |
 | Eiffel | design-by-contract (pre/post/invariants) |
 | Python | readability, REPL culture, examples-as-docs (doctest) |
-| APL/NumPy/Mojo | first-class arrays/tensors, kernel programming |
+| APL lineage / NumPy | first-class arrays/tensors, kernel programming |
 | Lua | small register-based VM design |
 | MLIR/LLVM | dialect-based lowering to heterogeneous hardware |
-| Smalltalk/HyperCard/VB | live environment, visual composition over a real language |
+| Smalltalk (Squeak/Pharo) | live environment, visual composition over a real language |
 | E/Pony | capability security |
 
 ## Non-goals (v1)

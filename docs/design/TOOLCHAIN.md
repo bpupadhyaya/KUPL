@@ -46,7 +46,7 @@ one file). The 2015 Scala/Java sbt scaffold currently in `KUPL/` should be archi
   rowan) — required for the formatter, IDE features, and semantic diff.
 - AST is a typed projection of the CST with stable **node IDs** (hash of
   module path + item name + disambiguator) — these IDs are what `kupl diff`/`patch`
-  and Builder use to track components across edits.
+  and visual tools use to track components across edits.
 - **Error recovery is a feature:** the parser always produces a tree; unparseable
   regions become `Error` nodes with spans. An AI agent gets *all* the errors in one
   pass, not the first one.
@@ -98,7 +98,7 @@ one file). The 2015 Scala/Java sbt scaffold currently in `KUPL/` should be archi
 - `intent` strings are carried into TAST, KIR metadata, and manifests.
 - Manifest emission (`.kman.json` per component): name, intent, ports (name/type/
   direction), props, requires, fulfills, examples (source text), doc trivia, node ID.
-  This is Builder's palette/canvas API and `kupl context`'s index.
+  This is the palette/canvas API for visual tools and `kupl context`'s index.
 
 ## 7. KIR — the typed SSA intermediate representation
 
@@ -117,7 +117,7 @@ MLIR-inspired: one IR, multiple **dialects**, progressive lowering.
   - `sys` — pointers, volatile, atomics, `asm`, explicit layout.
 - **Metadata:** every op keeps source spans, node IDs, and (on component/fun defs)
   intent strings — so *diagnostics from any phase, even codegen, map back to
-  source*, and Builder can highlight the running op's component.
+  source*, and visual tools can highlight the running op's component.
 - **Passes (target-independent):** inlining, DCE, const-fold/prop, escape analysis
   (decides message move vs copy; stack-promotes non-escaping data), handler
   devirtualization (wire targets are usually statically known), tensor fusion,
@@ -156,7 +156,7 @@ simpler JIT mapping later).
   a shared immutable region for interned/frozen data). **No global pauses ever.**
 - **Supervision runtime:** panic → unwind instance → notify supervisor per policy →
   fresh instance (optionally `on start` receives last-good snapshot for state
-  migration — the hot-swap hook Builder uses for live editing).
+  migration — the hot-swap hook visual live-editing builds on).
 - **Device runtime:** unified stream abstraction over CUDA/Metal/Vulkan-compute
   (and future TPU/NPU plugins): device discovery, memory pools, async copies,
   kernel launch, events. `at(target)` compiles to a dispatch through this layer;
@@ -173,7 +173,7 @@ simpler JIT mapping later).
   iteration) and **LLVM** for release.
 - Output: single static executable embedding libkrt; cross-compilation first-class
   (Rust-style target triples); WASM (+WASI) is a supported target for
-  browser/edge — this is how Builder previews components client-side.
+  browser/edge — and how visual tools can preview components client-side.
 - FFI: `extern "c"` declarations (system tier only) both directions; exported
   C ABI for embedding KUPL in existing apps.
 
@@ -188,7 +188,7 @@ simpler JIT mapping later).
   (`.kupl-session` files are just source — a REPL session is a reproducible
   script).
 - Hot-swap: redefining a component migrates existing instances via the state-
-  migration hook; this same machinery powers Builder's live canvas.
+  migration hook; this same machinery powers live visual canvases.
 
 ## 11. CLI, LSP, packages
 
@@ -240,11 +240,11 @@ be excellent LLM context.
 | 0 | Spec v0.1 (these docs) + 20 canonical example programs (`examples/`) | design reads well to humans *and* models — test: can an LLM write correct KUPL from LANGUAGE.md alone? |
 | 1 | Rust workspace: lexer, parser, CST/AST, `kupl fmt`, resolver, type/effect checker, tree-walk interpreter, REPL | the language exists; iterate on syntax while it's cheap |
 | 2 | Contracts/examples/laws in `kupl test`; manifests; `kupl context`; JSON diagnostics | the AI-first tooling story end-to-end |
-| 3 | KIR + KVM (bytecode compiler, register VM, scheduler, per-component GC, supervision) | production interpreter performance; Builder can target this |
+| 3 | KIR + KVM (bytecode compiler, register VM, scheduler, per-component GC, supervision) | production interpreter performance; visual tools can target this |
 | 4 | Native backend (Cranelift dev / LLVM release), libkrt, WASM target | deployment story |
-| 5 | `tensor` dialect + device runtime (Metal first — dev machine is a Mac — then PTX/SPIR-V) | heterogeneous-hardware story |
-| 6 | LSP, `kupl diff/patch`, package registry; Builder integration hardening | ecosystem |
+| 5 | `tensor` dialect + device runtime (Metal first, then PTX/SPIR-V) | heterogeneous-hardware story |
+| 6 | LSP, `kupl diff/patch`, package registry; visual-tool integration hardening | ecosystem |
 | 7+ | Template JIT for KVM; self-hosting front end in KUPL (system tier proves itself) | maturity |
 
-Guiding rule for sequencing: **every phase ships something a user (or Builder, or
-an AI agent) can actually run.** No multi-year dark tunnels.
+Guiding rule for sequencing: **every phase ships something a user (or a visual
+tool, or an AI agent) can actually run.** No multi-year dark tunnels.

@@ -54,7 +54,7 @@ reads the same way to humans and models):
 3. `requires` — capabilities/dependencies injected at instantiation (database, network,
    clock, another component's contract). **The only way to reach the outside world.**
 4. `in` / `out` ports — typed message channels. `in` ports trigger handlers; `out`
-   ports are emitted to. Ports are the wiring surface Builder draws.
+   ports are emitted to. Ports are the wiring surface visual tools draw.
 5. `prop` — instantiation-time configuration (immutable after construction).
 6. `state` — private mutable state. Invisible outside; mutated only by handlers.
 7. `on` handlers — react to `in` ports, lifecycle events (`on start`, `on stop`),
@@ -456,7 +456,7 @@ app TodoApp {
 }
 ```
 
-Note what Builder gets for free: every box on its canvas (`TodoList`, `SqlTodoRepo`,
+Note what a visual builder gets for free: every box on its canvas (`TodoList`, `SqlTodoRepo`,
 `TodoPage`), every arrow (`wire`), every property panel (`prop`, `requires`), and
 every doc tooltip (`intent`) is literally this source code.
 
@@ -492,6 +492,6 @@ every doc tooltip (`intent`) is literally this source code.
 3. Effect granularity: is `db.read`/`db.write` the right grain, or user-definable
    effect hierarchies from day one?
 4. Hot-swap semantics for `state` migration on component upgrade (Erlang's
-   `code_change` equivalent) — needed by Builder live-editing.
+   `code_change` equivalent) — needed for visual live-editing.
 5. Package identity & registry: content-addressed packages with signed manifests —
    spec in TOOLCHAIN.md, needs a decision on namespace governance.
