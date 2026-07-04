@@ -969,6 +969,41 @@ impl Checker {
                 ctx.scopes.pop();
                 Ty::Fun(ptys, Box::new(bt))
             }
+            ExprKind::With { recv, updates } => {
+                let rt = self.infer_expr(recv, ctx);
+                let rt = self.uni.apply(&rt);
+                let Ty::Named(tn) = &rt else {
+                    self.err("K0233", format!("{rt} has no fields to update"), expr.span);
+                    return self.uni.fresh();
+                };
+                let sig = self.checked.types.get(tn).cloned();
+                match sig {
+                    Some(sig) if sig.variants.len() == 1 => {
+                        for (field, value) in updates {
+                            let vt = self.infer_expr(value, ctx);
+                            match sig.variants[0].fields.iter().find(|(f, _)| f == field) {
+                                Some((_, fty)) => {
+                                    self.unify(&fty.clone(), &vt, value.span, &format!("field `{field}`"));
+                                }
+                                None => self.err(
+                                    "K0230",
+                                    format!("type `{tn}` has no field `{field}`"),
+                                    value.span,
+                                ),
+                            }
+                        }
+                        rt
+                    }
+                    _ => {
+                        self.err(
+                            "K0231",
+                            format!("`{tn}` has multiple variants — use `match` to rebuild"),
+                            expr.span,
+                        );
+                        self.uni.fresh()
+                    }
+                }
+            }
             ExprKind::Try(inner) => {
                 let it = self.infer_expr(inner, ctx);
                 let ok = self.uni.fresh();
@@ -1177,6 +1212,34 @@ impl Checker {
                 Some((vec![], elem))
             }
             (Ty::List(t), "contains") => Some((vec![(**t).clone()], Ty::Bool)),
+            (Ty::List(t), "fold") => {
+                let acc = self.uni.fresh();
+                Some((
+                    vec![
+                        acc.clone(),
+                        Ty::Fun(vec![acc.clone(), (**t).clone()], Box::new(acc.clone())),
+                    ],
+                    acc,
+                ))
+            }
+            (Ty::List(t), "any") | (Ty::List(t), "all") => Some((
+                vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
+                Ty::Bool,
+            )),
+            (Ty::List(t), "sort") => {
+                let elem = self.uni.apply(t);
+                if !matches!(elem, Ty::Int | Ty::Float | Ty::Str | Ty::Var(_)) {
+                    self.err("K0234", format!("cannot order values of type {elem}"), span);
+                }
+                Some((vec![], Ty::List(t.clone())))
+            }
+            (Ty::List(t), "take") | (Ty::List(t), "drop") => {
+                Some((vec![Ty::Int], Ty::List(t.clone())))
+            }
+            (Ty::List(t), "get") => Some((vec![Ty::Int], Ty::Option(t.clone()))),
+            (Ty::List(t), "index_of") => {
+                Some((vec![(**t).clone()], Ty::Option(Box::new(Ty::Int))))
+            }
             (Ty::List(t), "push") => Some((vec![(**t).clone()], Ty::List(t.clone()))),
             (Ty::List(t), "first") | (Ty::List(t), "last") => Some((vec![], Ty::Option(t.clone()))),
             (Ty::List(t), "reverse") => Some((vec![], Ty::List(t.clone()))),
@@ -1192,12 +1255,25 @@ impl Checker {
             (Ty::Str, "starts_with") => Some((vec![Ty::Str], Ty::Bool)),
             (Ty::Str, "to_upper") | (Ty::Str, "to_lower") | (Ty::Str, "trim") => Some((vec![], Ty::Str)),
             (Ty::Str, "split") => Some((vec![Ty::Str], Ty::List(Box::new(Ty::Str)))),
+            (Ty::Str, "ends_with") => Some((vec![Ty::Str], Ty::Bool)),
+            (Ty::Str, "replace") => Some((vec![Ty::Str, Ty::Str], Ty::Str)),
+            (Ty::Str, "chars") => Some((vec![], Ty::List(Box::new(Ty::Str)))),
+            (Ty::Str, "repeat") => Some((vec![Ty::Int], Ty::Str)),
+            (Ty::Str, "parse_int") => Some((vec![], Ty::Option(Box::new(Ty::Int)))),
+            (Ty::Str, "parse_float") => Some((vec![], Ty::Option(Box::new(Ty::Float)))),
             (Ty::Int, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Int, "to_float") => Some((vec![], Ty::Float)),
             (Ty::Int, "abs") => Some((vec![], Ty::Int)),
+            (Ty::Int, "min") | (Ty::Int, "max") => Some((vec![Ty::Int], Ty::Int)),
             (Ty::Float, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Float, "to_int") => Some((vec![], Ty::Int)),
             (Ty::Float, "abs") | (Ty::Float, "sqrt") => Some((vec![], Ty::Float)),
+            (Ty::Float, "floor") | (Ty::Float, "ceil") | (Ty::Float, "round") => {
+                Some((vec![], Ty::Float))
+            }
+            (Ty::Float, "min") | (Ty::Float, "max") | (Ty::Float, "pow") => {
+                Some((vec![Ty::Float], Ty::Float))
+            }
             (Ty::Option(t), "is_some") | (Ty::Option(t), "is_none") => {
                 let _ = t;
                 Some((vec![], Ty::Bool))

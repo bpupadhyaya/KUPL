@@ -349,6 +349,13 @@ fn encode_op(w: &mut W, op: &Op) {
             w.u8(39);
             w.u16(*m);
         }
+        WithField { dst, obj, name, value } => {
+            w.u8(40);
+            w.u8(*dst);
+            w.u8(*obj);
+            w.u16(*name);
+            w.u8(*value);
+        }
     }
 }
 
@@ -577,6 +584,7 @@ fn decode_op(r: &mut R) -> DecodeResult<Op> {
             },
         },
         39 => Panic(r.u16()?),
+        40 => WithField { dst: r.u8()?, obj: r.u8()?, name: r.u16()?, value: r.u8()? },
         t => return Err(format!("unknown opcode {t}")),
     })
 }

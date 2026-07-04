@@ -549,6 +549,35 @@ impl Interp {
                 body: Rc::new(body.clone()),
                 env: env.clone(),
             }))),
+            ExprKind::With { recv, updates } => {
+                let base = self.eval(recv, env)?;
+                let Value::Ctor { ty, variant, fields } = base else {
+                    return Err(Self::panic_flow(
+                        format!("{} has no fields to update", base.type_name()),
+                        expr.span,
+                    ));
+                };
+                let names = self
+                    .db
+                    .ctors
+                    .get(variant.as_str())
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_default();
+                let mut new_fields = fields.as_ref().clone();
+                for (field, value) in updates {
+                    let v = self.eval(value, env)?;
+                    match names.iter().position(|f| f == field) {
+                        Some(i) => new_fields[i] = v,
+                        None => {
+                            return Err(Self::panic_flow(
+                                format!("`{ty}` has no field `{field}`"),
+                                expr.span,
+                            ))
+                        }
+                    }
+                }
+                Ok(Value::Ctor { ty, variant, fields: Rc::new(new_fields) })
+            }
             ExprKind::Try(inner) => {
                 let v = self.eval(inner, env)?;
                 match &v {
@@ -913,6 +942,82 @@ pub fn shared_method(
                 Ok(Value::Int(int_sum))
             }
         }
+        (Value::List(items), "fold") => {
+            let mut it = args.into_iter();
+            let mut acc = it.next().ok_or("`fold` needs an initial value")?;
+            let f = it.next().ok_or("`fold` needs a function")?;
+            for item in items.iter() {
+                acc = call(f.clone(), vec![acc, item.clone()])?;
+            }
+            Ok(acc)
+        }
+        (Value::List(items), "any") => {
+            let f = args.into_iter().next().ok_or("`any` needs a function")?;
+            for item in items.iter() {
+                if let Value::Bool(true) = call(f.clone(), vec![item.clone()])? {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            Ok(Value::Bool(false))
+        }
+        (Value::List(items), "all") => {
+            let f = args.into_iter().next().ok_or("`all` needs a function")?;
+            for item in items.iter() {
+                if let Value::Bool(false) = call(f.clone(), vec![item.clone()])? {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        (Value::List(items), "sort") => {
+            let mut out = items.as_ref().clone();
+            let mut err = None;
+            out.sort_by(|a, b| match (a, b) {
+                (Value::Int(x), Value::Int(y)) => x.cmp(y),
+                (Value::Float(x), Value::Float(y)) => {
+                    x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                (Value::Str(x), Value::Str(y)) => x.cmp(y),
+                _ => {
+                    err = Some("`sort` needs Int, Float, or Str elements".to_string());
+                    std::cmp::Ordering::Equal
+                }
+            });
+            match err {
+                Some(e) => Err(e),
+                None => Ok(Value::List(Rc::new(out))),
+            }
+        }
+        (Value::List(items), "take") => match args.into_iter().next() {
+            Some(Value::Int(n)) => {
+                let n = (n.max(0) as usize).min(items.len());
+                Ok(Value::List(Rc::new(items[..n].to_vec())))
+            }
+            _ => Err("`take` needs an Int".into()),
+        },
+        (Value::List(items), "drop") => match args.into_iter().next() {
+            Some(Value::Int(n)) => {
+                let n = (n.max(0) as usize).min(items.len());
+                Ok(Value::List(Rc::new(items[n..].to_vec())))
+            }
+            _ => Err("`drop` needs an Int".into()),
+        },
+        (Value::List(items), "get") => match args.into_iter().next() {
+            Some(Value::Int(i)) => Ok(if i >= 0 && (i as usize) < items.len() {
+                Value::some(items[i as usize].clone())
+            } else {
+                Value::none()
+            }),
+            _ => Err("`get` needs an Int".into()),
+        },
+        (Value::List(items), "index_of") => {
+            let needle = args.into_iter().next().ok_or("`index_of` needs a value")?;
+            Ok(items
+                .iter()
+                .position(|v| *v == needle)
+                .map(|i| Value::some(Value::Int(i as i64)))
+                .unwrap_or_else(Value::none))
+        }
         (Value::List(items), "contains") => {
             let needle = args.into_iter().next().ok_or("`contains` needs a value")?;
             Ok(Value::Bool(items.iter().any(|v| *v == needle)))
@@ -950,6 +1055,39 @@ pub fn shared_method(
         (Value::Str(s), "to_upper") => Ok(Value::str(s.to_uppercase())),
         (Value::Str(s), "to_lower") => Ok(Value::str(s.to_lowercase())),
         (Value::Str(s), "trim") => Ok(Value::str(s.trim().to_string())),
+        (Value::Str(s), "ends_with") => match args.into_iter().next() {
+            Some(Value::Str(n)) => Ok(Value::Bool(s.ends_with(n.as_str()))),
+            _ => Err("`ends_with` needs a Str".into()),
+        },
+        (Value::Str(s), "replace") => {
+            let mut it = args.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                    Ok(Value::str(s.replace(from.as_str(), to.as_str())))
+                }
+                _ => Err("`replace` needs two Str arguments".into()),
+            }
+        }
+        (Value::Str(s), "chars") => Ok(Value::List(Rc::new(
+            s.chars().map(|c| Value::str(c.to_string())).collect(),
+        ))),
+        (Value::Str(s), "repeat") => match args.into_iter().next() {
+            Some(Value::Int(n)) if n >= 0 => {
+                if s.len().saturating_mul(n as usize) > 100_000_000 {
+                    return Err("`repeat` result too large".into());
+                }
+                Ok(Value::str(s.repeat(n as usize)))
+            }
+            _ => Err("`repeat` needs a non-negative Int".into()),
+        },
+        (Value::Str(s), "parse_int") => Ok(s
+            .parse::<i64>()
+            .map(|v| Value::some(Value::Int(v)))
+            .unwrap_or_else(|_| Value::none())),
+        (Value::Str(s), "parse_float") => Ok(s
+            .parse::<f64>()
+            .map(|v| Value::some(Value::Float(v)))
+            .unwrap_or_else(|_| Value::none())),
         (Value::Str(s), "split") => match args.into_iter().next() {
             Some(Value::Str(sep)) => Ok(Value::List(Rc::new(
                 s.split(sep.as_str()).map(Value::str).collect(),
@@ -962,10 +1100,33 @@ pub fn shared_method(
             .checked_abs()
             .map(Value::Int)
             .ok_or_else(|| "integer overflow in abs".to_string()),
+        (Value::Int(v), "min") => match args.into_iter().next() {
+            Some(Value::Int(w)) => Ok(Value::Int((*v).min(w))),
+            _ => Err("`min` needs an Int".into()),
+        },
+        (Value::Int(v), "max") => match args.into_iter().next() {
+            Some(Value::Int(w)) => Ok(Value::Int((*v).max(w))),
+            _ => Err("`max` needs an Int".into()),
+        },
         (Value::Float(v), "to_str") => Ok(Value::str(v.to_string())),
         (Value::Float(v), "to_int") => Ok(Value::Int(*v as i64)),
         (Value::Float(v), "abs") => Ok(Value::Float(v.abs())),
         (Value::Float(v), "sqrt") => Ok(Value::Float(v.sqrt())),
+        (Value::Float(v), "floor") => Ok(Value::Float(v.floor())),
+        (Value::Float(v), "ceil") => Ok(Value::Float(v.ceil())),
+        (Value::Float(v), "round") => Ok(Value::Float(v.round())),
+        (Value::Float(v), "min") => match args.into_iter().next() {
+            Some(Value::Float(w)) => Ok(Value::Float(v.min(w))),
+            _ => Err("`min` needs a Float".into()),
+        },
+        (Value::Float(v), "max") => match args.into_iter().next() {
+            Some(Value::Float(w)) => Ok(Value::Float(v.max(w))),
+            _ => Err("`max` needs a Float".into()),
+        },
+        (Value::Float(v), "pow") => match args.into_iter().next() {
+            Some(Value::Float(w)) => Ok(Value::Float(v.powf(w))),
+            _ => Err("`pow` needs a Float".into()),
+        },
         (Value::Tensor(d), "len") => Ok(Value::Int(d.len() as i64)),
         (Value::Tensor(d), "get") => match args.into_iter().next() {
             Some(Value::Int(i)) if i >= 0 && (i as usize) < d.len() => Ok(Value::Float(d[i as usize])),

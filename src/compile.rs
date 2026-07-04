@@ -296,6 +296,8 @@ struct FnCompiler<'s> {
     /// scope stack of (name, reg)
     scopes: Vec<Vec<(String, Reg)>>,
     next: u16,
+    /// Highest register ever allocated (frame size), independent of resets.
+    high_water: u16,
     /// (continue_target, break_patches); usize::MAX target = for-loop, whose
     /// continues are collected in `pending_continues` and patched at the
     /// increment position.
@@ -320,6 +322,7 @@ impl<'s> FnCompiler<'s> {
             comp: None,
             scopes: vec![Vec::new()],
             next: 0,
+            high_water: 0,
             loops: Vec::new(),
             pending_continues: Vec::new(),
             too_large: false,
@@ -396,7 +399,7 @@ impl<'s> FnCompiler<'s> {
     }
 
     fn finish(mut self) -> Chunk {
-        self.chunk.nregs = self.next.max(1);
+        self.chunk.nregs = self.high_water.max(self.next).max(1);
         self.chunk
     }
 
@@ -407,6 +410,9 @@ impl<'s> FnCompiler<'s> {
     fn alloc(&mut self, span: Span) -> Reg {
         let r = self.next;
         self.next += 1;
+        if self.next > self.high_water {
+            self.high_water = self.next;
+        }
         if r > 255 && !self.too_large {
             self.too_large = true;
             self.err("K0801", "function too large for KVM v0 (more than 256 registers)", span);
@@ -470,24 +476,41 @@ impl<'s> FnCompiler<'s> {
     // ---------------- blocks & statements ----------------
 
     /// Compile a block; returns the register of the trailing expression value.
+    ///
+    /// Register reclamation: each statement's temporaries are freed when it
+    /// ends (`next` resets to the statement mark plus any locals it created,
+    /// which are always allocated first). Registers are compile-time slots,
+    /// so loop bodies reuse the same registers every iteration.
     fn block(&mut self, b: &Block) -> Option<Reg> {
         self.scopes.push(Vec::new());
         let mut last: Option<Reg> = None;
         for stmt in &b.stmts {
-            last = self.stmt(stmt);
+            let mark = self.next;
+            let (created, val) = self.stmt(stmt);
+            last = val;
+            self.next = mark + created;
         }
         self.scopes.pop();
         last
     }
 
-    fn stmt(&mut self, stmt: &Stmt) -> Option<Reg> {
+    /// Returns (locals created at the statement mark, trailing value register).
+    fn stmt(&mut self, stmt: &Stmt) -> (u16, Option<Reg>) {
+        if let Stmt::Let { name, init, span, .. } = stmt {
+            // local FIRST (at the statement mark, survives the temp reset);
+            // the name is only visible after the initializer (shadowing).
+            let local = self.alloc(*span);
+            let r = self.expr(init);
+            self.emit(Op::Move(local, r), *span);
+            self.scopes.last_mut().unwrap().push((name.clone(), local));
+            return (1, None);
+        }
+        (0, self.stmt_rest(stmt))
+    }
+
+    fn stmt_rest(&mut self, stmt: &Stmt) -> Option<Reg> {
         match stmt {
-            Stmt::Let { name, init, span, .. } => {
-                let r = self.expr(init);
-                let local = self.bind_local(name);
-                self.emit(Op::Move(local, r), *span);
-                None
-            }
+            Stmt::Let { .. } => unreachable!("handled by stmt()"),
             Stmt::Assign { target, op, value, span } => {
                 let rhs = self.expr(value);
                 let ExprKind::Ident(name) = &target.kind else {
@@ -808,8 +831,11 @@ impl<'s> FnCompiler<'s> {
                 dst
             }
             ExprKind::BlockExpr(b) => {
+                let dst = self.alloc(span);
                 let r = self.block(b);
-                r.unwrap_or_else(|| self.const_reg(Value::Unit, span))
+                let r = r.unwrap_or_else(|| self.const_reg(Value::Unit, span));
+                self.emit(Op::Move(dst, r), span);
+                dst
             }
             ExprKind::Match { scrutinee, arms } => {
                 let s = self.expr(scrutinee);
@@ -881,6 +907,17 @@ impl<'s> FnCompiler<'s> {
                     span,
                 );
                 dst
+            }
+            ExprKind::With { recv, updates } => {
+                let mut cur = self.expr(recv);
+                for (field, value) in updates {
+                    let v = self.expr(value);
+                    let name_idx = self.const_idx(Value::str(field.clone()));
+                    let dst = self.alloc(span);
+                    self.emit(Op::WithField { dst, obj: cur, name: name_idx, value: v }, span);
+                    cur = dst;
+                }
+                cur
             }
             ExprKind::Try(inner) => {
                 let r = self.expr(inner);
@@ -1162,6 +1199,12 @@ fn free_vars_expr(e: &Expr, bound: &HashSet<String>, free: &mut BTreeSet<String>
         ExprKind::Range { lo, hi, .. } => {
             free_vars_expr(lo, bound, free);
             free_vars_expr(hi, bound, free);
+        }
+        ExprKind::With { recv, updates } => {
+            free_vars_expr(recv, bound, free);
+            for (_, v) in updates {
+                free_vars_expr(v, bound, free);
+            }
         }
         ExprKind::Try(inner) | ExprKind::Await(inner) => free_vars_expr(inner, bound, free),
         _ => {}

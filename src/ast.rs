@@ -310,6 +310,11 @@ pub enum ExprKind {
         hi: Box<Expr>,
         inclusive: bool,
     },
+    /// `expr with field: value, …` — record update (new value, fields replaced).
+    With {
+        recv: Box<Expr>,
+        updates: Vec<(String, Expr)>,
+    },
     /// `expr?` — Result propagation.
     Try(Box<Expr>),
     Await(Box<Expr>),

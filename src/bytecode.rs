@@ -53,6 +53,8 @@ pub enum Op {
     GetField { dst: Reg, obj: Reg, idx: u8 },
     /// dst <- regs[obj].field named consts[name] (records: resolved at runtime)
     GetFieldNamed { dst: Reg, obj: Reg, name: u16 },
+    /// dst <- copy of regs[obj] with field consts[name] replaced by regs[value]
+    WithField { dst: Reg, obj: Reg, name: u16, value: Reg },
     /// dst <- Bool: is regs[obj] an instance of ctors[ctor]?
     TagIs { dst: Reg, obj: Reg, ctor: u16 },
     /// dst <- closure over chunks[proto], capturing regs[start .. start+ncaps]

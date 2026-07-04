@@ -523,6 +523,40 @@ impl<'m> Vm<'m> {
                         }
                     }
                 }
+                Op::WithField { dst, obj, name, value } => {
+                    let field = match &chunk.consts[name as usize] {
+                        Value::Str(s) => s.as_str().to_string(),
+                        _ => return Err(VmError { msg: "bad field name".into(), span }),
+                    };
+                    match reg!(obj) {
+                        Value::Ctor { ty, variant, fields } => {
+                            let position = self
+                                .module
+                                .ctor_field_names
+                                .get(variant.as_str())
+                                .and_then(|fs| fs.iter().position(|f| f == &field));
+                            match position {
+                                Some(i) => {
+                                    let mut new_fields = fields.as_ref().clone();
+                                    new_fields[i] = reg!(value);
+                                    set!(dst, Value::Ctor { ty, variant, fields: Rc::new(new_fields) });
+                                }
+                                None => {
+                                    return Err(VmError {
+                                        msg: format!("`{ty}` has no field `{field}`"),
+                                        span,
+                                    })
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(VmError {
+                                msg: format!("{} has no fields to update", other.type_name()),
+                                span,
+                            })
+                        }
+                    }
+                }
                 Op::TagIs { dst, obj, ctor } => {
                     let meta = &self.module.ctors[ctor as usize];
                     let is = matches!(reg!(obj), Value::Ctor { variant, .. } if *variant == meta.variant);

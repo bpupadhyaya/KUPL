@@ -1,0 +1,34 @@
+// Standard library tour: new methods + `with` record update.
+
+type Player = { name: Str, score: Int, active: Bool }
+
+fun main() {
+    let xs = [5, 3, 9, 1, 7]
+    print("sorted     = {xs.sort()}")
+    print("fold sum   = {xs.fold(0, fn acc, n { acc + n })}")
+    print("any > 8    = {xs.any(fn n { n > 8 })}, all > 0 = {xs.all(fn n { n > 0 })}")
+    print("take/drop  = {xs.take(2)} / {xs.drop(2)}")
+    print("get        = {xs.get(1)} {xs.get(99)}")
+    print("index_of 9 = {xs.index_of(9)}")
+
+    let s = "hello kupl world"
+    print("replace    = {s.replace("kupl", "universal")}")
+    print("ends_with  = {s.ends_with("world")}")
+    print("chars      = {"abc".chars()}")
+    print("repeat     = {"ko".repeat(3)}")
+    print("parse      = {"42".parse_int()} {"x42".parse_int()} {"2.5".parse_float()}")
+
+    print("min/max    = {3.min(7)} {3.max(7)} {2.0.pow(10.0)} {2.7.floor()} {2.2.ceil()}")
+
+    let p = Player(name: "Ada", score: 100, active: true)
+    let p2 = p with score: 250, active: false
+    print("before     = {p}")
+    print("after      = {p2}")
+    expect p.score == 100
+    expect p2.score == 250
+    expect (p with name: "Grace").name == "Grace"
+
+    let names = ["carol", "alice", "bob"]
+    print("pipeline   = {names.sort().map(fn n { n.to_upper() }).join(", ")}")
+    print("all stdlib expectations hold")
+}

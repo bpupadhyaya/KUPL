@@ -143,6 +143,7 @@ fn (x: Int, y: Int) { x + y }       // or annotated
 xs.map(fn x { x + 1 })              // method call
 user.name                           // field access (records)
 half(n)?                            // Result propagation (functions only)
+user with age: 37, name: "Ada L."   // record update: new value, fields replaced
 "total: {a + b}"                    // interpolation
 { let t = a; t * t }                // block expression (value = last expr)
 ```

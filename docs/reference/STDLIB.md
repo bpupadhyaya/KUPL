@@ -36,6 +36,12 @@ unless supervised.
 | `.sum()` | `-> T` | Int or Float lists; Int overflow panics |
 | `.contains(v)` | `(T) -> Bool` | structural equality |
 | `.push(v)` | `(T) -> List[T]` | returns a **new** list (lists are immutable) |
+| `.fold(init, f)` | `(A, fn(A, T) -> A) -> A` | left fold |
+| `.any(f)` / `.all(f)` | `(fn(T) -> Bool) -> Bool` | short-circuiting |
+| `.sort()` | `-> List[T]` | Int/Float/Str elements; stable ascending |
+| `.take(n)` / `.drop(n)` | `(Int) -> List[T]` | clamped to list bounds |
+| `.get(i)` | `(Int) -> Option[T]` | safe indexing |
+| `.index_of(v)` | `(T) -> Option[Int]` | first occurrence |
 | `.first()` / `.last()` | `-> Option[T]` | |
 | `.reverse()` | `-> List[T]` | |
 | `.join(sep)` | `(Str) -> Str` | elements rendered with Display |
@@ -50,6 +56,12 @@ unless supervised.
 | `.to_upper()` / `.to_lower()` | `-> Str` | |
 | `.trim()` | `-> Str` | strips ASCII whitespace at both ends |
 | `.split(sep)` | `(Str) -> List[Str]` | non-empty separator |
+| `.ends_with(s)` | `(Str) -> Bool` | |
+| `.replace(from, to)` | `(Str, Str) -> Str` | all occurrences |
+| `.chars()` | `-> List[Str]` | one-character strings |
+| `.repeat(n)` | `(Int) -> Str` | n ≥ 0 |
+| `.parse_int()` | `-> Option[Int]` | `None` on any malformed input |
+| `.parse_float()` | `-> Option[Float]` | |
 
 `+` concatenates two Str values; `"…{expr}…"` interpolation renders any value.
 
@@ -60,6 +72,7 @@ unless supervised.
 | `.to_str()` | `-> Str` | |
 | `.to_float()` | `-> Float` | |
 | `.abs()` | `-> Int` | `Int.min.abs()` panics |
+| `.min(other)` / `.max(other)` | `(Int) -> Int` | |
 
 ### Float
 
@@ -68,6 +81,8 @@ unless supervised.
 | `.to_str()` | `-> Str` | |
 | `.to_int()` | `-> Int` | truncates toward zero |
 | `.abs()` / `.sqrt()` | `-> Float` | |
+| `.floor()` / `.ceil()` / `.round()` | `-> Float` | |
+| `.min(other)` / `.max(other)` / `.pow(exp)` | `(Float) -> Float` | |
 
 ### Option[T]
 

@@ -170,6 +170,13 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             let f = str_const(chunk, *name)?;
             format!("regs[{dst}] = k_field_named(regs[{obj}], \"{}\");", c_escape(f))
         }
+        WithField { dst, obj, name, value } => {
+            let f = str_const(chunk, *name)?;
+            format!(
+                "regs[{dst}] = k_with_field(regs[{obj}], \"{}\", regs[{value}]);",
+                c_escape(f)
+            )
+        }
         TagIs { dst, obj, ctor } => format!("regs[{dst}] = k_bool(k_tag_is(regs[{obj}], {ctor}));"),
         MakeClosure { dst, proto, start, ncaps } => {
             format!("regs[{dst}] = k_closure({proto}, &regs[{start}], {ncaps});")
@@ -576,6 +583,22 @@ static KValue k_field_named(KValue v, const char* name) {
     k_panic("no such field"); return k_unit();
 }
 
+static KValue k_with_field(KValue v, const char* name, KValue newval) {
+    if (v.tag != K_CTOR) k_panic("value has no fields to update");
+    const KCtorMeta* m = &CTORS[v.as.ctor->ctor];
+    for (int i = 0; i < m->arity; i++) {
+        if (strcmp(m->fields[i], name) == 0) {
+            KValue* fields = k_alloc(sizeof(KValue) * (v.as.ctor->nfields < 1 ? 1 : v.as.ctor->nfields));
+            memcpy(fields, v.as.ctor->fields, sizeof(KValue) * v.as.ctor->nfields);
+            fields[i] = newval;
+            KCtor* c = k_alloc(sizeof(KCtor));
+            c->ctor = v.as.ctor->ctor; c->nfields = v.as.ctor->nfields; c->fields = fields;
+            KValue out; out.tag = K_CTOR; out.as.ctor = c; return out;
+        }
+    }
+    k_panic("no such field"); return k_unit();
+}
+
 static int k_tag_is(KValue v, int ctor) {
     return v.tag == K_CTOR && strcmp(CTORS[v.as.ctor->ctor].variant, CTORS[ctor].variant) == 0;
 }
@@ -653,6 +676,63 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             out[l->len] = args[0];
             return k_list(out, (int)l->len + 1);
         }
+        if (!strcmp(name, "fold")) {
+            KValue acc = args[0];
+            for (int64_t i = 0; i < l->len; i++) {
+                KValue cb[2]; cb[0] = acc; cb[1] = l->items[i];
+                acc = k_call(args[1], cb, 2);
+            }
+            return acc;
+        }
+        if (!strcmp(name, "any")) {
+            for (int64_t i = 0; i < l->len; i++)
+                if (k_truthy(k_call(args[0], &l->items[i], 1))) return k_bool(1);
+            return k_bool(0);
+        }
+        if (!strcmp(name, "all")) {
+            for (int64_t i = 0; i < l->len; i++)
+                if (!k_truthy(k_call(args[0], &l->items[i], 1))) return k_bool(0);
+            return k_bool(1);
+        }
+        if (!strcmp(name, "sort")) {
+            KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+            memcpy(out, l->items, sizeof(KValue) * l->len);
+            /* insertion sort: stable, no globals needed for the comparator */
+            for (int64_t i = 1; i < l->len; i++) {
+                KValue key = out[i];
+                int64_t j = i - 1;
+                while (j >= 0) {
+                    int gt;
+                    if (out[j].tag == K_INT && key.tag == K_INT) gt = out[j].as.i > key.as.i;
+                    else if (out[j].tag == K_FLOAT && key.tag == K_FLOAT) gt = out[j].as.f > key.as.f;
+                    else if (out[j].tag == K_STR && key.tag == K_STR) gt = strcmp(out[j].as.s, key.as.s) > 0;
+                    else { k_panic("`sort` needs Int, Float, or Str elements"); gt = 0; }
+                    if (!gt) break;
+                    out[j + 1] = out[j];
+                    j--;
+                }
+                out[j + 1] = key;
+            }
+            return k_list(out, (int)l->len);
+        }
+        if (!strcmp(name, "take") || !strcmp(name, "drop")) {
+            if (args[0].tag != K_INT) k_panic("`take`/`drop` needs an Int");
+            int64_t n = args[0].as.i;
+            if (n < 0) n = 0;
+            if (n > l->len) n = l->len;
+            if (name[0] == 't') return k_list(l->items, (int)n);
+            return k_list(l->items + n, (int)(l->len - n));
+        }
+        if (!strcmp(name, "get")) {
+            if (args[0].tag != K_INT) k_panic("`get` needs an Int");
+            int64_t i = args[0].as.i;
+            return (i >= 0 && i < l->len) ? k_some(l->items[i]) : k_none();
+        }
+        if (!strcmp(name, "index_of")) {
+            for (int64_t i = 0; i < l->len; i++)
+                if (k_eq(l->items[i], args[0])) return k_some(k_int(i));
+            return k_none();
+        }
         if (!strcmp(name, "first")) return l->len ? k_some(l->items[0]) : k_none();
         if (!strcmp(name, "last")) return l->len ? k_some(l->items[l->len - 1]) : k_none();
         if (!strcmp(name, "reverse")) {
@@ -700,6 +780,65 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             out[z - a] = 0;
             return k_str(out);
         }
+        if (!strcmp(name, "ends_with")) {
+            size_t sl = strlen(s), nl = strlen(args[0].as.s);
+            return k_bool(nl <= sl && strcmp(s + sl - nl, args[0].as.s) == 0);
+        }
+        if (!strcmp(name, "replace")) {
+            const char* from = args[0].as.s; const char* to = args[1].as.s;
+            size_t fl = strlen(from);
+            if (fl == 0) return k_str(s);
+            KBuf b = {0};
+            const char* p = s;
+            for (;;) {
+                const char* q = strstr(p, from);
+                if (!q) { kb_puts(&b, p); break; }
+                char* piece = k_alloc((size_t)(q - p) + 1);
+                memcpy(piece, p, (size_t)(q - p)); piece[q - p] = 0;
+                kb_puts(&b, piece); kb_puts(&b, to);
+                p = q + fl;
+            }
+            return k_str(b.buf ? b.buf : "");
+        }
+        if (!strcmp(name, "chars")) {
+            KValue tmp_items[4096];
+            int n = 0;
+            const char* p = s;
+            while (*p && n < 4096) {
+                int len = 1;
+                if ((*p & 0xF8) == 0xF0) len = 4;
+                else if ((*p & 0xF0) == 0xE0) len = 3;
+                else if ((*p & 0xE0) == 0xC0) len = 2;
+                char* c = k_alloc((size_t)len + 1);
+                memcpy(c, p, (size_t)len); c[len] = 0;
+                tmp_items[n++] = k_str(c);
+                p += len;
+            }
+            return k_list(tmp_items, n);
+        }
+        if (!strcmp(name, "repeat")) {
+            if (args[0].tag != K_INT || args[0].as.i < 0) k_panic("`repeat` needs a non-negative Int");
+            int64_t n = args[0].as.i;
+            size_t sl = strlen(s);
+            if (sl * (size_t)n > 100000000) k_panic("`repeat` result too large");
+            char* out = k_alloc(sl * (size_t)n + 1);
+            out[0] = 0;
+            for (int64_t i = 0; i < n; i++) memcpy(out + i * sl, s, sl);
+            out[sl * (size_t)n] = 0;
+            return k_str(out);
+        }
+        if (!strcmp(name, "parse_int")) {
+            char* end;
+            long long v = strtoll(s, &end, 10);
+            if (end == s || *end != 0) return k_none();
+            return k_some(k_int((int64_t)v));
+        }
+        if (!strcmp(name, "parse_float")) {
+            char* end;
+            double v = strtod(s, &end);
+            if (end == s || *end != 0) return k_none();
+            return k_some(k_float(v));
+        }
         if (!strcmp(name, "split")) {
             const char* sep = args[0].as.s;
             size_t seplen = strlen(sep);
@@ -729,12 +868,20 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             if (recv.as.i == INT64_MIN) k_panic("integer overflow in abs");
             return k_int(recv.as.i < 0 ? -recv.as.i : recv.as.i);
         }
+        if (!strcmp(name, "min")) return k_int(recv.as.i < args[0].as.i ? recv.as.i : args[0].as.i);
+        if (!strcmp(name, "max")) return k_int(recv.as.i > args[0].as.i ? recv.as.i : args[0].as.i);
     }
     if (recv.tag == K_FLOAT) {
         if (!strcmp(name, "to_str")) return k_to_str(recv);
         if (!strcmp(name, "to_int")) return k_int((int64_t)recv.as.f);
         if (!strcmp(name, "abs")) return k_float(fabs(recv.as.f));
         if (!strcmp(name, "sqrt")) return k_float(sqrt(recv.as.f));
+        if (!strcmp(name, "floor")) return k_float(floor(recv.as.f));
+        if (!strcmp(name, "ceil")) return k_float(ceil(recv.as.f));
+        if (!strcmp(name, "round")) return k_float(round(recv.as.f));
+        if (!strcmp(name, "min")) return k_float(recv.as.f < args[0].as.f ? recv.as.f : args[0].as.f);
+        if (!strcmp(name, "max")) return k_float(recv.as.f > args[0].as.f ? recv.as.f : args[0].as.f);
+        if (!strcmp(name, "pow")) return k_float(pow(recv.as.f, args[0].as.f));
     }
     if (recv.tag == K_TENSOR) {
         KTensor* t = recv.as.ten;

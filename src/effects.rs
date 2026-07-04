@@ -262,6 +262,12 @@ fn walk_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_expr(lo, f);
             walk_expr(hi, f);
         }
+        ExprKind::With { recv, updates } => {
+            walk_expr(recv, f);
+            for (_, v) in updates {
+                walk_expr(v, f);
+            }
+        }
         ExprKind::Try(e) | ExprKind::Await(e) => walk_expr(e, f),
         _ => {}
     }

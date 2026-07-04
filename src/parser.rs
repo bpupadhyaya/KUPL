@@ -940,7 +940,7 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_range()?;
+        let mut lhs = self.parse_with()?;
         loop {
             let op = match self.peek() {
                 Tok::Lt => BinOp::Lt,
@@ -950,9 +950,36 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let rhs = self.parse_range()?;
+            let rhs = self.parse_with()?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr { kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }, span };
+        }
+        Ok(lhs)
+    }
+
+    /// `expr with field: value, field: value` — record update. After a comma,
+    /// the update list only continues when `ident :` follows (so `f(t with
+    /// x: 1, other)` parses `other` as the next call argument).
+    fn parse_with(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_range()?;
+        while matches!(self.peek(), Tok::Ident(n) if n == "with") {
+            self.bump();
+            let mut updates = Vec::new();
+            loop {
+                let (field, _) = self.expect_ident()?;
+                self.expect(Tok::Colon)?;
+                let value = self.parse_range()?;
+                updates.push((field, value));
+                if !(self.at(&Tok::Comma)
+                    && matches!(self.peek_at(1), Tok::Ident(_))
+                    && matches!(self.peek_at(2), Tok::Colon))
+                {
+                    break;
+                }
+                self.bump(); // comma
+            }
+            let span = lhs.span.merge(self.prev_span());
+            lhs = Expr { kind: ExprKind::With { recv: Box::new(lhs), updates }, span };
         }
         Ok(lhs)
     }

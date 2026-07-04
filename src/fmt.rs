@@ -373,10 +373,11 @@ const P_OR: u8 = 1;
 const P_AND: u8 = 2;
 const P_EQ: u8 = 3;
 const P_CMP: u8 = 4;
-const P_RANGE: u8 = 5;
-const P_ADD: u8 = 6;
-const P_MUL: u8 = 7;
-const P_UNARY: u8 = 8;
+const P_WITH: u8 = 5;
+const P_RANGE: u8 = 6;
+const P_ADD: u8 = 7;
+const P_MUL: u8 = 8;
+const P_UNARY: u8 = 9;
 
 fn bin_prec(op: BinOp) -> u8 {
     use BinOp::*;
@@ -540,6 +541,14 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
             let l = expr_str(lo, P_RANGE + 1);
             let h = expr_str(hi, P_RANGE + 1);
             (format!("{l}{}{h}", if *inclusive { "..=" } else { ".." }), P_RANGE)
+        }
+        ExprKind::With { recv, updates } => {
+            let r = expr_str(recv, P_WITH + 1);
+            let us: Vec<String> = updates
+                .iter()
+                .map(|(f, v)| format!("{f}: {}", expr_str(v, P_RANGE)))
+                .collect();
+            (format!("{r} with {}", us.join(", ")), P_WITH)
         }
         ExprKind::Try(inner) => (format!("{}?", expr_str(inner, P_UNARY + 1)), ATOM),
         ExprKind::Await(inner) => (format!("await {}", expr_str(inner, P_UNARY)), P_UNARY),
