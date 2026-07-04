@@ -244,9 +244,10 @@ mode built for editors and AI agents), a zero-dependency LSP server, component
 manifests for visual tools, `kupl context` for LLM prompt-packing, and
 property-based testing built in. This is Rust-cargo-quality ambition delivered
 in a v1.0-alpha. It trails Rust only because rust-analyzer/clippy/the crates
-graph are mature; the LSP now serves **hover, go-to-definition, and completion**
-(it44) in addition to diagnostics — the headline IDE features are shipped, with
-rename/find-references still to come.
+graph are mature; the LSP now serves **hover, go-to-definition, completion, find-references, and
+rename** (it44/it49) in addition to diagnostics — the everyday IDE feature set is
+shipped (references/rename are token-based, not yet scope-aware). What still
+trails Rust is the maturity of rust-analyzer/clippy and the crates graph.
 
 ### Ecosystem & maturity — KUPL 2
 

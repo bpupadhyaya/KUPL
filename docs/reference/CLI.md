@@ -103,10 +103,11 @@ count. This is the palette/canvas API for visual tools.
 ### `kupl lsp`
 Language Server Protocol over stdio. Capabilities: full-text document sync,
 `publishDiagnostics` on open/change/save, **hover** (item signatures),
-**go-to-definition** (jump to a top-level declaration, across `use`d files), and
-**completion** (top-level funs/types/components/contracts/constructors +
-keywords). Unsaved buffer contents override disk. Register `kupl lsp` as the
-server for `.kupl` files in any LSP-capable editor.
+**go-to-definition**, **completion** (top-level names + keywords), **find-
+references**, and **rename**. Unsaved buffer contents override disk. Register
+`kupl lsp` as the server for `.kupl` files in any LSP-capable editor.
+References/rename are lexer-token-based (they never touch strings or comments)
+but not yet scope-aware — they act on every same-named identifier in the file.
 
 ## Project scaffolding
 

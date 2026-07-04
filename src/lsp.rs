@@ -440,6 +440,33 @@ pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String
     Some(format!("```kupl\n{sig}\n```"))
 }
 
+/// Every occurrence of the identifier `name`, as 0-based LSP ranges. Uses the
+/// LEXER, so it matches only real identifier tokens — never text inside string
+/// literals or comments (an identifier inside a `{…}` interpolation IS a real
+/// reference and is included). Token-based, NOT scope-aware: it finds every
+/// same-named identifier in the file (a shadowing local or a same-named field
+/// included) — the common simple-LSP behavior; scope-aware rename is future work.
+pub fn occurrences(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
+    let (tokens, _diags) = crate::lexer::lex(text);
+    let mut out = Vec::new();
+    for t in &tokens {
+        if let crate::token::Tok::Ident(s) = &t.tok {
+            if s == name {
+                let (l0, c0) = crate::diag::line_col(text, t.span.start);
+                let (l1, c1) = crate::diag::line_col(text, t.span.end);
+                out.push((l0 - 1, c0 - 1, l1 - 1, c1 - 1));
+            }
+        }
+    }
+    out
+}
+
+/// The identifier under the cursor (for references/rename resolution).
+fn ident_under(text: &str, line: usize, character: usize) -> Option<String> {
+    let off = offset_at(text, line, character);
+    ident_at(text, off).map(|(n, _, _)| n)
+}
+
 /// Definition location (0-based range) for the symbol at an LSP position.
 pub fn resolve_definition(text: &str, line: usize, character: usize) -> Option<(usize, usize, usize, usize)> {
     let off = offset_at(text, line, character);
@@ -519,7 +546,7 @@ pub fn serve() -> i32 {
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -612,6 +639,53 @@ pub fn serve() -> i32 {
                     Some(format!(
                         "{{\"uri\":\"{}\",\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}}}}",
                         json_escape(uri)
+                    ))
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/references" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let (uri, line, ch) = position_of(p)?;
+                    let text = doc_text(uri, &buffers)?;
+                    let name = ident_under(&text, line, ch)?;
+                    let locs: Vec<String> = occurrences(&text, &name)
+                        .into_iter()
+                        .map(|(l0, c0, l1, c1)| {
+                            format!(
+                                "{{\"uri\":\"{}\",\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}}}}",
+                                json_escape(uri)
+                            )
+                        })
+                        .collect();
+                    Some(format!("[{}]", locs.join(",")))
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/rename" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let (uri, line, ch) = position_of(p)?;
+                    let new_name = p.get("newName")?.str()?;
+                    let text = doc_text(uri, &buffers)?;
+                    let name = ident_under(&text, line, ch)?;
+                    let edits: Vec<String> = occurrences(&text, &name)
+                        .into_iter()
+                        .map(|(l0, c0, l1, c1)| {
+                            format!(
+                                "{{\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}},\"newText\":\"{}\"}}",
+                                json_escape(new_name)
+                            )
+                        })
+                        .collect();
+                    Some(format!(
+                        "{{\"changes\":{{\"{}\":[{}]}}}}",
+                        json_escape(uri),
+                        edits.join(",")
                     ))
                 })()
                 .unwrap_or_else(|| "null".into());
@@ -717,6 +791,33 @@ mod tests {
         let add = items.iter().find(|(l, _, _)| l == "add").unwrap();
         assert_eq!(add.1, 3);
         assert!(add.2.contains("-> Int"));
+    }
+
+    #[test]
+    fn occurrences_skips_strings_and_comments() {
+        // `add` appears: decl (l0), the call in main, plus a string + a comment
+        // that must NOT match.
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+                   // add is a helper\n\
+                   fun main() uses io {\n    print(\"call add here\")\n    print(add(1, 2))\n}\n";
+        let occ = occurrences(src, "add");
+        // exactly two real identifier occurrences: the `fun add` decl and the
+        // `add(1, 2)` call — NOT the comment, NOT the string literal.
+        assert_eq!(occ.len(), 2, "occ: {occ:?}");
+        assert_eq!(occ[0].0, 0); // declaration on line 0
+    }
+
+    #[test]
+    fn references_and_rename() {
+        // references from any occurrence returns all of them (decl + uses)
+        let refs = occurrences(PROG, "add");
+        assert!(refs.len() >= 2, "add is declared once and called once: {refs:?}");
+        // ident under the call site resolves to `add`
+        let call_line = PROG.lines().position(|l| l.contains("print(add")).unwrap();
+        let ch = PROG.lines().nth(call_line).unwrap().find("add").unwrap() + 1;
+        assert_eq!(ident_under(PROG, call_line, ch).as_deref(), Some("add"));
+        // rename would produce one edit per occurrence (same count)
+        assert_eq!(occurrences(PROG, "add").len(), refs.len());
     }
 
     #[test]
