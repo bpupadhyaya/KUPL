@@ -12,6 +12,7 @@ pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
     pub diags: Vec<Diag>,
+    uses: Vec<(String, Span)>,
 }
 
 fn str_parts_text(parts: &[StrPart]) -> String {
@@ -27,8 +28,22 @@ fn str_parts_text(parts: &[StrPart]) -> String {
 type PResult<T> = Result<T, Diag>;
 
 pub fn parse(src: &str) -> (Program, Vec<Diag>) {
-    let (toks, mut diags) = lexer::lex(src);
-    let mut p = Parser { toks, pos: 0, diags: Vec::new() };
+    parse_with_base(src, 0)
+}
+
+/// Parse with all spans shifted by `base` — used by the multi-file loader so
+/// spans index into the concatenated source map.
+pub fn parse_with_base(src: &str, base: u32) -> (Program, Vec<Diag>) {
+    let (mut toks, mut diags) = lexer::lex(src);
+    if base != 0 {
+        for t in &mut toks {
+            t.span = Span::new(t.span.start + base, t.span.end + base);
+        }
+        for d in &mut diags {
+            d.span = Span::new(d.span.start + base, d.span.end + base);
+        }
+    }
+    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new() };
     let program = p.parse_program();
     diags.extend(p.diags);
     (program, diags)
@@ -40,7 +55,7 @@ pub fn parse_stmt_fragment(src: &str) -> Result<Stmt, Diag> {
     if let Some(d) = diags.into_iter().next() {
         return Err(d);
     }
-    let mut p = Parser { toks, pos: 0, diags: Vec::new() };
+    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new() };
     p.skip_newlines();
     let stmt = p.parse_stmt()?;
     if let Some(d) = p.diags.into_iter().next() {
@@ -59,7 +74,7 @@ pub fn parse_expr_fragment(src: &str, offset: u32) -> Result<Expr, Diag> {
     if let Some(d) = diags.into_iter().next() {
         return Err(d);
     }
-    let mut p = Parser { toks, pos: 0, diags: Vec::new() };
+    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new() };
     p.skip_newlines();
     let expr = p.parse_expr()?;
     if let Some(d) = p.diags.into_iter().next() {
@@ -183,14 +198,14 @@ impl Parser {
     // ---- program & items ----------------------------------------------
 
     fn parse_program(&mut self) -> Program {
-        let mut items = Vec::new();
+        let mut program = Program::default();
         loop {
             self.skip_newlines();
             if matches!(self.peek(), Tok::Eof) {
                 break;
             }
             match self.parse_item() {
-                Ok(Some(item)) => items.push(item),
+                Ok(Some(item)) => program.items.push(item),
                 Ok(None) => {}
                 Err(d) => {
                     self.diags.push(d);
@@ -198,7 +213,8 @@ impl Parser {
                 }
             }
         }
-        Program { items }
+        program.uses = std::mem::take(&mut self.uses);
+        program
     }
 
     fn parse_item(&mut self) -> PResult<Option<Item>> {
@@ -209,8 +225,21 @@ impl Parser {
             Tok::KwComponent => Ok(Some(Item::Component(self.parse_component(false)?))),
             Tok::KwApp => Ok(Some(Item::Component(self.parse_component(true)?))),
             Tok::KwContract => Ok(Some(Item::Contract(self.parse_contract()?))),
-            Tok::KwModule | Tok::KwUse => {
-                // Accepted and recorded as no-ops in v0.1 (single-file programs).
+            Tok::KwUse => {
+                let uspan = self.span();
+                self.bump();
+                let (mut path, _) = self.expect_ident()?;
+                while self.eat(&Tok::Dot) {
+                    let (part, _) = self.expect_ident()?;
+                    path.push('.');
+                    path.push_str(&part);
+                }
+                self.uses.push((path, uspan.merge(self.prev_span())));
+                self.expect_terminator()?;
+                Ok(None)
+            }
+            Tok::KwModule => {
+                // Accepted; module identity is derived from the file path (v0).
                 self.bump();
                 while !matches!(self.peek(), Tok::Newline | Tok::Eof) {
                     self.bump();

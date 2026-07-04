@@ -34,14 +34,10 @@ pub fn compile(src: &str) -> Result<Compiled, Vec<Diag>> {
 
 /// `kupl context <name>`: emit the item plus the source of everything it
 /// directly references — the minimal dependency-closed context for an LLM.
-pub fn emit_context(src: &str, file: &str, name: &str) -> i32 {
-    let compiled = match compile(src) {
-        Ok(c) => c,
-        Err(errors) => {
-            print_diags(&errors, src, file);
-            return 1;
-        }
-    };
+pub fn emit_context(path: &str, name: &str) -> i32 {
+    let Ok((compiled, map)) = load_compile(path) else { return 1 };
+    let file = path;
+    let src: &str = &map.concat;
     let items: Vec<(&str, Span)> = compiled
         .program
         .items
@@ -203,21 +199,44 @@ pub fn print_diags(diags: &[Diag], src: &str, file: &str) {
     }
 }
 
-fn report_panic(msg: &str, span: Span, src: &str, file: &str) {
+fn print_diags_map(diags: &[Diag], map: &crate::loader::SourceMap) {
+    for d in diags {
+        eprint!("{}", map.render(d));
+    }
+}
+
+fn report_panic_map(msg: &str, span: Span, map: &crate::loader::SourceMap) {
     let d = Diag::error("K0900", format!("panic: {msg}"), span);
-    eprint!("{}", diag::render(&d, src, file));
+    eprint!("{}", map.render(&d));
+}
+
+/// Load (multi-file), type-check, effect-check. Prints errors itself.
+pub fn load_compile(path: &str) -> Result<(Compiled, crate::loader::SourceMap), i32> {
+    let (program, map) = match crate::loader::load(path) {
+        Ok(ok) => ok,
+        Err((diags, map)) => {
+            print_diags_map(&diags, &map);
+            return Err(1);
+        }
+    };
+    let (checked, mut diags) = check::check(&program);
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        diags.extend(crate::effects::check_effects(&program));
+    }
+    let (errors, warnings): (Vec<_>, Vec<_>) =
+        diags.into_iter().partition(|d| d.severity == Severity::Error);
+    if !errors.is_empty() {
+        print_diags_map(&errors, &map);
+        return Err(1);
+    }
+    print_diags_map(&warnings, &map);
+    Ok((Compiled { program, checked, warnings: Vec::new() }, map))
 }
 
 /// `kupl run`: execute the first `app` (or a `fun main()` if there is no app).
-pub fn run_program(src: &str, file: &str) -> i32 {
-    let compiled = match compile(src) {
-        Ok(c) => c,
-        Err(errors) => {
-            print_diags(&errors, src, file);
-            return 1;
-        }
-    };
-    print_diags(&compiled.warnings, src, file);
+pub fn run_program(path: &str) -> i32 {
+    let Ok((compiled, map)) = load_compile(path) else { return 1 };
+    let file = path;
 
     let app = compiled.program.items.iter().find_map(|item| match item {
         Item::Component(c) if c.is_app => Some(c.name.clone()),
@@ -269,28 +288,21 @@ pub fn run_program(src: &str, file: &str) -> i32 {
     match outcome {
         Ok(()) => 0,
         Err(Flow::Panic { msg, span }) => {
-            report_panic(&msg, span, src, file);
+            report_panic_map(&msg, span, &map);
             101
         }
         Err(_) => 0,
     }
 }
 
-/// `kupl run --vm`: compile the functional core to KVM bytecode and execute
-/// `fun main` on the register VM.
-pub fn run_program_vm(src: &str, file: &str) -> i32 {
-    let compiled = match compile(src) {
-        Ok(c) => c,
-        Err(errors) => {
-            print_diags(&errors, src, file);
-            return 1;
-        }
-    };
-    print_diags(&compiled.warnings, src, file);
+/// `kupl run --vm`: compile to KVM bytecode and execute on the register VM.
+pub fn run_program_vm(path: &str) -> i32 {
+    let Ok((compiled, map)) = load_compile(path) else { return 1 };
+    let file = path;
     let module = match crate::compile::compile_module(&compiled.program, &compiled.checked) {
         Ok(m) => m,
         Err(diags) => {
-            print_diags(&diags, src, file);
+            print_diags_map(&diags, &map);
             return 1;
         }
     };
@@ -311,23 +323,50 @@ pub fn run_program_vm(src: &str, file: &str) -> i32 {
     match outcome {
         Ok(_) => 0,
         Err(e) => {
-            report_panic(&e.msg, e.span, src, file);
+            report_panic_map(&e.msg, e.span, &map);
             101
         }
     }
 }
 
-/// `kupl manifest`: emit the component manifests (the visual-tool palette API)
-/// as JSON: intent, ports, props, state, exposes, fulfills, wiring.
-pub fn emit_manifest(src: &str, file: &str) -> i32 {
-    use crate::diag::json_escape as esc;
-    let compiled = match compile(src) {
-        Ok(c) => c,
-        Err(errors) => {
-            print_diags(&errors, src, file);
+/// `kupl check [--json]`: load (multi-file), type-check, effect-check.
+pub fn check_cmd(path: &str, json: bool) -> i32 {
+    let (program, map) = match crate::loader::load(path) {
+        Ok(ok) => ok,
+        Err((diags, map)) => {
+            if json {
+                println!("{}", map.to_json(&diags));
+            } else {
+                print_diags_map(&diags, &map);
+            }
             return 1;
         }
     };
+    let (_, mut diags) = check::check(&program);
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        diags.extend(crate::effects::check_effects(&program));
+    }
+    let has_errors = diags.iter().any(|d| d.severity == Severity::Error);
+    if json {
+        println!("{}", map.to_json(&diags));
+    } else {
+        print_diags_map(&diags, &map);
+        if !has_errors {
+            println!("ok: {path}");
+        }
+    }
+    if has_errors {
+        1
+    } else {
+        0
+    }
+}
+
+/// `kupl manifest`: emit the component manifests (the visual-tool palette API)
+/// as JSON: intent, ports, props, state, exposes, fulfills, wiring.
+pub fn emit_manifest(path: &str) -> i32 {
+    use crate::diag::json_escape as esc;
+    let Ok((compiled, _map)) = load_compile(path) else { return 1 };
     let mut out = String::from("{\"components\":[");
     let mut first = true;
     for item in &compiled.program.items {
@@ -441,36 +480,24 @@ pub fn run_module(module: &crate::bytecode::Module, origin: &str) -> i32 {
 }
 
 /// `kupl dis`: disassemble the compiled module.
-pub fn disassemble(src: &str, file: &str) -> i32 {
-    let compiled = match compile(src) {
-        Ok(c) => c,
-        Err(errors) => {
-            print_diags(&errors, src, file);
-            return 1;
-        }
-    };
+pub fn disassemble(path: &str) -> i32 {
+    let Ok((compiled, map)) = load_compile(path) else { return 1 };
     match crate::compile::compile_module(&compiled.program, &compiled.checked) {
         Ok(m) => {
             print!("{}", m.disassemble());
             0
         }
         Err(diags) => {
-            print_diags(&diags, src, file);
+            print_diags_map(&diags, &map);
             1
         }
     }
 }
 
 /// `kupl test`: run every `example` block of every component.
-pub fn run_tests(src: &str, file: &str) -> i32 {
-    let compiled = match compile(src) {
-        Ok(c) => c,
-        Err(errors) => {
-            print_diags(&errors, src, file);
-            return 1;
-        }
-    };
-    print_diags(&compiled.warnings, src, file);
+pub fn run_tests(path: &str) -> i32 {
+    let Ok((compiled, map)) = load_compile(path) else { return 1 };
+    let src: &str = &map.concat;
 
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -507,7 +534,7 @@ pub fn run_tests(src: &str, file: &str) -> i32 {
                 }
                 Err(Flow::Panic { msg, span }) => {
                     println!("FAIL  {label}: panic: {msg}");
-                    report_panic(&msg, span, src, file);
+                    report_panic_map(&msg, span, &map);
                     failed += 1;
                 }
                 Err(_) => {

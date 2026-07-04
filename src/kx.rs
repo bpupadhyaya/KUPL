@@ -31,9 +31,6 @@ impl W {
     fn u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
-    fn u64(&mut self, v: u64) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
-    }
     fn i64(&mut self, v: i64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }

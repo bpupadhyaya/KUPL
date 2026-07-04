@@ -1,0 +1,3 @@
+fun mean(xs: List[Int]) -> Float {
+    xs.sum().to_float() / xs.len().to_float()
+}

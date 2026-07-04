@@ -1,0 +1,33 @@
+// Multi-file KUPL: `use util` -> util.kupl, `use lib.stats` -> lib/stats.kupl
+use util
+use lib.stats
+
+app Main {
+    intent "Report stats over a dataset using functions from two modules."
+
+    let reporter = Reporter()
+    let source = Source()
+
+    wire source.data -> reporter.numbers
+}
+
+component Source {
+    intent "Emits a dataset at startup."
+
+    out data: List[Int]
+
+    on start {
+        emit data([4, 8, 15, 16, 23, 42])
+    }
+}
+
+component Reporter {
+    intent "Prints mean and label for arriving datasets."
+
+    in numbers: List[Int]
+
+    on numbers(xs) {
+        let m = mean(xs)
+        print("mean of {xs} is {m} ({label(m)})")
+    }
+}

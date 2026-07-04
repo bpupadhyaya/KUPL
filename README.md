@@ -37,6 +37,8 @@ kupl check --json broken.kupl     # machine-readable diagnostics (for AI/editors
 kupl fmt file.kupl [--write]      # THE canonical form (zero config, idempotent)
 kupl context file.kupl TodoStore  # item + direct deps — minimal LLM context
 kupl repl                         # interactive session
+kupl manifest examples/todo.kupl  # JSON component manifests (visual tools)
+kupl run examples/multifile/main.kupl  # multi-file: `use util`, `use lib.stats`
 ```
 
 A taste of KUPL:

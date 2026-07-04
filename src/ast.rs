@@ -6,6 +6,8 @@ use crate::token::StrPart;
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub items: Vec<Item>,
+    /// `use` declarations: dotted module path + span (resolved by the loader).
+    pub uses: Vec<(String, Span)>,
 }
 
 #[derive(Debug, Clone)]

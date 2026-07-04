@@ -15,6 +15,7 @@ pub mod vm;
 pub mod interp;
 pub mod kx;
 pub mod lexer;
+pub mod loader;
 pub mod parser;
 pub mod repl;
 pub mod run;

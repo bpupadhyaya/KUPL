@@ -1,0 +1,7 @@
+fun label(x: Float) -> Str {
+    if x > 15.0 {
+        "high"
+    } else {
+        "low"
+    }
+}
