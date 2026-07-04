@@ -9,11 +9,9 @@ and known limitations called out in commit messages. Checked off as landed.
 The four big arcs (sized numerics, packages, real-thread concurrency, native
 components) are complete as of it40. Remaining work, ranked by value ÷ effort:
 
-1. **Native `f32`** (small, completes the native numeric surface) — the last
-   native numeric defer. Needs a shortest-round-trip float formatter in C that
-   matches Rust's `Display` (try increasing precision, parse back, take the
-   first that round-trips; decimal form only — Rust never uses scientific
-   notation for Display). Unblocks `kupl native examples/sized.kupl`.
+1. ~~**Native `f32`**~~ — DONE (it42). K_F32 KValue + shortest-round-trip
+   display via `strtof`; examples/sized.kupl is fully native. Native numeric
+   surface complete (only ai/JSON/CSV/HTTP builtins defer).
 2. **Native JSON** (`json_parse`/`json_stringify` in C) — JSON is core to "any
    software"; recursive `Ctor` construction already works natively, so this is
    mostly porting `src/json.rs`'s parser/serializer to the C runtime. Lets
@@ -136,8 +134,7 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       sized ints i8…u64 fully landed across ALL engines: checked/wrapping/
       saturating arithmetic, width-aware bitwise, full conversion matrix
       (it27-29), and native codegen via a boxed __int128 KValue (it40). f32 runs
-      on interp/KVM/.kx (it28); native f32 codegen is pending a shortest-float
-      formatter. Bitwise Int methods + literals (it17); numeric formatting +
+      on ALL engines incl. native (it28/it42, shortest-round-trip display). Bitwise Int methods + literals (it17); numeric formatting +
       math (it24). Byte/Char, BigInt/Decimal still to do.
 - [x] Broader standard library (audit #3, it12) — ~40 methods across all core
       types, all engines byte-identical incl. native. List (is_empty/concat/

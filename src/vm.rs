@@ -1427,10 +1427,13 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
-    fn f32_native_defers_it28() {
-        let compiled = crate::run::compile("fun main() {\n    let x = 1.5f32\n    let _ = x\n}\n").expect("compiles");
+    fn f32_native_compiles_it42() {
+        // f32 now compiles to native (it42) — emit_c succeeds. (Runtime byte-
+        // identity vs the interpreter is covered by the cc-guarded cgen tests.)
+        let compiled = crate::run::compile("fun main() {\n    let x = 22.0f32 / 7.0f32\n    let _ = x\n}\n")
+            .expect("compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
-        assert!(crate::cgen::emit_c(&module).unwrap_err().contains("f32"));
+        assert!(crate::cgen::emit_c(&module).is_ok(), "native should compile f32 now");
     }
 
     #[test]

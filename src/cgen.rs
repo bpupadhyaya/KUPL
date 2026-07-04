@@ -214,12 +214,9 @@ fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
                 format!("k_sized((__int128)(unsigned long long){}ULL, {})", v, w.tag())
             }
         }
-        Value::F32(_) => {
-            return Err(
-                "f32 is not supported by the native backend yet \
-                 — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
-                    .to_string(),
-            )
+        Value::F32(v) => {
+            // reconstruct from the exact 32-bit pattern (never lossy)
+            format!("k_f32_bits({}u)", v.to_bits())
         }
         other => return Err(format!("non-serializable constant {other}")),
     })
@@ -458,9 +455,9 @@ typedef struct { const char* type_name; const char* variant; int arity; const ch
 typedef struct { __int128 v; int width; } KSized;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32 } tag;
     union {
-        int64_t i; double f; int b;
+        int64_t i; double f; int b; float f32v;
         const char* s;
         KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
         int32_t fun; KSized* sized;
@@ -491,6 +488,8 @@ static void* k_alloc(size_t n) {
 
 static KValue k_int(int64_t v)   { KValue x; x.tag = K_INT;   x.as.i = v; return x; }
 static KValue k_float(double v)  { KValue x; x.tag = K_FLOAT; x.as.f = v; return x; }
+static KValue k_f32(float v)     { KValue x; x.tag = K_F32;   x.as.f32v = v; return x; }
+static KValue k_f32_bits(uint32_t bits) { float v; memcpy(&v, &bits, 4); return k_f32(v); }
 
 /* ---- fixed-width integers (mirror value.rs IntW + interp raw_binary_op) ---- */
 static int k_iw_bits(int w) { switch (w % 4) { case 0: return 8; case 1: return 16; case 2: return 32; default: return 64; } }
@@ -748,6 +747,21 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
                 snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)v.as.sized->v);
             kb_puts(b, tmp);
             break;
+        case K_F32: {
+            /* mirror value.rs F32 Display: whole -> "%.1f", else the shortest
+               decimal that round-trips AS A FLOAT (strtof, not strtod) */
+            float ff = v.as.f32v;
+            if (isfinite(ff) && ff == floorf(ff)) {
+                snprintf(tmp, sizeof tmp, "%.1f", (double)ff);
+            } else {
+                for (int prec = 1; prec <= 9; prec++) {
+                    snprintf(tmp, sizeof tmp, "%.*g", prec, (double)ff);
+                    if (strtof(tmp, 0) == ff) break;
+                }
+            }
+            kb_puts(b, tmp);
+            break;
+        }
         case K_RANGE:
             snprintf(tmp, sizeof tmp, "%lld..%s%lld", (long long)v.as.range.lo,
                      v.as.range.incl ? "=" : "", (long long)v.as.range.hi);
@@ -807,6 +821,7 @@ static KValue k_concat(KValue a, KValue b) {
 static int k_eq(KValue a, KValue b) {
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT)
         return a.as.sized->width == b.as.sized->width && a.as.sized->v == b.as.sized->v;
+    if (a.tag == K_F32 && b.tag == K_F32) return a.as.f32v == b.as.f32v;
     if (a.tag == K_MAP && b.tag == K_MAP) {
         if (a.as.map->len != b.as.map->len) return 0;
         for (int64_t i = 0; i < a.as.map->len; i++) {
@@ -881,6 +896,7 @@ static KValue k_add(KValue a, KValue b) {
         return k_int(r);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f + b.as.f);
+    if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v + b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 0);
     if (a.tag == K_STR && b.tag == K_STR) return k_concat(a, b);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 0);
@@ -893,6 +909,7 @@ static KValue k_sub(KValue a, KValue b) {
         return k_int(r);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f - b.as.f);
+    if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v - b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 1);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 1);
     k_panic("invalid operand types"); return k_unit();
@@ -904,6 +921,7 @@ static KValue k_mul(KValue a, KValue b) {
         return k_int(r);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f * b.as.f);
+    if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v * b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 2);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 2);
     k_panic("invalid operand types"); return k_unit();
@@ -915,6 +933,7 @@ static KValue k_div(KValue a, KValue b) {
         return k_int(a.as.i / b.as.i);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(a.as.f / b.as.f);
+    if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v / b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 3);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 3);
     k_panic("invalid operand types"); return k_unit();
@@ -925,6 +944,7 @@ static KValue k_rem(KValue a, KValue b) {
         return k_int(a.as.i % b.as.i);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(fmod(a.as.f, b.as.f));
+    if (a.tag == K_F32 && b.tag == K_F32) return k_f32(fmodf(a.as.f32v, b.as.f32v));
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 4);
     k_panic("invalid operand types"); return k_unit();
 }
@@ -932,6 +952,7 @@ static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
     double x, y; int is_str = 0; int c = 0;
     if (a.tag == K_INT && b.tag == K_INT) { x = 0; y = 0; c = (a.as.i < b.as.i) ? -1 : (a.as.i > b.as.i); }
     else if (a.tag == K_FLOAT && b.tag == K_FLOAT) { x = a.as.f; y = b.as.f; c = (x < y) ? -1 : (x > y); }
+    else if (a.tag == K_F32 && b.tag == K_F32) { float p = a.as.f32v, q = b.as.f32v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) { __int128 p = a.as.sized->v, q = b.as.sized->v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_STR && b.tag == K_STR) { is_str = 1; int r = strcmp(a.as.s, b.as.s); c = (r < 0) ? -1 : (r > 0); }
     else { k_panic("invalid operand types"); }
@@ -1418,6 +1439,14 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         }
         /* unmatched sized method falls through to the generic "no such method" */
     }
+    if (recv.tag == K_F32) {
+        if (!strcmp(name, "to_float")) return k_float((double)recv.as.f32v);
+        if (!strcmp(name, "to_str")) {
+            const char* s = k_show(recv);
+            char* c = (char*)k_alloc(strlen(s) + 1); strcpy(c, s); return k_str(c);
+        }
+    }
+    if (recv.tag == K_FLOAT && !strcmp(name, "to_f32")) return k_f32((float)recv.as.f);
     if (recv.tag == K_LIST) {
         KList* l = recv.as.list;
         if (!strcmp(name, "len")) return k_int(l->len);
@@ -2552,6 +2581,25 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stderr).contains("integer overflow in addition"));
         let _ = std::fs::remove_file(&cp);
         let _ = std::fs::remove_file(&bin);
+    }
+
+    /// f32 compiles to native and matches the interpreter — arithmetic,
+    /// non-integer shortest-round-trip display, whole-value ".0", conversions.
+    #[test]
+    fn native_f32() {
+        if !cc_available() {
+            return;
+        }
+        // each `expected` was verified against `kupl run` on the same source
+        for (src, expected) in [
+            ("fun main() uses io { print(22.0f32 / 7.0f32) }", "3.142857\n"),
+            ("fun main() uses io { print(10.0f32) }", "10.0\n"),
+            ("fun main() uses io { print(1.5f32 + 0.25f32) }", "1.75\n"),
+            ("fun main() uses io { print((1.0).to_f32() + 0.5f32) }", "1.5\n"),
+            ("fun main() uses io { print((3.5f32).to_float() * 2.0) }", "7.0\n"),
+        ] {
+            assert_eq!(native_main_stdout(src, "f32"), expected, "src: {src}");
+        }
     }
 
     /// Direct cross-component expose calls compile to native and dispatch to the

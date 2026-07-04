@@ -1,3 +1,10 @@
+> **Native complete (it42):** f32 now compiles to native too — a K_F32 KValue
+> (a C `float`, literals reconstructed from the exact 32-bit pattern), f32
+> arithmetic/compare/eq, f32↔Float conversions, and a Display that reuses the
+> shortest-round-trip formatter (loop `%.*g`, comparing `strtof`) so non-integer
+> f32 prints byte-identically to Rust. examples/sized.kupl (sized ints AND f32)
+> is now fully native. **Sized numerics are on ALL FOUR engines.**
+>
 > **Native (it40):** sized integers (i8..i64/u8..u64) now COMPILE to machine
 > code — a K_SIZEDINT KValue (boxed __int128 + width) mirroring the interpreter's
 > i128 range-check/wrap/saturate semantics exactly, incl. u64 values above
