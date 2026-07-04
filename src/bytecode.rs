@@ -204,6 +204,8 @@ pub const BUILTIN_BASE64_DECODE: u8 = 39;
 pub const BUILTIN_HEX_ENCODE: u8 = 40;
 pub const BUILTIN_HEX_DECODE: u8 = 41;
 pub const BUILTIN_HASH_FNV: u8 = 42;
+pub const BUILTIN_CSV_PARSE: u8 = 43;
+pub const BUILTIN_CSV_STRINGIFY: u8 = 44;
 
 impl Module {
     pub fn disassemble(&self) -> String {

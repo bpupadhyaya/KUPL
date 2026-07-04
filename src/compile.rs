@@ -1080,6 +1080,8 @@ impl<'s> FnCompiler<'s> {
                 ("hex_encode", 1) => Some(BUILTIN_HEX_ENCODE),
                 ("hex_decode", 1) => Some(BUILTIN_HEX_DECODE),
                 ("hash_fnv", 1) => Some(BUILTIN_HASH_FNV),
+                ("csv_parse", 1) => Some(BUILTIN_CSV_PARSE),
+                ("csv_stringify", 1) => Some(BUILTIN_CSV_STRINGIFY),
                 _ => None,
             };
             if let Some(which) = builtin {

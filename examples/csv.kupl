@@ -1,0 +1,49 @@
+// CSV — parse and write comma-separated data (RFC 4180).
+//
+//   csv_parse(text)     -> List[List[Str]]   rows of fields
+//   csv_stringify(rows) -> Str               fields joined with `,`, rows with `\n`
+//
+// Both pure. Quoted fields may contain commas, newlines, and doubled quotes
+// (`""`); stringify quotes a field only when it contains `,` `"` or a newline.
+
+// Pair each header name with the matching cell of a row → a JSON object.
+fun row_to_obj(header: List[Str], row: List[Str]) -> Json {
+    var fields = Map()
+    var i = 0
+    for name in header {
+        let cell = match row.get(i) {
+            Some(c) => c
+            None => ""
+        }
+        fields = fields.insert(name, JStr(cell))
+        i = i + 1
+    }
+    JObj(fields)
+}
+
+// Turn a CSV table with a header row into JSON (a list of objects).
+fun csv_to_json(text: Str) -> Str {
+    let rows = csv_parse(text)
+    match rows.first() {
+        None => "[]"
+        Some(header) => {
+            let objects = rows.tail().map(fn row { row_to_obj(header, row) })
+            json_stringify(JArr(objects))
+        }
+    }
+}
+
+fun main() uses io {
+    let data = "name,role\nAda,\"engineer, lead\"\nGrace,admiral"
+    let rows = csv_parse(data)
+    print("{rows.len()} rows")
+    for row in rows {
+        print(row.join(" / "))
+    }
+
+    // round-trip: parse then re-serialize
+    print(csv_stringify(rows))
+
+    // CSV -> JSON
+    print(csv_to_json(data))
+}

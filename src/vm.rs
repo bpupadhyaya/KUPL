@@ -634,6 +634,13 @@ impl<'m> Vm<'m> {
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_CSV_PARSE | BUILTIN_CSV_STRINGIFY => {
+                            let name = if which == BUILTIN_CSV_PARSE { "csv_parse" } else { "csv_stringify" };
+                            match crate::interp::csv_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1179,6 +1186,30 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_csv_it25() {
+        // parse into rows × fields
+        assert_eq!(
+            differential("fun probe() -> Int {\n    csv_parse(\"a,b,c\\n1,2,3\").len()\n}\n"),
+            "2"
+        );
+        // quoted field with an embedded comma
+        assert_eq!(
+            differential("fun probe() -> Str {\n    match csv_parse(\"\\\"a,b\\\",c\").first() {\n        Some(row) => row.join(\"|\")\n        None => \"none\"\n    }\n}\n"),
+            "a,b|c"
+        );
+        // stringify quotes a field with a comma
+        assert_eq!(
+            differential("fun probe() -> Str {\n    csv_stringify([[\"x,y\", \"z\"]])\n}\n"),
+            "\"x,y\",z"
+        );
+        // round-trip stability, including embedded newline + doubled quote
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    let rows = csv_parse(\"a,\\\"b\\nc\\\"\\n\\\"he \\\"\\\"q\\\"\\\"\\\",d\")\n    csv_parse(csv_stringify(rows)) == rows\n}\n"),
+            "true"
+        );
     }
 
     #[test]

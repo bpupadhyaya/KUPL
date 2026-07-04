@@ -39,6 +39,8 @@ unless supervised.
 | `base64_encode(s)` / `hex_encode(s)` | `(Str) -> Str` | encode the UTF-8 bytes; pure |
 | `base64_decode(s)` / `hex_decode(s)` | `(Str) -> Result[Str, Str]` | `Err` on malformed input or non-UTF-8 |
 | `hash_fnv(s)` | `(Str) -> Int` | FNV-1a 64-bit; stable, non-cryptographic |
+| `csv_parse(text)` | `(Str) -> List[List[Str]]` | RFC 4180; handles quoted fields |
+| `csv_stringify(rows)` | `(List[List[Str]]) -> Str` | quotes fields with `,` `"` or newline |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
 | `re_match(pat, text)` | `(Str, Str) -> Bool` | regex search (`^…$` for full match) |
@@ -76,6 +78,12 @@ every engine including native. They work on the string's UTF-8 bytes; `*_decode`
 returns `Err` on malformed input or if the decoded bytes are not valid UTF-8.
 `hash_fnv` is deterministic and stable across runs and engines — good for
 bucketing/sharding, not for security.
+
+**CSV** (`csv_parse`/`csv_stringify`) follows RFC 4180: `,` field separator,
+`\n` or `\r\n` row endings on input (`\n` on output), quoted fields for
+values containing `,` `"` or newlines (with `""` for an embedded quote). A
+trailing newline yields no extra row; a blank interior line is a one-field row.
+Pure and interp==KVM; not yet on the native backend.
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

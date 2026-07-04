@@ -198,6 +198,13 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_HEX_ENCODE => format!("regs[{dst}] = k_hex_encode(regs[{start}]); (void){argc};"),
             BUILTIN_HEX_DECODE => format!("regs[{dst}] = k_hex_decode(regs[{start}]); (void){argc};"),
             BUILTIN_HASH_FNV => format!("regs[{dst}] = k_hash_fnv(regs[{start}]); (void){argc};"),
+            BUILTIN_CSV_PARSE | BUILTIN_CSV_STRINGIFY => {
+                return Err(
+                    "csv_parse/csv_stringify are not yet supported by the native backend \
+                     — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
+                        .into(),
+                )
+            }
             BUILTIN_ENV_VAR => format!("regs[{dst}] = k_env_var(regs[{start}]); (void){argc};"),
             BUILTIN_ARGS => format!("regs[{dst}] = k_args(); (void){start}; (void){argc};"),
             BUILTIN_EPRINT => format!("regs[{dst}] = k_eprint(regs[{start}]); (void){argc};"),

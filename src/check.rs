@@ -1509,6 +1509,21 @@ impl Checker {
                     self.unify(&Ty::Str, &t, args[0].value.span, "hash_fnv argument");
                     return Ty::Int;
                 }
+                ("csv_parse", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "csv_parse argument");
+                    return Ty::List(Box::new(Ty::List(Box::new(Ty::Str))));
+                }
+                ("csv_stringify", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(
+                        &Ty::List(Box::new(Ty::List(Box::new(Ty::Str)))),
+                        &t,
+                        args[0].value.span,
+                        "csv_stringify argument",
+                    );
+                    return Ty::Str;
+                }
                 ("eprint", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Unit;

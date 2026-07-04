@@ -960,6 +960,10 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return encoding_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("csv_parse", 1) | ("csv_stringify", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return csv_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("exit", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     let code = match v {
@@ -2196,6 +2200,45 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Unit)
         }
         _ => Err(format!("unknown process builtin `{name}`")),
+    }
+}
+
+/// CSV builtins — shared by interpreter and KVM. Pure.
+pub fn csv_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "csv_parse" => {
+            let text = match &args[0] {
+                Value::Str(s) => s.as_str().to_string(),
+                other => other.to_string(),
+            };
+            let rows = crate::csv::parse(&text);
+            let out: Vec<Value> = rows
+                .into_iter()
+                .map(|row| {
+                    Value::List(Rc::new(row.into_iter().map(Value::str).collect()))
+                })
+                .collect();
+            Ok(Value::List(Rc::new(out)))
+        }
+        "csv_stringify" => {
+            let rows = match &args[0] {
+                Value::List(rows) => rows,
+                other => return Err(format!("`csv_stringify` needs a List, found {}", other.type_name())),
+            };
+            let mut grid: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+            for row in rows.iter() {
+                let fields = match row {
+                    Value::List(fs) => fs,
+                    other => return Err(format!("`csv_stringify` rows must be Lists, found {}", other.type_name())),
+                };
+                grid.push(fields.iter().map(|f| match f {
+                    Value::Str(s) => s.as_str().to_string(),
+                    other => other.to_string(),
+                }).collect());
+            }
+            Ok(Value::str(crate::csv::stringify(&grid)))
+        }
+        _ => Err(format!("unknown csv builtin `{name}`")),
     }
 }
 

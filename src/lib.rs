@@ -9,6 +9,7 @@ pub mod json;
 pub mod regex;
 pub mod time;
 pub mod encoding;
+pub mod csv;
 pub mod ast;
 pub mod bytecode;
 pub mod cgen;
