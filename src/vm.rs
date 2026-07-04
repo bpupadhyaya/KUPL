@@ -1202,6 +1202,32 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_f32_it28() {
+        assert_eq!(differential("fun probe() -> f32 {\n    1.5f32 + 2.0f32\n}\n"), "3.5");
+        assert_eq!(differential("fun probe() -> f32 {\n    1.0f32\n}\n"), "1.0");
+        assert_eq!(differential("fun probe() -> f32 {\n    2.0f32 * 3.0f32\n}\n"), "6.0");
+        assert_eq!(differential("fun probe() -> f32 {\n    10.0f32 / 4.0f32\n}\n"), "2.5");
+        assert_eq!(differential("fun probe() -> Bool {\n    1.0f32 < 2.0f32\n}\n"), "true");
+        assert_eq!(differential("fun probe() -> Float {\n    (3.5f32).to_float()\n}\n"), "3.5");
+        // integer-bodied f32 literal, and f32 rounding
+        assert_eq!(differential("fun probe() -> f32 {\n    10f32\n}\n"), "10.0");
+        assert_eq!(differential("fun probe() -> f32 {\n    (3.14).to_f32()\n}\n"), "3.14");
+    }
+
+    #[test]
+    fn f32_float_mix_is_type_error_it28() {
+        let (_, diags) = crate::check::check(&crate::parser::parse("fun f() {\n    let x = 1.0f32 + 2.0\n}\n").0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+    }
+
+    #[test]
+    fn f32_native_defers_it28() {
+        let compiled = crate::run::compile("fun main() {\n    let x = 1.5f32\n    let _ = x\n}\n").expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        assert!(crate::cgen::emit_c(&module).unwrap_err().contains("f32"));
+    }
+
+    #[test]
     fn diff_sized_ints_it27() {
         // arithmetic within a width, checked, byte-identical on both engines
         assert_eq!(differential("fun probe() -> u8 {\n    200u8 + 55u8\n}\n"), "255");

@@ -229,6 +229,10 @@ fn encode_const(w: &mut W, v: &Value) {
             w.i64(b.0 as i64); // low 64 bits
             w.u8(b.1.tag());
         }
+        Value::F32(x) => {
+            w.u8(7);
+            w.buf.extend_from_slice(&x.to_le_bytes());
+        }
         other => {
             // compiler only emits the constants above
             panic!("non-serializable constant: {other}");
@@ -687,6 +691,11 @@ fn decode_const(r: &mut R) -> DecodeResult<Value> {
             let width = crate::value::IntW::from_tag(r.u8()?)
                 .ok_or_else(|| "invalid sized-int width tag".to_string())?;
             Value::SizedInt(Box::new((v, width)))
+        }
+        7 => {
+            let mut b = [0u8; 4];
+            for i in 0..4 { b[i] = r.u8()?; }
+            Value::F32(f32::from_le_bytes(b))
         }
         t => return Err(format!("unknown constant tag {t}")),
     })

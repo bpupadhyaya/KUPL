@@ -68,6 +68,7 @@ letters are permitted. `_` alone is the wildcard pattern.
 |---|---|---|
 | Int | `42`, `1_000_000`, `0xFF`, `0b1010`, `-7` | 64-bit signed (default); hex/binary + `_` separators; overflow **panics**. Bitwise via `.band`/`.bor`/…; format via `.to_hex`/`.to_radix` |
 | Sized int | `255u8`, `1000i16`, `0xFFu8`, `-7i32` | fixed width `i8`…`i64`/`u8`…`u64`; checked arithmetic; mixing widths is a type error; convert with `.to_u8()`…/`.to_int()` |
+| `f32` | `1.5f32`, `10f32`, `1e3f32` | single-precision float; arithmetic like `Float`; convert with `.to_f32()`/`.to_float()` |
 | Float | `3.14`, `1.5e3` | IEEE-754 f64; `1..5` is a range, `1.5` a float |
 | Bool | `true`, `false` | |
 | Str | `"hi"`, `"n = {x + 1}"` | UTF-8, immutable; `{expr}` interpolates (any type, rendered with Display); escapes: `\n \t \r \\ \" \{ \} \0` |

@@ -29,6 +29,11 @@ fun main() uses io {
     print((255u8).to_int() + 1)  // 256
     print(clamp_byte(42))        // 42
 
+    // single-precision floats (f32)
+    let ratio: f32 = 22.0f32 / 7.0f32
+    print(ratio)                 // 3.142857
+    print((1.0).to_f32() + 0.5f32)  // 1.5
+
     // overflow is a panic, not a silent wrap — uncomment to see:
     //   print(200u8 + 100u8)   // panic: integer overflow in addition
 }

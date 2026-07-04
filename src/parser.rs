@@ -1354,6 +1354,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr { kind: ExprKind::SizedInt(v, w), span })
             }
+            Tok::F32Lit(v) => {
+                self.bump();
+                Ok(Expr { kind: ExprKind::F32(v), span })
+            }
             Tok::Float(v) => {
                 self.bump();
                 Ok(Expr { kind: ExprKind::Float(v), span })

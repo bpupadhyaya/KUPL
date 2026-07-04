@@ -8,6 +8,8 @@ pub enum Tok {
     Int(i64),
     /// A width-suffixed integer literal (`255u8`, `1000i16`), value in i128.
     SizedInt(i128, crate::value::IntW),
+    /// An `f32`-suffixed float literal (`1.5f32`).
+    F32Lit(f32),
     Float(f64),
     /// String literal, decomposed into literal text and `{expr}` interpolation parts.
     Str(Vec<StrPart>),
@@ -203,6 +205,7 @@ impl Tok {
         match self {
             Tok::Int(v) => format!("integer `{v}`"),
             Tok::SizedInt(v, w) => format!("integer `{v}{}`", w.name()),
+            Tok::F32Lit(v) => format!("float `{v}f32`"),
             Tok::Float(v) => format!("float `{v}`"),
             Tok::Str(_) => "string literal".to_string(),
             Tok::Ident(s) => format!("identifier `{s}`"),

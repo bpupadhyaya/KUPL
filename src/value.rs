@@ -109,6 +109,8 @@ pub enum Value {
     /// would grow the whole enum to 32 — sized ints are rare, so they pay the
     /// indirection instead of every value paying the size).
     SizedInt(Box<(i128, IntW)>),
+    /// A single-precision float (`1.5f32`).
+    F32(f32),
     Float(f64),
     Bool(bool),
     Str(Rc<String>),
@@ -180,6 +182,7 @@ impl Value {
         match self {
             Value::Int(_) => "Int".into(),
             Value::SizedInt(b) => b.1.name().into(),
+            Value::F32(_) => "f32".into(),
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "Str".into(),
@@ -205,6 +208,7 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             // sized ints are equal iff both value AND width match
             (Value::SizedInt(a), Value::SizedInt(b)) => a == b,
+            (Value::F32(a), Value::F32(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
@@ -237,6 +241,13 @@ impl fmt::Display for Value {
         match self {
             Value::Int(v) => write!(f, "{v}"),
             Value::SizedInt(b) => write!(f, "{}", b.0),
+            Value::F32(v) => {
+                if v.fract() == 0.0 && v.is_finite() {
+                    write!(f, "{v:.1}")
+                } else {
+                    write!(f, "{v}")
+                }
+            }
             Value::Float(v) => {
                 if v.fract() == 0.0 && v.is_finite() {
                     write!(f, "{v:.1}")

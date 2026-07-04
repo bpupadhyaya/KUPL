@@ -10,6 +10,8 @@ pub enum Ty {
     Int,
     /// A fixed-width integer type (`i8`…`u64`).
     IntW(IntW),
+    /// A single-precision float type (`f32`).
+    F32,
     Float,
     Bool,
     Str,
@@ -39,7 +41,7 @@ pub enum Ty {
 
 impl Ty {
     pub fn is_numeric(&self) -> bool {
-        matches!(self, Ty::Int | Ty::Float | Ty::IntW(_))
+        matches!(self, Ty::Int | Ty::Float | Ty::IntW(_) | Ty::F32)
     }
 }
 
@@ -116,6 +118,7 @@ impl Unifier {
             // sized ints unify only with the *same* width — differing widths
             // are a type error (mixed-width arithmetic needs explicit conversion)
             (Ty::IntW(x), Ty::IntW(y)) if x == y => Ok(()),
+            (Ty::F32, Ty::F32) => Ok(()),
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
             | (Ty::Bool, Ty::Bool)
@@ -157,6 +160,7 @@ impl fmt::Display for Ty {
         match self {
             Ty::Int => write!(f, "Int"),
             Ty::IntW(w) => write!(f, "{}", w.name()),
+            Ty::F32 => write!(f, "f32"),
             Ty::Float => write!(f, "Float"),
             Ty::Bool => write!(f, "Bool"),
             Ty::Str => write!(f, "Str"),

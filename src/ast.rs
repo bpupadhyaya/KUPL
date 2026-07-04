@@ -350,6 +350,8 @@ pub enum ExprKind {
     },
     /// A width-suffixed integer literal (`255u8`, `1000i16`).
     SizedInt(i128, crate::value::IntW),
+    /// An `f32`-suffixed float literal (`1.5f32`).
+    F32(f32),
     /// `expr?` — Result propagation.
     Try(Box<Expr>),
     Await(Box<Expr>),

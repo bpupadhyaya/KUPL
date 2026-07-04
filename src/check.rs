@@ -402,6 +402,7 @@ impl Checker {
                 "Unit" => Ty::Unit,
                 "Event" => Ty::Event,
                 "Tensor" => Ty::Tensor,
+                "f32" => Ty::F32,
                 _ if crate::value::IntW::from_name(n.as_str()).is_some() => {
                     Ty::IntW(crate::value::IntW::from_name(n.as_str()).unwrap())
                 }
@@ -1059,6 +1060,7 @@ impl Checker {
         match &expr.kind {
             ExprKind::Int(_) => Ty::Int,
             ExprKind::SizedInt(_, w) => Ty::IntW(*w),
+            ExprKind::F32(_) => Ty::F32,
             ExprKind::Float(_) => Ty::Float,
             ExprKind::Bool(_) => Ty::Bool,
             ExprKind::Unit => Ty::Unit,
@@ -1798,6 +1800,9 @@ impl Checker {
             (Ty::IntW(_), "to_int") => Some((vec![], Ty::Int)),
             (Ty::IntW(_), "to_str") => Some((vec![], Ty::Str)),
             (Ty::IntW(_), "to_float") => Some((vec![], Ty::Float)),
+            (Ty::F32, "to_float") => Some((vec![], Ty::Float)),
+            (Ty::F32, "to_str") => Some((vec![], Ty::Str)),
+            (Ty::Float, "to_f32") => Some((vec![], Ty::F32)),
             (Ty::Int, "abs") => Some((vec![], Ty::Int)),
             (Ty::Int, "min") | (Ty::Int, "max") | (Ty::Int, "pow") | (Ty::Int, "gcd") => {
                 Some((vec![Ty::Int], Ty::Int))

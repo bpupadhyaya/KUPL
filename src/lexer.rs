@@ -8,6 +8,13 @@
 use crate::diag::{Diag, Span};
 use crate::token::{keyword, StrPart, Tok, Token};
 
+/// A numeric type suffix on a literal: an integer width, `f32`, or none.
+enum NumSuffix {
+    Int(crate::value::IntW),
+    F32,
+    None,
+}
+
 pub struct Lexer<'a> {
     src: &'a str,
     bytes: &'a [u8],
@@ -164,23 +171,16 @@ impl<'a> Lexer<'a> {
                 return;
             }
             let radixed = u64::from_str_radix(&text, radix);
-            match self.peek_width_suffix() {
-                Some(w) => match radixed {
-                    Ok(v) => self.emit_sized(v as i128, w, start),
-                    Err(_) => self.diags.push(Diag::error(
-                        "K0004",
-                        "integer literal does not fit in Int (64-bit)".to_string(),
-                        self.span_from(start),
-                    )),
-                },
-                None => match radixed {
-                    Ok(v) => self.push(Tok::Int(v as i64), start),
-                    Err(_) => self.diags.push(Diag::error(
-                        "K0004",
-                        "integer literal does not fit in Int (64-bit)".to_string(),
-                        self.span_from(start),
-                    )),
-                },
+            let fit_err = |lx: &mut Self| lx.diags.push(Diag::error(
+                "K0004",
+                "integer literal does not fit in Int (64-bit)".to_string(),
+                lx.span_from(start),
+            ));
+            match (self.peek_num_suffix(), radixed) {
+                (NumSuffix::Int(w), Ok(v)) => self.emit_sized(v as i128, w, start),
+                (NumSuffix::F32, Ok(v)) => self.push(Tok::F32Lit(v as f32), start),
+                (NumSuffix::None, Ok(v)) => self.push(Tok::Int(v as i64), start),
+                (_, Err(_)) => fit_err(self),
             }
             return;
         }
@@ -212,22 +212,46 @@ impl<'a> Lexer<'a> {
             }
         }
         let text: String = self.src[start..self.pos].replace('_', "");
+        // an `f32` suffix applies to any numeric body (`1.5f32`, `1e3f32`, `10f32`)
+        match self.peek_num_suffix() {
+            NumSuffix::F32 => {
+                match text.parse::<f64>() {
+                    Ok(v) => self.push(Tok::F32Lit(v as f32), start),
+                    Err(_) => self.diags.push(Diag::error(
+                        "K0003",
+                        format!("invalid float literal `{text}`"),
+                        self.span_from(start),
+                    )),
+                }
+                return;
+            }
+            NumSuffix::Int(w) => {
+                if is_float {
+                    self.diags.push(Diag::error(
+                        "K0009",
+                        format!("integer width suffix `{}` on a float literal", w.name()),
+                        self.span_from(start),
+                    ));
+                } else {
+                    match text.parse::<i128>() {
+                        Ok(v) => self.emit_sized(v, w, start),
+                        Err(_) => self.diags.push(Diag::error(
+                            "K0009",
+                            format!("literal `{text}` out of range for `{}`", w.name()),
+                            self.span_from(start),
+                        )),
+                    }
+                }
+                return;
+            }
+            NumSuffix::None => {}
+        }
         if is_float {
             match text.parse::<f64>() {
                 Ok(v) => self.push(Tok::Float(v), start),
                 Err(_) => self.diags.push(Diag::error(
                     "K0003",
                     format!("invalid float literal `{text}`"),
-                    self.span_from(start),
-                )),
-            }
-        } else if let Some(w) = self.peek_width_suffix() {
-            // width-suffixed integer literal, e.g. `255u8`, `1000i16`
-            match text.parse::<i128>() {
-                Ok(v) => self.emit_sized(v, w, start),
-                Err(_) => self.diags.push(Diag::error(
-                    "K0009",
-                    format!("literal `{text}` out of range for `{}`", w.name()),
                     self.span_from(start),
                 )),
             }
@@ -243,12 +267,12 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// After an integer body, consume a width suffix (`i8`…`u64`) if present.
-    /// A trailing identifier run that is not exactly a width name is left alone
-    /// (so `123index` stays `123` then `index`).
-    fn peek_width_suffix(&mut self) -> Option<crate::value::IntW> {
-        if !matches!(self.peek(), Some(b'i') | Some(b'u')) {
-            return None;
+    /// After a number body, consume a numeric type suffix if present: an integer
+    /// width (`i8`…`u64`) or `f32`. A trailing identifier run that is not exactly
+    /// one of those is left alone (so `123index` stays `123` then `index`).
+    fn peek_num_suffix(&mut self) -> NumSuffix {
+        if !matches!(self.peek(), Some(b'i') | Some(b'u') | Some(b'f')) {
+            return NumSuffix::None;
         }
         let save = self.pos;
         let s = self.pos;
@@ -258,12 +282,13 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         let run = &self.src[s..self.pos];
-        match crate::value::IntW::from_name(run) {
-            Some(w) => Some(w),
-            None => {
-                self.pos = save; // not a width suffix — put it back
-                None
-            }
+        if let Some(w) = crate::value::IntW::from_name(run) {
+            NumSuffix::Int(w)
+        } else if run == "f32" {
+            NumSuffix::F32
+        } else {
+            self.pos = save; // not a numeric suffix — put it back
+            NumSuffix::None
         }
     }
 
@@ -515,6 +540,15 @@ mod tests {
         let (toks, diags) = lex(src);
         assert!(diags.is_empty(), "unexpected diags: {diags:?}");
         toks.into_iter().map(|t| t.tok).collect()
+    }
+
+    #[test]
+    fn f32_literals() {
+        assert_eq!(kinds("1.5f32"), vec![Tok::F32Lit(1.5), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("1e3f32"), vec![Tok::F32Lit(1000.0), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("10f32"), vec![Tok::F32Lit(10.0), Tok::Newline, Tok::Eof]);
+        // bare float is still Float
+        assert_eq!(kinds("1.5"), vec![Tok::Float(1.5), Tok::Newline, Tok::Eof]);
     }
 
     #[test]

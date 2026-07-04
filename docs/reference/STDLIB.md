@@ -204,14 +204,20 @@ literals are read as 64-bit patterns, so `0xFFFFFFFFFFFFFFFF` is `-1`.
 Fixed-width integers for binary formats and interop. Write a literal with a
 width suffix: `255u8`, `1000i16`, `0xFFu8`, `0b1010u8`. Out-of-range literals
 are a compile error (K0009). Arithmetic is **checked** (overflow panics, like
-`Int`); mixing widths is a type error — convert explicitly. Not yet on the
-native backend (`kupl run`/`--vm`/`bundle`).
+`Int`); mixing widths is a type error — convert explicitly. There is also a
+single-precision **`f32`** float (`1.5f32`, `10f32`, `1e3f32`); its arithmetic
+matches `Float` (no overflow panic) and it does not mix with `Float`. Not yet
+on the native backend (`kupl run`/`--vm`/`bundle`).
 
 | Method | Signature | Notes |
 |---|---|---|
 | `.to_int()` | `-> Int` | to i64; panics if a `u64` exceeds `i64::MAX` |
 | `.to_str()` | `-> Str` | |
 | `.to_float()` | `-> Float` | |
+| `.to_str()` | `-> Str` | |
+
+`f32` methods: `.to_float()` → `Float`, `.to_str()` → `Str`. Convert a `Float`
+to `f32` with `Float.to_f32()`.
 
 ### Float
 

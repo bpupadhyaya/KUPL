@@ -119,6 +119,13 @@ fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
                     .to_string(),
             )
         }
+        Value::F32(_) => {
+            return Err(
+                "f32 is not supported by the native backend yet \
+                 — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
+                    .to_string(),
+            )
+        }
         other => return Err(format!("non-serializable constant {other}")),
     })
 }

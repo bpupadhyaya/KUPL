@@ -651,6 +651,7 @@ impl Interp {
         match &expr.kind {
             ExprKind::Int(v) => Ok(Value::Int(*v)),
             ExprKind::SizedInt(v, w) => Ok(Value::SizedInt(Box::new((*v, *w)))),
+            ExprKind::F32(v) => Ok(Value::F32(*v)),
             ExprKind::Float(v) => Ok(Value::Float(*v)),
             ExprKind::Bool(v) => Ok(Value::Bool(*v)),
             ExprKind::Unit => Ok(Value::Unit),
@@ -1247,6 +1248,19 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             Ge => Value::Bool(a >= b),
             _ => unreachable!(),
         }),
+        // f32: same semantics as Float, computed in f32 (never panics)
+        (Value::F32(a), Value::F32(b)) => Ok(match op {
+            Add => Value::F32(a + b),
+            Sub => Value::F32(a - b),
+            Mul => Value::F32(a * b),
+            Div => Value::F32(a / b),
+            Rem => Value::F32(a % b),
+            Lt => Value::Bool(a < b),
+            Le => Value::Bool(a <= b),
+            Gt => Value::Bool(a > b),
+            Ge => Value::Bool(a >= b),
+            _ => unreachable!(),
+        }),
         (Value::Tensor(a), Value::Tensor(b)) => {
             if a.len() != b.len() {
                 return Err(format!("tensor length mismatch ({} vs {})", a.len(), b.len()));
@@ -1739,6 +1753,10 @@ pub fn shared_method(
         }
         (Value::SizedInt(b), "to_str") => Ok(Value::str(b.0.to_string())),
         (Value::SizedInt(b), "to_float") => Ok(Value::Float(b.0 as f64)),
+        // f32 <-> Float
+        (Value::F32(v), "to_float") => Ok(Value::Float(*v as f64)),
+        (Value::F32(v), "to_str") => Ok(Value::str(Value::F32(*v).to_string())),
+        (Value::Float(v), "to_f32") => Ok(Value::F32(*v as f32)),
         (Value::Int(v), "abs") => v
             .checked_abs()
             .map(Value::Int)

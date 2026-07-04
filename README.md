@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 134 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 138 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -219,7 +219,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/encoding.kupl` | base64/hex encode+decode, FNV hash — auth header, sharding |
 | `examples/csv.kupl` | CSV parse/stringify (RFC 4180) and a CSV→JSON converter |
 | `examples/url.kupl` | URL encode/decode + query strings — build & parse request URLs |
-| `examples/sized.kupl` | sized integers `i8`…`u64` — literal suffixes, checked arithmetic, conversions |
+| `examples/sized.kupl` | sized numbers `i8`…`u64` + `f32` — literal suffixes, checked arithmetic, conversions |
 | `examples/multifile/` | `use`-based multi-file programs |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
@@ -254,7 +254,7 @@ component manifests; an LSP server; and four verified execution modes.
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~19,900 lines of dependency-free Rust, 134 tests, all engines differentially
+~20,000 lines of dependency-free Rust, 138 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and
