@@ -317,6 +317,28 @@ pub fn run_program_vm(src: &str, file: &str) -> i32 {
     }
 }
 
+/// Execute an already-compiled module: the first `app`, else `fun main`.
+pub fn run_module(module: &crate::bytecode::Module, origin: &str) -> i32 {
+    let mut vm = crate::vm::Vm::new(module);
+    vm.print_unwired = true;
+    let app = module.components.iter().find(|c| c.is_app).map(|c| c.name.clone());
+    let outcome = match app {
+        Some(name) => vm.run_app(&name).map(|_| Value::Unit),
+        None if module.funs.contains_key("main") => vm.call_named("main", vec![]),
+        None => {
+            eprintln!("error: no `app` or `fun main()` in {origin}");
+            return 2;
+        }
+    };
+    match outcome {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("panic: {} (in {origin})", e.msg);
+            101
+        }
+    }
+}
+
 /// `kupl dis`: disassemble the compiled module.
 pub fn disassemble(src: &str, file: &str) -> i32 {
     let compiled = match compile(src) {
