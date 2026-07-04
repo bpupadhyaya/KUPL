@@ -116,6 +116,15 @@ pub struct CtorMeta {
     pub arity: u8,
 }
 
+/// A compiled timer handler: its chunk, whether it recurs, and its interval
+/// (virtual milliseconds).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimerMeta {
+    pub chunk: u16,
+    pub every: bool,
+    pub interval_ms: i64,
+}
+
 /// A compiled component: slot layout + chunk indices for its behavior.
 #[derive(Debug, Clone)]
 pub struct ComponentMeta {
@@ -133,6 +142,8 @@ pub struct ComponentMeta {
     pub handlers: Vec<(String, u16, bool)>,
     pub exposes: std::collections::HashMap<String, u16>,
     pub out_ports: Vec<String>,
+    /// `on every`/`on after` timer handlers, in declaration order.
+    pub timers: Vec<TimerMeta>,
 }
 
 /// A compiled program: all function chunks + the constructor table.

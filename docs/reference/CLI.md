@@ -12,7 +12,10 @@ they belong to. Exit codes: `0` success · `1` compile/test/diff failure ·
 ### `kupl run <file.kupl>`
 Runs the first `app` in the program (instantiate → `on start` in creation
 order → drain the message queue). With no `app`, runs `fun main()`. Values
-emitted on unwired out ports print as `Component.port = value`.
+emitted on unwired out ports print as `Component.port = value`. If the app has
+timers (`on every`/`on after`), the virtual clock advances automatically —
+bounded to 100 firings — so recurring timers yield finite, deterministic
+output.
 
 ### `kupl run --vm <file.kupl>`
 Same program on the KVM register bytecode VM. Output is byte-identical to the
@@ -51,7 +54,7 @@ init/handlers/exposes), constants, and the constructor table.
 
 ### `kupl test <file.kupl>`
 Runs every top-level `law` (free-standing tests, including `forall`
-properties), every component's `example` blocks, **and** every contract `law`
+properties), every component's `example` blocks (with `advance` steps for timers), **and** every contract `law`
 against every fulfilling component. Output: `ok`/`FAIL` per case + summary. A
 failing `expect` reports the exact source expectation; a failing `forall`
 reports the shrunk counterexample (`property failed for n = 50`). Property

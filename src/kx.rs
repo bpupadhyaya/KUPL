@@ -131,6 +131,12 @@ pub fn encode(m: &Module) -> Vec<u8> {
         for p in &c.out_ports {
             w.s(p);
         }
+        w.u32(c.timers.len() as u32);
+        for t in &c.timers {
+            w.u16(t.chunk);
+            w.u8(t.every as u8);
+            w.buf.extend_from_slice(&t.interval_ms.to_le_bytes());
+        }
     }
 
     w.u32(m.ai_funs.len() as u32);
@@ -573,6 +579,14 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         for _ in 0..nports {
             out_ports.push(r.s()?);
         }
+        let ntimers = r.u32()?;
+        let mut timers = Vec::with_capacity(ntimers as usize);
+        for _ in 0..ntimers {
+            let chunk = r.u16()?;
+            let every = r.u8()? != 0;
+            let interval_ms = i64::from_le_bytes(r.take(8)?.try_into().unwrap());
+            timers.push(TimerMeta { chunk, every, interval_ms });
+        }
         m.component_names.insert(name.clone(), i as u16);
         m.components.push(ComponentMeta {
             name,
@@ -584,6 +598,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
             handlers,
             exposes,
             out_ports,
+            timers,
         });
     }
 

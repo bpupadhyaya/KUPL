@@ -1,0 +1,64 @@
+// Timers — components can do periodic and delayed work.
+//
+//   on every 5s { … }   recurring
+//   on after 2s { … }   one-shot
+//
+// Time is a VIRTUAL clock the runtime advances explicitly — never wall-clock —
+// so timer-driven behavior is deterministic and testable. In `example` blocks
+// `advance 5s` moves the clock forward, firing every due timer in order (ties
+// broken deterministically). `kupl run` advances automatically (bounded) so an
+// app with a recurring timer produces finite, reproducible output.
+
+component Ticker {
+    intent "Emits a rising tick count on a recurring timer."
+
+    out tick: Int
+    state n: Int = 0
+
+    on every 5s {
+        n += 1
+        emit tick(n)
+    }
+
+    example {
+        advance 12s        // fires at 5s and 10s
+        expect tick == 2
+        advance 3s         // fires at 15s
+        expect tick == 3
+    }
+}
+
+component Delayed {
+    intent "Emits a single ready signal after a delay, exactly once."
+
+    out ready: Int
+    state fired: Int = 0
+
+    on after 2s {
+        fired = 1
+        emit ready(fired)
+    }
+
+    example {
+        advance 1s         // too early — nothing fires yet
+        advance 2s         // now past 2s — the one-shot fires
+        expect ready == 1
+        advance 100s       // a one-shot never fires again
+        expect ready == 1
+    }
+}
+
+// A self-contained app: `kupl run` advances the virtual clock automatically
+// (bounded), so this recurring timer prints a finite, deterministic sequence.
+app Clock {
+    intent "Prints the first few ticks of a recurring timer."
+
+    state count: Int = 0
+
+    on every 1s {
+        count += 1
+        if count <= 3 {
+            print("tick {count}")
+        }
+    }
+}

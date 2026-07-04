@@ -85,6 +85,16 @@ impl ProgramDb {
     }
 }
 
+/// A live timer on an instance: which handler it fires, whether it recurs, its
+/// interval, and its next virtual-time firing.
+pub struct TimerState {
+    pub handler_idx: usize,
+    pub every: bool,
+    pub interval: i64,
+    pub next_fire: i64,
+    pub active: bool,
+}
+
 pub struct Instance {
     pub comp: Rc<ComponentDecl>,
     /// Props + state (+ children) — the instance's private heap.
@@ -94,6 +104,8 @@ pub struct Instance {
     pub last_emit: HashMap<String, Value>,
     /// Set by the parent's `supervise child restart on_failure`.
     pub restart_on_failure: bool,
+    /// Armed `on every`/`on after` timers.
+    pub timers: Vec<TimerState>,
 }
 
 pub struct Interp {
@@ -105,6 +117,9 @@ pub struct Interp {
     /// Print unwired emissions (used by `kupl run` for observable output).
     pub print_unwired: bool,
     pub globals: Env,
+    /// The virtual clock (milliseconds). Advanced explicitly — never wall-clock,
+    /// so timer-driven behavior is deterministic and reproducible.
+    pub now: i64,
 }
 
 impl Interp {
@@ -116,6 +131,7 @@ impl Interp {
             current: None,
             print_unwired: false,
             globals: Env::new(),
+            now: 0,
         }
     }
 
@@ -173,6 +189,7 @@ impl Interp {
             wires: HashMap::new(),
             last_emit: HashMap::new(),
             restart_on_failure: false,
+            timers: Vec::new(),
         });
 
         // children (constructed after the parent exists, in declaration order)
@@ -218,8 +235,98 @@ impl Interp {
     pub fn start_all(&mut self) -> Result<(), Flow> {
         for id in 0..self.instances.len() {
             self.run_lifecycle(id, &Trigger::Start)?;
+            self.arm_timers(id);
         }
         self.drain()?;
+        Ok(())
+    }
+
+    /// Arm the instance's timers relative to the current virtual time.
+    fn arm_timers(&mut self, id: usize) {
+        let comp = self.instances[id].comp.clone();
+        let now = self.now;
+        let mut timers = Vec::new();
+        for (i, h) in comp.handlers.iter().enumerate() {
+            let (every, interval) = match &h.trigger {
+                Trigger::Every(ms) => (true, *ms),
+                Trigger::After(ms) => (false, *ms),
+                _ => continue,
+            };
+            timers.push(TimerState {
+                handler_idx: i,
+                every,
+                interval,
+                next_fire: now + interval,
+                active: true,
+            });
+        }
+        self.instances[id].timers = timers;
+    }
+
+    /// Advance the virtual clock by `dur` ms, firing every due timer in time
+    /// order (ties broken by instance then declaration order — deterministic).
+    /// Recurring timers reschedule; one-shots deactivate.
+    pub fn advance(&mut self, dur: i64) -> Result<(), Flow> {
+        if dur < 0 {
+            return Err(Self::panic_flow("cannot advance the clock by a negative duration", Span::default()));
+        }
+        let target = self.now + dur;
+        loop {
+            // earliest active timer with next_fire <= target
+            let mut best: Option<(i64, usize, usize)> = None;
+            for (iid, inst) in self.instances.iter().enumerate() {
+                for (ti, t) in inst.timers.iter().enumerate() {
+                    if t.active && t.next_fire <= target {
+                        let cand = (t.next_fire, iid, ti);
+                        if best.map_or(true, |b| cand < b) {
+                            best = Some(cand);
+                        }
+                    }
+                }
+            }
+            let Some((fire_time, iid, ti)) = best else { break };
+            self.now = fire_time;
+            let handler_idx = self.instances[iid].timers[ti].handler_idx;
+            let comp = self.instances[iid].comp.clone();
+            let h = comp.handlers[handler_idx].clone();
+            match self.run_handler(iid, &h, Value::Unit) {
+                Ok(()) => {}
+                Err(Flow::Panic { msg, .. }) if self.instances[iid].restart_on_failure => {
+                    self.restart(iid, &msg)?;
+                }
+                Err(other) => return Err(other),
+            }
+            self.drain()?;
+            let t = &mut self.instances[iid].timers[ti];
+            if t.every {
+                t.next_fire += t.interval;
+            } else {
+                t.active = false;
+            }
+        }
+        self.now = target;
+        Ok(())
+    }
+
+    /// For `kupl run`: fire up to `max_fires` timer events by advancing the
+    /// clock to each next firing — bounds recurring timers so an app produces
+    /// finite, deterministic output.
+    pub fn run_timers(&mut self, max_fires: usize) -> Result<(), Flow> {
+        for _ in 0..max_fires {
+            let mut best: Option<(i64, usize, usize)> = None;
+            for (iid, inst) in self.instances.iter().enumerate() {
+                for (ti, t) in inst.timers.iter().enumerate() {
+                    if t.active {
+                        let cand = (t.next_fire, iid, ti);
+                        if best.map_or(true, |b| cand < b) {
+                            best = Some(cand);
+                        }
+                    }
+                }
+            }
+            let Some((fire_time, _, _)) = best else { break };
+            self.advance(fire_time - self.now)?;
+        }
         Ok(())
     }
 
@@ -277,6 +384,7 @@ impl Interp {
                 self.run_handler(id, h, Value::Unit)?;
             }
         }
+        self.arm_timers(id);
         Ok(())
     }
 

@@ -214,13 +214,20 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         (shared.module.chunks.len() - 1) as u16
     };
 
-    // handlers
+    // handlers (ports + lifecycle) and timers
     let mut handlers = Vec::new();
-    for h in &c.handlers {
-        let (key, label) = match &h.trigger {
-            Trigger::Start => ("@start".to_string(), "start".to_string()),
-            Trigger::Stop => ("@stop".to_string(), "stop".to_string()),
-            Trigger::Port(p) => (p.clone(), p.clone()),
+    let mut timers = Vec::new();
+    for (i, h) in c.handlers.iter().enumerate() {
+        let (key, label, timer) = match &h.trigger {
+            Trigger::Start => ("@start".to_string(), "start".to_string(), None),
+            Trigger::Stop => ("@stop".to_string(), "stop".to_string(), None),
+            Trigger::Port(p) => (p.clone(), p.clone(), None),
+            Trigger::Every(ms) => {
+                (format!("@every#{i}"), format!("every {ms}ms"), Some((true, *ms)))
+            }
+            Trigger::After(ms) => {
+                (format!("@after#{i}"), format!("after {ms}ms"), Some((false, *ms)))
+            }
         };
         let has_param = h.param.is_some();
         let mut fc = FnCompiler::new(
@@ -238,7 +245,13 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         fc.emit(Op::Ret(u), h.span);
         let chunk = fc.finish();
         shared.module.chunks.push(chunk);
-        handlers.push((key, (shared.module.chunks.len() - 1) as u16, has_param));
+        let chunk_idx = (shared.module.chunks.len() - 1) as u16;
+        match timer {
+            Some((every, interval_ms)) => {
+                timers.push(TimerMeta { chunk: chunk_idx, every, interval_ms });
+            }
+            None => handlers.push((key, chunk_idx, has_param)),
+        }
     }
 
     // component functions (private + exposed) into their reserved chunk slots
@@ -281,6 +294,7 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
             .filter(|p| p.dir == PortDir::Out)
             .map(|p| p.name.clone())
             .collect(),
+        timers,
     }
 }
 

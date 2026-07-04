@@ -51,8 +51,10 @@ and known limitations called out in commit messages. Checked off as landed.
       counterexample. Generators for Int/Bool/Float/Str/List/Option/records.
       Plus top-level `law "…" { … }` free-standing tests. Runs under
       `kupl test` on the interpreter (KVM rejects with K0804). (`examples/properties.kupl`)
-- [ ] **Timers** — `on every 5s`, `after 2s` (design §4); needs a virtual-time
-      story for deterministic tests
+- [x] **Timers** — `on every 5s` (recurring), `on after 2s` (one-shot) timer
+      handlers on a virtual clock advanced explicitly (`advance 5s` example
+      step; `kupl run` auto-advances bounded). Deterministic, byte-identical on
+      interpreter + KVM. Durations `ms`/`s`/`m`/`h`. (`examples/timers.kupl`)
 - [ ] **Hot-swap state migration** (design open Q4; Builder live-editing hook)
 
 ## Tier 3 — hardware & systems tiers (next arc)

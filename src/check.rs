@@ -697,6 +697,16 @@ impl Checker {
                         self.err("K0210", format!("`on {key}` takes no parameter"), h.span);
                     }
                 }
+                Trigger::Every(ms) | Trigger::After(ms) => {
+                    // timer handlers carry no payload, like `on start`
+                    if h.param.is_some() {
+                        let kw = if matches!(h.trigger, Trigger::Every(_)) { "every" } else { "after" };
+                        self.err("K0210", format!("`on {kw}` (a timer) takes no parameter"), h.span);
+                    }
+                    if *ms <= 0 {
+                        self.err("K0266", "timer duration must be positive", h.span);
+                    }
+                }
                 Trigger::Port(p) => {
                     if !seen_triggers.insert(p.clone()) {
                         self.err("K0209", format!("duplicate `on {p}` handler"), h.span);
@@ -868,6 +878,8 @@ impl Checker {
                     let t = self.infer_expr(expr, &mut ctx);
                     self.unify(&Ty::Bool, &t, *span, "`expect` condition");
                 }
+                // `advance` is a literal duration — nothing to type-check
+                ExampleStep::Advance { .. } => {}
             }
         }
     }

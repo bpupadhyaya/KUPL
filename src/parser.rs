@@ -423,6 +423,52 @@ impl Parser {
         })
     }
 
+    /// Parse a duration literal like `5s`, `2s`, `100ms`, `1m`, `2h` into
+    /// virtual milliseconds. Written as an integer immediately followed by a
+    /// unit identifier.
+    fn parse_duration(&mut self) -> PResult<i64> {
+        let span = self.span();
+        let n = match self.bump() {
+            Tok::Int(n) => n,
+            other => {
+                return Err(Diag::error(
+                    "K0120",
+                    format!("expected a duration (e.g. `5s`, `100ms`), found {}", other.describe()),
+                    span,
+                ))
+            }
+        };
+        let unit = match self.peek().clone() {
+            Tok::Ident(u) => {
+                self.bump();
+                u
+            }
+            other => {
+                return Err(Diag::error(
+                    "K0120",
+                    format!("expected a duration unit (`ms`, `s`, `m`, `h`), found {}", other.describe()),
+                    self.span(),
+                ))
+            }
+        };
+        let per = match unit.as_str() {
+            "ms" => 1,
+            "s" => 1000,
+            "m" => 60_000,
+            "h" => 3_600_000,
+            _ => {
+                return Err(Diag::error(
+                    "K0120",
+                    format!("unknown duration unit `{unit}` (use `ms`, `s`, `m`, or `h`)"),
+                    self.prev_span(),
+                ))
+            }
+        };
+        n.checked_mul(per).ok_or_else(|| {
+            Diag::error("K0120", "duration is too large".to_string(), span.merge(self.prev_span()))
+        })
+    }
+
     fn parse_params(&mut self) -> PResult<Vec<Param>> {
         let mut params = Vec::new();
         self.skip_newlines();
@@ -788,6 +834,17 @@ impl Parser {
                         self.bump();
                         Trigger::Stop
                     }
+                    // `on every 5s` / `on after 2s` — timers (soft keywords)
+                    Tok::Ident(ref kw) if kw == "every" || kw == "after" => {
+                        let recurring = kw == "every";
+                        self.bump();
+                        let ms = self.parse_duration()?;
+                        if recurring {
+                            Trigger::Every(ms)
+                        } else {
+                            Trigger::After(ms)
+                        }
+                    }
                     Tok::Ident(name) => {
                         self.bump();
                         Trigger::Port(name)
@@ -795,7 +852,7 @@ impl Parser {
                     other => {
                         return Err(Diag::error(
                             "K0105",
-                            format!("`on` expects a port name, `start`, or `stop`; found {}", other.describe()),
+                            format!("`on` expects a port name, `start`, `stop`, `every <dur>`, or `after <dur>`; found {}", other.describe()),
                             self.span(),
                         ))
                     }
@@ -855,10 +912,18 @@ impl Parser {
                             steps.push(ExampleStep::Expect { expr, span: sspan.merge(self.prev_span()) });
                             self.expect_terminator()?;
                         }
+                        // `advance 5s` — move the virtual clock (soft keyword)
+                        Tok::Ident(ref kw) if kw == "advance" => {
+                            let sspan = self.span();
+                            self.bump();
+                            let ms = self.parse_duration()?;
+                            steps.push(ExampleStep::Advance { ms, span: sspan.merge(self.prev_span()) });
+                            self.expect_terminator()?;
+                        }
                         other => {
                             return Err(Diag::error(
                                 "K0106",
-                                format!("example blocks contain `send` and `expect` steps; found {}", other.describe()),
+                                format!("example blocks contain `send`, `expect`, and `advance` steps; found {}", other.describe()),
                                 self.span(),
                             ))
                         }

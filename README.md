@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 69 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 72 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -204,6 +204,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/di.kupl` | contract-typed props: dependency injection with dynamic dispatch through an interface |
 | `examples/properties.kupl` | property-based testing: `forall` over generated values, top-level `law` tests |
 | `examples/supervise.kupl` | fault tolerance: panics restart the component, the app survives |
+| `examples/timers.kupl` | timers: `on every`/`on after` on a deterministic virtual clock (`advance`) |
 | `examples/tensors.kupl` | first-class tensors, elementwise ops, dot products |
 | `examples/multifile/` | `use`-based multi-file programs |
 
@@ -213,7 +214,7 @@ programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.
 ## What works today
 
 Components as isolated actors (typed ports, `wire`, state, `on start/stop`,
-supervision with `restart on_failure`); contracts with laws that run as tests, contract types for dependency injection (dynamic dispatch through an interface), and property-based testing (`forall` with deterministic generation and shrinking);
+supervision with `restart on_failure`, and timers on a deterministic virtual clock); contracts with laws that run as tests, contract types for dependency injection (dynamic dispatch through an interface), and property-based testing (`forall` with deterministic generation and shrinking);
 pure functions with **inferred + enforced effects** (`pub`/`expose` must declare
 `uses io` etc.); ADTs with exhaustive `match`, records, newtypes,
 `Option`/`Result` + `?`, lambdas, string interpolation; checked 64-bit integers
@@ -226,7 +227,7 @@ component manifests; an LSP server; and four verified execution modes.
 - [`docs/reference/LANGUAGE-REFERENCE.md`](docs/reference/LANGUAGE-REFERENCE.md) — the language reference manual (as implemented): lexical structure, types, expressions, statements, functions & effects, components, contracts, supervision, semantics
 - [`docs/reference/STDLIB.md`](docs/reference/STDLIB.md) — built-in functions, constructors, and every method on List/Str/Int/Float/Option/Result/Tensor
 - [`docs/reference/CLI.md`](docs/reference/CLI.md) — every `kupl` command, flags, exit codes, artifact formats
-- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (102 diagnostics, grouped by phase)
+- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (104 diagnostics, grouped by phase)
 
 ## Design documents
 
@@ -238,7 +239,7 @@ component manifests; an LSP server; and four verified execution modes.
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~15,900 lines of dependency-free Rust, 69 tests, all engines differentially
+~16,300 lines of dependency-free Rust, 72 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

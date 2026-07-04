@@ -250,10 +250,15 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
         };
         out.push_str(&format!("supervise {} restart {policy}\n", s.child));
     }
-    // handlers: on start, then port handlers in in-port declaration order, then on stop
+    // handlers: on start, timers, port handlers (in in-port order), on stop
     let mut handlers: Vec<&Handler> = Vec::new();
     for h in &c.handlers {
         if matches!(h.trigger, Trigger::Start) {
+            handlers.push(h);
+        }
+    }
+    for h in &c.handlers {
+        if matches!(h.trigger, Trigger::Every(_) | Trigger::After(_)) {
             handlers.push(h);
         }
     }
@@ -283,6 +288,8 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
             Trigger::Start => out.push_str("start"),
             Trigger::Stop => out.push_str("stop"),
             Trigger::Port(p) => out.push_str(p),
+            Trigger::Every(ms) => out.push_str(&format!("every {}", fmt_duration(*ms))),
+            Trigger::After(ms) => out.push_str(&format!("after {}", fmt_duration(*ms))),
         }
         if let Some(param) = &h.param {
             out.push_str(&format!("({param})"));
@@ -322,6 +329,9 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
                 ExampleStep::Expect { expr, .. } => {
                     out.push_str(&format!("expect {}", expr_str(expr, 0)));
                 }
+                ExampleStep::Advance { ms, .. } => {
+                    out.push_str(&format!("advance {}", fmt_duration(*ms)));
+                }
             }
             out.push('\n');
         }
@@ -329,6 +339,16 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
         out.push_str("}\n");
     }
     out.push_str("}\n");
+}
+
+/// Render virtual milliseconds back to the largest whole-unit duration literal.
+fn fmt_duration(ms: i64) -> String {
+    for (unit, per) in [("h", 3_600_000i64), ("m", 60_000), ("s", 1000)] {
+        if ms % per == 0 {
+            return format!("{}{unit}", ms / per);
+        }
+    }
+    format!("{ms}ms")
 }
 
 fn fmt_block(out: &mut String, b: &Block, level: usize) {
@@ -690,6 +710,18 @@ mod tests {
         roundtrip(
             "contract Store {\n intent \"keyed storage\"\n expose fun get(k: Str) -> Option[Str]\n law \"missing is None\" { expect get(\"x\") == None }\n}\ncomponent M fulfills Store {\n intent \"in-memory\"\n expose fun get(k: Str) -> Option[Str] { None }\n}\n",
         );
+    }
+
+    #[test]
+    fn fmt_idempotent_timers() {
+        let src = "component T {\n out tick: Int\n intent \"t\"\n state n: Int = 0\n on every 5s { n += 1\n emit tick(n) }\n on after 100ms { emit tick(0) }\n example { advance 5s\n expect tick == 1 }\n}\n";
+        roundtrip(src);
+        // guard against silent handler loss (idempotence alone can't catch it)
+        let (p, _) = parser::parse(src);
+        let f = super::format_program(&p);
+        assert!(f.contains("on every 5s"), "{f}");
+        assert!(f.contains("on after 100ms"), "{f}");
+        assert!(f.contains("advance 5s"), "{f}");
     }
 
     #[test]

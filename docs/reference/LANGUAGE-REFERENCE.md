@@ -54,7 +54,8 @@ while wire
 ### Contextual keywords
 
 Valid identifiers everywhere except in their clause:
-`fulfills` `law` `restart` `on_failure` `never`
+`fulfills` `law` `restart` `on_failure` `never` `forall` `every` `after`
+`advance` `ai` `tools` `model`
 
 ### Identifiers
 
@@ -386,6 +387,7 @@ Member kinds (the formatter enforces this order):
 | `wire a.out -> b.in` | connect children's ports (types must match) |
 | `supervise child restart on_failure` | see §9 |
 | `on port(payload) { … }` | handler; `on start` / `on stop` lifecycle |
+| `on every <dur> { … }` / `on after <dur> { … }` | timer handlers (no payload) — see §7.1 |
 | `expose fun …` | synchronous request/response interface |
 | `fun …` (private) | component-local helper; sees props/state/children; callable from handlers, exposes, and other component functions |
 | `example { … }` | executable spec: `send port(v)` steps + `expect` over out-port values |
@@ -402,6 +404,44 @@ Semantics:
 - Expose calls (`store.all()`) are synchronous method calls on the instance.
 - Component state cannot leave the component except through emitted messages
   and expose return values.
+
+### 7.1 Timers and the virtual clock
+
+Components do periodic and delayed work with timer handlers:
+
+```kupl
+component Ticker {
+    intent "Emits a rising tick on a recurring timer."
+    out tick: Int
+    state n: Int = 0
+
+    on every 5s { n += 1  emit tick(n) }    // recurring
+    on after 2s { emit tick(0) }            // one-shot
+
+    example {
+        advance 12s        // fires the recurring timer at 5s and 10s
+        expect tick == 2
+    }
+}
+```
+
+- **Durations** are an integer and a unit: `ms`, `s`, `m`, `h`
+  (`100ms`, `5s`, `2m`, `1h`). Timer handlers take **no payload** (like
+  `on start`); a non-positive duration is an error (K0266).
+- **Time is a virtual clock, never wall-clock.** It only moves when advanced
+  explicitly, which makes timer behavior fully deterministic and reproducible.
+  In `example` blocks, the **`advance <dur>`** step moves the clock forward,
+  firing every due timer in time order (ties broken by instance, then
+  declaration order). A recurring timer fires once per interval crossed within
+  a single `advance`; a one-shot fires at most once.
+- Timers are armed at `on start` (relative to the current time) and re-armed on
+  a supervision restart.
+- `kupl run` advances the clock **automatically but bounded** (up to 100 timer
+  firings) so an app with a recurring timer yields finite, deterministic output
+  rather than running forever.
+- Timers run identically on the interpreter and the KVM (differentially
+  tested). Like all component features, they require `kupl run`/`--vm`/`bundle`
+  — the native backend does not compile components. See `examples/timers.kupl`.
 
 ## 8. Contracts and laws
 

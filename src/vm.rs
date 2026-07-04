@@ -27,6 +27,15 @@ struct Frame {
     inst: Option<usize>,
 }
 
+/// One armed timer on a VM instance (mirrors the interpreter's TimerState).
+struct VmTimer {
+    chunk: u16,
+    every: bool,
+    interval: i64,
+    next_fire: i64,
+    active: bool,
+}
+
 /// A live component instance: slots hold props, then state, then children.
 struct VmInstance {
     comp: u16,
@@ -34,6 +43,7 @@ struct VmInstance {
     /// out port -> [(target instance, target in port)]
     wires: std::collections::HashMap<String, Vec<(usize, String)>>,
     restart_on_failure: bool,
+    timers: Vec<VmTimer>,
 }
 
 pub struct Vm<'m> {
@@ -43,6 +53,8 @@ pub struct Vm<'m> {
     instances: Vec<VmInstance>,
     queue: std::collections::VecDeque<(usize, String, Value)>,
     pub print_unwired: bool,
+    /// Virtual clock (ms), advanced explicitly — same model as the interpreter.
+    now: i64,
 }
 
 impl<'m> Vm<'m> {
@@ -54,6 +66,7 @@ impl<'m> Vm<'m> {
             instances: Vec::new(),
             queue: std::collections::VecDeque::new(),
             print_unwired: false,
+            now: 0,
         }
     }
 
@@ -83,8 +96,10 @@ impl<'m> Vm<'m> {
         self.instantiate(idx, Vec::new())?;
         for id in 0..self.instances.len() {
             self.run_lifecycle(id, "@start")?;
+            self.arm_timers(id);
         }
         self.drain()?;
+        self.run_timers(100)?;
         Ok(())
     }
 
@@ -131,6 +146,7 @@ impl<'m> Vm<'m> {
         eprintln!("[supervise] {name} restarted after panic: {panic_msg}");
         self.call_chunk_nested(restart_chunk, Vec::new(), Some(id))?;
         self.run_lifecycle(id, "@start")?;
+        self.arm_timers(id);
         Ok(())
     }
 
@@ -147,9 +163,87 @@ impl<'m> Vm<'m> {
             slots,
             wires: std::collections::HashMap::new(),
             restart_on_failure: false,
+            timers: Vec::new(),
         });
         self.call_chunk_nested(init, Vec::new(), Some(id))?;
         Ok(id)
+    }
+
+    /// Arm the instance's timers relative to the current virtual time.
+    fn arm_timers(&mut self, id: usize) {
+        let now = self.now;
+        let comp = self.instances[id].comp as usize;
+        let timers: Vec<VmTimer> = self.module.components[comp]
+            .timers
+            .iter()
+            .map(|t| VmTimer {
+                chunk: t.chunk,
+                every: t.every,
+                interval: t.interval_ms,
+                next_fire: now + t.interval_ms,
+                active: true,
+            })
+            .collect();
+        self.instances[id].timers = timers;
+    }
+
+    /// Advance the virtual clock, firing due timers in time order (ties broken
+    /// by instance then declaration order) — identical semantics to the interp.
+    pub fn advance(&mut self, dur: i64) -> Result<(), VmError> {
+        if dur < 0 {
+            return Err(VmError { msg: "cannot advance the clock by a negative duration".into(), span: Span::default() });
+        }
+        let target = self.now + dur;
+        loop {
+            let mut best: Option<(i64, usize, usize)> = None;
+            for (iid, inst) in self.instances.iter().enumerate() {
+                for (ti, t) in inst.timers.iter().enumerate() {
+                    if t.active && t.next_fire <= target {
+                        let cand = (t.next_fire, iid, ti);
+                        if best.map_or(true, |b| cand < b) {
+                            best = Some(cand);
+                        }
+                    }
+                }
+            }
+            let Some((fire_time, iid, ti)) = best else { break };
+            self.now = fire_time;
+            let chunk = self.instances[iid].timers[ti].chunk;
+            match self.call_chunk_nested(chunk, Vec::new(), Some(iid)) {
+                Ok(_) => {}
+                Err(e) if self.instances[iid].restart_on_failure => self.restart(iid, &e.msg)?,
+                Err(e) => return Err(e),
+            }
+            self.drain()?;
+            let t = &mut self.instances[iid].timers[ti];
+            if t.every {
+                t.next_fire += t.interval;
+            } else {
+                t.active = false;
+            }
+        }
+        self.now = target;
+        Ok(())
+    }
+
+    /// For `kupl run`: bounded timer firing (mirrors `Interp::run_timers`).
+    pub fn run_timers(&mut self, max_fires: usize) -> Result<(), VmError> {
+        for _ in 0..max_fires {
+            let mut best: Option<(i64, usize, usize)> = None;
+            for (iid, inst) in self.instances.iter().enumerate() {
+                for (ti, t) in inst.timers.iter().enumerate() {
+                    if t.active {
+                        let cand = (t.next_fire, iid, ti);
+                        if best.map_or(true, |b| cand < b) {
+                            best = Some(cand);
+                        }
+                    }
+                }
+            }
+            let Some((fire_time, _, _)) = best else { break };
+            self.advance(fire_time - self.now)?;
+        }
+        Ok(())
     }
 
     /// Instantiate a component by name (props must be complete). Public for
@@ -160,6 +254,7 @@ impl<'m> Vm<'m> {
         };
         let id = self.instantiate(idx, props)?;
         self.run_lifecycle(id, "@start")?;
+        self.arm_timers(id);
         self.drain()?;
         Ok(id)
     }
@@ -972,6 +1067,61 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_timers_fire_identically_under_advance() {
+        // A recurring and a one-shot timer; drive the virtual clock on both
+        // engines and assert identical timer-driven emissions.
+        let src = "component T {\n    intent \"timers\"\n    out tick: Int\n    out ready: Int\n    state n: Int = 0\n\
+    on every 5s {\n        n += 1\n        emit tick(n)\n    }\n\
+    on after 2s {\n        emit ready(1)\n    }\n\
+    expose fun ticks() -> Int {\n        n\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        let iid = match it.instantiate("T", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(id)) => id,
+            _ => panic!("inst"),
+        };
+        it.start_all().ok();
+        assert!(it.advance(12_000).is_ok()); // fires every@5,10 and after@2
+        let i_ticks = {
+            let f = Value::Bound(iid, std::rc::Rc::new("ticks".to_string()));
+            match it.call_value(f, vec![], crate::diag::Span::default()) {
+                Ok(v) => v.to_string(),
+                Err(_) => panic!("ticks call failed"),
+            }
+        };
+        let i_ready = it.instances[iid].last_emit.get("ready").cloned().unwrap().to_string();
+        let i_tick = it.instances[iid].last_emit.get("tick").cloned().unwrap().to_string();
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let vid = vm.instantiate_named("T", vec![]).expect("inst");
+        vm.advance(12_000).expect("advance");
+        let v_ticks = vm.call_expose(vid, "ticks", vec![]).unwrap().to_string();
+
+        assert_eq!(i_ticks, v_ticks, "interpreter and KVM disagree on timer count");
+        assert_eq!(i_ticks, "2"); // every 5s fired at 5s and 10s within 12s
+        assert_eq!(i_ready, "1");
+        assert_eq!(i_tick, "2");
+    }
+
+    #[test]
+    fn timers_kx_roundtrip() {
+        let src = "component T {\n    intent \"t\"\n    out tick: Int\n    state n: Int = 0\n\
+    on every 3s {\n        n += 1\n        emit tick(n)\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let decoded = crate::kx::decode(&crate::kx::encode(&module)).expect("decodes");
+        assert_eq!(module.components[0].timers, decoded.components[0].timers);
+        assert_eq!(decoded.components[0].timers[0].interval_ms, 3000);
     }
 
     #[test]

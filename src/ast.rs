@@ -193,6 +193,10 @@ pub enum Trigger {
     Port(String),
     Start,
     Stop,
+    /// `on every 5s { … }` — recurring timer; interval in virtual milliseconds.
+    Every(i64),
+    /// `on after 2s { … }` — one-shot timer; delay in virtual milliseconds.
+    After(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +221,8 @@ pub enum ExampleStep {
     /// `expect value == 2` — any Bool expression; out-port names are bound to
     /// the last value emitted on that port.
     Expect { expr: Expr, span: Span },
+    /// `advance 5s` — move the virtual clock forward, firing due timers.
+    Advance { ms: i64, span: Span },
 }
 
 #[derive(Debug, Clone)]

@@ -28,8 +28,8 @@ Severity: **E** = error, **W** = warning.
 | K0102 | E | expected end of statement |
 | K0103 | E | expected a declaration (`fun`, `type`, `component`, `app`, …) |
 | K0104 | E | `intent` expects a string literal |
-| K0105 | E | `on` expects a port name, `start`, or `stop` |
-| K0106 | E | example blocks contain only `send` and `expect` steps |
+| K0105 | E | `on` expects a port name, `start`, `stop`, `every <dur>`, or `after <dur>` |
+| K0106 | E | example blocks contain `send`, `expect`, and `advance` steps |
 | K0107 | E | unexpected token in component body |
 | K0108 | E | invalid assignment target |
 | K0109 | E | expected `,` or newline between match arms |
@@ -43,6 +43,7 @@ Severity: **E** = error, **W** = warning.
 | K0117 | E | expected `restart` after the child name in `supervise` |
 | K0118 | E | unknown restart policy (use `on_failure` or `never`) |
 | K0119 | E | an `ai fun` body is `intent "…"` optionally followed by `model "…"` |
+| K0120 | E | malformed duration literal (expected `<int><unit>`, unit in `ms`/`s`/`m`/`h`) |
 
 ## K02xx — Type & semantic checker
 
@@ -111,6 +112,7 @@ Severity: **E** = error, **W** = warning.
 | K0263 | E | exposed signature does not match the contract |
 | K0264 | E | exposed effects exceed the contract's budget |
 | K0265 | E | `supervise` references unknown child |
+| K0266 | E | timer duration must be positive |
 | K0270 | E | `ai fun` must declare a return type (it defines the structured output) |
 | K0271 | E | `ai fun` return type not representable as structured output (unsupported/recursive/multi-variant type) |
 | K0272 | E | `ai fun` tool is not a monomorphic top-level function with representable parameter/return types |

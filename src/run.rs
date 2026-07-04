@@ -280,6 +280,9 @@ pub fn run_program(path: &str) -> i32 {
                 }
                 interp.instantiate(&name, &[], Span::default())?;
                 interp.start_all()?;
+                // fire timers deterministically (bounded, so recurring timers
+                // yield finite output under `kupl run`)
+                interp.run_timers(100)?;
                 Ok(())
             }
             None => {
@@ -754,6 +757,9 @@ fn run_example(
                     let text = snippet(src, *span);
                     return Ok(Some(format!("`{text}` was not satisfied")));
                 }
+            }
+            ExampleStep::Advance { ms, .. } => {
+                interp.advance(*ms)?;
             }
         }
     }
