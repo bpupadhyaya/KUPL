@@ -1,4 +1,10 @@
-> **Progress:** slice 1 landed (it30) — local **path** dependencies. A new
+> **Progress:** slice 2 landed (it31) — NAMESPACE ISOLATION via load-time name
+> mangling (src/resolve.rs): each dependency package's definitions + internal
+> references are renamed `pkg$name`, the root stays bare, and cross-package
+> access is qualified `dep.name`. Two deps with the same name no longer collide.
+> Frontend-only (loader + resolve pass) — engines untouched, invariant intact.
+>
+> Slice 1 landed (it30) — local **path** dependencies. A new
 > zero-dep `src/manifest.rs` reads the `kupl.toml` `[dependencies]` subset, and
 > the loader resolves `use <dep>` across packages (its manifest's `entry`), with
 > a clear K0400 on a missing path. Namespace isolation (mangling), lockfile +

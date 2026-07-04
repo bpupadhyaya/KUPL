@@ -25,6 +25,7 @@ pub mod interp;
 pub mod kx;
 pub mod lexer;
 pub mod loader;
+pub mod resolve;
 pub mod lsp;
 pub mod parser;
 pub mod prop;

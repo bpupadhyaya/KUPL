@@ -35,10 +35,14 @@ use util          // loads util.kupl        (same directory as the entry file)
 use lib.stats     // loads lib/stats.kupl
 ```
 
-`use` merges the target file's items into the program (one flat namespace in
-v1.0-alpha — duplicate item names across files are an error). Loading is
-recursive, cycle-safe, and deduplicated. `module` headers are accepted and
-currently derive identity from the file path.
+`use` merges the target file's items into the program. Files within one package
+share a flat namespace (duplicate item names across those files are an error).
+Loading is recursive, cycle-safe, and deduplicated.
+
+**Packages.** A directory with a `kupl.toml` is a package; its `[dependencies]`
+name other local packages by path. `use <dep>` brings a dependency in, and its
+public items are accessed **qualified**: `dep.item(…)`. Dependency namespaces
+are isolated, so two dependencies may define the same name without colliding.
 
 ## 2. Lexical structure
 

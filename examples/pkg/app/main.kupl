@@ -1,8 +1,10 @@
 // This app depends on the local `greet` package (see kupl.toml).
+// Cross-package names are qualified: `greet.hello(…)` calls the `greet`
+// package's `hello` (namespaces are isolated, so packages can't collide).
 // Run it with:  kupl run examples/pkg/app/main.kupl
 use greet
 
 fun main() uses io {
-    print(hello("KUPL"))
-    print(shout(hello("world")))
+    print(greet.hello("KUPL"))
+    print(greet.shout(greet.hello("world")))
 }

@@ -12,11 +12,13 @@ use crate::ast::Program;
 use crate::diag::{self, Diag, Span};
 use crate::parser;
 
-/// A loaded package: the directory its files resolve relative to, plus its
-/// declared dependencies (name -> the directory of the dependency package).
+/// A loaded package: the directory its files resolve relative to, its declared
+/// dependencies (name -> directory), and its mangling prefix (`""` for the root
+/// package, which is never mangled).
 struct PkgCtx {
     root: PathBuf,
     deps: HashMap<String, PathBuf>,
+    prefix: String,
 }
 
 /// Lexically resolve `.` and `..` in a path without touching the filesystem
@@ -43,7 +45,7 @@ fn normalize(p: &Path) -> PathBuf {
 /// file's project); otherwise the manifest must be at `dir/kupl.toml` (a named
 /// *dependency*). With no manifest the package is anonymous (`root = dir`, no
 /// deps) — exactly today's behavior, so bare `.kupl` files are unaffected.
-fn pkg_ctx(dir: &Path, walk: bool) -> Rc<PkgCtx> {
+fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
     let mut d: Option<&Path> = Some(dir);
     while let Some(cur) = d {
         let toml = cur.join("kupl.toml");
@@ -56,12 +58,12 @@ fn pkg_ctx(dir: &Path, walk: bool) -> Rc<PkgCtx> {
                     }
                     // version-only deps resolve via a registry — a later slice
                 }
-                return Rc::new(PkgCtx { root: cur.to_path_buf(), deps });
+                return Rc::new(PkgCtx { root: cur.to_path_buf(), deps, prefix: prefix.to_string() });
             }
         }
         d = if walk { cur.parent() } else { None };
     }
-    Rc::new(PkgCtx { root: dir.to_path_buf(), deps: HashMap::new() })
+    Rc::new(PkgCtx { root: dir.to_path_buf(), deps: HashMap::new(), prefix: prefix.to_string() })
 }
 
 pub struct SourceFile {
@@ -166,9 +168,13 @@ pub fn load_with(
 
     let entry_path = PathBuf::from(entry);
     let root_dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let root_ctx = pkg_ctx(&root_dir, true);
+    let root_ctx = pkg_ctx(&root_dir, true, "");
     let mut ctx_cache: HashMap<PathBuf, Rc<PkgCtx>> = HashMap::new();
     let mut queue: Vec<(PathBuf, Rc<PkgCtx>, Option<Span>)> = vec![(entry_path, root_ctx, None)];
+    // items tagged with their owning package's mangling prefix, plus the deps
+    // each package may reference — fed to the namespace-isolation pass.
+    let mut tagged: Vec<(crate::ast::Item, String)> = Vec::new();
+    let mut pkg_deps: HashMap<String, HashSet<String>> = HashMap::new();
 
     while let Some((path, ctx, use_span)) = queue.pop() {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -200,13 +206,18 @@ pub fn load_with(
             base,
         });
         diags.extend(file_diags);
+        pkg_deps
+            .entry(ctx.prefix.clone())
+            .or_default()
+            .extend(ctx.deps.keys().cloned());
         for (use_path, span) in &file_program.uses {
             let first = use_path.split('.').next().unwrap_or(use_path);
             if let Some(dep_dir) = ctx.deps.get(first) {
-                // cross-package `use <dep>` (or `<dep>.sub`)
+                // cross-package `use <dep>` (or `<dep>.sub`) — the dependency's
+                // package is mangled with its import alias as the prefix
                 let dep_ctx = ctx_cache
                     .entry(dep_dir.clone())
-                    .or_insert_with(|| pkg_ctx(dep_dir, false))
+                    .or_insert_with(|| pkg_ctx(dep_dir, false, first))
                     .clone();
                 let target = if let Some(tail) =
                     use_path.strip_prefix(first).and_then(|t| t.strip_prefix('.'))
@@ -228,8 +239,19 @@ pub fn load_with(
                 queue.push((fs_path, ctx.clone(), Some(*span)));
             }
         }
-        program.items.extend(file_program.items);
+        for item in file_program.items {
+            tagged.push((item, ctx.prefix.clone()));
+        }
     }
+
+    // Isolate package namespaces (mangle dependency names). When there are no
+    // dependency packages, keep items verbatim so ordinary programs are
+    // byte-identical to before.
+    program.items = if tagged.iter().any(|(_, p)| !p.is_empty()) {
+        crate::resolve::isolate(tagged, &pkg_deps)
+    } else {
+        tagged.into_iter().map(|(i, _)| i).collect()
+    };
 
     let has_errors = diags.iter().any(|d| d.severity == crate::diag::Severity::Error);
     if has_errors {
@@ -308,7 +330,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             app.join("main.kupl"),
-            "use math\n\nfun main() uses io {\n    print(add(1, 2))\n}\n",
+            "use math\n\nfun main() uses io {\n    print(math.add(1, 2))\n}\n",
         )
         .unwrap();
 
@@ -336,6 +358,51 @@ mod tests {
             Ok(_) => panic!("missing dependency should fail to load"),
         }
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn two_packages_same_name_dont_collide() {
+        // two dependencies BOTH define `helper` — namespace isolation keeps them
+        // distinct, and each dep's internal calls bind to its own definitions.
+        let base = std::env::temp_dir().join(format!("kupl-ns-test-{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        let app = base.join("app");
+        for d in [&a, &b, &app] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(a.join("kupl.toml"), "[project]\nname = \"a\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(a.join("main.kupl"), "pub fun helper() -> Int {\n    1\n}\npub fun via() -> Int {\n    helper() + 10\n}\n").unwrap();
+        std::fs::write(b.join("kupl.toml"), "[project]\nname = \"b\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(b.join("main.kupl"), "pub fun helper() -> Int {\n    2\n}\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\na = { path = \"../a\" }\nb = { path = \"../b\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use a\nuse b\n\nfun probe() -> Int {\n    a.helper() + b.helper() * 10 + a.via() * 100\n}\n",
+        )
+        .unwrap();
+
+        let (program, _) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("two same-named deps load without collision");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "no collision expected, got {diags:?}"
+        );
+        // 1 + 2*10 + 11*100 = 1121
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("probe".to_string()));
+        match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => assert_eq!(v.to_string(), "1121"),
+            Err(_) => panic!("probe should evaluate"),
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

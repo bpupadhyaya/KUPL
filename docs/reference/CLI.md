@@ -119,10 +119,13 @@ math = { path = "../math" }
 util = "vendor/util"          # bare-string shorthand for a path
 ```
 
-A `use <dep>` in your code then resolves to that dependency package's `entry`
-file (and `use <dep>.sub` to a subfile within it). A missing dependency path is
-reported as **K0400** at the `use` site. Version-only dependencies (registry
-fetch) are a later addition; local path dependencies work today.
+A `use <dep>` in your code makes that dependency package available; access its
+public items with a **qualified** name, `dep.item(…)` — e.g. `math.add(1, 2)`.
+Namespaces are isolated (each package's names are mangled internally), so two
+dependencies can define the same name without colliding. `use <dep>.sub`
+reaches a subfile within the dependency. A missing dependency path is reported
+as **K0400** at the `use` site. Version-only dependencies (registry fetch) are a
+later addition; local path dependencies with qualified access work today.
 
 ### `kupl version`
 Prints the toolchain version.
