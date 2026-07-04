@@ -16,7 +16,8 @@ pub struct Checked {
     pub types: HashMap<String, TypeSig>,
     /// variant name -> (owning type name, fields)
     pub ctors: HashMap<String, (String, Vec<(String, Ty)>)>,
-    pub funs: HashMap<String, (Vec<Ty>, Ty)>,
+    /// name -> (params, ret, quantified type-variable ids)
+    pub funs: HashMap<String, (Vec<Ty>, Ty, Vec<u32>)>,
     pub components: HashMap<String, ComponentSig>,
     pub contracts: HashMap<String, ContractSig>,
 }
@@ -26,6 +27,7 @@ pub fn check(program: &Program) -> (Checked, Vec<Diag>) {
         checked: Checked::default(),
         diags: Vec::new(),
         uni: Unifier::default(),
+        tyvars: HashMap::new(),
     };
     ck.collect(program);
     ck.check_bodies(program);
@@ -36,6 +38,8 @@ struct Checker {
     checked: Checked,
     diags: Vec<Diag>,
     uni: Unifier,
+    /// In-scope type parameters while resolving a generic function.
+    tyvars: HashMap<String, Ty>,
 }
 
 /// Lexical scope stack for body checking.
@@ -145,12 +149,22 @@ impl Checker {
                     );
                 }
                 Item::Fun(f) => {
+                    let mut qvars = Vec::new();
+                    self.tyvars.clear();
+                    for tp in &f.type_params {
+                        let v = self.uni.fresh();
+                        if let Ty::Var(id) = v {
+                            qvars.push(id);
+                        }
+                        self.tyvars.insert(tp.clone(), v);
+                    }
                     let params: Vec<Ty> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
                     let ret = f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
+                    self.tyvars.clear();
                     if self.checked.funs.contains_key(&f.name) {
                         self.err("K0203", format!("function `{}` is defined more than once", f.name), f.span);
                     }
-                    self.checked.funs.insert(f.name.clone(), (params, ret));
+                    self.checked.funs.insert(f.name.clone(), (params, ret, qvars));
                 }
                 Item::Component(c) => {
                     let mut sig = ComponentSig::default();
@@ -200,6 +214,9 @@ impl Checker {
     fn resolve_ty(&mut self, t: &TyExpr) -> Ty {
         match &t.kind {
             TyExprKind::Name(n) => match n.as_str() {
+                _ if self.tyvars.contains_key(n.as_str()) => {
+                    self.tyvars.get(n.as_str()).cloned().unwrap()
+                }
                 "Int" => Ty::Int,
                 "Float" => Ty::Float,
                 "Bool" => Ty::Bool,
@@ -334,6 +351,11 @@ impl Checker {
     }
 
     fn check_fun(&mut self, f: &FunDecl, component: Option<&ComponentDecl>) {
+        self.tyvars.clear();
+        for tp in &f.type_params {
+            let v = self.uni.fresh();
+            self.tyvars.insert(tp.clone(), v);
+        }
         let mut ctx = Ctx {
             scopes: Scopes::new(),
             ret: f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit),
@@ -355,6 +377,7 @@ impl Checker {
         if ret != Ty::Unit {
             self.unify(&ret, &body_ty, f.body.span, &format!("return value of `{}`", f.name));
         }
+        self.tyvars.clear();
     }
 
     /// Put props (immutable) and state (mutable) in scope.
@@ -379,6 +402,12 @@ impl Checker {
             if self.checked.components.contains_key(&child.component) {
                 ctx.scopes.insert(&child.name, Ty::Component(child.component.clone()), false);
             }
+        }
+        // component functions (private and exposed) callable from any body
+        for f in c.funs.iter().chain(c.exposes.iter()) {
+            let params: Vec<Ty> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
+            let ret = f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
+            ctx.scopes.insert(&f.name, Ty::Fun(params, Box::new(ret)), false);
         }
     }
 
@@ -1038,11 +1067,39 @@ impl Checker {
         }
     }
 
+    /// Instantiate a function scheme: quantified vars become fresh vars.
+    fn instantiate_scheme(&mut self, params: &[Ty], ret: &Ty, qvars: &[u32]) -> (Vec<Ty>, Ty) {
+        if qvars.is_empty() {
+            return (params.to_vec(), ret.clone());
+        }
+        let mut mapping: HashMap<u32, Ty> = HashMap::new();
+        for q in qvars {
+            mapping.insert(*q, self.uni.fresh());
+        }
+        fn subst(ty: &Ty, m: &HashMap<u32, Ty>) -> Ty {
+            match ty {
+                Ty::Var(id) => m.get(id).cloned().unwrap_or(Ty::Var(*id)),
+                Ty::List(e) => Ty::List(Box::new(subst(e, m))),
+                Ty::Option(e) => Ty::Option(Box::new(subst(e, m))),
+                Ty::Result(a, b) => Ty::Result(Box::new(subst(a, m)), Box::new(subst(b, m))),
+                Ty::Fun(ps, r) => {
+                    Ty::Fun(ps.iter().map(|p| subst(p, m)).collect(), Box::new(subst(r, m)))
+                }
+                other => other.clone(),
+            }
+        }
+        (
+            params.iter().map(|p| subst(p, &mapping)).collect(),
+            subst(ret, &mapping),
+        )
+    }
+
     fn infer_ident(&mut self, name: &str, span: Span, ctx: &mut Ctx) -> Ty {
         if let Some((ty, _)) = ctx.scopes.get(name) {
             return ty;
         }
-        if let Some((params, ret)) = self.checked.funs.get(name).cloned() {
+        if let Some((params, ret, qvars)) = self.checked.funs.get(name).cloned() {
+            let (params, ret) = self.instantiate_scheme(&params, &ret, &qvars);
             return Ty::Fun(params, Box::new(ret));
         }
         // nullary constructors as values

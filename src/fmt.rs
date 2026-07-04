@@ -74,7 +74,11 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
     if f.is_pub {
         out.push_str("pub ");
     }
-    out.push_str(&format!("fun {}(", f.name));
+    out.push_str(&format!("fun {}", f.name));
+    if !f.type_params.is_empty() {
+        out.push_str(&format!("[{}]", f.type_params.join(", ")));
+    }
+    out.push('(');
     for (i, p) in f.params.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");

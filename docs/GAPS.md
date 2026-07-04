@@ -10,9 +10,9 @@ and known limitations called out in commit messages. Checked off as landed.
 - [x] **Std lib depth** — List: fold/any/all/sort/take/drop/get/index_of;
       Str: ends_with/replace/chars/repeat/parse_int/parse_float;
       Int: min/max; Float: floor/ceil/round/min/max/pow
-- [ ] **Component-private functions callable** from handlers/exposes (declared
+- [x] **Component-private functions callable** from handlers/exposes (declared
       but unreachable today)
-- [ ] **User-code generics** — `fun sort_by[T](xs: List[T], key: fn(T) -> Int)`
+- [x] **User-code generics** — `fun sort_by[T](xs: List[T], key: fn(T) -> Int)`
       (checker-level instantiation; engines are ready)
 - [ ] **Map[K, V] and Set[T]** collections (design §3)
 

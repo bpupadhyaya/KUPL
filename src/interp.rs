@@ -607,6 +607,13 @@ impl Interp {
         if name == "None" {
             return Ok(Value::none());
         }
+        // component-local function referenced as a value
+        if let Some(id) = self.current {
+            let comp = self.instances[id].comp.clone();
+            if comp.funs.iter().chain(comp.exposes.iter()).any(|f| f.name == name) {
+                return Ok(Value::Bound(id, Rc::new(name.to_string())));
+            }
+        }
         if let Some((tyname, fields)) = self.db.ctors.get(name).cloned() {
             if fields.is_empty() {
                 return Ok(Value::Ctor {
@@ -652,6 +659,26 @@ impl Interp {
                     return Ok(Value::err(v));
                 }
                 _ => {}
+            }
+            // component-local function (private or exposed) with live state
+            if let Some(id) = self.current {
+                if env.get(name).is_none() {
+                    let comp = self.instances[id].comp.clone();
+                    if let Some(decl) = comp
+                        .funs
+                        .iter()
+                        .chain(comp.exposes.iter())
+                        .find(|f| f.name == *name)
+                    {
+                        let decl = decl.clone();
+                        let mut avs = Vec::with_capacity(args.len());
+                        for a in args {
+                            avs.push(self.eval(&a.value, env)?);
+                        }
+                        let base = self.instances[id].env.clone();
+                        return self.call_fun(&decl, avs, &base, span);
+                    }
+                }
             }
             // user constructor
             if let Some((tyname, field_names)) = self.db.ctors.get(name).cloned() {

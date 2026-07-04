@@ -127,8 +127,19 @@ type UserId = new Str                                       // newtype
 Types are inferred inside bodies (Hindley-Milner-style unification, checked
 bidirectionally so lambda parameters take their types from context). **All
 public boundaries must be written out**: function parameters and returns,
-ports, props, expose signatures. Generics for user code are **[design]**;
-`List`/`Option`/`Result` and the builtin methods are generic internally.
+ports, props, expose signatures.
+
+### Generic functions
+
+```kupl
+fun identity[T](x: T) -> T { x }
+fun apply2[T, U](f: fn(T) -> U, a: T, b: T) -> List[U] { [f(a), f(b)] }
+```
+
+Type parameters in `[...]` are universally quantified and instantiated fresh
+at every call site — `identity(42)`, `identity("s")`, and `identity(true)` in
+one program all check. Bounds (`[T: Ord]`) are **[design]**. Type parameters
+on `type` declarations are **[design]**.
 
 ## 4. Expressions
 
@@ -240,6 +251,7 @@ Member kinds (the formatter enforces this order):
 | `supervise child restart on_failure` | see §9 |
 | `on port(payload) { … }` | handler; `on start` / `on stop` lifecycle |
 | `expose fun …` | synchronous request/response interface |
+| `fun …` (private) | component-local helper; sees props/state/children; callable from handlers, exposes, and other component functions |
 | `example { … }` | executable spec: `send port(v)` steps + `expect` over out-port values |
 
 Semantics:

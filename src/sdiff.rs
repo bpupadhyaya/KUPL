@@ -113,7 +113,7 @@ fn interface_of(item: &Item) -> String {
     let mut s = String::new();
     match item {
         Item::Fun(f) => {
-            s.push_str(&format!("fun {} pub={}", f.name, f.is_pub));
+            s.push_str(&format!("fun {}[{}] pub={}", f.name, f.type_params.join(","), f.is_pub));
             for p in &f.params {
                 s.push_str(&format!(" {}:{}", p.name, ty_str(&p.ty)));
             }

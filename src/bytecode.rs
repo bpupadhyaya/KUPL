@@ -38,6 +38,8 @@ pub enum Op {
 
     /// dst <- chunks[fun](regs[start .. start+argc])
     Call { dst: Reg, fun: u16, start: Reg, argc: u8 },
+    /// like Call, but the callee runs with the CURRENT instance (component funs)
+    CallComp { dst: Reg, fun: u16, start: Reg, argc: u8 },
     /// dst <- builtin(regs[start .. start+argc]); 0=print 1=to_str 2=panic
     CallBuiltin { dst: Reg, which: u8, start: Reg, argc: u8 },
     /// dst <- (regs[f])(regs[start .. start+argc]) — closures, fn refs

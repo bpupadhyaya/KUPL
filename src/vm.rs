@@ -368,6 +368,14 @@ impl<'m> Vm<'m> {
                         e
                     })?;
                 }
+                Op::CallComp { dst, fun, start, argc } => {
+                    let args: Vec<Value> =
+                        (0..argc).map(|i| reg!(start + i)).collect();
+                    self.push_frame(fun, &args, dst, cur_inst).map_err(|mut e| {
+                        e.span = span;
+                        e
+                    })?;
+                }
                 Op::CallBuiltin { dst, which, start, argc } => {
                     let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
                     match which {

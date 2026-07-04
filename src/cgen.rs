@@ -190,7 +190,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
         }
         ToStr(d, s) => format!("regs[{d}] = k_to_str(regs[{s}]);"),
         Concat(d, a, b) => format!("regs[{d}] = k_concat(regs[{a}], regs[{b}]);"),
-        StateGet(..) | StateSet(..) | MakeInstance { .. } | WireOp { .. } | EmitOp { .. } => {
+        StateGet(..) | StateSet(..) | MakeInstance { .. } | WireOp { .. } | EmitOp { .. }
+        | CallComp { .. } => {
             "k_panic(\"components are not supported by the native backend v0 (use kupl bundle)\");"
                 .to_string()
         }

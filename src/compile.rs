@@ -148,7 +148,22 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         slots.insert(child.name.clone(), slot);
         slot += 1;
     }
-    let comp_ctx = CompCtx { slots: slots.clone() };
+    // pre-assign chunk indices for ALL component functions (mutual recursion)
+    let mut fun_chunks: HashMap<String, u16> = HashMap::new();
+    for f in c.funs.iter().chain(c.exposes.iter()) {
+        let idx = shared.module.chunks.len() as u16;
+        shared.module.chunks.push(Chunk {
+            name: format!("{}::{}", c.name, f.name),
+            ncaps: 0,
+            nparams: f.params.len() as u8,
+            nregs: 0,
+            consts: Vec::new(),
+            code: Vec::new(),
+            spans: Vec::new(),
+        });
+        fun_chunks.insert(f.name.clone(), idx);
+    }
+    let comp_ctx = CompCtx { slots: slots.clone(), funs: fun_chunks.clone() };
     let props = shared.comp_props.get(&c.name).cloned().unwrap_or_default();
 
     // restart chunk: state inits only (supervision resets state, keeps wiring)
@@ -222,9 +237,10 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         handlers.push((key, (shared.module.chunks.len() - 1) as u16, has_param));
     }
 
-    // exposes
+    // component functions (private + exposed) into their reserved chunk slots
     let mut exposes = HashMap::new();
-    for f in &c.exposes {
+    for f in c.funs.iter().chain(c.exposes.iter()) {
+        let idx = fun_chunks[&f.name];
         let mut fc = FnCompiler::new(
             shared,
             &format!("{}::{}", c.name, f.name),
@@ -238,9 +254,12 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         let last = fc.block(&f.body);
         let r = last.unwrap_or_else(|| fc.const_reg(Value::Unit, f.span));
         fc.emit(Op::Ret(r), f.span);
-        let chunk = fc.finish();
-        shared.module.chunks.push(chunk);
-        exposes.insert(f.name.clone(), (shared.module.chunks.len() - 1) as u16);
+        let mut chunk = fc.finish();
+        chunk.name = format!("{}::{}", c.name, f.name);
+        shared.module.chunks[idx as usize] = chunk;
+    }
+    for f in &c.exposes {
+        exposes.insert(f.name.clone(), fun_chunks[&f.name]);
     }
 
     ComponentMeta {
@@ -271,10 +290,12 @@ struct Shared {
     fun_names: HashSet<String>,
 }
 
-/// Component compilation context: name -> instance slot (props, state, children).
+/// Component compilation context: name -> instance slot (props, state, children),
+/// plus the chunk indices of the component's own functions (private + exposed).
 #[derive(Clone)]
 struct CompCtx {
     slots: HashMap<String, u8>,
+    funs: HashMap<String, u16>,
 }
 
 fn compile_fun(shared: &mut Shared, f: &FunDecl) -> Chunk {
@@ -979,6 +1000,17 @@ impl<'s> FnCompiler<'s> {
                 let dst = self.alloc(span);
                 self.emit(Op::MakeCtor { dst, ctor: idx, start, len: ordered.len() as u8 }, span);
                 return dst;
+            }
+            // component-local function (private or exposed)
+            if self.lookup(name).is_none() {
+                let comp_fun = self.comp.as_ref().and_then(|c| c.funs.get(name.as_str()).copied());
+                if let Some(fun) = comp_fun {
+                    let exprs: Vec<Expr> = args.iter().map(|a| a.value.clone()).collect();
+                    let start = self.consecutive(&exprs, span);
+                    let dst = self.alloc(span);
+                    self.emit(Op::CallComp { dst, fun, start, argc: args.len() as u8 }, span);
+                    return dst;
+                }
             }
             // component construction
             if self.lookup(name).is_none()

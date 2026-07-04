@@ -261,6 +261,17 @@ impl Parser {
         self.eat(&Tok::KwAsync);
         let start = self.expect(Tok::KwFun)?;
         let (name, _) = self.expect_ident()?;
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::LBracket) {
+            loop {
+                let (tp, _) = self.expect_ident()?;
+                type_params.push(tp);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RBracket)?;
+        }
         self.expect(Tok::LParen)?;
         let params = self.parse_params()?;
         self.expect(Tok::RParen)?;
@@ -286,7 +297,7 @@ impl Parser {
         };
         let body = self.parse_block()?;
         let span = start.merge(body.span);
-        Ok(FunDecl { name, params, ret, effects, body, is_pub, span })
+        Ok(FunDecl { name, type_params, params, ret, effects, body, is_pub, span })
     }
 
     fn parse_params(&mut self) -> PResult<Vec<Param>> {

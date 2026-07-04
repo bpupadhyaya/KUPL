@@ -1,0 +1,77 @@
+// User-code generics + component-private functions.
+
+fun identity[T](x: T) -> T {
+    x
+}
+
+fun swap_apply[T, U](f: fn(T) -> U, a: T, b: T) -> List[U] {
+    [f(b), f(a)]
+}
+
+fun first_or[T](xs: List[T], default: T) -> T {
+    match xs.first() {
+        Some(x) => x
+        None => default
+    }
+}
+
+component Accumulator {
+    intent "Accumulates values, using private helpers for the math."
+
+    in add: Int
+    out report: Str
+
+    state total: Int = 0
+    state count: Int = 0
+
+    on add(n) {
+        total += clamp(n)
+        count += 1
+        emit report(describe())
+    }
+
+    fun clamp(n: Int) -> Int {
+        n.min(100).max(-100)
+    }
+
+    fun describe() -> Str {
+        "total={total} avg={average()}"
+    }
+
+    fun average() -> Int {
+        if count == 0 {
+            0
+        } else {
+            total / count
+        }
+    }
+
+    example {
+        send add(50)
+        send add(500)
+        expect report == "total=150 avg=75"
+    }
+}
+
+app Main {
+    intent "Exercise generics and private component functions."
+
+    let acc = Accumulator()
+    let feed = Feed()
+    wire feed.out_n -> acc.add
+}
+
+component Feed {
+    intent "Feeds values at startup, printing generic-function results first."
+
+    out out_n: Int
+
+    on start {
+        print("identity      = {identity(42)} {identity("str")} {identity(true)}")
+        print("swap_apply    = {swap_apply(fn n { n * n }, 3, 4)}")
+        print("first_or      = {first_or([9, 8], 0)} {first_or([], 7)}")
+        emit out_n(50)
+        emit out_n(500)
+        emit out_n(-500)
+    }
+}

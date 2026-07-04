@@ -50,6 +50,8 @@ pub struct Law {
 #[derive(Debug, Clone)]
 pub struct FunDecl {
     pub name: String,
+    /// Type parameters: `fun first[T](xs: List[T]) -> Option[T]`
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Option<TyExpr>,
     pub effects: Vec<String>,
