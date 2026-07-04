@@ -1430,6 +1430,21 @@ impl Checker {
                     self.unify(&Ty::Named("Json".into()), &t, args[0].value.span, "json_stringify argument");
                     return Ty::Str;
                 }
+                ("env_var", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "env_var name");
+                    return Ty::Option(Box::new(Ty::Str));
+                }
+                ("args", 0) => return Ty::List(Box::new(Ty::Str)),
+                ("eprint", 1) => {
+                    self.infer_expr(&args[0].value, ctx);
+                    return Ty::Unit;
+                }
+                ("exit", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Int, &t, args[0].value.span, "exit code");
+                    return self.uni.fresh();
+                }
                 ("Some", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
                     return Ty::Option(Box::new(self.uni.apply(&t)));

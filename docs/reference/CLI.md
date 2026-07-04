@@ -9,13 +9,17 @@ they belong to. Exit codes: `0` success · `1` compile/test/diff failure ·
 
 ## Running
 
-### `kupl run <file.kupl>`
+### `kupl run <file.kupl> [-- args…]`
 Runs the first `app` in the program (instantiate → `on start` in creation
 order → drain the message queue). With no `app`, runs `fun main()`. Values
 emitted on unwired out ports print as `Component.port = value`. If the app has
 timers (`on every`/`on after`), the virtual clock advances automatically —
 bounded to 100 firings — so recurring timers yield finite, deterministic
 output.
+
+Everything after a `--` is passed to the program as its command-line arguments,
+readable with `args()` (e.g. `kupl run tool.kupl -- input.txt --verbose`). A
+native binary (`kupl native`) reads its arguments directly: `./tool input.txt`.
 
 ### `kupl run --vm <file.kupl>`
 Same program on the KVM register bytecode VM. Output is byte-identical to the

@@ -59,7 +59,7 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
 
     let _ = writeln!(
         out,
-        "\nint main(void) {{\n    fun_{main_idx}(0, 0);\n    return 0;\n}}"
+        "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    fun_{main_idx}(0, 0);\n    return 0;\n}}"
     );
     Ok(out)
 }
@@ -169,6 +169,10 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
                         .into(),
                 )
             }
+            BUILTIN_ENV_VAR => format!("regs[{dst}] = k_env_var(regs[{start}]); (void){argc};"),
+            BUILTIN_ARGS => format!("regs[{dst}] = k_args(); (void){start}; (void){argc};"),
+            BUILTIN_EPRINT => format!("regs[{dst}] = k_eprint(regs[{start}]); (void){argc};"),
+            BUILTIN_EXIT => format!("fflush(stdout); exit((int)regs[{start}].as.i); (void){argc}; (void){dst};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -778,6 +782,25 @@ static KValue k_delete_file(KValue path) {
 }
 static KValue k_file_exists(KValue path) {
     return k_bool(access(path.as.s, F_OK) == 0);
+}
+
+/* ---- environment & process builtins ---- */
+static int k_argc = 0;
+static char** k_argv = 0;
+static KValue k_env_var(KValue name) {
+    const char* v = getenv(name.as.s);
+    return v ? k_some(k_str(v)) : k_none();
+}
+static KValue k_args(void) {
+    /* the program's own args are argv[1..] */
+    int n = k_argc > 1 ? k_argc - 1 : 0;
+    KValue* out = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    for (int i = 0; i < n; i++) out[i] = k_str(k_argv[i + 1]);
+    return k_list(out, n);
+}
+static KValue k_eprint(KValue v) {
+    fprintf(stderr, "%s\n", k_show(v));
+    return k_unit();
 }
 
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {

@@ -177,6 +177,10 @@ pub const BUILTIN_DELETE_FILE: u8 = 12;
 pub const BUILTIN_FILE_EXISTS: u8 = 13;
 pub const BUILTIN_JSON_PARSE: u8 = 14;
 pub const BUILTIN_JSON_STRINGIFY: u8 = 15;
+pub const BUILTIN_ENV_VAR: u8 = 16;
+pub const BUILTIN_ARGS: u8 = 17;
+pub const BUILTIN_EPRINT: u8 = 18;
+pub const BUILTIN_EXIT: u8 = 19;
 
 impl Module {
     pub fn disassemble(&self) -> String {

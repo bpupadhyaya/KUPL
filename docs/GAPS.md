@@ -84,6 +84,11 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       Interp + KVM + `.kx` + bundle byte-identical; native reports a clear
       "not yet supported" error (recursive ctor construction in C deferred).
       Confirmed recursive ADTs work end-to-end. (`examples/json.kupl`)
+- [x] **Environment & process** (it16) — `args()` (command-line arguments),
+      `env_var(name) -> Option[Str]`, `eprint` (stderr), `exit(code)`. With file
+      I/O + JSON, KUPL can now write real CLI tools. `args`/`env_var` carry the
+      `io.env` effect. All engines incl. native (argv, getenv, exit).
+      (`examples/cli.kupl`)
 - [ ] **Native components + KIR** (audit #2) — typed SSA IR; components compile
       to native (per-component GC), so real apps run at native, not VM, speed
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first

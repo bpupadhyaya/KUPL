@@ -24,6 +24,15 @@ unless supervised.
 | `file_exists(path)` | `(Str) -> Bool` — **uses `io.fs`** | any filesystem entry |
 | `json_parse(text)` | `(Str) -> Result[Json, Str]` | pure; `Err` on malformed input |
 | `json_stringify(j)` | `(Json) -> Str` | compact; object key order preserved |
+| `args()` | `() -> List[Str]` — **uses `io.env`** | the program's command-line arguments |
+| `env_var(name)` | `(Str) -> Option[Str]` — **uses `io.env`** | environment variable, or `None` |
+| `eprint(v)` | `(any) -> Unit` — **uses `io`** | prints Display form + newline to stderr |
+| `exit(code)` | `(Int) -> !` | flushes stdout and terminates the process |
+
+`args`/`env_var` read ambient input, so they carry the `io.env` effect (a
+sub-effect of `io`). `args()` is everything after `--` when run through the
+toolchain (`kupl run prog.kupl -- a b`) and `argv[1..]` for a native binary.
+`exit` diverges (like `panic`) so it needs no effect.
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

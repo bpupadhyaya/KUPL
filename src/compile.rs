@@ -1053,6 +1053,10 @@ impl<'s> FnCompiler<'s> {
                 ("file_exists", 1) => Some(BUILTIN_FILE_EXISTS),
                 ("json_parse", 1) => Some(BUILTIN_JSON_PARSE),
                 ("json_stringify", 1) => Some(BUILTIN_JSON_STRINGIFY),
+                ("env_var", 1) => Some(BUILTIN_ENV_VAR),
+                ("args", 0) => Some(BUILTIN_ARGS),
+                ("eprint", 1) => Some(BUILTIN_EPRINT),
+                ("exit", 1) => Some(BUILTIN_EXIT),
                 _ => None,
             };
             if let Some(which) = builtin {

@@ -923,6 +923,21 @@ impl Interp {
                         .map(Value::str)
                         .map_err(|m| Self::panic_flow(m, span));
                 }
+                ("env_var", 1) | ("eprint", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return proc_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
+                }
+                ("args", 0) => return proc_builtin(name, &[]).map_err(|m| Self::panic_flow(m, span)),
+                ("exit", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    let code = match v {
+                        Value::Int(n) => n as i32,
+                        _ => 0,
+                    };
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                    std::process::exit(code);
+                }
                 ("Some", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     return Ok(Value::some(v));
@@ -1933,6 +1948,44 @@ pub fn set_from_list(v: &Value) -> Result<Value, String> {
             Ok(Value::Set(Rc::new(out)))
         }
         other => Err(format!("Set(...) needs a List, found {}", other.type_name())),
+    }
+}
+
+/// The program's own command-line arguments. When KUPL is run through the
+/// toolchain (`kupl run prog.kupl -- a b c`), the program's args are everything
+/// after `--`; with no `--`, there are none. (The native backend reads argv
+/// directly.)
+pub fn program_args() -> Vec<String> {
+    let all: Vec<String> = std::env::args().collect();
+    match all.iter().position(|a| a == "--") {
+        Some(i) => all[i + 1..].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Environment & process builtins that return a value — shared by interpreter
+/// and KVM. `env_var`/`args` carry the `io.env` effect; `eprint` carries `io`.
+/// (`exit` diverges and is handled inline, like `panic`.)
+pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "env_var" => {
+            let key = match &args[0] {
+                Value::Str(s) => s.as_str().to_string(),
+                other => other.to_string(),
+            };
+            Ok(match std::env::var(&key) {
+                Ok(v) => Value::some(Value::str(v)),
+                Err(_) => Value::none(),
+            })
+        }
+        "args" => Ok(Value::List(Rc::new(
+            program_args().into_iter().map(Value::str).collect(),
+        ))),
+        "eprint" => {
+            eprintln!("{}", args[0]);
+            Ok(Value::Unit)
+        }
+        _ => Err(format!("unknown process builtin `{name}`")),
     }
 }
 

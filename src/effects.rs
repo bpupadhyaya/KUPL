@@ -159,6 +159,10 @@ fn builtin_effects(name: &str) -> Option<&'static str> {
         "read_file" | "write_file" | "append_file" | "delete_file" | "file_exists" => {
             Some("io.fs")
         }
+        // reading the environment / command line — another `io` sub-effect
+        "env_var" | "args" => Some("io.env"),
+        // stderr output is ordinary `io` (`exit` diverges like `panic`: no effect)
+        "eprint" => Some("io"),
         _ => None,
     }
 }

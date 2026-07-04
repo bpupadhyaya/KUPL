@@ -1,0 +1,33 @@
+// A tiny command-line tool: greet the names passed as arguments.
+//
+// Environment & process builtins let KUPL write real CLI programs:
+//   args()          -> List[Str]     the program's command-line arguments
+//   env_var(name)   -> Option[Str]   an environment variable, or None
+//   eprint(v)                        print to standard error
+//   exit(code)                       terminate with an exit code
+//
+// `args`/`env_var` carry the `io.env` effect; `eprint` carries `io`.
+//
+// Run it:
+//   kupl run examples/cli.kupl -- Ada Grace
+//   GREETING=Hi kupl run examples/cli.kupl -- Ada
+// Or compile a real binary:
+//   kupl native examples/cli.kupl -o greet && ./greet Ada Grace
+
+fun main() uses io, io.env {
+    let names = args()
+    if names.is_empty() {
+        eprint("usage: greet <name>...")
+        exit(1)
+    }
+
+    // an env var can override the greeting word; default to "Hello"
+    let word = match env_var("GREETING") {
+        Some(g) => g
+        None => "Hello"
+    }
+
+    for name in names {
+        print("{word}, {name}!")
+    }
+}

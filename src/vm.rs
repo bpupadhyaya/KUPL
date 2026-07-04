@@ -550,6 +550,26 @@ impl<'m> Vm<'m> {
                             Ok(s) => set!(dst, Value::str(s)),
                             Err(msg) => return Err(VmError { msg, span }),
                         },
+                        BUILTIN_ENV_VAR | BUILTIN_ARGS | BUILTIN_EPRINT => {
+                            let name = match which {
+                                BUILTIN_ENV_VAR => "env_var",
+                                BUILTIN_ARGS => "args",
+                                _ => "eprint",
+                            };
+                            match crate::interp::proc_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
+                        BUILTIN_EXIT => {
+                            let code = match args.first() {
+                                Some(Value::Int(n)) => *n as i32,
+                                _ => 0,
+                            };
+                            use std::io::Write;
+                            std::io::stdout().flush().ok();
+                            std::process::exit(code);
+                        }
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1095,6 +1115,22 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_env_var_it16() {
+        // deterministic env read: a fixed set variable is Some on both engines,
+        // an unset one is None. (args()/exit are covered by CLI-level checks,
+        // since the in-process test harness has nondeterministic argv.)
+        std::env::set_var("KUPL_DIFFTEST_IT16", "present");
+        assert_eq!(
+            differential("fun probe() -> Str {\n    match env_var(\"KUPL_DIFFTEST_IT16\") {\n        Some(v) => v\n        None => \"missing\"\n    }\n}\n"),
+            "present"
+        );
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    match env_var(\"KUPL_DEFINITELY_UNSET_XYZ_IT16\") {\n        Some(_) => true\n        None => false\n    }\n}\n"),
+            "false"
+        );
     }
 
     #[test]
