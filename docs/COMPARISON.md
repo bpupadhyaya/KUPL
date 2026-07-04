@@ -1,6 +1,7 @@
 # KUPL vs. the field — an honest audit
 
-**Version:** 1.0-alpha · audited 2026-07-04 · updated per enrichment iteration.
+**Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed 2026-07-04
+after enrichment iteration 20**.
 
 This document compares KUPL, **as actually implemented today**, against nine
 established languages: Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift,
@@ -12,6 +13,22 @@ The comparison is written by the KUPL project, so treat the framing with
 appropriate skepticism — but the ratings below are deliberately conservative,
 and every KUPL weakness is stated plainly.
 
+### What changed since the first (it10) audit
+
+The original audit predates a large capability arc. KUPL has since added, all
+byte-identical across the interpreter and KVM (native where feasible): **file
+I/O** (`io.fs`), a built-in **JSON** type + parser/serializer, **environment &
+process** access (`args`/`env_var`/`exit`, `io.env`), an **HTTP client** via
+system curl (`io.net`), **regular expressions**, **seeded random**, **bitwise
+ops + hex/binary literals**, and **parallel iteration** (`par_map`/`par_filter`).
+The practical effect: KUPL can now write real scripts and CLI tools — fetch an
+API, parse JSON, validate with a regex, transform, and write a file — which it
+could not at it10. The standard library is no longer a weak point; what remains
+thin is the *third-party* ecosystem. The load-bearing weaknesses below
+(concurrency *execution*, native-component performance, ecosystem) are
+unchanged, so most scores hold — the movement is in "fast to write" and
+domain universality, reflected in the prose.
+
 ## How to read this
 
 Two things are true at once and must not be conflated:
@@ -22,10 +39,12 @@ Two things are true at once and must not be conflated:
   differential tests, plus a genuinely novel AI-native core no other language
   has.
 - **KUPL is young and narrow.** It has no package ecosystem, no true
-  parallelism yet, a small standard library, and several headline capabilities
-  (GPU kernels, a systems tier, sized numerics) that are **designed but not yet
-  built**. Against 15–35-year-old languages with vast ecosystems, that is a
-  large gap and this document does not pretend otherwise.
+  parallelism yet (the concurrency constructs exist but execute sequentially),
+  and several headline capabilities (GPU kernels, a systems tier, sized
+  numerics) that are **designed but not yet built**. Its standard library is now
+  broad (file I/O, JSON, HTTP, regex, random, rich collections), but against
+  15–35-year-old languages with vast *third-party* ecosystems that is still a
+  large gap, and this document does not pretend otherwise.
 
 Throughout, **✅ = shipped and tested today**, **◐ = partial / bounded**,
 **□ [design] = specified but not implemented**, **— = not a goal**.
@@ -72,11 +91,16 @@ approachability.
 Type inference inside bodies (annotations only at public boundaries), ADTs +
 exhaustive `match`, `Option`/`Result` + `?`, immutable collections with rich
 methods, and `example` blocks that are tests-as-you-write make small programs
-quick. It is not yet as fast as Python/Kotlin for throwaway scripts because the
-standard library is still thin and there are no third-party packages to reach
-for. The AI-native features (`ai fun`, agent components) make a specific class
-of program — LLM applications — dramatically faster to write than in any listed
-language, where the same thing means SDKs, JSON plumbing, and glue.
+quick. The standard library now covers the common real-world tasks — file I/O,
+JSON, an HTTP client, regex, seeded random, CLI args/env — so an everyday script
+(fetch an endpoint, parse JSON, validate with a regex, write a file) is
+genuinely concise (see `examples/showcase.kupl`). It still trails Python/Kotlin
+for throwaway work because there are no *third-party* packages to reach for. The
+AI-native features (`ai fun`, agent components) make a specific class of
+program — LLM applications — dramatically faster to write than in any listed
+language, where the same thing means SDKs, JSON plumbing, and glue. Rating held
+at 4: broad batteries, but ecosystem and a couple of ergonomic gaps (no
+top-level constants, `{`-as-interpolation quirk) keep it just under a 5.
 
 ### Type & memory safety — KUPL 4
 
@@ -180,11 +204,14 @@ ship today).
 
 The unavoidable truth: **KUPL has no package registry, no third-party
 libraries, and no production users.** Every language it is compared to has
-15–35 years of libraries, frameworks, hiring pools, and battle-testing. A rich
-standard library, `kupl pkg`, a package registry with enforced API-compat, and
-a conformance suite are all **□ [design]/roadmap**. No amount of language design
-substitutes for an ecosystem; this is the gap that only time and adoption
-close.
+15–35 years of libraries, frameworks, hiring pools, and battle-testing. The
+*standard* library is now genuinely broad — file I/O, JSON, HTTP, regex,
+random, and rich collections mean many real programs need nothing beyond it
+(a Go-style batteries-included posture) — so the gap is squarely the
+*third-party* ecosystem and adoption, not the built-ins. `kupl pkg`, a package
+registry with enforced API-compat, and a conformance suite remain
+**□ [design]/roadmap**. No amount of language design substitutes for an
+ecosystem; this is the gap that only time and adoption close, and it stays at 1.
 
 ## Head to head
 
@@ -267,22 +294,26 @@ for a language this approachable.
 
 **Where it clearly trails today, in priority order:**
 
-1. **Concurrency / parallelism** — the runtime is single-threaded; `par`/async
-   are □ [design]. Go, Rust, Kotlin, Swift, and the JVM all win decisively. This
-   is the top gap to close for the "universal, capable of any software" claim.
+1. **Concurrency / parallelism** — the constructs exist (`par`, `par_map`) but
+   execute **sequentially**; a real multi-threaded scheduler and async I/O are
+   □ [design]. Go, Rust, Kotlin, Swift, and the JVM all win decisively. Still the
+   top gap for the "universal, capable of any software" claim.
 2. **Performance on components** — native codegen doesn't cover components yet
    (□ KIR + native components). Real apps run at VM speed.
-3. **Ecosystem & maturity** — no packages, no users, thin stdlib. Only adoption
-   fixes this; the roadmap can at least ship a registry and a broad stdlib.
-4. **Hardware universality** — GPU kernels, `at()` placement, sized numerics,
-   and the system/hardware tiers are □ [design].
+3. **Ecosystem & maturity** — no third-party packages, no users. (The *standard*
+   library is now broad — that part of the it10 gap is closed.) Only a registry
+   plus adoption fixes the rest.
+4. **Hardware universality & sized numerics** — GPU kernels, `at()` placement,
+   full sized numerics (i8…u64, f32), and the system/hardware tiers are
+   □ [design] (bitwise ops + hex/binary literals landed as a first slice).
 
-**Roadmap implication (drives it11+):** the criteria where KUPL scores lowest
+**Roadmap implication (drives it22+):** the criteria where KUPL scores lowest
 and which are most load-bearing for the founding thesis are, in order:
-**(a) real concurrency/parallelism** on the actor model (async I/O, `par`,
-a work-stealing or multi-threaded scheduler with the virtual clock preserved
-for tests); **(b) native components + KIR** to make components fast;
-**(c) sized numerics** (i8…u64, f32) and broader stdlib depth as prerequisites
-for systems work and ecosystem; **(d) the GPU/kernel and system tiers** for the
-hardware-universality claim. See [`GAPS.md`](GAPS.md) for the tracked roadmap;
-the next iterations target these in roughly this order.
+**(a) real concurrency/parallelism** on the actor model (async I/O + a
+work-stealing/multi-threaded scheduler behind the existing `par`/`par_map`
+seam, with the virtual clock preserved for tests); **(b) native components +
+KIR** to make components fast; **(c) full sized numerics** (i8…u64, f32) for
+systems and binary work; **(d) the GPU/kernel and system tiers** and a package
+**registry**. The it14–20 arc closed the everyday-capability and stdlib gaps;
+what remains are the hard performance/concurrency and ecosystem items. See
+[`GAPS.md`](GAPS.md) for the tracked roadmap.

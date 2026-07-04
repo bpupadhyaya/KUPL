@@ -214,6 +214,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/random.kupl` | seeded random: `random_ints`/`random_floats`/`shuffle` (deterministic) |
 | `examples/http.kupl` | HTTP client: `http_get` → `json_parse` → summarize (`io.net` effect) |
 | `examples/regex.kupl` | regex: `re_match`/`re_find_all`/`re_replace` — validate, extract, redact |
+| `examples/showcase.kupl` | capstone: JSON + file I/O + regex + parallel `par_map` in one pipeline |
 | `examples/multifile/` | `use`-based multi-file programs |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`

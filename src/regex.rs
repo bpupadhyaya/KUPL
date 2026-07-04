@@ -209,13 +209,20 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     let c = self.peek().ok_or("dangling `\\` in class")?;
                     self.pos += 1;
-                    let lit = match c {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        other => other,
-                    };
-                    ranges.push((lit, lit));
+                    // predefined classes expand into ranges inside `[...]`
+                    match c {
+                        'd' => ranges.push(('0', '9')),
+                        'w' => {
+                            ranges.extend([('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')]);
+                        }
+                        's' => {
+                            ranges.extend([(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')]);
+                        }
+                        'n' => ranges.push(('\n', '\n')),
+                        't' => ranges.push(('\t', '\t')),
+                        'r' => ranges.push(('\r', '\r')),
+                        other => ranges.push((other, other)),
+                    }
                 }
                 Some(lo) => {
                     self.pos += 1;
@@ -460,6 +467,10 @@ mod tests {
         assert!(!m("^[a-z]+$", "Hello"));
         assert!(m("^[^0-9]+$", "abc"));
         assert!(!m("^[^0-9]+$", "ab3"));
+        // predefined classes expand inside `[...]`
+        assert!(m("^[\\w.]+$", "a.b_9"));
+        assert!(!m("^[\\w.]+$", "a b"));
+        assert_eq!(f("@[\\w.]+", "ada@math.org here"), Some("@math.org".to_string()));
         assert!(m("^\\d+$", "12345"));
         assert!(!m("^\\d+$", "12a45"));
         assert!(m("^\\w+$", "a_9Z"));

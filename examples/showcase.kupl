@@ -1,0 +1,88 @@
+// Capstone showcase — a small end-to-end pipeline that ties the stack together:
+// build JSON → write a file → read it back → parse → validate & extract with
+// regex → transform in parallel → write a report → read it → clean up.
+//
+// It exercises JSON, file I/O, regex, and concurrency at once, and is fully
+// hermetic (no network, no arguments) so it runs in the test suite unchanged.
+
+// ---- helpers over Json values ----
+
+fun get_str(j: Json, key: Str) -> Str {
+    match j {
+        JObj(fields) => match fields.get(key) {
+            Some(JStr(s)) => s
+            _ => ""
+        }
+        _ => ""
+    }
+}
+
+fun items_of(j: Json) -> List[Json] {
+    match j {
+        JArr(items) => items
+        _ => []
+    }
+}
+
+// A contact is valid if its email looks like one; its "domain" is the part
+// after the @ (extracted with a regex).
+fun domain_of(email: Str) -> Str {
+    match re_find("@[\\w.]+", email) {
+        Some(at) => at.slice(1, at.len())     // drop the leading '@'
+        None => "?"
+    }
+}
+
+fun classify(contact: Json) -> Str {
+    let name = get_str(contact, "name")
+    let email = get_str(contact, "email")
+    if re_match("^\\w+@\\w+\\.\\w+$", email) {
+        "{name}: valid ({domain_of(email)})"
+    } else {
+        "{name}: INVALID email"
+    }
+}
+
+fun main() uses io, io.fs {
+    // 1. build a contacts document as JSON (no literal braces in source)
+    let contacts = JArr([
+        JObj(Map().insert("name", JStr("Ada")).insert("email", JStr("ada@math.org"))),
+        JObj(Map().insert("name", JStr("Grace")).insert("email", JStr("grace@navy.mil"))),
+        JObj(Map().insert("name", JStr("Bad")).insert("email", JStr("not-an-email")))
+    ])
+    let doc = json_stringify(contacts)
+
+    // 2. persist and reload it (round-trips through the filesystem)
+    let path = "showcase_contacts.json"
+    let _ = write_file(path, doc)
+
+    let loaded = match read_file(path) {
+        Ok(text) => match json_parse(text) {
+            Ok(j) => j
+            Err(e) => panic("bad json: {e}")
+        }
+        Err(e) => panic("cannot read: {e}")
+    }
+
+    // 3. classify every contact IN PARALLEL (par_map over a dynamic list)
+    let rows = items_of(loaded).par_map(fn c { classify(c) })
+
+    // 4. write a report, read it back, and summarize
+    let report = rows.join("\n")
+    let _ = write_file("showcase_report.txt", report)
+    match read_file("showcase_report.txt") {
+        Ok(text) => {
+            for line in text.lines() {
+                print(line)
+            }
+            let valid = rows.count(fn r { r.contains("valid (") })
+            print("---")
+            print("{valid}/{rows.len()} contacts valid")
+        }
+        Err(e) => print("report error: {e}")
+    }
+
+    // 5. clean up
+    let _ = delete_file(path)
+    let _ = delete_file("showcase_report.txt")
+}

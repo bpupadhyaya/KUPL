@@ -59,7 +59,8 @@ and known limitations called out in commit messages. Checked off as landed.
 
 ## Tier 3 — audit-driven priorities (next arc)
 
-Ordered by the 2026-07-04 comparison audit ([`COMPARISON.md`](COMPARISON.md)):
+Ordered by the comparison audit ([`COMPARISON.md`](COMPARISON.md), refreshed
+after it20):
 the lowest-scoring, most load-bearing gaps vs Python/Go/TS/Java/Rust/Haskell/
 C++/Swift/Kotlin. Concurrency is the #1 gap for the "universal, any software"
 claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
