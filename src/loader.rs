@@ -17,7 +17,8 @@ use crate::parser;
 /// package, which is never mangled).
 struct PkgCtx {
     root: PathBuf,
-    deps: HashMap<String, PathBuf>,
+    /// name -> (directory, required version if the manifest pinned one)
+    deps: HashMap<String, (PathBuf, Option<String>)>,
     prefix: String,
 }
 
@@ -54,7 +55,7 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
                 let mut deps = HashMap::new();
                 for dep in &m.deps {
                     if let Some(p) = &dep.path {
-                        deps.insert(dep.name.clone(), normalize(&cur.join(p)));
+                        deps.insert(dep.name.clone(), (normalize(&cur.join(p)), dep.version.clone()));
                     }
                     // version-only deps resolve via a registry — a later slice
                 }
@@ -156,6 +157,68 @@ pub fn load(entry: &str) -> Result<(Program, SourceMap), (Vec<Diag>, SourceMap)>
     load_with(entry, &std::collections::HashMap::new())
 }
 
+/// A resolved direct dependency of a project (for `kupl pkg` + the lockfile).
+pub struct ResolvedDep {
+    pub name: String,
+    pub path: String,
+    pub version: String,
+    /// FNV-1a hash (hex) of the dependency's entry source — for drift detection.
+    pub hash: String,
+}
+
+/// Resolve the direct dependencies declared in the project owning `entry`.
+/// Returns them sorted by name (deterministic). Errors if a dependency's
+/// manifest or entry source cannot be read.
+pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
+    let entry_path = PathBuf::from(entry);
+    let dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let ctx = pkg_ctx(&dir, true, "");
+    let mut out = Vec::new();
+    let mut names: Vec<&String> = ctx.deps.keys().collect();
+    names.sort();
+    for name in names {
+        let (dep_dir, _req) = &ctx.deps[name];
+        let m = crate::manifest::read(&dep_dir.join("kupl.toml"))
+            .map_err(|e| format!("dependency `{name}`: {e}"))?;
+        let entry_file = dep_dir.join(&m.entry);
+        let src = std::fs::read_to_string(&entry_file)
+            .map_err(|e| format!("dependency `{name}` entry {}: {e}", entry_file.display()))?;
+        let hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(&src)));
+        out.push(ResolvedDep {
+            name: name.clone(),
+            path: dep_dir.display().to_string(),
+            version: m.version,
+            hash,
+        });
+    }
+    Ok(out)
+}
+
+/// Serialize resolved deps to the `kupl.lock` line format:
+/// `name<TAB>path<TAB>version<TAB>hash` (one per line, name-sorted).
+pub fn lock_text(deps: &[ResolvedDep]) -> String {
+    let mut s = String::from("# kupl.lock — resolved dependencies (do not edit by hand)\n");
+    for d in deps {
+        s.push_str(&format!("{}\t{}\t{}\t{}\n", d.name, d.path, d.version, d.hash));
+    }
+    s
+}
+
+/// Parse a `kupl.lock` into (name -> hash) for drift comparison.
+pub fn lock_hashes(text: &str) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    for line in text.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() == 4 {
+            m.insert(cols[0].to_string(), cols[3].to_string());
+        }
+    }
+    m
+}
+
 /// Like `load`, but file contents can be overridden (unsaved editor buffers).
 pub fn load_with(
     entry: &str,
@@ -212,7 +275,23 @@ pub fn load_with(
             .extend(ctx.deps.keys().cloned());
         for (use_path, span) in &file_program.uses {
             let first = use_path.split('.').next().unwrap_or(use_path);
-            if let Some(dep_dir) = ctx.deps.get(first) {
+            if let Some((dep_dir, req_version)) = ctx.deps.get(first) {
+                // version assertion: a pinned version must match the dependency's
+                // own manifest (exact match in v1; ranges are a future addition)
+                if let Some(req) = req_version {
+                    if let Ok(dm) = crate::manifest::read(&dep_dir.join("kupl.toml")) {
+                        if !dm.version.is_empty() && &dm.version != req {
+                            diags.push(Diag::error(
+                                "K0401",
+                                format!(
+                                    "dependency `{first}` requires version {req} but found {}",
+                                    dm.version
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                }
                 // cross-package `use <dep>` (or `<dep>.sub`) — the dependency's
                 // package is mangled with its import alias as the prefix
                 let dep_ctx = ctx_cache
@@ -403,6 +482,55 @@ mod tests {
             Ok(v) => assert_eq!(v.to_string(), "1121"),
             Err(_) => panic!("probe should evaluate"),
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dependency_version_assertion_and_lock() {
+        let base = std::env::temp_dir().join(format!("kupl-ver-test-{}", std::process::id()));
+        let math = base.join("math");
+        let app = base.join("app");
+        std::fs::create_dir_all(&math).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(math.join("kupl.toml"), "[project]\nname = \"math\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(math.join("main.kupl"), "pub fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n").unwrap();
+        // matching version loads clean
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = { path = \"../math\", version = \"1.0.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use math\n\nfun main() {\n    let _ = math.add(1, 2)\n}\n").unwrap();
+        assert!(super::load(app.join("main.kupl").to_str().unwrap()).is_ok(), "matching version loads");
+
+        // mismatched version -> K0401
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = { path = \"../math\", version = \"2.0.0\" }\n",
+        )
+        .unwrap();
+        match super::load(app.join("main.kupl").to_str().unwrap()) {
+            Err((diags, _)) => assert!(diags.iter().any(|d| d.code == "K0401"), "{diags:?}"),
+            Ok(_) => panic!("version mismatch should fail"),
+        }
+
+        // lockfile round-trips and detects drift
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = { path = \"../math\", version = \"1.0.0\" }\n",
+        )
+        .unwrap();
+        let deps = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "math");
+        let lock = super::lock_text(&deps);
+        let hashes = super::lock_hashes(&lock);
+        assert_eq!(hashes.get("math"), Some(&deps[0].hash)); // no drift when unchanged
+        // edit the dependency source → its hash changes → drift vs the old lock
+        std::fs::write(math.join("main.kupl"), "pub fun add(a: Int, b: Int) -> Int {\n    a + b + 1\n}\n").unwrap();
+        let deps2 = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).unwrap();
+        assert_ne!(deps2[0].hash, deps[0].hash, "editing the dep changes its hash");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

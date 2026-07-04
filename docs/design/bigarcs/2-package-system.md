@@ -1,4 +1,11 @@
-> **Progress:** slice 2 landed (it31) — NAMESPACE ISOLATION via load-time name
+> **Progress:** slice 3 landed (it32) — dependency VERSION ASSERTIONS (K0401 on
+> an exact-match mismatch) and a `kupl.lock` (via `kupl pkg lock`) recording each
+> dep's path/version/content-hash, with `kupl pkg tree` reporting drift. The
+> package arc's LOCAL surface is now complete: path deps + namespace isolation +
+> versions + lockfile. A hosted REGISTRY (version-only deps fetched over the
+> network) is deliberately future — it needs server infrastructure.
+>
+> Slice 2 landed (it31) — NAMESPACE ISOLATION via load-time name
 > mangling (src/resolve.rs): each dependency package's definitions + internal
 > references are renamed `pkg$name`, the root stays bare, and cross-package
 > access is qualified `dep.name`. Two deps with the same name no longer collide.

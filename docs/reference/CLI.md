@@ -124,8 +124,21 @@ public items with a **qualified** name, `dep.item(…)` — e.g. `math.add(1, 2)
 Namespaces are isolated (each package's names are mangled internally), so two
 dependencies can define the same name without colliding. `use <dep>.sub`
 reaches a subfile within the dependency. A missing dependency path is reported
-as **K0400** at the `use` site. Version-only dependencies (registry fetch) are a
-later addition; local path dependencies with qualified access work today.
+as **K0400** at the `use` site. A dependency may pin an exact `version` (as
+above); if it doesn't match the dependency's own `kupl.toml` version, that is
+**K0401**. `kupl pkg lock` records a `kupl.lock` for reproducibility. Registry
+fetch (version-only dependencies) needs a hosted registry and is future work;
+local path dependencies with qualified access, version pinning, and locking
+work today.
+
+### `kupl pkg tree <file.kupl>`
+Prints the project's resolved dependency graph (`name @ version  (path)`),
+flagging `[drift]` on any dependency whose source no longer matches `kupl.lock`.
+
+### `kupl pkg lock <file.kupl>`
+Writes/updates `kupl.lock` next to the project's `kupl.toml`, recording each
+dependency's resolved path, version, and a content hash for reproducibility.
+Locks are written only by this command — never during `run`/`build`/`test`.
 
 ### `kupl version`
 Prints the toolchain version.

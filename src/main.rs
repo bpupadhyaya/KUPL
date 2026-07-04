@@ -82,6 +82,14 @@ fn main() -> ExitCode {
             }
         },
         Some("manifest") => with_path(&args, run::emit_manifest),
+        Some("pkg") => match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some("tree"), Some(p)) => run::pkg_tree(p),
+            (Some("lock"), Some(p)) => run::pkg_lock(p),
+            _ => {
+                eprintln!("usage: kupl pkg <tree|lock> <file.kupl>");
+                2
+            }
+        },
         Some("build") => with_file(&args, |src, file| {
             build_module(&args, src, file, false)
         }),

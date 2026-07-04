@@ -396,6 +396,67 @@ pub fn check_cmd(path: &str, json: bool) -> i32 {
 
 /// `kupl manifest`: emit the component manifests (the visual-tool palette API)
 /// as JSON: intent, ports, props, state, exposes, fulfills, wiring.
+/// `kupl pkg tree <entry>` — print the resolved dependency graph, flagging
+/// drift against an existing kupl.lock.
+pub fn pkg_tree(path: &str) -> i32 {
+    let deps = match crate::loader::resolve_deps(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    if deps.is_empty() {
+        println!("no dependencies");
+        return 0;
+    }
+    // compare against a lockfile in the project dir, if present
+    let lock_path = std::path::Path::new(path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("kupl.lock");
+    let locked = std::fs::read_to_string(&lock_path)
+        .ok()
+        .map(|t| crate::loader::lock_hashes(&t));
+    for d in &deps {
+        let ver = if d.version.is_empty() { "?".to_string() } else { d.version.clone() };
+        let drift = match &locked {
+            Some(h) => match h.get(&d.name) {
+                Some(old) if old != &d.hash => "  [drift]",
+                _ => "",
+            },
+            None => "",
+        };
+        println!("{} @ {}  ({}){}", d.name, ver, d.path, drift);
+    }
+    0
+}
+
+/// `kupl pkg lock <entry>` — write/update kupl.lock next to the project.
+pub fn pkg_lock(path: &str) -> i32 {
+    let deps = match crate::loader::resolve_deps(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let lock_path = std::path::Path::new(path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("kupl.lock");
+    match std::fs::write(&lock_path, crate::loader::lock_text(&deps)) {
+        Ok(()) => {
+            println!("wrote {} ({} dependencies)", lock_path.display(), deps.len());
+            0
+        }
+        Err(e) => {
+            eprintln!("error: cannot write {}: {e}", lock_path.display());
+            1
+        }
+    }
+}
+
 pub fn emit_manifest(path: &str) -> i32 {
     use crate::diag::json_escape as esc;
     let Ok((compiled, _map)) = load_compile(path) else { return 1 };

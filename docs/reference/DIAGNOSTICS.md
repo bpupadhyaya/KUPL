@@ -131,6 +131,7 @@ Severity: **E** = error, **W** = warning.
 | Code | Sev | Meaning |
 |---|---|---|
 | K0400 | E | cannot read module file referenced by `use` |
+| K0401 | E | dependency version mismatch (`requires 1.2.0 but found 0.9.0`) |
 
 ## K08xx — KVM backend limits
 
