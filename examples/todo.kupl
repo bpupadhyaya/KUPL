@@ -1,0 +1,65 @@
+// A miniature end-to-end app: store component + list component, wired.
+
+type Todo = { title: Str, done: Bool }
+
+component TodoStore {
+    intent "Holds todos; exposes queries; accepts new items."
+
+    in add: Str
+    out changed: Int
+
+    state todos: List[Todo] = []
+
+    on add(title) {
+        todos = todos.push(Todo(title: title, done: false))
+        emit changed(todos.len())
+    }
+
+    expose fun all() -> List[Todo] {
+        todos
+    }
+
+    expose fun count() -> Int {
+        todos.len()
+    }
+
+    example {
+        send add("buy milk")
+        send add("write KUPL")
+        expect changed == 2
+    }
+}
+
+component Reporter {
+    intent "Prints how many todos exist whenever the count changes."
+
+    in count: Int
+
+    on count(n) {
+        print("todo count is now {n}")
+    }
+}
+
+app TodoApp {
+    intent "Add three todos and watch the count change."
+
+    let store = TodoStore()
+    let reporter = Reporter()
+
+    wire store.changed -> reporter.count
+
+    let seeder = Seeder()
+    wire seeder.item -> store.add
+}
+
+component Seeder {
+    intent "Seeds three todos at startup."
+
+    out item: Str
+
+    on start {
+        emit item("learn components")
+        emit item("wire things together")
+        emit item("ship v0.1")
+    }
+}

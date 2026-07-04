@@ -1,0 +1,17 @@
+[package]
+name = "kupl"
+version = "0.1.0"
+edition = "2021"
+description = "KUPL — K Universal Programming Language: AI-first, component-oriented"
+license = "MIT"
+
+[[bin]]
+name = "kupl"
+path = "src/main.rs"
+
+[lib]
+name = "kupl"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true

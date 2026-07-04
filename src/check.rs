@@ -1,0 +1,1284 @@
+//! Type & semantic checker.
+//!
+//! Two passes: (1) collect signatures of types, functions, and components;
+//! (2) check every body with local inference (fresh vars + unification).
+//! Public boundaries (fun params/returns, ports, props) must be annotated —
+//! that is enforced by the grammar itself in v0.1.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::ast::*;
+use crate::diag::{Diag, Span};
+use crate::types::{ComponentSig, Ty, TypeSig, Unifier, VariantSig};
+
+#[derive(Default)]
+pub struct Checked {
+    pub types: HashMap<String, TypeSig>,
+    /// variant name -> (owning type name, fields)
+    pub ctors: HashMap<String, (String, Vec<(String, Ty)>)>,
+    pub funs: HashMap<String, (Vec<Ty>, Ty)>,
+    pub components: HashMap<String, ComponentSig>,
+}
+
+pub fn check(program: &Program) -> (Checked, Vec<Diag>) {
+    let mut ck = Checker {
+        checked: Checked::default(),
+        diags: Vec::new(),
+        uni: Unifier::default(),
+    };
+    ck.collect(program);
+    ck.check_bodies(program);
+    (ck.checked, ck.diags)
+}
+
+struct Checker {
+    checked: Checked,
+    diags: Vec<Diag>,
+    uni: Unifier,
+}
+
+/// Lexical scope stack for body checking.
+struct Scopes {
+    stack: Vec<HashMap<String, (Ty, bool)>>,
+}
+
+impl Scopes {
+    fn new() -> Self {
+        Scopes { stack: vec![HashMap::new()] }
+    }
+    fn push(&mut self) {
+        self.stack.push(HashMap::new());
+    }
+    fn pop(&mut self) {
+        self.stack.pop();
+    }
+    fn insert(&mut self, name: &str, ty: Ty, mutable: bool) {
+        self.stack.last_mut().unwrap().insert(name.to_string(), (ty, mutable));
+    }
+    fn get(&self, name: &str) -> Option<(Ty, bool)> {
+        for scope in self.stack.iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+}
+
+/// What surrounds the body being checked.
+struct Ctx<'a> {
+    scopes: Scopes,
+    ret: Ty,
+    /// Some(component) while checking handlers/funs of a component.
+    component: Option<&'a ComponentDecl>,
+    in_handler: bool,
+    loop_depth: usize,
+}
+
+impl Checker {
+    fn err(&mut self, code: &'static str, msg: impl Into<String>, span: Span) {
+        self.diags.push(Diag::error(code, msg, span));
+    }
+    fn warn(&mut self, code: &'static str, msg: impl Into<String>, span: Span) {
+        self.diags.push(Diag::warning(code, msg, span));
+    }
+
+    fn unify(&mut self, a: &Ty, b: &Ty, span: Span, what: &str) -> Ty {
+        if let Err((x, y)) = self.uni.unify(a, b) {
+            let x = self.uni.apply(&x);
+            let y = self.uni.apply(&y);
+            self.err("K0200", format!("type mismatch in {what}: expected {x}, found {y}"), span);
+        }
+        self.uni.apply(a)
+    }
+
+    // ---------------- pass 1: collect ----------------
+
+    fn collect(&mut self, program: &Program) {
+        // types first (functions/components may reference them)
+        for item in &program.items {
+            if let Item::Type(t) = item {
+                if self.checked.types.contains_key(&t.name) {
+                    self.err("K0201", format!("type `{}` is defined more than once", t.name), t.span);
+                    continue;
+                }
+                // placeholder so recursive types resolve
+                self.checked.types.insert(
+                    t.name.clone(),
+                    TypeSig { name: t.name.clone(), variants: Vec::new(), is_record: false },
+                );
+            }
+        }
+        for item in &program.items {
+            if let Item::Component(c) = item {
+                self.checked.components.insert(c.name.clone(), ComponentSig::default());
+            }
+        }
+        // now resolve type bodies
+        for item in &program.items {
+            match item {
+                Item::Type(t) => {
+                    let mut variants = Vec::new();
+                    for v in &t.variants {
+                        let mut fields = Vec::new();
+                        for f in &v.fields {
+                            let ty = self.resolve_ty(&f.ty);
+                            fields.push((f.name.clone(), ty));
+                        }
+                        if self.checked.ctors.contains_key(&v.name) {
+                            self.err(
+                                "K0202",
+                                format!("constructor `{}` is defined more than once", v.name),
+                                v.span,
+                            );
+                        }
+                        self.checked
+                            .ctors
+                            .insert(v.name.clone(), (t.name.clone(), fields.clone()));
+                        variants.push(VariantSig { name: v.name.clone(), fields });
+                    }
+                    let is_record = t.variants.len() == 1 && t.variants[0].name == t.name;
+                    self.checked.types.insert(
+                        t.name.clone(),
+                        TypeSig { name: t.name.clone(), variants, is_record },
+                    );
+                }
+                Item::Fun(f) => {
+                    let params: Vec<Ty> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
+                    let ret = f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
+                    if self.checked.funs.contains_key(&f.name) {
+                        self.err("K0203", format!("function `{}` is defined more than once", f.name), f.span);
+                    }
+                    self.checked.funs.insert(f.name.clone(), (params, ret));
+                }
+                Item::Component(c) => {
+                    let mut sig = ComponentSig::default();
+                    for port in &c.ports {
+                        let ty = self.resolve_ty(&port.ty);
+                        let map = match port.dir {
+                            PortDir::In => &mut sig.in_ports,
+                            PortDir::Out => &mut sig.out_ports,
+                        };
+                        if map.insert(port.name.clone(), ty).is_some() {
+                            self.err("K0204", format!("port `{}` declared twice", port.name), port.span);
+                        }
+                    }
+                    for prop in &c.props {
+                        let ty = self.resolve_ty(&prop.ty);
+                        sig.props.push((prop.name.clone(), ty, prop.default.is_some()));
+                    }
+                    for f in &c.exposes {
+                        let params: Vec<Ty> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
+                        let ret = f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
+                        sig.exposes.insert(f.name.clone(), (params, ret));
+                    }
+                    self.checked.components.insert(c.name.clone(), sig);
+                    if c.intent.is_none() {
+                        self.warn(
+                            "K0300",
+                            format!("component `{}` has no `intent` — every component should state its purpose", c.name),
+                            c.span,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_ty(&mut self, t: &TyExpr) -> Ty {
+        match &t.kind {
+            TyExprKind::Name(n) => match n.as_str() {
+                "Int" => Ty::Int,
+                "Float" => Ty::Float,
+                "Bool" => Ty::Bool,
+                "Str" => Ty::Str,
+                "Unit" => Ty::Unit,
+                "Event" => Ty::Event,
+                other => {
+                    if self.checked.types.contains_key(other) {
+                        Ty::Named(other.to_string())
+                    } else if self.checked.components.contains_key(other) {
+                        Ty::Component(other.to_string())
+                    } else {
+                        self.err("K0205", format!("unknown type `{other}`"), t.span);
+                        self.uni.fresh()
+                    }
+                }
+            },
+            TyExprKind::Generic(n, args) => {
+                let mut ats: Vec<Ty> = args.iter().map(|a| self.resolve_ty(a)).collect();
+                match (n.as_str(), ats.len()) {
+                    ("List", 1) => Ty::List(Box::new(ats.remove(0))),
+                    ("Option", 1) => Ty::Option(Box::new(ats.remove(0))),
+                    ("Result", 2) => {
+                        let e = ats.remove(1);
+                        let ok = ats.remove(0);
+                        Ty::Result(Box::new(ok), Box::new(e))
+                    }
+                    _ => {
+                        self.err(
+                            "K0206",
+                            format!("unknown generic type `{n}` with {} argument(s)", args.len()),
+                            t.span,
+                        );
+                        self.uni.fresh()
+                    }
+                }
+            }
+            TyExprKind::Fun(params, ret) => {
+                let ps = params.iter().map(|p| self.resolve_ty(p)).collect();
+                let r = self.resolve_ty(ret);
+                Ty::Fun(ps, Box::new(r))
+            }
+        }
+    }
+
+    // ---------------- pass 2: check bodies ----------------
+
+    fn check_bodies(&mut self, program: &Program) {
+        for item in &program.items {
+            match item {
+                Item::Fun(f) => self.check_fun(f, None),
+                Item::Type(_) => {}
+                Item::Component(c) => self.check_component(c),
+            }
+        }
+    }
+
+    fn check_fun(&mut self, f: &FunDecl, component: Option<&ComponentDecl>) {
+        let mut ctx = Ctx {
+            scopes: Scopes::new(),
+            ret: f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit),
+            component,
+            in_handler: false,
+            loop_depth: 0,
+        };
+        if let Some(c) = component {
+            self.bind_component_env(c, &mut ctx);
+        }
+        ctx.scopes.push();
+        for p in &f.params {
+            let ty = self.resolve_ty(&p.ty);
+            ctx.scopes.insert(&p.name, ty, false);
+        }
+        let body_ty = self.check_block(&f.body, &mut ctx);
+        // The block's tail value must match the return type (unless Unit-returning).
+        let ret = self.uni.apply(&ctx.ret.clone());
+        if ret != Ty::Unit {
+            self.unify(&ret, &body_ty, f.body.span, &format!("return value of `{}`", f.name));
+        }
+    }
+
+    /// Put props (immutable) and state (mutable) in scope.
+    fn bind_component_env(&mut self, c: &ComponentDecl, ctx: &mut Ctx) {
+        for prop in &c.props {
+            let ty = self.resolve_ty(&prop.ty);
+            ctx.scopes.insert(&prop.name, ty, false);
+        }
+        // state types: annotation wins, else inferred from init in a props-only env
+        for s in &c.state {
+            let ty = match &s.ty {
+                Some(t) => self.resolve_ty(t),
+                None => {
+                    let t = self.infer_expr(&s.init, ctx);
+                    self.uni.apply(&t)
+                }
+            };
+            ctx.scopes.insert(&s.name, ty, true);
+        }
+        // children in scope as component refs
+        for child in &c.children {
+            if self.checked.components.contains_key(&child.component) {
+                ctx.scopes.insert(&child.name, Ty::Component(child.component.clone()), false);
+            }
+        }
+    }
+
+    fn check_component(&mut self, c: &ComponentDecl) {
+        // state inits against annotations
+        {
+            let mut ctx = Ctx {
+                scopes: Scopes::new(),
+                ret: Ty::Unit,
+                component: Some(c),
+                in_handler: false,
+                loop_depth: 0,
+            };
+            for prop in &c.props {
+                let ty = self.resolve_ty(&prop.ty);
+                ctx.scopes.insert(&prop.name, ty, false);
+            }
+            for s in &c.state {
+                let init_ty = self.infer_expr(&s.init, &mut ctx);
+                if let Some(t) = &s.ty {
+                    let ann = self.resolve_ty(t);
+                    self.unify(&ann, &init_ty, s.span, &format!("state `{}`", s.name));
+                    ctx.scopes.insert(&s.name, ann, true);
+                } else {
+                    ctx.scopes.insert(&s.name, self.uni.apply(&init_ty), true);
+                }
+            }
+        }
+
+        // children & wires
+        let mut child_types: HashMap<String, String> = HashMap::new();
+        for child in &c.children {
+            if child_types.contains_key(&child.name) {
+                self.err("K0207", format!("child `{}` declared twice", child.name), child.span);
+            }
+            let Some(sig) = self.checked.components.get(&child.component).cloned() else {
+                self.err("K0208", format!("unknown component `{}`", child.component), child.span);
+                continue;
+            };
+            child_types.insert(child.name.clone(), child.component.clone());
+            self.check_ctor_args(&child.component, &sig, &child.args, child.span, c);
+        }
+        for wire in &c.wires {
+            let from_ty = self.wire_port_ty(&child_types, &wire.from, true, wire.span);
+            let to_ty = self.wire_port_ty(&child_types, &wire.to, false, wire.span);
+            if let (Some(a), Some(b)) = (from_ty, to_ty) {
+                self.unify(&a, &b, wire.span, "wire (out port must match in port)");
+            }
+        }
+
+        // handlers
+        let sig = self.checked.components.get(&c.name).cloned().unwrap_or_default();
+        let mut seen_triggers: HashSet<String> = HashSet::new();
+        for h in &c.handlers {
+            let mut ctx = Ctx {
+                scopes: Scopes::new(),
+                ret: Ty::Unit,
+                component: Some(c),
+                in_handler: true,
+                loop_depth: 0,
+            };
+            self.bind_component_env(c, &mut ctx);
+            ctx.scopes.push();
+            match &h.trigger {
+                Trigger::Start | Trigger::Stop => {
+                    let key = if matches!(h.trigger, Trigger::Start) { "start" } else { "stop" };
+                    if !seen_triggers.insert(key.to_string()) {
+                        self.err("K0209", format!("duplicate `on {key}` handler"), h.span);
+                    }
+                    if h.param.is_some() {
+                        self.err("K0210", format!("`on {key}` takes no parameter"), h.span);
+                    }
+                }
+                Trigger::Port(p) => {
+                    if !seen_triggers.insert(p.clone()) {
+                        self.err("K0209", format!("duplicate `on {p}` handler"), h.span);
+                    }
+                    match sig.in_ports.get(p) {
+                        None => {
+                            let hint = if sig.out_ports.contains_key(p) {
+                                " (it is an `out` port — handlers react to `in` ports)"
+                            } else {
+                                ""
+                            };
+                            self.err("K0211", format!("`on {p}`: component `{}` has no `in` port named `{p}`{hint}", c.name), h.span);
+                        }
+                        Some(ty) => {
+                            if let Some(param) = &h.param {
+                                if *ty == Ty::Event {
+                                    self.err(
+                                        "K0212",
+                                        format!("port `{p}` is an Event (no payload) — remove the parameter `{param}`"),
+                                        h.span,
+                                    );
+                                } else {
+                                    ctx.scopes.insert(param, ty.clone(), false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            self.check_block(&h.body, &mut ctx);
+        }
+
+        // exposed + private functions
+        for f in c.exposes.iter().chain(c.funs.iter()) {
+            self.check_fun(f, Some(c));
+        }
+
+        // examples
+        for ex in &c.examples {
+            self.check_example(c, &sig, ex);
+        }
+    }
+
+    fn wire_port_ty(
+        &mut self,
+        child_types: &HashMap<String, String>,
+        end: &(String, String),
+        is_from: bool,
+        span: Span,
+    ) -> Option<Ty> {
+        let (child, port) = end;
+        let Some(comp_name) = child_types.get(child) else {
+            self.err("K0213", format!("`wire` references unknown child `{child}`"), span);
+            return None;
+        };
+        let sig = self.checked.components.get(comp_name).cloned().unwrap_or_default();
+        let (map, kind) = if is_from {
+            (&sig.out_ports, "out")
+        } else {
+            (&sig.in_ports, "in")
+        };
+        match map.get(port) {
+            Some(ty) => Some(ty.clone()),
+            None => {
+                self.err(
+                    "K0214",
+                    format!("component `{comp_name}` has no `{kind}` port named `{port}`"),
+                    span,
+                );
+                None
+            }
+        }
+    }
+
+    fn check_ctor_args(
+        &mut self,
+        comp_name: &str,
+        sig: &ComponentSig,
+        args: &[Arg],
+        span: Span,
+        enclosing: &ComponentDecl,
+    ) {
+        let mut ctx = Ctx {
+            scopes: Scopes::new(),
+            ret: Ty::Unit,
+            component: Some(enclosing),
+            in_handler: false,
+            loop_depth: 0,
+        };
+        self.bind_component_env(enclosing, &mut ctx);
+
+        let mut supplied: HashSet<String> = HashSet::new();
+        for (i, arg) in args.iter().enumerate() {
+            let target = match &arg.name {
+                Some(n) => sig.props.iter().find(|(pn, _, _)| pn == n).cloned(),
+                None => sig.props.get(i).cloned(),
+            };
+            let arg_ty = self.infer_expr(&arg.value, &mut ctx);
+            match target {
+                Some((pname, pty, _)) => {
+                    supplied.insert(pname.clone());
+                    self.unify(&pty, &arg_ty, arg.value.span, &format!("prop `{pname}` of `{comp_name}`"));
+                }
+                None => {
+                    self.err(
+                        "K0215",
+                        match &arg.name {
+                            Some(n) => format!("component `{comp_name}` has no prop named `{n}`"),
+                            None => format!("too many arguments for `{comp_name}` (has {} props)", sig.props.len()),
+                        },
+                        arg.value.span,
+                    );
+                }
+            }
+        }
+        for (pname, _, has_default) in &sig.props {
+            if !has_default && !supplied.contains(pname) {
+                self.err(
+                    "K0216",
+                    format!("missing required prop `{pname}` when constructing `{comp_name}`"),
+                    span,
+                );
+            }
+        }
+    }
+
+    fn check_example(&mut self, c: &ComponentDecl, sig: &ComponentSig, ex: &Example) {
+        for step in &ex.steps {
+            match step {
+                ExampleStep::Send { port, arg, span } => match sig.in_ports.get(port) {
+                    None => self.err(
+                        "K0217",
+                        format!("`send {port}`: component `{}` has no `in` port named `{port}`", c.name),
+                        *span,
+                    ),
+                    Some(ty) => {
+                        let ty = ty.clone();
+                        let mut ctx = Ctx {
+                            scopes: Scopes::new(),
+                            ret: Ty::Unit,
+                            component: Some(c),
+                            in_handler: false,
+                            loop_depth: 0,
+                        };
+                        match (arg, ty) {
+                            (None, Ty::Event) => {}
+                            (Some(a), Ty::Event) => {
+                                self.err("K0218", format!("port `{port}` is an Event and takes no payload"), a.span)
+                            }
+                            (None, other) => self.err(
+                                "K0219",
+                                format!("port `{port}` carries {other} — `send {port}(value)` needs a payload"),
+                                *span,
+                            ),
+                            (Some(a), other) => {
+                                let at = self.infer_expr(a, &mut ctx);
+                                self.unify(&other, &at, a.span, &format!("payload for port `{port}`"));
+                            }
+                        }
+                    }
+                },
+                ExampleStep::Expect { expr, span } => {
+                    let mut ctx = Ctx {
+                        scopes: Scopes::new(),
+                        ret: Ty::Unit,
+                        component: Some(c),
+                        in_handler: false,
+                        loop_depth: 0,
+                    };
+                    // out ports are bound to their last emitted value
+                    for (name, ty) in &sig.out_ports {
+                        ctx.scopes.insert(name, ty.clone(), false);
+                    }
+                    let t = self.infer_expr(expr, &mut ctx);
+                    self.unify(&Ty::Bool, &t, *span, "`expect` condition");
+                }
+            }
+        }
+    }
+
+    // ---------------- statements & expressions ----------------
+
+    fn check_block(&mut self, block: &Block, ctx: &mut Ctx) -> Ty {
+        ctx.scopes.push();
+        let mut last: Ty = Ty::Unit;
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            last = self.check_stmt(stmt, ctx);
+            if i + 1 < block.stmts.len() {
+                last = Ty::Unit;
+            }
+        }
+        ctx.scopes.pop();
+        last
+    }
+
+    fn check_stmt(&mut self, stmt: &Stmt, ctx: &mut Ctx) -> Ty {
+        match stmt {
+            Stmt::Let { name, ty, init, mutable, span } => {
+                let init_ty = self.infer_expr(init, ctx);
+                let final_ty = match ty {
+                    Some(t) => {
+                        let ann = self.resolve_ty(t);
+                        self.unify(&ann, &init_ty, *span, &format!("`let {name}`"));
+                        ann
+                    }
+                    None => self.uni.apply(&init_ty),
+                };
+                ctx.scopes.insert(name, final_ty, *mutable);
+                Ty::Unit
+            }
+            Stmt::Assign { target, op, value, span } => {
+                let value_ty = self.infer_expr(value, ctx);
+                match &target.kind {
+                    ExprKind::Ident(name) => match ctx.scopes.get(name) {
+                        None => self.err("K0220", format!("unknown variable `{name}`"), target.span),
+                        Some((ty, mutable)) => {
+                            if !mutable {
+                                self.err(
+                                    "K0221",
+                                    format!("`{name}` is immutable (declared with `let`; use `var` or `state`)"),
+                                    target.span,
+                                );
+                            }
+                            self.unify(&ty, &value_ty, *span, &format!("assignment to `{name}`"));
+                            if *op != AssignOp::Set {
+                                let rt = self.uni.apply(&ty);
+                                let rt = self.default_numeric(rt);
+                                if !rt.is_numeric() {
+                                    self.err("K0222", format!("`{}=` needs a numeric variable, `{name}` is {rt}", op_sym(*op)), *span);
+                                }
+                            }
+                        }
+                    },
+                    ExprKind::Field { .. } => {
+                        self.err("K0223", "field assignment is not supported in v0.1 — rebuild the record with `with` planned for v0.2", target.span);
+                    }
+                    _ => {}
+                }
+                Ty::Unit
+            }
+            Stmt::Expr(e) => self.infer_expr(e, ctx),
+            Stmt::Return(value, span) => {
+                let vt = match value {
+                    Some(v) => self.infer_expr(v, ctx),
+                    None => Ty::Unit,
+                };
+                let ret = ctx.ret.clone();
+                self.unify(&ret, &vt, *span, "return value");
+                Ty::Unit
+            }
+            Stmt::While { cond, body, span: _ } => {
+                let ct = self.infer_expr(cond, ctx);
+                self.unify(&Ty::Bool, &ct, cond.span, "`while` condition");
+                ctx.loop_depth += 1;
+                self.check_block(body, ctx);
+                ctx.loop_depth -= 1;
+                Ty::Unit
+            }
+            Stmt::For { var, iter, body, span: _ } => {
+                let it = self.infer_expr(iter, ctx);
+                let elem = match self.uni.apply(&it) {
+                    Ty::Range => Ty::Int,
+                    Ty::List(e) => *e,
+                    Ty::Var(_) => {
+                        // default: range
+                        self.unify(&it, &Ty::Range, iter.span, "`for` iterable");
+                        Ty::Int
+                    }
+                    other => {
+                        self.err("K0224", format!("`for` needs a Range or List, found {other}"), iter.span);
+                        self.uni.fresh()
+                    }
+                };
+                ctx.scopes.push();
+                ctx.scopes.insert(var, elem, false);
+                ctx.loop_depth += 1;
+                self.check_block(body, ctx);
+                ctx.loop_depth -= 1;
+                ctx.scopes.pop();
+                Ty::Unit
+            }
+            Stmt::Emit { port, arg, span } => {
+                let Some(c) = ctx.component else {
+                    self.err("K0225", "`emit` is only valid inside a component", *span);
+                    return Ty::Unit;
+                };
+                let sig = self.checked.components.get(&c.name).cloned().unwrap_or_default();
+                match sig.out_ports.get(port) {
+                    None => {
+                        let hint = if sig.in_ports.contains_key(port) {
+                            " (it is an `in` port — you can only `emit` on `out` ports)"
+                        } else {
+                            ""
+                        };
+                        self.err("K0226", format!("component `{}` has no `out` port named `{port}`{hint}", c.name), *span);
+                    }
+                    Some(ty) => match (arg, ty.clone()) {
+                        (None, Ty::Event) => {}
+                        (Some(a), Ty::Event) => {
+                            self.err("K0227", format!("port `{port}` is an Event and takes no payload"), a.span)
+                        }
+                        (None, other) => self.err(
+                            "K0228",
+                            format!("port `{port}` carries {other} — `emit {port}(value)` needs a payload"),
+                            *span,
+                        ),
+                        (Some(a), other) => {
+                            let at = self.infer_expr(a, ctx);
+                            self.unify(&other, &at, a.span, &format!("payload for port `{port}`"));
+                        }
+                    },
+                }
+                Ty::Unit
+            }
+            Stmt::Break(span) | Stmt::Continue(span) => {
+                if ctx.loop_depth == 0 {
+                    self.err("K0229", "`break`/`continue` outside of a loop", *span);
+                }
+                Ty::Unit
+            }
+        }
+    }
+
+    fn default_numeric(&mut self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Var(_) => {
+                let _ = self.uni.unify(&ty, &Ty::Int);
+                Ty::Int
+            }
+            other => other,
+        }
+    }
+
+    fn infer_expr(&mut self, expr: &Expr, ctx: &mut Ctx) -> Ty {
+        match &expr.kind {
+            ExprKind::Int(_) => Ty::Int,
+            ExprKind::Float(_) => Ty::Float,
+            ExprKind::Bool(_) => Ty::Bool,
+            ExprKind::Unit => Ty::Unit,
+            ExprKind::Str(pieces) => {
+                for p in pieces {
+                    if let StrPiece::Expr(e) = p {
+                        self.infer_expr(e, ctx); // any type; stringified at runtime
+                    }
+                }
+                Ty::Str
+            }
+            ExprKind::List(items) => {
+                let elem = self.uni.fresh();
+                for item in items {
+                    let t = self.infer_expr(item, ctx);
+                    self.unify(&elem, &t, item.span, "list element");
+                }
+                Ty::List(Box::new(self.uni.apply(&elem)))
+            }
+            ExprKind::Range { lo, hi, .. } => {
+                let lt = self.infer_expr(lo, ctx);
+                self.unify(&Ty::Int, &lt, lo.span, "range bound");
+                let ht = self.infer_expr(hi, ctx);
+                self.unify(&Ty::Int, &ht, hi.span, "range bound");
+                Ty::Range
+            }
+            ExprKind::Ident(name) => self.infer_ident(name, expr.span, ctx),
+            ExprKind::Call { callee, args } => self.infer_call(callee, args, expr.span, ctx),
+            ExprKind::MethodCall { recv, name, args } => self.infer_method(recv, name, args, expr.span, ctx),
+            ExprKind::Field { recv, name } => {
+                let rt = self.infer_expr(recv, ctx);
+                match self.uni.apply(&rt) {
+                    Ty::Named(tn) => {
+                        let sig = self.checked.types.get(&tn).cloned();
+                        match sig {
+                            Some(sig) if sig.variants.len() == 1 => {
+                                match sig.variants[0].fields.iter().find(|(fname, _)| fname == name) {
+                                    Some((_, ty)) => ty.clone(),
+                                    None => {
+                                        self.err("K0230", format!("type `{tn}` has no field `{name}`"), expr.span);
+                                        self.uni.fresh()
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                self.err(
+                                    "K0231",
+                                    format!("`{tn}` has multiple variants — use `match` to access fields"),
+                                    expr.span,
+                                );
+                                self.uni.fresh()
+                            }
+                            None => self.uni.fresh(),
+                        }
+                    }
+                    Ty::Var(_) => {
+                        self.err(
+                            "K0232",
+                            format!("cannot infer the type of this value to access field `{name}` — add a type annotation"),
+                            recv.span,
+                        );
+                        self.uni.fresh()
+                    }
+                    other => {
+                        self.err("K0233", format!("{other} has no fields"), expr.span);
+                        self.uni.fresh()
+                    }
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let lt = self.infer_expr(lhs, ctx);
+                let rt = self.infer_expr(rhs, ctx);
+                match op {
+                    BinOp::And | BinOp::Or => {
+                        self.unify(&Ty::Bool, &lt, lhs.span, "logical operand");
+                        self.unify(&Ty::Bool, &rt, rhs.span, "logical operand");
+                        Ty::Bool
+                    }
+                    BinOp::Eq | BinOp::Ne => {
+                        self.unify(&lt, &rt, expr.span, "comparison");
+                        Ty::Bool
+                    }
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        self.unify(&lt, &rt, expr.span, "comparison");
+                        let t = self.uni.apply(&lt);
+                        let t = self.default_numeric(t);
+                        if !t.is_numeric() && t != Ty::Str {
+                            self.err("K0234", format!("cannot order values of type {t}"), expr.span);
+                        }
+                        Ty::Bool
+                    }
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                        self.unify(&lt, &rt, expr.span, "arithmetic");
+                        let t = self.uni.apply(&lt);
+                        let t = self.default_numeric(t);
+                        let str_ok = *op == BinOp::Add && t == Ty::Str;
+                        if !t.is_numeric() && !str_ok {
+                            self.err("K0235", format!("arithmetic needs Int or Float operands, found {t}"), expr.span);
+                        }
+                        t
+                    }
+                }
+            }
+            ExprKind::Unary { op, operand } => {
+                let t = self.infer_expr(operand, ctx);
+                match op {
+                    UnOp::Neg => {
+                        let t = self.uni.apply(&t);
+                        let t = self.default_numeric(t);
+                        if !t.is_numeric() {
+                            self.err("K0236", format!("unary `-` needs Int or Float, found {t}"), expr.span);
+                        }
+                        t
+                    }
+                    UnOp::Not => {
+                        self.unify(&Ty::Bool, &t, operand.span, "`!` operand");
+                        Ty::Bool
+                    }
+                }
+            }
+            ExprKind::If { cond, then_block, else_block } => {
+                let ct = self.infer_expr(cond, ctx);
+                self.unify(&Ty::Bool, &ct, cond.span, "`if` condition");
+                let tt = self.check_block(then_block, ctx);
+                match else_block {
+                    Some(e) => {
+                        let et = self.infer_expr(e, ctx);
+                        self.unify(&tt, &et, expr.span, "`if`/`else` branches");
+                        self.uni.apply(&tt)
+                    }
+                    None => Ty::Unit,
+                }
+            }
+            ExprKind::BlockExpr(b) => self.check_block(b, ctx),
+            ExprKind::Match { scrutinee, arms } => {
+                let st = self.infer_expr(scrutinee, ctx);
+                let result = self.uni.fresh();
+                for arm in arms {
+                    ctx.scopes.push();
+                    self.check_pattern(&arm.pattern, &st, ctx);
+                    let at = self.infer_expr(&arm.body, ctx);
+                    self.unify(&result, &at, arm.body.span, "match arms (all arms must have the same type)");
+                    ctx.scopes.pop();
+                }
+                self.check_exhaustive(&st, arms, expr.span);
+                self.uni.apply(&result)
+            }
+            ExprKind::Lambda { params, body } => {
+                ctx.scopes.push();
+                let mut ptys = Vec::new();
+                for p in params {
+                    let ty = match &p.ty {
+                        Some(t) => self.resolve_ty(t),
+                        None => self.uni.fresh(),
+                    };
+                    ctx.scopes.insert(&p.name, ty.clone(), false);
+                    ptys.push(ty);
+                }
+                let bt = self.check_block(body, ctx);
+                ctx.scopes.pop();
+                Ty::Fun(ptys, Box::new(bt))
+            }
+            ExprKind::Try(inner) => {
+                let it = self.infer_expr(inner, ctx);
+                let ok = self.uni.fresh();
+                let err = self.uni.fresh();
+                let expected = Ty::Result(Box::new(ok.clone()), Box::new(err.clone()));
+                self.unify(&expected, &it, inner.span, "`?` operand (must be a Result)");
+                if ctx.in_handler {
+                    self.err(
+                        "K0237",
+                        "`?` is not allowed in handlers in v0.1 — handle the Result with `match`",
+                        expr.span,
+                    );
+                } else {
+                    let ret_err = self.uni.fresh();
+                    let ret_ok = self.uni.fresh();
+                    let want = Ty::Result(Box::new(ret_ok), Box::new(ret_err.clone()));
+                    let ret = ctx.ret.clone();
+                    if self.uni.unify(&want, &ret).is_err() {
+                        let r = self.uni.apply(&ret);
+                        self.err(
+                            "K0238",
+                            format!("`?` requires the enclosing function to return a Result, but it returns {r}"),
+                            expr.span,
+                        );
+                    } else {
+                        let _ = self.uni.unify(&err, &ret_err);
+                    }
+                }
+                self.uni.apply(&ok)
+            }
+            ExprKind::Await(inner) => self.infer_expr(inner, ctx),
+        }
+    }
+
+    fn infer_ident(&mut self, name: &str, span: Span, ctx: &mut Ctx) -> Ty {
+        if let Some((ty, _)) = ctx.scopes.get(name) {
+            return ty;
+        }
+        if let Some((params, ret)) = self.checked.funs.get(name).cloned() {
+            return Ty::Fun(params, Box::new(ret));
+        }
+        // nullary constructors as values
+        match name {
+            "None" => return Ty::Option(Box::new(self.uni.fresh())),
+            _ => {}
+        }
+        if let Some((tyname, fields)) = self.checked.ctors.get(name).cloned() {
+            if fields.is_empty() {
+                return Ty::Named(tyname);
+            }
+            return Ty::Fun(
+                fields.iter().map(|(_, t)| t.clone()).collect(),
+                Box::new(Ty::Named(tyname)),
+            );
+        }
+        self.err("K0240", format!("unknown name `{name}`"), span);
+        self.uni.fresh()
+    }
+
+    fn infer_call(&mut self, callee: &Expr, args: &[Arg], span: Span, ctx: &mut Ctx) -> Ty {
+        if let ExprKind::Ident(name) = &callee.kind {
+            // builtins
+            match (name.as_str(), args.len()) {
+                ("print", 1) => {
+                    self.infer_expr(&args[0].value, ctx);
+                    return Ty::Unit;
+                }
+                ("to_str", 1) => {
+                    self.infer_expr(&args[0].value, ctx);
+                    return Ty::Str;
+                }
+                ("panic", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "panic message");
+                    return self.uni.fresh();
+                }
+                ("Some", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    return Ty::Option(Box::new(self.uni.apply(&t)));
+                }
+                ("Ok", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    return Ty::Result(Box::new(self.uni.apply(&t)), Box::new(self.uni.fresh()));
+                }
+                ("Err", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    return Ty::Result(Box::new(self.uni.fresh()), Box::new(self.uni.apply(&t)));
+                }
+                _ => {}
+            }
+            // user constructor
+            if let Some((tyname, fields)) = self.checked.ctors.get(name).cloned() {
+                self.check_named_args(name, &fields, args, span, ctx);
+                return Ty::Named(tyname);
+            }
+            // component construction
+            if let Some(sig) = self.checked.components.get(name).cloned() {
+                if let Some(enclosing) = ctx.component {
+                    self.check_ctor_args(name, &sig, args, span, enclosing);
+                } else {
+                    // constructing outside a component (e.g. REPL): still check props
+                    for arg in args {
+                        self.infer_expr(&arg.value, ctx);
+                    }
+                }
+                return Ty::Component(name.clone());
+            }
+        }
+        // general callable
+        let ct = self.infer_expr(callee, ctx);
+        let mut arg_tys = Vec::new();
+        for a in args {
+            if a.name.is_some() {
+                self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+            }
+            arg_tys.push(self.infer_expr(&a.value, ctx));
+        }
+        let ret = self.uni.fresh();
+        let want = Ty::Fun(arg_tys, Box::new(ret.clone()));
+        match self.uni.apply(&ct) {
+            Ty::Fun(ps, _) if ps.len() != args.len() => {
+                self.err(
+                    "K0242",
+                    format!("this function takes {} argument(s), {} given", ps.len(), args.len()),
+                    span,
+                );
+            }
+            _ => {
+                self.unify(&want, &ct, span, "function call");
+            }
+        }
+        self.uni.apply(&ret)
+    }
+
+    fn check_named_args(
+        &mut self,
+        ctor: &str,
+        fields: &[(String, Ty)],
+        args: &[Arg],
+        span: Span,
+        ctx: &mut Ctx,
+    ) {
+        if args.len() != fields.len() {
+            self.err(
+                "K0243",
+                format!("`{ctor}` has {} field(s), {} argument(s) given", fields.len(), args.len()),
+                span,
+            );
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let target = match &arg.name {
+                Some(n) => fields.iter().find(|(fname, _)| fname == n).cloned(),
+                None => fields.get(i).cloned(),
+            };
+            let at = self.infer_expr(&arg.value, ctx);
+            match target {
+                Some((fname, fty)) => {
+                    self.unify(&fty, &at, arg.value.span, &format!("field `{fname}` of `{ctor}`"));
+                }
+                None => {
+                    if let Some(n) = &arg.name {
+                        self.err("K0244", format!("`{ctor}` has no field named `{n}`"), arg.value.span);
+                    }
+                }
+            }
+        }
+    }
+
+    fn infer_method(&mut self, recv: &Expr, name: &str, args: &[Expr], span: Span, ctx: &mut Ctx) -> Ty {
+        let rt = self.infer_expr(recv, ctx);
+        let rt = self.uni.apply(&rt);
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, ctx)).collect();
+
+        let sig: Option<(Vec<Ty>, Ty)> = match (&rt, name) {
+            (Ty::List(_), "len") => Some((vec![], Ty::Int)),
+            (Ty::List(t), "map") => {
+                let u = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**t).clone()], Box::new(u.clone()))],
+                    Ty::List(Box::new(u)),
+                ))
+            }
+            (Ty::List(t), "filter") => Some((
+                vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
+                Ty::List(t.clone()),
+            )),
+            (Ty::List(t), "find") => Some((
+                vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
+                Ty::Option(t.clone()),
+            )),
+            (Ty::List(t), "sum") => {
+                let elem = self.uni.apply(t);
+                let elem = self.default_numeric(elem);
+                if !elem.is_numeric() {
+                    self.err("K0245", format!("`sum` needs a List[Int] or List[Float], found List[{elem}]"), span);
+                }
+                Some((vec![], elem))
+            }
+            (Ty::List(t), "contains") => Some((vec![(**t).clone()], Ty::Bool)),
+            (Ty::List(t), "push") => Some((vec![(**t).clone()], Ty::List(t.clone()))),
+            (Ty::List(t), "first") | (Ty::List(t), "last") => Some((vec![], Ty::Option(t.clone()))),
+            (Ty::List(t), "reverse") => Some((vec![], Ty::List(t.clone()))),
+            (Ty::List(t), "join") => {
+                let elem = self.uni.apply(t);
+                if elem != Ty::Str && !matches!(elem, Ty::Var(_)) {
+                    self.err("K0246", format!("`join` needs a List[Str], found List[{elem}]"), span);
+                }
+                Some((vec![Ty::Str], Ty::Str))
+            }
+            (Ty::Str, "len") => Some((vec![], Ty::Int)),
+            (Ty::Str, "contains") => Some((vec![Ty::Str], Ty::Bool)),
+            (Ty::Str, "starts_with") => Some((vec![Ty::Str], Ty::Bool)),
+            (Ty::Str, "to_upper") | (Ty::Str, "to_lower") | (Ty::Str, "trim") => Some((vec![], Ty::Str)),
+            (Ty::Str, "split") => Some((vec![Ty::Str], Ty::List(Box::new(Ty::Str)))),
+            (Ty::Int, "to_str") => Some((vec![], Ty::Str)),
+            (Ty::Int, "to_float") => Some((vec![], Ty::Float)),
+            (Ty::Int, "abs") => Some((vec![], Ty::Int)),
+            (Ty::Float, "to_str") => Some((vec![], Ty::Str)),
+            (Ty::Float, "to_int") => Some((vec![], Ty::Int)),
+            (Ty::Float, "abs") | (Ty::Float, "sqrt") => Some((vec![], Ty::Float)),
+            (Ty::Option(t), "is_some") | (Ty::Option(t), "is_none") => {
+                let _ = t;
+                Some((vec![], Ty::Bool))
+            }
+            (Ty::Option(t), "unwrap_or") => Some((vec![(**t).clone()], (**t).clone())),
+            (Ty::Result(t, e), "is_ok") | (Ty::Result(t, e), "is_err") => {
+                let _ = (t, e);
+                Some((vec![], Ty::Bool))
+            }
+            (Ty::Result(t, _), "unwrap_or") => Some((vec![(**t).clone()], (**t).clone())),
+            (Ty::Component(cname), _) => {
+                let sig = self.checked.components.get(cname).cloned().unwrap_or_default();
+                match sig.exposes.get(name) {
+                    Some((ps, r)) => Some((ps.clone(), r.clone())),
+                    None => {
+                        self.err(
+                            "K0247",
+                            format!("component `{cname}` does not expose a function named `{name}`"),
+                            span,
+                        );
+                        return self.uni.fresh();
+                    }
+                }
+            }
+            (Ty::Var(_), _) => {
+                self.err(
+                    "K0248",
+                    format!("cannot infer the receiver type for `.{name}(…)` — add a type annotation"),
+                    recv.span,
+                );
+                return self.uni.fresh();
+            }
+            _ => None,
+        };
+
+        match sig {
+            None => {
+                self.err("K0249", format!("{rt} has no method `{name}`"), span);
+                self.uni.fresh()
+            }
+            Some((params, ret)) => {
+                if params.len() != arg_tys.len() {
+                    self.err(
+                        "K0250",
+                        format!("`.{name}` takes {} argument(s), {} given", params.len(), arg_tys.len()),
+                        span,
+                    );
+                } else {
+                    for (p, (a, ae)) in params.iter().zip(arg_tys.iter().zip(args.iter())) {
+                        self.unify(p, a, ae.span, &format!("argument to `.{name}`"));
+                    }
+                }
+                self.uni.apply(&ret)
+            }
+        }
+    }
+
+    fn check_pattern(&mut self, pat: &Pattern, expected: &Ty, ctx: &mut Ctx) {
+        match &pat.kind {
+            PatternKind::Wildcard => {}
+            PatternKind::Bind(name) => {
+                let ty = self.uni.apply(expected);
+                ctx.scopes.insert(name, ty, false);
+            }
+            PatternKind::Int(_) => {
+                self.unify(expected, &Ty::Int, pat.span, "pattern");
+            }
+            PatternKind::Bool(_) => {
+                self.unify(expected, &Ty::Bool, pat.span, "pattern");
+            }
+            PatternKind::Str(_) => {
+                self.unify(expected, &Ty::Str, pat.span, "pattern");
+            }
+            PatternKind::Ctor { name, args } => match name.as_str() {
+                "Some" => {
+                    let inner = self.uni.fresh();
+                    self.unify(expected, &Ty::Option(Box::new(inner.clone())), pat.span, "pattern");
+                    if args.len() == 1 {
+                        self.check_pattern(&args[0], &inner, ctx);
+                    } else {
+                        self.err("K0251", "`Some` pattern takes exactly one argument", pat.span);
+                    }
+                }
+                "None" => {
+                    let inner = self.uni.fresh();
+                    self.unify(expected, &Ty::Option(Box::new(inner)), pat.span, "pattern");
+                    if !args.is_empty() {
+                        self.err("K0252", "`None` pattern takes no arguments", pat.span);
+                    }
+                }
+                "Ok" | "Err" => {
+                    let ok = self.uni.fresh();
+                    let e = self.uni.fresh();
+                    self.unify(
+                        expected,
+                        &Ty::Result(Box::new(ok.clone()), Box::new(e.clone())),
+                        pat.span,
+                        "pattern",
+                    );
+                    let inner = if name == "Ok" { ok } else { e };
+                    if args.len() == 1 {
+                        self.check_pattern(&args[0], &inner, ctx);
+                    } else {
+                        self.err("K0253", format!("`{name}` pattern takes exactly one argument"), pat.span);
+                    }
+                }
+                other => match self.checked.ctors.get(other).cloned() {
+                    None => self.err("K0254", format!("unknown constructor `{other}` in pattern"), pat.span),
+                    Some((tyname, fields)) => {
+                        self.unify(expected, &Ty::Named(tyname), pat.span, "pattern");
+                        if args.len() != fields.len() {
+                            self.err(
+                                "K0255",
+                                format!("`{other}` has {} field(s), pattern has {}", fields.len(), args.len()),
+                                pat.span,
+                            );
+                        }
+                        for (a, (_, fty)) in args.iter().zip(fields.iter()) {
+                            self.check_pattern(a, fty, ctx);
+                        }
+                    }
+                },
+            },
+        }
+    }
+
+    fn check_exhaustive(&mut self, scrut: &Ty, arms: &[MatchArm], span: Span) {
+        let has_catch_all = arms
+            .iter()
+            .any(|a| matches!(a.pattern.kind, PatternKind::Wildcard | PatternKind::Bind(_)));
+        if has_catch_all {
+            return;
+        }
+        let covered: HashSet<&str> = arms
+            .iter()
+            .filter_map(|a| match &a.pattern.kind {
+                PatternKind::Ctor { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<String> = match self.uni.apply(scrut) {
+            Ty::Bool => {
+                let mut m = Vec::new();
+                let has_true = arms.iter().any(|a| matches!(a.pattern.kind, PatternKind::Bool(true)));
+                let has_false = arms.iter().any(|a| matches!(a.pattern.kind, PatternKind::Bool(false)));
+                if !has_true {
+                    m.push("true".into());
+                }
+                if !has_false {
+                    m.push("false".into());
+                }
+                m
+            }
+            Ty::Option(_) => ["Some", "None"]
+                .iter()
+                .filter(|v| !covered.contains(**v))
+                .map(|v| v.to_string())
+                .collect(),
+            Ty::Result(_, _) => ["Ok", "Err"]
+                .iter()
+                .filter(|v| !covered.contains(**v))
+                .map(|v| v.to_string())
+                .collect(),
+            Ty::Named(tn) => match self.checked.types.get(&tn) {
+                Some(sig) => sig
+                    .variants
+                    .iter()
+                    .filter(|v| !covered.contains(v.name.as_str()))
+                    .map(|v| v.name.clone())
+                    .collect(),
+                None => Vec::new(),
+            },
+            _ => {
+                self.err(
+                    "K0256",
+                    "this `match` needs a catch-all arm (`_ => …`) — the scrutinee type has unbounded values",
+                    span,
+                );
+                return;
+            }
+        };
+        if !missing.is_empty() {
+            self.err(
+                "K0257",
+                format!("non-exhaustive `match`: missing {}", missing.join(", ")),
+                span,
+            );
+        }
+    }
+}
+
+fn op_sym(op: AssignOp) -> &'static str {
+    match op {
+        AssignOp::Set => "",
+        AssignOp::Add => "+",
+        AssignOp::Sub => "-",
+        AssignOp::Mul => "*",
+        AssignOp::Div => "/",
+    }
+}

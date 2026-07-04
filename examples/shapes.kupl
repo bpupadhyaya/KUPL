@@ -1,0 +1,63 @@
+// Pure functional core: ADTs, match, records, Option/Result, lambdas.
+
+type Shape = Circle(r: Float) | Rect(w: Float, h: Float)
+
+type User = { name: Str, age: Int }
+
+fun area(s: Shape) -> Float {
+    match s {
+        Circle(r) => 3.14159265 * r * r
+        Rect(w, h) => w * h
+    }
+}
+
+fun describe(age: Int) -> Str {
+    if age >= 18 {
+        "adult"
+    } else {
+        "minor"
+    }
+}
+
+fun safe_div(a: Int, b: Int) -> Result[Int, Str] {
+    if b == 0 {
+        Err("division by zero")
+    } else {
+        Ok(a / b)
+    }
+}
+
+fun both(a: Int, b: Int) -> Result[Int, Str] {
+    let x = safe_div(100, a)?
+    let y = safe_div(100, b)?
+    Ok(x + y)
+}
+
+fun main() {
+    let shapes = [Circle(r: 1.0), Rect(w: 3.0, h: 4.0)]
+    let areas = shapes.map(fn s { area(s) })
+    print("areas: {areas}")
+    print("total: {areas.sum()}")
+
+    let u = User(name: "Ada", age: 36)
+    print("{u.name} is {describe(u.age)}")
+
+    let numbers = [1, 2, 3, 4, 5, 6]
+    let evens = numbers.filter(fn n { n % 2 == 0 })
+    print("evens: {evens}, sum {evens.sum()}")
+
+    match both(4, 5) {
+        Ok(v) => print("both ok: {v}")
+        Err(e) => print("failed: {e}")
+    }
+    match both(0, 5) {
+        Ok(v) => print("both ok: {v}")
+        Err(e) => print("failed: {e}")
+    }
+
+    let found = numbers.find(fn n { n > 4 })
+    match found {
+        Some(n) => print("first > 4: {n}")
+        None => print("none found")
+    }
+}
