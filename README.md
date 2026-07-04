@@ -223,6 +223,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/multifile/` | `use`-based multi-file programs |
 | `examples/pkg/` | two local packages: an app depending on `greet` via `kupl.toml` |
 | `examples/native-showcase.kupl` | sized ints + parallel `par_map` + component exposes + wires — identical on interp, KVM, and **native** |
+| `examples/analytics.kupl` | access-log analytics CLI: CSV parse + regex validation + status-class bucketing + latency stats + JSON summary — a real tool, identical on interp/KVM/native |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.

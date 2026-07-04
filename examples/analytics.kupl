@@ -1,0 +1,170 @@
+// Access-log analytics — a small, real command-line-style report generator.
+//
+// It ties the standard library together end to end: parse embedded CSV log
+// rows, validate each path with a regex, bucket requests by HTTP status class,
+// compute per-bucket latency statistics (count / total / min / max / average),
+// and emit BOTH a human-readable report AND a machine-readable JSON summary.
+//
+// The dataset is embedded, so the program is hermetic and deterministic — it
+// runs identically on the interpreter, the KVM, and native machine code.
+
+type Row = {
+    method: Str,
+    path: Str,
+    status: Int,
+    ms: Float,
+}
+
+// Running statistics for one status bucket.
+type Stat = {
+    count: Int,
+    total: Float,
+    min: Float,
+    max: Float,
+}
+
+// Group requests by HTTP status class: 2xx success, 3xx redirect, 4xx client
+// error, 5xx server error.
+fun class_of(status: Int) -> Str {
+    if status >= 500 {
+        "5xx server-error"
+    } else if status >= 400 {
+        "4xx client-error"
+    } else if status >= 300 {
+        "3xx redirect"
+    } else {
+        "2xx success"
+    }
+}
+
+// A path is well-formed if it starts with "/" and has no spaces.
+fun valid_path(path: Str) -> Bool {
+    re_match("^/[^ ]*$", path)
+}
+
+// Turn one CSV record into a Row, if it has the expected shape.
+fun parse_row(fields: List[Str]) -> Option[Row] {
+    if fields.len() != 4 {
+        return None
+    }
+    let method = fields.get(0).unwrap_or("")
+    let path = fields.get(1).unwrap_or("")
+    match fields.get(2).unwrap_or("").parse_int() {
+        Some(status) => match fields.get(3).unwrap_or("").parse_float() {
+            Some(ms) => Some(Row(method: method, path: path, status: status, ms: ms))
+            None => None
+        }
+        None => None
+    }
+}
+
+// Fold a row's latency into a bucket's running Stat.
+fun accumulate(stat: Stat, ms: Float) -> Stat {
+    Stat(
+        count: stat.count + 1,
+        total: stat.total + ms,
+        min: if ms < stat.min { ms } else { stat.min },
+        max: if ms > stat.max { ms } else { stat.max },
+    )
+}
+
+fun mean(stat: Stat) -> Float {
+    if stat.count == 0 { 0.0 } else { stat.total / stat.count.to_float() }
+}
+
+// Build the JSON summary: one object per bucket, in first-seen order.
+fun to_json(buckets: Map[Str, Stat]) -> Json {
+    var obj = Map()
+    for key in buckets.keys() {
+        match buckets.get(key) {
+            Some(s) => {
+                let entry = JObj(
+                    Map()
+                        .insert("count", JNum(s.count.to_float()))
+                        .insert("avg_ms", JNum(mean(s)))
+                        .insert("max_ms", JNum(s.max))
+                )
+                obj = obj.insert(key, entry)
+            }
+            None => {}
+        }
+    }
+    JObj(obj)
+}
+
+fun main() uses io {
+    // method,path,status,latency_ms
+    let data = "GET,/,200,12.5\n" +
+        "GET,/api/users,200,88.0\n" +
+        "POST,/api/users,201,143.2\n" +
+        "GET,/api/users/7,404,9.1\n" +
+        "GET,/health,200,2.0\n" +
+        "GET,/api/orders,500,512.4\n" +
+        "GET,/api/orders,200,74.3\n" +
+        "GET,/old-home,301,3.4\n" +
+        "GET,/bad path,200,5.0\n" +
+        "DELETE,/api/users/3,204,40.0"
+
+    let rows = csv_parse(data)
+
+    // parse + validate, collecting rows and counting rejects
+    var valid: List[Row] = []
+    var rejected = 0
+    for fields in rows {
+        match parse_row(fields) {
+            Some(r) => {
+                if valid_path(r.path) {
+                    valid = valid.push(r)
+                } else {
+                    rejected = rejected + 1
+                }
+            }
+            None => {
+                rejected = rejected + 1
+            }
+        }
+    }
+
+    // bucket by status class, accumulating latency stats
+    var buckets = Map()
+    for r in valid {
+        let key = class_of(r.status)
+        let cur = buckets.get(key).unwrap_or(Stat(count: 0, total: 0.0, min: r.ms, max: r.ms))
+        buckets = buckets.insert(key, accumulate(cur, r.ms))
+    }
+
+    // human-readable report
+    print("Access-log report")
+    print("=================")
+    print("requests: {valid.len()} valid, {rejected} rejected")
+    print("")
+    for key in buckets.keys() {
+        match buckets.get(key) {
+            Some(s) => print("{key}: n={s.count} avg={mean(s).format(1)}ms min={s.min.format(1)} max={s.max.format(1)}")
+            None => {}
+        }
+    }
+
+    // slowest request overall
+    var slowest = 0.0
+    var slow_path = ""
+    for r in valid {
+        if r.ms > slowest {
+            slowest = r.ms
+            slow_path = r.path
+        }
+    }
+    print("")
+    print("slowest: {slow_path} at {slowest.format(1)}ms")
+
+    // machine-readable JSON summary
+    print("")
+    print("json: {json_stringify(to_json(buckets))}")
+}
+
+// A quick invariant check runnable with `kupl test`.
+law "every accumulated bucket has max >= min" {
+    let s = accumulate(accumulate(Stat(count: 0, total: 0.0, min: 5.0, max: 5.0), 5.0), 9.0)
+    expect s.max >= s.min
+    expect s.count == 2
+}
