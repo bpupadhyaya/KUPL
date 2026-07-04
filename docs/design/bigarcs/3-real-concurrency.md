@@ -1,3 +1,13 @@
+> **Progress:** slice 3 landed (it35) — the real-thread fast path is now on the
+> KVM too (Vm carries an Option<ProgramImage>, set on source runs; workers still
+> use the tree-Interp, so results are identical to the interpreter). par_map and
+> par_filter run in parallel on BOTH primary engines. The differential harness
+> deliberately leaves the KVM image None, keeping a SEQUENTIAL VM reference that
+> proves the parallel interpreter path correct; a separate VM-with-image test
+> asserts ABSOLUTE expected values (incl. lowest-index panic propagation) since
+> both engines now parallelize. .kx-only runs (no AST) stay sequential; native
+> is still sequential/deferred.
+>
 > **Progress:** slice 2 landed (it34) — real-thread `par_filter` too, sharing
 > the slice-1 core (`gate` + `par_eval`): the pure predicate is evaluated across
 > threads and survivors are kept in input-index order, byte-identical to the

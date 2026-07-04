@@ -55,6 +55,11 @@ pub struct Vm<'m> {
     pub print_unwired: bool,
     /// Virtual clock (ms), advanced explicitly — same model as the interpreter.
     now: i64,
+    /// Send+Sync program snapshot enabling the real-thread `par_map`/`par_filter`
+    /// fast path. Set on source runs (`run --vm`); `None` for a bare `.kx` run
+    /// (no AST) → sequential, and left `None` in the differential harness so the
+    /// KVM stays the sequential reference that proves the parallel path correct.
+    image: Option<std::sync::Arc<crate::parallel::ProgramImage>>,
 }
 
 impl<'m> Vm<'m> {
@@ -67,7 +72,14 @@ impl<'m> Vm<'m> {
             queue: std::collections::VecDeque::new(),
             print_unwired: false,
             now: 0,
+            image: None,
         }
+    }
+
+    /// Enable the real-thread parallel fast path (`par_map`/`par_filter` over
+    /// pure named callbacks). Only source runs, which have the AST, set this.
+    pub fn set_image(&mut self, image: std::sync::Arc<crate::parallel::ProgramImage>) {
+        self.image = Some(image);
     }
 
     pub fn call_named(&mut self, name: &str, args: Vec<Value>) -> Result<Value, VmError> {
@@ -712,6 +724,23 @@ impl<'m> Vm<'m> {
                         set!(dst, v);
                         continue;
                     }
+                    // real-thread fast path (par_map/par_filter over pure named
+                    // callbacks); falls through to sequential shared_method on
+                    // any non-qualifying call. Same helper as the interpreter,
+                    // so results are byte-identical by construction.
+                    if let Some(image) = self.image.clone() {
+                        if let Some(res) = crate::parallel::try_par_map(&r, &method, &args, &image)
+                            .or_else(|| crate::parallel::try_par_filter(&r, &method, &args, &image))
+                        {
+                            match res {
+                                Ok(v) => {
+                                    set!(dst, v);
+                                    continue;
+                                }
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
+                    }
                     let mut call = |f: Value, args: Vec<Value>| self.call_value_nested(f, args);
                     match shared_method(&r, &method, args, &mut call) {
                         Ok(v) => set!(dst, v),
@@ -1237,6 +1266,48 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         let s = differential(&ordered);
         assert!(s.starts_with("[0, 1001, 2002,"), "ordered head: {s}");
         assert!(s.ends_with("298298, 299299]"), "ordered tail: {s}");
+    }
+
+    // Run `probe` on the KVM WITH the parallel image set (so par_map/par_filter
+    // take the real-thread path on the VM). Asserting ABSOLUTE expected values
+    // anchors correctness even though both engines now parallelize.
+    #[cfg(test)]
+    fn vm_parallel(src: &str) -> String {
+        let compiled = crate::run::compile(src).expect("program must compile");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut vm = Vm::new(&module);
+        vm.set_image(crate::parallel::ProgramImage::from_db(&db));
+        match vm.call_named("probe", vec![]) {
+            Ok(v) => v.to_string(),
+            Err(e) => format!("panic: {}", e.msg),
+        }
+    }
+
+    #[test]
+    fn vm_parallel_par_map_absolute_it35() {
+        // par_map(dbl) over [0..1000) on the KVM's real-thread path, summed
+        let src = format!(
+            "{MK}fun dbl(n: Int) -> Int {{\n    n * 2 + 1\n}}\n\
+             fun probe() -> Int {{\n    mk(1000).par_map(dbl).sum()\n}}\n"
+        );
+        assert_eq!(vm_parallel(&src), "1000000");
+
+        // par_filter(is_even) over [0..600) returns the exact even list, in order
+        let evens = format!(
+            "{MK}fun is_even(n: Int) -> Bool {{\n    n % 2 == 0\n}}\n\
+             fun probe() -> List[Int] {{\n    mk(600).par_filter(is_even)\n}}\n"
+        );
+        let s = vm_parallel(&evens);
+        assert!(s.starts_with("[0, 2, 4,") && s.ends_with("596, 598]"), "vm evens: {s}");
+
+        // a panicking pure element reports the lowest-index panic on the VM too
+        let boom = format!(
+            "{MK}fun bad(n: Int) -> Int {{\n    100 / (n - 300)\n}}\n\
+             fun probe() -> Int {{\n    mk(400).par_map(bad).sum()\n}}\n"
+        );
+        assert_eq!(vm_parallel(&boom), "panic: division by zero");
     }
 
     #[test]

@@ -72,10 +72,10 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       Send boundary + a Send+Sync `ProgramImage` + `std::thread::scope`; results
       placed by input index so the output is byte-identical to sequential
       `map`). Everything else still evaluates sequentially (deterministic,
-      byte-identical on all engines incl. native). Wired into the interpreter;
-      the KVM stays the sequential reference, so the differential harness proves
-      byte-identity every run. Still open: the VM-side fast path, extending real
-      threads to `par_filter`/`par_each`/`par{}`, a work-stealing scheduler,
+      byte-identical on all engines incl. native). Runs on BOTH the interpreter and the
+      KVM (it35); the differential harness keeps a sequential-VM reference and
+      absolute-value tests anchor correctness. Still open: extending real
+      threads to `par{}` fixed branches, a work-stealing scheduler,
       async I/O, and `await` actually suspending (evaluates synchronously
       today). Virtual clock (it9) preserved for deterministic tests.
 - [x] **File I/O** (it14) — `read_file`/`write_file`/`append_file`/`delete_file`

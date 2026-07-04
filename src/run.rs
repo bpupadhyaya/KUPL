@@ -344,6 +344,9 @@ pub fn run_program_vm(path: &str) -> i32 {
     });
     let mut vm = crate::vm::Vm::new(&module);
     vm.print_unwired = true;
+    // enable the real-thread par_map/par_filter fast path (source run has the AST)
+    let db = ProgramDb::build(&compiled.program, &compiled.checked);
+    vm.set_image(crate::parallel::ProgramImage::from_db(&db));
     let outcome = match app {
         Some(name) => vm.run_app(&name).map(|_| Value::Unit),
         None if module.funs.contains_key("main") => vm.call_named("main", vec![]),
