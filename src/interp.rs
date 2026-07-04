@@ -955,6 +955,11 @@ impl Interp {
                     return time_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
                 }
                 ("now", 0) => return Ok(Value::Int(now_seconds())),
+                ("base64_encode", 1) | ("base64_decode", 1) | ("hex_encode", 1)
+                | ("hex_decode", 1) | ("hash_fnv", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return encoding_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("exit", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     let code = match v {
@@ -2122,6 +2127,30 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err(format!("unknown process builtin `{name}`")),
     }
+}
+
+/// Encoding & hash builtins — shared by interpreter and KVM. All pure.
+/// `*_decode` returns a `Result` value; encode/hash always succeed.
+pub fn encoding_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let s = match &args[0] {
+        Value::Str(s) => s.as_str().to_string(),
+        other => other.to_string(),
+    };
+    use crate::encoding as enc;
+    Ok(match name {
+        "base64_encode" => Value::str(enc::base64_encode(&s)),
+        "hex_encode" => Value::str(enc::hex_encode(&s)),
+        "hash_fnv" => Value::Int(enc::hash_fnv(&s)),
+        "base64_decode" => match enc::base64_decode(&s) {
+            Ok(v) => Value::ok(Value::str(v)),
+            Err(e) => Value::err(Value::str(e)),
+        },
+        "hex_decode" => match enc::hex_decode(&s) {
+            Ok(v) => Value::ok(Value::str(v)),
+            Err(e) => Value::err(Value::str(e)),
+        },
+        _ => return Err(format!("unknown encoding builtin `{name}`")),
+    })
 }
 
 /// Time/date builtins — shared by interpreter and KVM. All PURE (a timestamp

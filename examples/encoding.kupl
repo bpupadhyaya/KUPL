@@ -1,0 +1,39 @@
+// Data encodings & hashing — base64, hex, and a fast non-crypto hash.
+//
+//   base64_encode(s) -> Str            base64_decode(s) -> Result[Str, Str]
+//   hex_encode(s)    -> Str            hex_decode(s)    -> Result[Str, Str]
+//   hash_fnv(s)      -> Int            FNV-1a 64-bit (stable, non-crypto)
+//
+// All pure and deterministic. Encode/decode operate on the string's UTF-8
+// bytes; decode returns Err on malformed input or non-UTF-8 output.
+
+// Build an HTTP Basic auth header value (user:pass, base64-encoded).
+fun basic_auth(user: Str, pass: Str) -> Str {
+    "Basic " + base64_encode(user + ":" + pass)
+}
+
+// Shard a key into one of `n` buckets by hashing it.
+fun bucket(key: Str, n: Int) -> Int {
+    hash_fnv(key).band(0x7FFFFFFFFFFFFFFF) % n
+}
+
+fun main() uses io {
+    print(basic_auth("ada", "s3cret"))       // Basic YWRhOnMzY3JldA==
+
+    print(hex_encode("KUPL"))                 // 4b55504c
+    match hex_decode("4b55504c") {
+        Ok(s) => print(s)                     // KUPL
+        Err(e) => print("bad hex: {e}")
+    }
+
+    // deterministic sharding — same key always lands in the same bucket
+    for key in ["alice", "bob", "carol", "dave"] {
+        print("{key} -> bucket {bucket(key, 4)}")
+    }
+
+    // malformed input is a value-level error, never a crash
+    match base64_decode("not valid base64!") {
+        Ok(_) => print("unexpected")
+        Err(_) => print("bad base64 handled")
+    }
+}

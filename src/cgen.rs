@@ -193,6 +193,11 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_SECOND_OF => format!("regs[{dst}] = k_second_of(regs[{start}]); (void){argc};"),
             BUILTIN_WEEKDAY_OF => format!("regs[{dst}] = k_weekday_of(regs[{start}]); (void){argc};"),
             BUILTIN_NOW => format!("regs[{dst}] = k_now(); (void){start}; (void){argc};"),
+            BUILTIN_BASE64_ENCODE => format!("regs[{dst}] = k_base64_encode(regs[{start}]); (void){argc};"),
+            BUILTIN_BASE64_DECODE => format!("regs[{dst}] = k_base64_decode(regs[{start}]); (void){argc};"),
+            BUILTIN_HEX_ENCODE => format!("regs[{dst}] = k_hex_encode(regs[{start}]); (void){argc};"),
+            BUILTIN_HEX_DECODE => format!("regs[{dst}] = k_hex_decode(regs[{start}]); (void){argc};"),
+            BUILTIN_HASH_FNV => format!("regs[{dst}] = k_hash_fnv(regs[{start}]); (void){argc};"),
             BUILTIN_ENV_VAR => format!("regs[{dst}] = k_env_var(regs[{start}]); (void){argc};"),
             BUILTIN_ARGS => format!("regs[{dst}] = k_args(); (void){start}; (void){argc};"),
             BUILTIN_EPRINT => format!("regs[{dst}] = k_eprint(regs[{start}]); (void){argc};"),
@@ -829,6 +834,121 @@ static KValue k_args(void) {
 static KValue k_eprint(KValue v) {
     fprintf(stderr, "%s\n", k_show(v));
     return k_unit();
+}
+
+/* ---- encodings & hash; mirrors src/encoding.rs exactly ---- */
+static const char* K_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static int k_valid_utf8(const unsigned char* b, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = b[i];
+        int len; unsigned int minv;
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) { len = 2; minv = 0x80; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; minv = 0x800; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; minv = 0x10000; }
+        else return 0;
+        if (i + (size_t)len > n) return 0;
+        unsigned int cp = c & (0x7F >> len);
+        for (int k = 1; k < len; k++) {
+            if ((b[i + k] & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (b[i + k] & 0x3F);
+        }
+        if (cp < minv || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return 0;
+        i += len;
+    }
+    return 1;
+}
+static KValue k_base64_encode(KValue sv) {
+    const unsigned char* s = (const unsigned char*)sv.as.s;
+    size_t n = strlen(sv.as.s);
+    char* out = k_alloc((n + 2) / 3 * 4 + 1);
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned int b0 = s[i];
+        unsigned int b1 = i + 1 < n ? s[i + 1] : 0;
+        unsigned int b2 = i + 2 < n ? s[i + 2] : 0;
+        unsigned int x = (b0 << 16) | (b1 << 8) | b2;
+        out[o++] = K_B64[x >> 18 & 63];
+        out[o++] = K_B64[x >> 12 & 63];
+        out[o++] = (i + 1 < n) ? K_B64[x >> 6 & 63] : '=';
+        out[o++] = (i + 2 < n) ? K_B64[x & 63] : '=';
+    }
+    out[o] = 0;
+    return k_str(out);
+}
+static int k_b64val(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+static KValue k_base64_decode(KValue sv) {
+    const char* src = sv.as.s;
+    /* strip newlines */
+    size_t rn = 0, sl = strlen(src);
+    unsigned char* raw = k_alloc(sl + 1);
+    for (size_t i = 0; i < sl; i++) if (src[i] != '\n' && src[i] != '\r') raw[rn++] = (unsigned char)src[i];
+    if (rn % 4 != 0) return k_err(k_str("invalid base64: length not a multiple of 4"));
+    unsigned char* out = k_alloc(rn / 4 * 3 + 1);
+    size_t o = 0;
+    for (size_t i = 0; i < rn; i += 4) {
+        int pad = 0;
+        for (int k = 0; k < 4; k++) if (raw[i + k] == '=') pad++;
+        if (pad > 2) return k_err(k_str("invalid base64: too much padding"));
+        unsigned int x = 0;
+        for (int k = 0; k < 4; k++) {
+            int v;
+            if (raw[i + k] == '=') {
+                if (k < 4 - pad) return k_err(k_str("invalid base64: misplaced padding"));
+                v = 0;
+            } else {
+                v = k_b64val(raw[i + k]);
+                if (v < 0) return k_err(k_str("invalid base64: bad character"));
+            }
+            x = (x << 6) | (unsigned int)v;
+        }
+        out[o++] = (unsigned char)(x >> 16 & 0xFF);
+        if (pad < 2) out[o++] = (unsigned char)(x >> 8 & 0xFF);
+        if (pad < 1) out[o++] = (unsigned char)(x & 0xFF);
+    }
+    if (!k_valid_utf8(out, o)) return k_err(k_str("decoded bytes are not valid UTF-8"));
+    out[o] = 0;
+    return k_ok(k_str((char*)out));
+}
+static KValue k_hex_encode(KValue sv) {
+    const unsigned char* s = (const unsigned char*)sv.as.s;
+    size_t n = strlen(sv.as.s);
+    const char* H = "0123456789abcdef";
+    char* out = k_alloc(n * 2 + 1);
+    for (size_t i = 0; i < n; i++) { out[2 * i] = H[s[i] >> 4]; out[2 * i + 1] = H[s[i] & 0xF]; }
+    out[n * 2] = 0;
+    return k_str(out);
+}
+static KValue k_hex_decode(KValue sv) {
+    const char* s = sv.as.s;
+    size_t n = strlen(s);
+    if (n % 2 != 0) return k_err(k_str("invalid hex: odd length"));
+    unsigned char* out = k_alloc(n / 2 + 1);
+    for (size_t i = 0; i < n; i += 2) {
+        int hi = -1, lo = -1;
+        char a = s[i], b = s[i + 1];
+        if (a >= '0' && a <= '9') hi = a - '0'; else if (a >= 'a' && a <= 'f') hi = a - 'a' + 10; else if (a >= 'A' && a <= 'F') hi = a - 'A' + 10;
+        if (b >= '0' && b <= '9') lo = b - '0'; else if (b >= 'a' && b <= 'f') lo = b - 'a' + 10; else if (b >= 'A' && b <= 'F') lo = b - 'A' + 10;
+        if (hi < 0 || lo < 0) return k_err(k_str("invalid hex: bad digit"));
+        out[i / 2] = (unsigned char)((hi << 4) | lo);
+    }
+    if (!k_valid_utf8(out, n / 2)) return k_err(k_str("decoded bytes are not valid UTF-8"));
+    out[n / 2] = 0;
+    return k_ok(k_str((char*)out));
+}
+static KValue k_hash_fnv(KValue sv) {
+    const unsigned char* s = (const unsigned char*)sv.as.s;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; s[i]; i++) { h ^= s[i]; h *= 0x100000001b3ULL; }
+    return k_int((int64_t)h);
 }
 
 /* ---- time/date; mirrors interp::time / src/time.rs exactly ---- */

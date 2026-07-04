@@ -1075,6 +1075,11 @@ impl<'s> FnCompiler<'s> {
                 ("second_of", 1) => Some(BUILTIN_SECOND_OF),
                 ("weekday_of", 1) => Some(BUILTIN_WEEKDAY_OF),
                 ("now", 0) => Some(BUILTIN_NOW),
+                ("base64_encode", 1) => Some(BUILTIN_BASE64_ENCODE),
+                ("base64_decode", 1) => Some(BUILTIN_BASE64_DECODE),
+                ("hex_encode", 1) => Some(BUILTIN_HEX_ENCODE),
+                ("hex_decode", 1) => Some(BUILTIN_HEX_DECODE),
+                ("hash_fnv", 1) => Some(BUILTIN_HASH_FNV),
                 _ => None,
             };
             if let Some(which) = builtin {

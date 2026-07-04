@@ -199,6 +199,11 @@ pub const BUILTIN_MINUTE_OF: u8 = 34;
 pub const BUILTIN_SECOND_OF: u8 = 35;
 pub const BUILTIN_WEEKDAY_OF: u8 = 36;
 pub const BUILTIN_NOW: u8 = 37;
+pub const BUILTIN_BASE64_ENCODE: u8 = 38;
+pub const BUILTIN_BASE64_DECODE: u8 = 39;
+pub const BUILTIN_HEX_ENCODE: u8 = 40;
+pub const BUILTIN_HEX_DECODE: u8 = 41;
+pub const BUILTIN_HASH_FNV: u8 = 42;
 
 impl Module {
     pub fn disassemble(&self) -> String {

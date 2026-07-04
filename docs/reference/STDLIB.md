@@ -36,6 +36,9 @@ unless supervised.
 | `year_of/month_of/day_of(epoch)` | `(Int) -> Int` | UTC calendar fields; pure |
 | `hour_of/minute_of/second_of(epoch)` | `(Int) -> Int` | UTC time fields; pure |
 | `weekday_of(epoch)` | `(Int) -> Int` | 0 = Sunday … 6 = Saturday; pure |
+| `base64_encode(s)` / `hex_encode(s)` | `(Str) -> Str` | encode the UTF-8 bytes; pure |
+| `base64_decode(s)` / `hex_decode(s)` | `(Str) -> Result[Str, Str]` | `Err` on malformed input or non-UTF-8 |
+| `hash_fnv(s)` | `(Str) -> Int` | FNV-1a 64-bit; stable, non-cryptographic |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
 | `re_match(pat, text)` | `(Str, Str) -> Bool` | regex search (`^…$` for full match) |
@@ -67,6 +70,12 @@ clear message. Not yet on the native backend (`kupl run`/`--vm`/`bundle`).
 (correct for negative/pre-1970 timestamps), byte-identical on every engine
 including native. Only `now()` reads the wall clock — it carries the `io.time`
 effect and is non-deterministic. No locale or leap seconds.
+
+**Encodings** (`base64_*`, `hex_*`, `hash_fnv`) are pure and byte-identical on
+every engine including native. They work on the string's UTF-8 bytes; `*_decode`
+returns `Err` on malformed input or if the decoded bytes are not valid UTF-8.
+`hash_fnv` is deterministic and stable across runs and engines — good for
+bucketing/sharding, not for security.
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

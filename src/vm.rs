@@ -620,6 +620,20 @@ impl<'m> Vm<'m> {
                             }
                         }
                         BUILTIN_NOW => set!(dst, Value::Int(crate::interp::now_seconds())),
+                        BUILTIN_BASE64_ENCODE | BUILTIN_BASE64_DECODE | BUILTIN_HEX_ENCODE
+                        | BUILTIN_HEX_DECODE | BUILTIN_HASH_FNV => {
+                            let name = match which {
+                                BUILTIN_BASE64_ENCODE => "base64_encode",
+                                BUILTIN_BASE64_DECODE => "base64_decode",
+                                BUILTIN_HEX_ENCODE => "hex_encode",
+                                BUILTIN_HEX_DECODE => "hex_decode",
+                                _ => "hash_fnv",
+                            };
+                            match crate::interp::encoding_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1165,6 +1179,34 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_encoding_it23() {
+        // known vectors, identical on both engines
+        assert_eq!(differential("fun probe() -> Str {\n    base64_encode(\"hello\")\n}\n"), "aGVsbG8=");
+        assert_eq!(differential("fun probe() -> Str {\n    hex_encode(\"AB\")\n}\n"), "4142");
+        // round-trips
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    match base64_decode(base64_encode(\"the quick brown fox\")) {\n        Ok(s) => s == \"the quick brown fox\"\n        Err(_) => false\n    }\n}\n"),
+            "true"
+        );
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    match hex_decode(hex_encode(\"KUPL\")) {\n        Ok(s) => s == \"KUPL\"\n        Err(_) => false\n    }\n}\n"),
+            "true"
+        );
+        // FNV is stable and equal across engines
+        assert_eq!(differential("fun probe() -> Int {\n    hash_fnv(\"foobar\")\n}\n"), (0x85944171f73967e8u64 as i64).to_string());
+        assert_eq!(differential("fun probe() -> Bool {\n    hash_fnv(\"a\") == hash_fnv(\"a\")\n}\n"), "true");
+        // invalid input → Err on both engines
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    match hex_decode(\"zz\") {\n        Ok(_) => false\n        Err(_) => true\n    }\n}\n"),
+            "true"
+        );
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    match base64_decode(\"abc\") {\n        Ok(_) => false\n        Err(_) => true\n    }\n}\n"),
+            "true"
+        );
     }
 
     #[test]

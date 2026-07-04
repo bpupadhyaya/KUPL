@@ -1494,6 +1494,21 @@ impl Checker {
                     return Ty::Int;
                 }
                 ("now", 0) => return Ty::Int,
+                ("base64_encode", 1) | ("hex_encode", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "encode argument");
+                    return Ty::Str;
+                }
+                ("base64_decode", 1) | ("hex_decode", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "decode argument");
+                    return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
+                ("hash_fnv", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "hash_fnv argument");
+                    return Ty::Int;
+                }
                 ("eprint", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Unit;
