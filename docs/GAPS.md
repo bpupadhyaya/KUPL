@@ -12,10 +12,8 @@ components) are complete as of it40. Remaining work, ranked by value ÷ effort:
 1. ~~**Native `f32`**~~ — DONE (it42). K_F32 KValue + shortest-round-trip
    display via `strtof`; examples/sized.kupl is fully native. Native numeric
    surface complete (only ai/JSON/CSV/HTTP builtins defer).
-2. **Native JSON** (`json_parse`/`json_stringify` in C) — JSON is core to "any
-   software"; recursive `Ctor` construction already works natively, so this is
-   mostly porting `src/json.rs`'s parser/serializer to the C runtime. Lets
-   compiled binaries do JSON without falling back to `bundle`.
+2. ~~**Native JSON**~~ — DONE (it43). json_parse + json_stringify ported to the
+   C runtime, byte-identical to src/json.rs; examples/json.kupl is fully native.
 3. **LSP hover / completion / go-to-definition** — diagnostics ship today; this
    is the biggest IDE-parity gap vs Swift/Kotlin/Rust and a high-visibility win.
 4. **Flagship "any software" example(s)** — a non-trivial end-to-end program
@@ -111,9 +109,9 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 - [x] **JSON** (it15) — built-in recursive `Json` ADT (via a prelude) +
       `json_parse` / `json_stringify` (pure). Round-trips are stable (key order
       preserved, ints without `.0`). Pairs with file I/O and the AI-native core.
-      Interp + KVM + `.kx` + bundle byte-identical; native reports a clear
-      "not yet supported" error (recursive ctor construction in C deferred).
-      Confirmed recursive ADTs work end-to-end. (`examples/json.kupl`)
+      Interp + KVM + `.kx` + bundle byte-identical; **native too (it43)** — the
+      parser/serializer are ported to the C runtime, so compiled binaries do
+      JSON. Confirmed recursive ADTs work end-to-end. (`examples/json.kupl`)
 - [x] **Environment & process** (it16) — `args()` (command-line arguments),
       `env_var(name) -> Option[Str]`, `eprint` (stderr), `exit(code)`. With file
       I/O + JSON, KUPL can now write real CLI tools. `args`/`env_var` carry the

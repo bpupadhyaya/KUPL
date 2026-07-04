@@ -64,7 +64,10 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             if names.is_empty() { "0".to_string() } else { names.join(", ") }
         );
     }
-    let _ = writeln!(out, "}};\n#define N_CTORS {}\n", module.ctors.len());
+    let _ = writeln!(out, "}};\n#define N_CTORS {}", module.ctors.len());
+    // runtime-visible count for k_ctor_by_name (the #define is out of scope in
+    // the RUNTIME text, which comes earlier in the output)
+    let _ = writeln!(out, "const int K_NCTORS = {};\n", module.ctors.len());
 
     // component metadata: per-component handler + timer tables, then COMPS[]
     for (ci, c) in module.components.iter().enumerate() {
@@ -268,12 +271,9 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_APPEND_FILE => format!("regs[{dst}] = k_write_file(regs[{start}], regs[{start}+1], 1); (void){argc};"),
             BUILTIN_DELETE_FILE => format!("regs[{dst}] = k_delete_file(regs[{start}]); (void){argc};"),
             BUILTIN_FILE_EXISTS => format!("regs[{dst}] = k_file_exists(regs[{start}]); (void){argc};"),
-            BUILTIN_JSON_PARSE | BUILTIN_JSON_STRINGIFY => {
-                return Err(
-                    "json_parse/json_stringify are not yet supported by the native backend \
-                     — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
-                        .into(),
-                )
+            BUILTIN_JSON_PARSE => format!("regs[{dst}] = k_json_parse(regs[{start}]); (void){argc};"),
+            BUILTIN_JSON_STRINGIFY => {
+                format!("regs[{dst}] = k_json_stringify(regs[{start}]); (void){argc};")
             }
             BUILTIN_HTTP_GET | BUILTIN_HTTP_POST => {
                 return Err(
@@ -1050,6 +1050,195 @@ static KValue k_some(KValue v) { return k_ctor(0, &v, 1); }        /* ctor table
 static KValue k_none(void) { return k_ctor(1, 0, 0); }
 static KValue k_ok(KValue v) { return k_ctor(2, &v, 1); }
 static KValue k_err(KValue v) { return k_ctor(3, &v, 1); }
+
+/* ---- JSON (mirrors src/json.rs byte-for-byte) ---- */
+extern const int K_NCTORS;
+static int k_ctor_by_name(const char* variant) {
+    for (int i = 0; i < K_NCTORS; i++)
+        if (!strcmp(CTORS[i].variant, variant)) return i;
+    k_panic("unknown Json constructor"); return 0;
+}
+static KValue k_jc_(const char* name, KValue* fields, int n);
+static void kb_putc(KBuf* b, char c) { char s[2] = { c, 0 }; kb_puts(b, s); }
+static void kb_putcp(KBuf* b, unsigned int cp) {   /* UTF-8 encode a code point */
+    if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;  /* lone surrogate -> replacement */
+    if (cp < 0x80) kb_putc(b, (char)cp);
+    else if (cp < 0x800) { kb_putc(b, (char)(0xC0 | (cp >> 6))); kb_putc(b, (char)(0x80 | (cp & 0x3F))); }
+    else { kb_putc(b, (char)(0xE0 | (cp >> 12))); kb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3F))); kb_putc(b, (char)(0x80 | (cp & 0x3F))); }
+}
+
+/* --- serialize (mirror json.rs write_value/format_num/write_string) --- */
+static void k_json_num(KBuf* b, double n) {
+    if (isfinite(n) && n == floor(n) && fabs(n) < 1e15) {
+        char t[32]; snprintf(t, sizeof t, "%lld", (long long)n); kb_puts(b, t);
+    } else {  /* n.to_string(): shortest round-trip */
+        char t[64];
+        for (int p = 1; p <= 17; p++) { snprintf(t, sizeof t, "%.*g", p, n); if (strtod(t, 0) == n) break; }
+        kb_puts(b, t);
+    }
+}
+static void k_json_str(KBuf* b, const char* s) {
+    kb_putc(b, '"');
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        unsigned char c = *p;
+        if (c == '"') kb_puts(b, "\\\"");
+        else if (c == '\\') kb_puts(b, "\\\\");
+        else if (c == '\n') kb_puts(b, "\\n");
+        else if (c == '\t') kb_puts(b, "\\t");
+        else if (c == '\r') kb_puts(b, "\\r");
+        else if (c == 0x08) kb_puts(b, "\\b");
+        else if (c == 0x0C) kb_puts(b, "\\f");
+        else if (c < 0x20) { char t[8]; snprintf(t, sizeof t, "\\u%04x", c); kb_puts(b, t); }
+        else kb_putc(b, (char)c);
+    }
+    kb_putc(b, '"');
+}
+static void k_json_write(KBuf* b, KValue v) {
+    if (v.tag != K_CTOR) k_panic("json_stringify needs a Json value");
+    const char* var = CTORS[v.as.ctor->ctor].variant;
+    KValue* f = v.as.ctor->fields;
+    if (!strcmp(var, "JNull")) kb_puts(b, "null");
+    else if (!strcmp(var, "JBool")) kb_puts(b, f[0].as.b ? "true" : "false");
+    else if (!strcmp(var, "JNum")) k_json_num(b, f[0].as.f);
+    else if (!strcmp(var, "JStr")) k_json_str(b, f[0].as.s);
+    else if (!strcmp(var, "JArr")) {
+        kb_putc(b, '[');
+        KList* l = f[0].as.list;
+        for (int64_t i = 0; i < l->len; i++) { if (i) kb_putc(b, ','); k_json_write(b, l->items[i]); }
+        kb_putc(b, ']');
+    } else if (!strcmp(var, "JObj")) {
+        kb_putc(b, '{');
+        KMap* m = f[0].as.map;
+        for (int64_t i = 0; i < m->len; i++) { if (i) kb_putc(b, ','); k_json_str(b, m->keys[i].as.s); kb_putc(b, ':'); k_json_write(b, m->vals[i]); }
+        kb_putc(b, '}');
+    } else k_panic("not a Json constructor");
+}
+static KValue k_json_stringify(KValue v) {
+    KBuf b = { 0, 0, 0 }; k_json_write(&b, v);
+    return k_str(b.buf ? b.buf : (char*)"");
+}
+
+/* --- parse (mirror json.rs Parser); build Json ctors, wrap in Ok/Err --- */
+typedef struct { const unsigned char* s; long pos, len; int failed; } KJP;
+static KValue kjp_value(KJP* p);
+static void kjp_ws(KJP* p) { while (p->pos < p->len) { unsigned char c = p->s[p->pos]; if (c==' '||c=='\t'||c=='\n'||c=='\r') p->pos++; else break; } }
+static int kjp_peek(KJP* p) { return p->pos < p->len ? p->s[p->pos] : -1; }
+static char* kjp_string(KJP* p) {  /* assumes current char is the opening quote */
+    p->pos++;
+    KBuf b = { 0, 0, 0 };
+    for (;;) {
+        if (p->pos >= p->len) { p->failed = 1; break; }
+        int c = p->s[p->pos++];
+        if (c == '"') break;
+        if (c == '\\') {
+            if (p->pos >= p->len) { p->failed = 1; break; }
+            int e = p->s[p->pos++];
+            if (e == '"') kb_putc(&b, '"');
+            else if (e == '\\') kb_putc(&b, '\\');
+            else if (e == '/') kb_putc(&b, '/');
+            else if (e == 'n') kb_putc(&b, '\n');
+            else if (e == 't') kb_putc(&b, '\t');
+            else if (e == 'r') kb_putc(&b, '\r');
+            else if (e == 'b') kb_putc(&b, 0x08);
+            else if (e == 'f') kb_putc(&b, 0x0C);
+            else if (e == 'u') {
+                unsigned int code = 0; int bad = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (p->pos >= p->len) { bad = 1; break; }
+                    int d = p->s[p->pos++];
+                    int hv = (d>='0'&&d<='9')?d-'0':(d>='a'&&d<='f')?d-'a'+10:(d>='A'&&d<='F')?d-'A'+10:-1;
+                    if (hv < 0) { bad = 1; break; }
+                    code = code * 16 + hv;
+                }
+                if (bad) { p->failed = 1; break; }
+                kb_putcp(&b, code);
+            } else { p->failed = 1; break; }
+        } else kb_putc(&b, (char)c);
+    }
+    return b.buf ? b.buf : (char*)"";
+}
+static KValue kjp_number(KJP* p) {
+    long start = p->pos;
+    if (kjp_peek(p) == '-') p->pos++;
+    while (p->pos < p->len) { unsigned char c = p->s[p->pos]; if ((c>='0'&&c<='9')||c=='.'||c=='e'||c=='E'||c=='+'||c=='-') p->pos++; else break; }
+    char buf[64]; long n = p->pos - start; if (n >= (long)sizeof buf) n = sizeof buf - 1;
+    memcpy(buf, p->s + start, n); buf[n] = 0;
+    char* end; double d = strtod(buf, &end);
+    if (end == buf || *end != 0) { p->failed = 1; return k_unit(); }
+    KValue f = k_float(d); return k_jc_("JNum", &f, 1);
+}
+static KValue k_jc_(const char* name, KValue* fields, int n) { return k_ctor(k_ctor_by_name(name), fields, n); }
+static KValue kjp_array(KJP* p) {
+    p->pos++;  /* '[' */
+    KValue items[4096]; int n = 0;
+    kjp_ws(p);
+    if (kjp_peek(p) == ']') { p->pos++; KValue l = k_list(items, 0); return k_jc_("JArr", &l, 1); }
+    for (;;) {
+        if (n >= 4096) { p->failed = 1; break; }
+        items[n++] = kjp_value(p);
+        if (p->failed) break;
+        kjp_ws(p);
+        int c = p->pos < p->len ? p->s[p->pos++] : -1;
+        if (c == ',') continue;
+        if (c == ']') break;
+        p->failed = 1; break;
+    }
+    KValue l = k_list(items, n);
+    return k_jc_("JArr", &l, 1);
+}
+static KValue kjp_object(KJP* p) {
+    p->pos++;  /* '{' */
+    KValue keys[4096], vals[4096]; int n = 0;
+    kjp_ws(p);
+    if (kjp_peek(p) == '}') { p->pos++; KMap* m = k_alloc(sizeof(KMap)); m->len = 0; m->keys = k_alloc(1); m->vals = k_alloc(1); KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1); }
+    for (;;) {
+        kjp_ws(p);
+        if (kjp_peek(p) != '"') { p->failed = 1; break; }
+        char* key = kjp_string(p);
+        if (p->failed) break;
+        kjp_ws(p);
+        if (!(p->pos < p->len && p->s[p->pos++] == ':')) { p->failed = 1; break; }
+        KValue val = kjp_value(p);
+        if (p->failed) break;
+        KValue kv = k_str(key);
+        int found = -1;
+        for (int i = 0; i < n; i++) if (!strcmp(keys[i].as.s, key)) { found = i; break; }
+        if (found >= 0) vals[found] = val;
+        else if (n < 4096) { keys[n] = kv; vals[n] = val; n++; }
+        else { p->failed = 1; break; }
+        kjp_ws(p);
+        int c = p->pos < p->len ? p->s[p->pos++] : -1;
+        if (c == ',') continue;
+        if (c == '}') break;
+        p->failed = 1; break;
+    }
+    KMap* m = k_alloc(sizeof(KMap));
+    m->len = n; m->keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n)); m->vals = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    memcpy(m->keys, keys, sizeof(KValue) * n); memcpy(m->vals, vals, sizeof(KValue) * n);
+    KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1);
+}
+static KValue kjp_value(KJP* p) {
+    kjp_ws(p);
+    int c = kjp_peek(p);
+    if (c == '{') return kjp_object(p);
+    if (c == '[') return kjp_array(p);
+    if (c == '"') { char* s = kjp_string(p); KValue sv = k_str(s); return k_jc_("JStr", &sv, 1); }
+    if (c == 't') { if (p->pos+4<=p->len && !memcmp(p->s+p->pos,"true",4)) { p->pos+=4; KValue b=k_bool(1); return k_jc_("JBool",&b,1);} p->failed=1; return k_unit(); }
+    if (c == 'f') { if (p->pos+5<=p->len && !memcmp(p->s+p->pos,"false",5)) { p->pos+=5; KValue b=k_bool(0); return k_jc_("JBool",&b,1);} p->failed=1; return k_unit(); }
+    if (c == 'n') { if (p->pos+4<=p->len && !memcmp(p->s+p->pos,"null",4)) { p->pos+=4; return k_jc_("JNull",0,0);} p->failed=1; return k_unit(); }
+    if (c == '-' || (c >= '0' && c <= '9')) return kjp_number(p);
+    p->failed = 1; return k_unit();
+}
+static KValue k_json_parse(KValue s) {
+    if (s.tag != K_STR) { const char* d = k_show(s); (void)d; }
+    const char* str = (s.tag == K_STR) ? s.as.s : k_show(s);
+    KJP p; p.s = (const unsigned char*)str; p.pos = 0; p.len = (long)strlen(str); p.failed = 0;
+    kjp_ws(&p);
+    KValue v = kjp_value(&p);
+    kjp_ws(&p);
+    if (p.failed || p.pos != p.len) return k_err(k_str("invalid JSON"));
+    return k_ok(v);
+}
 
 /* ---- file I/O builtins (effect io.fs); mirror interp::fs_builtin.
    The Ok/Err *structure* matches every engine; the Err message text is a
@@ -2600,6 +2789,39 @@ mod tests {
         ] {
             assert_eq!(native_main_stdout(src, "f32"), expected, "src: {src}");
         }
+    }
+
+    /// JSON compiles to native: stringify (canonical form, whole numbers without
+    /// `.0`, string escapes) and parse (round-trip, error handling) == interp.
+    #[test]
+    fn native_json() {
+        if !cc_available() {
+            return;
+        }
+        // stringify: key order preserved, whole floats as ints, escapes
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io { print(json_stringify(JObj(Map().insert(\"b\", JNum(1.0)).insert(\"a\", JArr([JBool(true), JNull, JNum(2.5)]))))) }",
+                "js"
+            ),
+            "{\"b\":1,\"a\":[true,null,2.5]}\n"
+        );
+        // round-trip parse -> stringify (match arms need newlines)
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io {\n    match json_parse(\"[1, 2.0, 2.5, \\\"x\\\"]\") {\n        Ok(j) => print(json_stringify(j))\n        Err(e) => print(e)\n    }\n}\n",
+                "jp"
+            ),
+            "[1,2,2.5,\"x\"]\n"
+        );
+        // malformed input is an Err, never a crash
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io {\n    match json_parse(\"[1, 2\") {\n        Ok(_) => print(\"bad\")\n        Err(_) => print(\"handled\")\n    }\n}\n",
+                "je"
+            ),
+            "handled\n"
+        );
     }
 
     /// Direct cross-component expose calls compile to native and dispatch to the
