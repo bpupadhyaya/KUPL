@@ -349,3 +349,13 @@ the instance's state.
 | `0..5`, `0..=5` | `0..5`, `0..=5` |
 | tensors | `Tensor([0.0, 1.0])` |
 | functions, instances | `<fn>`, `<component #0>` |
+
+
+## Parallelism
+
+`list.par_map(f)` is semantically identical to `list.map(f)` — same results, same
+order. When `f` is a **pure** top-level function (no effects) and the list is
+large (≥ 256 elements), it runs across real OS threads; otherwise it evaluates
+sequentially. Because a pure function can't observe I/O, the clock, randomness,
+or shared state, and results are placed by input index, the output is
+deterministic and byte-for-byte identical whether it ran on one thread or many.

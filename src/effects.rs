@@ -146,6 +146,78 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
     diags
 }
 
+/// Infer the transitive effect set of every function (keyed as in
+/// `check_effects`: top-level name, or `Component.fun`). Exposed so other passes
+/// (e.g. the parallel scheduler) can ask which functions are pure.
+pub fn infer_effects(program: &Program) -> HashMap<String, EffectSet> {
+    // key -> (decl body, owning component)
+    let mut funs: HashMap<String, (&FunDecl, Option<&str>)> = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Fun(f) => {
+                funs.insert(fun_key(None, &f.name), (f, None));
+            }
+            Item::Component(c) => {
+                for f in &c.exposes {
+                    funs.insert(fun_key(Some(&c.name), &f.name), (f, Some(c.name.as_str())));
+                }
+                for f in &c.funs {
+                    funs.insert(fun_key(Some(&c.name), &f.name), (f, Some(c.name.as_str())));
+                }
+            }
+            Item::Type(_) | Item::Contract(_) | Item::Law(_) => {}
+        }
+    }
+
+    let mut direct: HashMap<String, EffectSet> = HashMap::new();
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, (decl, component)) in &funs {
+        let mut eff = EffectSet::new();
+        let mut calls = Vec::new();
+        if decl.ai.is_some() {
+            eff.insert("ai".to_string());
+        }
+        walk_block(&decl.body, &mut |expr| {
+            collect_expr(expr, *component, &funs, &mut eff, &mut calls);
+        });
+        direct.insert(key.clone(), eff);
+        edges.insert(key.clone(), calls);
+    }
+
+    let mut inferred = direct;
+    loop {
+        let mut changed = false;
+        for (key, callees) in &edges {
+            let mut acc = inferred.get(key).cloned().unwrap_or_default();
+            let before = acc.len();
+            for callee in callees {
+                if let Some(ce) = inferred.get(callee) {
+                    acc.extend(ce.iter().cloned());
+                }
+            }
+            if acc.len() != before {
+                changed = true;
+            }
+            inferred.insert(key.clone(), acc);
+        }
+        if !changed {
+            break;
+        }
+    }
+    inferred
+}
+
+/// Top-level functions with NO inferred effects — referentially transparent, so
+/// safe to evaluate on a worker thread. Component methods are excluded (they can
+/// touch instance state); only bare `fun` names are returned.
+pub fn pure_funs(program: &Program) -> std::collections::HashSet<String> {
+    infer_effects(program)
+        .into_iter()
+        .filter(|(key, eff)| eff.is_empty() && !key.contains('.'))
+        .map(|(key, _)| key)
+        .collect()
+}
+
 /// `db` covers `db` and `db.read`; `db.read` covers only `db.read`.
 fn covers(declared: &str, used: &str) -> bool {
     used == declared || used.starts_with(&format!("{declared}."))

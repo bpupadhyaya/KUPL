@@ -1,3 +1,15 @@
+> **Progress:** slice 1 landed (it33) — real-thread `par_map` for PURE named
+> functions over lists ≥ 256 elements. A new `src/parallel.rs` (PortableValue
+> Send boundary + ProgramImage + try_par_map with std::thread::scope) runs the
+> callback across worker threads, placing results by input index so the output
+> is byte-identical to the sequential `map`. Effects gained `infer_effects` /
+> `pure_funs`. Wired into the INTERPRETER; the KVM stays sequential, so the
+> differential harness (interp-parallel vs KVM-sequential) proves byte-identity
+> on every run. Anything non-qualifying (impure/closure callback, small list,
+> non-portable element) falls back to the unchanged sequential path. Deferred to
+> slice 2: wiring the VM's own fast path, par_filter/par_each/par{}, threshold
+> tuning.
+
 # Big-arc design: Real-thread concurrency for par { } and par_map/par_filter
 
 **Feasibility:** high · **Risk:** medium · **Estimated effort:** ~5 /loop iterations

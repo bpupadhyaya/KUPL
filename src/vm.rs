@@ -1201,6 +1201,62 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
     }
 
+    // helper: source that builds List[Int] = [0, 1, …, n-1] via a loop
+    #[cfg(test)]
+    const MK: &str = "fun mk(n: Int) -> List[Int] {\n    \
+                      var xs: List[Int] = []\n    var i = 0\n    \
+                      while i < n {\n        xs = xs.push(i)\n        i = i + 1\n    }\n    xs\n}\n";
+
+    #[test]
+    fn diff_par_map_pure_it33() {
+        // A pure named fn over a list crossing the 256 threshold takes the
+        // real-thread path in the interpreter; the KVM computes it sequentially.
+        // The differential assert proves the parallel result is byte-identical.
+        let src = format!(
+            "{MK}fun dbl(n: Int) -> Int {{\n    n * 2 + 1\n}}\n\
+             fun probe() -> Int {{\n    mk(1000).par_map(dbl).sum()\n}}\n"
+        );
+        // sum of (2i+1) for i in 0..1000 = 2*(0+..+999) + 1000 = 999000 + 1000
+        assert_eq!(differential(&src), "1000000");
+
+        // heavier pure fn (a loop) over a big list — actually exercises workers
+        let heavy = format!(
+            "{MK}fun work(n: Int) -> Int {{\n    var acc = 0\n    \
+             for i in 0..100 {{\n        acc = acc + (n % (i + 1))\n    }}\n    acc\n}}\n\
+             fun probe() -> Int {{\n    mk(500).par_map(work).sum()\n}}\n"
+        );
+        // differential() asserts interp==KVM internally
+        let _ = differential(&heavy);
+
+        // ordering: probe RETURNS the mapped list, so its string encodes order —
+        // the differential assert catches any mis-ordering of the parallel result
+        let ordered = format!(
+            "{MK}fun tag(n: Int) -> Int {{\n    n * 1000 + n\n}}\n\
+             fun probe() -> List[Int] {{\n    mk(300).par_map(tag)\n}}\n"
+        );
+        let s = differential(&ordered);
+        assert!(s.starts_with("[0, 1001, 2002,"), "ordered head: {s}");
+        assert!(s.ends_with("298298, 299299]"), "ordered tail: {s}");
+    }
+
+    #[test]
+    fn diff_par_map_impure_stays_sequential_it33() {
+        // a closure (non-named) callback cannot take the thread path — but the
+        // OUTPUT must still be identical interp vs KVM (sequential fallback).
+        let lambda = format!(
+            "{MK}fun probe() -> Int {{\n    mk(400).par_map(fn n {{ n + 1 }}).sum()\n}}\n"
+        );
+        // sum of (i+1) for i in 0..400 = (0+..+399) + 400 = 79800 + 400 = 80200
+        assert_eq!(differential(&lambda), "80200");
+
+        // below threshold stays sequential; still identical
+        let small = format!(
+            "{MK}fun dbl(n: Int) -> Int {{\n    n * 2\n}}\n\
+             fun probe() -> Int {{\n    mk(10).par_map(dbl).sum()\n}}\n"
+        );
+        assert_eq!(differential(&small), "90");
+    }
+
     #[test]
     fn diff_sized_methods_it29() {
         // wrapping

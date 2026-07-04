@@ -66,11 +66,16 @@ C++/Swift/Kotlin. Concurrency is the #1 gap for the "universal, any software"
 claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 
 - [◐] **Concurrency / parallelism** (audit #1) — **`par { … }` fork-join
-      (it11) + parallel iteration `par_map`/`par_filter`/`par_each` (it13)**:
-      fixed-branch and dynamic-collection parallel work, both deterministic and
-      byte-identical on all engines (incl. native). The language seam where a
-      real scheduler plugs in is now complete. Still open: a multi-threaded/
-      work-stealing scheduler (execute on OS threads — needs Arc-based values),
+      (it11) + parallel iteration `par_map`/`par_filter`/`par_each` (it13), and
+      as of it33 REAL OS-THREAD execution for `par_map` with a pure named
+      callback over lists ≥ 256 elements** (`src/parallel.rs`: a `PortableValue`
+      Send boundary + a Send+Sync `ProgramImage` + `std::thread::scope`; results
+      placed by input index so the output is byte-identical to sequential
+      `map`). Everything else still evaluates sequentially (deterministic,
+      byte-identical on all engines incl. native). Wired into the interpreter;
+      the KVM stays the sequential reference, so the differential harness proves
+      byte-identity every run. Still open: the VM-side fast path, extending real
+      threads to `par_filter`/`par_each`/`par{}`, a work-stealing scheduler,
       async I/O, and `await` actually suspending (evaluates synchronously
       today). Virtual clock (it9) preserved for deterministic tests.
 - [x] **File I/O** (it14) — `read_file`/`write_file`/`append_file`/`delete_file`

@@ -33,6 +33,8 @@ pub struct ProgramDb {
     pub ai_funs: HashMap<String, Rc<crate::ai::AiFunMeta>>,
     /// type name -> variants (for `forall` value generation).
     pub type_variants: crate::prop::TypeDb,
+    /// top-level function names with no effects — safe to run on worker threads.
+    pub pure_funs: std::collections::HashSet<String>,
 }
 
 impl ProgramDb {
@@ -81,7 +83,8 @@ impl ProgramDb {
                 type_variants.insert(t.name.clone(), variants);
             }
         }
-        ProgramDb { funs, components, contracts, ctors, ai_funs, type_variants }
+        let pure_funs = crate::effects::pure_funs(program);
+        ProgramDb { funs, components, contracts, ctors, ai_funs, type_variants, pure_funs }
     }
 }
 
@@ -120,10 +123,14 @@ pub struct Interp {
     /// The virtual clock (milliseconds). Advanced explicitly — never wall-clock,
     /// so timer-driven behavior is deterministic and reproducible.
     pub now: i64,
+    /// Send+Sync program snapshot enabling the real-thread `par_map` fast path.
+    /// `None` on worker interps (they stay sequential — no nested threading).
+    pub image: Option<std::sync::Arc<crate::parallel::ProgramImage>>,
 }
 
 impl Interp {
     pub fn new(db: ProgramDb) -> Interp {
+        let image = Some(crate::parallel::ProgramImage::from_db(&db));
         Interp {
             db,
             instances: Vec::new(),
@@ -132,6 +139,22 @@ impl Interp {
             print_unwired: false,
             globals: Env::new(),
             now: 0,
+            image,
+        }
+    }
+
+    /// A worker interpreter for the parallel fast path: no program image, so its
+    /// own `par_map` calls stay sequential (no nested thread explosion).
+    pub fn new_bare(db: ProgramDb) -> Interp {
+        Interp {
+            db,
+            instances: Vec::new(),
+            queue: VecDeque::new(),
+            current: None,
+            print_unwired: false,
+            globals: Env::new(),
+            now: 0,
+            image: None,
         }
     }
 
@@ -2647,6 +2670,13 @@ fn builtin_method(
     span: Span,
     interp: &mut Interp,
 ) -> EvalResult {
+    // real-thread fast path: `xs.par_map(pure_fn)` over a large list. Falls
+    // through to the sequential shared_method on any non-qualifying call.
+    if let Some(image) = interp.image.clone() {
+        if let Some(res) = crate::parallel::try_par_map(&recv, name, &args, &image) {
+            return res.map_err(|msg| Flow::Panic { msg, span });
+        }
+    }
     let mut call = |f: Value, args: Vec<Value>| -> Result<Value, String> {
         match interp.call_value(f, args, span) {
             Ok(v) => Ok(v),

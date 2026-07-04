@@ -22,6 +22,7 @@ pub mod effects;
 pub mod fmt;
 pub mod vm;
 pub mod interp;
+pub mod parallel;
 pub mod kx;
 pub mod lexer;
 pub mod loader;
