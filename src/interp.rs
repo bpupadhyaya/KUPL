@@ -31,6 +31,8 @@ pub struct ProgramDb {
     pub ctors: HashMap<String, (String, Vec<String>)>,
     /// `ai fun` runtime signatures (from the checker).
     pub ai_funs: HashMap<String, Rc<crate::ai::AiFunMeta>>,
+    /// type name -> variants (for `forall` value generation).
+    pub type_variants: crate::prop::TypeDb,
 }
 
 impl ProgramDb {
@@ -49,7 +51,7 @@ impl ProgramDb {
                 Item::Contract(ct) => {
                     contracts.insert(ct.name.clone(), Rc::new(ct.clone()));
                 }
-                Item::Type(_) => {}
+                Item::Type(_) | Item::Law(_) => {}
             }
         }
         let ctors = checked
@@ -64,7 +66,22 @@ impl ProgramDb {
             .iter()
             .map(|(name, meta)| (name.clone(), Rc::new(meta.clone())))
             .collect();
-        ProgramDb { funs, components, contracts, ctors, ai_funs }
+        let mut type_variants = crate::prop::TypeDb::new();
+        for item in &program.items {
+            if let Item::Type(t) = item {
+                let variants = t
+                    .variants
+                    .iter()
+                    .map(|v| {
+                        let fields =
+                            v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect();
+                        (v.name.clone(), fields)
+                    })
+                    .collect();
+                type_variants.insert(t.name.clone(), variants);
+            }
+        }
+        ProgramDb { funs, components, contracts, ctors, ai_funs, type_variants }
     }
 }
 
@@ -413,8 +430,110 @@ impl Interp {
                 }
                 Ok(Value::Unit)
             }
+            Stmt::Forall { vars, body, span } => self.run_forall(vars, body, *span, env),
             Stmt::Break(_) => Err(Flow::Break),
             Stmt::Continue(_) => Err(Flow::Continue),
+        }
+    }
+
+    /// Run a `forall` property: generate `CASES` deterministic bindings, run the
+    /// body for each, and on the first failure shrink to a minimal counterexample
+    /// and panic with a descriptive message. `expect`-failures and any panic in
+    /// the body both count as a falsifying case.
+    fn run_forall(
+        &mut self,
+        vars: &[(String, TyExpr)],
+        body: &Block,
+        span: Span,
+        env: &Env,
+    ) -> EvalResult {
+        let types = self.db.type_variants.clone();
+        let mut rng = crate::prop::Rng::new(crate::prop::SEED);
+        for _ in 0..crate::prop::CASES {
+            let mut vals = Vec::with_capacity(vars.len());
+            for (_, ty) in vars {
+                match crate::prop::generate(ty, &mut rng, &types, 0) {
+                    Ok(v) => vals.push(v),
+                    Err(e) => return Err(Self::panic_flow(e, span)),
+                }
+            }
+            // if this case fails, shrink and report
+            if self.forall_case(vars, body, &vals, env)?.is_some() {
+                let vals = self.shrink_forall(vars, body, vals, env);
+                let msg = self.forall_case(vars, body, &vals, env)?.unwrap_or_default();
+                let binding: Vec<String> = vars
+                    .iter()
+                    .zip(&vals)
+                    .map(|((n, _), v)| format!("{n} = {}", crate::prop::render(v)))
+                    .collect();
+                let detail = if msg == "expectation failed" || msg.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (panic: {msg})")
+                };
+                return Err(Self::panic_flow(
+                    format!("property failed for {}{}", binding.join(", "), detail),
+                    span,
+                ));
+            }
+        }
+        Ok(Value::Unit)
+    }
+
+    /// Run the body with one binding. `Ok(None)` = passed, `Ok(Some(msg))` =
+    /// failed (msg is the panic message), `Err(flow)` = unexpected control flow.
+    fn forall_case(
+        &mut self,
+        vars: &[(String, TyExpr)],
+        body: &Block,
+        vals: &[Value],
+        env: &Env,
+    ) -> Result<Option<String>, Flow> {
+        let scope = env.child();
+        for ((name, _), v) in vars.iter().zip(vals) {
+            scope.define(name, v.clone());
+        }
+        match self.exec_block(body, &scope) {
+            Ok(_) => Ok(None),
+            Err(Flow::Panic { msg, .. }) => Ok(Some(msg)),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Greedily shrink a failing binding toward a minimal counterexample: for
+    /// each position, try candidate smaller values; keep any that still fails.
+    fn shrink_forall(
+        &mut self,
+        vars: &[(String, TyExpr)],
+        body: &Block,
+        mut vals: Vec<Value>,
+        env: &Env,
+    ) -> Vec<Value> {
+        let mut budget = 1000usize;
+        loop {
+            let mut improved = false;
+            for i in 0..vals.len() {
+                for cand in crate::prop::shrink(&vals[i]) {
+                    if budget == 0 {
+                        return vals;
+                    }
+                    budget -= 1;
+                    let mut trial = vals.clone();
+                    trial[i] = cand;
+                    // a candidate that itself triggers unexpected flow is skipped
+                    if matches!(self.forall_case(vars, body, &trial, env), Ok(Some(_))) {
+                        vals = trial;
+                        improved = true;
+                        break;
+                    }
+                }
+                if improved {
+                    break;
+                }
+            }
+            if !improved {
+                return vals;
+            }
         }
     }
 

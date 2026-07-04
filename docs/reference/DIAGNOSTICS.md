@@ -135,6 +135,7 @@ Severity: **E** = error, **W** = warning.
 |---|---|---|
 | K0801 | E | function too large for KVM v0 (more than 256 registers) |
 | K0803 | E | cannot assign to a lambda-captured variable on the KVM |
+| K0804 | E | `forall` runs only under `kupl test` (interpreter); not compiled to the KVM |
 
 ## K09xx — Runtime
 

@@ -1117,6 +1117,50 @@ fun main() {\n    let c = Cache(store: NotAStore())\n    let _ = c\n}\n";
     }
 
     #[test]
+    fn forall_property_passes_and_fails_with_shrunk_counterexample() {
+        // run a top-level law body on the interpreter and inspect the outcome
+        let run_law = |src: &str| -> Result<(), String> {
+            let compiled = crate::run::compile(src).expect("compiles");
+            let law = compiled
+                .program
+                .items
+                .iter()
+                .find_map(|i| match i {
+                    crate::ast::Item::Law(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .expect("has a law");
+            let db = ProgramDb::build(&compiled.program, &compiled.checked);
+            let mut it = Interp::new(db);
+            let env = it.globals.child();
+            match it.exec_block(&law.body, &env) {
+                Ok(_) => Ok(()),
+                Err(Flow::Panic { msg, .. }) => Err(msg),
+                Err(_) => Err("flow".into()),
+            }
+        };
+
+        // a true property holds across all generated cases
+        run_law("law \"comm\" {\n    forall a: Int, b: Int { expect a + b == b + a }\n}\n")
+            .expect("commutativity holds");
+
+        // a false property fails and shrinks to the minimal counterexample n = 50
+        let err = run_law("law \"small\" {\n    forall n: Int { expect n < 50 }\n}\n")
+            .expect_err("must fail");
+        assert!(err.contains("n = 50"), "expected shrunk counterexample, got: {err}");
+    }
+
+    #[test]
+    fn forall_is_rejected_by_the_kvm_compiler() {
+        // forall is interpreter-only (kupl test); compiling it to the KVM errors
+        let src = "fun probe() -> Int {\n    forall n: Int { expect n >= 0 }\n    0\n}\n";
+        let compiled = crate::run::compile(src).expect("type-checks");
+        let err = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect_err("KVM must reject forall");
+        assert!(err.iter().any(|d| d.code == "K0804"), "{err:?}");
+    }
+
+    #[test]
     fn ai_fun_unknown_tool_is_rejected() {
         let src = "ai fun bad(q: Str) -> Str tools [nope] {\n    intent \"x\"\n}\n";
         let (_, diags) = crate::check::check(&crate::parser::parse(src).0);

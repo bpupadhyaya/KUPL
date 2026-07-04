@@ -47,6 +47,7 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
             Item::Type(t) => (t.name.as_str(), t.span),
             Item::Component(c) => (c.name.as_str(), c.span),
             Item::Contract(ct) => (ct.name.as_str(), ct.span),
+            Item::Law(l) => (l.name.as_str(), l.span),
         })
         .collect();
     let Some(target) = compiled.program.items.iter().find(|item| match item {
@@ -54,6 +55,7 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
         Item::Type(t) => t.name == name,
         Item::Component(c) => c.name == name,
         Item::Contract(ct) => ct.name == name,
+        Item::Law(l) => l.name == name,
     }) else {
         eprintln!("error: no item named `{name}` in {file}");
         return 1;
@@ -135,6 +137,9 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
                 crate::effects::walk_block(&f.body, &mut |e| collect_expr_names(e, &mut note));
             }
         }
+        Item::Law(l) => {
+            crate::effects::walk_block(&l.body, &mut |e| collect_expr_names(e, &mut note));
+        }
     }
 
     let slice = |span: Span| {
@@ -147,6 +152,7 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
         Item::Type(t) => t.span,
         Item::Component(c) => c.span,
         Item::Contract(ct) => ct.span,
+        Item::Law(l) => l.span,
     };
     println!("// kupl context: {name} ({file})");
     println!("{}", slice(target_span));
@@ -561,6 +567,34 @@ pub fn run_tests(path: &str) -> i32 {
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
+
+    // top-level laws (free-standing tests, incl. `forall` properties)
+    for item in &compiled.program.items {
+        let Item::Law(law) = item else { continue };
+        let label = format!("law \"{}\"", law.name);
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let env = interp.globals.child();
+        match interp.exec_block(&law.body, &env) {
+            Ok(_) | Err(Flow::Return(_)) => {
+                println!("ok    {label}");
+                passed += 1;
+            }
+            Err(Flow::Panic { msg, span }) => {
+                let detail = if msg == "expectation failed" {
+                    format!("`{}` was not satisfied", snippet(src, span))
+                } else {
+                    msg
+                };
+                println!("FAIL  {label}: {detail}");
+                failed += 1;
+            }
+            Err(_) => {
+                println!("FAIL  {label}: unexpected control flow");
+                failed += 1;
+            }
+        }
+    }
 
     for item in &compiled.program.items {
         let Item::Component(c) = item else { continue };

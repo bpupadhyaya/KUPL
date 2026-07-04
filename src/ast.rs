@@ -16,6 +16,9 @@ pub enum Item {
     Type(TypeDecl),
     Component(ComponentDecl),
     Contract(ContractDecl),
+    /// A top-level `law "name" { … }` — a free-standing test (property or
+    /// concrete) run by `kupl test`.
+    Law(Law),
 }
 
 /// `contract Store { expose fun get(...) -> ...  law "..." { ... } }`
@@ -257,6 +260,13 @@ pub enum Stmt {
     },
     /// `expect expr` — runtime assertion (the workhorse of laws and tests).
     Expect(Expr, Span),
+    /// `forall x: Int, y: Str { … }` — property-based test: the body runs over
+    /// many generated bindings; a failing case is reported (shrunk).
+    Forall {
+        vars: Vec<(String, TyExpr)>,
+        body: Block,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
 }

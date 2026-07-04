@@ -714,6 +714,16 @@ impl<'s> FnCompiler<'s> {
                 self.emit(Op::EmitOp { port: port_idx, payload }, *span);
                 None
             }
+            Stmt::Forall { span, .. } => {
+                // `forall` is a property-test construct run by the interpreter
+                // (`kupl test`); it is not compiled to the KVM.
+                self.err(
+                    "K0804",
+                    "`forall` runs only under `kupl test` (interpreter); not supported on the KVM",
+                    *span,
+                );
+                None
+            }
         }
     }
 
@@ -1180,6 +1190,18 @@ fn free_vars_stmt(
             free_vars_expr(value, bound, free);
         }
         Stmt::Expr(e) | Stmt::Expect(e, _) => free_vars_expr(e, bound, free),
+        Stmt::Forall { vars, body, .. } => {
+            let mut inner_added = Vec::new();
+            for (n, _) in vars {
+                if bound.insert(n.clone()) {
+                    inner_added.push(n.clone());
+                }
+            }
+            free_vars_block(body, bound, free);
+            for n in inner_added {
+                bound.remove(&n);
+            }
+        }
         Stmt::Return(Some(e), _) => free_vars_expr(e, bound, free),
         Stmt::Return(None, _) => {}
         Stmt::While { cond, body, .. } => {

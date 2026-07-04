@@ -19,6 +19,11 @@ pub fn format_program(p: &Program) -> String {
             Item::Type(t) => fmt_type(&mut out, t),
             Item::Component(c) => fmt_component(&mut out, c),
             Item::Contract(ct) => fmt_contract(&mut out, ct),
+            Item::Law(l) => {
+                out.push_str(&format!("law \"{}\" ", escape_str(&l.name)));
+                fmt_block(&mut out, &l.body, 0);
+                out.push('\n');
+            }
         }
     }
     out
@@ -389,6 +394,12 @@ fn fmt_stmt(out: &mut String, stmt: &Stmt, level: usize) {
         Stmt::Expect(e, _) => {
             out.push_str(&format!("expect {}\n", expr_str(e, 0)));
         }
+        Stmt::Forall { vars, body, .. } => {
+            let bs: Vec<String> = vars.iter().map(|(n, t)| format!("{n}: {}", ty_str(t))).collect();
+            out.push_str(&format!("forall {} ", bs.join(", ")));
+            fmt_block(out, body, level);
+            out.push('\n');
+        }
         Stmt::Break(_) => out.push_str("break\n"),
         Stmt::Continue(_) => out.push_str("continue\n"),
     }
@@ -678,6 +689,13 @@ mod tests {
     fn fmt_idempotent_contract() {
         roundtrip(
             "contract Store {\n intent \"keyed storage\"\n expose fun get(k: Str) -> Option[Str]\n law \"missing is None\" { expect get(\"x\") == None }\n}\ncomponent M fulfills Store {\n intent \"in-memory\"\n expose fun get(k: Str) -> Option[Str] { None }\n}\n",
+        );
+    }
+
+    #[test]
+    fn fmt_idempotent_forall_and_toplevel_law() {
+        roundtrip(
+            "fun id(xs: List[Int]) -> List[Int] {\n    xs\n}\nlaw \"reverse\" {\n    forall xs: List[Int], n: Int {\n        expect id(xs) == xs\n    }\n}\n",
         );
     }
 

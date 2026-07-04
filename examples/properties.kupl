@@ -1,0 +1,45 @@
+// Property-based testing with `forall`. A `forall` generates many values
+// (deterministic seed), runs the body over each, and — on failure — reports
+// the falsifying case, shrunk toward a minimal counterexample.
+//
+// Top-level `law "..." { ... }` blocks are free-standing tests: `kupl test`
+// runs them alongside component `example` blocks and contract laws.
+
+fun reverse2(xs: List[Int]) -> List[Int] {
+    xs.reverse().reverse()
+}
+
+fun abs2(n: Int) -> Int {
+    if n < 0 { 0 - n } else { n }
+}
+
+// A true property: reversing twice is the identity.
+law "reverse is its own inverse" {
+    forall xs: List[Int] {
+        expect reverse2(xs) == xs
+    }
+}
+
+// A true property over two generated values.
+law "addition commutes" {
+    forall a: Int, b: Int {
+        expect a + b == b + a
+    }
+}
+
+// A true property: abs is never negative.
+law "abs is non-negative" {
+    forall n: Int {
+        expect abs2(n) >= 0
+    }
+}
+
+// Properties can also quantify over records and options.
+type Point = { x: Int, y: Int }
+
+law "swapping coordinates twice is identity" {
+    forall p: Point {
+        let swapped = Point(x: p.y, y: p.x)
+        expect Point(x: swapped.y, y: swapped.x) == p
+    }
+}

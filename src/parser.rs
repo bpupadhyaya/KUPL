@@ -246,6 +246,24 @@ impl Parser {
             self.bump();
             return Ok(Some(Item::Fun(self.parse_ai_fun(is_pub)?)));
         }
+        // top-level `law "name" { … }` — a free-standing test (soft keyword)
+        if matches!(self.peek(), Tok::Ident(n) if n == "law") {
+            let lspan = self.span();
+            self.bump();
+            let name = match self.bump() {
+                Tok::Str(parts) => str_parts_text(&parts),
+                other => {
+                    return Err(Diag::error(
+                        "K0115",
+                        format!("`law` expects a name string, found {}", other.describe()),
+                        self.prev_span(),
+                    ))
+                }
+            };
+            let body = self.parse_block()?;
+            let span = lspan.merge(body.span);
+            return Ok(Some(Item::Law(Law { name, body, span })));
+        }
         match self.peek() {
             Tok::KwFun | Tok::KwAsync => Ok(Some(Item::Fun(self.parse_fun(is_pub)?))),
             Tok::KwType => Ok(Some(Item::Type(self.parse_type_decl()?))),
@@ -943,6 +961,27 @@ impl Parser {
                 let span = span.merge(expr.span);
                 self.expect_terminator()?;
                 Ok(Stmt::Expect(expr, span))
+            }
+            // `forall` is a soft keyword: a statement only when a binder follows
+            Tok::Ident(ref n)
+                if n == "forall" && matches!(self.peek_at(1), Tok::Ident(_)) =>
+            {
+                let span = self.span();
+                self.bump();
+                let mut vars = Vec::new();
+                loop {
+                    let (name, _) = self.expect_ident()?;
+                    self.expect(Tok::Colon)?;
+                    let ty = self.parse_ty()?;
+                    vars.push((name, ty));
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                    self.skip_newlines();
+                }
+                let body = self.parse_block()?;
+                let full = span.merge(body.span);
+                Ok(Stmt::Forall { vars, body, span: full })
             }
             Tok::KwBreak => {
                 let span = self.span();

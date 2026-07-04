@@ -46,7 +46,11 @@ and known limitations called out in commit messages. Checked off as landed.
       params, and `let`/`var`; non-fulfilling injection is K0200. Also fixed a
       pre-existing gap: props are now type-checked when constructing from a
       top-level `fun`. (`examples/di.kupl`)
-- [ ] **`forall` in laws** — property testing with generated values (design §1)
+- [x] **`forall` in laws** — property-based testing: `forall x: Int { … }`
+      generates 100 deterministic cases, shrinks failures to a minimal
+      counterexample. Generators for Int/Bool/Float/Str/List/Option/records.
+      Plus top-level `law "…" { … }` free-standing tests. Runs under
+      `kupl test` on the interpreter (KVM rejects with K0804). (`examples/properties.kupl`)
 - [ ] **Timers** — `on every 5s`, `after 2s` (design §4); needs a virtual-time
       story for deterministic tests
 - [ ] **Hot-swap state migration** (design open Q4; Builder live-editing hook)

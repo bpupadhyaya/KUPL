@@ -50,9 +50,12 @@ init/handlers/exposes), constants, and the constructor table.
 ## Testing & quality
 
 ### `kupl test <file.kupl>`
-Runs every component's `example` blocks **and** every contract `law` against
-every fulfilling component. Output: `ok`/`FAIL` per case + summary. A failing
-`expect` reports the exact source expectation.
+Runs every top-level `law` (free-standing tests, including `forall`
+properties), every component's `example` blocks, **and** every contract `law`
+against every fulfilling component. Output: `ok`/`FAIL` per case + summary. A
+failing `expect` reports the exact source expectation; a failing `forall`
+reports the shrunk counterexample (`property failed for n = 50`). Property
+generation is deterministic (fixed seed), so runs are reproducible.
 
 ### `kupl check <file.kupl> [--json]`
 Parse + type-check + effect-check without running. `--json` emits

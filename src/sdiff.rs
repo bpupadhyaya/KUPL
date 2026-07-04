@@ -90,6 +90,7 @@ fn item_name(item: &Item) -> &str {
         Item::Type(t) => &t.name,
         Item::Component(c) => &c.name,
         Item::Contract(ct) => &ct.name,
+        Item::Law(l) => &l.name,
     }
 }
 
@@ -100,6 +101,7 @@ fn kind(item: &Item) -> &'static str {
         Item::Component(c) if c.is_app => "app      ",
         Item::Component(_) => "component",
         Item::Contract(_) => "contract ",
+        Item::Law(_) => "law      ",
     }
 }
 
@@ -174,6 +176,8 @@ fn interface_of(item: &Item) -> String {
                 s.push_str(&format!(" law:{}", law.name));
             }
         }
+        // a top-level law has no public interface (it is a test, not surface)
+        Item::Law(l) => s.push_str(&format!("law {}", l.name)),
     }
     s
 }

@@ -246,6 +246,7 @@ impl Checker {
                         }
                     }
                 }
+                Item::Law(_) => {} // no signature to collect
             }
         }
         self.collect_ai_funs(program);
@@ -459,6 +460,16 @@ impl Checker {
                 Item::Type(_) => {}
                 Item::Component(c) => self.check_component(c),
                 Item::Contract(ct) => self.check_contract(ct),
+                Item::Law(l) => {
+                    let mut ctx = Ctx {
+                        scopes: Scopes::new(),
+                        ret: Ty::Unit,
+                        component: None,
+                        in_handler: false,
+                        loop_depth: 0,
+                    };
+                    self.check_block(&l.body, &mut ctx);
+                }
             }
         }
     }
@@ -1004,6 +1015,16 @@ impl Checker {
                 if ctx.loop_depth == 0 {
                     self.err("K0229", "`break`/`continue` outside of a loop", *span);
                 }
+                Ty::Unit
+            }
+            Stmt::Forall { vars, body, .. } => {
+                ctx.scopes.push();
+                for (name, ty) in vars {
+                    let t = self.resolve_ty(ty);
+                    ctx.scopes.insert(name, t, false);
+                }
+                self.check_block(body, ctx);
+                ctx.scopes.pop();
                 Ty::Unit
             }
         }

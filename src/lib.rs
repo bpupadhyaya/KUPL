@@ -20,6 +20,7 @@ pub mod lexer;
 pub mod loader;
 pub mod lsp;
 pub mod parser;
+pub mod prop;
 pub mod repl;
 pub mod run;
 pub mod sdiff;

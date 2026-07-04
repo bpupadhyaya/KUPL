@@ -379,7 +379,7 @@ Member kinds (the formatter enforces this order):
 | Member | Meaning |
 |---|---|
 | `intent "…"` | required natural-language purpose (missing → warning K0300) |
-| `prop name: T [= default]` | instantiation-time configuration, immutable; `requires` is accepted as a synonym. `T` may be a contract type — see §8.1 (dependency injection) |
+| `prop name: T [= default]` | instantiation-time configuration, immutable; `requires` is accepted as a synonym. `T` may be a contract type — see §8.2 (dependency injection) |
 | `in name: T` / `out name: T` | typed ports; `Event` = no payload |
 | `state name[: T] = init` | private mutable state; invisible outside |
 | `let child = Comp(args)` | child instance (positional or `name:` args against props) |
@@ -425,10 +425,46 @@ component MemoryStore fulfills KeyStore { … }
   signature must be exposed with the exact type (K0262/K0263) and effects
   within the contract's budget (K0264).
 - Every `law` runs against every fulfilling component under `kupl test`, with
-  the contract's functions bound to a live instance. `forall` quantification
-  is **[design]** — laws are concrete executable scenarios today.
+  the contract's functions bound to a live instance.
 
-### 8.1 Contract types (dependency injection)
+### 8.1 Property-based testing (`forall`)
+
+A `forall` runs its body over many **generated** values instead of one
+concrete scenario:
+
+```kupl
+law "reverse is its own inverse" {          // top-level, free-standing test
+    forall xs: List[Int] {
+        expect xs.reverse().reverse() == xs
+    }
+}
+
+law "addition commutes" {
+    forall a: Int, b: Int {                 // multiple binders
+        expect a + b == b + a
+    }
+}
+```
+
+- Generation is **deterministic** (a fixed seed), so a `forall` passes or fails
+  identically on every machine and run — reproducible and CI-friendly. Each
+  `forall` runs 100 cases.
+- On failure the runner **shrinks** the counterexample toward a minimal
+  falsifying case and reports the binding, e.g.
+  `property failed for n = 50`. A panic in the body (e.g. a division by zero)
+  is also a falsifying case and is reported with the offending input.
+- Generators cover `Int`, `Bool`, `Float`, `Str`, `List[T]`, `Option[T]`, and
+  record/ADT types (fields generated recursively). Generated integers are
+  bounded to ±1e6 so ordinary arithmetic in a property stays inside checked
+  `Int` — test boundary/overflow behavior with explicit concrete `expect`s.
+- A **top-level `law "name" { … }`** is a free-standing test (property or
+  concrete) that `kupl test` runs alongside component `example` blocks and
+  contract laws. `forall` may also appear inside contract laws and any block.
+- `forall` runs on the interpreter under `kupl test`; it is not compiled to the
+  KVM (K0804 if used in a function compiled with `--vm`/`native`). See
+  `examples/properties.kupl`.
+
+### 8.2 Contract types (dependency injection)
 
 A **contract name is a type**. A component can declare a prop (or a function
 parameter) of a contract type; **any component that fulfills the contract is
