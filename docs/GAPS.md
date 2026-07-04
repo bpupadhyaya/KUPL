@@ -20,7 +20,10 @@ components) are complete as of it40. Remaining work, ranked by value ÷ effort:
 4. **Flagship "any software" example(s)** — a non-trivial end-to-end program
    (e.g. a small HTTP/JSON service, or a data pipeline) proving breadth, doubling
    as documentation and a regression.
-5. **WASM target** / **stdlib breadth** / **KIR unboxing (perf)** — larger or
+5. **Native regex** (port src/regex.rs's backtracking engine to C) + **native
+   HTTP** (system curl) — the last native-builtin gaps (only ai fun would then
+   remain). Native CSV + URL/query landed in it45.
+6. **WASM target** / **stdlib breadth** / **KIR unboxing (perf)** — larger or
    lower-marginal-value; revisit if the above land with iterations to spare.
 
 **Recommended for it42+:** native `f32` (1) first — small, finishes the numeric

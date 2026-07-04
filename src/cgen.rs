@@ -304,22 +304,12 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_HEX_ENCODE => format!("regs[{dst}] = k_hex_encode(regs[{start}]); (void){argc};"),
             BUILTIN_HEX_DECODE => format!("regs[{dst}] = k_hex_decode(regs[{start}]); (void){argc};"),
             BUILTIN_HASH_FNV => format!("regs[{dst}] = k_hash_fnv(regs[{start}]); (void){argc};"),
-            BUILTIN_CSV_PARSE | BUILTIN_CSV_STRINGIFY => {
-                return Err(
-                    "csv_parse/csv_stringify are not yet supported by the native backend \
-                     — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
-                        .into(),
-                )
-            }
+            BUILTIN_CSV_PARSE => format!("regs[{dst}] = k_csv_parse(regs[{start}]); (void){argc};"),
+            BUILTIN_CSV_STRINGIFY => format!("regs[{dst}] = k_csv_stringify(regs[{start}]); (void){argc};"),
             BUILTIN_URL_ENCODE => format!("regs[{dst}] = k_url_encode(regs[{start}]); (void){argc};"),
             BUILTIN_URL_DECODE => format!("regs[{dst}] = k_url_decode(regs[{start}]); (void){argc};"),
-            BUILTIN_QUERY_PARSE | BUILTIN_QUERY_BUILD => {
-                return Err(
-                    "query_parse/query_build are not yet supported by the native backend \
-                     — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
-                        .into(),
-                )
-            }
+            BUILTIN_QUERY_PARSE => format!("regs[{dst}] = k_query_parse(regs[{start}]); (void){argc};"),
+            BUILTIN_QUERY_BUILD => format!("regs[{dst}] = k_query_build(regs[{start}]); (void){argc};"),
             BUILTIN_ENV_VAR => format!("regs[{dst}] = k_env_var(regs[{start}]); (void){argc};"),
             BUILTIN_ARGS => format!("regs[{dst}] = k_args(); (void){start}; (void){argc};"),
             BUILTIN_EPRINT => format!("regs[{dst}] = k_eprint(regs[{start}]); (void){argc};"),
@@ -1238,6 +1228,155 @@ static KValue k_json_parse(KValue s) {
     kjp_ws(&p);
     if (p.failed || p.pos != p.len) return k_err(k_str("invalid JSON"));
     return k_ok(v);
+}
+
+/* ---- URL + CSV (mirror src/url.rs / src/csv.rs byte-for-byte) ---- */
+static char* kb_take(KBuf* b) { return b->buf ? b->buf : (char*)""; }
+static int k_hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+/* validate that `n` bytes are well-formed UTF-8 (mirrors String::from_utf8) */
+static int k_utf8_ok(const unsigned char* s, long n) {
+    long i = 0;
+    while (i < n) {
+        unsigned char c = s[i];
+        int extra; unsigned int cp;
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; }
+        else return 0;
+        if (i + extra >= n) return 0;
+        for (int k = 1; k <= extra; k++) { if ((s[i + k] & 0xC0) != 0x80) return 0; cp = (cp << 6) | (s[i + k] & 0x3F); }
+        if (cp < (extra == 1 ? 0x80u : extra == 2 ? 0x800u : 0x10000u)) return 0; /* overlong */
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return 0;
+        i += extra + 1;
+    }
+    return 1;
+}
+static const char* k_as_str(KValue v) { return v.tag == K_STR ? v.as.s : k_show(v); }
+static KValue k_url_encode(KValue s);   /* defined later in the runtime */
+
+/* decode into `b`; returns "" on success or an error message (mirrors url.rs) */
+static const char* k_url_decode_into(KBuf* b, const char* in) {
+    const unsigned char* p = (const unsigned char*)in;
+    long i = 0, n = (long)strlen(in);
+    while (i < n) {
+        if (p[i] == '%') {
+            if (i + 2 >= n) return "invalid percent-encoding: truncated escape";
+            int hi = k_hexval(p[i + 1]), lo = k_hexval(p[i + 2]);
+            if (hi < 0 || lo < 0) return "invalid percent-encoding: bad hex";
+            kb_putc(b, (char)((hi << 4) | lo)); i += 3;
+        } else if (p[i] == '+') { kb_putc(b, ' '); i++; }
+        else { kb_putc(b, (char)p[i]); i++; }
+    }
+    return "";
+}
+/* a decoded string that falls back to the raw text on a malformed escape */
+static KValue k_url_decode_lossy(const char* seg) {
+    KBuf b = { 0, 0, 0 };
+    const char* err = k_url_decode_into(&b, seg);
+    if (err[0] || !k_utf8_ok((const unsigned char*)kb_take(&b), (long)b.len)) {
+        char* c = (char*)k_alloc(strlen(seg) + 1); strcpy(c, seg); return k_str(c);
+    }
+    return k_str(kb_take(&b));
+}
+static KValue k_query_parse(KValue s) {
+    const char* in = k_as_str(s);
+    KValue pairs[4096]; int np = 0;
+    long start = 0, n = (long)strlen(in), i = 0;
+    for (i = 0; i <= n; i++) {
+        if (i == n || in[i] == '&') {
+            long seglen = i - start;
+            if (seglen > 0) {
+                char* seg = (char*)k_alloc(seglen + 1); memcpy(seg, in + start, seglen); seg[seglen] = 0;
+                char* eq = strchr(seg, '=');
+                KValue kv, vv;
+                if (eq) { *eq = 0; kv = k_url_decode_lossy(seg); vv = k_url_decode_lossy(eq + 1); }
+                else { kv = k_url_decode_lossy(seg); vv = k_str(""); }
+                KValue pair[2] = { kv, vv };
+                if (np < 4096) pairs[np++] = k_list(pair, 2);
+            }
+            start = i + 1;
+        }
+    }
+    return k_list(pairs, np);
+}
+static KValue k_query_build(KValue lst) {
+    if (lst.tag != K_LIST) k_panic("query_build needs a list");
+    KBuf b = { 0, 0, 0 };
+    KList* rows = lst.as.list;
+    for (int64_t r = 0; r < rows->len; r++) {
+        if (r) kb_putc(&b, '&');
+        KList* pair = rows->items[r].as.list;
+        KValue kv = pair->len > 0 ? pair->items[0] : k_str("");
+        KValue vv = pair->len > 1 ? pair->items[1] : k_str("");
+        KValue ek = k_url_encode(kv), ev = k_url_encode(vv);
+        kb_puts(&b, ek.as.s); kb_putc(&b, '='); kb_puts(&b, ev.as.s);
+    }
+    return k_str(kb_take(&b));
+}
+static KValue k_csv_parse(KValue s) {
+    const char* in = k_as_str(s);
+    long n = (long)strlen(in), i = 0;
+    KValue rows[4096]; int nrows = 0;
+    KValue row[4096]; int ncols = 0;
+    KBuf field = { 0, 0, 0 };
+    while (i < n) {
+        char c = in[i];
+        if (c == '"') {
+            i++;
+            for (;;) {
+                if (i >= n) break;
+                char q = in[i];
+                if (q == '"') {
+                    if (i + 1 < n && in[i + 1] == '"') { kb_putc(&field, '"'); i += 2; }
+                    else { i++; break; }
+                } else { kb_putc(&field, q); i++; }
+            }
+        } else if (c == ',') {
+            if (ncols < 4096) row[ncols++] = k_str(kb_take(&field));
+            field = (KBuf){ 0, 0, 0 }; i++;
+        } else if (c == '\n' || c == '\r') {
+            if (c == '\r' && i + 1 < n && in[i + 1] == '\n') i++;
+            if (ncols < 4096) row[ncols++] = k_str(kb_take(&field));
+            field = (KBuf){ 0, 0, 0 };
+            if (nrows < 4096) rows[nrows++] = k_list(row, ncols);
+            ncols = 0; i++;
+        } else { kb_putc(&field, c); i++; }
+    }
+    // flush the final field/record unless input ended exactly on a newline
+    if (field.len > 0 || ncols > 0) {
+        if (ncols < 4096) row[ncols++] = k_str(kb_take(&field));
+        if (nrows < 4096) rows[nrows++] = k_list(row, ncols);
+    }
+    return k_list(rows, nrows);
+}
+static void k_csv_field(KBuf* b, const char* f) {
+    int needs = 0;
+    for (const char* p = f; *p; p++) if (*p == ',' || *p == '"' || *p == '\n' || *p == '\r') { needs = 1; break; }
+    if (needs) {
+        kb_putc(b, '"');
+        for (const char* p = f; *p; p++) { if (*p == '"') kb_putc(b, '"'); kb_putc(b, *p); }
+        kb_putc(b, '"');
+    } else kb_puts(b, f);
+}
+static KValue k_csv_stringify(KValue lst) {
+    if (lst.tag != K_LIST) k_panic("csv_stringify needs a list");
+    KBuf b = { 0, 0, 0 };
+    KList* rows = lst.as.list;
+    for (int64_t r = 0; r < rows->len; r++) {
+        if (r) kb_putc(&b, '\n');
+        KList* row = rows->items[r].as.list;
+        for (int64_t c = 0; c < row->len; c++) {
+            if (c) kb_putc(&b, ',');
+            k_csv_field(&b, row->items[c].as.s);
+        }
+    }
+    return k_str(kb_take(&b));
 }
 
 /* ---- file I/O builtins (effect io.fs); mirror interp::fs_builtin.
@@ -2821,6 +2960,39 @@ mod tests {
                 "je"
             ),
             "handled\n"
+        );
+    }
+
+    /// CSV + URL/query builtins compile to native, byte-identical to the
+    /// interpreter (quoting, percent-encoding, round-trips).
+    #[test]
+    fn native_csv_url() {
+        if !cc_available() {
+            return;
+        }
+        // url_encode + query_build
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io { print(query_build([[\"a\", \"b c\"], [\"d\", \"e&f\"]])) }",
+                "qb"
+            ),
+            "a=b%20c&d=e%26f\n"
+        );
+        // csv_stringify quotes fields with commas/quotes
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io { print(csv_stringify([[\"a\", \"b,c\"], [\"d\\\"e\", \"f\"]])) }",
+                "cs"
+            ),
+            "a,\"b,c\"\n\"d\"\"e\",f\n"
+        );
+        // csv_parse handles quoted fields containing a comma
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io {\n    let rows = csv_parse(\"1,2\\n\\\"x,y\\\",z\")\n    print(\"{rows.len()}\")\n    for r in rows { print(r.join(\"|\")) }\n}\n",
+                "cp"
+            ),
+            "2\n1|2\nx,y|z\n"
         );
     }
 
