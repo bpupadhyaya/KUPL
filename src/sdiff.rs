@@ -127,6 +127,9 @@ fn interface_of(item: &Item) -> String {
                 s.push_str(&format!(" -> {}", ty_str(r)));
             }
             s.push_str(&format!(" uses[{}]", f.effects.join(",")));
+            if let Some(ai) = &f.ai {
+                s.push_str(&format!(" ai[intent={} tools={}]", ai.intent, ai.tools.join(",")));
+            }
         }
         Item::Type(t) => {
             for v in &t.variants {

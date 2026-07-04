@@ -113,6 +113,7 @@ Severity: **E** = error, **W** = warning.
 | K0265 | E | `supervise` references unknown child |
 | K0270 | E | `ai fun` must declare a return type (it defines the structured output) |
 | K0271 | E | `ai fun` return type not representable as structured output (unsupported/recursive/multi-variant type) |
+| K0272 | E | `ai fun` tool is not a monomorphic top-level function with representable parameter/return types |
 
 ## K03xx — Effects & style
 

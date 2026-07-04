@@ -324,6 +324,7 @@ fn compile_ai_fun(shared: &mut Shared, f: &FunDecl, checked: &Checked) -> Chunk 
         params: f.params.iter().map(|p| p.name.clone()).collect(),
         shape: crate::ai::AiShape::Str,
         wraps_result: false,
+        tools: Vec::new(),
     });
     shared.module.ai_funs.push(meta);
     let nparams = f.params.len() as u8;

@@ -118,7 +118,7 @@ Prints the toolchain version.
 | `KUPL_AI_MODEL` | `ai fun` calls | model id; required for openai/ollama, overrides the anthropic default (`claude-opus-4-8`) |
 | `KUPL_AI_BASE_URL` | `ai fun` calls | endpoint base override (e.g. a proxy, or a remote Ollama) |
 | `KUPL_AI_MOCK` | `ai fun` calls | canned response text — forces the deterministic mock provider (no network) |
-| `KUPL_AI_MOCK_<FUN>` | `ai fun` calls | per-function canned response (fun name upper-cased); wins over `KUPL_AI_MOCK` |
+| `KUPL_AI_MOCK_<FUN>` | `ai fun` calls | per-function canned response (fun name upper-cased); wins over `KUPL_AI_MOCK`. For a `tools` ai fun, a JSON array of rounds (`{"tool":…,"input":…}` / `{"final":…}`) |
 
 ## Artifact formats
 

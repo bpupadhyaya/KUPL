@@ -1,0 +1,29 @@
+// Agentic ai fun — the model can call KUPL functions as tools while it works.
+// `tools [f, g]` exposes top-level functions to the model; the runtime drives
+// the model↔tool loop and converts each side (JSON ↔ typed KUPL values).
+//
+// Deterministic run (no network): the mock provider takes a scripted array of
+// rounds, each either {"tool": name, "input": {...}} or {"final": ...}.
+//
+//   export KUPL_AI_MOCK_ASSIST='[
+//     {"tool":"add","input":{"a":2,"b":3}},
+//     {"tool":"weather","input":{"city":"Paris"}},
+//     {"final":"2+3 is 5 and Paris is sunny, 21C."}
+//   ]'
+//   kupl run examples/agent.kupl
+
+fun add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+fun weather(city: Str) -> Str {
+    "sunny, 21C in {city}"
+}
+
+ai fun assist(question: Str) -> Str tools [add, weather] {
+    intent "Answer the user's question. Use the add tool for arithmetic and the weather tool for current conditions."
+}
+
+fun main() uses io, ai {
+    print(assist("What is 2+3 and how is the weather in Paris?"))
+}

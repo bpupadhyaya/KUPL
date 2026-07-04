@@ -98,6 +98,12 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
     }
     out.push(' ');
     if let Some(ai) = &f.ai {
+        if !ai.tools.is_empty() {
+            // `tools [...]` renders before the return-type-adjacent brace; the
+            // ` ` pushed above sits between `-> T` and `tools`.
+            out.pop();
+            out.push_str(&format!(" tools [{}] ", ai.tools.join(", ")));
+        }
         out.push_str("{\n");
         indent(out, level + 1);
         out.push_str(&format!("intent \"{}\"\n", escape_str(&ai.intent)));

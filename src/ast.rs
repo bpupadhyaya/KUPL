@@ -63,10 +63,12 @@ pub struct FunDecl {
 }
 
 /// Body of an `ai fun`: `{ intent "..."  model "..." }` (model optional).
+/// `tools` names top-level functions the model may call while answering.
 #[derive(Debug, Clone)]
 pub struct AiDecl {
     pub intent: String,
     pub model: Option<String>,
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -785,7 +785,7 @@ impl Interp {
                     span,
                 ));
             };
-            return crate::ai::ai_call(&meta, &args).map_err(|m| Self::panic_flow(m, span));
+            return crate::ai::ai_call(&meta, &args, self).map_err(|m| Self::panic_flow(m, span));
         }
         let scope = base_env.child();
         for (p, a) in decl.params.iter().zip(args) {
@@ -814,6 +814,23 @@ impl Interp {
             return result;
         }
         builtin_method(recv, name, args, span, self)
+    }
+}
+
+impl crate::ai::ToolHost for Interp {
+    /// The model asked to run tool `name`: call the top-level KUPL function of
+    /// that name with the converted arguments. A panic in the tool surfaces as
+    /// an `Err` so the ai fun can capture it (or panic itself).
+    fn call_tool(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        let Some(decl) = self.db.funs.get(name).cloned() else {
+            return Err(format!("tool `{name}` is not a top-level function"));
+        };
+        let env = self.globals.clone();
+        match self.call_fun(&decl, args, &env, Span::default()) {
+            Ok(v) => Ok(v),
+            Err(Flow::Panic { msg, .. }) => Err(msg),
+            Err(_) => Err(format!("tool `{name}` used non-local control flow")),
+        }
     }
 }
 

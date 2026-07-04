@@ -330,6 +330,23 @@ impl Parser {
             }
         }
         let ret = if self.eat(&Tok::Arrow) { Some(self.parse_ty()?) } else { None };
+        // `tools [f, g]` — soft keyword, before the body brace.
+        let mut tools = Vec::new();
+        if matches!(self.peek(), Tok::Ident(n) if n == "tools") {
+            self.bump();
+            self.expect(Tok::LBracket)?;
+            self.skip_newlines();
+            while !matches!(self.peek(), Tok::RBracket | Tok::Eof) {
+                let (t, _) = self.expect_ident()?;
+                tools.push(t);
+                self.skip_newlines();
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+                self.skip_newlines();
+            }
+            self.expect(Tok::RBracket)?;
+        }
         self.expect(Tok::LBrace)?;
         self.skip_newlines();
         let bad_body = |span| {
@@ -367,7 +384,7 @@ impl Parser {
             effects,
             body: Block { stmts: Vec::new(), span },
             is_pub,
-            ai: Some(AiDecl { intent, model }),
+            ai: Some(AiDecl { intent, model, tools }),
             span,
         })
     }

@@ -150,6 +150,17 @@ pub fn encode(m: &Module) -> Vec<u8> {
         }
         encode_shape(&mut w, &a.shape);
         w.u8(a.wraps_result as u8);
+        w.u32(a.tools.len() as u32);
+        for t in &a.tools {
+            w.s(&t.name);
+            w.s(&t.description);
+            w.u32(t.params.len() as u32);
+            for (pname, pshape) in &t.params {
+                w.s(pname);
+                encode_shape(&mut w, pshape);
+            }
+            encode_shape(&mut w, &t.ret);
+        }
     }
 
     w.buf
@@ -587,7 +598,29 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         }
         let shape = decode_shape(&mut r)?;
         let wraps_result = r.u8()? != 0;
-        m.ai_funs.push(crate::ai::AiFunMeta { name, intent, model, params, shape, wraps_result });
+        let ntools = r.u32()?;
+        let mut tools = Vec::with_capacity(ntools as usize);
+        for _ in 0..ntools {
+            let tname = r.s()?;
+            let description = r.s()?;
+            let nparams = r.u32()?;
+            let mut tparams = Vec::with_capacity(nparams as usize);
+            for _ in 0..nparams {
+                let pname = r.s()?;
+                tparams.push((pname, decode_shape(&mut r)?));
+            }
+            let ret = decode_shape(&mut r)?;
+            tools.push(crate::ai::ToolMeta { name: tname, description, params: tparams, ret });
+        }
+        m.ai_funs.push(crate::ai::AiFunMeta {
+            name,
+            intent,
+            model,
+            params,
+            shape,
+            wraps_result,
+            tools,
+        });
     }
 
     Ok(m)

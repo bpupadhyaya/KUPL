@@ -24,8 +24,12 @@ and known limitations called out in commit messages. Checked off as landed.
       provider-agnostic runtime (anthropic / openai-compatible / ollama /
       deterministic mock via `KUPL_AI_MOCK*`); interpreter + KVM + `.kx`
       (native rejects with a clear error)
-- [ ] **Agent components** — conversation state in a component; `ai` handlers
-      with tool use (expose KUPL functions as tools to the model)
+- [x] **Tool use** — `ai fun … tools [f, g]` exposes top-level KUPL functions
+      to the model; the runtime drives the model↔tool loop (JSON ↔ typed
+      values), bounded, scriptable via the mock provider for tests. Real
+      providers use native tool calling (Anthropic tool_use, OpenAI tool_calls)
+- [ ] **Agent components** — conversation state persisted in a component across
+      turns; `on message` handlers that call tool-using ai funs
 - [ ] **Prompt-context builders** — `kupl context` output as a first-class
       value; embeddings + similarity as stdlib
 - [ ] **`ai fun` on the native backend** (libcurl or platform HTTP)

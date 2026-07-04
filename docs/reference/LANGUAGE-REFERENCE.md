@@ -272,6 +272,42 @@ provider; a `model "…"` clause in the function wins over both.
 `ai fun`s run on the interpreter, the KVM, and inside `.kx`/bundles. The
 native backend rejects programs containing them with a clear error (planned).
 
+### 6.2 Tool use (`ai fun … tools [f, g]`)
+
+An `ai fun` can let the model **call KUPL functions** while it produces the
+answer. `tools [f, g]` names top-level functions the model may invoke; the
+runtime drives the model↔tool loop — converting the model's JSON arguments to
+typed KUPL values, running the function, and converting the result back —
+until the model returns a final answer of the declared return type.
+
+```kupl
+fun add(a: Int, b: Int) -> Int { a + b }
+fun weather(city: Str) -> Str { "sunny, 21C in {city}" }
+
+ai fun assist(question: Str) -> Str tools [add, weather] {
+    intent "Answer the question. Use add for arithmetic and weather for conditions."
+}
+```
+
+Rules:
+
+- Each tool must be a **monomorphic, non-ai top-level function** whose
+  parameter and return types are supported structured-output shapes
+  (§6.1) — otherwise K0272. The function's signature becomes the tool's
+  JSON Schema; its name and rendered signature become the tool description.
+- The loop is bounded (8 rounds) so a misbehaving model cannot spin forever.
+- A panic inside a tool surfaces to the ai fun as a failure: captured as
+  `Err` if the ai fun returns `Result[T, Str]`, otherwise it panics.
+- Tool effects are **not** statically propagated to the ai fun in
+  v1.0-alpha (a documented limitation, like calls through variables).
+
+The mock provider scripts the loop deterministically: `KUPL_AI_MOCK_<FUN>` is
+a JSON **array of rounds**, each either `{"tool": name, "input": {…}}` or
+`{"final": <payload>}`. This runs the full agent loop with no network, so
+tool-using ai funs are differentially tested on every engine. Real providers
+use native tool calling (Anthropic `tools`/`tool_use`/`tool_result`;
+OpenAI-compatible `tools`/`tool_calls`/`role:"tool"`).
+
 ## 7. Components
 
 The component is the universal unit. Every instance is an isolated actor:

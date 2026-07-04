@@ -49,6 +49,15 @@ pub enum AiShape {
     },
 }
 
+/// A KUPL function exposed to the model as a callable tool.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolMeta {
+    pub name: String,
+    pub description: String,
+    pub params: Vec<(String, AiShape)>,
+    pub ret: AiShape,
+}
+
 /// Everything the runtime needs to execute one `ai fun`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AiFunMeta {
@@ -60,6 +69,25 @@ pub struct AiFunMeta {
     pub shape: AiShape,
     /// True when declared `-> Result[T, Str]`: failures become `Err(msg)`.
     pub wraps_result: bool,
+    /// Functions the model may call while producing the answer (`tools [...]`).
+    pub tools: Vec<ToolMeta>,
+}
+
+/// The engine calls its own KUPL functions on behalf of the model. The
+/// interpreter and the KVM each implement this so an `ai fun` with `tools`
+/// runs identically on both.
+pub trait ToolHost {
+    fn call_tool(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String>;
+}
+
+/// A host that refuses every tool call — used where no tools are configured
+/// (and by unit tests).
+pub struct NullToolHost;
+
+impl ToolHost for NullToolHost {
+    fn call_tool(&mut self, name: &str, _args: Vec<Value>) -> Result<Value, String> {
+        Err(format!("model requested tool `{name}` but no tools are available"))
+    }
 }
 
 /// Build an [`AiShape`] from a resolved return type. `records` maps a type
@@ -132,6 +160,91 @@ fn wire_schema(shape: &AiShape) -> String {
         "{{\"type\":\"object\",\"properties\":{{\"value\":{}}},\"required\":[\"value\"],\"additionalProperties\":false}}",
         schema_json(shape)
     )
+}
+
+/// Object schema for a named-field list (tool parameters).
+fn params_schema(params: &[(String, AiShape)]) -> String {
+    let props: Vec<String> = params
+        .iter()
+        .map(|(n, s)| format!("\"{}\":{}", json_escape(n), schema_json(s)))
+        .collect();
+    let req: Vec<String> =
+        params.iter().map(|(n, _)| format!("\"{}\"", json_escape(n))).collect();
+    format!(
+        "{{\"type\":\"object\",\"properties\":{{{}}},\"required\":[{}],\"additionalProperties\":false}}",
+        props.join(","),
+        req.join(",")
+    )
+}
+
+/// Serialize a KUPL value to JSON, guided by its shape (records need the field
+/// names, which the value itself does not carry positionally).
+fn value_to_json(shape: &AiShape, v: &Value) -> String {
+    match (shape, v) {
+        (AiShape::Str, Value::Str(s)) => format!("\"{}\"", json_escape(s)),
+        (AiShape::Int, Value::Int(n)) => n.to_string(),
+        (AiShape::Float, Value::Float(f)) => {
+            if f.is_finite() {
+                if f.fract() == 0.0 {
+                    format!("{f:.1}")
+                } else {
+                    format!("{f}")
+                }
+            } else {
+                "null".into()
+            }
+        }
+        (AiShape::Bool, Value::Bool(b)) => b.to_string(),
+        (AiShape::List(inner), Value::List(items)) => {
+            let parts: Vec<String> = items.iter().map(|x| value_to_json(inner, x)).collect();
+            format!("[{}]", parts.join(","))
+        }
+        (AiShape::Option(inner), Value::Ctor { variant, fields, .. }) => {
+            if variant.as_str() == "Some" && !fields.is_empty() {
+                value_to_json(inner, &fields[0])
+            } else {
+                "null".into()
+            }
+        }
+        (AiShape::Record { fields, .. }, Value::Ctor { fields: vals, .. }) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .zip(vals.iter())
+                .map(|((name, s), val)| format!("\"{}\":{}", json_escape(name), value_to_json(s, val)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        // shape/value mismatch: fall back to the Display form as a JSON string
+        (_, other) => format!("\"{}\"", json_escape(&other.to_string())),
+    }
+}
+
+/// Serialize a parsed [`Json`] value back to a compact JSON string (used to
+/// echo assistant tool_use content and tool inputs into the message history).
+fn dump_json(j: &Json) -> String {
+    match j {
+        Json::Null => "null".into(),
+        Json::Bool(b) => b.to_string(),
+        Json::Num(n) => {
+            if n.fract() == 0.0 && n.is_finite() {
+                format!("{}", *n as i64)
+            } else {
+                format!("{n}")
+            }
+        }
+        Json::Str(s) => format!("\"{}\"", json_escape(s)),
+        Json::Arr(items) => {
+            let parts: Vec<String> = items.iter().map(dump_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        Json::Obj(pairs) => {
+            let parts: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| format!("\"{}\":{}", json_escape(k), dump_json(v)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+    }
 }
 
 /// Convert parsed JSON to a KUPL value guided by the shape.
@@ -361,10 +474,358 @@ fn convert(meta: &AiFunMeta, text: &str) -> Result<Value, String> {
         .or_else(|first| value_from_json(&meta.shape, &json).map_err(|_| first))
 }
 
+// ---------------- tool-calling loop (agentic ai funs) ----------------
+
+/// Bound on model↔tool round-trips, so a misbehaving model or mock can't loop
+/// forever. Deterministic per call.
+const MAX_TOOL_ROUNDS: usize = 8;
+
+/// One tool the model asked to run this round.
+struct ToolReq {
+    id: String,
+    name: String,
+    input: Json,
+}
+
+/// What a provider returns for one round.
+enum Reply {
+    Final(String),
+    Tools(Vec<ToolReq>),
+}
+
+/// A provider that can carry a multi-turn tool conversation. Each impl owns
+/// its own message history in its own wire format.
+trait ToolProvider {
+    fn round(&mut self) -> Result<Reply, String>;
+    fn push_results(&mut self, results: Vec<(ToolReq, String)>);
+}
+
+/// Convert a model tool request into KUPL values, run it through the host,
+/// and serialize the result back to JSON for the next round.
+fn execute_tool(host: &mut dyn ToolHost, meta: &AiFunMeta, req: &ToolReq) -> Result<String, String> {
+    let tool = meta
+        .tools
+        .iter()
+        .find(|t| t.name == req.name)
+        .ok_or_else(|| format!("model called unknown tool `{}`", req.name))?;
+    let mut args = Vec::with_capacity(tool.params.len());
+    for (pname, pshape) in &tool.params {
+        let pj = req
+            .input
+            .get(pname)
+            .ok_or_else(|| format!("tool `{}` is missing argument `{pname}`", req.name))?;
+        args.push(value_from_json(pshape, pj)?);
+    }
+    let result = host.call_tool(&req.name, args)?;
+    Ok(value_to_json(&tool.ret, &result))
+}
+
+/// The engine-agnostic loop: round → execute tools → feed results → repeat,
+/// until the provider produces a final answer.
+fn run_tool_loop(
+    provider: &mut dyn ToolProvider,
+    host: &mut dyn ToolHost,
+    meta: &AiFunMeta,
+) -> Result<String, String> {
+    for _ in 0..MAX_TOOL_ROUNDS {
+        match provider.round()? {
+            Reply::Final(text) => return Ok(text),
+            Reply::Tools(reqs) => {
+                if reqs.is_empty() {
+                    return Err("provider asked to use zero tools".into());
+                }
+                let mut results = Vec::with_capacity(reqs.len());
+                for req in reqs {
+                    let out = execute_tool(host, meta, &req)?;
+                    results.push((req, out));
+                }
+                provider.push_results(results);
+            }
+        }
+    }
+    Err(format!("tool loop exceeded {MAX_TOOL_ROUNDS} rounds without a final answer"))
+}
+
+fn anthropic_tools_json(tools: &[ToolMeta]) -> String {
+    let arr: Vec<String> = tools
+        .iter()
+        .map(|t| {
+            format!(
+                "{{\"name\":\"{}\",\"description\":\"{}\",\"input_schema\":{}}}",
+                json_escape(&t.name),
+                json_escape(&t.description),
+                params_schema(&t.params)
+            )
+        })
+        .collect();
+    format!("[{}]", arr.join(","))
+}
+
+fn openai_tools_json(tools: &[ToolMeta]) -> String {
+    let arr: Vec<String> = tools
+        .iter()
+        .map(|t| {
+            format!(
+                "{{\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"description\":\"{}\",\"parameters\":{}}}}}",
+                json_escape(&t.name),
+                json_escape(&t.description),
+                params_schema(&t.params)
+            )
+        })
+        .collect();
+    format!("[{}]", arr.join(","))
+}
+
+/// Deterministic tool provider: a scripted array of rounds, each either
+/// `{"tool": name, "input": {...}}` or `{"final": <payload>}`.
+struct MockProvider {
+    rounds: Vec<Json>,
+    idx: usize,
+}
+
+impl ToolProvider for MockProvider {
+    fn round(&mut self) -> Result<Reply, String> {
+        let r = self
+            .rounds
+            .get(self.idx)
+            .cloned()
+            .ok_or("mock provider ran out of scripted rounds")?;
+        self.idx += 1;
+        if let Some(final_) = r.get("final") {
+            return Ok(Reply::Final(match final_ {
+                Json::Str(s) => s.clone(),
+                other => dump_json(other),
+            }));
+        }
+        if let Some(Json::Str(name)) = r.get("tool") {
+            let input = r.get("input").cloned().unwrap_or(Json::Obj(Vec::new()));
+            return Ok(Reply::Tools(vec![ToolReq {
+                id: format!("mock_tool_{}", self.idx),
+                name: name.clone(),
+                input,
+            }]));
+        }
+        Err("mock round must be `{\"tool\": ...}` or `{\"final\": ...}`".into())
+    }
+    fn push_results(&mut self, _results: Vec<(ToolReq, String)>) {}
+}
+
+/// Anthropic Messages API tool loop.
+struct AnthropicProvider {
+    model: String,
+    key: String,
+    base: String,
+    tools_json: String,
+    messages: Vec<String>,
+}
+
+impl ToolProvider for AnthropicProvider {
+    fn round(&mut self) -> Result<Reply, String> {
+        let body = format!(
+            "{{\"model\":\"{}\",\"max_tokens\":4096,\"tools\":{},\"messages\":[{}]}}",
+            json_escape(&self.model),
+            self.tools_json,
+            self.messages.join(",")
+        );
+        let resp = http_post(
+            &format!("{}/v1/messages", self.base),
+            &[format!("x-api-key: {}", self.key), "anthropic-version: 2023-06-01".into()],
+            &body,
+        )?;
+        let json = parse_json(&resp).map_err(|e| format!("bad provider response: {e}"))?;
+        if json.get("type").and_then(Json::str) == Some("error") {
+            let msg = json
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Json::str)
+                .unwrap_or("unknown provider error");
+            return Err(format!("anthropic: {msg}"));
+        }
+        let Some(Json::Arr(content)) = json.get("content") else {
+            return Err("anthropic: response has no content".into());
+        };
+        let stop = json.get("stop_reason").and_then(Json::str).unwrap_or("");
+        if stop == "tool_use" {
+            // echo the assistant turn verbatim, then collect the tool requests
+            self.messages.push(format!(
+                "{{\"role\":\"assistant\",\"content\":{}}}",
+                dump_json(&Json::Arr(content.clone()))
+            ));
+            let mut reqs = Vec::new();
+            for block in content {
+                if block.get("type").and_then(Json::str) == Some("tool_use") {
+                    let id = block.get("id").and_then(Json::str).unwrap_or("").to_string();
+                    let name = block.get("name").and_then(Json::str).unwrap_or("").to_string();
+                    let input = block.get("input").cloned().unwrap_or(Json::Obj(Vec::new()));
+                    reqs.push(ToolReq { id, name, input });
+                }
+            }
+            return Ok(Reply::Tools(reqs));
+        }
+        let text: String = content
+            .iter()
+            .filter(|b| b.get("type").and_then(Json::str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Json::str))
+            .collect();
+        Ok(Reply::Final(text))
+    }
+
+    fn push_results(&mut self, results: Vec<(ToolReq, String)>) {
+        let blocks: Vec<String> = results
+            .iter()
+            .map(|(req, out)| {
+                format!(
+                    "{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":{}}}",
+                    json_escape(&req.id),
+                    // tool results are sent as a JSON string content block
+                    format!("\"{}\"", json_escape(out))
+                )
+            })
+            .collect();
+        self.messages.push(format!("{{\"role\":\"user\",\"content\":[{}]}}", blocks.join(",")));
+    }
+}
+
+/// OpenAI-compatible (`/v1/chat/completions`) tool loop.
+struct OpenAiProvider {
+    model: String,
+    headers: Vec<String>,
+    url: String,
+    tools_json: String,
+    messages: Vec<String>,
+}
+
+impl ToolProvider for OpenAiProvider {
+    fn round(&mut self) -> Result<Reply, String> {
+        let body = format!(
+            "{{\"model\":\"{}\",\"tools\":{},\"messages\":[{}]}}",
+            json_escape(&self.model),
+            self.tools_json,
+            self.messages.join(",")
+        );
+        let resp = http_post(&self.url, &self.headers, &body)?;
+        let json = parse_json(&resp).map_err(|e| format!("bad provider response: {e}"))?;
+        if let Some(err) = json.get("error") {
+            let msg = err.get("message").and_then(Json::str).unwrap_or("unknown provider error");
+            return Err(format!("provider: {msg}"));
+        }
+        let message = json
+            .get("choices")
+            .and_then(|c| c.index(0))
+            .and_then(|c| c.get("message"))
+            .ok_or("provider: response has no message")?;
+        if let Some(Json::Arr(calls)) = message.get("tool_calls") {
+            self.messages.push(dump_json(message));
+            let mut reqs = Vec::new();
+            for call in calls {
+                let id = call.get("id").and_then(Json::str).unwrap_or("").to_string();
+                let func = call.get("function");
+                let name = func
+                    .and_then(|f| f.get("name"))
+                    .and_then(Json::str)
+                    .unwrap_or("")
+                    .to_string();
+                let args_str =
+                    func.and_then(|f| f.get("arguments")).and_then(Json::str).unwrap_or("{}");
+                let input = parse_json(args_str).unwrap_or(Json::Obj(Vec::new()));
+                reqs.push(ToolReq { id, name, input });
+            }
+            return Ok(Reply::Tools(reqs));
+        }
+        let text = message.get("content").and_then(Json::str).unwrap_or("").to_string();
+        Ok(Reply::Final(text))
+    }
+
+    fn push_results(&mut self, results: Vec<(ToolReq, String)>) {
+        for (req, out) in results {
+            self.messages.push(format!(
+                "{{\"role\":\"tool\",\"tool_call_id\":\"{}\",\"content\":\"{}\"}}",
+                json_escape(&req.id),
+                json_escape(&out)
+            ));
+        }
+    }
+}
+
+fn user_message(prompt: &str) -> String {
+    format!("{{\"role\":\"user\",\"content\":\"{}\"}}", json_escape(prompt))
+}
+
+fn tool_response(meta: &AiFunMeta, args: &[Value], host: &mut dyn ToolHost) -> Result<String, String> {
+    let prompt = build_prompt(meta, args);
+    if let Some(script) = mock_response(&meta.name) {
+        let rounds = match parse_json(&script) {
+            Ok(Json::Arr(a)) => a,
+            Ok(other) => vec![Json::Obj(vec![("final".into(), other)])],
+            Err(_) => vec![Json::Obj(vec![("final".into(), Json::Str(script.clone()))])],
+        };
+        let mut p = MockProvider { rounds, idx: 0 };
+        return run_tool_loop(&mut p, host, meta);
+    }
+    match env("KUPL_AI_PROVIDER").as_deref() {
+        None | Some("anthropic") => {
+            let key = env("ANTHROPIC_API_KEY")
+                .ok_or("ANTHROPIC_API_KEY is not set (or set KUPL_AI_MOCK for the mock provider)")?;
+            let model = meta
+                .model
+                .clone()
+                .or_else(|| env("KUPL_AI_MODEL"))
+                .unwrap_or_else(|| "claude-opus-4-8".into());
+            let base = env("KUPL_AI_BASE_URL").unwrap_or_else(|| "https://api.anthropic.com".into());
+            let mut p = AnthropicProvider {
+                model,
+                key,
+                base,
+                tools_json: anthropic_tools_json(&meta.tools),
+                messages: vec![user_message(&prompt)],
+            };
+            run_tool_loop(&mut p, host, meta)
+        }
+        Some(provider @ ("openai" | "ollama")) => {
+            let model = meta
+                .model
+                .clone()
+                .or_else(|| env("KUPL_AI_MODEL"))
+                .ok_or("KUPL_AI_MODEL is not set (required for openai/ollama providers)")?;
+            let mut headers = Vec::new();
+            match env("OPENAI_API_KEY") {
+                Some(key) => headers.push(format!("Authorization: Bearer {key}")),
+                None if provider == "openai" => return Err("OPENAI_API_KEY is not set".into()),
+                None => {}
+            }
+            let default_base = if provider == "openai" {
+                "https://api.openai.com"
+            } else {
+                "http://localhost:11434"
+            };
+            let base = env("KUPL_AI_BASE_URL").unwrap_or_else(|| default_base.into());
+            let mut p = OpenAiProvider {
+                model,
+                headers,
+                url: format!("{base}/v1/chat/completions"),
+                tools_json: openai_tools_json(&meta.tools),
+                messages: vec![user_message(&prompt)],
+            };
+            run_tool_loop(&mut p, host, meta)
+        }
+        Some("mock") => Err(format!(
+            "mock provider: set KUPL_AI_MOCK_{} to a scripted round array",
+            meta.name.to_uppercase()
+        )),
+        Some(other) => Err(format!("unknown KUPL_AI_PROVIDER `{other}`")),
+    }
+}
+
 /// Execute one `ai fun` call. `Err` means panic (unless the function wraps
-/// its result — then failures come back as `Ok(Err(msg))`).
-pub fn ai_call(meta: &AiFunMeta, args: &[Value]) -> Result<Value, String> {
-    let outcome = raw_response(meta, args).and_then(|text| convert(meta, &text));
+/// its result — then failures come back as `Ok(Err(msg))`). `host` lets an
+/// ai fun with `tools` call back into the engine's KUPL functions.
+pub fn ai_call(meta: &AiFunMeta, args: &[Value], host: &mut dyn ToolHost) -> Result<Value, String> {
+    let text = if meta.tools.is_empty() {
+        raw_response(meta, args)
+    } else {
+        tool_response(meta, args, host)
+    };
+    let outcome = text.and_then(|t| convert(meta, &t));
     match outcome {
         Ok(v) if meta.wraps_result => Ok(Value::ok(v)),
         Ok(v) => Ok(v),
@@ -385,13 +846,18 @@ mod tests {
             params: vec!["x".into()],
             shape,
             wraps_result: wraps,
+            tools: Vec::new(),
         }
+    }
+
+    fn run(m: &AiFunMeta, args: &[Value]) -> Result<Value, String> {
+        ai_call(m, args, &mut NullToolHost)
     }
 
     #[test]
     fn mock_str_roundtrip() {
         std::env::set_var("KUPL_AI_MOCK_T_STR", "  hello  ");
-        let v = ai_call(&meta("t_str", AiShape::Str, false), &[Value::Int(1)]).unwrap();
+        let v = run(&meta("t_str", AiShape::Str, false), &[Value::Int(1)]).unwrap();
         assert_eq!(v, Value::str("hello"));
     }
 
@@ -406,21 +872,21 @@ mod tests {
             "KUPL_AI_MOCK_T_REC",
             "{\"value\":{\"label\":\"positive\",\"score\":0.9}}",
         );
-        let v = ai_call(&meta("t_rec", shape, false), &[Value::str("great")]).unwrap();
+        let v = run(&meta("t_rec", shape, false), &[Value::str("great")]).unwrap();
         assert_eq!(v.to_string(), "Sentiment(\"positive\", 0.9)");
     }
 
     #[test]
     fn wrapped_result_captures_errors() {
         std::env::set_var("KUPL_AI_MOCK_T_BAD", "not json");
-        let v = ai_call(&meta("t_bad", AiShape::Int, true), &[Value::Int(1)]).unwrap();
+        let v = run(&meta("t_bad", AiShape::Int, true), &[Value::Int(1)]).unwrap();
         assert!(v.to_string().starts_with("Err("), "{v}");
     }
 
     #[test]
     fn code_fences_are_stripped() {
         std::env::set_var("KUPL_AI_MOCK_T_FENCE", "```json\n{\"value\": 42}\n```");
-        let v = ai_call(&meta("t_fence", AiShape::Int, false), &[Value::Int(1)]).unwrap();
+        let v = run(&meta("t_fence", AiShape::Int, false), &[Value::Int(1)]).unwrap();
         assert_eq!(v, Value::Int(42));
     }
 

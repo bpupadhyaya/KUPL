@@ -246,23 +246,109 @@ impl Checker {
                 Ty::Result(t, e) if **e == Ty::Str => ((**t).clone(), true),
                 other => (other.clone(), false),
             };
-            match crate::ai::build_shape(&target, &records, &mut Vec::new()) {
-                Ok(shape) => {
-                    self.checked.ai_funs.insert(
-                        f.name.clone(),
-                        crate::ai::AiFunMeta {
-                            name: f.name.clone(),
-                            intent: ai.intent.clone(),
-                            model: ai.model.clone(),
-                            params: f.params.iter().map(|p| p.name.clone()).collect(),
-                            shape,
-                            wraps_result,
-                        },
-                    );
+            let shape = match crate::ai::build_shape(&target, &records, &mut Vec::new()) {
+                Ok(shape) => shape,
+                Err(msg) => {
+                    self.err("K0271", format!("`ai fun {}`: {msg}", f.name), ret.span);
+                    continue;
                 }
-                Err(msg) => self.err("K0271", format!("`ai fun {}`: {msg}", f.name), ret.span),
-            }
+            };
+            let tools = self.resolve_ai_tools(f, ai, program, &records);
+            self.checked.ai_funs.insert(
+                f.name.clone(),
+                crate::ai::AiFunMeta {
+                    name: f.name.clone(),
+                    intent: ai.intent.clone(),
+                    model: ai.model.clone(),
+                    params: f.params.iter().map(|p| p.name.clone()).collect(),
+                    shape,
+                    wraps_result,
+                    tools,
+                },
+            );
         }
+    }
+
+    /// Resolve an `ai fun`'s `tools [...]` list into `ToolMeta`s. Each tool must
+    /// be a non-generic, non-ai top-level function whose parameter and return
+    /// types are representable as structured output.
+    fn resolve_ai_tools(
+        &mut self,
+        owner: &FunDecl,
+        ai: &AiDecl,
+        program: &Program,
+        records: &std::collections::HashMap<String, (String, Vec<(String, Ty)>)>,
+    ) -> Vec<crate::ai::ToolMeta> {
+        let mut out = Vec::new();
+        for tool_name in &ai.tools {
+            let decl = program.items.iter().find_map(|it| match it {
+                Item::Fun(f) if &f.name == tool_name && f.ai.is_none() => Some(f),
+                _ => None,
+            });
+            let Some(decl) = decl else {
+                self.err(
+                    "K0272",
+                    format!(
+                        "`ai fun {}` lists tool `{tool_name}`, which is not a top-level function",
+                        owner.name
+                    ),
+                    owner.span,
+                );
+                continue;
+            };
+            if !decl.type_params.is_empty() {
+                self.err(
+                    "K0272",
+                    format!("tool `{tool_name}` is generic — ai tools must be monomorphic"),
+                    decl.span,
+                );
+                continue;
+            }
+            let Some(ret_ty) = &decl.ret else {
+                self.err(
+                    "K0272",
+                    format!("tool `{tool_name}` must declare a return type"),
+                    decl.span,
+                );
+                continue;
+            };
+            let mut params = Vec::new();
+            let mut ok = true;
+            for p in &decl.params {
+                let pty = self.resolve_ty(&p.ty);
+                match crate::ai::build_shape(&pty, records, &mut Vec::new()) {
+                    Ok(shape) => params.push((p.name.clone(), shape)),
+                    Err(msg) => {
+                        self.err(
+                            "K0272",
+                            format!("tool `{tool_name}` parameter `{}`: {msg}", p.name),
+                            p.span,
+                        );
+                        ok = false;
+                    }
+                }
+            }
+            let ret = self.resolve_ty(ret_ty);
+            let ret_shape = match crate::ai::build_shape(&ret, records, &mut Vec::new()) {
+                Ok(shape) => shape,
+                Err(msg) => {
+                    self.err("K0272", format!("tool `{tool_name}` return: {msg}"), ret_ty.span);
+                    continue;
+                }
+            };
+            if !ok {
+                continue;
+            }
+            let sig: Vec<String> =
+                decl.params.iter().map(|p| format!("{}: {}", p.name, crate::fmt::ty_str(&p.ty))).collect();
+            let description = format!(
+                "KUPL function `{tool_name}({}) -> {}`",
+                sig.join(", "),
+                crate::fmt::ty_str(ret_ty)
+            );
+            out.push(crate::ai::ToolMeta { name: tool_name.clone(), description, params, ret: ret_shape });
+        }
+        out
     }
 
     fn resolve_ty(&mut self, t: &TyExpr) -> Ty {

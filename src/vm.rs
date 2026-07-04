@@ -66,6 +66,14 @@ impl<'m> Vm<'m> {
         self.run(depth)
     }
 
+    /// Re-entrantly call a top-level function by name (used by the ai tool host).
+    fn call_fun_nested(&mut self, name: &str, args: Vec<Value>) -> Result<Value, VmError> {
+        let Some(&idx) = self.module.funs.get(name) else {
+            return Err(VmError { msg: format!("no function `{name}`"), span: Span::default() });
+        };
+        self.call_chunk_nested(idx, args, None)
+    }
+
     /// Instantiate the app component, deliver `on start` to every instance in
     /// creation order, then drain the message queue to quiescence.
     pub fn run_app(&mut self, app: &str) -> Result<(), VmError> {
@@ -377,12 +385,15 @@ impl<'m> Vm<'m> {
                     })?;
                 }
                 Op::CallAi { dst, info } => {
-                    let Some(meta) = self.module.ai_funs.get(info as usize) else {
+                    // `module` is &'m, independent of the &mut self we pass as
+                    // the tool host below.
+                    let module = self.module;
+                    let Some(meta) = module.ai_funs.get(info as usize) else {
                         return Err(VmError { msg: "unknown ai fun".into(), span });
                     };
                     let args: Vec<Value> =
                         (0..chunk.nparams).map(|i| reg!(chunk.ncaps + i)).collect();
-                    match crate::ai::ai_call(meta, &args) {
+                    match crate::ai::ai_call(meta, &args, self) {
                         Ok(v) => set!(dst, v),
                         Err(msg) => return Err(VmError { msg, span }),
                     }
@@ -705,6 +716,12 @@ impl<'m> Vm<'m> {
     }
 }
 
+impl crate::ai::ToolHost for Vm<'_> {
+    fn call_tool(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        self.call_fun_nested(name, args).map_err(|e| e.msg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,6 +955,48 @@ fun probe() -> Str {\n    kx_haiku(\"t\")\n}\n";
         let mut vm = Vm::new(&decoded);
         let v = vm.call_named("probe", vec![]).expect("runs");
         assert_eq!(v.to_string(), "one two three");
+    }
+
+    #[test]
+    fn diff_ai_fun_tool_loop() {
+        // Scripted mock: two tool calls, then a final answer built from them.
+        std::env::set_var(
+            "KUPL_AI_MOCK_DIFF_ASSIST",
+            "[{\"tool\":\"diff_add\",\"input\":{\"a\":2,\"b\":3}},\
+{\"tool\":\"diff_greet\",\"input\":{\"who\":\"Ada\"}},\
+{\"final\":\"done\"}]",
+        );
+        let src = "fun diff_add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
+ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
+fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
+        assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn ai_fun_tools_kx_roundtrip() {
+        std::env::set_var(
+            "KUPL_AI_MOCK_KX_ASSIST",
+            "[{\"tool\":\"kx_add\",\"input\":{\"a\":10,\"b\":5}},{\"final\":\"ok\"}]",
+        );
+        let src = "fun kx_add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+ai fun kx_assist(q: Str) -> Str tools [kx_add] {\n    intent \"Assist.\"\n}\n\
+fun probe() -> Str {\n    kx_assist(\"x\")\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let decoded = crate::kx::decode(&crate::kx::encode(&module)).expect("decodes");
+        assert_eq!(module.ai_funs, decoded.ai_funs);
+        assert_eq!(decoded.ai_funs[0].tools.len(), 1);
+        let mut vm = Vm::new(&decoded);
+        assert_eq!(vm.call_named("probe", vec![]).unwrap().to_string(), "ok");
+    }
+
+    #[test]
+    fn ai_fun_unknown_tool_is_rejected() {
+        let src = "ai fun bad(q: Str) -> Str tools [nope] {\n    intent \"x\"\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(src).0);
+        assert!(diags.iter().any(|d| d.code == "K0272"), "{diags:?}");
     }
 
     #[test]
