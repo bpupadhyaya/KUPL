@@ -13,17 +13,168 @@ pub struct Compiled {
     pub warnings: Vec<Diag>,
 }
 
-/// Parse + check. Errors are returned; warnings ride along on success.
+/// Parse + check (types, then effects). Errors are returned; warnings ride
+/// along on success.
 pub fn compile(src: &str) -> Result<Compiled, Vec<Diag>> {
     let (program, mut diags) = parser::parse(src);
     let (checked, check_diags) = check::check(&program);
     diags.extend(check_diags);
+    // Effects only make sense on a program that parsed; skip if already broken.
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        diags.extend(crate::effects::check_effects(&program));
+    }
     let (errors, warnings): (Vec<_>, Vec<_>) =
         diags.into_iter().partition(|d| d.severity == Severity::Error);
     if errors.is_empty() {
         Ok(Compiled { program, checked, warnings })
     } else {
         Err(errors)
+    }
+}
+
+/// `kupl context <name>`: emit the item plus the source of everything it
+/// directly references — the minimal dependency-closed context for an LLM.
+pub fn emit_context(src: &str, file: &str, name: &str) -> i32 {
+    let compiled = match compile(src) {
+        Ok(c) => c,
+        Err(errors) => {
+            print_diags(&errors, src, file);
+            return 1;
+        }
+    };
+    let items: Vec<(&str, Span)> = compiled
+        .program
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Fun(f) => (f.name.as_str(), f.span),
+            Item::Type(t) => (t.name.as_str(), t.span),
+            Item::Component(c) => (c.name.as_str(), c.span),
+        })
+        .collect();
+    let Some(target) = compiled.program.items.iter().find(|item| match item {
+        Item::Fun(f) => f.name == name,
+        Item::Type(t) => t.name == name,
+        Item::Component(c) => c.name == name,
+    }) else {
+        eprintln!("error: no item named `{name}` in {file}");
+        return 1;
+    };
+
+    // Names the target references, resolved to item names.
+    let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut note = |n: &str| {
+        // constructor names resolve to their owning type
+        let owner = compiled
+            .checked
+            .ctors
+            .get(n)
+            .map(|(ty, _)| ty.as_str())
+            .unwrap_or(n);
+        if owner != name && items.iter().any(|(i, _)| *i == owner) {
+            referenced.insert(owner.to_string());
+        }
+    };
+    match target {
+        Item::Fun(f) => {
+            for p in &f.params {
+                collect_ty_names(&p.ty, &mut note);
+            }
+            if let Some(r) = &f.ret {
+                collect_ty_names(r, &mut note);
+            }
+            crate::effects::walk_block(&f.body, &mut |e| collect_expr_names(e, &mut note));
+        }
+        Item::Type(t) => {
+            for v in &t.variants {
+                for fld in &v.fields {
+                    collect_ty_names(&fld.ty, &mut note);
+                }
+            }
+        }
+        Item::Component(c) => {
+            for p in &c.ports {
+                collect_ty_names(&p.ty, &mut note);
+            }
+            for p in &c.props {
+                collect_ty_names(&p.ty, &mut note);
+            }
+            for child in &c.children {
+                note(&child.component);
+            }
+            for s in &c.state {
+                crate::effects::walk_block(
+                    &crate::ast::Block { stmts: vec![crate::ast::Stmt::Expr(s.init.clone())], span: s.span },
+                    &mut |e| collect_expr_names(e, &mut note),
+                );
+            }
+            for h in &c.handlers {
+                crate::effects::walk_block(&h.body, &mut |e| collect_expr_names(e, &mut note));
+            }
+            for f in c.exposes.iter().chain(c.funs.iter()) {
+                for p in &f.params {
+                    collect_ty_names(&p.ty, &mut note);
+                }
+                if let Some(r) = &f.ret {
+                    collect_ty_names(r, &mut note);
+                }
+                crate::effects::walk_block(&f.body, &mut |e| collect_expr_names(e, &mut note));
+            }
+        }
+    }
+
+    let slice = |span: Span| {
+        let s = (span.start as usize).min(src.len());
+        let e = (span.end as usize).min(src.len());
+        src[s..e].trim_end().to_string()
+    };
+    let target_span = match target {
+        Item::Fun(f) => f.span,
+        Item::Type(t) => t.span,
+        Item::Component(c) => c.span,
+    };
+    println!("// kupl context: {name} ({file})");
+    println!("{}", slice(target_span));
+    if !referenced.is_empty() {
+        println!("\n// --- direct dependencies ---");
+        for dep in &referenced {
+            if let Some((_, span)) = items.iter().find(|(i, _)| i == dep) {
+                println!("\n{}", slice(*span));
+            }
+        }
+    }
+    0
+}
+
+fn collect_ty_names(t: &crate::ast::TyExpr, f: &mut impl FnMut(&str)) {
+    use crate::ast::TyExprKind;
+    match &t.kind {
+        TyExprKind::Name(n) => f(n),
+        TyExprKind::Generic(n, args) => {
+            f(n);
+            for a in args {
+                collect_ty_names(a, f);
+            }
+        }
+        TyExprKind::Fun(params, ret) => {
+            for p in params {
+                collect_ty_names(p, f);
+            }
+            collect_ty_names(ret, f);
+        }
+    }
+}
+
+fn collect_expr_names(e: &crate::ast::Expr, f: &mut impl FnMut(&str)) {
+    use crate::ast::ExprKind;
+    match &e.kind {
+        ExprKind::Ident(n) => f(n),
+        ExprKind::Call { callee, .. } => {
+            if let ExprKind::Ident(n) = &callee.kind {
+                f(n);
+            }
+        }
+        _ => {}
     }
 }
 

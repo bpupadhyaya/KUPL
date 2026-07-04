@@ -117,6 +117,27 @@ the VM. No visual tool is ever required to use KUPL.
 | Smalltalk (Squeak/Pharo) | live environment, visual composition over a real language |
 | E/Pony | capability security |
 
+## What "Universal" means (and deliberately doesn't)
+
+KUPL claims universality on five axes, and rejects it on one:
+
+- **Domains** — one `component` model for UI, services, drivers, ML pipelines.
+- **Hardware** — CPU/GPU/TPU/NPU via kernels and placement (`at`), one semantics.
+- **Altitude** — app tier to inline `asm` in one language, progressively disclosed.
+- **Execution modes** — REPL, interpreter, VM, native: explore-to-ship without
+  switching languages.
+- **Authorship** — designed equally for human and machine writers and repairers.
+- **Platforms & ecosystems** — universal *by strategy, not by wish*: see
+  `PLATFORMS.md` (capability-provider profiles, honest compile-time target checks),
+  `INTEROP.md` (foreign code behind adapter components), `DISTRIBUTION.md`
+  (typed ports across machines), `UI.md` (one view protocol, swappable renderers).
+
+**Not** universal in paradigm or style: no inheritance, no macros (v1), no
+exceptions, one canonical form, one way to do most things. That narrowness is the
+point — fewer degrees of freedom per token is what makes machine generation
+reliable and human repair fast. KUPL is universal in where it runs and what it can
+build, opinionated in how code is written.
+
 ## Non-goals (v1)
 
 - Not a research playground: no dependent types, no macros in v1 (canonical
@@ -129,3 +150,8 @@ the VM. No visual tool is ever required to use KUPL.
 
 - `LANGUAGE.md` — the language: model, types, effects, keywords, grammar, semantics, examples.
 - `TOOLCHAIN.md` — every phase: lexer, parser, canonicalizer, resolver, type/effect checker, KIR, optimizer, KVM bytecode + VM, native backend, runtime, REPL, CLI, LSP, package manager.
+- `UI.md` — the view protocol: `render` blocks, typed layout/style, renderer adapters (wgpu reference, DOM, native).
+- `INTEROP.md` — foreign code behind adapter components: C ABI, WASM sandbox, sidecars, `kupl bridge`, kser interchange.
+- `DISTRIBUTION.md` — components across machines: explicit placement, portability rules, kser wire format, partition-as-supervision.
+- `PLATFORMS.md` — target profiles, capability-provider adapters, lifecycle-as-ports, packaging (server/desktop/web/mobile/embedded).
+- `VISUAL-TOOLS-CONTRACT.md` — numbered obligations (C1–C8+) to visual tools: canonical form, node IDs, `@meta` blocks, manifests, hot swap, trace hooks.

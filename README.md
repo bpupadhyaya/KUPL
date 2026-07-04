@@ -27,7 +27,10 @@ cargo build --release          # produces target/release/kupl
 kupl run examples/counter.kupl    # run an app (components, wiring, messages)
 kupl run examples/shapes.kupl     # run a pure functional program (fun main)
 kupl test examples/counter.kupl   # run `example` blocks as tests
-kupl check examples/todo.kupl     # parse + type-check only
+kupl check examples/todo.kupl     # parse + type-check + effect-check
+kupl check --json broken.kupl     # machine-readable diagnostics (for AI/editors)
+kupl fmt file.kupl [--write]      # THE canonical form (zero config, idempotent)
+kupl context file.kupl TodoStore  # item + direct deps — minimal LLM context
 kupl repl                         # interactive session
 ```
 
@@ -55,15 +58,19 @@ component Counter {
 }
 ```
 
-What v0.1 already gives you: components as isolated actors with typed ports and
+What works today: components as isolated actors with typed ports and
 `wire`-based composition; pure functions, ADTs + exhaustive `match`, records,
 newtypes, `Option`/`Result` with `?`, lambdas, string interpolation, list/string
 methods; checked 64-bit integers (overflow panics, never wraps); `intent` and
-executable `example` blocks as syntax; precise diagnostics with stable codes.
+executable `example` blocks as syntax; **effect inference + boundary enforcement**
+(`pub`/`expose` functions must declare `uses io` etc. — inferred transitively
+through private helpers); **the normative formatter** (`kupl fmt`, idempotent by
+construction); **JSON diagnostics** with stable codes; **`kupl context`** for
+minimal LLM prompts.
 
-Next phases (see `docs/design/TOOLCHAIN.md`): effects/capabilities enforcement,
-contracts & laws, the canonical formatter, KIR, the KVM bytecode VM, native
-compilation, and the tensor/kernel hardware story.
+Next phases (see `docs/design/TOOLCHAIN.md`): contracts & laws, KIR, the KVM
+bytecode VM, native compilation, and the tensor/kernel hardware story.
 
-Status: v0.1 interpreter + REPL working end-to-end (2026-07-03); design proposal
-in `docs/design/`. The pre-2026 Scala/Java scaffold lives in `attic/`.
+Status: v0.2 — interpreter, REPL, formatter, effect checking, AI tooling
+(2026-07-03); design proposal in `docs/design/`. The pre-2026 Scala/Java
+scaffold lives in `attic/`.

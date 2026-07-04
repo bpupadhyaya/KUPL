@@ -88,3 +88,45 @@ impl fmt::Display for Diag {
         write!(f, "[{}] {}", self.code, self.message)
     }
 }
+
+/// Machine-readable diagnostics (`--json`): one JSON object per line would be
+/// hostile to small consumers, so we emit a single document.
+pub fn to_json(diags: &[Diag], src: &str, file: &str) -> String {
+    let mut out = String::from("{\"diagnostics\":[");
+    for (i, d) in diags.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let (line, col) = line_col(src, d.span.start);
+        let sev = match d.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        out.push_str(&format!(
+            "{{\"severity\":\"{sev}\",\"code\":\"{}\",\"message\":\"{}\",\"file\":\"{}\",\"span\":{{\"start\":{},\"end\":{},\"line\":{line},\"col\":{col}}}}}",
+            d.code,
+            json_escape(&d.message),
+            json_escape(file),
+            d.span.start,
+            d.span.end,
+        ));
+    }
+    out.push_str("]}");
+    out
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}

@@ -486,12 +486,20 @@ every doc tooltip (`intent`) is literally this source code.
 
 1. Syntax for UI trees: is nesting components enough or do we want JSX-like literal
    composition sugar? (Leaning: a `render` block that is itself just component
-   construction — no separate template language.)
+   construction — no separate template language.) **→ full proposal in `UI.md`
+   (pure `render` projection, typed view tree, renderer adapters); pending review.**
 2. `Int` default: 64-bit checked vs BigInt-by-default (Python-style)? Leaning i64
    checked; BigInt in std.
 3. Effect granularity: is `db.read`/`db.write` the right grain, or user-definable
    effect hierarchies from day one?
 4. Hot-swap semantics for `state` migration on component upgrade (Erlang's
-   `code_change` equivalent) — needed for visual live-editing.
+   `code_change` equivalent) — needed for visual live-editing (contract item C6,
+   see `VISUAL-TOOLS-CONTRACT.md`).
 5. Package identity & registry: content-addressed packages with signed manifests —
    spec in TOOLCHAIN.md, needs a decision on namespace governance.
+6. `@meta` tool-annotation blocks (proposed in `VISUAL-TOOLS-CONTRACT.md` C3) —
+   accept into grammar §9? (Leaning yes: semantics-free, formatter-placed, needed
+   for sidecar-free visual tooling.)
+7. Portability rules for network ports + kser wire format (proposed in
+   `DISTRIBUTION.md`) — must be resolved **in** spec v1.0 even though the
+   distributed runtime ships much later.
