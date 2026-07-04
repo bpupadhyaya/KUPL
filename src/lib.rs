@@ -10,6 +10,7 @@ pub mod regex;
 pub mod time;
 pub mod encoding;
 pub mod csv;
+pub mod url;
 pub mod ast;
 pub mod bytecode;
 pub mod cgen;

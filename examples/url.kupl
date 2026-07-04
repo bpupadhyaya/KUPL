@@ -1,0 +1,36 @@
+// URL encoding & query strings — the web plumbing for the HTTP client.
+//
+//   url_encode(s)  -> Str            percent-encode (space -> %20, unreserved kept)
+//   url_decode(s)  -> Result[Str,Str]  reverse %XX, `+` -> space
+//   query_parse(s) -> List[List[Str]]  "a=1&b=2" -> [[a,1],[b,2]] (decoded)
+//   query_build(p) -> Str             [[a,1],[b,2]] -> "a=1&b=2" (encoded)
+//
+// All pure. Combine with http_get to call an API with parameters.
+
+// Build a full URL with an encoded query string.
+fun with_params(base: Str, params: List[List[Str]]) -> Str {
+    base + "?" + query_build(params)
+}
+
+fun main() uses io {
+    let url = with_params("https://example.com/search", [
+        ["q", "kupl language"],
+        ["lang", "en"],
+        ["tag", "a+b"]
+    ])
+    print(url)
+
+    // parse a query string back into pairs
+    let pairs = query_parse("name=Ada%20Lovelace&role=eng%2Blead&active=")
+    for pair in pairs {
+        let key = pair.get(0).unwrap_or("?")
+        let value = pair.get(1).unwrap_or("")
+        print("{key} -> {value}")
+    }
+
+    // decode gracefully handles bad input
+    match url_decode("100%") {
+        Ok(s) => print(s)
+        Err(_) => print("malformed percent-encoding handled")
+    }
+}

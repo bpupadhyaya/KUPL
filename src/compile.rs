@@ -1082,6 +1082,10 @@ impl<'s> FnCompiler<'s> {
                 ("hash_fnv", 1) => Some(BUILTIN_HASH_FNV),
                 ("csv_parse", 1) => Some(BUILTIN_CSV_PARSE),
                 ("csv_stringify", 1) => Some(BUILTIN_CSV_STRINGIFY),
+                ("url_encode", 1) => Some(BUILTIN_URL_ENCODE),
+                ("url_decode", 1) => Some(BUILTIN_URL_DECODE),
+                ("query_parse", 1) => Some(BUILTIN_QUERY_PARSE),
+                ("query_build", 1) => Some(BUILTIN_QUERY_BUILD),
                 _ => None,
             };
             if let Some(which) = builtin {

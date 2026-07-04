@@ -206,6 +206,10 @@ pub const BUILTIN_HEX_DECODE: u8 = 41;
 pub const BUILTIN_HASH_FNV: u8 = 42;
 pub const BUILTIN_CSV_PARSE: u8 = 43;
 pub const BUILTIN_CSV_STRINGIFY: u8 = 44;
+pub const BUILTIN_URL_ENCODE: u8 = 45;
+pub const BUILTIN_URL_DECODE: u8 = 46;
+pub const BUILTIN_QUERY_PARSE: u8 = 47;
+pub const BUILTIN_QUERY_BUILD: u8 = 48;
 
 impl Module {
     pub fn disassemble(&self) -> String {

@@ -641,6 +641,19 @@ impl<'m> Vm<'m> {
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_URL_ENCODE | BUILTIN_URL_DECODE | BUILTIN_QUERY_PARSE
+                        | BUILTIN_QUERY_BUILD => {
+                            let name = match which {
+                                BUILTIN_URL_ENCODE => "url_encode",
+                                BUILTIN_URL_DECODE => "url_decode",
+                                BUILTIN_QUERY_PARSE => "query_parse",
+                                _ => "query_build",
+                            };
+                            match crate::interp::url_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1186,6 +1199,36 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_url_it26() {
+        assert_eq!(differential("fun probe() -> Str {\n    url_encode(\"a b&c\")\n}\n"), "a%20b%26c");
+        assert_eq!(differential("fun probe() -> Str {\n    url_encode(\"a-b_c.d~e\")\n}\n"), "a-b_c.d~e");
+        // decode incl. + as space and %XX
+        assert_eq!(
+            differential("fun probe() -> Str {\n    match url_decode(\"a+b%26c\") {\n        Ok(s) => s\n        Err(e) => e\n    }\n}\n"),
+            "a b&c"
+        );
+        // round-trip incl. unicode
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    match url_decode(url_encode(\"π≈3.14 x/y\")) {\n        Ok(s) => s == \"π≈3.14 x/y\"\n        Err(_) => false\n    }\n}\n"),
+            "true"
+        );
+        // malformed escape → Err
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    match url_decode(\"%2\") {\n        Ok(_) => false\n        Err(_) => true\n    }\n}\n"),
+            "true"
+        );
+        // query build + parse round-trip
+        assert_eq!(
+            differential("fun probe() -> Str {\n    query_build([[\"n\", \"A B\"], [\"r\", \"x+y\"]])\n}\n"),
+            "n=A%20B&r=x%2By"
+        );
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    let q = query_build([[\"n\", \"A B\"], [\"r\", \"x+y\"]])\n    query_parse(q) == [[\"n\", \"A B\"], [\"r\", \"x+y\"]]\n}\n"),
+            "true"
+        );
     }
 
     #[test]

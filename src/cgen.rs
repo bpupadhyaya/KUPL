@@ -205,6 +205,15 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
                         .into(),
                 )
             }
+            BUILTIN_URL_ENCODE => format!("regs[{dst}] = k_url_encode(regs[{start}]); (void){argc};"),
+            BUILTIN_URL_DECODE => format!("regs[{dst}] = k_url_decode(regs[{start}]); (void){argc};"),
+            BUILTIN_QUERY_PARSE | BUILTIN_QUERY_BUILD => {
+                return Err(
+                    "query_parse/query_build are not yet supported by the native backend \
+                     — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
+                        .into(),
+                )
+            }
             BUILTIN_ENV_VAR => format!("regs[{dst}] = k_env_var(regs[{start}]); (void){argc};"),
             BUILTIN_ARGS => format!("regs[{dst}] = k_args(); (void){start}; (void){argc};"),
             BUILTIN_EPRINT => format!("regs[{dst}] = k_eprint(regs[{start}]); (void){argc};"),
@@ -979,6 +988,45 @@ static KValue k_hash_fnv(KValue sv) {
     uint64_t h = 0xcbf29ce484222325ULL;
     for (size_t i = 0; s[i]; i++) { h ^= s[i]; h *= 0x100000001b3ULL; }
     return k_int((int64_t)h);
+}
+static int k_url_unreserved(unsigned char b) {
+    return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+        || b == '-' || b == '_' || b == '.' || b == '~';
+}
+static KValue k_url_encode(KValue sv) {
+    const unsigned char* s = (const unsigned char*)sv.as.s;
+    size_t n = strlen(sv.as.s);
+    const char* H = "0123456789ABCDEF";
+    char* out = k_alloc(n * 3 + 1);
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (k_url_unreserved(s[i])) { out[o++] = (char)s[i]; }
+        else { out[o++] = '%'; out[o++] = H[s[i] >> 4]; out[o++] = H[s[i] & 0xF]; }
+    }
+    out[o] = 0;
+    return k_str(out);
+}
+static KValue k_url_decode(KValue sv) {
+    const char* s = sv.as.s;
+    size_t n = strlen(s);
+    unsigned char* out = k_alloc(n + 1);
+    size_t o = 0, i = 0;
+    while (i < n) {
+        if (s[i] == '%') {
+            if (i + 2 >= n) return k_err(k_str("invalid percent-encoding: truncated escape"));
+            int hi = -1, lo = -1;
+            char a = s[i + 1], b = s[i + 2];
+            if (a >= '0' && a <= '9') hi = a - '0'; else if (a >= 'a' && a <= 'f') hi = a - 'a' + 10; else if (a >= 'A' && a <= 'F') hi = a - 'A' + 10;
+            if (b >= '0' && b <= '9') lo = b - '0'; else if (b >= 'a' && b <= 'f') lo = b - 'a' + 10; else if (b >= 'A' && b <= 'F') lo = b - 'A' + 10;
+            if (hi < 0 || lo < 0) return k_err(k_str("invalid percent-encoding: bad hex"));
+            out[o++] = (unsigned char)((hi << 4) | lo);
+            i += 3;
+        } else if (s[i] == '+') { out[o++] = ' '; i++; }
+        else { out[o++] = (unsigned char)s[i]; i++; }
+    }
+    if (!k_valid_utf8(out, o)) return k_err(k_str("decoded bytes are not valid UTF-8"));
+    out[o] = 0;
+    return k_ok(k_str((char*)out));
 }
 
 /* ---- time/date; mirrors interp::time / src/time.rs exactly ---- */

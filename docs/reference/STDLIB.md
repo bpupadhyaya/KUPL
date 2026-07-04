@@ -41,6 +41,10 @@ unless supervised.
 | `hash_fnv(s)` | `(Str) -> Int` | FNV-1a 64-bit; stable, non-cryptographic |
 | `csv_parse(text)` | `(Str) -> List[List[Str]]` | RFC 4180; handles quoted fields |
 | `csv_stringify(rows)` | `(List[List[Str]]) -> Str` | quotes fields with `,` `"` or newline |
+| `url_encode(s)` | `(Str) -> Str` | percent-encode; space → `%20`; keeps `A-Za-z0-9-_.~` |
+| `url_decode(s)` | `(Str) -> Result[Str, Str]` | reverse `%XX`; `+` → space; `Err` on bad input |
+| `query_parse(s)` | `(Str) -> List[List[Str]]` | `a=1&b=2` → `[[a,1],[b,2]]`, decoded |
+| `query_build(pairs)` | `(List[List[Str]]) -> Str` | encode `[key, value]` pairs into `a=1&b=2` |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
 | `re_match(pat, text)` | `(Str, Str) -> Bool` | regex search (`^…$` for full match) |
@@ -84,6 +88,14 @@ bucketing/sharding, not for security.
 values containing `,` `"` or newlines (with `""` for an embedded quote). A
 trailing newline yields no extra row; a blank interior line is a one-field row.
 Pure and interp==KVM; not yet on the native backend.
+
+**URL** (`url_encode`/`url_decode`) is percent-encoding: `url_encode` keeps the
+RFC 3986 unreserved set `A-Za-z0-9-_.~` and encodes everything else including
+space as `%20`; `url_decode` reverses `%XX`, treats `+` as space, and returns
+`Err` on a malformed escape or non-UTF-8. `query_parse`/`query_build` handle
+`key=value&…` pairs (each part url-decoded/encoded). `url_encode`/`url_decode`
+run on all engines incl. native; the query helpers are interp==KVM (native
+deferred).
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

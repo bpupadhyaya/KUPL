@@ -964,6 +964,10 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return csv_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("url_encode", 1) | ("url_decode", 1) | ("query_parse", 1) | ("query_build", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return url_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("exit", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     let code = match v {
@@ -2201,6 +2205,47 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err(format!("unknown process builtin `{name}`")),
     }
+}
+
+/// URL & query-string builtins — shared by interpreter and KVM. Pure.
+pub fn url_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let as_str = |v: &Value| match v {
+        Value::Str(s) => s.as_str().to_string(),
+        other => other.to_string(),
+    };
+    use crate::url as u;
+    Ok(match name {
+        "url_encode" => Value::str(u::url_encode(&as_str(&args[0]))),
+        "url_decode" => match u::url_decode(&as_str(&args[0])) {
+            Ok(v) => Value::ok(Value::str(v)),
+            Err(e) => Value::err(Value::str(e)),
+        },
+        "query_parse" => {
+            let pairs = u::query_parse(&as_str(&args[0]));
+            Value::List(Rc::new(
+                pairs
+                    .into_iter()
+                    .map(|p| Value::List(Rc::new(p.into_iter().map(Value::str).collect())))
+                    .collect(),
+            ))
+        }
+        "query_build" => {
+            let rows = match &args[0] {
+                Value::List(rows) => rows,
+                other => return Err(format!("`query_build` needs a List, found {}", other.type_name())),
+            };
+            let mut grid: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+            for row in rows.iter() {
+                let fields = match row {
+                    Value::List(fs) => fs,
+                    other => return Err(format!("`query_build` pairs must be Lists, found {}", other.type_name())),
+                };
+                grid.push(fields.iter().map(|f| as_str(f)).collect());
+            }
+            Value::str(u::query_build(&grid))
+        }
+        _ => return Err(format!("unknown url builtin `{name}`")),
+    })
 }
 
 /// CSV builtins — shared by interpreter and KVM. Pure.

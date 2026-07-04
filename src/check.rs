@@ -1524,6 +1524,31 @@ impl Checker {
                     );
                     return Ty::Str;
                 }
+                ("url_encode", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "url_encode argument");
+                    return Ty::Str;
+                }
+                ("url_decode", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "url_decode argument");
+                    return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
+                ("query_parse", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "query_parse argument");
+                    return Ty::List(Box::new(Ty::List(Box::new(Ty::Str))));
+                }
+                ("query_build", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(
+                        &Ty::List(Box::new(Ty::List(Box::new(Ty::Str)))),
+                        &t,
+                        args[0].value.span,
+                        "query_build argument",
+                    );
+                    return Ty::Str;
+                }
                 ("eprint", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Unit;
