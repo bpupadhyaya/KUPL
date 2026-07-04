@@ -237,8 +237,8 @@ They carry the same guarantees as `par`: each element is processed
 independently, and execution is deterministic (results in input order), so
 tests stay reproducible. `par_map` is semantically identical to `map`. When its
 callback is a **pure** top-level function (no effects) and the list is large
-(≥ 256 elements), `par_map` now runs the callback across **real OS threads**;
-otherwise it evaluates sequentially. Because a pure function cannot observe I/O,
+(≥ 256 elements), `par_map` — and `par_filter` — now run the callback across
+**real OS threads**; otherwise they evaluate sequentially. Because a pure function cannot observe I/O,
 the clock, randomness, or shared state — and results are written back by input
 index — the output is byte-for-byte identical regardless of how many threads
 ran it. `par_each` applies the function for its effects and returns `()`. All

@@ -67,8 +67,8 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 
 - [◐] **Concurrency / parallelism** (audit #1) — **`par { … }` fork-join
       (it11) + parallel iteration `par_map`/`par_filter`/`par_each` (it13), and
-      as of it33 REAL OS-THREAD execution for `par_map` with a pure named
-      callback over lists ≥ 256 elements** (`src/parallel.rs`: a `PortableValue`
+      as of it33-34 REAL OS-THREAD execution for `par_map` AND `par_filter` with a
+      pure named callback over lists ≥ 256 elements** (`src/parallel.rs`: a `PortableValue`
       Send boundary + a Send+Sync `ProgramImage` + `std::thread::scope`; results
       placed by input index so the output is byte-identical to sequential
       `map`). Everything else still evaluates sequentially (deterministic,

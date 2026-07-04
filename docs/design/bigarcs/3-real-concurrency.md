@@ -1,3 +1,13 @@
+> **Progress:** slice 2 landed (it34) — real-thread `par_filter` too, sharing
+> the slice-1 core (`gate` + `par_eval`): the pure predicate is evaluated across
+> threads and survivors are kept in input-index order, byte-identical to the
+> sequential `filter`. `par_each` is deliberately NOT parallelized — a pure
+> callback has no effects, so it's a no-op. THRESHOLD stays 256 (a conservative
+> floor: below it, thread-spawn + per-worker Interp construction dominates;
+> benchmark-driven tuning is future). New `examples/parallel-bench.kupl` maps a
+> compute-heavy pure Collatz kernel over 2000 elements. Still interpreter-only
+> (KVM = sequential reference proving byte-identity).
+>
 > **Progress:** slice 1 landed (it33) — real-thread `par_map` for PURE named
 > functions over lists ≥ 256 elements. A new `src/parallel.rs` (PortableValue
 > Send boundary + ProgramImage + try_par_map with std::thread::scope) runs the

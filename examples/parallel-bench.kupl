@@ -1,0 +1,48 @@
+// Parallel map/filter over a large list with COMPUTE-HEAVY pure functions.
+//
+// `par_map`/`par_filter` with a pure (effect-free) callback over a list of at
+// least 256 elements run across real OS threads. Because a pure function can't
+// observe I/O, the clock, randomness, or shared state — and results are written
+// back by input index — the output is deterministic and byte-for-byte identical
+// whether it ran on one thread or many. So this program prints the same numbers
+// on the interpreter, the KVM, and native, regardless of core count.
+
+// Length of the Collatz (3n+1) sequence starting at n — a pure numeric kernel
+// with data-dependent work per element (a good parallelism stress test).
+fun collatz_len(n: Int) -> Int {
+    var steps = 0
+    var x = n
+    while x > 1 {
+        if x % 2 == 0 {
+            x = x / 2
+        } else {
+            x = x * 3 + 1
+        }
+        steps = steps + 1
+    }
+    steps
+}
+
+fun is_long(n: Int) -> Bool {
+    collatz_len(n + 1) > 60
+}
+
+fun main() uses io {
+    // build [1, 2, …, 2000]
+    var xs: List[Int] = []
+    var i = 1
+    while i <= 2000 {
+        xs = xs.push(i)
+        i = i + 1
+    }
+
+    // fan the pure kernel out across threads, then reduce deterministically
+    let lengths = xs.par_map(collatz_len)
+    print("count      = {lengths.len()}")
+    print("total steps= {lengths.sum()}")
+    print("max steps  = {lengths.fold(0, fn acc, n { if n > acc { n } else { acc } })}")
+
+    // parallel filter: how many starting points have a long-ish sequence
+    let long_ones = xs.par_filter(is_long)
+    print("long (>60) = {long_ones.len()}")
+}

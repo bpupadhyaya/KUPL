@@ -158,6 +158,54 @@ pub fn try_par_map(
     if name != "par_map" {
         return None;
     }
+    let (portable, fname) = gate(recv, args, image)?;
+    // map keeps EVERY result, from_portable back into `Value`s, in index order.
+    let mut out = Vec::with_capacity(portable.len());
+    for r in par_eval(&portable, &fname, image) {
+        match r {
+            Ok(pv) => out.push(from_portable(&pv)),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok(Value::List(Rc::new(out))))
+}
+
+/// Real-thread `xs.par_filter(pure_pred)`: evaluate the predicate on every
+/// element in parallel, then keep the ORIGINAL elements whose predicate is
+/// `true`, in input-index order — byte-identical to the sequential `filter`
+/// (which keeps `x` only when `call(pred, x)` matches `Value::Bool(true)`).
+pub fn try_par_filter(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    image: &Arc<ProgramImage>,
+) -> Option<Result<Value, String>> {
+    if name != "par_filter" {
+        return None;
+    }
+    let (portable, fname) = gate(recv, args, image)?;
+    let mut out = Vec::new();
+    for (i, r) in par_eval(&portable, &fname, image).into_iter().enumerate() {
+        match r {
+            Ok(PortableValue::Bool(true)) => out.push(from_portable(&portable[i])),
+            // false OR any non-Bool: excluded, exactly as the sequential
+            // `if let Value::Bool(true) = …` does (it never errors on non-Bool).
+            Ok(_) => {}
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok(Value::List(Rc::new(out))))
+}
+
+// Note: there is deliberately no `try_par_each`. A pure function has no effects,
+// so `list.par_each(pure_fn)` does nothing observable — parallelizing a no-op is
+// pointless. A callback with effects isn't pure and wouldn't qualify anyway.
+
+/// Shared preconditions for a parallel list method: the receiver is a list of at
+/// least `THRESHOLD` fully-portable elements and the callback is a named pure
+/// function. Returns the portable elements + the function name, or `None` to
+/// fall back to the sequential path.
+fn gate(recv: &Value, args: &[Value], image: &ProgramImage) -> Option<(Vec<PortableValue>, String)> {
     let Value::List(items) = recv else { return None };
     if items.len() < THRESHOLD {
         return None;
@@ -166,19 +214,27 @@ pub fn try_par_map(
         Some(Value::Fun(n)) if image.pure_funs.contains(n.as_str()) => (**n).clone(),
         _ => return None,
     };
-    // all elements must be portable (else fall back — no partial parallelism)
     let mut portable: Vec<PortableValue> = Vec::with_capacity(items.len());
     for it in items.iter() {
-        portable.push(to_portable(it)?);
+        portable.push(to_portable(it)?); // any non-portable element → sequential
     }
+    Some((portable, fname))
+}
 
+/// Evaluate `fname` on every element across worker threads, returning the
+/// per-element results in INPUT-INDEX ORDER. Each worker owns a disjoint index
+/// range, builds one thread-local `Interp`, and returns its results in order;
+/// `PortableValue` is the only thing that crosses a thread boundary.
+fn par_eval(
+    portable: &[PortableValue],
+    fname: &str,
+    image: &Arc<ProgramImage>,
+) -> Vec<Result<PortableValue, String>> {
     let n = portable.len();
-    let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).clamp(1, n);
+    let workers =
+        std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).clamp(1, n.max(1));
     let chunk = n.div_ceil(workers);
-
-    // Each worker owns a disjoint index range, builds one thread-local Interp,
-    // and returns its results in order. PortableValue is the only thing sent.
-    let results: Vec<Result<PortableValue, String>> = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for w in 0..workers {
             let start = w * chunk;
@@ -188,32 +244,17 @@ pub fn try_par_map(
             let end = ((w + 1) * chunk).min(n);
             let slice = &portable[start..end];
             let image = image;
-            let fname = fname.as_str();
             handles.push(scope.spawn(move || {
                 let mut interp = crate::interp::Interp::new_bare(image.worker_db());
-                slice
-                    .iter()
-                    .map(|p| eval_one(&mut interp, fname, p))
-                    .collect::<Vec<_>>()
+                slice.iter().map(|p| eval_one(&mut interp, fname, p)).collect::<Vec<_>>()
             }));
         }
         let mut all = Vec::with_capacity(n);
         for h in handles {
-            all.extend(h.join().expect("par_map worker thread panicked"));
+            all.extend(h.join().expect("par worker thread panicked"));
         }
         all
-    });
-
-    // Assemble in index order; the first (lowest-index) error wins — matching
-    // the sequential map, which stops at the first failing element.
-    let mut out = Vec::with_capacity(n);
-    for r in results {
-        match r {
-            Ok(pv) => out.push(from_portable(&pv)),
-            Err(e) => return Some(Err(e)),
-        }
-    }
-    Some(Ok(Value::List(Rc::new(out))))
+    })
 }
 
 /// Evaluate the pure function on one element (thread-local `Value`s only).
@@ -225,9 +266,9 @@ fn eval_one(
     let f = Value::Fun(Rc::new(fname.to_string()));
     match interp.call_value(f, vec![from_portable(arg)], Span::default()) {
         Ok(v) => to_portable(&v)
-            .ok_or_else(|| "par_map callback returned a non-portable value".to_string()),
+            .ok_or_else(|| "parallel callback returned a non-portable value".to_string()),
         Err(crate::interp::Flow::Panic { msg, .. }) => Err(msg),
-        Err(_) => Err("invalid control flow in par_map callback".to_string()),
+        Err(_) => Err("invalid control flow in parallel callback".to_string()),
     }
 }
 

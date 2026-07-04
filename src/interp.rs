@@ -2673,7 +2673,9 @@ fn builtin_method(
     // real-thread fast path: `xs.par_map(pure_fn)` over a large list. Falls
     // through to the sequential shared_method on any non-qualifying call.
     if let Some(image) = interp.image.clone() {
-        if let Some(res) = crate::parallel::try_par_map(&recv, name, &args, &image) {
+        if let Some(res) = crate::parallel::try_par_map(&recv, name, &args, &image)
+            .or_else(|| crate::parallel::try_par_filter(&recv, name, &args, &image))
+        {
             return res.map_err(|msg| Flow::Panic { msg, span });
         }
     }

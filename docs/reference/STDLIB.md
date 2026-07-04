@@ -353,9 +353,9 @@ the instance's state.
 
 ## Parallelism
 
-`list.par_map(f)` is semantically identical to `list.map(f)` — same results, same
-order. When `f` is a **pure** top-level function (no effects) and the list is
-large (≥ 256 elements), it runs across real OS threads; otherwise it evaluates
-sequentially. Because a pure function can't observe I/O, the clock, randomness,
+`list.par_map(f)` / `list.par_filter(pred)` are semantically identical to
+`map`/`filter` — same results, same order. When the callback is a **pure**
+top-level function (no effects) and the list is large (≥ 256 elements), they run
+across real OS threads; otherwise they evaluate sequentially. Because a pure function can't observe I/O, the clock, randomness,
 or shared state, and results are placed by input index, the output is
 deterministic and byte-for-byte identical whether it ran on one thread or many.

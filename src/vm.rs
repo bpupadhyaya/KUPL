@@ -1240,6 +1240,51 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_par_filter_pure_it34() {
+        // pure predicate over a list crossing 256 takes the real-thread path in
+        // the interpreter; the KVM filters sequentially. probe RETURNS the
+        // filtered list, so its string encodes both selection AND order.
+        let evens = format!(
+            "{MK}fun is_even(n: Int) -> Bool {{\n    n % 2 == 0\n}}\n\
+             fun probe() -> List[Int] {{\n    mk(600).par_filter(is_even)\n}}\n"
+        );
+        let s = differential(&evens);
+        assert!(s.starts_with("[0, 2, 4,"), "evens head: {s}");
+        assert!(s.ends_with("596, 598]"), "evens tail: {s}");
+
+        // sparse selection: keep multiples of 100 → order + selection correctness
+        let sparse = format!(
+            "{MK}fun keep(n: Int) -> Bool {{\n    n % 100 == 0\n}}\n\
+             fun probe() -> List[Int] {{\n    mk(500).par_filter(keep)\n}}\n"
+        );
+        assert_eq!(differential(&sparse), "[0, 100, 200, 300, 400]");
+
+        // count survivors (aggregate) — crosses threshold, pure predicate
+        let count = format!(
+            "{MK}fun big(n: Int) -> Bool {{\n    n >= 250\n}}\n\
+             fun probe() -> Int {{\n    mk(300).par_filter(big).len()\n}}\n"
+        );
+        assert_eq!(differential(&count), "50"); // 250..=299
+    }
+
+    #[test]
+    fn diff_par_filter_falls_back_it34() {
+        // closure predicate cannot take the thread path; still identical
+        let lambda = format!(
+            "{MK}fun probe() -> Int {{\n    mk(400).par_filter(fn n {{ n % 3 == 0 }}).len()\n}}\n"
+        );
+        // multiples of 3 in 0..400: 0,3,…,399 → 134
+        assert_eq!(differential(&lambda), "134");
+
+        // below threshold stays sequential; identical
+        let small = format!(
+            "{MK}fun odd(n: Int) -> Bool {{\n    n % 2 == 1\n}}\n\
+             fun probe() -> List[Int] {{\n    mk(6).par_filter(odd)\n}}\n"
+        );
+        assert_eq!(differential(&small), "[1, 3, 5]");
+    }
+
+    #[test]
     fn diff_par_map_impure_stays_sequential_it33() {
         // a closure (non-named) callback cannot take the thread path — but the
         // OUTPUT must still be identical interp vs KVM (sequential fallback).
