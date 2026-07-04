@@ -4,6 +4,46 @@ Audited 2026-07-04 against: `docs/design/LANGUAGE.md` (incl. §12 open
 questions), the `[design]` markers in `docs/reference/LANGUAGE-REFERENCE.md`,
 and known limitations called out in commit messages. Checked off as landed.
 
+## Enrichment campaign (it1–it50) — summary
+
+A 50-iteration enrichment campaign took KUPL from a young four-engine toolchain
+to one that closes its four largest audited gaps and compiles nearly the whole
+language to native machine code. Every iteration held the **sacred invariant**:
+the interpreter and the KVM stay byte-identical (differential tests in
+`src/vm.rs`), and the all-examples regression (`kupl run` vs `kupl run --vm`)
+stays green — verified on every commit. The arc, by phase:
+
+- **Breadth + AI-native core + effects (early)** — file I/O, JSON, HTTP, regex,
+  seeded random, CSV, URL, encoding/time stdlib; the `ai fun` typed-prompt core
+  with tool use, agent components, and a deterministic mock provider; the
+  hierarchical effect system.
+- **Sized numerics (it27–29)** — `i8…i64`/`u8…u64` and `f32`: checked/wrapping/
+  saturating arithmetic, width-aware bitwise ops, the full conversion matrix.
+- **Package system (it30–32)** — `kupl.toml` local path dependencies with
+  namespace isolation (name-mangling), exact version pinning, and a `kupl.lock`.
+- **Real-thread concurrency (it33–35)** — `par_map`/`par_filter` over a pure
+  named function execute across real OS threads, on both the interpreter and the
+  KVM, deterministic and byte-identical to the sequential form.
+- **Native components (it36–39)** — the whole component model compiles to machine
+  code: state, handlers, children, wires, `emit`, the message-queue/drain loop,
+  virtual-clock timers, `supervise` restart-on-failure, and cross-component
+  `expose` calls — a C mirror of `vm.rs`.
+- **Native numeric surface (it40, it42)** — sized ints (boxed `__int128`) and
+  `f32` (shortest-round-trip formatter) compile natively.
+- **Native stdlib (it43, it45, it46, it47)** — JSON, CSV, URL/query, regex (a
+  full backtracking engine), and HTTP (via system `curl`) all lower to C. The
+  native backend now compiles the **entire language except `ai fun`**.
+- **LSP (it44, it49)** — hover, go-to-definition, completion, find-references, and
+  rename on top of diagnostics — the everyday IDE feature set.
+- **Flagship examples (it41, it48)** — `native-showcase.kupl` (sized ints +
+  `par_map` + exposes + wires) and `analytics.kupl` (CSV + regex + grouping +
+  JSON), each byte-identical on interpreter, KVM, and native.
+
+**Honest remaining gaps:** `ai fun` on the native backend; a hosted package
+registry and third-party ecosystem; general async/await + coroutines; the
+GPU/kernel and systems/ownership tiers; and the optional KValue-unboxing perf IR
+(KIR). These are documented, not hidden.
+
 ## Final stretch — prioritized shortlist (it42–50)
 
 The four big arcs (sized numerics, packages, real-thread concurrency, native

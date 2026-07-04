@@ -1,7 +1,8 @@
 # KUPL vs. the field — an honest audit
 
 **Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed 2026-07-04
-after enrichment iteration 40** (the four big arcs are done — see below).
+after enrichment iteration 50** (the four big arcs are done; the native backend
+compiles everything but `ai fun`; the LSP is everyday-complete — see below).
 
 This document compares KUPL, **as actually implemented today**, against nine
 established languages: Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift,
@@ -20,9 +21,9 @@ byte-identical across the interpreter and KVM by differential tests:
 
 - **Sized numerics (it27–29, native it40)** — `i8…i64`/`u8…u64` and `f32`, with
   checked/wrapping/saturating arithmetic, width-aware bitwise ops, and a full
-  conversion matrix. Sized ints now compile to native machine code too (via a
-  boxed `__int128`); `f32` runs on interp/KVM (native codegen pending a
-  shortest-float formatter).
+  conversion matrix. The whole numeric surface — sized ints (via a boxed
+  `__int128`) and `f32` (with a shortest-round-trip formatter) — compiles to
+  native machine code, byte-identical to the interpreter.
 - **Package system (it30–32)** — `kupl.toml` local **path dependencies** with
   **namespace isolation** (name-mangling, so two deps can't collide), exact
   **version pinning**, and a **`kupl.lock`** for reproducibility. A real package
@@ -40,9 +41,14 @@ byte-identical across the interpreter and KVM by differential tests:
   just VM speed.
 
 The scores below move accordingly: **concurrency 1→3**, **runtime performance
-2–3→3**, **universality 3→4**, **ecosystem 1→2**. What remains open is honest and
-named: native `f32`/JSON/`ai fun`, a hosted package registry, LSP completion/
-hover, a WASM target, and the KValue-unboxing perf IR (KIR).
+2–3→3**, **universality 3→4**, **ecosystem 1→2**. By it50 the native backend
+compiles the **entire language except `ai fun`** (JSON, CSV, URL, regex, and HTTP
+all lower to machine code, byte-identical to the interpreter), and the LSP serves
+the everyday IDE feature set (hover, go-to-definition, completion, find-
+references, rename) on top of diagnostics. What remains open is honest and named:
+`ai fun` on the native backend, a hosted package registry, general async/await +
+coroutines, a WASM target, the GPU/kernel + systems/ownership tiers, and the
+KValue-unboxing perf IR (KIR).
 
 ### What changed since the first (it10) audit
 
