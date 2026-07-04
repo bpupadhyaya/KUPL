@@ -19,6 +19,7 @@ Usage:
   kupl context <file.kupl> <name>   Emit an item + its direct deps (LLM context)
   kupl manifest <file.kupl>         Emit component manifests as JSON (visual tools)
   kupl repl                         Start an interactive session
+  kupl lsp                          Start the Language Server (stdio, for editors)
   kupl version                      Print version
 ";
 
@@ -119,6 +120,7 @@ fn main() -> ExitCode {
             }
         },
         Some("repl") => repl::repl(),
+        Some("lsp") => kupl::lsp::serve(),
         Some("version") | Some("--version") | Some("-V") => {
             println!("kupl {}", env!("CARGO_PKG_VERSION"));
             0

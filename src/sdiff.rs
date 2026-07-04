@@ -20,7 +20,7 @@ pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
     }
 
     let mut changes = 0usize;
-    let mut report = |line: String| {
+    let report = |line: String| {
         println!("{line}");
     };
 

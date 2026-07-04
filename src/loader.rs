@@ -98,6 +98,14 @@ fn severity_str(d: &Diag) -> &'static str {
 
 /// Load the entry file plus everything reachable through `use`.
 pub fn load(entry: &str) -> Result<(Program, SourceMap), (Vec<Diag>, SourceMap)> {
+    load_with(entry, &std::collections::HashMap::new())
+}
+
+/// Like `load`, but file contents can be overridden (unsaved editor buffers).
+pub fn load_with(
+    entry: &str,
+    overrides: &std::collections::HashMap<PathBuf, String>,
+) -> Result<(Program, SourceMap), (Vec<Diag>, SourceMap)> {
     let mut map = SourceMap { files: Vec::new(), concat: String::new() };
     let mut program = Program::default();
     let mut diags: Vec<Diag> = Vec::new();
@@ -112,7 +120,11 @@ pub fn load(entry: &str) -> Result<(Program, SourceMap), (Vec<Diag>, SourceMap)>
         if !seen.insert(canonical) {
             continue;
         }
-        let src = match std::fs::read_to_string(&path) {
+        let override_src = overrides
+            .get(&path)
+            .cloned()
+            .or_else(|| path.canonicalize().ok().and_then(|c| overrides.get(&c).cloned()));
+        let src = match override_src.map(Ok).unwrap_or_else(|| std::fs::read_to_string(&path)) {
             Ok(s) => s,
             Err(e) => {
                 diags.push(Diag::error(

@@ -17,6 +17,7 @@ pub mod interp;
 pub mod kx;
 pub mod lexer;
 pub mod loader;
+pub mod lsp;
 pub mod parser;
 pub mod repl;
 pub mod run;
