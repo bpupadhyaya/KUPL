@@ -181,6 +181,9 @@ pub const BUILTIN_ENV_VAR: u8 = 16;
 pub const BUILTIN_ARGS: u8 = 17;
 pub const BUILTIN_EPRINT: u8 = 18;
 pub const BUILTIN_EXIT: u8 = 19;
+pub const BUILTIN_RANDOM_INTS: u8 = 20;
+pub const BUILTIN_RANDOM_FLOATS: u8 = 21;
+pub const BUILTIN_SHUFFLE: u8 = 22;
 
 impl Module {
     pub fn disassemble(&self) -> String {

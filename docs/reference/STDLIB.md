@@ -28,11 +28,18 @@ unless supervised.
 | `env_var(name)` | `(Str) -> Option[Str]` — **uses `io.env`** | environment variable, or `None` |
 | `eprint(v)` | `(any) -> Unit` — **uses `io`** | prints Display form + newline to stderr |
 | `exit(code)` | `(Int) -> !` | flushes stdout and terminates the process |
+| `random_ints(seed, count)` | `(Int, Int) -> List[Int]` | deterministic; `count ≤ 0` → empty |
+| `random_floats(seed, count)` | `(Int, Int) -> List[Float]` | each in `[0.0, 1.0)`; deterministic |
+| `shuffle(seed, xs)` | `(Int, List[T]) -> List[T]` | deterministic Fisher-Yates permutation |
 
 `args`/`env_var` read ambient input, so they carry the `io.env` effect (a
 sub-effect of `io`). `args()` is everything after `--` when run through the
 toolchain (`kupl run prog.kupl -- a b`) and `argv[1..]` for a native binary.
 `exit` diverges (like `panic`) so it needs no effect.
+
+`random_ints` / `random_floats` / `shuffle` are **pure** (no effect): a given
+seed always yields the same result (xorshift64\*), so simulations and tests are
+reproducible. There is no ambient/global RNG — pass a seed explicitly.
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

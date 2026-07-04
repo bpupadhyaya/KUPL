@@ -570,6 +570,17 @@ impl<'m> Vm<'m> {
                             std::io::stdout().flush().ok();
                             std::process::exit(code);
                         }
+                        BUILTIN_RANDOM_INTS | BUILTIN_RANDOM_FLOATS | BUILTIN_SHUFFLE => {
+                            let name = match which {
+                                BUILTIN_RANDOM_INTS => "random_ints",
+                                BUILTIN_RANDOM_FLOATS => "random_floats",
+                                _ => "shuffle",
+                            };
+                            match crate::interp::random_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1115,6 +1126,41 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_seeded_random_it18() {
+        // a fixed seed yields an exact, reproducible sequence on both engines
+        assert_eq!(
+            differential("fun probe() -> List[Int] {\n    random_ints(42, 3)\n}\n"),
+            "[6255019084209693600, -4016670646968046118, -3871288216479333770]"
+        );
+        // floats land in [0, 1) and match byte-for-byte across engines
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    random_floats(42, 100).all(fn f { f >= 0.0 && f < 1.0 })\n}\n"),
+            "true"
+        );
+        // shuffle is a permutation and deterministic for a given seed
+        assert_eq!(
+            differential("fun probe() -> List[Int] {\n    shuffle(7, [1, 2, 3, 4, 5, 6])\n}\n"),
+            "[6, 2, 1, 3, 4, 5]"
+        );
+        // shuffle is generic over element type
+        assert_eq!(
+            differential("fun probe() -> List[Str] {\n    shuffle(7, [\"a\", \"b\", \"c\", \"d\"])\n}\n"),
+            "[\"b\", \"a\", \"d\", \"c\"]"
+        );
+        // same seed → same output; different seeds differ
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    random_ints(42, 8) == random_ints(42, 8)\n}\n"),
+            "true"
+        );
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    random_ints(1, 8) == random_ints(2, 8)\n}\n"),
+            "false"
+        );
+        // count <= 0 → empty
+        assert_eq!(differential("fun probe() -> Int {\n    random_ints(9, 0 - 3).len()\n}\n"), "0");
     }
 
     #[test]

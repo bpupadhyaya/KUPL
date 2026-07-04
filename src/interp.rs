@@ -928,6 +928,13 @@ impl Interp {
                     return proc_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
                 }
                 ("args", 0) => return proc_builtin(name, &[]).map_err(|m| Self::panic_flow(m, span)),
+                ("random_ints", 2) | ("random_floats", 2) | ("shuffle", 2) => {
+                    let mut vals = Vec::with_capacity(2);
+                    for a in args {
+                        vals.push(self.eval(&a.value, env)?);
+                    }
+                    return random_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("exit", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     let code = match v {
@@ -1980,6 +1987,82 @@ pub fn set_from_list(v: &Value) -> Result<Value, String> {
             Ok(Value::Set(Rc::new(out)))
         }
         other => Err(format!("Set(...) needs a List, found {}", other.type_name())),
+    }
+}
+
+/// Deterministic PRNG (xorshift64*) behind the seeded-random builtins. The
+/// exact algorithm — state init, `next`, the `>> 11` float mapping, and the
+/// Fisher-Yates order — is mirrored byte-for-byte in cgen.rs so `random_*` and
+/// `shuffle` give identical results on the interpreter, KVM, and native.
+struct SeedRng(u64);
+
+impl SeedRng {
+    fn new(seed: i64) -> Self {
+        // xorshift needs a non-zero state
+        SeedRng(if seed as u64 == 0 { 1 } else { seed as u64 })
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
+/// Seeded random builtins — shared by interpreter and KVM. Pure: a given seed
+/// always yields the same output, so results are reproducible.
+pub fn random_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let as_int = |v: &Value| match v {
+        Value::Int(n) => *n,
+        _ => 0,
+    };
+    match name {
+        "random_ints" => {
+            let mut r = SeedRng::new(as_int(&args[0]));
+            let n = as_int(&args[1]).max(0);
+            if n > 100_000_000 {
+                return Err("random count too large".into());
+            }
+            let mut out = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                out.push(Value::Int(r.next_u64() as i64));
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
+        "random_floats" => {
+            let mut r = SeedRng::new(as_int(&args[0]));
+            let n = as_int(&args[1]).max(0);
+            if n > 100_000_000 {
+                return Err("random count too large".into());
+            }
+            let mut out = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                // top 53 bits → a double in [0, 1)
+                out.push(Value::Float(
+                    (r.next_u64() >> 11) as f64 * (1.0 / 9007199254740992.0),
+                ));
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
+        "shuffle" => {
+            let list = match &args[1] {
+                Value::List(xs) => xs,
+                other => return Err(format!("`shuffle` needs a List, found {}", other.type_name())),
+            };
+            let mut out = list.as_ref().clone();
+            let mut r = SeedRng::new(as_int(&args[0]));
+            // Fisher-Yates from the end: swap i with a random j in 0..=i
+            let mut i = out.len();
+            while i > 1 {
+                i -= 1;
+                let j = (r.next_u64() % (i as u64 + 1)) as usize;
+                out.swap(i, j);
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
+        _ => Err(format!("unknown random builtin `{name}`")),
     }
 }
 

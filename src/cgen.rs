@@ -173,6 +173,9 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_ARGS => format!("regs[{dst}] = k_args(); (void){start}; (void){argc};"),
             BUILTIN_EPRINT => format!("regs[{dst}] = k_eprint(regs[{start}]); (void){argc};"),
             BUILTIN_EXIT => format!("fflush(stdout); exit((int)regs[{start}].as.i); (void){argc}; (void){dst};"),
+            BUILTIN_RANDOM_INTS => format!("regs[{dst}] = k_random_ints(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_RANDOM_FLOATS => format!("regs[{dst}] = k_random_floats(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_SHUFFLE => format!("regs[{dst}] = k_shuffle(regs[{start}], regs[{start}+1]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -801,6 +804,46 @@ static KValue k_args(void) {
 static KValue k_eprint(KValue v) {
     fprintf(stderr, "%s\n", k_show(v));
     return k_unit();
+}
+
+/* ---- seeded random (xorshift64*); mirrors interp::SeedRng exactly ---- */
+static uint64_t k_rng_next(uint64_t* s) {
+    uint64_t x = *s;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *s = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+static KValue k_random_ints(KValue seed, KValue count) {
+    uint64_t s = (uint64_t)seed.as.i; if (s == 0) s = 1;
+    int64_t n = count.as.i; if (n < 0) n = 0;
+    if (n > 100000000) k_panic("random count too large");
+    KValue* out = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    for (int64_t i = 0; i < n; i++) out[i] = k_int((int64_t)k_rng_next(&s));
+    return k_list(out, (int)n);
+}
+static KValue k_random_floats(KValue seed, KValue count) {
+    uint64_t s = (uint64_t)seed.as.i; if (s == 0) s = 1;
+    int64_t n = count.as.i; if (n < 0) n = 0;
+    if (n > 100000000) k_panic("random count too large");
+    KValue* out = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    for (int64_t i = 0; i < n; i++)
+        out[i] = k_float((double)(k_rng_next(&s) >> 11) * (1.0 / 9007199254740992.0));
+    return k_list(out, (int)n);
+}
+static KValue k_shuffle(KValue seed, KValue lst) {
+    uint64_t s = (uint64_t)seed.as.i; if (s == 0) s = 1;
+    KList* l = lst.as.list;
+    KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+    memcpy(out, l->items, sizeof(KValue) * l->len);
+    int64_t i = l->len;
+    while (i > 1) {
+        i--;
+        int64_t j = (int64_t)(k_rng_next(&s) % (uint64_t)(i + 1));
+        KValue t = out[i]; out[i] = out[j]; out[j] = t;
+    }
+    return k_list(out, (int)l->len);
 }
 
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {

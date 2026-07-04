@@ -1436,6 +1436,28 @@ impl Checker {
                     return Ty::Option(Box::new(Ty::Str));
                 }
                 ("args", 0) => return Ty::List(Box::new(Ty::Str)),
+                ("random_ints", 2) => {
+                    for a in args {
+                        let t = self.infer_expr(&a.value, ctx);
+                        self.unify(&Ty::Int, &t, a.value.span, "random_ints argument");
+                    }
+                    return Ty::List(Box::new(Ty::Int));
+                }
+                ("random_floats", 2) => {
+                    for a in args {
+                        let t = self.infer_expr(&a.value, ctx);
+                        self.unify(&Ty::Int, &t, a.value.span, "random_floats argument");
+                    }
+                    return Ty::List(Box::new(Ty::Float));
+                }
+                ("shuffle", 2) => {
+                    let seed = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Int, &seed, args[0].value.span, "shuffle seed");
+                    let elem = self.uni.fresh();
+                    let list = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&Ty::List(Box::new(elem.clone())), &list, args[1].value.span, "shuffle list");
+                    return Ty::List(Box::new(self.uni.apply(&elem)));
+                }
                 ("eprint", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Unit;

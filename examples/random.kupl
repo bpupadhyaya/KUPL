@@ -1,0 +1,30 @@
+// Seeded random — reproducible pseudo-random generation.
+//
+//   random_ints(seed, count)   -> List[Int]     count 64-bit values
+//   random_floats(seed, count) -> List[Float]   each in [0.0, 1.0)
+//   shuffle(seed, xs)          -> List[T]        deterministic Fisher-Yates
+//
+// These are PURE: the same seed always produces the same output, so anything
+// built on them (games, simulations, sampling) is fully reproducible and
+// testable — no hidden global RNG state.
+
+// Roll `n` six-sided dice from a seed.
+fun roll(seed: Int, n: Int) -> List[Int] {
+    // mask off the sign bit so the modulo stays in 0..5, then shift to 1..6
+    random_ints(seed, n).map(fn x { x.band(0x7FFFFFFFFFFFFFFF) % 6 + 1 })
+}
+
+fun main() uses io {
+    print(roll(2026, 5))                 // e.g. [3, 1, 6, 2, 5]
+
+    // shuffle a small deck deterministically
+    let deck = ["A", "K", "Q", "J", "10"]
+    print(shuffle(2026, deck))
+
+    // sample three uniform floats
+    let fs = random_floats(2026, 3)
+    print(fs.all(fn f { f >= 0.0 && f < 1.0 }))   // true
+
+    // reproducibility: the same seed replays exactly
+    print(roll(2026, 5) == roll(2026, 5))         // true
+}

@@ -278,8 +278,9 @@ pub fun broadcast(msg: Str) uses io {   // public: effects MUST be declared
   `write_file` / `append_file` / `delete_file` / `file_exists` (`io.fs`); and
   `args` / `env_var` (`io.env`). The sub-effects mean `uses io` covers all of
   them, while `uses io.fs` / `uses io.env` are the precise capabilities.
-  Capability *values* — attenuable, passable file/network handles — are
-  **[design]**.
+  (`json_parse`/`json_stringify` and the seeded-random builtins are pure — no
+  effect.) Capability *values* — attenuable, passable file/network handles —
+  are **[design]**.
 - Recursion (incl. mutual) is fully supported. Functions are first-class:
   pass them by name or as lambdas; calls through variables are supported
   (their effects are not tracked in v1.0-alpha — documented limitation).

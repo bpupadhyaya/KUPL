@@ -1057,6 +1057,9 @@ impl<'s> FnCompiler<'s> {
                 ("args", 0) => Some(BUILTIN_ARGS),
                 ("eprint", 1) => Some(BUILTIN_EPRINT),
                 ("exit", 1) => Some(BUILTIN_EXIT),
+                ("random_ints", 2) => Some(BUILTIN_RANDOM_INTS),
+                ("random_floats", 2) => Some(BUILTIN_RANDOM_FLOATS),
+                ("shuffle", 2) => Some(BUILTIN_SHUFFLE),
                 _ => None,
             };
             if let Some(which) = builtin {
