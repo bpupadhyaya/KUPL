@@ -1,52 +1,13 @@
 # KUPL
-K - Universal Programming Language
+**K Universal Programming Language**
 
 An AI-first, component-oriented, general-purpose programming language with a
-complete toolchain: REPL, interpreter, virtual machine, bytecode compiler, and
-native machine-code compiler — designed to run efficiently across CPU, GPU, TPU,
-and neural engines, with progressive low-level control down to the register when
-you need it.
+complete toolchain: REPL, interpreter, register-based virtual machine, bytecode
+compiler, and native machine-code compiler — designed to run efficiently across
+CPU, GPU, TPU, and neural engines, with progressive low-level control down to
+the register when you need it.
 
 KUPL is open source and **free forever**.
-
-## Design documents
-
-- [`docs/design/VISION.md`](docs/design/VISION.md) — vision, the seven pillars, inspirations, non-goals
-- [`docs/design/LANGUAGE.md`](docs/design/LANGUAGE.md) — the language: component model, type system, effects & capabilities, keywords, grammar, semantics, worked examples
-- [`docs/design/TOOLCHAIN.md`](docs/design/TOOLCHAIN.md) — every compiler phase (lexer → parser → type/effect checker → KIR → KVM bytecode / native code), VM design, runtime, REPL, CLI/LSP/packages, roadmap
-
-## Getting started (v0.1 toolchain)
-
-The v0.1 toolchain (lexer → parser → type/effect checker → tree-walking
-interpreter with a deterministic component runtime, REPL, example-test runner)
-is implemented in Rust in `src/`.
-
-```sh
-cargo build --release          # produces target/release/kupl
-
-kupl run examples/counter.kupl    # run an app (components, wiring, messages)
-kupl run examples/shapes.kupl     # run a pure functional program (fun main)
-kupl run --vm examples/shapes.kupl  # same program on the KVM bytecode VM
-kupl build examples/todo.kupl     # compile to a .kx bytecode module
-kupl run examples/todo.kx         # run the compiled module directly
-kupl bundle examples/counter.kupl -o counter-app   # self-contained executable
-kupl native examples/shapes.kupl -o shapes  # TRUE machine code via C (fun main)
-kupl run examples/tensors.kupl    # first-class tensors, native numeric kernels
-kupl dis examples/shapes.kupl     # disassemble the compiled bytecode
-kupl test examples/counter.kupl   # run `example` blocks as tests
-kupl check examples/todo.kupl     # parse + type-check + effect-check
-kupl check --json broken.kupl     # machine-readable diagnostics (for AI/editors)
-kupl fmt file.kupl [--write]      # THE canonical form (zero config, idempotent)
-kupl context file.kupl TodoStore  # item + direct deps — minimal LLM context
-kupl repl                         # interactive session
-kupl lsp                          # Language Server for editors (diagnostics)
-kupl diff old.kupl new.kupl       # semantic diff (interface vs implementation)
-kupl new my-app                   # scaffold a runnable multi-file project
-kupl manifest examples/todo.kupl  # JSON component manifests (visual tools)
-kupl run examples/multifile/main.kupl  # multi-file: `use util`, `use lib.stats`
-```
-
-A taste of KUPL:
 
 ```kupl
 component Counter {
@@ -70,19 +31,192 @@ component Counter {
 }
 ```
 
-What works today: components as isolated actors with typed ports and
-`wire`-based composition; pure functions, ADTs + exhaustive `match`, records,
-newtypes, `Option`/`Result` with `?`, lambdas, string interpolation, list/string
-methods; checked 64-bit integers (overflow panics, never wraps); `intent` and
-executable `example` blocks as syntax; **effect inference + boundary enforcement**
-(`pub`/`expose` functions must declare `uses io` etc. — inferred transitively
-through private helpers); **the normative formatter** (`kupl fmt`, idempotent by
-construction); **JSON diagnostics** with stable codes; **`kupl context`** for
-minimal LLM prompts.
+---
 
-Next phases (see `docs/design/TOOLCHAIN.md`): contracts & laws, KIR, the KVM
-bytecode VM, native compilation, and the tensor/kernel hardware story.
+## Installation
 
-Status: v1.0-alpha — interpreter, REPL, formatter, effects, contracts+laws, KVM bytecode VM (functional core + full component apps + supervision, differentially tested), .kx modules, self-contained executables (kupl bundle), native machine-code compilation via C (kupl native), multi-file modules, component manifests, first-class tensors, semantic diff, LSP server, project scaffolding
-(2026-07-03); design proposal in `docs/design/`. The pre-2026 Scala/Java
-scaffold lives in `attic/`.
+### Prerequisites
+
+| Tool | Needed for | Install |
+|---|---|---|
+| **Rust** (stable, 1.75+) | building the `kupl` toolchain | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` — or on macOS: `brew install rustup && rustup default stable` |
+| **A C compiler** (`cc`) | `kupl native` only (machine-code output) | macOS: `xcode-select --install` · Linux: `apt install gcc` or `clang` |
+
+Everything else is self-contained — the toolchain has **zero external
+dependencies** (no crates, no runtime downloads).
+
+### Build and install
+
+```sh
+git clone https://github.com/bpupadhyaya/KUPL.git
+cd KUPL
+
+# Option A: install into ~/.cargo/bin (on your PATH after rustup setup)
+cargo install --path .
+
+# Option B: just build; the binary lands in target/release/kupl
+cargo build --release
+export PATH="$PWD/target/release:$PATH"
+```
+
+### Verify
+
+```sh
+kupl version                 # -> kupl 1.0.0-alpha
+kupl run examples/counter.kupl
+cargo test                   # 43 tests, includes interpreter-vs-VM differential suite
+```
+
+---
+
+## Quick start: your first project
+
+```sh
+kupl new hello-kupl          # scaffolds main.kupl, util.kupl, kupl.toml
+kupl run hello-kupl/main.kupl
+# hello from hello-kupl!
+```
+
+Or start from a single file. Save this as `greet.kupl`:
+
+```kupl
+fun greeting(name: Str) -> Str {
+    "hello, {name}!"
+}
+
+fun main() {
+    for name in ["world", "KUPL"] {
+        print(greeting(name))
+    }
+}
+```
+
+```sh
+kupl check greet.kupl        # parse + type-check + effect-check
+kupl run greet.kupl          # hello, world! / hello, KUPL!
+```
+
+Programs can span multiple files: `use util` loads `util.kupl`, `use lib.math`
+loads `lib/math.kupl` (relative to the entry file). Diagnostics always point
+into the right file. See `examples/multifile/`.
+
+---
+
+## Compiling and running
+
+KUPL has **four execution modes** — same semantics, verified against each other
+by differential tests:
+
+| Mode | Command | When to use |
+|---|---|---|
+| REPL | `kupl repl` | exploring, trying expressions, defining components live |
+| Interpreter | `kupl run app.kupl` | development default; runs everything (apps, contracts, tests) |
+| KVM bytecode VM | `kupl run --vm app.kupl` | production interpreter; also what `.kx`/`bundle` use |
+| Native machine code | `kupl native prog.kupl -o prog` | fastest binaries for `fun main` programs (via the system C compiler) |
+
+### Run
+
+```sh
+kupl run app.kupl            # run the `app` (components, wiring, messages)
+kupl run prog.kupl           # or a `fun main()` program
+kupl run --vm app.kupl       # same program on the bytecode VM
+kupl repl                    # interactive session (:help, :defs, :quit)
+```
+
+### Compile & package
+
+```sh
+kupl build app.kupl -o app.kx      # ahead-of-time compile to a .kx bytecode module
+kupl run app.kx                    # run a compiled module (no source needed)
+
+kupl bundle app.kupl -o app        # ONE self-contained executable (runtime + module)
+./app                              # runs anywhere the binary runs — no kupl needed
+
+kupl native prog.kupl -o prog      # true machine code via C (fun main programs)
+./prog                             # add --keep-c to inspect the generated C
+
+kupl dis app.kupl                  # human-readable disassembly of the bytecode
+```
+
+Which to pick: `bundle` for component apps (full runtime, single file),
+`native` for compute-heavy `fun main` programs (fastest, smallest), `.kx` when
+you control the machines and want tiny artifacts (a todo app is ~1.5 KB).
+
+### Test & quality
+
+```sh
+kupl test app.kupl           # runs `example` blocks AND contract `law`s as tests
+kupl check app.kupl          # parse + type-check + effect-check (exit 0/1)
+kupl check --json app.kupl   # machine-readable diagnostics (stable K-codes, spans)
+kupl fmt app.kupl --write    # THE canonical format — zero config, idempotent
+kupl diff old.kupl new.kupl  # semantic diff: interface-breaking vs implementation-only
+```
+
+### AI & editor tooling
+
+```sh
+kupl context app.kupl TodoStore   # one item + its direct deps — minimal LLM context
+kupl manifest app.kupl            # JSON component manifests (ports/props/exposes) for visual tools
+kupl lsp                          # Language Server (stdio): live diagnostics in any LSP editor
+```
+
+To use the LSP in your editor, register `kupl lsp` as the language server for
+`.kupl` files. Example for Neovim:
+
+```lua
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "kupl",
+  callback = function()
+    vim.lsp.start({ name = "kupl", cmd = { "kupl", "lsp" } })
+  end,
+})
+vim.filetype.add({ extension = { kupl = "kupl" } })
+```
+
+---
+
+## Examples
+
+| File | Shows |
+|---|---|
+| `examples/counter.kupl` | components, typed ports, wiring, `example` tests |
+| `examples/shapes.kupl` | functional core: ADTs, `match`, records, `Option`/`Result` + `?`, lambdas |
+| `examples/todo.kupl` | a small app: store + reporter, expose functions, message flow |
+| `examples/contracts.kupl` | contracts with executable `law`s (`kupl test` runs them) |
+| `examples/supervise.kupl` | fault tolerance: panics restart the component, the app survives |
+| `examples/tensors.kupl` | first-class tensors, elementwise ops, dot products |
+| `examples/multifile/` | `use`-based multi-file programs |
+
+All examples run identically on the interpreter, the VM, and (for `fun main`
+programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.
+
+## What works today
+
+Components as isolated actors (typed ports, `wire`, state, `on start/stop`,
+supervision with `restart on_failure`); contracts with laws that run as tests;
+pure functions with **inferred + enforced effects** (`pub`/`expose` must declare
+`uses io` etc.); ADTs with exhaustive `match`, records, newtypes,
+`Option`/`Result` + `?`, lambdas, string interpolation; checked 64-bit integers
+(overflow panics, never wraps); first-class tensors with native numeric kernels;
+multi-file modules; the canonical formatter; semantic diff; JSON diagnostics;
+component manifests; an LSP server; and four verified execution modes.
+
+## Design documents
+
+- [`docs/design/VISION.md`](docs/design/VISION.md) — vision, the seven pillars, inspirations, non-goals
+- [`docs/design/LANGUAGE.md`](docs/design/LANGUAGE.md) — component model, type system, effects & capabilities, keywords, grammar, semantics
+- [`docs/design/TOOLCHAIN.md`](docs/design/TOOLCHAIN.md) — every compiler phase, VM design, runtime, roadmap
+- Further design: `PLATFORMS.md`, `INTEROP.md`, `DISTRIBUTION.md`, `UI.md`, `VISUAL-TOOLS-CONTRACT.md`
+
+## Status & roadmap
+
+**v1.0-alpha** (2026-07): the founding vision is implemented end to end —
+~12,400 lines of dependency-free Rust, 43 tests, all engines differentially
+verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
+lowering (Metal first), components + per-component GC in the native backend,
+timers (`on every`), the package registry, LSP hover/completion, and
+self-hosting. The pre-2026 Scala/Java scaffold lives in `attic/`.
+
+## License
+
+MIT — free forever. Fork it, ship it, build on it.
