@@ -1,0 +1,43 @@
+// Concurrency — `par` structured fork-join.
+//
+//   par { a  b  c }   evaluates independent branches and joins their results
+//                     into a List (all branches the same type).
+//
+// The branches are INDEPENDENT: no data flows between them, so they are safe to
+// run in parallel. Execution is deterministic (results in branch order), which
+// keeps tests reproducible; a real multi-threaded scheduler is a later step
+// that does not change results. Because KUPL values are immutable and component
+// state is actor-isolated, `par` cannot introduce a data race by construction.
+
+fun fib(n: Int) -> Int {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+// Fork-join over independent CPU work.
+fun main() uses io, ai {
+    let results = par {
+        fib(10)
+        fib(15)
+        fib(20)
+    }
+    print(results)              // [55, 610, 6765]
+    print(results.sum())        // 7430
+
+    // The real payoff: fan out N independent LLM calls as one parallel batch.
+    // In an AI application this is the #1 use of concurrency — and `par` over
+    // `ai fun` calls expresses it directly.
+    let verdicts = par {
+        classify("I love it")
+        classify("It broke immediately")
+        classify("It is fine")
+    }
+    print(verdicts)
+
+    // Run this deterministically with the mock provider:
+    //   export KUPL_AI_MOCK_CLASSIFY="positive"
+    //   kupl run examples/parallel.kupl
+}
+
+ai fun classify(review: Str) -> Str {
+    intent "One word — positive, negative, or neutral — for: {review}"
+}

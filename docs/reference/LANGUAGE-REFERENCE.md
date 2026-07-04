@@ -46,7 +46,7 @@ currently derive identity from the file path.
 
 ```
 app async await break component contract continue else emit example expect
-expose false fn for fun if in intent let match module new on out prop pub
+expose false fn for fun if in intent let match module new on out par prop pub
 requires return send start state stop supervise test true type use uses var
 while wire
 ```
@@ -160,6 +160,7 @@ half(n)?                            // Result propagation (functions only)
 user with age: 37, name: "Ada L."   // record update: new value, fields replaced
 "total: {a + b}"                    // interpolation
 { let t = a; t * t }                // block expression (value = last expr)
+par { f(a)  g(b)  h(c) }            // structured fork-join → List of results
 ```
 
 - `match` exhaustiveness is compile-checked: all variants of a union,
@@ -170,6 +171,37 @@ user with age: 37, name: "Ada L."   // record update: new value, fields replaced
   allowed in handlers (K0237) — handle the Result with `match` there.
 - `await expr` is accepted and currently evaluates `expr` directly (expose
   calls are synchronous in v1.0-alpha; true asynchrony is **[design]**).
+
+### 4.1 Concurrency — `par` (structured fork-join)
+
+`par { branch1  branch2  … }` evaluates a set of **independent** branches and
+joins their results into a `List[T]` (all branches the same type `T`, one per
+line or comma-separated):
+
+```kupl
+let sizes = par {
+    measure(a)
+    measure(b)
+    measure(c)
+}                                    // List of three results, in branch order
+```
+
+- Branches are **independent** — no value flows between them (each is a
+  self-contained expression evaluated from the same enclosing scope), so the
+  result never depends on evaluation order. Because KUPL values are immutable
+  and component state is actor-isolated, `par` cannot introduce a data race
+  by construction.
+- Branch types must agree (K0200 otherwise); the result is `List[T]` in branch
+  order.
+- **Execution is deterministic** in v1.0-alpha: branches run in order, so
+  `example`/`law`/`kupl test` results are fully reproducible. A real
+  multi-threaded scheduler is the next step and is designed to be
+  **semantics-preserving** — it will not change results, only run the branches
+  on separate threads. (Async I/O and a preemptive scheduler are **[design]**.)
+- The motivating use is **fanning out independent work** — most compellingly a
+  batch of independent `ai fun` calls: `par { classify(x)  classify(y) }` runs
+  the LLM calls as one parallel batch. Runs identically on the interpreter and
+  the KVM. See `examples/parallel.kupl`.
 
 ### Patterns
 

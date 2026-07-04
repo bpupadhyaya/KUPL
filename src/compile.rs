@@ -1010,6 +1010,14 @@ impl<'s> FnCompiler<'s> {
                 dst
             }
             ExprKind::Await(inner) => self.expr(inner),
+            ExprKind::Par(branches) => {
+                // fork-join: evaluate each branch, collect into a list (same
+                // deterministic branch order as the interpreter)
+                let start = self.consecutive(branches, span);
+                let dst = self.alloc(span);
+                self.emit(Op::MakeList { dst, start, len: branches.len() as u8 }, span);
+                dst
+            }
         }
     }
 
@@ -1311,6 +1319,11 @@ fn free_vars_expr(e: &Expr, bound: &HashSet<String>, free: &mut BTreeSet<String>
             }
         }
         ExprKind::Try(inner) | ExprKind::Await(inner) => free_vars_expr(inner, bound, free),
+        ExprKind::Par(branches) => {
+            for b in branches {
+                free_vars_expr(b, bound, free);
+            }
+        }
         _ => {}
     }
 }

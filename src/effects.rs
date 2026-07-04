@@ -278,6 +278,11 @@ fn walk_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             }
         }
         ExprKind::Try(e) | ExprKind::Await(e) => walk_expr(e, f),
+        ExprKind::Par(branches) => {
+            for b in branches {
+                walk_expr(b, f);
+            }
+        }
         _ => {}
     }
 }

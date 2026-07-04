@@ -1070,6 +1070,37 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_par_fork_join() {
+        // structured fork-join: independent branches collected into a list,
+        // deterministic branch order, identical on both engines
+        assert_eq!(
+            differential("fun sq(n: Int) -> Int {\n    n * n\n}\nfun probe() -> Int {\n    par { sq(2)  sq(3)  sq(4) }.sum()\n}\n"),
+            "29"
+        );
+        // par yields a list in branch order
+        assert_eq!(
+            differential("fun probe() -> List[Int] {\n    par { 1  1 + 1  1 + 2 }\n}\n"),
+            "[1, 2, 3]"
+        );
+    }
+
+    #[test]
+    fn par_branches_must_agree_in_type() {
+        let src = "fun probe() {\n    let _ = par { 1  \"two\" }\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(src).0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+    }
+
+    #[test]
+    fn diff_par_over_ai_fun_fanout() {
+        // the payoff use case: fan out independent ai fun calls in parallel
+        std::env::set_var("KUPL_AI_MOCK_PAR_LABEL", "yes");
+        let src = "ai fun par_label(x: Str) -> Str {\n    intent \"Label {x}\"\n}\n\
+fun probe() -> Str {\n    par { par_label(\"a\")  par_label(\"b\") }.join(\",\")\n}\n";
+        assert_eq!(differential(src), "yes,yes");
+    }
+
+    #[test]
     fn diff_timers_fire_identically_under_advance() {
         // A recurring and a one-shot timer; drive the virtual clock on both
         // engines and assert identical timer-driven emissions.

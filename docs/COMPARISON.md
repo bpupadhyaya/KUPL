@@ -108,13 +108,17 @@ the VM, not the vision.
 The most important gap to be candid about. KUPL's runtime is a **single-threaded
 deterministic actor scheduler**: components are isolated actors with mailboxes,
 which is the *right foundation* for concurrency (Erlang-style), and the new
-virtual-clock timers add scheduling — but there is **no true parallelism and no
-async I/O yet**. `await` currently evaluates synchronously; `par` is
-**□ [design]**. Go (goroutines/channels), Rust (fearless concurrency), Kotlin
-(coroutines), Swift (actors/async-await), and the JVM all decisively beat KUPL
-here today. The actor isolation and supervision already in place mean the
-*model* is sound; the *execution* is not there yet. This is the single biggest
-"as good or better" claim KUPL cannot make today.
+virtual-clock timers add scheduling. A first step landed in it11: the **`par`
+structured fork-join** construct (independent branches → `List[T]`,
+deterministic, both engines) — the language seam where a real scheduler plugs
+in — but its **execution is still sequential**, and there is **no
+multi-threading, no true parallelism, and no async I/O yet**. `await` currently
+evaluates synchronously; a multi-threaded scheduler and async are **□ [design]**.
+Go (goroutines/channels), Rust (fearless concurrency), Kotlin (coroutines),
+Swift (actors/async-await), and the JVM all decisively beat KUPL here today. The
+actor isolation and supervision already in place mean the *model* is sound, and
+`par` now names the parallel work; the *parallel execution* is not there yet.
+This is the single biggest "as good or better" claim KUPL cannot make today.
 
 ### Scalability (large codebases) — KUPL 3
 

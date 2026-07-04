@@ -828,6 +828,18 @@ impl Interp {
                 }
             }
             ExprKind::Await(inner) => self.eval(inner, env),
+            ExprKind::Par(branches) => {
+                // Fork-join: evaluate each independent branch and collect the
+                // results into a list. Branches share only the (immutable)
+                // enclosing scope, so evaluation order does not affect results;
+                // v1.0-alpha runs them in deterministic branch order (a
+                // multi-threaded scheduler is a later, semantics-preserving step).
+                let mut results = Vec::with_capacity(branches.len());
+                for b in branches {
+                    results.push(self.eval(b, env)?);
+                }
+                Ok(Value::List(Rc::new(results)))
+            }
         }
     }
 

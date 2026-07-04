@@ -351,6 +351,11 @@ pub enum ExprKind {
     /// `expr?` — Result propagation.
     Try(Box<Expr>),
     Await(Box<Expr>),
+    /// `par { e1  e2  … }` — structured fork-join over independent branches;
+    /// evaluates to `List[T]` of the branch results (all branches same type).
+    /// Branches are independent (no data flows between them), so they are safe
+    /// to run in parallel; execution is deterministic (results in branch order).
+    Par(Vec<Expr>),
 }
 
 #[derive(Debug, Clone)]

@@ -1404,6 +1404,21 @@ impl Parser {
                 let end = self.expect(Tok::RBracket)?;
                 Ok(Expr { kind: ExprKind::List(items), span: span.merge(end) })
             }
+            Tok::KwPar => {
+                self.bump();
+                self.expect(Tok::LBrace)?;
+                self.skip_newlines();
+                let mut branches = Vec::new();
+                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                    branches.push(self.parse_expr()?);
+                    self.skip_newlines();
+                    if self.eat(&Tok::Comma) {
+                        self.skip_newlines();
+                    }
+                }
+                let end = self.expect(Tok::RBrace)?;
+                Ok(Expr { kind: ExprKind::Par(branches), span: span.merge(end) })
+            }
             Tok::KwIf => self.parse_if(),
             Tok::KwMatch => {
                 self.bump();

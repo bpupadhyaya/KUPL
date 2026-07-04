@@ -1287,6 +1287,15 @@ impl Checker {
                 self.uni.apply(&ok)
             }
             ExprKind::Await(inner) => self.infer_expr(inner, ctx),
+            ExprKind::Par(branches) => {
+                // all branches must agree; the result is a list of their values
+                let elem = self.uni.fresh();
+                for b in branches {
+                    let t = self.infer_expr(b, ctx);
+                    self.unify(&elem, &t, b.span, "`par` branch");
+                }
+                Ty::List(Box::new(self.uni.apply(&elem)))
+            }
         }
     }
 

@@ -609,6 +609,10 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
         }
         ExprKind::Try(inner) => (format!("{}?", expr_str(inner, P_UNARY + 1)), ATOM),
         ExprKind::Await(inner) => (format!("await {}", expr_str(inner, P_UNARY)), P_UNARY),
+        ExprKind::Par(branches) => {
+            let inner: Vec<String> = branches.iter().map(|b| expr_str(b, 0)).collect();
+            (format!("par {{ {} }}", inner.join(", ")), ATOM)
+        }
     }
 }
 
@@ -710,6 +714,11 @@ mod tests {
         roundtrip(
             "contract Store {\n intent \"keyed storage\"\n expose fun get(k: Str) -> Option[Str]\n law \"missing is None\" { expect get(\"x\") == None }\n}\ncomponent M fulfills Store {\n intent \"in-memory\"\n expose fun get(k: Str) -> Option[Str] { None }\n}\n",
         );
+    }
+
+    #[test]
+    fn fmt_idempotent_par() {
+        roundtrip("fun f(n: Int) -> Int {\n    n\n}\nfun g() -> List[Int] {\n    par { f(1)  f(2)  f(3) }\n}\n");
     }
 
     #[test]

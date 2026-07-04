@@ -64,10 +64,13 @@ the lowest-scoring, most load-bearing gaps vs Python/Go/TS/Java/Rust/Haskell/
 C++/Swift/Kotlin. Concurrency is the #1 gap for the "universal, any software"
 claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 
-- [ ] **Concurrency / parallelism** (audit #1) — async I/O, `par`, a real
-      scheduler on the actor model (work-stealing or multi-threaded), keeping
-      the virtual clock for deterministic tests. `await` evaluates synchronously
-      today; `par` is unbuilt.
+- [◐] **Concurrency / parallelism** (audit #1) — **`par { … }` structured
+      fork-join landed** (it11): independent branches → `List[T]`, deterministic
+      results, both engines identical; the seam where real threads plug in.
+      Still open: a multi-threaded/work-stealing scheduler (execute `par`
+      branches on OS threads — needs Arc-based values), async I/O, and `await`
+      actually suspending (evaluates synchronously today). Virtual clock (it9)
+      preserved for deterministic tests.
 - [ ] **Native components + KIR** (audit #2) — typed SSA IR; components compile
       to native (per-component GC), so real apps run at native, not VM, speed
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
