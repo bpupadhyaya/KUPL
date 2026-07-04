@@ -581,6 +581,13 @@ impl<'m> Vm<'m> {
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_HTTP_GET | BUILTIN_HTTP_POST => {
+                            let name = if which == BUILTIN_HTTP_GET { "http_get" } else { "http_post" };
+                            match crate::interp::http_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1126,6 +1133,20 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_http_err_path_it19() {
+        // deterministic, network-free: nothing listens on 127.0.0.1:9, so the
+        // request fails and both engines observe an Err (message text may vary
+        // by platform, so only the Ok/Err structure is asserted)
+        let src = "fun probe() -> Bool {\n\
+            match http_get(\"http://127.0.0.1:9/\") {\n\
+                Ok(_) => false\n\
+                Err(_) => true\n\
+            }\n\
+        }\n";
+        assert_eq!(differential(src), "true");
     }
 
     #[test]

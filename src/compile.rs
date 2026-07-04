@@ -1060,6 +1060,8 @@ impl<'s> FnCompiler<'s> {
                 ("random_ints", 2) => Some(BUILTIN_RANDOM_INTS),
                 ("random_floats", 2) => Some(BUILTIN_RANDOM_FLOATS),
                 ("shuffle", 2) => Some(BUILTIN_SHUFFLE),
+                ("http_get", 1) => Some(BUILTIN_HTTP_GET),
+                ("http_post", 2) => Some(BUILTIN_HTTP_POST),
                 _ => None,
             };
             if let Some(which) = builtin {

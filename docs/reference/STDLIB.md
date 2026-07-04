@@ -31,6 +31,8 @@ unless supervised.
 | `random_ints(seed, count)` | `(Int, Int) -> List[Int]` | deterministic; `count ≤ 0` → empty |
 | `random_floats(seed, count)` | `(Int, Int) -> List[Float]` | each in `[0.0, 1.0)`; deterministic |
 | `shuffle(seed, xs)` | `(Int, List[T]) -> List[T]` | deterministic Fisher-Yates permutation |
+| `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
+| `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
 
 `args`/`env_var` read ambient input, so they carry the `io.env` effect (a
 sub-effect of `io`). `args()` is everything after `--` when run through the
@@ -40,6 +42,11 @@ toolchain (`kupl run prog.kupl -- a b`) and `argv[1..]` for a native binary.
 `random_ints` / `random_floats` / `shuffle` are **pure** (no effect): a given
 seed always yields the same result (xorshift64\*), so simulations and tests are
 reproducible. There is no ambient/global RNG — pass a seed explicitly.
+
+`http_get` / `http_post` shell out to the system `curl` (the same transport the
+AI runtime uses) and carry the `io.net` effect. A non-2xx status or unreachable
+host is an ordinary `Err` (message text is platform-dependent). Not yet on the
+native backend — use `kupl run`/`--vm`/`bundle`.
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

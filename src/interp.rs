@@ -935,6 +935,13 @@ impl Interp {
                     }
                     return random_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("http_get", 1) | ("http_post", 2) => {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        vals.push(self.eval(&a.value, env)?);
+                    }
+                    return http_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("exit", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     let code = match v {
@@ -2102,6 +2109,64 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err(format!("unknown process builtin `{name}`")),
     }
+}
+
+/// HTTP builtins — shared by interpreter and KVM. Effect `io.net`. Transport is
+/// the system `curl` (the same zero-dependency approach the AI runtime uses).
+/// Returns a `Result` value: `Ok(body)` on a successful request, `Err(message)`
+/// otherwise (unreachable host, non-2xx, curl missing, …). The `Err` text is a
+/// human-readable description and may vary by platform — match `Ok`/`Err`.
+pub fn http_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let as_str = |v: &Value| match v {
+        Value::Str(s) => s.as_str().to_string(),
+        other => other.to_string(),
+    };
+    let url = as_str(&args[0]);
+    // `--fail` makes curl return a non-zero status (and thus an Err) on HTTP
+    // 4xx/5xx; `-sS` silences the progress meter but keeps error messages.
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sS", "--fail", "--max-time", "30"]);
+    let result = match name {
+        "http_get" => {
+            cmd.arg(&url);
+            run_curl(cmd, None)
+        }
+        "http_post" => {
+            let body = as_str(&args[1]);
+            cmd.args(["-X", "POST", "--data-binary", "@-", &url]);
+            run_curl(cmd, Some(body))
+        }
+        _ => return Err(format!("unknown http builtin `{name}`")),
+    };
+    Ok(match result {
+        Ok(body) => Value::ok(Value::str(body)),
+        Err(msg) => Value::err(Value::str(msg)),
+    })
+}
+
+fn run_curl(mut cmd: std::process::Command, body: Option<String>) -> Result<String, String> {
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    if body.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("cannot run curl: {e}"))?;
+    if let Some(b) = body {
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b.as_bytes()).map_err(|e| format!("curl stdin: {e}"))?;
+        }
+    }
+    let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("request failed (curl exit {})", out.status.code().unwrap_or(-1))
+        } else {
+            err
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// File I/O builtins — shared by interpreter and KVM. Effect `io.fs`.

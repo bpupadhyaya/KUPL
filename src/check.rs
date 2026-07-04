@@ -1458,6 +1458,18 @@ impl Checker {
                     self.unify(&Ty::List(Box::new(elem.clone())), &list, args[1].value.span, "shuffle list");
                     return Ty::List(Box::new(self.uni.apply(&elem)));
                 }
+                ("http_get", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "http_get url");
+                    return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
+                ("http_post", 2) => {
+                    let u = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &u, args[0].value.span, "http_post url");
+                    let b = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&Ty::Str, &b, args[1].value.span, "http_post body");
+                    return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
                 ("eprint", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Unit;

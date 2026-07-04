@@ -161,6 +161,8 @@ fn builtin_effects(name: &str) -> Option<&'static str> {
         }
         // reading the environment / command line — another `io` sub-effect
         "env_var" | "args" => Some("io.env"),
+        // network access — another `io` sub-effect
+        "http_get" | "http_post" => Some("io.net"),
         // stderr output is ordinary `io` (`exit` diverges like `panic`: no effect)
         "eprint" => Some("io"),
         _ => None,

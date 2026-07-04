@@ -4,8 +4,8 @@
 
 This manual describes the KUPL language *as implemented* by the reference
 toolchain in this repository. Features that exist only in the design proposal
-(kernels/`at()`, capabilities-as-values, `par`, timers, generics with bounds,
-the system/hardware tiers) are covered in [`../design/LANGUAGE.md`](../design/LANGUAGE.md)
+(kernels/`at()`, capabilities-as-values, generics with bounds, the
+system/hardware tiers) are covered in [`../design/LANGUAGE.md`](../design/LANGUAGE.md)
 and are marked **[design]** where mentioned. Everything else on this page runs
 today, identically, on all four execution engines.
 
@@ -276,8 +276,9 @@ pub fun broadcast(msg: Str) uses io {   // public: effects MUST be declared
   `db.read` does not cover `db.write`. Built-in effectful operations in
   v1.0-alpha: `print` / `eprint` (`io`); the file builtins `read_file` /
   `write_file` / `append_file` / `delete_file` / `file_exists` (`io.fs`); and
-  `args` / `env_var` (`io.env`). The sub-effects mean `uses io` covers all of
-  them, while `uses io.fs` / `uses io.env` are the precise capabilities.
+  `args` / `env_var` (`io.env`); and `http_get` / `http_post` (`io.net`). The
+  sub-effects mean `uses io` covers all of them, while `uses io.fs` /
+  `uses io.env` / `uses io.net` are the precise capabilities.
   (`json_parse`/`json_stringify` and the seeded-random builtins are pure — no
   effect.) Capability *values* — attenuable, passable file/network handles —
   are **[design]**.

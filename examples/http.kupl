@@ -1,0 +1,36 @@
+// HTTP client — fetch a URL and, if it's JSON, summarize it.
+//
+//   http_get(url)        -> Result[Str, Str]   (Ok = body, Err = message)
+//   http_post(url, body) -> Result[Str, Str]
+//
+// Both shell out to the system `curl` and carry the `io.net` effect. This ties
+// the stack together: fetch over HTTP → parse with json_parse → inspect.
+//
+// The URL comes from the command line, so running with no arguments does no
+// network at all:
+//   kupl run examples/http.kupl -- https://api.github.com/repos/rust-lang/rust
+//   kupl run examples/http.kupl -- https://example.com/
+
+fun summarize(body: Str) -> Str {
+    // if the body is JSON, describe its top level; otherwise report its size
+    match json_parse(body) {
+        Ok(JObj(fields)) => "JSON object with keys {fields.keys()}"
+        Ok(JArr(items)) => "JSON array of {items.len()}"
+        Ok(_) => "a JSON scalar"
+        Err(_) => "{body.len()} bytes of non-JSON"
+    }
+}
+
+fun main() uses io, io.net {
+    let urls = args()
+    if urls.is_empty() {
+        print("usage: kupl run examples/http.kupl -- <url>")
+        return
+    }
+    for url in urls {
+        match http_get(url) {
+            Ok(body) => print("{url} -> {summarize(body)}")
+            Err(e) => print("{url} -> error: {e}")
+        }
+    }
+}

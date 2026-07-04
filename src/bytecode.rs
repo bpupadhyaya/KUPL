@@ -184,6 +184,8 @@ pub const BUILTIN_EXIT: u8 = 19;
 pub const BUILTIN_RANDOM_INTS: u8 = 20;
 pub const BUILTIN_RANDOM_FLOATS: u8 = 21;
 pub const BUILTIN_SHUFFLE: u8 = 22;
+pub const BUILTIN_HTTP_GET: u8 = 23;
+pub const BUILTIN_HTTP_POST: u8 = 24;
 
 impl Module {
     pub fn disassemble(&self) -> String {
