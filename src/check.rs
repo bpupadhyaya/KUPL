@@ -239,6 +239,12 @@ impl Checker {
                 let mut ats: Vec<Ty> = args.iter().map(|a| self.resolve_ty(a)).collect();
                 match (n.as_str(), ats.len()) {
                     ("List", 1) => Ty::List(Box::new(ats.remove(0))),
+                    ("Set", 1) => Ty::Set(Box::new(ats.remove(0))),
+                    ("Map", 2) => {
+                        let v = ats.remove(1);
+                        let k = ats.remove(0);
+                        Ty::Map(Box::new(k), Box::new(v))
+                    }
                     ("Option", 1) => Ty::Option(Box::new(ats.remove(0))),
                     ("Result", 2) => {
                         let e = ats.remove(1);
@@ -1080,6 +1086,8 @@ impl Checker {
             match ty {
                 Ty::Var(id) => m.get(id).cloned().unwrap_or(Ty::Var(*id)),
                 Ty::List(e) => Ty::List(Box::new(subst(e, m))),
+                Ty::Set(e) => Ty::Set(Box::new(subst(e, m))),
+                Ty::Map(k, v) => Ty::Map(Box::new(subst(k, m)), Box::new(subst(v, m))),
                 Ty::Option(e) => Ty::Option(Box::new(subst(e, m))),
                 Ty::Result(a, b) => Ty::Result(Box::new(subst(a, m)), Box::new(subst(b, m))),
                 Ty::Fun(ps, r) => {
@@ -1136,6 +1144,20 @@ impl Checker {
                     let t = self.infer_expr(&args[0].value, ctx);
                     self.unify(&Ty::Str, &t, args[0].value.span, "panic message");
                     return self.uni.fresh();
+                }
+                ("Map", 0) => {
+                    let k = self.uni.fresh();
+                    let v = self.uni.fresh();
+                    return Ty::Map(Box::new(k), Box::new(v));
+                }
+                ("Set", 0) => {
+                    return Ty::Set(Box::new(self.uni.fresh()));
+                }
+                ("Set", 1) => {
+                    let elem = self.uni.fresh();
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::List(Box::new(elem.clone())), &t, args[0].value.span, "Set(...) argument");
+                    return Ty::Set(Box::new(self.uni.apply(&elem)));
                 }
                 ("tensor", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
@@ -1341,6 +1363,24 @@ impl Checker {
                 Some((vec![], Ty::Bool))
             }
             (Ty::Result(t, _), "unwrap_or") => Some((vec![(**t).clone()], (**t).clone())),
+            (Ty::Map(k, v), "insert") => {
+                Some((vec![(**k).clone(), (**v).clone()], Ty::Map(k.clone(), v.clone())))
+            }
+            (Ty::Map(k, v), "get") => Some((vec![(**k).clone()], Ty::Option(v.clone()))),
+            (Ty::Map(k, v), "remove") => Some((vec![(**k).clone()], Ty::Map(k.clone(), v.clone()))),
+            (Ty::Map(k, _), "contains_key") => Some((vec![(**k).clone()], Ty::Bool)),
+            (Ty::Map(k, _), "keys") => Some((vec![], Ty::List(k.clone()))),
+            (Ty::Map(_, v), "values") => Some((vec![], Ty::List(v.clone()))),
+            (Ty::Map(_, _), "len") => Some((vec![], Ty::Int)),
+            (Ty::Set(t), "insert") | (Ty::Set(t), "remove") => {
+                Some((vec![(**t).clone()], Ty::Set(t.clone())))
+            }
+            (Ty::Set(t), "contains") => Some((vec![(**t).clone()], Ty::Bool)),
+            (Ty::Set(_), "len") => Some((vec![], Ty::Int)),
+            (Ty::Set(t), "union") | (Ty::Set(t), "intersect") | (Ty::Set(t), "difference") => {
+                Some((vec![Ty::Set(t.clone())], Ty::Set(t.clone())))
+            }
+            (Ty::Set(t), "to_list") => Some((vec![], Ty::List(t.clone()))),
             (Ty::Tensor, "len") => Some((vec![], Ty::Int)),
             (Ty::Tensor, "get") => Some((vec![Ty::Int], Ty::Float)),
             (Ty::Tensor, "sum") | (Ty::Tensor, "mean") | (Ty::Tensor, "max") | (Ty::Tensor, "min") => {

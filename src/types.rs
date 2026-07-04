@@ -23,6 +23,8 @@ pub enum Ty {
     Range,
     /// Rank-1 f64 tensor (v0; dtype/shape parameters arrive with KIR).
     Tensor,
+    Map(Box<Ty>, Box<Ty>),
+    Set(Box<Ty>),
     /// Inference variable.
     Var(u32),
 }
@@ -61,6 +63,8 @@ impl Unifier {
         let t = self.resolve(ty);
         match t {
             Ty::List(e) => Ty::List(Box::new(self.apply(&e))),
+            Ty::Set(e) => Ty::Set(Box::new(self.apply(&e))),
+            Ty::Map(k, v) => Ty::Map(Box::new(self.apply(&k)), Box::new(self.apply(&v))),
             Ty::Option(e) => Ty::Option(Box::new(self.apply(&e))),
             Ty::Result(a, b) => Ty::Result(Box::new(self.apply(&a)), Box::new(self.apply(&b))),
             Ty::Fun(ps, r) => Ty::Fun(
@@ -74,7 +78,8 @@ impl Unifier {
     fn occurs(&self, id: u32, ty: &Ty) -> bool {
         match self.resolve(ty) {
             Ty::Var(other) => other == id,
-            Ty::List(e) | Ty::Option(e) => self.occurs(id, &e),
+            Ty::List(e) | Ty::Option(e) | Ty::Set(e) => self.occurs(id, &e),
+            Ty::Map(k, v) => self.occurs(id, &k) || self.occurs(id, &v),
             Ty::Result(a, b) => self.occurs(id, &a) || self.occurs(id, &b),
             Ty::Fun(ps, r) => ps.iter().any(|p| self.occurs(id, p)) || self.occurs(id, &r),
             _ => false,
@@ -111,6 +116,11 @@ impl Unifier {
             (Ty::Named(x), Ty::Named(y)) if x == y => Ok(()),
             (Ty::Component(x), Ty::Component(y)) if x == y => Ok(()),
             (Ty::List(x), Ty::List(y)) => self.unify(&x.clone(), &y.clone()),
+            (Ty::Set(x), Ty::Set(y)) => self.unify(&x.clone(), &y.clone()),
+            (Ty::Map(xk, xv), Ty::Map(yk, yv)) => {
+                self.unify(&xk.clone(), &yk.clone())?;
+                self.unify(&xv.clone(), &yv.clone())
+            }
             (Ty::Option(x), Ty::Option(y)) => self.unify(&x.clone(), &y.clone()),
             (Ty::Result(xa, xb), Ty::Result(ya, yb)) => {
                 self.unify(&xa.clone(), &ya.clone())?;
@@ -156,6 +166,8 @@ impl fmt::Display for Ty {
             }
             Ty::Range => write!(f, "Range"),
             Ty::Tensor => write!(f, "Tensor"),
+            Ty::Map(k, v) => write!(f, "Map[{k}, {v}]"),
+            Ty::Set(e) => write!(f, "Set[{e}]"),
             Ty::Var(id) => write!(f, "?{id}"),
         }
     }

@@ -101,6 +101,8 @@ letters are permitted. `_` alone is the wildcard pattern.
 | `List[T]` | immutable lists | methods return new lists |
 | `Option[T]` | `Some(v)` / `None` | there is no null |
 | `Result[T, E]` | `Ok(v)` / `Err(e)` | errors are values; `?` propagates |
+| `Map[K, V]` | insertion-ordered immutable maps | order-insensitive equality |
+| `Set[T]` | insertion-ordered immutable sets | order-insensitive equality |
 | `Tensor` | rank-1 f64 tensors | native numeric kernels; dtype/shape params **[design]** |
 | `Range` | `a..b` | iterable in `for` |
 | `fn(T1, …) -> R` | functions and lambdas | |

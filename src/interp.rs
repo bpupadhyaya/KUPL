@@ -642,6 +642,12 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return Err(Self::panic_flow(v.to_string(), span));
                 }
+                ("Map", 0) => return Ok(Value::Map(Rc::new(Vec::new()))),
+                ("Set", 0) => return Ok(Value::Set(Rc::new(Vec::new()))),
+                ("Set", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return set_from_list(&v).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("tensor", 1) | ("zeros", 1) | ("arange", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     return tensor_builtin(name, &v).map_err(|m| Self::panic_flow(m, span));
@@ -1154,6 +1160,90 @@ pub fn shared_method(
             Some(Value::Float(w)) => Ok(Value::Float(v.powf(w))),
             _ => Err("`pow` needs a Float".into()),
         },
+        (Value::Map(pairs), "insert") => {
+            let mut it = args.into_iter();
+            let (k, v) = (
+                it.next().ok_or("`insert` needs a key")?,
+                it.next().ok_or("`insert` needs a value")?,
+            );
+            let mut out = pairs.as_ref().clone();
+            match out.iter_mut().find(|(pk, _)| *pk == k) {
+                Some(pair) => pair.1 = v,
+                None => out.push((k, v)),
+            }
+            Ok(Value::Map(Rc::new(out)))
+        }
+        (Value::Map(pairs), "get") => {
+            let k = args.into_iter().next().ok_or("`get` needs a key")?;
+            Ok(pairs
+                .iter()
+                .find(|(pk, _)| *pk == k)
+                .map(|(_, v)| Value::some(v.clone()))
+                .unwrap_or_else(Value::none))
+        }
+        (Value::Map(pairs), "remove") => {
+            let k = args.into_iter().next().ok_or("`remove` needs a key")?;
+            Ok(Value::Map(Rc::new(
+                pairs.iter().filter(|(pk, _)| *pk != k).cloned().collect(),
+            )))
+        }
+        (Value::Map(pairs), "contains_key") => {
+            let k = args.into_iter().next().ok_or("`contains_key` needs a key")?;
+            Ok(Value::Bool(pairs.iter().any(|(pk, _)| *pk == k)))
+        }
+        (Value::Map(pairs), "keys") => Ok(Value::List(Rc::new(
+            pairs.iter().map(|(k, _)| k.clone()).collect(),
+        ))),
+        (Value::Map(pairs), "values") => Ok(Value::List(Rc::new(
+            pairs.iter().map(|(_, v)| v.clone()).collect(),
+        ))),
+        (Value::Map(pairs), "len") => Ok(Value::Int(pairs.len() as i64)),
+        (Value::Set(items), "insert") => {
+            let v = args.into_iter().next().ok_or("`insert` needs a value")?;
+            if items.iter().any(|x| *x == v) {
+                Ok(Value::Set(items.clone()))
+            } else {
+                let mut out = items.as_ref().clone();
+                out.push(v);
+                Ok(Value::Set(Rc::new(out)))
+            }
+        }
+        (Value::Set(items), "remove") => {
+            let v = args.into_iter().next().ok_or("`remove` needs a value")?;
+            Ok(Value::Set(Rc::new(
+                items.iter().filter(|x| **x != v).cloned().collect(),
+            )))
+        }
+        (Value::Set(items), "contains") => {
+            let v = args.into_iter().next().ok_or("`contains` needs a value")?;
+            Ok(Value::Bool(items.iter().any(|x| *x == v)))
+        }
+        (Value::Set(items), "len") => Ok(Value::Int(items.len() as i64)),
+        (Value::Set(items), "union") => match args.into_iter().next() {
+            Some(Value::Set(other)) => {
+                let mut out = items.as_ref().clone();
+                for x in other.iter() {
+                    if !out.iter().any(|y| y == x) {
+                        out.push(x.clone());
+                    }
+                }
+                Ok(Value::Set(Rc::new(out)))
+            }
+            _ => Err("`union` needs a Set".into()),
+        },
+        (Value::Set(items), "intersect") => match args.into_iter().next() {
+            Some(Value::Set(other)) => Ok(Value::Set(Rc::new(
+                items.iter().filter(|x| other.iter().any(|y| y == *x)).cloned().collect(),
+            ))),
+            _ => Err("`intersect` needs a Set".into()),
+        },
+        (Value::Set(items), "difference") => match args.into_iter().next() {
+            Some(Value::Set(other)) => Ok(Value::Set(Rc::new(
+                items.iter().filter(|x| !other.iter().any(|y| y == *x)).cloned().collect(),
+            ))),
+            _ => Err("`difference` needs a Set".into()),
+        },
+        (Value::Set(items), "to_list") => Ok(Value::List(Rc::new(items.as_ref().clone()))),
         (Value::Tensor(d), "len") => Ok(Value::Int(d.len() as i64)),
         (Value::Tensor(d), "get") => match args.into_iter().next() {
             Some(Value::Int(i)) if i >= 0 && (i as usize) < d.len() => Ok(Value::Float(d[i as usize])),
@@ -1218,6 +1308,22 @@ pub fn shared_method(
             }
         }
         (other, _) => Err(format!("{} has no method `{name}`", other.type_name())),
+    }
+}
+
+/// Build a Set from a List, dropping duplicates (shared by all engines).
+pub fn set_from_list(v: &Value) -> Result<Value, String> {
+    match v {
+        Value::List(items) => {
+            let mut out: Vec<Value> = Vec::new();
+            for it in items.iter() {
+                if !out.iter().any(|x| x == it) {
+                    out.push(it.clone());
+                }
+            }
+            Ok(Value::Set(Rc::new(out)))
+        }
+        other => Err(format!("Set(...) needs a List, found {}", other.type_name())),
     }
 }
 

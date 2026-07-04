@@ -14,7 +14,7 @@ and known limitations called out in commit messages. Checked off as landed.
       but unreachable today)
 - [x] **User-code generics** — `fun sort_by[T](xs: List[T], key: fn(T) -> Int)`
       (checker-level instantiation; engines are ready)
-- [ ] **Map[K, V] and Set[T]** collections (design §3)
+- [x] **Map[K, V] and Set[T]** collections (design §3)
 
 ## Tier 2 — component model completion
 

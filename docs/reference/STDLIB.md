@@ -12,6 +12,8 @@ unless supervised.
 | `print(v)` | `(any) -> Unit` — **uses `io`** | prints Display form + newline |
 | `to_str(v)` | `(any) -> Str` | Display form of any value |
 | `panic(msg)` | `(Str) -> !` | aborts the instance/program with `msg` |
+| `Map()` | `() -> Map[K, V]` | empty map |
+| `Set()` / `Set(xs)` | `() -> Set[T]` / `(List[T]) -> Set[T]` | duplicates dropped |
 | `tensor(xs)` | `(List[Float]) -> Tensor` | Int elements are accepted and widened |
 | `zeros(n)` | `(Int) -> Tensor` | n zeros; negative n panics |
 | `arange(n)` | `(Int) -> Tensor` | `[0.0, 1.0, …, n-1]` |
@@ -99,6 +101,33 @@ unless supervised.
 | `.unwrap_or(default)` | `(T) -> T` | |
 
 Prefer `match` or `?` for handling; `?` propagates the `Err` to the caller.
+
+### Map[K, V]
+
+Constructed with `Map()` (empty) then `.insert`. Insertion-ordered; updating an
+existing key keeps its position. Equality is order-insensitive.
+
+| Method | Signature | Notes |
+|---|---|---|
+| `.insert(k, v)` | `(K, V) -> Map[K, V]` | new map; updates in place positionally |
+| `.get(k)` | `(K) -> Option[V]` | |
+| `.remove(k)` | `(K) -> Map[K, V]` | |
+| `.contains_key(k)` | `(K) -> Bool` | |
+| `.keys()` / `.values()` | `-> List[K]` / `-> List[V]` | insertion order |
+| `.len()` | `-> Int` | |
+
+### Set[T]
+
+Constructed with `Set()` (empty) or `Set(list)` (duplicates dropped).
+Insertion-ordered; equality is order-insensitive.
+
+| Method | Signature | Notes |
+|---|---|---|
+| `.insert(v)` / `.remove(v)` | `(T) -> Set[T]` | new set |
+| `.contains(v)` | `(T) -> Bool` | |
+| `.union(s)` / `.intersect(s)` / `.difference(s)` | `(Set[T]) -> Set[T]` | |
+| `.to_list()` | `-> List[T]` | insertion order |
+| `.len()` | `-> Int` | |
 
 ### Tensor
 

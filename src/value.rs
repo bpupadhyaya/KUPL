@@ -33,6 +33,10 @@ pub enum Value {
     VmClosure(u16, Rc<Vec<Value>>),
     /// A rank-1 tensor of f64 (shapes/dtypes arrive with KIR; ops are native loops).
     Tensor(Rc<Vec<f64>>),
+    /// Insertion-ordered immutable map (association pairs; updates keep position).
+    Map(Rc<Vec<(Value, Value)>>),
+    /// Insertion-ordered immutable set.
+    Set(Rc<Vec<Value>>),
     Range(i64, i64, bool),
 }
 
@@ -89,6 +93,8 @@ impl Value {
             Value::Bound(..) => "fn".into(),
             Value::VmClosure(..) => "fn".into(),
             Value::Tensor(_) => "Tensor".into(),
+            Value::Map(_) => "Map".into(),
+            Value::Set(_) => "Set".into(),
             Value::Range(..) => "Range".into(),
         }
     }
@@ -110,6 +116,16 @@ impl PartialEq for Value {
             (Value::Component(a), Value::Component(b)) => a == b,
             (Value::Range(a, b, i), Value::Range(c, d, j)) => a == c && b == d && i == j,
             (Value::Tensor(a), Value::Tensor(b)) => a == b,
+            // Map/Set equality is order-insensitive (Python dict/set semantics)
+            (Value::Map(a), Value::Map(b)) => {
+                a.len() == b.len()
+                    && a.iter().all(|(k, v)| {
+                        b.iter().any(|(k2, v2)| k == k2 && v == v2)
+                    })
+            }
+            (Value::Set(a), Value::Set(b)) => {
+                a.len() == b.len() && a.iter().all(|x| b.iter().any(|y| x == y))
+            }
             _ => false,
         }
     }
@@ -158,6 +174,26 @@ impl fmt::Display for Value {
             Value::Component(id) => write!(f, "<component #{id}>"),
             Value::Bound(id, name) => write!(f, "<fn {name} of #{id}>"),
             Value::VmClosure(proto, _) => write!(f, "<fn @{proto}>"),
+            Value::Map(pairs) => {
+                write!(f, "Map{{")?;
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", DebugStr(k), DebugStr(v))?;
+                }
+                write!(f, "}}")
+            }
+            Value::Set(items) => {
+                write!(f, "Set{{")?;
+                for (i, x) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", DebugStr(x))?;
+                }
+                write!(f, "}}")
+            }
             Value::Tensor(data) => {
                 write!(f, "Tensor([")?;
                 for (i, x) in data.iter().enumerate() {

@@ -384,6 +384,12 @@ impl<'m> Vm<'m> {
                             set!(dst, Value::Unit);
                         }
                         BUILTIN_TO_STR => set!(dst, Value::str(args[0].to_string())),
+                        BUILTIN_MAP_NEW => set!(dst, Value::Map(Rc::new(Vec::new()))),
+                        BUILTIN_SET_NEW => set!(dst, Value::Set(Rc::new(Vec::new()))),
+                        BUILTIN_SET_FROM => match crate::interp::set_from_list(&args[0]) {
+                            Ok(v) => set!(dst, v),
+                            Err(msg) => return Err(VmError { msg, span }),
+                        },
                         BUILTIN_TENSOR | BUILTIN_ZEROS | BUILTIN_ARANGE => {
                             let name = match which {
                                 BUILTIN_TENSOR => "tensor",

@@ -148,6 +148,9 @@ pub const BUILTIN_PANIC: u8 = 2;
 pub const BUILTIN_TENSOR: u8 = 3;
 pub const BUILTIN_ZEROS: u8 = 4;
 pub const BUILTIN_ARANGE: u8 = 5;
+pub const BUILTIN_MAP_NEW: u8 = 6;
+pub const BUILTIN_SET_NEW: u8 = 7;
+pub const BUILTIN_SET_FROM: u8 = 8;
 
 impl Module {
     pub fn disassemble(&self) -> String {

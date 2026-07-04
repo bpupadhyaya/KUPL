@@ -1,0 +1,38 @@
+// Map and Set: insertion-ordered, immutable, order-insensitive equality.
+
+fun main() {
+    var ages = Map()
+    ages = ages.insert("ada", 36)
+    ages = ages.insert("alan", 41)
+    ages = ages.insert("grace", 85)
+    ages = ages.insert("ada", 37)          // update keeps position
+
+    print("map        = {ages}")
+    print("get        = {ages.get("alan")} {ages.get("nobody")}")
+    print("keys       = {ages.keys()}")
+    print("values     = {ages.values()}")
+    print("without    = {ages.remove("alan")}")
+    print("has key    = {ages.contains_key("grace")}, len = {ages.len()}")
+
+    let a = Set([1, 2, 3, 2, 1])
+    let b = Set([3, 4, 5])
+    print("a          = {a}  (dupes dropped)")
+    print("union      = {a.union(b)}")
+    print("intersect  = {a.intersect(b)}")
+    print("difference = {a.difference(b)}")
+    print("insert     = {a.insert(9)}, again = {a.insert(1)}")
+
+    // order-insensitive equality (Python semantics)
+    expect Set([1, 2, 3]) == Set([3, 1, 2])
+    expect Map().insert("x", 1).insert("y", 2) == Map().insert("y", 2).insert("x", 1)
+
+    // maps with record values, sets of strings
+    let words = "the quick brown fox the lazy dog the end".split(" ")
+    var counts = Map()
+    for w in words {
+        counts = counts.insert(w, counts.get(w).unwrap_or(0) + 1)
+    }
+    print("word count = {counts}")
+    print("unique     = {Set(words).len()} of {words.len()}")
+    print("all collection expectations hold")
+}

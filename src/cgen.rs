@@ -145,6 +145,9 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_PRINT => format!("k_print(regs[{start}]); regs[{dst}] = k_unit(); (void){argc};"),
             BUILTIN_TO_STR => format!("regs[{dst}] = k_to_str(regs[{start}]); (void){argc};"),
             BUILTIN_PANIC => format!("k_panic_v(regs[{start}]); (void){argc}; (void){dst};"),
+            BUILTIN_MAP_NEW => format!("regs[{dst}] = k_map_new(); (void){start}; (void){argc};"),
+            BUILTIN_SET_NEW => format!("regs[{dst}] = k_set_new(); (void){start}; (void){argc};"),
+            BUILTIN_SET_FROM => format!("regs[{dst}] = k_set_from(regs[{start}]); (void){argc};"),
             BUILTIN_TENSOR => format!("regs[{dst}] = k_bt_tensor(regs[{start}]); (void){argc};"),
             BUILTIN_ZEROS => format!("regs[{dst}] = k_bt_zeros(regs[{start}]); (void){argc};"),
             BUILTIN_ARANGE => format!("regs[{dst}] = k_bt_arange(regs[{start}]); (void){argc};"),
@@ -234,14 +237,16 @@ typedef struct { int64_t len; KValue* items; } KList;
 typedef struct { int32_t ctor; KValue* fields; int32_t nfields; } KCtor;
 typedef struct { int32_t proto; int32_t ncaps; KValue* caps; } KClosure;
 typedef struct { int64_t len; double* data; } KTensor;
+typedef struct { int64_t len; KValue* keys; KValue* vals; } KMap;
+typedef struct { int64_t len; KValue* items; } KSet;
 typedef struct { const char* type_name; const char* variant; int arity; const char** fields; } KCtorMeta;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET } tag;
     union {
         int64_t i; double f; int b;
         const char* s;
-        KList* list; KCtor* ctor; KClosure* clo; KTensor* ten;
+        KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
         int32_t fun;
         struct { int64_t lo, hi; int incl; } range;
     } as;
@@ -301,6 +306,48 @@ static KValue k_tensor_new(double* data, int64_t n) {
     KTensor* t = k_alloc(sizeof(KTensor));
     t->len = n; t->data = data;
     KValue x; x.tag = K_TENSOR; x.as.ten = t; return x;
+}
+
+static int k_eq(KValue a, KValue b);
+
+static KValue k_map_new(void) {
+    KMap* m = k_alloc(sizeof(KMap));
+    m->len = 0; m->keys = 0; m->vals = 0;
+    KValue x; x.tag = K_MAP; x.as.map = m; return x;
+}
+static KValue k_map_make(KValue* keys, KValue* vals, int64_t n) {
+    KMap* m = k_alloc(sizeof(KMap));
+    m->len = n;
+    m->keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    m->vals = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    memcpy(m->keys, keys, sizeof(KValue) * n);
+    memcpy(m->vals, vals, sizeof(KValue) * n);
+    KValue x; x.tag = K_MAP; x.as.map = m; return x;
+}
+static KValue k_set_new(void) {
+    KSet* s = k_alloc(sizeof(KSet));
+    s->len = 0; s->items = 0;
+    KValue x; x.tag = K_SET; x.as.set = s; return x;
+}
+static KValue k_set_make(KValue* items, int64_t n) {
+    KSet* s = k_alloc(sizeof(KSet));
+    s->len = n;
+    s->items = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    memcpy(s->items, items, sizeof(KValue) * n);
+    KValue x; x.tag = K_SET; x.as.set = s; return x;
+}
+static KValue k_set_from(KValue v) {
+    if (v.tag != K_LIST) k_panic("Set(...) needs a List");
+    KList* l = v.as.list;
+    KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+    int64_t n = 0;
+    for (int64_t i = 0; i < l->len; i++) {
+        int dup = 0;
+        for (int64_t j = 0; j < n; j++)
+            if (k_eq(out[j], l->items[i])) { dup = 1; break; }
+        if (!dup) out[n++] = l->items[i];
+    }
+    return k_set_make(out, n);
 }
 
 static KValue k_bt_tensor(KValue v) {
@@ -406,6 +453,26 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
                      v.as.range.incl ? "=" : "", (long long)v.as.range.hi);
             kb_puts(b, tmp);
             break;
+        case K_MAP: {
+            kb_puts(b, "Map{");
+            for (int64_t i = 0; i < v.as.map->len; i++) {
+                if (i) kb_puts(b, ", ");
+                k_display_inner(b, v.as.map->keys[i]);
+                kb_puts(b, ": ");
+                k_display_inner(b, v.as.map->vals[i]);
+            }
+            kb_puts(b, "}");
+            break;
+        }
+        case K_SET: {
+            kb_puts(b, "Set{");
+            for (int64_t i = 0; i < v.as.set->len; i++) {
+                if (i) kb_puts(b, ", ");
+                k_display_inner(b, v.as.set->items[i]);
+            }
+            kb_puts(b, "}");
+            break;
+        }
         case K_TENSOR: {
             kb_puts(b, "Tensor([");
             for (int64_t i = 0; i < v.as.ten->len; i++) {
@@ -438,6 +505,27 @@ static KValue k_concat(KValue a, KValue b) {
 /* ---- operators (mirror interp raw_binary_op) ---- */
 
 static int k_eq(KValue a, KValue b) {
+    if (a.tag == K_MAP && b.tag == K_MAP) {
+        if (a.as.map->len != b.as.map->len) return 0;
+        for (int64_t i = 0; i < a.as.map->len; i++) {
+            int found = 0;
+            for (int64_t j = 0; j < b.as.map->len; j++)
+                if (k_eq(a.as.map->keys[i], b.as.map->keys[j])
+                    && k_eq(a.as.map->vals[i], b.as.map->vals[j])) { found = 1; break; }
+            if (!found) return 0;
+        }
+        return 1;
+    }
+    if (a.tag == K_SET && b.tag == K_SET) {
+        if (a.as.set->len != b.as.set->len) return 0;
+        for (int64_t i = 0; i < a.as.set->len; i++) {
+            int found = 0;
+            for (int64_t j = 0; j < b.as.set->len; j++)
+                if (k_eq(a.as.set->items[i], b.as.set->items[j])) { found = 1; break; }
+            if (!found) return 0;
+        }
+        return 1;
+    }
     if (a.tag != b.tag) return 0;
     switch (a.tag) {
         case K_INT: return a.as.i == b.as.i;
@@ -883,6 +971,91 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "min")) return k_float(recv.as.f < args[0].as.f ? recv.as.f : args[0].as.f);
         if (!strcmp(name, "max")) return k_float(recv.as.f > args[0].as.f ? recv.as.f : args[0].as.f);
         if (!strcmp(name, "pow")) return k_float(pow(recv.as.f, args[0].as.f));
+    }
+    if (recv.tag == K_MAP) {
+        KMap* m = recv.as.map;
+        if (!strcmp(name, "len")) return k_int(m->len);
+        if (!strcmp(name, "get")) {
+            for (int64_t i = 0; i < m->len; i++)
+                if (k_eq(m->keys[i], args[0])) return k_some(m->vals[i]);
+            return k_none();
+        }
+        if (!strcmp(name, "contains_key")) {
+            for (int64_t i = 0; i < m->len; i++)
+                if (k_eq(m->keys[i], args[0])) return k_bool(1);
+            return k_bool(0);
+        }
+        if (!strcmp(name, "insert")) {
+            KValue* ks = k_alloc(sizeof(KValue) * (m->len + 1));
+            KValue* vs = k_alloc(sizeof(KValue) * (m->len + 1));
+            memcpy(ks, m->keys, sizeof(KValue) * m->len);
+            memcpy(vs, m->vals, sizeof(KValue) * m->len);
+            for (int64_t i = 0; i < m->len; i++)
+                if (k_eq(ks[i], args[0])) { vs[i] = args[1]; return k_map_make(ks, vs, m->len); }
+            ks[m->len] = args[0]; vs[m->len] = args[1];
+            return k_map_make(ks, vs, m->len + 1);
+        }
+        if (!strcmp(name, "remove")) {
+            KValue* ks = k_alloc(sizeof(KValue) * (m->len < 1 ? 1 : m->len));
+            KValue* vs = k_alloc(sizeof(KValue) * (m->len < 1 ? 1 : m->len));
+            int64_t n = 0;
+            for (int64_t i = 0; i < m->len; i++)
+                if (!k_eq(m->keys[i], args[0])) { ks[n] = m->keys[i]; vs[n] = m->vals[i]; n++; }
+            return k_map_make(ks, vs, n);
+        }
+        if (!strcmp(name, "keys")) return k_list(m->keys, (int)m->len);
+        if (!strcmp(name, "values")) return k_list(m->vals, (int)m->len);
+    }
+    if (recv.tag == K_SET) {
+        KSet* st = recv.as.set;
+        if (!strcmp(name, "len")) return k_int(st->len);
+        if (!strcmp(name, "contains")) {
+            for (int64_t i = 0; i < st->len; i++)
+                if (k_eq(st->items[i], args[0])) return k_bool(1);
+            return k_bool(0);
+        }
+        if (!strcmp(name, "insert")) {
+            for (int64_t i = 0; i < st->len; i++)
+                if (k_eq(st->items[i], args[0])) return recv;
+            KValue* out = k_alloc(sizeof(KValue) * (st->len + 1));
+            memcpy(out, st->items, sizeof(KValue) * st->len);
+            out[st->len] = args[0];
+            return k_set_make(out, st->len + 1);
+        }
+        if (!strcmp(name, "remove")) {
+            KValue* out = k_alloc(sizeof(KValue) * (st->len < 1 ? 1 : st->len));
+            int64_t n = 0;
+            for (int64_t i = 0; i < st->len; i++)
+                if (!k_eq(st->items[i], args[0])) out[n++] = st->items[i];
+            return k_set_make(out, n);
+        }
+        if (!strcmp(name, "union")) {
+            KSet* o = args[0].as.set;
+            KValue* out = k_alloc(sizeof(KValue) * (st->len + o->len < 1 ? 1 : st->len + o->len));
+            memcpy(out, st->items, sizeof(KValue) * st->len);
+            int64_t n = st->len;
+            for (int64_t i = 0; i < o->len; i++) {
+                int dup = 0;
+                for (int64_t j = 0; j < n; j++)
+                    if (k_eq(out[j], o->items[i])) { dup = 1; break; }
+                if (!dup) out[n++] = o->items[i];
+            }
+            return k_set_make(out, n);
+        }
+        if (!strcmp(name, "intersect") || !strcmp(name, "difference")) {
+            KSet* o = args[0].as.set;
+            int want = name[0] == 'i';
+            KValue* out = k_alloc(sizeof(KValue) * (st->len < 1 ? 1 : st->len));
+            int64_t n = 0;
+            for (int64_t i = 0; i < st->len; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < o->len; j++)
+                    if (k_eq(st->items[i], o->items[j])) { found = 1; break; }
+                if (found == want) out[n++] = st->items[i];
+            }
+            return k_set_make(out, n);
+        }
+        if (!strcmp(name, "to_list")) return k_list(st->items, (int)st->len);
     }
     if (recv.tag == K_TENSOR) {
         KTensor* t = recv.as.ten;
