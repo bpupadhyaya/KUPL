@@ -313,8 +313,9 @@ fn compile_fun(shared: &mut Shared, f: &FunDecl) -> Chunk {
     fc.finish()
 }
 
-/// An `ai fun` chunk is a single `CallAi` over the parameter registers — the
-/// runtime signature (intent, model, shape) lives in `module.ai_funs`.
+/// An `ai fun` chunk builds the interpolated intent string from the parameter
+/// registers, then issues one `CallAi` — the runtime signature (model, shape,
+/// tools) lives in `module.ai_funs`.
 fn compile_ai_fun(shared: &mut Shared, f: &FunDecl, checked: &Checked) -> Chunk {
     let info = shared.module.ai_funs.len() as u16;
     let meta = checked.ai_funs.get(&f.name).cloned().unwrap_or(crate::ai::AiFunMeta {
@@ -327,17 +328,18 @@ fn compile_ai_fun(shared: &mut Shared, f: &FunDecl, checked: &Checked) -> Chunk 
         tools: Vec::new(),
     });
     shared.module.ai_funs.push(meta);
-    let nparams = f.params.len() as u8;
-    let dst = nparams; // params live in 0..nparams; result goes right after
-    Chunk {
-        name: f.name.clone(),
-        ncaps: 0,
-        nparams,
-        nregs: nparams as u16 + 1,
-        consts: Vec::new(),
-        code: vec![Op::CallAi { dst, info }, Op::Ret(dst)],
-        spans: vec![f.span, f.span],
+    let mut fc = FnCompiler::new(shared, &f.name, 0, f.params.len() as u8);
+    for p in &f.params {
+        fc.bind_local(&p.name);
     }
+    let intent = match f.ai.as_ref() {
+        Some(ai) => fc.expr(&ai.intent_expr),
+        None => fc.const_reg(Value::str(String::new()), f.span),
+    };
+    let dst = fc.alloc(f.span);
+    fc.emit(Op::CallAi { dst, info, intent }, f.span);
+    fc.emit(Op::Ret(dst), f.span);
+    fc.finish()
 }
 
 struct FnCompiler<'s> {

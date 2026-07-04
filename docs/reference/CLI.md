@@ -112,7 +112,7 @@ Prints the toolchain version.
 | Variable | Used by | Meaning |
 |---|---|---|
 | `CC` | `kupl native` | C compiler to invoke (default `cc`) |
-| `KUPL_AI_PROVIDER` | `ai fun` calls | `anthropic` (default) · `openai` · `ollama` · `mock` |
+| `KUPL_AI_PROVIDER` | `ai fun` calls | `anthropic` (default) · `openai` · `ollama` · `mock` · `echo` (returns the composed prompt, no network — for debugging) |
 | `ANTHROPIC_API_KEY` | anthropic provider | API key for the Messages API |
 | `OPENAI_API_KEY` | openai provider | bearer token (optional for ollama) |
 | `KUPL_AI_MODEL` | `ai fun` calls | model id; required for openai/ollama, overrides the anthropic default (`claude-opus-4-8`) |

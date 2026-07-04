@@ -246,8 +246,10 @@ Rules:
 - An `ai fun` performs the **`ai` effect**; the keyword itself is the
   boundary declaration. Callers are checked as usual: a `pub fun` that calls
   one must declare `uses ai`.
-- Arguments are rendered into the prompt as `name: value` lines using
-  Display form; the intent should refer to parameters by name.
+- The **intent is an interpolated string** evaluated in the parameter scope at
+  call time: `intent "Summarize {text} in one line."` substitutes the argument.
+  Arguments are also appended to the prompt as `name: value` lines (Display
+  form), so an intent that mentions no parameters still receives them.
 - `ai fun`s are declared at the top level (components call them freely) and
   cannot be generic. Bodies allow exactly `intent "…"` and an optional
   `model "…"` (K0119).
@@ -307,6 +309,44 @@ a JSON **array of rounds**, each either `{"tool": name, "input": {…}}` or
 tool-using ai funs are differentially tested on every engine. Real providers
 use native tool calling (Anthropic `tools`/`tool_use`/`tool_result`;
 OpenAI-compatible `tools`/`tool_calls`/`role:"tool"`).
+
+The `echo` provider (`KUPL_AI_PROVIDER=echo`) returns the composed prompt
+verbatim without any network call — handy for seeing exactly what an ai fun,
+including its resolved intent, would send.
+
+### 6.3 Agent components
+
+An **agent** is just a component that keeps conversation state and calls
+ai funs from its handlers/exposes — no special construct. The component is the
+memory: each turn appends to state, so later turns carry earlier context.
+
+```kupl
+fun add(a: Int, b: Int) -> Int { a + b }
+
+ai fun reply(history: List[Str], msg: Str) -> Str tools [add] {
+    intent "Conversation so far: {history}. Reply to: {msg}"
+}
+
+component Assistant {
+    intent "A stateful chat assistant that remembers the conversation."
+    state history: List[Str] = []
+
+    expose fun ask(msg: Str) uses ai -> Str {
+        let answer = reply(history, msg)
+        history = history.push("user: {msg}").push("assistant: {answer}")
+        answer
+    }
+}
+```
+
+`Assistant().ask(...)` is a synchronous request/response call; state persists
+across calls on the instance. See `examples/agent_component.kupl`.
+
+Note the effects limitation: effects do **not** propagate across an expose
+call (`bot.ask(...)` is a method call on an instance), so a caller of `ask`
+is not statically required to declare `ai` — the same v1.0-alpha limitation
+that applies to calls through variables. The `ai` effect is still required and
+checked on `ask` itself.
 
 ## 7. Components
 

@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 58 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 60 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -197,6 +197,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/counter.kupl` | components, typed ports, wiring, `example` tests |
 | `examples/ai.kupl` | `ai fun` typed prompt functions: text, structured records, lists, `Result` capture |
 | `examples/agent.kupl` | agentic `ai fun`: the model calls KUPL functions as tools (`tools [add, weather]`) |
+| `examples/agent_component.kupl` | agent component: conversation state persisted across turns, interpolated intent, tool use |
 | `examples/shapes.kupl` | functional core: ADTs, `match`, records, `Option`/`Result` + `?`, lambdas |
 | `examples/todo.kupl` | a small app: store + reporter, expose functions, message flow |
 | `examples/contracts.kupl` | contracts with executable `law`s (`kupl test` runs them) |
@@ -215,7 +216,7 @@ pure functions with **inferred + enforced effects** (`pub`/`expose` must declare
 `uses io` etc.); ADTs with exhaustive `match`, records, newtypes,
 `Option`/`Result` + `?`, lambdas, string interpolation; checked 64-bit integers
 (overflow panics, never wraps); first-class tensors with native numeric kernels;
-multi-file modules; `ai fun` typed prompt functions with structured output and a provider-agnostic runtime (Anthropic, OpenAI-compatible, Ollama, deterministic mock), tool use (model calls KUPL functions); the canonical formatter; semantic diff; JSON diagnostics;
+multi-file modules; `ai fun` typed prompt functions with structured output and a provider-agnostic runtime (Anthropic, OpenAI-compatible, Ollama, deterministic mock), tool use (model calls KUPL functions), interpolated intents, agent components (stateful, multi-turn); the canonical formatter; semantic diff; JSON diagnostics;
 component manifests; an LSP server; and four verified execution modes.
 
 ## Reference documentation
@@ -235,7 +236,7 @@ component manifests; an LSP server; and four verified execution modes.
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~15,000 lines of dependency-free Rust, 58 tests, all engines differentially
+~15,100 lines of dependency-free Rust, 60 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

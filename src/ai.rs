@@ -327,8 +327,9 @@ fn http_post(url: &str, headers: &[String], body: &str) -> Result<String, String
 
 /// Build the prompt: intent + rendered arguments + (for structured shapes)
 /// the JSON instruction. Deterministic — the mock provider ignores it.
-fn build_prompt(meta: &AiFunMeta, args: &[Value]) -> String {
-    let mut prompt = meta.intent.clone();
+/// `intent` is the interpolated intent, already resolved in the call scope.
+fn build_prompt(meta: &AiFunMeta, intent: &str, args: &[Value]) -> String {
+    let mut prompt = intent.to_string();
     if !args.is_empty() {
         prompt.push_str("\n");
         for (name, value) in meta.params.iter().zip(args) {
@@ -433,15 +434,18 @@ fn openai_call(meta: &AiFunMeta, prompt: &str, default_base: &str, need_key: boo
         .ok_or_else(|| "provider: response has no message content".into())
 }
 
-fn raw_response(meta: &AiFunMeta, args: &[Value]) -> Result<String, String> {
+fn raw_response(meta: &AiFunMeta, intent: &str, args: &[Value]) -> Result<String, String> {
     if let Some(text) = mock_response(&meta.name) {
         return Ok(text);
     }
-    let prompt = build_prompt(meta, args);
+    let prompt = build_prompt(meta, intent, args);
     match env("KUPL_AI_PROVIDER").as_deref() {
         None | Some("anthropic") => anthropic_call(meta, &prompt),
         Some("openai") => openai_call(meta, &prompt, "https://api.openai.com", true),
         Some("ollama") => openai_call(meta, &prompt, "http://localhost:11434", false),
+        // debug provider: returns the composed prompt verbatim (no network) so
+        // you can see exactly what an ai fun would send, incl. resolved intent.
+        Some("echo") => Ok(prompt),
         Some("mock") => Err(format!(
             "mock provider: set KUPL_AI_MOCK or KUPL_AI_MOCK_{} to the canned response",
             meta.name.to_uppercase()
@@ -751,8 +755,13 @@ fn user_message(prompt: &str) -> String {
     format!("{{\"role\":\"user\",\"content\":\"{}\"}}", json_escape(prompt))
 }
 
-fn tool_response(meta: &AiFunMeta, args: &[Value], host: &mut dyn ToolHost) -> Result<String, String> {
-    let prompt = build_prompt(meta, args);
+fn tool_response(
+    meta: &AiFunMeta,
+    intent: &str,
+    args: &[Value],
+    host: &mut dyn ToolHost,
+) -> Result<String, String> {
+    let prompt = build_prompt(meta, intent, args);
     if let Some(script) = mock_response(&meta.name) {
         let rounds = match parse_json(&script) {
             Ok(Json::Arr(a)) => a,
@@ -819,11 +828,16 @@ fn tool_response(meta: &AiFunMeta, args: &[Value], host: &mut dyn ToolHost) -> R
 /// Execute one `ai fun` call. `Err` means panic (unless the function wraps
 /// its result — then failures come back as `Ok(Err(msg))`). `host` lets an
 /// ai fun with `tools` call back into the engine's KUPL functions.
-pub fn ai_call(meta: &AiFunMeta, args: &[Value], host: &mut dyn ToolHost) -> Result<Value, String> {
+pub fn ai_call(
+    meta: &AiFunMeta,
+    intent: &str,
+    args: &[Value],
+    host: &mut dyn ToolHost,
+) -> Result<Value, String> {
     let text = if meta.tools.is_empty() {
-        raw_response(meta, args)
+        raw_response(meta, intent, args)
     } else {
-        tool_response(meta, args, host)
+        tool_response(meta, intent, args, host)
     };
     let outcome = text.and_then(|t| convert(meta, &t));
     match outcome {
@@ -851,7 +865,8 @@ mod tests {
     }
 
     fn run(m: &AiFunMeta, args: &[Value]) -> Result<Value, String> {
-        ai_call(m, args, &mut NullToolHost)
+        let intent = m.intent.clone();
+        ai_call(m, &intent, args, &mut NullToolHost)
     }
 
     #[test]

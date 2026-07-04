@@ -66,7 +66,11 @@ pub struct FunDecl {
 /// `tools` names top-level functions the model may call while answering.
 #[derive(Debug, Clone)]
 pub struct AiDecl {
+    /// Flattened source form (`{expr}` kept literal) — for fmt/manifest/diff.
     pub intent: String,
+    /// The intent as an interpolated string expression, evaluated in the ai
+    /// fun's parameter scope at call time so `{param}` substitutes real values.
+    pub intent_expr: Expr,
     pub model: Option<String>,
     pub tools: Vec<String>,
 }

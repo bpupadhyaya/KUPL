@@ -87,10 +87,11 @@ pub enum Op {
     /// Unconditional panic with message consts[idx].
     Panic(u16),
 
-    /// dst <- ai_funs[info](frame params). The entire body of a compiled
-    /// `ai fun` chunk: reads the frame's parameter registers, performs the
-    /// provider call, converts the response per the stored shape.
-    CallAi { dst: Reg, info: u16 },
+    /// dst <- ai_funs[info](frame params) with the resolved intent in
+    /// regs[intent]. The body of a compiled `ai fun` chunk first builds the
+    /// interpolated intent string, then this op reads the parameter registers,
+    /// performs the provider call, and converts the response per the shape.
+    CallAi { dst: Reg, info: u16, intent: Reg },
 }
 
 #[derive(Debug, Clone)]

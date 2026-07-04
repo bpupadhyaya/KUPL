@@ -28,8 +28,12 @@ and known limitations called out in commit messages. Checked off as landed.
       to the model; the runtime drives the model↔tool loop (JSON ↔ typed
       values), bounded, scriptable via the mock provider for tests. Real
       providers use native tool calling (Anthropic tool_use, OpenAI tool_calls)
-- [ ] **Agent components** — conversation state persisted in a component across
-      turns; `on message` handlers that call tool-using ai funs
+- [x] **Agent components** — conversation state persisted in component state
+      across turns; exposes/handlers call tool-using ai funs. Plus **intent
+      interpolation**: the `ai fun` intent is an interpolated string evaluated
+      in the parameter scope (`intent "Reply to {msg}"`). `echo` debug provider.
+      (Known limitation: effects don't propagate across expose/method calls —
+      candidate for a future type-aware effect pass.)
 - [ ] **Prompt-context builders** — `kupl context` output as a first-class
       value; embeddings + similarity as stdlib
 - [ ] **`ai fun` on the native backend** (libcurl or platform HTTP)

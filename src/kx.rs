@@ -414,10 +414,11 @@ fn encode_op(w: &mut W, op: &Op) {
             w.u8(*start);
             w.u8(*argc);
         }
-        CallAi { dst, info } => {
+        CallAi { dst, info, intent } => {
             w.u8(43);
             w.u8(*dst);
             w.u16(*info);
+            w.u8(*intent);
         }
         WithField { dst, obj, name, value } => {
             w.u8(40);
@@ -717,7 +718,7 @@ fn decode_op(r: &mut R) -> DecodeResult<Op> {
         39 => Panic(r.u16()?),
         40 => WithField { dst: r.u8()?, obj: r.u8()?, name: r.u16()?, value: r.u8()? },
         42 => CallComp { dst: r.u8()?, fun: r.u16()?, start: r.u8()?, argc: r.u8()? },
-        43 => CallAi { dst: r.u8()?, info: r.u16()? },
+        43 => CallAi { dst: r.u8()?, info: r.u16()?, intent: r.u8()? },
         t => return Err(format!("unknown opcode {t}")),
     })
 }

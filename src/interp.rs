@@ -778,14 +778,21 @@ impl Interp {
                 span,
             ));
         }
-        if decl.ai.is_some() {
+        if let Some(ai) = &decl.ai {
             let Some(meta) = self.db.ai_funs.get(&decl.name).cloned() else {
                 return Err(Self::panic_flow(
                     format!("ai fun `{}` has no runtime signature", decl.name),
                     span,
                 ));
             };
-            return crate::ai::ai_call(&meta, &args, self).map_err(|m| Self::panic_flow(m, span));
+            // resolve the interpolated intent in a scope holding the arguments
+            let scope = base_env.child();
+            for (p, a) in decl.params.iter().zip(&args) {
+                scope.define(&p.name, a.clone());
+            }
+            let intent = self.eval(&ai.intent_expr, &scope)?.to_string();
+            return crate::ai::ai_call(&meta, &intent, &args, self)
+                .map_err(|m| Self::panic_flow(m, span));
         }
         let scope = base_env.child();
         for (p, a) in decl.params.iter().zip(args) {

@@ -106,7 +106,8 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
         }
         out.push_str("{\n");
         indent(out, level + 1);
-        out.push_str(&format!("intent \"{}\"\n", escape_str(&ai.intent)));
+        // render from the expression so interpolation `{...}` round-trips
+        out.push_str(&format!("intent {}\n", expr_str(&ai.intent_expr, 0)));
         if let Some(model) = &ai.model {
             indent(out, level + 1);
             out.push_str(&format!("model \"{}\"\n", escape_str(model)));
@@ -677,6 +678,14 @@ mod tests {
     fn fmt_idempotent_contract() {
         roundtrip(
             "contract Store {\n intent \"keyed storage\"\n expose fun get(k: Str) -> Option[Str]\n law \"missing is None\" { expect get(\"x\") == None }\n}\ncomponent M fulfills Store {\n intent \"in-memory\"\n expose fun get(k: Str) -> Option[Str] { None }\n}\n",
+        );
+    }
+
+    #[test]
+    fn fmt_idempotent_ai_fun_interpolated_intent() {
+        // the intent interpolation braces must round-trip, not get escaped
+        roundtrip(
+            "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nai fun reply(msg: Str) -> Str tools [add] {\n    intent \"Reply to {msg} using add.\"\n    model \"claude-opus-4-8\"\n}\n",
         );
     }
 }

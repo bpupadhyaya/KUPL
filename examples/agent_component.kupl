@@ -1,0 +1,46 @@
+// Agent component — a stateful assistant that keeps conversation history in
+// component state across turns and calls a tool-using `ai fun` each turn.
+//
+// This composes the three AI-native pieces: `ai fun` (typed prompt function),
+// intent interpolation ({history}, {msg} substituted at call time), and tool
+// use (the model can call `add` while answering). The component is the memory:
+// each `ask` appends to `history`, so later turns carry the earlier context.
+//
+// Deterministic run (no network) — the mock scripts the tool loop per turn:
+//
+//   export KUPL_AI_MOCK_REPLY='[{"tool":"add","input":{"a":2,"b":3}},{"final":"5"}]'
+//   kupl run examples/agent_component.kupl
+
+fun add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+ai fun reply(history: List[Str], msg: Str) -> Str tools [add] {
+    intent "You are a concise assistant. Conversation so far: {history}. Use the add tool for arithmetic. Reply to: {msg}"
+}
+
+component Assistant {
+    intent "A stateful chat assistant that remembers the conversation."
+
+    state history: List[Str] = []
+
+    expose fun ask(msg: Str) uses ai -> Str {
+        let answer = reply(history, msg)
+        history = history.push("user: {msg}").push("assistant: {answer}")
+        answer
+    }
+
+    expose fun turns() -> Int {
+        history.len()
+    }
+}
+
+// `ai` is not declared here: effects do not propagate across an expose call
+// (`bot.ask(...)` is a method call on an instance), a documented v1.0-alpha
+// limitation. The `ai` effect is required and declared on `ask` itself.
+fun main() uses io {
+    let bot = Assistant()
+    print(bot.ask("what is 2 plus 3?"))
+    print(bot.ask("thanks!"))
+    print("history entries: {bot.turns()}")
+}

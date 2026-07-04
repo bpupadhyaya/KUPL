@@ -384,16 +384,17 @@ impl<'m> Vm<'m> {
                         e
                     })?;
                 }
-                Op::CallAi { dst, info } => {
+                Op::CallAi { dst, info, intent } => {
                     // `module` is &'m, independent of the &mut self we pass as
                     // the tool host below.
                     let module = self.module;
                     let Some(meta) = module.ai_funs.get(info as usize) else {
                         return Err(VmError { msg: "unknown ai fun".into(), span });
                     };
+                    let intent_str = reg!(intent).to_string();
                     let args: Vec<Value> =
                         (0..chunk.nparams).map(|i| reg!(chunk.ncaps + i)).collect();
-                    match crate::ai::ai_call(meta, &args, self) {
+                    match crate::ai::ai_call(meta, &intent_str, &args, self) {
                         Ok(v) => set!(dst, v),
                         Err(msg) => return Err(VmError { msg, span }),
                     }
@@ -971,6 +972,64 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_agent_component() {
+        // A stateful component whose expose calls a tool-using ai fun with an
+        // interpolated intent; history persists across turns. Both engines must
+        // agree, turn for turn.
+        std::env::set_var(
+            "KUPL_AI_MOCK_AGENT_REPLY",
+            "[{\"tool\":\"agent_add\",\"input\":{\"a\":4,\"b\":6}},{\"final\":\"10\"}]",
+        );
+        let src = "fun agent_add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+ai fun agent_reply(history: List[Str], msg: Str) -> Str tools [agent_add] {\n    intent \"History {history}, reply to {msg}\"\n}\n\
+component Bot {\n    intent \"stateful bot\"\n    state history: List[Str] = []\n\
+    expose fun ask(msg: Str) uses ai -> Str {\n        let a = agent_reply(history, msg)\n        history = history.push(\"u:{msg}\").push(\"b:{a}\")\n        a\n    }\n\
+    expose fun turns() -> Int {\n        history.len()\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let iid = match interp.instantiate("Bot", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(id)) => id,
+            _ => panic!("instantiate failed"),
+        };
+        interp.start_all().ok();
+        let call_i = |it: &mut Interp, id: usize, m: &str, a: Vec<Value>| -> String {
+            let f = Value::Bound(id, std::rc::Rc::new(m.to_string()));
+            match it.call_value(f, a, crate::diag::Span::default()) {
+                Ok(v) => v.to_string(),
+                Err(Flow::Panic { msg, .. }) => format!("panic: {msg}"),
+                Err(_) => "flow".into(),
+            }
+        };
+        let mut i_log = Vec::new();
+        i_log.push(call_i(&mut interp, iid, "ask", vec![Value::str("4+6?")]));
+        i_log.push(call_i(&mut interp, iid, "ask", vec![Value::str("thanks")]));
+        i_log.push(call_i(&mut interp, iid, "turns", vec![]));
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let vid = vm.instantiate_named("Bot", vec![]).expect("instantiate");
+        let call_v = |vm: &mut Vm, id: usize, m: &str, a: Vec<Value>| -> String {
+            match vm.call_expose(id, m, a) {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("panic: {}", e.msg),
+            }
+        };
+        let mut v_log = Vec::new();
+        v_log.push(call_v(&mut vm, vid, "ask", vec![Value::str("4+6?")]));
+        v_log.push(call_v(&mut vm, vid, "ask", vec![Value::str("thanks")]));
+        v_log.push(call_v(&mut vm, vid, "turns", vec![]));
+
+        assert_eq!(i_log, v_log, "interpreter and KVM disagree on agent component");
+        assert_eq!(v_log[0], "10");
+        assert_eq!(v_log[2], "4"); // 2 asks x 2 history pushes
     }
 
     #[test]

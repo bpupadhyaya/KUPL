@@ -25,6 +25,21 @@ fn str_parts_text(parts: &[StrPart]) -> String {
         .collect()
 }
 
+/// Build an interpolated-string `Expr` from lexed string parts (interpolation
+/// sub-expressions are parsed). Used for `ai fun` intents.
+fn str_parts_expr(parts: &[StrPart], span: Span) -> PResult<Expr> {
+    let mut pieces = Vec::new();
+    for part in parts {
+        match part {
+            StrPart::Text(t) => pieces.push(StrPiece::Text(t.clone())),
+            StrPart::Expr(src, off) => {
+                pieces.push(StrPiece::Expr(Box::new(parse_expr_fragment(src, *off)?)));
+            }
+        }
+    }
+    Ok(Expr { kind: ExprKind::Str(pieces), span })
+}
+
 type PResult<T> = Result<T, Diag>;
 
 pub fn parse(src: &str) -> (Program, Vec<Diag>) {
@@ -360,8 +375,9 @@ impl Parser {
             return Err(bad_body(self.span()));
         }
         self.bump();
-        let intent = match self.bump() {
-            Tok::Str(parts) => str_parts_text(&parts),
+        let intent_span = self.span();
+        let (intent, intent_expr) = match self.bump() {
+            Tok::Str(parts) => (str_parts_text(&parts), str_parts_expr(&parts, intent_span)?),
             _ => return Err(bad_body(self.prev_span())),
         };
         self.skip_newlines();
@@ -384,7 +400,7 @@ impl Parser {
             effects,
             body: Block { stmts: Vec::new(), span },
             is_pub,
-            ai: Some(AiDecl { intent, model, tools }),
+            ai: Some(AiDecl { intent, intent_expr, model, tools }),
             span,
         })
     }
