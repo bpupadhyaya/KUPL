@@ -282,14 +282,10 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
                         .into(),
                 )
             }
-            BUILTIN_RE_MATCH | BUILTIN_RE_FIND | BUILTIN_RE_FIND_ALL | BUILTIN_RE_REPLACE => {
-                return Err(
-                    "regex builtins (re_match/re_find/re_find_all/re_replace) are not yet \
-                     supported by the native backend — use `kupl run`, `kupl run --vm`, or \
-                     `kupl bundle`"
-                        .into(),
-                )
-            }
+            BUILTIN_RE_MATCH => format!("regs[{dst}] = k_re_match(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_RE_FIND => format!("regs[{dst}] = k_re_find(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_RE_FIND_ALL => format!("regs[{dst}] = k_re_find_all(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_RE_REPLACE => format!("regs[{dst}] = k_re_replace(regs[{start}], regs[{start}+1], regs[{start}+2]); (void){argc};"),
             BUILTIN_FORMAT_TIME => format!("regs[{dst}] = k_format_time(regs[{start}]); (void){argc};"),
             BUILTIN_YEAR_OF => format!("regs[{dst}] = k_year_of(regs[{start}]); (void){argc};"),
             BUILTIN_MONTH_OF => format!("regs[{dst}] = k_month_of(regs[{start}]); (void){argc};"),
@@ -1376,6 +1372,257 @@ static KValue k_csv_stringify(KValue lst) {
             k_csv_field(&b, row->items[c].as.s);
         }
     }
+    return k_str(kb_take(&b));
+}
+
+/* ---- regex (mirrors src/regex.rs; byte-oriented — ASCII-correct, which is
+   what the KUPL regex examples use; multi-byte class ranges would differ) ---- */
+typedef struct KReAtom KReAtom;
+typedef struct { KReAtom* atom; int quant; } KRePiece;    /* quant: 0 One 1 * 2 + 3 ? */
+typedef struct { KRePiece* p; int n; } KReSeq;
+typedef struct { KReSeq* a; int n; } KReAlts;
+typedef struct { unsigned char lo, hi; } KReRange;
+struct KReAtom {
+    int kind;                 /* 0 Any, 1 Char, 2 Class, 3 Group */
+    unsigned char ch;
+    int negated; KReRange* ranges; int nranges;
+    KReAlts group;
+};
+typedef struct { KReAlts alts; int astart, aend; } KRegex;
+typedef struct { const unsigned char* s; int pos, len, aend, err; const char* msg; } KReP;
+
+static KReAlts kre_alternation(KReP* p);
+static void kre_fail(KReP* p, const char* m) { if (!p->err) { p->err = 1; p->msg = m; } }
+static int kre_peek(KReP* p) { return p->pos < p->len ? p->s[p->pos] : -1; }
+
+static void kre_class(KReP* p, KReAtom* a) {
+    p->pos++;                 /* '[' */
+    a->kind = 2; a->negated = 0; a->ranges = 0; a->nranges = 0;
+    int cap = 0;
+    if (kre_peek(p) == '^') { a->negated = 1; p->pos++; }
+    #define REPUSH(LO, HI) do { if (a->nranges == cap) { cap = cap ? cap * 2 : 8; a->ranges = (KReRange*)realloc(a->ranges, sizeof(KReRange) * cap); } a->ranges[a->nranges].lo = (LO); a->ranges[a->nranges].hi = (HI); a->nranges++; } while (0)
+    if (kre_peek(p) == ']') { REPUSH(']', ']'); p->pos++; }
+    for (;;) {
+        int c = kre_peek(p);
+        if (c < 0) { kre_fail(p, "unclosed character class `[`"); return; }
+        if (c == ']') { p->pos++; break; }
+        if (c == '\\') {
+            p->pos++;
+            int e = kre_peek(p);
+            if (e < 0) { kre_fail(p, "dangling `\\` in class"); return; }
+            p->pos++;
+            switch (e) {
+                case 'd': REPUSH('0', '9'); break;
+                case 'w': REPUSH('a', 'z'); REPUSH('A', 'Z'); REPUSH('0', '9'); REPUSH('_', '_'); break;
+                case 's': REPUSH(' ', ' '); REPUSH('\t', '\t'); REPUSH('\n', '\n'); REPUSH('\r', '\r'); break;
+                case 'n': REPUSH('\n', '\n'); break;
+                case 't': REPUSH('\t', '\t'); break;
+                case 'r': REPUSH('\r', '\r'); break;
+                default: REPUSH((unsigned char)e, (unsigned char)e); break;
+            }
+        } else {
+            p->pos++;
+            /* range lo-hi when `-` is followed by a non-`]` */
+            if (kre_peek(p) == '-' && p->pos + 1 < p->len && p->s[p->pos + 1] != ']') {
+                p->pos++;
+                int hi = kre_peek(p); p->pos++;
+                if ((unsigned char)c <= (unsigned char)hi) REPUSH((unsigned char)c, (unsigned char)hi);
+                else REPUSH((unsigned char)hi, (unsigned char)c);
+            } else {
+                REPUSH((unsigned char)c, (unsigned char)c);
+            }
+        }
+    }
+    #undef REPUSH
+}
+
+static KReAtom* kre_atom(KReP* p) {
+    KReAtom* a = (KReAtom*)k_alloc(sizeof(KReAtom));
+    memset(a, 0, sizeof(KReAtom));
+    int c = kre_peek(p);
+    if (c == '(') {
+        p->pos++; a->kind = 3; a->group = kre_alternation(p);
+        if (kre_peek(p) == ')') p->pos++; else kre_fail(p, "unclosed group `(`");
+    } else if (c == '[') {
+        kre_class(p, a);
+    } else if (c == '.') { p->pos++; a->kind = 0; }
+    else if (c == '\\') {
+        p->pos++;
+        int e = kre_peek(p);
+        if (e < 0) { kre_fail(p, "dangling `\\` at end of pattern"); return a; }
+        p->pos++;
+        switch (e) {
+            case 'd': a->kind = 2; a->negated = 0; a->ranges = (KReRange*)k_alloc(sizeof(KReRange)); a->ranges[0].lo = '0'; a->ranges[0].hi = '9'; a->nranges = 1; break;
+            case 'D': a->kind = 2; a->negated = 1; a->ranges = (KReRange*)k_alloc(sizeof(KReRange)); a->ranges[0].lo = '0'; a->ranges[0].hi = '9'; a->nranges = 1; break;
+            case 'w': case 'W': {
+                a->kind = 2; a->negated = (e == 'W'); a->ranges = (KReRange*)k_alloc(sizeof(KReRange) * 4);
+                a->ranges[0] = (KReRange){'a','z'}; a->ranges[1] = (KReRange){'A','Z'}; a->ranges[2] = (KReRange){'0','9'}; a->ranges[3] = (KReRange){'_','_'}; a->nranges = 4; break;
+            }
+            case 's': case 'S': {
+                a->kind = 2; a->negated = (e == 'S'); a->ranges = (KReRange*)k_alloc(sizeof(KReRange) * 4);
+                a->ranges[0] = (KReRange){' ',' '}; a->ranges[1] = (KReRange){'\t','\t'}; a->ranges[2] = (KReRange){'\n','\n'}; a->ranges[3] = (KReRange){'\r','\r'}; a->nranges = 4; break;
+            }
+            case 'n': a->kind = 1; a->ch = '\n'; break;
+            case 't': a->kind = 1; a->ch = '\t'; break;
+            case 'r': a->kind = 1; a->ch = '\r'; break;
+            default: a->kind = 1; a->ch = (unsigned char)e; break;   /* escaped literal */
+        }
+    } else if (c == ')' || c == '|') { kre_fail(p, "unexpected metacharacter"); }
+    else if (c == '*' || c == '+' || c == '?') { kre_fail(p, "quantifier with nothing to repeat"); }
+    else if (c < 0) { kre_fail(p, "unexpected end of pattern"); }
+    else { p->pos++; a->kind = 1; a->ch = (unsigned char)c; }
+    return a;
+}
+
+static KReSeq kre_sequence(KReP* p) {
+    KReSeq seq; seq.p = 0; seq.n = 0; int cap = 0;
+    for (;;) {
+        int c = kre_peek(p);
+        if (c < 0 || c == '|' || c == ')') break;
+        if (c == '$' && p->pos + 1 == p->len) { p->pos++; p->aend = 1; break; }
+        KReAtom* atom = kre_atom(p);
+        if (p->err) break;
+        int q = 0, n = kre_peek(p);
+        if (n == '*') { q = 1; p->pos++; } else if (n == '+') { q = 2; p->pos++; } else if (n == '?') { q = 3; p->pos++; }
+        if (seq.n == cap) { cap = cap ? cap * 2 : 8; seq.p = (KRePiece*)realloc(seq.p, sizeof(KRePiece) * cap); }
+        seq.p[seq.n].atom = atom; seq.p[seq.n].quant = q; seq.n++;
+    }
+    return seq;
+}
+
+static KReAlts kre_alternation(KReP* p) {
+    KReAlts alts; alts.a = 0; alts.n = 0; int cap = 0;
+    for (;;) {
+        KReSeq s = kre_sequence(p);
+        if (alts.n == cap) { cap = cap ? cap * 2 : 4; alts.a = (KReSeq*)realloc(alts.a, sizeof(KReSeq) * cap); }
+        alts.a[alts.n++] = s;
+        if (kre_peek(p) == '|') p->pos++; else break;
+    }
+    return alts;
+}
+
+/* compile; on error, k_panic("invalid regex: <msg>") like regex_builtin */
+static KRegex k_re_compile(const char* pat) {
+    KReP p; p.s = (const unsigned char*)pat; p.pos = 0; p.len = (int)strlen(pat); p.aend = 0; p.err = 0; p.msg = "";
+    KRegex re; re.astart = 0; re.aend = 0;
+    if (kre_peek(&p) == '^') { re.astart = 1; p.pos++; }
+    re.alts = kre_alternation(&p);
+    if (!p.err && p.pos != p.len) { p.err = 1; p.msg = "unexpected metacharacter in pattern"; }
+    re.aend = p.aend;
+    if (p.err) { char b[128]; snprintf(b, sizeof b, "invalid regex: %s", p.msg); k_panic(b); }
+    return re;
+}
+
+/* matcher — recursive, mirrors regex.rs match_here/seq/piece/atom exactly */
+static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, int* out);
+static int kre_atom_match(KReAtom* a, const unsigned char* t, int tlen, int pos, int* np) {
+    switch (a->kind) {
+        case 0: if (pos < tlen) { *np = pos + 1; return 1; } return 0;
+        case 1: if (pos < tlen && t[pos] == a->ch) { *np = pos + 1; return 1; } return 0;
+        case 2: {
+            if (pos >= tlen) return 0;
+            unsigned char ch = t[pos]; int inside = 0;
+            for (int i = 0; i < a->nranges; i++) if (ch >= a->ranges[i].lo && ch <= a->ranges[i].hi) { inside = 1; break; }
+            if (inside != a->negated) { *np = pos + 1; return 1; } return 0;
+        }
+        default: { /* group */
+            for (int i = 0; i < a->group.n; i++) {
+                int e; if (kre_match_seq(a->group.a[i].p, a->group.a[i].n, t, tlen, pos, &e)) { *np = e; return 1; }
+            }
+            return 0;
+        }
+    }
+}
+static int kre_match_piece(KRePiece* first, KRePiece* rest, int nrest, const unsigned char* t, int tlen, int pos, int* out) {
+    KReAtom* a = first->atom;
+    if (first->quant == 0) {
+        int np; if (!kre_atom_match(a, t, tlen, pos, &np)) return 0;
+        return kre_match_seq(rest, nrest, t, tlen, np, out);
+    }
+    if (first->quant == 3) {   /* ? greedy: one then zero */
+        int np;
+        if (kre_atom_match(a, t, tlen, pos, &np)) { if (kre_match_seq(rest, nrest, t, tlen, np, out)) return 1; }
+        return kre_match_seq(rest, nrest, t, tlen, pos, out);
+    }
+    /* * or + : collect greedy ends, then backtrack toward min */
+    int cap = 16, cnt = 0; int* ends = (int*)malloc(sizeof(int) * cap); ends[cnt++] = pos;
+    int cur = pos, np;
+    while (kre_atom_match(a, t, tlen, cur, &np)) {
+        if (np == cur) break;   /* zero-width guard */
+        cur = np;
+        if (cnt == cap) { cap *= 2; ends = (int*)realloc(ends, sizeof(int) * cap); }
+        ends[cnt++] = cur;
+    }
+    int min = (first->quant == 2) ? 1 : 0;
+    for (int k = cnt - 1; k >= min; k--) {
+        if (kre_match_seq(rest, nrest, t, tlen, ends[k], out)) { free(ends); return 1; }
+    }
+    free(ends);
+    return 0;
+}
+static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, int* out) {
+    if (n == 0) { *out = pos; return 1; }
+    return kre_match_piece(&pieces[0], pieces + 1, n - 1, t, tlen, pos, out);
+}
+/* try to match starting exactly at pos; returns end index or -1 (honors $) */
+static int k_re_match_here(KRegex* re, const unsigned char* t, int tlen, int pos) {
+    for (int i = 0; i < re->alts.n; i++) {
+        int end;
+        if (kre_match_seq(re->alts.a[i].p, re->alts.a[i].n, t, tlen, pos, &end)) {
+            if (!re->aend || end == tlen) return end;
+        }
+    }
+    return -1;
+}
+/* leftmost match: fills *start,*end; returns 1 if found */
+static int k_re_leftmost(KRegex* re, const unsigned char* t, int tlen, int* start, int* end) {
+    int last = re->astart ? 0 : tlen;
+    for (int s = 0; s <= last; s++) {
+        int e = k_re_match_here(re, t, tlen, s);
+        if (e >= 0) { *start = s; *end = e; return 1; }
+        if (re->astart) break;
+    }
+    return 0;
+}
+static KValue k_substr(const unsigned char* t, int a, int b) {
+    char* c = (char*)k_alloc(b - a + 1); memcpy(c, t + a, b - a); c[b - a] = 0; return k_str(c);
+}
+
+static KValue k_re_match(KValue pat, KValue text) {
+    KRegex re = k_re_compile(k_as_str(pat));
+    const char* t = k_as_str(text); int tlen = (int)strlen(t);
+    int s, e; return k_bool(k_re_leftmost(&re, (const unsigned char*)t, tlen, &s, &e));
+}
+static KValue k_re_find(KValue pat, KValue text) {
+    KRegex re = k_re_compile(k_as_str(pat));
+    const char* t = k_as_str(text); int tlen = (int)strlen(t);
+    int s, e;
+    if (k_re_leftmost(&re, (const unsigned char*)t, tlen, &s, &e)) return k_some(k_substr((const unsigned char*)t, s, e));
+    return k_none();
+}
+static KValue k_re_find_all(KValue pat, KValue text) {
+    KRegex re = k_re_compile(k_as_str(pat));
+    const unsigned char* t = (const unsigned char*)k_as_str(text); int tlen = (int)strlen((const char*)t);
+    KValue items[8192]; int n = 0; int i = 0;
+    while (i <= tlen) {
+        int e = k_re_match_here(&re, t, tlen, i);
+        if (e >= 0) { if (n < 8192) items[n++] = k_substr(t, i, e); i = e > i ? e : i + 1; }
+        else if (re.astart) break;
+        else i++;
+    }
+    return k_list(items, n);
+}
+static KValue k_re_replace(KValue pat, KValue text, KValue repl) {
+    KRegex re = k_re_compile(k_as_str(pat));
+    const unsigned char* t = (const unsigned char*)k_as_str(text); int tlen = (int)strlen((const char*)t);
+    const char* rep = k_as_str(repl);
+    KBuf b = { 0, 0, 0 }; int i = 0;
+    while (i < tlen) {
+        int e = k_re_match_here(&re, t, tlen, i);
+        if (e >= 0) { kb_puts(&b, rep); if (e > i) i = e; else { kb_putc(&b, (char)t[i]); i++; } }
+        else { kb_putc(&b, (char)t[i]); i++; }
+    }
+    if (i == tlen && k_re_match_here(&re, t, tlen, i) == i) kb_puts(&b, rep);
     return k_str(kb_take(&b));
 }
 
@@ -2994,6 +3241,29 @@ mod tests {
             ),
             "2\n1|2\nx,y|z\n"
         );
+    }
+
+    /// The regex engine compiles to native, byte-identical to src/regex.rs —
+    /// anchors, classes, quantifiers (greedy + zero-width), groups, alternation,
+    /// find/find_all/replace. Each expected value verified against `kupl run`.
+    #[test]
+    fn native_regex() {
+        if !cc_available() {
+            return;
+        }
+        for (src, expected) in [
+            ("fun main() uses io { print(re_match(\"^\\\\d+$\", \"12345\")) }", "true\n"),
+            ("fun main() uses io { print(re_match(\"^\\\\d+$\", \"12a45\")) }", "false\n"),
+            ("fun main() uses io { print(re_find(\"@[\\\\w.]+\", \"user@ex.com\")) }", "Some(\"@ex.com\")\n"),
+            ("fun main() uses io { print(re_find_all(\"\\\\d+\", \"a1b22c333\").join(\",\")) }", "1,22,333\n"),
+            ("fun main() uses io { print(re_replace(\"\\\\s+\", \"a  b   c\", \"_\")) }", "a_b_c\n"),
+            // zero-width greedy: a* matches at each position -> ["","aaa",""]
+            ("fun main() uses io { print(re_find_all(\"a*\", \"baaa\").join(\"|\")) }", "|aaa|\n"),
+            ("fun main() uses io { print(re_match(\"(cat|dog)s?\", \"dogs\")) }", "true\n"),
+            ("fun main() uses io { print(re_replace(\"[aeiou]\", \"hello world\", \"*\")) }", "h*ll* w*rld\n"),
+        ] {
+            assert_eq!(native_main_stdout(src, "re"), expected, "src: {src}");
+        }
     }
 
     /// Direct cross-component expose calls compile to native and dispatch to the

@@ -20,9 +20,10 @@ components) are complete as of it40. Remaining work, ranked by value ÷ effort:
 4. **Flagship "any software" example(s)** — a non-trivial end-to-end program
    (e.g. a small HTTP/JSON service, or a data pipeline) proving breadth, doubling
    as documentation and a regression.
-5. **Native regex** (port src/regex.rs's backtracking engine to C) + **native
-   HTTP** (system curl) — the last native-builtin gaps (only ai fun would then
-   remain). Native CSV + URL/query landed in it45.
+5. ~~**Native regex**~~ — DONE (it46). src/regex.rs's backtracking engine ported
+   to C (parser + greedy/backtrack matcher + all 4 re_ builtins), byte-identical;
+   examples/showcase.kupl (regex+JSON+file I/O+par_map) is fully native. Only
+   **native HTTP** (system curl) remains among the builtins — then only ai fun.
 6. **WASM target** / **stdlib breadth** / **KIR unboxing (perf)** — larger or
    lower-marginal-value; revisit if the above land with iterations to spare.
 
