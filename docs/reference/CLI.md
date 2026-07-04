@@ -48,9 +48,10 @@ Recommended for component apps.
 ### `kupl native <file.kupl> [-o prog] [--keep-c]`
 Compiles to **machine code**: bytecode → generated C → `$CC` (default `cc`)
 `-O2`. Compiles a `fun main()` program, or a **component `app`** — instance state,
-`on start`/port handlers, child components, `wire`s, and `emit` all compile to
-machine code. Timers, supervision, and direct cross-component expose calls
-defer with a clear message; use `bundle` for those.
+`on start`/port handlers, child components, `wire`s, `emit`, virtual-clock
+timers (`on every`/`on after`), and `supervise` restart-on-failure all compile
+to machine code. Only direct cross-component expose calls are not yet native
+(clear message; use `bundle`).
 `--keep-c` keeps the generated `.c` beside the output for inspection.
 
 ### `kupl dis <file.kupl>`

@@ -1,3 +1,14 @@
+> **Progress:** slice 3 landed (it38) — native TIMERS + SUPERVISION. The C
+> runtime gains a virtual clock (k_vnow), per-instance armed timers, and
+> k_advance/k_run_timers(100) ported verbatim from vm.rs (the (time, instance,
+> decl) tie-break + drain-between-fires + 100-fire bound). Supervision uses a
+> setjmp/longjmp landing pad: k_panic longjmps to the active pad, the supervised
+> dispatch catches it and runs restart (reset state, re-run @start, re-arm),
+> printing the exact `[supervise] {name} restarted after panic: {msg}` to
+> stderr; unsupervised panics still exit(101). timers.kupl native == `kupl run`.
+> Only direct cross-component expose calls remain (a clear native message; full
+> support is slice 4).
+>
 > **Progress:** slice 2 landed (it37) — native MULTI-COMPONENT apps. The C
 > runtime now mirrors vm.rs: KInstance wires (append-order), a FIFO message
 > queue, k_wire/k_emit/k_drain, and props-aware k_instantiate. MakeInstance/

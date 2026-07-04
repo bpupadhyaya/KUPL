@@ -66,35 +66,39 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     }
     let _ = writeln!(out, "}};\n#define N_CTORS {}\n", module.ctors.len());
 
-    // component metadata: per-component handler tables, then the COMPS[] table
+    // component metadata: per-component handler + timer tables, then COMPS[]
     for (ci, c) in module.components.iter().enumerate() {
-        if c.handlers.is_empty() {
-            continue;
+        if !c.handlers.is_empty() {
+            let _ = writeln!(out, "static const KHandler COMP{ci}_H[] = {{");
+            for (port, chunk, has_param) in &c.handlers {
+                let _ = writeln!(out, "    {{ \"{}\", {}, {} }},", c_escape(port), chunk, *has_param as i32);
+            }
+            let _ = writeln!(out, "}};");
         }
-        let _ = writeln!(out, "static const KHandler COMP{ci}_H[] = {{");
-        for (port, chunk, has_param) in &c.handlers {
-            let _ = writeln!(
-                out,
-                "    {{ \"{}\", {}, {} }},",
-                c_escape(port),
-                chunk,
-                *has_param as i32
-            );
+        if !c.timers.is_empty() {
+            let _ = writeln!(out, "static const KTimerMeta COMP{ci}_T[] = {{");
+            for t in &c.timers {
+                let _ = writeln!(out, "    {{ {}, {}, {}LL }},", t.chunk, t.every as i32, t.interval_ms);
+            }
+            let _ = writeln!(out, "}};");
         }
-        let _ = writeln!(out, "}};");
     }
     let _ = writeln!(out, "const KCompMeta COMPS[] = {{");
     for (ci, c) in module.components.iter().enumerate() {
         let handlers = if c.handlers.is_empty() { "0".to_string() } else { format!("COMP{ci}_H") };
+        let timers = if c.timers.is_empty() { "0".to_string() } else { format!("COMP{ci}_T") };
         let _ = writeln!(
             out,
-            "    {{ \"{}\", {}, {}, {}, {}, {} }},",
+            "    {{ \"{}\", {}, {}, {}, {}, {}, {}, {}, {} }},",
             c_escape(&c.name),
             c.is_app as i32,
             c.nslots,
             c.init_chunk,
+            c.restart_chunk,
             handlers,
             c.handlers.len(),
+            timers,
+            c.timers.len(),
         );
     }
     let _ = writeln!(out, "}};\n#define N_COMPS {}\n", module.components.len());
@@ -119,8 +123,9 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
                 "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    \
                  k_print_unwired = 1;\n    \
                  k_instantiate({app_idx}, 0, 0);\n    \
-                 for (int id = 0; id < k_ninsts; id++) k_run_lifecycle(id, \"@start\");\n    \
+                 for (int id = 0; id < k_ninsts; id++) {{ k_run_lifecycle(id, \"@start\"); k_arm_timers(id); }}\n    \
                  k_drain();\n    \
+                 k_run_timers(100);\n    \
                  return 0;\n}}"
             );
         }
@@ -129,16 +134,11 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
 }
 
 /// Reject the constructs the native component backend can't compile yet, with a
-/// clear message (rather than a runtime panic). Children, wires, and `emit` are
-/// supported; timers and direct cross-component expose calls (`CallComp`) are
-/// not. Scans EVERY component (children are reachable from the app).
+/// clear message (rather than a runtime panic). State, handlers, children,
+/// wires, `emit`, timers, and supervision are supported; only direct
+/// cross-component expose calls (`CallComp`) defer. Scans EVERY component.
 fn check_native_component(module: &Module, _app_idx: usize) -> Result<(), String> {
     for comp in &module.components {
-        if !comp.timers.is_empty() {
-            return Err(
-                "timers are not yet supported by the native backend — use `kupl bundle`".into(),
-            );
-        }
         let mut chunks = vec![comp.init_chunk as usize];
         chunks.extend(comp.handlers.iter().map(|(_, c, _)| *c as usize));
         chunks.extend(comp.exposes.values().map(|c| *c as usize));
@@ -439,6 +439,7 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
+#include <setjmp.h>
 
 typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
@@ -460,7 +461,17 @@ struct KValue {
     } as;
 };
 
+/* Supervision landing pad: when a supervised dispatch is active, k_panic saves
+   the message and longjmps to the pad instead of exiting (mirrors the VM's
+   call_chunk_nested returning Err, caught by the restart-on-failure branch). */
+static jmp_buf* k_pad = 0;
+static char k_panic_buf[1024];
 static void k_panic(const char* msg) {
+    if (k_pad) {
+        strncpy(k_panic_buf, msg, sizeof(k_panic_buf) - 1);
+        k_panic_buf[sizeof(k_panic_buf) - 1] = 0;
+        longjmp(*k_pad, 1);
+    }
     fprintf(stderr, "panic: %s\n", msg);
     exit(101);
 }
@@ -1965,6 +1976,8 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return args[0];
         }
     }
+    if (recv.tag == K_COMPONENT)
+        k_panic("cross-component expose calls are not yet supported by the native backend (use kupl bundle)");
     k_panic("no such method");
     return k_unit();
 }
@@ -1978,18 +1991,30 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
 const COMPONENT_RUNTIME: &str = r#"
 /* --- component runtime (native component apps) --- */
 typedef struct { const char* port; int chunk; int has_param; } KHandler;
-typedef struct { const char* name; int is_app; int nslots; int init_chunk;
-                 const KHandler* handlers; int nhandlers; } KCompMeta;
+typedef struct { int chunk; int every; long long interval_ms; } KTimerMeta;
+typedef struct { const char* name; int is_app; int nslots; int init_chunk; int restart_chunk;
+                 const KHandler* handlers; int nhandlers;
+                 const KTimerMeta* timers; int ntimers; } KCompMeta;
 extern const KCompMeta COMPS[];
 static KValue k_component(int id) { KValue v; v.tag = K_COMPONENT; v.as.i = id; return v; }
 
 typedef struct { const char* out_port; int to; const char* in_port; } KWire;
+/* a live timer on an instance (armed copy of the component's KTimerMeta) */
+typedef struct { int chunk; int every; long long interval; long long next_fire; int active; } KTimer;
 typedef struct { int comp; KValue* slots; int nslots;
-                 KWire* wires; int nwires; int restart_on_failure; } KInstance;
+                 KWire* wires; int nwires; int restart_on_failure;
+                 KTimer* timers; int ntimers; } KInstance;
 static KInstance* k_insts = 0;
 static int k_ninsts = 0;
 static int k_cur_inst = -1;
 static int k_print_unwired = 0;
+static long long k_vnow = 0;  /* virtual clock (ms), advanced explicitly */
+
+/* forward declarations for the mutually-recursive component driver */
+static void k_run_lifecycle(int id, const char* key);
+static void k_arm_timers(int id);
+static void k_restart(int id, const char* msg);
+static void k_dispatch(int id, int chunk, KValue* arg);
 
 /* FIFO message queue (grow-only; head advances — arena model, bounded runs) */
 typedef struct { int id; const char* port; KValue value; } KMsg;
@@ -2010,6 +2035,7 @@ static int k_instantiate(int comp_idx, KValue* props, int nprops) {
     k_insts[id].slots = (KValue*)malloc(sizeof(KValue) * (ns > 0 ? ns : 1));
     for (int i = 0; i < ns; i++) k_insts[id].slots[i] = (i < nprops) ? props[i] : k_unit();
     k_insts[id].wires = 0; k_insts[id].nwires = 0; k_insts[id].restart_on_failure = 0;
+    k_insts[id].timers = 0; k_insts[id].ntimers = 0;
     int saved = k_cur_inst;
     k_cur_inst = id;
     CHUNKS[COMPS[comp_idx].init_chunk](0, 0);   /* children created here get higher ids */
@@ -2045,6 +2071,28 @@ static void k_emit(const char* port, KValue value) {
     }
 }
 
+/* Dispatch a chunk on an instance. If the instance is supervised, catch a panic
+   via a setjmp pad and restart it (mirrors the VM's restart-on-failure branch);
+   otherwise a panic propagates (k_pad unchanged → exit 101 at top level). */
+static void k_dispatch(int id, int chunk, KValue* arg) {
+    if (!k_insts[id].restart_on_failure) {
+        int saved = k_cur_inst; k_cur_inst = id;
+        CHUNKS[chunk](0, arg);
+        k_cur_inst = saved;
+        return;
+    }
+    jmp_buf pad; jmp_buf* prev = k_pad; k_pad = &pad;
+    int saved = k_cur_inst; k_cur_inst = id;
+    if (setjmp(pad) == 0) {
+        CHUNKS[chunk](0, arg);
+        k_cur_inst = saved; k_pad = prev;
+    } else {
+        /* panic caught: restore, then restart this instance */
+        k_cur_inst = saved; k_pad = prev;
+        k_restart(id, k_panic_buf);
+    }
+}
+
 /* drain the queue to quiescence: pop front, dispatch by first-match handler */
 static void k_drain(void) {
     while (k_qhead < k_qlen) {
@@ -2053,11 +2101,8 @@ static void k_drain(void) {
         const KCompMeta* cm = &COMPS[inst->comp];
         for (int i = 0; i < cm->nhandlers; i++) {
             if (!strcmp(cm->handlers[i].port, m.port)) {
-                int saved = k_cur_inst;
-                k_cur_inst = m.id;
-                if (cm->handlers[i].has_param) { KValue a = m.value; CHUNKS[cm->handlers[i].chunk](0, &a); }
-                else CHUNKS[cm->handlers[i].chunk](0, 0);
-                k_cur_inst = saved;
+                KValue a = m.value;
+                k_dispatch(m.id, cm->handlers[i].chunk, cm->handlers[i].has_param ? &a : 0);
                 break;   /* linear first-match */
             }
         }
@@ -2069,11 +2114,82 @@ static void k_run_lifecycle(int id, const char* key) {
     const KCompMeta* cm = &COMPS[k_insts[id].comp];
     for (int i = 0; i < cm->nhandlers; i++) {
         if (!strcmp(cm->handlers[i].port, key)) {
-            int saved = k_cur_inst; k_cur_inst = id;
-            CHUNKS[cm->handlers[i].chunk](0, 0);
-            k_cur_inst = saved;
+            k_dispatch(id, cm->handlers[i].chunk, 0);
             return;
         }
+    }
+}
+
+/* arm an instance's timers relative to the current virtual time */
+static void k_arm_timers(int id) {
+    const KCompMeta* cm = &COMPS[k_insts[id].comp];
+    KInstance* inst = &k_insts[id];
+    inst->ntimers = cm->ntimers;
+    inst->timers = cm->ntimers ? (KTimer*)malloc(sizeof(KTimer) * cm->ntimers) : 0;
+    for (int i = 0; i < cm->ntimers; i++) {
+        inst->timers[i].chunk = cm->timers[i].chunk;
+        inst->timers[i].every = cm->timers[i].every;
+        inst->timers[i].interval = cm->timers[i].interval_ms;
+        inst->timers[i].next_fire = k_vnow + cm->timers[i].interval_ms;
+        inst->timers[i].active = 1;
+    }
+}
+
+/* supervision restart: [supervise] line, reset state, re-run @start, re-arm */
+static void k_restart(int id, const char* msg) {
+    const KCompMeta* cm = &COMPS[k_insts[id].comp];
+    fprintf(stderr, "[supervise] %s restarted after panic: %s\n", cm->name, msg);
+    int saved = k_cur_inst; k_cur_inst = id;
+    CHUNKS[cm->restart_chunk](0, 0);
+    k_cur_inst = saved;
+    k_run_lifecycle(id, "@start");
+    k_arm_timers(id);
+}
+
+/* advance the virtual clock to now+dur, firing due timers in (time, instance,
+   decl) order, draining between fires — verbatim from vm.rs::advance */
+static void k_advance(long long dur) {
+    long long target = k_vnow + dur;
+    for (;;) {
+        long long bt = 0; int bi = -1, btk = -1;
+        for (int iid = 0; iid < k_ninsts; iid++) {
+            KInstance* in = &k_insts[iid];
+            for (int ti = 0; ti < in->ntimers; ti++) {
+                KTimer* t = &in->timers[ti];
+                if (t->active && t->next_fire <= target) {
+                    if (bi < 0 || t->next_fire < bt || (t->next_fire == bt && (iid < bi || (iid == bi && ti < btk)))) {
+                        bt = t->next_fire; bi = iid; btk = ti;
+                    }
+                }
+            }
+        }
+        if (bi < 0) break;
+        k_vnow = bt;
+        k_dispatch(bi, k_insts[bi].timers[btk].chunk, 0);
+        k_drain();
+        KTimer* t = &k_insts[bi].timers[btk];
+        if (t->every) t->next_fire += t->interval; else t->active = 0;
+    }
+    k_vnow = target;
+}
+
+/* bounded timer firing for `kupl run` — mirrors vm.rs::run_timers(100) */
+static void k_run_timers(int max_fires) {
+    for (int n = 0; n < max_fires; n++) {
+        long long bt = 0; int bi = -1, btk = -1;
+        for (int iid = 0; iid < k_ninsts; iid++) {
+            KInstance* in = &k_insts[iid];
+            for (int ti = 0; ti < in->ntimers; ti++) {
+                KTimer* t = &in->timers[ti];
+                if (t->active) {
+                    if (bi < 0 || t->next_fire < bt || (t->next_fire == bt && (iid < bi || (iid == bi && ti < btk)))) {
+                        bt = t->next_fire; bi = iid; btk = ti;
+                    }
+                }
+            }
+        }
+        if (bi < 0) break;
+        k_advance(bt - k_vnow);
     }
 }
 "#;
@@ -2153,14 +2269,88 @@ mod tests {
         let _ = std::fs::remove_file(&bin);
     }
 
-    /// Timers still defer with a clear error (a later native slice).
-    #[test]
-    fn native_timers_defer() {
-        let src = "app A {\n    state n: Int = 0\n    on every 1s { n = n + 1 }\n}\n";
+    /// Compile `src` (a component app) to native, run it, and return stdout.
+    #[cfg(test)]
+    fn native_stdout(src: &str, tag: &str) -> String {
         let compiled = crate::run::compile(src).expect("program compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
             .expect("module compiles");
-        let err = super::emit_c(&module).expect_err("native must defer timers");
-        assert!(err.contains("timers are not yet supported"), "clear defer message: {err}");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-{tag}-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A virtual-clock timer (`on every`) compiles and fires up to the 100-fire
+    /// bound, matching the interpreter's deterministic output.
+    #[test]
+    fn native_timers_run() {
+        if !cc_available() {
+            return;
+        }
+        let src = "app A {\n    intent \"x\"\n    state n: Int = 0\n    \
+                   on every 5s {\n        n = n + 1\n        print(\"tick {n}\")\n    }\n}\n";
+        let out = native_stdout(src, "tmr");
+        // bounded to 100 fires — tick 1 .. tick 100
+        assert!(out.starts_with("tick 1\ntick 2\n"), "head: {out:?}");
+        assert!(out.ends_with("tick 100\n"), "tail: {out:?}");
+        assert_eq!(out.lines().count(), 100);
+    }
+
+    /// A supervised child that panics restarts (state reset), printing the
+    /// `[supervise]` line to stderr — semantics match the interpreter.
+    #[test]
+    fn native_supervision_restart() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component W {\n    intent \"x\"\n    in tick: Int\n    state seen: Int = 0\n    \
+                   on tick(n) {\n        seen = seen + 1\n        if seen == 2 {\n            print(\"ok n={n}\")\n        } else {\n            panic(\"boom\")\n        }\n    }\n}\n\
+                   component D {\n    intent \"x\"\n    out pulse: Int\n    \
+                   on start {\n        emit pulse(1)\n        emit pulse(2)\n    }\n}\n\
+                   app A {\n    intent \"x\"\n    let w = W()\n    let d = D()\n    \
+                   supervise w restart on_failure\n    wire d.pulse -> w.tick\n}\n";
+        // both ticks panic (restart resets seen to 0 each time) — no "ok" line,
+        // and the app survives (doesn't exit 101). stdout is empty; the two
+        // [supervise] lines go to stderr. Just assert clean stdout + termination.
+        let out = native_stdout(src, "sup");
+        assert_eq!(out, "", "supervised panics keep stdout clean: {out:?}");
+    }
+
+    /// Direct cross-component expose calls are not yet supported — a clear
+    /// native runtime message (compile-time detection is a later slice).
+    #[test]
+    fn native_expose_call_message() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component S {\n    intent \"x\"\n    state v: Int = 7\n    expose fun get() -> Int { v }\n}\n\
+                   app A {\n    intent \"x\"\n    let s = S()\n    on start { print(\"{s.get()}\") }\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-exp-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status().expect("cc runs").success());
+        let out = std::process::Command::new(&bin).output().expect("runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("expose calls are not yet supported"), "clear message: {err}");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
     }
 }

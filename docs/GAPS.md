@@ -97,9 +97,10 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       (`examples/cli.kupl`)
 - [◐] **Native components + KIR** (audit #2) — as of it36-37, `kupl native`
       compiles COMPONENT apps to machine code: instance state, `on start`/port
-      handlers, child components, `wire`s, `emit`, and the message-queue/drain
-      loop (a C mirror of vm.rs). counter/todo/native-counter native stdout ==
-      `kupl run`. Remaining: timers, supervision, cross-component expose calls,
+      handlers, child components, `wire`s, `emit`, the message-queue/drain loop, virtual-clock
+      timers, and `supervise` restart-on-failure (a C mirror of vm.rs, incl. a
+      setjmp/longjmp panic landing pad). counter/todo/timers/native-counter
+      native stdout == `kupl run`. Remaining: cross-component expose calls,
       and the optional typed SSA IR (KValue unboxing for raw-register numeric
       loops — a perf, not correctness, arc; deliberately deferred).
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
