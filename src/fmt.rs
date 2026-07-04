@@ -480,6 +480,7 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
     const ATOM: u8 = 10;
     match &e.kind {
         ExprKind::Int(v) => (v.to_string(), ATOM),
+        ExprKind::SizedInt(v, w) => (format!("{v}{}", w.name()), ATOM),
         ExprKind::Float(v) => {
             let s = if v.fract() == 0.0 && v.is_finite() {
                 format!("{v:.1}")

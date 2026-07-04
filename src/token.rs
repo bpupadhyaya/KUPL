@@ -6,6 +6,8 @@ use crate::diag::Span;
 pub enum Tok {
     // Literals
     Int(i64),
+    /// A width-suffixed integer literal (`255u8`, `1000i16`), value in i128.
+    SizedInt(i128, crate::value::IntW),
     Float(f64),
     /// String literal, decomposed into literal text and `{expr}` interpolation parts.
     Str(Vec<StrPart>),
@@ -200,6 +202,7 @@ impl Tok {
     pub fn describe(&self) -> String {
         match self {
             Tok::Int(v) => format!("integer `{v}`"),
+            Tok::SizedInt(v, w) => format!("integer `{v}{}`", w.name()),
             Tok::Float(v) => format!("float `{v}`"),
             Tok::Str(_) => "string literal".to_string(),
             Tok::Ident(s) => format!("identifier `{s}`"),

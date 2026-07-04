@@ -112,6 +112,13 @@ fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
                 .ok_or_else(|| format!("unknown function `{name}` in constant"))?;
             format!("k_fun({idx})")
         }
+        Value::SizedInt(_) => {
+            return Err(
+                "sized integers (i8..u64) are not supported by the native backend yet \
+                 — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
+                    .to_string(),
+            )
+        }
         other => return Err(format!("non-serializable constant {other}")),
     })
 }

@@ -3,9 +3,13 @@
 use std::collections::HashMap;
 use std::fmt;
 
+pub use crate::value::IntW;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ty {
     Int,
+    /// A fixed-width integer type (`i8`…`u64`).
+    IntW(IntW),
     Float,
     Bool,
     Str,
@@ -35,7 +39,7 @@ pub enum Ty {
 
 impl Ty {
     pub fn is_numeric(&self) -> bool {
-        matches!(self, Ty::Int | Ty::Float)
+        matches!(self, Ty::Int | Ty::Float | Ty::IntW(_))
     }
 }
 
@@ -109,6 +113,9 @@ impl Unifier {
                 self.subst[*y as usize] = Some(ra);
                 Ok(())
             }
+            // sized ints unify only with the *same* width — differing widths
+            // are a type error (mixed-width arithmetic needs explicit conversion)
+            (Ty::IntW(x), Ty::IntW(y)) if x == y => Ok(()),
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
             | (Ty::Bool, Ty::Bool)
@@ -149,6 +156,7 @@ impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Ty::Int => write!(f, "Int"),
+            Ty::IntW(w) => write!(f, "{}", w.name()),
             Ty::Float => write!(f, "Float"),
             Ty::Bool => write!(f, "Bool"),
             Ty::Str => write!(f, "Str"),

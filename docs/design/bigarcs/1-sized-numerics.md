@@ -1,3 +1,10 @@
+> **Progress:** iter 1 landed (it27) — integer widths i8..u64 end-to-end on
+> interpreter + KVM + .kx (checked arithmetic matching i64; overflow panics).
+> f32, wrapping/saturating/bitwise, the full conversion matrix, and native
+> codegen are later slices. NOTE: the `Value` enum was already 32 bytes at
+> baseline (no discriminant niche), not 24 as this design assumed — sized ints
+> box their payload so the enum does not grow.
+
 # Big-arc design: Sized numerics i8..u64, f32 (type-system depth)
 
 **Feasibility:** high · **Risk:** medium · **Estimated effort:** ~5 /loop iterations

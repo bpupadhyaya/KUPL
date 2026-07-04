@@ -1350,6 +1350,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr { kind: ExprKind::Int(v), span })
             }
+            Tok::SizedInt(v, w) => {
+                self.bump();
+                Ok(Expr { kind: ExprKind::SizedInt(v, w), span })
+            }
             Tok::Float(v) => {
                 self.bump();
                 Ok(Expr { kind: ExprKind::Float(v), span })

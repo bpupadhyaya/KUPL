@@ -348,6 +348,8 @@ pub enum ExprKind {
         recv: Box<Expr>,
         updates: Vec<(String, Expr)>,
     },
+    /// A width-suffixed integer literal (`255u8`, `1000i16`).
+    SizedInt(i128, crate::value::IntW),
     /// `expr?` — Result propagation.
     Try(Box<Expr>),
     Await(Box<Expr>),

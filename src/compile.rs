@@ -760,6 +760,7 @@ impl<'s> FnCompiler<'s> {
         let span = e.span;
         match &e.kind {
             ExprKind::Int(v) => self.const_reg(Value::Int(*v), span),
+            ExprKind::SizedInt(v, w) => self.const_reg(Value::SizedInt(Box::new((*v, *w))), span),
             ExprKind::Float(v) => self.const_reg(Value::Float(*v), span),
             ExprKind::Bool(v) => self.const_reg(Value::Bool(*v), span),
             ExprKind::Unit => self.const_reg(Value::Unit, span),

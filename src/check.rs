@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diag::{Diag, Span};
-use crate::types::{ComponentSig, ContractSig, Ty, TypeSig, Unifier, VariantSig};
+use crate::types::{ComponentSig, ContractSig, IntW, Ty, TypeSig, Unifier, VariantSig};
 
 #[derive(Default)]
 pub struct Checked {
@@ -402,6 +402,9 @@ impl Checker {
                 "Unit" => Ty::Unit,
                 "Event" => Ty::Event,
                 "Tensor" => Ty::Tensor,
+                _ if crate::value::IntW::from_name(n.as_str()).is_some() => {
+                    Ty::IntW(crate::value::IntW::from_name(n.as_str()).unwrap())
+                }
                 other => {
                     if self.checked.types.contains_key(other) {
                         Ty::Named(other.to_string())
@@ -1055,6 +1058,7 @@ impl Checker {
     fn infer_expr(&mut self, expr: &Expr, ctx: &mut Ctx) -> Ty {
         match &expr.kind {
             ExprKind::Int(_) => Ty::Int,
+            ExprKind::SizedInt(_, w) => Ty::IntW(*w),
             ExprKind::Float(_) => Ty::Float,
             ExprKind::Bool(_) => Ty::Bool,
             ExprKind::Unit => Ty::Unit,
@@ -1783,6 +1787,17 @@ impl Checker {
             (Ty::Str, "lines") => Some((vec![], Ty::List(Box::new(Ty::Str)))),
             (Ty::Int, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Int, "to_float") => Some((vec![], Ty::Float)),
+            (Ty::Int, "to_i8") => Some((vec![], Ty::IntW(IntW::I8))),
+            (Ty::Int, "to_i16") => Some((vec![], Ty::IntW(IntW::I16))),
+            (Ty::Int, "to_i32") => Some((vec![], Ty::IntW(IntW::I32))),
+            (Ty::Int, "to_i64") => Some((vec![], Ty::IntW(IntW::I64))),
+            (Ty::Int, "to_u8") => Some((vec![], Ty::IntW(IntW::U8))),
+            (Ty::Int, "to_u16") => Some((vec![], Ty::IntW(IntW::U16))),
+            (Ty::Int, "to_u32") => Some((vec![], Ty::IntW(IntW::U32))),
+            (Ty::Int, "to_u64") => Some((vec![], Ty::IntW(IntW::U64))),
+            (Ty::IntW(_), "to_int") => Some((vec![], Ty::Int)),
+            (Ty::IntW(_), "to_str") => Some((vec![], Ty::Str)),
+            (Ty::IntW(_), "to_float") => Some((vec![], Ty::Float)),
             (Ty::Int, "abs") => Some((vec![], Ty::Int)),
             (Ty::Int, "min") | (Ty::Int, "max") | (Ty::Int, "pow") | (Ty::Int, "gcd") => {
                 Some((vec![Ty::Int], Ty::Int))

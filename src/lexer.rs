@@ -163,13 +163,24 @@ impl<'a> Lexer<'a> {
                 ));
                 return;
             }
-            match u64::from_str_radix(&text, radix) {
-                Ok(v) => self.push(Tok::Int(v as i64), start),
-                Err(_) => self.diags.push(Diag::error(
-                    "K0004",
-                    format!("integer literal does not fit in Int (64-bit)"),
-                    self.span_from(start),
-                )),
+            let radixed = u64::from_str_radix(&text, radix);
+            match self.peek_width_suffix() {
+                Some(w) => match radixed {
+                    Ok(v) => self.emit_sized(v as i128, w, start),
+                    Err(_) => self.diags.push(Diag::error(
+                        "K0004",
+                        "integer literal does not fit in Int (64-bit)".to_string(),
+                        self.span_from(start),
+                    )),
+                },
+                None => match radixed {
+                    Ok(v) => self.push(Tok::Int(v as i64), start),
+                    Err(_) => self.diags.push(Diag::error(
+                        "K0004",
+                        "integer literal does not fit in Int (64-bit)".to_string(),
+                        self.span_from(start),
+                    )),
+                },
             }
             return;
         }
@@ -210,6 +221,16 @@ impl<'a> Lexer<'a> {
                     self.span_from(start),
                 )),
             }
+        } else if let Some(w) = self.peek_width_suffix() {
+            // width-suffixed integer literal, e.g. `255u8`, `1000i16`
+            match text.parse::<i128>() {
+                Ok(v) => self.emit_sized(v, w, start),
+                Err(_) => self.diags.push(Diag::error(
+                    "K0009",
+                    format!("literal `{text}` out of range for `{}`", w.name()),
+                    self.span_from(start),
+                )),
+            }
         } else {
             match text.parse::<i64>() {
                 Ok(v) => self.push(Tok::Int(v), start),
@@ -219,6 +240,43 @@ impl<'a> Lexer<'a> {
                     self.span_from(start),
                 )),
             }
+        }
+    }
+
+    /// After an integer body, consume a width suffix (`i8`…`u64`) if present.
+    /// A trailing identifier run that is not exactly a width name is left alone
+    /// (so `123index` stays `123` then `index`).
+    fn peek_width_suffix(&mut self) -> Option<crate::value::IntW> {
+        if !matches!(self.peek(), Some(b'i') | Some(b'u')) {
+            return None;
+        }
+        let save = self.pos;
+        let s = self.pos;
+        while matches!(self.peek(),
+            Some(b'0'..=b'9') | Some(b'a'..=b'z') | Some(b'A'..=b'Z') | Some(b'_'))
+        {
+            self.bump();
+        }
+        let run = &self.src[s..self.pos];
+        match crate::value::IntW::from_name(run) {
+            Some(w) => Some(w),
+            None => {
+                self.pos = save; // not a width suffix — put it back
+                None
+            }
+        }
+    }
+
+    /// Emit a sized-int token, range-checking at lex time (K0009 on overflow).
+    fn emit_sized(&mut self, v: i128, w: crate::value::IntW, start: usize) {
+        if w.check_range(v) {
+            self.push(Tok::SizedInt(v, w), start);
+        } else {
+            self.diags.push(Diag::error(
+                "K0009",
+                format!("literal `{v}` out of range for `{}`", w.name()),
+                self.span_from(start),
+            ));
         }
     }
 
@@ -457,6 +515,23 @@ mod tests {
         let (toks, diags) = lex(src);
         assert!(diags.is_empty(), "unexpected diags: {diags:?}");
         toks.into_iter().map(|t| t.tok).collect()
+    }
+
+    #[test]
+    fn sized_int_literals() {
+        use crate::value::IntW;
+        assert_eq!(kinds("255u8"), vec![Tok::SizedInt(255, IntW::U8), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("1000i16"), vec![Tok::SizedInt(1000, IntW::I16), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("0xFFu8"), vec![Tok::SizedInt(255, IntW::U8), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("0b101u8"), vec![Tok::SizedInt(5, IntW::U8), Tok::Newline, Tok::Eof]);
+        // bare number is still a plain Int
+        assert_eq!(kinds("1000"), vec![Tok::Int(1000), Tok::Newline, Tok::Eof]);
+        // out-of-range suffix is a K0009 diagnostic
+        let (_, diags) = lex("256u8");
+        assert!(diags.iter().any(|d| d.code == "K0009"), "{diags:?}");
+        // a trailing identifier that isn't a width name is NOT consumed as a suffix
+        let toks: Vec<Tok> = lex("123index").0.into_iter().map(|t| t.tok).collect();
+        assert_eq!(toks, vec![Tok::Int(123), Tok::Ident("index".into()), Tok::Newline, Tok::Eof]);
     }
 
     #[test]

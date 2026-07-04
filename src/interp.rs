@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::check::Checked;
 use crate::diag::Span;
-use crate::value::{Closure, Env, Value};
+use crate::value::{Closure, Env, IntW, Value};
 
 /// Non-local control flow during evaluation.
 pub enum Flow {
@@ -650,6 +650,7 @@ impl Interp {
     pub fn eval(&mut self, expr: &Expr, env: &Env) -> EvalResult {
         match &expr.kind {
             ExprKind::Int(v) => Ok(Value::Int(*v)),
+            ExprKind::SizedInt(v, w) => Ok(Value::SizedInt(Box::new((*v, *w)))),
             ExprKind::Float(v) => Ok(Value::Float(*v)),
             ExprKind::Bool(v) => Ok(Value::Bool(*v)),
             ExprKind::Unit => Ok(Value::Unit),
@@ -1198,6 +1199,42 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
                 _ => unreachable!(),
             })
         }
+        // Sized ints: same-width only (mixed widths fall through to the type
+        // error below — the checker already forbids them). Arithmetic is done in
+        // i128 (which cannot overflow for any i8..u64 operands) then range-checked
+        // against the width, panicking with the same messages as `Int`.
+        (Value::SizedInt(x), Value::SizedInt(y)) if x.1 == y.1 => {
+            let (a, b, w) = (x.0, y.0, x.1);
+            let checked = |r: i128, what: &str| -> Result<Value, String> {
+                if w.check_range(r) {
+                    Ok(Value::SizedInt(Box::new((r, w))))
+                } else {
+                    Err(overflow(what))
+                }
+            };
+            match op {
+                Add => checked(a + b, "addition"),
+                Sub => checked(a - b, "subtraction"),
+                Mul => checked(a * b, "multiplication"),
+                Div => {
+                    if b == 0 {
+                        return Err("division by zero".into());
+                    }
+                    checked(a / b, "division")
+                }
+                Rem => {
+                    if b == 0 {
+                        return Err("remainder by zero".into());
+                    }
+                    checked(a % b, "remainder")
+                }
+                Lt => Ok(Value::Bool(a < b)),
+                Le => Ok(Value::Bool(a <= b)),
+                Gt => Ok(Value::Bool(a > b)),
+                Ge => Ok(Value::Bool(a >= b)),
+                _ => unreachable!(),
+            }
+        }
         (Value::Float(a), Value::Float(b)) => Ok(match op {
             Add => Value::Float(a + b),
             Sub => Value::Float(a - b),
@@ -1679,6 +1716,29 @@ pub fn shared_method(
         }
         (Value::Int(v), "to_str") => Ok(Value::str(v.to_string())),
         (Value::Int(v), "to_float") => Ok(Value::Float(*v as f64)),
+        // Int -> sized int: checked narrowing, panics if out of range.
+        (Value::Int(v), "to_i8") | (Value::Int(v), "to_i16") | (Value::Int(v), "to_i32")
+        | (Value::Int(v), "to_i64") | (Value::Int(v), "to_u8") | (Value::Int(v), "to_u16")
+        | (Value::Int(v), "to_u32") | (Value::Int(v), "to_u64") => {
+            let w = IntW::from_name(&name[3..]).expect("width method");
+            let x = *v as i128;
+            if w.check_range(x) {
+                Ok(Value::SizedInt(Box::new((x, w))))
+            } else {
+                Err(format!("{v} out of range for `{}`", w.name()))
+            }
+        }
+        // sized int -> Int (i64), checked (a u64 above i64::MAX panics).
+        (Value::SizedInt(b), "to_int") => {
+            let v = b.0;
+            if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
+                Ok(Value::Int(v as i64))
+            } else {
+                Err(format!("{v} does not fit in Int (i64)"))
+            }
+        }
+        (Value::SizedInt(b), "to_str") => Ok(Value::str(b.0.to_string())),
+        (Value::SizedInt(b), "to_float") => Ok(Value::Float(b.0 as f64)),
         (Value::Int(v), "abs") => v
             .checked_abs()
             .map(Value::Int)

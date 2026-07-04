@@ -185,6 +185,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.clamp(lo, hi)` | `(Int, Int) -> Int` | `lo ≤ hi` required |
 | `.sign()` | `-> Int` | `-1` / `0` / `1` |
 | `.is_even()` / `.is_odd()` | `-> Bool` | |
+| `.to_i8()` … `.to_i64()` / `.to_u8()` … `.to_u64()` | `-> i8`…`u64` | checked narrowing; panics if out of range |
 | `.band(x)` / `.bor(x)` / `.bxor(x)` | `(Int) -> Int` | bitwise and / or / xor |
 | `.bnot()` | `-> Int` | bitwise complement (`~`) |
 | `.shl(n)` | `(Int) -> Int` | left shift; `n` in `0..=63` (else panics) |
@@ -197,6 +198,20 @@ match `Ok`/`Err` structurally rather than on the text.
 Integer literals may be written in decimal, hex (`0xFF`, `0xff`), or binary
 (`0b1010`), with `_` digit separators (`1_000_000`, `0xDEAD_BEEF`). Hex/binary
 literals are read as 64-bit patterns, so `0xFFFFFFFFFFFFFFFF` is `-1`.
+
+### Sized integers (`i8`…`i64`, `u8`…`u64`)
+
+Fixed-width integers for binary formats and interop. Write a literal with a
+width suffix: `255u8`, `1000i16`, `0xFFu8`, `0b1010u8`. Out-of-range literals
+are a compile error (K0009). Arithmetic is **checked** (overflow panics, like
+`Int`); mixing widths is a type error — convert explicitly. Not yet on the
+native backend (`kupl run`/`--vm`/`bundle`).
+
+| Method | Signature | Notes |
+|---|---|---|
+| `.to_int()` | `-> Int` | to i64; panics if a `u64` exceeds `i64::MAX` |
+| `.to_str()` | `-> Str` | |
+| `.to_float()` | `-> Float` | |
 
 ### Float
 

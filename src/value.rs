@@ -7,10 +7,108 @@ use std::rc::Rc;
 
 use crate::ast::Block;
 
+/// A fixed-width integer type. Values are stored in an `i128`, which exactly
+/// represents every `i8..=u64` value (`u64::MAX < i128::MAX`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntW {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
+impl IntW {
+    pub fn min(self) -> i128 {
+        match self {
+            IntW::I8 => i8::MIN as i128,
+            IntW::I16 => i16::MIN as i128,
+            IntW::I32 => i32::MIN as i128,
+            IntW::I64 => i64::MIN as i128,
+            IntW::U8 | IntW::U16 | IntW::U32 | IntW::U64 => 0,
+        }
+    }
+    pub fn max(self) -> i128 {
+        match self {
+            IntW::I8 => i8::MAX as i128,
+            IntW::I16 => i16::MAX as i128,
+            IntW::I32 => i32::MAX as i128,
+            IntW::I64 => i64::MAX as i128,
+            IntW::U8 => u8::MAX as i128,
+            IntW::U16 => u16::MAX as i128,
+            IntW::U32 => u32::MAX as i128,
+            IntW::U64 => u64::MAX as i128,
+        }
+    }
+    pub fn check_range(self, v: i128) -> bool {
+        v >= self.min() && v <= self.max()
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            IntW::I8 => "i8",
+            IntW::I16 => "i16",
+            IntW::I32 => "i32",
+            IntW::I64 => "i64",
+            IntW::U8 => "u8",
+            IntW::U16 => "u16",
+            IntW::U32 => "u32",
+            IntW::U64 => "u64",
+        }
+    }
+    /// A stable byte tag for serialization (.kx modules).
+    pub fn tag(self) -> u8 {
+        match self {
+            IntW::I8 => 0,
+            IntW::I16 => 1,
+            IntW::I32 => 2,
+            IntW::I64 => 3,
+            IntW::U8 => 4,
+            IntW::U16 => 5,
+            IntW::U32 => 6,
+            IntW::U64 => 7,
+        }
+    }
+    pub fn from_tag(t: u8) -> Option<IntW> {
+        Some(match t {
+            0 => IntW::I8,
+            1 => IntW::I16,
+            2 => IntW::I32,
+            3 => IntW::I64,
+            4 => IntW::U8,
+            5 => IntW::U16,
+            6 => IntW::U32,
+            7 => IntW::U64,
+            _ => return None,
+        })
+    }
+    /// Parse a width suffix / type name.
+    pub fn from_name(s: &str) -> Option<IntW> {
+        Some(match s {
+            "i8" => IntW::I8,
+            "i16" => IntW::I16,
+            "i32" => IntW::I32,
+            "i64" => IntW::I64,
+            "u8" => IntW::U8,
+            "u16" => IntW::U16,
+            "u32" => IntW::U32,
+            "u64" => IntW::U64,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
     // (Debug is implemented manually below via Display)
     Int(i64),
+    /// A fixed-width integer (`255u8`, `1000i16`, …). The `i128` value + width
+    /// are boxed so `Value` stays 24 bytes (a bare `i128` is 16-byte-aligned and
+    /// would grow the whole enum to 32 — sized ints are rare, so they pay the
+    /// indirection instead of every value paying the size).
+    SizedInt(Box<(i128, IntW)>),
     Float(f64),
     Bool(bool),
     Str(Rc<String>),
@@ -81,6 +179,7 @@ impl Value {
     pub fn type_name(&self) -> String {
         match self {
             Value::Int(_) => "Int".into(),
+            Value::SizedInt(b) => b.1.name().into(),
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "Str".into(),
@@ -104,6 +203,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
+            // sized ints are equal iff both value AND width match
+            (Value::SizedInt(a), Value::SizedInt(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
@@ -135,6 +236,7 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(v) => write!(f, "{v}"),
+            Value::SizedInt(b) => write!(f, "{}", b.0),
             Value::Float(v) => {
                 if v.fract() == 0.0 && v.is_finite() {
                     write!(f, "{v:.1}")

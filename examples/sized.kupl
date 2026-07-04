@@ -1,0 +1,34 @@
+// Sized integers — fixed-width numeric types for binary formats and interop.
+//
+// Widths: i8 i16 i32 i64 (signed) and u8 u16 u32 u64 (unsigned). Write a literal
+// with a suffix (`255u8`, `1000i16`, `0xFFu8`). Arithmetic is checked — overflow
+// panics, just like the default Int (i64). Mixing widths is a type error; convert
+// explicitly with `.to_u8()`…`.to_u64()` / `.to_i8()`… and `.to_int()`.
+
+// A byte with an explicit width.
+fun clamp_byte(n: Int) -> u8 {
+    // narrowing conversion panics if out of 0..=255
+    n.to_u8()
+}
+
+fun main() uses io {
+    // wrapping a color channel value stays a u8
+    let r: u8 = 200u8
+    let g: u8 = 55u8
+    print(r + g)                 // 255
+
+    // hex literals take suffixes too
+    print(0xFFu8)                // 255
+    print(0b1010u8)              // 10
+
+    // signed 16-bit
+    let x: i16 = 1000i16
+    print(x * 3i16)              // 3000
+
+    // conversions between Int and sized types
+    print((255u8).to_int() + 1)  // 256
+    print(clamp_byte(42))        // 42
+
+    // overflow is a panic, not a silent wrap — uncomment to see:
+    //   print(200u8 + 100u8)   // panic: integer overflow in addition
+}

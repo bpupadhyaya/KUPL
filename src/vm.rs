@@ -1202,6 +1202,66 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_sized_ints_it27() {
+        // arithmetic within a width, checked, byte-identical on both engines
+        assert_eq!(differential("fun probe() -> u8 {\n    200u8 + 55u8\n}\n"), "255");
+        assert_eq!(differential("fun probe() -> i16 {\n    1000i16\n}\n"), "1000");
+        assert_eq!(differential("fun probe() -> i32 {\n    100i32 * 3i32\n}\n"), "300");
+        assert_eq!(differential("fun probe() -> Bool {\n    10u8 < 20u8\n}\n"), "true");
+        // hex literal with a width suffix
+        assert_eq!(differential("fun probe() -> u8 {\n    0xFFu8\n}\n"), "255");
+        // overflow panics with the shared Int message
+        assert_eq!(
+            differential("fun probe() -> u8 {\n    200u8 + 100u8\n}\n"),
+            "panic: integer overflow in addition"
+        );
+        assert_eq!(
+            differential("fun probe() -> i8 {\n    127i8 + 1i8\n}\n"),
+            "panic: integer overflow in addition"
+        );
+        assert_eq!(
+            differential("fun probe() -> i32 {\n    1000000i32 * 1000000i32\n}\n"),
+            "panic: integer overflow in multiplication"
+        );
+        // conversions
+        assert_eq!(differential("fun probe() -> Int {\n    (255u8).to_int()\n}\n"), "255");
+        assert_eq!(differential("fun probe() -> u16 {\n    (65535).to_u16()\n}\n"), "65535");
+        assert_eq!(
+            differential("fun probe() -> u8 {\n    (300).to_u8()\n}\n"),
+            "panic: 300 out of range for `u8`"
+        );
+    }
+
+    #[test]
+    fn value_enum_did_not_grow_it27() {
+        // The baseline Value is 32 bytes (max variant Ctor = 3 pointers = 24,
+        // plus an 8-byte discriminant — there is no niche, since Int(i64)/Range
+        // use every bit). Sized ints box their (i128, IntW) payload, so adding
+        // them does NOT grow the enum past that baseline.
+        assert!(
+            std::mem::size_of::<Value>() <= 32,
+            "Value grew to {} bytes",
+            std::mem::size_of::<Value>()
+        );
+    }
+
+    #[test]
+    fn mixed_width_is_type_error_it27() {
+        let (_, diags) = crate::check::check(&crate::parser::parse("fun f() {\n    let x = 1i32 + 2i16\n}\n").0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+    }
+
+    #[test]
+    fn sized_int_native_defers_it27() {
+        let compiled = crate::run::compile("fun main() {\n    let x = 255u8\n    let _ = x\n}\n")
+            .expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let err = crate::cgen::emit_c(&module);
+        assert!(err.is_err(), "native should defer sized ints");
+        assert!(err.unwrap_err().contains("sized integers"), "clear error");
+    }
+
+    #[test]
     fn diff_url_it26() {
         assert_eq!(differential("fun probe() -> Str {\n    url_encode(\"a b&c\")\n}\n"), "a%20b%26c");
         assert_eq!(differential("fun probe() -> Str {\n    url_encode(\"a-b_c.d~e\")\n}\n"), "a-b_c.d~e");
