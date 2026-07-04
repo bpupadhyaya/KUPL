@@ -1,3 +1,10 @@
+> **Progress:** slice 1 landed (it30) — local **path** dependencies. A new
+> zero-dep `src/manifest.rs` reads the `kupl.toml` `[dependencies]` subset, and
+> the loader resolves `use <dep>` across packages (its manifest's `entry`), with
+> a clear K0400 on a missing path. Namespace isolation (mangling), lockfile +
+> versions, and a `kupl pkg` registry are later slices. Backward-compatible:
+> bare `.kupl` files with no manifest load exactly as before.
+
 # Big-arc design: Package / dependency system (ecosystem)
 
 **Feasibility:** high · **Risk:** medium · **Estimated effort:** ~5 /loop iterations

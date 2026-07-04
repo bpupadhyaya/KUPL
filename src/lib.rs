@@ -11,6 +11,7 @@ pub mod time;
 pub mod encoding;
 pub mod csv;
 pub mod url;
+pub mod manifest;
 pub mod ast;
 pub mod bytecode;
 pub mod cgen;

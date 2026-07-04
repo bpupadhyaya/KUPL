@@ -1,0 +1,8 @@
+// A tiny reusable package: pub functions are visible to dependents.
+pub fun hello(name: Str) -> Str {
+    "Hello, " + name + "!"
+}
+
+pub fun shout(s: Str) -> Str {
+    s.to_upper()
+}

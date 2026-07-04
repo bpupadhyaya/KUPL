@@ -1,0 +1,8 @@
+// This app depends on the local `greet` package (see kupl.toml).
+// Run it with:  kupl run examples/pkg/app/main.kupl
+use greet
+
+fun main() uses io {
+    print(hello("KUPL"))
+    print(shout(hello("world")))
+}

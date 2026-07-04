@@ -112,7 +112,17 @@ immediately: `kupl run <name>/main.kupl`.
 name = "my-app"
 version = "0.1.0"
 entry = "main.kupl"
+
+[dependencies]
+# depend on another local KUPL package by path (resolved relative to this file)
+math = { path = "../math" }
+util = "vendor/util"          # bare-string shorthand for a path
 ```
+
+A `use <dep>` in your code then resolves to that dependency package's `entry`
+file (and `use <dep>.sub` to a subfile within it). A missing dependency path is
+reported as **K0400** at the `use` site. Version-only dependencies (registry
+fetch) are a later addition; local path dependencies work today.
 
 ### `kupl version`
 Prints the toolchain version.
