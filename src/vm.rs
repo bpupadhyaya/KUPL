@@ -588,6 +588,19 @@ impl<'m> Vm<'m> {
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_RE_MATCH | BUILTIN_RE_FIND | BUILTIN_RE_FIND_ALL
+                        | BUILTIN_RE_REPLACE => {
+                            let name = match which {
+                                BUILTIN_RE_MATCH => "re_match",
+                                BUILTIN_RE_FIND => "re_find",
+                                BUILTIN_RE_FIND_ALL => "re_find_all",
+                                _ => "re_replace",
+                            };
+                            match crate::interp::regex_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
                         _ => return Err(VmError { msg: "unknown builtin".into(), span }),
                     }
                 }
@@ -1133,6 +1146,33 @@ fun diff_greet(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
 ai fun diff_assist(q: Str) -> Str tools [diff_add, diff_greet] {\n    intent \"Assist.\"\n}\n\
 fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
+    }
+
+    #[test]
+    fn diff_regex_it20() {
+        assert_eq!(differential("fun probe() -> Bool {\n    re_match(\"^\\\\d+$\", \"12345\")\n}\n"), "true");
+        assert_eq!(differential("fun probe() -> Bool {\n    re_match(\"^\\\\d+$\", \"12a45\")\n}\n"), "false");
+        assert_eq!(
+            differential("fun probe() -> List[Str] {\n    re_find_all(\"\\\\d+\", \"a1b22c333\")\n}\n"),
+            "[\"1\", \"22\", \"333\"]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    re_replace(\"\\\\s+\", \"a  b c\", \"_\")\n}\n"),
+            "a_b_c"
+        );
+        // alternation + groups + quantifiers
+        assert_eq!(differential("fun probe() -> Bool {\n    re_match(\"^(cat|dog)s?$\", \"dogs\")\n}\n"), "true");
+        assert_eq!(differential("fun probe() -> Bool {\n    re_match(\"^(ab)+$\", \"ababab\")\n}\n"), "true");
+        // find returns the first match substring
+        assert_eq!(
+            differential("fun probe() -> Str {\n    match re_find(\"[a-z]+\", \"123abc456\") {\n        Some(m) => m\n        None => \"none\"\n    }\n}\n"),
+            "abc"
+        );
+        // a malformed pattern panics identically on both engines
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    re_match(\"(unclosed\", \"x\")\n}\n"),
+            "panic: invalid regex: unclosed group `(`"
+        );
     }
 
     #[test]

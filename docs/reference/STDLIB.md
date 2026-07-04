@@ -33,6 +33,10 @@ unless supervised.
 | `shuffle(seed, xs)` | `(Int, List[T]) -> List[T]` | deterministic Fisher-Yates permutation |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
+| `re_match(pat, text)` | `(Str, Str) -> Bool` | regex search (`^…$` for full match) |
+| `re_find(pat, text)` | `(Str, Str) -> Option[Str]` | first match substring |
+| `re_find_all(pat, text)` | `(Str, Str) -> List[Str]` | all non-overlapping matches |
+| `re_replace(pat, text, repl)` | `(Str, Str, Str) -> Str` | replace all matches with `repl` |
 
 `args`/`env_var` read ambient input, so they carry the `io.env` effect (a
 sub-effect of `io`). `args()` is everything after `--` when run through the
@@ -47,6 +51,12 @@ reproducible. There is no ambient/global RNG — pass a seed explicitly.
 AI runtime uses) and carry the `io.net` effect. A non-2xx status or unreachable
 host is an ordinary `Err` (message text is platform-dependent). Not yet on the
 native backend — use `kupl run`/`--vm`/`bundle`.
+
+**Regex** (`re_*`) is a pure, self-contained engine: literals, `.`, `* + ?`
+(greedy), classes `[a-z]`/`[^…]`, `\d \w \s` (+ `\D \W \S`), anchors
+`^`/`$`, alternation `|`, groups `(...)`, and `\`-escapes. `re_match` searches
+(anchor with `^…$` for a full match). A malformed pattern **panics** with a
+clear message. Not yet on the native backend (`kupl run`/`--vm`/`bundle`).
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

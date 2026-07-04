@@ -1,0 +1,38 @@
+// Regular expressions — validate, extract, and rewrite text.
+//
+//   re_match(pattern, text)          -> Bool          search (^…$ for a full match)
+//   re_find(pattern, text)           -> Option[Str]   first match
+//   re_find_all(pattern, text)       -> List[Str]     every non-overlapping match
+//   re_replace(pattern, text, repl)  -> Str           replace all matches
+//
+// All pure and deterministic. Supported syntax: literals, `.`, `* + ?`,
+// classes `[a-z]`/`[^…]`, `\d \w \s` (and \D \W \S), anchors `^ $`,
+// alternation `a|b`, groups `(...)`. Escape metacharacters with `\` (which
+// is `\\` inside a KUPL string).
+
+// A simple email check. `^…$` makes it a full-string match.
+fun is_email(s: Str) -> Bool {
+    re_match("^\\w+@\\w+\\.\\w+$", s)
+}
+
+fun main() uses io {
+    print(is_email("ada@example.com"))        // true
+    print(is_email("nope"))                   // false
+
+    // pull every number out of a line of text
+    let log = "order 42 shipped 7 items for $128"
+    print(re_find_all("\\d+", log))           // [42, 7, 128]
+
+    // the first word
+    match re_find("[A-Za-z]+", "  hello world") {
+        Some(w) => print("first word: {w}")
+        None => print("no word")
+    }
+
+    // redact anything that looks like a phone number's digits
+    print(re_replace("\\d", "call 555-0100", "*"))   // call ***-****
+
+    // alternation + optional suffix
+    print(re_match("^(cat|dog)s?$", "dogs"))  // true
+    print(re_match("^(cat|dog)s?$", "cows"))  // false
+}

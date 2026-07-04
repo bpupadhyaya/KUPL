@@ -186,6 +186,10 @@ pub const BUILTIN_RANDOM_FLOATS: u8 = 21;
 pub const BUILTIN_SHUFFLE: u8 = 22;
 pub const BUILTIN_HTTP_GET: u8 = 23;
 pub const BUILTIN_HTTP_POST: u8 = 24;
+pub const BUILTIN_RE_MATCH: u8 = 25;
+pub const BUILTIN_RE_FIND: u8 = 26;
+pub const BUILTIN_RE_FIND_ALL: u8 = 27;
+pub const BUILTIN_RE_REPLACE: u8 = 28;
 
 impl Module {
     pub fn disassemble(&self) -> String {

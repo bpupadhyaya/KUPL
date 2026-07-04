@@ -1062,6 +1062,10 @@ impl<'s> FnCompiler<'s> {
                 ("shuffle", 2) => Some(BUILTIN_SHUFFLE),
                 ("http_get", 1) => Some(BUILTIN_HTTP_GET),
                 ("http_post", 2) => Some(BUILTIN_HTTP_POST),
+                ("re_match", 2) => Some(BUILTIN_RE_MATCH),
+                ("re_find", 2) => Some(BUILTIN_RE_FIND),
+                ("re_find_all", 2) => Some(BUILTIN_RE_FIND_ALL),
+                ("re_replace", 3) => Some(BUILTIN_RE_REPLACE),
                 _ => None,
             };
             if let Some(which) = builtin {

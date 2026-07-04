@@ -176,6 +176,14 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
                         .into(),
                 )
             }
+            BUILTIN_RE_MATCH | BUILTIN_RE_FIND | BUILTIN_RE_FIND_ALL | BUILTIN_RE_REPLACE => {
+                return Err(
+                    "regex builtins (re_match/re_find/re_find_all/re_replace) are not yet \
+                     supported by the native backend — use `kupl run`, `kupl run --vm`, or \
+                     `kupl bundle`"
+                        .into(),
+                )
+            }
             BUILTIN_ENV_VAR => format!("regs[{dst}] = k_env_var(regs[{start}]); (void){argc};"),
             BUILTIN_ARGS => format!("regs[{dst}] = k_args(); (void){start}; (void){argc};"),
             BUILTIN_EPRINT => format!("regs[{dst}] = k_eprint(regs[{start}]); (void){argc};"),

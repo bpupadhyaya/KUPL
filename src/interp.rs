@@ -942,6 +942,13 @@ impl Interp {
                     }
                     return http_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("re_match", 2) | ("re_find", 2) | ("re_find_all", 2) | ("re_replace", 3) => {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        vals.push(self.eval(&a.value, env)?);
+                    }
+                    return regex_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("exit", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     let code = match v {
@@ -2109,6 +2116,31 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err(format!("unknown process builtin `{name}`")),
     }
+}
+
+/// Regex builtins — shared by interpreter and KVM. Pure; a malformed pattern
+/// panics with a clear message (the pattern is program text, so this is a bug
+/// to surface, like a bad format string).
+pub fn regex_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let as_str = |v: &Value| match v {
+        Value::Str(s) => s.as_str().to_string(),
+        other => other.to_string(),
+    };
+    let re = crate::regex::compile(&as_str(&args[0]))
+        .map_err(|e| format!("invalid regex: {e}"))?;
+    let text = as_str(&args[1]);
+    Ok(match name {
+        "re_match" => Value::Bool(re.is_match(&text)),
+        "re_find" => re
+            .find(&text)
+            .map(|m| Value::some(Value::str(m)))
+            .unwrap_or_else(Value::none),
+        "re_find_all" => Value::List(Rc::new(
+            re.find_all(&text).into_iter().map(Value::str).collect(),
+        )),
+        "re_replace" => Value::str(re.replace_all(&text, &as_str(&args[2]))),
+        _ => return Err(format!("unknown regex builtin `{name}`")),
+    })
 }
 
 /// HTTP builtins — shared by interpreter and KVM. Effect `io.net`. Transport is

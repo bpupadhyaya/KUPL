@@ -1470,6 +1470,18 @@ impl Checker {
                     self.unify(&Ty::Str, &b, args[1].value.span, "http_post body");
                     return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
                 }
+                ("re_match", 2) | ("re_find", 2) | ("re_find_all", 2) | ("re_replace", 3) => {
+                    for a in args {
+                        let t = self.infer_expr(&a.value, ctx);
+                        self.unify(&Ty::Str, &t, a.value.span, "regex argument");
+                    }
+                    return match name.as_str() {
+                        "re_match" => Ty::Bool,
+                        "re_find" => Ty::Option(Box::new(Ty::Str)),
+                        "re_find_all" => Ty::List(Box::new(Ty::Str)),
+                        _ => Ty::Str, // re_replace
+                    };
+                }
                 ("eprint", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Unit;
