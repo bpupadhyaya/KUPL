@@ -57,12 +57,23 @@ and known limitations called out in commit messages. Checked off as landed.
       interpreter + KVM. Durations `ms`/`s`/`m`/`h`. (`examples/timers.kupl`)
 - [ ] **Hot-swap state migration** (design open Q4; Builder live-editing hook)
 
-## Tier 3 — hardware & systems tiers (next arc)
+## Tier 3 — audit-driven priorities (next arc)
 
-- [ ] KIR (typed SSA) + `kernel fun` + `at(gpu)` placement; Metal lowering first
-- [ ] Components + per-component GC in the native backend
-- [ ] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal
-- [ ] System tier: ownership, `low`/`asm` (design §6)
+Ordered by the 2026-07-04 comparison audit ([`COMPARISON.md`](COMPARISON.md)):
+the lowest-scoring, most load-bearing gaps vs Python/Go/TS/Java/Rust/Haskell/
+C++/Swift/Kotlin. Concurrency is the #1 gap for the "universal, any software"
+claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
+
+- [ ] **Concurrency / parallelism** (audit #1) — async I/O, `par`, a real
+      scheduler on the actor model (work-stealing or multi-threaded), keeping
+      the virtual clock for deterministic tests. `await` evaluates synchronously
+      today; `par` is unbuilt.
+- [ ] **Native components + KIR** (audit #2) — typed SSA IR; components compile
+      to native (per-component GC), so real apps run at native, not VM, speed
+- [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
+- [ ] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal (audit #3)
+- [ ] Broader standard library (audit #3 — stdlib depth for real programs)
+- [ ] System tier: ownership, `low`/`asm` (design §6; audit #4)
 - [ ] Capabilities as attenuable values (`cap.Http.limited_to(…)`)
 
 ## Tier 4 — ecosystem
