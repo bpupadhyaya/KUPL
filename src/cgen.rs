@@ -275,13 +275,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_JSON_STRINGIFY => {
                 format!("regs[{dst}] = k_json_stringify(regs[{start}]); (void){argc};")
             }
-            BUILTIN_HTTP_GET | BUILTIN_HTTP_POST => {
-                return Err(
-                    "http_get/http_post are not yet supported by the native backend \
-                     — use `kupl run`, `kupl run --vm`, or `kupl bundle`"
-                        .into(),
-                )
-            }
+            BUILTIN_HTTP_GET => format!("regs[{dst}] = k_http_get(regs[{start}]); (void){argc};"),
+            BUILTIN_HTTP_POST => format!("regs[{dst}] = k_http_post(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_MATCH => format!("regs[{dst}] = k_re_match(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_FIND => format!("regs[{dst}] = k_re_find(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_FIND_ALL => format!("regs[{dst}] = k_re_find_all(regs[{start}], regs[{start}+1]); (void){argc};"),
@@ -427,6 +422,7 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <unistd.h>
 #include <time.h>
 #include <setjmp.h>
+#include <sys/wait.h>
 
 typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
@@ -1373,6 +1369,53 @@ static KValue k_csv_stringify(KValue lst) {
         }
     }
     return k_str(kb_take(&b));
+}
+
+/* ---- HTTP (mirror interp::http_builtin — shell out to `curl`) ---- */
+static void kb_write(KBuf* b, const char* s, long n) { kb_grow(b, n); memcpy(b->buf + b->len, s, n); b->len += n; b->buf[b->len] = 0; }
+/* run curl via fork/exec (no shell — argv matches the interpreter's Command);
+   optional `body` is piped to stdin. Ok(stdout) on exit 0, else Err(stderr|msg). */
+static KValue k_run_curl(char* const argv[], const char* body) {
+    int outp[2], errp[2], inp[2] = { -1, -1 };
+    if (pipe(outp) || pipe(errp) || (body && pipe(inp))) return k_err(k_str("cannot run curl: pipe failed"));
+    pid_t pid = fork();
+    if (pid < 0) return k_err(k_str("cannot run curl: fork failed"));
+    if (pid == 0) {
+        dup2(outp[1], 1); dup2(errp[1], 2);
+        if (body) dup2(inp[0], 0);
+        close(outp[0]); close(outp[1]); close(errp[0]); close(errp[1]);
+        if (body) { close(inp[0]); close(inp[1]); }
+        execvp("curl", argv);
+        _exit(127);
+    }
+    close(outp[1]); close(errp[1]);
+    if (body) { close(inp[0]); long bl = (long)strlen(body); long off = 0; while (off < bl) { ssize_t w = write(inp[1], body + off, bl - off); if (w <= 0) break; off += w; } close(inp[1]); }
+    KBuf out = { 0, 0, 0 }, er = { 0, 0, 0 };
+    char buf[4096]; ssize_t n;
+    while ((n = read(outp[0], buf, sizeof buf)) > 0) kb_write(&out, buf, n);
+    while ((n = read(errp[0], buf, sizeof buf)) > 0) kb_write(&er, buf, n);
+    close(outp[0]); close(errp[0]);
+    int status = 0; waitpid(pid, &status, 0);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == 127) return k_err(k_str("cannot run curl: command not found"));
+    if (code != 0) {
+        char* e = er.buf ? er.buf : (char*)"";
+        while (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r') e++;      /* trim start */
+        long len = (long)strlen(e);
+        while (len > 0 && (e[len-1] == ' ' || e[len-1] == '\t' || e[len-1] == '\n' || e[len-1] == '\r')) e[--len] = 0;
+        if (len > 0) return k_err(k_str(e));
+        char m[64]; snprintf(m, sizeof m, "request failed (curl exit %d)", code);
+        return k_err(k_str(m));
+    }
+    return k_ok(k_str(out.buf ? out.buf : (char*)""));
+}
+static KValue k_http_get(KValue url) {
+    char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30", (char*)k_as_str(url), 0 };
+    return k_run_curl(argv, 0);
+}
+static KValue k_http_post(KValue url, KValue body) {
+    char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30", (char*)"-X", (char*)"POST", (char*)"--data-binary", (char*)"@-", (char*)k_as_str(url), 0 };
+    return k_run_curl(argv, k_as_str(body));
 }
 
 /* ---- regex (mirrors src/regex.rs; byte-oriented — ASCII-correct, which is
@@ -3263,6 +3306,22 @@ mod tests {
             ("fun main() uses io { print(re_replace(\"[aeiou]\", \"hello world\", \"*\")) }", "h*ll* w*rld\n"),
         ] {
             assert_eq!(native_main_stdout(src, "re"), expected, "src: {src}");
+        }
+    }
+
+    /// HTTP compiles to native (was a defer). A live request is non-
+    /// deterministic, so we test the DETERMINISTIC error path: an unresolvable
+    /// host returns Err on both engines.
+    #[test]
+    fn native_http() {
+        // emit_c succeeds for an http program (no longer a compile-time defer)
+        let src = "fun main() uses io {\n    match http_get(\"http://nonexistent.invalid.localhost.example\") {\n        Ok(_) => print(\"ok\")\n        Err(_) => print(\"handled\")\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        assert!(super::emit_c(&module).is_ok(), "native should compile http now");
+        // and the unresolvable-host error path prints the Err branch natively
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "http"), "handled\n");
         }
     }
 

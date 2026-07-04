@@ -157,8 +157,11 @@ model compiles natively too** — instance state, handlers, children, wires,
 `emit`, the drain loop, timers, supervision, and `expose` calls (a C mirror of
 the VM, byte-identical to `kupl run`). So a realistic KUPL application now runs
 at native speed, not VM speed — the previous "components run on the VM" weak
-spot is closed. What keeps this a 3 rather than a 4–5 is that native values are
-still the **boxed 16-byte tagged `KValue`**: monomorphic numeric loops pay
+spot is closed. As of it40–47 the native backend compiles the **entire language except `ai fun`**
+— components, sized numerics/f32, JSON, CSV, URL, regex, file I/O, and HTTP all
+lower to machine code, byte-identical to the interpreter. What keeps this a 3
+rather than a 4–5 is that native values are still the **boxed 16-byte tagged
+`KValue`**: monomorphic numeric loops pay
 tag-dispatch instead of running in raw registers. The typed SSA IR (**KIR**)
 that would unbox them is a deliberate *future performance* arc (**□ [design]**),
 not a correctness gap. Rust, C++, and hand-tuned C still beat KUPL on tight

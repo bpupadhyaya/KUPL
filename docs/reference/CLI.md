@@ -51,10 +51,11 @@ Compiles to **machine code**: bytecode → generated C → `$CC` (default `cc`)
 `on start`/port handlers, child components, `wire`s, `emit`, virtual-clock
 timers (`on every`/`on after`), `supervise` restart-on-failure, and
 cross-component `expose` calls all compile to machine code — the full component
-model. (The full numeric surface — sized integers and `f32` — plus **JSON**, **CSV**,
-**URL/query**, and **regex** builtins now compile natively; only `ai fun` and
-HTTP still defer with a clear message, use `bundle`. KValue unboxing for tighter
-numeric loops is a future performance arc.)
+model. (The native backend now compiles the **entire language except `ai fun`** —
+components, the full numeric surface, JSON, CSV, URL/query, regex, file I/O,
+env/process, and HTTP (via system `curl`) all lower to machine code. Only
+`ai fun` defers (it needs a provider + network protocol); use `bundle` for those.
+KValue unboxing for tighter numeric loops is a future performance arc.)
 `--keep-c` keeps the generated `.c` beside the output for inspection.
 
 ### `kupl dis <file.kupl>`
