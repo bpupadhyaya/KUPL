@@ -115,7 +115,7 @@ pub fn to_json(diags: &[Diag], src: &str, file: &str) -> String {
     out
 }
 
-fn json_escape(s: &str) -> String {
+pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {

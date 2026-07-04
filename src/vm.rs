@@ -33,6 +33,7 @@ struct VmInstance {
     slots: Vec<Value>,
     /// out port -> [(target instance, target in port)]
     wires: std::collections::HashMap<String, Vec<(usize, String)>>,
+    restart_on_failure: bool,
 }
 
 pub struct Vm<'m> {
@@ -102,9 +103,26 @@ impl<'m> Vm<'m> {
                 .map(|(_, chunk, has_param)| (*chunk, *has_param));
             if let Some((chunk, has_param)) = handler {
                 let args = if has_param { vec![value] } else { Vec::new() };
-                self.call_chunk_nested(chunk, args, Some(id))?;
+                match self.call_chunk_nested(chunk, args, Some(id)) {
+                    Ok(_) => {}
+                    Err(e) if self.instances[id].restart_on_failure => {
+                        self.restart(id, &e.msg)?;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
+        Ok(())
+    }
+
+    /// Supervision restart: reset state (restart chunk), re-run `on start`.
+    fn restart(&mut self, id: usize, panic_msg: &str) -> Result<(), VmError> {
+        let meta = &self.module.components[self.instances[id].comp as usize];
+        let name = meta.name.clone();
+        let restart_chunk = meta.restart_chunk;
+        eprintln!("[supervise] {name} restarted after panic: {panic_msg}");
+        self.call_chunk_nested(restart_chunk, Vec::new(), Some(id))?;
+        self.run_lifecycle(id, "@start")?;
         Ok(())
     }
 
@@ -120,6 +138,7 @@ impl<'m> Vm<'m> {
             comp: comp_idx,
             slots,
             wires: std::collections::HashMap::new(),
+            restart_on_failure: false,
         });
         self.call_chunk_nested(init, Vec::new(), Some(id))?;
         Ok(id)
@@ -165,8 +184,17 @@ impl<'m> Vm<'m> {
         inst: Option<usize>,
     ) -> Result<Value, VmError> {
         let depth = self.frames.len();
+        let stack_len = self.stack.len();
         self.push_frame(chunk, &args, 0, inst)?;
-        self.run(depth)
+        match self.run(depth) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // unwind so supervision restarts leave the VM consistent
+                self.frames.truncate(depth);
+                self.stack.truncate(stack_len);
+                Err(e)
+            }
+        }
     }
 
     fn chunk(&self, idx: u16) -> &'m Chunk {
@@ -553,7 +581,7 @@ impl<'m> Vm<'m> {
                     let v = reg!(src);
                     self.instances[id].slots[slot as usize] = v;
                 }
-                Op::MakeInstance { dst, comp, start, argc } => {
+                Op::MakeInstance { dst, comp, start, argc, policy } => {
                     let props: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
                     let id = self.instantiate(comp, props).map_err(|mut e| {
                         if e.span == Span::default() {
@@ -561,6 +589,7 @@ impl<'m> Vm<'m> {
                         }
                         e
                     })?;
+                    self.instances[id].restart_on_failure = policy == 1;
                     set!(dst, Value::Component(id));
                 }
                 Op::WireOp { from, out_port, to, in_port } => {

@@ -478,6 +478,7 @@ impl Parser {
             state: Vec::new(),
             children: Vec::new(),
             wires: Vec::new(),
+            supervises: Vec::new(),
             handlers: Vec::new(),
             exposes: Vec::new(),
             funs: Vec::new(),
@@ -582,6 +583,34 @@ impl Parser {
                 self.expect(Tok::Dot)?;
                 let (bp, _) = self.expect_ident()?;
                 c.wires.push(WireDecl { from: (a, ap), to: (b, bp), span: wspan.merge(self.prev_span()) });
+                self.expect_terminator()
+            }
+            Tok::KwSupervise => {
+                let sspan = self.span();
+                self.bump();
+                let (child, _) = self.expect_ident()?;
+                // contextual: `restart on_failure` | `restart never`
+                let (word1, w1span) = self.expect_ident()?;
+                if word1 != "restart" {
+                    return Err(Diag::error(
+                        "K0117",
+                        format!("expected `restart` after the child name, found `{word1}`"),
+                        w1span,
+                    ));
+                }
+                let (word2, w2span) = self.expect_ident()?;
+                let policy = match word2.as_str() {
+                    "on_failure" => SupervisePolicy::RestartOnFailure,
+                    "never" => SupervisePolicy::Never,
+                    other => {
+                        return Err(Diag::error(
+                            "K0118",
+                            format!("unknown restart policy `{other}` (use `on_failure` or `never`)"),
+                            w2span,
+                        ))
+                    }
+                };
+                c.supervises.push(SuperviseDecl { child, policy, span: sspan.merge(self.prev_span()) });
                 self.expect_terminator()
             }
             Tok::KwOn => {

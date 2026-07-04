@@ -68,6 +68,8 @@ pub struct Instance {
     /// out port -> [(target instance, target in port)]
     pub wires: HashMap<String, Vec<(usize, String)>>,
     pub last_emit: HashMap<String, Value>,
+    /// Set by the parent's `supervise child restart on_failure`.
+    pub restart_on_failure: bool,
 }
 
 pub struct Interp {
@@ -146,6 +148,7 @@ impl Interp {
             env: env.clone(),
             wires: HashMap::new(),
             last_emit: HashMap::new(),
+            restart_on_failure: false,
         });
 
         // children (constructed after the parent exists, in declaration order)
@@ -159,6 +162,13 @@ impl Interp {
             let v = self.instantiate(&child.component, &child_args, child.span)?;
             if let Value::Component(cid) = v {
                 child_ids.insert(child.name.clone(), cid);
+                let supervised = comp
+                    .supervises
+                    .iter()
+                    .any(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
+                if supervised {
+                    self.instances[cid].restart_on_failure = true;
+                }
             }
             env.define(&child.name, v);
         }
@@ -215,8 +225,32 @@ impl Interp {
             let comp = self.instances[id].comp.clone();
             for h in &comp.handlers {
                 if matches!(&h.trigger, Trigger::Port(p) if p == &port) {
-                    self.run_handler(id, h, value.clone())?;
+                    match self.run_handler(id, h, value.clone()) {
+                        Ok(()) => {}
+                        Err(Flow::Panic { msg, .. }) if self.instances[id].restart_on_failure => {
+                            self.restart(id, &msg)?;
+                        }
+                        Err(other) => return Err(other),
+                    }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Supervision restart: reset state fields to their initial values, keep
+    /// props/children/wires, re-run `on start`.
+    fn restart(&mut self, id: usize, panic_msg: &str) -> Result<(), Flow> {
+        let comp = self.instances[id].comp.clone();
+        let env = self.instances[id].env.clone();
+        eprintln!("[supervise] {} restarted after panic: {panic_msg}", comp.name);
+        for s in &comp.state {
+            let v = self.eval(&s.init, &env)?;
+            env.define(&s.name, v);
+        }
+        for h in &comp.handlers {
+            if matches!(h.trigger, Trigger::Start) {
+                self.run_handler(id, h, Value::Unit)?;
             }
         }
         Ok(())

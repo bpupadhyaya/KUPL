@@ -210,6 +210,15 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
         indent(out, 1);
         out.push_str(&format!("wire {}.{} -> {}.{}\n", w.from.0, w.from.1, w.to.0, w.to.1));
     }
+    sep(out, !c.supervises.is_empty());
+    for s in &c.supervises {
+        indent(out, 1);
+        let policy = match s.policy {
+            SupervisePolicy::RestartOnFailure => "on_failure",
+            SupervisePolicy::Never => "never",
+        };
+        out.push_str(&format!("supervise {} restart {policy}\n", s.child));
+    }
     // handlers: on start, then port handlers in in-port declaration order, then on stop
     let mut handlers: Vec<&Handler> = Vec::new();
     for h in &c.handlers {

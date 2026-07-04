@@ -428,6 +428,15 @@ impl Checker {
                 self.unify(&a, &b, wire.span, "wire (out port must match in port)");
             }
         }
+        for s in &c.supervises {
+            if !child_types.contains_key(&s.child) {
+                self.err(
+                    "K0265",
+                    format!("`supervise` references unknown child `{}`", s.child),
+                    s.span,
+                );
+            }
+        }
 
         // handlers
         let sig = self.checked.components.get(&c.name).cloned().unwrap_or_default();

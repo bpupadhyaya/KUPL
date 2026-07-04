@@ -116,6 +116,7 @@ pub fn encode(m: &Module) -> Vec<u8> {
         }
         w.u8(c.nslots);
         w.u16(c.init_chunk);
+        w.u16(c.restart_chunk);
         w.u32(c.handlers.len() as u32);
         for (key, chunk, has_param) in &c.handlers {
             w.s(key);
@@ -321,12 +322,13 @@ fn encode_op(w: &mut W, op: &Op) {
             w.u8(*a);
             w.u8(*b);
         }
-        MakeInstance { dst, comp, start, argc } => {
+        MakeInstance { dst, comp, start, argc, policy } => {
             w.u8(36);
             w.u8(*dst);
             w.u16(*comp);
             w.u8(*start);
             w.u8(*argc);
+            w.u8(*policy);
         }
         WireOp { from, out_port, to, in_port } => {
             w.u8(37);
@@ -475,6 +477,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         }
         let nslots = r.u8()?;
         let init_chunk = r.u16()?;
+        let restart_chunk = r.u16()?;
         let nhandlers = r.u32()?;
         let mut handlers = Vec::with_capacity(nhandlers as usize);
         for _ in 0..nhandlers {
@@ -502,6 +505,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
             props,
             nslots,
             init_chunk,
+            restart_chunk,
             handlers,
             exposes,
             out_ports,
@@ -562,7 +566,7 @@ fn decode_op(r: &mut R) -> DecodeResult<Op> {
         33 => Concat(r.u8()?, r.u8()?, r.u8()?),
         34 => StateGet(r.u8()?, r.u8()?),
         35 => StateSet(r.u8()?, r.u8()?),
-        36 => MakeInstance { dst: r.u8()?, comp: r.u16()?, start: r.u8()?, argc: r.u8()? },
+        36 => MakeInstance { dst: r.u8()?, comp: r.u16()?, start: r.u8()?, argc: r.u8()?, policy: r.u8()? },
         37 => WireOp { from: r.u8()?, out_port: r.u16()?, to: r.u8()?, in_port: r.u16()? },
         38 => EmitOp {
             port: r.u16()?,

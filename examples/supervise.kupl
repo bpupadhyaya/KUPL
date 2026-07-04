@@ -1,0 +1,47 @@
+// Supervision: a panic kills the component instance, never the app.
+// The supervised divider restarts (state reset, on start re-run) after
+// each division by zero; the app keeps flowing.
+
+component Divider {
+    intent "Divides 100 by whatever arrives; keeps a running count."
+
+    in input: Int
+    out result: Int
+
+    state served: Int = 0
+
+    on start {
+        emit result(-1)
+    }
+
+    on input(n) {
+        let v = 100 / n
+        served += 1
+        emit result(v * 1000 + served)
+    }
+}
+
+component Feed {
+    intent "Feeds a mix of good and bad (zero) inputs at startup."
+
+    out numbers: Int
+
+    on start {
+        emit numbers(4)
+        emit numbers(0)
+        emit numbers(5)
+        emit numbers(0)
+        emit numbers(2)
+    }
+}
+
+app Main {
+    intent "Supervised pipeline: divide-by-zero panics restart the divider."
+
+    let feed = Feed()
+    let divider = Divider()
+
+    wire feed.numbers -> divider.input
+
+    supervise divider restart on_failure
+}

@@ -317,6 +317,107 @@ pub fn run_program_vm(src: &str, file: &str) -> i32 {
     }
 }
 
+/// `kupl manifest`: emit the component manifests (the visual-tool palette API)
+/// as JSON: intent, ports, props, state, exposes, fulfills, wiring.
+pub fn emit_manifest(src: &str, file: &str) -> i32 {
+    use crate::diag::json_escape as esc;
+    let compiled = match compile(src) {
+        Ok(c) => c,
+        Err(errors) => {
+            print_diags(&errors, src, file);
+            return 1;
+        }
+    };
+    let mut out = String::from("{\"components\":[");
+    let mut first = true;
+    for item in &compiled.program.items {
+        let Item::Component(c) = item else { continue };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&format!(
+            "{{\"name\":\"{}\",\"kind\":\"{}\",\"intent\":\"{}\"",
+            esc(&c.name),
+            if c.is_app { "app" } else { "component" },
+            esc(c.intent.as_deref().unwrap_or("")),
+        ));
+        let ports: Vec<String> = c
+            .ports
+            .iter()
+            .map(|p| {
+                format!(
+                    "{{\"name\":\"{}\",\"dir\":\"{}\",\"type\":\"{}\"}}",
+                    esc(&p.name),
+                    if p.dir == crate::ast::PortDir::In { "in" } else { "out" },
+                    esc(&crate::fmt::ty_str(&p.ty))
+                )
+            })
+            .collect();
+        out.push_str(&format!(",\"ports\":[{}]", ports.join(",")));
+        let props: Vec<String> = c
+            .props
+            .iter()
+            .map(|p| {
+                format!(
+                    "{{\"name\":\"{}\",\"type\":\"{}\",\"required\":{}}}",
+                    esc(&p.name),
+                    esc(&crate::fmt::ty_str(&p.ty)),
+                    p.default.is_none()
+                )
+            })
+            .collect();
+        out.push_str(&format!(",\"props\":[{}]", props.join(",")));
+        let state: Vec<String> = c.state.iter().map(|s| format!("\"{}\"", esc(&s.name))).collect();
+        out.push_str(&format!(",\"state\":[{}]", state.join(",")));
+        let exposes: Vec<String> = c
+            .exposes
+            .iter()
+            .map(|f| {
+                let params: Vec<String> = f
+                    .params
+                    .iter()
+                    .map(|p| format!("\"{}: {}\"", esc(&p.name), esc(&crate::fmt::ty_str(&p.ty))))
+                    .collect();
+                format!(
+                    "{{\"name\":\"{}\",\"params\":[{}],\"returns\":\"{}\",\"uses\":[{}]}}",
+                    esc(&f.name),
+                    params.join(","),
+                    esc(&f.ret.as_ref().map(crate::fmt::ty_str).unwrap_or_else(|| "Unit".into())),
+                    f.effects.iter().map(|e| format!("\"{}\"", esc(e))).collect::<Vec<_>>().join(",")
+                )
+            })
+            .collect();
+        out.push_str(&format!(",\"exposes\":[{}]", exposes.join(",")));
+        let fulfills: Vec<String> = c.fulfills.iter().map(|f| format!("\"{}\"", esc(f))).collect();
+        out.push_str(&format!(",\"fulfills\":[{}]", fulfills.join(",")));
+        let children: Vec<String> = c
+            .children
+            .iter()
+            .map(|ch| format!("{{\"name\":\"{}\",\"component\":\"{}\"}}", esc(&ch.name), esc(&ch.component)))
+            .collect();
+        out.push_str(&format!(",\"children\":[{}]", children.join(",")));
+        let wires: Vec<String> = c
+            .wires
+            .iter()
+            .map(|w| {
+                format!(
+                    "{{\"from\":\"{}.{}\",\"to\":\"{}.{}\"}}",
+                    esc(&w.from.0),
+                    esc(&w.from.1),
+                    esc(&w.to.0),
+                    esc(&w.to.1)
+                )
+            })
+            .collect();
+        out.push_str(&format!(",\"wires\":[{}]", wires.join(",")));
+        out.push_str(&format!(",\"examples\":{}}}", c.examples.len()));
+    }
+    out.push_str("]}");
+    println!("{out}");
+    0
+}
+
 /// Execute an already-compiled module: the first `app`, else `fun main`.
 pub fn run_module(module: &crate::bytecode::Module, origin: &str) -> i32 {
     let mut vm = crate::vm::Vm::new(module);

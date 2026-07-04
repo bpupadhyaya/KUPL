@@ -71,8 +71,10 @@ pub enum Op {
     StateGet(Reg, u8),
     /// current instance slot <- regs[src]
     StateSet(u8, Reg),
-    /// dst <- new instance of components[comp]; props from regs[start..start+argc]
-    MakeInstance { dst: Reg, comp: u16, start: Reg, argc: u8 },
+    /// dst <- new instance of components[comp]; props from regs[start..start+argc].
+    /// policy: 0 = escalate on panic, 1 = restart on failure (set by the parent's
+    /// `supervise` clause, resolved at compile time).
+    MakeInstance { dst: Reg, comp: u16, start: Reg, argc: u8, policy: u8 },
     /// wire regs[from].out consts[out_port] -> regs[to].in consts[in_port]
     WireOp { from: Reg, out_port: u16, to: Reg, in_port: u16 },
     /// emit on the current instance's out port consts[port]
@@ -115,6 +117,8 @@ pub struct ComponentMeta {
     pub nslots: u8,
     /// runs with the instance current: state inits, children, wires
     pub init_chunk: u16,
+    /// state inits only — used by supervision restarts
+    pub restart_chunk: u16,
     /// port name -> (chunk, has_param); "@start"/"@stop" for lifecycle
     pub handlers: Vec<(String, u16, bool)>,
     pub exposes: std::collections::HashMap<String, u16>,

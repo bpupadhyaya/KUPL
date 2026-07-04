@@ -151,6 +151,21 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
     let comp_ctx = CompCtx { slots: slots.clone() };
     let props = shared.comp_props.get(&c.name).cloned().unwrap_or_default();
 
+    // restart chunk: state inits only (supervision resets state, keeps wiring)
+    let restart_chunk = {
+        let mut fc = FnCompiler::new(shared, &format!("{}::restart", c.name), 0, 0);
+        fc.comp = Some(comp_ctx.clone());
+        for s in &c.state {
+            let r = fc.expr(&s.init);
+            fc.emit(Op::StateSet(slots[&s.name], r), s.span);
+        }
+        let u = fc.const_reg(Value::Unit, c.span);
+        fc.emit(Op::Ret(u), c.span);
+        let chunk = fc.finish();
+        shared.module.chunks.push(chunk);
+        (shared.module.chunks.len() - 1) as u16
+    };
+
     // init chunk: state inits, children, wires (instance is current)
     let init_chunk = {
         let mut fc = FnCompiler::new(shared, &format!("{}::init", c.name), 0, 0);
@@ -160,7 +175,10 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
             fc.emit(Op::StateSet(slots[&s.name], r), s.span);
         }
         for child in &c.children {
-            let r = fc.instance_expr(&child.component, &child.args, child.span);
+            let supervised = c.supervises.iter().any(|s| {
+                s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure
+            });
+            let r = fc.instance_expr(&child.component, &child.args, child.span, supervised as u8);
             fc.emit(Op::StateSet(slots[&child.name], r), child.span);
         }
         for w in &c.wires {
@@ -231,6 +249,7 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         props,
         nslots: slot,
         init_chunk,
+        restart_chunk,
         handlers,
         exposes,
         out_ports: c
@@ -325,7 +344,7 @@ impl<'s> FnCompiler<'s> {
 
     /// Construct a component instance: args ordered to prop order, defaults
     /// filled by calling the prop's default chunk.
-    fn instance_expr(&mut self, comp_name: &str, args: &[Arg], span: Span) -> Reg {
+    fn instance_expr(&mut self, comp_name: &str, args: &[Arg], span: Span, policy: u8) -> Reg {
         let Some(&comp_idx) = self.shared.module.component_names.get(comp_name) else {
             self.err("K0208", format!("unknown component `{comp_name}` (KVM)"), span);
             return self.const_reg(Value::Unit, span);
@@ -370,7 +389,7 @@ impl<'s> FnCompiler<'s> {
         }
         let dst = self.alloc(span);
         self.emit(
-            Op::MakeInstance { dst, comp: comp_idx, start, argc: props.len() as u8 },
+            Op::MakeInstance { dst, comp: comp_idx, start, argc: props.len() as u8, policy },
             span,
         );
         dst
@@ -926,7 +945,7 @@ impl<'s> FnCompiler<'s> {
                 && self.shared.module.component_names.contains_key(name.as_str())
             {
                 let comp_name = name.clone();
-                return self.instance_expr(&comp_name, args, span);
+                return self.instance_expr(&comp_name, args, span, 0);
             }
             // direct call to a top-level fun
             if self.lookup(name).is_none() {

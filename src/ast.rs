@@ -88,6 +88,7 @@ pub struct ComponentDecl {
     pub state: Vec<StateField>,
     pub children: Vec<ChildDecl>,
     pub wires: Vec<WireDecl>,
+    pub supervises: Vec<SuperviseDecl>,
     pub handlers: Vec<Handler>,
     pub exposes: Vec<FunDecl>,
     pub funs: Vec<FunDecl>,
@@ -147,6 +148,22 @@ pub struct WireDecl {
     pub from: (String, String),
     pub to: (String, String),
     pub span: Span,
+}
+
+/// `supervise child restart on_failure` / `supervise child restart never`
+#[derive(Debug, Clone)]
+pub struct SuperviseDecl {
+    pub child: String,
+    pub policy: SupervisePolicy,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisePolicy {
+    /// A panic resets the child's state and re-runs `on start`; the app lives.
+    RestartOnFailure,
+    /// A panic escalates (default behavior when unsupervised).
+    Never,
 }
 
 #[derive(Debug, Clone)]

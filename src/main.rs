@@ -14,6 +14,7 @@ Usage:
   kupl check <file.kupl> [--json]   Parse, type-check, and effect-check
   kupl fmt <file.kupl> [--write]    Print (or rewrite to) canonical form
   kupl context <file.kupl> <name>   Emit an item + its direct deps (LLM context)
+  kupl manifest <file.kupl>         Emit component manifests as JSON (visual tools)
   kupl repl                         Start an interactive session
   kupl version                      Print version
 ";
@@ -61,6 +62,7 @@ fn main() -> ExitCode {
         Some("run") if vm => with_file(&args, run::run_program_vm),
         Some("run") => with_file(&args, run::run_program),
         Some("dis") => with_file(&args, run::disassemble),
+        Some("manifest") => with_file(&args, run::emit_manifest),
         Some("build") => with_file(&args, |src, file| {
             build_module(&args, src, file, false)
         }),
