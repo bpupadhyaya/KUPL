@@ -181,3 +181,9 @@ pub struct ComponentSig {
     pub props: Vec<(String, Ty, bool)>, // name, ty, has_default
     pub exposes: HashMap<String, (Vec<Ty>, Ty)>,
 }
+
+/// Signature of a contract: exposed function signatures with effects.
+#[derive(Debug, Clone, Default)]
+pub struct ContractSig {
+    pub sigs: HashMap<String, (Vec<Ty>, Ty, Vec<String>)>,
+}

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diag::{Diag, Span};
-use crate::types::{ComponentSig, Ty, TypeSig, Unifier, VariantSig};
+use crate::types::{ComponentSig, ContractSig, Ty, TypeSig, Unifier, VariantSig};
 
 #[derive(Default)]
 pub struct Checked {
@@ -18,6 +18,7 @@ pub struct Checked {
     pub ctors: HashMap<String, (String, Vec<(String, Ty)>)>,
     pub funs: HashMap<String, (Vec<Ty>, Ty)>,
     pub components: HashMap<String, ComponentSig>,
+    pub contracts: HashMap<String, ContractSig>,
 }
 
 pub fn check(program: &Program) -> (Checked, Vec<Diag>) {
@@ -181,6 +182,17 @@ impl Checker {
                         );
                     }
                 }
+                Item::Contract(ct) => {
+                    let mut sig = ContractSig::default();
+                    for s in &ct.sigs {
+                        let params: Vec<Ty> = s.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
+                        let ret = s.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
+                        sig.sigs.insert(s.name.clone(), (params, ret, s.effects.clone()));
+                    }
+                    if self.checked.contracts.insert(ct.name.clone(), sig).is_some() {
+                        self.err("K0260", format!("contract `{}` is defined more than once", ct.name), ct.span);
+                    }
+                }
             }
         }
     }
@@ -241,6 +253,81 @@ impl Checker {
                 Item::Fun(f) => self.check_fun(f, None),
                 Item::Type(_) => {}
                 Item::Component(c) => self.check_component(c),
+                Item::Contract(ct) => self.check_contract(ct),
+            }
+        }
+    }
+
+    /// Check law bodies: contract expose names are in scope as functions.
+    fn check_contract(&mut self, ct: &ContractDecl) {
+        let sig = self.checked.contracts.get(&ct.name).cloned().unwrap_or_default();
+        for law in &ct.laws {
+            let mut ctx = Ctx {
+                scopes: Scopes::new(),
+                ret: Ty::Unit,
+                component: None,
+                in_handler: false,
+                loop_depth: 0,
+            };
+            for (name, (params, ret, _)) in &sig.sigs {
+                ctx.scopes.insert(name, Ty::Fun(params.clone(), Box::new(ret.clone())), false);
+            }
+            self.check_block(&law.body, &mut ctx);
+        }
+    }
+
+    /// A fulfilling component must expose every contract signature, with
+    /// exactly matching types and effects within the contract's budget.
+    fn check_fulfills(&mut self, c: &ComponentDecl) {
+        for contract_name in &c.fulfills {
+            let Some(contract) = self.checked.contracts.get(contract_name).cloned() else {
+                self.err(
+                    "K0261",
+                    format!("`{}` fulfills unknown contract `{contract_name}`", c.name),
+                    c.span,
+                );
+                continue;
+            };
+            let comp_sig = self.checked.components.get(&c.name).cloned().unwrap_or_default();
+            for (fname, (params, ret, effects)) in &contract.sigs {
+                match comp_sig.exposes.get(fname) {
+                    None => self.err(
+                        "K0262",
+                        format!("`{}` fulfills `{contract_name}` but does not expose `{fname}`", c.name),
+                        c.span,
+                    ),
+                    Some((cp, cr)) => {
+                        let want = Ty::Fun(params.clone(), Box::new(ret.clone()));
+                        let got = Ty::Fun(cp.clone(), Box::new(cr.clone()));
+                        if self.uni.unify(&want, &got).is_err() {
+                            self.err(
+                                "K0263",
+                                format!(
+                                    "`{}` exposes `{fname}` as {got} but contract `{contract_name}` requires {want}",
+                                    c.name
+                                ),
+                                c.span,
+                            );
+                        }
+                        // the component's declared effects must fit the contract's budget
+                        let decl = c.exposes.iter().find(|f| &f.name == fname);
+                        if let Some(decl) = decl {
+                            for e in &decl.effects {
+                                if !effects.iter().any(|budget| covers_effect(budget, e)) {
+                                    self.err(
+                                        "K0264",
+                                        format!(
+                                            "`{}`.`{fname}` uses `{e}` but contract `{contract_name}` allows only [{}]",
+                                            c.name,
+                                            effects.join(", ")
+                                        ),
+                                        decl.span,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -295,6 +382,7 @@ impl Checker {
     }
 
     fn check_component(&mut self, c: &ComponentDecl) {
+        self.check_fulfills(c);
         // state inits against annotations
         {
             let mut ctx = Ctx {
@@ -678,6 +766,11 @@ impl Checker {
                 }
                 Ty::Unit
             }
+            Stmt::Expect(expr, span) => {
+                let t = self.infer_expr(expr, ctx);
+                self.unify(&Ty::Bool, &t, *span, "`expect` condition");
+                Ty::Unit
+            }
             Stmt::Break(span) | Stmt::Continue(span) => {
                 if ctx.loop_depth == 0 {
                     self.err("K0229", "`break`/`continue` outside of a loop", *span);
@@ -1033,7 +1126,6 @@ impl Checker {
     fn infer_method(&mut self, recv: &Expr, name: &str, args: &[Expr], span: Span, ctx: &mut Ctx) -> Ty {
         let rt = self.infer_expr(recv, ctx);
         let rt = self.uni.apply(&rt);
-        let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, ctx)).collect();
 
         let sig: Option<(Vec<Ty>, Ty)> = match (&rt, name) {
             (Ty::List(_), "len") => Some((vec![], Ty::Int)),
@@ -1119,24 +1211,64 @@ impl Checker {
 
         match sig {
             None => {
+                for a in args {
+                    self.infer_expr(a, ctx);
+                }
                 self.err("K0249", format!("{rt} has no method `{name}`"), span);
                 self.uni.fresh()
             }
             Some((params, ret)) => {
-                if params.len() != arg_tys.len() {
+                if params.len() != args.len() {
+                    for a in args {
+                        self.infer_expr(a, ctx);
+                    }
                     self.err(
                         "K0250",
-                        format!("`.{name}` takes {} argument(s), {} given", params.len(), arg_tys.len()),
+                        format!("`.{name}` takes {} argument(s), {} given", params.len(), args.len()),
                         span,
                     );
                 } else {
-                    for (p, (a, ae)) in params.iter().zip(arg_tys.iter().zip(args.iter())) {
-                        self.unify(p, a, ae.span, &format!("argument to `.{name}`"));
+                    // Bidirectional: check each argument AGAINST its expected type,
+                    // so lambda parameters get their types from the method signature
+                    // before the body is checked (`xs.filter(fn e { e.key == k })`).
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        let at = self.check_expr_expecting(a, p, ctx);
+                        self.unify(p, &at, a.span, &format!("argument to `.{name}`"));
                     }
                 }
                 self.uni.apply(&ret)
             }
         }
+    }
+
+    /// Check `expr` against an expected type. For lambdas this pushes the
+    /// expected parameter types into scope before checking the body; everything
+    /// else falls back to plain inference (the caller unifies afterwards).
+    fn check_expr_expecting(&mut self, expr: &Expr, expected: &Ty, ctx: &mut Ctx) -> Ty {
+        if let (ExprKind::Lambda { params, body }, Ty::Fun(want_params, _)) =
+            (&expr.kind, self.uni.apply(expected))
+        {
+            if params.len() == want_params.len() {
+                ctx.scopes.push();
+                let mut ptys = Vec::new();
+                for (p, want) in params.iter().zip(want_params.iter()) {
+                    let ty = match &p.ty {
+                        Some(t) => {
+                            let ann = self.resolve_ty(t);
+                            self.unify(&ann, want, p.span, &format!("lambda parameter `{}`", p.name));
+                            ann
+                        }
+                        None => want.clone(),
+                    };
+                    ctx.scopes.insert(&p.name, ty.clone(), false);
+                    ptys.push(ty);
+                }
+                let bt = self.check_block(body, ctx);
+                ctx.scopes.pop();
+                return Ty::Fun(ptys, Box::new(bt));
+            }
+        }
+        self.infer_expr(expr, ctx)
     }
 
     fn check_pattern(&mut self, pat: &Pattern, expected: &Ty, ctx: &mut Ctx) {
@@ -1271,6 +1403,11 @@ impl Checker {
             );
         }
     }
+}
+
+/// `db` covers `db` and `db.read`; `db.read` covers only itself.
+fn covers_effect(budget: &str, used: &str) -> bool {
+    used == budget || used.starts_with(&format!("{budget}."))
 }
 
 fn op_sym(op: AssignOp) -> &'static str {

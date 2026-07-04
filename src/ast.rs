@@ -13,6 +13,36 @@ pub enum Item {
     Fun(FunDecl),
     Type(TypeDecl),
     Component(ComponentDecl),
+    Contract(ContractDecl),
+}
+
+/// `contract Store { expose fun get(...) -> ...  law "..." { ... } }`
+#[derive(Debug, Clone)]
+pub struct ContractDecl {
+    pub name: String,
+    pub intent: Option<String>,
+    pub sigs: Vec<FunSig>,
+    pub laws: Vec<Law>,
+    pub span: Span,
+}
+
+/// A body-less function signature inside a contract.
+#[derive(Debug, Clone)]
+pub struct FunSig {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Option<TyExpr>,
+    pub effects: Vec<String>,
+    pub span: Span,
+}
+
+/// `law "put then get returns the value" { ... }` — an executable property
+/// run by `kupl test` against every component that fulfills the contract.
+#[derive(Debug, Clone)]
+pub struct Law {
+    pub name: String,
+    pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +81,7 @@ pub struct Variant {
 pub struct ComponentDecl {
     pub name: String,
     pub is_app: bool,
+    pub fulfills: Vec<String>,
     pub intent: Option<String>,
     pub ports: Vec<Port>,
     pub props: Vec<PropDecl>,
@@ -188,6 +219,8 @@ pub enum Stmt {
         arg: Option<Expr>,
         span: Span,
     },
+    /// `expect expr` — runtime assertion (the workhorse of laws and tests).
+    Expect(Expr, Span),
     Break(Span),
     Continue(Span),
 }

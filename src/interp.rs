@@ -26,6 +26,7 @@ pub type EvalResult = Result<Value, Flow>;
 pub struct ProgramDb {
     pub funs: HashMap<String, Rc<FunDecl>>,
     pub components: HashMap<String, Rc<ComponentDecl>>,
+    pub contracts: HashMap<String, Rc<ContractDecl>>,
     /// variant name -> (type name, field names)
     pub ctors: HashMap<String, (String, Vec<String>)>,
 }
@@ -34,6 +35,7 @@ impl ProgramDb {
     pub fn build(program: &Program, checked: &Checked) -> ProgramDb {
         let mut funs = HashMap::new();
         let mut components = HashMap::new();
+        let mut contracts = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Fun(f) => {
@@ -41,6 +43,9 @@ impl ProgramDb {
                 }
                 Item::Component(c) => {
                     components.insert(c.name.clone(), Rc::new(c.clone()));
+                }
+                Item::Contract(ct) => {
+                    contracts.insert(ct.name.clone(), Rc::new(ct.clone()));
                 }
                 Item::Type(_) => {}
             }
@@ -52,7 +57,7 @@ impl ProgramDb {
                 (name.clone(), (ty.clone(), fields.iter().map(|(n, _)| n.clone()).collect()))
             })
             .collect();
-        ProgramDb { funs, components, ctors }
+        ProgramDb { funs, components, contracts, ctors }
     }
 }
 
@@ -360,6 +365,13 @@ impl Interp {
                 self.emit(port, value, *span)?;
                 Ok(Value::Unit)
             }
+            Stmt::Expect(expr, span) => {
+                let v = self.eval(expr, env)?;
+                if v != Value::Bool(true) {
+                    return Err(Flow::Panic { msg: "expectation failed".into(), span: *span });
+                }
+                Ok(Value::Unit)
+            }
             Stmt::Break(_) => Err(Flow::Break),
             Stmt::Continue(_) => Err(Flow::Continue),
         }
@@ -617,6 +629,7 @@ impl Interp {
 
     pub fn call_value(&mut self, f: Value, args: Vec<Value>, span: Span) -> EvalResult {
         match f {
+            Value::Bound(id, name) => self.eval_method(Value::Component(id), &name, args, span),
             Value::Fun(name) => {
                 let Some(decl) = self.db.funs.get(name.as_str()).cloned() else {
                     return Err(Self::panic_flow(format!("unknown function `{name}`"), span));

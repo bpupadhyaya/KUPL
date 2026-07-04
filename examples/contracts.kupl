@@ -1,0 +1,50 @@
+// Contracts: interfaces + executable laws.
+// `kupl test` runs every law against every component that fulfills the contract.
+
+contract KeyStore {
+    intent "Durable keyed storage for string values."
+
+    expose fun put(key: Str, value: Str) -> Bool
+    expose fun get(key: Str) -> Option[Str]
+    expose fun size() -> Int
+
+    law "put then get returns the value" {
+        put("name", "Ada")
+        expect get("name") == Some("Ada")
+    }
+
+    law "get of a missing key is None" {
+        expect get("never-stored") == None
+    }
+
+    law "put overwrites" {
+        put("k", "first")
+        put("k", "second")
+        expect get("k") == Some("second")
+        expect size() == 1
+    }
+}
+
+type Entry = { key: Str, value: Str }
+
+component MemoryStore fulfills KeyStore {
+    intent "KeyStore backed by an in-memory list."
+
+    state entries: List[Entry] = []
+
+    expose fun put(key: Str, value: Str) -> Bool {
+        entries = entries.filter(fn e { e.key != key }).push(Entry(key: key, value: value))
+        true
+    }
+
+    expose fun get(key: Str) -> Option[Str] {
+        match entries.find(fn e { e.key == key }) {
+            Some(e) => Some(e.value)
+            None => None
+        }
+    }
+
+    expose fun size() -> Int {
+        entries.len()
+    }
+}

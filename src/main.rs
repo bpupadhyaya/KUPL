@@ -6,7 +6,7 @@ const USAGE: &str = "KUPL — K Universal Programming Language (v0.2)
 
 Usage:
   kupl run <file.kupl>              Run the app (or `fun main()`) in a file
-  kupl test <file.kupl>             Run all `example` blocks as tests
+  kupl test <file.kupl>             Run `example` blocks + contract laws as tests
   kupl check <file.kupl> [--json]   Parse, type-check, and effect-check
   kupl fmt <file.kupl> [--write]    Print (or rewrite to) canonical form
   kupl context <file.kupl> <name>   Emit an item + its direct deps (LLM context)

@@ -14,6 +14,16 @@ pub struct Parser {
     pub diags: Vec<Diag>,
 }
 
+fn str_parts_text(parts: &[StrPart]) -> String {
+    parts
+        .iter()
+        .map(|p| match p {
+            StrPart::Text(t) => t.clone(),
+            StrPart::Expr(e, _) => format!("{{{e}}}"),
+        })
+        .collect()
+}
+
 type PResult<T> = Result<T, Diag>;
 
 pub fn parse(src: &str) -> (Program, Vec<Diag>) {
@@ -198,6 +208,7 @@ impl Parser {
             Tok::KwType => Ok(Some(Item::Type(self.parse_type_decl()?))),
             Tok::KwComponent => Ok(Some(Item::Component(self.parse_component(false)?))),
             Tok::KwApp => Ok(Some(Item::Component(self.parse_component(true)?))),
+            Tok::KwContract => Ok(Some(Item::Contract(self.parse_contract()?))),
             Tok::KwModule | Tok::KwUse => {
                 // Accepted and recorded as no-ops in v0.1 (single-file programs).
                 self.bump();
@@ -337,16 +348,130 @@ impl Parser {
         }
     }
 
+    // ---- contracts --------------------------------------------------------
+
+    fn parse_contract(&mut self) -> PResult<ContractDecl> {
+        let start = self.expect(Tok::KwContract)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+        let mut c = ContractDecl {
+            name,
+            intent: None,
+            sigs: Vec::new(),
+            laws: Vec::new(),
+            span: start,
+        };
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                break;
+            }
+            match self.peek().clone() {
+                Tok::KwIntent => {
+                    self.bump();
+                    match self.bump() {
+                        Tok::Str(parts) => {
+                            c.intent = Some(str_parts_text(&parts));
+                        }
+                        other => {
+                            return Err(Diag::error(
+                                "K0104",
+                                format!("`intent` expects a string literal, found {}", other.describe()),
+                                self.prev_span(),
+                            ))
+                        }
+                    }
+                    self.expect_terminator()?;
+                }
+                Tok::KwExpose => {
+                    self.bump();
+                    let sig = self.parse_fun_sig()?;
+                    c.sigs.push(sig);
+                }
+                Tok::Ident(ref n) if n == "law" => {
+                    let lspan = self.span();
+                    self.bump();
+                    let name = match self.bump() {
+                        Tok::Str(parts) => str_parts_text(&parts),
+                        other => {
+                            return Err(Diag::error(
+                                "K0115",
+                                format!("`law` expects a name string, found {}", other.describe()),
+                                self.prev_span(),
+                            ))
+                        }
+                    };
+                    let body = self.parse_block()?;
+                    let span = lspan.merge(body.span);
+                    c.laws.push(Law { name, body, span });
+                }
+                other => {
+                    return Err(Diag::error(
+                        "K0116",
+                        format!(
+                            "unexpected {} in contract body (expected `intent`, `expose fun`, or `law`)",
+                            other.describe()
+                        ),
+                        self.span(),
+                    ))
+                }
+            }
+        }
+        let end = self.expect(Tok::RBrace)?;
+        c.span = start.merge(end);
+        Ok(c)
+    }
+
+    /// A body-less `fun name(params) [uses ...] [-> Ty]` signature.
+    fn parse_fun_sig(&mut self) -> PResult<FunSig> {
+        let start = self.expect(Tok::KwFun)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(Tok::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(Tok::RParen)?;
+        let mut effects = Vec::new();
+        if self.eat(&Tok::KwUses) {
+            loop {
+                let (mut eff, _) = self.expect_ident()?;
+                while self.eat(&Tok::Dot) {
+                    let (part, _) = self.expect_ident()?;
+                    eff.push('.');
+                    eff.push_str(&part);
+                }
+                effects.push(eff);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        let ret = if self.eat(&Tok::Arrow) { Some(self.parse_ty()?) } else { None };
+        let span = start.merge(self.prev_span());
+        self.expect_terminator()?;
+        Ok(FunSig { name, params, ret, effects, span })
+    }
+
     // ---- components -----------------------------------------------------
 
     fn parse_component(&mut self, is_app: bool) -> PResult<ComponentDecl> {
         let start = self.span();
         self.bump(); // `component` or `app`
         let (name, _) = self.expect_ident()?;
+        let mut fulfills = Vec::new();
+        if matches!(self.peek(), Tok::Ident(n) if n == "fulfills") {
+            self.bump();
+            loop {
+                let (contract, _) = self.expect_ident()?;
+                fulfills.push(contract);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
         self.expect(Tok::LBrace)?;
         let mut c = ComponentDecl {
             name,
             is_app,
+            fulfills,
             intent: None,
             ports: Vec::new(),
             props: Vec::new(),
@@ -636,6 +761,14 @@ impl Parser {
                 }
                 self.expect_terminator()?;
                 Ok(Stmt::Emit { port, arg, span: span.merge(self.prev_span()) })
+            }
+            Tok::KwExpect => {
+                let span = self.span();
+                self.bump();
+                let expr = self.parse_expr()?;
+                let span = span.merge(expr.span);
+                self.expect_terminator()?;
+                Ok(Stmt::Expect(expr, span))
             }
             Tok::KwBreak => {
                 let span = self.span();

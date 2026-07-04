@@ -26,6 +26,8 @@ pub enum Value {
     Fun(Rc<String>),
     /// Reference to a component instance in the runtime.
     Component(usize),
+    /// An expose function bound to a live instance (used by laws/tests).
+    Bound(usize, Rc<String>),
     Range(i64, i64, bool),
 }
 
@@ -79,6 +81,7 @@ impl Value {
             Value::Closure(_) => "fn".into(),
             Value::Fun(_) => "fn".into(),
             Value::Component(_) => "component".into(),
+            Value::Bound(..) => "fn".into(),
             Value::Range(..) => "Range".into(),
         }
     }
@@ -145,6 +148,7 @@ impl fmt::Display for Value {
             Value::Closure(_) => write!(f, "<fn>"),
             Value::Fun(name) => write!(f, "<fn {name}>"),
             Value::Component(id) => write!(f, "<component #{id}>"),
+            Value::Bound(id, name) => write!(f, "<fn {name} of #{id}>"),
             Value::Range(a, b, incl) => write!(f, "{a}..{}{b}", if *incl { "=" } else { "" }),
         }
     }

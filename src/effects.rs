@@ -60,7 +60,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                     );
                 }
             }
-            Item::Type(_) => {}
+            Item::Type(_) | Item::Contract(_) => {}
         }
     }
 
@@ -205,6 +205,7 @@ fn walk_stmt(stmt: &Stmt, f: &mut impl FnMut(&Expr)) {
         }
         Stmt::Emit { arg: Some(e), .. } => walk_expr(e, f),
         Stmt::Emit { arg: None, .. } => {}
+        Stmt::Expect(e, _) => walk_expr(e, f),
         Stmt::Break(_) | Stmt::Continue(_) => {}
     }
 }

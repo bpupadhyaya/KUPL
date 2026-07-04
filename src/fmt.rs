@@ -18,6 +18,7 @@ pub fn format_program(p: &Program) -> String {
             Item::Fun(f) => fmt_fun(&mut out, f, 0),
             Item::Type(t) => fmt_type(&mut out, t),
             Item::Component(c) => fmt_component(&mut out, c),
+            Item::Contract(ct) => fmt_contract(&mut out, ct),
         }
     }
     out
@@ -93,9 +94,57 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
     out.push('\n');
 }
 
+fn fmt_contract(out: &mut String, ct: &ContractDecl) {
+    out.push_str(&format!("contract {} {{\n", ct.name));
+    let mut first = true;
+    if let Some(intent) = &ct.intent {
+        indent(out, 1);
+        out.push_str(&format!("intent \"{}\"\n", escape_str(intent)));
+        first = false;
+    }
+    if !ct.sigs.is_empty() {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        for s in &ct.sigs {
+            indent(out, 1);
+            out.push_str(&format!("expose fun {}(", s.name));
+            for (i, p) in s.params.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("{}: {}", p.name, ty_str(&p.ty)));
+            }
+            out.push(')');
+            if !s.effects.is_empty() {
+                out.push_str(&format!(" uses {}", s.effects.join(", ")));
+            }
+            if let Some(r) = &s.ret {
+                out.push_str(&format!(" -> {}", ty_str(r)));
+            }
+            out.push('\n');
+        }
+    }
+    for law in &ct.laws {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        indent(out, 1);
+        out.push_str(&format!("law \"{}\" ", escape_str(&law.name)));
+        fmt_block(out, &law.body, 1);
+        out.push('\n');
+    }
+    out.push_str("}\n");
+}
+
 fn fmt_component(out: &mut String, c: &ComponentDecl) {
     out.push_str(if c.is_app { "app " } else { "component " });
     out.push_str(&c.name);
+    if !c.fulfills.is_empty() {
+        out.push_str(&format!(" fulfills {}", c.fulfills.join(", ")));
+    }
     out.push_str(" {\n");
     let mut first_group = true;
     let mut sep = |out: &mut String, has_items: bool| {
@@ -206,9 +255,11 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
         sep(out, true);
         indent(out, 1);
         out.push_str("expose ");
-        // reuse fmt_fun body without leading indent duplication
+        // exposes are implicitly public — never print `pub`
+        let mut plain = f.clone();
+        plain.is_pub = false;
         let mut tmp = String::new();
-        fmt_fun(&mut tmp, f, 1);
+        fmt_fun(&mut tmp, &plain, 1);
         out.push_str(tmp.trim_start());
     }
     for f in &c.funs {
@@ -299,6 +350,9 @@ fn fmt_stmt(out: &mut String, stmt: &Stmt, level: usize) {
                 out.push_str("()");
             }
             out.push('\n');
+        }
+        Stmt::Expect(e, _) => {
+            out.push_str(&format!("expect {}\n", expr_str(e, 0)));
         }
         Stmt::Break(_) => out.push_str("break\n"),
         Stmt::Continue(_) => out.push_str("continue\n"),
@@ -574,5 +628,12 @@ mod tests {
     #[test]
     fn fmt_idempotent_exprs() {
         roundtrip("fun f(x: Int) -> Int {\n    let y = (x + 1) * 2\n    match y { 0 => 1, n => n * 2 }\n}\n");
+    }
+
+    #[test]
+    fn fmt_idempotent_contract() {
+        roundtrip(
+            "contract Store {\n intent \"keyed storage\"\n expose fun get(k: Str) -> Option[Str]\n law \"missing is None\" { expect get(\"x\") == None }\n}\ncomponent M fulfills Store {\n intent \"in-memory\"\n expose fun get(k: Str) -> Option[Str] { None }\n}\n",
+        );
     }
 }

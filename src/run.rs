@@ -50,12 +50,14 @@ pub fn emit_context(src: &str, file: &str, name: &str) -> i32 {
             Item::Fun(f) => (f.name.as_str(), f.span),
             Item::Type(t) => (t.name.as_str(), t.span),
             Item::Component(c) => (c.name.as_str(), c.span),
+            Item::Contract(ct) => (ct.name.as_str(), ct.span),
         })
         .collect();
     let Some(target) = compiled.program.items.iter().find(|item| match item {
         Item::Fun(f) => f.name == name,
         Item::Type(t) => t.name == name,
         Item::Component(c) => c.name == name,
+        Item::Contract(ct) => ct.name == name,
     }) else {
         eprintln!("error: no item named `{name}` in {file}");
         return 1;
@@ -92,7 +94,23 @@ pub fn emit_context(src: &str, file: &str, name: &str) -> i32 {
                 }
             }
         }
+        Item::Contract(ct) => {
+            for s in &ct.sigs {
+                for p in &s.params {
+                    collect_ty_names(&p.ty, &mut note);
+                }
+                if let Some(r) = &s.ret {
+                    collect_ty_names(r, &mut note);
+                }
+            }
+            for law in &ct.laws {
+                crate::effects::walk_block(&law.body, &mut |e| collect_expr_names(e, &mut note));
+            }
+        }
         Item::Component(c) => {
+            for contract in &c.fulfills {
+                note(contract);
+            }
             for p in &c.ports {
                 collect_ty_names(&p.ty, &mut note);
             }
@@ -132,6 +150,7 @@ pub fn emit_context(src: &str, file: &str, name: &str) -> i32 {
         Item::Fun(f) => f.span,
         Item::Type(t) => t.span,
         Item::Component(c) => c.span,
+        Item::Contract(ct) => ct.span,
     };
     println!("// kupl context: {name} ({file})");
     println!("{}", slice(target_span));
@@ -309,6 +328,65 @@ pub fn run_tests(src: &str, file: &str) -> i32 {
                 Err(_) => {
                     println!("FAIL  {label}: unexpected control flow");
                     failed += 1;
+                }
+            }
+        }
+    }
+
+    // contract laws: every law runs against every fulfilling component
+    for item in &compiled.program.items {
+        let Item::Component(c) = item else { continue };
+        if c.fulfills.is_empty() {
+            continue;
+        }
+        if c.props.iter().any(|p| p.default.is_none()) {
+            println!("skip  {} laws (component requires props)", c.name);
+            continue;
+        }
+        for contract_name in &c.fulfills {
+            let Some(contract) = compiled.program.items.iter().find_map(|i| match i {
+                Item::Contract(ct) if &ct.name == contract_name => Some(ct),
+                _ => None,
+            }) else {
+                continue;
+            };
+            for law in &contract.laws {
+                let label = format!("{} law \"{}\"", c.name, law.name);
+                let db = ProgramDb::build(&compiled.program, &compiled.checked);
+                let mut interp = Interp::new(db);
+                let outcome: Result<(), Flow> = (|| {
+                    let v = interp.instantiate(&c.name, &[], Span::default())?;
+                    let Value::Component(id) = v else {
+                        return Err(Flow::Panic { msg: "instantiation failed".into(), span: law.span });
+                    };
+                    interp.start_all()?;
+                    let env = interp.globals.child();
+                    for sig in &contract.sigs {
+                        env.define(&sig.name, Value::Bound(id, std::rc::Rc::new(sig.name.clone())));
+                    }
+                    match interp.exec_block(&law.body, &env) {
+                        Ok(_) | Err(Flow::Return(_)) => Ok(()),
+                        Err(other) => Err(other),
+                    }
+                })();
+                match outcome {
+                    Ok(()) => {
+                        println!("ok    {label}");
+                        passed += 1;
+                    }
+                    Err(Flow::Panic { msg, span }) => {
+                        let detail = if msg == "expectation failed" {
+                            format!("`{}` was not satisfied", snippet(src, span))
+                        } else {
+                            format!("panic: {msg}")
+                        };
+                        println!("FAIL  {label}: {detail}");
+                        failed += 1;
+                    }
+                    Err(_) => {
+                        println!("FAIL  {label}: unexpected control flow");
+                        failed += 1;
+                    }
                 }
             }
         }
