@@ -1,3 +1,12 @@
+> **Progress:** slice 1 landed (it36) — native SINGLE-COMPONENT apps. `kupl
+> native` now compiles an `app` with instance state + an `on start` handler to
+> machine code (a KCompMeta COMPS[] table, a KInstance runtime with
+> k_instantiate/k_state_get/k_state_set, and an app `main()` that instantiates
+> then runs @start). Children, wires, `emit`, cross-component calls, and timers
+> defer with a CLEAR compile-time error ("use kupl bundle"). native stdout ==
+> `kupl run` (cc-guarded test + examples/native-counter.kupl). fun-main native
+> programs are unchanged. Next: child components + emit/wire.
+
 # Big-arc design: Native components + KIR (audit #2, performance)
 
 **Feasibility:** high · **Risk:** high · **Estimated effort:** ~5 /loop iterations

@@ -95,8 +95,11 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       I/O + JSON, KUPL can now write real CLI tools. `args`/`env_var` carry the
       `io.env` effect. All engines incl. native (argv, getenv, exit).
       (`examples/cli.kupl`)
-- [ ] **Native components + KIR** (audit #2) — typed SSA IR; components compile
-      to native (per-component GC), so real apps run at native, not VM, speed
+- [◐] **Native components + KIR** (audit #2) — as of it36, `kupl native`
+      compiles SINGLE-COMPONENT apps (instance state + `on start`) to machine
+      code (KInstance runtime + state get/set); native stdout == `kupl run`.
+      Children/wires/emit/timers + the full typed SSA IR (per-component GC,
+      multi-component apps at native speed) are the remaining slices.
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
 - [◐] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal (audit #3) —
       slices landed: bitwise Int methods + hex/binary/underscore literals (it17);

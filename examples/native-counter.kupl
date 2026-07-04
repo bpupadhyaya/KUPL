@@ -1,0 +1,21 @@
+// A single-component app that compiles to native machine code (`kupl native`).
+// It uses only instance state + an `on start` handler — no children, wires,
+// emit, or timers — the subset the native backend supports today. Runs
+// identically on the interpreter, KVM, and native.
+app Ticker {
+    intent "Sum 0..9 into instance state on startup and print the running total."
+
+    state total: Int = 0
+    state steps: Int = 0
+
+    on start {
+        var i = 0
+        while i < 10 {
+            total = total + i
+            steps = steps + 1
+            i = i + 1
+        }
+        print("steps = {steps}")
+        print("total = {total}")
+    }
+}

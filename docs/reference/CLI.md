@@ -47,7 +47,9 @@ Recommended for component apps.
 
 ### `kupl native <file.kupl> [-o prog] [--keep-c]`
 Compiles to **machine code**: bytecode → generated C → `$CC` (default `cc`)
-`-O2`. Requires a `fun main()` program (component apps: use `bundle`).
+`-O2`. Compiles a `fun main()` program, or a **single-component `app`** (instance
+state + an `on start` handler). Multi-component apps — children, wires, `emit`,
+or timers — defer with a clear message; use `bundle` for those.
 `--keep-c` keeps the generated `.c` beside the output for inspection.
 
 ### `kupl dis <file.kupl>`

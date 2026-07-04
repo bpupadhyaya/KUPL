@@ -12,19 +12,32 @@ use std::fmt::Write as _;
 use crate::bytecode::*;
 use crate::value::Value;
 
+/// How a native binary starts: a plain `fun main`, or a single-component `app`.
+enum Entry {
+    Main(usize),
+    App(usize),
+}
+
 pub fn emit_c(module: &Module) -> Result<String, String> {
-    let Some(&main_idx) = module.funs.get("main") else {
-        return Err("`kupl native` needs a `fun main()` (component apps: use `kupl bundle`)".into());
-    };
     if !module.ai_funs.is_empty() {
         return Err(format!(
             "`ai fun {}` is not supported by the native backend yet — use `kupl run`, `kupl run --vm`, or `kupl bundle`",
             module.ai_funs[0].name
         ));
     }
+    let entry = if let Some(&main_idx) = module.funs.get("main") {
+        Entry::Main(main_idx as usize)
+    } else if let Some(app_idx) = module.components.iter().position(|c| c.is_app) {
+        // slice 1: single-component apps only — children/wires/emit/timers defer
+        check_native_component(module, app_idx)?;
+        Entry::App(app_idx)
+    } else {
+        return Err("`kupl native` needs a `fun main()` or a single-component `app` (multi-component apps: use `kupl bundle`)".into());
+    };
 
     let mut out = String::new();
     out.push_str(RUNTIME);
+    out.push_str(COMPONENT_RUNTIME);
 
     // forward declarations
     for (i, c) in module.chunks.iter().enumerate() {
@@ -53,15 +66,75 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     }
     let _ = writeln!(out, "}};\n#define N_CTORS {}\n", module.ctors.len());
 
+    // component metadata: name, is_app, nslots, init chunk, @start handler chunk
+    let _ = writeln!(out, "const KCompMeta COMPS[] = {{");
+    for c in &module.components {
+        let start = c
+            .handlers
+            .iter()
+            .find(|(port, _, _)| port == "@start")
+            .map(|(_, chunk, _)| *chunk as i32)
+            .unwrap_or(-1);
+        let _ = writeln!(
+            out,
+            "    {{ \"{}\", {}, {}, {}, {} }},",
+            c_escape(&c.name),
+            c.is_app as i32,
+            c.nslots,
+            c.init_chunk,
+            start,
+        );
+    }
+    let _ = writeln!(out, "}};\n#define N_COMPS {}\n", module.components.len());
+
     for (i, chunk) in module.chunks.iter().enumerate() {
         emit_chunk(&mut out, module, i, chunk)?;
     }
 
-    let _ = writeln!(
-        out,
-        "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    fun_{main_idx}(0, 0);\n    return 0;\n}}"
-    );
+    match entry {
+        Entry::Main(main_idx) => {
+            let _ = writeln!(
+                out,
+                "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    fun_{main_idx}(0, 0);\n    return 0;\n}}"
+            );
+        }
+        Entry::App(app_idx) => {
+            // instantiate the app (runs its init chunk), then run its @start
+            // handler with that instance current; no queue to drain in slice 1.
+            let _ = writeln!(
+                out,
+                "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    \
+                 int app = k_instantiate({app_idx});\n    \
+                 int sc = COMPS[{app_idx}].start_chunk;\n    \
+                 if (sc >= 0) {{ k_cur_inst = app; CHUNKS[sc](0, 0); }}\n    \
+                 return 0;\n}}"
+            );
+        }
+    }
     Ok(out)
+}
+
+/// Reject the constructs the single-component-app slice can't compile yet, with
+/// a clear message (rather than a runtime panic). Children/wires/emit appear as
+/// ops in the component's init/handler chunks; timers are metadata.
+fn check_native_component(module: &Module, idx: usize) -> Result<(), String> {
+    let comp = &module.components[idx];
+    if !comp.timers.is_empty() {
+        return Err("timers are not yet supported by the native backend — use `kupl bundle`".into());
+    }
+    let mut chunks = vec![comp.init_chunk as usize];
+    chunks.extend(comp.handlers.iter().map(|(_, c, _)| *c as usize));
+    for &ci in &chunks {
+        for op in &module.chunks[ci].code {
+            if matches!(op, Op::MakeInstance { .. } | Op::WireOp { .. } | Op::EmitOp { .. } | Op::CallComp { .. }) {
+                return Err(
+                    "child components / wires / emit are not yet supported by the native backend — use `kupl bundle`"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn emit_chunk(out: &mut String, module: &Module, idx: usize, chunk: &Chunk) -> Result<(), String> {
@@ -277,9 +350,12 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
         }
         ToStr(d, s) => format!("regs[{d}] = k_to_str(regs[{s}]);"),
         Concat(d, a, b) => format!("regs[{d}] = k_concat(regs[{a}], regs[{b}]);"),
-        StateGet(..) | StateSet(..) | MakeInstance { .. } | WireOp { .. } | EmitOp { .. }
-        | CallComp { .. } => {
-            "k_panic(\"components are not supported by the native backend v0 (use kupl bundle)\");"
+        StateGet(dst, slot) => format!("regs[{dst}] = k_state_get({slot});"),
+        StateSet(slot, src) => format!("k_state_set({slot}, regs[{src}]);"),
+        MakeInstance { .. } | WireOp { .. } | EmitOp { .. } | CallComp { .. } => {
+            // deferred: child components, wires, emit, and cross-component calls
+            // (single-component apps compile; multi-component apps use kupl bundle)
+            "k_panic(\"child components / wires / emit are not yet supported by the native backend (use kupl bundle)\");"
                 .to_string()
         }
         // emit_c rejects modules with ai funs before reaching here
@@ -1848,3 +1924,91 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     return k_unit();
 }
 "#;
+
+/// Component runtime (single-component apps): instance slots + `@start`. Emitted
+/// after RUNTIME; references CHUNKS (declared in RUNTIME) and COMPS (emitted per
+/// module). k_state_get/set operate on the current instance's slots.
+const COMPONENT_RUNTIME: &str = r#"
+/* --- component runtime (native single-component apps) --- */
+typedef struct { const char* name; int is_app; int nslots; int init_chunk; int start_chunk; } KCompMeta;
+extern const KCompMeta COMPS[];
+
+typedef struct { int comp; KValue* slots; int nslots; } KInstance;
+static KInstance* k_insts = 0;
+static int k_ninsts = 0;
+static int k_cur_inst = -1;
+
+static int k_instantiate(int comp_idx) {
+    k_insts = (KInstance*)realloc(k_insts, sizeof(KInstance) * (k_ninsts + 1));
+    int id = k_ninsts++;
+    int ns = COMPS[comp_idx].nslots;
+    k_insts[id].comp = comp_idx;
+    k_insts[id].nslots = ns;
+    k_insts[id].slots = (KValue*)malloc(sizeof(KValue) * (ns > 0 ? ns : 1));
+    for (int i = 0; i < ns; i++) k_insts[id].slots[i] = k_unit();
+    int saved = k_cur_inst;
+    k_cur_inst = id;
+    CHUNKS[COMPS[comp_idx].init_chunk](0, 0);
+    k_cur_inst = saved;
+    return id;
+}
+
+static KValue k_state_get(int slot) { return k_insts[k_cur_inst].slots[slot]; }
+static void k_state_set(int slot, KValue v) { k_insts[k_cur_inst].slots[slot] = v; }
+"#;
+
+#[cfg(test)]
+mod tests {
+    fn cc() -> String {
+        std::env::var("CC").unwrap_or_else(|_| "cc".to_string())
+    }
+    fn cc_available() -> bool {
+        std::process::Command::new(cc())
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A single-component app compiles to native and prints the same as the
+    /// interpreter/KVM. Skipped (passes) where no C compiler is available.
+    #[test]
+    fn native_single_component_app() {
+        if !cc_available() {
+            return;
+        }
+        let src = "app C {\n    state n: Int = 0\n    on start {\n        n = n + 1\n        n = n + 41\n        print(\"n={n}\")\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds for a single-component app");
+
+        let base = std::env::temp_dir().join(format!("kupl-cgen-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "n=42\n");
+
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Multi-component constructs (children/wires/emit) defer with a clear error,
+    /// never a crash or bad C.
+    #[test]
+    fn native_multi_component_defers() {
+        let src = "component Child {\n    out v: Int\n    on start { emit v(1) }\n}\n\
+                   app A {\n    let c = Child()\n    on start { }\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let err = super::emit_c(&module).expect_err("native must defer child components");
+        assert!(err.contains("not yet supported"), "clear defer message: {err}");
+    }
+}
