@@ -1496,17 +1496,21 @@ impl Checker {
 
         let sig: Option<(Vec<Ty>, Ty)> = match (&rt, name) {
             (Ty::List(_), "len") => Some((vec![], Ty::Int)),
-            (Ty::List(t), "map") => {
+            (Ty::List(t), "map") | (Ty::List(t), "par_map") => {
                 let u = self.uni.fresh();
                 Some((
                     vec![Ty::Fun(vec![(**t).clone()], Box::new(u.clone()))],
                     Ty::List(Box::new(u)),
                 ))
             }
-            (Ty::List(t), "filter") => Some((
+            (Ty::List(t), "filter") | (Ty::List(t), "par_filter") => Some((
                 vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
                 Ty::List(t.clone()),
             )),
+            (Ty::List(t), "par_each") => {
+                let u = self.uni.fresh();
+                Some((vec![Ty::Fun(vec![(**t).clone()], Box::new(u))], Ty::Unit))
+            }
             (Ty::List(t), "find") => Some((
                 vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
                 Ty::Option(t.clone()),

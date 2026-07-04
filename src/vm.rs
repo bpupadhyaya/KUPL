@@ -1070,6 +1070,29 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_parallel_iteration_it13() {
+        // par_map / par_filter / par_each — deterministic, identical on both engines
+        assert_eq!(
+            differential("fun probe() -> List[Int] {\n    [1, 2, 3, 4].par_map(fn n { n * n })\n}\n"),
+            "[1, 4, 9, 16]"
+        );
+        assert_eq!(
+            differential("fun probe() -> List[Int] {\n    [1, 2, 3, 4, 5].par_filter(fn n { n % 2 == 1 })\n}\n"),
+            "[1, 3, 5]"
+        );
+        // par_each returns Unit; results collected via a fold to observe order
+        assert_eq!(
+            differential("fun probe() -> Str {\n    let r = [\"a\", \"b\", \"c\"].par_map(fn s { s.to_upper() })\n    r.join(\"-\")\n}\n"),
+            "A-B-C"
+        );
+        // par_map matches map exactly (same semantics, deterministic order)
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    let xs = [5, 3, 8, 1]\n    xs.par_map(fn n { n + 1 }) == xs.map(fn n { n + 1 })\n}\n"),
+            "true"
+        );
+    }
+
+    #[test]
     fn diff_stdlib_batch_it12() {
         // new List/Str/Int/Float/Map/Set methods, identical on both engines
         assert_eq!(differential("fun probe() -> List[Int] {\n    [3, 1, 2, 3, 1].unique()\n}\n"), "[3, 1, 2]");

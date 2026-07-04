@@ -34,6 +34,9 @@ unless supervised.
 | `.len()` | `-> Int` | |
 | `.map(f)` | `(fn(T) -> U) -> List[U]` | |
 | `.filter(f)` | `(fn(T) -> Bool) -> List[T]` | |
+| `.par_map(f)` | `(fn(T) -> U) -> List[U]` | parallel map — independent per element; deterministic (input order) |
+| `.par_filter(f)` | `(fn(T) -> Bool) -> List[T]` | parallel filter; deterministic (input order) |
+| `.par_each(f)` | `(fn(T) -> U) -> Unit` | parallel for-effect; result discarded |
 | `.find(f)` | `(fn(T) -> Bool) -> Option[T]` | first match |
 | `.sum()` | `-> T` | Int or Float lists; Int overflow panics |
 | `.contains(v)` | `(T) -> Bool` | structural equality |

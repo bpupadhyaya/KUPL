@@ -735,18 +735,22 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     if (recv.tag == K_LIST) {
         KList* l = recv.as.list;
         if (!strcmp(name, "len")) return k_int(l->len);
-        if (!strcmp(name, "map")) {
+        if (!strcmp(name, "map") || !strcmp(name, "par_map")) {
             KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
             for (int64_t i = 0; i < l->len; i++) out[i] = k_call(args[0], &l->items[i], 1);
             KValue r = k_list(out, (int)l->len);
             return r;
         }
-        if (!strcmp(name, "filter")) {
+        if (!strcmp(name, "filter") || !strcmp(name, "par_filter")) {
             KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
             int n = 0;
             for (int64_t i = 0; i < l->len; i++)
                 if (k_truthy(k_call(args[0], &l->items[i], 1))) out[n++] = l->items[i];
             return k_list(out, n);
+        }
+        if (!strcmp(name, "par_each")) {
+            for (int64_t i = 0; i < l->len; i++) k_call(args[0], &l->items[i], 1);
+            return k_unit();
         }
         if (!strcmp(name, "find")) {
             for (int64_t i = 0; i < l->len; i++)

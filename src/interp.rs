@@ -1203,7 +1203,11 @@ pub fn shared_method(
 ) -> Result<Value, String> {
     match (recv, name) {
         (Value::List(items), "len") => Ok(Value::Int(items.len() as i64)),
-        (Value::List(items), "map") => {
+        // `map` and `par_map` share one implementation: par_map declares the
+        // per-element work independent (safe to run in parallel); execution is
+        // deterministic (input order) today — a real scheduler is a later,
+        // semantics-preserving step. Same for `filter`/`par_filter`.
+        (Value::List(items), "map") | (Value::List(items), "par_map") => {
             let f = args.into_iter().next().ok_or("`map` needs a function")?;
             let mut out = Vec::with_capacity(items.len());
             for item in items.iter() {
@@ -1211,7 +1215,7 @@ pub fn shared_method(
             }
             Ok(Value::List(Rc::new(out)))
         }
-        (Value::List(items), "filter") => {
+        (Value::List(items), "filter") | (Value::List(items), "par_filter") => {
             let f = args.into_iter().next().ok_or("`filter` needs a function")?;
             let mut out = Vec::new();
             for item in items.iter() {
@@ -1220,6 +1224,13 @@ pub fn shared_method(
                 }
             }
             Ok(Value::List(Rc::new(out)))
+        }
+        (Value::List(items), "par_each") => {
+            let f = args.into_iter().next().ok_or("`par_each` needs a function")?;
+            for item in items.iter() {
+                call(f.clone(), vec![item.clone()])?;
+            }
+            Ok(Value::Unit)
         }
         (Value::List(items), "find") => {
             let f = args.into_iter().next().ok_or("`find` needs a function")?;

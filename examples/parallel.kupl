@@ -36,6 +36,15 @@ fun main() uses io, ai {
     // Run this deterministically with the mock provider:
     //   export KUPL_AI_MOCK_CLASSIFY="positive"
     //   kupl run examples/parallel.kupl
+
+    // `par { }` is for a FIXED set of branches. For a dynamic-size collection,
+    // `par_map` fans the same independent work out over an arbitrary list:
+    let reviews = ["great", "awful", "meh", "love it"]
+    let all_verdicts = reviews.par_map(fn r { classify(r) })
+    print(all_verdicts)
+
+    // par_filter and par_each round out the parallel List API:
+    print([1, 2, 3, 4, 5, 6].par_filter(fn n { n % 2 == 0 }))
 }
 
 ai fun classify(review: Str) -> Str {

@@ -203,6 +203,23 @@ let sizes = par {
   the LLM calls as one parallel batch. Runs identically on the interpreter and
   the KVM. See `examples/parallel.kupl`.
 
+**Parallel iteration.** `par { … }` handles a *fixed* set of branches; for a
+*dynamic* collection, use the parallel List methods `par_map` / `par_filter` /
+`par_each`:
+
+```kupl
+let scored = reviews.par_map(fn r { classify(r) })   // fan out over any list
+let good   = items.par_filter(fn x { keep(x) })
+```
+
+They carry the same guarantees as `par`: each element is processed
+independently, and execution is deterministic (results in input order), so
+tests stay reproducible. `par_map` is semantically identical to `map` today —
+the `par_` prefix marks the work as parallelizable for a future scheduler,
+exactly as with `par`. `par_each` applies the function for its effects and
+returns `()`. All three run identically on the interpreter, KVM, and native
+backends.
+
 ### Patterns
 
 `_` wildcard · `name` binding · Int/Bool/Str literals ·
