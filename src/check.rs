@@ -1677,6 +1677,11 @@ impl Checker {
             (Ty::Int, "clamp") => Some((vec![Ty::Int, Ty::Int], Ty::Int)),
             (Ty::Int, "sign") => Some((vec![], Ty::Int)),
             (Ty::Int, "is_even") | (Ty::Int, "is_odd") => Some((vec![], Ty::Bool)),
+            (Ty::Int, "band") | (Ty::Int, "bor") | (Ty::Int, "bxor")
+            | (Ty::Int, "shl") | (Ty::Int, "shr") | (Ty::Int, "ushr") => {
+                Some((vec![Ty::Int], Ty::Int))
+            }
+            (Ty::Int, "bnot") => Some((vec![], Ty::Int)),
             (Ty::Float, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Float, "to_int") => Some((vec![], Ty::Int)),
             (Ty::Float, "abs") | (Ty::Float, "sqrt") => Some((vec![], Ty::Float)),

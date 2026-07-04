@@ -1,0 +1,43 @@
+// Bit manipulation — permission flags packed into a single Int.
+//
+// KUPL integers support hex/binary literals (`0x…`, `0b…`, with `_`
+// separators) and bitwise methods: `.band` `.bor` `.bxor` `.bnot`
+// `.shl` `.shr` (arithmetic) `.ushr` (logical).
+
+// permission bits
+fun read_bit() -> Int { 0b100 }   // 4
+fun write_bit() -> Int { 0b010 }  // 2
+fun exec_bit() -> Int { 0b001 }   // 1
+
+fun has(perms: Int, flag: Int) -> Bool {
+    perms.band(flag) != 0
+}
+
+fun describe(perms: Int) -> Str {
+    let r = if has(perms, read_bit()) { "r" } else { "-" }
+    let w = if has(perms, write_bit()) { "w" } else { "-" }
+    let x = if has(perms, exec_bit()) { "x" } else { "-" }
+    r + w + x
+}
+
+fun main() uses io {
+    // grant read + write by OR-ing the flags together
+    let perms = read_bit().bor(write_bit())
+    print(describe(perms))            // rw-
+
+    // add execute, then drop write (AND with the complement)
+    let perms2 = perms.bor(exec_bit()).band(write_bit().bnot())
+    print(describe(perms2))           // r-x
+
+    // pack a byte and read each nibble with a shift + mask
+    let packed = 0xAB                 // 1010_1011
+    print(packed.ushr(4).band(0xF))   // 10 (high nibble)
+    print(packed.band(0xF))           // 11 (low nibble)
+
+    // a simple checksum via xor-fold
+    var sum = 0
+    for b in [0x12, 0x34, 0x56, 0x78] {
+        sum = sum.bxor(b)
+    }
+    print(sum)                        // 8
+}

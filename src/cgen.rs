@@ -1268,6 +1268,17 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "sign")) return k_int(recv.as.i > 0 ? 1 : (recv.as.i < 0 ? -1 : 0));
         if (!strcmp(name, "is_even")) return k_bool(recv.as.i % 2 == 0);
         if (!strcmp(name, "is_odd")) return k_bool(recv.as.i % 2 != 0);
+        if (!strcmp(name, "band")) return k_int(recv.as.i & args[0].as.i);
+        if (!strcmp(name, "bor")) return k_int(recv.as.i | args[0].as.i);
+        if (!strcmp(name, "bxor")) return k_int(recv.as.i ^ args[0].as.i);
+        if (!strcmp(name, "bnot")) return k_int(~recv.as.i);
+        if (!strcmp(name, "shl") || !strcmp(name, "shr") || !strcmp(name, "ushr")) {
+            int64_t n = args[0].as.i;
+            if (n < 0 || n > 63) k_panic("shift amount must be in 0..=63");
+            if (!strcmp(name, "shl")) return k_int(recv.as.i << n);
+            if (!strcmp(name, "ushr")) return k_int((int64_t)((uint64_t)recv.as.i >> n));
+            return k_int(recv.as.i >> n);                               /* shr (arithmetic) */
+        }
     }
     if (recv.tag == K_FLOAT) {
         if (!strcmp(name, "to_str")) return k_to_str(recv);

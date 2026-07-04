@@ -92,7 +92,10 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 - [ ] **Native components + KIR** (audit #2) — typed SSA IR; components compile
       to native (per-component GC), so real apps run at native, not VM, speed
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
-- [ ] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal (audit #3)
+- [◐] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal (audit #3) —
+      first slice landed (it17): bitwise Int methods (band/bor/bxor/bnot/shl/
+      shr/ushr) + hex/binary/underscore integer literals (0xFF, 0b1010, 1_000),
+      all engines incl. native. Full sized types still to do.
 - [x] Broader standard library (audit #3, it12) — ~40 methods across all core
       types, all engines byte-identical incl. native. List (is_empty/concat/
       unique/init/tail/product/min/max/flatten/count/flat_map/window/chunk); Str

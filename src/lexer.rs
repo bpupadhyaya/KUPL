@@ -140,6 +140,39 @@ impl<'a> Lexer<'a> {
 
     fn lex_number(&mut self) {
         let start = self.pos;
+        // Hex (`0xFF`) and binary (`0b1010`) literals, with `_` separators.
+        // Parsed as u64 then reinterpreted as i64, so full 64-bit bit patterns
+        // are writable (`0xFFFFFFFFFFFFFFFF` == -1).
+        if self.peek() == Some(b'0') && matches!(self.peek2(), Some(b'x') | Some(b'X') | Some(b'b') | Some(b'B')) {
+            self.bump(); // '0'
+            let radix: u32 = if matches!(self.peek(), Some(b'b') | Some(b'B')) { 2 } else { 16 };
+            self.bump(); // 'x' / 'b'
+            let digits_start = self.pos;
+            while matches!(self.peek(), Some(c) if c == b'_'
+                || (radix == 16 && c.is_ascii_hexdigit())
+                || (radix == 2 && matches!(c, b'0' | b'1')))
+            {
+                self.bump();
+            }
+            let text: String = self.src[digits_start..self.pos].replace('_', "");
+            if text.is_empty() {
+                self.diags.push(Diag::error(
+                    "K0004",
+                    format!("empty {} literal", if radix == 16 { "hex" } else { "binary" }),
+                    self.span_from(start),
+                ));
+                return;
+            }
+            match u64::from_str_radix(&text, radix) {
+                Ok(v) => self.push(Tok::Int(v as i64), start),
+                Err(_) => self.diags.push(Diag::error(
+                    "K0004",
+                    format!("integer literal does not fit in Int (64-bit)"),
+                    self.span_from(start),
+                )),
+            }
+            return;
+        }
         while matches!(self.peek(), Some(b'0'..=b'9') | Some(b'_')) {
             self.bump();
         }
@@ -424,6 +457,20 @@ mod tests {
         let (toks, diags) = lex(src);
         assert!(diags.is_empty(), "unexpected diags: {diags:?}");
         toks.into_iter().map(|t| t.tok).collect()
+    }
+
+    #[test]
+    fn integer_literal_forms() {
+        // hex, binary, and underscore separators all yield plain i64 Ints
+        assert_eq!(kinds("0xFF"), vec![Tok::Int(255), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("0xff"), vec![Tok::Int(255), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("0b1010"), vec![Tok::Int(10), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("0xDEAD_BEEF"), vec![Tok::Int(3735928559), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("1_000_000"), vec![Tok::Int(1_000_000), Tok::Newline, Tok::Eof]);
+        // full 64-bit pattern reinterpreted as i64
+        assert_eq!(kinds("0xFFFFFFFFFFFFFFFF"), vec![Tok::Int(-1), Tok::Newline, Tok::Eof]);
+        // `0` alone and a bare `0b`-less number still work
+        assert_eq!(kinds("0"), vec![Tok::Int(0), Tok::Newline, Tok::Eof]);
     }
 
     #[test]

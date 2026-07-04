@@ -1118,6 +1118,37 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_bitwise_it17() {
+        assert_eq!(differential("fun probe() -> Int {\n    (12).band(10)\n}\n"), "8");
+        assert_eq!(differential("fun probe() -> Int {\n    (12).bor(10)\n}\n"), "14");
+        assert_eq!(differential("fun probe() -> Int {\n    (12).bxor(10)\n}\n"), "6");
+        assert_eq!(differential("fun probe() -> Int {\n    (0).bnot()\n}\n"), "-1");
+        assert_eq!(differential("fun probe() -> Int {\n    (1).shl(8)\n}\n"), "256");
+        assert_eq!(differential("fun probe() -> Int {\n    (256).shr(2)\n}\n"), "64");
+        // arithmetic vs logical right shift differ on negatives
+        assert_eq!(differential("fun probe() -> Int {\n    (0 - 8).shr(1)\n}\n"), "-4");
+        assert_eq!(
+            differential("fun probe() -> Int {\n    (0 - 8).ushr(1)\n}\n"),
+            "9223372036854775804"
+        );
+        // out-of-range shift panics identically on both engines
+        assert_eq!(
+            differential("fun probe() -> Int {\n    (1).shl(64)\n}\n"),
+            "panic: shift amount must be in 0..=63"
+        );
+    }
+
+    #[test]
+    fn diff_int_literal_forms_it17() {
+        assert_eq!(differential("fun probe() -> Int {\n    0xFF\n}\n"), "255");
+        assert_eq!(differential("fun probe() -> Int {\n    0b1010\n}\n"), "10");
+        assert_eq!(differential("fun probe() -> Int {\n    0xDEAD_BEEF\n}\n"), "3735928559");
+        assert_eq!(differential("fun probe() -> Int {\n    1_000_000\n}\n"), "1000000");
+        // full 64-bit hex pattern reinterpreted as i64
+        assert_eq!(differential("fun probe() -> Int {\n    0xFFFFFFFFFFFFFFFF\n}\n"), "-1");
+    }
+
+    #[test]
     fn diff_env_var_it16() {
         // deterministic env read: a fixed set variable is Some on both engines,
         // an unset one is None. (args()/exit are covered by CLI-level checks,

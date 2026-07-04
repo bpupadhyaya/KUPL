@@ -1687,6 +1687,38 @@ pub fn shared_method(
         (Value::Int(v), "sign") => Ok(Value::Int(v.signum())),
         (Value::Int(v), "is_even") => Ok(Value::Bool(v % 2 == 0)),
         (Value::Int(v), "is_odd") => Ok(Value::Bool(v % 2 != 0)),
+        (Value::Int(v), "band") => match args.into_iter().next() {
+            Some(Value::Int(w)) => Ok(Value::Int(v & w)),
+            _ => Err("`band` needs an Int".into()),
+        },
+        (Value::Int(v), "bor") => match args.into_iter().next() {
+            Some(Value::Int(w)) => Ok(Value::Int(v | w)),
+            _ => Err("`bor` needs an Int".into()),
+        },
+        (Value::Int(v), "bxor") => match args.into_iter().next() {
+            Some(Value::Int(w)) => Ok(Value::Int(v ^ w)),
+            _ => Err("`bxor` needs an Int".into()),
+        },
+        (Value::Int(v), "bnot") => Ok(Value::Int(!v)),
+        (Value::Int(v), "shl") => match args.into_iter().next() {
+            Some(Value::Int(n)) if (0..=63).contains(&n) => Ok(Value::Int(v << n)),
+            Some(Value::Int(_)) => Err("shift amount must be in 0..=63".into()),
+            _ => Err("`shl` needs an Int".into()),
+        },
+        (Value::Int(v), "shr") => match args.into_iter().next() {
+            // arithmetic shift right (sign-preserving), matching i64 `>>`
+            Some(Value::Int(n)) if (0..=63).contains(&n) => Ok(Value::Int(v >> n)),
+            Some(Value::Int(_)) => Err("shift amount must be in 0..=63".into()),
+            _ => Err("`shr` needs an Int".into()),
+        },
+        (Value::Int(v), "ushr") => match args.into_iter().next() {
+            // logical (unsigned) shift right — zero-fills from the left
+            Some(Value::Int(n)) if (0..=63).contains(&n) => {
+                Ok(Value::Int(((*v as u64) >> n) as i64))
+            }
+            Some(Value::Int(_)) => Err("shift amount must be in 0..=63".into()),
+            _ => Err("`ushr` needs an Int".into()),
+        },
         (Value::Float(v), "to_str") => Ok(Value::str(v.to_string())),
         (Value::Float(v), "to_int") => Ok(Value::Int(*v as i64)),
         (Value::Float(v), "abs") => Ok(Value::Float(v.abs())),

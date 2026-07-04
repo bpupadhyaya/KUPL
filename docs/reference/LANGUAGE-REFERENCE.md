@@ -66,7 +66,7 @@ letters are permitted. `_` alone is the wildcard pattern.
 
 | Kind | Examples | Notes |
 |---|---|---|
-| Int | `42`, `1_000_000`, `-7` | 64-bit signed; overflow **panics** (never wraps) |
+| Int | `42`, `1_000_000`, `0xFF`, `0b1010`, `-7` | 64-bit signed; hex/binary + `_` separators; overflow **panics** (never wraps). Bitwise ops via methods (`.band`/`.bor`/`.bxor`/`.bnot`/`.shl`/`.shr`/`.ushr`) |
 | Float | `3.14`, `1.5e3` | IEEE-754 f64; `1..5` is a range, `1.5` a float |
 | Bool | `true`, `false` | |
 | Str | `"hi"`, `"n = {x + 1}"` | UTF-8, immutable; `{expr}` interpolates (any type, rendered with Display); escapes: `\n \t \r \\ \" \{ \} \0` |

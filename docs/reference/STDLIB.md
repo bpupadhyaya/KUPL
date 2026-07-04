@@ -122,6 +122,15 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.clamp(lo, hi)` | `(Int, Int) -> Int` | `lo ≤ hi` required |
 | `.sign()` | `-> Int` | `-1` / `0` / `1` |
 | `.is_even()` / `.is_odd()` | `-> Bool` | |
+| `.band(x)` / `.bor(x)` / `.bxor(x)` | `(Int) -> Int` | bitwise and / or / xor |
+| `.bnot()` | `-> Int` | bitwise complement (`~`) |
+| `.shl(n)` | `(Int) -> Int` | left shift; `n` in `0..=63` (else panics) |
+| `.shr(n)` | `(Int) -> Int` | **arithmetic** right shift (sign-preserving) |
+| `.ushr(n)` | `(Int) -> Int` | **logical** right shift (zero-fill) |
+
+Integer literals may be written in decimal, hex (`0xFF`, `0xff`), or binary
+(`0b1010`), with `_` digit separators (`1_000_000`, `0xDEAD_BEEF`). Hex/binary
+literals are read as 64-bit patterns, so `0xFFFFFFFFFFFFFFFF` is `-1`.
 
 ### Float
 
