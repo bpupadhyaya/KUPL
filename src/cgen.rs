@@ -151,6 +151,20 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
         let _ = writeln!(out, "static const KAiTool AITOOLS_{i}[] = {{ {} }};", entries.join(", "));
         tools_expr.push((format!("AITOOLS_{i}"), f.tools.len()));
     }
+    // UFCS table: every top-level function, reachable via `x.f(args)` when no
+    // built-in method matches. (Built-in methods are checked first in k_method.)
+    let mut ufcs: Vec<(&String, u16)> = module.funs.iter().map(|(n, &i)| (n, i)).collect();
+    ufcs.sort_by(|a, b| a.0.cmp(b.0));
+    let _ = writeln!(out, "const KUfcs UFCS_FUNS[] = {{");
+    if ufcs.is_empty() {
+        let _ = writeln!(out, "    {{ 0, 0 }}");
+    } else {
+        for (name, idx) in &ufcs {
+            let _ = writeln!(out, "    {{ \"{}\", {} }},", c_escape(name), idx);
+        }
+    }
+    let _ = writeln!(out, "}};\nconst int K_NUFCS = {};\n", ufcs.len());
+
     let _ = writeln!(out, "const KAiFun AI_FUNS[] = {{");
     if module.ai_funs.is_empty() {
         let _ = writeln!(out, "    {{ 0, 0, 0, 0, 0, 0, 0 }}");
@@ -2354,6 +2368,11 @@ static KValue k_shuffle(KValue seed, KValue lst) {
 }
 
 static KValue k_expose_call(KValue recv, const char* name, KValue* args, int argc);
+/* UFCS: a top-level function reachable via method-call syntax `x.f(args)` */
+typedef struct { const char* name; int fnid; } KUfcs;
+extern const KUfcs UFCS_FUNS[];
+extern const int K_NUFCS;
+
 /* stable sort by an Int key: qsort with an original-index tiebreak */
 typedef struct { int64_t key; int idx; KValue v; } KSortItem;
 static int k_sortby_cmp(const void* a, const void* b) {
@@ -3221,6 +3240,16 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return args[0];
         }
     }
+    // UFCS: no built-in method matched — call a top-level function of this name
+    // with the receiver prepended (`recv.f(args)` -> `f(recv, args…)`).
+    for (int i = 0; i < K_NUFCS; i++) {
+        if (!strcmp(UFCS_FUNS[i].name, name)) {
+            KValue* full = (KValue*)k_alloc(sizeof(KValue) * (argc + 1));
+            full[0] = recv;
+            for (int j = 0; j < argc; j++) full[j + 1] = args[j];
+            return k_call(k_fun(UFCS_FUNS[i].fnid), full, argc + 1);
+        }
+    }
     k_panic("no such method");
     return k_unit();
 }
@@ -3751,6 +3780,20 @@ mod tests {
             ("fun main() uses io { print(re_replace(\"[aeiou]\", \"hello world\", \"*\")) }", "h*ll* w*rld\n"),
         ] {
             assert_eq!(native_main_stdout(src, "re"), expected, "src: {src}");
+        }
+    }
+
+    /// UFCS (it57): `x.f(args)` resolves to a top-level `f(x, args)` when there
+    /// is no built-in method, including chaining — byte-identical on native.
+    #[test]
+    fn native_ufcs() {
+        let src = "type V = { n: Int }\n\
+                   fun inc(v: V) -> V { V(n: v.n + 1) }\n\
+                   fun dbl(v: V) -> V { V(n: v.n * 2) }\n\
+                   fun get(v: V) -> Int { v.n }\n\
+                   fun main() uses io { print(V(n: 3).inc().dbl().get()) }\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "ufcs"), "8\n");
         }
     }
 

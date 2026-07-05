@@ -1179,6 +1179,21 @@ impl Interp {
             self.current = saved;
             return result;
         }
+        // UFCS: if there's no built-in method, fall back to a top-level function
+        // `name(recv, args…)`. Built-in methods take precedence (tried first).
+        if self.db.funs.contains_key(name) {
+            match builtin_method(recv.clone(), name, args.clone(), span, self) {
+                Err(Flow::Panic { msg, .. }) if msg.contains("has no method") => {
+                    let decl = self.db.funs.get(name).cloned().unwrap();
+                    let mut full = Vec::with_capacity(args.len() + 1);
+                    full.push(recv);
+                    full.extend(args);
+                    let env = self.globals.clone();
+                    return self.call_fun(&decl, full, &env, span);
+                }
+                other => return other,
+            }
+        }
         builtin_method(recv, name, args, span, self)
     }
 }

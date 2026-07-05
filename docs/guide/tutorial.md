@@ -95,6 +95,21 @@ fun main() uses io {
 }
 ```
 
+Any function whose first parameter is some type can be called with **method
+syntax** on a value of that type — `area(shape)` and `shape.area()` are the same
+call (UFCS). This lets your own functions read as methods and chain, without any
+`impl` blocks:
+
+```kupl
+fun scaled(s: Shape, k: Float) -> Float { area(s) * k }
+
+Circle(2.0).area()             // == area(Circle(2.0))
+Circle(2.0).scaled(10.0)       // == scaled(Circle(2.0), 10.0)
+```
+
+Built-in methods (like `List.map`) take precedence; the free-function fallback
+only applies when there's no built-in method of that name.
+
 The last expression in a block is its value — no `return` needed (though `return`
 exists for early exit). **Lambdas** use `fn`:
 

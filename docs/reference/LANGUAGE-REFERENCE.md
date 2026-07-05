@@ -181,6 +181,7 @@ match n {                           // guards + or-patterns
 fn x { x * 2 }                      // lambda; parameter types from context
 fn (x: Int, y: Int) { x + y }       // or annotated
 xs.map(fn x { x + 1 })              // method call
+point.length()                      // UFCS: resolves to length(point) if no method
 user.name                           // field access (records)
 half(n)?                            // Result propagation (functions only)
 user with age: 37, name: "Ada L."   // record update: new value, fields replaced
@@ -213,6 +214,13 @@ par { f(a)  g(b)  h(c) }            // structured fork-join → List of results
   allowed in handlers (K0237) — handle the Result with `match` there.
 - `await expr` is accepted and currently evaluates `expr` directly (expose
   calls are synchronous in v1.0-alpha; true asynchrony is **[design]**).
+- **Method-call resolution** for `recv.name(args)` is: (1) a **built-in method**
+  on `recv`'s type, else (2) a **field** access (for a field-typed value with no
+  args), else (3) **UFCS** — a top-level function `name(recv, args…)` whose first
+  parameter matches `recv`'s type. So free functions read as methods and chain
+  (`p.add(q).scale(2.0)`). A UFCS call is exactly the function call `name(recv,
+  args…)` (same types, effects, and result). Built-in methods win, so a UFCS
+  function should not share a name with a built-in method. No match is K0249.
 
 ### 4.1 Concurrency — `par` (structured fork-join)
 

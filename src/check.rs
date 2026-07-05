@@ -1982,6 +1982,20 @@ impl Checker {
 
         match sig {
             None => {
+                // UFCS: with no built-in method, `recv.name(args)` resolves to a
+                // top-level function `name(recv, args…)` if one fits (built-in
+                // methods always take precedence — this is the fallback).
+                if let Some((params, ret, qvars)) = self.checked.funs.get(name).cloned() {
+                    let (params, ret) = self.instantiate_scheme(&params, &ret, &qvars);
+                    if params.len() == args.len() + 1 {
+                        self.unify(&params[0], &rt, recv.span, "method receiver (UFCS)");
+                        for (a, p) in args.iter().zip(params[1..].iter()) {
+                            let at = self.infer_expr(a, ctx);
+                            self.unify(p, &at, a.span, "method argument (UFCS)");
+                        }
+                        return self.uni.apply(&ret);
+                    }
+                }
                 for a in args {
                     self.infer_expr(a, ctx);
                 }

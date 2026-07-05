@@ -1,0 +1,46 @@
+// Uniform function call syntax (UFCS).
+//
+// `x.f(args)` first looks for a built-in method `f` on x's type; if there is
+// none, it resolves to a top-level function `f(x, args…)`. So a free function
+// whose first parameter is your type reads as a method — you get fluent,
+// chainable calls on your own ADTs and records without any `impl` blocks.
+//
+// Built-in methods always take precedence, so existing code is unaffected. (A
+// UFCS function should not share a name with a built-in method.)
+
+type Vec2 = { x: Float, y: Float }
+
+fun add(a: Vec2, b: Vec2) -> Vec2 {
+    Vec2(x: a.x + b.x, y: a.y + b.y)
+}
+
+fun scale(v: Vec2, k: Float) -> Vec2 {
+    Vec2(x: v.x * k, y: v.y * k)
+}
+
+fun length(v: Vec2) -> Float {
+    (v.x * v.x + v.y * v.y).sqrt()
+}
+
+fun show(v: Vec2) -> Str {
+    "({v.x.format(1)}, {v.y.format(1)})"
+}
+
+fun main() uses io {
+    let a = Vec2(x: 3.0, y: 4.0)
+    let b = Vec2(x: 1.0, y: 2.0)
+
+    // free functions called as methods
+    print("a           = {a.show()}")
+    print("length(a)   = {a.length().format(1)}")
+
+    // method CHAINING: add -> scale -> show, each a free function
+    print("(a+b)*2     = {a.add(b).scale(2.0).show()}")
+
+    // UFCS mixes freely with built-in methods (.format, .sqrt above)
+    let mag = a.add(b).length()
+    print("|a+b|       = {mag.format(3)}")
+
+    // built-in methods still win: List has a built-in `.len()`
+    print("list len    = {[a, b].len()}")
+}

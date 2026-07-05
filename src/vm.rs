@@ -746,9 +746,27 @@ impl<'m> Vm<'m> {
                             }
                         }
                     }
+                    // keep a copy for the UFCS fallback (only when a same-named
+                    // top-level function exists — built-in methods win)
+                    let ufcs = self.module.funs.get(&method).copied();
+                    let backup = ufcs.map(|_| (r.clone(), args.clone()));
                     let mut call = |f: Value, args: Vec<Value>| self.call_value_nested(f, args);
                     match shared_method(&r, &method, args, &mut call) {
                         Ok(v) => set!(dst, v),
+                        Err(msg) if backup.is_some() && msg.contains("has no method") => {
+                            // UFCS: `recv.method(args)` -> `method(recv, args…)`
+                            let (recv, margs) = backup.unwrap();
+                            let mut full = Vec::with_capacity(margs.len() + 1);
+                            full.push(recv);
+                            full.extend(margs);
+                            let v = self.call_chunk_nested(ufcs.unwrap(), full, None).map_err(|mut e| {
+                                if e.span == Span::default() {
+                                    e.span = span;
+                                }
+                                e
+                            })?;
+                            set!(dst, v);
+                        }
                         Err(msg) => return Err(VmError { msg, span }),
                     }
                 }

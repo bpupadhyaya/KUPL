@@ -251,23 +251,32 @@ fn collect_expr(
     eff: &mut EffectSet,
     calls: &mut Vec<String>,
 ) {
-    if let ExprKind::Call { callee, .. } = &expr.kind {
-        if let ExprKind::Ident(name) = &callee.kind {
-            if let Some(e) = builtin_effects(name) {
-                eff.insert(e.to_string());
+    // A method-call name may be a UFCS call to a top-level function; a plain
+    // call names the function directly. Both attribute that function's effects
+    // (conservatively — over-attribution is sound).
+    let call_name = match &expr.kind {
+        ExprKind::Call { callee, .. } => match &callee.kind {
+            ExprKind::Ident(name) => Some(name.as_str()),
+            _ => None,
+        },
+        ExprKind::MethodCall { name, .. } => Some(name.as_str()),
+        _ => None,
+    };
+    if let Some(name) = call_name {
+        if let Some(e) = builtin_effects(name) {
+            eff.insert(e.to_string());
+        }
+        // component-local fun first, then top-level
+        if let Some(c) = component {
+            let local = fun_key(Some(c), name);
+            if funs.contains_key(&local) {
+                calls.push(local);
+                return;
             }
-            // component-local fun first, then top-level
-            if let Some(c) = component {
-                let local = fun_key(Some(c), name);
-                if funs.contains_key(&local) {
-                    calls.push(local);
-                    return;
-                }
-            }
-            let global = fun_key(None, name);
-            if funs.contains_key(&global) {
-                calls.push(global);
-            }
+        }
+        let global = fun_key(None, name);
+        if funs.contains_key(&global) {
+            calls.push(global);
         }
     }
 }
