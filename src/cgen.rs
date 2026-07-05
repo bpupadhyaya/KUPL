@@ -3750,6 +3750,20 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// The static-site-generator's markdown transformer (it63) — string-ops
+    /// bold + link rendering — compiles to native byte-identically.
+    #[test]
+    fn native_ssg_markdown() {
+        let src = "fun bold(s: Str) -> Str {\n    var acc = \"\"\n    var i = 0\n    \
+                   for part in s.split(\"**\") {\n        \
+                   if i % 2 == 1 { acc = acc + \"<b>\" + part + \"</b>\" } else { acc = acc + part }\n        \
+                   i = i + 1\n    }\n    acc\n}\n\
+                   fun main() uses io {\n    print(bold(\"a **b** c **d**\"))\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "ssg"), "a <b>b</b> c <b>d</b>\n");
+        }
+    }
+
     /// Default parameters + named arguments (it62) resolve to positional calls
     /// before codegen, so native == interp.
     #[test]

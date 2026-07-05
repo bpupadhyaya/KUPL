@@ -1,0 +1,150 @@
+// A mini static site generator: turns markdown-ish content into a small HTML
+// site on disk, then reports what it built. It ties together the file/path
+// toolkit (make_dir/write_file/read_file/list_dir/remove_dir, path_join/ext)
+// with string processing — a real, shippable little program.
+//
+// Supported markdown: `# H1`, `## H2`, `**bold**`, `[text](url)` links, and
+// paragraphs (one per non-blank line). The renderer uses string operations
+// (split/split_once/slice) rather than regex backrefs.
+//
+// It is hermetic and self-cleaning: it writes into a temp directory and removes
+// it at the end, so it is deterministic and leaves no state behind.
+
+type Page = { title: Str, slug: Str, body: Str }
+
+// `**bold**` -> `<strong>bold</strong>` via splitting on the delimiter: odd
+// segments are the emphasized spans.
+fun bold(s: Str) -> Str {
+    var acc = ""
+    var i = 0
+    for part in s.split("**") {
+        if i % 2 == 1 {
+            acc = acc + "<strong>" + part + "</strong>"
+        } else {
+            acc = acc + part
+        }
+        i = i + 1
+    }
+    acc
+}
+
+// `[text](url)` -> `<a href="url">text</a>`, scanning left to right.
+fun links(s: Str) -> Str {
+    var acc = ""
+    var rest = s
+    while let Some(open) = rest.split_once("[") {
+        acc = acc + open.get(0).unwrap_or("")
+        let after = open.get(1).unwrap_or("")
+        if let Some(mid) = after.split_once("](") {
+            let text = mid.get(0).unwrap_or("")
+            if let Some(close) = mid.get(1).unwrap_or("").split_once(")") {
+                let url = close.get(0).unwrap_or("")
+                acc = acc + "<a href=\"" + url + "\">" + text + "</a>"
+                rest = close.get(1).unwrap_or("")
+            } else {
+                acc = acc + "[" + after
+                rest = ""
+            }
+        } else {
+            acc = acc + "[" + after
+            rest = ""
+        }
+    }
+    acc + rest
+}
+
+fun inline(s: Str) -> Str {
+    links(bold(s))
+}
+
+// convert a markdown body into an HTML fragment, line by line
+fun md_to_html(md: Str) -> Str {
+    var html = ""
+    for line in md.split("\n") {
+        let t = line.trim()
+        if t == "" {
+            html = html
+        } else if t.starts_with("## ") {
+            html = html + "<h2>" + inline(t.slice(3, t.len())) + "</h2>\n"
+        } else if t.starts_with("# ") {
+            html = html + "<h1>" + inline(t.slice(2, t.len())) + "</h1>\n"
+        } else {
+            html = html + "<p>" + inline(t) + "</p>\n"
+        }
+    }
+    html
+}
+
+// wrap a page body in a full HTML document (a `layout` name is accepted for
+// future themes; the default is the only one for now)
+fun render_page(page: Page, layout: Str = "default") -> Str {
+    "<!doctype html>\n<html>\n<head><title>" + page.title + "</title></head>\n" +
+        "<body>\n<h1>" + page.title + "</h1>\n" + md_to_html(page.body) +
+        "<footer>built with the " + layout + " layout</footer>\n</body>\n</html>\n"
+}
+
+fun build_index(pages: List[Page]) -> Str {
+    var items = ""
+    for p in pages {
+        items = items + "  <li><a href=\"" + p.slug + ".html\">" + p.title + "</a></li>\n"
+    }
+    "<!doctype html>\n<html>\n<head><title>Index</title></head>\n<body>\n<h1>Site</h1>\n<ul>\n" +
+        items + "</ul>\n</body>\n</html>\n"
+}
+
+fun main() uses io {
+    let pages = [
+        Page(title: "Home", slug: "index-home", body: "# Welcome\nThis is the **home** page.\nSee the [about](about.html) page."),
+        Page(title: "About", slug: "about", body: "# About\n## Who\nWe build **fast** tools.\nContact us [here](/contact)."),
+    ]
+
+    let dest = "kupl_ssg_site"
+    let _ = remove_dir(dest)                      // clean slate
+    match make_dir(dest) {
+        Ok(_) => {
+            var built = 0
+            for page in pages {
+                let html = render_page(page, layout: "default")
+                match write_file(path_join(dest, page.slug + ".html"), html) {
+                    Ok(_) => {
+                        built = built + 1
+                    }
+                    Err(_) => print("failed: {page.slug}")
+                }
+            }
+            let _ = write_file(path_join(dest, "index.html"), build_index(pages))
+
+            print("built {built} pages + index")
+            match list_dir(dest) {
+                Ok(names) => print("output: {names}")
+                Err(_) => print("list failed")
+            }
+
+            // read one rendered page back and show its first two lines
+            match read_file(path_join(dest, "about.html")) {
+                Ok(text) => {
+                    let head = text.split("\n").take(2).join(" | ")
+                    print("about.html starts: {head}")
+                }
+                Err(_) => print("read failed")
+            }
+
+            // show the rendered body of the first page inline
+            if let Some(first) = pages.first() {
+                print("--- {first.title} body ---")
+                print(md_to_html(first.body))
+            }
+
+            let _ = remove_dir(dest)              // cleanup
+        }
+        Err(_) => print("could not create output dir")
+    }
+    print("done (left behind: {file_exists(dest)})")
+}
+
+// the transformer's contract, checkable with `kupl test`
+law "markdown renders to the expected HTML" {
+    expect md_to_html("# Hi") == "<h1>Hi</h1>\n"
+    expect bold("a **b** c") == "a <strong>b</strong> c"
+    expect links("go [k](/k)") == "go <a href=\"/k\">k</a>"
+}
