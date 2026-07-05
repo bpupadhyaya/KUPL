@@ -429,13 +429,7 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_RANDOM_FLOATS => format!("regs[{dst}] = k_random_floats(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_SHUFFLE => format!("regs[{dst}] = k_shuffle(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_BIG => format!("regs[{dst}] = k_big_builtin(regs[{start}]); (void){argc};"),
-            BUILTIN_HTTP_SERVE => {
-                return Err(
-                    "`http_serve` is not yet supported by the native backend — use \
-                     `kupl run`, `kupl run --vm`, or `kupl bundle`"
-                        .into(),
-                )
-            }
+            BUILTIN_HTTP_SERVE => format!("regs[{dst}] = k_http_serve(regs[{start}], regs[{start}+1]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -556,6 +550,9 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <dirent.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
@@ -1855,6 +1852,68 @@ static int k_rmrf(const char* path) {
 static KValue k_remove_dir(KValue path) {
     if (k_rmrf(path.as.s) != 0) { char m[300]; snprintf(m, sizeof m, "cannot remove directory: %s", path.as.s); return k_err(k_str(k_strdup(m))); }
     return k_ok(k_unit());
+}
+
+/* http_serve(port, handler): a blocking HTTP server mirroring
+   interp::serve_http. Binds 127.0.0.1:port, and for each request calls the KUPL
+   handler value with (method, path) to get the response body. Err on bind
+   failure; otherwise never returns. */
+static KValue k_http_serve(KValue port, KValue handler) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { char m[64]; snprintf(m, sizeof m, "cannot bind 127.0.0.1:%lld: socket", (long long)port.as.i); return k_err(k_str(k_strdup(m))); }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port.as.i);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (bind(fd, (struct sockaddr*)&addr, sizeof addr) < 0 || listen(fd, 128) < 0) {
+        close(fd);
+        char m[64]; snprintf(m, sizeof m, "cannot bind 127.0.0.1:%lld: in use", (long long)port.as.i);
+        return k_err(k_str(k_strdup(m)));
+    }
+    for (;;) {
+        int conn = accept(fd, 0, 0);
+        if (conn < 0) continue;
+        /* read the request head until the blank line (or a 64KB cap) */
+        KBuf head = { 0, 0, 0 };
+        char buf[1024]; ssize_t n;
+        while ((n = read(conn, buf, sizeof buf)) > 0) {
+            kb_write(&head, buf, n);
+            if (head.len >= 4 && strstr(head.buf, "\r\n\r\n")) break;
+            if (head.len > 64 * 1024) break;
+        }
+        /* parse the request line: METHOD PATH HTTP/1.1 */
+        const char* method = "GET";
+        const char* path = "/";
+        if (head.buf) {
+            char* line = head.buf;
+            char* eol = strstr(line, "\r\n");
+            if (eol) *eol = 0;
+            char* sp1 = strchr(line, ' ');
+            if (sp1) {
+                *sp1 = 0; method = k_strdup(line);
+                char* p = sp1 + 1;
+                char* sp2 = strchr(p, ' ');
+                if (sp2) *sp2 = 0;
+                path = k_strdup(p);
+            }
+        }
+        KValue hargs[2] = { k_str(method), k_str(path) };
+        KValue rv = k_call(handler, hargs, 2);
+        const char* body = rv.tag == K_STR ? rv.as.s : "";
+        KBuf resp = { 0, 0, 0 };
+        char hdr[192];
+        int hn = snprintf(hdr, sizeof hdr,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+            strlen(body));
+        kb_write(&resp, hdr, hn);
+        kb_write(&resp, body, (long)strlen(body));
+        long off = 0;
+        while (off < resp.len) { ssize_t w = write(conn, resp.buf + off, resp.len - off); if (w <= 0) break; off += w; }
+        close(conn);
+    }
 }
 
 static KValue k_http_get(KValue url) {
@@ -3945,6 +4004,53 @@ mod tests {
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// http_serve (it68) compiles to native and serves real requests: a native
+    /// server binary answers GET /world with "GET /world".
+    #[test]
+    fn native_http_serve() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str) -> Str { \"{m} {p}\" }\n\
+                   fun main() uses io { let _ = http_serve(38121, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C (no longer a defer)");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srv-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        // connect with retry, send a request, assert the response, then kill
+        let mut stream = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38121u16)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let result = (|| {
+            let mut s = stream.ok_or("server should be listening")?;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\n\r\n").map_err(|e| e.to_string())?;
+            let mut resp = String::new();
+            let _ = s.read_to_string(&mut resp);
+            if !resp.contains("HTTP/1.1 200 OK") || !resp.ends_with("GET /world") {
+                return Err(format!("bad response: {resp}"));
+            }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
     }
 
     /// BigInt compiles to native (it65 C bignum): a big factorial, 2^128, and a
