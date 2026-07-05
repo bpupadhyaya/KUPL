@@ -30,5 +30,20 @@ fun main() {
 
     let names = ["carol", "alice", "bob"]
     print("pipeline   = {names.sort().map(fn n { n.to_upper() }).join(", ")}")
+
+    // sort_by (by a key), position/partition (by a predicate)
+    let nums = [5, 3, 8, 1, 9, 2]
+    print("sort_by    = {nums.sort_by(fn n { 0 - n })}")
+    print("position   = {nums.position(fn n { n > 7 })}")
+    print("partition  = {nums.partition(fn n { n % 2 == 0 })}")
+    expect nums.sort_by(fn n { n }) == nums.sort()
+
+    // rfind / replace_first / split_once
+    let path = "a.b.c.d"
+    print("rfind      = {path.rfind(".")}")
+    print("replace1   = {path.replace_first(".", "/")}")
+    print("split_once = {path.split_once(".")}")
+    print("no split   = {"nodot".split_once(".")}")
+
     print("all stdlib expectations hold")
 }

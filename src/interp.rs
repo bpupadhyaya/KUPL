@@ -1630,6 +1630,40 @@ pub fn shared_method(
             }
             Ok(Value::List(Rc::new(out)))
         }
+        (Value::List(items), "sort_by") => {
+            let f = args.into_iter().next().ok_or("`sort_by` needs a function")?;
+            // compute each element's Int key first, then stable-sort by it
+            let mut keyed: Vec<(i64, Value)> = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                match call(f.clone(), vec![item.clone()])? {
+                    Value::Int(k) => keyed.push((k, item.clone())),
+                    other => return Err(format!("`sort_by` key function must return Int, got {}", other.type_name())),
+                }
+            }
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(Value::List(Rc::new(keyed.into_iter().map(|(_, v)| v).collect())))
+        }
+        (Value::List(items), "position") => {
+            let f = args.into_iter().next().ok_or("`position` needs a function")?;
+            for (i, item) in items.iter().enumerate() {
+                if let Value::Bool(true) = call(f.clone(), vec![item.clone()])? {
+                    return Ok(Value::some(Value::Int(i as i64)));
+                }
+            }
+            Ok(Value::none())
+        }
+        (Value::List(items), "partition") => {
+            let f = args.into_iter().next().ok_or("`partition` needs a function")?;
+            let (mut yes, mut no) = (Vec::new(), Vec::new());
+            for item in items.iter() {
+                if let Value::Bool(true) = call(f.clone(), vec![item.clone()])? {
+                    yes.push(item.clone());
+                } else {
+                    no.push(item.clone());
+                }
+            }
+            Ok(Value::List(Rc::new(vec![Value::List(Rc::new(yes)), Value::List(Rc::new(no))])))
+        }
         (Value::List(items), "window") => match args.into_iter().next() {
             Some(Value::Int(n)) if n >= 1 => {
                 let n = n as usize;
@@ -1707,6 +1741,33 @@ pub fn shared_method(
         },
         (Value::Str(s), "is_empty") => Ok(Value::Bool(s.is_empty())),
         (Value::Str(s), "reverse") => Ok(Value::str(s.chars().rev().collect::<String>())),
+        (Value::Str(s), "rfind") => match args.into_iter().next() {
+            Some(Value::Str(sub)) => Ok(match s.rfind(sub.as_str()) {
+                // byte offset -> character index (matches `index_of`)
+                Some(byte) => Value::some(Value::Int(s[..byte].chars().count() as i64)),
+                None => Value::none(),
+            }),
+            _ => Err("`rfind` needs a Str".into()),
+        },
+        (Value::Str(s), "replace_first") => {
+            let mut it = args.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                    Ok(Value::str(s.as_str().replacen(from.as_str(), to.as_str(), 1)))
+                }
+                _ => Err("`replace_first` needs two Str arguments".into()),
+            }
+        }
+        (Value::Str(s), "split_once") => match args.into_iter().next() {
+            Some(Value::Str(sep)) => Ok(match s.as_str().split_once(sep.as_str()) {
+                Some((a, b)) => Value::some(Value::List(Rc::new(vec![
+                    Value::str(a.to_string()),
+                    Value::str(b.to_string()),
+                ]))),
+                None => Value::none(),
+            }),
+            _ => Err("`split_once` needs a Str".into()),
+        },
         (Value::Str(s), "lines") => Ok(Value::List(Rc::new(
             s.lines().map(Value::str).collect(),
         ))),

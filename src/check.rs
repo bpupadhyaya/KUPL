@@ -1779,6 +1779,18 @@ impl Checker {
                     Ty::List(Box::new(u)),
                 ))
             }
+            (Ty::List(t), "sort_by") => Some((
+                vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Int))],
+                Ty::List(t.clone()),
+            )),
+            (Ty::List(t), "position") => Some((
+                vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
+                Ty::Option(Box::new(Ty::Int)),
+            )),
+            (Ty::List(t), "partition") => Some((
+                vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
+                Ty::List(Box::new(Ty::List(t.clone()))),
+            )),
             (Ty::List(t), "window") | (Ty::List(t), "chunk") => {
                 Some((vec![Ty::Int], Ty::List(Box::new(Ty::List(t.clone())))))
             }
@@ -1800,6 +1812,11 @@ impl Checker {
             (Ty::Str, "slice") => Some((vec![Ty::Int, Ty::Int], Ty::Str)),
             (Ty::Str, "pad_left") | (Ty::Str, "pad_right") => Some((vec![Ty::Int, Ty::Str], Ty::Str)),
             (Ty::Str, "lines") => Some((vec![], Ty::List(Box::new(Ty::Str)))),
+            (Ty::Str, "rfind") => Some((vec![Ty::Str], Ty::Option(Box::new(Ty::Int)))),
+            (Ty::Str, "replace_first") => Some((vec![Ty::Str, Ty::Str], Ty::Str)),
+            (Ty::Str, "split_once") => {
+                Some((vec![Ty::Str], Ty::Option(Box::new(Ty::List(Box::new(Ty::Str))))))
+            }
             (Ty::Int, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Int, "to_float") => Some((vec![], Ty::Float)),
             (Ty::Int, "to_i8") => Some((vec![], Ty::IntW(IntW::I8))),

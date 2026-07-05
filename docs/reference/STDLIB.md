@@ -67,18 +67,18 @@ reproducible. There is no ambient/global RNG — pass a seed explicitly.
 
 `http_get` / `http_post` shell out to the system `curl` (the same transport the
 AI runtime uses) and carry the `io.net` effect. A non-2xx status or unreachable
-host is an ordinary `Err` (message text is platform-dependent). Not yet on the
-native backend — use `kupl run`/`--vm`/`bundle`.
+host is an ordinary `Err` (message text is platform-dependent). Compiles on the
+native backend too (via the system `curl`).
 
 **Regex** (`re_*`) is a pure, self-contained engine: literals, `.`, `* + ?`
 (greedy), classes `[a-z]`/`[^…]`, `\d \w \s` (+ `\D \W \S`), anchors
 `^`/`$`, alternation `|`, groups `(...)`, and `\`-escapes. `re_match` searches
 (anchor with `^…$` for a full match). A malformed pattern **panics** with a
-clear message. Not yet on the native backend (`kupl run`/`--vm`/`bundle`).
+clear message. Compiles on the native backend too (byte-oriented, ASCII-correct).
 
 **Time**: `date_make`, `date_iso`, `parse_iso`, `format_time`, and the `*_of`
-extractors are pure, deterministic UTC calendar math (epoch seconds ↔ civil date,
-(correct for negative/pre-1970 timestamps), byte-identical on every engine
+extractors are pure, deterministic UTC calendar math (epoch seconds ↔ civil
+date, correct for negative/pre-1970 timestamps), byte-identical on every engine
 including native. Only `now()` reads the wall clock — it carries the `io.time`
 effect and is non-deterministic. No locale or leap seconds.
 
@@ -92,15 +92,14 @@ bucketing/sharding, not for security.
 `\n` or `\r\n` row endings on input (`\n` on output), quoted fields for
 values containing `,` `"` or newlines (with `""` for an embedded quote). A
 trailing newline yields no extra row; a blank interior line is a one-field row.
-Pure and interp==KVM; not yet on the native backend.
+Pure and byte-identical on every engine including native.
 
 **URL** (`url_encode`/`url_decode`) is percent-encoding: `url_encode` keeps the
 RFC 3986 unreserved set `A-Za-z0-9-_.~` and encodes everything else including
 space as `%20`; `url_decode` reverses `%XX`, treats `+` as space, and returns
 `Err` on a malformed escape or non-UTF-8. `query_parse`/`query_build` handle
 `key=value&…` pairs (each part url-decoded/encoded). `url_encode`/`url_decode`
-run on all engines incl. native; the query helpers are interp==KVM (native
-deferred).
+run on all engines incl. native, as do the `query_*` helpers.
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a
@@ -150,6 +149,9 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.flat_map(f)` | `(fn(T) -> List[U]) -> List[U]` | map then flatten |
 | `.window(n)` | `(Int) -> List[List[T]]` | sliding windows of width n (n ≥ 1) |
 | `.chunk(n)` | `(Int) -> List[List[T]]` | consecutive chunks of size n (last may be shorter) |
+| `.sort_by(f)` | `(fn(T) -> Int) -> List[T]` | stable sort by an Int key |
+| `.position(f)` | `(fn(T) -> Bool) -> Option[Int]` | index of the first element matching the predicate |
+| `.partition(f)` | `(fn(T) -> Bool) -> List[List[T]]` | `[matching, non-matching]`, order preserved |
 
 ### Str
 
@@ -171,6 +173,9 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.reverse()` | `-> Str` | by characters, not bytes |
 | `.lines()` | `-> List[Str]` | splits on `\n`, strips a trailing `\r`; no trailing empty line |
 | `.index_of(sub)` | `(Str) -> Option[Int]` | character index of the first occurrence |
+| `.rfind(sub)` | `(Str) -> Option[Int]` | character index of the **last** occurrence |
+| `.replace_first(from, to)` | `(Str, Str) -> Str` | replace only the first occurrence |
+| `.split_once(sep)` | `(Str) -> Option[List[Str]]` | split at the first `sep` → `[before, after]`, else `None` |
 | `.count(sub)` | `(Str) -> Int` | non-overlapping occurrences (non-empty `sub`) |
 | `.slice(start, end)` | `(Int, Int) -> Str` | substring by character index, clamped |
 | `.pad_left(width, fill)` / `.pad_right(width, fill)` | `(Int, Str) -> Str` | pad to `width` chars with the first char of `fill` |

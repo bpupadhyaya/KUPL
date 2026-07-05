@@ -2354,6 +2354,16 @@ static KValue k_shuffle(KValue seed, KValue lst) {
 }
 
 static KValue k_expose_call(KValue recv, const char* name, KValue* args, int argc);
+/* stable sort by an Int key: qsort with an original-index tiebreak */
+typedef struct { int64_t key; int idx; KValue v; } KSortItem;
+static int k_sortby_cmp(const void* a, const void* b) {
+    const KSortItem* x = (const KSortItem*)a;
+    const KSortItem* y = (const KSortItem*)b;
+    if (x->key < y->key) return -1;
+    if (x->key > y->key) return 1;
+    return x->idx - y->idx;
+}
+
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     (void)argc;
     if (recv.tag == K_COMPONENT) return k_expose_call(recv, name, args, argc);
@@ -2633,6 +2643,36 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return k_list(out, (int)total);
         }
+        if (!strcmp(name, "sort_by")) {
+            int64_t n = l->len;
+            KSortItem* arr = (KSortItem*)k_alloc(sizeof(KSortItem) * (n < 1 ? 1 : n));
+            for (int64_t i = 0; i < n; i++) {
+                arr[i].key = k_call(args[0], &l->items[i], 1).as.i;
+                arr[i].idx = (int)i;
+                arr[i].v = l->items[i];
+            }
+            qsort(arr, n, sizeof(KSortItem), k_sortby_cmp);
+            KValue* out = (KValue*)k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+            for (int64_t i = 0; i < n; i++) out[i] = arr[i].v;
+            return k_list(out, (int)n);
+        }
+        if (!strcmp(name, "position")) {
+            for (int64_t i = 0; i < l->len; i++)
+                if (k_truthy(k_call(args[0], &l->items[i], 1))) return k_some(k_int(i));
+            return k_none();
+        }
+        if (!strcmp(name, "partition")) {
+            int64_t n = l->len;
+            KValue* yes = (KValue*)k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+            KValue* no = (KValue*)k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+            int ny = 0, nn = 0;
+            for (int64_t i = 0; i < n; i++) {
+                if (k_truthy(k_call(args[0], &l->items[i], 1))) yes[ny++] = l->items[i];
+                else no[nn++] = l->items[i];
+            }
+            KValue pair[2] = { k_list(yes, ny), k_list(no, nn) };
+            return k_list(pair, 2);
+        }
         if (!strcmp(name, "window")) {
             if (args[0].tag != K_INT || args[0].as.i < 1) k_panic("`window` needs a positive Int");
             int64_t w = args[0].as.i;
@@ -2801,6 +2841,45 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 p = q + 1;
             }
             return k_list(parts, n);
+        }
+        if (!strcmp(name, "rfind")) {
+            const char* sub = args[0].as.s;
+            size_t sl = strlen(sub);
+            const char* last = 0;
+            if (sl == 0) {
+                last = s + strlen(s);       /* Rust rfind("") == len */
+            } else {
+                const char* p = s;
+                for (;;) { const char* q = strstr(p, sub); if (!q) break; last = q; p = q + 1; }
+            }
+            if (!last) return k_none();
+            int64_t idx = 0;
+            for (const char* c = s; c < last; c++) if ((*c & 0xC0) != 0x80) idx++;
+            return k_some(k_int(idx));
+        }
+        if (!strcmp(name, "replace_first")) {
+            const char* from = args[0].as.s;
+            const char* to = args[1].as.s;
+            const char* q = strstr(s, from);
+            if (!q) return recv;            /* not found (from non-empty): unchanged */
+            KBuf b = { 0, 0, 0 };
+            kb_write(&b, s, (long)(q - s));
+            kb_write(&b, to, (long)strlen(to));
+            kb_write(&b, q + strlen(from), (long)strlen(q + strlen(from)));
+            return k_str(b.buf ? b.buf : "");
+        }
+        if (!strcmp(name, "split_once")) {
+            const char* sep = args[0].as.s;
+            const char* q = strstr(s, sep);
+            if (!q) return k_none();
+            size_t sl = strlen(sep);
+            char* a = (char*)k_alloc((size_t)(q - s) + 1);
+            memcpy(a, s, (size_t)(q - s)); a[q - s] = 0;
+            const char* tail = q + sl;
+            char* bb = (char*)k_alloc(strlen(tail) + 1);
+            memcpy(bb, tail, strlen(tail) + 1);
+            KValue pair[2] = { k_str(a), k_str(bb) };
+            return k_some(k_list(pair, 2));
         }
         if (!strcmp(name, "index_of")) {
             const char* q = strstr(s, args[0].as.s);
@@ -3672,6 +3751,24 @@ mod tests {
             ("fun main() uses io { print(re_replace(\"[aeiou]\", \"hello world\", \"*\")) }", "h*ll* w*rld\n"),
         ] {
             assert_eq!(native_main_stdout(src, "re"), expected, "src: {src}");
+        }
+    }
+
+    /// The it54 stdlib methods (sort_by / position / partition / rfind /
+    /// replace_first / split_once) compile to native byte-identically.
+    #[test]
+    fn native_stdlib_it54() {
+        let src = "fun main() uses io {\n    \
+                   let ns = [5, 3, 8, 1, 9, 2]\n    \
+                   print(\"{ns.sort_by(fn n { 0 - n })}\")\n    \
+                   print(\"{ns.position(fn n { n > 7 })} {ns.partition(fn n { n % 2 == 0 })}\")\n    \
+                   let p = \"a.b.c\"\n    \
+                   print(\"{p.rfind(\".\")} {p.replace_first(\".\", \"/\")} {p.split_once(\".\")}\")\n}\n";
+        if cc_available() {
+            assert_eq!(
+                native_main_stdout(src, "std54"),
+                "[9, 8, 5, 3, 2, 1]\nSome(2) [[8, 2], [5, 3, 1, 9]]\nSome(3) a/b.c Some([\"a\", \"b.c\"])\n"
+            );
         }
     }
 
