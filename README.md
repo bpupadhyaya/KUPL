@@ -298,6 +298,7 @@ language, every example verified against the toolchain).
 - [`docs/reference/STDLIB.md`](docs/reference/STDLIB.md) — built-in functions, constructors, and every method on List/Str/Int/Float/Option/Result/Tensor
 - [`docs/reference/CLI.md`](docs/reference/CLI.md) — every `kupl` command, flags, exit codes, artifact formats
 - [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (104 diagnostics, grouped by phase)
+- [`docs/PRODUCTION.md`](docs/PRODUCTION.md) — running KUPL in production: security model, resource limits, threat model (it is **not** a sandbox), operations, and an honest list of known limitations
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — an honest audit of KUPL vs Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift, and Kotlin (as-implemented vs designed)
 
 ## Design documents
