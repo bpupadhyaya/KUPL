@@ -1,0 +1,78 @@
+// Descriptive statistics + least-squares linear regression — written in KUPL.
+//
+// Numbers print through `Float.fmt(2)` so the output is clean and byte-identical
+// on every engine. The regression fits y = m*x + b to paired data by the closed-
+// form least-squares formulas.
+
+type Pair[A, B] = Pair(first: A, second: B)
+
+fun sum(xs: List[Float]) -> Float { xs.fold(0.0, fn acc, x { acc + x }) }
+
+fun mean(xs: List[Float]) -> Float { sum(xs) / xs.len().to_float() }
+
+// population variance = mean of squared deviations from the mean
+fun variance(xs: List[Float]) -> Float {
+    let m = mean(xs)
+    let sq = xs.map(fn x { (x - m) * (x - m) })
+    mean(sq)
+}
+
+fun stddev(xs: List[Float]) -> Float { variance(xs).sqrt() }
+
+// least-squares fit: returns (slope, intercept)
+fun linreg(xs: List[Float], ys: List[Float]) -> Pair[Float, Float] {
+    let n = xs.len().to_float()
+    var sx = 0.0
+    var sy = 0.0
+    var sxy = 0.0
+    var sxx = 0.0
+    var i = 0
+    while i < xs.len() {
+        let x = xs.get(i).unwrap_or(0.0)
+        let y = ys.get(i).unwrap_or(0.0)
+        sx = sx + x
+        sy = sy + y
+        sxy = sxy + x * y
+        sxx = sxx + x * x
+        i = i + 1
+    }
+    let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+    let intercept = (sy - slope * sx) / n
+    Pair(first: slope, second: intercept)
+}
+
+fun predict(slope: Float, intercept: Float, x: Float) -> Float {
+    slope * x + intercept
+}
+
+fun main() uses io {
+    let data = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    print("data     = {data}")
+    print("mean     = {mean(data).fmt(2)}")
+    print("variance = {variance(data).fmt(2)}")
+    print("stddev   = {stddev(data).fmt(2)}")
+    let lo = data.min().unwrap_or(0.0)
+    let hi = data.max().unwrap_or(0.0)
+    print("min/max  = {lo.fmt(2)} / {hi.fmt(2)}")
+
+    // fit a perfectly linear set: y = 2x + 1
+    let xs = [0.0, 1.0, 2.0, 3.0, 4.0]
+    let ys = [1.0, 3.0, 5.0, 7.0, 9.0]
+    let fit = linreg(xs, ys)
+    print("")
+    print("fit y = m*x + b to (0,1)(1,3)(2,5)(3,7)(4,9):")
+    print("  slope     = {fit.first.fmt(2)}")
+    print("  intercept = {fit.second.fmt(2)}")
+    print("  predict(10) = {predict(fit.first, fit.second, 10.0).fmt(2)}")
+}
+
+law "statistics + regression are correct" {
+    expect mean([2.0, 4.0, 6.0]) == 4.0
+    expect variance([1.0, 3.0]) == 1.0
+    expect stddev([1.0, 3.0]) == 1.0
+    expect variance([2.0, 4.0, 6.0]) == 2.6666666666666665
+    let fit = linreg([0.0, 1.0, 2.0, 3.0, 4.0], [1.0, 3.0, 5.0, 7.0, 9.0])
+    expect fit.first == 2.0
+    expect fit.second == 1.0
+    expect predict(fit.first, fit.second, 10.0) == 21.0
+}
