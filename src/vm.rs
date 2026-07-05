@@ -1106,6 +1106,29 @@ mod tests {
     }
 
     #[test]
+    fn diff_float_to_int_saturates() {
+        // Float.to_int() is a saturating cast (Rust `as i64`): out-of-range floats
+        // clamp to i64::MIN/MAX and NaN -> 0. Both engines must agree (the native
+        // backend used a raw C cast which is UB out of range — fixed PR-it26).
+        assert_eq!(differential("fun probe() -> Int {\n    (1e30).to_int()\n}\n"), "9223372036854775807");
+        assert_eq!(differential("fun probe() -> Int {\n    (0.0 - 1e30).to_int()\n}\n"), "-9223372036854775808");
+        assert_eq!(differential("fun probe() -> Int {\n    (0.0 / 0.0).to_int()\n}\n"), "0");
+        assert_eq!(differential("fun probe() -> Int {\n    (1.0 / 0.0).to_int()\n}\n"), "9223372036854775807");
+        assert_eq!(differential("fun probe() -> Int {\n    (3.7).to_int()\n}\n"), "3");
+    }
+
+    #[test]
+    fn diff_shift_bounds() {
+        // Shift methods panic identically on both engines for out-of-range amounts
+        // (0..=63), and compute identical values in range (incl. sign handling).
+        assert_eq!(differential("fun probe() -> Int {\n    (1).shl(63)\n}\n"), "-9223372036854775808");
+        assert_eq!(differential("fun probe() -> Int {\n    (1).shl(64)\n}\n"), "panic: shift amount must be in 0..=63");
+        assert_eq!(differential("fun probe() -> Int {\n    (1).shl(0 - 1)\n}\n"), "panic: shift amount must be in 0..=63");
+        assert_eq!(differential("fun probe() -> Int {\n    (0 - 1).ushr(4)\n}\n"), "1152921504606846975");
+        assert_eq!(differential("fun probe() -> Int {\n    (0 - 1).shr(4)\n}\n"), "-1");
+    }
+
+    #[test]
     fn diff_int_min_rem_overflow() {
         // i64::MIN % -1 overflows (the quotient overflows). It must be a clean
         // "integer overflow in remainder" panic on BOTH engines — a raw `%` used

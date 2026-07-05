@@ -293,7 +293,7 @@ to `f32` with `Float.to_f32()`.
 | Method | Signature | Notes |
 |---|---|---|
 | `.to_str()` | `-> Str` | |
-| `.to_int()` | `-> Int` | truncates toward zero |
+| `.to_int()` | `-> Int` | truncates toward zero; **saturating** — out-of-range floats clamp to `i64::MIN`/`i64::MAX`, `NaN` → `0` (identical on every engine) |
 | `.abs()` / `.sqrt()` | `-> Float` | |
 | `.floor()` / `.ceil()` / `.round()` | `-> Float` | |
 | `.min(other)` / `.max(other)` / `.pow(exp)` | `(Float) -> Float` | |

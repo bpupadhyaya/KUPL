@@ -2616,6 +2616,16 @@ static KValue k_int_radix(int64_t v, int base) {
     out[o] = 0;
     return k_str(out);
 }
+/* Rust-style saturating f64 -> i64 cast (matches the interpreter's `as i64`):
+   NaN -> 0; values >= 2^63 -> i64::MAX; values < -2^63 -> i64::MIN; otherwise
+   truncate toward zero. A raw (int64_t)double is UNDEFINED out of range (it
+   returned garbage, diverging from interp/KVM). */
+static int64_t k_f2i(double v) {
+    if (v != v) return 0;                              /* NaN */
+    if (v >= 9223372036854775808.0) return INT64_MAX;  /* >= 2^63 */
+    if (v < -9223372036854775808.0) return INT64_MIN;  /* <  -2^63 */
+    return (int64_t)v;
+}
 static int64_t k_isqrt(uint64_t n) {
     if (n == 0) return 0;
     uint64_t x = (uint64_t)sqrt((double)n);
@@ -3714,7 +3724,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     if (recv.tag == K_FLOAT) {
         if (!strcmp(name, "to_str")) return k_to_str(recv);
         if (!strcmp(name, "fmt")) return k_format_float(recv.as.f, args[0].as.i);
-        if (!strcmp(name, "to_int")) return k_int((int64_t)recv.as.f);
+        if (!strcmp(name, "to_int")) return k_int(k_f2i(recv.as.f));
         if (!strcmp(name, "abs")) return k_float(fabs(recv.as.f));
         if (!strcmp(name, "sqrt")) return k_float(sqrt(recv.as.f));
         if (!strcmp(name, "floor")) return k_float(floor(recv.as.f));
@@ -4427,6 +4437,23 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native Float.to_int() saturates like the interpreter's `as i64` (was a raw
+    /// C cast — UB out of range, returned garbage). PR-it26.
+    #[test]
+    fn native_float_to_int_saturates() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print((1e30).to_int())\n    \
+                   print((0.0 - 1e30).to_int())\n    print((0.0 / 0.0).to_int())\n    \
+                   print((1.0 / 0.0).to_int())\n    print((3.7).to_int())\n}\n";
+        let out = native_main_stdout(src, "f2i");
+        assert_eq!(
+            out.trim(),
+            "9223372036854775807\n-9223372036854775808\n0\n9223372036854775807\n3"
+        );
     }
 
     /// i64::MIN % -1 overflows: native must panic "integer overflow in remainder"
