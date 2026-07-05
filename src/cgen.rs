@@ -1323,7 +1323,12 @@ static int k_eq(KValue a, KValue b) {
 
 static KValue k_tensor_binop(KValue a, KValue b, int op) { /* 0:+ 1:- 2:* 3:/ */
     KTensor *x = a.as.ten, *y = b.as.ten;
-    if (x->len != y->len) k_panic("tensor length mismatch");
+    if (x->len != y->len) {
+        char mb[64];
+        snprintf(mb, sizeof mb, "tensor length mismatch (%lld vs %lld)",
+                 (long long)x->len, (long long)y->len);
+        k_panic(mb);
+    }
     double* d = k_alloc(sizeof(double) * (x->len < 1 ? 1 : x->len));
     for (int64_t i = 0; i < x->len; i++) {
         switch (op) {
@@ -4014,8 +4019,13 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_float(m);
         }
         if (!strcmp(name, "dot")) {
-            if (args[0].tag != K_TENSOR || args[0].as.ten->len != t->len)
-                k_panic("dot: length mismatch");
+            if (args[0].tag == K_TENSOR && args[0].as.ten->len != t->len) {
+                char mb[64];
+                snprintf(mb, sizeof mb, "dot: length mismatch (%lld vs %lld)",
+                         (long long)t->len, (long long)args[0].as.ten->len);
+                k_panic(mb);
+            }
+            if (args[0].tag != K_TENSOR) k_panic("dot: length mismatch");
             double s = 0;
             for (int64_t i = 0; i < t->len; i++) s += t->data[i] * args[0].as.ten->data[i];
             return k_float(s);
@@ -4509,6 +4519,21 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native tensor dot/elementwise length-mismatch panics include the two
+    /// lengths, matching the interpreter (was a bare message). PR-it49.
+    #[test]
+    fn native_tensor_mismatch_message() {
+        if !cc_available() {
+            return;
+        }
+        // both panic paths write to stderr; stdout stays empty. Also verify a valid
+        // dot still computes.
+        let ok = "fun main() uses io {\n    print(tensor([1.0, 2.0, 3.0]).dot(tensor([4.0, 5.0, 6.0])))\n}\n";
+        assert_eq!(native_main_stdout(ok, "tdot").trim(), "32.0");
+        let bad = "fun main() uses io {\n    print(tensor([1.0, 2.0]).dot(tensor([1.0, 2.0, 3.0])))\n}\n";
+        assert!(native_main_stdout(bad, "tdotbad").trim().is_empty(), "expected a panic");
     }
 
     /// Native BigInt/Rational (C bignum) matches the interpreter on sign edges,
