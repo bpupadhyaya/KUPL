@@ -1106,6 +1106,24 @@ mod tests {
     }
 
     #[test]
+    fn diff_deep_recursion_stack_overflow() {
+        // Unbounded recursion must yield the SAME clean `stack overflow` panic on
+        // both engines (the interpreter guards at MAX_CALL_DEPTH just like the KVM,
+        // rather than exhausting the native stack and aborting uncatchably). The
+        // interpreter needs the same large stack `main` gives it to reach the guard,
+        // so run the differential on a big-stack thread.
+        let src = "fun rec(n: Int) -> Int {\n    if n == 0 { 0 } else { rec(n - 1) }\n}\n\
+                   fun probe() -> Int {\n    rec(50000)\n}\n";
+        let out = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(move || differential(src))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(out, "panic: stack overflow (10000 frames)");
+    }
+
+    #[test]
     fn diff_recursion_fib() {
         let src = "fun fib(n: Int) -> Int {\n    if n < 2 {\n        n\n    } else {\n        fib(n - 1) + fib(n - 2)\n    }\n}\nfun probe() -> Int {\n    fib(15)\n}\n";
         assert_eq!(differential(src), "610");

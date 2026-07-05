@@ -126,7 +126,16 @@ pub struct Interp {
     /// Send+Sync program snapshot enabling the real-thread `par_map` fast path.
     /// `None` on worker interps (they stay sequential — no nested threading).
     pub image: Option<std::sync::Arc<crate::parallel::ProgramImage>>,
+    /// Current user-function call depth. Guards against unbounded recursion so a
+    /// deeply-recursive program yields a clean `stack overflow` panic instead of a
+    /// fatal, uncatchable native-stack abort — and matches the KVM's 10 000-frame
+    /// limit so the two engines stay byte-identical on deep recursion.
+    pub call_depth: usize,
 }
+
+/// Maximum user-function call depth, shared by the interpreter and the KVM
+/// (`vm.rs`) so both report `stack overflow (10000 frames)` at the same point.
+pub const MAX_CALL_DEPTH: usize = 10_000;
 
 impl Interp {
     pub fn new(db: ProgramDb) -> Interp {
@@ -140,6 +149,7 @@ impl Interp {
             globals: Env::new(),
             now: 0,
             image,
+            call_depth: 0,
         }
     }
 
@@ -155,6 +165,7 @@ impl Interp {
             globals: Env::new(),
             now: 0,
             image: None,
+            call_depth: 0,
         }
     }
 
@@ -1205,6 +1216,18 @@ impl Interp {
                 span,
             ));
         }
+        // Recursion guard (matches the KVM's 10 000-frame limit): a clean panic
+        // rather than exhausting the native stack and aborting uncatchably.
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(Self::panic_flow("stack overflow (10000 frames)".to_string(), span));
+        }
+        self.call_depth += 1;
+        let result = self.call_fun_body(decl, args, base_env, span);
+        self.call_depth -= 1;
+        result
+    }
+
+    fn call_fun_body(&mut self, decl: &FunDecl, args: Vec<Value>, base_env: &Env, span: Span) -> EvalResult {
         if let Some(ai) = &decl.ai {
             let Some(meta) = self.db.ai_funs.get(&decl.name).cloned() else {
                 return Err(Self::panic_flow(

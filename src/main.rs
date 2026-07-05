@@ -43,7 +43,11 @@ fn main() -> ExitCode {
     // more than the default 8 MiB — and this keeps the interpreter's recursion
     // depth on par with the KVM's heap-allocated frame stack.
     std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
+        // Sized so the interpreter can reach its MAX_CALL_DEPTH (10 000) recursion
+        // guard before exhausting the native stack — the guard then yields a clean
+        // `stack overflow` panic (matching the KVM) instead of a fatal abort. The
+        // reservation is virtual; only touched pages commit.
+        .stack_size(2 * 1024 * 1024 * 1024)
         .spawn(run_cli)
         .expect("spawn main thread")
         .join()
