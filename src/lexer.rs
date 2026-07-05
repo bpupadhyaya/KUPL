@@ -341,6 +341,20 @@ impl<'a> Lexer<'a> {
                         ));
                     }
                 },
+                Some(b'{') if self.peek() == Some(b'{') => {
+                    // `{{` is a literal `{` (so JSON/CSS/`{…}` templates can be
+                    // written directly); only a single `{` opens interpolation.
+                    self.bump();
+                    text.push('{');
+                }
+                Some(b'}') => {
+                    // `}}` collapses to a literal `}`, symmetric with `{{`; a lone
+                    // `}` in text is already literal.
+                    if self.peek() == Some(b'}') {
+                        self.bump();
+                    }
+                    text.push('}');
+                }
                 Some(b'{') => {
                     // interpolation: capture raw expression source until matching `}`
                     if !text.is_empty() {
@@ -541,6 +555,34 @@ mod tests {
         let (toks, diags) = lex(src);
         assert!(diags.is_empty(), "unexpected diags: {diags:?}");
         toks.into_iter().map(|t| t.tok).collect()
+    }
+
+    /// `{{`/`}}` are literal braces; a single `{` still opens interpolation.
+    #[test]
+    fn literal_brace_escaping() {
+        fn parts(src: &str) -> Vec<StrPart> {
+            let (toks, diags) = lex(src);
+            assert!(diags.is_empty(), "unexpected diags: {diags:?}");
+            match &toks[0].tok {
+                Tok::Str(p) => p.clone(),
+                other => panic!("expected a string, got {other:?}"),
+            }
+        }
+        assert_eq!(parts(r#""{{""#), vec![StrPart::Text("{".into())]);
+        assert_eq!(parts(r#""}}""#), vec![StrPart::Text("}".into())]);
+        assert_eq!(parts(r#""{{x}}""#), vec![StrPart::Text("{x}".into())]);
+        assert_eq!(parts(r#""{{\"a\":1}}""#), vec![StrPart::Text("{\"a\":1}".into())]);
+        // `{{ {n} }}` -> literal `{ `, interpolate n, literal ` }`
+        assert_eq!(
+            parts(r#""{{ {n} }}""#),
+            vec![
+                StrPart::Text("{ ".into()),
+                StrPart::Expr("n".into(), 5),
+                StrPart::Text(" }".into()),
+            ]
+        );
+        // a plain single-brace interpolation is unchanged
+        assert_eq!(parts(r#""{n}""#), vec![StrPart::Expr("n".into(), 2)]);
     }
 
     #[test]

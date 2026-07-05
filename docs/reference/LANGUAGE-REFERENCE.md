@@ -75,7 +75,7 @@ letters are permitted. `_` alone is the wildcard pattern.
 | `f32` | `1.5f32`, `10f32`, `1e3f32` | single-precision float; arithmetic like `Float`; convert with `.to_f32()`/`.to_float()` |
 | Float | `3.14`, `1.5e3` | IEEE-754 f64; `1..5` is a range, `1.5` a float |
 | Bool | `true`, `false` | |
-| Str | `"hi"`, `"n = {x + 1}"` | UTF-8, immutable; `{expr}` interpolates (any type, rendered with Display); escapes: `\n \t \r \\ \" \{ \} \0` |
+| Str | `"hi"`, `"n = {x + 1}"` | UTF-8, immutable; `{expr}` interpolates (any type, rendered with Display); `{{`/`}}` are literal braces (so JSON/`{…}` templates write directly, e.g. `"{{\"a\":{n}}}"`); escapes: `\n \t \r \\ \" \{ \} \0` |
 | Unit | `()` | the no-value value |
 | List | `[1, 2, 3]` | homogeneous |
 | Range | `0..10`, `0..=10` | Int bounds; exclusive / inclusive |

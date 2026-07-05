@@ -1,0 +1,23 @@
+// Literal braces in strings: `{{` -> `{` and `}}` -> `}`, so you can write JSON,
+// CSS, or any `{...}` template directly (a single `{` still interpolates). The
+// older `\{`/`\}` escapes work too.
+
+fun greeting(name: Str) -> Str {
+    // mix literal braces with real interpolation
+    "{{ \"hello\": \"{name}\" }}"
+}
+
+fun main() uses io {
+    print("{{\"lang\":\"KUPL\",\"year\":2026}}")
+    print(greeting("world"))
+    let n = 42
+    print("set = {{ {n} }}")
+    print(".box {{ width: 100px }}")
+}
+
+law "literal braces render correctly" {
+    expect "{{}}" == "\{\}"
+    expect "{{\"a\":1}}" == "\{\"a\":1\}"
+    expect greeting("KUPL") == "\{ \"hello\": \"KUPL\" \}"
+    expect "a {{b}} c" == "a \{b\} c"
+}
