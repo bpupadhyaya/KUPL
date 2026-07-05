@@ -1093,6 +1093,12 @@ static void kb_puts(KBuf* b, const char* s) {
 
 static void k_fmt_float(KBuf* b, double f) {
     char tmp[64];
+    /* Match Rust's f64 Display for non-finite values (the interpreter's Display
+       path): NaN -> "NaN", infinities -> "inf"/"-inf". Also portable — some libc
+       %g print NaN as "nan" or infinity as "1.#INF". (The `.fmt()` method uses
+       k_format_float, which mirrors interp::format_float's lowercase "nan".) */
+    if (isnan(f)) { kb_puts(b, "NaN"); return; }
+    if (isinf(f)) { kb_puts(b, f < 0 ? "-inf" : "inf"); return; }
     if (isfinite(f) && f == floor(f)) {
         snprintf(tmp, sizeof tmp, "%.1f", f);
     } else {
@@ -4316,6 +4322,16 @@ mod tests {
                    print(Some(5).ok_or(\"no\").map_err(fn e { e }).unwrap_or(0))\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
+        }
+    }
+
+    /// NaN/infinity Display matches the interpreter natively (was: `%g` -> "nan").
+    #[test]
+    fn native_nan_inf_display() {
+        let src = "fun main() uses io {\n    print(0.0 / 0.0)\n    \
+                   print(1.0 / 0.0)\n    print(-1.0 / 0.0)\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "naninf"), "NaN\ninf\n-inf\n");
         }
     }
 

@@ -1106,6 +1106,16 @@ mod tests {
     }
 
     #[test]
+    fn diff_nan_inf_display() {
+        // NaN and infinities must Display identically on both engines (Rust's f64
+        // Display: "NaN"/"inf"/"-inf"). The native backend matches too (PR-it5).
+        let src = "fun probe() -> Str {\n    \
+                   let n = 0.0 / 0.0\n    let p = 1.0 / 0.0\n    let m = -1.0 / 0.0\n    \
+                   \"{n} {p} {m}\"\n}\n";
+        assert_eq!(differential(src), "NaN inf -inf");
+    }
+
+    #[test]
     fn diff_deep_recursion_stack_overflow() {
         // Unbounded recursion must yield the SAME clean `stack overflow` panic on
         // both engines (the interpreter guards at MAX_CALL_DEPTH just like the KVM,
