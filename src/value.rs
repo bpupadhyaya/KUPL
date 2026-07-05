@@ -164,6 +164,7 @@ pub enum Value {
     F32(f32),
     /// An arbitrary-precision integer (`big(…)`).
     BigInt(Rc<crate::bigint::BigInt>),
+    Rational(Rc<crate::rational::Rational>),
     Float(f64),
     Bool(bool),
     Str(Rc<String>),
@@ -237,6 +238,7 @@ impl Value {
             Value::SizedInt(b) => b.1.name().into(),
             Value::F32(_) => "f32".into(),
             Value::BigInt(_) => "BigInt".into(),
+            Value::Rational(_) => "Rational".into(),
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "Str".into(),
@@ -263,6 +265,7 @@ impl PartialEq for Value {
             // sized ints are equal iff both value AND width match
             (Value::SizedInt(a), Value::SizedInt(b)) => a == b,
             (Value::BigInt(a), Value::BigInt(b)) => a == b,
+            (Value::Rational(a), Value::Rational(b)) => a == b,
             (Value::F32(a), Value::F32(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -297,6 +300,7 @@ impl fmt::Display for Value {
             Value::Int(v) => write!(f, "{v}"),
             Value::SizedInt(b) => write!(f, "{}", b.0),
             Value::BigInt(b) => write!(f, "{b}"),
+            Value::Rational(r) => write!(f, "{r}"),
             Value::F32(v) => {
                 if v.fract() == 0.0 && v.is_finite() {
                     write!(f, "{v:.1}")

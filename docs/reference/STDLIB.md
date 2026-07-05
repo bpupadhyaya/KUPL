@@ -59,6 +59,8 @@ unless supervised.
 | `query_build(pairs)` | `(List[List[Str]]) -> Str` | encode `[key, value]` pairs into `a=1&b=2` |
 | `big(x)` | `(Int) -> BigInt` / `(Str) -> BigInt` | arbitrary-precision integer (panics on a malformed string); pure |
 | `.pow/.abs/.sign/.is_negative` on BigInt | methods | power (Int exp), absolute value, `-1/0/1`, sign test |
+| `rat(n, d)` | `(Int, Int) -> Rational` | exact fraction `n/d`, reduced (panics if `d == 0`); pure |
+| `.num/.den/.to_float/.recip` on Rational | methods | numerator/denominator (BigInt), nearest Float, reciprocal |
 | `exec(program, args)` | `(Str, List[Str]) -> Result[Str, Str]` — **uses `io.proc`** | run a program (argv, no shell); `Ok` = stdout on exit 0 |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
@@ -111,6 +113,11 @@ effect and is non-deterministic. No locale or leap seconds.
 and `.pow`/`.abs`/`.sign`/`.is_negative`. Division truncates toward zero and the
 remainder takes the dividend's sign (like `Int`). Exact and deterministic on
 every engine including native (a from-scratch base-1e9 bignum).
+
+**Rational** (`rat`): exact fractions built on `BigInt`, always stored reduced
+with a positive denominator, so equality and `to_string` are canonical. `+ - * /`
+and comparisons, plus `.num`/`.den` (BigInt), `.to_float`, and `.recip`. No
+rounding error — `rat(1,3) + rat(1,6)` is exactly `rat(1,2)`. Native too.
 
 **Encodings** (`base64_*`, `hex_*`, `hash_fnv`) are pure and byte-identical on
 every engine including native. They work on the string's UTF-8 bytes; `*_decode`

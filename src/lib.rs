@@ -19,6 +19,7 @@ pub mod check;
 pub mod compile;
 pub mod diag;
 pub mod bigint;
+pub mod rational;
 pub mod callargs;
 pub mod effects;
 pub mod fmt;

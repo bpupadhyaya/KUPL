@@ -14,6 +14,8 @@ pub enum Ty {
     F32,
     /// An arbitrary-precision integer (`big(…)`).
     BigInt,
+    /// An exact rational number (`rat(…)`).
+    Rational,
     Float,
     Bool,
     Str,
@@ -43,7 +45,7 @@ pub enum Ty {
 
 impl Ty {
     pub fn is_numeric(&self) -> bool {
-        matches!(self, Ty::Int | Ty::Float | Ty::IntW(_) | Ty::F32 | Ty::BigInt)
+        matches!(self, Ty::Int | Ty::Float | Ty::IntW(_) | Ty::F32 | Ty::BigInt | Ty::Rational)
     }
 }
 
@@ -122,6 +124,7 @@ impl Unifier {
             (Ty::IntW(x), Ty::IntW(y)) if x == y => Ok(()),
             (Ty::F32, Ty::F32) => Ok(()),
             (Ty::BigInt, Ty::BigInt) => Ok(()),
+            (Ty::Rational, Ty::Rational) => Ok(()),
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
             | (Ty::Bool, Ty::Bool)
@@ -165,6 +168,7 @@ impl fmt::Display for Ty {
             Ty::IntW(w) => write!(f, "{}", w.name()),
             Ty::F32 => write!(f, "f32"),
             Ty::BigInt => write!(f, "BigInt"),
+            Ty::Rational => write!(f, "Rational"),
             Ty::Float => write!(f, "Float"),
             Ty::Bool => write!(f, "Bool"),
             Ty::Str => write!(f, "Str"),

@@ -294,6 +294,19 @@ impl BigInt {
         Some((quo, rem))
     }
 
+    /// The greatest common divisor of `|self|` and `|o|` — Euclid's algorithm.
+    /// Always non-negative; `gcd(0, 0) == 0`, `gcd(n, 0) == |n|`.
+    pub fn gcd(&self, o: &BigInt) -> BigInt {
+        let mut a = self.abs();
+        let mut b = o.abs();
+        while !b.is_zero() {
+            let (_, r) = a.divmod(&b).unwrap();
+            a = b;
+            b = r;
+        }
+        a
+    }
+
     /// `self ^ exp` for a non-negative exponent, by repeated squaring.
     pub fn pow(&self, exp: u64) -> BigInt {
         let mut result = BigInt::from_i64(1);
@@ -402,6 +415,18 @@ mod tests {
         assert_eq!(b("2").pow(128).to_decimal(), "340282366920938463463374607431768211456");
         assert_eq!(b("10").pow(0).to_decimal(), "1");
         assert_eq!(b("-3").pow(3).to_decimal(), "-27");
+    }
+
+    #[test]
+    fn gcd_euclid() {
+        assert_eq!(b("12").gcd(&b("18")).to_decimal(), "6");
+        assert_eq!(b("18").gcd(&b("12")).to_decimal(), "6");
+        assert_eq!(b("-12").gcd(&b("18")).to_decimal(), "6"); // magnitude
+        assert_eq!(b("17").gcd(&b("5")).to_decimal(), "1"); // coprime
+        assert_eq!(b("100").gcd(&b("0")).to_decimal(), "100");
+        assert_eq!(b("0").gcd(&b("0")).to_decimal(), "0");
+        // large: gcd(2^100, 2^60) == 2^60
+        assert_eq!(b("2").pow(100).gcd(&b("2").pow(60)), b("2").pow(60));
     }
 
     #[test]

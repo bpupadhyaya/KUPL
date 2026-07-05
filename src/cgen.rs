@@ -430,6 +430,7 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_SHUFFLE => format!("regs[{dst}] = k_shuffle(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_BIG => format!("regs[{dst}] = k_big_builtin(regs[{start}]); (void){argc};"),
             BUILTIN_HTTP_SERVE => format!("regs[{dst}] = k_http_serve(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_RAT => format!("regs[{dst}] = k_rat_builtin(regs[{start}], regs[{start}+1]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -566,14 +567,15 @@ typedef struct { const char* type_name; const char* variant; int arity; const ch
    KValue stays small; width is the IntW tag 0..7 (i8,i16,i32,i64,u8,u16,u32,u64) */
 typedef struct { __int128 v; int width; } KSized;
 typedef struct KBig KBig;
+typedef struct KRat KRat;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL } tag;
     union {
         int64_t i; double f; int b; float f32v;
         const char* s;
         KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
-        int32_t fun; KSized* sized; KBig* big;
+        int32_t fun; KSized* sized; KBig* big; KRat* rat;
         struct { int64_t lo, hi; int incl; } range;
     } as;
 };
@@ -842,6 +844,82 @@ static KValue k_big_builtin(KValue v) {
     }
     k_panic("`big` needs an Int or a Str"); return k_unit();
 }
+
+/* ---- Rational: exact fractions over KBig, a C mirror of src/rational.rs.
+   Always reduced, denominator > 0; to_decimal matches the Rust engine. ---- */
+struct KRat { KBig* num; KBig* den; };
+static KValue k_rat_v(KRat* r) { KValue x; x.tag = K_RATIONAL; x.as.rat = r; return x; }
+static KBig* k_big_abs(KBig* a) { return k_big_norm(0, a->limbs, a->n); }
+static KBig* k_big_gcd(KBig* a, KBig* b) {
+    KBig* x = k_big_abs(a);
+    KBig* y = k_big_abs(b);
+    while (y->n != 0) {
+        KBig* r = k_big_divmod(k_big_v(x), k_big_v(y), 1);
+        x = y;
+        y = r;
+    }
+    return x;
+}
+static int k_big_is_one(KBig* a) { return a->n == 1 && a->limbs[0] == 1 && !a->neg; }
+static KRat* k_rat_norm(KBig* num, KBig* den) {
+    if (den->n == 0) k_panic("division by zero");
+    if (den->neg) { num = k_big_negate(num); den = k_big_negate(den); }
+    KRat* r = (KRat*)k_alloc(sizeof(KRat));
+    KBig* g = k_big_gcd(num, den);
+    if (g->n == 0) { r->num = k_big_from_i64(0); r->den = k_big_from_i64(1); return r; }
+    r->num = k_big_divmod(k_big_v(num), k_big_v(g), 0);
+    r->den = k_big_divmod(k_big_v(den), k_big_v(g), 0);
+    return r;
+}
+static KBig* k_rat_to_big(KValue v) {
+    if (v.tag == K_INT) return k_big_from_i64(v.as.i);
+    if (v.tag == K_BIGINT) return v.as.big;
+    k_panic("`rat` needs Int or BigInt"); return 0;
+}
+static KValue k_rat_builtin(KValue n, KValue d) {
+    return k_rat_v(k_rat_norm(k_rat_to_big(n), k_rat_to_big(d)));
+}
+static KRat* k_rat_add(KValue av, KValue bv) {
+    KRat* a = av.as.rat; KRat* b = bv.as.rat;
+    KBig* n = k_big_add(k_big_v(k_big_mul(k_big_v(a->num), k_big_v(b->den))),
+                        k_big_v(k_big_mul(k_big_v(b->num), k_big_v(a->den))));
+    return k_rat_norm(n, k_big_mul(k_big_v(a->den), k_big_v(b->den)));
+}
+static KRat* k_rat_sub(KValue av, KValue bv) {
+    KRat* a = av.as.rat; KRat* b = bv.as.rat;
+    KBig* n = k_big_sub(k_big_v(k_big_mul(k_big_v(a->num), k_big_v(b->den))),
+                        k_big_v(k_big_mul(k_big_v(b->num), k_big_v(a->den))));
+    return k_rat_norm(n, k_big_mul(k_big_v(a->den), k_big_v(b->den)));
+}
+static KRat* k_rat_mul(KValue av, KValue bv) {
+    KRat* a = av.as.rat; KRat* b = bv.as.rat;
+    return k_rat_norm(k_big_mul(k_big_v(a->num), k_big_v(b->num)),
+                      k_big_mul(k_big_v(a->den), k_big_v(b->den)));
+}
+static KRat* k_rat_div(KValue av, KValue bv) {
+    KRat* a = av.as.rat; KRat* b = bv.as.rat;
+    if (b->num->n == 0) k_panic("division by zero");
+    return k_rat_norm(k_big_mul(k_big_v(a->num), k_big_v(b->den)),
+                      k_big_mul(k_big_v(a->den), k_big_v(b->num)));
+}
+static int k_rat_cmp(KValue av, KValue bv) {
+    KRat* a = av.as.rat; KRat* b = bv.as.rat;
+    return k_big_cmp(k_big_v(k_big_mul(k_big_v(a->num), k_big_v(b->den))),
+                     k_big_v(k_big_mul(k_big_v(b->num), k_big_v(a->den))));
+}
+static char* k_rat_to_decimal(KRat* r) {
+    char* n = k_big_to_decimal(r->num);
+    if (k_big_is_one(r->den)) return n;
+    char* d = k_big_to_decimal(r->den);
+    int len = (int)(strlen(n) + strlen(d) + 2);
+    char* out = (char*)k_alloc(len);
+    snprintf(out, len, "%s/%s", n, d);
+    return out;
+}
+static double k_rat_to_f64(KRat* r) {
+    return strtod(k_big_to_decimal(r->num), 0) / strtod(k_big_to_decimal(r->den), 0);
+}
+
 static KValue k_fun(int32_t idx) { KValue x; x.tag = K_FUN;   x.as.fun = idx; return x; }
 
 static KValue k_range(KValue lo, KValue hi, int incl) {
@@ -993,6 +1071,7 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
     switch (v.tag) {
         case K_INT: snprintf(tmp, sizeof tmp, "%lld", (long long)v.as.i); kb_puts(b, tmp); break;
         case K_BIGINT: kb_puts(b, k_big_to_decimal(v.as.big)); break;
+        case K_RATIONAL: kb_puts(b, k_rat_to_decimal(v.as.rat)); break;
         case K_FLOAT: k_fmt_float(b, v.as.f); break;
         case K_BOOL: kb_puts(b, v.as.b ? "true" : "false"); break;
         case K_UNIT: kb_puts(b, "()"); break;
@@ -1112,6 +1191,7 @@ static int k_eq(KValue a, KValue b) {
         return a.as.sized->width == b.as.sized->width && a.as.sized->v == b.as.sized->v;
     if (a.tag == K_F32 && b.tag == K_F32) return a.as.f32v == b.as.f32v;
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_cmp(a, b) == 0;
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_cmp(a, b) == 0;
     if (a.tag == K_MAP && b.tag == K_MAP) {
         if (a.as.map->len != b.as.map->len) return 0;
         for (int64_t i = 0; i < a.as.map->len; i++) {
@@ -1191,6 +1271,7 @@ static KValue k_add(KValue a, KValue b) {
     if (a.tag == K_STR && b.tag == K_STR) return k_concat(a, b);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 0);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_add(a, b));
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_add(a, b));
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_sub(KValue a, KValue b) {
@@ -1204,6 +1285,7 @@ static KValue k_sub(KValue a, KValue b) {
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 1);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 1);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_sub(a, b));
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_sub(a, b));
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_mul(KValue a, KValue b) {
@@ -1217,6 +1299,7 @@ static KValue k_mul(KValue a, KValue b) {
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 2);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 2);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_mul(a, b));
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_mul(a, b));
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_div(KValue a, KValue b) {
@@ -1230,6 +1313,7 @@ static KValue k_div(KValue a, KValue b) {
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 3);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 3);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_divmod(a, b, 0));
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_div(a, b));
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_rem(KValue a, KValue b) {
@@ -1251,6 +1335,7 @@ static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
     else if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) { __int128 p = a.as.sized->v, q = b.as.sized->v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_STR && b.tag == K_STR) { is_str = 1; int r = strcmp(a.as.s, b.as.s); c = (r < 0) ? -1 : (r > 0); }
     else if (a.tag == K_BIGINT && b.tag == K_BIGINT) { c = k_big_cmp(a, b); }
+    else if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { c = k_rat_cmp(a, b); }
     else { k_panic("invalid operand types"); }
     (void)is_str;
     switch (op) {
@@ -2807,6 +2892,13 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "is_negative")) return k_bool(recv.as.big->neg);
         if (!strcmp(name, "sign")) { KBig* a = recv.as.big; return k_int(a->n == 0 ? 0 : (a->neg ? -1 : 1)); }
     }
+    if (recv.tag == K_RATIONAL) {
+        (void)argc;
+        if (!strcmp(name, "num")) return k_big_v(recv.as.rat->num);
+        if (!strcmp(name, "den")) return k_big_v(recv.as.rat->den);
+        if (!strcmp(name, "to_float")) return k_float(k_rat_to_f64(recv.as.rat));
+        if (!strcmp(name, "recip")) { KRat* r = recv.as.rat; if (r->num->n == 0) k_panic("reciprocal of zero"); return k_rat_v(k_rat_norm(r->den, r->num)); }
+    }
     (void)argc;
     if (recv.tag == K_COMPONENT) return k_expose_call(recv, name, args, argc);
     /* Int/sized -> a sized width (checked), mirrors interp shared_method */
@@ -4004,6 +4096,17 @@ mod tests {
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Rational (it70) compiles to native, reusing the C bignum: exact fraction
+    /// arithmetic is byte-identical to the interpreter.
+    #[test]
+    fn native_rational() {
+        let src = "fun main() uses io {\n    print(rat(1, 3) + rat(1, 6))\n    print(rat(2, 4))\n    \
+                   print(rat(1, 3) / rat(1, 2))\n    print(rat(3, 7).recip())\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "rational"), "1/2\n1/2\n2/3\n7/3\n");
+        }
     }
 
     /// http_serve (it68) compiles to native and serves real requests: a native

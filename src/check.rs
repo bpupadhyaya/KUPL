@@ -404,6 +404,7 @@ impl Checker {
                 "Tensor" => Ty::Tensor,
                 "f32" => Ty::F32,
                 "BigInt" => Ty::BigInt,
+                "Rational" => Ty::Rational,
                 _ if crate::value::IntW::from_name(n.as_str()).is_some() => {
                     Ty::IntW(crate::value::IntW::from_name(n.as_str()).unwrap())
                 }
@@ -1502,6 +1503,12 @@ impl Checker {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::BigInt;
                 }
+                ("rat", 2) => {
+                    for a in args {
+                        self.infer_expr(&a.value, ctx);
+                    }
+                    return Ty::Rational;
+                }
                 ("path_join", 2) => {
                     for a in args {
                         let t = self.infer_expr(&a.value, ctx);
@@ -1931,6 +1938,9 @@ impl Checker {
                 Some((vec![Ty::Float], Ty::Float))
             }
             (Ty::BigInt, "pow") => Some((vec![Ty::Int], Ty::BigInt)),
+            (Ty::Rational, "num") | (Ty::Rational, "den") => Some((vec![], Ty::BigInt)),
+            (Ty::Rational, "to_float") => Some((vec![], Ty::Float)),
+            (Ty::Rational, "recip") => Some((vec![], Ty::Rational)),
             (Ty::BigInt, "abs") => Some((vec![], Ty::BigInt)),
             (Ty::BigInt, "is_negative") => Some((vec![], Ty::Bool)),
             (Ty::BigInt, "sign") => Some((vec![], Ty::Int)),

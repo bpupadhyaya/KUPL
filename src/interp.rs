@@ -943,6 +943,11 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return big_builtin(&v).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("rat", 2) => {
+                    let n = self.eval(&args[0].value, env)?;
+                    let d = self.eval(&args[1].value, env)?;
+                    return rat_builtin(&n, &d).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("path_join", 2) | ("path_base", 1) | ("path_dir", 1) | ("path_ext", 1) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -1290,6 +1295,21 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
                     Some((_, r)) => Value::BigInt(Rc::new(r)),
                     None => return Err("remainder by zero".into()),
                 },
+                _ => unreachable!(),
+            })
+        }
+        (Value::Rational(a), Value::Rational(b)) => {
+            use std::cmp::Ordering;
+            Ok(match op {
+                Add => Value::Rational(Rc::new(a.add(b))),
+                Sub => Value::Rational(Rc::new(a.sub(b))),
+                Mul => Value::Rational(Rc::new(a.mul(b))),
+                Div => Value::Rational(Rc::new(a.div(b)?)),
+                Lt => Value::Bool(a.cmp(b) == Ordering::Less),
+                Le => Value::Bool(a.cmp(b) != Ordering::Greater),
+                Gt => Value::Bool(a.cmp(b) == Ordering::Greater),
+                Ge => Value::Bool(a.cmp(b) != Ordering::Less),
+                Rem => return Err("Rational remainder is not supported".into()),
                 _ => unreachable!(),
             })
         }
@@ -2134,6 +2154,13 @@ pub fn shared_method(
         (Value::BigInt(b), "abs") => Ok(Value::BigInt(Rc::new(b.abs()))),
         (Value::BigInt(b), "is_negative") => Ok(Value::Bool(b.is_negative())),
         (Value::BigInt(b), "sign") => Ok(Value::Int(b.sign())),
+        (Value::Rational(r), "num") => Ok(Value::BigInt(Rc::new(r.num.clone()))),
+        (Value::Rational(r), "den") => Ok(Value::BigInt(Rc::new(r.den.clone()))),
+        (Value::Rational(r), "to_float") => Ok(Value::Float(r.to_f64())),
+        (Value::Rational(r), "recip") => r
+            .recip()
+            .map(|x| Value::Rational(Rc::new(x)))
+            .map_err(|_| "reciprocal of zero".to_string()),
         (Value::Float(v), "pow") => match args.into_iter().next() {
             Some(Value::Float(w)) => Ok(Value::Float(v.powf(w))),
             _ => Err("`pow` needs a Float".into()),
@@ -2982,6 +3009,22 @@ pub fn big_builtin(v: &Value) -> Result<Value, String> {
         },
         other => Err(format!("`big` needs an Int or a Str, found {}", other.type_name())),
     }
+}
+
+/// `rat(n, d)` — an exact rational number `n/d` (reduced; denominator 0 errors).
+/// Accepts `Int` or `BigInt` numerator/denominator.
+pub fn rat_builtin(n: &Value, d: &Value) -> Result<Value, String> {
+    use crate::bigint::BigInt;
+    use std::rc::Rc;
+    let to_big = |v: &Value| -> Result<BigInt, String> {
+        match v {
+            Value::Int(x) => Ok(BigInt::from_i64(*x)),
+            Value::BigInt(b) => Ok((**b).clone()),
+            other => Err(format!("`rat` needs Int or BigInt, found {}", other.type_name())),
+        }
+    };
+    let r = crate::rational::Rational::new(to_big(n)?, to_big(d)?)?;
+    Ok(Value::Rational(Rc::new(r)))
 }
 
 /// Pure `/`-path helpers (no effect). They operate lexically on forward-slash

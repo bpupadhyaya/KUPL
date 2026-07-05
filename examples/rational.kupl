@@ -1,0 +1,40 @@
+// Exact rational numbers — `rat(n, d)` never loses precision.
+//
+//   rat(n: Int, d: Int) -> Rational   the fraction n/d, always reduced (d != 0)
+//
+// Supports + - * / and comparisons; `.num()`/`.den()` (as BigInt), `.to_float()`,
+// and `.recip()`. The denominator is kept positive and the fraction reduced, so
+// equality is exact and the same on every engine (interpreter, KVM, native).
+
+// Sum 1/1 + 1/2 + ... + 1/n exactly.
+fun harmonic(n: Int) -> Rational {
+    var acc = rat(0, 1)
+    var i = 1
+    while i <= n {
+        acc = acc + rat(1, i)
+        i = i + 1
+    }
+    acc
+}
+
+fun main() uses io {
+    print("1/3 + 1/6 = {rat(1, 3) + rat(1, 6)}")   // 1/2
+    print("2/4       = {rat(2, 4)}")                 // reduces to 1/2
+    print("1/3 * 3   = {rat(1, 3) * rat(3, 1)}")     // 1
+    print("(1/3)/(1/2) = {rat(1, 3) / rat(1, 2)}")   // 2/3
+    print("H(10)     = {harmonic(10)}")              // 7381/2520
+    print("1/4 float = {rat(1, 4).to_float()}")      // 0.25
+    print("recip 3/7 = {rat(3, 7).recip()}")         // 7/3
+    print("num/den of 3/4 = {rat(3, 4).num()} {rat(3, 4).den()}")
+    print("1/3 < 1/2 = {rat(1, 3) < rat(1, 2)}")
+    print("-1/2      = {rat(1, -2)}")                // sign normalized
+}
+
+law "Rational arithmetic is exact" {
+    expect rat(1, 3) + rat(1, 6) == rat(1, 2)
+    expect rat(2, 4) == rat(1, 2)
+    expect rat(1, 3) * rat(3, 1) == rat(1, 1)
+    expect rat(1, 3) < rat(1, 2)
+    expect rat(1, -2) == rat(-1, 2)
+    expect harmonic(4) == rat(25, 12)
+}

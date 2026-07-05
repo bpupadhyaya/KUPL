@@ -682,6 +682,10 @@ impl<'m> Vm<'m> {
                             Ok(v) => set!(dst, v),
                             Err(msg) => return Err(VmError { msg, span }),
                         },
+                        BUILTIN_RAT => match crate::interp::rat_builtin(&args[0], &args[1]) {
+                            Ok(v) => set!(dst, v),
+                            Err(msg) => return Err(VmError { msg, span }),
+                        },
                         BUILTIN_PATH_JOIN | BUILTIN_PATH_BASE | BUILTIN_PATH_DIR
                         | BUILTIN_PATH_EXT => {
                             let name = match which {
