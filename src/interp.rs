@@ -1259,7 +1259,14 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
                 Le => Value::Bool(a.cmp(b) != Ordering::Greater),
                 Gt => Value::Bool(a.cmp(b) == Ordering::Greater),
                 Ge => Value::Bool(a.cmp(b) != Ordering::Less),
-                Div | Rem => return Err("BigInt division/remainder is not yet supported".into()),
+                Div => match a.divmod(b) {
+                    Some((q, _)) => Value::BigInt(Rc::new(q)),
+                    None => return Err("division by zero".into()),
+                },
+                Rem => match a.divmod(b) {
+                    Some((_, r)) => Value::BigInt(Rc::new(r)),
+                    None => return Err("remainder by zero".into()),
+                },
                 _ => unreachable!(),
             })
         }
@@ -2096,6 +2103,14 @@ pub fn shared_method(
             Some(Value::Float(w)) => Ok(Value::Float(v.max(w))),
             _ => Err("`max` needs a Float".into()),
         },
+        (Value::BigInt(b), "pow") => match args.into_iter().next() {
+            Some(Value::Int(e)) if e >= 0 => Ok(Value::BigInt(Rc::new(b.pow(e as u64)))),
+            Some(Value::Int(_)) => Err("`pow` exponent must be non-negative".into()),
+            _ => Err("`pow` needs an Int exponent".into()),
+        },
+        (Value::BigInt(b), "abs") => Ok(Value::BigInt(Rc::new(b.abs()))),
+        (Value::BigInt(b), "is_negative") => Ok(Value::Bool(b.is_negative())),
+        (Value::BigInt(b), "sign") => Ok(Value::Int(b.sign())),
         (Value::Float(v), "pow") => match args.into_iter().next() {
             Some(Value::Float(w)) => Ok(Value::Float(v.powf(w))),
             _ => Err("`pow` needs a Float".into()),

@@ -3,10 +3,10 @@
 //   big(n: Int) -> BigInt      from a machine integer
 //   big(s: Str) -> BigInt      from a decimal string (any size)
 //
-// Supported now: + - * and comparisons (== != < <= > >=). Division, modulo, and
-// power are coming. Everything is exact and deterministic — the same digits on
-// every engine. (Native compilation of BigInt is not yet available; use
-// `kupl run`, `kupl run --vm`, or `kupl bundle`.)
+// Supports + - * / % and comparisons, plus `.pow(exp)`, `.abs()`, `.sign()`,
+// `.is_negative()`. Division truncates toward zero and the remainder takes the
+// dividend's sign (like `Int`). Everything is exact and deterministic — the
+// same digits on every engine, including native machine code.
 
 fun factorial(n: Int) -> BigInt {
     var acc = big(1)
@@ -39,6 +39,13 @@ fun main() uses io {
     print("huge * 2 = {huge * big(2)}")
     print("huge - huge = {huge - huge}")
     print("signs: {big(-7) < big(0)} {big(7) > big(0)}")
+
+    // division, modulo, and power
+    let n = big("1000000000000000000000")
+    print("n / 7   = {n / big(7)}")
+    print("n % 7   = {n % big(7)}")
+    print("2^256   = {big(2).pow(256)}")
+    print("abs/sign: {big(-42).abs()} {big(-42).sign()}")
 }
 
 law "BigInt arithmetic is exact" {
@@ -46,4 +53,7 @@ law "BigInt arithmetic is exact" {
     expect factorial(10) == big("3628800")
     expect big(999999999) + big(1) == big("1000000000")
     expect big("-5") + big(3) == big("-2")
+    expect big(2).pow(10) == big("1024")
+    expect big(17) % big(5) == big("2")
+    expect (big(100) / big(7)) * big(7) + big(100) % big(7) == big("100")
 }

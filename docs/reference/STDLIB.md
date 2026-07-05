@@ -58,6 +58,7 @@ unless supervised.
 | `query_parse(s)` | `(Str) -> List[List[Str]]` | `a=1&b=2` → `[[a,1],[b,2]]`, decoded |
 | `query_build(pairs)` | `(List[List[Str]]) -> Str` | encode `[key, value]` pairs into `a=1&b=2` |
 | `big(x)` | `(Int) -> BigInt` / `(Str) -> BigInt` | arbitrary-precision integer (panics on a malformed string); pure |
+| `.pow/.abs/.sign/.is_negative` on BigInt | methods | power (Int exp), absolute value, `-1/0/1`, sign test |
 | `exec(program, args)` | `(Str, List[Str]) -> Result[Str, Str]` — **uses `io.proc`** | run a program (argv, no shell); `Ok` = stdout on exit 0 |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
@@ -104,6 +105,11 @@ extractors are pure, deterministic UTC calendar math (epoch seconds ↔ civil
 date, correct for negative/pre-1970 timestamps), byte-identical on every engine
 including native. Only `now()` reads the wall clock — it carries the `io.time`
 effect and is non-deterministic. No locale or leap seconds.
+
+**BigInt** (`big`): arbitrary-precision integers with `+ - * / %`, comparisons,
+and `.pow`/`.abs`/`.sign`/`.is_negative`. Division truncates toward zero and the
+remainder takes the dividend's sign (like `Int`). Exact and deterministic on
+every engine including native (a from-scratch base-1e9 bignum).
 
 **Encodings** (`base64_*`, `hex_*`, `hash_fnv`) are pure and byte-identical on
 every engine including native. They work on the string's UTF-8 bytes; `*_decode`

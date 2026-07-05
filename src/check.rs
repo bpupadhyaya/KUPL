@@ -1922,6 +1922,10 @@ impl Checker {
             (Ty::Float, "min") | (Ty::Float, "max") | (Ty::Float, "pow") => {
                 Some((vec![Ty::Float], Ty::Float))
             }
+            (Ty::BigInt, "pow") => Some((vec![Ty::Int], Ty::BigInt)),
+            (Ty::BigInt, "abs") => Some((vec![], Ty::BigInt)),
+            (Ty::BigInt, "is_negative") => Some((vec![], Ty::Bool)),
+            (Ty::BigInt, "sign") => Some((vec![], Ty::Int)),
             (Ty::Option(t), "is_some") | (Ty::Option(t), "is_none") => {
                 let _ = t;
                 Some((vec![], Ty::Bool))

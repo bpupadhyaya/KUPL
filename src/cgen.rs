@@ -428,13 +428,7 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_RANDOM_INTS => format!("regs[{dst}] = k_random_ints(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RANDOM_FLOATS => format!("regs[{dst}] = k_random_floats(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_SHUFFLE => format!("regs[{dst}] = k_shuffle(regs[{start}], regs[{start}+1]); (void){argc};"),
-            BUILTIN_BIG => {
-                return Err(
-                    "`big` / BigInt is not yet supported by the native backend — use \
-                     `kupl run`, `kupl run --vm`, or `kupl bundle`"
-                        .into(),
-                )
-            }
+            BUILTIN_BIG => format!("regs[{dst}] = k_big_builtin(regs[{start}]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -567,14 +561,15 @@ typedef struct { const char* type_name; const char* variant; int arity; const ch
 /* a fixed-width integer: the value is boxed (like the interpreter's i128 box) so
    KValue stays small; width is the IntW tag 0..7 (i8,i16,i32,i64,u8,u16,u32,u64) */
 typedef struct { __int128 v; int width; } KSized;
+typedef struct KBig KBig;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32 } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT } tag;
     union {
         int64_t i; double f; int b; float f32v;
         const char* s;
         KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
-        int32_t fun; KSized* sized;
+        int32_t fun; KSized* sized; KBig* big;
         struct { int64_t lo, hi; int incl; } range;
     } as;
 };
@@ -669,6 +664,180 @@ static KValue k_bool(int v)      { KValue x; x.tag = K_BOOL;  x.as.b = !!v; retu
 static KValue k_unit(void)       { KValue x; x.tag = K_UNIT;  x.as.i = 0; return x; }
 static KValue k_str(const char* s) { KValue x; x.tag = K_STR; x.as.s = s; return x; }
 static char* k_strdup(const char* s) { size_t n = strlen(s) + 1; char* c = (char*)k_alloc(n); memcpy(c, s, n); return c; }
+
+/* ---- BigInt: a C mirror of src/bigint.rs (sign-magnitude, base-1e9 limbs).
+   The base is chosen so to_decimal matches the Rust engine byte-for-byte. ---- */
+struct KBig { int neg; int n; uint32_t* limbs; };
+#define KBIG_BASE 1000000000u
+static KValue k_big_v(KBig* b) { KValue x; x.tag = K_BIGINT; x.as.big = b; return x; }
+static KBig* k_big_norm(int neg, const uint32_t* limbs, int n) {
+    while (n > 0 && limbs[n - 1] == 0) n--;
+    KBig* b = (KBig*)k_alloc(sizeof(KBig));
+    b->neg = (n == 0) ? 0 : (neg != 0);
+    b->n = n;
+    if (n > 0) { b->limbs = (uint32_t*)k_alloc(sizeof(uint32_t) * n); memcpy(b->limbs, limbs, sizeof(uint32_t) * n); }
+    else b->limbs = 0;
+    return b;
+}
+static KBig* k_big_from_i64(int64_t v) {
+    if (v == 0) return k_big_norm(0, 0, 0);
+    int neg = v < 0;
+    uint64_t m = neg ? (~(uint64_t)v + 1) : (uint64_t)v;
+    uint32_t tmp[3]; int n = 0;
+    while (m > 0) { tmp[n++] = (uint32_t)(m % KBIG_BASE); m /= KBIG_BASE; }
+    return k_big_norm(neg, tmp, n);
+}
+static KBig* k_big_from_str(const char* s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
+    if (!*s) return 0;
+    for (const char* p = s; *p; p++) if (*p < '0' || *p > '9') return 0;
+    int len = (int)strlen(s);
+    int cap = (len + 8) / 9; if (cap < 1) cap = 1;
+    uint32_t* limbs = (uint32_t*)k_alloc(sizeof(uint32_t) * cap);
+    int li = 0, i = len;
+    while (i > 0) {
+        int st = i - 9; if (st < 0) st = 0;
+        uint32_t v = 0;
+        for (int j = st; j < i; j++) v = v * 10 + (uint32_t)(s[j] - '0');
+        limbs[li++] = v;
+        i = st;
+    }
+    return k_big_norm(neg, limbs, li);
+}
+static char* k_big_to_decimal(KBig* b) {
+    if (b->n == 0) return k_strdup("0");
+    int cap = b->n * 9 + 2;
+    char* out = (char*)k_alloc(cap);
+    int pos = 0;
+    if (b->neg) out[pos++] = '-';
+    pos += snprintf(out + pos, cap - pos, "%u", b->limbs[b->n - 1]);
+    for (int i = b->n - 2; i >= 0; i--) pos += snprintf(out + pos, cap - pos, "%09u", b->limbs[i]);
+    out[pos] = 0;
+    return out;
+}
+static int k_big_cmp_mag(const uint32_t* a, int an, const uint32_t* bb, int bn) {
+    if (an != bn) return an < bn ? -1 : 1;
+    for (int i = an - 1; i >= 0; i--) if (a[i] != bb[i]) return a[i] < bb[i] ? -1 : 1;
+    return 0;
+}
+static int k_big_add_mag(const uint32_t* a, int an, const uint32_t* bb, int bn, uint32_t* out) {
+    uint64_t carry = 0; int m = an > bn ? an : bn, i;
+    for (i = 0; i < m; i++) { uint64_t av = i < an ? a[i] : 0, bv = i < bn ? bb[i] : 0, s = av + bv + carry; out[i] = (uint32_t)(s % KBIG_BASE); carry = s / KBIG_BASE; }
+    if (carry) out[i++] = (uint32_t)carry;
+    return i;
+}
+static int k_big_sub_mag(const uint32_t* a, int an, const uint32_t* bb, int bn, uint32_t* out) {
+    int64_t borrow = 0; int i;
+    for (i = 0; i < an; i++) { int64_t av = a[i], bv = i < bn ? bb[i] : 0, d = av - bv - borrow; if (d < 0) { d += KBIG_BASE; borrow = 1; } else borrow = 0; out[i] = (uint32_t)d; }
+    while (i > 0 && out[i - 1] == 0) i--;
+    return i;
+}
+static int k_big_mul_small(const uint32_t* a, int an, uint64_t k, uint32_t* out) {
+    if (k == 0 || an == 0) return 0;
+    uint64_t carry = 0; int i;
+    for (i = 0; i < an; i++) { uint64_t cur = (uint64_t)a[i] * k + carry; out[i] = (uint32_t)(cur % KBIG_BASE); carry = cur / KBIG_BASE; }
+    while (carry) { out[i++] = (uint32_t)(carry % KBIG_BASE); carry /= KBIG_BASE; }
+    return i;
+}
+static KBig* k_big_add(KValue av, KValue bv) {
+    KBig* a = av.as.big; KBig* b = bv.as.big;
+    if (a->neg == b->neg) {
+        uint32_t* out = (uint32_t*)k_alloc(sizeof(uint32_t) * (a->n + b->n + 2));
+        int n = k_big_add_mag(a->limbs, a->n, b->limbs, b->n, out);
+        return k_big_norm(a->neg, out, n);
+    }
+    int c = k_big_cmp_mag(a->limbs, a->n, b->limbs, b->n);
+    if (c == 0) return k_big_norm(0, 0, 0);
+    int cap = (a->n > b->n ? a->n : b->n) + 1;
+    uint32_t* out = (uint32_t*)k_alloc(sizeof(uint32_t) * cap);
+    if (c > 0) { int n = k_big_sub_mag(a->limbs, a->n, b->limbs, b->n, out); return k_big_norm(a->neg, out, n); }
+    int n = k_big_sub_mag(b->limbs, b->n, a->limbs, a->n, out);
+    return k_big_norm(b->neg, out, n);
+}
+static KBig* k_big_negate(KBig* a) {
+    KBig* r = (KBig*)k_alloc(sizeof(KBig));
+    r->neg = a->n ? !a->neg : 0; r->n = a->n; r->limbs = a->limbs;
+    return r;
+}
+static KBig* k_big_sub(KValue av, KValue bv) { return k_big_add(av, k_big_v(k_big_negate(bv.as.big))); }
+static KBig* k_big_mul(KValue av, KValue bv) {
+    KBig* a = av.as.big; KBig* b = bv.as.big;
+    if (a->n == 0 || b->n == 0) return k_big_norm(0, 0, 0);
+    int n = a->n + b->n;
+    uint64_t* acc = (uint64_t*)k_alloc(sizeof(uint64_t) * n);
+    for (int i = 0; i < n; i++) acc[i] = 0;
+    for (int i = 0; i < a->n; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < b->n; j++) { uint64_t cur = acc[i + j] + (uint64_t)a->limbs[i] * b->limbs[j] + carry; acc[i + j] = cur % KBIG_BASE; carry = cur / KBIG_BASE; }
+        acc[i + b->n] += carry;
+    }
+    uint32_t* out = (uint32_t*)k_alloc(sizeof(uint32_t) * n);
+    for (int i = 0; i < n; i++) out[i] = (uint32_t)acc[i];
+    return k_big_norm(a->neg != b->neg, out, n);
+}
+/* returns quotient (want_rem=0) or remainder (want_rem=1) with the truncated
+   sign convention (quotient sign = a^b, remainder sign = dividend). */
+static KBig* k_big_divmod(KValue av, KValue bv, int want_rem) {
+    KBig* a = av.as.big; KBig* b = bv.as.big;
+    if (b->n == 0) k_panic(want_rem ? "remainder by zero" : "division by zero");
+    if (k_big_cmp_mag(a->limbs, a->n, b->limbs, b->n) < 0)
+        return want_rem ? k_big_norm(a->neg, a->limbs, a->n) : k_big_norm(0, 0, 0);
+    int an = a->n, bn = b->n;
+    uint32_t* quo = (uint32_t*)k_alloc(sizeof(uint32_t) * an);
+    for (int i = 0; i < an; i++) quo[i] = 0;
+    uint32_t* rem = (uint32_t*)k_alloc(sizeof(uint32_t) * (an + 2));
+    uint32_t* nxt = (uint32_t*)k_alloc(sizeof(uint32_t) * (an + 2));
+    uint32_t* tmp = (uint32_t*)k_alloc(sizeof(uint32_t) * (bn + 2));
+    int remn = 0;
+    for (int i = an - 1; i >= 0; i--) {
+        nxt[0] = a->limbs[i];
+        for (int j = 0; j < remn; j++) nxt[j + 1] = rem[j];
+        int nn = remn + 1;
+        while (nn > 0 && nxt[nn - 1] == 0) nn--;
+        memcpy(rem, nxt, sizeof(uint32_t) * nn); remn = nn;
+        uint64_t lo = 0, hi = KBIG_BASE - 1;
+        while (lo < hi) {
+            uint64_t mid = (lo + hi + 1) / 2;
+            int tn = k_big_mul_small(b->limbs, bn, mid, tmp);
+            if (k_big_cmp_mag(tmp, tn, rem, remn) <= 0) lo = mid; else hi = mid - 1;
+        }
+        quo[i] = (uint32_t)lo;
+        if (lo > 0) { int tn = k_big_mul_small(b->limbs, bn, lo, tmp); remn = k_big_sub_mag(rem, remn, tmp, tn, rem); }
+    }
+    if (want_rem) return k_big_norm(a->neg, rem, remn);
+    return k_big_norm(a->neg != b->neg, quo, an);
+}
+static KBig* k_big_pow(KValue av, int64_t exp) {
+    KBig* result = k_big_from_i64(1);
+    KValue base = av;
+    uint64_t e = (uint64_t)exp;
+    while (e > 0) {
+        if (e & 1) result = k_big_mul(k_big_v(result), base);
+        e >>= 1;
+        if (e > 0) base = k_big_v(k_big_mul(base, base));
+    }
+    return result;
+}
+static int k_big_cmp(KValue av, KValue bv) {
+    KBig* a = av.as.big; KBig* b = bv.as.big;
+    int sa = a->n == 0 ? 0 : (a->neg ? -1 : 1), sb = b->n == 0 ? 0 : (b->neg ? -1 : 1);
+    if (sa != sb) return sa < sb ? -1 : 1;
+    int m = k_big_cmp_mag(a->limbs, a->n, b->limbs, b->n);
+    return sa < 0 ? -m : m;
+}
+/* the `big` builtin: from an Int or a decimal Str */
+static KValue k_big_builtin(KValue v) {
+    if (v.tag == K_INT) return k_big_v(k_big_from_i64(v.as.i));
+    if (v.tag == K_BIGINT) return v;
+    if (v.tag == K_STR) {
+        KBig* b = k_big_from_str(v.as.s);
+        if (!b) { char m[128]; snprintf(m, sizeof m, "invalid BigInt: %s", v.as.s); k_panic(m); }
+        return k_big_v(b);
+    }
+    k_panic("`big` needs an Int or a Str"); return k_unit();
+}
 static KValue k_fun(int32_t idx) { KValue x; x.tag = K_FUN;   x.as.fun = idx; return x; }
 
 static KValue k_range(KValue lo, KValue hi, int incl) {
@@ -819,6 +988,7 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
     char tmp[64];
     switch (v.tag) {
         case K_INT: snprintf(tmp, sizeof tmp, "%lld", (long long)v.as.i); kb_puts(b, tmp); break;
+        case K_BIGINT: kb_puts(b, k_big_to_decimal(v.as.big)); break;
         case K_FLOAT: k_fmt_float(b, v.as.f); break;
         case K_BOOL: kb_puts(b, v.as.b ? "true" : "false"); break;
         case K_UNIT: kb_puts(b, "()"); break;
@@ -937,6 +1107,7 @@ static int k_eq(KValue a, KValue b) {
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT)
         return a.as.sized->width == b.as.sized->width && a.as.sized->v == b.as.sized->v;
     if (a.tag == K_F32 && b.tag == K_F32) return a.as.f32v == b.as.f32v;
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_cmp(a, b) == 0;
     if (a.tag == K_MAP && b.tag == K_MAP) {
         if (a.as.map->len != b.as.map->len) return 0;
         for (int64_t i = 0; i < a.as.map->len; i++) {
@@ -1015,6 +1186,7 @@ static KValue k_add(KValue a, KValue b) {
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 0);
     if (a.tag == K_STR && b.tag == K_STR) return k_concat(a, b);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 0);
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_add(a, b));
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_sub(KValue a, KValue b) {
@@ -1027,6 +1199,7 @@ static KValue k_sub(KValue a, KValue b) {
     if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v - b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 1);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 1);
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_sub(a, b));
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_mul(KValue a, KValue b) {
@@ -1039,6 +1212,7 @@ static KValue k_mul(KValue a, KValue b) {
     if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v * b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 2);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 2);
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_mul(a, b));
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_div(KValue a, KValue b) {
@@ -1051,9 +1225,11 @@ static KValue k_div(KValue a, KValue b) {
     if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v / b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 3);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 3);
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_divmod(a, b, 0));
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_rem(KValue a, KValue b) {
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_divmod(a, b, 1));
     if (a.tag == K_INT && b.tag == K_INT) {
         if (b.as.i == 0) k_panic("remainder by zero");
         return k_int(a.as.i % b.as.i);
@@ -1070,6 +1246,7 @@ static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
     else if (a.tag == K_F32 && b.tag == K_F32) { float p = a.as.f32v, q = b.as.f32v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) { __int128 p = a.as.sized->v, q = b.as.sized->v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_STR && b.tag == K_STR) { is_str = 1; int r = strcmp(a.as.s, b.as.s); c = (r < 0) ? -1 : (r > 0); }
+    else if (a.tag == K_BIGINT && b.tag == K_BIGINT) { c = k_big_cmp(a, b); }
     else { k_panic("invalid operand types"); }
     (void)is_str;
     switch (op) {
@@ -2558,6 +2735,12 @@ static int k_sortby_cmp(const void* a, const void* b) {
 }
 
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
+    if (recv.tag == K_BIGINT) {
+        if (!strcmp(name, "pow")) { (void)argc; if (args[0].as.i < 0) k_panic("`pow` exponent must be non-negative"); return k_big_v(k_big_pow(recv, args[0].as.i)); }
+        if (!strcmp(name, "abs")) { KBig* a = recv.as.big; return k_big_v(k_big_norm(0, a->limbs, a->n)); }
+        if (!strcmp(name, "is_negative")) return k_bool(recv.as.big->neg);
+        if (!strcmp(name, "sign")) { KBig* a = recv.as.big; return k_int(a->n == 0 ? 0 : (a->neg ? -1 : 1)); }
+    }
     (void)argc;
     if (recv.tag == K_COMPONENT) return k_expose_call(recv, name, args, argc);
     /* Int/sized -> a sized width (checked), mirrors interp shared_method */
@@ -3757,15 +3940,20 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    /// BigInt (it64) lands on interp+KVM; the native backend defers it with a
-    /// clear message (native C bignum is scheduled for it65).
+    /// BigInt compiles to native (it65 C bignum): a big factorial, 2^128, and a
+    /// large division are byte-identical to the interpreter.
     #[test]
-    fn native_bigint_defers() {
-        let src = "fun main() uses io { print(big(2) * big(3)) }\n";
-        let compiled = crate::run::compile(src).expect("compiles");
-        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
-        let err = super::emit_c(&module).expect_err("native must defer BigInt");
-        assert!(err.contains("BigInt is not yet supported"), "{err}");
+    fn native_bigint() {
+        let src = "fun fact(n: Int) -> BigInt {\n    var a = big(1)\n    var i = 1\n    \
+                   while i <= n {\n        a = a * big(i)\n        i = i + 1\n    }\n    a\n}\n\
+                   fun main() uses io {\n    print(fact(30))\n    print(big(2).pow(128))\n    \
+                   print(big(\"1000000000000000000000\") / big(\"7\"))\n    print(big(\"1000000000000000000000\") % big(\"7\"))\n}\n";
+        if cc_available() {
+            assert_eq!(
+                native_main_stdout(src, "bigint"),
+                "265252859812191058636308480000000\n340282366920938463463374607431768211456\n142857142857142857142\n6\n"
+            );
+        }
     }
 
     /// The static-site-generator's markdown transformer (it63) — string-ops

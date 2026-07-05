@@ -220,6 +220,97 @@ impl BigInt {
         r
     }
 
+    /// Multiply a magnitude by a scalar `k` in `0..BASE`.
+    fn mul_small(a: &[u32], k: u64) -> Vec<u32> {
+        if k == 0 || a.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(a.len() + 1);
+        let mut carry = 0u64;
+        for &av in a {
+            let cur = av as u64 * k + carry;
+            out.push((cur % BASE) as u32);
+            carry = cur / BASE;
+        }
+        while carry > 0 {
+            out.push((carry % BASE) as u32);
+            carry /= BASE;
+        }
+        out
+    }
+
+    /// Divide magnitudes: returns (quotient, remainder) magnitudes, `b` != 0.
+    /// Long division processing dividend limbs high→low, choosing each base-1e9
+    /// quotient digit by binary search — a simple, deterministic method that
+    /// ports to C identically (byte-identity of the decimal result).
+    fn divmod_mag(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        if Self::cmp_mag(a, b) == Ordering::Less {
+            return (Vec::new(), a.to_vec());
+        }
+        let mut quo = vec![0u32; a.len()];
+        let mut rem: Vec<u32> = Vec::new();
+        for i in (0..a.len()).rev() {
+            // rem = rem * BASE + a[i]  (prepend the new limb)
+            let mut next = Vec::with_capacity(rem.len() + 1);
+            next.push(a[i]);
+            next.extend_from_slice(&rem);
+            while next.last() == Some(&0) {
+                next.pop();
+            }
+            rem = next;
+            // largest q in 0..BASE with b*q <= rem
+            let (mut lo, mut hi) = (0u64, BASE - 1);
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2;
+                if Self::cmp_mag(&Self::mul_small(b, mid), &rem) != Ordering::Greater {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            quo[i] = lo as u32;
+            if lo > 0 {
+                rem = Self::sub_mag(&rem, &Self::mul_small(b, lo));
+            }
+        }
+        while quo.last() == Some(&0) {
+            quo.pop();
+        }
+        (quo, rem)
+    }
+
+    /// Truncated division: the quotient truncates toward zero and the remainder
+    /// takes the DIVIDEND's sign (matching `Int` `/` and `%`). `None` on
+    /// division by zero.
+    pub fn divmod(&self, o: &BigInt) -> Option<(BigInt, BigInt)> {
+        if o.limbs.is_empty() {
+            return None;
+        }
+        let (q, r) = Self::divmod_mag(&self.limbs, &o.limbs);
+        let mut quo = BigInt { neg: self.neg != o.neg, limbs: q };
+        let mut rem = BigInt { neg: self.neg, limbs: r };
+        quo.normalize();
+        rem.normalize();
+        Some((quo, rem))
+    }
+
+    /// `self ^ exp` for a non-negative exponent, by repeated squaring.
+    pub fn pow(&self, exp: u64) -> BigInt {
+        let mut result = BigInt::from_i64(1);
+        let mut base = self.clone();
+        let mut e = exp;
+        while e > 0 {
+            if e & 1 == 1 {
+                result = result.mul(&base);
+            }
+            e >>= 1;
+            if e > 0 {
+                base = base.mul(&base);
+            }
+        }
+        result
+    }
+
     pub fn cmp(&self, o: &BigInt) -> Ordering {
         match (self.sign(), o.sign()) {
             (a, b) if a != b => a.cmp(&b),
@@ -287,6 +378,30 @@ mod tests {
             f = f.mul(&BigInt::from_i64(i));
         }
         assert_eq!(f.to_decimal(), "15511210043330985984000000");
+    }
+
+    #[test]
+    fn division_and_power() {
+        // q*d + r == dividend, and remainder has the dividend's sign
+        for (n, d) in [("100", "7"), ("-100", "7"), ("100", "-7"), ("-100", "-7"),
+                       ("1000000000000000000000", "7"), ("999999999999999999", "1000000000")] {
+            let (nb, db) = (b(n), b(d));
+            let (q, r) = nb.divmod(&db).unwrap();
+            assert_eq!(q.mul(&db).add(&r), nb, "{n}/{d}");
+            assert!(r.abs().cmp(&db.abs()) == Ordering::Less, "|r|<|d| for {n}/{d}");
+        }
+        assert_eq!(b("17").divmod(&b("5")).unwrap().1.to_decimal(), "2");
+        assert_eq!(b("-17").divmod(&b("5")).unwrap().1.to_decimal(), "-2"); // dividend sign
+        assert_eq!(b("100").divmod(&b("7")).unwrap().0.to_decimal(), "14");
+        assert!(b("5").divmod(&b("0")).is_none());
+        // 10^30 / 10^15 = 10^15
+        assert_eq!(b("1000000000000000000000000000000").divmod(&b("1000000000000000")).unwrap().0.to_decimal(),
+                   "1000000000000000");
+        // powers
+        assert_eq!(b("2").pow(10).to_decimal(), "1024");
+        assert_eq!(b("2").pow(128).to_decimal(), "340282366920938463463374607431768211456");
+        assert_eq!(b("10").pow(0).to_decimal(), "1");
+        assert_eq!(b("-3").pow(3).to_decimal(), "-27");
     }
 
     #[test]
