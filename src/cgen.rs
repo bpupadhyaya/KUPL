@@ -2895,7 +2895,10 @@ static KValue k_parse_iso(KValue sv) {
     char s[128];
     if (n >= (long)sizeof s) n = (long)sizeof s - 1;
     memcpy(s, raw, n); s[n] = 0;
-    char errbuf[160]; snprintf(errbuf, sizeof errbuf, "invalid ISO-8601 timestamp: %s", s);
+    /* Heap-allocated: k_str stores the pointer without copying, so a stack buffer
+       here would DANGLE after return and the Err message read as "" (empty). */
+    char* errbuf = (char*)k_alloc(160);
+    snprintf(errbuf, 160, "invalid ISO-8601 timestamp: %s", s);
     long y, mo, d, hh = 0, mi = 0, ss = 0;
     int neg = 0; char* p = s;
     if (*p == '-') { neg = 1; p++; }         /* negative year */
@@ -4460,6 +4463,21 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native parse_iso returns the SAME descriptive Err message as the interpreter
+    /// (was Err("") — a dangling stack buffer). PR-it36.
+    #[test]
+    fn native_parse_iso_error_message() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   match parse_iso(\"2020-13-01T00:00:00Z\") { Ok(t) => print(t), Err(m) => print(m) }\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "isoerr").trim(),
+            "invalid ISO-8601 timestamp: 2020-13-01T00:00:00"
+        );
     }
 
     /// Native JSON round-trip preserves object key order + .sort_by is stable,

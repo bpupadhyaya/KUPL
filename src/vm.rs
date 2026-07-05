@@ -1106,6 +1106,23 @@ mod tests {
     }
 
     #[test]
+    fn diff_datetime_format_and_parse() {
+        // Deterministic UTC civil-calendar math — format/components/parse are
+        // byte-identical across engines for fixed epochs incl. pre-1970 and extreme
+        // values. parse_iso's Err message (a first-class Result VALUE the program
+        // reads) is also identical — native used to return Err("") (a stack buffer
+        // that dangled after return; PR-it36 heap-allocated it).
+        assert_eq!(differential("fun probe() -> Str {\n    date_iso(0 - 1)\n}\n"), "1969-12-31T23:59:59Z");
+        assert_eq!(differential("fun probe() -> Str {\n    date_iso(253402300799)\n}\n"), "9999-12-31T23:59:59Z");
+        assert_eq!(differential("fun probe() -> Str {\n    date_iso(date_make(2000, 2, 29, 0, 0, 0))\n}\n"), "2000-02-29T00:00:00Z");
+        assert_eq!(differential("fun probe() -> Int {\n    weekday_of(0)\n}\n"), "4");
+        assert_eq!(
+            differential("fun probe() -> Str {\n    match parse_iso(\"nope\") { Ok(t) => \"{t}\", Err(m) => m }\n}\n"),
+            "invalid ISO-8601 timestamp: nope"
+        );
+    }
+
+    #[test]
     fn diff_json_key_order_and_sort_stability() {
         // JSON object keys keep INPUT order through parse -> stringify (not sorted),
         // identically on both engines; duplicate keys collapse to the last value.
