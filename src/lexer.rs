@@ -556,6 +556,10 @@ impl<'a> Lexer<'a> {
             }
             b'{' => Tok::LBrace,
             b'}' => Tok::RBrace,
+            // `;` is an explicit statement separator, equivalent to a newline —
+            // so `{ a; b }` on one line works (and the formatter's inline blocks
+            // parse). It carries no other meaning.
+            b';' => Tok::Newline,
             other => {
                 self.diags.push(Diag::error(
                     "K0001",
@@ -738,6 +742,16 @@ mod tests {
         assert!(diags.iter().any(|d| d.code == "K0008"), "escape: {diags:?}");
         let (_t2, diags2) = lex("\"a\0b\"");
         assert!(diags2.iter().any(|d| d.code == "K0008"), "raw byte: {diags2:?}");
+    }
+
+    #[test]
+    fn semicolon_is_a_statement_separator() {
+        // `;` lexes to a Newline token, so `a; b` separates statements on one line.
+        let ks = kinds("let a = 1; let b = 2");
+        assert!(ks.contains(&Tok::Newline));
+        // it appears where the `;` was (between the two `let`s), not just at EOF
+        let n_newlines = ks.iter().filter(|t| **t == Tok::Newline).count();
+        assert!(n_newlines >= 2, "expected a separator at `;` and at EOF: {ks:?}");
     }
 
     #[test]
