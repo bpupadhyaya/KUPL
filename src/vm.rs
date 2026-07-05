@@ -1106,6 +1106,17 @@ mod tests {
     }
 
     #[test]
+    fn diff_float_display_positional() {
+        // f64 Display is positional shortest-round-trip on both engines — small
+        // magnitudes are NOT scientific (native `%g` used to print "1e-05").
+        assert_eq!(differential("fun probe() -> Str {\n    \"{0.00001}\"\n}\n"), "0.00001");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{0.000012345}\"\n}\n"), "0.000012345");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{0.1 + 0.2}\"\n}\n"), "0.30000000000000004");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{1e20}\"\n}\n"), "100000000000000000000.0");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{(0.0 - 5.0) * 0.0}\"\n}\n"), "-0.0");
+    }
+
+    #[test]
     fn diff_empty_separator_panics() {
         // An empty separator/pattern is a programming error: split/replace/
         // replace_first all raise the SAME clean panic on both engines (native too,

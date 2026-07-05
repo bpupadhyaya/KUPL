@@ -1097,7 +1097,10 @@ static void kb_puts(KBuf* b, const char* s) {
 }
 
 static void k_fmt_float(KBuf* b, double f) {
-    char tmp[64];
+    /* Big enough for the full positional expansion of any f64: ~309 integer
+       digits (near f64::MAX) or ~324 fractional (smallest subnormal), plus sign,
+       point, and ".0". A 64-byte buffer used to TRUNCATE large whole values. */
+    char tmp[512];
     /* Match Rust's f64 Display for non-finite values (the interpreter's Display
        path): NaN -> "NaN", infinities -> "inf"/"-inf". Also portable — some libc
        %g print NaN as "nan" or infinity as "1.#INF". (The `.fmt()` method uses
@@ -1105,11 +1108,16 @@ static void k_fmt_float(KBuf* b, double f) {
     if (isnan(f)) { kb_puts(b, "NaN"); return; }
     if (isinf(f)) { kb_puts(b, f < 0 ? "-inf" : "inf"); return; }
     if (isfinite(f) && f == floor(f)) {
+        /* whole number -> "N.0" (matches the interpreter's Float Display) */
         snprintf(tmp, sizeof tmp, "%.1f", f);
     } else {
-        /* shortest representation that round-trips (matches Rust Display) */
-        for (int prec = 1; prec <= 17; prec++) {
-            snprintf(tmp, sizeof tmp, "%.*g", prec, f);
+        /* Shortest FIXED-notation (positional, never scientific) representation
+           that round-trips — Rust's f64 Display never uses exponents, so `%g`
+           (which switches to scientific for |exp| >= 5 / large) diverged on values
+           like 0.00001 -> "1e-05" and 1e-300. `%.*f` finds the shortest decimal-
+           place count that round-trips, which is the same string Rust prints. */
+        for (int prec = 1; prec <= 340; prec++) {
+            snprintf(tmp, sizeof tmp, "%.*f", prec, f);
             if (strtod(tmp, 0) == f) break;
         }
     }
@@ -4452,6 +4460,27 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native f64 Display is positional shortest-round-trip for ALL magnitudes,
+    /// matching the interpreter — small values are not scientific and large whole
+    /// values are not truncated (the 64-byte buffer clipped 1e300). PR-it30.
+    #[test]
+    fn native_float_display_positional() {
+        if !cc_available() {
+            return;
+        }
+        // small: positional, exact match to interp
+        assert_eq!(native_main_stdout("fun main() uses io {\n    print(0.00001)\n}\n", "fsm").trim(), "0.00001");
+        // 1e-300: positional (no exponent), long, starts with the leading zeros
+        let tiny = native_main_stdout("fun main() uses io {\n    print(1e-300)\n}\n", "ftiny");
+        let tiny = tiny.trim();
+        assert!(!tiny.contains(['e', 'E']), "1e-300 must be positional, got {tiny:?}");
+        assert!(tiny.starts_with("0.00000000") && tiny.len() > 290, "unexpected {tiny:?}");
+        // 1e300: not truncated (was clipped at ~63 chars), no exponent, ends ".0"
+        let big = native_main_stdout("fun main() uses io {\n    print(1e300)\n}\n", "fbig");
+        let big = big.trim();
+        assert!(!big.contains(['e', 'E']) && big.ends_with(".0") && big.len() > 290, "unexpected {big:?}");
     }
 
     /// Native split/replace/replace_first panic on an empty separator/pattern
