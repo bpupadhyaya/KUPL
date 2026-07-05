@@ -3467,12 +3467,22 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_str(out);
         }
         if (!strcmp(name, "parse_int")) {
+            /* Match Rust's i64::from_str: no leading/surrounding whitespace
+               (strtoll skips leading ws — reject it), and overflow is a failure
+               (strtoll saturates + sets ERANGE — reject it), not a saturated value. */
+            char c0 = s[0];
+            if (c0==' '||c0=='\t'||c0=='\n'||c0=='\r'||c0=='\v'||c0=='\f') return k_none();
             char* end;
+            errno = 0;
             long long v = strtoll(s, &end, 10);
-            if (end == s || *end != 0) return k_none();
+            if (end == s || *end != 0 || errno == ERANGE) return k_none();
             return k_some(k_int((int64_t)v));
         }
         if (!strcmp(name, "parse_float")) {
+            /* Match Rust: no leading whitespace (strtod skips it). Overflow to
+               inf is fine — Rust parses "1e999" as inf too. */
+            char c0 = s[0];
+            if (c0==' '||c0=='\t'||c0=='\n'||c0=='\r'||c0=='\v'||c0=='\f') return k_none();
             char* end;
             double v = strtod(s, &end);
             if (end == s || *end != 0) return k_none();

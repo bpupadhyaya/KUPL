@@ -1120,6 +1120,22 @@ mod tests {
     }
 
     #[test]
+    fn diff_parse_int_float_edges() {
+        // parse_int/parse_float edge inputs are byte-identical across engines
+        // (native strtoll/strtod were aligned to Rust: reject leading whitespace,
+        // integer overflow is a failure not a saturated value).
+        let p = |s: &str| format!("fun probe() -> Str {{\n    to_str({s})\n}}\n");
+        assert_eq!(differential(&p("\"  12\".parse_int()")), "None");
+        assert_eq!(differential(&p("\"99999999999999999999\".parse_int()")), "None");
+        assert_eq!(differential(&p("\"-99999999999999999999\".parse_int()")), "None");
+        assert_eq!(differential(&p("\"42\".parse_int()")), "Some(42)");
+        assert_eq!(differential(&p("\"0x10\".parse_int()")), "None");
+        assert_eq!(differential(&p("\"  1.5\".parse_float()")), "None");
+        assert_eq!(differential(&p("\"1e999\".parse_float()")), "Some(inf)");
+        assert_eq!(differential(&p("\"3.14\".parse_float()")), "Some(3.14)");
+    }
+
+    #[test]
     fn diff_utf8_string_ops() {
         // Multibyte UTF-8 string operations are byte-identical across engines:
         // len/slice/index are char-based; to_upper/to_lower are ASCII-only
