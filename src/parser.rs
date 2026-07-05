@@ -992,6 +992,39 @@ impl Parser {
             Tok::KwWhile => {
                 let span = self.span();
                 self.bump();
+                // `while let PATTERN = EXPR { BODY }` desugars to
+                // `while true { match EXPR { PATTERN => { BODY; () }  _ => { break } } }`
+                if self.at(&Tok::KwLet) {
+                    self.bump();
+                    let pattern = self.parse_pattern()?;
+                    self.expect(Tok::Eq)?;
+                    let scrutinee = self.parse_expr()?;
+                    let mut body = self.parse_block()?;
+                    let bspan = body.span;
+                    // append `()` so the matched arm is Unit-typed, unifying with
+                    // the break arm (which is also Unit)
+                    body.stmts.push(Stmt::Expr(Expr { kind: ExprKind::Unit, span: bspan }));
+                    let match_arm = MatchArm {
+                        pattern,
+                        guard: None,
+                        body: Expr { kind: ExprKind::BlockExpr(body), span: bspan },
+                        span: bspan,
+                    };
+                    let break_block = Block { stmts: vec![Stmt::Break(bspan)], span: bspan };
+                    let break_arm = MatchArm {
+                        pattern: Pattern { kind: PatternKind::Wildcard, span: bspan },
+                        guard: None,
+                        body: Expr { kind: ExprKind::BlockExpr(break_block), span: bspan },
+                        span: bspan,
+                    };
+                    let m = Expr {
+                        kind: ExprKind::Match { scrutinee: Box::new(scrutinee), arms: vec![match_arm, break_arm] },
+                        span: bspan,
+                    };
+                    let loop_body = Block { stmts: vec![Stmt::Expr(m)], span: bspan };
+                    let cond = Expr { kind: ExprKind::Bool(true), span };
+                    return Ok(Stmt::While { cond, body: loop_body, span });
+                }
                 let cond = self.parse_expr()?;
                 let body = self.parse_block()?;
                 Ok(Stmt::While { cond, body, span })
@@ -1505,6 +1538,36 @@ impl Parser {
 
     fn parse_if(&mut self) -> PResult<Expr> {
         let span = self.expect(Tok::KwIf)?;
+        // `if let PATTERN = EXPR { … } else { … }` desugars to a `match` whose
+        // wildcard arm is the else branch (or `()` when there is no else — which
+        // makes the then-branch required to be Unit, exactly like `if` w/o else).
+        if self.at(&Tok::KwLet) {
+            self.bump();
+            let pattern = self.parse_pattern()?;
+            self.expect(Tok::Eq)?;
+            let scrutinee = self.parse_expr()?;
+            let then = self.parse_block()?;
+            let then_span = then.span;
+            let then_expr = Expr { kind: ExprKind::BlockExpr(then), span: then_span };
+            let else_expr = if self.eat(&Tok::KwElse) {
+                if self.at(&Tok::KwIf) {
+                    self.parse_if()?
+                } else {
+                    let b = self.parse_block()?;
+                    let bs = b.span;
+                    Expr { kind: ExprKind::BlockExpr(b), span: bs }
+                }
+            } else {
+                Expr { kind: ExprKind::Unit, span: then_span }
+            };
+            let full = span.merge(self.prev_span());
+            let wild = Pattern { kind: PatternKind::Wildcard, span: else_expr.span };
+            let arms = vec![
+                MatchArm { pattern, guard: None, body: then_expr, span: then_span },
+                MatchArm { pattern: wild, guard: None, body: else_expr, span: full },
+            ];
+            return Ok(Expr { kind: ExprKind::Match { scrutinee: Box::new(scrutinee), arms }, span: full });
+        }
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
         let mut else_block = None;

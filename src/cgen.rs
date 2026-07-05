@@ -3783,6 +3783,20 @@ mod tests {
         }
     }
 
+    /// `if let` / `while let` (it58) desugar to match, so they compile to
+    /// native byte-identically.
+    #[test]
+    fn native_if_while_let() {
+        let src = "fun step(k: Int) -> Option[Int] { if k > 0 { Some(k) } else { None } }\n\
+                   fun main() uses io {\n    \
+                   if let Some(n) = Some(7) { print(n) }\n    \
+                   if let Some(n) = step(0) { print(n) } else { print(-1) }\n    \
+                   var i = 3\n    while let Some(v) = step(i) {\n        print(v)\n        i = i - 1\n    }\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "iflet"), "7\n-1\n3\n2\n1\n");
+        }
+    }
+
     /// UFCS (it57): `x.f(args)` resolves to a top-level `f(x, args)` when there
     /// is no built-in method, including chaining — byte-identical on native.
     #[test]

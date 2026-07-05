@@ -178,6 +178,8 @@ match n {                           // guards + or-patterns
     0 | 1 | 2 => "small"            // or-pattern: matches any alternative
     _ => "other"
 }
+if let Some(n) = opt { use(n) }     // refutable bind; else optional (Unit if absent)
+while let Some(x) = next() { … }     // loop while the pattern keeps matching
 fn x { x * 2 }                      // lambda; parameter types from context
 fn (x: Int, y: Int) { x + y }       // or annotated
 xs.map(fn x { x + 1 })              // method call
@@ -214,6 +216,13 @@ par { f(a)  g(b)  h(c) }            // structured fork-join → List of results
   allowed in handlers (K0237) — handle the Result with `match` there.
 - `await expr` is accepted and currently evaluates `expr` directly (expose
   calls are synchronous in v1.0-alpha; true asynchrony is **[design]**).
+- **`if let` / `while let`** desugar to `match`, so the full pattern grammar
+  applies. `if let P = E { T } else { F }` runs `T` (with `P`'s bindings) when
+  `E` matches `P`, else `F`; the `else` is optional (a non-match yields `Unit`,
+  so an `if let` without `else` requires `T : Unit`). With `else`, the two
+  branches must agree in type (it is an expression). `while let P = E { B }`
+  loops as long as `E` matches `P`. The patterns are refutable — no
+  exhaustiveness is required.
 - **Method-call resolution** for `recv.name(args)` is: (1) a **built-in method**
   on `recv`'s type, else (2) a **field** access (for a field-typed value with no
   args), else (3) **UFCS** — a top-level function `name(recv, args…)` whose first

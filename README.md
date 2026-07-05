@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 183 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 184 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -227,6 +227,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/datetime.kupl` | deterministic UTC date/time: `date_make`/`date_iso`/`parse_iso`/`*_of` over epoch seconds — pure civil-calendar math, identical on interp/KVM/native |
 | `examples/match.kupl` | pattern matching: guards (`if COND`) and or-patterns (`A | B`), with sound exhaustiveness |
 | `examples/ufcs.kupl` | uniform function call syntax: `x.f(args)` resolves to `f(x, args)`, so free functions chain as methods |
+| `examples/iflet.kupl` | `if let` / `while let` — ergonomic Option/Result unwrapping (desugars to `match`) |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.
@@ -268,7 +269,7 @@ language, every example verified against the toolchain).
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~25,700 lines of dependency-free Rust, 183 tests, all engines differentially
+~25,800 lines of dependency-free Rust, 184 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

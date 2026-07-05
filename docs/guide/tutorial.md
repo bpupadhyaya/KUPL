@@ -388,6 +388,21 @@ fun main() uses io {
 `.unwrap_or(default)` extracts a value with a fallback; `.map`, `.is_some`,
 `.is_ok` and friends are on the [`Option`/`Result` types](../reference/STDLIB.md).
 
+For a quick conditional unwrap, **`if let`** and **`while let`** bind a pattern
+inline (they desugar to `match`, so any pattern works):
+
+```kupl
+if let Some(n) = xs.find(fn x { x > 0 }) {
+    print("found {n}")
+} else {
+    print("none positive")            // else is optional
+}
+
+while let Some(job) = queue_pop() {   // loop until it stops matching
+    run(job)
+}
+```
+
 ---
 
 ## 8. Strings
