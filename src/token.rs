@@ -131,8 +131,6 @@ pub fn keyword(s: &str) -> Option<Tok> {
         "requires" => Tok::KwRequires,
         "prop" => Tok::KwProp,
         "in" => Tok::KwIn,
-        "out" => Tok::KwOut,
-        "state" => Tok::KwState,
         "on" => Tok::KwOn,
         "expose" => Tok::KwExpose,
         "emit" => Tok::KwEmit,
@@ -160,8 +158,6 @@ pub fn keyword(s: &str) -> Option<Tok> {
         "new" => Tok::KwNew,
         "use" => Tok::KwUse,
         "module" => Tok::KwModule,
-        "start" => Tok::KwStart,
-        "stop" => Tok::KwStop,
         _ => return None,
     })
 }

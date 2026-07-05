@@ -33,63 +33,63 @@ fun get_room(world: Map[Str, Room], id: Str) -> Room {
     world.get(id).unwrap_or(Room(name: "Void", desc: "nothing", exits: Map(), items: []))
 }
 
-fun describe(world: Map[Str, Room], st: State) -> Str {
-    let r = get_room(world, st.room)
+fun describe(world: Map[Str, Room], state: State) -> Str {
+    let r = get_room(world, state.room)
     let items = if r.items.is_empty() { "nothing" } else { r.items.join(", ") }
     let exits = r.exits.keys().join(", ")
     "{r.name}: {r.desc} You see: {items}. Exits: {exits}."
 }
 
 // Try to move; returns the new State + a message.
-fun do_go(world: Map[Str, Room], st: State, dir: Str) -> Pair[State, Str] {
-    let r = get_room(world, st.room)
+fun do_go(world: Map[Str, Room], state: State, dir: Str) -> Pair[State, Str] {
+    let r = get_room(world, state.room)
     match r.exits.get(dir) {
         Some(dest) => {
-            let moved = State(room: dest, inventory: st.inventory)
+            let moved = State(room: dest, inventory: state.inventory)
             Pair(first: moved, second: "You go {dir} to the {get_room(world, dest).name}.")
         }
-        None => Pair(first: st, second: "You can't go {dir} from here.")
+        None => Pair(first: state, second: "You can't go {dir} from here.")
     }
 }
 
 // Try to take an item; returns the new State + updated world + a message.
-fun do_take(world: Map[Str, Room], st: State, item: Str) -> Pair[State, Str] {
-    let r = get_room(world, st.room)
+fun do_take(world: Map[Str, Room], state: State, item: Str) -> Pair[State, Str] {
+    let r = get_room(world, state.room)
     if r.items.contains(item) {
-        let picked = State(room: st.room, inventory: st.inventory.push(item))
+        let picked = State(room: state.room, inventory: state.inventory.push(item))
         Pair(first: picked, second: "You take the {item}.")
     } else {
-        Pair(first: st, second: "There is no {item} here.")
+        Pair(first: state, second: "There is no {item} here.")
     }
 }
 
-fun step(world: Map[Str, Room], st: State, cmd: Str) -> Pair[State, Str] {
+fun step(world: Map[Str, Room], state: State, cmd: Str) -> Pair[State, Str] {
     let parts = cmd.split(" ")
     let verb = parts.get(0).unwrap_or("")
     let arg = parts.get(1).unwrap_or("")
     if verb == "look" {
-        Pair(first: st, second: describe(world, st))
+        Pair(first: state, second: describe(world, state))
     } else if verb == "go" {
-        do_go(world, st, arg)
+        do_go(world, state, arg)
     } else if verb == "take" {
-        do_take(world, st, arg)
+        do_take(world, state, arg)
     } else if verb == "inventory" {
-        let inv = if st.inventory.is_empty() { "empty-handed" } else { st.inventory.join(", ") }
-        Pair(first: st, second: "You carry: {inv}.")
+        let inv = if state.inventory.is_empty() { "empty-handed" } else { state.inventory.join(", ") }
+        Pair(first: state, second: "You carry: {inv}.")
     } else {
-        Pair(first: st, second: "I don't understand \"{cmd}\".")
+        Pair(first: state, second: "I don't understand \"{cmd}\".")
     }
 }
 
 // Run a script, returning one output line per command.
-fun run_script(world: Map[Str, Room], begin: State, cmds: List[Str]) -> List[Str] {
-    var st = begin
+fun run_script(world: Map[Str, Room], start: State, cmds: List[Str]) -> List[Str] {
+    var state = start
     var lines: List[Str] = []
     var i = 0
     while i < cmds.len() {
         let cmd = cmds.get(i).unwrap_or("")
-        let result = step(world, st, cmd)
-        st = result.first
+        let result = step(world, state, cmd)
+        state = result.first
         lines = lines.push("> {cmd}").push(result.second)
         i = i + 1
     }
@@ -99,20 +99,20 @@ fun run_script(world: Map[Str, Room], begin: State, cmds: List[Str]) -> List[Str
 // The final inventory after running a script from the hall.
 fun final_inventory(cmds: List[Str]) -> List[Str] {
     let world = make_world()
-    var st = State(room: "hall", inventory: [])
+    var state = State(room: "hall", inventory: [])
     var i = 0
     while i < cmds.len() {
-        st = step(world, st, cmds.get(i).unwrap_or("")).first
+        state = step(world, state, cmds.get(i).unwrap_or("")).first
         i = i + 1
     }
-    st.inventory
+    state.inventory
 }
 
 fun main() uses io {
     let world = make_world()
-    let begin = State(room: "hall", inventory: [])
+    let start = State(room: "hall", inventory: [])
     let script = ["look", "take torch", "go north", "take book", "inventory", "go south", "go east", "take key", "inventory"]
-    let lines = run_script(world, begin, script)
+    let lines = run_script(world, start, script)
     var i = 0
     while i < lines.len() {
         print(lines.get(i).unwrap_or(""))

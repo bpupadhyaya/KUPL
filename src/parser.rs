@@ -725,6 +725,11 @@ impl Parser {
         Ok(c)
     }
 
+    /// True at a port declaration: `in …` or the contextual keyword `out …`.
+    fn at_port_direction(&self) -> bool {
+        matches!(self.peek(), Tok::KwIn) || matches!(self.peek(), Tok::Ident(s) if s == "out")
+    }
+
     fn parse_component_member(&mut self, c: &mut ComponentDecl) -> PResult<()> {
         match self.peek().clone() {
             Tok::KwIntent => {
@@ -750,8 +755,13 @@ impl Parser {
                 }
                 self.expect_terminator()
             }
-            Tok::KwIn | Tok::KwOut => {
-                let dir = if matches!(self.bump(), Tok::KwIn) { PortDir::In } else { PortDir::Out };
+            // `in`/`out` port declarations. `out` is a contextual keyword (a plain
+            // identifier elsewhere), recognized here only in member position.
+            Tok::KwIn | Tok::Ident(_) if self.at_port_direction() => {
+                let dir = match self.bump() {
+                    Tok::KwIn => PortDir::In,
+                    _ => PortDir::Out,
+                };
                 let (name, nspan) = self.expect_ident()?;
                 self.expect(Tok::Colon)?;
                 let ty = self.parse_ty()?;
@@ -773,7 +783,9 @@ impl Parser {
                 }
                 self.expect_terminator()
             }
-            Tok::KwState => {
+            // `state` is a contextual keyword — a state field here, a plain
+            // identifier elsewhere.
+            Tok::Ident(s) if s == "state" => {
                 self.bump();
                 let (name, nspan) = self.expect_ident()?;
                 let ty = if self.eat(&Tok::Colon) { Some(self.parse_ty()?) } else { None };
@@ -842,11 +854,12 @@ impl Parser {
                 let hspan = self.span();
                 self.bump();
                 let trigger = match self.peek().clone() {
-                    Tok::KwStart => {
+                    // `start`/`stop` are contextual handler names here
+                    Tok::Ident(ref kw) if kw == "start" => {
                         self.bump();
                         Trigger::Start
                     }
-                    Tok::KwStop => {
+                    Tok::Ident(ref kw) if kw == "stop" => {
                         self.bump();
                         Trigger::Stop
                     }
@@ -1825,6 +1838,15 @@ mod tests {
 
     /// `else` may follow the then-block across a newline; the AST is identical
     /// to the same-line form, and a no-else `if` doesn't swallow the next line.
+    /// `out`/`state`/`start`/`stop` are contextual keywords — usable as ordinary
+    /// identifiers outside a component, while component syntax still parses.
+    #[test]
+    fn contextual_component_keywords() {
+        ok("fun f() -> Int {\n    let out = 1\n    let state = 2\n    let start = 3\n    let stop = 4\n    out + state + start + stop\n}\n");
+        // component with in/out ports, state, and on start still parses
+        ok("component C {\n    in click: Event\n    out value: Int\n    state count: Int = 0\n    on start {\n        emit value(count)\n    }\n    on click {\n        count += 1\n        emit value(count)\n    }\n}\n");
+    }
+
     #[test]
     fn newline_before_else() {
         // both the one-line and multi-line forms parse cleanly (the AST differs

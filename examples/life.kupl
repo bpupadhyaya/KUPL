@@ -1,7 +1,7 @@
 // Conway's Game of Life — a cellular automaton, written in KUPL.
 //
 // The grid is a flat `List[Int]` of W*H cells (0 = dead, 1 = alive), row-major,
-// with dead borders (ng-of-bounds neighbors count as dead). Each generation is
+// with dead borders (out-of-bounds neighbors count as dead). Each generation is
 // a NEW immutable grid built from the previous one under the B3/S23 rule: a live
 // cell survives with 2 or 3 live neighbors, a dead cell is born with exactly 3.
 
@@ -32,7 +32,7 @@ fun neighbors(g: List[Int], w: Int, h: Int, r: Int, c: Int) -> Int {
 }
 
 fun next_gen(g: List[Int], w: Int, h: Int) -> List[Int] {
-    var ng: List[Int] = []
+    var out: List[Int] = []
     var r = 0
     while r < h {
         var c = 0
@@ -44,12 +44,12 @@ fun next_gen(g: List[Int], w: Int, h: Int) -> List[Int] {
             } else {
                 if n == 3 { 1 } else { 0 }
             }
-            ng = ng.push(live)
+            out = out.push(live)
             c = c + 1
         }
         r = r + 1
     }
-    ng
+    out
 }
 
 fun step(g: List[Int], w: Int, h: Int, n: Int) -> List[Int] {

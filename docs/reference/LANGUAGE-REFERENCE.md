@@ -50,16 +50,17 @@ are isolated, so two dependencies may define the same name without colliding.
 
 ```
 app async await break component contract continue else emit example expect
-expose false fn for fun if in intent let match module new on out par prop pub
-requires return send start state stop supervise test true type use uses var
-while wire
+expose false fn for fun if in intent let match module new on par prop pub
+requires return send supervise test true type use uses var while wire
 ```
 
 ### Contextual keywords
 
 Valid identifiers everywhere except in their clause:
+`out` `state` `start` `stop` (component ports / state / lifecycle handlers)
 `fulfills` `law` `restart` `on_failure` `never` `forall` `every` `after`
-`advance` `ai` `tools` `model`
+`advance` `ai` `tools` `model`. `in` stays fully reserved (it also introduces a
+`for … in …` loop).
 
 ### Identifiers
 
