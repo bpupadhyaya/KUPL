@@ -1254,7 +1254,14 @@ impl Checker {
                                 match sig.variants[0].fields.iter().find(|(fname, _)| fname == name) {
                                     Some((_, ty)) => Self::subst_ty(ty, &m),
                                     None => {
-                                        self.err("K0230", format!("type `{tn}` has no field `{name}`"), expr.span);
+                                        let msg = match suggest(
+                                            name,
+                                            sig.variants[0].fields.iter().map(|(f, _)| f.as_str()),
+                                        ) {
+                                            Some(s) => format!("type `{tn}` has no field `{name}` (did you mean `{s}`?)"),
+                                            None => format!("type `{tn}` has no field `{name}`"),
+                                        };
+                                        self.err("K0230", msg, expr.span);
                                         self.uni.fresh()
                                     }
                                 }
@@ -1426,11 +1433,16 @@ impl Checker {
                                 Some((_, fty)) => {
                                     self.unify(&Self::subst_ty(fty, &m), &vt, value.span, &format!("field `{field}`"));
                                 }
-                                None => self.err(
-                                    "K0230",
-                                    format!("type `{tn}` has no field `{field}`"),
-                                    value.span,
-                                ),
+                                None => {
+                                    let msg = match suggest(
+                                        field,
+                                        sig.variants[0].fields.iter().map(|(f, _)| f.as_str()),
+                                    ) {
+                                        Some(s) => format!("type `{tn}` has no field `{field}` (did you mean `{s}`?)"),
+                                        None => format!("type `{tn}` has no field `{field}`"),
+                                    };
+                                    self.err("K0230", msg, value.span)
+                                }
                             }
                         }
                         rt
@@ -1942,7 +1954,11 @@ impl Checker {
                 }
                 None => {
                     if let Some(n) = &arg.name {
-                        self.err("K0244", format!("`{ctor}` has no field named `{n}`"), arg.value.span);
+                        let msg = match suggest(n, fields.iter().map(|(f, _)| f.as_str())) {
+                            Some(s) => format!("`{ctor}` has no field named `{n}` (did you mean `{s}`?)"),
+                            None => format!("`{ctor}` has no field named `{n}`"),
+                        };
+                        self.err("K0244", msg, arg.value.span);
                     }
                 }
             }
@@ -2695,6 +2711,22 @@ mod generic_tests {
             "type T = Foo | Bar\nfun f(x: T) -> Int { match x { Fooo => 1\n _ => 0 } }\nfun main() {}\n",
         );
         assert!(e3.iter().any(|d| d.message.contains("did you mean `Foo`?")), "{e3:?}");
+    }
+
+    #[test]
+    fn did_you_mean_fields() {
+        // K0230 field access -> nearest field name.
+        let e = errors("type Point = Point(x: Int, y: Int)\nfun main() uses io {\n    let p = Point(x: 1, y: 2)\n    print(p.xx)\n}\n");
+        assert!(e.iter().any(|d| d.code == "K0230" && d.message.contains("did you mean `x`?")), "{e:?}");
+        // K0244 constructor field -> nearest field name.
+        let e2 = errors("type Point = Point(x: Int, y: Int)\nfun main() uses io {\n    let p = Point(x: 1, yy: 2)\n    print(p.x)\n}\n");
+        assert!(e2.iter().any(|d| d.code == "K0244" && d.message.contains("did you mean `y`?")), "{e2:?}");
+        // `with` update unknown field -> nearest field name (also K0230).
+        let e3 = errors("type Point = Point(x: Int, y: Int)\nfun main() uses io {\n    let p = Point(x: 1, y: 2)\n    let q = p with yy: 5\n    print(q.x)\n}\n");
+        assert!(e3.iter().any(|d| d.message.contains("did you mean `y`?")), "{e3:?}");
+        // far-off name -> no bogus suggestion.
+        let e4 = errors("type Point = Point(x: Int, y: Int)\nfun main() uses io {\n    let p = Point(x: 1, y: 2)\n    print(p.zzzzz)\n}\n");
+        assert!(e4.iter().any(|d| d.code == "K0230" && !d.message.contains("did you mean")), "{e4:?}");
     }
 
     #[test]
