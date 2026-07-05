@@ -400,22 +400,52 @@ impl fmt::Display for DebugStr<'_> {
     }
 }
 
+/// A tiny FNV-1a hasher for the environment's variable map. Identifier keys are
+/// short, so SipHash's per-lookup cost dominates a tree-walker's hot path;
+/// FNV-1a is dramatically faster for these and stays zero-dependency. (The hash
+/// is never observable — `Env` maps are only get/set/define, never iterated for
+/// output — so this cannot affect byte-identity.)
+#[derive(Default, Clone)]
+pub struct FnvBuild;
+pub struct FnvHasher(u64);
+impl std::hash::BuildHasher for FnvBuild {
+    type Hasher = FnvHasher;
+    fn build_hasher(&self) -> FnvHasher {
+        FnvHasher(0xcbf29ce484222325)
+    }
+}
+impl std::hash::Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        self.0 = h;
+    }
+}
+
+type VarMap = HashMap<String, Value, FnvBuild>;
+
 /// Lexically scoped, shared, mutable environment (closures capture it).
 #[derive(Clone)]
 pub struct Env(Rc<RefCell<EnvInner>>);
 
 struct EnvInner {
-    vars: HashMap<String, Value>,
+    vars: VarMap,
     parent: Option<Env>,
 }
 
 impl Env {
     pub fn new() -> Env {
-        Env(Rc::new(RefCell::new(EnvInner { vars: HashMap::new(), parent: None })))
+        Env(Rc::new(RefCell::new(EnvInner { vars: VarMap::default(), parent: None })))
     }
     pub fn child(&self) -> Env {
         Env(Rc::new(RefCell::new(EnvInner {
-            vars: HashMap::new(),
+            vars: VarMap::default(),
             parent: Some(self.clone()),
         })))
     }
@@ -435,8 +465,10 @@ impl Env {
     /// Assign to an existing binding (walks up the chain). Returns false if unbound.
     pub fn set(&self, name: &str, value: Value) -> bool {
         let mut inner = self.0.borrow_mut();
-        if inner.vars.contains_key(name) {
-            inner.vars.insert(name.to_string(), value);
+        // In-place update: no re-hash, no `to_string()` allocation on the hot path
+        // (every loop assignment `i = i + 1` goes through here).
+        if let Some(slot) = inner.vars.get_mut(name) {
+            *slot = value;
             return true;
         }
         match inner.parent.clone() {

@@ -1,0 +1,19 @@
+fun build(n: Int) -> List[Int] {
+    var xs: List[Int] = []
+    var i = 0
+    while i < n {
+        xs = xs.push(i)
+        i = i + 1
+    }
+    xs
+}
+fun main() uses io {
+    let xs = build(1000)
+    var total = 0
+    var r = 0
+    while r < 500 {
+        total = total + xs.map(fn x { x * 2 }).filter(fn x { x % 3 == 0 }).fold(0, fn a, x { a + x })
+        r = r + 1
+    }
+    print(total)
+}
