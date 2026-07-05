@@ -103,7 +103,10 @@ completion (3). Everything stays byte-identical across engines.
       candidate for a future type-aware effect pass.)
 - [ ] **Prompt-context builders** — `kupl context` output as a first-class
       value; embeddings + similarity as stdlib
-- [ ] **`ai fun` on the native backend** (libcurl or platform HTTP)
+- [◐] **`ai fun` on the native backend** — the deterministic `KUPL_AI_MOCK*`
+      path compiles natively (it51), byte-identical to the interpreter, incl.
+      structured `Result`/record/`List` output. Real-provider HTTP and tool-use
+      rounds still defer at runtime (use `bundle`).
 
 ## Tier 2 — component model completion
 

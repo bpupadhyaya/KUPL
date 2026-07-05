@@ -19,12 +19,8 @@ enum Entry {
 }
 
 pub fn emit_c(module: &Module) -> Result<String, String> {
-    if !module.ai_funs.is_empty() {
-        return Err(format!(
-            "`ai fun {}` is not supported by the native backend yet — use `kupl run`, `kupl run --vm`, or `kupl bundle`",
-            module.ai_funs[0].name
-        ));
-    }
+    // ai funs compile via the deterministic mock path (KUPL_AI_MOCK*); a
+    // tool-using ai fun defers at runtime (see k_ai_call).
     let entry = if let Some(&main_idx) = module.funs.get("main") {
         Entry::Main(main_idx as usize)
     } else if let Some(app_idx) = module.components.iter().position(|c| c.is_app) {
@@ -120,6 +116,31 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     }
     let _ = writeln!(out, "}};\n#define N_COMPS {}\n", module.components.len());
 
+    // ai-fun metadata: per-function return-type shape trees, then the AI_FUNS
+    // table the C mock path reads. Always emit the table (a dummy entry when
+    // there are none) so the `extern const KAiFun AI_FUNS[]` symbol resolves.
+    let mut ai_ctr = 0usize;
+    let shape_addrs: Vec<String> =
+        module.ai_funs.iter().map(|f| emit_ai_shape(&mut out, &f.shape, &mut ai_ctr)).collect();
+    let _ = writeln!(out, "const KAiFun AI_FUNS[] = {{");
+    if module.ai_funs.is_empty() {
+        let _ = writeln!(out, "    {{ 0, 0, 0, 0, 0 }}");
+    } else {
+        for (i, f) in module.ai_funs.iter().enumerate() {
+            let key = format!("KUPL_AI_MOCK_{}", f.name.to_uppercase());
+            let _ = writeln!(
+                out,
+                "    {{ \"{}\", \"{}\", {}, {}, {} }},",
+                c_escape(&f.name),
+                c_escape(&key),
+                shape_addrs[i],
+                f.wraps_result as i32,
+                (!f.tools.is_empty()) as i32,
+            );
+        }
+    }
+    let _ = writeln!(out, "}};\n");
+
     for (i, chunk) in module.chunks.iter().enumerate() {
         emit_chunk(&mut out, module, i, chunk)?;
     }
@@ -158,6 +179,46 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
 /// future component construct that needs a clear compile-time refusal.
 fn check_native_component(_module: &Module, _app_idx: usize) -> Result<(), String> {
     Ok(())
+}
+
+/// Emit a `KAiShape` tree for an `ai fun` return type, returning the C address
+/// expression (`&AISH_n`). Children are emitted before their parent so all
+/// referenced statics are defined first.
+fn emit_ai_shape(out: &mut String, shape: &crate::ai::AiShape, ctr: &mut usize) -> String {
+    use crate::ai::AiShape;
+    let id = *ctr;
+    *ctr += 1;
+    match shape {
+        AiShape::Str => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 0, 0, 0, 0, 0, 0 }};"); }
+        AiShape::Int => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 1, 0, 0, 0, 0, 0 }};"); }
+        AiShape::Float => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 2, 0, 0, 0, 0, 0 }};"); }
+        AiShape::Bool => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 3, 0, 0, 0, 0, 0 }};"); }
+        AiShape::List(inner) => {
+            let ia = emit_ai_shape(out, inner, ctr);
+            let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 4, {ia}, 0, 0, 0, 0 }};");
+        }
+        AiShape::Option(inner) => {
+            let ia = emit_ai_shape(out, inner, ctr);
+            let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 5, {ia}, 0, 0, 0, 0 }};");
+        }
+        AiShape::Record { variant, fields, .. } => {
+            let field_addrs: Vec<String> =
+                fields.iter().map(|(_, s)| emit_ai_shape(out, s, ctr)).collect();
+            let names: Vec<String> =
+                fields.iter().map(|(n, _)| format!("\"{}\"", c_escape(n))).collect();
+            let n_expr = if names.is_empty() { "0".to_string() } else { names.join(", ") };
+            let s_expr = if field_addrs.is_empty() { "0".to_string() } else { field_addrs.join(", ") };
+            let _ = writeln!(out, "static const char* const AISH_{id}_N[] = {{ {n_expr} }};");
+            let _ = writeln!(out, "static const KAiShape* const AISH_{id}_S[] = {{ {s_expr} }};");
+            let _ = writeln!(
+                out,
+                "static const KAiShape AISH_{id} = {{ 6, 0, \"{}\", AISH_{id}_N, AISH_{id}_S, {} }};",
+                c_escape(variant),
+                fields.len()
+            );
+        }
+    }
+    format!("&AISH_{id}")
 }
 
 fn emit_chunk(out: &mut String, module: &Module, idx: usize, chunk: &Chunk) -> Result<(), String> {
@@ -382,8 +443,10 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             format!("(void){argc}; regs[{dst}] = CHUNKS[{fun}](0, &regs[{start}]);")
         }
         // emit_c rejects modules with ai funs before reaching here
-        CallAi { .. } => {
-            "k_panic(\"ai funs are not supported by the native backend yet\");".to_string()
+        CallAi { dst, info, intent } => {
+            // mock/deterministic path; the resolved intent + args are unused (the
+            // mock ignores the prompt). Real providers/tools defer in k_ai_call.
+            format!("regs[{dst}] = k_ai_call({info}); (void)regs[{intent}];")
         }
         Panic(idx) => {
             let m = str_const(chunk, *idx)?;
@@ -1416,6 +1479,141 @@ static KValue k_http_get(KValue url) {
 static KValue k_http_post(KValue url, KValue body) {
     char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30", (char*)"-X", (char*)"POST", (char*)"--data-binary", (char*)"@-", (char*)k_as_str(url), 0 };
     return k_run_curl(argv, k_as_str(body));
+}
+
+/* ---- ai fun (mock/deterministic path; mirrors src/ai.rs convert +
+   value_from_json). Real-provider HTTP and tool-use rounds defer. ---- */
+typedef struct KAiShape KAiShape;
+struct KAiShape {
+    int kind;                 /* 0 Str 1 Int 2 Float 3 Bool 4 List 5 Option 6 Record */
+    const KAiShape* inner;    /* List/Option element */
+    const char* variant;      /* Record: the constructor name */
+    const char* const* fnames; const KAiShape* const* fshapes; int nfields;  /* Record */
+};
+typedef struct { const char* name; const char* mock_key; const KAiShape* shape; int wraps_result; int has_tools; } KAiFun;
+extern const KAiFun AI_FUNS[];
+
+static int k_ai_ok = 1;
+static char k_ai_err[256];
+static const char* k_json_var(KValue j) { return j.tag == K_CTOR ? CTORS[j.as.ctor->ctor].variant : "?"; }
+static KValue k_json_field0(KValue j) { return j.as.ctor->fields[0]; }
+
+/* shape-directed conversion of a parsed Json value into the declared type */
+static KValue k_ai_from_json(const KAiShape* s, KValue j) {
+    const char* v = k_json_var(j);
+    switch (s->kind) {
+        case 0: if (!strcmp(v, "JStr")) return k_json_field0(j); break;
+        case 1:
+            if (!strcmp(v, "JNum")) {
+                double n = k_json_field0(j).as.f;
+                if (isfinite(n) && n == floor(n)) return k_int((int64_t)n);
+                snprintf(k_ai_err, sizeof k_ai_err, "expected an integer, model returned a fraction");
+                k_ai_ok = 0; return k_unit();
+            }
+            break;
+        case 2: if (!strcmp(v, "JNum")) return k_float(k_json_field0(j).as.f); break;
+        case 3: if (!strcmp(v, "JBool")) return k_json_field0(j); break;
+        case 4:
+            if (!strcmp(v, "JArr")) {
+                KList* items = k_json_field0(j).as.list;
+                KValue* out = (KValue*)k_alloc(sizeof(KValue) * (items->len < 1 ? 1 : items->len));
+                for (int64_t i = 0; i < items->len; i++) {
+                    out[i] = k_ai_from_json(s->inner, items->items[i]);
+                    if (!k_ai_ok) return k_unit();
+                }
+                return k_list(out, (int)items->len);
+            }
+            break;
+        case 5:
+            if (!strcmp(v, "JNull")) return k_none();
+            { KValue in = k_ai_from_json(s->inner, j); if (!k_ai_ok) return k_unit(); return k_some(in); }
+        case 6:
+            if (!strcmp(v, "JObj")) {
+                KMap* m = k_json_field0(j).as.map;
+                KValue* vals = (KValue*)k_alloc(sizeof(KValue) * (s->nfields < 1 ? 1 : s->nfields));
+                for (int i = 0; i < s->nfields; i++) {
+                    int found = 0; KValue fj = k_unit();
+                    for (int64_t k = 0; k < m->len; k++)
+                        if (!strcmp(m->keys[k].as.s, s->fnames[i])) { fj = m->vals[k]; found = 1; break; }
+                    if (!found) { snprintf(k_ai_err, sizeof k_ai_err, "model response is missing field `%s`", s->fnames[i]); k_ai_ok = 0; return k_unit(); }
+                    vals[i] = k_ai_from_json(s->fshapes[i], fj);
+                    if (!k_ai_ok) return k_unit();
+                }
+                return k_ctor(k_ctor_by_name(s->variant), vals, s->nfields);
+            }
+            break;
+    }
+    snprintf(k_ai_err, sizeof k_ai_err, "model response does not match the declared type");
+    k_ai_ok = 0; return k_unit();
+}
+
+/* strip a leading ```json fence (mirrors ai.rs::strip_fences); returns a copy */
+static const char* k_ai_strip(const char* text) {
+    const char* t = text;
+    while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
+    long n = (long)strlen(t);
+    while (n > 0 && (t[n-1] == ' ' || t[n-1] == '\t' || t[n-1] == '\n' || t[n-1] == '\r')) n--;
+    char* s = (char*)k_alloc(n + 1); memcpy(s, t, n); s[n] = 0;
+    if (strncmp(s, "```", 3) != 0) return s;
+    char* p = s + 3;
+    if (strncmp(p, "json", 4) == 0) p += 4;
+    while (*p == '\r' || *p == '\n') p++;
+    long pn = (long)strlen(p);
+    if (pn >= 3 && strcmp(p + pn - 3, "```") == 0) p[pn - 3] = 0;
+    /* trim */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    pn = (long)strlen(p);
+    while (pn > 0 && (p[pn-1] == ' ' || p[pn-1] == '\t' || p[pn-1] == '\n' || p[pn-1] == '\r')) p[--pn] = 0;
+    return p;
+}
+
+static KValue k_ai_convert(const KAiShape* shape, const char* text) {
+    k_ai_ok = 1;
+    if (shape->kind == 0) {   /* -> Str: return the trimmed text */
+        const char* t = text;
+        while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
+        long n = (long)strlen(t);
+        while (n > 0 && (t[n-1] == ' ' || t[n-1] == '\t' || t[n-1] == '\n' || t[n-1] == '\r')) n--;
+        char* c = (char*)k_alloc(n + 1); memcpy(c, t, n); c[n] = 0; return k_str(c);
+    }
+    const char* payload = k_ai_strip(text);
+    KValue parsed = k_json_parse(k_str(payload));
+    if (!strcmp(CTORS[parsed.as.ctor->ctor].variant, "Err")) {
+        snprintf(k_ai_err, sizeof k_ai_err, "model response is not valid JSON"); k_ai_ok = 0; return k_unit();
+    }
+    KValue json = k_json_field0(parsed);
+    /* accept a {"value": …} wrapper or a bare payload */
+    KValue inner = json;
+    if (!strcmp(k_json_var(json), "JObj")) {
+        KMap* m = k_json_field0(json).as.map;
+        for (int64_t k = 0; k < m->len; k++) if (!strcmp(m->keys[k].as.s, "value")) { inner = m->vals[k]; break; }
+    }
+    KValue v = k_ai_from_json(shape, inner);
+    if (k_ai_ok) return v;
+    /* retry against the whole object (mirrors convert's or_else) */
+    char first[256]; snprintf(first, sizeof first, "%s", k_ai_err);
+    k_ai_ok = 1;
+    KValue v2 = k_ai_from_json(shape, json);
+    if (!k_ai_ok) snprintf(k_ai_err, sizeof k_ai_err, "%s", first);
+    return v2;
+}
+
+static const char* k_getenv_ne(const char* key) { const char* v = getenv(key); return (v && v[0]) ? v : 0; }
+
+static KValue k_ai_call(int info) {
+    const KAiFun* f = &AI_FUNS[info];
+    if (f->has_tools) k_panic("tool-using `ai fun`s are not yet supported by the native backend (use `kupl bundle`)");
+    const char* text = k_getenv_ne(f->mock_key);
+    if (!text) text = k_getenv_ne("KUPL_AI_MOCK");
+    if (!text) {
+        const char* msg = "native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`";
+        if (f->wraps_result) return k_err(k_str(msg));
+        k_panic(msg); return k_unit();
+    }
+    KValue v = k_ai_convert(f->shape, text);
+    if (k_ai_ok) return f->wraps_result ? k_ok(v) : v;
+    if (f->wraps_result) return k_err(k_str(k_ai_err));
+    char b[320]; snprintf(b, sizeof b, "ai `%s`: %s", f->name, k_ai_err); k_panic(b); return k_unit();
 }
 
 /* ---- regex (mirrors src/regex.rs; byte-oriented — ASCII-correct, which is
@@ -3323,6 +3521,45 @@ mod tests {
         if cc_available() {
             assert_eq!(native_main_stdout(src, "http"), "handled\n");
         }
+    }
+
+    /// ai funs compile to native via the deterministic mock path: `-> Str`,
+    /// structured records, `List`, and `Result[T, Str]` all match the
+    /// interpreter's mock output. (Tool-using ai funs defer at runtime.)
+    #[test]
+    fn native_ai_mock() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Sent = { label: Str, score: Float }\n\
+                   ai fun haiku(t: Str) -> Str { intent \"x\" }\n\
+                   ai fun classify(r: Str) -> Result[Sent, Str] { intent \"x\" }\n\
+                   ai fun keywords(t: Str) -> Result[List[Str], Str] { intent \"x\" }\n\
+                   fun main() uses io {\n    print(haiku(\"s\"))\n    \
+                   match classify(\"g\") {\n        Ok(s) => print(\"{s.label} {s.score}\")\n        Err(e) => print(e)\n    }\n    \
+                   match keywords(\"a\") {\n        Ok(k) => print(\"{k}\")\n        Err(e) => print(e)\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("ai funs compile to C via the mock path");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-ai-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_HAIKU", "cherry blossoms")
+            .env("KUPL_AI_MOCK_CLASSIFY", "{\"label\":\"positive\",\"score\":0.9}")
+            .env("KUPL_AI_MOCK_KEYWORDS", "{\"value\":[\"alpha\",\"beta\"]}")
+            .output()
+            .expect("runs");
+        // exact bytes verified against `kupl run` under the same mock env
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "cherry blossoms\npositive 0.9\n[\"alpha\", \"beta\"]\n"
+        );
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
     }
 
     /// Direct cross-component expose calls compile to native and dispatch to the

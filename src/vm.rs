@@ -2163,13 +2163,15 @@ fun main() {\n    let c = Cache(store: NotAStore())\n    let _ = c\n}\n";
     }
 
     #[test]
-    fn ai_fun_native_backend_rejects() {
+    fn ai_fun_native_compiles_it51() {
+        // ai funs now compile to native via the deterministic mock path (it51);
+        // emit_c succeeds. (Byte-identity vs the interpreter under KUPL_AI_MOCK
+        // is covered by the cc-guarded native_ai_mock test in cgen.rs.)
         let src = "ai fun nat_x(t: Str) -> Str {\n    intent \"X.\"\n}\n\
 fun main() {\n    print(nat_x(\"t\"))\n}\n";
         let compiled = crate::run::compile(src).expect("compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
             .expect("module compiles");
-        let err = crate::cgen::emit_c(&module).expect_err("native must reject ai funs");
-        assert!(err.contains("not supported by the native backend"), "{err}");
+        assert!(crate::cgen::emit_c(&module).is_ok(), "native should compile ai funs now");
     }
 }
