@@ -243,6 +243,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/combinators.kupl` | Option/Result combinators: `.map`/`.and_then`/`.filter`/`.ok_or`/`.map_err`/`.ok` pipelines (with a `law`) |
 | `examples/sudoku.kupl` | a backtracking Sudoku solver (MRV heuristic) written in KUPL — recursion + `Option` + immutable-list updates (with a `law`) |
 | `examples/generic.kupl` | generic ADTs: `type Box[T]`/`Pair[A,B]`/`Tree[T]`, sound at multiple instantiations (with a `law`) |
+| `examples/collections.kupl` | a generic collections library: `Stack[T]`, `Queue[T]`, and a BST with an explicit compare fn (with a `law`) |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.
