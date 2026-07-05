@@ -2105,7 +2105,9 @@ pub fn shared_method(
                     let chars: Vec<char> = s.chars().collect();
                     let len = chars.len() as i64;
                     let lo = a.clamp(0, len) as usize;
-                    let hi = b.clamp(a.max(0), len) as usize;
+                    // `hi` in [lo, len]. NB: not `b.clamp(a.max(0), len)` — when
+                    // a > len the clamp bounds invert (min > max) and Rust panics.
+                    let hi = (b.clamp(0, len) as usize).max(lo);
                     Ok(Value::str(chars[lo..hi].iter().collect::<String>()))
                 }
                 _ => Err("`slice` needs two Int arguments".into()),

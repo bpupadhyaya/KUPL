@@ -2626,6 +2626,15 @@ static int64_t k_f2i(double v) {
     if (v < -9223372036854775808.0) return INT64_MIN;  /* <  -2^63 */
     return (int64_t)v;
 }
+/* byte length of the UTF-8 char whose leading byte is `c` (1..4; 1 for a stray
+   continuation/invalid byte). */
+static int k_utf8_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
 static int64_t k_isqrt(uint64_t n) {
     if (n == 0) return 0;
     uint64_t x = (uint64_t)sqrt((double)n);
@@ -3648,19 +3657,24 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             if (args[0].tag != K_INT) k_panic("`pad` needs an Int width");
             int64_t width = args[0].as.i;
             const char* fill = args[1].as.s;
-            char fc = fill[0] ? fill[0] : ' ';
+            /* fill with the first CHAR of `fill` (a full UTF-8 codepoint, not one
+               byte) — matches the interpreter; a byte-only fill corrupted multibyte
+               pad chars (é.pad_right(3,"日") -> "é??"). Empty fill -> space. */
+            const char* fc = fill[0] ? fill : " ";
+            int fcl = k_utf8_len((unsigned char)fc[0]);
             int64_t cur = 0;
             for (const char* p = s; *p; p++) if ((*p & 0xC0) != 0x80) cur++;
             if (cur >= width || width > 100000000) return k_str(s);
             int64_t pad = width - cur;
-            char* out = k_alloc(strlen(s) + (size_t)pad + 1);
+            size_t sl = strlen(s);
+            char* out = k_alloc(sl + (size_t)pad * fcl + 1);
             if (left) {
-                for (int64_t i = 0; i < pad; i++) out[i] = fc;
-                strcpy(out + pad, s);
+                for (int64_t i = 0; i < pad; i++) memcpy(out + i * fcl, fc, fcl);
+                memcpy(out + (size_t)pad * fcl, s, sl + 1);
             } else {
-                strcpy(out, s);
-                for (int64_t i = 0; i < pad; i++) out[strlen(s) + i] = fc;
-                out[strlen(s) + pad] = 0;
+                memcpy(out, s, sl);
+                for (int64_t i = 0; i < pad; i++) memcpy(out + sl + i * fcl, fc, fcl);
+                out[sl + (size_t)pad * fcl] = 0;
             }
             return k_str(out);
         }
@@ -4437,6 +4451,18 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native .pad_* fills with a full UTF-8 codepoint (was: one byte, corrupting a
+    /// multibyte fill char). PR-it28.
+    #[test]
+    fn native_pad_multibyte_fill() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print(\"é\".pad_right(3, \"日\"))\n    \
+                   print(\"é\".pad_left(3, \"日\"))\n    print(\"x\".pad_right(3, \"🎉\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "padmb").trim(), "é日日\n日日é\nx🎉🎉");
     }
 
     /// Native sized-int narrowing / .pow / abs overflow all PANIC (no C-UB wrap or

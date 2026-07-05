@@ -1106,6 +1106,21 @@ mod tests {
     }
 
     #[test]
+    fn diff_string_slice_and_pad_edges() {
+        // .slice with extreme/inverted indices must not panic (interp/KVM used to
+        // ICE on slice(i64::MAX, i64::MAX) — a clamp with inverted bounds), and
+        // char-indexed slicing over multibyte text agrees on both engines.
+        assert_eq!(differential("fun probe() -> Str {\n    \"hello\".slice(9223372036854775807, 9223372036854775807)\n}\n"), "");
+        assert_eq!(differential("fun probe() -> Str {\n    \"hello\".slice(9223372036854775807, 2)\n}\n"), "");
+        assert_eq!(differential("fun probe() -> Str {\n    \"hello\".slice(3, 1)\n}\n"), "");
+        assert_eq!(differential("fun probe() -> Str {\n    \"café\".slice(0, 4)\n}\n"), "café");
+        assert_eq!(differential("fun probe() -> Int {\n    \"日本\".len()\n}\n"), "2");
+        // .pad_* fills with the first CHAR (full codepoint) of the fill string.
+        assert_eq!(differential("fun probe() -> Str {\n    \"é\".pad_right(3, \"日\")\n}\n"), "é日日");
+        assert_eq!(differential("fun probe() -> Str {\n    \"é\".pad_left(3, \"日\")\n}\n"), "日日é");
+    }
+
+    #[test]
     fn diff_numeric_cast_and_overflow_panics() {
         // Sized-int narrowing that doesn't fit, integer .pow overflow, a negative
         // exponent, and i64::MIN.abs() all raise the SAME clean panic on both
