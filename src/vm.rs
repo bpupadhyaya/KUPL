@@ -1510,6 +1510,74 @@ component Store {
     }
 
     #[test]
+    fn diff_component_isolation_and_panic() {
+        // Two instances of the same component keep SEPARATE private state, and a
+        // panic inside an expose is caught identically on both engines (a clean
+        // "panic: …", never an ICE). Locks in actor state isolation + failure.
+        let src = r#"
+component Acc {
+    intent "isolated accumulator"
+    state sum: Int = 0
+    expose fun add(n: Int) -> Int { sum += n; sum }
+    expose fun risky(d: Int) -> Int { sum / d }
+}
+"#;
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter — two independent instances
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let mk = |interp: &mut Interp| match interp
+            .instantiate("Acc", &[], crate::diag::Span::default())
+        {
+            Ok(Value::Component(id)) => id,
+            _ => panic!("instantiates"),
+        };
+        let (a, b) = (mk(&mut interp), mk(&mut interp));
+        interp.start_all().ok();
+        let call_i = |interp: &mut Interp, id: usize, name: &str, args: Vec<Value>| -> String {
+            let f = Value::Bound(id, std::rc::Rc::new(name.to_string()));
+            match interp.call_value(f, args, crate::diag::Span::default()) {
+                Ok(v) => v.to_string(),
+                Err(Flow::Panic { msg, .. }) => format!("panic: {msg}"),
+                Err(_) => "flow".into(),
+            }
+        };
+        let mut i_log = Vec::new();
+        i_log.push(call_i(&mut interp, a, "add", vec![Value::Int(10)]));
+        i_log.push(call_i(&mut interp, b, "add", vec![Value::Int(100)]));
+        i_log.push(call_i(&mut interp, a, "add", vec![Value::Int(1)])); // a isolated from b
+        i_log.push(call_i(&mut interp, b, "add", vec![Value::Int(5)]));
+        i_log.push(call_i(&mut interp, a, "risky", vec![Value::Int(0)])); // panic
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let (va, vb) = (
+            vm.instantiate_named("Acc", vec![]).unwrap(),
+            vm.instantiate_named("Acc", vec![]).unwrap(),
+        );
+        let call_v = |vm: &mut Vm, id: usize, name: &str, args: Vec<Value>| -> String {
+            match vm.call_expose(id, name, args) {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("panic: {}", e.msg),
+            }
+        };
+        let mut v_log = Vec::new();
+        v_log.push(call_v(&mut vm, va, "add", vec![Value::Int(10)]));
+        v_log.push(call_v(&mut vm, vb, "add", vec![Value::Int(100)]));
+        v_log.push(call_v(&mut vm, va, "add", vec![Value::Int(1)]));
+        v_log.push(call_v(&mut vm, vb, "add", vec![Value::Int(5)]));
+        v_log.push(call_v(&mut vm, va, "risky", vec![Value::Int(0)]));
+
+        assert_eq!(i_log, v_log, "interp and KVM disagree on component isolation/panic");
+        assert_eq!(i_log[2], "11", "instance a is isolated from b (10 + 1, not + 100)");
+        assert_eq!(i_log[3], "105");
+        assert_eq!(i_log[4], "panic: division by zero");
+    }
+
+    #[test]
     fn diff_ai_fun_mock_provider() {
         // Deterministic mock responses; per-fun vars avoid cross-test races.
         std::env::set_var("KUPL_AI_MOCK_DIFF_SUMMARIZE", "  a short summary  ");
