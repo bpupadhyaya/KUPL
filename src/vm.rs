@@ -1106,6 +1106,29 @@ mod tests {
     }
 
     #[test]
+    fn diff_map_set_insertion_order_deterministic() {
+        // Map/Set iterate in INSERTION order — deterministic and identical on both
+        // engines (no randomized-HashMap ordering). Order survives removal; Set
+        // dedups keeping first occurrence; equality ignores insertion order.
+        assert_eq!(
+            differential("fun probe() -> Str {\n    let m = Map().insert(\"b\", 1).insert(\"a\", 2).insert(\"c\", 3)\n    \"{m.keys()}\"\n}\n"),
+            "[\"b\", \"a\", \"c\"]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    let m = Map().insert(50, 0).insert(10, 0).insert(30, 0).insert(90, 0)\n    \"{m.remove(30).keys()}\"\n}\n"),
+            "[50, 10, 90]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{Set([5, 1, 3, 9, 2, 7, 1, 5]).to_list()}\"\n}\n"),
+            "[5, 1, 3, 9, 2, 7]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    Map().insert(\"a\", 1).insert(\"b\", 2) == Map().insert(\"b\", 2).insert(\"a\", 1)\n}\n"),
+            "true"
+        );
+    }
+
+    #[test]
     fn diff_float_display_positional() {
         // f64 Display is positional shortest-round-trip on both engines — small
         // magnitudes are NOT scientific (native `%g` used to print "1e-05").

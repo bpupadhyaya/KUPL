@@ -4462,6 +4462,23 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native Map/Set iterate in INSERTION order — deterministic and identical to
+    /// the interpreter (no randomized-HashMap ordering). PR-it31.
+    #[test]
+    fn native_map_set_insertion_order() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let m = Map().insert(\"b\", 1).insert(\"a\", 2).insert(\"c\", 3)\n    \
+                   print(m.keys())\n    print(m.remove(\"a\").keys())\n    \
+                   print(Set([5, 1, 3, 9, 2, 7, 1, 5]).to_list())\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "mapord").trim(),
+            "[\"b\", \"a\", \"c\"]\n[\"b\", \"c\"]\n[5, 1, 3, 9, 2, 7]"
+        );
+    }
+
     /// Native f64 Display is positional shortest-round-trip for ALL magnitudes,
     /// matching the interpreter — small values are not scientific and large whole
     /// values are not truncated (the 64-byte buffer clipped 1e300). PR-it30.
