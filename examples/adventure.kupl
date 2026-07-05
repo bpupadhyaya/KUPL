@@ -1,0 +1,130 @@
+// A tiny text-adventure engine — written in KUPL.
+//
+// The world is a Map of rooms (each with a description, named exits, and items).
+// The player's location + inventory are immutable State threaded through a
+// command loop. Commands: `look`, `go <dir>`, `take <item>`, `inventory`. It's
+// driven here by a fixed script (a real game would read stdin), so the run is
+// deterministic. The world stays immutable; carried items are tracked in State.
+
+type Room = { name: Str, desc: Str, exits: Map[Str, Str], items: List[Str] }
+type State = { room: Str, inventory: List[Str] }
+type Pair[A, B] = Pair(first: A, second: B)
+
+fun make_world() -> Map[Str, Room] {
+    Map()
+        .insert("hall", Room(
+            name: "Entrance Hall",
+            desc: "A dusty hall with a faded rug.",
+            exits: Map().insert("north", "library").insert("east", "garden"),
+            items: ["torch"]))
+        .insert("library", Room(
+            name: "Library",
+            desc: "Shelves of ancient books line the walls.",
+            exits: Map().insert("south", "hall"),
+            items: ["book"]))
+        .insert("garden", Room(
+            name: "Walled Garden",
+            desc: "A quiet garden; a small key glints in the soil.",
+            exits: Map().insert("west", "hall"),
+            items: ["key"]))
+}
+
+fun get_room(world: Map[Str, Room], id: Str) -> Room {
+    world.get(id).unwrap_or(Room(name: "Void", desc: "nothing", exits: Map(), items: []))
+}
+
+fun describe(world: Map[Str, Room], st: State) -> Str {
+    let r = get_room(world, st.room)
+    let items = if r.items.is_empty() { "nothing" } else { r.items.join(", ") }
+    let exits = r.exits.keys().join(", ")
+    "{r.name}: {r.desc} You see: {items}. Exits: {exits}."
+}
+
+// Try to move; returns the new State + a message.
+fun do_go(world: Map[Str, Room], st: State, dir: Str) -> Pair[State, Str] {
+    let r = get_room(world, st.room)
+    match r.exits.get(dir) {
+        Some(dest) => {
+            let moved = State(room: dest, inventory: st.inventory)
+            Pair(first: moved, second: "You go {dir} to the {get_room(world, dest).name}.")
+        }
+        None => Pair(first: st, second: "You can't go {dir} from here.")
+    }
+}
+
+// Try to take an item; returns the new State + updated world + a message.
+fun do_take(world: Map[Str, Room], st: State, item: Str) -> Pair[State, Str] {
+    let r = get_room(world, st.room)
+    if r.items.contains(item) {
+        let picked = State(room: st.room, inventory: st.inventory.push(item))
+        Pair(first: picked, second: "You take the {item}.")
+    } else {
+        Pair(first: st, second: "There is no {item} here.")
+    }
+}
+
+fun step(world: Map[Str, Room], st: State, cmd: Str) -> Pair[State, Str] {
+    let parts = cmd.split(" ")
+    let verb = parts.get(0).unwrap_or("")
+    let arg = parts.get(1).unwrap_or("")
+    if verb == "look" {
+        Pair(first: st, second: describe(world, st))
+    } else if verb == "go" {
+        do_go(world, st, arg)
+    } else if verb == "take" {
+        do_take(world, st, arg)
+    } else if verb == "inventory" {
+        let inv = if st.inventory.is_empty() { "empty-handed" } else { st.inventory.join(", ") }
+        Pair(first: st, second: "You carry: {inv}.")
+    } else {
+        Pair(first: st, second: "I don't understand \"{cmd}\".")
+    }
+}
+
+// Run a script, returning one output line per command.
+fun run_script(world: Map[Str, Room], begin: State, cmds: List[Str]) -> List[Str] {
+    var st = begin
+    var lines: List[Str] = []
+    var i = 0
+    while i < cmds.len() {
+        let cmd = cmds.get(i).unwrap_or("")
+        let result = step(world, st, cmd)
+        st = result.first
+        lines = lines.push("> {cmd}").push(result.second)
+        i = i + 1
+    }
+    lines
+}
+
+// The final inventory after running a script from the hall.
+fun final_inventory(cmds: List[Str]) -> List[Str] {
+    let world = make_world()
+    var st = State(room: "hall", inventory: [])
+    var i = 0
+    while i < cmds.len() {
+        st = step(world, st, cmds.get(i).unwrap_or("")).first
+        i = i + 1
+    }
+    st.inventory
+}
+
+fun main() uses io {
+    let world = make_world()
+    let begin = State(room: "hall", inventory: [])
+    let script = ["look", "take torch", "go north", "take book", "inventory", "go south", "go east", "take key", "inventory"]
+    let lines = run_script(world, begin, script)
+    var i = 0
+    while i < lines.len() {
+        print(lines.get(i).unwrap_or(""))
+        i = i + 1
+    }
+}
+
+law "the adventure engine is correct" {
+    expect final_inventory(["go north", "take book"]) == ["book"]
+    expect final_inventory(["take torch", "go east", "take key"]) == ["torch", "key"]
+    let world = make_world()
+    let s0 = State(room: "hall", inventory: [])
+    expect step(world, s0, "go west").second == "You can't go west from here."
+    expect step(world, s0, "take sword").second == "There is no sword here."
+}

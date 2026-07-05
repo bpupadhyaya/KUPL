@@ -241,6 +241,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/sets.kupl` | set algebra (`union`/`intersect`/`difference`/`symmetric_difference`/`is_subset`) + keyed `min_by`/`max_by` (with a `law`) |
 | `examples/life.kupl` | Conway's Game of Life (cellular automaton): B3/S23 rule on an immutable grid, ASCII render (with a `law`) |
 | `examples/stats.kupl` | descriptive statistics (mean/variance/stddev) + least-squares linear regression (with a `law`) |
+| `examples/adventure.kupl` | a text-adventure engine: rooms/exits/items as a `Map` of records, immutable state threaded through commands (with a `law`) |
 | `examples/format.kupl` | number formatting: `Float.fmt(decimals)` fixed-point + `Int.to_hex`/`to_binary`/`to_radix` (with a `law`) |
 | `examples/jq.kupl` | a jq-like JSON query tool: path expressions (`.a.b`, `[0]`, `[]`) over the built-in `Json` type, written in KUPL (with a `law`) |
 | `examples/braces.kupl` | literal-brace escaping: `{{`/`}}` in interpolated strings for JSON/CSS/`{…}` templates (with a `law`) |
