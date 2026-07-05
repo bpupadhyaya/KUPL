@@ -129,6 +129,11 @@ by differential tests:
 | KVM bytecode VM | `kupl run --vm app.kupl` | production interpreter; also what `.kx`/`bundle` use |
 | Native machine code | `kupl native prog.kupl -o prog` | fastest binaries for `fun main` programs (via the system C compiler) |
 
+The interpreter is the reference semantics; the KVM is checked against it by a
+differential suite on every build, and `kupl native`'s output is **byte-identical
+to the interpreter across the entire deterministic example suite** (certified by a
+full three-engine sweep).
+
 ### Run
 
 ```sh

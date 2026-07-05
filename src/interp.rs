@@ -1448,10 +1448,6 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     }
 }
 
-fn binary_op(op: BinOp, l: Value, r: Value, span: Span) -> EvalResult {
-    raw_binary_op(op, &l, &r).map_err(|msg| Flow::Panic { msg, span })
-}
-
 /// Fixed-precision decimal formatting, rounding half away from zero. A manual
 /// algorithm (not the platform float formatter) so the interpreter, KVM, and the
 /// native C backend all produce byte-identical strings. `decimals` is clamped to
