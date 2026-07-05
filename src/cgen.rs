@@ -3184,6 +3184,18 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return k_some(best);
         }
+        if (!strcmp(name, "min_by") || !strcmp(name, "max_by")) {
+            int wmin = name[1] == 'i';
+            if (l->len == 0) return k_none();
+            KValue best = l->items[0];
+            KValue best_key = k_call(args[0], &best, 1);
+            for (int64_t i = 1; i < l->len; i++) {
+                KValue key = k_call(args[0], &l->items[i], 1);
+                KValue c = k_cmp(key, best_key, wmin ? 0 : 2); /* min: key<best  max: key>best */
+                if (c.tag == K_BOOL && c.as.b) { best = l->items[i]; best_key = key; }
+            }
+            return k_some(best);
+        }
         if (!strcmp(name, "flatten")) {
             int64_t total = 0;
             for (int64_t i = 0; i < l->len; i++) {
@@ -3725,6 +3737,22 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return k_set_make(out, n);
         }
+        if (!strcmp(name, "symmetric_difference")) {
+            KSet* o = args[0].as.set;
+            KValue* out = k_alloc(sizeof(KValue) * ((st->len + o->len) < 1 ? 1 : st->len + o->len));
+            int64_t n = 0;
+            for (int64_t i = 0; i < st->len; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < o->len; j++) if (k_eq(st->items[i], o->items[j])) { found = 1; break; }
+                if (!found) out[n++] = st->items[i];
+            }
+            for (int64_t i = 0; i < o->len; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < st->len; j++) if (k_eq(o->items[i], st->items[j])) { found = 1; break; }
+                if (!found) out[n++] = o->items[i];
+            }
+            return k_set_make(out, n);
+        }
         if (!strcmp(name, "to_list")) return k_list(st->items, (int)st->len);
         if (!strcmp(name, "is_empty")) return k_bool(st->len == 0);
         if (!strcmp(name, "is_subset")) {
@@ -4197,6 +4225,18 @@ mod tests {
                    print(Some(5).ok_or(\"no\").map_err(fn e { e }).unwrap_or(0))\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
+        }
+    }
+
+    /// Set.symmetric_difference and List.min_by/max_by (it84) compile to native
+    /// (min_by/max_by via k_call + k_cmp), matching the interpreter.
+    #[test]
+    fn native_set_and_minby() {
+        let src = "fun main() uses io {\n    \
+                   print(Set([1, 2, 3]).symmetric_difference(Set([2, 3, 4])).to_list())\n    \
+                   print([\"a\", \"ccc\", \"bb\"].max_by(fn s { s.len() }))\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "sets"), "[1, 4]\nSome(\"ccc\")\n");
         }
     }
 

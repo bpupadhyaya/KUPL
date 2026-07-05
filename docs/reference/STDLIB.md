@@ -194,6 +194,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.init()` / `.tail()` | `-> List[T]` | all but the last / all but the first |
 | `.product()` | `-> T` | Int or Float lists; Int overflow panics |
 | `.min()` / `.max()` | `-> Option[T]` | Int/Float/Str elements; `None` if empty |
+| `.min_by(f)` / `.max_by(f)` | `(fn(T) -> K) -> Option[T]` | element with the smallest/largest key |
 | `.flatten()` | `List[List[T]] -> List[T]` | one level of nesting |
 | `.count(f)` | `(fn(T) -> Bool) -> Int` | how many satisfy `f` |
 | `.flat_map(f)` | `(fn(T) -> List[U]) -> List[U]` | map then flatten |
@@ -357,6 +358,7 @@ Insertion-ordered; equality is order-insensitive.
 | `.insert(v)` / `.remove(v)` | `(T) -> Set[T]` | new set |
 | `.contains(v)` | `(T) -> Bool` | |
 | `.union(s)` / `.intersect(s)` / `.difference(s)` | `(Set[T]) -> Set[T]` | |
+| `.symmetric_difference(s)` | `(Set[T]) -> Set[T]` | in exactly one of the two |
 | `.to_list()` | `-> List[T]` | insertion order |
 | `.len()` | `-> Int` | |
 | `.is_empty()` | `-> Bool` | |

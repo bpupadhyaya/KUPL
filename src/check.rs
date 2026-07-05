@@ -1925,6 +1925,13 @@ impl Checker {
                 }
                 Some((vec![], elem))
             }
+            (Ty::List(t), "min_by") | (Ty::List(t), "max_by") => {
+                let key = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**t).clone()], Box::new(key))],
+                    Ty::Option(t.clone()),
+                ))
+            }
             (Ty::List(t), "min") | (Ty::List(t), "max") => {
                 let elem = self.uni.apply(t);
                 if !matches!(elem, Ty::Int | Ty::Float | Ty::Str | Ty::Var(_)) {
@@ -2136,7 +2143,7 @@ impl Checker {
             }
             (Ty::Set(t), "contains") => Some((vec![(**t).clone()], Ty::Bool)),
             (Ty::Set(_), "len") => Some((vec![], Ty::Int)),
-            (Ty::Set(t), "union") | (Ty::Set(t), "intersect") | (Ty::Set(t), "difference") => {
+            (Ty::Set(t), "union") | (Ty::Set(t), "intersect") | (Ty::Set(t), "difference") | (Ty::Set(t), "symmetric_difference") => {
                 Some((vec![Ty::Set(t.clone())], Ty::Set(t.clone())))
             }
             (Ty::Set(t), "to_list") => Some((vec![], Ty::List(t.clone()))),

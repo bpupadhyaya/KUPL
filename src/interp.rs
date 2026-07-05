@@ -1779,6 +1779,29 @@ pub fn shared_method(
             }
             Ok(best.map(Value::some).unwrap_or_else(Value::none))
         }
+        (Value::List(items), "min_by") | (Value::List(items), "max_by") => {
+            let f = args.into_iter().next().ok_or("`min_by`/`max_by` needs a function")?;
+            let want_min = name == "min_by";
+            let mut best: Option<(Value, Value)> = None; // (element, its key)
+            for item in items.iter() {
+                let key = call(f.clone(), vec![item.clone()])?;
+                let take = match &best {
+                    None => true,
+                    Some((_, bk)) => {
+                        let ord = list_order(bk, &key)?;
+                        if want_min {
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                        }
+                    }
+                };
+                if take {
+                    best = Some((item.clone(), key));
+                }
+            }
+            Ok(best.map(|(v, _)| Value::some(v)).unwrap_or_else(Value::none))
+        }
         (Value::List(items), "flatten") => {
             let mut out = Vec::new();
             for item in items.iter() {
@@ -2389,6 +2412,20 @@ pub fn shared_method(
                 items.iter().filter(|x| !other.iter().any(|y| y == *x)).cloned().collect(),
             ))),
             _ => Err("`difference` needs a Set".into()),
+        },
+        (Value::Set(items), "symmetric_difference") => match args.into_iter().next() {
+            Some(Value::Set(other)) => {
+                // (in self, not other) then (in other, not self) — deterministic order
+                let mut out: Vec<Value> =
+                    items.iter().filter(|x| !other.iter().any(|y| y == *x)).cloned().collect();
+                for x in other.iter() {
+                    if !items.iter().any(|y| y == x) {
+                        out.push(x.clone());
+                    }
+                }
+                Ok(Value::Set(Rc::new(out)))
+            }
+            _ => Err("`symmetric_difference` needs a Set".into()),
         },
         (Value::Set(items), "to_list") => Ok(Value::List(Rc::new(items.as_ref().clone()))),
         (Value::Set(items), "is_empty") => Ok(Value::Bool(items.is_empty())),
