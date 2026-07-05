@@ -495,6 +495,17 @@ impl Parser {
     fn parse_type_decl(&mut self) -> PResult<TypeDecl> {
         let start = self.expect(Tok::KwType)?;
         let (name, _) = self.expect_ident()?;
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::LBracket) {
+            loop {
+                let (tp, _) = self.expect_ident()?;
+                type_params.push(tp);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RBracket)?;
+        }
         self.expect(Tok::Eq)?;
         // `type UserId = new Str` — newtype: single variant wrapping one field.
         if self.eat(&Tok::KwNew) {
@@ -503,7 +514,7 @@ impl Parser {
             let field = Param { name: "value".into(), ty: inner, default: None, span };
             let variants = vec![Variant { name: name.clone(), fields: vec![field], span }];
             self.expect_terminator()?;
-            return Ok(TypeDecl { name, variants, span });
+            return Ok(TypeDecl { name, type_params, variants, span });
         }
         // `type User = { name: Str, age: Int }` — record: single variant named
         // like the type, constructed with named args.
@@ -526,7 +537,7 @@ impl Parser {
             let span = start.merge(end);
             let variants = vec![Variant { name: name.clone(), fields, span }];
             self.expect_terminator()?;
-            return Ok(TypeDecl { name, variants, span });
+            return Ok(TypeDecl { name, type_params, variants, span });
         }
         // Union of variants: `Circle(r: Float) | Rect(w: Float, h: Float)`
         let mut variants = Vec::new();
@@ -546,7 +557,7 @@ impl Parser {
         }
         let span = start.merge(self.prev_span());
         self.expect_terminator()?;
-        Ok(TypeDecl { name, variants, span })
+        Ok(TypeDecl { name, type_params, variants, span })
     }
 
     /// Allow a union to continue on the next line: `= A\n | B`.

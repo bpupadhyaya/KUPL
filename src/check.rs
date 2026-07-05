@@ -137,7 +137,13 @@ impl Checker {
                 // placeholder so recursive types resolve
                 self.checked.types.insert(
                     t.name.clone(),
-                    TypeSig { name: t.name.clone(), variants: Vec::new(), is_record: false },
+                    TypeSig {
+                        name: t.name.clone(),
+                        variants: Vec::new(),
+                        is_record: false,
+                        type_params: t.type_params.clone(),
+                        qvars: Vec::new(),
+                    },
                 );
             }
         }
@@ -154,6 +160,18 @@ impl Checker {
         for item in &program.items {
             match item {
                 Item::Type(t) => {
+                    // bind each type parameter to a fresh var (collected as qvars,
+                    // like a generic function's scheme) so variant field types that
+                    // reference `T` resolve to it; each use instantiates fresh vars.
+                    let mut qvars = Vec::new();
+                    self.tyvars.clear();
+                    for tp in &t.type_params {
+                        let v = self.uni.fresh();
+                        if let Ty::Var(id) = v {
+                            qvars.push(id);
+                        }
+                        self.tyvars.insert(tp.clone(), v);
+                    }
                     let mut variants = Vec::new();
                     for v in &t.variants {
                         let mut fields = Vec::new();
@@ -173,10 +191,17 @@ impl Checker {
                             .insert(v.name.clone(), (t.name.clone(), fields.clone()));
                         variants.push(VariantSig { name: v.name.clone(), fields });
                     }
+                    self.tyvars.clear();
                     let is_record = t.variants.len() == 1 && t.variants[0].name == t.name;
                     self.checked.types.insert(
                         t.name.clone(),
-                        TypeSig { name: t.name.clone(), variants, is_record },
+                        TypeSig {
+                            name: t.name.clone(),
+                            variants,
+                            is_record,
+                            type_params: t.type_params.clone(),
+                            qvars,
+                        },
                     );
                 }
                 Item::Fun(f) => {
@@ -409,8 +434,11 @@ impl Checker {
                     Ty::IntW(crate::value::IntW::from_name(n.as_str()).unwrap())
                 }
                 other => {
-                    if self.checked.types.contains_key(other) {
-                        Ty::Named(other.to_string())
+                    if let Some(sig) = self.checked.types.get(other) {
+                        // a bare generic type name instantiates fresh type args
+                        let n = sig.type_params.len();
+                        let args = (0..n).map(|_| self.uni.fresh()).collect();
+                        Ty::Named(other.to_string(), args)
                     } else if self.checked.components.contains_key(other) {
                         Ty::Component(other.to_string())
                     } else if self.checked.contracts.contains_key(other) {
@@ -436,6 +464,17 @@ impl Checker {
                         let e = ats.remove(1);
                         let ok = ats.remove(0);
                         Ty::Result(Box::new(ok), Box::new(e))
+                    }
+                    _ if self.checked.types.contains_key(n) => {
+                        let params = self.checked.types.get(n).unwrap().type_params.len();
+                        if params != ats.len() {
+                            self.err(
+                                "K0206",
+                                format!("`{n}` takes {params} type argument(s), {} given", ats.len()),
+                                t.span,
+                            );
+                        }
+                        Ty::Named(n.clone(), ats)
                     }
                     _ => {
                         self.err(
@@ -1063,7 +1102,7 @@ impl Checker {
     /// expression as that function's return type. Returns `None` otherwise, so
     /// the built-in numeric/string path is untouched.
     fn operator_overload(&mut self, op: BinOp, t: &Ty, span: Span) -> Option<Ty> {
-        if !matches!(t, Ty::Named(_)) {
+        if !matches!(t, Ty::Named(..)) {
             return None;
         }
         let fname = crate::interp::op_overload_name(op)?;
@@ -1114,12 +1153,14 @@ impl Checker {
             ExprKind::Field { recv, name } => {
                 let rt = self.infer_expr(recv, ctx);
                 match self.uni.apply(&rt) {
-                    Ty::Named(tn) => {
+                    Ty::Named(tn, args) => {
                         let sig = self.checked.types.get(&tn).cloned();
                         match sig {
                             Some(sig) if sig.variants.len() == 1 => {
+                                let m: HashMap<u32, Ty> =
+                                    sig.qvars.iter().cloned().zip(args.iter().cloned()).collect();
                                 match sig.variants[0].fields.iter().find(|(fname, _)| fname == name) {
-                                    Some((_, ty)) => ty.clone(),
+                                    Some((_, ty)) => Self::subst_ty(ty, &m),
                                     None => {
                                         self.err("K0230", format!("type `{tn}` has no field `{name}`"), expr.span);
                                         self.uni.fresh()
@@ -1193,7 +1234,7 @@ impl Checker {
                                 "K0235",
                                 format!(
                                     "arithmetic needs Int or Float operands, found {t}{}",
-                                    if matches!(t, Ty::Named(_)) {
+                                    if matches!(t, Ty::Named(..)) {
                                         format!(
                                             " — define `fun {}(a: {t}, b: {t}) -> {t}` to overload `{}`",
                                             crate::interp::op_overload_name(*op).unwrap_or("add"),
@@ -1276,18 +1317,22 @@ impl Checker {
             ExprKind::With { recv, updates } => {
                 let rt = self.infer_expr(recv, ctx);
                 let rt = self.uni.apply(&rt);
-                let Ty::Named(tn) = &rt else {
+                let Ty::Named(tn, args) = &rt else {
                     self.err("K0233", format!("{rt} has no fields to update"), expr.span);
                     return self.uni.fresh();
                 };
                 let sig = self.checked.types.get(tn).cloned();
+                let m: HashMap<u32, Ty> = sig
+                    .as_ref()
+                    .map(|s| s.qvars.iter().cloned().zip(args.iter().cloned()).collect())
+                    .unwrap_or_default();
                 match sig {
                     Some(sig) if sig.variants.len() == 1 => {
                         for (field, value) in updates {
                             let vt = self.infer_expr(value, ctx);
                             match sig.variants[0].fields.iter().find(|(f, _)| f == field) {
                                 Some((_, fty)) => {
-                                    self.unify(&fty.clone(), &vt, value.span, &format!("field `{field}`"));
+                                    self.unify(&Self::subst_ty(fty, &m), &vt, value.span, &format!("field `{field}`"));
                                 }
                                 None => self.err(
                                     "K0230",
@@ -1360,24 +1405,49 @@ impl Checker {
         for q in qvars {
             mapping.insert(*q, self.uni.fresh());
         }
-        fn subst(ty: &Ty, m: &HashMap<u32, Ty>) -> Ty {
-            match ty {
-                Ty::Var(id) => m.get(id).cloned().unwrap_or(Ty::Var(*id)),
-                Ty::List(e) => Ty::List(Box::new(subst(e, m))),
-                Ty::Set(e) => Ty::Set(Box::new(subst(e, m))),
-                Ty::Map(k, v) => Ty::Map(Box::new(subst(k, m)), Box::new(subst(v, m))),
-                Ty::Option(e) => Ty::Option(Box::new(subst(e, m))),
-                Ty::Result(a, b) => Ty::Result(Box::new(subst(a, m)), Box::new(subst(b, m))),
-                Ty::Fun(ps, r) => {
-                    Ty::Fun(ps.iter().map(|p| subst(p, m)).collect(), Box::new(subst(r, m)))
-                }
-                other => other.clone(),
-            }
-        }
         (
-            params.iter().map(|p| subst(p, &mapping)).collect(),
-            subst(ret, &mapping),
+            params.iter().map(|p| Self::subst_ty(p, &mapping)).collect(),
+            Self::subst_ty(ret, &mapping),
         )
+    }
+
+    /// Replace inference-var ids in `ty` per `m` (used to instantiate a generic
+    /// scheme or a generic ADT's field types). Recurses into every constructor.
+    fn subst_ty(ty: &Ty, m: &HashMap<u32, Ty>) -> Ty {
+        match ty {
+            Ty::Var(id) => m.get(id).cloned().unwrap_or(Ty::Var(*id)),
+            Ty::List(e) => Ty::List(Box::new(Self::subst_ty(e, m))),
+            Ty::Set(e) => Ty::Set(Box::new(Self::subst_ty(e, m))),
+            Ty::Map(k, v) => Ty::Map(Box::new(Self::subst_ty(k, m)), Box::new(Self::subst_ty(v, m))),
+            Ty::Option(e) => Ty::Option(Box::new(Self::subst_ty(e, m))),
+            Ty::Result(a, b) => Ty::Result(Box::new(Self::subst_ty(a, m)), Box::new(Self::subst_ty(b, m))),
+            Ty::Fun(ps, r) => Ty::Fun(
+                ps.iter().map(|p| Self::subst_ty(p, m)).collect(),
+                Box::new(Self::subst_ty(r, m)),
+            ),
+            Ty::Named(n, args) => {
+                Ty::Named(n.clone(), args.iter().map(|a| Self::subst_ty(a, m)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Instantiate a constructor's field types with fresh type args, returning
+    /// (field types, the `Named` result type carrying those fresh args).
+    fn instantiate_ctor(&mut self, tyname: &str, fields: &[(String, Ty)]) -> (Vec<Ty>, Ty) {
+        let qvars = self
+            .checked
+            .types
+            .get(tyname)
+            .map(|s| s.qvars.clone())
+            .unwrap_or_default();
+        let mut m = HashMap::new();
+        for q in &qvars {
+            m.insert(*q, self.uni.fresh());
+        }
+        let field_tys = fields.iter().map(|(_, t)| Self::subst_ty(t, &m)).collect();
+        let args = qvars.iter().map(|q| m[q].clone()).collect();
+        (field_tys, Ty::Named(tyname.to_string(), args))
     }
 
     fn infer_ident(&mut self, name: &str, span: Span, ctx: &mut Ctx) -> Ty {
@@ -1394,13 +1464,11 @@ impl Checker {
             _ => {}
         }
         if let Some((tyname, fields)) = self.checked.ctors.get(name).cloned() {
+            let (field_tys, result) = self.instantiate_ctor(&tyname, &fields);
             if fields.is_empty() {
-                return Ty::Named(tyname);
+                return result;
             }
-            return Ty::Fun(
-                fields.iter().map(|(_, t)| t.clone()).collect(),
-                Box::new(Ty::Named(tyname)),
-            );
+            return Ty::Fun(field_tys, Box::new(result));
         }
         self.err("K0240", format!("unknown name `{name}`"), span);
         self.uni.fresh()
@@ -1473,13 +1541,13 @@ impl Checker {
                     let t = self.infer_expr(&args[0].value, ctx);
                     self.unify(&Ty::Str, &t, args[0].value.span, "json_parse argument");
                     return Ty::Result(
-                        Box::new(Ty::Named("Json".into())),
+                        Box::new(Ty::Named("Json".into(), vec![])),
                         Box::new(Ty::Str),
                     );
                 }
                 ("json_stringify", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
-                    self.unify(&Ty::Named("Json".into()), &t, args[0].value.span, "json_stringify argument");
+                    self.unify(&Ty::Named("Json".into(), vec![]), &t, args[0].value.span, "json_stringify argument");
                     return Ty::Str;
                 }
                 ("env_var", 1) => {
@@ -1688,8 +1756,14 @@ impl Checker {
             }
             // user constructor
             if let Some((tyname, fields)) = self.checked.ctors.get(name).cloned() {
-                self.check_named_args(name, &fields, args, span, ctx);
-                return Ty::Named(tyname);
+                let (field_tys, result) = self.instantiate_ctor(&tyname, &fields);
+                let inst: Vec<(String, Ty)> = fields
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .zip(field_tys)
+                    .collect();
+                self.check_named_args(name, &inst, args, span, ctx);
+                return result;
             }
             // component construction (props checked in the caller's own scope)
             if let Some(sig) = self.checked.components.get(name).cloned() {
@@ -2248,15 +2322,16 @@ impl Checker {
                 other => match self.checked.ctors.get(other).cloned() {
                     None => self.err("K0254", format!("unknown constructor `{other}` in pattern"), pat.span),
                     Some((tyname, fields)) => {
-                        self.unify(expected, &Ty::Named(tyname), pat.span, "pattern");
-                        if args.len() != fields.len() {
+                        let (field_tys, result) = self.instantiate_ctor(&tyname, &fields);
+                        self.unify(expected, &result, pat.span, "pattern");
+                        if args.len() != field_tys.len() {
                             self.err(
                                 "K0255",
-                                format!("`{other}` has {} field(s), pattern has {}", fields.len(), args.len()),
+                                format!("`{other}` has {} field(s), pattern has {}", field_tys.len(), args.len()),
                                 pat.span,
                             );
                         }
-                        for (a, (_, fty)) in args.iter().zip(fields.iter()) {
+                        for (a, fty) in args.iter().zip(field_tys.iter()) {
                             self.check_pattern(a, fty, ctx);
                         }
                     }
@@ -2340,7 +2415,7 @@ impl Checker {
                 .filter(|v| !covered.contains(**v))
                 .map(|v| v.to_string())
                 .collect(),
-            Ty::Named(tn) => match self.checked.types.get(&tn) {
+            Ty::Named(tn, _) => match self.checked.types.get(&tn) {
                 Some(sig) => sig
                     .variants
                     .iter()
@@ -2400,5 +2475,39 @@ fn op_symbol(op: crate::ast::BinOp) -> &'static str {
         Add => "+", Sub => "-", Mul => "*", Div => "/", Rem => "%",
         Lt => "<", Le => "<=", Gt => ">", Ge => ">=",
         Eq => "==", Ne => "!=", And => "&&", Or => "||",
+    }
+}
+
+#[cfg(test)]
+mod generic_tests {
+    /// Type-check a source string and return the error diagnostics.
+    fn errors(src: &str) -> Vec<crate::diag::Diag> {
+        let (mut program, mut diags) = crate::parser::parse(src);
+        crate::run::inject_prelude(&mut program);
+        let (_checked, cdiags) = super::check(&program);
+        diags.extend(cdiags);
+        diags
+            .into_iter()
+            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .collect()
+    }
+
+    #[test]
+    fn generic_adt_infers_and_is_sound() {
+        // a well-typed generic program has no errors
+        assert!(errors(
+            "type Box[T] = Box(v: T)\nfun main() { let a: Int = Box(v: 5).v }\n"
+        )
+        .is_empty());
+        // Box[Int] cannot hold a Str — a real type error, not a crash
+        let errs = errors(
+            "type Box[T] = Box(v: T)\nfun main() { let b: Box[Int] = Box(v: \"x\") }\n",
+        );
+        assert!(errs.iter().any(|d| d.code == "K0200"), "expected K0200: {errs:?}");
+        // two instantiations of the same generic type coexist
+        assert!(errors(
+            "type Box[T] = Box(v: T)\nfun main() {\n  let a = Box(v: 1)\n  let b = Box(v: \"s\")\n}\n"
+        )
+        .is_empty());
     }
 }

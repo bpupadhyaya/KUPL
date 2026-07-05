@@ -122,6 +122,9 @@ letters are permitted. `_` alone is the wildcard pattern.
 type Shape = Circle(r: Float) | Rect(w: Float, h: Float)   // union (ADT)
 type User  = { name: Str, age: Int }                        // record
 type UserId = new Str                                       // newtype
+type Box[T] = Box(v: T)                                     // generic
+type Pair[A, B] = Pair(first: A, second: B)                 // multi-param
+type Tree[T] = Leaf | Node(value: T, left: Tree[T], right: Tree[T])
 ```
 
 - A **record** is a single-variant type constructed with named or positional
@@ -133,6 +136,11 @@ type UserId = new Str                                       // newtype
 - **Recursive** ADTs are supported: a variant may carry its own type
   (`type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)`), directly or through
   `List`/`Map`.
+- **Generic** ADTs take type parameters in `[…]`: `type Box[T]`,
+  `type Pair[A, B]`, `type Tree[T]`. Use them as `Box[Int]`, `Pair[Str, Int]`;
+  construction infers the arguments (`Box(v: 5)` is `Box[Int]`), and each
+  instantiation is distinct (a `Box[Int]` can't hold a `Str`). Type parameters
+  are checked but **erased at runtime**, so generics cost nothing at run time.
 
 ### Prelude
 

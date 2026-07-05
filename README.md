@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 209 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 210 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -242,6 +242,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/braces.kupl` | literal-brace escaping: `{{`/`}}` in interpolated strings for JSON/CSS/`{…}` templates (with a `law`) |
 | `examples/combinators.kupl` | Option/Result combinators: `.map`/`.and_then`/`.filter`/`.ok_or`/`.map_err`/`.ok` pipelines (with a `law`) |
 | `examples/sudoku.kupl` | a backtracking Sudoku solver (MRV heuristic) written in KUPL — recursion + `Option` + immutable-list updates (with a `law`) |
+| `examples/generic.kupl` | generic ADTs: `type Box[T]`/`Pair[A,B]`/`Tree[T]`, sound at multiple instantiations (with a `law`) |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.
@@ -292,7 +293,7 @@ language, every example verified against the toolchain).
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~29,100 lines of dependency-free Rust, 209 tests, all engines differentially
+~29,100 lines of dependency-free Rust, 210 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

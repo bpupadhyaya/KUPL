@@ -105,7 +105,7 @@ pub fn build_shape(
         Ty::Bool => Ok(AiShape::Bool),
         Ty::List(t) => Ok(AiShape::List(Box::new(build_shape(t, records, visiting)?))),
         Ty::Option(t) => Ok(AiShape::Option(Box::new(build_shape(t, records, visiting)?))),
-        Ty::Named(name) => {
+        Ty::Named(name, _) => {
             if visiting.iter().any(|v| v == name) {
                 return Err(format!("recursive type `{name}` is not supported"));
             }

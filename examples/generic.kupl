@@ -1,0 +1,43 @@
+// Generic ADTs — parametric user types, like Rust/Haskell/Swift/Kotlin.
+//
+//   type Box[T] = Box(v: T)
+//   type Pair[A, B] = Pair(first: A, second: B)
+//   type Tree[T] = Leaf | Node(value: T, left: Tree[T], right: Tree[T])
+//
+// Type parameters are checked but erased at runtime — the same `Box(v: 5)` value
+// on every engine — so this is a pure type-system feature (parser + checker).
+
+type Box[T] = Box(v: T)
+type Pair[A, B] = Pair(first: A, second: B)
+type Tree[T] = Leaf | Node(value: T, left: Tree[T], right: Tree[T])
+
+fun unbox[T](b: Box[T]) -> T { b.v }
+
+fun tree_sum(t: Tree[Int]) -> Int {
+    match t {
+        Leaf => 0
+        Node(v, l, r) => v + tree_sum(l) + tree_sum(r)
+    }
+}
+
+fun leaf() -> Tree[Int] { Leaf }
+fun node(v: Int, l: Tree[Int], r: Tree[Int]) -> Tree[Int] { Node(value: v, left: l, right: r) }
+
+fun main() uses io {
+    // one generic type at two instantiations
+    print(unbox(Box(v: 5)))       // 5    (Box[Int])
+    print(unbox(Box(v: "hi")))    // hi   (Box[Str])
+
+    let p = Pair(first: 1, second: "one")
+    print("{p.first} {p.second}") // 1 one (Pair[Int, Str])
+
+    // a recursive generic type
+    let t = node(2, node(1, leaf(), leaf()), node(3, leaf(), leaf()))
+    print(tree_sum(t))            // 6
+}
+
+law "generic ADTs" {
+    expect unbox(Box(v: 42)) == 42
+    expect Pair(first: 1, second: "a").second == "a"
+    expect tree_sum(node(5, leaf(), leaf())) == 5
+}

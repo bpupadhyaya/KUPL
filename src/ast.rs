@@ -90,6 +90,8 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct TypeDecl {
     pub name: String,
+    /// Type parameters (`type Box[T]` -> `["T"]`); empty for monomorphic types.
+    pub type_params: Vec<String>,
     pub variants: Vec<Variant>,
     pub span: Span,
 }

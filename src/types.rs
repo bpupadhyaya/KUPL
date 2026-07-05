@@ -25,8 +25,9 @@ pub enum Ty {
     List(Box<Ty>),
     Option(Box<Ty>),
     Result(Box<Ty>, Box<Ty>),
-    /// A user-declared ADT / record / newtype (monomorphic in v0.1).
-    Named(String),
+    /// A user-declared ADT / record / newtype, with any type arguments
+    /// (`Box[Int]` is `Named("Box", [Int])`; a monomorphic `Shape` has no args).
+    Named(String, Vec<Ty>),
     /// A reference to a component instance.
     Component(String),
     /// An interface type: any component that `fulfills` this contract. Values
@@ -85,6 +86,7 @@ impl Unifier {
                 ps.iter().map(|p| self.apply(p)).collect(),
                 Box::new(self.apply(&r)),
             ),
+            Ty::Named(n, args) => Ty::Named(n, args.iter().map(|a| self.apply(a)).collect()),
             other => other,
         }
     }
@@ -96,6 +98,7 @@ impl Unifier {
             Ty::Map(k, v) => self.occurs(id, &k) || self.occurs(id, &v),
             Ty::Result(a, b) => self.occurs(id, &a) || self.occurs(id, &b),
             Ty::Fun(ps, r) => ps.iter().any(|p| self.occurs(id, p)) || self.occurs(id, &r),
+            Ty::Named(_, args) => args.iter().any(|a| self.occurs(id, a)),
             _ => false,
         }
     }
@@ -133,7 +136,12 @@ impl Unifier {
             | (Ty::Event, Ty::Event)
             | (Ty::Tensor, Ty::Tensor)
             | (Ty::Range, Ty::Range) => Ok(()),
-            (Ty::Named(x), Ty::Named(y)) if x == y => Ok(()),
+            (Ty::Named(x, xa), Ty::Named(y, ya)) if x == y && xa.len() == ya.len() => {
+                for (a, b) in xa.clone().iter().zip(ya.clone().iter()) {
+                    self.unify(a, b)?;
+                }
+                Ok(())
+            }
             (Ty::Component(x), Ty::Component(y)) if x == y => Ok(()),
             (Ty::Contract(x), Ty::Contract(y)) if x == y => Ok(()),
             (Ty::List(x), Ty::List(y)) => self.unify(&x.clone(), &y.clone()),
@@ -177,7 +185,18 @@ impl fmt::Display for Ty {
             Ty::List(e) => write!(f, "List[{e}]"),
             Ty::Option(e) => write!(f, "Option[{e}]"),
             Ty::Result(a, b) => write!(f, "Result[{a}, {b}]"),
-            Ty::Named(n) => write!(f, "{n}"),
+            Ty::Named(n, args) => {
+                write!(f, "{n}")?;
+                if !args.is_empty() {
+                    write!(f, "[")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "{a}")?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
             Ty::Component(n) => write!(f, "{n}"),
             Ty::Contract(n) => write!(f, "{n}"),
             Ty::Fun(ps, r) => {
@@ -213,6 +232,11 @@ pub struct TypeSig {
     pub variants: Vec<VariantSig>,
     /// True when declared as a record / newtype (single variant named like the type).
     pub is_record: bool,
+    /// Type-parameter names (`type Box[T]` -> `["T"]`); empty for monomorphic types.
+    pub type_params: Vec<String>,
+    /// The fresh inference-var ids bound to `type_params` during registration;
+    /// variant field types reference these, and each use instantiates fresh vars.
+    pub qvars: Vec<u32>,
 }
 
 /// Signature of a component's interface.
