@@ -535,10 +535,16 @@ fn c_escape(s: &str) -> String {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            // `\?` neutralizes C trigraphs (`??x`); harmless in every C string.
+            '?' => out.push_str("\\?"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            // Control bytes: fixed-width 3-digit OCTAL, not `\xNN`. A C `\x` escape
+            // is greedy (consumes all following hex digits), so `\x00` + '5' would
+            // merge into one byte `\x005` — a miscompile. `\NNN` takes at most 3
+            // octal digits, so a following digit can never merge. (ch < 0x20.)
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\{:03o}", c as u32)),
             c => out.push(c),
         }
     }
@@ -4310,6 +4316,18 @@ mod tests {
                    print(Some(5).ok_or(\"no\").map_err(fn e { e }).unwrap_or(0))\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
+        }
+    }
+
+    /// A control byte followed by a hex digit escapes to native C correctly:
+    /// `\xNN` is greedy and would merge (`\x1b`+`f` -> one byte), so cgen emits
+    /// fixed-width octal `\NNN`. The string keeps both bytes -> length matches.
+    #[test]
+    fn native_control_byte_escape_no_merge() {
+        // "a", ESC (0x1b), "f" — three chars; ESC is a raw source byte.
+        let src = "fun main() uses io {\n    print(\"a\u{1b}f\".len())\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "ctrlesc"), "3\n");
         }
     }
 

@@ -329,7 +329,17 @@ impl<'a> Lexer<'a> {
                     Some(b'"') => text.push('"'),
                     Some(b'{') => text.push('{'),
                     Some(b'}') => text.push('}'),
-                    Some(b'0') => text.push('\0'),
+                    Some(b'0') => {
+                        // A `Str` is NUL-free UTF-8 text (so it maps cleanly to the
+                        // native C `char*` representation across all engines). Binary
+                        // data with embedded NULs belongs in a `List[Int]` of bytes.
+                        self.diags.push(Diag::error(
+                            "K0008",
+                            "NUL (`\\0`) is not allowed in a string literal — `Str` is \
+                             NUL-free UTF-8 text; use a byte list for binary data",
+                            self.span_from(self.pos.saturating_sub(2)),
+                        ));
+                    }
                     other => {
                         self.diags.push(Diag::error(
                             "K0006",
@@ -404,6 +414,15 @@ impl<'a> Lexer<'a> {
                     let end = self.pos.saturating_sub(1).max(expr_start);
                     let raw = self.src[expr_start..end].to_string();
                     parts.push(StrPart::Expr(raw, expr_start as u32));
+                }
+                Some(0) => {
+                    // A raw NUL byte in the source: `Str` is NUL-free (see K0008).
+                    self.diags.push(Diag::error(
+                        "K0008",
+                        "NUL byte is not allowed in a string literal — `Str` is \
+                         NUL-free UTF-8 text; use a byte list for binary data",
+                        self.span_from(self.pos.saturating_sub(1)),
+                    ));
                 }
                 Some(b) => {
                     // Copy UTF-8 continuation bytes verbatim.
@@ -709,6 +728,16 @@ mod tests {
         // the reduced trigger emits a clean unterminated-interpolation diagnostic
         let (_t, diags) = lex("\"{");
         assert!(diags.iter().any(|d| d.code == "K0007"), "expected K0007, got {diags:?}");
+    }
+
+    #[test]
+    fn nul_in_string_is_rejected() {
+        // `Str` is NUL-free UTF-8 text (maps to native char*): both the `\0` escape
+        // and a raw NUL byte in the source are compile errors (K0008), consistently.
+        let (_t, diags) = lex("\"a\\0b\"");
+        assert!(diags.iter().any(|d| d.code == "K0008"), "escape: {diags:?}");
+        let (_t2, diags2) = lex("\"a\0b\"");
+        assert!(diags2.iter().any(|d| d.code == "K0008"), "raw byte: {diags2:?}");
     }
 
     #[test]
