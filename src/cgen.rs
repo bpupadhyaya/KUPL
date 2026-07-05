@@ -4512,7 +4512,7 @@ mod tests {
         }
         let src = "fun main() uses io {\n    \
                    print(re_find_all(\"[0-9]+\", \"a1b22c333\"))\n    \
-                   print(re_replace(\"[0-9]+\", \"#\", \"a1b22c\"))\n    \
+                   print(re_replace(\"[0-9]+\", \"a1b22c\", \"#\"))\n    \
                    print(re_find(\".\", \"日本\"))\n    print(re_find(\"a.*z\", \"a日本z\"))\n}\n";
         assert_eq!(
             native_main_stdout(src, "regex").trim(),
