@@ -1073,6 +1073,7 @@ impl<'s> FnCompiler<'s> {
                 ("list_dir", 1) => Some(BUILTIN_LIST_DIR),
                 ("make_dir", 1) => Some(BUILTIN_MAKE_DIR),
                 ("remove_dir", 1) => Some(BUILTIN_REMOVE_DIR),
+                ("big", 1) => Some(BUILTIN_BIG),
                 ("eprint", 1) => Some(BUILTIN_EPRINT),
                 ("exit", 1) => Some(BUILTIN_EXIT),
                 ("random_ints", 2) => Some(BUILTIN_RANDOM_INTS),

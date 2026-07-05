@@ -1,0 +1,49 @@
+// Arbitrary-precision integers — `big(...)` never overflows.
+//
+//   big(n: Int) -> BigInt      from a machine integer
+//   big(s: Str) -> BigInt      from a decimal string (any size)
+//
+// Supported now: + - * and comparisons (== != < <= > >=). Division, modulo, and
+// power are coming. Everything is exact and deterministic — the same digits on
+// every engine. (Native compilation of BigInt is not yet available; use
+// `kupl run`, `kupl run --vm`, or `kupl bundle`.)
+
+fun factorial(n: Int) -> BigInt {
+    var acc = big(1)
+    var i = 1
+    while i <= n {
+        acc = acc * big(i)
+        i = i + 1
+    }
+    acc
+}
+
+fun main() uses io {
+    // 50! — far beyond a 64-bit integer, exact to the last digit
+    print("50! = {factorial(50)}")
+
+    // Fibonacci grows without bound
+    var a = big(0)
+    var b = big(1)
+    var k = 0
+    while k < 100 {
+        let next = a + b
+        a = b
+        b = next
+        k = k + 1
+    }
+    print("fib(100) = {a}")
+
+    // parse a huge literal and do exact arithmetic
+    let huge = big("123456789012345678901234567890")
+    print("huge * 2 = {huge * big(2)}")
+    print("huge - huge = {huge - huge}")
+    print("signs: {big(-7) < big(0)} {big(7) > big(0)}")
+}
+
+law "BigInt arithmetic is exact" {
+    expect big("2") * big("3") == big("6")
+    expect factorial(10) == big("3628800")
+    expect big(999999999) + big(1) == big("1000000000")
+    expect big("-5") + big(3) == big("-2")
+}

@@ -162,6 +162,8 @@ pub enum Value {
     SizedInt(Box<(i128, IntW)>),
     /// A single-precision float (`1.5f32`).
     F32(f32),
+    /// An arbitrary-precision integer (`big(…)`).
+    BigInt(Rc<crate::bigint::BigInt>),
     Float(f64),
     Bool(bool),
     Str(Rc<String>),
@@ -234,6 +236,7 @@ impl Value {
             Value::Int(_) => "Int".into(),
             Value::SizedInt(b) => b.1.name().into(),
             Value::F32(_) => "f32".into(),
+            Value::BigInt(_) => "BigInt".into(),
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "Str".into(),
@@ -259,6 +262,7 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             // sized ints are equal iff both value AND width match
             (Value::SizedInt(a), Value::SizedInt(b)) => a == b,
+            (Value::BigInt(a), Value::BigInt(b)) => a == b,
             (Value::F32(a), Value::F32(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -292,6 +296,7 @@ impl fmt::Display for Value {
         match self {
             Value::Int(v) => write!(f, "{v}"),
             Value::SizedInt(b) => write!(f, "{}", b.0),
+            Value::BigInt(b) => write!(f, "{b}"),
             Value::F32(v) => {
                 if v.fract() == 0.0 && v.is_finite() {
                     write!(f, "{v:.1}")

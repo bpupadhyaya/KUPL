@@ -428,6 +428,13 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_RANDOM_INTS => format!("regs[{dst}] = k_random_ints(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RANDOM_FLOATS => format!("regs[{dst}] = k_random_floats(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_SHUFFLE => format!("regs[{dst}] = k_shuffle(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_BIG => {
+                return Err(
+                    "`big` / BigInt is not yet supported by the native backend — use \
+                     `kupl run`, `kupl run --vm`, or `kupl bundle`"
+                        .into(),
+                )
+            }
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -3748,6 +3755,17 @@ mod tests {
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// BigInt (it64) lands on interp+KVM; the native backend defers it with a
+    /// clear message (native C bignum is scheduled for it65).
+    #[test]
+    fn native_bigint_defers() {
+        let src = "fun main() uses io { print(big(2) * big(3)) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let err = super::emit_c(&module).expect_err("native must defer BigInt");
+        assert!(err.contains("BigInt is not yet supported"), "{err}");
     }
 
     /// The static-site-generator's markdown transformer (it63) — string-ops

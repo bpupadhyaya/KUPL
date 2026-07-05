@@ -403,6 +403,7 @@ impl Checker {
                 "Event" => Ty::Event,
                 "Tensor" => Ty::Tensor,
                 "f32" => Ty::F32,
+                "BigInt" => Ty::BigInt,
                 _ if crate::value::IntW::from_name(n.as_str()).is_some() => {
                     Ty::IntW(crate::value::IntW::from_name(n.as_str()).unwrap())
                 }
@@ -1488,6 +1489,10 @@ impl Checker {
                     let a = self.infer_expr(&args[1].value, ctx);
                     self.unify(&Ty::List(Box::new(Ty::Str)), &a, args[1].value.span, "exec args");
                     return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
+                ("big", 1) => {
+                    self.infer_expr(&args[0].value, ctx);
+                    return Ty::BigInt;
                 }
                 ("path_join", 2) => {
                     for a in args {

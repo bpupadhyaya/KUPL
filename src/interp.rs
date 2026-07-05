@@ -939,6 +939,10 @@ impl Interp {
                     }
                     return fs_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("big", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return big_builtin(&v).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("path_join", 2) | ("path_base", 1) | ("path_dir", 1) | ("path_ext", 1) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -1245,6 +1249,20 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
         _ => {}
     }
     match (l, r) {
+        (Value::BigInt(a), Value::BigInt(b)) => {
+            use std::cmp::Ordering;
+            Ok(match op {
+                Add => Value::BigInt(Rc::new(a.add(b))),
+                Sub => Value::BigInt(Rc::new(a.sub(b))),
+                Mul => Value::BigInt(Rc::new(a.mul(b))),
+                Lt => Value::Bool(a.cmp(b) == Ordering::Less),
+                Le => Value::Bool(a.cmp(b) != Ordering::Greater),
+                Gt => Value::Bool(a.cmp(b) == Ordering::Greater),
+                Ge => Value::Bool(a.cmp(b) != Ordering::Less),
+                Div | Rem => return Err("BigInt division/remainder is not yet supported".into()),
+                _ => unreachable!(),
+            })
+        }
         (Value::Int(a), Value::Int(b)) => {
             let (a, b) = (*a, *b);
             Ok(match op {
@@ -2851,6 +2869,20 @@ pub fn fs_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             Err(e) => Value::err(Value::str(e.to_string())),
         }),
         _ => Err(format!("unknown file builtin `{name}`")),
+    }
+}
+
+/// `big(x)` — an arbitrary-precision integer from an `Int` or a decimal `Str`.
+pub fn big_builtin(v: &Value) -> Result<Value, String> {
+    use std::rc::Rc;
+    match v {
+        Value::Int(n) => Ok(Value::BigInt(Rc::new(crate::bigint::BigInt::from_i64(*n)))),
+        Value::BigInt(b) => Ok(Value::BigInt(b.clone())),
+        Value::Str(s) => match crate::bigint::BigInt::from_str(s) {
+            Some(b) => Ok(Value::BigInt(Rc::new(b))),
+            None => Err(format!("invalid BigInt: {s}")),
+        },
+        other => Err(format!("`big` needs an Int or a Str, found {}", other.type_name())),
     }
 }
 

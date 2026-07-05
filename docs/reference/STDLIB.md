@@ -57,6 +57,7 @@ unless supervised.
 | `url_decode(s)` | `(Str) -> Result[Str, Str]` | reverse `%XX`; `+` → space; `Err` on bad input |
 | `query_parse(s)` | `(Str) -> List[List[Str]]` | `a=1&b=2` → `[[a,1],[b,2]]`, decoded |
 | `query_build(pairs)` | `(List[List[Str]]) -> Str` | encode `[key, value]` pairs into `a=1&b=2` |
+| `big(x)` | `(Int) -> BigInt` / `(Str) -> BigInt` | arbitrary-precision integer (panics on a malformed string); pure |
 | `exec(program, args)` | `(Str, List[Str]) -> Result[Str, Str]` — **uses `io.proc`** | run a program (argv, no shell); `Ok` = stdout on exit 0 |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
