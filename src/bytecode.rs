@@ -210,6 +210,10 @@ pub const BUILTIN_URL_ENCODE: u8 = 45;
 pub const BUILTIN_URL_DECODE: u8 = 46;
 pub const BUILTIN_QUERY_PARSE: u8 = 47;
 pub const BUILTIN_QUERY_BUILD: u8 = 48;
+pub const BUILTIN_DATE_MAKE: u8 = 49;
+pub const BUILTIN_PARSE_ISO: u8 = 50;
+pub const BUILTIN_DATE_ISO: u8 = 51;
+pub const BUILTIN_YEARDAY_OF: u8 = 52;
 
 impl Module {
     pub fn disassemble(&self) -> String {

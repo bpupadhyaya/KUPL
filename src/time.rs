@@ -37,6 +37,83 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Count of days since 1970-01-01 for a civil (year, month 1..=12, day 1..=31).
+/// The inverse of `civil_from_days` — Howard Hinnant's well-known algorithm.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = floor_div(if y >= 0 { y } else { y - 399 }, 400);
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Compose a UTC timestamp from civil components (seconds since 1970-01-01).
+/// Components are not range-checked; out-of-range values normalize (e.g. a
+/// `month` of 13 rolls into the next year), matching civil arithmetic.
+pub fn make(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
+    days_from_civil(y, m, d) * 86_400 + hh * 3600 + mm * 60 + ss
+}
+
+/// Day of the year, 1 = Jan 1 … 365/366 = Dec 31.
+pub fn yearday_of(epoch_secs: i64) -> i64 {
+    let days = split(epoch_secs).0;
+    let (y, _, _) = civil_from_days(days);
+    days - days_from_civil(y, 1, 1) + 1
+}
+
+/// UTC ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` for a Unix timestamp.
+pub fn iso(epoch_secs: i64) -> String {
+    let (days, secs) = split(epoch_secs);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if y < 0 {
+        format!("-{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", -y, m, d, hh, mm, ss)
+    } else {
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
+    }
+}
+
+/// Parse an ISO-8601-ish UTC timestamp into epoch seconds. Accepts
+/// `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`, and `YYYY-MM-DD HH:MM:SS`, each with an
+/// optional trailing `Z`. Returns `Err` with a message on malformed input.
+pub fn parse_iso(s: &str) -> Result<i64, String> {
+    let s = s.trim().trim_end_matches('Z');
+    let bad = || format!("invalid ISO-8601 timestamp: {s}");
+    // date and optional time, split on 'T' or ' '
+    let (date, time) = match s.find(['T', ' ']) {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    };
+    let dp: Vec<&str> = date.split('-').collect();
+    // a leading '-' (negative year) yields an empty first field; rejoin it
+    let (yy, mm, dd) = match dp.as_slice() {
+        [y, m, d] => (y.to_string(), *m, *d),
+        ["", y, m, d] => (format!("-{y}"), *m, *d),
+        _ => return Err(bad()),
+    };
+    let y: i64 = yy.parse().map_err(|_| bad())?;
+    let mo: i64 = mm.parse().map_err(|_| bad())?;
+    let d: i64 = dd.parse().map_err(|_| bad())?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return Err(bad());
+    }
+    let (mut hh, mut mi, mut ss) = (0i64, 0i64, 0i64);
+    if !time.is_empty() {
+        let tp: Vec<&str> = time.split(':').collect();
+        if tp.len() != 3 {
+            return Err(bad());
+        }
+        hh = tp[0].parse().map_err(|_| bad())?;
+        mi = tp[1].parse().map_err(|_| bad())?;
+        ss = tp[2].parse().map_err(|_| bad())?;
+        if !(0..=23).contains(&hh) || !(0..=59).contains(&mi) || !(0..=60).contains(&ss) {
+            return Err(bad());
+        }
+    }
+    Ok(make(y, mo, d, hh, mi, ss))
+}
+
 /// Split a timestamp into (days-since-epoch, second-of-day 0..86399).
 fn split(epoch_secs: i64) -> (i64, i64) {
     let days = floor_div(epoch_secs, 86_400);
@@ -133,6 +210,41 @@ mod tests {
         assert_eq!(format_time(-86_400), "1969-12-31 00:00:00");
         // a very old date
         assert_eq!(format_time(-62_135_596_800), "0001-01-01 00:00:00");
+    }
+
+    #[test]
+    fn make_and_roundtrip() {
+        assert_eq!(make(1970, 1, 1, 0, 0, 0), 0);
+        assert_eq!(make(2001, 9, 9, 1, 46, 40), 1_000_000_000);
+        assert_eq!(make(2000, 2, 29, 0, 0, 0), 951_782_400);
+        // round-trip a spread of timestamps through iso <-> parse_iso
+        for &t in &[0i64, 1_000_000_000, 1_783_123_200, 951_782_400, -1, -62_135_596_800] {
+            assert_eq!(parse_iso(&iso(t)), Ok(t), "roundtrip {t}");
+            // days_from_civil is the exact inverse of civil_from_days
+            let d = split(t).0;
+            let (y, m, dd) = civil_from_days(d);
+            assert_eq!(days_from_civil(y, m, dd), d);
+        }
+    }
+
+    #[test]
+    fn iso_and_parse() {
+        assert_eq!(iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(parse_iso("2001-09-09T01:46:40Z"), Ok(1_000_000_000));
+        assert_eq!(parse_iso("2001-09-09 01:46:40"), Ok(1_000_000_000));
+        assert_eq!(parse_iso("1970-01-01"), Ok(0));
+        assert!(parse_iso("not-a-date").is_err());
+        assert!(parse_iso("2001-13-01").is_err());
+        assert!(parse_iso("2001-09-09T25:00:00").is_err());
+    }
+
+    #[test]
+    fn yeardays() {
+        assert_eq!(yearday_of(0), 1); // Jan 1
+        assert_eq!(yearday_of(make(2000, 12, 31, 0, 0, 0)), 366); // leap year
+        assert_eq!(yearday_of(make(2001, 12, 31, 0, 0, 0)), 365);
+        assert_eq!(yearday_of(make(2023, 3, 1, 0, 0, 0)), 60); // 31+28+1
     }
 
     #[test]

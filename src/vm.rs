@@ -615,7 +615,8 @@ impl<'m> Vm<'m> {
                         }
                         BUILTIN_FORMAT_TIME | BUILTIN_YEAR_OF | BUILTIN_MONTH_OF
                         | BUILTIN_DAY_OF | BUILTIN_HOUR_OF | BUILTIN_MINUTE_OF
-                        | BUILTIN_SECOND_OF | BUILTIN_WEEKDAY_OF => {
+                        | BUILTIN_SECOND_OF | BUILTIN_WEEKDAY_OF | BUILTIN_YEARDAY_OF
+                        | BUILTIN_DATE_ISO | BUILTIN_PARSE_ISO | BUILTIN_DATE_MAKE => {
                             let name = match which {
                                 BUILTIN_FORMAT_TIME => "format_time",
                                 BUILTIN_YEAR_OF => "year_of",
@@ -624,7 +625,11 @@ impl<'m> Vm<'m> {
                                 BUILTIN_HOUR_OF => "hour_of",
                                 BUILTIN_MINUTE_OF => "minute_of",
                                 BUILTIN_SECOND_OF => "second_of",
-                                _ => "weekday_of",
+                                BUILTIN_WEEKDAY_OF => "weekday_of",
+                                BUILTIN_YEARDAY_OF => "yearday_of",
+                                BUILTIN_DATE_ISO => "date_iso",
+                                BUILTIN_PARSE_ISO => "parse_iso",
+                                _ => "date_make",
                             };
                             match crate::interp::time_builtin(name, &args) {
                                 Ok(v) => set!(dst, v),

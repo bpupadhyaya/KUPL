@@ -975,9 +975,17 @@ impl Interp {
                     return regex_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
                 ("format_time", 1) | ("year_of", 1) | ("month_of", 1) | ("day_of", 1)
-                | ("hour_of", 1) | ("minute_of", 1) | ("second_of", 1) | ("weekday_of", 1) => {
+                | ("hour_of", 1) | ("minute_of", 1) | ("second_of", 1) | ("weekday_of", 1)
+                | ("yearday_of", 1) | ("date_iso", 1) | ("parse_iso", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     return time_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
+                }
+                ("date_make", 6) => {
+                    let mut vals = Vec::with_capacity(6);
+                    for a in args {
+                        vals.push(self.eval(&a.value, env)?);
+                    }
+                    return time_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
                 ("now", 0) => return Ok(Value::Int(now_seconds())),
                 ("base64_encode", 1) | ("base64_decode", 1) | ("hex_encode", 1)
@@ -2495,6 +2503,25 @@ pub fn time_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         "minute_of" => Value::Int(tm::minute_of(t)),
         "second_of" => Value::Int(tm::second_of(t)),
         "weekday_of" => Value::Int(tm::weekday_of(t)),
+        "yearday_of" => Value::Int(tm::yearday_of(t)),
+        "date_iso" => Value::str(tm::iso(t)),
+        "parse_iso" => {
+            let s = match &args[0] {
+                Value::Str(s) => s.as_str().to_string(),
+                other => other.to_string(),
+            };
+            match tm::parse_iso(&s) {
+                Ok(e) => Value::ok(Value::Int(e)),
+                Err(m) => Value::err(Value::str(m)),
+            }
+        }
+        "date_make" => {
+            let n = |i: usize| match args.get(i) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            Value::Int(tm::make(n(0), n(1), n(2), n(3), n(4), n(5)))
+        }
         _ => return Err(format!("unknown time builtin `{name}`")),
     })
 }

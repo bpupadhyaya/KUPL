@@ -32,10 +32,14 @@ unless supervised.
 | `random_floats(seed, count)` | `(Int, Int) -> List[Float]` | each in `[0.0, 1.0)`; deterministic |
 | `shuffle(seed, xs)` | `(Int, List[T]) -> List[T]` | deterministic Fisher-Yates permutation |
 | `now()` | `() -> Int` — **uses `io.time`** | current Unix epoch seconds (wall clock) |
+| `date_make(y, mo, d, h, mi, s)` | `(Int×6) -> Int` | compose UTC components → epoch seconds; pure |
 | `format_time(epoch)` | `(Int) -> Str` | UTC `YYYY-MM-DD HH:MM:SS`; pure |
+| `date_iso(epoch)` | `(Int) -> Str` | UTC ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`; pure |
+| `parse_iso(s)` | `(Str) -> Result[Int, Str]` | parse `YYYY-MM-DD`, `…THH:MM:SS`, or `… HH:MM:SS` (optional `Z`) → epoch; `Err` if malformed; pure |
 | `year_of/month_of/day_of(epoch)` | `(Int) -> Int` | UTC calendar fields; pure |
 | `hour_of/minute_of/second_of(epoch)` | `(Int) -> Int` | UTC time fields; pure |
 | `weekday_of(epoch)` | `(Int) -> Int` | 0 = Sunday … 6 = Saturday; pure |
+| `yearday_of(epoch)` | `(Int) -> Int` | 1 = Jan 1 … 365/366; pure |
 | `base64_encode(s)` / `hex_encode(s)` | `(Str) -> Str` | encode the UTF-8 bytes; pure |
 | `base64_decode(s)` / `hex_decode(s)` | `(Str) -> Result[Str, Str]` | `Err` on malformed input or non-UTF-8 |
 | `hash_fnv(s)` | `(Str) -> Int` | FNV-1a 64-bit; stable, non-cryptographic |
@@ -72,7 +76,8 @@ native backend — use `kupl run`/`--vm`/`bundle`.
 (anchor with `^…$` for a full match). A malformed pattern **panics** with a
 clear message. Not yet on the native backend (`kupl run`/`--vm`/`bundle`).
 
-**Time**: `format_time` and the `*_of` extractors are pure UTC calendar math
+**Time**: `date_make`, `date_iso`, `parse_iso`, `format_time`, and the `*_of`
+extractors are pure, deterministic UTC calendar math (epoch seconds ↔ civil date,
 (correct for negative/pre-1970 timestamps), byte-identical on every engine
 including native. Only `now()` reads the wall clock — it carries the `io.time`
 effect and is non-deterministic. No locale or leap seconds.

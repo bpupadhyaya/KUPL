@@ -1488,16 +1488,29 @@ impl Checker {
                         _ => Ty::Str, // re_replace
                     };
                 }
-                ("format_time", 1) => {
+                ("format_time", 1) | ("date_iso", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
-                    self.unify(&Ty::Int, &t, args[0].value.span, "format_time epoch");
+                    self.unify(&Ty::Int, &t, args[0].value.span, "format epoch");
                     return Ty::Str;
                 }
                 ("year_of", 1) | ("month_of", 1) | ("day_of", 1) | ("hour_of", 1)
-                | ("minute_of", 1) | ("second_of", 1) | ("weekday_of", 1) => {
+                | ("minute_of", 1) | ("second_of", 1) | ("weekday_of", 1)
+                | ("yearday_of", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
                     self.unify(&Ty::Int, &t, args[0].value.span, "epoch seconds");
                     return Ty::Int;
+                }
+                ("date_make", 6) => {
+                    for a in args {
+                        let t = self.infer_expr(&a.value, ctx);
+                        self.unify(&Ty::Int, &t, a.value.span, "date_make component");
+                    }
+                    return Ty::Int;
+                }
+                ("parse_iso", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "parse_iso string");
+                    return Ty::Result(Box::new(Ty::Int), Box::new(Ty::Str));
                 }
                 ("now", 0) => return Ty::Int,
                 ("base64_encode", 1) | ("hex_encode", 1) => {

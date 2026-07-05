@@ -381,6 +381,10 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_MINUTE_OF => format!("regs[{dst}] = k_minute_of(regs[{start}]); (void){argc};"),
             BUILTIN_SECOND_OF => format!("regs[{dst}] = k_second_of(regs[{start}]); (void){argc};"),
             BUILTIN_WEEKDAY_OF => format!("regs[{dst}] = k_weekday_of(regs[{start}]); (void){argc};"),
+            BUILTIN_YEARDAY_OF => format!("regs[{dst}] = k_yearday_of(regs[{start}]); (void){argc};"),
+            BUILTIN_DATE_ISO => format!("regs[{dst}] = k_date_iso(regs[{start}]); (void){argc};"),
+            BUILTIN_PARSE_ISO => format!("regs[{dst}] = k_parse_iso(regs[{start}]); (void){argc};"),
+            BUILTIN_DATE_MAKE => format!("regs[{dst}] = k_date_make(regs[{start}], regs[{start}+1], regs[{start}+2], regs[{start}+3], regs[{start}+4], regs[{start}+5]); (void){argc};"),
             BUILTIN_NOW => format!("regs[{dst}] = k_now(); (void){start}; (void){argc};"),
             BUILTIN_BASE64_ENCODE => format!("regs[{dst}] = k_base64_encode(regs[{start}]); (void){argc};"),
             BUILTIN_BASE64_DECODE => format!("regs[{dst}] = k_base64_decode(regs[{start}]); (void){argc};"),
@@ -2231,6 +2235,82 @@ static KValue k_hour_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); 
 static KValue k_minute_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int((s % 3600) / 60); }
 static KValue k_second_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int(s % 60); }
 static KValue k_weekday_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int(k_floor_mod(dy + 4, 7)); }
+/* inverse of k_civil: days-since-epoch from a civil (y, m, d) */
+static int64_t k_days_from_civil(int64_t y, int64_t m, int64_t d) {
+    y = m <= 2 ? y - 1 : y;
+    int64_t era = k_floor_div(y >= 0 ? y : y - 399, 400);
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+static int64_t k_make(int64_t y, int64_t m, int64_t d, int64_t hh, int64_t mm, int64_t ss) {
+    return k_days_from_civil(y, m, d) * 86400 + hh * 3600 + mm * 60 + ss;
+}
+static KValue k_date_make(KValue y, KValue m, KValue d, KValue hh, KValue mm, KValue ss) {
+    return k_int(k_make(y.as.i, m.as.i, d.as.i, hh.as.i, mm.as.i, ss.as.i));
+}
+static KValue k_yearday_of(KValue tv) {
+    int64_t dy, s, y, m, d; k_tsplit(tv.as.i, &dy, &s); k_civil(dy, &y, &m, &d);
+    return k_int(dy - k_days_from_civil(y, 1, 1) + 1);
+}
+static KValue k_date_iso(KValue tv) {
+    int64_t days, secs, y, m, d;
+    k_tsplit(tv.as.i, &days, &secs);
+    k_civil(days, &y, &m, &d);
+    int64_t hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
+    char* buf = k_alloc(64);
+    if (y < 0)
+        snprintf(buf, 64, "-%04lld-%02lld-%02lldT%02lld:%02lld:%02lldZ",
+                 (long long)(-y), (long long)m, (long long)d, (long long)hh, (long long)mm, (long long)ss);
+    else
+        snprintf(buf, 64, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lldZ",
+                 (long long)y, (long long)m, (long long)d, (long long)hh, (long long)mm, (long long)ss);
+    return k_str(buf);
+}
+/* parse "YYYY-MM-DD[(T| )HH:MM:SS][Z]" -> Ok(epoch) | Err(msg); mirrors time::parse_iso */
+static KValue k_parse_iso(KValue sv) {
+    const char* raw = sv.as.s;
+    /* trim leading/trailing spaces + a trailing Z */
+    while (*raw == ' ' || *raw == '\t' || *raw == '\n' || *raw == '\r') raw++;
+    long n = (long)strlen(raw);
+    while (n > 0 && (raw[n-1] == ' ' || raw[n-1] == '\t' || raw[n-1] == '\n' || raw[n-1] == '\r')) n--;
+    if (n > 0 && raw[n-1] == 'Z') n--;
+    char s[128];
+    if (n >= (long)sizeof s) n = (long)sizeof s - 1;
+    memcpy(s, raw, n); s[n] = 0;
+    char errbuf[160]; snprintf(errbuf, sizeof errbuf, "invalid ISO-8601 timestamp: %s", s);
+    long y, mo, d, hh = 0, mi = 0, ss = 0;
+    int neg = 0; char* p = s;
+    if (*p == '-') { neg = 1; p++; }         /* negative year */
+    char* time = 0;
+    for (char* q = p; *q; q++) if (*q == 'T' || *q == ' ') { *q = 0; time = q + 1; break; }
+    /* date part: Y-M-D */
+    char* dash1 = strchr(p, '-');
+    if (!dash1) return k_err(k_str(errbuf));
+    *dash1 = 0; char* mstr = dash1 + 1;
+    char* dash2 = strchr(mstr, '-');
+    if (!dash2) return k_err(k_str(errbuf));
+    *dash2 = 0; char* dstr = dash2 + 1;
+    char* end;
+    y = strtol(p, &end, 10);   if (*end) return k_err(k_str(errbuf));  if (neg) y = -y;
+    mo = strtol(mstr, &end, 10); if (*end) return k_err(k_str(errbuf));
+    d = strtol(dstr, &end, 10);  if (*end || dstr[0] == 0) return k_err(k_str(errbuf));
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) return k_err(k_str(errbuf));
+    if (time && *time) {
+        char* c1 = strchr(time, ':');
+        if (!c1) return k_err(k_str(errbuf));
+        *c1 = 0; char* mstr2 = c1 + 1;
+        char* c2 = strchr(mstr2, ':');
+        if (!c2) return k_err(k_str(errbuf));
+        *c2 = 0; char* sstr = c2 + 1;
+        hh = strtol(time, &end, 10);  if (*end) return k_err(k_str(errbuf));
+        mi = strtol(mstr2, &end, 10); if (*end) return k_err(k_str(errbuf));
+        ss = strtol(sstr, &end, 10);  if (*end || sstr[0] == 0) return k_err(k_str(errbuf));
+        if (hh < 0 || hh > 23 || mi < 0 || mi > 59 || ss < 0 || ss > 60) return k_err(k_str(errbuf));
+    }
+    return k_ok(k_int(k_make(y, mo, d, hh, mi, ss)));
+}
 static KValue k_now(void) { return k_int((int64_t)time(0)); }
 
 /* ---- seeded random (xorshift64*); mirrors interp::SeedRng exactly ---- */
@@ -3592,6 +3672,24 @@ mod tests {
             ("fun main() uses io { print(re_replace(\"[aeiou]\", \"hello world\", \"*\")) }", "h*ll* w*rld\n"),
         ] {
             assert_eq!(native_main_stdout(src, "re"), expected, "src: {src}");
+        }
+    }
+
+    /// The deterministic date/time surface (epoch-based, pure integer civil
+    /// math) compiles to native byte-identically: compose, format, extract,
+    /// and round-trip through parse_iso.
+    #[test]
+    fn native_datetime() {
+        let src = "fun main() uses io {\n    \
+                   let e = date_make(2001, 9, 9, 1, 46, 40)\n    \
+                   print(date_iso(e))\n    \
+                   print(\"{year_of(e)} {weekday_of(e)} {yearday_of(e)}\")\n    \
+                   match parse_iso(date_iso(e)) {\n        Ok(t) => print(\"{t}\")\n        Err(m) => print(m)\n    }\n}\n";
+        if cc_available() {
+            assert_eq!(
+                native_main_stdout(src, "datetime"),
+                "2001-09-09T01:46:40Z\n2001 0 252\n1000000000\n"
+            );
         }
     }
 

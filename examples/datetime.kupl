@@ -1,0 +1,55 @@
+// Date & time — a deterministic UTC calendar over Unix epoch seconds.
+//
+// Everything is keyed on an Int timestamp (seconds since 1970-01-01 UTC) using
+// pure integer civil-calendar math, so results are identical on every engine —
+// no wall clock, no timezone, no locale. (`now()` reads the real clock and
+// carries the `io.time` effect; it is intentionally not used here so this
+// program is reproducible.)
+//
+//   date_make(y, mo, d, h, mi, s) -> Int      compose components -> epoch
+//   date_iso(epoch) -> Str                    "YYYY-MM-DDTHH:MM:SSZ"
+//   format_time(epoch) -> Str                 "YYYY-MM-DD HH:MM:SS"
+//   year_of/month_of/day_of/hour_of/…         extract a component (Int)
+//   weekday_of(epoch) -> Int                  0 = Sunday … 6 = Saturday
+//   yearday_of(epoch) -> Int                  1 = Jan 1 … 366
+//   parse_iso(Str) -> Result[Int, Str]        parse -> epoch (Err if malformed)
+
+fun describe(epoch: Int) -> Str {
+    let wd = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    let name = wd.get(weekday_of(epoch)).unwrap_or("?")
+    "{date_iso(epoch)}  ({name}, day {yearday_of(epoch)} of {year_of(epoch)})"
+}
+
+fun main() uses io {
+    // the Unix epoch itself
+    print(describe(0))
+
+    // a fixed modern timestamp, composed from components
+    let launch = date_make(2026, 7, 4, 12, 30, 15)
+    print(describe(launch))
+    print("format_time: {format_time(launch)}")
+    print("h={hour_of(launch)} m={minute_of(launch)} s={second_of(launch)}")
+
+    // a leap day
+    print(describe(date_make(2000, 2, 29, 0, 0, 0)))
+
+    // parse round-trips back to the same instant
+    match parse_iso("2001-09-09T01:46:40Z") {
+        Ok(t) => print("parsed {t} -> {date_iso(t)}")
+        Err(m) => print("parse error: {m}")
+    }
+    // a date-only string defaults the time to midnight
+    match parse_iso("1970-01-02") {
+        Ok(t) => print("date-only -> {t} ({date_iso(t)})")
+        Err(m) => print("parse error: {m}")
+    }
+    // malformed input is an Err, not a crash
+    match parse_iso("last tuesday") {
+        Ok(t) => print("unexpected ok {t}")
+        Err(m) => print("rejected: {m}")
+    }
+
+    // durations are just integer arithmetic on epoch seconds
+    let day = 86400
+    print("a week after launch: {date_iso(launch + 7 * day)}")
+}
