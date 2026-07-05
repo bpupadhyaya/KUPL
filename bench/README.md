@@ -33,3 +33,4 @@ bound — a target for later.)
   FNV-1a hasher instead of SipHash. Interpreter: **loop 0.94→0.49s (~48% faster)**,
   fib 1.71→1.52s (~11%), listwork 0.13→0.11s. Byte-identity unaffected.
 - **PR-it7**: per-scope bindings use a linear-scan `Vec` instead of a `HashMap` — real scopes hold a handful of vars, so a scan of contiguous memory beats hashing and allocates no hash table per call/scope. Removed the custom hasher. Marginal wall-clock on the micro-benches (fib ~1.22→~1.19s, ~2-3%) but less allocation per scope; byte-identity unaffected.
+- **PR-it21**: interpreter function-call fast path — a top-level call by name (not shadowed by a local) dispatches straight to the function, skipping the ~29-arm builtin match, a `Value::Fun` (String+Rc) allocation, and a redundant `db.funs` lookup that the general call path incurred per call. **fib 1.22→~0.96s (~21% faster)**; loop/listwork unchanged (not call-heavy). Byte-identity unaffected.

@@ -1150,6 +1150,20 @@ impl Interp {
                 }
                 return self.instantiate(&comp_name, &avs, span);
             }
+            // Fast path: a top-level function called directly by name and not
+            // shadowed by a local binding. Equivalent to the general path below,
+            // but skips materializing a `Value::Fun` (a String + Rc allocation per
+            // call) and the redundant second `db.funs` lookup — hot for recursive/
+            // call-heavy code.
+            if env.get(name).is_none() {
+                if let Some(decl) = self.db.funs.get(name).cloned() {
+                    let mut avs = Vec::with_capacity(args.len());
+                    for a in args {
+                        avs.push(self.eval(&a.value, env)?);
+                    }
+                    return self.call_fun(&decl, avs, &self.globals.clone(), span);
+                }
+            }
         }
         // general call
         let f = self.eval(callee, env)?;
