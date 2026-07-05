@@ -62,6 +62,7 @@ unless supervised.
 | `exec(program, args)` | `(Str, List[Str]) -> Result[Str, Str]` — **uses `io.proc`** | run a program (argv, no shell); `Ok` = stdout on exit 0 |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
+| `http_serve(port, handler)` | `(Int, fn(Str, Str) -> Str) -> Result[Unit, Str]` — **uses `io.net`** | blocking HTTP server; `handler(method, path)` -> body |
 | `re_match(pat, text)` | `(Str, Str) -> Bool` | regex search (`^…$` for full match) |
 | `re_find(pat, text)` | `(Str, Str) -> Option[Str]` | first match substring |
 | `re_find_all(pat, text)` | `(Str, Str) -> List[Str]` | all non-overlapping matches |

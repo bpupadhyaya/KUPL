@@ -604,6 +604,22 @@ impl<'m> Vm<'m> {
                             Ok(v) => set!(dst, v),
                             Err(msg) => return Err(VmError { msg, span }),
                         },
+                        BUILTIN_HTTP_SERVE => {
+                            let port = match &args[0] {
+                                Value::Int(n) => *n,
+                                _ => return Err(VmError { msg: "http_serve port must be an Int".into(), span }),
+                            };
+                            let handler = args[1].clone();
+                            let mut call = |m: String, p: String| -> Result<String, String> {
+                                self.call_value_nested(handler.clone(), vec![Value::str(m), Value::str(p)])
+                                    .map(|v| v.to_string())
+                            };
+                            let v = match crate::interp::serve_http(port, &mut call) {
+                                Ok(()) => Value::ok(Value::Unit),
+                                Err(e) => Value::err(Value::str(e)),
+                            };
+                            set!(dst, v);
+                        }
                         BUILTIN_HTTP_GET | BUILTIN_HTTP_POST => {
                             let name = if which == BUILTIN_HTTP_GET { "http_get" } else { "http_post" };
                             match crate::interp::http_builtin(name, &args) {

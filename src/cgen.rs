@@ -429,6 +429,13 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_RANDOM_FLOATS => format!("regs[{dst}] = k_random_floats(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_SHUFFLE => format!("regs[{dst}] = k_shuffle(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_BIG => format!("regs[{dst}] = k_big_builtin(regs[{start}]); (void){argc};"),
+            BUILTIN_HTTP_SERVE => {
+                return Err(
+                    "`http_serve` is not yet supported by the native backend — use \
+                     `kupl run`, `kupl run --vm`, or `kupl bundle`"
+                        .into(),
+                )
+            }
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {

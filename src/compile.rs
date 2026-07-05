@@ -1074,6 +1074,7 @@ impl<'s> FnCompiler<'s> {
                 ("make_dir", 1) => Some(BUILTIN_MAKE_DIR),
                 ("remove_dir", 1) => Some(BUILTIN_REMOVE_DIR),
                 ("big", 1) => Some(BUILTIN_BIG),
+                ("http_serve", 2) => Some(BUILTIN_HTTP_SERVE),
                 ("eprint", 1) => Some(BUILTIN_EPRINT),
                 ("exit", 1) => Some(BUILTIN_EXIT),
                 ("random_ints", 2) => Some(BUILTIN_RANDOM_INTS),

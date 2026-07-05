@@ -235,7 +235,7 @@ fn builtin_effects(name: &str) -> Option<&'static str> {
         // reading the environment / command line — another `io` sub-effect
         "env_var" | "args" | "read_line" | "read_all" => Some("io.env"),
         // network access — another `io` sub-effect
-        "http_get" | "http_post" => Some("io.net"),
+        "http_get" | "http_post" | "http_serve" => Some("io.net"),
         "exec" => Some("io.proc"),
         // reading the wall clock — another `io` sub-effect (format_time and the
         // extractors are pure; only `now` observes ambient time)

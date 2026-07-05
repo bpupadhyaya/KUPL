@@ -225,6 +225,7 @@ pub const BUILTIN_LIST_DIR: u8 = 60;
 pub const BUILTIN_MAKE_DIR: u8 = 61;
 pub const BUILTIN_REMOVE_DIR: u8 = 62;
 pub const BUILTIN_BIG: u8 = 63;
+pub const BUILTIN_HTTP_SERVE: u8 = 64;
 
 impl Module {
     pub fn disassemble(&self) -> String {

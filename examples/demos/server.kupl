@@ -1,0 +1,26 @@
+// A tiny HTTP server. DEMO ONLY — it blocks (serves forever), so it is NOT part
+// of the automated test suite; run it by hand:
+//
+//   kupl run examples/demos/server.kupl        # then: curl http://127.0.0.1:8080/hello
+//
+//   http_serve(port, handler) -> Result[Unit, Str]
+//     binds 127.0.0.1:port and calls handler(method, path) -> response body for
+//     each request (200 text/plain). Returns Err only if the port can't be bound;
+//     otherwise it never returns. Carries the io.net effect. (Native: use `kupl
+//     run`/`--vm`/`bundle` — native sockets are a follow-up.)
+
+fun route(method: Str, path: Str) -> Str {
+    match path {
+        "/" => "Welcome to KUPL's HTTP server!\n"
+        "/health" => "ok\n"
+        _ => "You sent {method} {path}\n"
+    }
+}
+
+fun main() uses io {
+    print("serving on http://127.0.0.1:8080  (Ctrl-C to stop)")
+    match http_serve(8080, route) {
+        Ok(_) => print("server stopped")
+        Err(e) => print("could not start: {e}")
+    }
+}

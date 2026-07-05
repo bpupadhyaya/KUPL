@@ -1483,6 +1483,14 @@ impl Checker {
                     self.unify(&Ty::Str, &b, args[1].value.span, "http_post body");
                     return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
                 }
+                ("http_serve", 2) => {
+                    let p = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Int, &p, args[0].value.span, "http_serve port");
+                    let h = self.infer_expr(&args[1].value, ctx);
+                    let want = Ty::Fun(vec![Ty::Str, Ty::Str], Box::new(Ty::Str));
+                    self.unify(&want, &h, args[1].value.span, "http_serve handler");
+                    return Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Str));
+                }
                 ("exec", 2) => {
                     let p = self.infer_expr(&args[0].value, ctx);
                     self.unify(&Ty::Str, &p, args[0].value.span, "exec program");

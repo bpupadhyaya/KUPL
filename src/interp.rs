@@ -988,6 +988,29 @@ impl Interp {
                     }
                     return exec_builtin(&vals).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("http_serve", 2) => {
+                    let port = match self.eval(&args[0].value, env)? {
+                        Value::Int(n) => n,
+                        other => {
+                            return Err(Self::panic_flow(
+                                format!("http_serve port must be an Int, found {}", other.type_name()),
+                                span,
+                            ))
+                        }
+                    };
+                    let handler = self.eval(&args[1].value, env)?;
+                    let mut call = |m: String, p: String| -> Result<String, String> {
+                        match self.call_value(handler.clone(), vec![Value::str(m), Value::str(p)], span) {
+                            Ok(v) => Ok(v.to_string()),
+                            Err(Flow::Panic { msg, .. }) => Err(msg),
+                            Err(_) => Err("http_serve handler used non-local control flow".into()),
+                        }
+                    };
+                    return Ok(match serve_http(port, &mut call) {
+                        Ok(()) => Value::ok(Value::Unit),
+                        Err(e) => Value::err(Value::str(e)),
+                    });
+                }
                 ("http_get", 1) | ("http_post", 2) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -2759,6 +2782,66 @@ pub fn http_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     })
 }
 
+/// Parse an HTTP request line (`METHOD PATH HTTP/1.1`) into (method, path).
+pub fn parse_request_line(head: &str) -> (String, String) {
+    let line = head.lines().next().unwrap_or("");
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    (method, path)
+}
+
+/// Build a well-formed HTTP/1.1 text response.
+pub fn http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A minimal blocking HTTP server: bind `127.0.0.1:port`, and for each request
+/// call `handler(method, path)` to produce the response body. The socket + HTTP
+/// wire code is shared by both engines (they differ only in how they invoke the
+/// handler value), so behavior is identical. `Err` on bind failure; otherwise
+/// this never returns (it serves forever).
+pub fn serve_http(
+    port: i64,
+    handler: &mut dyn FnMut(String, String) -> Result<String, String>,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port as u16))
+        .map_err(|e| format!("cannot bind 127.0.0.1:{port}: {e}"))?;
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // read the request head (until the blank line ending the headers)
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        let (method, path) = parse_request_line(&head);
+        let resp = match handler(method, path) {
+            Ok(body) => http_response("200 OK", &body),
+            Err(msg) => http_response("500 Internal Server Error", &msg),
+        };
+        let _ = stream.write_all(resp.as_bytes());
+    }
+    Ok(())
+}
+
 /// `exec(program, args)` — run a program (no shell; argv-based) and capture
 /// stdout. `Ok(stdout)` on exit 0; else `Err(trimmed stderr)`, or
 /// `Err("exited with status N")` if stderr is empty, or
@@ -2997,5 +3080,50 @@ fn builtin_method(
     match shared_method(&recv, name, args, &mut call) {
         Ok(v) => Ok(v),
         Err(msg) => Err(Flow::Panic { msg, span }),
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::{http_response, parse_request_line, serve_http};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    #[test]
+    fn request_line_and_response() {
+        assert_eq!(parse_request_line("GET /world HTTP/1.1\r\nHost: x\r\n\r\n"),
+                   ("GET".to_string(), "/world".to_string()));
+        assert_eq!(parse_request_line("POST /a/b?x=1 HTTP/1.1"),
+                   ("POST".to_string(), "/a/b?x=1".to_string()));
+        assert_eq!(parse_request_line(""), ("GET".to_string(), "/".to_string()));
+        let r = http_response("200 OK", "hi");
+        assert!(r.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(r.contains("Content-Length: 2\r\n"));
+        assert!(r.ends_with("\r\n\r\nhi"));
+    }
+
+    /// End-to-end: a live server on a background thread answers a real request.
+    #[test]
+    fn serves_a_request() {
+        let port: u16 = 38111;
+        std::thread::spawn(move || {
+            let mut h = |m: String, p: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
+            let _ = serve_http(port as i64, &mut h);
+        });
+        let mut stream = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let mut stream = stream.expect("server should be listening");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        stream.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        let _ = stream.read_to_string(&mut resp);
+        assert!(resp.contains("HTTP/1.1 200 OK"), "resp: {resp}");
+        assert!(resp.ends_with("GET /world"), "resp: {resp}");
     }
 }
