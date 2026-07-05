@@ -320,18 +320,31 @@ fn is_ident(c: char) -> bool {
 
 /// The identifier token covering `offset`, as (name, start, end) byte offsets.
 fn ident_at(text: &str, offset: usize) -> Option<(String, usize, usize)> {
-    let b = text.as_bytes();
-    if offset > b.len() {
+    if offset > text.len() {
         return None;
     }
-    // walk left/right over identifier chars (ASCII-oriented; fine for KUPL names)
+    // Snap to a char boundary — an editor-supplied position can land inside a
+    // multi-byte UTF-8 character; slicing there would panic. Walk by whole `char`
+    // so `start`/`end` are always boundaries (and non-ASCII identifiers work).
+    let mut offset = offset;
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
     let mut start = offset;
-    while start > 0 && is_ident(b[start - 1] as char) {
-        start -= 1;
+    while let Some(c) = text[..start].chars().next_back() {
+        if is_ident(c) {
+            start -= c.len_utf8();
+        } else {
+            break;
+        }
     }
     let mut end = offset;
-    while end < b.len() && is_ident(b[end] as char) {
-        end += 1;
+    while let Some(c) = text[end..].chars().next() {
+        if is_ident(c) {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
     }
     if start == end {
         return None;
@@ -755,6 +768,35 @@ mod tests {
     const PROG: &str = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
                         type Shape = Circle(r: Float) | Square(s: Float)\n\
                         fun main() uses io {\n    print(add(1, 2))\n}\n";
+
+    #[test]
+    fn position_handlers_never_panic_on_edge_input() {
+        // The LSP runs on live, mid-edit, malformed buffers with editor-supplied
+        // positions that may be out of range or land mid-multibyte-UTF8. No handler
+        // may panic (a crashed LSP kills editor features).
+        let big = "fun f(){}\n".repeat(500);
+        let docs = [
+            "",
+            "fun",                              // truncated
+            "fun main() { print(",             // mid-edit
+            "let café = 1\nlet 日本 = 2\n",      // multibyte identifiers/text
+            "// 🎉🎉🎉 comment\nfun f() {}\n",   // emoji (4-byte) in a line
+            "\"unterminated {interp",
+            big.as_str(),                        // large-ish
+        ];
+        for doc in docs {
+            for line in [0usize, 1, 2, 5, 100, usize::MAX] {
+                for ch in [0usize, 1, 3, 4, 5, 50, 10_000, usize::MAX] {
+                    // must return (Some/None), never panic — incl. positions that
+                    // land mid-codepoint or past end of line/file
+                    let _ = resolve_hover(doc, line, ch);
+                    let _ = resolve_definition(doc, line, ch);
+                }
+            }
+            let _ = completions(doc);
+            let _ = occurrences(doc, "f");
+        }
+    }
 
     #[test]
     fn hover_shows_fun_signature() {
