@@ -2120,8 +2120,16 @@ static KValue k_ai_from_json(const KAiShape* s, KValue j) {
         case 1:
             if (!strcmp(v, "JNum")) {
                 double n = k_json_field0(j).as.f;
-                if (isfinite(n) && n == floor(n)) return k_int((int64_t)n);
-                snprintf(k_ai_err, sizeof k_ai_err, "expected an integer, model returned a fraction");
+                // A whole number that fits exactly in i64. Out-of-range values are
+                // REJECTED (not saturated to i64::MAX) — matching the interpreter,
+                // which rejects an integer the model returns that overflows i64.
+                if (isfinite(n) && n == floor(n)
+                    && n >= -9223372036854775808.0 && n < 9223372036854775808.0)
+                    return k_int((int64_t)n);
+                if (isfinite(n) && n == floor(n))
+                    snprintf(k_ai_err, sizeof k_ai_err, "expected an integer, model returned %.0f", n);
+                else
+                    snprintf(k_ai_err, sizeof k_ai_err, "expected an integer, model returned a fraction");
                 k_ai_ok = 0; return k_unit();
             }
             break;
@@ -4358,6 +4366,40 @@ mod tests {
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
         }
+    }
+
+    /// A model integer that overflows i64 is REJECTED natively (was: saturated to
+    /// i64::MAX — a wrong value), matching the interpreter.
+    #[test]
+    fn native_ai_int_overflow_rejected() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun score(t: Str) -> Int {\n    intent \"rate {t}\"\n}\n\
+                   fun main() uses io {\n    print(score(\"x\"))\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-aiovf-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_SCORE", "999999999999999999999")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stderr.contains("expected an integer"), "expected rejection, got out={stdout:?} err={stderr:?}");
+        assert!(!stdout.contains("9223372036854775807"), "must not saturate to i64::MAX");
     }
 
     /// Native codec decoders (base64/hex/url) match the interpreter on Ok values
