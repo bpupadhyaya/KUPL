@@ -4511,6 +4511,23 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native BigInt/Rational (C bignum) matches the interpreter on sign edges,
+    /// reduction, and div-by-zero. PR-it48.
+    #[test]
+    fn native_bigint_rational_edges() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print(big(0 - 7) / big(2))\n    \
+                   print(big(0 - 7) % big(2))\n    print(big(2).pow(100))\n    \
+                   print(rat(2, 0 - 4))\n    print(rat(0 - 2, 0 - 4))\n    \
+                   print(rat(1, 3) + rat(1, 6))\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "bigrat").trim(),
+            "-3\n-1\n1267650600228229401496703205376\n-1/2\n1/2\n1/2"
+        );
+    }
+
     /// Native Int math (clamp/gcd/isqrt) matches the interpreter on edge inputs,
     /// incl. inverted-clamp panic and i64::MIN gcd. PR-it47.
     #[test]

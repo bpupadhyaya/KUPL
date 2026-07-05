@@ -1106,6 +1106,22 @@ mod tests {
     }
 
     #[test]
+    fn diff_bigint_rational_edges() {
+        // BigInt/Rational arithmetic is byte-identical on both engines (the native C
+        // bignum mirrors the Rust reference): negative div/mod use truncated-toward-
+        // zero signs like Int, Rational normalizes the sign to the numerator and
+        // reduces, div-by-zero panics cleanly.
+        assert_eq!(differential("fun probe() -> Str {\n    \"{big(0 - 7) / big(2)}\"\n}\n"), "-3");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{big(0 - 7) % big(2)}\"\n}\n"), "-1");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{big(2).pow(100)}\"\n}\n"), "1267650600228229401496703205376");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{rat(2, 0 - 4)}\"\n}\n"), "-1/2");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{rat(0 - 2, 0 - 4)}\"\n}\n"), "1/2");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{rat(1, 3) + rat(1, 6)}\"\n}\n"), "1/2");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{big(5) / big(0)}\"\n}\n"), "panic: division by zero");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{rat(1, 0)}\"\n}\n"), "panic: division by zero");
+    }
+
+    #[test]
     fn diff_int_math_edges() {
         // clamp / gcd / isqrt / sign edge cases are byte-identical on both engines:
         // clamp with INVERTED bounds panics cleanly (no ICE — cf. the it28 slice
