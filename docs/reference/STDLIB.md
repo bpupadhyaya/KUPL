@@ -308,6 +308,10 @@ to `f32` with `Float.to_f32()`.
 |---|---|---|
 | `.is_some()` / `.is_none()` | `-> Bool` | |
 | `.unwrap_or(default)` | `(T) -> T` | |
+| `.map(f)` | `(fn(T) -> U) -> Option[U]` | `Some(x)` → `Some(f(x))`; `None` → `None` |
+| `.and_then(f)` | `(fn(T) -> Option[U]) -> Option[U]` | flat-map / chain fallible steps |
+| `.filter(f)` | `(fn(T) -> Bool) -> Option[T]` | `Some(x)` kept only if `f(x)` |
+| `.ok_or(err)` | `(E) -> Result[T, E]` | `Some(x)` → `Ok(x)`; `None` → `Err(err)` |
 
 ### Result[T, E]
 
@@ -315,6 +319,13 @@ to `f32` with `Float.to_f32()`.
 |---|---|---|
 | `.is_ok()` / `.is_err()` | `-> Bool` | |
 | `.unwrap_or(default)` | `(T) -> T` | |
+| `.map(f)` | `(fn(T) -> U) -> Result[U, E]` | transforms the `Ok` value; `Err` passes through |
+| `.map_err(f)` | `(fn(E) -> F) -> Result[T, F]` | transforms the `Err` value; `Ok` passes through |
+| `.and_then(f)` | `(fn(T) -> Result[U, E]) -> Result[U, E]` | chain fallible steps |
+| `.ok()` | `-> Option[T]` | `Ok(x)` → `Some(x)`; `Err(_)` → `None` |
+
+These combinators chain, so validation/transformation pipelines read without a
+pyramid of `match` (see `examples/combinators.kupl`).
 
 Prefer `match` or `?` for handling; `?` propagates the `Err` to the caller.
 

@@ -1,0 +1,47 @@
+// Option/Result combinators — the functional pipeline toolkit.
+//
+//   Option[T]: .map(f) .and_then(f) .filter(f) .ok_or(e) .unwrap_or(d)
+//   Result[T,E]: .map(f) .map_err(f) .and_then(f) .ok() .unwrap_or(d)
+//
+// They chain, so validation and transformation read left to right without a
+// pyramid of `match`.
+
+// Parse, double, keep only if > 10, else 0.
+fun big_double(s: Str) -> Int {
+    s.parse_int().map(fn x { x * 2 }).filter(fn x { x > 10 }).unwrap_or(0)
+}
+
+// Parse to a Result and validate positivity — `ok_or` lifts the Option to a
+// Result, `and_then` chains the validation; then render both outcomes.
+fun checked(s: Str) -> Str {
+    let r = s.parse_int().ok_or("not a number").and_then(fn x { if x > 0 { Ok(x * 10) } else { Err("must be positive") } })
+    match r {
+        Ok(v) => "ok: {v}"
+        Err(e) => "rejected: {e}"
+    }
+}
+
+fun main() uses io {
+    print(big_double("8"))    // 16
+    print(big_double("3"))    // 0  (6 is not > 10)
+    print(big_double("bad"))  // 0  (None)
+    print(checked("5"))       // ok: 50
+    print(checked("-2"))      // rejected: must be positive
+    print(checked("x"))       // rejected: not a number
+    let r: Result[Int, Str] = Ok(7)
+    print(r.map(fn x { x + 1 }).ok().unwrap_or(0))   // 8
+    let e: Result[Int, Str] = Err("boom")
+    print(e.ok().unwrap_or(-1))                       // -1
+}
+
+law "Option/Result combinators" {
+    expect Some(5).map(fn x { x + 1 }) == Some(6)
+    expect "bad".parse_int().map(fn x { x + 1 }) == None
+    expect Some(5).and_then(fn x { Some(x * 2) }) == Some(10)
+    expect Some(3).filter(fn x { x > 5 }) == None
+    expect Some(7).ok_or("no") == Ok(7)
+    expect "9".parse_int().ok_or("no").map(fn x { x * 2 }) == Ok(18)
+    expect Err("bad").map_err(fn e { "e:{e}" }) == Err("e:bad")
+    expect Ok(1).ok() == Some(1)
+    expect Err("x").ok() == None
+}

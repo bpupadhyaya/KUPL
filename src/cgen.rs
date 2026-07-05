@@ -3799,6 +3799,38 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 return recv.as.ctor->nfields ? recv.as.ctor->fields[0] : k_unit();
             return args[0];
         }
+        /* Option/Result combinators — guarded on the variant so user ADTs with a
+           like-named method still fall through to the UFCS lookup below. */
+        {
+            int is_some = k_ctor_variant_is(recv, "Some");
+            int is_none = k_ctor_variant_is(recv, "None");
+            int is_ok = k_ctor_variant_is(recv, "Ok");
+            int is_err = k_ctor_variant_is(recv, "Err");
+            KValue inner = recv.as.ctor->nfields ? recv.as.ctor->fields[0] : k_unit();
+            if (!strcmp(name, "map") && (is_some || is_none || is_ok || is_err)) {
+                if (is_some) return k_some(k_call(args[0], &inner, 1));
+                if (is_ok) return k_ok(k_call(args[0], &inner, 1));
+                return recv;
+            }
+            if (!strcmp(name, "and_then") && (is_some || is_none || is_ok || is_err)) {
+                if (is_some || is_ok) return k_call(args[0], &inner, 1);
+                return recv;
+            }
+            if (!strcmp(name, "filter") && (is_some || is_none)) {
+                if (is_some) { KValue b = k_call(args[0], &inner, 1); return (b.tag == K_BOOL && b.as.b) ? recv : k_none(); }
+                return k_none();
+            }
+            if (!strcmp(name, "ok_or") && (is_some || is_none)) {
+                return is_some ? k_ok(inner) : k_err(args[0]);
+            }
+            if (!strcmp(name, "map_err") && (is_ok || is_err)) {
+                if (is_err) return k_err(k_call(args[0], &inner, 1));
+                return recv;
+            }
+            if (!strcmp(name, "ok") && (is_ok || is_err)) {
+                return is_ok ? k_some(inner) : k_none();
+            }
+        }
     }
     // UFCS: no built-in method matched — call a top-level function of this name
     // with the receiver prepended (`recv.f(args)` -> `f(recv, args…)`).
@@ -4151,6 +4183,20 @@ mod tests {
                    print((0.0 - 1.5).fmt(1))\n    print(0.0.fmt(2))\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "format"), "3.14\n3\n-1.5\n0.00\n");
+        }
+    }
+
+    /// Option/Result combinators (it77) compile to native (callbacks via k_call):
+    /// a map/and_then/ok_or/map_err/ok chain matches the interpreter.
+    #[test]
+    fn native_combinators() {
+        let src = "fun main() uses io {\n    \
+                   print(\"8\".parse_int().map(fn x { x * 2 }).unwrap_or(0))\n    \
+                   print(\"bad\".parse_int().map(fn x { x + 1 }).unwrap_or(-1))\n    \
+                   print(Ok(3).map(fn x { x + 1 }).ok().unwrap_or(0))\n    \
+                   print(Some(5).ok_or(\"no\").map_err(fn e { e }).unwrap_or(0))\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
         }
     }
 

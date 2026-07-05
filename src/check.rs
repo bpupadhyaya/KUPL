@@ -1990,11 +1990,52 @@ impl Checker {
                 Some((vec![], Ty::Bool))
             }
             (Ty::Option(t), "unwrap_or") => Some((vec![(**t).clone()], (**t).clone())),
+            (Ty::Option(t), "map") => {
+                let u = self.uni.fresh();
+                Some((vec![Ty::Fun(vec![(**t).clone()], Box::new(u.clone()))], Ty::Option(Box::new(u))))
+            }
+            (Ty::Option(t), "and_then") => {
+                let u = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Option(Box::new(u.clone()))))],
+                    Ty::Option(Box::new(u)),
+                ))
+            }
+            (Ty::Option(t), "filter") => Some((
+                vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
+                Ty::Option(t.clone()),
+            )),
+            (Ty::Option(t), "ok_or") => {
+                let e = self.uni.fresh();
+                Some((vec![e.clone()], Ty::Result(t.clone(), Box::new(e))))
+            }
             (Ty::Result(t, e), "is_ok") | (Ty::Result(t, e), "is_err") => {
                 let _ = (t, e);
                 Some((vec![], Ty::Bool))
             }
             (Ty::Result(t, _), "unwrap_or") => Some((vec![(**t).clone()], (**t).clone())),
+            (Ty::Result(t, e), "map") => {
+                let u = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**t).clone()], Box::new(u.clone()))],
+                    Ty::Result(Box::new(u), e.clone()),
+                ))
+            }
+            (Ty::Result(t, e), "map_err") => {
+                let f = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**e).clone()], Box::new(f.clone()))],
+                    Ty::Result(t.clone(), Box::new(f)),
+                ))
+            }
+            (Ty::Result(t, e), "and_then") => {
+                let u = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Result(Box::new(u.clone()), e.clone())))],
+                    Ty::Result(Box::new(u), e.clone()),
+                ))
+            }
+            (Ty::Result(t, _), "ok") => Some((vec![], Ty::Option(t.clone()))),
             (Ty::Map(k, v), "insert") => {
                 Some((vec![(**k).clone(), (**v).clone()], Ty::Map(k.clone(), v.clone())))
             }

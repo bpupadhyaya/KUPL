@@ -2461,6 +2461,70 @@ pub fn shared_method(
                 _ => Ok(default),
             }
         }
+        // ---- Option / Result combinators (variant-guarded so user ADTs with a
+        // like-named method still fall through to the UFCS fallback) ----
+        (Value::Ctor { variant, fields, .. }, "map")
+            if matches!(variant.as_str(), "Some" | "None" | "Ok" | "Err") =>
+        {
+            let f = args.into_iter().next().ok_or("`map` needs a function")?;
+            let x = || fields.first().cloned().unwrap_or(Value::Unit);
+            match variant.as_str() {
+                "Some" => Ok(Value::some(call(f, vec![x()])?)),
+                "Ok" => Ok(Value::ok(call(f, vec![x()])?)),
+                _ => Ok(recv.clone()), // None / Err pass through
+            }
+        }
+        (Value::Ctor { variant, fields, .. }, "and_then")
+            if matches!(variant.as_str(), "Some" | "None" | "Ok" | "Err") =>
+        {
+            let f = args.into_iter().next().ok_or("`and_then` needs a function")?;
+            match variant.as_str() {
+                "Some" | "Ok" => call(f, vec![fields.first().cloned().unwrap_or(Value::Unit)]),
+                _ => Ok(recv.clone()),
+            }
+        }
+        (Value::Ctor { variant, fields, .. }, "filter")
+            if matches!(variant.as_str(), "Some" | "None") =>
+        {
+            let f = args.into_iter().next().ok_or("`filter` needs a function")?;
+            match variant.as_str() {
+                "Some" => {
+                    let x = fields.first().cloned().unwrap_or(Value::Unit);
+                    if let Value::Bool(true) = call(f, vec![x.clone()])? {
+                        Ok(Value::some(x))
+                    } else {
+                        Ok(Value::none())
+                    }
+                }
+                _ => Ok(Value::none()),
+            }
+        }
+        (Value::Ctor { variant, fields, .. }, "ok_or")
+            if matches!(variant.as_str(), "Some" | "None") =>
+        {
+            let err = args.into_iter().next().ok_or("`ok_or` needs an error value")?;
+            match variant.as_str() {
+                "Some" => Ok(Value::ok(fields.first().cloned().unwrap_or(Value::Unit))),
+                _ => Ok(Value::err(err)),
+            }
+        }
+        (Value::Ctor { variant, fields, .. }, "map_err")
+            if matches!(variant.as_str(), "Ok" | "Err") =>
+        {
+            let f = args.into_iter().next().ok_or("`map_err` needs a function")?;
+            match variant.as_str() {
+                "Err" => Ok(Value::err(call(f, vec![fields.first().cloned().unwrap_or(Value::Unit)])?)),
+                _ => Ok(recv.clone()),
+            }
+        }
+        (Value::Ctor { variant, fields, .. }, "ok")
+            if matches!(variant.as_str(), "Ok" | "Err") =>
+        {
+            match variant.as_str() {
+                "Ok" => Ok(Value::some(fields.first().cloned().unwrap_or(Value::Unit))),
+                _ => Ok(Value::none()),
+            }
+        }
         (other, _) => Err(format!("{} has no method `{name}`", other.type_name())),
     }
 }
