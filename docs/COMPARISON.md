@@ -1,11 +1,14 @@
 # KUPL vs. the field — an honest audit
 
-**Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed 2026-07-06
-after enrichment iteration 82** (the native backend compiles the **entire
-language** including `ai fun` (mock path), `BigInt`, `Rational`, and the HTTP
-server; the type system now has **generic ADTs**, operator overloading, and
-Option/Result combinators; a real HTTP **server** and several flagship apps
-demonstrate universality — see "What's new since it66" below).
+**Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed after enrichment
+iteration 95** (the native backend compiles the **entire language** including
+`ai fun` (mock path), `BigInt`, `Rational`, and the HTTP server; the type system
+has **generic ADTs**, operator overloading, and Option/Result combinators; the
+`List`/`Map`/`Set`/`Str` standard library is now comprehensive; all four syntactic
+papercuts are fixed; and eleven-plus flagship apps across web, data, algorithms,
+language implementation, simulation, interactive fiction, diffing, and a
+component-based application demonstrate universality — see "What's new since it81"
+below).
 
 This document compares KUPL, **as actually implemented today**, against nine
 established languages: Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift,
@@ -109,6 +112,29 @@ like Rust/Haskell's 5). Universality holds at 4 (web + algorithms + language-imp
 honest gaps are unchanged: general async/await, a hosted registry + third-party
 ecosystem, the GPU/kernel + systems tiers, a WASM target, and the KValue-unboxing
 perf IR (KIR, design-locked-out).
+
+### What's new since it81 (stdlib completion + ergonomics, it82–it95)
+
+This arc finished the standard library and closed the last syntactic sharp edges —
+nothing here changes the scorecard's *ceiling*, but it hardens the two criteria
+where KUPL already leads (fast-to-write, batteries) into "no missing primitives":
+
+- **Collection API completion** — `Map.filter`/`.fold`; `List.zip_with`/`.group_by`/
+  `.take_while`/`.drop_while`; `Str.trim_start`/`.trim_end`; `Set.symmetric_difference`.
+  The `List`/`Map`/`Set`/`Str` surface now matches what you'd reach for in Python,
+  Kotlin, or Swift — map/filter/fold/flat_map/group_by/sort_by/zip_with/window/chunk
+  and the rest all ship, byte-identical on every engine including native.
+- **The last ergonomics fix** — `out`/`state`/`start`/`stop` became **contextual
+  keywords** (reserved only inside a component), so common words are usable as
+  identifiers. With `{{`/`}}`, multi-line `else`, and multi-line method chains, all
+  four papercuts the demos surfaced are closed. KUPL reads like a modern language.
+- **More flagships** — CSV/statistics analytics, Conway's Game of Life, a
+  text-adventure engine, an LCS line-diff, and a capstone bank-ledger component,
+  adding the simulation, interactive-fiction, diffing, and real-application domains.
+  **Fast-to-write holds at 5** and **batteries/standard-library is now a settled
+  strength** (no missing everyday primitive). The honest gaps are still unchanged:
+  general async/await, a hosted registry + third-party ecosystem, bounded generics
+  (`[T: Ord]`), the GPU/systems tiers, a WASM target, and the perf IR.
 
 ### What changed at it20–it52 (the four big arcs + native completeness)
 

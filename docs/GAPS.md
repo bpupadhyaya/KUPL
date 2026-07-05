@@ -120,6 +120,39 @@ ecosystem; general async/await + coroutines; **bounded generics / typeclasses**
 GPU/kernel and systems/ownership tiers; a WASM target; and the KValue-unboxing
 perf IR (KIR is design-locked-out).
 
+## Enrichment campaign (it82–it95) — stdlib completion + ergonomics + flagships
+
+The campaign continued past it81. This arc finished the standard library, removed
+the remaining syntactic sharp edges, and broadened the flagship set — all held
+byte-identical across the interpreter, KVM, and native:
+
+- **Set operations (it84)** — `symmetric_difference` completed the `Set` algebra
+  (`union`/`intersect`/`difference` already shipped).
+- **Contextual keywords (it90)** — `out`/`state`/`start`/`stop` are now contextual:
+  reserved only inside a component, ordinary identifiers everywhere else. With the
+  earlier `{{`/`}}`, multi-line `else`, and multi-line method-chain fixes, all four
+  syntactic papercuts the flagship demos surfaced are closed — each a parse-time
+  change, so every engine stayed byte-identical. (`in` stays reserved for `for … in`.)
+- **Collection API completion (it89, it91, it94, it95)** — `Map.filter`/`.fold`;
+  `List.zip_with` (element-wise combine), `.group_by` (bucket into a `Map`),
+  `.take_while`/`.drop_while`; `Str.trim_start`/`.trim_end`. The `List`/`Map`/`Set`/
+  `Str` method surface is now comprehensive; callbacks route through the shared
+  method path (interp==KVM by construction) and native via `k_call`.
+- **Tutorial + docs refresh (it87)** — the learning tutorial was brought current
+  with generics, operator overloading, combinators, the numeric tower, and the web
+  server, with every snippet verified to run.
+- **Flagship apps** — the CSV/stats analytics (it82/86), Conway's Game of Life
+  (it85), a text-adventure engine (it88), an LCS line-diff (it92), and a capstone
+  bank-ledger component (it93) — adding the simulation, interactive-fiction,
+  diffing, and real-application domains to the flagship set. Every deterministic
+  example rides the interp-vs-`--vm` regression and compiles to matching native.
+
+**Remaining gaps (unchanged, honest):** the same list as above — a hosted package
+registry + third-party ecosystem; general async/await + coroutines; bounded
+generics / typeclasses; the GPU/kernel and systems/ownership tiers; a WASM target;
+and the KValue-unboxing perf IR. The language and standard library are otherwise
+feature-complete for general-purpose, component-oriented, AI-native programming.
+
 ## Final stretch — prioritized shortlist (it42–50)
 
 The four big arcs (sized numerics, packages, real-thread concurrency, native
