@@ -99,7 +99,7 @@ Severity: **E** = error, **W** = warning.
 | K0246 | E | `join` needs List[Str] |
 | K0247 | E | component does not expose that function |
 | K0248 | E | cannot infer receiver type for method call — annotate |
-| K0249 | E | type has no such method |
+| K0249 | E | type has no such method (suggests a close built-in method / UFCS fn — "did you mean `x`?") |
 | K0250 | E | wrong number of method arguments |
 | K0251 | E | `Some` pattern takes exactly one argument |
 | K0252 | E | `None` pattern takes no arguments |

@@ -119,6 +119,30 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
     best.map(|(_, c)| c.to_string())
 }
 
+/// Every built-in method name across all receiver types, for "did you mean"
+/// suggestions on an unknown method (K0249). Suggestion-only and best-effort —
+/// if a newly added method is missing here the only effect is a missed hint, so
+/// it need not track the method-resolution match perfectly.
+const BUILTIN_METHODS: &[&str] = &[
+    "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "cbrt", "ceil",
+    "chars", "chunk", "clamp", "concat", "contains", "contains_key", "cos", "count",
+    "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "filter",
+    "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "gcd",
+    "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
+    "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
+    "is_odd", "is_ok", "is_some", "is_subset", "isqrt", "join", "keys", "last", "len",
+    "lines", "log", "map", "map_err", "map_values", "max", "max_by", "mean", "merge",
+    "min", "min_by", "num", "ok", "ok_or", "pad_left", "pad_right", "par_each",
+    "par_filter", "par_map", "parse_float", "parse_int", "partition", "position",
+    "pow", "product", "push", "recip", "remove", "repeat", "replace", "replace_first",
+    "reverse", "rfind", "round", "saturating_add", "saturating_mul", "saturating_sub",
+    "scale", "shl", "shr", "sign", "sin", "slice", "sort", "sort_by", "split",
+    "split_once", "sqrt", "starts_with", "sum", "symmetric_difference", "tail", "take",
+    "take_while", "tan", "to_binary", "to_float", "to_hex", "to_int", "to_list",
+    "to_lower", "to_octal", "to_radix", "to_str", "to_upper", "trim", "trim_end",
+    "trim_start", "union", "unique", "unwrap_or", "ushr", "values", "window", "zip_with",
+];
+
 /// What surrounds the body being checked.
 struct Ctx<'a> {
     scopes: Scopes,
@@ -2342,7 +2366,16 @@ impl Checker {
                 for a in args {
                     self.infer_expr(a, ctx);
                 }
-                self.err("K0249", format!("{rt} has no method `{name}`"), span);
+                // Suggest a close method name (a built-in) or a UFCS function.
+                let cands = BUILTIN_METHODS
+                    .iter()
+                    .copied()
+                    .chain(self.checked.funs.keys().map(String::as_str));
+                let msg = match suggest(name, cands) {
+                    Some(s) => format!("{rt} has no method `{name}` (did you mean `{s}`?)"),
+                    None => format!("{rt} has no method `{name}`"),
+                };
+                self.err("K0249", msg, span);
                 self.uni.fresh()
             }
             Some((params, ret)) => {
@@ -2662,6 +2695,27 @@ mod generic_tests {
             "type T = Foo | Bar\nfun f(x: T) -> Int { match x { Fooo => 1\n _ => 0 } }\nfun main() {}\n",
         );
         assert!(e3.iter().any(|d| d.message.contains("did you mean `Foo`?")), "{e3:?}");
+    }
+
+    #[test]
+    fn did_you_mean_methods() {
+        // K0249 unknown method -> nearest built-in method name (a common typo).
+        let e = errors("fun main() uses io { print([1].puhs(2)) }\n");
+        assert!(
+            e.iter().any(|d| d.code == "K0249" && d.message.contains("did you mean `push`?")),
+            "{e:?}"
+        );
+        let e2 = errors("fun main() uses io { print([1, 2].revrese()) }\n");
+        assert!(
+            e2.iter().any(|d| d.message.contains("did you mean `reverse`?")),
+            "{e2:?}"
+        );
+        // no close match -> plain message (no bogus suggestion)
+        let e3 = errors("fun main() uses io { print([1].frobnicate()) }\n");
+        assert!(
+            e3.iter().any(|d| d.code == "K0249" && !d.message.contains("did you mean")),
+            "{e3:?}"
+        );
     }
 
     #[test]
