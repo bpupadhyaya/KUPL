@@ -1452,6 +1452,30 @@ fn binary_op(op: BinOp, l: Value, r: Value, span: Span) -> EvalResult {
     raw_binary_op(op, &l, &r).map_err(|msg| Flow::Panic { msg, span })
 }
 
+/// Fixed-precision decimal formatting, rounding half away from zero. A manual
+/// algorithm (not the platform float formatter) so the interpreter, KVM, and the
+/// native C backend all produce byte-identical strings. `decimals` is clamped to
+/// `0..=18`; non-finite inputs render as `nan`/`inf`/`-inf`.
+pub fn format_float(x: f64, decimals: i64) -> String {
+    if x.is_nan() {
+        return "nan".to_string();
+    }
+    if x.is_infinite() {
+        return if x < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    let d = decimals.clamp(0, 18) as u32;
+    let scale: u64 = 10u64.pow(d);
+    let scaled = (x.abs() * scale as f64 + 0.5).floor() as u64;
+    let sign = if x < 0.0 && scaled != 0 { "-" } else { "" };
+    if d == 0 {
+        format!("{sign}{scaled}")
+    } else {
+        let int_part = scaled / scale;
+        let frac = scaled % scale;
+        format!("{sign}{int_part}.{frac:0width$}", width = d as usize)
+    }
+}
+
 /// Operator overloading: the top-level function a binary operator on a
 /// user-defined type resolves to (`a + b` -> `add(a, b)`, `a < b` -> `lt(a, b)`).
 /// `==`/`!=` stay structural, so they are not overloadable.
@@ -2169,6 +2193,10 @@ pub fn shared_method(
             _ => Err("`ushr` needs an Int".into()),
         },
         (Value::Float(v), "to_str") => Ok(Value::str(v.to_string())),
+        (Value::Float(v), "fmt") => match args.into_iter().next() {
+            Some(Value::Int(d)) => Ok(Value::str(format_float(*v, d))),
+            _ => Err("`fmt` needs an Int number of decimals".into()),
+        },
         (Value::Float(v), "to_int") => Ok(Value::Int(*v as i64)),
         (Value::Float(v), "abs") => Ok(Value::Float(v.abs())),
         (Value::Float(v), "sqrt") => Ok(Value::Float(v.sqrt())),
@@ -3256,5 +3284,30 @@ fun main() uses io { let _ = http_serve(38131, handle) }
         let _ = stream.read_to_string(&mut resp);
         assert!(resp.contains("HTTP/1.1 200 OK"), "resp: {resp}");
         assert!(resp.ends_with("GET /world"), "resp: {resp}");
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::{format_float, int_to_radix};
+    #[test]
+    fn fixed_precision_rounds_half_away() {
+        assert_eq!(format_float(3.14159, 2), "3.14");
+        assert_eq!(format_float(2.5, 0), "3");
+        assert_eq!(format_float(2.4, 0), "2");
+        assert_eq!(format_float(0.0, 2), "0.00");
+        assert_eq!(format_float(-1.5, 1), "-1.5");
+        assert_eq!(format_float(100.0, 2), "100.00");
+        assert_eq!(format_float(-0.001, 2), "0.00"); // sign suppressed when zero
+        assert_eq!(format_float(f64::NAN, 2), "nan");
+        assert_eq!(format_float(f64::INFINITY, 2), "inf");
+        assert_eq!(format_float(f64::NEG_INFINITY, 2), "-inf");
+    }
+    #[test]
+    fn radix_lowercase_no_prefix() {
+        assert_eq!(int_to_radix(255, 16), "ff");
+        assert_eq!(int_to_radix(5, 2), "101");
+        assert_eq!(int_to_radix(-255, 16), "-ff");
+        assert_eq!(int_to_radix(0, 16), "0");
     }
 }

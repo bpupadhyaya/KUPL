@@ -1,0 +1,35 @@
+// Number formatting: fixed-precision decimals and integer bases.
+//
+//   Float.fmt(decimals) -> Str   fixed-point, rounding half away from zero
+//   Int.to_hex/to_binary/to_octal/to_radix(base) -> Str   lowercase, no prefix
+//
+// All deterministic and byte-identical on every engine, native included —
+// `.fmt` uses a hand-rolled algorithm (not the platform float formatter).
+
+fun main() uses io {
+    let price = 3.14159
+    print("price   = {price.fmt(2)}")        // 3.14
+    print("tax     = {(price * 0.08).fmt(2)}")
+    print("half    = {2.5.fmt(0)}")           // 3 (half away from zero)
+    print("down    = {2.4.fmt(0)}")           // 2
+    print("zero    = {0.0.fmt(2)}")           // 0.00
+    print("neg     = {(0.0 - 1.5).fmt(1)}")   // -1.5
+    print("hex 255 = {255.to_hex()}")         // ff
+    print("bin 5   = {5.to_binary()}")        // 101
+    print("oct 64  = {64.to_octal()}")        // 100
+    print("base36  = {1295.to_radix(36)}")    // zz
+}
+
+law "formatting is exact" {
+    expect 3.14159.fmt(2) == "3.14"
+    expect 2.5.fmt(0) == "3"
+    expect 2.4.fmt(0) == "2"
+    expect 0.0.fmt(2) == "0.00"
+    expect (0.0 - 1.5).fmt(1) == "-1.5"
+    expect 100.0.fmt(2) == "100.00"
+    expect 255.to_hex() == "ff"
+    expect 5.to_binary() == "101"
+    expect 64.to_octal() == "100"
+    expect (0 - 255).to_hex() == "-ff"
+    expect 0.to_hex() == "0"
+}

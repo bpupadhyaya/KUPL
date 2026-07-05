@@ -109,6 +109,14 @@ date, correct for negative/pre-1970 timestamps), byte-identical on every engine
 including native. Only `now()` reads the wall clock — it carries the `io.time`
 effect and is non-deterministic. No locale or leap seconds.
 
+**Number formatting**: `Float.fmt(decimals) -> Str` renders a fixed-point
+decimal, **rounding half away from zero** (`3.14159.fmt(2)` → `"3.14"`,
+`2.5.fmt(0)` → `"3"`); `decimals` is clamped to `0..=18` and non-finite inputs
+render as `nan`/`inf`/`-inf`. Integer bases: `Int.to_hex/to_binary/to_octal()`
+and `to_radix(base)` (2..=36) give a lowercase, prefix-free string (`255.to_hex()`
+→ `"ff"`), with a leading `-` for negatives. All byte-identical on every engine
+including native. See `examples/format.kupl`.
+
 **BigInt** (`big`): arbitrary-precision integers with `+ - * / %`, comparisons,
 and `.pow`/`.abs`/`.sign`/`.is_negative`. Division truncates toward zero and the
 remainder takes the dividend's sign (like `Int`). Exact and deterministic on

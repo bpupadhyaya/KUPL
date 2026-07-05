@@ -671,6 +671,26 @@ static KValue k_unit(void)       { KValue x; x.tag = K_UNIT;  x.as.i = 0; return
 static KValue k_str(const char* s) { KValue x; x.tag = K_STR; x.as.s = s; return x; }
 static char* k_strdup(const char* s) { size_t n = strlen(s) + 1; char* c = (char*)k_alloc(n); memcpy(c, s, n); return c; }
 
+/* fixed-precision decimal formatting — a byte-for-byte mirror of Rust's
+   interp::format_float (round half away from zero; no platform %.*f). */
+static KValue k_format_float(double x, int64_t decimals) {
+    char buf[64];
+    if (isnan(x)) return k_str(k_strdup("nan"));
+    if (isinf(x)) return k_str(k_strdup(x < 0 ? "-inf" : "inf"));
+    int d = decimals < 0 ? 0 : (decimals > 18 ? 18 : (int)decimals);
+    uint64_t scale = 1;
+    for (int i = 0; i < d; i++) scale *= 10;
+    uint64_t scaled = (uint64_t)floor(fabs(x) * (double)scale + 0.5);
+    const char* sign = (x < 0 && scaled != 0) ? "-" : "";
+    if (d == 0) {
+        snprintf(buf, sizeof buf, "%s%llu", sign, (unsigned long long)scaled);
+    } else {
+        uint64_t ip = scaled / scale, fp = scaled % scale;
+        snprintf(buf, sizeof buf, "%s%llu.%0*llu", sign, (unsigned long long)ip, d, (unsigned long long)fp);
+    }
+    return k_str(k_strdup(buf));
+}
+
 /* ---- BigInt: a C mirror of src/bigint.rs (sign-magnitude, base-1e9 limbs).
    The base is chosen so to_decimal matches the Rust engine byte-for-byte. ---- */
 struct KBig { int neg; int n; uint32_t* limbs; };
@@ -3557,6 +3577,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     }
     if (recv.tag == K_FLOAT) {
         if (!strcmp(name, "to_str")) return k_to_str(recv);
+        if (!strcmp(name, "fmt")) return k_format_float(recv.as.f, args[0].as.i);
         if (!strcmp(name, "to_int")) return k_int((int64_t)recv.as.f);
         if (!strcmp(name, "abs")) return k_float(fabs(recv.as.f));
         if (!strcmp(name, "sqrt")) return k_float(sqrt(recv.as.f));
@@ -4120,6 +4141,17 @@ mod tests {
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Float.fmt (it73) compiles to native and matches the interpreter's manual
+    /// fixed-precision formatting byte-for-byte.
+    #[test]
+    fn native_format_float() {
+        let src = "fun main() uses io {\n    print(3.14159.fmt(2))\n    print(2.5.fmt(0))\n    \
+                   print((0.0 - 1.5).fmt(1))\n    print(0.0.fmt(2))\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "format"), "3.14\n3\n-1.5\n0.00\n");
+        }
     }
 
     /// Operator overloading (it71): `+` and `<` on a user type resolve to

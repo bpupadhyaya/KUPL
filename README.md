@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 202 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 205 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -237,6 +237,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/rational.kupl` | exact rational numbers: `rat(n,d)` reduced fractions, `+ - * /`, `H(10)=7381/2520`, `.to_float`/`.recip` (with a `law`) |
 | `examples/operators.kupl` | operator overloading: define `add`/`sub`/`mul`/`lt`… for a user `Vec2` type, use `+ - * < >` (with a `law`) |
 | `examples/calc.kupl` | a mini expression-language interpreter: tokenizer → recursive-descent parser → evaluator with variables, written in KUPL (with a `law`) |
+| `examples/format.kupl` | number formatting: `Float.fmt(decimals)` fixed-point + `Int.to_hex`/`to_binary`/`to_radix` (with a `law`) |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.
@@ -287,7 +288,7 @@ language, every example verified against the toolchain).
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~28,600 lines of dependency-free Rust, 202 tests, all engines differentially
+~28,800 lines of dependency-free Rust, 205 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

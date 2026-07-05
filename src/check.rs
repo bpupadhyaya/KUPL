@@ -1962,6 +1962,7 @@ impl Checker {
             (Ty::Int, "to_radix") => Some((vec![Ty::Int], Ty::Str)),
             (Ty::Int, "isqrt") => Some((vec![], Ty::Int)),
             (Ty::Float, "to_str") => Some((vec![], Ty::Str)),
+            (Ty::Float, "fmt") => Some((vec![Ty::Int], Ty::Str)),
             (Ty::Float, "to_int") => Some((vec![], Ty::Int)),
             (Ty::Float, "abs") | (Ty::Float, "sqrt") => Some((vec![], Ty::Float)),
             (Ty::Float, "floor") | (Ty::Float, "ceil") | (Ty::Float, "round") => {
