@@ -239,6 +239,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/calc.kupl` | a mini expression-language interpreter: tokenizer → recursive-descent parser → evaluator with variables, written in KUPL (with a `law`) |
 | `examples/vm.kupl` | a bytecode compiler + stack VM: source → AST → bytecode → stack machine, written in KUPL (with a `law`) |
 | `examples/sets.kupl` | set algebra (`union`/`intersect`/`difference`/`symmetric_difference`/`is_subset`) + keyed `min_by`/`max_by` (with a `law`) |
+| `examples/life.kupl` | Conway's Game of Life (cellular automaton): B3/S23 rule on an immutable grid, ASCII render (with a `law`) |
 | `examples/format.kupl` | number formatting: `Float.fmt(decimals)` fixed-point + `Int.to_hex`/`to_binary`/`to_radix` (with a `law`) |
 | `examples/jq.kupl` | a jq-like JSON query tool: path expressions (`.a.b`, `[0]`, `[]`) over the built-in `Json` type, written in KUPL (with a `law`) |
 | `examples/braces.kupl` | literal-brace escaping: `{{`/`}}` in interpolated strings for JSON/CSS/`{…}` templates (with a `law`) |
