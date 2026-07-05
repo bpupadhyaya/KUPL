@@ -219,6 +219,12 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(out))
 }
 
+/// Upper bound on a single JSON-RPC message body. Generous for real source files,
+/// but refuses an absurd `Content-Length` before it becomes a pre-allocation DoS
+/// (a malicious client could otherwise claim gigabytes and abort the server on the
+/// `vec![0u8; content_length]` allocation).
+const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
+
 fn read_message(stdin: &mut impl BufRead) -> Option<String> {
     let mut content_length = 0usize;
     loop {
@@ -233,6 +239,9 @@ fn read_message(stdin: &mut impl BufRead) -> Option<String> {
         if let Some(v) = line.strip_prefix("Content-Length:") {
             content_length = v.trim().parse().ok()?;
         }
+    }
+    if content_length > MAX_MESSAGE_LEN {
+        return None; // refuse absurd frame sizes rather than pre-allocate them
     }
     let mut buf = vec![0u8; content_length];
     stdin.read_exact(&mut buf).ok()?;
@@ -768,6 +777,29 @@ mod tests {
     const PROG: &str = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
                         type Shape = Circle(r: Float) | Square(s: Float)\n\
                         fun main() uses io {\n    print(add(1, 2))\n}\n";
+
+    #[test]
+    fn frame_reader_handles_malformed_frames() {
+        use std::io::Cursor;
+        let rd = |bytes: &str| read_message(&mut Cursor::new(bytes.as_bytes().to_vec()));
+        // well-formed
+        assert_eq!(rd("Content-Length: 2\r\n\r\n{}").as_deref(), Some("{}"));
+        // no body at all -> EOF -> None (not a hang, not a panic)
+        assert_eq!(rd(""), None);
+        // header block with no Content-Length -> 0-length body (downstream JSON
+        // parse rejects it); the point is it returns gracefully, no panic/hang
+        assert_eq!(rd("garbage without a colon\r\n\r\n").as_deref(), Some(""));
+        // garbage / negative / overflowing Content-Length -> parse fails -> None
+        assert_eq!(rd("Content-Length: abc\r\n\r\n{}"), None);
+        assert_eq!(rd("Content-Length: -5\r\n\r\n{}"), None);
+        assert_eq!(rd("Content-Length: 999999999999999999999999\r\n\r\n{}"), None);
+        // ABSURD but parseable length -> refused by the cap, NOT pre-allocated
+        assert_eq!(rd("Content-Length: 999999999999\r\n\r\n{}"), None);
+        // length larger than the actual body -> read_exact hits EOF -> None (no hang)
+        assert_eq!(rd("Content-Length: 100\r\n\r\n{}"), None);
+        // Content-Length: 0 -> empty body, handled
+        assert_eq!(rd("Content-Length: 0\r\n\r\n").as_deref(), Some(""));
+    }
 
     #[test]
     fn position_handlers_never_panic_on_edge_input() {
