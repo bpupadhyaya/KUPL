@@ -1,0 +1,90 @@
+// A line diff via longest-common-subsequence — written in KUPL.
+//
+// Given two texts (as line lists), it finds their LCS with a dynamic-programming
+// table, then backtracks to produce a unified-style diff: "  " for a common line,
+// "- " for a line only in the old text, "+ " for a line only in the after one.
+
+// dp is a flat List[Int] of size (m+1)*(n+1); dp[i*(n+1)+j] = LCS length of the
+// first i lines of a and first j lines of b.
+fun build_table(a: List[Str], b: List[Str]) -> List[Int] {
+    let m = a.len()
+    let n = b.len()
+    let w = n + 1
+    // start with an all-zero table (row 0 and column 0 are the zero base cases)
+    var dp: List[Int] = []
+    var k = 0
+    while k < (m + 1) * w {
+        dp = dp.push(0)
+        k = k + 1
+    }
+    var i = 1
+    while i <= m {
+        var j = 1
+        while j <= n {
+            let cell = if a.get(i - 1) == b.get(j - 1) {
+                dp.get((i - 1) * w + (j - 1)).unwrap_or(0) + 1
+            } else {
+                let up = dp.get((i - 1) * w + j).unwrap_or(0)
+                let left = dp.get(i * w + (j - 1)).unwrap_or(0)
+                if up >= left { up } else { left }
+            }
+            dp = dp.take(i * w + j).push(cell).concat(dp.drop(i * w + j + 1))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    dp
+}
+
+fun lcs_len(a: List[Str], b: List[Str]) -> Int {
+    let n = b.len()
+    build_table(a, b).get(a.len() * (n + 1) + n).unwrap_or(0)
+}
+
+fun diff(a: List[Str], b: List[Str]) -> List[Str] {
+    let dp = build_table(a, b)
+    let w = b.len() + 1
+    var i = a.len()
+    var j = b.len()
+    var rev: List[Str] = []
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && a.get(i - 1) == b.get(j - 1) {
+            let line = a.get(i - 1).unwrap_or("")
+            rev = rev.push("  {line}")
+            i = i - 1
+            j = j - 1
+        } else if j > 0 && (i == 0 || dp.get((i) * w + (j - 1)).unwrap_or(0) >= dp.get((i - 1) * w + j).unwrap_or(0)) {
+            let line = b.get(j - 1).unwrap_or("")
+            rev = rev.push("+ {line}")
+            j = j - 1
+        } else {
+            let line = a.get(i - 1).unwrap_or("")
+            rev = rev.push("- {line}")
+            i = i - 1
+        }
+    }
+    rev.reverse()
+}
+
+fun main() uses io {
+    let old = ["title", "intro", "body one", "body two", "footer"]
+    let after = ["title", "a fresh intro", "body one", "body two", "extra", "footer"]
+    let d = diff(old, after)
+    var k = 0
+    while k < d.len() {
+        print(d.get(k).unwrap_or(""))
+        k = k + 1
+    }
+    print("")
+    print("lcs length = {lcs_len(old, after)}")
+}
+
+law "the LCS diff is correct" {
+    expect lcs_len(["a", "b", "c"], ["a", "c"]) == 2
+    expect lcs_len(["x"], ["y"]) == 0
+    expect lcs_len(["a", "b", "c", "d"], ["a", "b", "c", "d"]) == 4
+    // identical input -> every line is common
+    expect diff(["one", "two"], ["one", "two"]) == ["  one", "  two"]
+    // a removal and an addition
+    expect diff(["a", "b", "c"], ["a", "c", "d"]) == ["  a", "- b", "  c", "+ d"]
+}

@@ -242,6 +242,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/life.kupl` | Conway's Game of Life (cellular automaton): B3/S23 rule on an immutable grid, ASCII render (with a `law`) |
 | `examples/stats.kupl` | descriptive statistics (mean/variance/stddev) + least-squares linear regression (with a `law`) |
 | `examples/adventure.kupl` | a text-adventure engine: rooms/exits/items as a `Map` of records, immutable state threaded through commands (with a `law`) |
+| `examples/diff.kupl` | a line diff via longest-common-subsequence (dynamic programming + backtrack), written in KUPL (with a `law`) |
 | `examples/maps.kupl` | Map transformations: `.filter(fn(k,v))` and `.fold(init, fn(acc,k,v))` over entries (with a `law`) |
 | `examples/listops.kupl` | `List.zip_with` (element-wise combine) + `Str.trim_start`/`trim_end` (with a `law`) |
 | `examples/format.kupl` | number formatting: `Float.fmt(decimals)` fixed-point + `Int.to_hex`/`to_binary`/`to_radix` (with a `law`) |
