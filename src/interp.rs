@@ -1557,6 +1557,21 @@ pub fn shared_method(
             }
             Ok(Value::List(Rc::new(out)))
         }
+        // combine two lists element-wise with `f`, stopping at the shorter one
+        (Value::List(items), "zip_with") => {
+            let mut it = args.into_iter();
+            let other = it.next().ok_or("`zip_with` needs a second list")?;
+            let f = it.next().ok_or("`zip_with` needs a function")?;
+            let Value::List(other) = other else {
+                return Err("`zip_with` needs a List".into());
+            };
+            let n = items.len().min(other.len());
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(call(f.clone(), vec![items[i].clone(), other[i].clone()])?);
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
         (Value::List(items), "filter") | (Value::List(items), "par_filter") => {
             let f = args.into_iter().next().ok_or("`filter` needs a function")?;
             let mut out = Vec::new();
@@ -1903,6 +1918,13 @@ pub fn shared_method(
         (Value::Str(s), "to_upper") => Ok(Value::str(s.to_uppercase())),
         (Value::Str(s), "to_lower") => Ok(Value::str(s.to_lowercase())),
         (Value::Str(s), "trim") => Ok(Value::str(s.trim().to_string())),
+        // trim ` \t\n\r` from one side (the same set as `trim`, matching the C mirror)
+        (Value::Str(s), "trim_start") => {
+            Ok(Value::str(s.trim_start_matches([' ', '\t', '\n', '\r']).to_string()))
+        }
+        (Value::Str(s), "trim_end") => {
+            Ok(Value::str(s.trim_end_matches([' ', '\t', '\n', '\r']).to_string()))
+        }
         (Value::Str(s), "ends_with") => match args.into_iter().next() {
             Some(Value::Str(n)) => Ok(Value::Bool(s.ends_with(n.as_str()))),
             _ => Err("`ends_with` needs a Str".into()),

@@ -195,6 +195,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.product()` | `-> T` | Int or Float lists; Int overflow panics |
 | `.min()` / `.max()` | `-> Option[T]` | Int/Float/Str elements; `None` if empty |
 | `.min_by(f)` / `.max_by(f)` | `(fn(T) -> K) -> Option[T]` | element with the smallest/largest key |
+| `.zip_with(other, f)` | `(List[U], fn(T, U) -> W) -> List[W]` | element-wise combine, to the shorter length |
 | `.flatten()` | `List[List[T]] -> List[T]` | one level of nesting |
 | `.count(f)` | `(fn(T) -> Bool) -> Int` | how many satisfy `f` |
 | `.flat_map(f)` | `(fn(T) -> List[U]) -> List[U]` | map then flatten |
@@ -212,7 +213,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.contains(s)` | `(Str) -> Bool` | |
 | `.starts_with(s)` | `(Str) -> Bool` | |
 | `.to_upper()` / `.to_lower()` | `-> Str` | |
-| `.trim()` | `-> Str` | strips ASCII whitespace at both ends |
+| `.trim()` / `.trim_start()` / `.trim_end()` | `-> Str` | strip ASCII whitespace (` \t\n\r`) at both ends / the start / the end |
 | `.split(sep)` | `(Str) -> List[Str]` | non-empty separator |
 | `.ends_with(s)` | `(Str) -> Bool` | |
 | `.replace(from, to)` | `(Str, Str) -> Str` | all occurrences |

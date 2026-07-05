@@ -1854,6 +1854,17 @@ impl Checker {
                     Ty::List(Box::new(u)),
                 ))
             }
+            (Ty::List(t), "zip_with") => {
+                let b = self.uni.fresh();
+                let c = self.uni.fresh();
+                Some((
+                    vec![
+                        Ty::List(Box::new(b.clone())),
+                        Ty::Fun(vec![(**t).clone(), b], Box::new(c.clone())),
+                    ],
+                    Ty::List(Box::new(c)),
+                ))
+            }
             (Ty::List(t), "filter") | (Ty::List(t), "par_filter") => Some((
                 vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
                 Ty::List(t.clone()),
@@ -1973,7 +1984,7 @@ impl Checker {
             (Ty::Str, "len") => Some((vec![], Ty::Int)),
             (Ty::Str, "contains") => Some((vec![Ty::Str], Ty::Bool)),
             (Ty::Str, "starts_with") => Some((vec![Ty::Str], Ty::Bool)),
-            (Ty::Str, "to_upper") | (Ty::Str, "to_lower") | (Ty::Str, "trim") => Some((vec![], Ty::Str)),
+            (Ty::Str, "to_upper") | (Ty::Str, "to_lower") | (Ty::Str, "trim") | (Ty::Str, "trim_start") | (Ty::Str, "trim_end") => Some((vec![], Ty::Str)),
             (Ty::Str, "split") => Some((vec![Ty::Str], Ty::List(Box::new(Ty::Str)))),
             (Ty::Str, "ends_with") => Some((vec![Ty::Str], Ty::Bool)),
             (Ty::Str, "replace") => Some((vec![Ty::Str, Ty::Str], Ty::Str)),

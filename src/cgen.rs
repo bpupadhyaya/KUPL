@@ -3028,6 +3028,16 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             KValue r = k_list(out, (int)l->len);
             return r;
         }
+        if (!strcmp(name, "zip_with")) {
+            KList* o = args[0].as.list;
+            int64_t n = l->len < o->len ? l->len : o->len;
+            KValue* out = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+            for (int64_t i = 0; i < n; i++) {
+                KValue fa[2] = { l->items[i], o->items[i] };
+                out[i] = k_call(args[1], fa, 2);
+            }
+            return k_list(out, (int)n);
+        }
         if (!strcmp(name, "filter") || !strcmp(name, "par_filter")) {
             KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
             int n = 0;
@@ -3306,11 +3316,15 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             out[strlen(s)] = 0;
             return k_str(out);
         }
-        if (!strcmp(name, "trim")) {
+        if (!strcmp(name, "trim") || !strcmp(name, "trim_start") || !strcmp(name, "trim_end")) {
+            int do_start = strcmp(name, "trim_end") != 0;   /* trim + trim_start */
+            int do_end = strcmp(name, "trim_start") != 0;   /* trim + trim_end */
             const char* a = s;
-            while (*a == ' ' || *a == '\t' || *a == '\n' || *a == '\r') a++;
-            const char* z = a + strlen(a);
-            while (z > a && (z[-1] == ' ' || z[-1] == '\t' || z[-1] == '\n' || z[-1] == '\r')) z--;
+            const char* z = s + strlen(s);
+            if (do_start)
+                while (*a == ' ' || *a == '\t' || *a == '\n' || *a == '\r') a++;
+            if (do_end)
+                while (z > a && (z[-1] == ' ' || z[-1] == '\t' || z[-1] == '\n' || z[-1] == '\r')) z--;
             char* out = k_alloc((size_t)(z - a) + 1);
             memcpy(out, a, (size_t)(z - a));
             out[z - a] = 0;
@@ -4244,6 +4258,17 @@ mod tests {
                    print(Some(5).ok_or(\"no\").map_err(fn e { e }).unwrap_or(0))\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
+        }
+    }
+
+    /// List.zip_with and Str.trim_start/trim_end (it91) compile to native.
+    #[test]
+    fn native_zip_and_trim() {
+        let src = "fun main() uses io {\n    \
+                   print([1, 2, 3].zip_with([10, 20, 30], fn a, b { a + b }))\n    \
+                   print(\"[\" + \"  hi  \".trim_start() + \"]\")\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "listops"), "[11, 22, 33]\n[hi  ]\n");
         }
     }
 

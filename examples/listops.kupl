@@ -1,0 +1,29 @@
+// List.zip_with + Str.trim_start/trim_end.
+//
+//   List.zip_with(other, fn(A, B) -> C) -> List[C]   element-wise combine,
+//     stopping at the shorter list (no tuples needed — the combiner does the work)
+//   Str.trim_start() / trim_end()   trim ` \t\n\r` from one side
+
+fun main() uses io {
+    let xs = [1, 2, 3, 4]
+    let ys = [10, 20, 30]
+    print("sums   = {xs.zip_with(ys, fn a, b { a + b })}")     // [11, 22, 33] (min length)
+    print("dots   = {xs.zip_with(ys, fn a, b { a * b })}")     // [10, 40, 90]
+    let labels = ["x", "y", "z"]
+    let vals = [1, 2, 3]
+    let pairs = labels.zip_with(vals, fn k, v { "{k}={v}" })
+    let joined = pairs.join(", ")
+    print("pairs  = {joined}")                     // x=1, y=2, z=3
+
+    let padded = "   trim me   "
+    print("start = [{padded.trim_start()}]")
+    print("end   = [{padded.trim_end()}]")
+}
+
+law "zip_with + trim" {
+    expect [1, 2, 3].zip_with([10, 20, 30], fn a, b { a + b }) == [11, 22, 33]
+    expect [1, 2, 3, 4].zip_with([10, 20], fn a, b { a * b }) == [10, 40]
+    expect "  hi  ".trim_start() == "hi  "
+    expect "  hi  ".trim_end() == "  hi"
+    expect "\t\n x \r\n".trim_start() == "x \r\n"
+}
