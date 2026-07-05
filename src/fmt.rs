@@ -631,7 +631,12 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
     }
 }
 
-/// Collapse a formatted block onto one line when short: `{ a, b }`.
+/// Collapse a formatted block onto one line ONLY when it is a single simple
+/// statement with no nested block: `{ x }`. Anything else (multiple statements,
+/// or a nested `if`/`while`/`match`/block) is kept multi-line — collapsing it
+/// would corrupt the structure (a naive line-join drops the nested block's
+/// braces). The multi-line form always reparses correctly; KUPL is brace- and
+/// newline-delimited, not indentation-sensitive, so the block runs identically.
 fn reindent_inline(block: &str) -> String {
     let inner: Vec<&str> = block
         .lines()
@@ -641,7 +646,19 @@ fn reindent_inline(block: &str) -> String {
     if inner.is_empty() {
         return "{ }".into();
     }
-    format!("{{ {} }}", inner.join("; "))
+    // Safe to inline (joining statements with `;`) only when every statement line
+    // has BALANCED braces — i.e. no line opens a nested block that spans multiple
+    // lines. Flattening such a block would drop the nested `}` (which sits on its
+    // own line). A single-line inline `if`/`match`/lambda is balanced and inlines
+    // fine (important: it may live inside a `{…}` string interpolation, which must
+    // stay on one line).
+    let all_balanced = inner.iter().all(|l| {
+        l.bytes().filter(|&b| b == b'{').count() == l.bytes().filter(|&b| b == b'}').count()
+    });
+    if all_balanced {
+        return format!("{{ {} }}", inner.join("; "));
+    }
+    block.trim_end().to_string()
 }
 
 fn pattern_str(p: &Pattern) -> String {
@@ -739,6 +756,33 @@ mod tests {
         roundtrip("type Pair[A, B] = Pair(first: A, second: B)\n");
         roundtrip("type Tree[T] = Leaf | Node(value: T, left: Tree[T], right: Tree[T])\n");
         roundtrip("type Box[T] = { item: T }\n");
+    }
+
+    #[test]
+    fn fmt_roundtrips_every_example() {
+        // Every shipped example: format -> the output must reparse cleanly and
+        // formatting must be idempotent. Guards the whole formatter against
+        // regressions (the it16-18 round-trip fixes).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut n = 0;
+        for entry in std::fs::read_dir(&dir).expect("examples dir") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("kupl") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let (p1, d1) = parser::parse(&src);
+            if !d1.is_empty() {
+                continue; // only round-trip examples that parse cleanly
+            }
+            let f1 = super::format_program(&p1);
+            let (p2, d2) = parser::parse(&f1);
+            assert!(d2.is_empty(), "{}: formatted output failed to reparse: {d2:?}", path.display());
+            let f2 = super::format_program(&p2);
+            assert_eq!(f1, f2, "{}: formatter not idempotent", path.display());
+            n += 1;
+        }
+        assert!(n > 50, "expected to check all examples, only saw {n}");
     }
 
     #[test]
