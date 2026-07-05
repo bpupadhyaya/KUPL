@@ -2002,7 +2002,7 @@ static KValue k_path_ext(KValue p) {
 static int k_cmp_cstr(const void* a, const void* b) { return strcmp(*(const char* const*)a, *(const char* const*)b); }
 static KValue k_list_dir(KValue path) {
     DIR* d = opendir(path.as.s);
-    if (!d) { char m[300]; snprintf(m, sizeof m, "cannot read directory: %s", path.as.s); return k_err(k_str(k_strdup(m))); }
+    if (!d) return k_os_error(); /* matches interp's fs::read_dir io::Error */
     char** names = (char**)k_alloc(sizeof(char*) * 8192); int n = 0;
     struct dirent* e;
     while ((e = readdir(d)) && n < 8192) {
@@ -2024,10 +2024,18 @@ static int k_mkdirs(const char* path) {
         if (*q == '/') { *q = 0; mkdir(tmp, 0777); *q = '/'; }
     }
     int r = mkdir(tmp, 0777);
-    return (r == 0 || errno == EEXIST) ? 0 : -1;
+    if (r == 0) return 0;
+    /* EEXIST is success ONLY if the path is already a directory — mirrors interp's
+       create_dir_all. If a FILE exists there, it's an error ("File exists"). */
+    if (errno == EEXIST) {
+        struct stat st;
+        if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+        errno = EEXIST;
+    }
+    return -1;
 }
 static KValue k_make_dir(KValue path) {
-    if (k_mkdirs(path.as.s) != 0) { char m[300]; snprintf(m, sizeof m, "cannot create directory: %s", path.as.s); return k_err(k_str(k_strdup(m))); }
+    if (k_mkdirs(path.as.s) != 0) return k_os_error(); /* matches interp io::Error */
     return k_ok(k_unit());
 }
 static int k_rmrf(const char* path) {
@@ -2046,7 +2054,9 @@ static int k_rmrf(const char* path) {
     return rmdir(path);
 }
 static KValue k_remove_dir(KValue path) {
-    if (k_rmrf(path.as.s) != 0) { char m[300]; snprintf(m, sizeof m, "cannot remove directory: %s", path.as.s); return k_err(k_str(k_strdup(m))); }
+    /* k_rmrf mirrors interp's fs::remove_dir_all (recursive); the final rmdir sets
+       errno (ENOTDIR on a file, ENOENT on missing) so the message matches interp. */
+    if (k_rmrf(path.as.s) != 0) return k_os_error();
     return k_ok(k_unit());
 }
 
@@ -4487,6 +4497,24 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Directory IO ops (list_dir/remove_dir/make_dir) match the interpreter's
+    /// Ok/Err decision AND io::Error message on edge inputs. PR-it39.
+    #[test]
+    fn native_dir_io_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        // list_dir of the current dir (exists) is Ok; of a missing path errors with
+        // the os-error message (was a custom "cannot read directory: …").
+        let miss = "fun main() uses io {\n    \
+                    match list_dir(\"/no/such/dir/xyzzy\") { Ok(_) => print(\"ok\"), Err(e) => print(\"err:{e}\") }\n}\n";
+        assert_eq!(native_main_stdout(miss, "lsmiss").trim(), "err:No such file or directory (os error 2)");
+        // make_dir on an existing FILE errors "File exists" (not a bogus Ok).
+        let onfile = "fun main() uses io {\n    let _ = write_file(\"/tmp/kupl_it39_probe\", \"x\")\n    \
+                      match make_dir(\"/tmp/kupl_it39_probe\") { Ok(_) => print(\"ok\"), Err(e) => print(\"err:{e}\") }\n}\n";
+        assert_eq!(native_main_stdout(onfile, "mkfile").trim(), "err:File exists (os error 17)");
     }
 
     /// Native IO error VALUES match the interpreter (Rust io::Error Display):
