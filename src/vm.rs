@@ -1120,6 +1120,19 @@ mod tests {
     }
 
     #[test]
+    fn diff_utf8_string_ops() {
+        // Multibyte UTF-8 string operations are byte-identical across engines:
+        // len/slice/index are char-based; to_upper/to_lower are ASCII-only
+        // (non-ASCII passes through unchanged — the native runtime can't carry
+        // full Unicode case tables, so all engines agree on ASCII-only).
+        assert_eq!(differential("fun probe() -> Int {\n    \"日本語\".len()\n}\n"), "3");
+        assert_eq!(differential("fun probe() -> Int {\n    \"héllo\".len()\n}\n"), "5");
+        assert_eq!(differential("fun probe() -> Str {\n    \"日本語\".slice(0, 2)\n}\n"), "日本");
+        assert_eq!(differential("fun probe() -> Str {\n    \"héllo\".to_upper()\n}\n"), "HéLLO");
+        assert_eq!(differential("fun probe() -> Str {\n    \"HÉLLO\".to_lower()\n}\n"), "hÉllo");
+    }
+
+    #[test]
     fn diff_nan_inf_display() {
         // NaN and infinities must Display identically on both engines (Rust's f64
         // Display: "NaN"/"inf"/"-inf"). The native backend matches too (PR-it5).

@@ -214,7 +214,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.len()` | `-> Int` | counts characters, not bytes |
 | `.contains(s)` | `(Str) -> Bool` | |
 | `.starts_with(s)` | `(Str) -> Bool` | |
-| `.to_upper()` / `.to_lower()` | `-> Str` | |
+| `.to_upper()` / `.to_lower()` | `-> Str` | **ASCII-only** case mapping; non-ASCII characters pass through unchanged (identical on all engines) |
 | `.trim()` / `.trim_start()` / `.trim_end()` | `-> Str` | strip ASCII whitespace (` \t\n\r`) at both ends / the start / the end |
 | `.split(sep)` | `(Str) -> List[Str]` | non-empty separator |
 | `.ends_with(s)` | `(Str) -> Bool` | |

@@ -1982,8 +1982,12 @@ pub fn shared_method(
             Some(Value::Str(n)) => Ok(Value::Bool(s.starts_with(n.as_str()))),
             _ => Err("`starts_with` needs a Str".into()),
         },
-        (Value::Str(s), "to_upper") => Ok(Value::str(s.to_uppercase())),
-        (Value::Str(s), "to_lower") => Ok(Value::str(s.to_lowercase())),
+        // ASCII-only case mapping: non-ASCII characters pass through unchanged.
+        // Full Unicode case mapping needs large tables that the zero-dependency
+        // native C runtime can't carry, so all engines agree on ASCII-only (this
+        // keeps `to_upper`/`to_lower` byte-identical across interp/KVM/native).
+        (Value::Str(s), "to_upper") => Ok(Value::str(s.to_ascii_uppercase())),
+        (Value::Str(s), "to_lower") => Ok(Value::str(s.to_ascii_lowercase())),
         (Value::Str(s), "trim") => Ok(Value::str(s.trim().to_string())),
         // trim ` \t\n\r` from one side (the same set as `trim`, matching the C mirror)
         (Value::Str(s), "trim_start") => {
