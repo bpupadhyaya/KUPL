@@ -38,7 +38,13 @@ pub fn url_decode(s: &str) -> Result<String, String> {
                 }
                 let hi = hex_val(bytes[i + 1]).ok_or("invalid percent-encoding: bad hex")?;
                 let lo = hex_val(bytes[i + 2]).ok_or("invalid percent-encoding: bad hex")?;
-                out.push((hi << 4) | lo);
+                let byte = (hi << 4) | lo;
+                // KUPL strings are NUL-free (K0008); a decoded NUL is rejected rather
+                // than embedded (the native runtime would truncate at it — divergence).
+                if byte == 0 {
+                    return Err("invalid percent-encoding: decoded NUL byte".into());
+                }
+                out.push(byte);
                 i += 3;
             }
             b'+' => {

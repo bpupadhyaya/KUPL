@@ -1106,6 +1106,19 @@ mod tests {
     }
 
     #[test]
+    fn diff_url_decode_nul_and_edges() {
+        // url_decode of `%00` is REJECTED (a decoded NUL would violate KUPL's
+        // NUL-free strings; interp used to embed it, native truncated at it —
+        // divergence). Valid decode, `+`->space, and malformed escapes are
+        // byte-identical on both engines.
+        assert_eq!(differential("fun probe() -> Str {\n    \"{url_decode(\"a%00b\")}\"\n}\n"), "Err(\"invalid percent-encoding: decoded NUL byte\")");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{url_decode(\"a+b%20c\")}\"\n}\n"), "Ok(\"a b c\")");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{url_decode(\"abc%\")}\"\n}\n"), "Err(\"invalid percent-encoding: truncated escape\")");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{url_decode(\"%ZZ\")}\"\n}\n"), "Err(\"invalid percent-encoding: bad hex\")");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{url_decode(url_encode(\"a b/c?日\"))}\"\n}\n"), "Ok(\"a b/c?日\")");
+    }
+
+    #[test]
     fn diff_radix_formatting() {
         // to_hex/to_binary/to_octal/to_radix use SIGN-MAGNITUDE (a `-` prefix, not
         // two's-complement), handle i64::MIN without a negate-overflow, and panic

@@ -2833,7 +2833,11 @@ static KValue k_url_decode(KValue sv) {
             if (a >= '0' && a <= '9') hi = a - '0'; else if (a >= 'a' && a <= 'f') hi = a - 'a' + 10; else if (a >= 'A' && a <= 'F') hi = a - 'A' + 10;
             if (b >= '0' && b <= '9') lo = b - '0'; else if (b >= 'a' && b <= 'f') lo = b - 'a' + 10; else if (b >= 'A' && b <= 'F') lo = b - 'A' + 10;
             if (hi < 0 || lo < 0) return k_err(k_str("invalid percent-encoding: bad hex"));
-            out[o++] = (unsigned char)((hi << 4) | lo);
+            unsigned char byte = (unsigned char)((hi << 4) | lo);
+            /* reject a decoded NUL — KUPL strings are NUL-free (K0008); a C string
+               would silently truncate at it. Matches the interpreter. */
+            if (byte == 0) return k_err(k_str("invalid percent-encoding: decoded NUL byte"));
+            out[o++] = byte;
             i += 3;
         } else if (s[i] == '+') { out[o++] = ' '; i++; }
         else { out[o++] = (unsigned char)s[i]; i++; }
@@ -4501,6 +4505,22 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native url_decode rejects a decoded NUL (`%00`) like the interpreter (was:
+    /// truncated the C string at it). Valid decode/round-trip unchanged. PR-it45.
+    #[test]
+    fn native_url_decode_nul_rejected() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{url_decode(\"a%00b\")}\")\n    \
+                   print(\"{url_decode(url_encode(\"a b/c?日\"))}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "urldec").trim(),
+            "Err(\"invalid percent-encoding: decoded NUL byte\")\nOk(\"a b/c?日\")"
+        );
     }
 
     /// Native radix formatting (to_hex/to_radix) matches the interpreter incl. the
