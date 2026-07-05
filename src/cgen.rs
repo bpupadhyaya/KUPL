@@ -4511,6 +4511,22 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native Int math (clamp/gcd/isqrt) matches the interpreter on edge inputs,
+    /// incl. inverted-clamp panic and i64::MIN gcd. PR-it47.
+    #[test]
+    fn native_int_math_edges() {
+        if !cc_available() {
+            return;
+        }
+        let ok = "fun main() uses io {\n    print(15.clamp(0, 10))\n    print((0 - 12).gcd(8))\n    \
+                  print(9223372036854775807.isqrt())\n    \
+                  let m = (0 - 9223372036854775807) - 1\n    print(m.gcd(2))\n}\n";
+        assert_eq!(native_main_stdout(ok, "intmath").trim(), "10\n4\n3037000499\n2");
+        // inverted clamp -> a clean panic, empty stdout (no bogus value)
+        let bad = "fun main() uses io {\n    print(5.clamp(10, 2))\n}\n";
+        assert!(native_main_stdout(bad, "clampbad").trim().is_empty(), "expected a panic");
+    }
+
     /// Native hex_decode/base64_decode reject a decoded NUL like the interpreter
     /// (was: truncated the C string at it). Valid decode unchanged. PR-it46.
     #[test]

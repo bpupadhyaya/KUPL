@@ -1106,6 +1106,19 @@ mod tests {
     }
 
     #[test]
+    fn diff_int_math_edges() {
+        // clamp / gcd / isqrt / sign edge cases are byte-identical on both engines:
+        // clamp with INVERTED bounds panics cleanly (no ICE — cf. the it28 slice
+        // clamp bug), gcd handles 0/negative/i64::MIN, isqrt handles 0/negative/MAX.
+        assert_eq!(differential("fun probe() -> Int {\n    15.clamp(0, 10)\n}\n"), "10");
+        assert_eq!(differential("fun probe() -> Int {\n    5.clamp(10, 2)\n}\n"), "panic: `clamp`: lo must not exceed hi");
+        assert_eq!(differential("fun probe() -> Int {\n    (0 - 12).gcd(8)\n}\n"), "4");
+        assert_eq!(differential("fun probe() -> Int {\n    let m = (0 - 9223372036854775807) - 1\n    m.gcd(2)\n}\n"), "2");
+        assert_eq!(differential("fun probe() -> Int {\n    9223372036854775807.isqrt()\n}\n"), "3037000499");
+        assert_eq!(differential("fun probe() -> Int {\n    (0 - 4).isqrt()\n}\n"), "panic: `isqrt` of a negative Int");
+    }
+
+    #[test]
     fn diff_codec_decode_nul_rejected() {
         // hex_decode / base64_decode of bytes that include a NUL are REJECTED (a
         // NUL would violate NUL-free strings; interp embedded it, native truncated
