@@ -695,6 +695,18 @@ static KValue k_unit(void)       { KValue x; x.tag = K_UNIT;  x.as.i = 0; return
    strerror()'s or k_ai_err (a later call clobbers it). Wrap those in k_strdup(). */
 static KValue k_str(const char* s) { KValue x; x.tag = K_STR; x.as.s = s; return x; }
 static char* k_strdup(const char* s) { size_t n = strlen(s) + 1; char* c = (char*)k_alloc(n); memcpy(c, s, n); return c; }
+/* An `Err` whose message mirrors Rust's io::Error Display for a raw OS error:
+   "<strerror(errno)> (os error <errno>)" — so IO error VALUES are byte-identical to
+   the interpreter. Reads errno first; the message is heap-owned (k_str borrows). */
+static KValue k_err(KValue);
+static KValue k_os_error(void) {
+    int e = errno;
+    const char* m = strerror(e);
+    size_t cap = strlen(m) + 32;
+    char* buf = (char*)k_alloc(cap);
+    snprintf(buf, cap, "%s (os error %d)", m, e);
+    return k_err(k_str(buf));
+}
 
 /* fixed-precision decimal formatting — a byte-for-byte mirror of Rust's
    interp::format_float (round half away from zero; no platform %.*f). */
@@ -2565,11 +2577,19 @@ static KValue k_re_replace(KValue pat, KValue text, KValue repl) {
    platform OS description and may differ from the interpreter's wording. ---- */
 static KValue k_read_file(KValue path) {
     FILE* f = fopen(path.as.s, "rb");
-    if (!f) return k_err(k_str(k_strdup(strerror(errno))));
+    if (!f) return k_os_error();
+    /* fopen succeeds on a directory (then fread gives 0 bytes), but the
+       interpreter's fs::read errors — return the same EISDIR error. */
+    struct stat k_rf_st;
+    if (fstat(fileno(f), &k_rf_st) == 0 && S_ISDIR(k_rf_st.st_mode)) {
+        fclose(f);
+        errno = EISDIR;
+        return k_os_error();
+    }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (n < 0) { fclose(f); return k_err(k_str(k_strdup(strerror(errno)))); }
+    if (n < 0) { fclose(f); return k_os_error(); }
     char* buf = k_alloc((size_t)n + 1);
     size_t got = fread(buf, 1, (size_t)n, f);
     buf[got] = 0;
@@ -2578,7 +2598,7 @@ static KValue k_read_file(KValue path) {
 }
 static KValue k_write_file(KValue path, KValue content, int append) {
     FILE* f = fopen(path.as.s, append ? "ab" : "wb");
-    if (!f) return k_err(k_str(k_strdup(strerror(errno))));
+    if (!f) return k_os_error();
     const char* s = content.as.s;
     size_t len = strlen(s);
     size_t w = fwrite(s, 1, len, f);
@@ -2587,7 +2607,7 @@ static KValue k_write_file(KValue path, KValue content, int append) {
     return k_ok(k_unit());
 }
 static KValue k_delete_file(KValue path) {
-    if (remove(path.as.s) != 0) return k_err(k_str(k_strdup(strerror(errno))));
+    if (remove(path.as.s) != 0) return k_os_error();
     return k_ok(k_unit());
 }
 static KValue k_file_exists(KValue path) {
@@ -4469,19 +4489,24 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
-    /// A native IO-error Err string is a persistent OWNED copy (k_strdup) of
-    /// strerror()'s volatile shared buffer — not empty/garbage/aliased. PR-it37.
+    /// Native IO error VALUES match the interpreter (Rust io::Error Display):
+    /// "<message> (os error N)", owned (k_strdup). Reading a directory ERRORS like
+    /// the interpreter (not Ok("")). PR-it37 (lifetime) + PR-it38 (text + isdir).
     #[test]
     fn native_io_error_message_owned() {
         if !cc_available() {
             return;
         }
-        let src = "fun main() uses io {\n    \
-                   match read_file(\"/no/such/path/xyzzy\") { Ok(c) => print(c), Err(e) => print(\"err:{e}\") }\n}\n";
-        let out = native_main_stdout(src, "ioerr");
-        // a real, non-empty message (the strerror text), safely copied.
-        assert!(out.trim().starts_with("err:") && out.trim().len() > 5, "got {out:?}");
-        assert!(out.to_lowercase().contains("no such file"), "got {out:?}");
+        let miss = "fun main() uses io {\n    \
+                    match read_file(\"/no/such/path/xyzzy\") { Ok(c) => print(c), Err(e) => print(\"err:{e}\") }\n}\n";
+        assert_eq!(
+            native_main_stdout(miss, "ioerr").trim(),
+            "err:No such file or directory (os error 2)"
+        );
+        // reading the current directory (always exists) errors, not Ok("").
+        let dir = "fun main() uses io {\n    \
+                   match read_file(\".\") { Ok(c) => print(\"ok:{c.len()}\"), Err(e) => print(\"err:{e}\") }\n}\n";
+        assert_eq!(native_main_stdout(dir, "iodir").trim(), "err:Is a directory (os error 21)");
     }
 
     /// Native parse_iso returns the SAME descriptive Err message as the interpreter
