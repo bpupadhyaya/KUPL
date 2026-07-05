@@ -53,9 +53,10 @@ timers (`on every`/`on after`), `supervise` restart-on-failure, and
 cross-component `expose` calls all compile to machine code — the full component
 model. (The native backend now compiles the **entire language** — components, the full
 numeric surface, JSON, CSV, URL/query, regex, file I/O, env/process, HTTP (via
-system `curl`), and `ai fun` (the deterministic `KUPL_AI_MOCK*` path). A
-tool-using `ai fun` or a real-provider call without a mock defers at runtime with
-a clear message — use `bundle` for those. KValue unboxing for tighter numeric
+system `curl`), and `ai fun` — the deterministic `KUPL_AI_MOCK*` path is compiled COMPLETELY,
+including tool use (the mock tool loop invokes compiled KUPL functions). Only a
+real-provider *network* call defers at runtime with a clear message — use
+`bundle` for those. KValue unboxing for tighter numeric
 loops is a future performance arc.)
 `--keep-c` keeps the generated `.c` beside the output for inspection.
 

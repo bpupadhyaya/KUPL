@@ -104,9 +104,11 @@ completion (3). Everything stays byte-identical across engines.
 - [ ] **Prompt-context builders** — `kupl context` output as a first-class
       value; embeddings + similarity as stdlib
 - [◐] **`ai fun` on the native backend** — the deterministic `KUPL_AI_MOCK*`
-      path compiles natively (it51), byte-identical to the interpreter, incl.
-      structured `Result`/record/`List` output. Real-provider HTTP and tool-use
-      rounds still defer at runtime (use `bundle`).
+      path compiles natively and COMPLETELY (it51 non-tool, it52 tool use),
+      byte-identical to the interpreter: structured `Result`/record/`List`
+      output AND the mock tool loop (invoking compiled KUPL functions).
+      examples/agent.kupl + agent_component.kupl compile native. Only a
+      real-provider *network* call defers at runtime (use `bundle`).
 
 ## Tier 2 — component model completion
 

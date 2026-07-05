@@ -41,8 +41,9 @@ byte-identical across the interpreter and KVM by differential tests:
   just VM speed.
 
 The scores below move accordingly: **concurrency 1→3**, **runtime performance
-2–3→3**, **universality 3→4**, **ecosystem 1→2**. By it50 the native backend
-compiles the **entire language except `ai fun`** (JSON, CSV, URL, regex, and HTTP
+2–3→3**, **universality 3→4**, **ecosystem 1→2**. By it52 the native backend
+compiles the **entire language** — including `ai fun` via its deterministic
+mock path (real-provider network calls aside) (JSON, CSV, URL, regex, and HTTP
 all lower to machine code, byte-identical to the interpreter), and the LSP serves
 the everyday IDE feature set (hover, go-to-definition, completion, find-
 references, rename) on top of diagnostics. What remains open is honest and named:

@@ -122,20 +122,51 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     let mut ai_ctr = 0usize;
     let shape_addrs: Vec<String> =
         module.ai_funs.iter().map(|f| emit_ai_shape(&mut out, &f.shape, &mut ai_ctr)).collect();
+    // per-ai-fun tool tables (name, compiled-fn id, param names + shapes) so the
+    // C mock tool loop can convert each round's JSON input and invoke the tool.
+    let mut tools_expr: Vec<(String, usize)> = Vec::with_capacity(module.ai_funs.len());
+    for (i, f) in module.ai_funs.iter().enumerate() {
+        if f.tools.is_empty() {
+            tools_expr.push(("0".to_string(), 0));
+            continue;
+        }
+        let mut entries = Vec::with_capacity(f.tools.len());
+        for (j, t) in f.tools.iter().enumerate() {
+            let pshape_addrs: Vec<String> =
+                t.params.iter().map(|(_, s)| emit_ai_shape(&mut out, s, &mut ai_ctr)).collect();
+            let pnames: Vec<String> =
+                t.params.iter().map(|(n, _)| format!("\"{}\"", c_escape(n))).collect();
+            let pn = if pnames.is_empty() { "0".to_string() } else { pnames.join(", ") };
+            let ps = if pshape_addrs.is_empty() { "0".to_string() } else { pshape_addrs.join(", ") };
+            let _ = writeln!(out, "static const char* const AITOOL_{i}_{j}_PN[] = {{ {pn} }};");
+            let _ = writeln!(out, "static const KAiShape* const AITOOL_{i}_{j}_PS[] = {{ {ps} }};");
+            let fnid = *module.funs.get(&t.name).unwrap_or(&0);
+            entries.push(format!(
+                "{{ \"{}\", {}, AITOOL_{i}_{j}_PN, AITOOL_{i}_{j}_PS, {} }}",
+                c_escape(&t.name),
+                fnid,
+                t.params.len()
+            ));
+        }
+        let _ = writeln!(out, "static const KAiTool AITOOLS_{i}[] = {{ {} }};", entries.join(", "));
+        tools_expr.push((format!("AITOOLS_{i}"), f.tools.len()));
+    }
     let _ = writeln!(out, "const KAiFun AI_FUNS[] = {{");
     if module.ai_funs.is_empty() {
-        let _ = writeln!(out, "    {{ 0, 0, 0, 0, 0 }}");
+        let _ = writeln!(out, "    {{ 0, 0, 0, 0, 0, 0, 0 }}");
     } else {
         for (i, f) in module.ai_funs.iter().enumerate() {
             let key = format!("KUPL_AI_MOCK_{}", f.name.to_uppercase());
             let _ = writeln!(
                 out,
-                "    {{ \"{}\", \"{}\", {}, {}, {} }},",
+                "    {{ \"{}\", \"{}\", {}, {}, {}, {}, {} }},",
                 c_escape(&f.name),
                 c_escape(&key),
                 shape_addrs[i],
                 f.wraps_result as i32,
                 (!f.tools.is_empty()) as i32,
+                tools_expr[i].0,
+                tools_expr[i].1,
             );
         }
     }
@@ -1490,7 +1521,8 @@ struct KAiShape {
     const char* variant;      /* Record: the constructor name */
     const char* const* fnames; const KAiShape* const* fshapes; int nfields;  /* Record */
 };
-typedef struct { const char* name; const char* mock_key; const KAiShape* shape; int wraps_result; int has_tools; } KAiFun;
+typedef struct { const char* name; int fnid; const char* const* pnames; const KAiShape* const* pshapes; int nparams; } KAiTool;
+typedef struct { const char* name; const char* mock_key; const KAiShape* shape; int wraps_result; int has_tools; const KAiTool* tools; int ntools; } KAiFun;
 extern const KAiFun AI_FUNS[];
 
 static int k_ai_ok = 1;
@@ -1600,9 +1632,65 @@ static KValue k_ai_convert(const KAiShape* shape, const char* text) {
 
 static const char* k_getenv_ne(const char* key) { const char* v = getenv(key); return (v && v[0]) ? v : 0; }
 
+/* look up a field in a Json object's map; returns 1 + sets *out when present */
+static int k_map_field(KMap* m, const char* key, KValue* out) {
+    for (int64_t k = 0; k < m->len; k++)
+        if (!strcmp(m->keys[k].as.s, key)) { *out = m->vals[k]; return 1; }
+    return 0;
+}
+
+/* the tool-use mock path (mirrors ai.rs::tool_response + run_tool_loop with the
+   MockProvider): the mock env value is a JSON array of rounds — {"tool": …} calls
+   a KUPL function for its side effects (result discarded, as the mock ignores it)
+   and {"final": …} ends the loop. The final text is converted via the return
+   shape exactly like the non-tool path. */
+static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
+    k_ai_ok = 1;
+    KValue parsed = k_json_parse(k_str(script));
+    const char* final_text = 0;
+    if (strcmp(CTORS[parsed.as.ctor->ctor].variant, "Ok")) {
+        final_text = script;                 /* parse failure => single final = raw script */
+    } else {
+        KValue j = k_json_field0(parsed);
+        if (strcmp(k_json_var(j), "JArr")) { /* bare value => single final */
+            final_text = !strcmp(k_json_var(j), "JStr") ? k_json_field0(j).as.s : k_json_stringify(j).as.s;
+        } else {
+            KList* rounds = k_json_field0(j).as.list;
+            long limit = rounds->len < 8 ? (long)rounds->len : 8;
+            for (long i = 0; i < limit; i++) {
+                KValue r = rounds->items[i];
+                if (strcmp(k_json_var(r), "JObj")) { snprintf(k_ai_err, sizeof k_ai_err, "mock round must be `{\"tool\": ...}` or `{\"final\": ...}`"); k_ai_ok = 0; return k_unit(); }
+                KMap* m = k_json_field0(r).as.map;
+                KValue fin;
+                if (k_map_field(m, "final", &fin)) {
+                    final_text = !strcmp(k_json_var(fin), "JStr") ? fin.as.ctor->fields[0].as.s : k_json_stringify(fin).as.s;
+                    break;
+                }
+                KValue tn;
+                if (!k_map_field(m, "tool", &tn) || strcmp(k_json_var(tn), "JStr")) { snprintf(k_ai_err, sizeof k_ai_err, "mock round must be `{\"tool\": ...}` or `{\"final\": ...}`"); k_ai_ok = 0; return k_unit(); }
+                const char* name = tn.as.ctor->fields[0].as.s;
+                const KAiTool* t = 0;
+                for (int k = 0; k < f->ntools; k++) if (!strcmp(f->tools[k].name, name)) { t = &f->tools[k]; break; }
+                if (!t) { snprintf(k_ai_err, sizeof k_ai_err, "model called unknown tool `%s`", name); k_ai_ok = 0; return k_unit(); }
+                KValue input; int has_input = k_map_field(m, "input", &input);
+                KMap* im = (has_input && !strcmp(k_json_var(input), "JObj")) ? k_json_field0(input).as.map : 0;
+                KValue* targs = (KValue*)k_alloc(sizeof(KValue) * (t->nparams < 1 ? 1 : t->nparams));
+                for (int p = 0; p < t->nparams; p++) {
+                    KValue pj;
+                    if (!im || !k_map_field(im, t->pnames[p], &pj)) { snprintf(k_ai_err, sizeof k_ai_err, "tool `%s` is missing argument `%s`", name, t->pnames[p]); k_ai_ok = 0; return k_unit(); }
+                    targs[p] = k_ai_from_json(t->pshapes[p], pj);
+                    if (!k_ai_ok) return k_unit();
+                }
+                k_call(k_fun(t->fnid), targs, t->nparams);   /* side effects; result discarded (mock) */
+            }
+            if (!final_text) { snprintf(k_ai_err, sizeof k_ai_err, "mock provider ran out of scripted rounds"); k_ai_ok = 0; return k_unit(); }
+        }
+    }
+    return k_ai_convert(f->shape, final_text);
+}
+
 static KValue k_ai_call(int info) {
     const KAiFun* f = &AI_FUNS[info];
-    if (f->has_tools) k_panic("tool-using `ai fun`s are not yet supported by the native backend (use `kupl bundle`)");
     const char* text = k_getenv_ne(f->mock_key);
     if (!text) text = k_getenv_ne("KUPL_AI_MOCK");
     if (!text) {
@@ -1610,7 +1698,7 @@ static KValue k_ai_call(int info) {
         if (f->wraps_result) return k_err(k_str(msg));
         k_panic(msg); return k_unit();
     }
-    KValue v = k_ai_convert(f->shape, text);
+    KValue v = f->has_tools ? k_ai_tool_call(f, text) : k_ai_convert(f->shape, text);
     if (k_ai_ok) return f->wraps_result ? k_ok(v) : v;
     if (f->wraps_result) return k_err(k_str(k_ai_err));
     char b[320]; snprintf(b, sizeof b, "ai `%s`: %s", f->name, k_ai_err); k_panic(b); return k_unit();
@@ -3558,6 +3646,35 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             "cherry blossoms\npositive 0.9\n[\"alpha\", \"beta\"]\n"
         );
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A tool-using ai fun compiles to native and runs the mock tool loop: each
+    /// `{"tool":…}` round invokes the compiled KUPL function; the `{"final":…}`
+    /// round's text is converted via the return type — byte-identical to interp.
+    #[test]
+    fn native_ai_tools() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun add(a: Int, b: Int) -> Int { a + b }\n\
+                   ai fun assist(q: Str) -> Str tools [add] { intent \"x\" }\n\
+                   fun main() uses io { print(assist(\"2+3?\")) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("tool-using ai fun compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-ait-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_ASSIST", "[{\"tool\":\"add\",\"input\":{\"a\":2,\"b\":3}},{\"final\":\"5\"}]")
+            .output()
+            .expect("runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
         let _ = std::fs::remove_file(&cp);
         let _ = std::fs::remove_file(&bin);
     }
