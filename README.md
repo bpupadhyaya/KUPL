@@ -238,6 +238,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/operators.kupl` | operator overloading: define `add`/`sub`/`mul`/`lt`… for a user `Vec2` type, use `+ - * < >` (with a `law`) |
 | `examples/calc.kupl` | a mini expression-language interpreter: tokenizer → recursive-descent parser → evaluator with variables, written in KUPL (with a `law`) |
 | `examples/format.kupl` | number formatting: `Float.fmt(decimals)` fixed-point + `Int.to_hex`/`to_binary`/`to_radix` (with a `law`) |
+| `examples/jq.kupl` | a jq-like JSON query tool: path expressions (`.a.b`, `[0]`, `[]`) over the built-in `Json` type, written in KUPL (with a `law`) |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.

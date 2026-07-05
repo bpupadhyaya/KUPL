@@ -1,0 +1,190 @@
+// A jq-like JSON query tool — written in KUPL, over the built-in `Json` type.
+//
+// A query is a `.`-led path of segments:
+//   .key        object field
+//   [N]         array index
+//   []          iterate an array (fans out over its elements)
+//   .           the whole document (identity)
+// e.g.  .name   .address.city   .items[0].price   .items[].name
+//
+// It parses the path, walks the Json with `match` + recursion, and prints each
+// matched value — a real data tool, deterministic and identical on every engine.
+
+type Seg = Key(name: Str) | Index(i: Int) | Iter
+
+// ---- parse a path string into segments ------------------------------------
+
+fun parse_path(path: Str) -> List[Seg] {
+    let cs = path.chars()
+    var segs: List[Seg] = []
+    var i = 0
+    while i < cs.len() {
+        let c = cs.get(i).unwrap_or("")
+        if c == "." {
+            var name = ""
+            i = i + 1
+            while i < cs.len() && cs.get(i).unwrap_or("") != "." && cs.get(i).unwrap_or("") != "[" {
+                name = name + cs.get(i).unwrap_or("")
+                i = i + 1
+            }
+            if name != "" {
+                segs = segs.push(Key(name))
+            }
+        } else if c == "[" {
+            var inner = ""
+            i = i + 1
+            while i < cs.len() && cs.get(i).unwrap_or("") != "]" {
+                inner = inner + cs.get(i).unwrap_or("")
+                i = i + 1
+            }
+            i = i + 1
+            if inner == "" {
+                segs = segs.push(Iter)
+            } else {
+                segs = segs.push(Index(inner.parse_int().unwrap_or(0)))
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    segs
+}
+
+// ---- evaluate a path over a Json document ---------------------------------
+
+// Apply one segment to one Json value, yielding zero or more results.
+fun apply_seg(j: Json, seg: Seg) -> List[Json] {
+    match seg {
+        Key(k) => {
+            match j {
+                JObj(fields) => {
+                    match fields.get(k) {
+                        Some(v) => [v]
+                        None => []
+                    }
+                }
+                _ => []
+            }
+        }
+        Index(n) => {
+            match j {
+                JArr(items) => {
+                    match items.get(n) {
+                        Some(v) => [v]
+                        None => []
+                    }
+                }
+                _ => []
+            }
+        }
+        Iter => {
+            match j {
+                JArr(items) => items
+                _ => []
+            }
+        }
+    }
+}
+
+// Apply one segment across the whole current result set.
+fun step(current: List[Json], seg: Seg) -> List[Json] {
+    var acc: List[Json] = []
+    var i = 0
+    while i < current.len() {
+        let j = current.get(i).unwrap_or(JNull)
+        acc = acc.concat(apply_seg(j, seg))
+        i = i + 1
+    }
+    acc
+}
+
+fun query(doc: Json, segs: List[Seg]) -> List[Json] {
+    var current = [doc]
+    var i = 0
+    while i < segs.len() {
+        match segs.get(i) {
+            Some(seg) => { current = step(current, seg) }
+            None => {}
+        }
+        i = i + 1
+    }
+    current
+}
+
+// ---- rendering ------------------------------------------------------------
+
+// Scalars render bare (a string without quotes, a whole number without `.0`);
+// arrays/objects render as compact JSON.
+fun render(j: Json) -> Str {
+    match j {
+        JStr(s) => s
+        JBool(b) => "{b}"
+        JNull => "null"
+        _ => json_stringify(j)
+    }
+}
+
+fun run(json_text: Str, path: Str) -> List[Str] {
+    match json_parse(json_text) {
+        Err(e) => ["parse error: {e}"]
+        Ok(doc) => {
+            let results = query(doc, parse_path(path))
+            var lines: List[Str] = []
+            var i = 0
+            while i < results.len() {
+                lines = lines.push(render(results.get(i).unwrap_or(JNull)))
+                i = i + 1
+            }
+            lines
+        }
+    }
+}
+
+fun query_str(json_text: Str, path: Str) -> Str {
+    run(json_text, path).join(",")
+}
+
+// ---- demo -----------------------------------------------------------------
+
+// Build the sample document with the Json constructors, then serialize it — no
+// brace-escaping needed, and it exercises json_stringify on the way in.
+fun sample() -> Str {
+    let items = JArr([
+        JObj(Map().insert("id", JNum(1.0)).insert("price", JNum(10.0))),
+        JObj(Map().insert("id", JNum(2.0)).insert("price", JNum(20.0))),
+    ])
+    json_stringify(
+        JObj(
+            Map().insert("name", JStr("KUPL"))
+                .insert("tags", JArr([JStr("fast"), JStr("ai")]))
+                .insert("items", items)
+        )
+    )
+}
+
+fun main() uses io {
+    let doc = sample()
+    let queries = [".name", ".tags[0]", ".items[].price", ".items[1].id", ".missing", "."]
+    var i = 0
+    while i < queries.len() {
+        let path = queries.get(i).unwrap_or("")
+        let results = run(doc, path)
+        if results.is_empty() {
+            print("{path}  ->  (no match)")
+        } else {
+            let joined = results.join(", ")
+            print("{path}  ->  {joined}")
+        }
+        i = i + 1
+    }
+}
+
+law "jq queries are correct" {
+    expect query_str(sample(), ".name") == "KUPL"
+    expect query_str(sample(), ".tags[0]") == "fast"
+    expect query_str(sample(), ".tags[]") == "fast,ai"
+    expect query_str(sample(), ".items[].price") == "10,20"
+    expect query_str(sample(), ".items[1].id") == "2"
+    expect query_str(sample(), ".missing") == ""
+    expect query_str(sample(), ".items[9]") == ""
+}
