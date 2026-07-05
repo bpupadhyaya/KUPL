@@ -1,0 +1,274 @@
+// A mini expression-language interpreter — written entirely in KUPL.
+//
+// It reads a tiny language (integer arithmetic with variables) and runs it:
+//   let x = 2 + 3 * 4     // binds x = 14
+//   x * x                 // prints 196
+// Statements are separated by `;`. Operators `+ - * /` have the usual
+// precedence, `( )` group, and unary `-` negates. This is a real
+// tokenizer -> recursive-descent parser -> evaluator, using ADTs, `match`,
+// recursion, `Map`, and `Result` — proof that KUPL implements real software.
+
+type Token =
+    TNum(n: Int) | TIdent(s: Str)
+    | TPlus | TMinus | TStar | TSlash
+    | TLParen | TRParen | TEq | TLet | TSemi
+
+type Expr = Num(n: Int) | Var(s: Str) | Bin(op: Str, l: Expr, r: Expr) | Neg(e: Expr)
+
+type Stmt = Let(name: Str, e: Expr) | Print(e: Expr)
+
+// parser cursors: a parsed node paired with the next token index
+type PExpr = { node: Expr, pos: Int }
+type PStmt = { stmt: Stmt, pos: Int }
+
+fun is_digit(c: Str) -> Bool { c >= "0" && c <= "9" }
+fun is_alpha(c: Str) -> Bool { (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") }
+
+// ---- tokenizer ------------------------------------------------------------
+
+fun tokenize(src: Str) -> Result[List[Token], Str] {
+    let cs = src.chars()
+    var toks: List[Token] = []
+    var i = 0
+    while i < cs.len() {
+        let c = cs.get(i).unwrap_or("")
+        if c == " " {
+            i = i + 1
+        } else if is_digit(c) {
+            var num = ""
+            while i < cs.len() && is_digit(cs.get(i).unwrap_or("")) {
+                num = num + cs.get(i).unwrap_or("")
+                i = i + 1
+            }
+            toks = toks.push(TNum(num.parse_int().unwrap_or(0)))
+        } else if is_alpha(c) {
+            var id = ""
+            while i < cs.len() && is_alpha(cs.get(i).unwrap_or("")) {
+                id = id + cs.get(i).unwrap_or("")
+                i = i + 1
+            }
+            if id == "let" {
+                toks = toks.push(TLet)
+            } else {
+                toks = toks.push(TIdent(id))
+            }
+        } else {
+            let single = single_token(c)
+            match single {
+                Some(t) => {
+                    toks = toks.push(t)
+                    i = i + 1
+                }
+                None => {
+                    return Err("unexpected character `{c}`")
+                }
+            }
+        }
+    }
+    Ok(toks)
+}
+
+fun single_token(c: Str) -> Option[Token] {
+    if c == "+" { Some(TPlus) } else if c == "-" { Some(TMinus)
+    } else if c == "*" { Some(TStar) } else if c == "/" { Some(TSlash)
+    } else if c == "(" { Some(TLParen) } else if c == ")" { Some(TRParen)
+    } else if c == "=" { Some(TEq) } else if c == ";" { Some(TSemi)
+    } else { None }
+}
+
+// ---- parser (recursive descent, precedence-correct) -----------------------
+
+fun parse_factor(toks: List[Token], pos: Int) -> Result[PExpr, Str] {
+    match toks.get(pos) {
+        Some(TNum(n)) => Ok(PExpr(node: Num(n), pos: pos + 1))
+        Some(TIdent(s)) => Ok(PExpr(node: Var(s), pos: pos + 1))
+        Some(TMinus) => {
+            let inner = parse_factor(toks, pos + 1)?
+            Ok(PExpr(node: Neg(inner.node), pos: inner.pos))
+        }
+        Some(TLParen) => {
+            let inner = parse_expr(toks, pos + 1)?
+            match toks.get(inner.pos) {
+                Some(TRParen) => Ok(PExpr(node: inner.node, pos: inner.pos + 1))
+                _ => Err("expected `)`")
+            }
+        }
+        _ => Err("expected a number, name, or `(`")
+    }
+}
+
+fun parse_term(toks: List[Token], pos: Int) -> Result[PExpr, Str] {
+    var left = parse_factor(toks, pos)?
+    var node = left.node
+    var p = left.pos
+    while toks.get(p) == Some(TStar) || toks.get(p) == Some(TSlash) {
+        let op = if toks.get(p) == Some(TStar) { "*" } else { "/" }
+        let right = parse_factor(toks, p + 1)?
+        node = Bin(op, node, right.node)
+        p = right.pos
+    }
+    Ok(PExpr(node: node, pos: p))
+}
+
+fun parse_expr(toks: List[Token], pos: Int) -> Result[PExpr, Str] {
+    var left = parse_term(toks, pos)?
+    var node = left.node
+    var p = left.pos
+    while toks.get(p) == Some(TPlus) || toks.get(p) == Some(TMinus) {
+        let op = if toks.get(p) == Some(TPlus) { "+" } else { "-" }
+        let right = parse_term(toks, p + 1)?
+        node = Bin(op, node, right.node)
+        p = right.pos
+    }
+    Ok(PExpr(node: node, pos: p))
+}
+
+fun parse_stmt(toks: List[Token], pos: Int) -> Result[PStmt, Str] {
+    match toks.get(pos) {
+        Some(TLet) => {
+            match toks.get(pos + 1) {
+                Some(TIdent(name)) => {
+                    match toks.get(pos + 2) {
+                        Some(TEq) => {
+                            let body = parse_expr(toks, pos + 3)?
+                            Ok(PStmt(stmt: Let(name, body.node), pos: body.pos))
+                        }
+                        _ => Err("expected `=` after `let {name}`")
+                    }
+                }
+                _ => Err("expected a name after `let`")
+            }
+        }
+        _ => {
+            let body = parse_expr(toks, pos)?
+            Ok(PStmt(stmt: Print(body.node), pos: body.pos))
+        }
+    }
+}
+
+fun parse_program(toks: List[Token]) -> Result[List[Stmt], Str] {
+    var stmts: List[Stmt] = []
+    var pos = 0
+    while pos < toks.len() {
+        let s = parse_stmt(toks, pos)?
+        stmts = stmts.push(s.stmt)
+        pos = s.pos
+        if toks.get(pos) == Some(TSemi) {
+            pos = pos + 1
+        }
+    }
+    Ok(stmts)
+}
+
+// ---- evaluator ------------------------------------------------------------
+
+fun eval_expr(e: Expr, env: Map[Str, Int]) -> Result[Int, Str] {
+    match e {
+        Num(n) => Ok(n)
+        Var(s) => {
+            match env.get(s) {
+                Some(v) => Ok(v)
+                None => Err("unbound variable `{s}`")
+            }
+        }
+        Neg(x) => {
+            let v = eval_expr(x, env)?
+            Ok(0 - v)
+        }
+        Bin(op, l, r) => {
+            let a = eval_expr(l, env)?
+            let b = eval_expr(r, env)?
+            if op == "+" { Ok(a + b) } else if op == "-" { Ok(a - b)
+            } else if op == "*" { Ok(a * b) } else if b == 0 { Err("division by zero")
+            } else { Ok(a / b) }
+        }
+    }
+}
+
+// Run a whole program, returning one output line per statement (or the error).
+fun run(src: Str) -> List[Str] {
+    match tokenize(src) {
+        Err(e) => ["error: {e}"]
+        Ok(toks) => {
+            match parse_program(toks) {
+                Err(e) => ["error: {e}"]
+                Ok(stmts) => exec(stmts)
+            }
+        }
+    }
+}
+
+fun exec(stmts: List[Stmt]) -> List[Str] {
+    var env: Map[Str, Int] = Map()
+    var acc: List[Str] = []
+    var i = 0
+    var halt = false
+    while i < stmts.len() && !halt {
+        match stmts.get(i) {
+            Some(Let(name, e)) => {
+                match eval_expr(e, env) {
+                    Ok(v) => {
+                        env = env.insert(name, v)
+                        acc = acc.push("{name} = {v}")
+                    }
+                    Err(msg) => {
+                        acc = acc.push("error: {msg}")
+                        halt = true
+                    }
+                }
+            }
+            Some(Print(e)) => {
+                match eval_expr(e, env) {
+                    Ok(v) => { acc = acc.push("{v}") }
+                    Err(msg) => {
+                        acc = acc.push("error: {msg}")
+                        halt = true
+                    }
+                }
+            }
+            None => {}
+        }
+        i = i + 1
+    }
+    acc
+}
+
+// The last output line — handy for assertions.
+fun result_of(src: Str) -> Str {
+    let lines = run(src)
+    lines.last().unwrap_or("")
+}
+
+fun main() uses io {
+    let programs = [
+        "let x = 2 + 3 * 4; x * x",
+        "let a = 10; let b = 3; a / b",
+        "(2 + 3) * 4",
+        "-5 + 8",
+        "1 / 0",
+        "y + 1",
+    ]
+    var i = 0
+    while i < programs.len() {
+        let src = programs.get(i).unwrap_or("")
+        print("> {src}")
+        let lines = run(src)
+        var j = 0
+        while j < lines.len() {
+            let line = lines.get(j).unwrap_or("")
+            print("  {line}")
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+law "the calc interpreter is correct" {
+    expect result_of("2 + 3 * 4") == "14"
+    expect result_of("(2 + 3) * 4") == "20"
+    expect result_of("10 - 2 - 3") == "5"
+    expect result_of("let x = 5; x * x") == "25"
+    expect result_of("-7 + 2") == "-5"
+    expect result_of("1 / 0") == "error: division by zero"
+    expect result_of("y + 1") == "error: unbound variable `y`"
+}

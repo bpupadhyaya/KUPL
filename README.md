@@ -236,6 +236,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/bigint.kupl` | arbitrary-precision integers: exact `50!`, `fib(100)`, `2^256`, division/modulo/power — identical on all engines |
 | `examples/rational.kupl` | exact rational numbers: `rat(n,d)` reduced fractions, `+ - * /`, `H(10)=7381/2520`, `.to_float`/`.recip` (with a `law`) |
 | `examples/operators.kupl` | operator overloading: define `add`/`sub`/`mul`/`lt`… for a user `Vec2` type, use `+ - * < >` (with a `law`) |
+| `examples/calc.kupl` | a mini expression-language interpreter: tokenizer → recursive-descent parser → evaluator with variables, written in KUPL (with a `law`) |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.
