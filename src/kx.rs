@@ -498,7 +498,18 @@ impl<'a> R<'a> {
 
 pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
     let mut r = R { buf, pos: 0 };
-    if r.take(8)? != KX_MAGIC {
+    let magic = r.take(8)?;
+    if magic != KX_MAGIC {
+        // Distinguish a .kx built by an incompatible KUPL version (right prefix,
+        // wrong format version) from a file that isn't a .kx module at all — so a
+        // version skew gives an actionable message instead of a generic one.
+        if magic.starts_with(b"KUPLKX") {
+            return Err(format!(
+                "incompatible .kx format version (found `{}`, this KUPL build expects `{}`) — rebuild with `kupl build`",
+                String::from_utf8_lossy(magic),
+                String::from_utf8_lossy(KX_MAGIC),
+            ));
+        }
         return Err("not a .kx module (bad magic)".into());
     }
 
@@ -805,6 +816,24 @@ mod tests {
         assert_eq!(module.disassemble(), decoded.disassemble());
         assert_eq!(module.funs, decoded.funs);
         assert_eq!(module.component_names, decoded.component_names);
+    }
+
+    #[test]
+    fn version_mismatch_is_distinguished() {
+        let src = "fun main() {\n    print(1)\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut bytes = super::encode(&module);
+        // flip the format-version byte of the magic (KUPLKX02 -> KUPLKX09)
+        bytes[7] = b'9';
+        let err = super::decode(&bytes).unwrap_err();
+        assert!(err.contains("incompatible .kx format version"), "{err}");
+        assert!(err.contains("rebuild"), "{err}");
+        // a file that isn't a .kx at all gets the generic message
+        let not_kx = b"GARBAGE1\x00\x00\x00\x00";
+        let err2 = super::decode(not_kx).unwrap_err();
+        assert!(err2.contains("not a .kx module"), "{err2}");
     }
 
     #[test]
