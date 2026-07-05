@@ -1120,6 +1120,37 @@ mod tests {
     }
 
     #[test]
+    fn diff_codec_and_csv_consistency() {
+        // base64/hex/url decode (Ok values AND detailed Err messages), query_parse,
+        // and csv round-trip are byte-identical across engines — locked in so the
+        // native C mirrors can't drift from the Rust reference.
+        let p = |body: &str| format!("fun probe() -> Str {{\n    {body}\n}}\n");
+        assert_eq!(differential(&p("to_str(base64_decode(\"aGVsbG8=\"))")), "Ok(\"hello\")");
+        assert_eq!(
+            differential(&p("to_str(base64_decode(\"aGVsbG8\"))")),
+            "Err(\"invalid base64: length not a multiple of 4\")"
+        );
+        assert_eq!(differential(&p("to_str(hex_decode(\"48454C4C4F\"))")), "Ok(\"HELLO\")");
+        assert_eq!(differential(&p("to_str(hex_decode(\"abc\"))")), "Err(\"invalid hex: odd length\")");
+        assert_eq!(differential(&p("to_str(url_decode(\"a%20b\"))")), "Ok(\"a b\")");
+        assert_eq!(
+            differential(&p("to_str(url_decode(\"a%ZZ\"))")),
+            "Err(\"invalid percent-encoding: bad hex\")"
+        );
+        assert_eq!(
+            differential(&p("to_str(query_parse(\"a=1&a=2\"))")),
+            "[[\"a\", \"1\"], [\"a\", \"2\"]]"
+        );
+        // csv round-trip through a quoted field containing a comma
+        assert_eq!(
+            differential(&p(
+                "let r = [[\"a,b\", \"c\"]]\n    to_str(csv_parse(csv_stringify(r)) == r)"
+            )),
+            "true"
+        );
+    }
+
+    #[test]
     fn diff_parse_int_float_edges() {
         // parse_int/parse_float edge inputs are byte-identical across engines
         // (native strtoll/strtod were aligned to Rust: reject leading whitespace,

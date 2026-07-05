@@ -4360,6 +4360,24 @@ mod tests {
         }
     }
 
+    /// Native codec decoders (base64/hex/url) match the interpreter on Ok values
+    /// AND detailed Err messages.
+    #[test]
+    fn native_codec_errors_match() {
+        let src = "fun main() uses io {\n    \
+                   print(hex_decode(\"abc\"))\n    \
+                   print(url_decode(\"a%ZZ\"))\n    \
+                   print(base64_decode(\"aGVsbG8=\"))\n}\n";
+        if cc_available() {
+            assert_eq!(
+                native_main_stdout(src, "codec"),
+                "Err(\"invalid hex: odd length\")\n\
+                 Err(\"invalid percent-encoding: bad hex\")\n\
+                 Ok(\"hello\")\n"
+            );
+        }
+    }
+
     /// NaN/infinity Display matches the interpreter natively (was: `%g` -> "nan").
     #[test]
     fn native_nan_inf_display() {
