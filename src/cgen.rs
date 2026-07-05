@@ -4503,6 +4503,19 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native radix formatting (to_hex/to_radix) matches the interpreter incl. the
+    /// i64::MIN edge (no negate-overflow) and sign-magnitude negatives. PR-it44.
+    #[test]
+    fn native_radix_formatting() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print((0 - 255).to_hex())\n    \
+                   print(1295.to_radix(36))\n    \
+                   let m = (0 - 9223372036854775807) - 1\n    print(m.to_hex())\n}\n";
+        assert_eq!(native_main_stdout(src, "radix").trim(), "-ff\nzz\n-8000000000000000");
+    }
+
     /// Native CSV (csv_parse/csv_stringify, RFC 4180) matches the interpreter on
     /// quoting/escaping of embedded commas, quotes, and newlines. PR-it43.
     #[test]

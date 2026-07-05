@@ -1106,6 +1106,24 @@ mod tests {
     }
 
     #[test]
+    fn diff_radix_formatting() {
+        // to_hex/to_binary/to_octal/to_radix use SIGN-MAGNITUDE (a `-` prefix, not
+        // two's-complement), handle i64::MIN without a negate-overflow, and panic
+        // cleanly on an out-of-range base — all byte-identical on both engines.
+        assert_eq!(differential("fun probe() -> Str {\n    (0 - 255).to_hex()\n}\n"), "-ff");
+        assert_eq!(differential("fun probe() -> Str {\n    1295.to_radix(36)\n}\n"), "zz");
+        assert_eq!(differential("fun probe() -> Str {\n    (0 - 5).to_radix(2)\n}\n"), "-101");
+        assert_eq!(
+            differential("fun probe() -> Str {\n    let m = (0 - 9223372036854775807) - 1\n    m.to_hex()\n}\n"),
+            "-8000000000000000"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    (10).to_radix(37)\n}\n"),
+            "panic: `to_radix` base must be in 2..=36"
+        );
+    }
+
+    #[test]
     fn diff_csv_ops() {
         // csv_parse / csv_stringify (RFC 4180) — quoting/escaping of embedded commas,
         // quotes ("" escape), and newlines is byte-identical on both engines, and a
