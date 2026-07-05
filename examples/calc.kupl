@@ -69,11 +69,15 @@ fun tokenize(src: Str) -> Result[List[Token], Str] {
 }
 
 fun single_token(c: Str) -> Option[Token] {
-    if c == "+" { Some(TPlus) } else if c == "-" { Some(TMinus)
-    } else if c == "*" { Some(TStar) } else if c == "/" { Some(TSlash)
-    } else if c == "(" { Some(TLParen) } else if c == ")" { Some(TRParen)
-    } else if c == "=" { Some(TEq) } else if c == ";" { Some(TSemi)
-    } else { None }
+    if c == "+" { Some(TPlus) }
+    else if c == "-" { Some(TMinus) }
+    else if c == "*" { Some(TStar) }
+    else if c == "/" { Some(TSlash) }
+    else if c == "(" { Some(TLParen) }
+    else if c == ")" { Some(TRParen) }
+    else if c == "=" { Some(TEq) }
+    else if c == ";" { Some(TSemi) }
+    else { None }
 }
 
 // ---- parser (recursive descent, precedence-correct) -----------------------
@@ -178,9 +182,11 @@ fun eval_expr(e: Expr, env: Map[Str, Int]) -> Result[Int, Str] {
         Bin(op, l, r) => {
             let a = eval_expr(l, env)?
             let b = eval_expr(r, env)?
-            if op == "+" { Ok(a + b) } else if op == "-" { Ok(a - b)
-            } else if op == "*" { Ok(a * b) } else if b == 0 { Err("division by zero")
-            } else { Ok(a / b) }
+            if op == "+" { Ok(a + b) }
+            else if op == "-" { Ok(a - b) }
+            else if op == "*" { Ok(a * b) }
+            else if b == 0 { Err("division by zero") }
+            else { Ok(a / b) }
         }
     }
 }

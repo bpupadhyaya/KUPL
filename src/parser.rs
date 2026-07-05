@@ -1541,6 +1541,23 @@ impl Parser {
         }
     }
 
+    /// Consume an `else` that may follow the then-block across newline(s), so
+    /// multi-line `}\nelse { … }` parses like `} else { … }`. `else` cannot begin
+    /// a statement, so skipping newlines to find it is unambiguous; if none
+    /// follows, the cursor is restored and the newline still separates statements.
+    fn eat_else(&mut self) -> bool {
+        let saved = self.pos;
+        while matches!(self.peek(), Tok::Newline) {
+            self.bump();
+        }
+        if self.eat(&Tok::KwElse) {
+            true
+        } else {
+            self.pos = saved;
+            false
+        }
+    }
+
     fn parse_if(&mut self) -> PResult<Expr> {
         let span = self.expect(Tok::KwIf)?;
         // `if let PATTERN = EXPR { … } else { … }` desugars to a `match` whose
@@ -1554,7 +1571,7 @@ impl Parser {
             let then = self.parse_block()?;
             let then_span = then.span;
             let then_expr = Expr { kind: ExprKind::BlockExpr(then), span: then_span };
-            let else_expr = if self.eat(&Tok::KwElse) {
+            let else_expr = if self.eat_else() {
                 if self.at(&Tok::KwIf) {
                     self.parse_if()?
                 } else {
@@ -1576,7 +1593,7 @@ impl Parser {
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
         let mut else_block = None;
-        if self.eat(&Tok::KwElse) {
+        if self.eat_else() {
             if self.at(&Tok::KwIf) {
                 else_block = Some(Box::new(self.parse_if()?));
             } else {
@@ -1779,6 +1796,21 @@ mod tests {
         let (p, diags) = parse(src);
         assert!(diags.is_empty(), "diags: {diags:#?}");
         p
+    }
+
+    /// `else` may follow the then-block across a newline; the AST is identical
+    /// to the same-line form, and a no-else `if` doesn't swallow the next line.
+    #[test]
+    fn newline_before_else() {
+        // both the one-line and multi-line forms parse cleanly (the AST differs
+        // only in spans, which reflect the different source layout)
+        ok("fun f(c: Bool) -> Int {\n    if c { 1 } else { 2 }\n}\n");
+        ok("fun f(c: Bool) -> Int {\n    if c {\n        1\n    }\n    else {\n        2\n    }\n}\n");
+        // else-if chain across lines
+        ok("fun g(n: Int) -> Str {\n    if n > 1 {\n        \"a\"\n    }\n    else if n > 0 {\n        \"b\"\n    }\n    else {\n        \"c\"\n    }\n}\n");
+        // a no-else `if` followed by a newline + another statement is TWO statements
+        let p = ok("fun h() -> Int {\n    var x = 0\n    if true {\n        x = 5\n    }\n    x = x + 1\n    x\n}\n");
+        assert_eq!(p.items.len(), 1);
     }
 
     #[test]

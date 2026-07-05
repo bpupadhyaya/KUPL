@@ -169,6 +169,7 @@ on `type` declarations are **[design]**.
 
 ```kupl
 if cond { a } else { b }            // expression; both arms must agree in type
+                                    // `else` (and `else if`) may sit on a new line
 match v {                           // expression; must be exhaustive
     Circle(r) => 3.14 * r * r
     Rect(w, h) => w * h
