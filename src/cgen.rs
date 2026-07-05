@@ -4499,6 +4499,23 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native Display of nested/complex values (nested lists, Map/Set, Option
+    /// nesting, reduced Rationals) is byte-identical to the interpreter. PR-it40.
+    #[test]
+    fn native_nested_value_display() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print([[1, 2], [3], []])\n    \
+                   print([Some(1), None, Some(3)])\n    \
+                   print(Map().insert(\"a\", [1, 2]).insert(\"b\", [3]))\n    \
+                   print(Set([3, 1, 2]))\n    print([rat(1, 2), rat(2, 4)])\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "nestdisp").trim(),
+            "[[1, 2], [3], []]\n[Some(1), None, Some(3)]\nMap{\"a\": [1, 2], \"b\": [3]}\nSet{3, 1, 2}\n[1/2, 1/2]"
+        );
+    }
+
     /// Directory IO ops (list_dir/remove_dir/make_dir) match the interpreter's
     /// Ok/Err decision AND io::Error message on edge inputs. PR-it39.
     #[test]

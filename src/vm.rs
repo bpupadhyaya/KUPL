@@ -1106,6 +1106,19 @@ mod tests {
     }
 
     #[test]
+    fn diff_nested_value_display() {
+        // Display of complex/nested values (lists of lists, Option/Result nesting,
+        // Map/Set with nested elements, reduced Rationals) is byte-identical on both
+        // engines — programs that print/log structured values agree everywhere.
+        assert_eq!(differential("fun probe() -> Str {\n    \"{[[1, 2], [3], []]}\"\n}\n"), "[[1, 2], [3], []]");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{[Some(1), None, Some(3)]}\"\n}\n"), "[Some(1), None, Some(3)]");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{Map().insert(\"a\", [1, 2]).insert(\"b\", [3])}\"\n}\n"), "Map{\"a\": [1, 2], \"b\": [3]}");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{Set([3, 1, 2])}\"\n}\n"), "Set{3, 1, 2}");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{[rat(1, 2), rat(2, 4)]}\"\n}\n"), "[1/2, 1/2]");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{Map().insert(\"x\", Map().insert(\"y\", 1))}\"\n}\n"), "Map{\"x\": Map{\"y\": 1}}");
+    }
+
+    #[test]
     fn diff_datetime_format_and_parse() {
         // Deterministic UTC civil-calendar math — format/components/parse are
         // byte-identical across engines for fixed epochs incl. pre-1970 and extreme
