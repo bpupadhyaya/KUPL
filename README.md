@@ -239,6 +239,14 @@ pure functions with **inferred + enforced effects** (`pub`/`expose` must declare
 multi-file modules; `par` structured fork-join concurrency; `ai fun` typed prompt functions with structured output and a provider-agnostic runtime (Anthropic, OpenAI-compatible, Ollama, deterministic mock), tool use (model calls KUPL functions), interpolated intents, agent components (stateful, multi-turn); the canonical formatter; semantic diff; JSON diagnostics;
 component manifests; an LSP server; and four verified execution modes.
 
+## Documentation
+
+Start at the **[documentation home](docs/index.md)** — a docs.python.org-style
+index tying everything together. New users should read
+**[Getting Started](docs/guide/getting-started.md)** then work through
+**[The KUPL Tutorial](docs/guide/tutorial.md)** (a hands-on tour of the whole
+language, every example verified against the toolchain).
+
 ## Reference documentation
 
 - [`docs/reference/LANGUAGE-REFERENCE.md`](docs/reference/LANGUAGE-REFERENCE.md) — the language reference manual (as implemented): lexical structure, types, expressions, statements, functions & effects, components, contracts, supervision, semantics
