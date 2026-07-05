@@ -1106,6 +1106,22 @@ mod tests {
     }
 
     #[test]
+    fn diff_numeric_cast_and_overflow_panics() {
+        // Sized-int narrowing that doesn't fit, integer .pow overflow, a negative
+        // exponent, and i64::MIN.abs() all raise the SAME clean panic on both
+        // engines (certified consistent — the native backend matches too, see the
+        // cgen tests). No wrap, no UB, no ICE.
+        assert_eq!(differential("fun probe() -> Str {\n    \"{300.to_i8()}\"\n}\n"), "panic: 300 out of range for `i8`");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{(0 - 1).to_u8()}\"\n}\n"), "panic: -1 out of range for `u8`");
+        assert_eq!(differential("fun probe() -> Int {\n    2.pow(100)\n}\n"), "panic: integer overflow in pow");
+        assert_eq!(differential("fun probe() -> Int {\n    2.pow(0 - 1)\n}\n"), "panic: `pow` needs a non-negative exponent");
+        assert_eq!(differential("fun probe() -> Int {\n    ((0 - 9223372036854775807) - 1).abs()\n}\n"), "panic: integer overflow in abs");
+        // in-range casts / pow are unchanged
+        assert_eq!(differential("fun probe() -> Int {\n    127.to_i8().to_int()\n}\n"), "127");
+        assert_eq!(differential("fun probe() -> Int {\n    2.pow(62)\n}\n"), "4611686018427387904");
+    }
+
+    #[test]
     fn diff_float_to_int_saturates() {
         // Float.to_int() is a saturating cast (Rust `as i64`): out-of-range floats
         // clamp to i64::MIN/MAX and NaN -> 0. Both engines must agree (the native

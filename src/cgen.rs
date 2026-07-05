@@ -4439,6 +4439,25 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native sized-int narrowing / .pow / abs overflow all PANIC (no C-UB wrap or
+    /// bogus value) — matching the interpreter. Certified in PR-it27.
+    #[test]
+    fn native_numeric_overflow_panics() {
+        if !cc_available() {
+            return;
+        }
+        // each program overflows; a clean panic writes to stderr and leaves stdout
+        // empty (a C-UB wrap would have printed a bogus value).
+        for (src, tag) in [
+            ("fun main() uses io {\n    print(300.to_i8())\n}\n", "toi8"),
+            ("fun main() uses io {\n    print(2.pow(100))\n}\n", "pow"),
+            ("fun main() uses io {\n    print(((0 - 9223372036854775807) - 1).abs())\n}\n", "absmin"),
+        ] {
+            let out = native_main_stdout(src, tag);
+            assert!(out.trim().is_empty(), "{tag}: expected a panic, got stdout {out:?}");
+        }
+    }
+
     /// Native Float.to_int() saturates like the interpreter's `as i64` (was a raw
     /// C cast — UB out of range, returned garbage). PR-it26.
     #[test]
