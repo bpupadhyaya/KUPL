@@ -214,6 +214,8 @@ pub const BUILTIN_DATE_MAKE: u8 = 49;
 pub const BUILTIN_PARSE_ISO: u8 = 50;
 pub const BUILTIN_DATE_ISO: u8 = 51;
 pub const BUILTIN_YEARDAY_OF: u8 = 52;
+pub const BUILTIN_READ_LINE: u8 = 53;
+pub const BUILTIN_READ_ALL: u8 = 54;
 
 impl Module {
     pub fn disassemble(&self) -> String {

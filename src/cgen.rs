@@ -400,6 +400,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_PARSE_ISO => format!("regs[{dst}] = k_parse_iso(regs[{start}]); (void){argc};"),
             BUILTIN_DATE_MAKE => format!("regs[{dst}] = k_date_make(regs[{start}], regs[{start}+1], regs[{start}+2], regs[{start}+3], regs[{start}+4], regs[{start}+5]); (void){argc};"),
             BUILTIN_NOW => format!("regs[{dst}] = k_now(); (void){start}; (void){argc};"),
+            BUILTIN_READ_LINE => format!("regs[{dst}] = k_read_line(); (void){start}; (void){argc};"),
+            BUILTIN_READ_ALL => format!("regs[{dst}] = k_read_all(); (void){start}; (void){argc};"),
             BUILTIN_BASE64_ENCODE => format!("regs[{dst}] = k_base64_encode(regs[{start}]); (void){argc};"),
             BUILTIN_BASE64_DECODE => format!("regs[{dst}] = k_base64_decode(regs[{start}]); (void){argc};"),
             BUILTIN_HEX_ENCODE => format!("regs[{dst}] = k_hex_encode(regs[{start}]); (void){argc};"),
@@ -2326,6 +2328,28 @@ static KValue k_parse_iso(KValue sv) {
     return k_ok(k_int(k_make(y, mo, d, hh, mi, ss)));
 }
 static KValue k_now(void) { return k_int((int64_t)time(0)); }
+/* read one line from stdin (newline stripped); None at EOF */
+static KValue k_read_line(void) {
+    KBuf b = { 0, 0, 0 };
+    int c, any = 0;
+    while ((c = getchar()) != EOF) {
+        any = 1;
+        if (c == '\n') break;
+        char ch = (char)c;
+        kb_write(&b, &ch, 1);
+    }
+    if (!any) return k_none();
+    /* strip a trailing \r (CRLF input) */
+    if (b.len > 0 && b.buf[b.len - 1] == '\r') { b.len--; b.buf[b.len] = 0; }
+    return k_some(k_str(b.buf ? b.buf : ""));
+}
+/* read all of stdin into a single string */
+static KValue k_read_all(void) {
+    KBuf b = { 0, 0, 0 };
+    char chunk[4096]; size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, stdin)) > 0) kb_write(&b, chunk, (long)n);
+    return k_str(b.buf ? b.buf : "");
+}
 
 /* ---- seeded random (xorshift64*); mirrors interp::SeedRng exactly ---- */
 static uint64_t k_rng_next(uint64_t* s) {
@@ -3581,6 +3605,42 @@ mod tests {
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Stdin builtins (it59): read_line strips the newline and returns None at
+    /// EOF; read_all reads everything. Native == the deterministic expectations
+    /// for both piped input and empty stdin.
+    #[test]
+    fn native_stdin() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    var n = 0\n    var c = 0\n    \
+                   while let Some(l) = read_line() {\n        n = n + 1\n        c = c + l.len()\n    }\n    \
+                   print(\"lines={n} chars={c}\")\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-stdin-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let run_with = |input: &str| -> String {
+            use std::io::Write;
+            let mut child = std::process::Command::new(&bin)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(run_with("ab cd\nX\n"), "lines=2 chars=6\n"); // "ab cd"=5 + "X"=1
+        assert_eq!(run_with(""), "lines=0 chars=0\n"); // EOF-safe
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
     }
 
     /// A virtual-clock timer (`on every`) compiles and fires up to the 100-fire

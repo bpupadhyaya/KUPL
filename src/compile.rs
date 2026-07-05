@@ -1063,6 +1063,8 @@ impl<'s> FnCompiler<'s> {
                 ("json_stringify", 1) => Some(BUILTIN_JSON_STRINGIFY),
                 ("env_var", 1) => Some(BUILTIN_ENV_VAR),
                 ("args", 0) => Some(BUILTIN_ARGS),
+                ("read_line", 0) => Some(BUILTIN_READ_LINE),
+                ("read_all", 0) => Some(BUILTIN_READ_ALL),
                 ("eprint", 1) => Some(BUILTIN_EPRINT),
                 ("exit", 1) => Some(BUILTIN_EXIT),
                 ("random_ints", 2) => Some(BUILTIN_RANDOM_INTS),

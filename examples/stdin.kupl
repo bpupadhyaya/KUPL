@@ -1,0 +1,29 @@
+// Reading standard input — the basis of Unix-filter programs.
+//
+//   read_line() -> Option[Str]   one line (newline stripped), None at EOF
+//   read_all()  -> Str           the whole of stdin as one string
+//
+// Both carry the `io.env` effect (they read ambient input, like `args()`).
+//
+// This is a `wc`-style filter: it counts lines, words, and characters. It is
+// EOF-safe — with no input it prints a deterministic zero result — so it runs
+// unchanged in the test suite. Try it for real:
+//
+//   echo "hello world" | kupl run examples/stdin.kupl
+//   kupl native examples/stdin.kupl -o wc && some-command | ./wc
+
+fun main() uses io {
+    var lines = 0
+    var words = 0
+    var chars = 0
+    while let Some(line) = read_line() {
+        lines = lines + 1
+        chars = chars + line.len()
+        for w in line.split(" ") {
+            if w.len() > 0 {
+                words = words + 1
+            }
+        }
+    }
+    print("lines={lines} words={words} chars={chars}")
+}

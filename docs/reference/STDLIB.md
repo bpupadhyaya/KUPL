@@ -26,6 +26,8 @@ unless supervised.
 | `json_stringify(j)` | `(Json) -> Str` | compact; object key order preserved |
 | `args()` | `() -> List[Str]` — **uses `io.env`** | the program's command-line arguments |
 | `env_var(name)` | `(Str) -> Option[Str]` — **uses `io.env`** | environment variable, or `None` |
+| `read_line()` | `() -> Option[Str]` — **uses `io.env`** | one line from stdin (trailing newline stripped); `None` at EOF |
+| `read_all()` | `() -> Str` — **uses `io.env`** | all of stdin as one string (empty at EOF) |
 | `eprint(v)` | `(any) -> Unit` — **uses `io`** | prints Display form + newline to stderr |
 | `exit(code)` | `(Int) -> !` | flushes stdout and terminates the process |
 | `random_ints(seed, count)` | `(Int, Int) -> List[Int]` | deterministic; `count ≤ 0` → empty |
@@ -56,9 +58,13 @@ unless supervised.
 | `re_find_all(pat, text)` | `(Str, Str) -> List[Str]` | all non-overlapping matches |
 | `re_replace(pat, text, repl)` | `(Str, Str, Str) -> Str` | replace all matches with `repl` |
 
-`args`/`env_var` read ambient input, so they carry the `io.env` effect (a
-sub-effect of `io`). `args()` is everything after `--` when run through the
-toolchain (`kupl run prog.kupl -- a b`) and `argv[1..]` for a native binary.
+`args`/`env_var`/`read_line`/`read_all` read ambient input, so they carry the
+`io.env` effect (a sub-effect of `io`). `args()` is everything after `--` when
+run through the toolchain (`kupl run prog.kupl -- a b`) and `argv[1..]` for a
+native binary. `read_line`/`read_all` read standard input — the basis of
+Unix-filter programs (`echo … | kupl run filter.kupl`); `read_line` strips the
+trailing newline and returns `None` at end of input, so `while let Some(l) =
+read_line() { … }` drains stdin.
 `exit` diverges (like `panic`) so it needs no effect.
 
 `random_ints` / `random_floats` / `shuffle` are **pure** (no effect): a given

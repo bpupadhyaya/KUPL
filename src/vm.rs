@@ -562,10 +562,13 @@ impl<'m> Vm<'m> {
                             Ok(s) => set!(dst, Value::str(s)),
                             Err(msg) => return Err(VmError { msg, span }),
                         },
-                        BUILTIN_ENV_VAR | BUILTIN_ARGS | BUILTIN_EPRINT => {
+                        BUILTIN_ENV_VAR | BUILTIN_ARGS | BUILTIN_EPRINT
+                        | BUILTIN_READ_LINE | BUILTIN_READ_ALL => {
                             let name = match which {
                                 BUILTIN_ENV_VAR => "env_var",
                                 BUILTIN_ARGS => "args",
+                                BUILTIN_READ_LINE => "read_line",
+                                BUILTIN_READ_ALL => "read_all",
                                 _ => "eprint",
                             };
                             match crate::interp::proc_builtin(name, &args) {

@@ -959,7 +959,9 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return proc_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
                 }
-                ("args", 0) => return proc_builtin(name, &[]).map_err(|m| Self::panic_flow(m, span)),
+                ("args", 0) | ("read_line", 0) | ("read_all", 0) => {
+                    return proc_builtin(name, &[]).map_err(|m| Self::panic_flow(m, span))
+                }
                 ("random_ints", 2) | ("random_floats", 2) | ("shuffle", 2) => {
                     let mut vals = Vec::with_capacity(2);
                     for a in args {
@@ -2469,6 +2471,28 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         "args" => Ok(Value::List(Rc::new(
             program_args().into_iter().map(Value::str).collect(),
         ))),
+        "read_line" => {
+            use std::io::BufRead;
+            let mut line = String::new();
+            let n = std::io::stdin().lock().read_line(&mut line).unwrap_or(0);
+            if n == 0 {
+                Ok(Value::none()) // EOF
+            } else {
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                Ok(Value::some(Value::str(line)))
+            }
+        }
+        "read_all" => {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = std::io::stdin().lock().read_to_string(&mut buf);
+            Ok(Value::str(buf))
+        }
         "eprint" => {
             eprintln!("{}", args[0]);
             Ok(Value::Unit)

@@ -1446,6 +1446,8 @@ impl Checker {
                     return Ty::Option(Box::new(Ty::Str));
                 }
                 ("args", 0) => return Ty::List(Box::new(Ty::Str)),
+                ("read_line", 0) => return Ty::Option(Box::new(Ty::Str)),
+                ("read_all", 0) => return Ty::Str,
                 ("random_ints", 2) => {
                     for a in args {
                         let t = self.infer_expr(&a.value, ctx);

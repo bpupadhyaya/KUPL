@@ -232,7 +232,7 @@ fn builtin_effects(name: &str) -> Option<&'static str> {
             Some("io.fs")
         }
         // reading the environment / command line — another `io` sub-effect
-        "env_var" | "args" => Some("io.env"),
+        "env_var" | "args" | "read_line" | "read_all" => Some("io.env"),
         // network access — another `io` sub-effect
         "http_get" | "http_post" => Some("io.net"),
         // reading the wall clock — another `io` sub-effect (format_time and the
