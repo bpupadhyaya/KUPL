@@ -1058,6 +1058,25 @@ impl Checker {
         }
     }
 
+    /// Operator overloading: if `t` is a user-defined type and a matching
+    /// two-argument operator function exists (`add`/`sub`/…/`lt`/…), type the
+    /// expression as that function's return type. Returns `None` otherwise, so
+    /// the built-in numeric/string path is untouched.
+    fn operator_overload(&mut self, op: BinOp, t: &Ty, span: Span) -> Option<Ty> {
+        if !matches!(t, Ty::Named(_)) {
+            return None;
+        }
+        let fname = crate::interp::op_overload_name(op)?;
+        let (params, ret, qvars) = self.checked.funs.get(fname).cloned()?;
+        let (params, ret) = self.instantiate_scheme(&params, &ret, &qvars);
+        if params.len() != 2 {
+            return None;
+        }
+        self.unify(&params[0], t, span, "operator operand");
+        self.unify(&params[1], t, span, "operator operand");
+        Some(self.uni.apply(&ret))
+    }
+
     fn infer_expr(&mut self, expr: &Expr, ctx: &mut Ctx) -> Ty {
         match &expr.kind {
             ExprKind::Int(_) => Ty::Int,
@@ -1148,6 +1167,9 @@ impl Checker {
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         self.unify(&lt, &rt, expr.span, "comparison");
                         let t = self.uni.apply(&lt);
+                        if let Some(ret) = self.operator_overload(*op, &t, expr.span) {
+                            return ret;
+                        }
                         let t = self.default_numeric(t);
                         if !t.is_numeric() && t != Ty::Str {
                             self.err("K0234", format!("cannot order values of type {t}"), expr.span);
@@ -1157,6 +1179,9 @@ impl Checker {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                         self.unify(&lt, &rt, expr.span, "arithmetic");
                         let t = self.uni.apply(&lt);
+                        if let Some(ret) = self.operator_overload(*op, &t, expr.span) {
+                            return ret;
+                        }
                         let t = self.default_numeric(t);
                         let str_ok = *op == BinOp::Add && t == Ty::Str;
                         let tensor_ok = t == Ty::Tensor && *op != BinOp::Rem;
@@ -1164,7 +1189,22 @@ impl Checker {
                             return t;
                         }
                         if !t.is_numeric() && !str_ok {
-                            self.err("K0235", format!("arithmetic needs Int or Float operands, found {t}"), expr.span);
+                            self.err(
+                                "K0235",
+                                format!(
+                                    "arithmetic needs Int or Float operands, found {t}{}",
+                                    if matches!(t, Ty::Named(_)) {
+                                        format!(
+                                            " — define `fun {}(a: {t}, b: {t}) -> {t}` to overload `{}`",
+                                            crate::interp::op_overload_name(*op).unwrap_or("add"),
+                                            op_symbol(*op),
+                                        )
+                                    } else {
+                                        String::new()
+                                    }
+                                ),
+                                expr.span,
+                            );
                         }
                         t
                     }
@@ -2308,5 +2348,15 @@ fn op_sym(op: AssignOp) -> &'static str {
         AssignOp::Sub => "-",
         AssignOp::Mul => "*",
         AssignOp::Div => "/",
+    }
+}
+
+/// The source symbol for a binary operator (used in diagnostics).
+fn op_symbol(op: crate::ast::BinOp) -> &'static str {
+    use crate::ast::BinOp::*;
+    match op {
+        Add => "+", Sub => "-", Mul => "*", Div => "/", Rem => "%",
+        Lt => "<", Le => "<=", Gt => ">", Ge => ">=",
+        Eq => "==", Ne => "!=", And => "&&", Or => "||",
     }
 }

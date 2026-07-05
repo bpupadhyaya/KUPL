@@ -1,0 +1,34 @@
+// Operator overloading — define `add`/`sub`/`mul`/`div`/`lt`/... for your own
+// type and the operators `+ - * / < <= > >=` work on it. Equality (`==`/`!=`)
+// stays structural, so it needs no definition.
+
+type Vec2 = { x: Int, y: Int }
+
+fun add(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x + b.x, y: a.y + b.y) }
+fun sub(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x - b.x, y: a.y - b.y) }
+fun mul(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x * b.x, y: a.y * b.y) }
+
+// order by squared magnitude
+fun mag2(v: Vec2) -> Int { v.x * v.x + v.y * v.y }
+fun lt(a: Vec2, b: Vec2) -> Bool { mag2(a) < mag2(b) }
+fun gt(a: Vec2, b: Vec2) -> Bool { mag2(a) > mag2(b) }
+
+fun show(v: Vec2) -> Str { "({v.x}, {v.y})" }
+
+fun main() uses io {
+    let a = Vec2(x: 1, y: 2)
+    let b = Vec2(x: 3, y: 4)
+    print("a + b = {show(a + b)}")     // (4, 6)
+    print("b - a = {show(b - a)}")     // (2, 2)
+    print("a * b = {show(a * b)}")     // (3, 8)
+    print("a < b = {a < b}")           // true
+    print("a > b = {a > b}")           // false
+    print("a == a = {a == a}")         // true (structural)
+    print("a == b = {a == b}")         // false
+}
+
+law "operators on a user type" {
+    expect (Vec2(x: 1, y: 2) + Vec2(x: 3, y: 4)) == Vec2(x: 4, y: 6)
+    expect (Vec2(x: 5, y: 5) - Vec2(x: 1, y: 1)) == Vec2(x: 4, y: 4)
+    expect Vec2(x: 1, y: 1) < Vec2(x: 3, y: 3)
+}

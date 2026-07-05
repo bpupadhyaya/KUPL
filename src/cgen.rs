@@ -961,6 +961,7 @@ static KValue k_tensor_new(double* data, int64_t n) {
 }
 
 static int k_eq(KValue a, KValue b);
+static int k_op_overload(const char* name, KValue a, KValue b, KValue* out);
 
 static KValue k_map_new(void) {
     KMap* m = k_alloc(sizeof(KMap));
@@ -1272,6 +1273,7 @@ static KValue k_add(KValue a, KValue b) {
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 0);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_add(a, b));
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_add(a, b));
+    { KValue _o; if (a.tag == K_CTOR && k_op_overload("add", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_sub(KValue a, KValue b) {
@@ -1286,6 +1288,7 @@ static KValue k_sub(KValue a, KValue b) {
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 1);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_sub(a, b));
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_sub(a, b));
+    { KValue _o; if (a.tag == K_CTOR && k_op_overload("sub", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_mul(KValue a, KValue b) {
@@ -1300,6 +1303,7 @@ static KValue k_mul(KValue a, KValue b) {
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 2);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_mul(a, b));
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_mul(a, b));
+    { KValue _o; if (a.tag == K_CTOR && k_op_overload("mul", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_div(KValue a, KValue b) {
@@ -1314,6 +1318,7 @@ static KValue k_div(KValue a, KValue b) {
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 3);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_divmod(a, b, 0));
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_div(a, b));
+    { KValue _o; if (a.tag == K_CTOR && k_op_overload("div", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_rem(KValue a, KValue b) {
@@ -1325,6 +1330,7 @@ static KValue k_rem(KValue a, KValue b) {
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(fmod(a.as.f, b.as.f));
     if (a.tag == K_F32 && b.tag == K_F32) return k_f32(fmodf(a.as.f32v, b.as.f32v));
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 4);
+    { KValue _o; if (a.tag == K_CTOR && k_op_overload("rem", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
@@ -1336,6 +1342,12 @@ static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
     else if (a.tag == K_STR && b.tag == K_STR) { is_str = 1; int r = strcmp(a.as.s, b.as.s); c = (r < 0) ? -1 : (r > 0); }
     else if (a.tag == K_BIGINT && b.tag == K_BIGINT) { c = k_big_cmp(a, b); }
     else if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { c = k_rat_cmp(a, b); }
+    else if (a.tag == K_CTOR) {
+        static const char* CMPFN[4] = { "lt", "le", "gt", "ge" };
+        KValue _o;
+        if (op >= 0 && op < 4 && k_op_overload(CMPFN[op], a, b, &_o)) return _o;
+        k_panic("invalid operand types");
+    }
     else { k_panic("invalid operand types"); }
     (void)is_str;
     switch (op) {
@@ -2874,6 +2886,18 @@ static KValue k_expose_call(KValue recv, const char* name, KValue* args, int arg
 typedef struct { const char* name; int fnid; } KUfcs;
 extern const KUfcs UFCS_FUNS[];
 extern const int K_NUFCS;
+/* operator overloading: call a top-level operator function (`add`/`lt`/…) on
+   user values. Returns 1 and sets *out if the function exists, else 0. */
+static int k_op_overload(const char* name, KValue a, KValue b, KValue* out) {
+    for (int i = 0; i < K_NUFCS; i++) {
+        if (!strcmp(UFCS_FUNS[i].name, name)) {
+            KValue args[2] = { a, b };
+            *out = k_call(k_fun(UFCS_FUNS[i].fnid), args, 2);
+            return 1;
+        }
+    }
+    return 0;
+}
 
 /* stable sort by an Int key: qsort with an original-index tiebreak */
 typedef struct { int64_t key; int idx; KValue v; } KSortItem;
@@ -4096,6 +4120,19 @@ mod tests {
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Operator overloading (it71): `+` and `<` on a user type resolve to
+    /// top-level `add`/`lt` functions and compile to native, matching interp.
+    #[test]
+    fn native_operator_overload() {
+        let src = "type V = { x: Int }\n\
+                   fun add(a: V, b: V) -> V { V(x: a.x + b.x) }\n\
+                   fun lt(a: V, b: V) -> Bool { a.x < b.x }\n\
+                   fun main() uses io {\n    print((V(x: 2) + V(x: 3)).x)\n    print(V(x: 1) < V(x: 9))\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "operators"), "5\ntrue\n");
+        }
     }
 
     /// Rational (it70) compiles to native, reusing the C bignum: exact fraction

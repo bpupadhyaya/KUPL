@@ -242,6 +242,33 @@ par { f(a)  g(b)  h(c) }            // structured fork-join → List of results
   args…)` (same types, effects, and result). Built-in methods win, so a UFCS
   function should not share a name with a built-in method. No match is K0249.
 
+### 4.05 Operator overloading
+
+Binary operators work on your own types. When the operands are a user-defined
+type (a record or ADT), the operator resolves to a top-level function named for
+it — exactly like UFCS — and every engine executes that call:
+
+| Operator | Function | | Operator | Function |
+|---|---|---|---|---|
+| `a + b` | `add(a, b)` | | `a < b` | `lt(a, b)` |
+| `a - b` | `sub(a, b)` | | `a <= b` | `le(a, b)` |
+| `a * b` | `mul(a, b)` | | `a > b` | `gt(a, b)` |
+| `a / b` | `div(a, b)` | | `a >= b` | `ge(a, b)` |
+| `a % b` | `rem(a, b)` | | | |
+
+```kupl
+type Vec2 = { x: Int, y: Int }
+fun add(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x + b.x, y: a.y + b.y) }
+// now `v1 + v2` works
+```
+
+`==` and `!=` are **structural** on all values (they compare fields/variants
+directly), so they are not overloadable and need no definition. Using an
+operator on a user type with no matching function is a type error (K0234/K0235)
+that names the exact function to define. Built-in numeric and string operators
+are unaffected — only user-typed operands take this path. See
+`examples/operators.kupl`.
+
 ### 4.1 Concurrency — `par` (structured fork-join)
 
 `par { branch1  branch2  … }` evaluates a set of **independent** branches and

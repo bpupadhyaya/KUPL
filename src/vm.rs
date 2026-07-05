@@ -412,7 +412,24 @@ impl<'m> Vm<'m> {
                     let r = reg!($b);
                     match raw_binary_op($op, &l, &r) {
                         Ok(v) => set!($dst, v),
-                        Err(msg) => return Err(VmError { msg, span }),
+                        Err(msg) => {
+                            // operator overloading: a user value falls back to a
+                            // top-level operator function (`a + b` -> `add(a, b)`)
+                            let overload = matches!(l, Value::Ctor { .. })
+                                .then(|| crate::interp::op_overload_name($op))
+                                .flatten()
+                                .filter(|f| self.module.funs.contains_key(*f));
+                            match overload {
+                                Some(fname) => {
+                                    let f = Value::Fun(std::rc::Rc::new(fname.to_string()));
+                                    match self.call_value_nested(f, vec![l, r]) {
+                                        Ok(v) => set!($dst, v),
+                                        Err(msg) => return Err(VmError { msg, span }),
+                                    }
+                                }
+                                None => return Err(VmError { msg, span }),
+                            }
+                        }
                     }
                 }};
             }

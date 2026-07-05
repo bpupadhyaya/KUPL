@@ -486,7 +486,7 @@ impl Interp {
                         AssignOp::Div => BinOp::Div,
                         AssignOp::Set => unreachable!(),
                     };
-                    binary_op(bin, old, rhs, *span)?
+                    self.binary_or_overload(bin, old, rhs, *span)?
                 };
                 if !env.set(name, new_value) {
                     return Err(Self::panic_flow(format!("unknown variable `{name}`"), *span));
@@ -758,7 +758,7 @@ impl Interp {
                 }
                 let l = self.eval(lhs, env)?;
                 let r = self.eval(rhs, env)?;
-                binary_op(*op, l, r, expr.span)
+                self.binary_or_overload(*op, l, r, expr.span)
             }
             ExprKind::Unary { op, operand } => {
                 let v = self.eval(operand, env)?;
@@ -1142,6 +1142,25 @@ impl Interp {
         self.call_value(f, avs, span)
     }
 
+    /// Evaluate a binary operator, falling back to an overloaded operator
+    /// function when the operands are user-defined values (`a + b` -> `add(a, b)`).
+    fn binary_or_overload(&mut self, op: BinOp, l: Value, r: Value, span: Span) -> EvalResult {
+        match raw_binary_op(op, &l, &r) {
+            Ok(v) => Ok(v),
+            Err(msg) => {
+                if let Value::Ctor { .. } = l {
+                    if let Some(fname) = op_overload_name(op) {
+                        if let Some(decl) = self.db.funs.get(fname).cloned() {
+                            let env = self.globals.clone();
+                            return self.call_fun(&decl, vec![l, r], &env, span);
+                        }
+                    }
+                }
+                Err(Flow::Panic { msg, span })
+            }
+        }
+    }
+
     pub fn call_value(&mut self, f: Value, args: Vec<Value>, span: Span) -> EvalResult {
         match f {
             Value::Bound(id, name) => self.eval_method(Value::Component(id), &name, args, span),
@@ -1431,6 +1450,24 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
 
 fn binary_op(op: BinOp, l: Value, r: Value, span: Span) -> EvalResult {
     raw_binary_op(op, &l, &r).map_err(|msg| Flow::Panic { msg, span })
+}
+
+/// Operator overloading: the top-level function a binary operator on a
+/// user-defined type resolves to (`a + b` -> `add(a, b)`, `a < b` -> `lt(a, b)`).
+/// `==`/`!=` stay structural, so they are not overloadable.
+pub fn op_overload_name(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Add => "add",
+        BinOp::Sub => "sub",
+        BinOp::Mul => "mul",
+        BinOp::Div => "div",
+        BinOp::Rem => "rem",
+        BinOp::Lt => "lt",
+        BinOp::Le => "le",
+        BinOp::Gt => "gt",
+        BinOp::Ge => "ge",
+        _ => return None,
+    })
 }
 
 pub fn match_pattern(pat: &Pattern, value: &Value, env: &Env) -> bool {
