@@ -2470,10 +2470,14 @@ static KRegex k_re_compile(const char* pat) {
 }
 
 /* matcher — recursive, mirrors regex.rs match_here/seq/piece/atom exactly */
+static int k_utf8_len(unsigned char c); /* defined earlier in the runtime; fwd-decl for `.` */
 static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, int* out);
 static int kre_atom_match(KReAtom* a, const unsigned char* t, int tlen, int pos, int* np) {
     switch (a->kind) {
-        case 0: if (pos < tlen) { *np = pos + 1; return 1; } return 0;
+        /* `.` matches any single CHARACTER — advance a full UTF-8 codepoint, not
+           one byte, so it mirrors the interpreter (which matches over chars) and
+           never returns an invalid-UTF-8 byte fragment. */
+        case 0: if (pos < tlen) { *np = pos + k_utf8_len(t[pos]); return 1; } return 0;
         case 1: if (pos < tlen && t[pos] == a->ch) { *np = pos + 1; return 1; } return 0;
         case 2: {
             if (pos >= tlen) return 0;
@@ -4497,6 +4501,23 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native regex matches the interpreter, incl. `.` over multi-byte characters
+    /// (was one byte -> invalid-UTF-8 fragments; PR-it42). ASCII unchanged.
+    #[test]
+    fn native_regex_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(re_find_all(\"[0-9]+\", \"a1b22c333\"))\n    \
+                   print(re_replace(\"[0-9]+\", \"#\", \"a1b22c\"))\n    \
+                   print(re_find(\".\", \"日本\"))\n    print(re_find(\"a.*z\", \"a日本z\"))\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "regex").trim(),
+            "[\"1\", \"22\", \"333\"]\na#b#c\nSome(\"日\")\nSome(\"a日本z\")"
+        );
     }
 
     /// Native par_map / par{} produce the SAME order-preserving result as the

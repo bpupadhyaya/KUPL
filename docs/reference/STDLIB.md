@@ -101,7 +101,10 @@ native backend too (via the system `curl`).
 (greedy), classes `[a-z]`/`[^…]`, `\d \w \s` (+ `\D \W \S`), anchors
 `^`/`$`, alternation `|`, groups `(...)`, and `\`-escapes. `re_match` searches
 (anchor with `^…$` for a full match). A malformed pattern **panics** with a
-clear message. Compiles on the native backend too (byte-oriented, ASCII-correct).
+clear message. `.` matches a full character (multi-byte-safe) on every engine;
+character **classes/ranges** (`[a-z]`, `\w`, …) are ASCII-oriented on the native
+backend, so non-ASCII class matching may differ there — use `.` for arbitrary
+characters.
 
 **Time**: `date_make`, `date_iso`, `parse_iso`, `format_time`, and the `*_of`
 extractors are pure, deterministic UTC calendar math (epoch seconds ↔ civil

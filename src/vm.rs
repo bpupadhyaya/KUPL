@@ -1106,6 +1106,20 @@ mod tests {
     }
 
     #[test]
+    fn diff_regex_ops() {
+        // The shared regex engine (src/regex.rs) — match/find/find_all/replace and
+        // invalid-pattern panics are byte-identical on both engines, and `.` matches
+        // a full character (incl. multi-byte, after the it42 native fix).
+        assert_eq!(differential("fun probe() -> Str {\n    \"{re_find_all(\"[0-9]+\", \"a1b22c333\")}\"\n}\n"), "[\"1\", \"22\", \"333\"]");
+        assert_eq!(differential("fun probe() -> Str {\n    re_replace(\"[0-9]+\", \"#\", \"a1b22c\")\n}\n"), "a#b#c");
+        assert_eq!(differential("fun probe() -> Bool {\n    re_match(\"^a.c$\", \"abc\")\n}\n"), "true");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{re_find(\".\", \"日本\")}\"\n}\n"), "Some(\"日\")");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{re_find(\"a.*z\", \"a日本z\")}\"\n}\n"), "Some(\"a日本z\")");
+        // invalid pattern -> identical clean panic
+        assert_eq!(differential("fun probe() -> Bool {\n    re_match(\"(abc\", \"abc\")\n}\n"), "panic: invalid regex: unclosed group `(`");
+    }
+
+    #[test]
     fn diff_par_determinism_and_panic() {
         // par_map / par_filter / par{} preserve INPUT order deterministically on both
         // engines (par_map runs branches on threads but joins in order), and a panic
