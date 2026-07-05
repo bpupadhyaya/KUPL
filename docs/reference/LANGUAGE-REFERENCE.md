@@ -200,6 +200,14 @@ par { f(a)  g(b)  h(c) }            // structured fork-join → List of results
 - **Or-patterns** — `P1 | P2 | … => …` matches if any alternative matches. An
   or-pattern arm covers each of its alternatives for exhaustiveness.
   Alternatives may **not** bind variables (K0258), so no binding-merge is needed.
+- **`@` bindings** — `name @ SUBPATTERN` binds `name` to the whole matched value
+  while also matching `SUBPATTERN` against it (e.g. `whole @ Circle(r) => …`
+  binds both `whole` and `r`). An `@` pattern covers whatever its inner pattern
+  covers (so `name @ _` is a catch-all). `@` binds, so it may not appear in an
+  or-pattern alternative (K0258).
+- **Range patterns** (Int) — `lo..hi` matches `lo ≤ x < hi` (half-open) and
+  `lo..=hi` matches `lo ≤ x ≤ hi` (inclusive). Ranges do **not** make an Int
+  match exhaustive (Int is unbounded), so a catch-all is still required.
 - `expr?` requires `expr : Result[T, E]` and an enclosing function returning
   `Result[_, E]`; on `Err(e)` the function returns early with that error. Not
   allowed in handlers (K0237) — handle the Result with `match` there.

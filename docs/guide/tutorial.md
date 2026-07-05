@@ -226,6 +226,23 @@ A guarded arm doesn't count toward exhaustiveness (it might not run), so a
 `match` still needs unguarded arms or a catch-all to cover every case.
 Or-pattern alternatives may not bind variables.
 
+Integer arms can also use **range patterns** (`lo..hi` half-open, `lo..=hi`
+inclusive), and **`@` bindings** capture the whole value while destructuring:
+
+```kupl
+match n {
+    0 => "zero"
+    1..10 => "small"            // 1 ≤ n < 10
+    10..=99 => "medium"         // 10 ≤ n ≤ 99
+    _ => "large"
+}
+
+match shape {
+    whole @ Circle(r) if r > 5 => big(whole)   // binds both `whole` and `r`
+    other => small(other)
+}
+```
+
 `Option` and `Result` (below) are themselves ADTs you match on.
 
 ---

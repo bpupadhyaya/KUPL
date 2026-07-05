@@ -2120,6 +2120,14 @@ impl Checker {
                     self.check_pattern(alt, expected, ctx);
                 }
             }
+            PatternKind::At { name, inner } => {
+                let ty = self.uni.apply(expected);
+                ctx.scopes.insert(name, ty, false);
+                self.check_pattern(inner, expected, ctx);
+            }
+            PatternKind::Range { .. } => {
+                self.unify(expected, &Ty::Int, pat.span, "range pattern");
+            }
         }
     }
 
@@ -2144,6 +2152,9 @@ impl Checker {
                         collect(a, catch_all, covered, bools);
                     }
                 }
+                // `name @ inner` covers whatever `inner` covers (so `name @ _`
+                // is a catch-all). Ranges never exhaust an unbounded Int.
+                PatternKind::At { inner, .. } => collect(inner, catch_all, covered, bools),
                 _ => {}
             }
         }
@@ -2206,7 +2217,7 @@ impl Checker {
 /// Whether a pattern binds any variable (used to reject binding or-patterns).
 fn pattern_binds_var(p: &Pattern) -> bool {
     match &p.kind {
-        PatternKind::Bind(_) => true,
+        PatternKind::Bind(_) | PatternKind::At { .. } => true,
         PatternKind::Ctor { args, .. } => args.iter().any(pattern_binds_var),
         PatternKind::Or(alts) => alts.iter().any(pattern_binds_var),
         _ => false,

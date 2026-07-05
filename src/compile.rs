@@ -1229,6 +1229,27 @@ impl<'s> FnCompiler<'s> {
                     self.pattern(arg, f, fails);
                 }
             }
+            PatternKind::At { name, inner } => {
+                // bind the whole value, then test the inner subpattern
+                let local = self.bind_local(name);
+                self.emit(Op::Move(local, v), span);
+                self.pattern(inner, v, fails);
+            }
+            PatternKind::Range { lo, hi, inclusive } => {
+                // v >= lo && v < hi (or v <= hi if inclusive)
+                let clo = self.const_reg(Value::Int(*lo), span);
+                let t1 = self.alloc(span);
+                self.emit(Op::Ge(t1, v, clo), span);
+                fails.push(self.emit(Op::JumpIfFalse(t1, 0), span));
+                let chi = self.const_reg(Value::Int(*hi), span);
+                let t2 = self.alloc(span);
+                if *inclusive {
+                    self.emit(Op::Le(t2, v, chi), span);
+                } else {
+                    self.emit(Op::Lt(t2, v, chi), span);
+                }
+                fails.push(self.emit(Op::JumpIfFalse(t2, 0), span));
+            }
             PatternKind::Or(alts) => {
                 // try each alternative; a match jumps past the block, a failed
                 // non-last alt falls through to the next, the last alt's fails
@@ -1413,6 +1434,10 @@ fn bind_pattern_names(p: &Pattern, bound: &mut HashSet<String>) {
             for a in args {
                 bind_pattern_names(a, bound);
             }
+        }
+        PatternKind::At { name, inner } => {
+            bound.insert(name.clone());
+            bind_pattern_names(inner, bound);
         }
         _ => {}
     }

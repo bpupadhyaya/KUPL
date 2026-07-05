@@ -499,6 +499,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             b'?' => Tok::Question,
+            b'@' => Tok::At,
             b',' => Tok::Comma,
             b':' => Tok::Colon,
             b'(' => {

@@ -1544,12 +1544,12 @@ impl Parser {
         match self.peek().clone() {
             Tok::Int(v) => {
                 self.bump();
-                Ok(Pattern { kind: PatternKind::Int(v), span })
+                self.maybe_range(v, span)
             }
             Tok::Minus => {
                 self.bump();
                 match self.bump() {
-                    Tok::Int(v) => Ok(Pattern { kind: PatternKind::Int(-v), span: span.merge(self.prev_span()) }),
+                    Tok::Int(v) => self.maybe_range(-v, span.merge(self.prev_span())),
                     other => Err(Diag::error(
                         "K0111",
                         format!("expected integer after `-` in pattern, found {}", other.describe()),
@@ -1601,6 +1601,14 @@ impl Parser {
                     Ok(Pattern { kind: PatternKind::Ctor { name, args }, span: span.merge(end) })
                 } else if is_ctor {
                     Ok(Pattern { kind: PatternKind::Ctor { name, args: Vec::new() }, span })
+                } else if self.eat(&Tok::At) {
+                    // `name @ SUBPATTERN` — bind the whole value AND match inner
+                    let inner = self.parse_pattern_primary()?;
+                    let end = inner.span;
+                    Ok(Pattern {
+                        kind: PatternKind::At { name, inner: Box::new(inner) },
+                        span: span.merge(end),
+                    })
                 } else {
                     Ok(Pattern { kind: PatternKind::Bind(name), span })
                 }
@@ -1611,6 +1619,35 @@ impl Parser {
                 span,
             )),
         }
+    }
+
+    /// After an Int literal in a pattern, an optional `..`/`..=` upper bound
+    /// turns it into a range pattern.
+    fn maybe_range(&mut self, lo: i64, span: Span) -> PResult<Pattern> {
+        let inclusive = match self.peek() {
+            Tok::DotDot => false,
+            Tok::DotDotEq => true,
+            _ => return Ok(Pattern { kind: PatternKind::Int(lo), span }),
+        };
+        self.bump();
+        let neg = self.eat(&Tok::Minus);
+        let hi = match self.bump() {
+            Tok::Int(v) => {
+                if neg {
+                    -v
+                } else {
+                    v
+                }
+            }
+            other => {
+                return Err(Diag::error(
+                    "K0111",
+                    format!("expected an integer upper bound in range pattern, found {}", other.describe()),
+                    self.prev_span(),
+                ))
+            }
+        };
+        Ok(Pattern { kind: PatternKind::Range { lo, hi, inclusive }, span: span.merge(self.prev_span()) })
     }
 
     // ---- types --------------------------------------------------------------

@@ -426,6 +426,10 @@ pub enum PatternKind {
     /// `A | B | C` — matches if any alternative matches. Alternatives may not
     /// bind variables (checked), so no binding-merge is needed.
     Or(Vec<Pattern>),
+    /// `name @ SUBPATTERN` — binds `name` to the whole value and matches inner.
+    At { name: String, inner: Box<Pattern> },
+    /// `lo..hi` (half-open) / `lo..=hi` (inclusive) — Int range pattern.
+    Range { lo: i64, hi: i64, inclusive: bool },
 }
 
 /// Type syntax as written in source.

@@ -3754,6 +3754,19 @@ mod tests {
         }
     }
 
+    /// Match `@` bindings and range patterns (it56) compile to native
+    /// byte-identically: ranges lower to two compares, `@` to a Move + inner.
+    #[test]
+    fn native_match_at_range() {
+        let src = "type S = C(r: Int)\n\
+                   fun b(n: Int) -> Str {\n    match n {\n        1..10 => \"s\"\n        10..=99 => \"m\"\n        _ => \"l\"\n    }\n}\n\
+                   fun d(x: S) -> Int {\n    match x {\n        w @ C(r) if r > 5 => r + 100\n        C(r) => r\n    }\n}\n\
+                   fun main() uses io {\n    print(\"{b(5)} {b(10)} {b(99)} {b(100)}\")\n    print(\"{d(C(8))} {d(C(3))}\")\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "matchar"), "s m m l\n108 3\n");
+        }
+    }
+
     /// Match guards and or-patterns (it55) compile to native byte-identically:
     /// or-patterns fan out to one body, guards fall through on false.
     #[test]

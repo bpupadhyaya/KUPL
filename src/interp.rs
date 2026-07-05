@@ -1356,6 +1356,17 @@ pub fn match_pattern(pat: &Pattern, value: &Value, env: &Env) -> bool {
             args.iter().zip(fields.iter()).all(|(p, v)| match_pattern(p, v, env))
         }
         (PatternKind::Or(alts), v) => alts.iter().any(|p| match_pattern(p, v, env)),
+        (PatternKind::At { name, inner }, v) => {
+            if match_pattern(inner, v, env) {
+                env.define(name, v.clone());
+                true
+            } else {
+                false
+            }
+        }
+        (PatternKind::Range { lo, hi, inclusive }, Value::Int(v)) => {
+            *v >= *lo && (if *inclusive { *v <= *hi } else { *v < *hi })
+        }
         _ => false,
     }
 }

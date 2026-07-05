@@ -85,6 +85,7 @@ pub enum Tok {
     Arrow,     // ->
     FatArrow,  // =>
     Question,
+    At, // @
     Dot,
     Comma,
     Colon,
@@ -284,6 +285,7 @@ impl Tok {
             Tok::Arrow => "->",
             Tok::FatArrow => "=>",
             Tok::Question => "?",
+            Tok::At => "@",
             Tok::Dot => ".",
             Tok::Comma => ",",
             Tok::Colon => ":",

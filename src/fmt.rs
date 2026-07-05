@@ -654,6 +654,10 @@ fn pattern_str(p: &Pattern) -> String {
             let a: Vec<String> = alts.iter().map(pattern_str).collect();
             a.join(" | ")
         }
+        PatternKind::At { name, inner } => format!("{name} @ {}", pattern_str(inner)),
+        PatternKind::Range { lo, hi, inclusive } => {
+            format!("{lo}..{}{hi}", if *inclusive { "=" } else { "" })
+        }
     }
 }
 
