@@ -2767,6 +2767,9 @@ static KValue k_base64_decode(KValue sv) {
         if (pad < 2) out[o++] = (unsigned char)(x >> 8 & 0xFF);
         if (pad < 1) out[o++] = (unsigned char)(x & 0xFF);
     }
+    /* reject a decoded NUL — KUPL strings are NUL-free (K0008); a C string would
+       truncate at it (divergence from interp). Matches the interpreter. */
+    if (memchr(out, 0, o)) return k_err(k_str("decoded bytes contain a NUL byte"));
     if (!k_valid_utf8(out, o)) return k_err(k_str("decoded bytes are not valid UTF-8"));
     out[o] = 0;
     return k_ok(k_str((char*)out));
@@ -2793,6 +2796,7 @@ static KValue k_hex_decode(KValue sv) {
         if (hi < 0 || lo < 0) return k_err(k_str("invalid hex: bad digit"));
         out[i / 2] = (unsigned char)((hi << 4) | lo);
     }
+    if (memchr(out, 0, n / 2)) return k_err(k_str("decoded bytes contain a NUL byte"));
     if (!k_valid_utf8(out, n / 2)) return k_err(k_str("decoded bytes are not valid UTF-8"));
     out[n / 2] = 0;
     return k_ok(k_str((char*)out));
@@ -4505,6 +4509,23 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native hex_decode/base64_decode reject a decoded NUL like the interpreter
+    /// (was: truncated the C string at it). Valid decode unchanged. PR-it46.
+    #[test]
+    fn native_codec_decode_nul_rejected() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{hex_decode(\"610062\")}\")\n    \
+                   print(\"{base64_decode(\"AA==\")}\")\n    \
+                   print(\"{hex_decode(hex_encode(\"héllo\"))}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "codecnul").trim(),
+            "Err(\"decoded bytes contain a NUL byte\")\nErr(\"decoded bytes contain a NUL byte\")\nOk(\"héllo\")"
+        );
     }
 
     /// Native url_decode rejects a decoded NUL (`%00`) like the interpreter (was:

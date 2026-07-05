@@ -1106,6 +1106,18 @@ mod tests {
     }
 
     #[test]
+    fn diff_codec_decode_nul_rejected() {
+        // hex_decode / base64_decode of bytes that include a NUL are REJECTED (a
+        // NUL would violate NUL-free strings; interp embedded it, native truncated
+        // — divergence, same class as the it45 url_decode fix). Valid decode and
+        // round-trips are unchanged.
+        assert_eq!(differential("fun probe() -> Str {\n    \"{hex_decode(\"610062\")}\"\n}\n"), "Err(\"decoded bytes contain a NUL byte\")");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{base64_decode(\"AA==\")}\"\n}\n"), "Err(\"decoded bytes contain a NUL byte\")");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{hex_decode(hex_encode(\"héllo\"))}\"\n}\n"), "Ok(\"héllo\")");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{base64_decode(base64_encode(\"data\"))}\"\n}\n"), "Ok(\"data\")");
+    }
+
+    #[test]
     fn diff_url_decode_nul_and_edges() {
         // url_decode of `%00` is REJECTED (a decoded NUL would violate KUPL's
         // NUL-free strings; interp used to embed it, native truncated at it —

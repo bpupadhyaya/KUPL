@@ -8,6 +8,16 @@
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// Decoded bytes -> a KUPL string. Rejects a NUL (K0008: KUPL strings are
+/// NUL-free — the native C runtime would truncate at it, a cross-engine
+/// divergence) and non-UTF-8. Shared by base64_decode and hex_decode.
+fn bytes_to_string(out: Vec<u8>) -> Result<String, String> {
+    if out.contains(&0) {
+        return Err("decoded bytes contain a NUL byte".into());
+    }
+    String::from_utf8(out).map_err(|_| "decoded bytes are not valid UTF-8".into())
+}
+
 pub fn base64_encode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
@@ -66,7 +76,7 @@ pub fn base64_decode(s: &str) -> Result<String, String> {
             out.push((n & 0xFF) as u8);
         }
     }
-    String::from_utf8(out).map_err(|_| "decoded bytes are not valid UTF-8".into())
+    bytes_to_string(out)
 }
 
 pub fn hex_encode(s: &str) -> String {
@@ -98,7 +108,7 @@ pub fn hex_decode(s: &str) -> Result<String, String> {
         let lo = nibble(pair[1]).ok_or("invalid hex: bad digit")?;
         out.push((hi << 4) | lo);
     }
-    String::from_utf8(out).map_err(|_| "decoded bytes are not valid UTF-8".into())
+    bytes_to_string(out)
 }
 
 /// FNV-1a, 64-bit. Non-cryptographic; stable across engines and runs.
