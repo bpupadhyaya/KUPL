@@ -491,7 +491,28 @@ impl Checker {
                     } else if self.checked.contracts.contains_key(other) {
                         Ty::Contract(other.to_string())
                     } else {
-                        self.err("K0205", format!("unknown type `{other}`"), t.span);
+                        let suggestion = {
+                            let builtins = [
+                                "Int", "Float", "Str", "Bool", "Unit", "List", "Map", "Set",
+                                "Option", "Result", "Json", "Tensor", "BigInt", "Rational",
+                                "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32",
+                            ]
+                            .into_iter();
+                            let cands = self
+                                .checked
+                                .types
+                                .keys()
+                                .map(String::as_str)
+                                .chain(self.checked.components.keys().map(String::as_str))
+                                .chain(self.checked.contracts.keys().map(String::as_str))
+                                .chain(builtins);
+                            suggest(other, cands)
+                        };
+                        let msg = match suggestion {
+                            Some(s) => format!("unknown type `{other}` (did you mean `{s}`?)"),
+                            None => format!("unknown type `{other}`"),
+                        };
+                        self.err("K0205", msg, t.span);
                         self.uni.fresh()
                     }
                 }
@@ -2428,7 +2449,21 @@ impl Checker {
                     }
                 }
                 other => match self.checked.ctors.get(other).cloned() {
-                    None => self.err("K0254", format!("unknown constructor `{other}` in pattern"), pat.span),
+                    None => {
+                        let suggestion = {
+                            let builtins = ["Some", "None", "Ok", "Err"].into_iter();
+                            let cands =
+                                self.checked.ctors.keys().map(String::as_str).chain(builtins);
+                            suggest(other, cands)
+                        };
+                        let msg = match suggestion {
+                            Some(s) => {
+                                format!("unknown constructor `{other}` in pattern (did you mean `{s}`?)")
+                            }
+                            None => format!("unknown constructor `{other}` in pattern"),
+                        };
+                        self.err("K0254", msg, pat.span)
+                    }
                     Some((tyname, fields)) => {
                         let (field_tys, result) = self.instantiate_ctor(&tyname, &fields);
                         self.unify(expected, &result, pat.span, "pattern");
@@ -2613,6 +2648,20 @@ mod generic_tests {
         let e2 = errors("fun main() { let z = zzzzqqq }\n");
         assert!(e2.iter().any(|d| d.code == "K0240"));
         assert!(!e2.iter().any(|d| d.message.contains("did you mean")));
+    }
+
+    #[test]
+    fn did_you_mean_types_and_ctors() {
+        // unknown type -> nearest user type or built-in
+        let e = errors("type Shape = Circle(r: Int)\nfun f(x: Shpe) -> Int { 1 }\nfun main() {}\n");
+        assert!(e.iter().any(|d| d.message.contains("did you mean `Shape`?")), "{e:?}");
+        let e2 = errors("fun f(x: Flot) -> Int { 1 }\nfun main() {}\n");
+        assert!(e2.iter().any(|d| d.message.contains("did you mean `Float`?")), "{e2:?}");
+        // unknown constructor in a pattern -> nearest ctor
+        let e3 = errors(
+            "type T = Foo | Bar\nfun f(x: T) -> Int { match x { Fooo => 1\n _ => 0 } }\nfun main() {}\n",
+        );
+        assert!(e3.iter().any(|d| d.message.contains("did you mean `Foo`?")), "{e3:?}");
     }
 
     #[test]
