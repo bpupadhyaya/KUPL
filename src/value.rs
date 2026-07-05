@@ -1,7 +1,6 @@
 //! Runtime values and environments.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -400,62 +399,48 @@ impl fmt::Display for DebugStr<'_> {
     }
 }
 
-/// A tiny FNV-1a hasher for the environment's variable map. Identifier keys are
-/// short, so SipHash's per-lookup cost dominates a tree-walker's hot path;
-/// FNV-1a is dramatically faster for these and stays zero-dependency. (The hash
-/// is never observable — `Env` maps are only get/set/define, never iterated for
-/// output — so this cannot affect byte-identity.)
-#[derive(Default, Clone)]
-pub struct FnvBuild;
-pub struct FnvHasher(u64);
-impl std::hash::BuildHasher for FnvBuild {
-    type Hasher = FnvHasher;
-    fn build_hasher(&self) -> FnvHasher {
-        FnvHasher(0xcbf29ce484222325)
-    }
-}
-impl std::hash::Hasher for FnvHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        let mut h = self.0;
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        self.0 = h;
-    }
-}
-
-type VarMap = HashMap<String, Value, FnvBuild>;
-
 /// Lexically scoped, shared, mutable environment (closures capture it).
+///
+/// A scope holds its bindings in a small `Vec` scanned linearly rather than a
+/// `HashMap`: real scopes hold only a handful of variables (function params +
+/// a few locals), for which a linear scan over contiguous memory beats hashing
+/// a `String` key — and it allocates far less per call (no hash table per scope).
+/// Binding order is not observable (the env is only get/set/define, never
+/// iterated for output), so this cannot affect byte-identity.
 #[derive(Clone)]
 pub struct Env(Rc<RefCell<EnvInner>>);
 
 struct EnvInner {
-    vars: VarMap,
+    vars: Vec<(Box<str>, Value)>,
     parent: Option<Env>,
 }
 
 impl Env {
     pub fn new() -> Env {
-        Env(Rc::new(RefCell::new(EnvInner { vars: VarMap::default(), parent: None })))
+        Env(Rc::new(RefCell::new(EnvInner { vars: Vec::new(), parent: None })))
     }
     pub fn child(&self) -> Env {
         Env(Rc::new(RefCell::new(EnvInner {
-            vars: VarMap::default(),
+            vars: Vec::new(),
             parent: Some(self.clone()),
         })))
     }
     pub fn define(&self, name: &str, value: Value) {
-        self.0.borrow_mut().vars.insert(name.to_string(), value);
+        let mut inner = self.0.borrow_mut();
+        // Re-`let` in the same scope overwrites (HashMap-insert semantics).
+        if let Some(slot) = inner.vars.iter_mut().find(|(k, _)| &**k == name) {
+            slot.1 = value;
+        } else {
+            inner.vars.push((name.into(), value));
+        }
     }
     pub fn get(&self, name: &str) -> Option<Value> {
         let inner = self.0.borrow();
-        if let Some(v) = inner.vars.get(name) {
-            return Some(v.clone());
+        // Scan newest-first so a shadowing binding wins (matches lexical scope).
+        for (k, v) in inner.vars.iter().rev() {
+            if &**k == name {
+                return Some(v.clone());
+            }
         }
         match &inner.parent {
             Some(p) => p.get(name),
@@ -465,10 +450,8 @@ impl Env {
     /// Assign to an existing binding (walks up the chain). Returns false if unbound.
     pub fn set(&self, name: &str, value: Value) -> bool {
         let mut inner = self.0.borrow_mut();
-        // In-place update: no re-hash, no `to_string()` allocation on the hot path
-        // (every loop assignment `i = i + 1` goes through here).
-        if let Some(slot) = inner.vars.get_mut(name) {
-            *slot = value;
+        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
+            slot.1 = value;
             return true;
         }
         match inner.parent.clone() {

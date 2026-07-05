@@ -32,3 +32,4 @@ bound — a target for later.)
   allocation or double-hash on every assignment) and the variable map uses an
   FNV-1a hasher instead of SipHash. Interpreter: **loop 0.94→0.49s (~48% faster)**,
   fib 1.71→1.52s (~11%), listwork 0.13→0.11s. Byte-identity unaffected.
+- **PR-it7**: per-scope bindings use a linear-scan `Vec` instead of a `HashMap` — real scopes hold a handful of vars, so a scan of contiguous memory beats hashing and allocates no hash table per call/scope. Removed the custom hasher. Marginal wall-clock on the micro-benches (fib ~1.22→~1.19s, ~2-3%) but less allocation per scope; byte-identity unaffected.
