@@ -689,6 +689,10 @@ static void k_i128_print(char* buf, size_t n, __int128 x) {
 }
 static KValue k_bool(int v)      { KValue x; x.tag = K_BOOL;  x.as.b = !!v; return x; }
 static KValue k_unit(void)       { KValue x; x.tag = K_UNIT;  x.as.i = 0; return x; }
+/* Borrows `s` — does NOT copy. The pointer must outlive the KValue: pass a string
+   literal, a k_strdup/k_alloc'd heap buffer, or a buffer owned by a live structure.
+   NEVER a local stack buffer (dangles after return) or a shared/volatile static like
+   strerror()'s or k_ai_err (a later call clobbers it). Wrap those in k_strdup(). */
 static KValue k_str(const char* s) { KValue x; x.tag = K_STR; x.as.s = s; return x; }
 static char* k_strdup(const char* s) { size_t n = strlen(s) + 1; char* c = (char*)k_alloc(n); memcpy(c, s, n); return c; }
 
@@ -2301,7 +2305,7 @@ static KValue k_ai_call(int info) {
     }
     KValue v = f->has_tools ? k_ai_tool_call(f, text) : k_ai_convert(f->shape, text);
     if (k_ai_ok) return f->wraps_result ? k_ok(v) : v;
-    if (f->wraps_result) return k_err(k_str(k_ai_err));
+    if (f->wraps_result) return k_err(k_str(k_strdup(k_ai_err)));
     char b[320]; snprintf(b, sizeof b, "ai `%s`: %s", f->name, k_ai_err); k_panic(b); return k_unit();
 }
 
@@ -2561,11 +2565,11 @@ static KValue k_re_replace(KValue pat, KValue text, KValue repl) {
    platform OS description and may differ from the interpreter's wording. ---- */
 static KValue k_read_file(KValue path) {
     FILE* f = fopen(path.as.s, "rb");
-    if (!f) return k_err(k_str(strerror(errno)));
+    if (!f) return k_err(k_str(k_strdup(strerror(errno))));
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (n < 0) { fclose(f); return k_err(k_str(strerror(errno))); }
+    if (n < 0) { fclose(f); return k_err(k_str(k_strdup(strerror(errno)))); }
     char* buf = k_alloc((size_t)n + 1);
     size_t got = fread(buf, 1, (size_t)n, f);
     buf[got] = 0;
@@ -2574,7 +2578,7 @@ static KValue k_read_file(KValue path) {
 }
 static KValue k_write_file(KValue path, KValue content, int append) {
     FILE* f = fopen(path.as.s, append ? "ab" : "wb");
-    if (!f) return k_err(k_str(strerror(errno)));
+    if (!f) return k_err(k_str(k_strdup(strerror(errno))));
     const char* s = content.as.s;
     size_t len = strlen(s);
     size_t w = fwrite(s, 1, len, f);
@@ -2583,7 +2587,7 @@ static KValue k_write_file(KValue path, KValue content, int append) {
     return k_ok(k_unit());
 }
 static KValue k_delete_file(KValue path) {
-    if (remove(path.as.s) != 0) return k_err(k_str(strerror(errno)));
+    if (remove(path.as.s) != 0) return k_err(k_str(k_strdup(strerror(errno))));
     return k_ok(k_unit());
 }
 static KValue k_file_exists(KValue path) {
@@ -4463,6 +4467,21 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// A native IO-error Err string is a persistent OWNED copy (k_strdup) of
+    /// strerror()'s volatile shared buffer — not empty/garbage/aliased. PR-it37.
+    #[test]
+    fn native_io_error_message_owned() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   match read_file(\"/no/such/path/xyzzy\") { Ok(c) => print(c), Err(e) => print(\"err:{e}\") }\n}\n";
+        let out = native_main_stdout(src, "ioerr");
+        // a real, non-empty message (the strerror text), safely copied.
+        assert!(out.trim().starts_with("err:") && out.trim().len() > 5, "got {out:?}");
+        assert!(out.to_lowercase().contains("no such file"), "got {out:?}");
     }
 
     /// Native parse_iso returns the SAME descriptive Err message as the interpreter
