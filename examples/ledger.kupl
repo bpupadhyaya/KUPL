@@ -1,0 +1,94 @@
+// A bank-ledger component — KUPL's component model tying together records,
+// collections, and combinators in one realistic little application.
+//
+// The Ledger holds a running balance and a transaction log as private state,
+// accepts deposit/withdraw/report messages, guards against overdrafts, and emits
+// balance updates and report lines. A Driver seeds a sequence at startup and a
+// Reporter prints what the Ledger emits.
+
+type Txn = { kind: Str, amount: Int, memo: Str }
+
+component Ledger {
+    intent "A bank account: deposits, guarded withdrawals, and a report."
+
+    in deposit: Int
+    in withdraw: Int
+    in report: Event
+    out balance_out: Int
+    out line: Str
+
+    state balance: Int = 0
+    state log: List[Txn] = []
+
+    on deposit(amount) {
+        balance += amount
+        log = log.push(Txn(kind: "deposit", amount: amount, memo: ""))
+        emit line("deposit {amount} -> balance {balance}")
+        emit balance_out(balance)
+    }
+
+    on withdraw(amount) {
+        if amount <= balance {
+            balance -= amount
+            log = log.push(Txn(kind: "withdraw", amount: amount, memo: ""))
+            emit line("withdraw {amount} -> balance {balance}")
+            emit balance_out(balance)
+        } else {
+            emit line("declined withdraw {amount}: only {balance} available")
+        }
+    }
+
+    on report {
+        let deposits = log.filter(fn t { t.kind == "deposit" }).fold(0, fn acc, t { acc + t.amount })
+        let withdrawals = log.filter(fn t { t.kind == "withdraw" }).fold(0, fn acc, t { acc + t.amount })
+        emit line("report: {log.len()} txns, +{deposits} -{withdrawals}, balance {balance}")
+    }
+
+    example {
+        send deposit(100)
+        expect balance_out == 100
+        send withdraw(30)
+        expect balance_out == 70
+        send withdraw(1000)
+        expect balance_out == 70
+    }
+}
+
+component Reporter {
+    intent "Prints each ledger line as it is emitted."
+
+    in line: Str
+
+    on line(msg) {
+        print(msg)
+    }
+}
+
+component Driver {
+    intent "Seeds a sequence of transactions at startup."
+
+    out deposit: Int
+    out withdraw: Int
+    out report: Event
+
+    on start {
+        emit deposit(100)
+        emit deposit(50)
+        emit withdraw(30)
+        emit withdraw(1000)
+        emit report()
+    }
+}
+
+app Bank {
+    intent "Drive a ledger through some transactions and print the trace."
+
+    let ledger = Ledger()
+    let reporter = Reporter()
+    let driver = Driver()
+
+    wire ledger.line -> reporter.line
+    wire driver.deposit -> ledger.deposit
+    wire driver.withdraw -> ledger.withdraw
+    wire driver.report -> ledger.report
+}
