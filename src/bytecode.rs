@@ -217,6 +217,13 @@ pub const BUILTIN_YEARDAY_OF: u8 = 52;
 pub const BUILTIN_READ_LINE: u8 = 53;
 pub const BUILTIN_READ_ALL: u8 = 54;
 pub const BUILTIN_EXEC: u8 = 55;
+pub const BUILTIN_PATH_JOIN: u8 = 56;
+pub const BUILTIN_PATH_BASE: u8 = 57;
+pub const BUILTIN_PATH_DIR: u8 = 58;
+pub const BUILTIN_PATH_EXT: u8 = 59;
+pub const BUILTIN_LIST_DIR: u8 = 60;
+pub const BUILTIN_MAKE_DIR: u8 = 61;
+pub const BUILTIN_REMOVE_DIR: u8 = 62;
 
 impl Module {
     pub fn disassemble(&self) -> String {

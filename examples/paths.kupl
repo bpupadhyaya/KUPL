@@ -1,0 +1,46 @@
+// Paths & directories — the file-processing toolkit.
+//
+// Pure path helpers (no effect) operate lexically on `/`-separated paths:
+//   path_join(a, b) -> Str    join with a single "/" (absolute b wins)
+//   path_base(p)    -> Str    final component
+//   path_dir(p)     -> Str    everything before the last "/"
+//   path_ext(p)     -> Str    extension incl. the dot (".txt"), or "" (dotfiles have none)
+//
+// Directory ops carry the io.fs effect:
+//   list_dir(path)  -> Result[List[Str], Str]   entries (names only), SORTED
+//   make_dir(path)  -> Result[Unit, Str]         create (incl. parents)
+//   remove_dir(path)-> Result[Unit, Str]         remove recursively
+
+fun main() uses io {
+    // pure path helpers — deterministic string math
+    print("join    = {path_join("src/app", "main.kupl")}")
+    print("join abs= {path_join("src", "/etc/hosts")}")
+    print("base    = {path_base("src/app/main.kupl")}")
+    print("dir     = {path_dir("src/app/main.kupl")}")
+    print("ext     = {path_ext("src/app/main.kupl")}")
+    print("ext2    = {path_ext("archive.tar.gz")}")
+    print("dotfile = [{path_ext(".gitignore")}]")
+
+    // filesystem round-trip in a self-cleaning temp directory
+    let dir = "kupl_paths_tmp"
+    let _ = remove_dir(dir)                    // clean slate (ignore if absent)
+    match make_dir(dir) {
+        Ok(_) => {
+            // create files in NON-sorted order to prove list_dir sorts
+            let _ = write_file(path_join(dir, "zebra.txt"), "z")
+            let _ = write_file(path_join(dir, "apple.md"), "a")
+            let _ = write_file(path_join(dir, "mango.txt"), "m")
+            match list_dir(dir) {
+                Ok(names) => {
+                    print("entries = {names}")
+                    let txts = names.filter(fn n { path_ext(n) == ".txt" })
+                    print("*.txt   = {txts}")
+                }
+                Err(_) => print("list failed")
+            }
+            let _ = remove_dir(dir)            // recursive cleanup
+        }
+        Err(_) => print("mkdir failed")
+    }
+    print("cleaned = {file_exists(dir)}")
+}

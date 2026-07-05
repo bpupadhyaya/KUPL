@@ -931,12 +931,20 @@ impl Interp {
                     return tensor_builtin(name, &v).map_err(|m| Self::panic_flow(m, span));
                 }
                 ("read_file", 1) | ("write_file", 2) | ("append_file", 2)
-                | ("delete_file", 1) | ("file_exists", 1) => {
+                | ("delete_file", 1) | ("file_exists", 1) | ("list_dir", 1)
+                | ("make_dir", 1) | ("remove_dir", 1) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
                         vals.push(self.eval(&a.value, env)?);
                     }
                     return fs_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
+                }
+                ("path_join", 2) | ("path_base", 1) | ("path_dir", 1) | ("path_ext", 1) => {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        vals.push(self.eval(&a.value, env)?);
+                    }
+                    return path_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
                 ("json_parse", 1) => {
                     let v = self.eval(&args[0].value, env)?;
@@ -2823,7 +2831,66 @@ pub fn fs_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             Err(e) => Value::err(Value::str(e.to_string())),
         }),
         "file_exists" => Ok(Value::Bool(std::path::Path::new(&as_str(&args[0])).exists())),
+        "list_dir" => Ok(match std::fs::read_dir(as_str(&args[0])) {
+            Ok(rd) => {
+                // names only, "."/".." excluded by read_dir; SORTED for determinism
+                let mut names: Vec<String> = rd
+                    .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                    .collect();
+                names.sort();
+                Value::ok(Value::List(Rc::new(names.into_iter().map(Value::str).collect())))
+            }
+            Err(e) => Value::err(Value::str(e.to_string())),
+        }),
+        "make_dir" => Ok(match std::fs::create_dir_all(as_str(&args[0])) {
+            Ok(()) => Value::ok(Value::Unit),
+            Err(e) => Value::err(Value::str(e.to_string())),
+        }),
+        "remove_dir" => Ok(match std::fs::remove_dir_all(as_str(&args[0])) {
+            Ok(()) => Value::ok(Value::Unit),
+            Err(e) => Value::err(Value::str(e.to_string())),
+        }),
         _ => Err(format!("unknown file builtin `{name}`")),
+    }
+}
+
+/// Pure `/`-path helpers (no effect). They operate lexically on forward-slash
+/// paths — no filesystem access.
+pub fn path_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let as_str = |v: &Value| -> String {
+        match v {
+            Value::Str(s) => s.as_str().to_string(),
+            other => other.to_string(),
+        }
+    };
+    let p = as_str(&args[0]);
+    match name {
+        "path_join" => {
+            let b = as_str(&args[1]);
+            let joined = if p.is_empty() {
+                b
+            } else if b.starts_with('/') {
+                b
+            } else {
+                format!("{}/{}", p.trim_end_matches('/'), b)
+            };
+            Ok(Value::str(joined))
+        }
+        "path_base" => Ok(Value::str(p.rsplit('/').next().unwrap_or("").to_string())),
+        "path_dir" => Ok(Value::str(match p.rfind('/') {
+            Some(i) => p[..i].to_string(),
+            None => String::new(),
+        })),
+        "path_ext" => {
+            let base = p.rsplit('/').next().unwrap_or("");
+            // the ext is the last `.` onward in the base name; a leading-dot
+            // dotfile (".bashrc") or a name with no dot has no ext
+            Ok(Value::str(match base.rfind('.') {
+                Some(i) if i > 0 => base[i..].to_string(),
+                _ => String::new(),
+            }))
+        }
+        _ => Err(format!("unknown path builtin `{name}`")),
     }
 }
 

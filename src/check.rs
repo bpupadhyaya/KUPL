@@ -1489,6 +1489,28 @@ impl Checker {
                     self.unify(&Ty::List(Box::new(Ty::Str)), &a, args[1].value.span, "exec args");
                     return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
                 }
+                ("path_join", 2) => {
+                    for a in args {
+                        let t = self.infer_expr(&a.value, ctx);
+                        self.unify(&Ty::Str, &t, a.value.span, "path_join");
+                    }
+                    return Ty::Str;
+                }
+                ("path_base", 1) | ("path_dir", 1) | ("path_ext", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "path");
+                    return Ty::Str;
+                }
+                ("list_dir", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "list_dir path");
+                    return Ty::Result(Box::new(Ty::List(Box::new(Ty::Str))), Box::new(Ty::Str));
+                }
+                ("make_dir", 1) | ("remove_dir", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "directory path");
+                    return Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Str));
+                }
                 ("re_match", 2) | ("re_find", 2) | ("re_find_all", 2) | ("re_replace", 3) => {
                     for a in args {
                         let t = self.infer_expr(&a.value, ctx);

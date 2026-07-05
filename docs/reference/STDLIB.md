@@ -22,6 +22,12 @@ unless supervised.
 | `append_file(path, s)` | `(Str, Str) -> Result[Unit, Str]` — **uses `io.fs`** | creates if missing |
 | `delete_file(path)` | `(Str) -> Result[Unit, Str]` — **uses `io.fs`** | |
 | `file_exists(path)` | `(Str) -> Bool` — **uses `io.fs`** | any filesystem entry |
+| `list_dir(path)` | `(Str) -> Result[List[Str], Str]` — **uses `io.fs`** | entry names (no `.`/`..`), **sorted**; `Err` if not a directory |
+| `make_dir(path)` | `(Str) -> Result[Unit, Str]` — **uses `io.fs`** | create a directory (incl. parent dirs); `Ok` if it already exists |
+| `remove_dir(path)` | `(Str) -> Result[Unit, Str]` — **uses `io.fs`** | remove a directory **recursively** |
+| `path_join(a, b)` | `(Str, Str) -> Str` | join with one `/`; empty `a` or absolute `b` → `b`; pure |
+| `path_base(p)` / `path_dir(p)` | `(Str) -> Str` | final component / everything before the last `/`; pure |
+| `path_ext(p)` | `(Str) -> Str` | extension incl. the dot (`.txt`), or `""` (a leading-dot dotfile has none); pure |
 | `json_parse(text)` | `(Str) -> Result[Json, Str]` | pure; `Err` on malformed input |
 | `json_stringify(j)` | `(Json) -> Str` | compact; object key order preserved |
 | `args()` | `() -> List[Str]` — **uses `io.env`** | the program's command-line arguments |
@@ -116,6 +122,11 @@ space as `%20`; `url_decode` reverses `%XX`, treats `+` as space, and returns
 `Err` on a malformed escape or non-UTF-8. `query_parse`/`query_build` handle
 `key=value&…` pairs (each part url-decoded/encoded). `url_encode`/`url_decode`
 run on all engines incl. native, as do the `query_*` helpers.
+
+The **path helpers** (`path_join`/`path_base`/`path_dir`/`path_ext`) are pure
+(no effect) and operate lexically on `/`-separated paths — no filesystem access.
+`list_dir` returns entry names **sorted** (byte order) so output is deterministic
+across engines, platforms, and runs (OS directory order is not).
 
 File builtins carry the `io.fs` effect (a sub-effect of `io`, so `uses io`
 covers them; `uses io.fs` is the precise capability). The `Err` message is a

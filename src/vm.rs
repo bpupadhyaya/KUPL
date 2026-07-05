@@ -535,12 +535,16 @@ impl<'m> Vm<'m> {
                             return Err(VmError { msg: args[0].to_string(), span })
                         }
                         BUILTIN_READ_FILE | BUILTIN_WRITE_FILE | BUILTIN_APPEND_FILE
-                        | BUILTIN_DELETE_FILE | BUILTIN_FILE_EXISTS => {
+                        | BUILTIN_DELETE_FILE | BUILTIN_FILE_EXISTS | BUILTIN_LIST_DIR
+                        | BUILTIN_MAKE_DIR | BUILTIN_REMOVE_DIR => {
                             let name = match which {
                                 BUILTIN_READ_FILE => "read_file",
                                 BUILTIN_WRITE_FILE => "write_file",
                                 BUILTIN_APPEND_FILE => "append_file",
                                 BUILTIN_DELETE_FILE => "delete_file",
+                                BUILTIN_LIST_DIR => "list_dir",
+                                BUILTIN_MAKE_DIR => "make_dir",
+                                BUILTIN_REMOVE_DIR => "remove_dir",
                                 _ => "file_exists",
                             };
                             match crate::interp::fs_builtin(name, &args) {
@@ -654,6 +658,19 @@ impl<'m> Vm<'m> {
                                 _ => "hash_fnv",
                             };
                             match crate::interp::encoding_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
+                        BUILTIN_PATH_JOIN | BUILTIN_PATH_BASE | BUILTIN_PATH_DIR
+                        | BUILTIN_PATH_EXT => {
+                            let name = match which {
+                                BUILTIN_PATH_JOIN => "path_join",
+                                BUILTIN_PATH_BASE => "path_base",
+                                BUILTIN_PATH_DIR => "path_dir",
+                                _ => "path_ext",
+                            };
+                            match crate::interp::path_builtin(name, &args) {
                                 Ok(v) => set!(dst, v),
                                 Err(msg) => return Err(VmError { msg, span }),
                             }

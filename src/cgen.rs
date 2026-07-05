@@ -382,6 +382,13 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
                 format!("regs[{dst}] = k_json_stringify(regs[{start}]); (void){argc};")
             }
             BUILTIN_EXEC => format!("regs[{dst}] = k_exec(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_PATH_JOIN => format!("regs[{dst}] = k_path_join(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_PATH_BASE => format!("regs[{dst}] = k_path_base(regs[{start}]); (void){argc};"),
+            BUILTIN_PATH_DIR => format!("regs[{dst}] = k_path_dir(regs[{start}]); (void){argc};"),
+            BUILTIN_PATH_EXT => format!("regs[{dst}] = k_path_ext(regs[{start}]); (void){argc};"),
+            BUILTIN_LIST_DIR => format!("regs[{dst}] = k_list_dir(regs[{start}]); (void){argc};"),
+            BUILTIN_MAKE_DIR => format!("regs[{dst}] = k_make_dir(regs[{start}]); (void){argc};"),
+            BUILTIN_REMOVE_DIR => format!("regs[{dst}] = k_remove_dir(regs[{start}]); (void){argc};"),
             BUILTIN_HTTP_GET => format!("regs[{dst}] = k_http_get(regs[{start}]); (void){argc};"),
             BUILTIN_HTTP_POST => format!("regs[{dst}] = k_http_post(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_MATCH => format!("regs[{dst}] = k_re_match(regs[{start}], regs[{start}+1]); (void){argc};"),
@@ -538,6 +545,9 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <time.h>
 #include <setjmp.h>
 #include <sys/wait.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
@@ -1568,6 +1578,92 @@ static KValue k_exec(KValue prog, KValue arglist) {
         return k_err(k_str(k_strdup(m)));
     }
     return k_ok(k_str(out.buf ? out.buf : (char*)""));
+}
+
+/* ---- pure `/`-path helpers (mirror interp::path_builtin) ---- */
+static KValue k_path_join(KValue a, KValue b) {
+    const char* pa = a.as.s; const char* pb = b.as.s;
+    if (!pa[0]) return k_str(k_strdup(pb));
+    if (pb[0] == '/') return k_str(k_strdup(pb));
+    long la = (long)strlen(pa);
+    while (la > 0 && pa[la - 1] == '/') la--;
+    KBuf buf = { 0, 0, 0 };
+    kb_write(&buf, pa, la);
+    kb_write(&buf, "/", 1);
+    kb_write(&buf, pb, (long)strlen(pb));
+    return k_str(buf.buf ? buf.buf : "");
+}
+static KValue k_path_base(KValue p) {
+    const char* slash = strrchr(p.as.s, '/');
+    return k_str(k_strdup(slash ? slash + 1 : p.as.s));
+}
+static KValue k_path_dir(KValue p) {
+    const char* s = p.as.s;
+    const char* slash = strrchr(s, '/');
+    if (!slash) return k_str("");
+    long n = slash - s;
+    char* c = (char*)k_alloc(n + 1); memcpy(c, s, n); c[n] = 0;
+    return k_str(c);
+}
+static KValue k_path_ext(KValue p) {
+    const char* s = p.as.s;
+    const char* slash = strrchr(s, '/');
+    const char* base = slash ? slash + 1 : s;
+    const char* dot = strrchr(base, '.');
+    if (dot && dot > base) return k_str(k_strdup(dot));
+    return k_str("");
+}
+
+/* ---- directory ops (mirror interp::fs_builtin; list_dir is SORTED) ---- */
+static int k_cmp_cstr(const void* a, const void* b) { return strcmp(*(const char* const*)a, *(const char* const*)b); }
+static KValue k_list_dir(KValue path) {
+    DIR* d = opendir(path.as.s);
+    if (!d) { char m[300]; snprintf(m, sizeof m, "cannot read directory: %s", path.as.s); return k_err(k_str(k_strdup(m))); }
+    char** names = (char**)k_alloc(sizeof(char*) * 8192); int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) && n < 8192) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        names[n++] = k_strdup(e->d_name);
+    }
+    closedir(d);
+    qsort(names, n, sizeof(char*), k_cmp_cstr);
+    KValue* out = (KValue*)k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    for (int i = 0; i < n; i++) out[i] = k_str(names[i]);
+    return k_ok(k_list(out, n));
+}
+static int k_mkdirs(const char* path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    long len = (long)strlen(tmp);
+    if (len > 0 && tmp[len - 1] == '/') tmp[len - 1] = 0;
+    for (char* q = tmp + 1; *q; q++) {
+        if (*q == '/') { *q = 0; mkdir(tmp, 0777); *q = '/'; }
+    }
+    int r = mkdir(tmp, 0777);
+    return (r == 0 || errno == EEXIST) ? 0 : -1;
+}
+static KValue k_make_dir(KValue path) {
+    if (k_mkdirs(path.as.s) != 0) { char m[300]; snprintf(m, sizeof m, "cannot create directory: %s", path.as.s); return k_err(k_str(k_strdup(m))); }
+    return k_ok(k_unit());
+}
+static int k_rmrf(const char* path) {
+    DIR* d = opendir(path);
+    if (d) {
+        struct dirent* e;
+        while ((e = readdir(d))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            char child[4096]; snprintf(child, sizeof child, "%s/%s", path, e->d_name);
+            struct stat st;
+            if (!stat(child, &st) && S_ISDIR(st.st_mode)) k_rmrf(child);
+            else unlink(child);
+        }
+        closedir(d);
+    }
+    return rmdir(path);
+}
+static KValue k_remove_dir(KValue path) {
+    if (k_rmrf(path.as.s) != 0) { char m[300]; snprintf(m, sizeof m, "cannot remove directory: %s", path.as.s); return k_err(k_str(k_strdup(m))); }
+    return k_ok(k_unit());
 }
 
 static KValue k_http_get(KValue url) {
@@ -3652,6 +3748,24 @@ mod tests {
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Path helpers + list_dir (it61) compile to native byte-identically:
+    /// pure `/`-path math, and a sorted directory round-trip in a temp dir.
+    #[test]
+    fn native_paths() {
+        let src = "fun main() uses io {\n    \
+                   print(\"{path_join(\"a/b\", \"c.txt\")} {path_base(\"a/b/c.txt\")} {path_dir(\"a/b/c.txt\")} {path_ext(\"a/b/c.txt\")}\")\n    \
+                   let d = \"kupl_it61_native_tmp\"\n    let _ = remove_dir(d)\n    let _ = make_dir(d)\n    \
+                   let _ = write_file(path_join(d, \"b.txt\"), \"b\")\n    let _ = write_file(path_join(d, \"a.txt\"), \"a\")\n    \
+                   match list_dir(d) {\n        Ok(n) => print(\"{n}\")\n        Err(_) => print(\"err\")\n    }\n    \
+                   let _ = remove_dir(d)\n}\n";
+        if cc_available() {
+            assert_eq!(
+                native_main_stdout(src, "paths"),
+                "a/b/c.txt c.txt a/b .txt\n[\"a.txt\", \"b.txt\"]\n"
+            );
+        }
     }
 
     /// exec (it60): argv-based subprocess. `echo` captures stdout (single arg
