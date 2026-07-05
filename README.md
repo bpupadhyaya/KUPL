@@ -241,6 +241,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/jq.kupl` | a jq-like JSON query tool: path expressions (`.a.b`, `[0]`, `[]`) over the built-in `Json` type, written in KUPL (with a `law`) |
 | `examples/braces.kupl` | literal-brace escaping: `{{`/`}}` in interpolated strings for JSON/CSS/`{…}` templates (with a `law`) |
 | `examples/combinators.kupl` | Option/Result combinators: `.map`/`.and_then`/`.filter`/`.ok_or`/`.map_err`/`.ok` pipelines (with a `law`) |
+| `examples/sudoku.kupl` | a backtracking Sudoku solver (MRV heuristic) written in KUPL — recursion + `Option` + immutable-list updates (with a `law`) |
 
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.

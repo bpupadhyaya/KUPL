@@ -1,0 +1,155 @@
+// A backtracking Sudoku solver — written in KUPL.
+//
+// The board is a flat `List[Int]` of 81 cells (row-major, 0 = empty). KUPL lists
+// are immutable, so placing a digit returns a NEW board. The solver finds the
+// first empty cell, tries 1..9 that don't clash on the row/column/3x3 box, and
+// recurses — classic depth-first backtracking with `Option` for success/failure.
+
+fun parse_board(s: Str) -> List[Int] {
+    let cs = s.chars()
+    var b: List[Int] = []
+    var i = 0
+    while i < cs.len() {
+        b = b.push(cs.get(i).unwrap_or("0").parse_int().unwrap_or(0))
+        i = i + 1
+    }
+    b
+}
+
+fun cell(b: List[Int], r: Int, c: Int) -> Int {
+    b.get(r * 9 + c).unwrap_or(0)
+}
+
+// Return a new board with cell `i` set to `v`.
+fun set_at(b: List[Int], i: Int, v: Int) -> List[Int] {
+    b.take(i).push(v).concat(b.drop(i + 1))
+}
+
+fun ok_row(b: List[Int], r: Int, v: Int) -> Bool {
+    var c = 0
+    var ok = true
+    while c < 9 {
+        if cell(b, r, c) == v { ok = false }
+        c = c + 1
+    }
+    ok
+}
+
+fun ok_col(b: List[Int], c: Int, v: Int) -> Bool {
+    var r = 0
+    var ok = true
+    while r < 9 {
+        if cell(b, r, c) == v { ok = false }
+        r = r + 1
+    }
+    ok
+}
+
+fun ok_box(b: List[Int], r: Int, c: Int, v: Int) -> Bool {
+    let br = (r / 3) * 3
+    let bc = (c / 3) * 3
+    var dr = 0
+    var ok = true
+    while dr < 3 {
+        var dc = 0
+        while dc < 3 {
+            if cell(b, br + dr, bc + dc) == v { ok = false }
+            dc = dc + 1
+        }
+        dr = dr + 1
+    }
+    ok
+}
+
+fun valid(b: List[Int], pos: Int, v: Int) -> Bool {
+    let r = pos / 9
+    let c = pos % 9
+    ok_row(b, r, v) && ok_col(b, c, v) && ok_box(b, r, c, v)
+}
+
+// How many digits are still legal at `pos`.
+fun candidates(b: List[Int], pos: Int) -> Int {
+    var v = 1
+    var count = 0
+    while v <= 9 {
+        if valid(b, pos, v) { count = count + 1 }
+        v = v + 1
+    }
+    count
+}
+
+// Pick the empty cell with the fewest candidates (minimum-remaining-values) —
+// this prunes the search tree so even a hard puzzle solves in a few backtracks.
+fun find_empty(b: List[Int]) -> Option[Int] {
+    var i = 0
+    var best = -1
+    var best_count = 10
+    // stop as soon as a forced (or dead-end) cell appears — nothing beats it
+    while i < 81 && best_count > 1 {
+        if b.get(i).unwrap_or(0) == 0 {
+            let cnt = candidates(b, i)
+            if cnt < best_count {
+                best_count = cnt
+                best = i
+            }
+        }
+        i = i + 1
+    }
+    if best < 0 { None } else { Some(best) }
+}
+
+// Try digits v..9 at `pos`; return the first that leads to a full solution.
+fun try_values(b: List[Int], pos: Int, v: Int) -> Option[List[Int]] {
+    if v > 9 {
+        None
+    } else if valid(b, pos, v) {
+        match solve(set_at(b, pos, v)) {
+            Some(sol) => Some(sol)
+            None => try_values(b, pos, v + 1)
+        }
+    } else {
+        try_values(b, pos, v + 1)
+    }
+}
+
+fun solve(b: List[Int]) -> Option[List[Int]] {
+    match find_empty(b) {
+        None => Some(b)
+        Some(pos) => try_values(b, pos, 1)
+    }
+}
+
+fun render(b: List[Int]) -> Str {
+    var s = ""
+    var r = 0
+    while r < 9 {
+        var c = 0
+        while c < 9 {
+            let d = cell(b, r, c)
+            s = s + "{d}"
+            c = c + 1
+        }
+        s = s + "\n"
+        r = r + 1
+    }
+    s
+}
+
+fun main() uses io {
+    let puzzle = parse_board("530070000600195000098000060800060003400803001700020006060000280000419005000080079")
+    print("puzzle:")
+    print(render(puzzle))
+    match solve(puzzle) {
+        Some(sol) => {
+            print("solution:")
+            print(render(sol))
+        }
+        None => print("no solution")
+    }
+}
+
+law "the solver produces the known solution" {
+    let puzzle = parse_board("530070000600195000098000060800060003400803001700020006060000280000419005000080079")
+    let solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+    expect render(solve(puzzle).unwrap_or([])) == render(parse_board(solution))
+}

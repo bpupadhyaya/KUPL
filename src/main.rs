@@ -24,6 +24,20 @@ Usage:
 ";
 
 fn main() -> ExitCode {
+    // Run the whole CLI on a worker thread with a large stack. The tree-walking
+    // interpreter recurses on the native stack (one KUPL call = several Rust
+    // frames), so deeply-recursive programs (e.g. a backtracking solver) need
+    // more than the default 8 MiB — and this keeps the interpreter's recursion
+    // depth on par with the KVM's heap-allocated frame stack.
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(run_cli)
+        .expect("spawn main thread")
+        .join()
+        .unwrap_or(ExitCode::from(101))
+}
+
+fn run_cli() -> ExitCode {
     // A bundled executable carries its module in a trailer — run it directly.
     if let Ok(exe) = std::env::current_exe() {
         if let Ok(bytes) = std::fs::read(&exe) {
