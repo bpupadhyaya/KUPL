@@ -1350,6 +1350,20 @@ impl Parser {
                     let span = expr.span.merge(end);
                     expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
                 }
+                // a method chain may continue on the next line when that line
+                // starts with `.` (a leading `.` can't begin a statement, so this
+                // is unambiguous); otherwise the newline still ends the statement.
+                Tok::Newline => {
+                    let saved = self.pos;
+                    while matches!(self.peek(), Tok::Newline) {
+                        self.bump();
+                    }
+                    if matches!(self.peek(), Tok::Dot) {
+                        continue;
+                    }
+                    self.pos = saved;
+                    break;
+                }
                 _ => break,
             }
         }
@@ -1810,6 +1824,18 @@ mod tests {
         ok("fun g(n: Int) -> Str {\n    if n > 1 {\n        \"a\"\n    }\n    else if n > 0 {\n        \"b\"\n    }\n    else {\n        \"c\"\n    }\n}\n");
         // a no-else `if` followed by a newline + another statement is TWO statements
         let p = ok("fun h() -> Int {\n    var x = 0\n    if true {\n        x = 5\n    }\n    x = x + 1\n    x\n}\n");
+        assert_eq!(p.items.len(), 1);
+    }
+
+    /// A method chain continues on a line starting with `.`; a normal statement
+    /// sequence (no leading dot) is unaffected.
+    #[test]
+    fn multiline_method_chain() {
+        ok("fun m() -> Int {\n    Some(5).map(fn x { x + 1 })\n        .filter(fn x { x > 3 })\n        .unwrap_or(0)\n}\n");
+        // a `.field` continuation across a newline
+        ok("type P = { x: Int }\nfun m(p: P) -> Int {\n    p\n        .x\n}\n");
+        // two independent statements with NO leading dot -> still two statements
+        let p = ok("fun m() -> Int {\n    let a = 1\n    let b = 2\n    a + b\n}\n");
         assert_eq!(p.items.len(), 1);
     }
 

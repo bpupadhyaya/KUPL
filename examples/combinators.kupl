@@ -6,15 +6,20 @@
 // They chain, so validation and transformation read left to right without a
 // pyramid of `match`.
 
-// Parse, double, keep only if > 10, else 0.
+// Parse, double, keep only if > 10, else 0 — a fluent multi-line chain.
 fun big_double(s: Str) -> Int {
-    s.parse_int().map(fn x { x * 2 }).filter(fn x { x > 10 }).unwrap_or(0)
+    s.parse_int()
+        .map(fn x { x * 2 })
+        .filter(fn x { x > 10 })
+        .unwrap_or(0)
 }
 
 // Parse to a Result and validate positivity — `ok_or` lifts the Option to a
 // Result, `and_then` chains the validation; then render both outcomes.
 fun checked(s: Str) -> Str {
-    let r = s.parse_int().ok_or("not a number").and_then(fn x { if x > 0 { Ok(x * 10) } else { Err("must be positive") } })
+    let r = s.parse_int()
+        .ok_or("not a number")
+        .and_then(fn x { if x > 0 { Ok(x * 10) } else { Err("must be positive") } })
     match r {
         Ok(v) => "ok: {v}"
         Err(e) => "rejected: {e}"
