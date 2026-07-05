@@ -237,6 +237,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/rational.kupl` | exact rational numbers: `rat(n,d)` reduced fractions, `+ - * /`, `H(10)=7381/2520`, `.to_float`/`.recip` (with a `law`) |
 | `examples/operators.kupl` | operator overloading: define `add`/`sub`/`mul`/`lt`… for a user `Vec2` type, use `+ - * < >` (with a `law`) |
 | `examples/calc.kupl` | a mini expression-language interpreter: tokenizer → recursive-descent parser → evaluator with variables, written in KUPL (with a `law`) |
+| `examples/vm.kupl` | a bytecode compiler + stack VM: source → AST → bytecode → stack machine, written in KUPL (with a `law`) |
 | `examples/format.kupl` | number formatting: `Float.fmt(decimals)` fixed-point + `Int.to_hex`/`to_binary`/`to_radix` (with a `law`) |
 | `examples/jq.kupl` | a jq-like JSON query tool: path expressions (`.a.b`, `[0]`, `[]`) over the built-in `Json` type, written in KUPL (with a `law`) |
 | `examples/braces.kupl` | literal-brace escaping: `{{`/`}}` in interpolated strings for JSON/CSS/`{…}` templates (with a `law`) |
