@@ -35,9 +35,10 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     out.push_str(RUNTIME);
     out.push_str(COMPONENT_RUNTIME);
 
-    // forward declarations
+    // forward declarations — the depth-guarding wrapper `fun_i` and its body `fun_i_impl`
     for (i, c) in module.chunks.iter().enumerate() {
         let _ = writeln!(out, "static KValue fun_{i}(KValue* caps, KValue* args); /* {} */", c.name);
+        let _ = writeln!(out, "static KValue fun_{i}_impl(KValue* caps, KValue* args);");
     }
     let _ = writeln!(out, "\nKValue (*CHUNKS[])(KValue*, KValue*) = {{");
     for i in 0..module.chunks.len() {
@@ -268,7 +269,16 @@ fn emit_ai_shape(out: &mut String, shape: &crate::ai::AiShape, ctr: &mut usize) 
 
 fn emit_chunk(out: &mut String, module: &Module, idx: usize, chunk: &Chunk) -> Result<(), String> {
     let _ = writeln!(out, "/* {} */", chunk.name);
+    // Depth-guard wrapper: matches the interpreter/KVM 10 000-frame recursion cap
+    // so deep recursion panics cleanly rather than overflowing the C stack. cc -O2
+    // inlines the one-line body call, so the overhead is a single inc/dec per call.
     let _ = writeln!(out, "static KValue fun_{idx}(KValue* caps, KValue* args) {{");
+    let _ = writeln!(out, "    if (++k_depth > 10000) k_panic(\"stack overflow (10000 frames)\");");
+    let _ = writeln!(out, "    KValue r = fun_{idx}_impl(caps, args);");
+    let _ = writeln!(out, "    --k_depth;");
+    let _ = writeln!(out, "    return r;");
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(out, "static KValue fun_{idx}_impl(KValue* caps, KValue* args) {{");
     let nregs = chunk.nregs.max(1);
     let _ = writeln!(out, "    KValue regs[{nregs}];");
     let _ = writeln!(out, "    for (int i = 0; i < {nregs}; i++) regs[i] = k_unit();");
@@ -585,6 +595,11 @@ struct KValue {
    call_chunk_nested returning Err, caught by the restart-on-failure branch). */
 static jmp_buf* k_pad = 0;
 static char k_panic_buf[1024];
+/* User-function call depth. Guards against unbounded recursion so deep recursion
+   yields the same clean panic as the interpreter/KVM (which cap at 10 000 frames)
+   instead of segfaulting on the C stack. __thread-local for safety if a future
+   backend runs generated functions on multiple threads. */
+static __thread int64_t k_depth = 0;
 static void k_panic(const char* msg) {
     if (k_pad) {
         strncpy(k_panic_buf, msg, sizeof(k_panic_buf) - 1);
@@ -4296,6 +4311,40 @@ mod tests {
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
         }
+    }
+
+    /// Deep recursion in native code hits the same 10 000-frame guard as the
+    /// interpreter/KVM and panics cleanly (was: a C-stack segfault).
+    #[test]
+    fn native_deep_recursion_guard() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun rec(n: Int) -> Int {\n    if n == 0 { 0 } else { rec(n - 1) }\n}\n\
+                   fun main() uses io {\n    print(rec(50000))\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-rec-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let out = std::process::Command::new(&bin).output().unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // clean panic, not a segfault (segfault -> no output + a signal exit)
+        assert!(
+            stderr.contains("stack overflow (10000 frames)"),
+            "expected clean recursion-depth panic, got stderr={stderr:?} status={:?}",
+            out.status
+        );
     }
 
     /// List.take_while / drop_while (it95) compile to native.
