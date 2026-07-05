@@ -3456,7 +3456,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "replace")) {
             const char* from = args[0].as.s; const char* to = args[1].as.s;
             size_t fl = strlen(from);
-            if (fl == 0) return k_str(s);
+            if (fl == 0) k_panic("`replace` needs a non-empty pattern");
             KBuf b = {0};
             const char* p = s;
             for (;;) {
@@ -3593,6 +3593,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "replace_first")) {
             const char* from = args[0].as.s;
             const char* to = args[1].as.s;
+            if (!from[0]) k_panic("`replace_first` needs a non-empty pattern");
             const char* q = strstr(s, from);
             if (!q) return recv;            /* not found (from non-empty): unchanged */
             KBuf b = { 0, 0, 0 };
@@ -4451,6 +4452,28 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native split/replace/replace_first panic on an empty separator/pattern
+    /// (native replace used to no-op, diverging from the interpreter). PR-it29.
+    #[test]
+    fn native_empty_separator_panics() {
+        if !cc_available() {
+            return;
+        }
+        for (src, tag) in [
+            ("fun main() uses io {\n    print(\"abc\".split(\"\").len())\n}\n", "spl"),
+            ("fun main() uses io {\n    print(\"abc\".replace(\"\", \"x\"))\n}\n", "rep"),
+            ("fun main() uses io {\n    print(\"abc\".replace_first(\"\", \"x\"))\n}\n", "rf"),
+        ] {
+            let out = native_main_stdout(src, tag);
+            assert!(out.trim().is_empty(), "{tag}: expected a panic, got stdout {out:?}");
+        }
+        // normal replace still works
+        assert_eq!(
+            native_main_stdout("fun main() uses io {\n    print(\"aXbXc\".replace(\"X\", \"-\"))\n}\n", "repok").trim(),
+            "a-b-c"
+        );
     }
 
     /// Native .pad_* fills with a full UTF-8 codepoint (was: one byte, corrupting a

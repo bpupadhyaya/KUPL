@@ -2020,6 +2020,9 @@ pub fn shared_method(
             let mut it = args.into_iter();
             match (it.next(), it.next()) {
                 (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                    if from.is_empty() {
+                        return Err("`replace` needs a non-empty pattern".into());
+                    }
                     Ok(Value::str(s.replace(from.as_str(), to.as_str())))
                 }
                 _ => Err("`replace` needs two Str arguments".into()),
@@ -2046,9 +2049,10 @@ pub fn shared_method(
             .map(|v| Value::some(Value::Float(v)))
             .unwrap_or_else(|_| Value::none())),
         (Value::Str(s), "split") => match args.into_iter().next() {
-            Some(Value::Str(sep)) => Ok(Value::List(Rc::new(
+            Some(Value::Str(sep)) if !sep.is_empty() => Ok(Value::List(Rc::new(
                 s.split(sep.as_str()).map(Value::str).collect(),
             ))),
+            Some(Value::Str(_)) => Err("`split` needs a non-empty separator".into()),
             _ => Err("`split` needs a Str separator".into()),
         },
         (Value::Str(s), "is_empty") => Ok(Value::Bool(s.is_empty())),
@@ -2065,6 +2069,9 @@ pub fn shared_method(
             let mut it = args.into_iter();
             match (it.next(), it.next()) {
                 (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                    if from.is_empty() {
+                        return Err("`replace_first` needs a non-empty pattern".into());
+                    }
                     Ok(Value::str(s.as_str().replacen(from.as_str(), to.as_str(), 1)))
                 }
                 _ => Err("`replace_first` needs two Str arguments".into()),

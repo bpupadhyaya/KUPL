@@ -218,7 +218,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.trim()` / `.trim_start()` / `.trim_end()` | `-> Str` | strip ASCII whitespace (` \t\n\r`) at both ends / the start / the end |
 | `.split(sep)` | `(Str) -> List[Str]` | non-empty separator |
 | `.ends_with(s)` | `(Str) -> Bool` | |
-| `.replace(from, to)` | `(Str, Str) -> Str` | all occurrences |
+| `.replace(from, to)` | `(Str, Str) -> Str` | all occurrences; non-empty `from` |
 | `.chars()` | `-> List[Str]` | one-character strings |
 | `.repeat(n)` | `(Int) -> Str` | n ≥ 0 |
 | `.parse_int()` | `-> Option[Int]` | `None` on any malformed input |

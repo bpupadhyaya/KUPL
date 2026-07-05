@@ -1106,6 +1106,21 @@ mod tests {
     }
 
     #[test]
+    fn diff_empty_separator_panics() {
+        // An empty separator/pattern is a programming error: split/replace/
+        // replace_first all raise the SAME clean panic on both engines (native too,
+        // see cgen test) instead of the interpreter's old Rust-passthrough behavior
+        // (which split into per-char pieces / inserted everywhere) diverging from
+        // native's no-op/panic. Matches the existing `.count` non-empty rule.
+        assert_eq!(differential("fun probe() -> Int {\n    \"abc\".split(\"\").len()\n}\n"), "panic: `split` needs a non-empty separator");
+        assert_eq!(differential("fun probe() -> Str {\n    \"abc\".replace(\"\", \"x\")\n}\n"), "panic: `replace` needs a non-empty pattern");
+        assert_eq!(differential("fun probe() -> Str {\n    \"abc\".replace_first(\"\", \"x\")\n}\n"), "panic: `replace_first` needs a non-empty pattern");
+        // normal usage unaffected
+        assert_eq!(differential("fun probe() -> Int {\n    \"a,b,c\".split(\",\").len()\n}\n"), "3");
+        assert_eq!(differential("fun probe() -> Str {\n    \"aXbXc\".replace(\"X\", \"-\")\n}\n"), "a-b-c");
+    }
+
+    #[test]
     fn diff_string_slice_and_pad_edges() {
         // .slice with extreme/inverted indices must not panic (interp/KVM used to
         // ICE on slice(i64::MAX, i64::MAX) — a clamp with inverted bounds), and
