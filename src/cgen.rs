@@ -1564,7 +1564,10 @@ static KValue k_json_stringify(KValue v) {
 }
 
 /* --- parse (mirror json.rs Parser); build Json ctors, wrap in Ok/Err --- */
-typedef struct { const unsigned char* s; long pos, len; int failed; } KJP;
+typedef struct { const unsigned char* s; long pos, len; int failed; int depth; } KJP;
+/* Same nesting cap as json::MAX_JSON_DEPTH — untrusted deep input fails cleanly
+   instead of overflowing the (small) C stack. */
+#define K_MAX_JSON_DEPTH 500
 static KValue kjp_value(KJP* p);
 static void kjp_ws(KJP* p) { while (p->pos < p->len) { unsigned char c = p->s[p->pos]; if (c==' '||c=='\t'||c=='\n'||c=='\r') p->pos++; else break; } }
 static int kjp_peek(KJP* p) { return p->pos < p->len ? p->s[p->pos] : -1; }
@@ -1615,11 +1618,15 @@ static KValue kjp_number(KJP* p) {
 static KValue k_jc_(const char* name, KValue* fields, int n) { return k_ctor(k_ctor_by_name(name), fields, n); }
 static KValue kjp_array(KJP* p) {
     p->pos++;  /* '[' */
-    KValue items[4096]; int n = 0;
+    /* Heap-grown (not a large stack array): keeps the recursion frame tiny so the
+       depth guard in kjp_value bounds nesting before the stack overflows, and
+       removes the old 4096-element cap (matching the interpreter's unbounded Vec). */
+    int cap = 8, n = 0;
+    KValue* items = k_alloc(sizeof(KValue) * cap);
     kjp_ws(p);
     if (kjp_peek(p) == ']') { p->pos++; KValue l = k_list(items, 0); return k_jc_("JArr", &l, 1); }
     for (;;) {
-        if (n >= 4096) { p->failed = 1; break; }
+        if (n >= cap) { int nc = cap * 2; KValue* ni = k_alloc(sizeof(KValue) * nc); memcpy(ni, items, sizeof(KValue) * n); items = ni; cap = nc; }
         items[n++] = kjp_value(p);
         if (p->failed) break;
         kjp_ws(p);
@@ -1633,7 +1640,9 @@ static KValue kjp_array(KJP* p) {
 }
 static KValue kjp_object(KJP* p) {
     p->pos++;  /* '{' */
-    KValue keys[4096], vals[4096]; int n = 0;
+    int cap = 8, n = 0;
+    KValue* keys = k_alloc(sizeof(KValue) * cap);
+    KValue* vals = k_alloc(sizeof(KValue) * cap);
     kjp_ws(p);
     if (kjp_peek(p) == '}') { p->pos++; KMap* m = k_alloc(sizeof(KMap)); m->len = 0; m->keys = k_alloc(1); m->vals = k_alloc(1); KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1); }
     for (;;) {
@@ -1649,8 +1658,15 @@ static KValue kjp_object(KJP* p) {
         int found = -1;
         for (int i = 0; i < n; i++) if (!strcmp(keys[i].as.s, key)) { found = i; break; }
         if (found >= 0) vals[found] = val;
-        else if (n < 4096) { keys[n] = kv; vals[n] = val; n++; }
-        else { p->failed = 1; break; }
+        else {
+            if (n >= cap) {
+                int nc = cap * 2;
+                KValue* nk = k_alloc(sizeof(KValue) * nc); memcpy(nk, keys, sizeof(KValue) * n); keys = nk;
+                KValue* nv = k_alloc(sizeof(KValue) * nc); memcpy(nv, vals, sizeof(KValue) * n); vals = nv;
+                cap = nc;
+            }
+            keys[n] = kv; vals[n] = val; n++;
+        }
         kjp_ws(p);
         int c = p->pos < p->len ? p->s[p->pos++] : -1;
         if (c == ',') continue;
@@ -1665,8 +1681,12 @@ static KValue kjp_object(KJP* p) {
 static KValue kjp_value(KJP* p) {
     kjp_ws(p);
     int c = kjp_peek(p);
-    if (c == '{') return kjp_object(p);
-    if (c == '[') return kjp_array(p);
+    if (c == '{' || c == '[') {
+        if (++p->depth > K_MAX_JSON_DEPTH) { p->failed = 1; return k_unit(); }
+        KValue v = (c == '{') ? kjp_object(p) : kjp_array(p);
+        p->depth--;
+        return v;
+    }
     if (c == '"') { char* s = kjp_string(p); KValue sv = k_str(s); return k_jc_("JStr", &sv, 1); }
     if (c == 't') { if (p->pos+4<=p->len && !memcmp(p->s+p->pos,"true",4)) { p->pos+=4; KValue b=k_bool(1); return k_jc_("JBool",&b,1);} p->failed=1; return k_unit(); }
     if (c == 'f') { if (p->pos+5<=p->len && !memcmp(p->s+p->pos,"false",5)) { p->pos+=5; KValue b=k_bool(0); return k_jc_("JBool",&b,1);} p->failed=1; return k_unit(); }
@@ -1677,7 +1697,7 @@ static KValue kjp_value(KJP* p) {
 static KValue k_json_parse(KValue s) {
     if (s.tag != K_STR) { const char* d = k_show(s); (void)d; }
     const char* str = (s.tag == K_STR) ? s.as.s : k_show(s);
-    KJP p; p.s = (const unsigned char*)str; p.pos = 0; p.len = (long)strlen(str); p.failed = 0;
+    KJP p; p.s = (const unsigned char*)str; p.pos = 0; p.len = (long)strlen(str); p.failed = 0; p.depth = 0;
     kjp_ws(&p);
     KValue v = kjp_value(&p);
     kjp_ws(&p);

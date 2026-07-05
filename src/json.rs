@@ -19,9 +19,16 @@ fn ctor(variant: &str, fields: Vec<Value>) -> Value {
 }
 
 /// Parse a JSON document into a `Json` value. Trailing non-whitespace is an error.
+/// Maximum JSON nesting depth. Untrusted input must not be able to drive the
+/// recursive-descent parser (or the recursive serializer/Display) past this —
+/// otherwise deeply-nested input overflows the stack (a segfault on the native
+/// C backend, where the stack is small). Real JSON nests only a few dozen deep;
+/// the native backend enforces the same limit so all engines agree.
+pub const MAX_JSON_DEPTH: usize = 500;
+
 pub fn parse(input: &str) -> Result<Value, String> {
     let chars: Vec<char> = input.chars().collect();
-    let mut p = Parser { chars: &chars, pos: 0 };
+    let mut p = Parser { chars: &chars, pos: 0, depth: 0 };
     p.skip_ws();
     let v = p.value()?;
     p.skip_ws();
@@ -34,6 +41,7 @@ pub fn parse(input: &str) -> Result<Value, String> {
 struct Parser<'a> {
     chars: &'a [char],
     pos: usize,
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -58,8 +66,16 @@ impl Parser<'_> {
     fn value(&mut self) -> Result<Value, String> {
         self.skip_ws();
         match self.peek() {
-            Some('{') => self.object(),
-            Some('[') => self.array(),
+            Some('{') | Some('[') => {
+                // Bound nesting so untrusted deep input can't overflow the stack.
+                self.depth += 1;
+                if self.depth > MAX_JSON_DEPTH {
+                    return Err("JSON nested too deeply".into());
+                }
+                let v = if self.peek() == Some('{') { self.object() } else { self.array() };
+                self.depth -= 1;
+                v
+            }
             Some('"') => Ok(ctor("JStr", vec![Value::str(self.string()?)])),
             Some('t') | Some('f') => self.boolean(),
             Some('n') => self.null(),
@@ -331,5 +347,22 @@ mod tests {
         assert!(parse("").is_err());
         assert!(parse("nul").is_err());
         assert!(parse("[1] extra").is_err());
+    }
+
+    #[test]
+    fn deep_nesting_is_bounded() {
+        // At the limit still parses; one deeper is a clean error (not a stack
+        // overflow). Guards untrusted deeply-nested input across all engines.
+        let ok = "[".repeat(MAX_JSON_DEPTH) + &"]".repeat(MAX_JSON_DEPTH);
+        assert!(parse(&ok).is_ok());
+        let deep = "[".repeat(MAX_JSON_DEPTH + 1) + &"]".repeat(MAX_JSON_DEPTH + 1);
+        assert_eq!(parse(&deep).unwrap_err(), "JSON nested too deeply");
+    }
+
+    #[test]
+    fn large_array_parses() {
+        // No fixed element cap (the native parser used to cap at 4096).
+        let big = "[".to_string() + &"1,".repeat(9999) + "1]";
+        assert!(parse(&big).is_ok());
     }
 }

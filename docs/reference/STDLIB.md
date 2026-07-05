@@ -28,7 +28,7 @@ unless supervised.
 | `path_join(a, b)` | `(Str, Str) -> Str` | join with one `/`; empty `a` or absolute `b` → `b`; pure |
 | `path_base(p)` / `path_dir(p)` | `(Str) -> Str` | final component / everything before the last `/`; pure |
 | `path_ext(p)` | `(Str) -> Str` | extension incl. the dot (`.txt`), or `""` (a leading-dot dotfile has none); pure |
-| `json_parse(text)` | `(Str) -> Result[Json, Str]` | pure; `Err` on malformed input |
+| `json_parse(text)` | `(Str) -> Result[Json, Str]` | pure; `Err` on malformed input (nesting capped at 500); match `Ok`/`Err` structurally — the `Err` *text* is engine-dependent |
 | `json_stringify(j)` | `(Json) -> Str` | compact; object key order preserved |
 | `args()` | `() -> List[Str]` — **uses `io.env`** | the program's command-line arguments |
 | `env_var(name)` | `(Str) -> Option[Str]` — **uses `io.env`** | environment variable, or `None` |
