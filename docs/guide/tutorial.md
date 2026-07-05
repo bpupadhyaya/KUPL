@@ -325,6 +325,11 @@ fun main() uses io {
 }
 ```
 
+`List` also has `flat_map`/`flatten`, `zip_with` (element-wise combine),
+`group_by` (bucket into a `Map`), `sort_by` (stable, by key), `take_while`/
+`drop_while`, `min_by`/`max_by`, `window`/`chunk`, and `partition` — the standard
+functional toolkit.
+
 **Maps** are insertion-ordered and immutable:
 
 ```kupl
@@ -351,7 +356,9 @@ fun main() uses io {
 }
 ```
 
-See the **[Standard Library](../reference/STDLIB.md)** for the full method list.
+`Map` has `filter`/`fold`/`map_values`/`merge`; `Set` adds `difference` and
+`symmetric_difference`. See the **[Standard Library](../reference/STDLIB.md)** for
+the complete `List`/`Map`/`Set`/`Str` method reference.
 
 ---
 
