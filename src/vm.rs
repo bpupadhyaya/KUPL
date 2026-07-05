@@ -1106,6 +1106,19 @@ mod tests {
     }
 
     #[test]
+    fn diff_par_determinism_and_panic() {
+        // par_map / par_filter / par{} preserve INPUT order deterministically on both
+        // engines (par_map runs branches on threads but joins in order), and a panic
+        // inside a parallel branch propagates as the SAME clean panic (no ICE/hang/
+        // partial result). Certifies the async axis.
+        assert_eq!(differential("fun probe() -> Str {\n    \"{[5, 3, 8, 1, 9, 2].par_map(fn x { x * x })}\"\n}\n"), "[25, 9, 64, 1, 81, 4]");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{[1, 2, 3, 4, 5, 6].par_filter(fn x { x % 2 == 0 })}\"\n}\n"), "[2, 4, 6]");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{[1].drop(1).par_map(fn x { x + 1 })}\"\n}\n"), "[]");
+        assert_eq!(differential("fun probe() -> Int {\n    let r = par {\n        3 * 3\n        4 * 4\n        5 * 5\n    }\n    r.sum()\n}\n"), "50");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{[1, 2, 0, 4].par_map(fn x { 10 / x })}\"\n}\n"), "panic: division by zero");
+    }
+
+    #[test]
     fn diff_nested_value_display() {
         // Display of complex/nested values (lists of lists, Option/Result nesting,
         // Map/Set with nested elements, reduced Rationals) is byte-identical on both

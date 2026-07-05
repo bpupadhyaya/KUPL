@@ -4499,6 +4499,22 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native par_map / par{} produce the SAME order-preserving result as the
+    /// interpreter, and a panic in a parallel branch propagates cleanly. PR-it41.
+    #[test]
+    fn native_par_determinism_and_panic() {
+        if !cc_available() {
+            return;
+        }
+        let ok = "fun sq(n: Int) -> Int { n * n }\nfun main() uses io {\n    \
+                  print([5, 3, 8, 1, 9, 2].par_map(fn x { x * x }))\n    \
+                  let r = par {\n        sq(3)\n        sq(4)\n        sq(5)\n    }\n    print(r)\n}\n";
+        assert_eq!(native_main_stdout(ok, "parok").trim(), "[25, 9, 64, 1, 81, 4]\n[9, 16, 25]");
+        // panic in a par_map branch -> clean panic, empty stdout (no partial result).
+        let bad = "fun main() uses io {\n    print([1, 2, 0, 4].par_map(fn x { 10 / x }))\n}\n";
+        assert!(native_main_stdout(bad, "parbad").trim().is_empty(), "expected a panic, not a value");
+    }
+
     /// Native Display of nested/complex values (nested lists, Map/Set, Option
     /// nesting, reduced Rationals) is byte-identical to the interpreter. PR-it40.
     #[test]
