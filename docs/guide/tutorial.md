@@ -399,6 +399,23 @@ fun main() uses io {
 `.unwrap_or(default)` extracts a value with a fallback; `.map`, `.is_some`,
 `.is_ok` and friends are on the [`Option`/`Result` types](../reference/STDLIB.md).
 
+**Combinators** chain fallible steps without a pyramid of `match` — `Option` and
+`Result` both have `.map`/`.and_then`/`.unwrap_or`, `Option` adds `.filter`/
+`.ok_or`, `Result` adds `.map_err`/`.ok`. A method chain may span lines when the
+line starts with `.`:
+
+```kupl
+fun main() uses io {
+    let r = "8".parse_int()
+        .map(fn x { x * 2 })
+        .filter(fn x { x > 10 })
+        .unwrap_or(0)
+    print(r)                              // 16
+    print("5".parse_int().ok_or("nan").map(fn x { x * 10 }))   // Ok(50)
+    print("x".parse_int().ok_or("nan"))                        // Err("nan")
+}
+```
+
 For a quick conditional unwrap, **`if let`** and **`while let`** bind a pattern
 inline (they desugar to `match`, so any pattern works):
 
@@ -465,8 +482,49 @@ fun main() uses io {
 }
 ```
 
-Bounds (`[T: Ord]`) and type parameters on `type` declarations are **[design]**
-(not yet implemented).
+**Types** can be generic too — parameters in `[...]` after the name, referenced in
+the variant fields:
+
+```kupl
+type Box[T] = Box(v: T)
+type Pair[A, B] = Pair(first: A, second: B)
+type Tree[T] = Leaf | Node(value: T, left: Tree[T], right: Tree[T])
+
+fun unwrap[T](b: Box[T]) -> T { b.v }
+
+fun main() uses io {
+    print(unwrap(Box(v: 5)))          // 5     (Box[Int], inferred)
+    print(unwrap(Box(v: "hi")))       // hi    (Box[Str])
+    let p = Pair(first: 1, second: "one")
+    print("{p.first} {p.second}")     // 1 one (Pair[Int, Str])
+}
+```
+
+Construction infers the type arguments (`Box(v: 5)` is `Box[Int]`), each
+instantiation is distinct (a `Box[Int]` can't hold a `Str`), and type parameters
+are **erased at runtime** — generics cost nothing at run time. Bounds (`[T: Ord]`)
+are still **[design]**: ordered generic code passes an explicit compare function
+(see `examples/collections.kupl`).
+
+---
+
+## 9a. Operator overloading
+
+Define `add`/`sub`/`mul`/`div`/`rem` (for `+ - * / %`) or `lt`/`le`/`gt`/`ge` (for
+`< <= > >=`) on your own type and the operator works on it — like a method call.
+`==`/`!=` are always structural, so they need no definition.
+
+```kupl
+type Vec2 = { x: Int, y: Int }
+fun add(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x + b.x, y: a.y + b.y) }
+fun lt(a: Vec2, b: Vec2) -> Bool { a.x * a.x + a.y * a.y < b.x * b.x + b.y * b.y }
+
+fun main() uses io {
+    let s = Vec2(x: 1, y: 2) + Vec2(x: 3, y: 4)
+    print("({s.x}, {s.y})")                            // (4, 6)
+    print(Vec2(x: 1, y: 1) < Vec2(x: 3, y: 3))         // true
+}
+```
 
 ---
 
@@ -781,6 +839,21 @@ Sized-integer arithmetic is checked (out-of-range **panics**); use `.wrapping_*`
 or `.saturating_*` for modular/clamping behavior. Mixing widths is a type error;
 convert explicitly. These compile natively too.
 
+Beyond machine integers, the **exact numeric tower** never loses precision:
+`big(...)` is an arbitrary-precision `BigInt` and `rat(n, d)` an exact `Rational`
+(reduced fraction). And `Float.fmt(decimals)` formats a fixed-point decimal:
+
+```kupl
+fun main() uses io {
+    print(big(2).pow(100))                        // 1267650600228229401496703205376
+    print(rat(1, 3) + rat(1, 6))                  // 1/2  (exact)
+    print(3.14159.fmt(2))                         // 3.14
+}
+```
+
+Everything above — sized numerics, `BigInt`, `Rational`, and `Float.fmt` — is
+exact and **byte-identical on every engine**, native included.
+
 ---
 
 ## 18. Compiling to native code
@@ -805,11 +878,45 @@ $ ./app
 
 ---
 
+## 18a. A web server
+
+KUPL can serve HTTP. `http_serve(port, handler)` binds a port and calls your
+`handler(method, path) -> Str` for each request (it blocks and serves forever):
+
+```kupl
+fun route(method: Str, path: Str) -> Str {
+    if path == "/health" { "ok" } else { "you sent {method} {path}" }
+}
+
+fun main() uses io {
+    match http_serve(8080, route) {   // then: curl http://127.0.0.1:8080/health
+        Ok(_) => print("stopped")
+        Err(e) => print("could not start: {e}")
+    }
+}
+```
+
+Combine it with the built-in `Json` type (`json_parse`/`json_stringify`) for a
+JSON API — see `examples/demos/api.kupl` for a worked REST service.
+
+---
+
 ## 19. Where to go from here
 
-- Read the example programs in [`examples/`](../../examples) — `showcase.kupl`
-  (JSON → file → regex → parallel pipeline) and `analytics.kupl` (CSV → regex →
-  grouping → JSON) tie the stack together.
+Every domain has a worked example in [`examples/`](../../examples):
+
+| Domain | Example |
+|---|---|
+| Pipelines / data | `showcase.kupl`, `analytics.kupl`, `jq.kupl` |
+| Web backend | `demos/api.kupl`, `demos/server.kupl` |
+| Language implementation | `calc.kupl` (interpreter), `vm.kupl` (compiler + stack VM) |
+| Algorithms / simulation | `sudoku.kupl`, `life.kupl` |
+| Generics / data structures | `generic.kupl`, `collections.kupl` |
+| Numerics | `bigint.kupl`, `rational.kupl`, `stats.kupl`, `tensors.kupl` |
+| Language features | `operators.kupl`, `combinators.kupl`, `format.kupl`, `sets.kupl` |
+
+- `showcase.kupl` (JSON → file → regex → parallel pipeline) and `analytics.kupl`
+  (CSV → regex → grouping → JSON) tie the stack together.
 - Keep the **[Language Reference](../reference/LANGUAGE-REFERENCE.md)** and
   **[Standard Library](../reference/STDLIB.md)** at hand.
 - See the **[CLI reference](../reference/CLI.md)** for every `kupl` subcommand.

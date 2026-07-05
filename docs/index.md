@@ -18,7 +18,7 @@ KUPL is open source and **free forever**.
 | | |
 |---|---|
 | **[Getting Started](guide/getting-started.md)** | Install/build the toolchain, run the REPL, and write your first program. Start here. |
-| **[The KUPL Tutorial](guide/tutorial.md)** | A hands-on, progressive walkthrough of the whole language — values, functions, types, pattern matching, collections, error handling, effects, components, the AI-native core, packages, concurrency, and native compilation. The best way to learn KUPL. |
+| **[The KUPL Tutorial](guide/tutorial.md)** | A hands-on, progressive walkthrough of the whole language — values, functions, types, pattern matching, **generics** (functions *and* types), **operator overloading**, collections, error handling with **`Option`/`Result` combinators**, effects, components, the AI-native core, packages, concurrency, the **exact numeric tower** (`BigInt`/`Rational`), a **web server**, and native compilation. The best way to learn KUPL. |
 | **[Language Reference](reference/LANGUAGE-REFERENCE.md)** | The normative description of the language *as implemented*: lexical structure, types, expressions, statements, declarations, components, effects, and semantics. |
 | **[Standard Library](reference/STDLIB.md)** | Every built-in type and method — `Int`, `Float`, sized integers, `Str`, `List`, `Map`, `Set`, `Option`, `Result`, `Json`, `Tensor` — plus the free functions (file I/O, JSON, HTTP, regex, CSV, URL, time, encoding, random). |
 | **[Command-Line Interface](reference/CLI.md)** | Every `kupl` subcommand: `run`, `build`, `bundle`, `native`, `test`, `check`, `fmt`, `diff`, `repl`, `lsp`, `pkg`, and more. |
