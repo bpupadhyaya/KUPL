@@ -70,6 +70,53 @@ impl Scopes {
         }
         None
     }
+    /// All in-scope binding names (for "did you mean" suggestions).
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.stack.iter().flat_map(|s| s.keys().map(String::as_str))
+    }
+}
+
+/// Levenshtein edit distance (small strings — identifier names).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The nearest candidate name to `name` within a small edit distance, for a
+/// "did you mean `…`?" hint. Deterministic: closest wins, ties broken
+/// alphabetically. Returns `None` if nothing is close enough (so it never fires
+/// spuriously). Short names require a closer match.
+fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<String> {
+    let max_dist = if name.chars().count() <= 3 { 1 } else { 2 };
+    let mut best: Option<(usize, &str)> = None;
+    for cand in candidates {
+        if cand == name {
+            continue;
+        }
+        let d = edit_distance(name, cand);
+        if d > max_dist {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((bd, bc)) => d < *bd || (d == *bd && cand < *bc),
+        };
+        if better {
+            best = Some((d, cand));
+        }
+    }
+    best.map(|(_, c)| c.to_string())
 }
 
 /// What surrounds the body being checked.
@@ -1470,7 +1517,23 @@ impl Checker {
             }
             return Ty::Fun(field_tys, Box::new(result));
         }
-        self.err("K0240", format!("unknown name `{name}`"), span);
+        let suggestion = {
+            // in-scope locals, user functions, user constructors, and the built-in
+            // Option/Result constructors
+            let builtins = ["Some", "None", "Ok", "Err"].into_iter();
+            let cands = ctx
+                .scopes
+                .names()
+                .chain(self.checked.funs.keys().map(String::as_str))
+                .chain(self.checked.ctors.keys().map(String::as_str))
+                .chain(builtins);
+            suggest(name, cands)
+        };
+        let msg = match suggestion {
+            Some(s) => format!("unknown name `{name}` (did you mean `{s}`?)"),
+            None => format!("unknown name `{name}`"),
+        };
+        self.err("K0240", msg, span);
         self.uni.fresh()
     }
 
@@ -2535,6 +2598,31 @@ mod generic_tests {
             .into_iter()
             .filter(|d| d.severity == crate::diag::Severity::Error)
             .collect()
+    }
+
+    #[test]
+    fn did_you_mean_suggestions() {
+        // a typo'd function name suggests the real one; a genuinely unknown name
+        // gets no spurious hint
+        let e = errors("fun compute(x: Int) -> Int { x }\nfun main() { let y = comptue(1) }\n");
+        assert!(
+            e.iter().any(|d| d.message.contains("did you mean `compute`?")),
+            "{:?}",
+            e.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let e2 = errors("fun main() { let z = zzzzqqq }\n");
+        assert!(e2.iter().any(|d| d.code == "K0240"));
+        assert!(!e2.iter().any(|d| d.message.contains("did you mean")));
+    }
+
+    #[test]
+    fn edit_distance_and_suggest() {
+        assert_eq!(super::edit_distance("compute", "comptue"), 2);
+        assert_eq!(super::edit_distance("total", "totl"), 1);
+        assert_eq!(super::edit_distance("abc", "xyz"), 3);
+        // ties broken alphabetically; nothing close -> None
+        assert_eq!(super::suggest("cat", ["car", "bat"].into_iter()), Some("bat".into()));
+        assert_eq!(super::suggest("xyzzy", ["hello", "world"].into_iter()), None);
     }
 
     #[test]
