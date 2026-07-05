@@ -1205,6 +1205,10 @@ impl Checker {
                 for arm in arms {
                     ctx.scopes.push();
                     self.check_pattern(&arm.pattern, &st, ctx);
+                    if let Some(guard) = &arm.guard {
+                        let gt = self.infer_expr(guard, ctx);
+                        self.unify(&Ty::Bool, &gt, guard.span, "match guard (must be Bool)");
+                    }
                     let at = self.infer_expr(&arm.body, ctx);
                     self.unify(&result, &at, arm.body.span, "match arms (all arms must have the same type)");
                     ctx.scopes.pop();
@@ -2104,32 +2108,59 @@ impl Checker {
                     }
                 },
             },
+            PatternKind::Or(alts) => {
+                for alt in alts {
+                    if pattern_binds_var(alt) {
+                        self.err(
+                            "K0258",
+                            "an or-pattern alternative cannot bind variables",
+                            alt.span,
+                        );
+                    }
+                    self.check_pattern(alt, expected, ctx);
+                }
+            }
         }
     }
 
     fn check_exhaustive(&mut self, scrut: &Ty, arms: &[MatchArm], span: Span) {
-        let has_catch_all = arms
-            .iter()
-            .any(|a| matches!(a.pattern.kind, PatternKind::Wildcard | PatternKind::Bind(_)));
-        if has_catch_all {
+        // Only UNGUARDED arms contribute to exhaustiveness — a guarded arm may
+        // not run even when its pattern matches. An or-pattern arm covers each
+        // of its alternatives.
+        let mut catch_all = false;
+        let mut covered: HashSet<String> = HashSet::new();
+        let mut bools: HashSet<bool> = HashSet::new();
+        fn collect(p: &Pattern, catch_all: &mut bool, covered: &mut HashSet<String>, bools: &mut HashSet<bool>) {
+            match &p.kind {
+                PatternKind::Wildcard | PatternKind::Bind(_) => *catch_all = true,
+                PatternKind::Ctor { name, .. } => {
+                    covered.insert(name.clone());
+                }
+                PatternKind::Bool(b) => {
+                    bools.insert(*b);
+                }
+                PatternKind::Or(alts) => {
+                    for a in alts {
+                        collect(a, catch_all, covered, bools);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for a in arms.iter().filter(|a| a.guard.is_none()) {
+            collect(&a.pattern, &mut catch_all, &mut covered, &mut bools);
+        }
+        if catch_all {
             return;
         }
-        let covered: HashSet<&str> = arms
-            .iter()
-            .filter_map(|a| match &a.pattern.kind {
-                PatternKind::Ctor { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
+        let covered: HashSet<&str> = covered.iter().map(String::as_str).collect();
         let missing: Vec<String> = match self.uni.apply(scrut) {
             Ty::Bool => {
                 let mut m = Vec::new();
-                let has_true = arms.iter().any(|a| matches!(a.pattern.kind, PatternKind::Bool(true)));
-                let has_false = arms.iter().any(|a| matches!(a.pattern.kind, PatternKind::Bool(false)));
-                if !has_true {
+                if !bools.contains(&true) {
                     m.push("true".into());
                 }
-                if !has_false {
+                if !bools.contains(&false) {
                     m.push("false".into());
                 }
                 m
@@ -2169,6 +2200,16 @@ impl Checker {
                 span,
             );
         }
+    }
+}
+
+/// Whether a pattern binds any variable (used to reject binding or-patterns).
+fn pattern_binds_var(p: &Pattern) -> bool {
+    match &p.kind {
+        PatternKind::Bind(_) => true,
+        PatternKind::Ctor { args, .. } => args.iter().any(pattern_binds_var),
+        PatternKind::Or(alts) => alts.iter().any(pattern_binds_var),
+        _ => false,
     }
 }
 

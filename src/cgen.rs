@@ -3754,6 +3754,19 @@ mod tests {
         }
     }
 
+    /// Match guards and or-patterns (it55) compile to native byte-identically:
+    /// or-patterns fan out to one body, guards fall through on false.
+    #[test]
+    fn native_match_guards_or() {
+        let src = "type D = A | B | C\n\
+                   fun k(d: D) -> Int {\n    match d {\n        A | B => 1\n        C => 2\n    }\n}\n\
+                   fun g(n: Int) -> Str {\n    match n {\n        x if x < 0 => \"neg\"\n        0 => \"zero\"\n        _ => \"pos\"\n    }\n}\n\
+                   fun main() uses io {\n    print(\"{k(A)} {k(C)}\")\n    print(\"{g(-2)} {g(0)} {g(5)}\")\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "matchg"), "1 2\nneg zero pos\n");
+        }
+    }
+
     /// The it54 stdlib methods (sort_by / position / partition / rfind /
     /// replace_first / split_once) compile to native byte-identically.
     #[test]

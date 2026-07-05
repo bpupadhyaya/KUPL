@@ -925,6 +925,12 @@ impl<'s> FnCompiler<'s> {
                     self.scopes.push(Vec::new());
                     let mut fails = Vec::new();
                     self.pattern(&arm.pattern, s, &mut fails);
+                    // a guard is tested after the pattern binds; a false guard
+                    // falls through to the next arm just like a failed pattern
+                    if let Some(guard) = &arm.guard {
+                        let g = self.expr(guard);
+                        fails.push(self.emit(Op::JumpIfFalse(g, 0), arm.span));
+                    }
                     let r = self.expr(&arm.body);
                     self.emit(Op::Move(dst, r), arm.span);
                     end_jumps.push(self.emit(Op::Jump(0), arm.span));
@@ -1223,6 +1229,27 @@ impl<'s> FnCompiler<'s> {
                     self.pattern(arg, f, fails);
                 }
             }
+            PatternKind::Or(alts) => {
+                // try each alternative; a match jumps past the block, a failed
+                // non-last alt falls through to the next, the last alt's fails
+                // propagate to the caller. Alternatives bind no variables.
+                let mut matched = Vec::new();
+                for (i, alt) in alts.iter().enumerate() {
+                    if i + 1 < alts.len() {
+                        let mut local = Vec::new();
+                        self.pattern(alt, v, &mut local);
+                        matched.push(self.emit(Op::Jump(0), span));
+                        for f in local {
+                            self.patch_jump(f);
+                        }
+                    } else {
+                        self.pattern(alt, v, fails);
+                    }
+                }
+                for j in matched {
+                    self.patch_jump(j);
+                }
+            }
         }
     }
 }
@@ -1344,6 +1371,9 @@ fn free_vars_expr(e: &Expr, bound: &HashSet<String>, free: &mut BTreeSet<String>
             for arm in arms {
                 let mut b = bound.clone();
                 bind_pattern_names(&arm.pattern, &mut b);
+                if let Some(guard) = &arm.guard {
+                    free_vars_expr(guard, &b, free);
+                }
                 free_vars_expr(&arm.body, &b, free);
             }
         }

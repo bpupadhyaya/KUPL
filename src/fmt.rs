@@ -574,7 +574,11 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
                 if i > 0 {
                     s.push_str(", ");
                 }
-                s.push_str(&format!("{} => {}", pattern_str(&arm.pattern), expr_str(&arm.body, 0)));
+                let guard = match &arm.guard {
+                    Some(g) => format!(" if {}", expr_str(g, 0)),
+                    None => String::new(),
+                };
+                s.push_str(&format!("{}{} => {}", pattern_str(&arm.pattern), guard, expr_str(&arm.body, 0)));
             }
             s.push_str(" }");
             (s, ATOM)
@@ -645,6 +649,10 @@ fn pattern_str(p: &Pattern) -> String {
                 let a: Vec<String> = args.iter().map(pattern_str).collect();
                 format!("{name}({})", a.join(", "))
             }
+        }
+        PatternKind::Or(alts) => {
+            let a: Vec<String> = alts.iter().map(pattern_str).collect();
+            a.join(" | ")
         }
     }
 }

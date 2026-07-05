@@ -401,6 +401,9 @@ pub struct LambdaParam {
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    /// Optional `if COND` guard: the arm matches only when the pattern binds and
+    /// the guard is true; a failed guard falls through to the next arm.
+    pub guard: Option<Expr>,
     pub body: Expr,
     pub span: Span,
 }
@@ -420,6 +423,9 @@ pub enum PatternKind {
     Str(String),
     /// `Circle(r)`, `Some(x)`, `None`
     Ctor { name: String, args: Vec<Pattern> },
+    /// `A | B | C` — matches if any alternative matches. Alternatives may not
+    /// bind variables (checked), so no binding-merge is needed.
+    Or(Vec<Pattern>),
 }
 
 /// Type syntax as written in source.

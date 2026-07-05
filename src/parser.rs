@@ -1439,6 +1439,12 @@ impl Parser {
                         break;
                     }
                     let pattern = self.parse_pattern()?;
+                    // optional `if COND` guard before the `=>`
+                    let guard = if self.eat(&Tok::KwIf) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
                     self.expect(Tok::FatArrow)?;
                     let body = if self.at(&Tok::LBrace) {
                         let b = self.parse_block()?;
@@ -1448,7 +1454,7 @@ impl Parser {
                         self.parse_expr()?
                     };
                     let aspan = pattern.span.merge(body.span);
-                    arms.push(MatchArm { pattern, body, span: aspan });
+                    arms.push(MatchArm { pattern, guard, body, span: aspan });
                     if !self.eat(&Tok::Comma) {
                         if !matches!(self.peek(), Tok::Newline | Tok::RBrace) {
                             return Err(Diag::error(
@@ -1519,6 +1525,21 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> PResult<Pattern> {
+        let first = self.parse_pattern_primary()?;
+        if !self.at(&Tok::Pipe) {
+            return Ok(first);
+        }
+        // or-pattern: `P1 | P2 | …`
+        let span = first.span;
+        let mut alts = vec![first];
+        while self.eat(&Tok::Pipe) {
+            alts.push(self.parse_pattern_primary()?);
+        }
+        let end = alts.last().map(|p| p.span).unwrap_or(span);
+        Ok(Pattern { kind: PatternKind::Or(alts), span: span.merge(end) })
+    }
+
+    fn parse_pattern_primary(&mut self) -> PResult<Pattern> {
         let span = self.span();
         match self.peek().clone() {
             Tok::Int(v) => {

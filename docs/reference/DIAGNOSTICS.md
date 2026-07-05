@@ -107,6 +107,7 @@ Severity: **E** = error, **W** = warning.
 | K0255 | E | wrong number of pattern fields |
 | K0256 | E | `match` over unbounded type needs a catch-all arm |
 | K0257 | E | non-exhaustive `match` (lists the missing variants) |
+| K0258 | E | an or-pattern alternative cannot bind variables |
 | K0260 | E | contract defined more than once |
 | K0261 | E | `fulfills` names an unknown contract |
 | K0262 | E | fulfilling component does not expose a required function |

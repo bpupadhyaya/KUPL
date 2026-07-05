@@ -202,6 +202,30 @@ fun main() uses io {
 }
 ```
 
+Arms can carry a **guard** (`if COND`) and can share a body with an
+**or-pattern** (`P1 | P2`):
+
+```kupl
+fun sign(n: Int) -> Str {
+    match n {
+        x if x < 0 => "negative"    // guard — runs only when the condition holds
+        0 => "zero"
+        _ => "positive"
+    }
+}
+
+fun is_weekend(d: Day) -> Bool {
+    match d {
+        Sat | Sun => true           // or-pattern — any alternative matches
+        _ => false
+    }
+}
+```
+
+A guarded arm doesn't count toward exhaustiveness (it might not run), so a
+`match` still needs unguarded arms or a catch-all to cover every case.
+Or-pattern alternatives may not bind variables.
+
 `Option` and `Result` (below) are themselves ADTs you match on.
 
 ---

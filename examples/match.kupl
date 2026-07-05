@@ -1,0 +1,59 @@
+// Pattern matching — guards and or-patterns.
+//
+//   PATTERN if COND => …    a guard: the arm runs only when COND (evaluated with
+//                           the pattern's bindings in scope) is true; a false
+//                           guard falls through to the next arm.
+//   P1 | P2 | … => …        an or-pattern: matches if any alternative matches.
+//                           Alternatives bind no variables.
+//
+// Guarded arms do NOT satisfy exhaustiveness on their own — a match still needs
+// unguarded arms (or a catch-all) to cover every case.
+
+type Day = Mon | Tue | Wed | Thu | Fri | Sat | Sun
+
+// or-patterns group variants without repeating the arm body
+fun is_weekend(d: Day) -> Bool {
+    match d {
+        Sat | Sun => true
+        Mon | Tue | Wed | Thu | Fri => false
+    }
+}
+
+// guards refine a match with a boolean condition
+fun sign(n: Int) -> Str {
+    match n {
+        x if x < 0 => "negative"
+        0 => "zero"
+        _ => "positive"
+    }
+}
+
+// guards see the pattern's bindings; first matching arm wins (top to bottom)
+fun grade(score: Int) -> Str {
+    match score {
+        s if s >= 90 => "A"
+        s if s >= 80 => "B"
+        s if s >= 70 => "C"
+        s if s >= 60 => "D"
+        _ => "F"
+    }
+}
+
+// literal or-patterns
+fun small_prime(n: Int) -> Bool {
+    match n {
+        2 | 3 | 5 | 7 => true
+        _ => false
+    }
+}
+
+fun main() uses io {
+    print("weekend? {is_weekend(Sat)} {is_weekend(Wed)}")
+    for n in [-4, 0, 9] {
+        print("sign({n}) = {sign(n)}")
+    }
+    for s in [95, 83, 71, 65, 40] {
+        print("grade({s}) = {grade(s)}")
+    }
+    print("primes: {[1, 2, 4, 5, 7, 9].filter(fn n { small_prime(n) })}")
+}

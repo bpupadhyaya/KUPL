@@ -173,6 +173,11 @@ match v {                           // expression; must be exhaustive
     Circle(r) => 3.14 * r * r
     Rect(w, h) => w * h
 }
+match n {                           // guards + or-patterns
+    x if x < 0 => "negative"        // guard: arm runs only when the cond holds
+    0 | 1 | 2 => "small"            // or-pattern: matches any alternative
+    _ => "other"
+}
 fn x { x * 2 }                      // lambda; parameter types from context
 fn (x: Int, y: Int) { x + y }       // or annotated
 xs.map(fn x { x + 1 })              // method call
@@ -187,6 +192,14 @@ par { f(a)  g(b)  h(c) }            // structured fork-join → List of results
 - `match` exhaustiveness is compile-checked: all variants of a union,
   `Some`/`None`, `Ok`/`Err`, `true`/`false` — or a catch-all `_`/binding arm.
   Unbounded scrutinees (Int, Str) require a catch-all.
+- **Guards** — `PATTERN if COND => …` runs the arm only when `COND` (a `Bool`,
+  evaluated with the pattern's bindings in scope) is true; a false guard falls
+  through to the next arm. A **guarded arm does not contribute to
+  exhaustiveness** (it may not run), so a match still needs unguarded arms or a
+  catch-all to be complete.
+- **Or-patterns** — `P1 | P2 | … => …` matches if any alternative matches. An
+  or-pattern arm covers each of its alternatives for exhaustiveness.
+  Alternatives may **not** bind variables (K0258), so no binding-merge is needed.
 - `expr?` requires `expr : Result[T, E]` and an enclosing function returning
   `Result[_, E]`; on `Err(e)` the function returns early with that error. Not
   allowed in handlers (K0237) — handle the Result with `match` there.

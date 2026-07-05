@@ -795,6 +795,13 @@ impl Interp {
                 for arm in arms {
                     let scope = env.child();
                     if match_pattern(&arm.pattern, &v, &scope) {
+                        // a guard is checked with the pattern's bindings in
+                        // scope; a false guard falls through to the next arm
+                        if let Some(guard) = &arm.guard {
+                            if !matches!(self.eval(guard, &scope)?, Value::Bool(true)) {
+                                continue;
+                            }
+                        }
                         return self.eval(&arm.body, &scope);
                     }
                 }
@@ -1348,6 +1355,7 @@ pub fn match_pattern(pat: &Pattern, value: &Value, env: &Env) -> bool {
             }
             args.iter().zip(fields.iter()).all(|(p, v)| match_pattern(p, v, env))
         }
+        (PatternKind::Or(alts), v) => alts.iter().any(|p| match_pattern(p, v, env)),
         _ => false,
     }
 }
