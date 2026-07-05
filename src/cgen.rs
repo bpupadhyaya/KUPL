@@ -3045,6 +3045,20 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 if (k_truthy(k_call(args[0], &l->items[i], 1))) out[n++] = l->items[i];
             return k_list(out, n);
         }
+        if (!strcmp(name, "take_while")) {
+            KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+            int n = 0;
+            for (int64_t i = 0; i < l->len; i++) {
+                if (!k_truthy(k_call(args[0], &l->items[i], 1))) break;
+                out[n++] = l->items[i];
+            }
+            return k_list(out, n);
+        }
+        if (!strcmp(name, "drop_while")) {
+            int64_t i = 0;
+            while (i < l->len && k_truthy(k_call(args[0], &l->items[i], 1))) i++;
+            return k_list(l->items + i, (int)(l->len - i));
+        }
         if (!strcmp(name, "par_each")) {
             for (int64_t i = 0; i < l->len; i++) k_call(args[0], &l->items[i], 1);
             return k_unit();
@@ -4281,6 +4295,18 @@ mod tests {
                    print(Some(5).ok_or(\"no\").map_err(fn e { e }).unwrap_or(0))\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
+        }
+    }
+
+    /// List.take_while / drop_while (it95) compile to native.
+    #[test]
+    fn native_take_drop_while() {
+        let src = "fun main() uses io {\n    \
+                   let xs = [2, 4, 5, 6]\n    \
+                   print(xs.take_while(fn n { n % 2 == 0 }))\n    \
+                   print(xs.drop_while(fn n { n % 2 == 0 }))\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "listmore"), "[2, 4]\n[5, 6]\n");
         }
     }
 

@@ -172,6 +172,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.len()` | `-> Int` | |
 | `.map(f)` | `(fn(T) -> U) -> List[U]` | |
 | `.filter(f)` | `(fn(T) -> Bool) -> List[T]` | |
+| `.take_while(f)` / `.drop_while(f)` | `(fn(T) -> Bool) -> List[T]` | longest matching prefix / the rest after it |
 | `.par_map(f)` | `(fn(T) -> U) -> List[U]` | parallel map — independent per element; deterministic (input order) |
 | `.par_filter(f)` | `(fn(T) -> Bool) -> List[T]` | parallel filter; deterministic (input order) |
 | `.par_each(f)` | `(fn(T) -> U) -> Unit` | parallel for-effect; result discarded |

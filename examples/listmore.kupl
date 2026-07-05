@@ -1,0 +1,24 @@
+// More list operations: take_while / drop_while (prefix by predicate),
+// flat_map (map then concat), and flatten (a list of lists -> one list).
+
+fun main() uses io {
+    let xs = [2, 4, 6, 7, 8, 10]
+    print("leading evens: {xs.take_while(fn n { n % 2 == 0 })}")
+    print("the rest:      {xs.drop_while(fn n { n % 2 == 0 })}")
+
+    // flat_map: expand each element into several
+    print("expanded: {[1, 2, 3].flat_map(fn n { [n, n * n] })}")
+    // flatten a nested list
+    print("flat: {[[1, 2], [], [3, 4, 5]].flatten()}")
+}
+
+law "take_while / drop_while / flat_map / flatten" {
+    let xs = [1, 2, 3, 4, 1]
+    expect xs.take_while(fn n { n < 3 }) == [1, 2]
+    expect xs.drop_while(fn n { n < 3 }) == [3, 4, 1]
+    expect [1, 2, 3].flat_map(fn n { [n, n * 10] }) == [1, 10, 2, 20, 3, 30]
+    expect [[1, 2], [3], [4, 5]].flatten() == [1, 2, 3, 4, 5]
+    // predicate false immediately / never
+    expect [5, 1].take_while(fn n { n < 3 }) == []
+    expect [1, 2].drop_while(fn n { n < 9 }) == []
+}

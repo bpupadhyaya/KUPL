@@ -1865,7 +1865,10 @@ impl Checker {
                     Ty::List(Box::new(c)),
                 ))
             }
-            (Ty::List(t), "filter") | (Ty::List(t), "par_filter") => Some((
+            (Ty::List(t), "filter")
+            | (Ty::List(t), "par_filter")
+            | (Ty::List(t), "take_while")
+            | (Ty::List(t), "drop_while") => Some((
                 vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
                 Ty::List(t.clone()),
             )),

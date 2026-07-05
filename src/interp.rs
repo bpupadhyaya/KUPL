@@ -1582,6 +1582,30 @@ pub fn shared_method(
             }
             Ok(Value::List(Rc::new(out)))
         }
+        (Value::List(items), "take_while") => {
+            let f = args.into_iter().next().ok_or("`take_while` needs a function")?;
+            let mut out = Vec::new();
+            for item in items.iter() {
+                if let Value::Bool(true) = call(f.clone(), vec![item.clone()])? {
+                    out.push(item.clone());
+                } else {
+                    break;
+                }
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
+        (Value::List(items), "drop_while") => {
+            let f = args.into_iter().next().ok_or("`drop_while` needs a function")?;
+            let mut i = 0;
+            while i < items.len() {
+                if let Value::Bool(true) = call(f.clone(), vec![items[i].clone()])? {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            Ok(Value::List(Rc::new(items[i..].to_vec())))
+        }
         (Value::List(items), "par_each") => {
             let f = args.into_iter().next().ok_or("`par_each` needs a function")?;
             for item in items.iter() {
