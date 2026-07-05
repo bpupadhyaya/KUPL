@@ -1056,14 +1056,19 @@ static KValue k_bt_tensor(KValue v) {
     }
     return k_tensor_new(d, l->len);
 }
+/* Same 100M-element sanity cap as interp::MAX_TENSOR_LEN — a huge size panics
+   cleanly instead of hanging / OOM-killing the process. */
+#define K_MAX_TENSOR_LEN 100000000LL
 static KValue k_bt_zeros(KValue v) {
     if (v.tag != K_INT || v.as.i < 0) k_panic("zeros() needs a non-negative size");
+    if (v.as.i > K_MAX_TENSOR_LEN) k_panic("zeros() size too large");
     double* d = k_alloc(sizeof(double) * (v.as.i < 1 ? 1 : v.as.i));
     for (int64_t i = 0; i < v.as.i; i++) d[i] = 0.0;
     return k_tensor_new(d, v.as.i);
 }
 static KValue k_bt_arange(KValue v) {
     if (v.tag != K_INT || v.as.i < 0) k_panic("arange() needs a non-negative size");
+    if (v.as.i > K_MAX_TENSOR_LEN) k_panic("arange() size too large");
     double* d = k_alloc(sizeof(double) * (v.as.i < 1 ? 1 : v.as.i));
     for (int64_t i = 0; i < v.as.i; i++) d[i] = (double)i;
     return k_tensor_new(d, v.as.i);

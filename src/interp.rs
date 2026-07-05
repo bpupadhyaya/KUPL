@@ -137,6 +137,13 @@ pub struct Interp {
 /// (`vm.rs`) so both report `stack overflow (10000 frames)` at the same point.
 pub const MAX_CALL_DEPTH: usize = 10_000;
 
+/// Maximum element count for a `zeros`/`arange` tensor. A sanity bound so a huge
+/// or accidental size (e.g. `arange(100000000000)`) fails with a clean panic
+/// instead of hanging the process or triggering the OS OOM killer. 100M f64 is
+/// 800 MB — generous for real numeric work; the native backend enforces the same
+/// limit so all engines agree.
+pub const MAX_TENSOR_LEN: u64 = 100_000_000;
+
 impl Interp {
     pub fn new(db: ProgramDb) -> Interp {
         let image = Some(crate::parallel::ProgramImage::from_db(&db));
@@ -3352,11 +3359,17 @@ pub fn tensor_builtin(name: &str, arg: &Value) -> Result<Value, String> {
             if *n < 0 {
                 return Err("zeros() needs a non-negative size".into());
             }
+            if *n as u64 > MAX_TENSOR_LEN {
+                return Err("zeros() size too large".into());
+            }
             Ok(Value::Tensor(Rc::new(vec![0.0; *n as usize])))
         }
         ("arange", Value::Int(n)) => {
             if *n < 0 {
                 return Err("arange() needs a non-negative size".into());
+            }
+            if *n as u64 > MAX_TENSOR_LEN {
+                return Err("arange() size too large".into());
             }
             Ok(Value::Tensor(Rc::new((0..*n).map(|i| i as f64).collect())))
         }

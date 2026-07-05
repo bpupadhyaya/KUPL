@@ -1106,6 +1106,20 @@ mod tests {
     }
 
     #[test]
+    fn diff_huge_tensor_is_capped() {
+        // A huge zeros()/arange() must panic cleanly (not hang / OOM), identically
+        // on both engines (the native backend enforces the same cap).
+        assert_eq!(
+            differential("fun probe() -> Int {\n    arange(100000000000).len()\n}\n"),
+            "panic: arange() size too large"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    zeros(100000000000).len()\n}\n"),
+            "panic: zeros() size too large"
+        );
+    }
+
+    #[test]
     fn diff_nan_inf_display() {
         // NaN and infinities must Display identically on both engines (Rust's f64
         // Display: "NaN"/"inf"/"-inf"). The native backend matches too (PR-it5).

@@ -15,8 +15,8 @@ unless supervised.
 | `Map()` | `() -> Map[K, V]` | empty map |
 | `Set()` / `Set(xs)` | `() -> Set[T]` / `(List[T]) -> Set[T]` | duplicates dropped |
 | `tensor(xs)` | `(List[Float]) -> Tensor` | Int elements are accepted and widened |
-| `zeros(n)` | `(Int) -> Tensor` | n zeros; negative n panics |
-| `arange(n)` | `(Int) -> Tensor` | `[0.0, 1.0, …, n-1]` |
+| `zeros(n)` | `(Int) -> Tensor` | n zeros; negative n panics; capped at 100M elements |
+| `arange(n)` | `(Int) -> Tensor` | `[0.0, 1.0, …, n-1]`; capped at 100M elements |
 | `read_file(path)` | `(Str) -> Result[Str, Str]` — **uses `io.fs`** | whole file as text; `Err` carries the OS message |
 | `write_file(path, s)` | `(Str, Str) -> Result[Unit, Str]` — **uses `io.fs`** | creates or truncates |
 | `append_file(path, s)` | `(Str, Str) -> Result[Unit, Str]` — **uses `io.fs`** | creates if missing |
