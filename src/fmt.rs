@@ -36,15 +36,21 @@ fn indent(out: &mut String, level: usize) {
 }
 
 fn fmt_type(out: &mut String, t: &TypeDecl) {
+    // generic type parameters, e.g. `type Pair[A, B] = …`
+    let tp = if t.type_params.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", t.type_params.join(", "))
+    };
     // newtype: single variant named like the type with one field `value`
     let is_record = t.variants.len() == 1 && t.variants[0].name == t.name;
     if is_record {
         let v = &t.variants[0];
         if v.fields.len() == 1 && v.fields[0].name == "value" {
-            out.push_str(&format!("type {} = new {}\n", t.name, ty_str(&v.fields[0].ty)));
+            out.push_str(&format!("type {}{tp} = new {}\n", t.name, ty_str(&v.fields[0].ty)));
             return;
         }
-        out.push_str(&format!("type {} = {{ ", t.name));
+        out.push_str(&format!("type {}{tp} = {{ ", t.name));
         for (i, f) in v.fields.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
@@ -54,7 +60,7 @@ fn fmt_type(out: &mut String, t: &TypeDecl) {
         out.push_str(" }\n");
         return;
     }
-    out.push_str(&format!("type {} = ", t.name));
+    out.push_str(&format!("type {}{tp} = ", t.name));
     for (i, v) in t.variants.iter().enumerate() {
         if i > 0 {
             out.push_str(" | ");
@@ -92,6 +98,9 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
             out.push_str(", ");
         }
         out.push_str(&format!("{}: {}", p.name, ty_str(&p.ty)));
+        if let Some(d) = &p.default {
+            out.push_str(&format!(" = {}", expr_str(d, 0)));
+        }
     }
     out.push(')');
     if !f.effects.is_empty() {
@@ -721,6 +730,21 @@ mod tests {
     #[test]
     fn fmt_idempotent_exprs() {
         roundtrip("fun f(x: Int) -> Int {\n    let y = (x + 1) * 2\n    match y { 0 => 1, n => n * 2 }\n}\n");
+    }
+
+    #[test]
+    fn fmt_preserves_generic_type_params() {
+        // regression: fmt used to drop `[A, B]` / `[T]` on type declarations, so
+        // the formatted program had "unknown type A" and failed to reparse.
+        roundtrip("type Pair[A, B] = Pair(first: A, second: B)\n");
+        roundtrip("type Tree[T] = Leaf | Node(value: T, left: Tree[T], right: Tree[T])\n");
+        roundtrip("type Box[T] = { item: T }\n");
+    }
+
+    #[test]
+    fn fmt_preserves_default_params() {
+        // regression: fmt used to drop `= "hi"` default values.
+        roundtrip("fun greet(name: Str, greeting: Str = \"hi\") -> Str {\n    greeting\n}\n");
     }
 
     #[test]
