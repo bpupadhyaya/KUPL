@@ -24,6 +24,19 @@ Usage:
 ";
 
 fn main() -> ExitCode {
+    // Production safety net: a bug in the compiler should never dump a raw Rust
+    // panic + backtrace at the user. Convert any panic into one concise,
+    // reportable line. The worker-thread join below turns it into exit code 101.
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!(" [{}:{}]", l.file(), l.line()))
+            .unwrap_or_default();
+        eprintln!(
+            "kupl: internal compiler error{loc} — this is a bug in KUPL, not your program. \
+             Please report it with the input that triggered it."
+        );
+    }));
     // Run the whole CLI on a worker thread with a large stack. The tree-walking
     // interpreter recurses on the native stack (one KUPL call = several Rust
     // frames), so deeply-recursive programs (e.g. a backtracking solver) need

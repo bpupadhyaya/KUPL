@@ -398,7 +398,10 @@ impl<'a> Lexer<'a> {
                             _ => {}
                         }
                     }
-                    let end = self.pos.saturating_sub(1);
+                    // `self.pos - 1` is the byte just before the closing `}`. At
+                    // EOF the loop never advances, so clamp to `expr_start` to keep
+                    // the range non-inverted (a degenerate `{` at end-of-input).
+                    let end = self.pos.saturating_sub(1).max(expr_start);
                     let raw = self.src[expr_start..end].to_string();
                     parts.push(StrPart::Expr(raw, expr_start as u32));
                 }
@@ -692,6 +695,20 @@ mod tests {
             }
             other => panic!("expected string, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unterminated_interpolation_at_eof_does_not_panic() {
+        // regression: a string ending in `{` at EOF used to build an inverted
+        // byte range (expr_start > end) and panic slicing self.src. It must
+        // instead produce a clean unterminated-interpolation diagnostic.
+        // none of these may panic (the point of the test is reaching this line)
+        for src in ["\"{", "\"abc{", "\"{ ", "\"x{y", "\"{{{\"", "\"{"] {
+            let _ = lex(src);
+        }
+        // the reduced trigger emits a clean unterminated-interpolation diagnostic
+        let (_t, diags) = lex("\"{");
+        assert!(diags.iter().any(|d| d.code == "K0007"), "expected K0007, got {diags:?}");
     }
 
     #[test]
