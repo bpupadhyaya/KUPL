@@ -3256,6 +3256,29 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             for (int64_t i = 0; i < n; i++) out[i] = arr[i].v;
             return k_list(out, (int)n);
         }
+        if (!strcmp(name, "group_by")) {
+            int64_t n = l->len;
+            KValue* keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+            KValue** buckets = k_alloc(sizeof(KValue*) * (n < 1 ? 1 : n));
+            int64_t* counts = k_alloc(sizeof(int64_t) * (n < 1 ? 1 : n));
+            int64_t ng = 0;
+            for (int64_t i = 0; i < n; i++) {
+                KValue key = k_call(args[0], &l->items[i], 1);
+                int64_t g = -1;
+                for (int64_t j = 0; j < ng; j++) if (k_eq(keys[j], key)) { g = j; break; }
+                if (g < 0) {
+                    g = ng;
+                    keys[ng] = key;
+                    buckets[ng] = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+                    counts[ng] = 0;
+                    ng++;
+                }
+                buckets[g][counts[g]++] = l->items[i];
+            }
+            KValue* vals = k_alloc(sizeof(KValue) * (ng < 1 ? 1 : ng));
+            for (int64_t j = 0; j < ng; j++) vals[j] = k_list(buckets[j], (int)counts[j]);
+            return k_map_make(keys, vals, ng);
+        }
         if (!strcmp(name, "position")) {
             for (int64_t i = 0; i < l->len; i++)
                 if (k_truthy(k_call(args[0], &l->items[i], 1))) return k_some(k_int(i));
@@ -4258,6 +4281,17 @@ mod tests {
                    print(Some(5).ok_or(\"no\").map_err(fn e { e }).unwrap_or(0))\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
+        }
+    }
+
+    /// List.group_by (it94) compiles to native, first-seen key order preserved.
+    #[test]
+    fn native_group_by() {
+        let src = "fun main() uses io {\n    \
+                   let g = [1, 2, 3, 4, 5].group_by(fn n { n % 2 })\n    \
+                   print(g.get(1))\n    print(g.get(0))\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "sortgroup"), "Some([1, 3, 5])\nSome([2, 4])\n");
         }
     }
 

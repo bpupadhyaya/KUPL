@@ -1970,6 +1970,13 @@ impl Checker {
                 vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Int))],
                 Ty::List(t.clone()),
             )),
+            (Ty::List(t), "group_by") => {
+                let k = self.uni.fresh();
+                Some((
+                    vec![Ty::Fun(vec![(**t).clone()], Box::new(k.clone()))],
+                    Ty::Map(Box::new(k), Box::new(Ty::List(t.clone()))),
+                ))
+            }
             (Ty::List(t), "position") => Some((
                 vec![Ty::Fun(vec![(**t).clone()], Box::new(Ty::Bool))],
                 Ty::Option(Box::new(Ty::Int)),

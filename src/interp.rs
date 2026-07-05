@@ -1861,6 +1861,23 @@ pub fn shared_method(
             keyed.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(Value::List(Rc::new(keyed.into_iter().map(|(_, v)| v).collect())))
         }
+        (Value::List(items), "group_by") => {
+            let f = args.into_iter().next().ok_or("`group_by` needs a function")?;
+            // first-seen key order preserved (Map is insertion-ordered)
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            for item in items.iter() {
+                let key = call(f.clone(), vec![item.clone()])?;
+                match groups.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, list)) => list.push(item.clone()),
+                    None => groups.push((key, vec![item.clone()])),
+                }
+            }
+            let pairs = groups
+                .into_iter()
+                .map(|(k, vs)| (k, Value::List(Rc::new(vs))))
+                .collect();
+            Ok(Value::Map(Rc::new(pairs)))
+        }
         (Value::List(items), "position") => {
             let f = args.into_iter().next().ok_or("`position` needs a function")?;
             for (i, item) in items.iter().enumerate() {

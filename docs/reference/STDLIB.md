@@ -202,6 +202,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.window(n)` | `(Int) -> List[List[T]]` | sliding windows of width n (n ≥ 1) |
 | `.chunk(n)` | `(Int) -> List[List[T]]` | consecutive chunks of size n (last may be shorter) |
 | `.sort_by(f)` | `(fn(T) -> Int) -> List[T]` | stable sort by an Int key |
+| `.group_by(f)` | `(fn(T) -> K) -> Map[K, List[T]]` | bucket elements by a key; keys in first-seen order, each bucket in input order |
 | `.position(f)` | `(fn(T) -> Bool) -> Option[Int]` | index of the first element matching the predicate |
 | `.partition(f)` | `(fn(T) -> Bool) -> List[List[T]]` | `[matching, non-matching]`, order preserved |
 

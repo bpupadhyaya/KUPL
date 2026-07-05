@@ -1,0 +1,26 @@
+// Sorting and grouping lists.
+//
+//   List.sort_by(fn(T) -> Int) -> List[T]      stable sort by an integer key
+//   List.group_by(fn(T) -> K) -> Map[K, List[T]]  bucket by a key (first-seen order)
+
+fun main() uses io {
+    // sort words by length — stable, so equal-length words keep their input order
+    let words = ["pear", "fig", "apple", "kiwi", "date", "plum"]
+    let by_len = words.sort_by(fn w { w.len() })
+    let joined = by_len.join(", ")
+    print("by length: {joined}")
+
+    // group numbers by remainder mod 3 (keys appear in first-seen order: 1, 2, 0)
+    let nums = [1, 2, 3, 4, 5, 6, 7]
+    let by_mod = nums.group_by(fn n { n % 3 })
+    print("mod 3 == 1: {by_mod.get(1)}")
+    print("mod 3 == 0: {by_mod.get(0)}")
+}
+
+law "sort_by is stable; group_by buckets by key" {
+    // stability: "fig"/"date"/"kiwi"/"pear"/"plum" all differ, but the two
+    // length-3 words keep input order (fig before <none> — use a tie case)
+    expect ["bb", "a", "cc", "d"].sort_by(fn s { s.len() }) == ["a", "d", "bb", "cc"]
+    // group by parity: first-seen key order (odd first)
+    expect [1, 2, 3, 4].group_by(fn n { n % 2 }) == Map().insert(1, [1, 3]).insert(0, [2, 4])
+}
