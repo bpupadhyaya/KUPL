@@ -39,10 +39,47 @@ stays green — verified on every commit. The arc, by phase:
   `par_map` + exposes + wires) and `analytics.kupl` (CSV + regex + grouping +
   JSON), each byte-identical on interpreter, KVM, and native.
 
-**Honest remaining gaps:** `ai fun` on the native backend; a hosted package
-registry and third-party ecosystem; general async/await + coroutines; the
+**Honest remaining gaps (as of it50):** `ai fun` on the native backend; a hosted
+package registry and third-party ecosystem; general async/await + coroutines; the
 GPU/kernel and systems/ownership tiers; and the optional KValue-unboxing perf IR
 (KIR). These are documented, not hidden.
+
+## Enrichment campaign (it51–it66) — extension summary
+
+The campaign was extended past it50; a further set of iterations deepened the
+standard library and the language, holding the same sacred invariant (interp==KVM
+byte-identical + the all-examples regression green on every commit):
+
+- **Native completeness (it51–52)** — `ai fun` now compiles to native via its
+  deterministic `KUPL_AI_MOCK*` path (non-tool and tool-use), so the native
+  backend compiles the entire language (real-provider network calls aside).
+- **Date/time (it53)** — a deterministic UTC calendar keyed on epoch seconds:
+  `date_make`, `date_iso`, `parse_iso`, and the `*_of` extractors, pure integer
+  civil math, byte-identical on every engine including native.
+- **Stdlib depth (it54)** — `List.sort_by`/`position`/`partition`, `Str.rfind`/
+  `replace_first`/`split_once`.
+- **Match ergonomics (it55–56)** — guards (`if COND`), or-patterns (`A | B`),
+  `@` bindings, and Int range patterns (`lo..hi`, `lo..=hi`), all lowering to
+  existing branch ops (native-free).
+- **UFCS (it57)** — `x.f(args)` resolves to a top-level `f(x, args…)` when there
+  is no built-in method: free functions read as methods and chain.
+- **`if let` / `while let` (it58)** — refutable binding that desugars to `match`.
+- **Stdin (it59)** — `read_line`/`read_all` (Unix-filter programs).
+- **Subprocess (it60)** — `exec(program, args)`, argv-based (no shell).
+- **File/path toolkit (it61)** — `list_dir` (sorted), `make_dir`/`remove_dir`,
+  and the pure `path_join`/`path_base`/`path_dir`/`path_ext` helpers.
+- **Default params + named args (it62)** — resolved to positional form before
+  checking, so all engines see plain positional calls.
+- **Flagship app (it63)** — `examples/ssg.kupl`, a mini static-site generator
+  (markdown→HTML on disk) using the file/path toolkit + string processing.
+- **BigInt (it64–65)** — arbitrary-precision integers (`+ - * / %`, comparisons,
+  `.pow`/`.abs`/`.sign`), a from-scratch base-1e9 bignum with a native C mirror,
+  byte-identical on every engine.
+
+**Remaining gaps (unchanged, honest):** a hosted package registry + third-party
+ecosystem; general async/await + coroutines; the GPU/kernel and systems/ownership
+tiers; a WASM target; and the KValue-unboxing perf IR (KIR is design-locked-out —
+"lower existing bytecode, no KIR").
 
 ## Final stretch — prioritized shortlist (it42–50)
 

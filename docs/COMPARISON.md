@@ -1,8 +1,10 @@
 # KUPL vs. the field — an honest audit
 
-**Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed 2026-07-04
-after enrichment iteration 50** (the four big arcs are done; the native backend
-compiles everything but `ai fun`; the LSP is everyday-complete — see below).
+**Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed 2026-07-05
+after enrichment iteration 66** (the four big arcs are done; the native backend
+compiles the **entire language** including `ai fun` (mock path) and `BigInt`; the
+LSP is everyday-complete; a further 15 arcs have deepened the stdlib and the
+language ergonomics — see "What's new since it50" below).
 
 This document compares KUPL, **as actually implemented today**, against nine
 established languages: Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift,
@@ -40,7 +42,37 @@ byte-identical across the interpreter and KVM by differential tests:
   component app (`counter`/`todo`/`timers`/`di`) now runs at native speed, not
   just VM speed.
 
-The scores below move accordingly: **concurrency 1→3**, **runtime performance
+### What's new since it50 (batteries + ergonomics, it51–it66)
+
+Fifteen further iterations deepened the standard library and the language,
+every one held byte-identical across the interpreter and KVM (and native, where
+applicable):
+
+- **Batteries**: a deterministic UTC **date/time** library (`date_make`/`date_iso`/
+  `parse_iso`/`*_of`, epoch-based civil math), **stdin** (`read_line`/`read_all`,
+  for Unix-filter programs), **subprocess** (`exec`, argv-based, no shell), the
+  **file/path toolkit** (`list_dir` sorted, `make_dir`/`remove_dir`, `path_*`),
+  and **arbitrary-precision `BigInt`** (`+ - * / %`, `.pow`, exact and native).
+  With JSON/CSV/URL/regex/HTTP/encodings/seeded-random already present, the
+  standard library is now genuinely broad — and all of it compiles to native.
+- **Language ergonomics**: `match` **guards** and **or-patterns**, **`@` bindings**
+  and **range patterns**; **UFCS** (a free function reads as a method, so
+  `x.f(y)` falls back to `f(x, y)`); **`if let` / `while let`**; and **default
+  parameter values + named arguments**. This closes most of the everyday
+  expressiveness distance to Rust/Swift/Kotlin.
+- **Proof of universality**: a real mini **static-site generator**
+  (`examples/ssg.kupl`, markdown→HTML on disk) and a **CSV analytics** tool join
+  the example set — the file/path toolkit + string processing building actual
+  software, identical on every engine.
+
+The scores below reflect these: **fast to write 4→5** (the ergonomics + batteries
+now match the mainstream scripting experience). Concurrency, runtime performance,
+and ecosystem are unchanged — general async/await, the perf IR (design-locked
+out), and a third-party ecosystem remain the honest gaps.
+
+### What changed at it20–it52 (the four big arcs + native completeness)
+
+The scores moved accordingly: **concurrency 1→3**, **runtime performance
 2–3→3**, **universality 3→4**, **ecosystem 1→2**. By it52 the native backend
 compiles the **entire language** — including `ai fun` via its deterministic
 mock path (real-provider network calls aside) (JSON, CSV, URL, regex, and HTTP
@@ -96,7 +128,7 @@ its design docs). They are impressionistic, not benchmarks.
 | Criterion | KUPL | Python | Go | TypeScript | Java | Rust | Haskell | C++ | Swift | Kotlin |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Natural / readable syntax | 4 | 5 | 4 | 4 | 3 | 3 | 3 | 2 | 4 | 5 |
-| Fast to write | 4 | 5 | 4 | 4 | 3 | 3 | 3 | 2 | 4 | 5 |
+| Fast to write | 5 | 5 | 4 | 4 | 3 | 3 | 3 | 2 | 4 | 5 |
 | Type & memory safety | 4 | 2 | 3 | 3 | 4 | 5 | 5 | 2 | 4 | 4 |
 | Runtime performance | 3 | 1 | 4 | 2 | 4 | 5 | 4 | 5 | 4 | 4 |
 | Concurrency / parallelism | 3 | 2 | 5 | 2 | 4 | 5 | 4 | 3 | 4 | 5 |
@@ -127,16 +159,23 @@ conveniences; KUPL trades a little terseness for `intent`/`example`/contract
 syntax that carries the spec inline. It clears Java, Rust, Haskell, and C++ on
 approachability.
 
-### Fast to write — KUPL 4
+### Fast to write — KUPL 5
 
 Type inference inside bodies (annotations only at public boundaries), ADTs +
-exhaustive `match`, `Option`/`Result` + `?`, immutable collections with rich
+exhaustive `match` — now with **guards, or-patterns, `@` bindings, and range
+patterns** — `Option`/`Result` + `?` plus **`if let`/`while let`**, **UFCS** (any
+free function reads as a method, so results chain: `p.add(q).scale(2.0)`),
+**default parameter values + named arguments**, immutable collections with rich
 methods, and `example` blocks that are tests-as-you-write make small programs
-quick. The standard library now covers the common real-world tasks — file I/O,
-JSON, an HTTP client, regex, seeded random, CLI args/env — so an everyday script
-(fetch an endpoint, parse JSON, validate with a regex, write a file) is
-genuinely concise (see `examples/showcase.kupl`). It still trails Python/Kotlin
-for throwaway work because there are no *third-party* packages to reach for. The
+quick. The standard library now covers the common real-world tasks — file/path
+operations, directory listing, subprocess (`exec`), stdin filters, dates, JSON,
+an HTTP client, regex, CSV/URL, encodings, seeded random, CLI args/env, and
+arbitrary-precision `BigInt` — so everyday programs (a Unix filter, a static-site
+generator, a data pipeline, a build script) are genuinely concise (see
+`examples/ssg.kupl`, `analytics.kupl`, `stdin.kupl`). With that ergonomics + the
+batteries, the day-to-day writing experience now matches mainstream scripting
+languages; it still trails Python/Kotlin only for *throwaway* work, because there
+are no *third-party* packages to reach for. The
 AI-native features (`ai fun`, agent components) make a specific class of
 program — LLM applications — dramatically faster to write than in any listed
 language, where the same thing means SDKs, JSON plumbing, and glue. Rating held
