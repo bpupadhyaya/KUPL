@@ -1,10 +1,11 @@
 # KUPL vs. the field — an honest audit
 
-**Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed 2026-07-05
-after enrichment iteration 66** (the four big arcs are done; the native backend
-compiles the **entire language** including `ai fun` (mock path) and `BigInt`; the
-LSP is everyday-complete; a further 15 arcs have deepened the stdlib and the
-language ergonomics — see "What's new since it50" below).
+**Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed 2026-07-06
+after enrichment iteration 82** (the native backend compiles the **entire
+language** including `ai fun` (mock path), `BigInt`, `Rational`, and the HTTP
+server; the type system now has **generic ADTs**, operator overloading, and
+Option/Result combinators; a real HTTP **server** and several flagship apps
+demonstrate universality — see "What's new since it66" below).
 
 This document compares KUPL, **as actually implemented today**, against nine
 established languages: Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift,
@@ -70,6 +71,45 @@ now match the mainstream scripting experience). Concurrency, runtime performance
 and ecosystem are unchanged — general async/await, the perf IR (design-locked
 out), and a third-party ecosystem remain the honest gaps.
 
+### What's new since it66 (type system + web + flagships, it67–it81)
+
+Sixteen further iterations deepened the type system, added a web-server tier, and
+proved universality with real applications — all held byte-identical across the
+interpreter, KVM, and native machine code:
+
+- **Type system / expressiveness**: **generic ADTs** (`type Box[T]`,
+  `type Pair[A, B]`, `type Tree[T]` — sound, type parameters checked then erased,
+  it80) on top of the existing generic *functions*; **operator overloading** for
+  user types (`a + b` -> `add(a, b)`, it71); and **Option/Result combinators**
+  (`.map`/`.and_then`/`.filter`/`.ok_or`/`.map_err`/`.ok`, it77). With rich `match`
+  and UFCS already present, KUPL is now genuinely on par with Rust/Swift/Kotlin on
+  the everyday type-and-expressiveness axes, and with Haskell for ADTs.
+- **Web backends**: a real blocking **HTTP server** (`http_serve`, it67–68) on
+  every engine including native (POSIX sockets), enabling the **JSON REST API**
+  flagship (it69).
+- **Exact numeric tower**: **`Rational`** exact fractions (it70) completing
+  `Int -> BigInt -> Rational`, plus fixed-precision **`Float.fmt`** (it73) — all
+  native and byte-identical.
+- **Modern ergonomics**: literal-brace escaping `{{`/`}}` (it75), multi-line
+  `else` (it76), and multi-line method chains (it78) — three lexer/parser fixes
+  that make everyday code read like any mainstream language.
+- **Robustness**: the interpreter now recurses as deeply as the KVM (a 512 MiB
+  worker-thread stack, it79) — closing a latent deep-recursion divergence.
+- **Proof of universality**: flagship apps written *in* KUPL — a language
+  interpreter (it72), a jq-like JSON query tool (it74), a Sudoku solver (it79),
+  and a generic collections library (it81).
+
+The scores move: **scalability 3→4** — generic ADTs + generic functions +
+modules + namespaced packages + contracts/interfaces + static types give KUPL the
+*language* machinery for large codebases (on par with Java/Go/TypeScript); what
+still caps real-world scale is maturity, not the language. Type-safety holds at 4
+(sound generics, exhaustive match, no null — but no ownership/purity guarantees
+like Rust/Haskell's 5). Universality holds at 4 (web + algorithms + language-impl
++ exact math — but the GPU/systems tiers are still designed, not built). The
+honest gaps are unchanged: general async/await, a hosted registry + third-party
+ecosystem, the GPU/kernel + systems tiers, a WASM target, and the KValue-unboxing
+perf IR (KIR, design-locked-out).
+
 ### What changed at it20–it52 (the four big arcs + native completeness)
 
 The scores moved accordingly: **concurrency 1→3**, **runtime performance
@@ -132,7 +172,7 @@ its design docs). They are impressionistic, not benchmarks.
 | Type & memory safety | 4 | 2 | 3 | 3 | 4 | 5 | 5 | 2 | 4 | 4 |
 | Runtime performance | 3 | 1 | 4 | 2 | 4 | 5 | 4 | 5 | 4 | 4 |
 | Concurrency / parallelism | 3 | 2 | 5 | 2 | 4 | 5 | 4 | 3 | 4 | 5 |
-| Scalability (large codebases) | 3 | 2 | 4 | 4 | 5 | 5 | 4 | 3 | 4 | 4 |
+| Scalability (large codebases) | 4 | 2 | 4 | 4 | 5 | 5 | 4 | 3 | 4 | 4 |
 | Universality (domains × hardware) | 4 | 4 | 3 | 3 | 4 | 5 | 3 | 5 | 3 | 4 |
 | **AI-native (in the language)** | **5** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | Tooling & diagnostics | 4 | 3 | 4 | 4 | 4 | 5 | 3 | 3 | 4 | 4 |
@@ -233,16 +273,20 @@ Swift (actors/async-await) still beat it for general concurrency; but for the
 common *data-parallel* case KUPL now competes, and the actor isolation +
 supervision mean the model scales cleanly.
 
-### Scalability (large codebases) — KUPL 3
+### Scalability (large codebases) — KUPL 4
 
 Strong design bones — components as the unit of isolation, contracts as
 interfaces with dynamic dispatch (dependency injection landed in it7), semantic
-diff, canonical form, `kupl context` for local reasoning, multi-file modules —
-but unproven at scale and lacking the module/visibility granularity, generics
-bounds, and package boundaries that Java/Rust/TypeScript rely on for
-million-line codebases. Generics have no bounds (`[T: Ord]` is **□ [design]**),
-and there is a single flat namespace across `use`d files. Good foundations, not
-yet battle-tested.
+diff, canonical form, `kupl context` for local reasoning, multi-file modules, a
+package *manager* with namespace isolation and version pinning — plus, since
+it80, **generic types** on top of generic functions, so reusable abstractions
+(containers, algorithms) have real static-typed machinery. That is the
+large-codebase toolkit Java/Go/TypeScript rely on, which is why this moves to 4.
+What still caps it is *maturity*, not the language: generics have no **bounds**
+(`[T: Ord]` is **□ [design]** — ordered generic code passes an explicit compare
+function today), there is a single flat namespace across `use`d files, and no
+codebase has yet exercised it at million-line scale. Good foundations, now with
+the type machinery — but not yet battle-tested.
 
 ### Universality (domains × hardware) — KUPL 4 (design: 5)
 

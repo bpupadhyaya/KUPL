@@ -76,10 +76,49 @@ byte-identical + the all-examples regression green on every commit):
   `.pow`/`.abs`/`.sign`), a from-scratch base-1e9 bignum with a native C mirror,
   byte-identical on every engine.
 
-**Remaining gaps (unchanged, honest):** a hosted package registry + third-party
+**Remaining gaps (as of it66):** a hosted package registry + third-party
 ecosystem; general async/await + coroutines; the GPU/kernel and systems/ownership
 tiers; a WASM target; and the KValue-unboxing perf IR (KIR is design-locked-out —
 "lower existing bytecode, no KIR").
+
+## Enrichment campaign (it67–it81) — type system + web + flagships
+
+The campaign continued past it66; these iterations deepened the type system,
+added a web-server tier, and proved universality — all held byte-identical across
+the interpreter, KVM, and native (except the blocking HTTP server, validated by
+live socket tests rather than the stdout regression):
+
+- **HTTP server (it67–68)** — `http_serve(port, handler)`, a real blocking server
+  dispatching to a KUPL handler; interp+KVM, then native via POSIX sockets. The
+  one honest regression exception (blocks) — it lives in `examples/demos/` and is
+  covered by live unit tests.
+- **Rational (it70)** — exact fractions over `BigInt`, completing the numeric
+  tower `Int -> BigInt -> Rational`; native via a C mirror.
+- **Operator overloading (it71)** — `+ - * / % < <= > >=` on user types resolve to
+  `add`/`sub`/…/`lt` functions (== stays structural); a lowered call, so native is
+  free.
+- **Number formatting (it73)** — `Float.fmt(decimals)`, a hand-rolled round-half-
+  away algorithm mirrored in C (byte-identical, no platform `%.*f`).
+- **Option/Result combinators (it77)** — `.map`/`.and_then`/`.filter`/`.ok_or` /
+  `.map_err`/`.ok`, variant-guarded, callbacks via the shared call path.
+- **Ergonomics (it75, it76, it78)** — literal-brace escaping `{{`/`}}`, `else` on a
+  new line, and multi-line method chains — three lexer/parser fixes surfaced by
+  the flagship demos, each byte-identical for free.
+- **Interpreter recursion depth (it79)** — the tree-walker now runs on a 512 MiB
+  worker-thread stack, matching the KVM's heap frames (closes a latent deep-
+  recursion divergence).
+- **Generic ADTs (it80)** — `type Box[T]`, `type Pair[A, B]`, `type Tree[T]`:
+  parametric user types, sound, with type parameters checked then erased at
+  runtime — a parser + checker-only change, so all engines were unchanged.
+- **Flagship apps** — a JSON REST API (it69), a jq-like JSON query tool (it74), a
+  language interpreter (it72), a Sudoku solver (it79), and a generic collections
+  library (it81), all written in KUPL.
+
+**Remaining gaps (unchanged, honest):** a hosted package registry + third-party
+ecosystem; general async/await + coroutines; **bounded generics / typeclasses**
+(`[T: Ord]` — ordered generic code passes an explicit compare function today); the
+GPU/kernel and systems/ownership tiers; a WASM target; and the KValue-unboxing
+perf IR (KIR is design-locked-out).
 
 ## Final stretch — prioritized shortlist (it42–50)
 
