@@ -969,6 +969,13 @@ impl Interp {
                     }
                     return random_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("exec", 2) => {
+                    let mut vals = Vec::with_capacity(2);
+                    for a in args {
+                        vals.push(self.eval(&a.value, env)?);
+                    }
+                    return exec_builtin(&vals).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("http_get", 1) | ("http_post", 2) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -2709,6 +2716,47 @@ pub fn http_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         Ok(body) => Value::ok(Value::str(body)),
         Err(msg) => Value::err(Value::str(msg)),
     })
+}
+
+/// `exec(program, args)` — run a program (no shell; argv-based) and capture
+/// stdout. `Ok(stdout)` on exit 0; else `Err(trimmed stderr)`, or
+/// `Err("exited with status N")` if stderr is empty, or
+/// `Err("cannot run <program>: <e>")` if it can't be spawned. Same success/
+/// failure shape as `http_builtin`, so the two are consistent. Effect `io.proc`.
+pub fn exec_builtin(args: &[Value]) -> Result<Value, String> {
+    let program = match &args[0] {
+        Value::Str(s) => s.as_str().to_string(),
+        other => other.to_string(),
+    };
+    let arglist: Vec<String> = match &args[1] {
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::Str(s) => s.as_str().to_string(),
+                other => other.to_string(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&arglist);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => return Ok(Value::err(Value::str(format!("cannot run {program}: {e}")))),
+    };
+    if out.status.success() {
+        Ok(Value::ok(Value::str(String::from_utf8_lossy(&out.stdout).into_owned())))
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let msg = if err.is_empty() {
+            format!("exited with status {}", out.status.code().unwrap_or(-1))
+        } else {
+            err
+        };
+        Ok(Value::err(Value::str(msg)))
+    }
 }
 
 fn run_curl(mut cmd: std::process::Command, body: Option<String>) -> Result<String, String> {

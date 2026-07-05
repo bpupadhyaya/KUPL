@@ -1,0 +1,32 @@
+// Running external programs — automation, glue code, build tooling.
+//
+//   exec(program: Str, args: List[Str]) -> Result[Str, Str]
+//
+// argv-based (NO shell), so arguments are passed literally — no word-splitting,
+// globbing, or injection. `Ok(stdout)` on exit 0; otherwise `Err` carrying the
+// trimmed stderr (or "exited with status N", or "cannot run …"). Carries the
+// `io.proc` effect (a sub-effect of `io`).
+//
+// This example uses only POSIX `echo`/`false` and prints FIXED strings on the
+// error branch, so its output is deterministic on every engine and platform.
+
+fun run(program: Str, args: List[Str]) -> Str {
+    match exec(program, args) {
+        Ok(text) => text.trim()
+        Err(_) => "<failed>"
+    }
+}
+
+fun main() uses io {
+    // capture stdout
+    print("echo    : {run("echo", ["hello", "kupl"])}")
+
+    // arguments are literal: a single arg with a space stays one arg
+    print("literal : {run("echo", ["a b c"])}")
+
+    // a non-zero exit is an Err (handled, not a crash)
+    print("false   : {run("false", [])}")
+
+    // a missing program is an Err too
+    print("missing : {run("definitely_not_a_real_program_xyz", [])}")
+}

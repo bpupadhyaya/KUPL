@@ -51,6 +51,7 @@ unless supervised.
 | `url_decode(s)` | `(Str) -> Result[Str, Str]` | reverse `%XX`; `+` → space; `Err` on bad input |
 | `query_parse(s)` | `(Str) -> List[List[Str]]` | `a=1&b=2` → `[[a,1],[b,2]]`, decoded |
 | `query_build(pairs)` | `(List[List[Str]]) -> Str` | encode `[key, value]` pairs into `a=1&b=2` |
+| `exec(program, args)` | `(Str, List[Str]) -> Result[Str, Str]` — **uses `io.proc`** | run a program (argv, no shell); `Ok` = stdout on exit 0 |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
 | `re_match(pat, text)` | `(Str, Str) -> Bool` | regex search (`^…$` for full match) |
@@ -70,6 +71,15 @@ read_line() { … }` drains stdin.
 `random_ints` / `random_floats` / `shuffle` are **pure** (no effect): a given
 seed always yields the same result (xorshift64\*), so simulations and tests are
 reproducible. There is no ambient/global RNG — pass a seed explicitly.
+
+`exec(program, args)` runs a program **without a shell** — `program` and each
+element of `args` become the process argv verbatim, so arguments with spaces or
+shell metacharacters are passed literally (no word-splitting, globbing, or
+injection). It captures stdout: `Ok(stdout)` on exit code 0, otherwise `Err`
+carrying the trimmed stderr (or `"exited with status N"` if stderr is empty, or
+`"cannot run <program>: …"` if it can't be spawned). It carries the `io.proc`
+effect (a sub-effect of `io`). Error *message text* is platform-dependent — match
+`Ok`/`Err` structurally rather than on the text.
 
 `http_get` / `http_post` shell out to the system `curl` (the same transport the
 AI runtime uses) and carry the `io.net` effect. A non-2xx status or unreachable

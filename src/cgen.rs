@@ -381,6 +381,7 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
             BUILTIN_JSON_STRINGIFY => {
                 format!("regs[{dst}] = k_json_stringify(regs[{start}]); (void){argc};")
             }
+            BUILTIN_EXEC => format!("regs[{dst}] = k_exec(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_HTTP_GET => format!("regs[{dst}] = k_http_get(regs[{start}]); (void){argc};"),
             BUILTIN_HTTP_POST => format!("regs[{dst}] = k_http_post(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_MATCH => format!("regs[{dst}] = k_re_match(regs[{start}], regs[{start}+1]); (void){argc};"),
@@ -650,6 +651,7 @@ static void k_i128_print(char* buf, size_t n, __int128 x) {
 static KValue k_bool(int v)      { KValue x; x.tag = K_BOOL;  x.as.b = !!v; return x; }
 static KValue k_unit(void)       { KValue x; x.tag = K_UNIT;  x.as.i = 0; return x; }
 static KValue k_str(const char* s) { KValue x; x.tag = K_STR; x.as.s = s; return x; }
+static char* k_strdup(const char* s) { size_t n = strlen(s) + 1; char* c = (char*)k_alloc(n); memcpy(c, s, n); return c; }
 static KValue k_fun(int32_t idx) { KValue x; x.tag = K_FUN;   x.as.fun = idx; return x; }
 
 static KValue k_range(KValue lo, KValue hi, int incl) {
@@ -1523,6 +1525,51 @@ static KValue k_run_curl(char* const argv[], const char* body) {
     }
     return k_ok(k_str(out.buf ? out.buf : (char*)""));
 }
+/* exec(program, args) — fork/execvp an arbitrary program (no shell), capture
+   stdout. Ok(stdout) on exit 0, else Err(trimmed stderr | "exited with status N"
+   | "cannot run …"). Mirrors interp::exec_builtin's decision + shape. */
+static KValue k_exec(KValue prog, KValue arglist) {
+    const char* program = prog.as.s;
+    KList* al = arglist.as.list;
+    int argc = (int)al->len;
+    char** argv = (char**)k_alloc(sizeof(char*) * (argc + 2));
+    argv[0] = (char*)program;
+    for (int i = 0; i < argc; i++) argv[i + 1] = (char*)al->items[i].as.s;
+    argv[argc + 1] = 0;
+    int outp[2], errp[2];
+    if (pipe(outp) || pipe(errp)) return k_err(k_str("cannot run: pipe failed"));
+    pid_t pid = fork();
+    if (pid < 0) return k_err(k_str("cannot run: fork failed"));
+    if (pid == 0) {
+        dup2(outp[1], 1); dup2(errp[1], 2);
+        close(outp[0]); close(outp[1]); close(errp[0]); close(errp[1]);
+        execvp(program, argv);
+        _exit(127);
+    }
+    close(outp[1]); close(errp[1]);
+    KBuf out = { 0, 0, 0 }, er = { 0, 0, 0 };
+    char buf[4096]; ssize_t n;
+    while ((n = read(outp[0], buf, sizeof buf)) > 0) kb_write(&out, buf, n);
+    while ((n = read(errp[0], buf, sizeof buf)) > 0) kb_write(&er, buf, n);
+    close(outp[0]); close(errp[0]);
+    int status = 0; waitpid(pid, &status, 0);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == 127) {
+        char m[300]; snprintf(m, sizeof m, "cannot run %s: command not found", program);
+        return k_err(k_str(k_strdup(m)));
+    }
+    if (code != 0) {
+        char* e = er.buf ? er.buf : (char*)"";
+        while (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r') e++;
+        long len = (long)strlen(e);
+        while (len > 0 && (e[len-1] == ' ' || e[len-1] == '\t' || e[len-1] == '\n' || e[len-1] == '\r')) e[--len] = 0;
+        if (len > 0) return k_err(k_str(e));
+        char m[64]; snprintf(m, sizeof m, "exited with status %d", code);
+        return k_err(k_str(k_strdup(m)));
+    }
+    return k_ok(k_str(out.buf ? out.buf : (char*)""));
+}
+
 static KValue k_http_get(KValue url) {
     char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30", (char*)k_as_str(url), 0 };
     return k_run_curl(argv, 0);
@@ -3605,6 +3652,19 @@ mod tests {
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// exec (it60): argv-based subprocess. `echo` captures stdout (single arg
+    /// with a space stays one arg — no shell splitting); a missing program is
+    /// an Err. Native == interp.
+    #[test]
+    fn native_exec() {
+        let src = "fun main() uses io {\n    \
+                   match exec(\"echo\", [\"a b\"]) {\n        Ok(t) => print(\"[{t}]\")\n        Err(_) => print(\"err\")\n    }\n    \
+                   match exec(\"no_such_prog_xyz\", []) {\n        Ok(_) => print(\"ok\")\n        Err(_) => print(\"missing\")\n    }\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "exec"), "[a b\n]\nmissing\n");
+        }
     }
 
     /// Stdin builtins (it59): read_line strips the newline and returns None at

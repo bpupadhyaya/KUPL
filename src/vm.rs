@@ -596,6 +596,10 @@ impl<'m> Vm<'m> {
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_EXEC => match crate::interp::exec_builtin(&args) {
+                            Ok(v) => set!(dst, v),
+                            Err(msg) => return Err(VmError { msg, span }),
+                        },
                         BUILTIN_HTTP_GET | BUILTIN_HTTP_POST => {
                             let name = if which == BUILTIN_HTTP_GET { "http_get" } else { "http_post" };
                             match crate::interp::http_builtin(name, &args) {

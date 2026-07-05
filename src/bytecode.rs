@@ -216,6 +216,7 @@ pub const BUILTIN_DATE_ISO: u8 = 51;
 pub const BUILTIN_YEARDAY_OF: u8 = 52;
 pub const BUILTIN_READ_LINE: u8 = 53;
 pub const BUILTIN_READ_ALL: u8 = 54;
+pub const BUILTIN_EXEC: u8 = 55;
 
 impl Module {
     pub fn disassemble(&self) -> String {

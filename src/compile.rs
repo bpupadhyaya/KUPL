@@ -1065,6 +1065,7 @@ impl<'s> FnCompiler<'s> {
                 ("args", 0) => Some(BUILTIN_ARGS),
                 ("read_line", 0) => Some(BUILTIN_READ_LINE),
                 ("read_all", 0) => Some(BUILTIN_READ_ALL),
+                ("exec", 2) => Some(BUILTIN_EXEC),
                 ("eprint", 1) => Some(BUILTIN_EPRINT),
                 ("exit", 1) => Some(BUILTIN_EXIT),
                 ("random_ints", 2) => Some(BUILTIN_RANDOM_INTS),

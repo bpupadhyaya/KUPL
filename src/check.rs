@@ -1482,6 +1482,13 @@ impl Checker {
                     self.unify(&Ty::Str, &b, args[1].value.span, "http_post body");
                     return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
                 }
+                ("exec", 2) => {
+                    let p = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &p, args[0].value.span, "exec program");
+                    let a = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&Ty::List(Box::new(Ty::Str)), &a, args[1].value.span, "exec args");
+                    return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
                 ("re_match", 2) | ("re_find", 2) | ("re_find_all", 2) | ("re_replace", 3) => {
                     for a in args {
                         let t = self.infer_expr(&a.value, ctx);
