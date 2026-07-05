@@ -3085,9 +3085,60 @@ fn builtin_method(
 
 #[cfg(test)]
 mod server_tests {
-    use super::{http_response, parse_request_line, serve_http};
+    use super::{http_response, parse_request_line, serve_http, Flow, Interp, ProgramDb, Value};
     use std::io::{Read, Write};
     use std::net::TcpStream;
+
+    /// Send one GET and return the response body (everything after the headers).
+    fn get_body(port: u16, path: &str) -> String {
+        let mut stream = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let mut stream = stream.expect("server should be listening");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut resp = String::new();
+        let _ = stream.read_to_string(&mut resp);
+        resp.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or(resp)
+    }
+
+    /// A real JSON REST API (the shape of examples/demos/api.kupl) answers live
+    /// requests through the interpreter — routing + json_stringify end to end.
+    #[test]
+    fn json_api_routes() {
+        let src = r#"
+fun handle(method: Str, path: Str) -> Str {
+    let parts = path.split("/")
+    if path == "/health" {
+        json_stringify(JObj(Map().insert("status", JStr("ok"))))
+    } else if parts.len() == 4 && parts.get(1) == Some("add") {
+        let x = parts.get(2).unwrap_or("").parse_int().unwrap_or(0)
+        let y = parts.get(3).unwrap_or("").parse_int().unwrap_or(0)
+        json_stringify(JObj(Map().insert("sum", JNum((x + y).to_float()))))
+    } else {
+        json_stringify(JObj(Map().insert("error", JStr("not found"))))
+    }
+}
+fun main() uses io { let _ = http_serve(38131, handle) }
+"#;
+        let compiled = crate::run::compile(src).expect("api compiles");
+        std::thread::spawn(move || {
+            let db = ProgramDb::build(&compiled.program, &compiled.checked);
+            let mut interp = Interp::new(db);
+            let f = Value::Fun(std::rc::Rc::new("main".to_string()));
+            let _ = interp.call_value(f, vec![], crate::diag::Span::default());
+        });
+        assert_eq!(get_body(38131, "/health"), "{\"status\":\"ok\"}");
+        assert_eq!(get_body(38131, "/add/2/3"), "{\"sum\":5}");
+        assert_eq!(get_body(38131, "/nope"), "{\"error\":\"not found\"}");
+    }
 
     #[test]
     fn request_line_and_response() {

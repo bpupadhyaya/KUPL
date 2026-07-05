@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 197 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 198 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -238,6 +238,15 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 All examples run identically on the interpreter, the VM, and (for `fun main`
 programs) native — try `diff <(kupl run f.kupl) <(kupl run --vm f.kupl)`.
 
+**Demos** (`examples/demos/`) are runnable programs that block (an HTTP server
+serves forever), so they live outside the automated example regression but are
+covered by integration tests:
+
+| Demo | What it shows |
+|---|---|
+| `examples/demos/server.kupl` | a tiny HTTP server: `http_serve(port, handler)` routing method+path to a response body |
+| `examples/demos/api.kupl` | a JSON REST API web backend: `http_serve` + `json_stringify` + routing (`/health`, `/add/2/3`, `/echo/x`, `/time/0`) |
+
 ## What works today
 
 Components as isolated actors (typed ports, `wire`, state, `on start/stop`,
@@ -275,7 +284,7 @@ language, every example verified against the toolchain).
 ## Status & roadmap
 
 **v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~28,100 lines of dependency-free Rust, 197 tests, all engines differentially
+~28,200 lines of dependency-free Rust, 198 tests, all engines differentially
 verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
 lowering (Metal first), components + per-component GC in the native backend,
 timers (`on every`), the package registry, LSP hover/completion, and

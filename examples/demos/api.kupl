@@ -1,0 +1,78 @@
+// A JSON REST API — a real web backend in KUPL, end to end.
+//
+// DEMO ONLY: http_serve blocks (serves forever), so this is NOT part of the
+// automated example regression. Run it by hand and hit it with curl:
+//
+//   kupl run examples/demos/api.kupl        # or: --vm, or: kupl native ... -o api
+//   curl http://127.0.0.1:8080/health       # {"status":"ok"}
+//   curl http://127.0.0.1:8080/add/2/3      # {"sum":5}
+//   curl http://127.0.0.1:8080/echo/hello   # {"you_said":"hello"}
+//   curl http://127.0.0.1:8080/time/0       # {"epoch":0,"iso":"1970-01-01T00:00:00Z"}
+//
+// It stitches together http_serve + json_stringify + routing + the stdlib. The
+// same request produces the same JSON on every engine (interpreter, KVM, native)
+// — the routing logic is covered by an integration test in the test suite.
+
+fun ok_status() -> Str {
+    json_stringify(JObj(Map().insert("status", JStr("ok"))))
+}
+
+fun not_found(method: Str, path: Str) -> Str {
+    json_stringify(
+        JObj(
+            Map()
+                .insert("error", JStr("not found"))
+                .insert("method", JStr(method))
+                .insert("path", JStr(path))
+        )
+    )
+}
+
+// GET /add/<a>/<b> — sum two path integers, or an error object.
+fun route_add(a: Str, b: Str) -> Str {
+    match a.parse_int() {
+        Some(x) => match b.parse_int() {
+            Some(y) => json_stringify(JObj(Map().insert("sum", JNum((x + y).to_float()))))
+            None => json_stringify(JObj(Map().insert("error", JStr("b is not an integer"))))
+        }
+        None => json_stringify(JObj(Map().insert("error", JStr("a is not an integer"))))
+    }
+}
+
+// GET /time/<epoch> — echo the epoch and its ISO-8601 rendering.
+fun route_time(epoch: Str) -> Str {
+    match epoch.parse_int() {
+        Some(n) => json_stringify(
+            JObj(Map().insert("epoch", JNum(n.to_float())).insert("iso", JStr(date_iso(n))))
+        )
+        None => json_stringify(JObj(Map().insert("error", JStr("epoch is not an integer"))))
+    }
+}
+
+// The router: method + path -> JSON response body.
+fun handle(method: Str, path: Str) -> Str {
+    let parts = path.split("/")
+    match path {
+        "/" => json_stringify(JObj(Map().insert("service", JStr("kupl-api")).insert("version", JNum(1.0))))
+        "/health" => ok_status()
+        _ => {
+            if parts.len() == 4 && parts.get(1) == Some("add") {
+                route_add(parts.get(2).unwrap_or(""), parts.get(3).unwrap_or(""))
+            } else if parts.len() == 3 && parts.get(1) == Some("echo") {
+                json_stringify(JObj(Map().insert("you_said", JStr(parts.get(2).unwrap_or("")))))
+            } else if parts.len() == 3 && parts.get(1) == Some("time") {
+                route_time(parts.get(2).unwrap_or(""))
+            } else {
+                not_found(method, path)
+            }
+        }
+    }
+}
+
+fun main() uses io {
+    print("JSON API on http://127.0.0.1:8080  (Ctrl-C to stop)")
+    match http_serve(8080, handle) {
+        Ok(_) => print("stopped")
+        Err(e) => print("could not start: {e}")
+    }
+}
