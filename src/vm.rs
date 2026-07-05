@@ -1106,6 +1106,31 @@ mod tests {
     }
 
     #[test]
+    fn diff_json_key_order_and_sort_stability() {
+        // JSON object keys keep INPUT order through parse -> stringify (not sorted),
+        // identically on both engines; duplicate keys collapse to the last value.
+        assert_eq!(
+            differential(r#"fun probe() -> Str {
+    match json_parse("{{ \"b\": 1, \"a\": 2, \"c\": 3 }}") { Ok(j) => json_stringify(j), Err(e) => e }
+}
+"#),
+            r#"{"b":1,"a":2,"c":3}"#
+        );
+        assert_eq!(
+            differential(r#"fun probe() -> Str {
+    match json_parse("{{ \"k\": 1, \"k\": 2 }}") { Ok(j) => json_stringify(j), Err(e) => e }
+}
+"#),
+            r#"{"k":2}"#
+        );
+        // .sort_by is STABLE — equal keys keep their original relative order.
+        assert_eq!(
+            differential("type R = R(k: Int, t: Str)\nfun probe() -> Str {\n    var o = \"\"\n    for r in [R(2, \"a\"), R(1, \"b\"), R(2, \"c\"), R(1, \"d\"), R(3, \"e\"), R(1, \"f\")].sort_by(fn r { r.k }) { o = o + \"{r.t}\" }\n    o\n}\n"),
+            "bdface"
+        );
+    }
+
+    #[test]
     fn diff_map_set_insertion_order_deterministic() {
         // Map/Set iterate in INSERTION order — deterministic and identical on both
         // engines (no randomized-HashMap ordering). Order survives removal; Set

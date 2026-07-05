@@ -4462,6 +4462,22 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native JSON round-trip preserves object key order + .sort_by is stable,
+    /// matching the interpreter. PR-it32.
+    #[test]
+    fn native_json_order_and_sort_stable() {
+        if !cc_available() {
+            return;
+        }
+        let json = "fun main() uses io {\n    \
+                    match json_parse(\"{{ \\\"b\\\": 1, \\\"a\\\": 2, \\\"c\\\": 3 }}\") { \
+                    Ok(j) => print(json_stringify(j)), Err(e) => print(e) }\n}\n";
+        assert_eq!(native_main_stdout(json, "jord").trim(), "{\"b\":1,\"a\":2,\"c\":3}");
+        let sort = "type R = R(k: Int, t: Str)\nfun main() uses io {\n    var o = \"\"\n    \
+                    for r in [R(2, \"a\"), R(1, \"b\"), R(2, \"c\"), R(1, \"d\"), R(3, \"e\"), R(1, \"f\")].sort_by(fn r { r.k }) { o = o + \"{r.t}\" }\n    print(o)\n}\n";
+        assert_eq!(native_main_stdout(sort, "sstab").trim(), "bdface");
+    }
+
     /// Native Map/Set iterate in INSERTION order — deterministic and identical to
     /// the interpreter (no randomized-HashMap ordering). PR-it31.
     #[test]
