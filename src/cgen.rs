@@ -1377,6 +1377,9 @@ static KValue k_rem(KValue a, KValue b) {
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_divmod(a, b, 1));
     if (a.tag == K_INT && b.tag == K_INT) {
         if (b.as.i == 0) k_panic("remainder by zero");
+        /* INT64_MIN % -1 overflows (like the division) — C would be UB; panic to
+           match the interpreter instead of returning a bogus 0. */
+        if (a.as.i == INT64_MIN && b.as.i == -1) k_panic("integer overflow in remainder");
         return k_int(a.as.i % b.as.i);
     }
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(fmod(a.as.f, b.as.f));
@@ -4424,6 +4427,21 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// i64::MIN % -1 overflows: native must panic "integer overflow in remainder"
+    /// (C's `%` is UB there and returned a bogus 0 — diverging from the interp,
+    /// which itself used to ICE). PR-it25.
+    #[test]
+    fn native_int_min_rem_overflow() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let m = (0 - 9223372036854775807) - 1\n    print(m % (0 - 1))\n}\n";
+        let out = native_main_stdout(src, "aiminrem");
+        // native_main_stdout returns stdout; the panic goes to stderr and aborts,
+        // so stdout must be empty (no bogus "0").
+        assert!(!out.contains('0'), "expected a panic, not a value; got {out:?}");
     }
 
     /// A model integer that overflows i64 is REJECTED natively (was: saturated to

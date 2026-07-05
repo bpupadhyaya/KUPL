@@ -1392,7 +1392,9 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
                     if b == 0 {
                         return Err("remainder by zero".into());
                     }
-                    Value::Int(a % b)
+                    // checked_rem catches i64::MIN % -1 (overflow) — a raw `%` would
+                    // panic and escape as an ICE; this matches Div's clean overflow.
+                    Value::Int(a.checked_rem(b).ok_or_else(|| overflow("remainder"))?)
                 }
                 Lt => Value::Bool(a < b),
                 Le => Value::Bool(a <= b),

@@ -1106,6 +1106,21 @@ mod tests {
     }
 
     #[test]
+    fn diff_int_min_rem_overflow() {
+        // i64::MIN % -1 overflows (the quotient overflows). It must be a clean
+        // "integer overflow in remainder" panic on BOTH engines — a raw `%` used
+        // to overflow-panic and escape as an ICE on the interpreter (PR-it25).
+        // Matches how i64::MIN / -1 already reports division overflow.
+        let src = "fun probe() -> Int {\n    let m = (0 - 9223372036854775807) - 1\n    m % (0 - 1)\n}\n";
+        assert_eq!(differential(src), "panic: integer overflow in remainder");
+        // and the division form, for good measure
+        let d = "fun probe() -> Int {\n    let m = (0 - 9223372036854775807) - 1\n    m / (0 - 1)\n}\n";
+        assert_eq!(differential(d), "panic: integer overflow in division");
+        // normal remainder is unaffected (truncated-toward-zero sign convention)
+        assert_eq!(differential("fun probe() -> Int {\n    (0 - 17) % 5\n}\n"), "-2");
+    }
+
+    #[test]
     fn diff_huge_tensor_is_capped() {
         // A huge zeros()/arange() must panic cleanly (not hang / OOM), identically
         // on both engines (the native backend enforces the same cap).
