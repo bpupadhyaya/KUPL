@@ -4,6 +4,46 @@ Audited 2026-07-04 against: `docs/design/LANGUAGE.md` (incl. §12 open
 questions), the `[design]` markers in `docs/reference/LANGUAGE-REFERENCE.md`,
 and known limitations called out in commit messages. Checked off as landed.
 
+## Enrichment campaign complete — 100 iterations
+
+The 100-iteration enrichment campaign is **complete**. It took KUPL from an early
+language to a complete, honestly-documented one, held to a strict invariant
+throughout: every engine produces byte-identical output, verified on every build.
+
+**Final certified state:**
+
+- **Four engines, byte-identical** — the interpreter (reference semantics), the KVM
+  register bytecode VM (checked against the interpreter by a per-build differential
+  suite, byte-identical across all 63 examples), `.kx` compiled modules, and a
+  **native** machine-code backend (via generated C) whose output is **byte-identical
+  to the interpreter across all 55 sweepable examples** (0 divergences; the eight
+  skips are stdin/network/subprocess/thread-order programs, multi-component apps that
+  use `kupl bundle`, and one cosmetic error-string case — see the it98 note below).
+- **A comprehensive, zero-dependency standard library** — `List`/`Map`/`Set`/`Str`
+  with the full functional toolkit, the exact numeric tower `Int → BigInt →
+  Rational`, sized numerics, and JSON/CSV/URL/regex/HTTP/time/encoding/random
+  batteries — all in the box, no external crates.
+- **A modern type system + syntax** — generics over functions *and* types, operator
+  overloading, `Option`/`Result` combinators, exhaustive `match`, an effect system,
+  and no null; all four syntactic papercuts the flagship demos surfaced are fixed.
+- **The distinctive core** — components as isolated actors with typed ports, private
+  state, supervision, and inline `example`/`law` tests; `ai fun` as a typed,
+  mockable language feature.
+- **~29k lines of dependency-free Rust, 216 tests, `cargo build` warning-clean**, and
+  flagship programs across 11+ domains (web backends, data tools, algorithms,
+  language implementation — an interpreter *and* a compiler/VM, data structures,
+  simulation, numerical computing, interactive fiction, diffing, and a
+  component-based application).
+
+**Honest remaining gaps (unchanged, explicitly deferred):** a hosted package
+registry + third-party ecosystem; general async/await + coroutines; bounded generics
+/ typeclasses (`[T: Ord]` — ordered generic code passes an explicit compare
+function today); the GPU/kernel and systems/ownership tiers; a WASM target; and the
+KValue-unboxing performance IR. KUPL is **feature-complete for general-purpose,
+component-oriented, AI-native programming** — what remains is maturity/ecosystem and
+the explicitly-deferred hardware/performance tiers, all tracked honestly in
+[`COMPARISON.md`](COMPARISON.md) and the campaign history below.
+
 ## Enrichment campaign (it1–it50) — summary
 
 A 50-iteration enrichment campaign took KUPL from a young four-engine toolchain
