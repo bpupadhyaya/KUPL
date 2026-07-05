@@ -3673,6 +3673,25 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             for (int64_t i = 0; i < m->len; i++) { ks[i] = m->keys[i]; vs[i] = k_call(args[0], &m->vals[i], 1); }
             return k_map_make(ks, vs, m->len);
         }
+        if (!strcmp(name, "filter")) {
+            KValue* ks = k_alloc(sizeof(KValue) * (m->len < 1 ? 1 : m->len));
+            KValue* vs = k_alloc(sizeof(KValue) * (m->len < 1 ? 1 : m->len));
+            int64_t n = 0;
+            for (int64_t i = 0; i < m->len; i++) {
+                KValue fa[2] = { m->keys[i], m->vals[i] };
+                KValue keep = k_call(args[0], fa, 2);
+                if (keep.tag == K_BOOL && keep.as.b) { ks[n] = m->keys[i]; vs[n] = m->vals[i]; n++; }
+            }
+            return k_map_make(ks, vs, n);
+        }
+        if (!strcmp(name, "fold")) {
+            KValue acc = args[0];
+            for (int64_t i = 0; i < m->len; i++) {
+                KValue fa[3] = { acc, m->keys[i], m->vals[i] };
+                acc = k_call(args[1], fa, 3);
+            }
+            return acc;
+        }
         if (!strcmp(name, "merge")) {
             KMap* o = args[0].as.map;
             KValue* ks = k_alloc(sizeof(KValue) * (m->len + o->len < 1 ? 1 : m->len + o->len));
@@ -4225,6 +4244,19 @@ mod tests {
                    print(Some(5).ok_or(\"no\").map_err(fn e { e }).unwrap_or(0))\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "combinators"), "16\n-1\n4\n5\n");
+        }
+    }
+
+    /// Map.filter and Map.fold (it89) compile to native (callbacks via k_call),
+    /// matching the interpreter.
+    #[test]
+    fn native_map_filter_fold() {
+        let src = "fun main() uses io {\n    \
+                   let m = Map().insert(\"a\", 1).insert(\"b\", 2).insert(\"c\", 3)\n    \
+                   print(m.filter(fn k, v { v >= 2 }).values())\n    \
+                   print(m.fold(0, fn acc, k, v { acc + v }))\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "maps"), "[2, 3]\n6\n");
         }
     }
 

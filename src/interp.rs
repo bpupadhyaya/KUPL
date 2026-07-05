@@ -2368,6 +2368,25 @@ pub fn shared_method(
             }
             Ok(Value::Map(Rc::new(out)))
         }
+        (Value::Map(pairs), "filter") => {
+            let f = args.into_iter().next().ok_or("`filter` needs a function")?;
+            let mut out = Vec::new();
+            for (k, v) in pairs.iter() {
+                if let Value::Bool(true) = call(f.clone(), vec![k.clone(), v.clone()])? {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            Ok(Value::Map(Rc::new(out)))
+        }
+        (Value::Map(pairs), "fold") => {
+            let mut it = args.into_iter();
+            let mut acc = it.next().ok_or("`fold` needs an initial value")?;
+            let f = it.next().ok_or("`fold` needs a function")?;
+            for (k, v) in pairs.iter() {
+                acc = call(f.clone(), vec![acc, k.clone(), v.clone()])?;
+            }
+            Ok(acc)
+        }
         (Value::Set(items), "insert") => {
             let v = args.into_iter().next().ok_or("`insert` needs a value")?;
             if items.iter().any(|x| *x == v) {

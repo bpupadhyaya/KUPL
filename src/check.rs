@@ -2138,6 +2138,23 @@ impl Checker {
                     Ty::Map(k.clone(), Box::new(w)),
                 ))
             }
+            (Ty::Map(k, v), "filter") => Some((
+                vec![Ty::Fun(vec![(**k).clone(), (**v).clone()], Box::new(Ty::Bool))],
+                Ty::Map(k.clone(), v.clone()),
+            )),
+            (Ty::Map(k, v), "fold") => {
+                let acc = self.uni.fresh();
+                Some((
+                    vec![
+                        acc.clone(),
+                        Ty::Fun(
+                            vec![acc.clone(), (**k).clone(), (**v).clone()],
+                            Box::new(acc.clone()),
+                        ),
+                    ],
+                    acc,
+                ))
+            }
             (Ty::Set(t), "insert") | (Ty::Set(t), "remove") => {
                 Some((vec![(**t).clone()], Ty::Set(t.clone())))
             }

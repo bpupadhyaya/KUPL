@@ -1,0 +1,33 @@
+// Map transformations — filter and fold over key/value entries.
+//
+//   Map.filter(fn(K, V) -> Bool) -> Map[K, V]   keep matching entries
+//   Map.fold(init, fn(Acc, K, V) -> Acc) -> Acc  reduce over entries
+//
+// Entries are visited in insertion order, so results are deterministic.
+
+fun main() uses io {
+    let prices = Map()
+        .insert("apple", 3)
+        .insert("bread", 2)
+        .insert("caviar", 40)
+        .insert("donut", 1)
+
+    // entries costing at least 2
+    let dear = prices.filter(fn item, cost { cost >= 2 })
+    let names = dear.keys().join(", ")
+    print("at least 2: {names}")
+
+    // total and a receipt line, both by fold
+    let total = prices.fold(0, fn acc, item, cost { acc + cost })
+    print("total = {total}")
+    let receipt = prices.fold("", fn acc, item, cost { "{acc}{item}:{cost} " })
+    print("receipt = {receipt}")
+}
+
+law "Map filter and fold" {
+    let m = Map().insert("a", 1).insert("b", 2).insert("c", 3)
+    expect m.filter(fn k, v { v >= 2 }) == Map().insert("b", 2).insert("c", 3)
+    expect m.filter(fn k, v { k == "a" }) == Map().insert("a", 1)
+    expect m.fold(0, fn acc, k, v { acc + v }) == 6
+    expect m.fold("", fn acc, k, v { acc + k }) == "abc"
+}

@@ -347,6 +347,8 @@ existing key keeps its position. Equality is order-insensitive.
 | `.get_or(k, default)` | `(K, V) -> V` | value for `k`, or `default` |
 | `.merge(other)` | `(Map[K, V]) -> Map[K, V]` | `other`'s entries override |
 | `.map_values(f)` | `(fn(V) -> W) -> Map[K, W]` | transform values, keep keys/order |
+| `.filter(f)` | `(fn(K, V) -> Bool) -> Map[K, V]` | keep matching entries (insertion order) |
+| `.fold(init, f)` | `(Acc, fn(Acc, K, V) -> Acc) -> Acc` | reduce over entries in insertion order |
 
 ### Set[T]
 
