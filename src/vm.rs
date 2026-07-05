@@ -1106,6 +1106,35 @@ mod tests {
     }
 
     #[test]
+    fn diff_csv_ops() {
+        // csv_parse / csv_stringify (RFC 4180) — quoting/escaping of embedded commas,
+        // quotes ("" escape), and newlines is byte-identical on both engines, and a
+        // parse->stringify round-trip preserves the fields.
+        assert_eq!(
+            differential("fun probe() -> Str {\n    csv_stringify([[\"a\", \"b,c\"], [\"d\", \"e\"]])\n}\n"),
+            "a,\"b,c\"\nd,e"
+        );
+        // a field containing a quote is quoted and the quote doubled
+        assert_eq!(
+            differential("fun probe() -> Str {\n    csv_stringify([[\"a\\\"b\", \"c\"]])\n}\n"),
+            "\"a\"\"b\",c"
+        );
+        // round-trip: a comma-containing field survives stringify->parse
+        assert_eq!(
+            differential("fun probe() -> Str {\n    csv_parse(csv_stringify([[\"x,y\", \"z\"]])).get(0).unwrap_or([]).get(0).unwrap_or(\"?\")\n}\n"),
+            "x,y"
+        );
+        // parse handles the "" escape inside a quoted field
+        assert_eq!(
+            differential(r#"fun probe() -> Str {
+    csv_parse("x,\"say \"\"hi\"\"\"").get(0).unwrap_or([]).get(1).unwrap_or("?")
+}
+"#),
+            "say \"hi\""
+        );
+    }
+
+    #[test]
     fn diff_regex_ops() {
         // The shared regex engine (src/regex.rs) — match/find/find_all/replace and
         // invalid-pattern panics are byte-identical on both engines, and `.` matches

@@ -4503,6 +4503,21 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native CSV (csv_parse/csv_stringify, RFC 4180) matches the interpreter on
+    /// quoting/escaping of embedded commas, quotes, and newlines. PR-it43.
+    #[test]
+    fn native_csv_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(csv_stringify([[\"a\", \"b,c\"], [\"d\", \"e\"]]))\n    \
+                   print(csv_stringify([[\"a\\\"b\", \"c\"]]))\n    \
+                   let r = csv_parse(csv_stringify([[\"x,y\", \"z\"]]))\n    \
+                   print(r.get(0).unwrap_or([]).get(0).unwrap_or(\"?\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "csv").trim(), "a,\"b,c\"\nd,e\n\"a\"\"b\",c\nx,y");
+    }
+
     /// Native regex matches the interpreter, incl. `.` over multi-byte characters
     /// (was one byte -> invalid-UTF-8 fragments; PR-it42). ASCII unchanged.
     #[test]
