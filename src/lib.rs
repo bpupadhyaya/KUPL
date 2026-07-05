@@ -18,6 +18,7 @@ pub mod cgen;
 pub mod check;
 pub mod compile;
 pub mod diag;
+pub mod callargs;
 pub mod effects;
 pub mod fmt;
 pub mod vm;

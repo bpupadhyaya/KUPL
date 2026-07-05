@@ -35,6 +35,9 @@ pub fn inject_prelude(program: &mut Program) {
 pub fn compile(src: &str) -> Result<Compiled, Vec<Diag>> {
     let (mut program, mut diags) = parser::parse(src);
     inject_prelude(&mut program);
+    // resolve named args + fill default parameters into positional form, so the
+    // checker and every engine see plain positional calls
+    diags.extend(crate::callargs::resolve_call_args(&mut program));
     let (checked, check_diags) = check::check(&program);
     diags.extend(check_diags);
     // Effects only make sense on a program that parsed; skip if already broken.
@@ -244,7 +247,9 @@ pub fn load_compile(path: &str) -> Result<(Compiled, crate::loader::SourceMap), 
         }
     };
     inject_prelude(&mut program);
-    let (checked, mut diags) = check::check(&program);
+    let mut diags = crate::callargs::resolve_call_args(&mut program);
+    let (checked, check_diags) = check::check(&program);
+    diags.extend(check_diags);
     if !diags.iter().any(|d| d.severity == Severity::Error) {
         diags.extend(crate::effects::check_effects(&program));
     }

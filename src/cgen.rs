@@ -3750,6 +3750,20 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Default parameters + named arguments (it62) resolve to positional calls
+    /// before codegen, so native == interp.
+    #[test]
+    fn native_defaults_named() {
+        let src = "fun mk(a: Int, b: Int = 10, c: Int = 100) -> Int { a + b + c }\n\
+                   fun main() uses io {\n    \
+                   print(mk(1))\n    print(mk(1, 2))\n    print(mk(1, 2, 3))\n    \
+                   print(mk(c: 3, a: 1))\n}\n";
+        if cc_available() {
+            // 1+10+100=111; 1+2+100=103; 1+2+3=6; a=1,b=10,c=3 -> 14
+            assert_eq!(native_main_stdout(src, "defs"), "111\n103\n6\n14\n");
+        }
+    }
+
     /// Path helpers + list_dir (it61) compile to native byte-identically:
     /// pure `/`-path math, and a sorted directory round-trip in a temp dir.
     #[test]

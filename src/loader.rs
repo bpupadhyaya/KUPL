@@ -332,6 +332,10 @@ pub fn load_with(
         tagged.into_iter().map(|(i, _)| i).collect()
     };
 
+    // resolve named args + default parameters into positional form on the
+    // merged program, so every downstream phase sees plain positional calls
+    diags.extend(crate::callargs::resolve_call_args(&mut program));
+
     let has_errors = diags.iter().any(|d| d.severity == crate::diag::Severity::Error);
     if has_errors {
         Err((diags, map))

@@ -82,6 +82,8 @@ pub struct AiDecl {
 pub struct Param {
     pub name: String,
     pub ty: TyExpr,
+    /// Optional default value (`x: Int = EXPR`). Defaults must be trailing.
+    pub default: Option<Expr>,
     pub span: Span,
 }
 

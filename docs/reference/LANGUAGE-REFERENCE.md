@@ -223,6 +223,17 @@ par { f(a)  g(b)  h(c) }            // structured fork-join → List of results
   branches must agree in type (it is an expression). `while let P = E { B }`
   loops as long as `E` matches `P`. The patterns are refutable — no
   exhaustiveness is required.
+- **Default parameters** — a `fun` parameter may have a default,
+  `fun f(a: Int, b: Int = 10)`. Defaults must be **trailing** (a required
+  parameter may not follow a defaulted one, K0267). A call may omit trailing
+  defaulted arguments; the default expression is evaluated **at the call site**,
+  once per call. Applies to top-level `fun` calls.
+- **Named arguments** — `f(b: 2, a: 1)` binds arguments by parameter name, in any
+  order, but named arguments must come **after** any positional ones (K0268). An
+  unknown name is K0273, a doubly-bound parameter K0269, and a missing required
+  argument K0274. Named args + defaults combine: `f(c: 3)` fills `a`/`b` from
+  their defaults. Applies to top-level `fun` calls (constructors already support
+  named fields; methods/UFCS do not yet).
 - **Method-call resolution** for `recv.name(args)` is: (1) a **built-in method**
   on `recv`'s type, else (2) a **field** access (for a field-typed value with no
   args), else (3) **UFCS** — a top-level function `name(recv, args…)` whose first

@@ -110,6 +110,17 @@ Circle(2.0).scaled(10.0)       // == scaled(Circle(2.0), 10.0)
 Built-in methods (like `List.map`) take precedence; the free-function fallback
 only applies when there's no built-in method of that name.
 
+Parameters can have **defaults** (which must be trailing), and calls can pass
+**named arguments** in any order (after any positional ones):
+
+```kupl
+fun greet(name: Str, greeting: Str = "Hello") -> Str { "{greeting}, {name}" }
+
+greet("Ada")                   // "Hello, Ada"  (default used)
+greet("Ada", "Hi")             // "Hi, Ada"
+greet(greeting: "Yo", name: "Ada")   // named, reordered
+```
+
 The last expression in a block is its value — no `return` needed (though `return`
 exists for early exit). **Lambdas** use `fn`:
 

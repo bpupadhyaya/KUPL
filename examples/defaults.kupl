@@ -1,0 +1,30 @@
+// Default parameter values and named arguments — expressive function calls.
+//
+//   fun f(a: Int, b: Int = EXPR)   defaults must be TRAILING; a call may omit
+//                                  them (the default is evaluated at the call).
+//   f(b: 2, a: 1)                  named arguments bind by name, in any order,
+//                                  but must come after any positional arguments.
+
+fun greet(name: Str, greeting: Str = "Hello", excited: Bool = false) -> Str {
+    let mark = if excited { "!" } else { "." }
+    "{greeting}, {name}{mark}"
+}
+
+fun rect(width: Int, height: Int) -> Int {
+    width * height
+}
+
+fun main() uses io {
+    // omit trailing defaults
+    print(greet("Ada"))                        // both defaults
+    print(greet("Bob", "Hi"))                  // one default
+    print(greet("Cid", "Hey", true))           // no defaults
+
+    // named arguments — reorder, and skip a defaulted parameter
+    print(greet("Dee", excited: true))         // greeting defaults, excited named
+    print(greet(name: "Eve", greeting: "Yo"))  // all named
+
+    // named args are handy when positions are easy to mix up
+    print("area = {rect(height: 3, width: 4)}")
+    print("area = {rect(4, 3)}")               // still works positionally
+}

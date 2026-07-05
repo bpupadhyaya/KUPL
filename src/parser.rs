@@ -476,8 +476,13 @@ impl Parser {
             let (name, nspan) = self.expect_ident()?;
             self.expect(Tok::Colon)?;
             let ty = self.parse_ty()?;
+            let default = if self.eat(&Tok::Eq) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             let span = nspan.merge(ty.span);
-            params.push(Param { name, ty, span });
+            params.push(Param { name, ty, default, span });
             self.skip_newlines();
             if !self.eat(&Tok::Comma) {
                 break;
@@ -495,7 +500,7 @@ impl Parser {
         if self.eat(&Tok::KwNew) {
             let inner = self.parse_ty()?;
             let span = start.merge(inner.span);
-            let field = Param { name: "value".into(), ty: inner, span };
+            let field = Param { name: "value".into(), ty: inner, default: None, span };
             let variants = vec![Variant { name: name.clone(), fields: vec![field], span }];
             self.expect_terminator()?;
             return Ok(TypeDecl { name, variants, span });
@@ -510,7 +515,7 @@ impl Parser {
                 let (fname, fspan) = self.expect_ident()?;
                 self.expect(Tok::Colon)?;
                 let ty = self.parse_ty()?;
-                fields.push(Param { name: fname, ty, span: fspan });
+                fields.push(Param { name: fname, ty, default: None, span: fspan });
                 self.skip_newlines();
                 if !self.eat(&Tok::Comma) {
                     break;
