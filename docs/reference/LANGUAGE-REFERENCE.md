@@ -413,7 +413,11 @@ Rules:
   supported (K0271 otherwise; a return type is required — K0270).
 - Declaring `-> Result[T, Str]` makes the call **total**: provider failures,
   refusals, and malformed responses come back as `Err(message)`. Any other
-  return type panics on failure (supervision applies, §9).
+  return type panics on failure (supervision applies, §9). The **failure
+  decision** (which responses are accepted vs. rejected, and the resulting value)
+  is identical on every engine; the human-readable **error-message text** for a
+  malformed response is engine-dependent — match on `Ok`/`Err` structurally, not
+  on the message string.
 - An `ai fun` performs the **`ai` effect**; the keyword itself is the
   boundary declaration. Callers are checked as usual: a `pub fun` that calls
   one must declare `uses ai`.

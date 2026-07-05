@@ -4368,6 +4368,64 @@ mod tests {
         }
     }
 
+    /// Native ai-fun response conversion matches the interpreter on Ok VALUES for
+    /// Float/Bool/List shapes, and on the REJECT decision for malformed responses
+    /// (the error-message text may differ — engine-dependent, like JSON errors).
+    #[test]
+    fn native_ai_typed_shapes_consistent() {
+        if !cc_available() {
+            return;
+        }
+        let build = |ret: &str| -> std::path::PathBuf {
+            let src = format!(
+                "ai fun f(x: Str) -> {ret} {{\n    intent \"v {{x}}\"\n}}\n\
+                 fun main() uses io {{\n    print(f(\"x\"))\n}}\n"
+            );
+            let compiled = crate::run::compile(&src).expect("compiles");
+            let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module");
+            let c = super::emit_c(&module).expect("emit_c");
+            let base = std::env::temp_dir()
+                .join(format!("kupl-aishape-{}-{}", ret.replace(['[', ']'], "_"), std::process::id()));
+            let cpath = base.with_extension("c");
+            let bin = base.with_extension("out");
+            std::fs::write(&cpath, &c).unwrap();
+            assert!(std::process::Command::new(cc())
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success());
+            let _ = std::fs::remove_file(&cpath);
+            bin
+        };
+        let run = |bin: &std::path::Path, mock: &str| -> (String, String) {
+            let out = std::process::Command::new(bin)
+                .env("KUPL_AI_MOCK_F", mock)
+                .output()
+                .unwrap();
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let flt = build("Float");
+        assert_eq!(run(&flt, "1.5").0, "1.5");
+        assert_eq!(run(&flt, "3").0, "3.0");
+        assert_eq!(run(&flt, "1e999").0, "inf");
+        assert!(run(&flt, "abc").1.contains("not valid JSON")); // rejected
+        let bl = build("Bool");
+        assert_eq!(run(&bl, "true").0, "true");
+        assert_eq!(run(&bl, "false").0, "false");
+        assert!(!run(&bl, "1").1.is_empty()); // Num is not a Bool -> rejected
+        let li = build("List[Int]");
+        assert_eq!(run(&li, "[1,2,3]").0, "[1, 2, 3]");
+        assert_eq!(run(&li, "[]").0, "[]");
+        assert!(run(&li, "[999999999999999999999]").1.contains("expected an integer")); // overflow elem rejected
+        let _ = std::fs::remove_file(&flt);
+        let _ = std::fs::remove_file(&bl);
+        let _ = std::fs::remove_file(&li);
+    }
+
     /// A model integer that overflows i64 is REJECTED natively (was: saturated to
     /// i64::MAX — a wrong value), matching the interpreter.
     #[test]
@@ -4579,9 +4637,11 @@ mod tests {
             .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
-        // connect with retry, send a request, assert the response, then kill
+        // Connect with a generous retry budget (~12s): under heavy parallel test
+        // load (many concurrent `cc` invocations) the spawned server can be starved
+        // of scheduling before it binds — a short window made this test flaky.
         let mut stream = None;
-        for _ in 0..50 {
+        for _ in 0..300 {
             std::thread::sleep(std::time::Duration::from_millis(40));
             if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38121u16)) {
                 stream = Some(s);
