@@ -392,7 +392,8 @@ pub fn run_program_vm(path: &str) -> i32 {
 pub fn check_cmd(path: &str, json: bool) -> i32 {
     let (program, map) = match crate::loader::load(path) {
         Ok(ok) => ok,
-        Err((diags, map)) => {
+        Err((mut diags, map)) => {
+            sort_diags(&mut diags);
             if json {
                 println!("{}", map.to_json(&diags));
             } else {
@@ -405,6 +406,10 @@ pub fn check_cmd(path: &str, json: bool) -> i32 {
     if !diags.iter().any(|d| d.severity == Severity::Error) {
         diags.extend(crate::effects::check_effects(&program));
     }
+    // Deterministic, position-ordered output — the effects pass emits in HashMap
+    // order (see sort_diags / PR-it78), which made `kupl check` (and `--json`)
+    // print warnings in a different order run-to-run.
+    sort_diags(&mut diags);
     let has_errors = diags.iter().any(|d| d.severity == Severity::Error);
     if json {
         println!("{}", map.to_json(&diags));
@@ -877,4 +882,31 @@ fn snippet(src: &str, span: Span) -> String {
     let start = (span.start as usize).min(src.len());
     let end = (span.end as usize).min(src.len());
     src[start..end].trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_diags;
+    use crate::diag::{Diag, Span};
+
+    #[test]
+    fn sort_diags_is_deterministic_and_position_ordered() {
+        // Diagnostics arriving in arbitrary (e.g. HashMap-iteration) order must come
+        // out ordered by source position, then code, then message — so `kupl check`/
+        // `run` output is byte-identical every invocation (PR-it78/79).
+        let mk = |start: u32, code: &'static str, msg: &str| Diag::warning(code, msg.to_string(), Span::new(start, start + 1));
+        let ordered = vec![
+            mk(0, "K0302", "a"),
+            mk(5, "K0100", "b"),
+            mk(5, "K0101", "c"), // same span, later code
+            mk(20, "K0302", "d"),
+        ];
+        // feed several scrambles; each must sort to the same canonical order
+        for perm in [[3, 1, 0, 2], [2, 0, 3, 1], [1, 3, 2, 0], [0, 1, 2, 3]] {
+            let mut v: Vec<Diag> = perm.iter().map(|&i| ordered[i].clone()).collect();
+            sort_diags(&mut v);
+            let keys: Vec<(u32, &str)> = v.iter().map(|d| (d.span.start, d.code)).collect();
+            assert_eq!(keys, vec![(0, "K0302"), (5, "K0100"), (5, "K0101"), (20, "K0302")]);
+        }
+    }
 }
