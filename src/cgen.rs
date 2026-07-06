@@ -4760,6 +4760,27 @@ mod tests {
         assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
     }
 
+    /// Native Map/Set methods match the interpreter/KVM, including INSERTION-order
+    /// iteration of keys/values/to_list and missing-key -> None. PR-it83 (finishes
+    /// the stdlib collection sweep).
+    #[test]
+    fn native_map_set_method_semantics() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let m = Map().insert(\"banana\", 1).insert(\"apple\", 2).insert(\"banana\", 9)\n    \
+                   let a: Set[Int] = Set().insert(1).insert(2).insert(3)\n    \
+                   let b: Set[Int] = Set().insert(2).insert(3).insert(4)\n    \
+                   print(\"{m.keys()}|{m.values()}|{m.get(\"apple\")}|{m.get(\"z\")}|{m.contains_key(\"z\")}|\
+                   {m.len()}|{m.remove(\"z\").len()}|{a.union(b).to_list()}|{a.intersect(b).to_list()}|\
+                   {a.difference(b).to_list()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "mapset").trim(),
+            "[\"banana\", \"apple\"]|[9, 2]|Some(2)|None|false|2|2|[1, 2, 3, 4]|[2, 3]|[1]"
+        );
+    }
+
     /// Native numeric/math edges match the interpreter/KVM — full-precision
     /// transcendentals (libm vs Rust f64), IEEE special values, mod sign, radix.
     /// PR-it82.

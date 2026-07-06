@@ -1791,6 +1791,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_map_set_method_semantics() {
+        // Map/Set methods behave identically on interp and KVM, and iteration order
+        // is INSERTION order (not sorted, not hash order) — keys/values follow the
+        // insert sequence, an overwrite keeps the position + last value. Reads: keys
+        // (insertion order, dedup on overwrite), values (last-write), get present/
+        // missing, contains_key missing, len (overwrite doesn't grow), remove missing
+        // (unchanged), union/intersect/difference.
+        let src = "fun probe() -> Str {\n    \
+                   let m = Map().insert(\"banana\", 1).insert(\"apple\", 2).insert(\"banana\", 9)\n    \
+                   let a: Set[Int] = Set().insert(1).insert(2).insert(3)\n    \
+                   let b: Set[Int] = Set().insert(2).insert(3).insert(4)\n    \
+                   \"{m.keys()}|{m.values()}|{m.get(\"apple\")}|{m.get(\"z\")}|{m.contains_key(\"z\")}|\
+                   {m.len()}|{m.remove(\"z\").len()}|{a.union(b).to_list()}|{a.intersect(b).to_list()}|\
+                   {a.difference(b).to_list()}\"\n}\n";
+        assert_eq!(
+            differential(src),
+            "[\"banana\", \"apple\"]|[9, 2]|Some(2)|None|false|2|2|[1, 2, 3, 4]|[2, 3]|[1]"
+        );
+    }
+
+    #[test]
     fn diff_numeric_and_math_edge_cases() {
         // Numeric/math edges are identical on interp and KVM — including the full
         // 17-digit transcendental strings (Rust f64 vs libm agree) and IEEE
