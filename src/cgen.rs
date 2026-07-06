@@ -613,6 +613,10 @@ static void k_panic(const char* msg) {
         k_panic_buf[sizeof(k_panic_buf) - 1] = 0;
         longjmp(*k_pad, 1);
     }
+    /* flush buffered stdout first so output printed BEFORE the panic appears
+       before the panic message (chronological order, matching the interpreter);
+       otherwise stdout is buffered and flushes only at exit, after stderr. */
+    fflush(stdout);
     fprintf(stderr, "panic: %s\n", msg);
     exit(101);
 }
@@ -4690,6 +4694,41 @@ mod tests {
             native_main_stdout(src, "interp").trim(),
             "i=42 f=3.0 b=true l=[1, 2] o=Some(5)\n{x}=5 {5}\nb=18446744073709551616 r=1/3 t=Tensor([1.0, 2.0])"
         );
+    }
+
+    /// Output printed before a panic appears BEFORE the panic message on native
+    /// (stdout is flushed in k_panic), matching the interpreter's chronological
+    /// order — not buffered-until-exit after the stderr panic. PR-it69.
+    #[test]
+    fn native_flushes_stdout_before_panic() {
+        if !cc_available() {
+            return;
+        }
+        // combined stdout+stderr must show the prints, then the panic line — the
+        // native binary is spawned and its merged streams checked in order.
+        let src = "fun main() uses io {\n    print(\"before\")\n    print(1 / 0)\n    print(\"after\")\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-flush-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin)
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .output().unwrap();
+        // stdout carries "before"; stderr carries the panic; "before" must have been
+        // flushed (present) and "after" never reached.
+        let so = String::from_utf8_lossy(&out.stdout);
+        let se = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(so.trim(), "before");
+        assert!(se.contains("panic: division by zero"), "stderr: {se}");
+        assert!(!so.contains("after"));
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
     }
 
     /// A `wire` cycle (a component re-emits an output wired back to its own input)
