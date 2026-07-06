@@ -1106,6 +1106,31 @@ mod tests {
     }
 
     #[test]
+    fn diff_seeded_rng_determinism() {
+        // Seeded RNG (xorshift64*) is pure + deterministic: the same seed yields the
+        // identical sequence on interp == KVM (and, per the native test, native too),
+        // for positive, negative, and i64::MIN seeds. Reproducibility is a certified
+        // invariant — these exact sequences are the reference and must never drift.
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{random_ints(42, 5)}\"\n}\n"),
+            "[6255019084209693600, -4016670646968046118, -3871288216479333770, -1032231191467822881, -4346169525355410938]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{random_floats(42, 4)}\"\n}\n"),
+            "[0.33908526400192196, 0.7822558479199243, 0.7901370452687786, 0.9440426349851643]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{shuffle(42, [1, 2, 3, 4, 5, 6, 7, 8])}\"\n}\n"),
+            "[2, 5, 4, 6, 7, 3, 8, 1]"
+        );
+        // i64::MIN seed (built at runtime — the literal would overflow, K0004)
+        assert_eq!(
+            differential("fun probe() -> Str {\n    let s = (0 - 9223372036854775807) - 1\n    \"{random_ints(s, 3)}\"\n}\n"),
+            "[-1079387622448562176, -6523166708701680128, -3755698650707786723]"
+        );
+    }
+
+    #[test]
     fn diff_string_interpolation() {
         // Interpolation renders every value type identically on both engines, in a
         // single mixed string; literal `{{`/`}}` and nested interpolation work.

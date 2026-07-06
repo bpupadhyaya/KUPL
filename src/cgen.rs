@@ -4544,6 +4544,41 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native seeded RNG (xorshift64*) produces the identical sequence to the
+    /// interpreter — bit-exact, incl. negative seeds. PR-it52.
+    #[test]
+    fn native_seeded_rng_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{random_ints(42, 5)}\")\n    \
+                   print(\"{random_floats(42, 4)}\")\n    \
+                   print(\"{shuffle(42, [1, 2, 3, 4, 5, 6, 7, 8])}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "rng").trim(),
+            "[6255019084209693600, -4016670646968046118, -3871288216479333770, -1032231191467822881, -4346169525355410938]\n\
+             [0.33908526400192196, 0.7822558479199243, 0.7901370452687786, 0.9440426349851643]\n\
+             [2, 5, 4, 6, 7, 3, 8, 1]"
+        );
+    }
+
+    /// Native env_var matches the interpreter: set -> Some, missing -> None, empty
+    /// -> Some(""). PR-it52.
+    #[test]
+    fn native_env_var_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        // set a var in this process; the compiled binary is spawned as a child and
+        // inherits it. A missing var must be None on both engines.
+        let src = "fun main() uses io {\n    \
+                   print(\"{env_var(\"KUPL_NATIVE_TEST_VAR\")}\")\n    \
+                   print(\"{env_var(\"KUPL_DEFINITELY_MISSING_XYZ\")}\")\n}\n";
+        let out = native_main_stdout_env(src, "envv", &[("KUPL_NATIVE_TEST_VAR", "hello")]);
+        assert_eq!(out.trim(), "Some(\"hello\")\nNone");
+    }
+
     /// Native exec matches the interpreter on the nonexistent-command message
     /// (os-error, not "command not found"), NUL-in-output rejection, and exit
     /// codes. PR-it51.
@@ -5329,6 +5364,11 @@ mod tests {
     /// Compile a `fun main` program to native, run it, return stdout.
     #[cfg(test)]
     fn native_main_stdout(src: &str, tag: &str) -> String {
+        native_main_stdout_env(src, tag, &[])
+    }
+
+    /// Compile `src` to native, run it (with any extra env vars set), return stdout.
+    fn native_main_stdout_env(src: &str, tag: &str, env: &[(&str, &str)]) -> String {
         let compiled = crate::run::compile(src).expect("program compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
             .expect("module compiles");
@@ -5342,7 +5382,11 @@ mod tests {
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
-        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let mut cmd = std::process::Command::new(&bin);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("binary runs");
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stdout).into_owned()
