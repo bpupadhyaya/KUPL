@@ -26,6 +26,10 @@ runaway program fails cleanly instead of taking down the host. Each is enforced 
 | Recursion / call depth | `10_000` frames | interpreter (`interp.rs` `MAX_CALL_DEPTH`), KVM (`vm.rs`, `frames.len() >= 10_000`), native (`cgen.rs`, thread-local `k_depth`) |
 | Tensor length | `100_000_000` elements | interpreter (`interp.rs` `MAX_TENSOR_LEN`), native (`cgen.rs` `K_MAX_TENSOR_LEN`) — `zeros`/`arange` reject oversized requests |
 | JSON nesting depth | `500` levels | JSON parser (`json.rs` `MAX_JSON_DEPTH`), native (`cgen.rs` `K_MAX_JSON_DEPTH`) |
+| Expression / type nesting depth | `128` levels | parser (`parser.rs` `MAX_EXPR_DEPTH`) — deeply nested source (`[[[…]]]` or `List[List[…]]`) is a clean `K0121` instead of a superlinear type-checker blow-up |
+| Component messages per settle | `1_000_000` | interpreter/KVM/native (`interp.rs` `MAX_COMPONENT_MESSAGES`) — a `wire` cycle panics cleanly rather than draining forever |
+| Regex backtracking | `10_000_000` steps | shared matcher (`regex.rs` `MATCH_BUDGET`) + native (`cgen.rs` `kre_steps`) — a catastrophic-backtracking (ReDoS) pattern errors cleanly instead of hanging |
+| `.kx` / bundle module length | validated ≤ remaining bytes | loader (`kx.rs`) — a tampered/corrupt count or trailer length is rejected, never over-allocated or sliced out of bounds (no OOM / panic) |
 | LSP message size | `64 MiB` | language server frame reader (`lsp.rs` `MAX_MESSAGE_LEN`) — refuses an oversized `Content-Length` before allocating |
 | String contents | no NUL bytes | lexer rejects `\0` and raw NUL (diagnostic `K0008`) — keeps strings safe across the native C runtime, which is NUL-terminated |
 
