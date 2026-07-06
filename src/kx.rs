@@ -494,6 +494,15 @@ impl<'a> R<'a> {
     fn usz(&mut self) -> DecodeResult<usize> {
         Ok(self.u32()? as usize)
     }
+    /// A safe `Vec::with_capacity` hint for a count read from the (possibly
+    /// corrupt/untrusted) buffer: never pre-allocate for more items than there are
+    /// bytes left, since decoding each item consumes at least one byte. A tampered
+    /// count (e.g. 0xFFFFFFFF) therefore cannot trigger a multi-gigabyte allocation
+    /// that aborts the process — the following decode loop hits a clean
+    /// "truncated .kx module" error instead.
+    fn cap(&self, n: usize) -> usize {
+        n.min(self.buf.len().saturating_sub(self.pos))
+    }
 }
 
 pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
@@ -521,16 +530,16 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let nparams = r.u8()?;
         let nregs = r.u16()?;
         let nconsts = r.u32()?;
-        let mut consts = Vec::with_capacity(nconsts as usize);
+        let mut consts = Vec::with_capacity(r.cap(nconsts as usize));
         for _ in 0..nconsts {
             consts.push(decode_const(&mut r)?);
         }
         let ncode = r.u32()?;
-        let mut code = Vec::with_capacity(ncode as usize);
+        let mut code = Vec::with_capacity(r.cap(ncode as usize));
         for _ in 0..ncode {
             code.push(decode_op(&mut r)?);
         }
-        let mut spans = Vec::with_capacity(ncode as usize);
+        let mut spans = Vec::with_capacity(r.cap(ncode as usize));
         for _ in 0..ncode {
             let start = r.u32()?;
             let end = r.u32()?;
@@ -558,7 +567,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
     for _ in 0..ncfn {
         let variant = r.s()?;
         let n = r.u32()?;
-        let mut fields = Vec::with_capacity(n as usize);
+        let mut fields = Vec::with_capacity(r.cap(n as usize));
         for _ in 0..n {
             fields.push(r.s()?);
         }
@@ -570,7 +579,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let name = r.s()?;
         let is_app = r.u8()? != 0;
         let nprops = r.u32()?;
-        let mut props = Vec::with_capacity(nprops as usize);
+        let mut props = Vec::with_capacity(r.cap(nprops as usize));
         for _ in 0..nprops {
             let pname = r.s()?;
             let has_default = r.u8()? != 0;
@@ -581,7 +590,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let init_chunk = r.u16()?;
         let restart_chunk = r.u16()?;
         let nhandlers = r.u32()?;
-        let mut handlers = Vec::with_capacity(nhandlers as usize);
+        let mut handlers = Vec::with_capacity(r.cap(nhandlers as usize));
         for _ in 0..nhandlers {
             let key = r.s()?;
             let chunk = r.u16()?;
@@ -596,12 +605,12 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
             exposes.insert(ename, chunk);
         }
         let nports = r.u32()?;
-        let mut out_ports = Vec::with_capacity(nports as usize);
+        let mut out_ports = Vec::with_capacity(r.cap(nports as usize));
         for _ in 0..nports {
             out_ports.push(r.s()?);
         }
         let ntimers = r.u32()?;
-        let mut timers = Vec::with_capacity(ntimers as usize);
+        let mut timers = Vec::with_capacity(r.cap(ntimers as usize));
         for _ in 0..ntimers {
             let chunk = r.u16()?;
             let every = r.u8()? != 0;
@@ -629,19 +638,19 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let intent = r.s()?;
         let model = if r.u8()? != 0 { Some(r.s()?) } else { None };
         let nparams = r.u32()?;
-        let mut params = Vec::with_capacity(nparams as usize);
+        let mut params = Vec::with_capacity(r.cap(nparams as usize));
         for _ in 0..nparams {
             params.push(r.s()?);
         }
         let shape = decode_shape(&mut r)?;
         let wraps_result = r.u8()? != 0;
         let ntools = r.u32()?;
-        let mut tools = Vec::with_capacity(ntools as usize);
+        let mut tools = Vec::with_capacity(r.cap(ntools as usize));
         for _ in 0..ntools {
             let tname = r.s()?;
             let description = r.s()?;
             let nparams = r.u32()?;
-            let mut tparams = Vec::with_capacity(nparams as usize);
+            let mut tparams = Vec::with_capacity(r.cap(nparams as usize));
             for _ in 0..nparams {
                 let pname = r.s()?;
                 tparams.push((pname, decode_shape(&mut r)?));
@@ -676,7 +685,7 @@ fn decode_shape(r: &mut R) -> DecodeResult<crate::ai::AiShape> {
             let ty = r.s()?;
             let variant = r.s()?;
             let n = r.u32()?;
-            let mut fields = Vec::with_capacity(n as usize);
+            let mut fields = Vec::with_capacity(r.cap(n as usize));
             for _ in 0..n {
                 let name = r.s()?;
                 fields.push((name, decode_shape(r)?));
@@ -816,6 +825,44 @@ mod tests {
         assert_eq!(module.disassemble(), decoded.disassemble());
         assert_eq!(module.funs, decoded.funs);
         assert_eq!(module.component_names, decoded.component_names);
+    }
+
+    #[test]
+    fn corrupt_kx_is_rejected_not_a_crash() {
+        // A tampered/untrusted .kx must decode to a clean Err — never a panic, an
+        // index-out-of-bounds, or a giant allocation from an attacker-controlled
+        // count. A huge `nconsts` used to feed Vec::with_capacity directly (would
+        // try to allocate ~GBs and abort); it is now clamped to the bytes that
+        // remain, so the decode loop hits "truncated .kx module" instead.
+        let mut b = Vec::new();
+        b.extend_from_slice(super::KX_MAGIC);
+        b.extend_from_slice(&1u32.to_le_bytes()); // nchunks = 1
+        b.extend_from_slice(&0u32.to_le_bytes()); // chunk name: len 0
+        b.push(0); // ncaps
+        b.push(0); // nparams
+        b.extend_from_slice(&0u16.to_le_bytes()); // nregs
+        b.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nconsts = 4.29 billion
+        // (no const bytes follow) — must be Err, must return fast (no huge alloc)
+        assert!(super::decode(&b).is_err(), "huge nconsts must be a clean error");
+
+        // truncating a valid module at every prefix length is always a clean Err.
+        let src = "fun add(a: Int, b: Int) -> Int { a + b }\nfun main() { print(add(2, 3)) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let full = super::encode(&module);
+        assert!(super::decode(&full).is_ok());
+        for cut in (0..full.len()).step_by(1) {
+            // never panics; a partial module is Err (except the trivially-empty
+            // prefix cases which are also Err via the magic/length checks)
+            let _ = super::decode(&full[..cut]);
+        }
+        // flip a byte in the body (past the 8-byte magic) — never a panic.
+        for i in 8..full.len() {
+            let mut t = full.clone();
+            t[i] ^= 0xFF;
+            let _ = super::decode(&t); // Ok or Err, but never a crash
+        }
     }
 
     #[test]
