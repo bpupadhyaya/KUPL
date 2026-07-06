@@ -612,6 +612,30 @@ impl Interp {
                                 }
                             }
                         }
+                        // Fast path for `s = s.insert(v)` (Set self-insert, 1 arg):
+                        // same in-place uniqueness optimization — O(n^2) set build -> O(n).
+                        if name == "insert"
+                            && args.len() == 1
+                            && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
+                        {
+                            let v = self.eval(&args[0], env)?;
+                            match env.insert_set_in_place(tname, v) {
+                                None => return Ok(Value::Unit),
+                                Some(v) => {
+                                    let recv_val = env.get(tname).ok_or_else(|| {
+                                        Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                                    })?;
+                                    let nv = self.eval_method(recv_val, "insert", vec![v], value.span)?;
+                                    if !env.set(tname, nv) {
+                                        return Err(Self::panic_flow(
+                                            format!("unknown variable `{tname}`"),
+                                            *span,
+                                        ));
+                                    }
+                                    return Ok(Value::Unit);
+                                }
+                            }
+                        }
                     }
                 }
                 let rhs = self.eval(value, env)?;

@@ -851,6 +851,28 @@ impl<'m> Vm<'m> {
                         }
                         continue;
                     }
+                    // Self-insert fast path (`s = s.insert(v)`, 1 arg): in-place dedup
+                    // append on a uniquely-owned Set — O(n^2) build loop -> O(n).
+                    if method == "insert"
+                        && argc == 1
+                        && dst == recv
+                        && matches!(&self.stack[base + recv as usize], Value::Set(_))
+                    {
+                        let v = reg!(start);
+                        if let Value::Set(rc) = &mut self.stack[base + recv as usize] {
+                            let items = match Rc::get_mut(rc) {
+                                Some(it) => it,
+                                None => {
+                                    *rc = Rc::new(rc.as_ref().clone());
+                                    Rc::get_mut(rc).unwrap()
+                                }
+                            };
+                            if !items.iter().any(|x| *x == v) {
+                                items.push(v);
+                            }
+                        }
+                        continue;
+                    }
                     let r = reg!(recv);
                     let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
                     // expose call on a component instance
@@ -1839,6 +1861,21 @@ mod tests {
                         for i in 0..4 { m = m.insert(\"k{i}\", i) }\n    \
                         m = m.insert(\"k1\", 99)\n    \"{m.keys()}|{m.values()}\"\n}\n";
         assert_eq!(differential(loop_src), "[\"k0\", \"k1\", \"k2\", \"k3\"]|[0, 99, 2, 3]");
+    }
+
+    #[test]
+    fn diff_set_self_insert_in_place_preserves_aliasing_and_dedup() {
+        // `s = s.insert(v)` in-place (PR-it92, O(n^2)->O(n) set build) fires only on a
+        // uniquely-owned Set. An aliased set is untouched, dedup still holds (inserting
+        // a present element is a no-op), insertion order is preserved. interp == KVM.
+        let src = "fun probe() -> Str {\n    var s: Set[Int] = Set().insert(1).insert(2)\n    \
+                   let alias = s\n    s = s.insert(2)\n    s = s.insert(3)\n    \
+                   \"{alias.to_list()}|{s.to_list()}\"\n}\n";
+        assert_eq!(differential(src), "[1, 2]|[1, 2, 3]");
+        // a build loop with duplicates dedups to the distinct values, in order.
+        let loop_src = "fun probe() -> Str {\n    var s: Set[Int] = Set()\n    \
+                        for i in 0..6 { s = s.insert(i % 3) }\n    \"{s.to_list()}\"\n}\n";
+        assert_eq!(differential(loop_src), "[0, 1, 2]");
     }
 
     #[test]

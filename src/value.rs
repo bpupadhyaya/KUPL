@@ -530,6 +530,31 @@ impl Env {
         }
     }
 
+    /// `s = s.insert(v)` in place when `s` is a uniquely-owned Set — the Set-build
+    /// analogue of `insert_map_in_place` (a Set is an insertion-ordered `Vec` with
+    /// dedup). None on success, Some(v) to fall back.
+    pub fn insert_set_in_place(&self, name: &str, v: Value) -> Option<Value> {
+        let mut inner = self.0.borrow_mut();
+        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
+            if let Value::Set(rc) = &mut slot.1 {
+                if let Some(items) = Rc::get_mut(rc) {
+                    if !items.iter().any(|x| *x == v) {
+                        items.push(v);
+                    }
+                    return None;
+                }
+            }
+            return Some(v);
+        }
+        match inner.parent.clone() {
+            Some(p) => {
+                drop(inner);
+                p.insert_set_in_place(name, v)
+            }
+            None => Some(v),
+        }
+    }
+
     /// Assign to an existing binding (walks up the chain). Returns false if unbound.
     pub fn set(&self, name: &str, value: Value) -> bool {
         let mut inner = self.0.borrow_mut();

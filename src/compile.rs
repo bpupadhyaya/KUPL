@@ -599,7 +599,10 @@ impl<'s> FnCompiler<'s> {
                                 // dst == recv so the VM mutates the uniquely-owned
                                 // collection in place — O(n^2) build loop -> O(n).
                                 let self_recv = matches!(&recv.kind, ExprKind::Ident(n) if n == name);
-                                if self_recv && ((m == "push" && args.len() == 1) || (m == "insert" && args.len() == 2)) {
+                                if self_recv
+                                    && ((m == "push" && args.len() == 1)
+                                        || (m == "insert" && (args.len() == 1 || args.len() == 2)))
+                                {
                                     let exprs: Vec<Expr> = args.clone();
                                     let start = self.consecutive(&exprs, *span);
                                     let name_idx = self.const_idx(Value::str(m.to_string()));
