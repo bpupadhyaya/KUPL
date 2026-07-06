@@ -1791,6 +1791,26 @@ mod tests {
     }
 
     #[test]
+    fn diff_numeric_and_math_edge_cases() {
+        // Numeric/math edges are identical on interp and KVM — including the full
+        // 17-digit transcendental strings (Rust f64 vs libm agree) and IEEE
+        // special values. Reads: parse_int garbage(None)/valid(Some), truncated mod
+        // sign (-7%3=-1, 7%-3=1), float div (inf, NaN), sqrt of a negative (NaN),
+        // sqrt(2), log(2), 1e20 formatting, to_hex, gcd, negative to_hex.
+        let src = "fun probe() -> Str {\n    let neg = 0.0 - 1.0\n    \
+                   \"{\"abc\".parse_int()}|{\"42\".parse_int()}|{-7 % 3}|{7 % -3}|{1.0 / 0.0}|\
+                   {0.0 / 0.0}|{neg.sqrt()}|{(2.0).sqrt()}|{(2.0).log()}|{100000000000000000000.0}|\
+                   {(255).to_hex()}|{(48).gcd(36)}|{(0 - 8).to_hex()}\"\n}\n";
+        assert_eq!(
+            differential(src),
+            "None|Some(42)|-1|1|inf|NaN|NaN|1.4142135623730951|0.6931471805599453|100000000000000000000.0|ff|12|-8"
+        );
+        // Int divide/modulo by zero is a clean guarded panic, same message everywhere.
+        assert_eq!(differential("fun probe() -> Str { \"{7 / 0}\" }\n"), "panic: division by zero");
+        assert_eq!(differential("fun probe() -> Str { \"{7 % 0}\" }\n"), "panic: remainder by zero");
+    }
+
+    #[test]
     fn diff_stdlib_method_edge_cases() {
         // Boundary/empty/unicode/out-of-range inputs to stdlib methods behave
         // identically on interp and KVM. Reads: slice past end (clamps), reversed

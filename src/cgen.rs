@@ -4760,6 +4760,24 @@ mod tests {
         assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
     }
 
+    /// Native numeric/math edges match the interpreter/KVM — full-precision
+    /// transcendentals (libm vs Rust f64), IEEE special values, mod sign, radix.
+    /// PR-it82.
+    #[test]
+    fn native_numeric_and_math_edge_cases() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let neg = 0.0 - 1.0\n    \
+                   print(\"{\"abc\".parse_int()}|{\"42\".parse_int()}|{-7 % 3}|{7 % -3}|{1.0 / 0.0}|\
+                   {0.0 / 0.0}|{neg.sqrt()}|{(2.0).sqrt()}|{(2.0).log()}|{100000000000000000000.0}|\
+                   {(255).to_hex()}|{(48).gcd(36)}|{(0 - 8).to_hex()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "numedge").trim(),
+            "None|Some(42)|-1|1|inf|NaN|NaN|1.4142135623730951|0.6931471805599453|100000000000000000000.0|ff|12|-8"
+        );
+    }
+
     /// Native stdlib methods handle boundary/empty/unicode/out-of-range inputs
     /// identically to the interpreter/KVM (slice clamp, take/drop past len, index_of
     /// None, multibyte reverse, zip truncation, get None). PR-it81.
