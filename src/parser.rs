@@ -145,11 +145,13 @@ impl Parser {
             self.bump();
             Ok(s)
         } else {
-            Err(Diag::error(
-                "K0100",
-                format!("expected {}, found {}", tok.describe(), self.peek().describe()),
-                self.span(),
-            ))
+            let mut msg = format!("expected {}, found {}", tok.describe(), self.peek().describe());
+            // A bare `=` where a token was expected is almost always the classic
+            // `=` (assignment) vs `==` (comparison) slip — e.g. `if n = 5 { … }`.
+            if matches!(self.peek(), Tok::Eq) {
+                msg.push_str(" — `=` assigns a value; use `==` to compare");
+            }
+            Err(Diag::error("K0100", msg, self.span()))
         }
     }
     fn expect_ident(&mut self) -> PResult<(String, Span)> {
@@ -1874,6 +1876,22 @@ mod tests {
         let (p, diags) = parse(src);
         assert!(diags.is_empty(), "diags: {diags:#?}");
         p
+    }
+
+    #[test]
+    fn eq_in_condition_suggests_double_equals() {
+        // `=` (assignment) where `==` (comparison) was meant is a classic slip; the
+        // K0100 error must point at the fix, not just say "expected `{`, found `=`".
+        for src in ["fun f(n: Int) -> Bool { if n = 5 { true } else { false } }\n",
+                    "fun main() uses io { while x = 0 { print(\"x\") } }\n"] {
+            let (_, diags) = parse(src);
+            let m = &diags.iter().find(|d| d.code == "K0100").expect("K0100").message;
+            assert!(m.contains("use `==` to compare"), "missing == hint: {m}");
+        }
+        // a genuine missing brace (found something other than `=`) gets no such hint
+        let (_, diags) = parse("fun f() -> Int 1 }\n");
+        let m = &diags.iter().find(|d| d.code == "K0100").expect("K0100").message;
+        assert!(!m.contains("use `==`"), "spurious == hint: {m}");
     }
 
     /// `else` may follow the then-block across a newline; the AST is identical
