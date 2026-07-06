@@ -20,6 +20,9 @@ struct PkgCtx {
     /// name -> (directory, required version if the manifest pinned one)
     deps: HashMap<String, (PathBuf, Option<String>)>,
     prefix: String,
+    /// Set when a `kupl.toml` was found but failed to parse — surfaced as a hard
+    /// error rather than silently ignored (which would make the deps vanish).
+    err: Option<String>,
 }
 
 /// Lexically resolve `.` and `..` in a path without touching the filesystem
@@ -51,20 +54,32 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
     while let Some(cur) = d {
         let toml = cur.join("kupl.toml");
         if toml.is_file() {
-            if let Ok(m) = crate::manifest::read(&toml) {
-                let mut deps = HashMap::new();
-                for dep in &m.deps {
-                    if let Some(p) = &dep.path {
-                        deps.insert(dep.name.clone(), (normalize(&cur.join(p)), dep.version.clone()));
+            match crate::manifest::read(&toml) {
+                Ok(m) => {
+                    let mut deps = HashMap::new();
+                    for dep in &m.deps {
+                        if let Some(p) = &dep.path {
+                            deps.insert(dep.name.clone(), (normalize(&cur.join(p)), dep.version.clone()));
+                        }
+                        // version-only deps resolve via a registry — a later slice
                     }
-                    // version-only deps resolve via a registry — a later slice
+                    return Rc::new(PkgCtx { root: cur.to_path_buf(), deps, prefix: prefix.to_string(), err: None });
                 }
-                return Rc::new(PkgCtx { root: cur.to_path_buf(), deps, prefix: prefix.to_string() });
+                // The manifest exists but is malformed — stop and report it, rather
+                // than walking past it (which would silently drop the project's deps).
+                Err(e) => {
+                    return Rc::new(PkgCtx {
+                        root: cur.to_path_buf(),
+                        deps: HashMap::new(),
+                        prefix: prefix.to_string(),
+                        err: Some(format!("invalid manifest {}: {e}", toml.display())),
+                    });
+                }
             }
         }
         d = if walk { cur.parent() } else { None };
     }
-    Rc::new(PkgCtx { root: dir.to_path_buf(), deps: HashMap::new(), prefix: prefix.to_string() })
+    Rc::new(PkgCtx { root: dir.to_path_buf(), deps: HashMap::new(), prefix: prefix.to_string(), err: None })
 }
 
 pub struct SourceFile {
@@ -173,6 +188,9 @@ pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
     let entry_path = PathBuf::from(entry);
     let dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
     let ctx = pkg_ctx(&dir, true, "");
+    if let Some(e) = &ctx.err {
+        return Err(e.clone());
+    }
     let mut out = Vec::new();
     let mut names: Vec<&String> = ctx.deps.keys().collect();
     names.sort();
@@ -232,6 +250,13 @@ pub fn load_with(
     let entry_path = PathBuf::from(entry);
     let root_dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
     let root_ctx = pkg_ctx(&root_dir, true, "");
+    // A malformed project manifest is a hard error — otherwise its dependencies
+    // would silently vanish and the build would fail later with confusing
+    // "unknown name" errors that never mention the broken kupl.toml.
+    if let Some(e) = &root_ctx.err {
+        diags.push(Diag::error("K0401", e.clone(), Span::default()));
+        return Err((diags, map));
+    }
     let mut ctx_cache: HashMap<PathBuf, Rc<PkgCtx>> = HashMap::new();
     let mut queue: Vec<(PathBuf, Rc<PkgCtx>, Option<Span>)> = vec![(entry_path, root_ctx, None)];
     // items tagged with their owning package's mangling prefix, plus the deps
@@ -394,6 +419,31 @@ mod tests {
         let rendered = map2.render(err);
         assert!(rendered.contains("util.kupl"), "diag should point at util.kupl:\n{rendered}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_manifest_is_a_clean_error_not_silently_ignored() {
+        let dir = std::env::temp_dir().join(format!("kupl-loader-badtoml-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.kupl"), "fun main() {}\n").unwrap();
+        // a kupl.toml that exists but doesn't parse must not be silently walked past
+        // (which would drop the project's dependencies and fail later, confusingly).
+        std::fs::write(dir.join("kupl.toml"), "this is not toml at all {{{\n").unwrap();
+        let (diags, _) = match super::load(dir.join("main.kupl").to_str().unwrap()) {
+            Ok(_) => panic!("a malformed manifest must be an error"),
+            Err(e) => e,
+        };
+        assert!(
+            diags.iter().any(|d| d.severity == crate::diag::Severity::Error
+                && d.message.contains("invalid manifest")),
+            "should report an invalid manifest: {diags:?}"
+        );
+        // a valid manifest (and an empty one — a valid dependency-free project) load fine
+        std::fs::write(dir.join("kupl.toml"), "[project]\nname = \"app\"\nentry = \"main.kupl\"\n").unwrap();
+        assert!(super::load(dir.join("main.kupl").to_str().unwrap()).is_ok(), "valid manifest loads");
+        std::fs::write(dir.join("kupl.toml"), "").unwrap();
+        assert!(super::load(dir.join("main.kupl").to_str().unwrap()).is_ok(), "empty manifest loads");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
