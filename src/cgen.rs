@@ -4760,6 +4760,26 @@ mod tests {
         assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
     }
 
+    /// Deeply nested JSON is rejected by the native runtime's depth guard
+    /// (K_MAX_JSON_DEPTH) — a clean Err, never a stack-overflow/segfault on the
+    /// recursive C descent. PR-it73 (certifies the untrusted-input JSON path).
+    #[test]
+    fn native_deep_json_is_bounded_not_a_crash() {
+        if !cc_available() {
+            return;
+        }
+        // 5000-deep '[' — well past the guard. Must print "rejected" (a clean Err),
+        // and the process must exit normally (the test itself would fail on SIGSEGV).
+        let deep = format!("[{}", "[".repeat(4999)) + &"]".repeat(5000);
+        let src = format!(
+            "fun main() uses io {{ match json_parse(\"{deep}\") {{ Ok(v) => print(\"ok\"), Err(e) => print(\"rejected\") }} }}\n"
+        );
+        assert_eq!(native_main_stdout(&src, "deepjson").trim(), "rejected");
+        // a normal shallow JSON still parses
+        let ok = "fun main() uses io { match json_parse(\"[1, [2, 3], 4]\") { Ok(v) => print(\"ok\"), Err(e) => print(\"err\") } }\n";
+        assert_eq!(native_main_stdout(ok, "okjson").trim(), "ok");
+    }
+
     /// A malformed / trailing-garbage AI mock (`KUPL_AI_MOCK_ASSIST`) is treated as
     /// the raw final answer on native — and the interpreter matches (it now gates on
     /// the strict `json` parser instead of the lenient lsp one). PR-it67.

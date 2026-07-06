@@ -1791,6 +1791,24 @@ mod tests {
     }
 
     #[test]
+    fn diff_csv_pathological_input() {
+        // csv_parse handles hostile/edge input identically on both engines without
+        // panicking: an unterminated quoted field takes the rest of the row, doubled
+        // quotes unescape, a trailing comma yields a trailing empty field, empty
+        // input is no rows.
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{csv_parse(\"a,\\\"unterminated,b\")}\"\n}\n"),
+            "[[\"a\", \"unterminated,b\"]]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{csv_parse(\"a,\\\"he said \\\"\\\"hi\\\"\\\"\\\",c\")}\"\n}\n"),
+            "[[\"a\", \"he said \"hi\"\", \"c\"]]"
+        );
+        assert_eq!(differential("fun probe() -> Str {\n    \"{csv_parse(\"a,b,\")}\"\n}\n"), "[[\"a\", \"b\", \"\"]]");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{csv_parse(\"\")}\"\n}\n"), "[]");
+    }
+
+    #[test]
     fn diff_runtime_panic_messages_actionable() {
         // Certify that the common runtime panics carry actionable context and are
         // identical on both engines: overflow says WHICH op, pow names its
