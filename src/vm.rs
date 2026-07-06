@@ -1780,6 +1780,18 @@ mod tests {
     }
 
     #[test]
+    fn diff_runtime_panic_messages_actionable() {
+        // Certify that the common runtime panics carry actionable context and are
+        // identical on both engines: overflow says WHICH op, pow names its
+        // constraint. (Vague ones were fixed in it64 tensor-index / it65 expect;
+        // the non-exhaustive-match fall-through is unreachable — the K0256/K0257
+        // exhaustiveness checker rejects it at compile time.)
+        assert_eq!(differential("fun probe() -> Int {\n    2.pow(0 - 1)\n}\n"), "panic: `pow` needs a non-negative exponent");
+        assert_eq!(differential("fun probe() -> Int {\n    let m = (0 - 9223372036854775807) - 1\n    m.abs()\n}\n"), "panic: integer overflow in abs");
+        assert_eq!(differential("fun probe() -> Int {\n    let m = (0 - 9223372036854775807) - 1\n    m / (0 - 1)\n}\n"), "panic: integer overflow in division");
+    }
+
+    #[test]
     fn diff_expect_stmt() {
         let src = "fun probe() -> Int {\n    expect 1 + 1 == 2\n    7\n}\n";
         assert_eq!(differential(src), "7");
