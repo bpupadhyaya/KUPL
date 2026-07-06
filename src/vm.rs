@@ -827,6 +827,30 @@ impl<'m> Vm<'m> {
                         }
                         continue;
                     }
+                    // Self-insert fast path (`m = m.insert(k, v)`): same in-place
+                    // update of a uniquely-owned Map — O(n^2) build loop -> O(n).
+                    if method == "insert"
+                        && argc == 2
+                        && dst == recv
+                        && matches!(&self.stack[base + recv as usize], Value::Map(_))
+                    {
+                        let key = reg!(start);
+                        let val = reg!(start + 1);
+                        if let Value::Map(rc) = &mut self.stack[base + recv as usize] {
+                            let pairs = match Rc::get_mut(rc) {
+                                Some(p) => p,
+                                None => {
+                                    *rc = Rc::new(rc.as_ref().clone());
+                                    Rc::get_mut(rc).unwrap()
+                                }
+                            };
+                            match pairs.iter_mut().find(|(pk, _)| *pk == key) {
+                                Some(pair) => pair.1 = val,
+                                None => pairs.push((key, val)),
+                            }
+                        }
+                        continue;
+                    }
                     let r = reg!(recv);
                     let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
                     // expose call on a component instance
@@ -1799,6 +1823,22 @@ mod tests {
                    let f = [1, 2, 3, 4, 5, 6, 7, 8].par_filter(fn n { n % 2 == 0 })\n    \
                    let e: List[Int] = []\n    \"{r}|{f}|{e.par_map(fn n { n + 1 })}|{[42].par_map(fn n { n * 2 })}\"\n}\n";
         assert_eq!(differential(src), "[25, 9, 64, 1, 81, 4]|[2, 4, 6, 8]|[]|[84]");
+    }
+
+    #[test]
+    fn diff_map_self_insert_in_place_preserves_aliasing() {
+        // The `m = m.insert(k, v)` in-place fast path (PR-it91, O(n^2)->O(n) map
+        // build) must only fire when the Map is uniquely owned. An aliased map must
+        // be untouched — value semantics. Here `alias` shares m before the insert,
+        // so it stays len 1 while m grows to 2, on both interp and KVM.
+        let src = "fun probe() -> Str {\n    var m = Map().insert(\"a\", 1)\n    let alias = m\n    \
+                   m = m.insert(\"b\", 2)\n    \"{alias.len()}|{m.len()}|{alias.get(\"b\")}\"\n}\n";
+        assert_eq!(differential(src), "1|2|None");
+        // and a self-insert loop with an overwrite of an existing key stays correct.
+        let loop_src = "fun probe() -> Str {\n    var m = Map()\n    \
+                        for i in 0..4 { m = m.insert(\"k{i}\", i) }\n    \
+                        m = m.insert(\"k1\", 99)\n    \"{m.keys()}|{m.values()}\"\n}\n";
+        assert_eq!(differential(loop_src), "[\"k0\", \"k1\", \"k2\", \"k3\"]|[0, 99, 2, 3]");
     }
 
     #[test]

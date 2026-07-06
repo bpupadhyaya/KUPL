@@ -580,6 +580,38 @@ impl Interp {
                                 }
                             }
                         }
+                        // Fast path for `m = m.insert(k, v)` (Map self-insert): update
+                        // in place when `m` is a uniquely-owned Map — turns the O(n^2)
+                        // map-building loop into O(n) allocations. (2 args => Map
+                        // insert; Set insert takes 1 arg, so it never matches here.)
+                        if name == "insert"
+                            && args.len() == 2
+                            && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
+                        {
+                            let key = self.eval(&args[0], env)?;
+                            let val = self.eval(&args[1], env)?;
+                            match env.insert_map_in_place(tname, key, val) {
+                                None => return Ok(Value::Unit),
+                                Some((key, val)) => {
+                                    let recv_val = env.get(tname).ok_or_else(|| {
+                                        Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                                    })?;
+                                    let nv = self.eval_method(
+                                        recv_val,
+                                        "insert",
+                                        vec![key, val],
+                                        value.span,
+                                    )?;
+                                    if !env.set(tname, nv) {
+                                        return Err(Self::panic_flow(
+                                            format!("unknown variable `{tname}`"),
+                                            *span,
+                                        ));
+                                    }
+                                    return Ok(Value::Unit);
+                                }
+                            }
+                        }
                     }
                 }
                 let rhs = self.eval(value, env)?;

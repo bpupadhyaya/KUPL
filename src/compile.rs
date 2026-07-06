@@ -595,15 +595,16 @@ impl<'s> FnCompiler<'s> {
                                 }
                             }
                             if let ExprKind::MethodCall { recv, name: m, args } = &value.kind {
-                                if m == "push"
-                                    && args.len() == 1
-                                    && matches!(&recv.kind, ExprKind::Ident(n) if n == name)
-                                {
+                                // `x = x.push(e)` (list) and `m = m.insert(k, v)` (Map):
+                                // dst == recv so the VM mutates the uniquely-owned
+                                // collection in place — O(n^2) build loop -> O(n).
+                                let self_recv = matches!(&recv.kind, ExprKind::Ident(n) if n == name);
+                                if self_recv && ((m == "push" && args.len() == 1) || (m == "insert" && args.len() == 2)) {
                                     let exprs: Vec<Expr> = args.clone();
                                     let start = self.consecutive(&exprs, *span);
-                                    let name_idx = self.const_idx(Value::str("push".to_string()));
+                                    let name_idx = self.const_idx(Value::str(m.to_string()));
                                     self.emit(
-                                        Op::Method { dst: local, recv: local, name: name_idx, start, argc: 1 },
+                                        Op::Method { dst: local, recv: local, name: name_idx, start, argc: args.len() as u8 },
                                         *span,
                                     );
                                     return None;

@@ -502,6 +502,34 @@ impl Env {
         }
     }
 
+    /// `m = m.insert(k, v)` in place when `m` is a uniquely-owned Map — updates or
+    /// appends the pair without cloning the whole assoc-list, turning an O(n^2)
+    /// map-building loop into O(n) allocations. Returns None on success, or
+    /// Some((k, v)) to fall back (shared map / not found / other shape). Behaves
+    /// exactly like `.insert` (same overwrite semantics, same insertion order).
+    pub fn insert_map_in_place(&self, name: &str, key: Value, val: Value) -> Option<(Value, Value)> {
+        let mut inner = self.0.borrow_mut();
+        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
+            if let Value::Map(rc) = &mut slot.1 {
+                if let Some(pairs) = Rc::get_mut(rc) {
+                    match pairs.iter_mut().find(|(pk, _)| *pk == key) {
+                        Some(pair) => pair.1 = val,
+                        None => pairs.push((key, val)),
+                    }
+                    return None;
+                }
+            }
+            return Some((key, val));
+        }
+        match inner.parent.clone() {
+            Some(p) => {
+                drop(inner);
+                p.insert_map_in_place(name, key, val)
+            }
+            None => Some((key, val)),
+        }
+    }
+
     /// Assign to an existing binding (walks up the chain). Returns false if unbound.
     pub fn set(&self, name: &str, value: Value) -> bool {
         let mut inner = self.0.borrow_mut();
