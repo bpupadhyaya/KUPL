@@ -390,7 +390,7 @@ pub fn run_program_vm(path: &str) -> i32 {
 
 /// `kupl check [--json]`: load (multi-file), type-check, effect-check.
 pub fn check_cmd(path: &str, json: bool) -> i32 {
-    let (program, map) = match crate::loader::load(path) {
+    let (mut program, map) = match crate::loader::load(path) {
         Ok(ok) => ok,
         Err((mut diags, map)) => {
             sort_diags(&mut diags);
@@ -402,6 +402,10 @@ pub fn check_cmd(path: &str, json: bool) -> i32 {
             return 1;
         }
     };
+    // Inject the prelude (the built-in `Json` ADT etc.) exactly like `compile()` /
+    // `load_compile()` — without this, `kupl check` reported false "unknown type
+    // `Json`" errors on valid programs that `kupl run`/`build` accept.
+    inject_prelude(&mut program);
     let (_, mut diags) = check::check(&program);
     if !diags.iter().any(|d| d.severity == Severity::Error) {
         diags.extend(crate::effects::check_effects(&program));
@@ -888,6 +892,19 @@ fn snippet(src: &str, span: Span) -> String {
 mod tests {
     use super::{compile, sort_diags};
     use crate::diag::{Diag, Span};
+
+    #[test]
+    fn check_cmd_injects_the_prelude() {
+        // `kupl check` must accept a program that uses a prelude type (the built-in
+        // `Json` ADT) — before PR-it89 it reported false "unknown type `Json`"
+        // errors because check_cmd skipped inject_prelude (unlike run/build).
+        let ex = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/json.kupl");
+        assert_eq!(
+            super::check_cmd(ex.to_str().unwrap(), false),
+            0,
+            "`kupl check` must accept a valid Json-using program"
+        );
+    }
 
     #[test]
     fn ai_fun_intent_interpolation_is_checked() {
