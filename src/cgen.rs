@@ -4544,6 +4544,24 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native path helpers (k_path_join/base/dir/ext) match the interpreter on
+    /// trailing-slash, dotfile, and empty-input edges. PR-it53.
+    #[test]
+    fn native_path_builtins_edges() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{path_join(\"a\", \"/b\")}|{path_join(\"\", \"b\")}|{path_join(\"a\", \"\")}\")\n    \
+                   print(\"{path_base(\"a/b/\")}|{path_base(\"/\")}|{path_base(\"noslash\")}\")\n    \
+                   print(\"{path_dir(\"a/b/c\")}|{path_dir(\"/a\")}|{path_dir(\"a/b/\")}\")\n    \
+                   print(\"{path_ext(\"a.tar.gz\")}|{path_ext(\".hidden\")}|{path_ext(\"a.\")}|{path_ext(\"a.b/c\")}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "paths").trim(),
+            "/b|b|a/\n||noslash\na/b||a/b\n.gz||.|"
+        );
+    }
+
     /// Native seeded RNG (xorshift64*) produces the identical sequence to the
     /// interpreter — bit-exact, incl. negative seeds. PR-it52.
     #[test]

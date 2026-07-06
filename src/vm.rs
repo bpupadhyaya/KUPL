@@ -1106,6 +1106,30 @@ mod tests {
     }
 
     #[test]
+    fn diff_path_builtins_edges() {
+        // Pure path helpers agree on the fiddly cases: absolute-second-arg + empty
+        // join, trailing-slash base/dir (-> "" / parent), root/no-slash dir, and
+        // ext of a multi-dot name, a dotfile (none), a trailing dot, and a dot that
+        // is in the directory not the base (none).
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{path_join(\"a\", \"/b\")}|{path_join(\"\", \"b\")}|{path_join(\"a\", \"\")}\"\n}\n"),
+            "/b|b|a/"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{path_base(\"a/b/\")}|{path_base(\"/\")}|{path_base(\"noslash\")}\"\n}\n"),
+            "||noslash"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{path_dir(\"a/b/c\")}|{path_dir(\"/a\")}|{path_dir(\"a/b/\")}\"\n}\n"),
+            "a/b||a/b"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"{path_ext(\"a.tar.gz\")}|{path_ext(\".hidden\")}|{path_ext(\"a.\")}|{path_ext(\"a.b/c\")}\"\n}\n"),
+            ".gz||.|"
+        );
+    }
+
+    #[test]
     fn diff_seeded_rng_determinism() {
         // Seeded RNG (xorshift64*) is pure + deterministic: the same seed yields the
         // identical sequence on interp == KVM (and, per the native test, native too),
