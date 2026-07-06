@@ -894,6 +894,35 @@ mod tests {
     use crate::diag::{Diag, Span};
 
     #[test]
+    fn frontend_accepts_valid_and_rejects_invalid_across_features() {
+        // Cross-command validity consistency (PR-it90): every command (check, run,
+        // build, native) reaches the SAME frontend — compile() and check_cmd both
+        // parse + inject the prelude + type-check + effect-check. This pins that the
+        // shared frontend accepts a representative valid program per feature and
+        // rejects the ill-typed ones, so no command can diverge on validity. (native
+        // and run additionally require an entry point, which is a separate, intended
+        // requirement — a valid library with no `main` still type-checks here.)
+        let valid = [
+            "fun f(j: Json) -> Str { match j { JStr(s) => s\n _ => \"x\" } }\n", // prelude ADT
+            "fun id[T](x: T) -> T { x }\nfun main() { let _ = id(5) }\n",        // generics
+            "fun add(a: Int, b: Int) -> Int { a + b }\nai fun s(q: Str) -> Str tools [add] { intent \"{q}\" }\n", // ai fun
+            "component C {\n intent \"x\"\n in tick: Int\n state n: Int = 0\n on tick(v) { n = n + v } }\n", // component
+        ];
+        for src in valid {
+            assert!(compile(src).is_ok(), "frontend wrongly rejected a valid program:\n{src}");
+        }
+        let invalid = [
+            "fun main() { let x = nope }\n",                               // undefined name
+            "fun f() -> Int { \"s\" }\n",                                  // type mismatch
+            "fun main() { let x = Nope(1) }\n",                            // undefined ctor
+            "type C = Red | Green\nfun f(c: C) -> Int { match c { Red => 1 } }\n", // non-exhaustive
+        ];
+        for src in invalid {
+            assert!(compile(src).is_err(), "frontend wrongly accepted an ill-typed program:\n{src}");
+        }
+    }
+
+    #[test]
     fn check_cmd_injects_the_prelude() {
         // `kupl check` must accept a program that uses a prelude type (the built-in
         // `Json` ADT) — before PR-it89 it reported false "unknown type `Json`"
