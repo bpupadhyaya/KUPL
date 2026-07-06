@@ -2669,7 +2669,9 @@ pub fn shared_method(
         (Value::Tensor(d), "len") => Ok(Value::Int(d.len() as i64)),
         (Value::Tensor(d), "get") => match args.into_iter().next() {
             Some(Value::Int(i)) if i >= 0 && (i as usize) < d.len() => Ok(Value::Float(d[i as usize])),
-            Some(Value::Int(_)) => Err("tensor index out of range".into()),
+            Some(Value::Int(i)) => {
+                Err(format!("tensor index {i} out of range for length {}", d.len()))
+            }
             _ => Err("`get` needs an Int index".into()),
         },
         (Value::Tensor(d), "sum") => Ok(Value::Float(d.iter().sum())),

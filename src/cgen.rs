@@ -4036,8 +4036,13 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         KTensor* t = recv.as.ten;
         if (!strcmp(name, "len")) return k_int(t->len);
         if (!strcmp(name, "get")) {
-            if (args[0].tag != K_INT || args[0].as.i < 0 || args[0].as.i >= t->len)
-                k_panic("tensor index out of range");
+            if (args[0].tag != K_INT) k_panic("`get` needs an Int index");
+            if (args[0].as.i < 0 || args[0].as.i >= t->len) {
+                char mb[96];
+                snprintf(mb, sizeof mb, "tensor index %lld out of range for length %lld",
+                         (long long)args[0].as.i, (long long)t->len);
+                k_panic(mb);
+            }
             return k_float(t->data[args[0].as.i]);
         }
         if (!strcmp(name, "sum") || !strcmp(name, "mean")) {
@@ -4680,6 +4685,21 @@ mod tests {
             native_main_stdout(src, "interp").trim(),
             "i=42 f=3.0 b=true l=[1, 2] o=Some(5)\n{x}=5 {5}\nb=18446744073709551616 r=1/3 t=Tensor([1.0, 2.0])"
         );
+    }
+
+    /// Native tensor `.get` out-of-range panic names the offending index and the
+    /// tensor length (was a bare "tensor index out of range"). PR-it64.
+    #[test]
+    fn native_tensor_index_message() {
+        if !cc_available() {
+            return;
+        }
+        // a valid get still works; the panic message (to stderr) carries index+length.
+        let ok = "fun main() uses io { print(tensor([1.0, 2.0, 3.0]).get(1)) }\n";
+        assert_eq!(native_main_stdout(ok, "tget").trim(), "2.0");
+        // out-of-range -> panic, empty stdout
+        let bad = "fun main() uses io { print(tensor([1.0, 2.0]).get(9)) }\n";
+        assert!(native_main_stdout(bad, "tgetbad").trim().is_empty(), "expected a panic");
     }
 
     /// Native tensor dot/elementwise length-mismatch panics include the two

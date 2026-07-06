@@ -1310,7 +1310,7 @@ mod tests {
         // mismatch messages gained the "(N vs M)" detail in it49.)
         assert_eq!(differential("fun probe() -> Str {\n    \"{tensor([1.0, 2.0]).dot(tensor([1.0, 2.0, 3.0]))}\"\n}\n"), "panic: dot: length mismatch (2 vs 3)");
         assert_eq!(differential("fun probe() -> Str {\n    \"{tensor([1.0, 2.0]) + tensor([1.0, 2.0, 3.0])}\"\n}\n"), "panic: tensor length mismatch (2 vs 3)");
-        assert_eq!(differential("fun probe() -> Str {\n    \"{tensor([1.0, 2.0, 3.0]).get(5)}\"\n}\n"), "panic: tensor index out of range");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{tensor([1.0, 2.0, 3.0]).get(5)}\"\n}\n"), "panic: tensor index 5 out of range for length 3");
         assert_eq!(differential("fun probe() -> Str {\n    \"{tensor([1.0, 0.0 / 0.0, 3.0])}\"\n}\n"), "Tensor([1.0, NaN, 3.0])");
         assert_eq!(differential("fun probe() -> Str {\n    \"{tensor([1.0, 2.0, 3.0]).dot(tensor([4.0, 5.0, 6.0]))}\"\n}\n"), "32.0");
         assert_eq!(differential("fun probe() -> Str {\n    \"{zeros(0 - 1)}\"\n}\n"), "panic: zeros() needs a non-negative size");
