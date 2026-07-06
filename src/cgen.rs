@@ -4760,6 +4760,23 @@ mod tests {
         assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
     }
 
+    /// Native evaluates call arguments strictly left-to-right and short-circuits
+    /// `&&`/`||` — matching the interpreter/KVM. Observed through print order.
+    /// PR-it77 (certifies evaluation-order semantics across engines).
+    #[test]
+    fn native_eval_order_and_short_circuit() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun tag(s: Str) uses io -> Int { print(s)\n    0 }\n\
+                   fun three(a: Int, b: Int, c: Int) -> Int { 0 }\n\
+                   fun bad() uses io -> Bool { print(\"BADRAN\")\n    true }\n\
+                   fun main() uses io { let _ = three(tag(\"a\"), tag(\"b\"), tag(\"c\"))\n    \
+                   let x = false && bad()\n    print(\"x={x}\") }\n";
+        // left-to-right args (a,b,c), and bad() never runs (no BADRAN) so x=false
+        assert_eq!(native_main_stdout(src, "evalorder").trim(), "a\nb\nc\nx=false");
+    }
+
     /// Native closures capture free locals by value like the interpreter/KVM: an
     /// outer mutation after creation isn't seen, and a counter closure doesn't
     /// accumulate. PR-it76 (aligned the interp to this value-capture semantics).

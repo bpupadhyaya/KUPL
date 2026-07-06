@@ -1791,6 +1791,22 @@ mod tests {
     }
 
     #[test]
+    fn diff_eval_order_and_short_circuit() {
+        // `&&`/`||` short-circuit: the RHS (which would panic on divide-by-zero) is
+        // NOT evaluated when the LHS already decides the result — identically on
+        // interp and KVM. If either engine evaluated it, this would be "panic: …".
+        let sc = "fun bad() -> Bool { let z = 0\n    1 / z == 1 }\n\
+                  fun probe() -> Str { let a = false && bad()\n    let b = true || bad()\n    \"{a},{b}\" }\n";
+        assert_eq!(differential(sc), "false,true");
+        // Loop-variable capture: each closure built in the loop captures its OWN
+        // iteration value (value capture, PR-it76), not a shared last value.
+        let lc = "fun probe() -> Str { var fns: List[fn() -> Int] = []\n    \
+                  for i in 0..3 { fns = fns.push(fn() { i * 10 }) }\n    var out = \"\"\n    \
+                  for f in fns { out = out + \"{f()};\" }\n    out }\n";
+        assert_eq!(differential(lc), "0;10;20;");
+    }
+
+    #[test]
     fn diff_closure_value_capture() {
         // Closures capture free locals BY VALUE (a snapshot rebound per call), so
         // interp == KVM: mutating the outer var after the closure is made is NOT
