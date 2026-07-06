@@ -890,6 +890,19 @@ mod tests {
     use crate::diag::{Diag, Span};
 
     #[test]
+    fn ai_fun_intent_interpolation_is_checked() {
+        // An `ai fun`'s `intent` string is type-checked like any string: an undefined
+        // interpolation `{var}` is a clean compile error (K0240), not a runtime panic
+        // that diverges interp (K0900) vs KVM (K0240). PR-it88.
+        assert!(
+            compile("ai fun greet(name: Str) -> Str { intent \"Hello {nombre}\" }\n").is_err(),
+            "undefined intent interpolation var must be a compile error"
+        );
+        // a valid intent referencing a real param checks clean.
+        assert!(compile("ai fun greet(name: Str) -> Str { intent \"Hello {name}\" }\n").is_ok());
+    }
+
+    #[test]
     fn type_checker_rejects_ill_typed_programs() {
         // Soundness: the checker must REJECT programs that would otherwise crash or
         // misbehave at runtime — no silent hole hands an ill-typed program to the

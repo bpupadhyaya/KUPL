@@ -591,8 +591,8 @@ impl Checker {
     fn check_bodies(&mut self, program: &Program) {
         for item in &program.items {
             match item {
-                // ai fun bodies are prompts, not code — nothing to body-check
-                Item::Fun(f) if f.ai.is_some() => {}
+                // an ai fun's body is a prompt, not code — check_fun type-checks its
+                // `intent` interpolation (undefined `{var}` -> K0240) but no block.
                 Item::Fun(f) => self.check_fun(f, None),
                 Item::Type(_) => {}
                 Item::Component(c) => self.check_component(c),
@@ -706,11 +706,19 @@ impl Checker {
             let ty = self.resolve_ty(&p.ty);
             ctx.scopes.insert(&p.name, ty, false);
         }
-        let body_ty = self.check_block(&f.body, &mut ctx);
-        // The block's tail value must match the return type (unless Unit-returning).
-        let ret = self.uni.apply(&ctx.ret.clone());
-        if ret != Ty::Unit {
-            self.unify(&ret, &body_ty, f.body.span, &format!("return value of `{}`", f.name));
+        if let Some(ai) = &f.ai {
+            // An `ai fun`'s "body" is its `intent` string. Type-check its
+            // interpolation holes against the params in scope, exactly like a
+            // regular string — so an undefined `{var}` is a clean compile error
+            // (K0240) instead of a runtime panic that also diverges interp vs KVM.
+            self.infer_expr(&ai.intent_expr, &mut ctx);
+        } else {
+            let body_ty = self.check_block(&f.body, &mut ctx);
+            // The block's tail value must match the return type (unless Unit-returning).
+            let ret = self.uni.apply(&ctx.ret.clone());
+            if ret != Ty::Unit {
+                self.unify(&ret, &body_ty, f.body.span, &format!("return value of `{}`", f.name));
+            }
         }
         self.tyvars.clear();
     }
