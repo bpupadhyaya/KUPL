@@ -5,8 +5,43 @@
 //! state → children → wires → handlers → expose → funs → examples), 4-space
 //! indent, one statement per line. Note: `x |> f` is canonicalized to `f(x)`
 //! at parse time, so the formatter emits the desugared call.
+//!
+//! LIMITATION: the formatter renders from the AST, and the lexer discards
+//! comments, so `format_program` does NOT preserve comments. The CLI uses
+//! `source_has_comments` to warn before dropping them (especially on
+//! `fmt --write`, which overwrites the file in place).
 
 use crate::ast::*;
+
+/// Whether `src` contains a `//` line comment or `/* … */` block comment outside
+/// of a string literal. Used to warn that `kupl fmt` would drop comments — the
+/// lexer skips them, so the formatter cannot round-trip them.
+pub fn source_has_comments(src: &str) -> bool {
+    let b = src.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            match c {
+                b'\\' => i += 2, // skip an escaped char (e.g. \" or \\)
+                b'"' => {
+                    in_str = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        } else if c == b'"' {
+            in_str = true;
+            i += 1;
+        } else if c == b'/' && i + 1 < b.len() && (b[i + 1] == b'/' || b[i + 1] == b'*') {
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
 
 pub fn format_program(p: &Program) -> String {
     let mut out = String::new();
@@ -735,6 +770,31 @@ mod tests {
     #[test]
     fn fmt_idempotent_fun() {
         roundtrip("fun add(a:Int,b:Int)->Int{a+b}\n");
+    }
+
+    #[test]
+    fn fmt_idempotent_on_tricky_constructs() {
+        // Precedence (redundant parens dropped, needed ones kept), string escapes +
+        // interpolation, guarded/nested match, negatives, nested type annotations,
+        // method chains — each must reach a stable fixpoint (roundtrip asserts f1==f2)
+        // and reparse cleanly.
+        roundtrip("fun main() uses io { print(1 + 2 * 3 - 4 / 2)\n    print((1 + 2) * 3)\n    print(((5))) }\n");
+        roundtrip("fun main() uses io { print(\"tab\\there\")\n    print(\"q\\\"q\")\n    let x = 5\n    print(\"sum={x + 1}\") }\n");
+        roundtrip("fun f(n: Int) -> Str { match n {\n x if x > 10 => \"big\"\n 0 => \"zero\"\n _ => \"other\" } }\n");
+        roundtrip("fun f(m: Map[Str, List[Int]]) -> Int { m.len() }\n");
+        roundtrip("fun main() uses io { print([1, 2, 3, 4].filter(fn(n) { n % 2 == 0 }).map(fn(n) { n * n }).sum()) }\n");
+    }
+
+    #[test]
+    fn source_has_comments_detects_only_real_comments() {
+        assert!(super::source_has_comments("// a comment\nfun main() {}\n"));
+        assert!(super::source_has_comments("fun main() { let x = 1 /* block */ }\n"));
+        assert!(super::source_has_comments("fun main() { let x = 1 } // trailing\n"));
+        // a `//` inside a string literal is NOT a comment
+        assert!(!super::source_has_comments("fun main() uses io { print(\"http://example.com\") }\n"));
+        assert!(!super::source_has_comments("fun main() { let x = 1 }\n"));
+        // an escaped quote must not end the string early and expose a following //
+        assert!(!super::source_has_comments("fun main() uses io { print(\"a\\\" // b\") }\n"));
     }
 
     #[test]

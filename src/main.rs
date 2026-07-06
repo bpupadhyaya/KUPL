@@ -140,6 +140,13 @@ fn run_cli() -> ExitCode {
                 return 1;
             }
             let formatted = kupl::fmt::format_program(&program);
+            // The formatter renders from the AST, which has no comments — warn so a
+            // format-on-save / `--write` never silently deletes them.
+            if kupl::fmt::source_has_comments(src) {
+                eprintln!(
+                    "note: `kupl fmt` does not yet preserve comments — they are dropped from the formatted output"
+                );
+            }
             if args.iter().any(|a| a == "--write") {
                 if let Err(e) = std::fs::write(file, &formatted) {
                     eprintln!("error: cannot write {file}: {e}");

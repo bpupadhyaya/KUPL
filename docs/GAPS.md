@@ -44,6 +44,14 @@ component-oriented, AI-native programming** — what remains is maturity/ecosyst
 the explicitly-deferred hardware/performance tiers, all tracked honestly in
 [`COMPARISON.md`](COMPARISON.md) and the campaign history below.
 
+**Tooling limitation — `kupl fmt` does not preserve comments.** The formatter renders
+from the AST, and the lexer discards comments, so formatting a file drops every `//`
+and `/* … */` comment. The formatter is otherwise a stable, canonical fixpoint
+(`fmt(fmt(x)) == fmt(x)`) and never changes a program's runtime behavior. `kupl fmt`
+prints a `note:` to stderr whenever the input contains comments, so a format-on-save
+or `fmt --write` never silently deletes them. Comment-preserving formatting (a
+lexer/parser trivia system) is deferred.
+
 ## Enrichment campaign (it1–it50) — summary
 
 A 50-iteration enrichment campaign took KUPL from a young four-engine toolchain
