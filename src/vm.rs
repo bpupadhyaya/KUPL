@@ -1130,6 +1130,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_string_self_append() {
+        // `s = s + x` is optimized to an in-place append when s is uniquely owned,
+        // but MUST preserve value semantics: an aliased string is never mutated, and
+        // the result is identical to a normal concat on both engines.
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var s = \"ab\"\n    let a = s\n    s = s + \"cd\"\n    \"{s}|{a}\"\n}\n"),
+            "abcd|ab"
+        );
+        // a build loop yields the same string as an allocating concat would
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var s = \"\"\n    var i = 0\n    while i < 5 { s = s + \"ab\"\n        i = i + 1 }\n    s\n}\n"),
+            "ababababab"
+        );
+        // multibyte suffix stays valid (NUL-free UTF-8)
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var s = \"x\"\n    s = s + \"é\"\n    \"{s}|{s.len()}\"\n}\n"),
+            "xé|2"
+        );
+    }
+
+    #[test]
     fn diff_for_loop_lazy_semantics() {
         // The for loop iterates a Range lazily (no Vec materialization) and a List
         // over its shared Rc (no clone) — identical on both engines, and the List

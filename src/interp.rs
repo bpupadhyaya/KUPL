@@ -501,6 +501,38 @@ impl Interp {
                 Ok(Value::Unit)
             }
             Stmt::Assign { target, op, value, span } => {
+                // Fast path for `x = x + <expr>` (string self-append): append in place
+                // when `x` is a uniquely-owned Str, avoiding a full realloc each time
+                // — turns the common O(n^2) string-building loop into O(n). Any other
+                // shape (shared string, non-Str, different lhs) falls through to the
+                // identical general path below, so behavior is unchanged.
+                if *op == AssignOp::Set {
+                    if let (ExprKind::Ident(tname), ExprKind::Binary { op: BinOp::Add, lhs, rhs }) =
+                        (&target.kind, &value.kind)
+                    {
+                        if matches!(&lhs.kind, ExprKind::Ident(l) if l == tname) {
+                            let rv = self.eval(rhs, env)?;
+                            if let Value::Str(rs) = &rv {
+                                if env.append_str_in_place(tname, rs) {
+                                    return Ok(Value::Unit);
+                                }
+                            }
+                            // Shared string or non-Str: fall back to a normal concat
+                            // using the already-evaluated rhs (don't re-eval — effects).
+                            let lv = env.get(tname).ok_or_else(|| {
+                                Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                            })?;
+                            let nv = self.binary_or_overload(BinOp::Add, lv, rv, value.span)?;
+                            if !env.set(tname, nv) {
+                                return Err(Self::panic_flow(
+                                    format!("unknown variable `{tname}`"),
+                                    *span,
+                                ));
+                            }
+                            return Ok(Value::Unit);
+                        }
+                    }
+                }
                 let rhs = self.eval(value, env)?;
                 let ExprKind::Ident(name) = &target.kind else {
                     return Err(Self::panic_flow("unsupported assignment target", *span));

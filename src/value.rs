@@ -447,6 +447,33 @@ impl Env {
             None => None,
         }
     }
+    /// Fast path for `x = x + <str>`: if `name` is bound to a UNIQUELY-owned `Str`,
+    /// append `suffix` to it in place and return true. Returns false if the binding
+    /// is missing, isn't a `Str`, or is shared (Rc strong_count > 1) — the caller
+    /// then falls back to an allocating concat, so value semantics are preserved (a
+    /// string aliased by another binding is never mutated). Turns an O(n^2) build
+    /// loop (`while … { s = s + "x" }`) into O(n). Two NUL-free UTF-8 strings
+    /// concatenate to a NUL-free UTF-8 string, so K0008 still holds.
+    pub fn append_str_in_place(&self, name: &str, suffix: &str) -> bool {
+        let mut inner = self.0.borrow_mut();
+        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
+            if let Value::Str(rc) = &mut slot.1 {
+                if let Some(s) = Rc::get_mut(rc) {
+                    s.push_str(suffix);
+                    return true;
+                }
+            }
+            return false;
+        }
+        match inner.parent.clone() {
+            Some(p) => {
+                drop(inner);
+                p.append_str_in_place(name, suffix)
+            }
+            None => false,
+        }
+    }
+
     /// Assign to an existing binding (walks up the chain). Returns false if unbound.
     pub fn set(&self, name: &str, value: Value) -> bool {
         let mut inner = self.0.borrow_mut();
