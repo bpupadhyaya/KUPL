@@ -4760,6 +4760,22 @@ mod tests {
         assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
     }
 
+    /// Native `==`/`!=`/`<` match the interpreter/KVM: deep structural equality of
+    /// lists/ctors/Options/Maps (order-independent), IEEE NaN and -0.0 handling, and
+    /// codepoint string ordering. PR-it80 (certifies equality/comparison semantics).
+    #[test]
+    fn native_equality_and_comparison_semantics() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type P = Pt(x: Int, y: Int)\ntype C = Red | Green | Blue\n\
+                   fun main() uses io {\n    let ma = Map().insert(\"x\", 1).insert(\"y\", 2)\n    \
+                   let mb = Map().insert(\"y\", 2).insert(\"x\", 1)\n    let nan = 0.0 / 0.0\n    \
+                   print(\"{[1, 2] == [1, 2]}{Pt(1, 2) == Pt(1, 2)}{Red == Blue}{Some([1, 2]) == Some([1, 2])}\
+                   {ma == mb}{nan == nan}{-0.0 == 0.0}{\"Z\" < \"a\"}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
+    }
+
     /// Native evaluates call arguments strictly left-to-right and short-circuits
     /// `&&`/`||` — matching the interpreter/KVM. Observed through print order.
     /// PR-it77 (certifies evaluation-order semantics across engines).

@@ -1791,6 +1791,22 @@ mod tests {
     }
 
     #[test]
+    fn diff_equality_and_comparison_semantics() {
+        // Structural (deep, not identity) equality across every compound shape,
+        // order-independent Map equality, IEEE float edges, and codepoint string
+        // ordering — all identical on interp and KVM. The bool string reads:
+        // list, nested-list, ctor, variant==, variant!=, nested-Option, Map(reordered),
+        // NaN==NaN(false), NaN!=NaN(true), -0.0==0.0(true), "Z"<"a"(codepoint).
+        let src = "type P = Pt(x: Int, y: Int)\ntype C = Red | Green | Blue\n\
+                   fun probe() -> Str {\n    let ma = Map().insert(\"x\", 1).insert(\"y\", 2)\n    \
+                   let mb = Map().insert(\"y\", 2).insert(\"x\", 1)\n    let nan = 0.0 / 0.0\n    \
+                   \"{[1, 2] == [1, 2]}{[[1], [2]] == [[1], [2]]}{Pt(1, 2) == Pt(1, 2)}{Red == Red}\
+                   {Red == Blue}{Some([1, 2]) == Some([1, 2])}{ma == mb}{nan == nan}{nan != nan}\
+                   {-0.0 == 0.0}{\"Z\" < \"a\"}\"\n}\n";
+        assert_eq!(differential(src), "truetruetruetruefalsetruetruefalsetruetruetrue");
+    }
+
+    #[test]
     fn diff_pattern_match_semantics() {
         // First-match-wins (the literal `1` arm before the guard before `_`), an
         // arm guard (`x if x > 10`) that falls through when false, and a nested
