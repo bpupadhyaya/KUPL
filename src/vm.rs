@@ -1106,6 +1106,37 @@ mod tests {
     }
 
     #[test]
+    fn diff_string_interpolation() {
+        // Interpolation renders every value type identically on both engines, in a
+        // single mixed string; literal `{{`/`}}` and nested interpolation work.
+        assert_eq!(
+            differential(r#"fun probe() -> Str {
+    "i={42} f={3.0} b={true} l={[1, 2]} o={Some(5)} m={Map().insert("k", 1)}"
+}
+"#),
+            "i=42 f=3.0 b=true l=[1, 2] o=Some(5) m=Map{\"k\": 1}"
+        );
+        // literal braces: {{ -> {, }} -> }, and {{{x}}} -> {value}
+        assert_eq!(
+            differential("fun probe() -> Str {\n    let x = 5\n    \"{{x}}={x} {{{x}}}\"\n}\n"),
+            "{x}=5 {5}"
+        );
+        // BigInt / Rational / Tensor render in interpolation
+        assert_eq!(
+            differential("fun probe() -> Str {\n    \"b={big(2).pow(64)} r={rat(1, 3)} t={tensor([1.0, 2.0])}\"\n}\n"),
+            "b=18446744073709551616 r=1/3 t=Tensor([1.0, 2.0])"
+        );
+        // nested method chain with an inner string literal (unescaped quotes inside {})
+        assert_eq!(
+            differential(r#"fun probe() -> Str {
+    "r={["a", "bb", "ccc"].filter(fn s { s.len() > 1 })}"
+}
+"#),
+            r#"r=["bb", "ccc"]"#
+        );
+    }
+
+    #[test]
     fn diff_tensor_edges() {
         // Tensor edge cases are byte-identical on both engines: dot / elementwise
         // length mismatch panic WITH the two lengths, get out-of-range/negative

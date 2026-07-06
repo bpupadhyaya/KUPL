@@ -4521,6 +4521,23 @@ mod tests {
         let _ = std::fs::remove_file(&li);
     }
 
+    /// Native string interpolation renders mixed value types + literal braces
+    /// identically to the interpreter. PR-it50.
+    #[test]
+    fn native_string_interpolation() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let x = 5\n    \
+                   print(\"i={42} f={3.0} b={true} l={[1, 2]} o={Some(5)}\")\n    \
+                   print(\"{{x}}={x} {{{x}}}\")\n    \
+                   print(\"b={big(2).pow(64)} r={rat(1, 3)} t={tensor([1.0, 2.0])}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "interp").trim(),
+            "i=42 f=3.0 b=true l=[1, 2] o=Some(5)\n{x}=5 {5}\nb=18446744073709551616 r=1/3 t=Tensor([1.0, 2.0])"
+        );
+    }
+
     /// Native tensor dot/elementwise length-mismatch panics include the two
     /// lengths, matching the interpreter (was a bare message). PR-it49.
     #[test]
