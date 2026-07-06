@@ -1791,6 +1791,17 @@ mod tests {
     }
 
     #[test]
+    fn diff_par_result_order_is_deterministic() {
+        // par_map/par_filter return results in INPUT order (not completion order),
+        // deterministically and identically on interp and KVM — parallelism must not
+        // leak into observable ordering.
+        let src = "fun probe() -> Str {\n    let r = [5, 3, 8, 1, 9, 2].par_map(fn n { n * n })\n    \
+                   let f = [1, 2, 3, 4, 5, 6, 7, 8].par_filter(fn n { n % 2 == 0 })\n    \
+                   let e: List[Int] = []\n    \"{r}|{f}|{e.par_map(fn n { n + 1 })}|{[42].par_map(fn n { n * 2 })}\"\n}\n";
+        assert_eq!(differential(src), "[25, 9, 64, 1, 81, 4]|[2, 4, 6, 8]|[]|[84]");
+    }
+
+    #[test]
     fn diff_map_set_method_semantics() {
         // Map/Set methods behave identically on interp and KVM, and iteration order
         // is INSERTION order (not sorted, not hash order) — keys/values follow the

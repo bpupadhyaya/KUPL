@@ -5707,6 +5707,31 @@ mod tests {
         assert_eq!(out.lines().count(), 100);
     }
 
+    /// Component message ordering is deterministic and matches the interpreter/KVM:
+    /// a source fanned out to two sinks delivers each message to both (in wire
+    /// order) before the next; a splitter emits its two outputs low-then-high per
+    /// input. PR-it84 (certifies component/concurrency message ordering).
+    #[test]
+    fn native_component_message_ordering() {
+        if !cc_available() {
+            return;
+        }
+        let src = "app Main {\n    intent \"x\"\n    let src = Source()\n    let a = Logger(\"A\")\n    \
+                   let b = Logger(\"B\")\n    wire src.out -> a.msg\n    wire src.out -> b.msg\n    \
+                   let split = Splitter()\n    let lo = Logger(\"lo\")\n    let hi = Logger(\"hi\")\n    \
+                   wire split.low -> lo.msg\n    wire split.high -> hi.msg\n    wire src.out -> split.input\n}\n\
+                   component Source {\n    intent \"x\"\n    out out: Int\n    \
+                   on start {\n        emit out(1)\n        emit out(2)\n    }\n}\n\
+                   component Splitter {\n    intent \"x\"\n    in input: Int\n    out low: Int\n    out high: Int\n    \
+                   on input(n) {\n        emit low(n)\n        emit high(n * 100)\n    }\n}\n\
+                   component Logger {\n    intent \"x\"\n    prop tag: Str\n    in msg: Int\n    \
+                   on msg(n) {\n        print(\"{tag}:{n}\")\n    }\n}\n";
+        assert_eq!(
+            native_stdout(src, "msgorder").trim(),
+            "A:1\nB:1\nA:2\nB:2\nlo:1\nhi:100\nlo:2\nhi:200"
+        );
+    }
+
     /// A supervised child that panics restarts (state reset), printing the
     /// `[supervise]` line to stderr — semantics match the interpreter.
     #[test]
