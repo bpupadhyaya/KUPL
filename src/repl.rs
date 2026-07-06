@@ -50,6 +50,13 @@ pub fn repl() -> i32 {
                     continue;
                 }
                 "" => continue,
+                // A `:`-prefixed line is a REPL command, not KUPL source — an
+                // unknown one gets a helpful message instead of a cryptic
+                // "expected an expression, found `:`" parse error.
+                other if other.starts_with(':') => {
+                    println!("unknown command `{other}` — type :help for the list");
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -126,4 +133,36 @@ fn braces_balanced(src: &str) -> bool {
         prev = ch;
     }
     depth <= 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{braces_balanced, is_item};
+
+    #[test]
+    fn braces_balanced_drives_multiline_reads() {
+        // balanced forms are ready to evaluate
+        assert!(braces_balanced("fun f() -> Int { 1 }"));
+        assert!(braces_balanced("2 + 3"));
+        assert!(braces_balanced("[1, 2, 3].sum()"));
+        // an unclosed brace/paren keeps the REPL reading (a `..>` continuation)
+        assert!(!braces_balanced("fun f() -> Int {"));
+        assert!(!braces_balanced("foo("));
+        // braces INSIDE a string literal (incl. `{x}` interpolation) don't count —
+        // otherwise the REPL would hang waiting for a matching `}` that is text.
+        assert!(braces_balanced("print(\"a { b\")"));
+        assert!(braces_balanced("print(\"val {x}\")"));
+    }
+
+    #[test]
+    fn is_item_classifies_declarations_vs_expressions() {
+        assert!(is_item("fun f() -> Int { 1 }"));
+        assert!(is_item("type P = Pt(x: Int)"));
+        assert!(is_item("pub fun g() {}"));
+        assert!(is_item("component C {}"));
+        // statements and expressions are not items (they run against current state)
+        assert!(!is_item("let x = 1"));
+        assert!(!is_item("2 + 3"));
+        assert!(!is_item("x.to_upper()"));
+    }
 }
