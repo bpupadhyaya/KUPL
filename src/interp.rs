@@ -2874,25 +2874,39 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         ))),
         "read_line" => {
             use std::io::BufRead;
-            let mut line = String::new();
-            let n = std::io::stdin().lock().read_line(&mut line).unwrap_or(0);
+            // Read raw bytes so a NUL or invalid UTF-8 is rejected rather than
+            // embedded (interp) or truncated (native) — a KUPL Str is NUL-free UTF-8.
+            let mut buf: Vec<u8> = Vec::new();
+            let n = std::io::stdin().lock().read_until(b'\n', &mut buf).unwrap_or(0);
             if n == 0 {
                 Ok(Value::none()) // EOF
             } else {
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') {
-                        line.pop();
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
                     }
                 }
-                Ok(Value::some(Value::str(line)))
+                if buf.contains(&0) {
+                    return Err("read_line: stdin line contains a NUL byte".into());
+                }
+                match String::from_utf8(buf) {
+                    Ok(s) => Ok(Value::some(Value::str(s))),
+                    Err(_) => Err("read_line: stdin line is not valid UTF-8".into()),
+                }
             }
         }
         "read_all" => {
             use std::io::Read;
-            let mut buf = String::new();
-            let _ = std::io::stdin().lock().read_to_string(&mut buf);
-            Ok(Value::str(buf))
+            let mut buf: Vec<u8> = Vec::new();
+            let _ = std::io::stdin().lock().read_to_end(&mut buf);
+            if buf.contains(&0) {
+                return Err("read_all: stdin contains a NUL byte".into());
+            }
+            match String::from_utf8(buf) {
+                Ok(s) => Ok(Value::str(s)),
+                Err(_) => Err("read_all: stdin is not valid UTF-8".into()),
+            }
         }
         "eprint" => {
             eprintln!("{}", args[0]);

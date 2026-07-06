@@ -3018,6 +3018,11 @@ static KValue k_read_line(void) {
     if (!any) return k_none();
     /* strip a trailing \r (CRLF input) */
     if (b.len > 0 && b.buf[b.len - 1] == '\r') { b.len--; b.buf[b.len] = 0; }
+    /* a KUPL Str is NUL-free valid UTF-8 — reject rather than truncate (native) or
+       embed (interp), matching the interpreter. */
+    if (b.buf && memchr(b.buf, 0, b.len)) k_panic("read_line: stdin line contains a NUL byte");
+    if (b.buf && !k_valid_utf8((const unsigned char*)b.buf, b.len))
+        k_panic("read_line: stdin line is not valid UTF-8");
     return k_some(k_str(b.buf ? b.buf : ""));
 }
 /* read all of stdin into a single string */
@@ -3025,6 +3030,9 @@ static KValue k_read_all(void) {
     KBuf b = { 0, 0, 0 };
     char chunk[4096]; size_t n;
     while ((n = fread(chunk, 1, sizeof chunk, stdin)) > 0) kb_write(&b, chunk, (long)n);
+    if (b.buf && memchr(b.buf, 0, b.len)) k_panic("read_all: stdin contains a NUL byte");
+    if (b.buf && !k_valid_utf8((const unsigned char*)b.buf, b.len))
+        k_panic("read_all: stdin is not valid UTF-8");
     return k_str(b.buf ? b.buf : "");
 }
 
@@ -5339,6 +5347,48 @@ mod tests {
         };
         assert_eq!(run_with("ab cd\nX\n"), "lines=2 chars=6\n"); // "ab cd"=5 + "X"=1
         assert_eq!(run_with(""), "lines=0 chars=0\n"); // EOF-safe
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// read_all/read_line reject a NUL or invalid-UTF-8 byte in stdin (a KUPL Str
+    /// is NUL-free UTF-8) — was embedded (interp) / truncated (native). PR-it54.
+    #[test]
+    fn native_stdin_rejects_nul_and_invalid_utf8() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io { print(\"all:[{read_all()}]\") }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-stdinnul-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        // returns (stdout, stderr_first_line)
+        let run_with = |input: &[u8]| -> (String, String) {
+            use std::io::Write;
+            let mut child = std::process::Command::new(&bin)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            let out = child.wait_with_output().unwrap();
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                err.lines().next().unwrap_or("").to_string(),
+            )
+        };
+        // NUL -> panic (empty stdout, exact message), invalid UTF-8 -> panic.
+        assert_eq!(run_with(b"a\0b"), (String::new(), "panic: read_all: stdin contains a NUL byte".to_string()));
+        assert_eq!(run_with(&[0xFFu8, 0xFE]), (String::new(), "panic: read_all: stdin is not valid UTF-8".to_string()));
+        // valid input is unaffected.
+        assert_eq!(run_with(b"hello").0, "all:[hello]\n");
         let _ = std::fs::remove_file(&cp);
         let _ = std::fs::remove_file(&bin);
     }
