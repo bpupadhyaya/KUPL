@@ -125,6 +125,24 @@ they never affect the value a correct program computes:
   is identical across engines (the native runtime cannot replicate Rust's full
   Unicode casing, so the common ASCII subset is the contract).
 
+### Performance characteristics
+
+Output is byte-identical across engines, but *time/space complexity is not part of that
+contract* — pick the engine and idiom that fit the workload:
+
+- **In-loop accumulation.** `Str` and `List` are immutable values, so `s = s + x` or
+  `xs = xs.push(x)` conceptually builds a new value each step. The **interpreter and
+  KVM** detect the common self-append shape and mutate in place when the value is
+  uniquely owned (no other binding aliases it), so a build loop is **O(n)**. The
+  **native** backend has no ownership tracking (its C runtime copies on every append),
+  so the same loop is **O(n²)** — e.g. pushing 100 000 elements one at a time takes
+  milliseconds on `run`/`--vm` but seconds compiled. A value shared by another binding
+  falls back to copying on every engine (value semantics are always preserved).
+- **Guidance.** For large accumulation on the native backend, prefer a single bulk pass
+  — `.map` / `.filter` / `.fold` / `.flat_map` over a source collection, or `.join` to
+  assemble a string — each of which allocates once and is O(n) on all four engines.
+  Reserve element-at-a-time `push`/`+` loops for small n or the interp/KVM engines.
+
 ---
 
 ## Known limitations
