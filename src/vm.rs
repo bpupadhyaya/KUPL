@@ -1130,6 +1130,17 @@ mod tests {
     }
 
     #[test]
+    fn diff_for_loop_lazy_semantics() {
+        // The for loop iterates a Range lazily (no Vec materialization) and a List
+        // over its shared Rc (no clone) — identical on both engines, and the List
+        // iteration snapshots: a body that rebuilds the source list does not extend
+        // the loop. break/continue still work.
+        assert_eq!(differential("fun probe() -> Int {\n    var s = 0\n    for i in 0..1000 { s = s + i }\n    s\n}\n"), "499500");
+        assert_eq!(differential("fun probe() -> Int {\n    var s = 0\n    for i in 0..10 { if i == 3 { continue }\n        if i == 7 { break }\n        s = s + i }\n    s\n}\n"), "18");
+        assert_eq!(differential("fun probe() -> Str {\n    var xs = [1, 2, 3]\n    var seen = []\n    for x in xs {\n        seen = seen.push(x)\n        xs = xs.push(99)\n    }\n    \"{seen}|{xs}\"\n}\n"), "[1, 2, 3]|[1, 2, 3, 99, 99, 99]");
+    }
+
+    #[test]
     fn diff_seeded_rng_determinism() {
         // Seeded RNG (xorshift64*) is pure + deterministic: the same seed yields the
         // identical sequence on interp == KVM (and, per the native test, native too),

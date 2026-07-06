@@ -553,27 +553,42 @@ impl Interp {
             }
             Stmt::For { var, iter, body, span } => {
                 let it = self.eval(iter, env)?;
-                let items: Vec<Value> = match it {
+                // Run the body once with `var` bound to `item`. Returns Ok(true) to
+                // keep looping, Ok(false) on `break`, Err to propagate.
+                macro_rules! step {
+                    ($item:expr) => {{
+                        let scope = env.child();
+                        scope.define(var, $item);
+                        match self.exec_block(body, &scope) {
+                            Ok(_) | Err(Flow::Continue) => {}
+                            Err(Flow::Break) => break,
+                            Err(other) => return Err(other),
+                        }
+                    }};
+                }
+                // Iterate LAZILY: a Range never materializes a Vec (was
+                // `(lo..hi).map(Value::Int).collect()` — O(n) upfront); a List is
+                // iterated over its shared Rc by reference (was a full `.clone()`).
+                // KUPL lists are value-semantic (mutation yields a new list), so the
+                // held Rc is an immutable snapshot — a body that rebuilds the source
+                // list can't affect this iteration.
+                match it {
                     Value::Range(lo, hi, incl) => {
                         let hi = if incl { hi + 1 } else { hi };
-                        (lo..hi).map(Value::Int).collect()
+                        for i in lo..hi {
+                            step!(Value::Int(i));
+                        }
                     }
-                    Value::List(items) => items.as_ref().clone(),
+                    Value::List(items) => {
+                        for item in items.iter() {
+                            step!(item.clone());
+                        }
+                    }
                     other => {
                         return Err(Self::panic_flow(
                             format!("`for` needs a Range or List, found {}", other.type_name()),
                             *span,
                         ))
-                    }
-                };
-                for item in items {
-                    let scope = env.child();
-                    scope.define(var, item);
-                    match self.exec_block(body, &scope) {
-                        Ok(_) => {}
-                        Err(Flow::Break) => break,
-                        Err(Flow::Continue) => continue,
-                        Err(other) => return Err(other),
                     }
                 }
                 Ok(Value::Unit)
