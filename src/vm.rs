@@ -1791,6 +1791,26 @@ mod tests {
     }
 
     #[test]
+    fn diff_stdlib_method_edge_cases() {
+        // Boundary/empty/unicode/out-of-range inputs to stdlib methods behave
+        // identically on interp and KVM. Reads: slice past end (clamps), reversed
+        // slice (empty), take/drop past len, split with empty field, pad_left,
+        // multibyte reverse, index_of not-found (None), zip_with unequal (truncates),
+        // first() of empty (None), get() out-of-range (None).
+        let src = "fun probe() -> Str {\n    let xs = [1, 2, 3]\n    let e: List[Int] = []\n    \
+                   \"{\"hello\".slice(2, 100)}|{\"hello\".slice(3, 1)}|{xs.take(10)}|{xs.drop(10)}|\
+                   {\"a,,b\".split(\",\").len()}|{\"hi\".pad_left(5, \" \")}|{\"héllo\".reverse()}|\
+                   {\"x\".index_of(\"z\")}|{xs.zip_with([10, 20], fn(a, b) { a + b })}|{e.first()}|\
+                   {[1, 2].get(5)}\"\n}\n";
+        assert_eq!(differential(src), "llo||[1, 2, 3]|[]|3|   hi|olléh|None|[11, 22]|None|None");
+        // chunk(0) is a clean guarded panic (not a native div-by-zero), same message.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{[1, 2, 3].chunk(0)}\" }\n"),
+            "panic: `chunk` needs a positive Int"
+        );
+    }
+
+    #[test]
     fn diff_equality_and_comparison_semantics() {
         // Structural (deep, not identity) equality across every compound shape,
         // order-independent Map equality, IEEE float edges, and codepoint string

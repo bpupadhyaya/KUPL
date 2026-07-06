@@ -4760,6 +4760,25 @@ mod tests {
         assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
     }
 
+    /// Native stdlib methods handle boundary/empty/unicode/out-of-range inputs
+    /// identically to the interpreter/KVM (slice clamp, take/drop past len, index_of
+    /// None, multibyte reverse, zip truncation, get None). PR-it81.
+    #[test]
+    fn native_stdlib_method_edge_cases() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let xs = [1, 2, 3]\n    let e: List[Int] = []\n    \
+                   print(\"{\"hello\".slice(2, 100)}|{\"hello\".slice(3, 1)}|{xs.take(10)}|{xs.drop(10)}|\
+                   {\"a,,b\".split(\",\").len()}|{\"hi\".pad_left(5, \" \")}|{\"héllo\".reverse()}|\
+                   {\"x\".index_of(\"z\")}|{xs.zip_with([10, 20], fn(a, b) { a + b })}|{e.first()}|\
+                   {[1, 2].get(5)}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "stdlibedge").trim(),
+            "llo||[1, 2, 3]|[]|3|   hi|olléh|None|[11, 22]|None|None"
+        );
+    }
+
     /// Native `==`/`!=`/`<` match the interpreter/KVM: deep structural equality of
     /// lists/ctors/Options/Maps (order-independent), IEEE NaN and -0.0 handling, and
     /// codepoint string ordering. PR-it80 (certifies equality/comparison semantics).
