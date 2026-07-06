@@ -1791,6 +1791,19 @@ mod tests {
     }
 
     #[test]
+    fn diff_pattern_match_semantics() {
+        // First-match-wins (the literal `1` arm before the guard before `_`), an
+        // arm guard (`x if x > 10`) that falls through when false, and a nested
+        // `Some(x)` binding — all identical on interp and KVM.
+        let src = "fun classify(n: Int) -> Str {\n    match n {\n        1 => \"one\"\n        \
+                   x if x > 10 => \"big\"\n        _ => \"other\"\n    }\n}\n\
+                   fun f(o: Option[Int]) -> Str {\n    match o {\n        Some(x) => \"some {x}\"\n        \
+                   None => \"none\"\n    }\n}\n\
+                   fun probe() -> Str { \"{classify(1)},{classify(20)},{classify(5)}|{f(Some(9))},{f(None)}\" }\n";
+        assert_eq!(differential(src), "one,big,other|some 9,none");
+    }
+
+    #[test]
     fn diff_eval_order_and_short_circuit() {
         // `&&`/`||` short-circuit: the RHS (which would panic on divide-by-zero) is
         // NOT evaluated when the LHS already decides the result — identically on

@@ -44,13 +44,30 @@ pub fn compile(src: &str) -> Result<Compiled, Vec<Diag>> {
     if !diags.iter().any(|d| d.severity == Severity::Error) {
         diags.extend(crate::effects::check_effects(&program));
     }
-    let (errors, warnings): (Vec<_>, Vec<_>) =
+    let (mut errors, mut warnings): (Vec<_>, Vec<_>) =
         diags.into_iter().partition(|d| d.severity == Severity::Error);
+    sort_diags(&mut errors);
+    sort_diags(&mut warnings);
     if errors.is_empty() {
         Ok(Compiled { program, checked, warnings })
     } else {
         Err(errors)
     }
+}
+
+/// Put diagnostics in a deterministic, top-to-bottom order. Some passes (e.g.
+/// effects, which walks a `HashMap` of functions) produce them in an arbitrary
+/// order — without this, `kupl run` printed warnings in a different order
+/// run-to-run and engine-to-engine. Sort by source position, then code/message
+/// to fully pin ties.
+pub(crate) fn sort_diags(diags: &mut [Diag]) {
+    diags.sort_by(|a, b| {
+        a.span
+            .start
+            .cmp(&b.span.start)
+            .then_with(|| a.code.cmp(&b.code))
+            .then_with(|| a.message.cmp(&b.message))
+    });
 }
 
 /// `kupl context <name>`: emit the item plus the source of everything it
@@ -253,8 +270,10 @@ pub fn load_compile(path: &str) -> Result<(Compiled, crate::loader::SourceMap), 
     if !diags.iter().any(|d| d.severity == Severity::Error) {
         diags.extend(crate::effects::check_effects(&program));
     }
-    let (errors, warnings): (Vec<_>, Vec<_>) =
+    let (mut errors, mut warnings): (Vec<_>, Vec<_>) =
         diags.into_iter().partition(|d| d.severity == Severity::Error);
+    sort_diags(&mut errors);
+    sort_diags(&mut warnings);
     if !errors.is_empty() {
         print_diags_map(&errors, &map);
         return Err(1);

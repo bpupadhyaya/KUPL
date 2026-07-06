@@ -421,6 +421,30 @@ mod tests {
     }
 
     #[test]
+    fn warnings_are_deterministic_and_position_sorted() {
+        // The effects pass walks a HashMap, so it emits K0302s in an arbitrary
+        // order; run::compile must sort them by source position so `kupl run`
+        // output is reproducible (and interp==KVM). Compile many times: the
+        // warning positions must be identical every time and strictly ascending.
+        let src = "fun aa() uses io -> Int { 1 }\nfun bb() uses io -> Int { 2 }\n\
+                   fun cc() uses io -> Int { 3 }\nfun main() { let _ = aa() + bb() + cc() }\n";
+        let positions = |()| -> Vec<u32> {
+            crate::run::compile(src)
+                .unwrap()
+                .warnings
+                .iter()
+                .map(|w| w.span.start)
+                .collect()
+        };
+        let first = positions(());
+        assert_eq!(first.len(), 3, "expected three K0302 warnings");
+        assert!(first.windows(2).all(|p| p[0] < p[1]), "warnings must be position-sorted: {first:?}");
+        for _ in 0..25 {
+            assert_eq!(positions(()), first, "warning order must be deterministic");
+        }
+    }
+
+    #[test]
     fn private_funs_stay_implicit() {
         let d = diags_for("fun helper() {\n    print(\"hi\")\n}\n");
         assert!(d.is_empty(), "{d:?}");
