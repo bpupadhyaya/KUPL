@@ -4687,6 +4687,39 @@ mod tests {
         );
     }
 
+    /// A malformed / trailing-garbage AI mock (`KUPL_AI_MOCK_ASSIST`) is treated as
+    /// the raw final answer on native — and the interpreter matches (it now gates on
+    /// the strict `json` parser instead of the lenient lsp one). PR-it67.
+    #[test]
+    fn native_ai_malformed_mock_is_raw_final() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun add(a: Int, b: Int) -> Int { a + b }\n\
+                   ai fun assist(q: Str) -> Str tools [add] { intent \"x\" }\n\
+                   fun main() uses io { print(assist(\"q\")) }\n";
+        // trailing garbage after valid JSON must NOT be parsed as a scripted round
+        // (that was the interp/native divergence — lsp parse was lenient).
+        assert_eq!(
+            native_main_stdout_env(src, "aimalformed", &[("KUPL_AI_MOCK_ASSIST", "not json at all")]).trim(),
+            "not json at all"
+        );
+        assert_eq!(
+            native_main_stdout_env(src, "aitrailing", &[("KUPL_AI_MOCK_ASSIST", "42 aardvark")]).trim(),
+            "42 aardvark"
+        );
+        // a valid scripted array still drives the tool loop
+        assert_eq!(
+            native_main_stdout_env(
+                src,
+                "aivalid",
+                &[("KUPL_AI_MOCK_ASSIST", "[{\"tool\":\"add\",\"input\":{\"a\":2,\"b\":3}},{\"final\":\"sum done\"}]")]
+            )
+            .trim(),
+            "sum done"
+        );
+    }
+
     /// Native `expect` failure names the failing expression (via the KVM module's
     /// panic message), matching the interpreter. PR-it65.
     #[test]

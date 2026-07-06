@@ -763,10 +763,16 @@ fn tool_response(
 ) -> Result<String, String> {
     let prompt = build_prompt(meta, intent, args);
     if let Some(script) = mock_response(&meta.name) {
+        // Only interpret the mock as scripted rounds when it is STRICT, complete
+        // JSON. `lsp::parse_json` is lenient about trailing garbage ("42 aardvark"
+        // -> 42), but the native runtime uses the strict `json` parser; gate on it
+        // so interp and native agree — malformed/garbage mock text becomes the raw
+        // final answer on both.
+        let strict = crate::json::parse(&script).is_ok();
         let rounds = match parse_json(&script) {
-            Ok(Json::Arr(a)) => a,
-            Ok(other) => vec![Json::Obj(vec![("final".into(), other)])],
-            Err(_) => vec![Json::Obj(vec![("final".into(), Json::Str(script.clone()))])],
+            Ok(Json::Arr(a)) if strict => a,
+            Ok(other) if strict => vec![Json::Obj(vec![("final".into(), other)])],
+            _ => vec![Json::Obj(vec![("final".into(), Json::Str(script.clone()))])],
         };
         let mut p = MockProvider { rounds, idx: 0 };
         return run_tool_loop(&mut p, host, meta);
