@@ -1130,6 +1130,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_list_self_push() {
+        // `xs = xs.push(x)` pushes in place when xs is uniquely owned, but preserves
+        // value semantics: an aliased list (and a mid-build snapshot) is never
+        // mutated, and results match a normal push on both engines.
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var xs = [1]\n    let a = xs\n    xs = xs.push(2)\n    xs = xs.push(3)\n    \"{xs}|{a}\"\n}\n"),
+            "[1, 2, 3]|[1]"
+        );
+        // a snapshot taken mid-build stays frozen
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var xs = [1, 2]\n    xs = xs.push(3)\n    let snap = xs\n    xs = xs.push(4)\n    \"{xs}|{snap}\"\n}\n"),
+            "[1, 2, 3, 4]|[1, 2, 3]"
+        );
+        // a build loop yields the same list as an allocating push would
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var xs = []\n    var i = 0\n    while i < 5 { xs = xs.push(i * i)\n        i = i + 1 }\n    \"{xs}\"\n}\n"),
+            "[0, 1, 4, 9, 16]"
+        );
+    }
+
+    #[test]
     fn diff_string_self_append() {
         // `s = s + x` is optimized to an in-place append when s is uniquely owned,
         // but MUST preserve value semantics: an aliased string is never mutated, and

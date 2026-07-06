@@ -474,6 +474,31 @@ impl Env {
         }
     }
 
+    /// Fast path for `xs = xs.push(item)`: if `name` is bound to a UNIQUELY-owned
+    /// `List`, push `item` onto it in place and return `None`. Otherwise (missing,
+    /// not a List, or shared) hand the item back as `Some(item)` so the caller can
+    /// fall back to the allocating push — value semantics preserved (an aliased list
+    /// is never mutated). Turns an O(n^2) build loop into O(n).
+    pub fn push_list_in_place(&self, name: &str, item: Value) -> Option<Value> {
+        let mut inner = self.0.borrow_mut();
+        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
+            if let Value::List(rc) = &mut slot.1 {
+                if let Some(v) = Rc::get_mut(rc) {
+                    v.push(item);
+                    return None;
+                }
+            }
+            return Some(item);
+        }
+        match inner.parent.clone() {
+            Some(p) => {
+                drop(inner);
+                p.push_list_in_place(name, item)
+            }
+            None => Some(item),
+        }
+    }
+
     /// Assign to an existing binding (walks up the chain). Returns false if unbound.
     pub fn set(&self, name: &str, value: Value) -> bool {
         let mut inner = self.0.borrow_mut();

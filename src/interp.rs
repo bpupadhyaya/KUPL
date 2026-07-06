@@ -532,6 +532,39 @@ impl Interp {
                             return Ok(Value::Unit);
                         }
                     }
+                    // Fast path for `xs = xs.push(<expr>)` (list self-push): push in
+                    // place when `xs` is a uniquely-owned List — turns the O(n^2)
+                    // list-building loop into O(n). Shared/other shapes fall through.
+                    if let (ExprKind::Ident(tname), ExprKind::MethodCall { recv, name, args }) =
+                        (&target.kind, &value.kind)
+                    {
+                        if name == "push"
+                            && args.len() == 1
+                            && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
+                        {
+                            let item = self.eval(&args[0], env)?;
+                            match env.push_list_in_place(tname, item) {
+                                None => return Ok(Value::Unit),
+                                Some(item) => {
+                                    // shared list or non-List receiver: fall back to
+                                    // the normal push via the usual method dispatch,
+                                    // reusing the already-evaluated arg (no re-eval).
+                                    let recv_val = env.get(tname).ok_or_else(|| {
+                                        Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                                    })?;
+                                    let nv =
+                                        self.eval_method(recv_val, "push", vec![item], value.span)?;
+                                    if !env.set(tname, nv) {
+                                        return Err(Self::panic_flow(
+                                            format!("unknown variable `{tname}`"),
+                                            *span,
+                                        ));
+                                    }
+                                    return Ok(Value::Unit);
+                                }
+                            }
+                        }
+                    }
                 }
                 let rhs = self.eval(value, env)?;
                 let ExprKind::Ident(name) = &target.kind else {
