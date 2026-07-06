@@ -779,6 +779,40 @@ mod tests {
                         fun main() uses io {\n    print(add(1, 2))\n}\n";
 
     #[test]
+    fn dispatch_helpers_reject_malformed_params_without_panic() {
+        // A hostile/buggy editor can send any JSON as request params. The param
+        // extractors must return None (never panic/unwrap) so the handler replies
+        // with a clean `null` result rather than crashing the whole LSP server.
+        let bad = [
+            "{}",                                                     // no textDocument
+            "{\"textDocument\":{}}",                                  // no uri
+            "{\"textDocument\":{\"uri\":\"file:///a\"}}",             // no position
+            "{\"textDocument\":{\"uri\":42},\"position\":{\"line\":0,\"character\":0}}", // uri not a string
+            "{\"textDocument\":{\"uri\":\"file:///a\"},\"position\":{\"line\":\"x\",\"character\":0}}", // line not a number
+            "{\"textDocument\":{\"uri\":\"file:///a\"},\"position\":{\"line\":-3,\"character\":0}}",     // negative line
+            "{\"position\":{\"line\":0,\"character\":0}}",            // no textDocument at all
+            "null",
+            "[]",
+            "\"just a string\"",
+            "42",
+        ];
+        for c in bad {
+            let j = parse_json(c).unwrap_or(Json::Null);
+            assert_eq!(position_of(&j), None, "expected None for params: {c}");
+        }
+        // a well-formed request still parses
+        let good = parse_json(
+            "{\"textDocument\":{\"uri\":\"file:///a\"},\"position\":{\"line\":2,\"character\":5}}",
+        )
+        .unwrap();
+        assert_eq!(position_of(&good), Some(("file:///a", 2, 5)));
+        // doc_text on an unopened / malformed uri -> None (no unwrap on a missing doc)
+        let empty: HashMap<PathBuf, String> = HashMap::new();
+        assert_eq!(doc_text("not a uri", &empty), None);
+        assert_eq!(doc_text("file:///no/such/path/xyz-kupl-lsp.kupl", &empty), None);
+    }
+
+    #[test]
     fn frame_reader_handles_malformed_frames() {
         use std::io::Cursor;
         let rd = |bytes: &str| read_message(&mut Cursor::new(bytes.as_bytes().to_vec()));
