@@ -471,12 +471,26 @@ impl Interp {
     }
 
     pub fn exec_block(&mut self, block: &Block, env: &Env) -> EvalResult {
-        let scope = env.child();
-        let mut last = Value::Unit;
-        for stmt in &block.stmts {
-            last = self.exec_stmt(stmt, &scope)?;
+        // A block introduces a new scope only to hold its own `let` bindings; `Let`
+        // is the sole statement that defines a name into the block scope. When the
+        // block has none, running its statements directly in the parent env is
+        // semantically identical (assignments walk the chain; nested while/for/if
+        // make their own scopes) and skips a per-call Env allocation — the hot path
+        // for loop bodies that only assign (e.g. `while … { s = s + i; i = i + 1 }`).
+        if block.stmts.iter().any(|s| matches!(s, Stmt::Let { .. })) {
+            let scope = env.child();
+            let mut last = Value::Unit;
+            for stmt in &block.stmts {
+                last = self.exec_stmt(stmt, &scope)?;
+            }
+            Ok(last)
+        } else {
+            let mut last = Value::Unit;
+            for stmt in &block.stmts {
+                last = self.exec_stmt(stmt, env)?;
+            }
+            Ok(last)
         }
-        Ok(last)
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &Env) -> EvalResult {
