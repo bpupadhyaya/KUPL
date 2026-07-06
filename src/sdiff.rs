@@ -255,6 +255,31 @@ mod tests {
     }
 
     #[test]
+    fn effect_and_type_variant_changes_are_interface() {
+        // Adding an effect changes the callable contract — a breaking interface
+        // change, not merely an implementation detail.
+        let (lines, _) = diff_lines(
+            "pub fun f() -> Int {\n    1\n}\n",
+            "pub fun f() uses io -> Int {\n    print(\"x\")\n    1\n}\n",
+        );
+        assert_eq!(lines, vec!["interface f"]);
+        // Adding a variant to a sum type breaks exhaustive matches downstream.
+        let (lines, _) = diff_lines("type C = Red | Green\n", "type C = Red | Green | Blue\n");
+        assert_eq!(lines, vec!["interface C"]);
+    }
+
+    #[test]
+    fn reordering_items_is_not_a_semantic_change() {
+        // The diff is keyed by item name, so swapping the order of two functions is
+        // not a change (source order carries no semantic meaning).
+        let (lines, changed) = diff_lines(
+            "fun a() -> Int {\n    1\n}\nfun b() -> Int {\n    2\n}\n",
+            "fun b() -> Int {\n    2\n}\nfun a() -> Int {\n    1\n}\n",
+        );
+        assert!(!changed, "reordering must not be a change: {lines:?}");
+    }
+
+    #[test]
     fn component_port_change_is_interface_state_change_is_impl() {
         let old = "component C {\n intent \"x\"\n in a: Int\n state n: Int = 0\n on a(v) { n += v }\n}\n";
         let impl_change = "component C {\n intent \"x\"\n in a: Int\n state n: Int = 100\n on a(v) { n += v }\n}\n";
