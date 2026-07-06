@@ -886,8 +886,40 @@ fn snippet(src: &str, span: Span) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sort_diags;
+    use super::{compile, sort_diags};
     use crate::diag::{Diag, Span};
+
+    #[test]
+    fn type_checker_rejects_ill_typed_programs() {
+        // Soundness: the checker must REJECT programs that would otherwise crash or
+        // misbehave at runtime — no silent hole hands an ill-typed program to the
+        // engines. compile() returns Err when there is any Severity::Error.
+        let rejected = [
+            "fun f(o: Option[Int]) -> Int { o + 1 }\n", // Option used as its inner type
+            "fun main() { let x: Int = [1, 2, 3].get(0) }\n", // get returns Option, no implicit unwrap
+            "fun main() { let xs = [1, 2].push(\"s\") }\n", // wrong element type
+            "fun f() -> Int { \"s\" }\n",               // return type mismatch
+            "fun main() { let xs = [1, \"s\"] }\n",     // heterogeneous list
+            "fun main() { let x = (5).to_upper() }\n",  // method on wrong receiver type
+            "fun g(a: Int, b: Int) -> Int { a + b }\nfun main() { let x = g(1) }\n", // arity
+            "type C = Red | Green | Blue\nfun f(c: C) -> Int { match c {\n Red => 1\n Green => 2 } }\n", // non-exhaustive
+            "fun main() { let x = nope }\n",            // undefined name
+            "fun id[T](x: T) -> T { x }\nfun main() { let a: Int = id(\"s\") }\n", // generic misuse
+        ];
+        for src in rejected {
+            assert!(compile(src).is_err(), "checker WRONGLY ACCEPTED ill-typed program:\n{src}");
+        }
+        // …and ACCEPT valid programs (no false positives): shadowing that changes a
+        // binding's type, a recursive ADT with match, and a generic function.
+        let accepted = [
+            "fun main() uses io { let x = 1\n    let x = \"s\"\n    print(x.to_upper()) }\n",
+            "type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)\nfun sum(t: Tree) -> Int { match t {\n Leaf(v) => v\n Node(l, r) => sum(l) + sum(r) } }\n",
+            "fun first[T](xs: List[T]) -> Option[T] { xs.first() }\nfun main() { let x = first([1, 2, 3]) }\n",
+        ];
+        for src in accepted {
+            assert!(compile(src).is_ok(), "checker WRONGLY REJECTED a valid program:\n{src}");
+        }
+    }
 
     #[test]
     fn sort_diags_is_deterministic_and_position_ordered() {
