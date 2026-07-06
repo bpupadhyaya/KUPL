@@ -398,6 +398,36 @@ mod tests {
     }
 
     #[test]
+    fn circular_use_loads_once_and_missing_module_errors_cleanly() {
+        let dir = std::env::temp_dir().join(format!("kupl-loader-circ-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // a `use` b and b `use` a — a cycle. The loader dedups via its `seen` set, so
+        // each file is merged once (no infinite loop / stack overflow) and every
+        // definition is available across the cycle.
+        std::fs::write(dir.join("a.kupl"), "use b\nfun fa() -> Int {\n    fb() + 1\n}\n").unwrap();
+        std::fs::write(dir.join("b.kupl"), "use a\nfun fb() -> Int {\n    10\n}\n").unwrap();
+        let (program, _) = super::load(dir.join("a.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("circular use loads");
+        assert_eq!(program.items.len(), 2, "both fa and fb are present exactly once");
+
+        // a `use` of a nonexistent module is a clean diagnostic (not a panic), and it
+        // names the missing file.
+        std::fs::write(dir.join("bad.kupl"), "use does_not_exist\nfun main() {}\n").unwrap();
+        let (diags, _) = match super::load(dir.join("bad.kupl").to_str().unwrap()) {
+            Ok(_) => panic!("missing module must be an error"),
+            Err(e) => e,
+        };
+        assert!(
+            diags.iter().any(|d| d.severity == crate::diag::Severity::Error
+                && d.message.contains("does_not_exist")),
+            "missing-module error should name the file: {diags:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn local_path_dependency() {
         let base = std::env::temp_dir().join(format!("kupl-pkg-test-{}", std::process::id()));
         let math = base.join("math");
