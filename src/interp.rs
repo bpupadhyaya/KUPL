@@ -3201,7 +3201,15 @@ pub fn exec_builtin(args: &[Value]) -> Result<Value, String> {
         Err(e) => return Ok(Value::err(Value::str(format!("cannot run {program}: {e}")))),
     };
     if out.status.success() {
-        Ok(Value::ok(Value::str(String::from_utf8_lossy(&out.stdout).into_owned())))
+        // A KUPL string must be valid UTF-8 and NUL-free (K0008). Reject rather than
+        // embed a NUL (which the native C runtime would truncate at) or lossily
+        // replace invalid bytes (which native would pass through raw) — either would
+        // diverge across engines.
+        match String::from_utf8(out.stdout) {
+            Ok(s) if !s.as_bytes().contains(&0) => Ok(Value::ok(Value::str(s))),
+            Ok(_) => Ok(Value::err(Value::str("command output contains a NUL byte".to_string()))),
+            Err(_) => Ok(Value::err(Value::str("command output is not valid UTF-8".to_string()))),
+        }
     } else {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let msg = if err.is_empty() {

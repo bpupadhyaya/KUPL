@@ -561,6 +561,7 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <time.h>
 #include <setjmp.h>
 #include <sys/wait.h>
@@ -1924,6 +1925,7 @@ static KValue k_run_curl(char* const argv[], const char* body) {
     }
     return k_ok(k_str(out.buf ? out.buf : (char*)""));
 }
+static int k_valid_utf8(const unsigned char* b, size_t n); /* defined later; fwd-decl */
 /* exec(program, args) — fork/execvp an arbitrary program (no shell), capture
    stdout. Ok(stdout) on exit 0, else Err(trimmed stderr | "exited with status N"
    | "cannot run …"). Mirrors interp::exec_builtin's decision + shape. */
@@ -1935,17 +1937,35 @@ static KValue k_exec(KValue prog, KValue arglist) {
     argv[0] = (char*)program;
     for (int i = 0; i < argc; i++) argv[i + 1] = (char*)al->items[i].as.s;
     argv[argc + 1] = 0;
-    int outp[2], errp[2];
+    int outp[2], errp[2], xp[2];
     if (pipe(outp) || pipe(errp)) return k_err(k_str("cannot run: pipe failed"));
+    /* close-on-exec pipe: on a successful exec it closes (parent reads EOF); on a
+       failed exec the child writes errno so the parent can report the exact error
+       (matching the interpreter's Command::spawn io::Error), not a bare 127. */
+    if (pipe(xp)) return k_err(k_str("cannot run: pipe failed"));
+    fcntl(xp[1], F_SETFD, FD_CLOEXEC);
     pid_t pid = fork();
     if (pid < 0) return k_err(k_str("cannot run: fork failed"));
     if (pid == 0) {
         dup2(outp[1], 1); dup2(errp[1], 2);
-        close(outp[0]); close(outp[1]); close(errp[0]); close(errp[1]);
+        close(outp[0]); close(outp[1]); close(errp[0]); close(errp[1]); close(xp[0]);
         execvp(program, argv);
+        int e = errno;
+        (void)!write(xp[1], &e, sizeof e);
         _exit(127);
     }
-    close(outp[1]); close(errp[1]);
+    close(outp[1]); close(errp[1]); close(xp[1]);
+    int exec_errno = 0;
+    (void)!read(xp[0], &exec_errno, sizeof exec_errno);
+    close(xp[0]);
+    if (exec_errno != 0) {
+        char m[300];
+        snprintf(m, sizeof m, "cannot run %s: %s (os error %d)", program, strerror(exec_errno), exec_errno);
+        /* drain the pipes so the child doesn't block, then reap it */
+        char d[4096]; while (read(outp[0], d, sizeof d) > 0) {} while (read(errp[0], d, sizeof d) > 0) {}
+        close(outp[0]); close(errp[0]); int st; waitpid(pid, &st, 0);
+        return k_err(k_str(k_strdup(m)));
+    }
     KBuf out = { 0, 0, 0 }, er = { 0, 0, 0 };
     char buf[4096]; ssize_t n;
     while ((n = read(outp[0], buf, sizeof buf)) > 0) kb_write(&out, buf, n);
@@ -1953,18 +1973,21 @@ static KValue k_exec(KValue prog, KValue arglist) {
     close(outp[0]); close(errp[0]);
     int status = 0; waitpid(pid, &status, 0);
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    if (code == 127) {
-        char m[300]; snprintf(m, sizeof m, "cannot run %s: command not found", program);
-        return k_err(k_str(k_strdup(m)));
-    }
     if (code != 0) {
         char* e = er.buf ? er.buf : (char*)"";
         while (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r') e++;
         long len = (long)strlen(e);
         while (len > 0 && (e[len-1] == ' ' || e[len-1] == '\t' || e[len-1] == '\n' || e[len-1] == '\r')) e[--len] = 0;
-        if (len > 0) return k_err(k_str(e));
+        if (len > 0) return k_err(k_str(k_strdup(e)));
         char m[64]; snprintf(m, sizeof m, "exited with status %d", code);
         return k_err(k_str(k_strdup(m)));
+    }
+    /* a KUPL string is NUL-free (K0008) + valid UTF-8 — reject rather than truncate
+       at a NUL or pass through invalid bytes (both diverge from the interpreter). */
+    if (out.buf) {
+        if (memchr(out.buf, 0, out.len)) return k_err(k_str("command output contains a NUL byte"));
+        if (!k_valid_utf8((const unsigned char*)out.buf, out.len))
+            return k_err(k_str("command output is not valid UTF-8"));
     }
     return k_ok(k_str(out.buf ? out.buf : (char*)""));
 }
@@ -4519,6 +4542,33 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native exec matches the interpreter on the nonexistent-command message
+    /// (os-error, not "command not found"), NUL-in-output rejection, and exit
+    /// codes. PR-it51.
+    #[test]
+    fn native_exec_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        // nonexistent command -> the Rust io::Error message, not a bare 127.
+        let miss = "fun main() uses io {\n    \
+                    match exec(\"no_such_cmd_xyzzy_42\", []) { Ok(s) => print(s), Err(e) => print(\"err:{e}\") }\n}\n";
+        assert_eq!(
+            native_main_stdout(miss, "execmiss").trim(),
+            "err:cannot run no_such_cmd_xyzzy_42: No such file or directory (os error 2)"
+        );
+        // output with a NUL byte -> rejected (KUPL strings are NUL-free), not truncated.
+        // printf emits a real NUL from the `\0` in its arg (the KUPL string holds a
+        // literal backslash-zero, not a NUL literal — that would be K0008).
+        let nul = "fun main() uses io {\n    \
+                   match exec(\"printf\", [\"a\\\\0b\"]) { Ok(s) => print(\"ok:{s.len()}\"), Err(e) => print(\"err:{e}\") }\n}\n";
+        assert_eq!(native_main_stdout(nul, "execnul").trim(), "err:command output contains a NUL byte");
+        // a normal command still works.
+        let ok = "fun main() uses io {\n    \
+                  match exec(\"echo\", [\"hi\"]) { Ok(s) => print(\"ok:{s.trim()}\"), Err(e) => print(\"err:{e}\") }\n}\n";
+        assert_eq!(native_main_stdout(ok, "execok").trim(), "ok:hi");
     }
 
     /// Native string interpolation renders mixed value types + literal braces
