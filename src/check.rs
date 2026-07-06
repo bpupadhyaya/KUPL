@@ -2698,9 +2698,15 @@ mod generic_tests {
                 let deep = format!("fun main() {{ let x = {}1{} }}\n", "[".repeat(2000), "]".repeat(2000));
                 let e = errors(&deep);
                 assert!(e.iter().any(|d| d.code == "K0121"), "expected K0121: {e:?}");
-                // a realistically-nested literal still type-checks with no errors
+                // deeply nested TYPE ANNOTATIONS parse via a separate path — also bounded
+                let deep_ty = format!("fun main() {{ let x: {}Int{} = 0 }}\n", "List[".repeat(2000), "]".repeat(2000));
+                let et = errors(&deep_ty);
+                assert!(et.iter().any(|d| d.code == "K0121"), "expected K0121 for type: {et:?}");
+                // a realistically-nested literal + type still type-check with no errors
                 let ok = errors("fun main() { let x = [[[[[1]]]]] }\n");
                 assert!(ok.is_empty(), "normal nesting must be clean: {ok:?}");
+                let ok_ty = errors("fun f(xs: List[List[List[Int]]]) -> Int { 0 }\nfun main() {}\n");
+                assert!(ok_ty.is_empty(), "normal type nesting must be clean: {ok_ty:?}");
             })
             .unwrap()
             .join()

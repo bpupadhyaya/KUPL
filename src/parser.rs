@@ -1798,6 +1798,24 @@ impl Parser {
     // ---- types --------------------------------------------------------------
 
     fn parse_ty(&mut self) -> PResult<TyExpr> {
+        // Same nesting bound as parse_expr (shared counter) — a deeply nested type
+        // annotation (List[List[…]]) builds an O(depth) `Ty` the checker handles
+        // superlinearly, so cap it to a clean K0121 instead of a slow blow-up.
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(Diag::error(
+                "K0121",
+                "type nesting too deep".to_string(),
+                self.span(),
+            ));
+        }
+        let r = self.parse_ty_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_ty_inner(&mut self) -> PResult<TyExpr> {
         let span = self.span();
         match self.peek().clone() {
             Tok::KwFn => {
