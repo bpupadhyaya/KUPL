@@ -802,7 +802,11 @@ pub fn read_bundle(exe: &[u8]) -> Option<DecodeResult<Module>> {
     }
     let len_bytes: [u8; 8] = exe[exe.len() - 16..exe.len() - 8].try_into().ok()?;
     let kx_len = u64::from_le_bytes(len_bytes) as usize;
-    if exe.len() < 16 + kx_len {
+    // Bound the (attacker-controllable) trailer length against the file: use
+    // saturating arithmetic so a corrupt near-usize::MAX length can't overflow
+    // `16 + kx_len` (wrapping past the check) and underflow the slice start —
+    // that would panic on an out-of-bounds slice. A bad length is just "no trailer".
+    if kx_len > exe.len().saturating_sub(16) {
         return None;
     }
     let kx = &exe[exe.len() - 16 - kx_len..exe.len() - 16];
@@ -895,5 +899,21 @@ mod tests {
         assert_eq!(module.disassemble(), back.disassemble());
         // an unbundled exe yields None
         assert!(super::read_bundle(&fake_exe).is_none());
+
+        // a CORRUPT trailer must be rejected cleanly (None), never panic. The
+        // length field is at [len-16 .. len-8]; a near-usize::MAX value used to
+        // overflow `16 + kx_len` past the bounds check and underflow the slice.
+        let mut evil = bundled.clone();
+        let n = evil.len();
+        evil[n - 16..n - 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(super::read_bundle(&evil).is_none(), "huge trailer length must be rejected");
+        // a length longer than the file, and a moderately-corrupt length
+        let mut over = bundled.clone();
+        over[n - 16..n - 8].copy_from_slice(&(n as u64 + 1000).to_le_bytes());
+        assert!(super::read_bundle(&over).is_none());
+        // truncating the bundle at every length never panics
+        for cut in 0..bundled.len() {
+            let _ = super::read_bundle(&bundled[..cut]);
+        }
     }
 }
