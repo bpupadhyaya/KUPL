@@ -241,7 +241,26 @@ fn build_module(args: &[String], src: &str, file: &str, bundle: bool) -> i32 {
 }
 
 /// `kupl new`: scaffold a project directory.
+/// A project name must be a plain, filesystem- and manifest-safe token: it becomes
+/// a directory AND is embedded verbatim in the generated `kupl.toml`/source. This
+/// rejects path traversal (`../evil`, `/abs`, `a/b`), the `.`/`..` specials, an
+/// empty name (which would scatter files into the cwd), and any character that
+/// would break the manifest string (quotes, backslashes, controls).
+fn valid_project_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn scaffold_project(name: &str) -> i32 {
+    if !valid_project_name(name) {
+        eprintln!(
+            "error: invalid project name `{name}` — use letters, digits, `-` or `_` \
+             (must start with a letter or digit; no path separators or `..`)"
+        );
+        return 1;
+    }
     let root = std::path::Path::new(name);
     if root.exists() {
         eprintln!("error: {name} already exists");
@@ -295,5 +314,24 @@ fn with_file(args: &[String], f: impl Fn(&str, &str) -> i32) -> i32 {
             eprintln!("error: cannot read {path}: {e}");
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_project_name;
+
+    #[test]
+    fn project_name_rejects_traversal_injection_and_empty() {
+        // safe names accepted
+        for ok in ["myapp", "my-app", "my_app", "app2", "A1"] {
+            assert!(valid_project_name(ok), "should accept `{ok}`");
+        }
+        // path traversal / separators / absolute / specials / injection / empty
+        for bad in ["../evil", "..", ".", "/abs", "a/b", "a\\b", "x\"evil", "", "-leading", "a b", "na\nme", "app;rm"] {
+            assert!(!valid_project_name(bad), "should reject `{bad:?}`");
+        }
+        // over-long names are rejected (keeps paths + manifests sane)
+        assert!(!valid_project_name(&"a".repeat(65)));
     }
 }
