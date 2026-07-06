@@ -129,7 +129,18 @@ impl<'m> Vm<'m> {
     }
 
     fn drain(&mut self) -> Result<(), VmError> {
+        let mut processed: u64 = 0;
         while let Some((id, port, value)) = self.queue.pop_front() {
+            processed += 1;
+            if processed > crate::interp::MAX_COMPONENT_MESSAGES {
+                return Err(VmError {
+                    msg: format!(
+                        "component message limit exceeded ({}) — a `wire` cycle?",
+                        crate::interp::MAX_COMPONENT_MESSAGES
+                    ),
+                    span: Span::default(),
+                });
+            }
             let meta = &self.module.components[self.instances[id].comp as usize];
             let handler = meta
                 .handlers

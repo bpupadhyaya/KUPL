@@ -4284,7 +4284,12 @@ static void k_dispatch(int id, int chunk, KValue* arg) {
 
 /* drain the queue to quiescence: pop front, dispatch by first-match handler */
 static void k_drain(void) {
+    long processed = 0;
     while (k_qhead < k_qlen) {
+        /* bound a `wire` cycle instead of hanging — same limit + message as the
+           interpreter/KVM (MAX_COMPONENT_MESSAGES). */
+        if (++processed > 1000000L)
+            k_panic("component message limit exceeded (1000000) — a `wire` cycle?");
         KMsg m = k_queue[k_qhead++];
         KInstance* inst = &k_insts[m.id];
         const KCompMeta* cm = &COMPS[inst->comp];
@@ -4685,6 +4690,24 @@ mod tests {
             native_main_stdout(src, "interp").trim(),
             "i=42 f=3.0 b=true l=[1, 2] o=Some(5)\n{x}=5 {5}\nb=18446744073709551616 r=1/3 t=Tensor([1.0, 2.0])"
         );
+    }
+
+    /// A `wire` cycle (a component re-emits an output wired back to its own input)
+    /// is bounded, not an infinite hang: the native drain stops after
+    /// MAX_COMPONENT_MESSAGES with the same panic as interp/KVM. PR-it68.
+    #[test]
+    fn native_wire_cycle_is_bounded() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Loop {\n    intent \"self-cycle\"\n    \
+                   in ping: Event\n    out pong: Event\n    \
+                   on start { emit pong() }\n    on ping { emit pong() }\n}\n\
+                   app Main {\n    intent \"circular wire\"\n    \
+                   let a = Loop()\n    wire a.pong -> a.ping\n}\n";
+        // the cycle panics on hitting the limit -> no normal output (empty stdout);
+        // crucially it TERMINATES (the test would hang otherwise).
+        assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
     }
 
     /// A malformed / trailing-garbage AI mock (`KUPL_AI_MOCK_ASSIST`) is treated as

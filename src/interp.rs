@@ -144,6 +144,12 @@ pub const MAX_CALL_DEPTH: usize = 10_000;
 /// limit so all engines agree.
 pub const MAX_TENSOR_LEN: u64 = 100_000_000;
 
+/// Bound on messages drained in one quiescence pass, so a wiring cycle (e.g.
+/// `wire a.out -> a.in` where the handler re-emits) fails with a clean panic
+/// instead of hanging the process. Real apps settle in far fewer; identical on
+/// the interpreter, KVM (`vm.rs`), and native runtime (`cgen.rs`).
+pub const MAX_COMPONENT_MESSAGES: u64 = 1_000_000;
+
 impl Interp {
     pub fn new(db: ProgramDb) -> Interp {
         let image = Some(crate::parallel::ProgramImage::from_db(&db));
@@ -393,7 +399,17 @@ impl Interp {
     }
 
     fn drain(&mut self) -> Result<(), Flow> {
+        let mut processed: u64 = 0;
         while let Some((id, port, value)) = self.queue.pop_front() {
+            processed += 1;
+            if processed > MAX_COMPONENT_MESSAGES {
+                return Err(Self::panic_flow(
+                    format!(
+                        "component message limit exceeded ({MAX_COMPONENT_MESSAGES}) — a `wire` cycle?"
+                    ),
+                    crate::diag::Span::default(),
+                ));
+            }
             let comp = self.instances[id].comp.clone();
             for h in &comp.handlers {
                 if matches!(&h.trigger, Trigger::Port(p) if p == &port) {
