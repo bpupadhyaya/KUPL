@@ -3275,6 +3275,12 @@ pub fn fs_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     };
     match name {
         "read_file" => Ok(match std::fs::read_to_string(as_str(&args[0])) {
+            // read_to_string already rejects invalid UTF-8; also reject an embedded
+            // NUL (valid UTF-8 but not allowed in a KUPL Str, K0008 — the native
+            // runtime would truncate at it: a cross-engine divergence).
+            Ok(contents) if contents.as_bytes().contains(&0) => {
+                Value::err(Value::str("file contains a NUL byte".to_string()))
+            }
             Ok(contents) => Value::ok(Value::str(contents)),
             Err(e) => Value::err(Value::str(e.to_string())),
         }),

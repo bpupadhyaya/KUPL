@@ -2636,6 +2636,12 @@ static KValue k_read_file(KValue path) {
     size_t got = fread(buf, 1, (size_t)n, f);
     buf[got] = 0;
     fclose(f);
+    /* a KUPL Str is NUL-free valid UTF-8 — reject rather than truncate at a NUL
+       (native) / embed it (interp), and reject invalid UTF-8 (the interpreter's
+       fs::read_to_string does). Same messages as the interpreter. */
+    if (memchr(buf, 0, got)) return k_err(k_str("file contains a NUL byte"));
+    if (!k_valid_utf8((const unsigned char*)buf, got))
+        return k_err(k_str("stream did not contain valid UTF-8"));
     return k_ok(k_str(buf));
 }
 static KValue k_write_file(KValue path, KValue content, int append) {
@@ -4550,6 +4556,33 @@ mod tests {
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// Native read_file rejects a NUL / invalid-UTF-8 file like the interpreter
+    /// (was truncate / raw bytes), and keeps the it38 missing/dir errors. PR-it55.
+    #[test]
+    fn native_read_file_rejects_nul_and_invalid_utf8() {
+        if !cc_available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-rf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let nul = dir.join("nul.bin");
+        let bad = dir.join("bad.bin");
+        let ok = dir.join("ok.txt");
+        std::fs::write(&nul, b"a\0b").unwrap();
+        std::fs::write(&bad, [0xFFu8, 0xFE]).unwrap();
+        std::fs::write(&ok, "héllo").unwrap();
+        let prog = |p: &std::path::Path| {
+            format!(
+                "fun main() uses io {{ match read_file(\"{}\") {{ Ok(s) => print(\"ok:{{s.len()}}\"), Err(e) => print(\"err:{{e}}\") }} }}\n",
+                p.display()
+            )
+        };
+        assert_eq!(native_main_stdout(&prog(&nul), "rfnul").trim(), "err:file contains a NUL byte");
+        assert_eq!(native_main_stdout(&prog(&bad), "rfbad").trim(), "err:stream did not contain valid UTF-8");
+        assert_eq!(native_main_stdout(&prog(&ok), "rfok").trim(), "ok:5"); // "héllo" = 5 chars
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Native path helpers (k_path_join/base/dir/ext) match the interpreter on
