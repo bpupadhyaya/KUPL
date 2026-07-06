@@ -2685,6 +2685,29 @@ mod generic_tests {
     }
 
     #[test]
+    fn deep_nesting_is_a_clean_error_not_a_hang() {
+        // Pathologically deep expression nesting (which used to make the type
+        // checker hang superlinearly on the owned Ty tree) now yields a clean
+        // K0121 diagnostic. A normal nesting depth is unaffected. Run on a
+        // production-sized (8 MiB) stack — the default 2 MiB test-thread stack is
+        // smaller than the real CLI main thread, and the recursive-descent parser
+        // recurses (bounded by K0121) while building the pathological input.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let deep = format!("fun main() {{ let x = {}1{} }}\n", "[".repeat(2000), "]".repeat(2000));
+                let e = errors(&deep);
+                assert!(e.iter().any(|d| d.code == "K0121"), "expected K0121: {e:?}");
+                // a realistically-nested literal still type-checks with no errors
+                let ok = errors("fun main() { let x = [[[[[1]]]]] }\n");
+                assert!(ok.is_empty(), "normal nesting must be clean: {ok:?}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn did_you_mean_suggestions() {
         // a typo'd function name suggests the real one; a genuinely unknown name
         // gets no spurious hint

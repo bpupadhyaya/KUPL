@@ -46,6 +46,7 @@ Severity: **E** = error, **W** = warning.
 | K0118 | E | unknown restart policy (use `on_failure` or `never`) |
 | K0119 | E | an `ai fun` body is `intent "…"` optionally followed by `model "…"` |
 | K0120 | E | malformed duration literal (expected `<int><unit>`, unit in `ms`/`s`/`m`/`h`) |
+| K0121 | E | expression nesting too deep (bounded to keep the checker fast on pathological input) |
 
 ## K02xx — Type & semantic checker
 

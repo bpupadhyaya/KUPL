@@ -13,7 +13,15 @@ pub struct Parser {
     pos: usize,
     pub diags: Vec<Diag>,
     uses: Vec<(String, Span)>,
+    depth: usize,
 }
+
+/// Max expression-nesting depth. Real code never approaches this; the bound turns
+/// pathological input (e.g. thousands of nested `[`) into a clean K0121 diagnostic
+/// instead of a superlinear hang in the type checker (whose owned `Ty` tree costs
+/// O(depth) to clone/resolve at each level). Kept modest so the recursive-descent
+/// parser (~11 precedence frames per level) stays well within a small thread stack.
+const MAX_EXPR_DEPTH: usize = 128;
 
 fn str_parts_text(parts: &[StrPart]) -> String {
     parts
@@ -58,7 +66,7 @@ pub fn parse_with_base(src: &str, base: u32) -> (Program, Vec<Diag>) {
             d.span = Span::new(d.span.start + base, d.span.end + base);
         }
     }
-    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new() };
+    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new(), depth: 0 };
     let program = p.parse_program();
     diags.extend(p.diags);
     (program, diags)
@@ -70,7 +78,7 @@ pub fn parse_stmt_fragment(src: &str) -> Result<Stmt, Diag> {
     if let Some(d) = diags.into_iter().next() {
         return Err(d);
     }
-    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new() };
+    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new(), depth: 0 };
     p.skip_newlines();
     let stmt = p.parse_stmt()?;
     if let Some(d) = p.diags.into_iter().next() {
@@ -89,7 +97,7 @@ pub fn parse_expr_fragment(src: &str, offset: u32) -> Result<Expr, Diag> {
     if let Some(d) = diags.into_iter().next() {
         return Err(d);
     }
-    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new() };
+    let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new(), depth: 0 };
     p.skip_newlines();
     let expr = p.parse_expr()?;
     if let Some(d) = p.diags.into_iter().next() {
@@ -1156,7 +1164,21 @@ impl Parser {
     // ---- expressions ------------------------------------------------------
 
     pub fn parse_expr(&mut self) -> PResult<Expr> {
-        self.parse_pipeline()
+        // Guard against pathologically deep nesting (every nested sub-expression
+        // re-enters here). Sequential expressions don't accumulate — depth is
+        // decremented on the way out.
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(Diag::error(
+                "K0121",
+                "expression nesting too deep".to_string(),
+                self.span(),
+            ));
+        }
+        let r = self.parse_pipeline();
+        self.depth -= 1;
+        r
     }
 
     fn parse_pipeline(&mut self) -> PResult<Expr> {
