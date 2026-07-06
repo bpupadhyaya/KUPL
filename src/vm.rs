@@ -441,7 +441,29 @@ impl<'m> Vm<'m> {
                     let v = reg!(src);
                     set!(dst, v);
                 }
-                Op::Add(d, a, b) => bin!(d, a, b, B::Add),
+                Op::Add(d, a, b) => {
+                    // Self-append fast path for `s = s + x` (compiled as Add(s, s, x)):
+                    // append x's rendering to the uniquely-owned Str in place instead
+                    // of reallocating — O(n^2) -> O(n). A shared string rebuilds, so
+                    // value semantics hold. All non-(Str+Str) cases use the shared op.
+                    let both_str = matches!(&self.stack[base + a as usize], Value::Str(_))
+                        && matches!(&self.stack[base + b as usize], Value::Str(_));
+                    if d == a && both_str {
+                        let r = reg!(b);
+                        let slot = &mut self.stack[base + a as usize];
+                        if let Value::Str(rc) = slot {
+                            if Rc::get_mut(rc).is_some() {
+                                use std::fmt::Write as _;
+                                let _ = write!(Rc::get_mut(rc).unwrap(), "{r}");
+                            } else {
+                                let l = rc.clone();
+                                *slot = Value::str(format!("{l}{r}"));
+                            }
+                        }
+                    } else {
+                        bin!(d, a, b, B::Add);
+                    }
+                }
                 Op::Sub(d, a, b) => bin!(d, a, b, B::Sub),
                 Op::Mul(d, a, b) => bin!(d, a, b, B::Mul),
                 Op::Div(d, a, b) => bin!(d, a, b, B::Div),
@@ -768,11 +790,33 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::Method { dst, recv, name, start, argc } => {
-                    let r = reg!(recv);
                     let method = match &chunk.consts[name as usize] {
                         Value::Str(s) => s.as_str().to_string(),
                         _ => return Err(VmError { msg: "bad method name".into(), span }),
                     };
+                    // Self-push fast path (`xs = xs.push(x)`): the result overwrites
+                    // the receiver register; push in place when the List is uniquely
+                    // owned (O(n^2) -> O(n)). A shared list rebuilds a new one, so
+                    // value semantics hold (an aliased list is never mutated).
+                    if method == "push"
+                        && argc == 1
+                        && dst == recv
+                        && matches!(&self.stack[base + recv as usize], Value::List(_))
+                    {
+                        let item = reg!(start);
+                        if let Value::List(rc) = &mut self.stack[base + recv as usize] {
+                            match Rc::get_mut(rc) {
+                                Some(v) => v.push(item),
+                                None => {
+                                    let mut out = rc.as_ref().clone();
+                                    out.push(item);
+                                    *rc = Rc::new(out);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let r = reg!(recv);
                     let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
                     // expose call on a component instance
                     if let Value::Component(id) = r {
@@ -1126,6 +1170,26 @@ mod tests {
         assert_eq!(
             differential("fun probe() -> Str {\n    \"{path_ext(\"a.tar.gz\")}|{path_ext(\".hidden\")}|{path_ext(\"a.\")}|{path_ext(\"a.b/c\")}\"\n}\n"),
             ".gz||.|"
+        );
+    }
+
+    #[test]
+    fn diff_kvm_self_accumulate_in_place() {
+        // The KVM compiles `x = x + e` / `x = x.push(e)` straight into x's register
+        // and mutates a uniquely-owned Str/List in place (O(n^2) -> O(n)). differential
+        // asserts interp == KVM, so this pins the KVM path's value semantics: aliases
+        // stay frozen, and a build loop equals the allocating form.
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var s = \"\"\n    var i = 0\n    while i < 6 { s = s + \"ab\"\n        i = i + 1 }\n    s\n}\n"),
+            "abababababab"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var xs = []\n    var i = 0\n    while i < 4 { xs = xs.push(i)\n        i = i + 1 }\n    let a = xs\n    xs = xs.push(99)\n    \"{xs}|{a}\"\n}\n"),
+            "[0, 1, 2, 3, 99]|[0, 1, 2, 3]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var s = \"x\"\n    let t = s\n    s = s + \"y\"\n    \"{s}|{t}\"\n}\n"),
+            "xy|x"
         );
     }
 

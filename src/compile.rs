@@ -580,6 +580,38 @@ impl<'s> FnCompiler<'s> {
         match stmt {
             Stmt::Let { .. } => unreachable!("handled by stmt()"),
             Stmt::Assign { target, op, value, span } => {
+                // Fast forms `x = x + e` and `x = x.push(e)` for a local `x`: compile
+                // the op straight into x's register (dst == src, no Move) so the VM
+                // can mutate the uniquely-owned Str/List in place — turning an O(n^2)
+                // build loop into O(n). Any other shape uses the general path below.
+                if *op == AssignOp::Set {
+                    if let ExprKind::Ident(name) = &target.kind {
+                        if let Some(local) = self.lookup(name) {
+                            if let ExprKind::Binary { op: BinOp::Add, lhs, rhs } = &value.kind {
+                                if matches!(&lhs.kind, ExprKind::Ident(n) if n == name) {
+                                    let b = self.expr(rhs);
+                                    self.emit(Op::Add(local, local, b), *span);
+                                    return None;
+                                }
+                            }
+                            if let ExprKind::MethodCall { recv, name: m, args } = &value.kind {
+                                if m == "push"
+                                    && args.len() == 1
+                                    && matches!(&recv.kind, ExprKind::Ident(n) if n == name)
+                                {
+                                    let exprs: Vec<Expr> = args.clone();
+                                    let start = self.consecutive(&exprs, *span);
+                                    let name_idx = self.const_idx(Value::str("push".to_string()));
+                                    self.emit(
+                                        Op::Method { dst: local, recv: local, name: name_idx, start, argc: 1 },
+                                        *span,
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                }
                 let rhs = self.expr(value);
                 let ExprKind::Ident(name) = &target.kind else {
                     self.err("K0803", "unsupported assignment target on KVM", *span);
