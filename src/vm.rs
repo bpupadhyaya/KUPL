@@ -1791,6 +1791,26 @@ mod tests {
     }
 
     #[test]
+    fn diff_closure_value_capture() {
+        // Closures capture free locals BY VALUE (a snapshot rebound per call), so
+        // interp == KVM: mutating the outer var after the closure is made is NOT
+        // seen (1, not 99), and a "counter" closure does not accumulate across calls
+        // (each starts from the captured snapshot). This used to diverge — the
+        // interpreter did live env-reference capture. make() also proves per-call
+        // isolation and independence of two closure instances.
+        let src = "fun make() -> fn() -> Int {\n    var n = 0\n    fn() { n = n + 1\n        n }\n}\n\
+                   fun probe() -> Str {\n    var x = 1\n    let f = fn() { x }\n    x = 99\n    \
+                   let c = make()\n    let d = make()\n    \"{f()}|{c()}{c()}{d()}{c()}\"\n}\n";
+        assert_eq!(differential(src), "1|1111");
+        // a closure over an unmutated outer var (the common map/fold idiom) is
+        // unchanged and identical
+        assert_eq!(
+            differential("fun probe() -> Str {\n    let y = 10\n    \"{[1, 2, 3].map(fn x { x + y })}\"\n}\n"),
+            "[11, 12, 13]"
+        );
+    }
+
+    #[test]
     fn diff_csv_pathological_input() {
         // csv_parse handles hostile/edge input identically on both engines without
         // panicking: an unterminated quoted field takes the rest of the row, doubled

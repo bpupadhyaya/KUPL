@@ -196,7 +196,10 @@ pub enum Value {
 pub struct Closure {
     pub params: Vec<String>,
     pub body: Rc<Block>,
-    pub env: Env,
+    /// Free locals captured BY VALUE at creation (a snapshot), rebound fresh on
+    /// every call — matching the KVM/native `MakeClosure` semantics. (A live env
+    /// clone would give reference capture, which diverges across engines.)
+    pub captures: Vec<(Box<str>, Value)>,
 }
 
 impl Value {

@@ -943,11 +943,24 @@ impl Interp {
                     expr.span,
                 ))
             }
-            ExprKind::Lambda { params, body } => Ok(Value::Closure(Rc::new(Closure {
-                params: params.iter().map(|p| p.name.clone()).collect(),
-                body: Rc::new(body.clone()),
-                env: env.clone(),
-            }))),
+            ExprKind::Lambda { params, body } => {
+                // Capture free LOCALS by value (snapshot), like the KVM/native
+                // MakeClosure: names not in scope (top-level funs, ctors, builtins)
+                // resolve via the DB at call time and aren't captured.
+                let mut bound: std::collections::HashSet<String> =
+                    params.iter().map(|p| p.name.clone()).collect();
+                let mut free: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                crate::compile::free_vars_block(body, &mut bound, &mut free);
+                let captures: Vec<(Box<str>, Value)> = free
+                    .iter()
+                    .filter_map(|n| env.get(n).map(|v| (n.as_str().into(), v)))
+                    .collect();
+                Ok(Value::Closure(Rc::new(Closure {
+                    params: params.iter().map(|p| p.name.clone()).collect(),
+                    body: Rc::new(body.clone()),
+                    captures,
+                })))
+            }
             ExprKind::With { recv, updates } => {
                 let base = self.eval(recv, env)?;
                 let Value::Ctor { ty, variant, fields } = base else {
@@ -1324,7 +1337,14 @@ impl Interp {
                         span,
                     ));
                 }
-                let scope = c.env.child();
+                // Fresh scope over the module globals: bind the captured snapshot
+                // then the params. Rebinding the captures per call (rather than
+                // sharing an env) gives value-capture semantics — a mutation of a
+                // captured name is call-local, matching the KVM/native.
+                let scope = self.globals.child();
+                for (n, v) in &c.captures {
+                    scope.define(n, v.clone());
+                }
                 for (p, a) in c.params.iter().zip(args) {
                     scope.define(p, a);
                 }

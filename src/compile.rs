@@ -1325,7 +1325,9 @@ impl<'s> FnCompiler<'s> {
 
 // ---------------- free-variable analysis ----------------
 
-fn free_vars_block(b: &Block, bound: &mut HashSet<String>, free: &mut BTreeSet<String>) {
+/// Free variables of a block, given the already-`bound` names. Shared with the
+/// interpreter so a closure snapshots exactly the same locals the KVM captures.
+pub fn free_vars_block(b: &Block, bound: &mut HashSet<String>, free: &mut BTreeSet<String>) {
     let added: Vec<String> = Vec::new();
     let mut local_added = added;
     for stmt in &b.stmts {

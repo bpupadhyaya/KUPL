@@ -4760,6 +4760,20 @@ mod tests {
         assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
     }
 
+    /// Native closures capture free locals by value like the interpreter/KVM: an
+    /// outer mutation after creation isn't seen, and a counter closure doesn't
+    /// accumulate. PR-it76 (aligned the interp to this value-capture semantics).
+    #[test]
+    fn native_closure_value_capture() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun make() -> fn() -> Int {\n    var n = 0\n    fn() { n = n + 1\n        n }\n}\n\
+                   fun main() uses io {\n    var x = 1\n    let f = fn() { x }\n    x = 99\n    \
+                   let c = make()\n    print(\"{f()}|{c()}{c()}{c()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "closurecap").trim(), "1|111");
+    }
+
     /// Deeply nested JSON is rejected by the native runtime's depth guard
     /// (K_MAX_JSON_DEPTH) — a clean Err, never a stack-overflow/segfault on the
     /// recursive C descent. PR-it73 (certifies the untrusted-input JSON path).
