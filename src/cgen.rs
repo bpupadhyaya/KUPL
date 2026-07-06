@@ -2552,7 +2552,14 @@ static int kre_match_piece(KRePiece* first, KRePiece* rest, int nrest, const uns
     free(ends);
     return 0;
 }
+/* backtracking-step budget — mirrors src/regex.rs MATCH_BUDGET (10_000_000). A
+   pathological pattern/input (e.g. `a*a*a*a*c` over a long non-matching string)
+   would otherwise hang exponentially (ReDoS); instead it panics cleanly with the
+   same message the interpreter raises. Reset at each top-level match op. */
+static long kre_steps = 0;
 static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, int* out) {
+    if (--kre_steps < 0)
+        k_panic("regex match budget exceeded (pattern too complex for the input)");
     if (n == 0) { *out = pos; return 1; }
     return kre_match_piece(&pieces[0], pieces + 1, n - 1, t, tlen, pos, out);
 }
@@ -2582,11 +2589,13 @@ static KValue k_substr(const unsigned char* t, int a, int b) {
 
 static KValue k_re_match(KValue pat, KValue text) {
     KRegex re = k_re_compile(k_as_str(pat));
+    kre_steps = 10000000;
     const char* t = k_as_str(text); int tlen = (int)strlen(t);
     int s, e; return k_bool(k_re_leftmost(&re, (const unsigned char*)t, tlen, &s, &e));
 }
 static KValue k_re_find(KValue pat, KValue text) {
     KRegex re = k_re_compile(k_as_str(pat));
+    kre_steps = 10000000;
     const char* t = k_as_str(text); int tlen = (int)strlen(t);
     int s, e;
     if (k_re_leftmost(&re, (const unsigned char*)t, tlen, &s, &e)) return k_some(k_substr((const unsigned char*)t, s, e));
@@ -2594,6 +2603,7 @@ static KValue k_re_find(KValue pat, KValue text) {
 }
 static KValue k_re_find_all(KValue pat, KValue text) {
     KRegex re = k_re_compile(k_as_str(pat));
+    kre_steps = 10000000;
     const unsigned char* t = (const unsigned char*)k_as_str(text); int tlen = (int)strlen((const char*)t);
     KValue items[8192]; int n = 0; int i = 0;
     while (i <= tlen) {
@@ -2606,6 +2616,7 @@ static KValue k_re_find_all(KValue pat, KValue text) {
 }
 static KValue k_re_replace(KValue pat, KValue text, KValue repl) {
     KRegex re = k_re_compile(k_as_str(pat));
+    kre_steps = 10000000;
     const unsigned char* t = (const unsigned char*)k_as_str(text); int tlen = (int)strlen((const char*)t);
     const char* rep = k_as_str(repl);
     KBuf b = { 0, 0, 0 }; int i = 0;

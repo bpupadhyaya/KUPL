@@ -45,6 +45,43 @@ enum Quant {
     ZeroOrOne,
 }
 
+/// Backtracking-step budget for one match operation. A pathological pattern over
+/// a long non-matching input (e.g. `a*a*a*a*c`, which forces O(n^k) ways to split
+/// the run across k quantifiers) would otherwise hang exponentially (ReDoS). When
+/// the budget is exhausted the match unwinds and `budget_exceeded()` reports it, so
+/// the caller can raise a clean error instead of the process hanging. Generous
+/// enough that ordinary matches never approach it. Mirrored in the native runtime.
+const MATCH_BUDGET: u64 = 10_000_000;
+
+thread_local! {
+    static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BUDGET_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn reset_budget() {
+    STEPS.with(|s| s.set(MATCH_BUDGET));
+    BUDGET_HIT.with(|h| h.set(false));
+}
+
+/// Consume one step; false (and flags the hit) once the budget is exhausted.
+fn tick() -> bool {
+    STEPS.with(|s| {
+        let n = s.get();
+        if n == 0 {
+            BUDGET_HIT.with(|h| h.set(true));
+            false
+        } else {
+            s.set(n - 1);
+            true
+        }
+    })
+}
+
+/// Whether the most recent match aborted after exceeding the step budget.
+pub fn budget_exceeded() -> bool {
+    BUDGET_HIT.with(|h| h.get())
+}
+
 pub fn compile(pattern: &str) -> Result<Regex, String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut p = Parser::new(&chars);
@@ -251,11 +288,13 @@ impl<'a> Parser<'a> {
 impl Regex {
     /// Does the pattern match anywhere in `text`? (Use `^…$` for a full match.)
     pub fn is_match(&self, text: &str) -> bool {
+        reset_budget();
         self.find_at_from(text).is_some()
     }
 
     /// The first (leftmost) matching substring, if any.
     pub fn find(&self, text: &str) -> Option<String> {
+        reset_budget();
         let chars: Vec<char> = text.chars().collect();
         let (start, end) = self.leftmost(&chars)?;
         Some(chars[start..end].iter().collect())
@@ -264,6 +303,7 @@ impl Regex {
     /// All non-overlapping matches, left to right. A zero-width match advances
     /// by one character to guarantee progress.
     pub fn find_all(&self, text: &str) -> Vec<String> {
+        reset_budget();
         let chars: Vec<char> = text.chars().collect();
         let mut out = Vec::new();
         let mut i = 0;
@@ -282,6 +322,7 @@ impl Regex {
 
     /// Replace every non-overlapping match with `replacement` (literal text).
     pub fn replace_all(&self, text: &str, replacement: &str) -> String {
+        reset_budget();
         let chars: Vec<char> = text.chars().collect();
         let mut out = String::new();
         let mut i = 0;
@@ -337,6 +378,11 @@ impl Regex {
 
 /// Match a sequence of pieces starting at `pos`, returning the end index.
 fn match_seq(pieces: &[Piece], chars: &[char], pos: usize) -> Option<usize> {
+    // Every recursive descent passes through here; charge a step so a pathological
+    // backtracking blow-up unwinds at the budget instead of hanging (see tick()).
+    if !tick() {
+        return None;
+    }
     match pieces.split_first() {
         None => Some(pos),
         Some((first, rest)) => match_piece(first, rest, chars, pos),
@@ -457,6 +503,22 @@ mod tests {
         assert!(m("^colou?r$", "color"));
         assert!(m("^colou?r$", "colour"));
         assert!(!m("^colou?r$", "colouur"));
+    }
+
+    #[test]
+    fn redos_pattern_is_bounded_not_a_hang() {
+        // A pathological pattern over a long non-matching input (O(n^k) ways to
+        // split the run across k quantifiers) must abort at the step budget instead
+        // of hanging exponentially. is_match returns fast and budget_exceeded() flags
+        // it (the interpreter turns that into a clean error).
+        let re = super::compile("a*a*a*a*c").unwrap();
+        let big: String = "a".repeat(400);
+        let _ = re.is_match(&big); // must return quickly, not hang
+        assert!(super::budget_exceeded(), "expected the ReDoS budget to trip");
+        // a normal match over the same input does NOT trip the budget
+        let ok = super::compile("a+c").unwrap();
+        let _ = ok.is_match(&big);
+        assert!(!super::budget_exceeded(), "a linear match must not trip the budget");
     }
 
     #[test]

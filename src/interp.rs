@@ -3196,7 +3196,7 @@ pub fn regex_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     let re = crate::regex::compile(&as_str(&args[0]))
         .map_err(|e| format!("invalid regex: {e}"))?;
     let text = as_str(&args[1]);
-    Ok(match name {
+    let result = match name {
         "re_match" => Value::Bool(re.is_match(&text)),
         "re_find" => re
             .find(&text)
@@ -3207,7 +3207,13 @@ pub fn regex_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         )),
         "re_replace" => Value::str(re.replace_all(&text, &as_str(&args[2]))),
         _ => return Err(format!("unknown regex builtin `{name}`")),
-    })
+    };
+    // A pathological pattern/input that blew the backtracking budget yields a clean
+    // error rather than a silently-wrong result (or a hang).
+    if crate::regex::budget_exceeded() {
+        return Err("regex match budget exceeded (pattern too complex for the input)".into());
+    }
+    Ok(result)
 }
 
 /// HTTP builtins — shared by interpreter and KVM. Effect `io.net`. Transport is
