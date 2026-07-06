@@ -469,18 +469,45 @@ pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String
 /// same-named identifier in the file (a shadowing local or a same-named field
 /// included) — the common simple-LSP behavior; scope-aware rename is future work.
 pub fn occurrences(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
-    let (tokens, _diags) = crate::lexer::lex(text);
     let mut out = Vec::new();
+    collect_occurrences(text, 0, name, text, &mut out);
+    // token order is source order at each level, but interpolation occurrences are
+    // discovered at their enclosing string token — sort so edits/refs are ascending.
+    out.sort();
+    out
+}
+
+/// Scan `text` (a full document, or the raw source of a string-interpolation
+/// `{expr}` at absolute byte offset `base`) for identifier uses of `name`,
+/// recursing into nested interpolations. Positions are line/col in `full`.
+fn collect_occurrences(
+    text: &str,
+    base: u32,
+    name: &str,
+    full: &str,
+    out: &mut Vec<(usize, usize, usize, usize)>,
+) {
+    let (tokens, _diags) = crate::lexer::lex(text);
     for t in &tokens {
-        if let crate::token::Tok::Ident(s) = &t.tok {
-            if s == name {
-                let (l0, c0) = crate::diag::line_col(text, t.span.start);
-                let (l1, c1) = crate::diag::line_col(text, t.span.end);
+        match &t.tok {
+            crate::token::Tok::Ident(s) if s == name => {
+                let (l0, c0) = crate::diag::line_col(full, base + t.span.start);
+                let (l1, c1) = crate::diag::line_col(full, base + t.span.end);
                 out.push((l0 - 1, c0 - 1, l1 - 1, c1 - 1));
             }
+            // `"…{x}…"` — the interpolated expression is captured raw inside the
+            // string token, so its identifier uses (real references, updated by a
+            // rename) are found by scanning the expression source at its offset.
+            crate::token::Tok::Str(parts) => {
+                for p in parts {
+                    if let crate::token::StrPart::Expr(raw, expr_start) = p {
+                        collect_occurrences(raw, *expr_start, name, full, out);
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    out
 }
 
 /// The identifier under the cursor (for references/rename resolution).
@@ -926,6 +953,21 @@ mod tests {
         assert_eq!(ident_under(PROG, call_line, ch).as_deref(), Some("add"));
         // rename would produce one edit per occurrence (same count)
         assert_eq!(occurrences(PROG, "add").len(), refs.len());
+    }
+
+    #[test]
+    fn references_include_string_interpolation() {
+        // A variable used inside a `"{x}"` interpolation is a REAL reference that
+        // rename must update — but plain string TEXT and comments must not be touched.
+        // Before PR-it94, occurrences only scanned bare Ident tokens and silently
+        // missed interpolation uses, so a rename left `{x}` pointing at the old name.
+        let src = "fun greet(x: Str) -> Str {\n    let y = x\n    \"hi {x}, the letter x\" // x here\n}\n";
+        let refs = occurrences(src, "x");
+        // param `x`, `= x`, and `{x}` = 3; the plain "letter x" text and the `// x`
+        // comment are NOT identifiers, so they're excluded.
+        assert_eq!(refs.len(), 3, "param + use + interpolation only: {refs:?}");
+        // the interpolation occurrence is on the string's line (0-based line 2).
+        assert!(refs.iter().any(|(l, _, _, _)| *l == 2), "interpolation ref on line 2: {refs:?}");
     }
 
     #[test]
