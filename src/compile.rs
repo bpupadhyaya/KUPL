@@ -718,7 +718,10 @@ impl<'s> FnCompiler<'s> {
             Stmt::Expect(e, span) => {
                 let r = self.expr(e);
                 let ok = self.emit(Op::JumpIfTrue(r, 0), *span);
-                let msg = self.const_idx(Value::str("expectation failed"));
+                // Name the failing expression (rendered from source) — the same text
+                // the interpreter produces, so KVM and native match byte-for-byte.
+                let text = format!("expectation failed: {}", crate::fmt::expr_str(e, 0));
+                let msg = self.const_idx(Value::str(text));
                 self.emit(Op::Panic(msg), *span);
                 self.patch_jump(ok);
                 None

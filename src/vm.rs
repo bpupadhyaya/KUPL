@@ -1783,6 +1783,16 @@ mod tests {
     fn diff_expect_stmt() {
         let src = "fun probe() -> Int {\n    expect 1 + 1 == 2\n    7\n}\n";
         assert_eq!(differential(src), "7");
+        // a FAILED expect names the failing expression (rendered from source) so the
+        // panic says WHAT failed — identical on both engines.
+        assert_eq!(
+            differential("fun probe() -> Int {\n    expect 1 == 2\n    7\n}\n"),
+            "panic: expectation failed: 1 == 2"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    let x = 5\n    expect x > 10\n    7\n}\n"),
+            "panic: expectation failed: x > 10"
+        );
     }
 
     /// Components: drive the same instance on both engines via sends + exposes.

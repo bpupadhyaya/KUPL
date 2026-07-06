@@ -669,7 +669,12 @@ impl Interp {
             Stmt::Expect(expr, span) => {
                 let v = self.eval(expr, env)?;
                 if v != Value::Bool(true) {
-                    return Err(Flow::Panic { msg: "expectation failed".into(), span: *span });
+                    // Name the failing expression (rendered from source) so a failed
+                    // `expect`/law says WHAT failed, not just "expectation failed".
+                    return Err(Flow::Panic {
+                        msg: format!("expectation failed: {}", crate::fmt::expr_str(expr, 0)),
+                        span: *span,
+                    });
                 }
                 Ok(Value::Unit)
             }
@@ -709,7 +714,7 @@ impl Interp {
                     .zip(&vals)
                     .map(|((n, _), v)| format!("{n} = {}", crate::prop::render(v)))
                     .collect();
-                let detail = if msg == "expectation failed" || msg.is_empty() {
+                let detail = if msg.starts_with("expectation failed") || msg.is_empty() {
                     String::new()
                 } else {
                     format!(" (panic: {msg})")

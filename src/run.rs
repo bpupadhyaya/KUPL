@@ -672,7 +672,7 @@ pub fn run_tests(path: &str) -> i32 {
                 passed += 1;
             }
             Err(Flow::Panic { msg, span }) => {
-                let detail = if msg == "expectation failed" {
+                let detail = if msg.starts_with("expectation failed") {
                     format!("`{}` was not satisfied", snippet(src, span))
                 } else {
                     msg
@@ -771,7 +771,7 @@ pub fn run_tests(path: &str) -> i32 {
                         passed += 1;
                     }
                     Err(Flow::Panic { msg, span }) => {
-                        let detail = if msg == "expectation failed" {
+                        let detail = if msg.starts_with("expectation failed") {
                             format!("`{}` was not satisfied", snippet(src, span))
                         } else {
                             format!("panic: {msg}")

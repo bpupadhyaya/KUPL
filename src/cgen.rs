@@ -4687,6 +4687,20 @@ mod tests {
         );
     }
 
+    /// Native `expect` failure names the failing expression (via the KVM module's
+    /// panic message), matching the interpreter. PR-it65.
+    #[test]
+    fn native_expect_message() {
+        if !cc_available() {
+            return;
+        }
+        // a passing expect is silent; a failing one panics (empty stdout).
+        let ok = "fun main() uses io {\n    expect 2 + 2 == 4\n    print(\"ok\")\n}\n";
+        assert_eq!(native_main_stdout(ok, "expok").trim(), "ok");
+        let bad = "fun main() uses io {\n    expect 1 == 2\n    print(\"x\")\n}\n";
+        assert!(native_main_stdout(bad, "expbad").trim().is_empty(), "expected a panic");
+    }
+
     /// Native tensor `.get` out-of-range panic names the offending index and the
     /// tensor length (was a bare "tensor index out of range"). PR-it64.
     #[test]
