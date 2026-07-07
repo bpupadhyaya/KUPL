@@ -2082,6 +2082,33 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_nested_map_of_maps_two_level() {
+        // A certification lock (it247): a genuine two-level Map[Str, Map[Str, Int]] — the
+        // object-of-objects / config-namespace idiom. Prior tests cover Map[Str, Set] and
+        // List[Map] (one level of nesting); this exercises a double lookup
+        // `outer.get(k1).unwrap_or(Map()).get(k2)` (present -> 2; missing outer key falls through
+        // both defaults -> -1) and an IMMUTABLE nested update: re-inserting a modified inner map
+        // under an existing outer key updates the value while keeping the outer key's position, and
+        // the inner map keeps its own insertion order with the appended key last. Byte-identical on
+        // interp/KVM (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    var outer: Map[Str, Map[Str, Int]] = Map()
+    let inner1 = Map().insert("a", 1).insert("b", 2)
+    let inner2 = Map().insert("x", 10)
+    outer = outer.insert("first", inner1).insert("second", inner2)
+    let got = outer.get("first").unwrap_or(Map()).get("b").unwrap_or(0)
+    let missing = outer.get("nope").unwrap_or(Map()).get("z").unwrap_or(0 - 1)
+    let updated = outer.insert("first", outer.get("first").unwrap_or(Map()).insert("c", 3))
+    "{got}|{missing}|{updated.get("first")}|{outer.keys()}|{updated.get("first").unwrap_or(Map()).keys()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"2|-1|Some(Map{"a": 1, "b": 2, "c": 3})|["first", "second"]|["a", "b", "c"]"#
+        );
+    }
+
+    #[test]
     fn diff_parse_float_scientific_notation() {
         // A bug-hunt-18 lock (it246): parse_float accepts scientific notation (mantissa e exponent,
         // lower- and upper-case E, negative exponents) and — critically — the resulting f64 prints
