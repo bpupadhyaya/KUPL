@@ -5298,6 +5298,22 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native mutual recursion: the C backend forward-declares every function, so a pair
+    /// (is_even/is_odd) that call each other compile and run like interp/KVM regardless of
+    /// definition order, and to depth (PR-it139).
+    #[test]
+    fn native_mutual_recursion() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun is_even(n: Int) -> Bool { if n == 0 { true } else { is_odd(n - 1) } }\n\
+                   fun is_odd(n: Int) -> Bool { if n == 0 { false } else { is_even(n - 1) } }\n\
+                   fun a(n: Int) -> Str { if n <= 0 { \"a\" } else { b(n - 1) } }\n\
+                   fun b(n: Int) -> Str { if n <= 0 { \"b\" } else { a(n - 1) } }\n\
+                   fun main() uses io {\n    print(\"{is_even(10)}|{is_odd(7)}|{is_even(1000)}|{a(0)}{a(1)}{a(5)}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "mutualrec").trim(), "true|true|true|abb");
+    }
+
     /// Native recursive ADTs (self-referential heap-allocated values) build, traverse,
     /// display nested, and recurse deeply exactly like interp/KVM (PR-it137).
     #[test]

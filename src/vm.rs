@@ -2038,6 +2038,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_mutual_recursion() {
+        // Mutually-recursive functions (a calls b, b calls a) work regardless of definition
+        // order — is_odd is defined AFTER is_even yet each calls the other. Byte-identical on
+        // interp/KVM; native must forward-declare every function for this to compile (PR-it139).
+        // The even/odd depth (1000) needs the interpreter's full stack, so run on a big-stack
+        // thread like the other deep-recursion differential tests.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let evenodd = "fun is_even(n: Int) -> Bool { if n == 0 { true } else { is_odd(n - 1) } }\n\
+                               fun is_odd(n: Int) -> Bool { if n == 0 { false } else { is_even(n - 1) } }\n\
+                               fun probe() -> Str { \"{is_even(10)}|{is_odd(7)}|{is_even(1000)}|{is_odd(0)}\" }\n";
+                assert_eq!(differential(evenodd), "true|true|true|false");
+                // A three-way cycle a -> b -> c -> a terminates and cycles deterministically.
+                let cycle = "fun a(n: Int) -> Str { if n <= 0 { \"a\" } else { b(n - 1) } }\n\
+                             fun b(n: Int) -> Str { if n <= 0 { \"b\" } else { c(n - 1) } }\n\
+                             fun c(n: Int) -> Str { if n <= 0 { \"c\" } else { a(n - 1) } }\n\
+                             fun probe() -> Str { \"{a(0)}{a(1)}{a(2)}{a(3)}{a(9)}\" }\n";
+                assert_eq!(differential(cycle), "abcaa");
+                // Mutual recursion with mixed return types (Int and Str), the Str fn defined
+                // between the two Int fns (a backward and a forward reference in one program).
+                let mixed = "fun ping(n: Int) -> Int { if n <= 0 { 0 } else { pong(n - 1) + 1 } }\n\
+                             fun label(n: Int) -> Str { if ping(n) > 2 { \"big\" } else { \"small\" } }\n\
+                             fun pong(n: Int) -> Int { if n <= 0 { 0 } else { ping(n - 1) + 1 } }\n\
+                             fun probe() -> Str { \"{ping(6)}|{label(5)}|{label(1)}\" }\n";
+                assert_eq!(differential(mixed), "6|big|small");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn diff_higher_order_and_closure_depth() {
         // A returned closure keeps its own captured environment; two are independent.
         let ret = "fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\
