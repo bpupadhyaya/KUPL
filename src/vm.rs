@@ -2179,6 +2179,30 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_numeric_collection_edges() {
+        // Subtle numeric/collection edges surfaced by a bug-hunt sweep, all byte-identical on
+        // interp/KVM (PR-it192): a NaN can be STORED in a Set (len grows) but contains(nan) is
+        // false since NaN != NaN (IEEE); a rational normalizes the sign onto the numerator and
+        // reduces; and the classic i64::MIN / -1 and x / 0 cases panic rather than wrap.
+        let src = r#"fun probe() -> Str {
+    let nan = 0.0 / 0.0
+    let s = Set([1.0, 2.0, nan])
+    let setnan = "{s.len()}|{s.contains(nan)}|{s.contains(1.0)}"
+    let rats = "{rat(3, 0 - 6)}|{rat(0 - 3, 0 - 6)}|{rat(0 - 4, 8)}"
+    "{setnan}#{rats}"
+}
+"#;
+        assert_eq!(differential(src), "3|false|true#-1/2|1/2|-1/2");
+        // Division edges are clean panics (not wrapped values), identical across engines.
+        assert_eq!(differential("fun probe() -> Str { \"{10 / 0}\" }\n"), "panic: division by zero");
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(0 - 9223372036854775807 - 1) / (0 - 1)}\" }\n"),
+            "panic: integer overflow in division"
+        );
+        assert_eq!(differential("fun probe() -> Str { \"{rat(5, 0)}\" }\n"), "panic: division by zero");
+    }
+
+    #[test]
     fn diff_float_copysign() {
         // The NEW copysign(x, y) is byte-identical on interp/KVM: magnitude of the receiver with
         // the SIGN BIT of the argument. Crucially the sign comes from the bit, so a genuine -0.0
