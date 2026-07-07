@@ -1883,6 +1883,31 @@ mod tests {
     }
 
     #[test]
+    fn diff_higher_order_and_closure_depth() {
+        // A returned closure keeps its own captured environment; two are independent.
+        let ret = "fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\
+                   fun probe() -> Str { let a3 = adder(3)\n    let a10 = adder(10)\n    \"{a3(1)}|{a10(1)}|{a3(100)}\" }\n";
+        assert_eq!(differential(ret), "4|11|103");
+        // Loop-variable capture is VALUE-at-creation (PR-it76), not the final value:
+        // the three closures return 0,1,2 — not 3,3,3.
+        let loopcap = "fun probe() -> Str { var fs: List[fn() -> Int] = []\n    var i = 0\n    \
+                       while i < 3 {\n        let captured = i\n        fs = fs.push(fn { captured })\n        i = i + 1\n    }\n    \
+                       let g0 = fs.get(0).unwrap_or(fn { 0 - 1 })\n    let g1 = fs.get(1).unwrap_or(fn { 0 - 1 })\n    \
+                       let g2 = fs.get(2).unwrap_or(fn { 0 - 1 })\n    \"{g0()}|{g1()}|{g2()}\" }\n";
+        assert_eq!(differential(loopcap), "0|1|2");
+        // Value-capture also means a later mutation of the captured var is not seen.
+        assert_eq!(
+            differential("fun probe() -> Str { var x = 1\n    let f = fn { x }\n    x = 99\n    \"{f()}\" }\n"),
+            "1"
+        );
+        // Composition (higher-order taking + returning funs) and closures held in a list.
+        let comp = "fun compose(f: fn(Int) -> Int, g: fn(Int) -> Int) -> fn(Int) -> Int { fn x { f(g(x)) } }\n\
+                    fun probe() -> Str { let inc = fn x { x + 1 }\n    let dbl = fn x { x * 2 }\n    \
+                    let h = compose(inc, dbl)\n    let fs = [inc, dbl]\n    \"{h(5)}|{fs.map(fn f { f(5) })}\" }\n";
+        assert_eq!(differential(comp), "11|[6, 10]");
+    }
+
+    #[test]
     fn diff_pattern_matching_depth() {
         // Guards (first-match-wins, may reference the bound variable), byte-identical.
         let guard = "fun cls(n: Int) -> Str { match n {\n        x if x > 10 => \"big\"\n        \

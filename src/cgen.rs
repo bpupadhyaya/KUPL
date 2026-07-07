@@ -4835,6 +4835,22 @@ mod tests {
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
     }
 
+    /// Native closures capture by value (PR-it76): returned closures keep independent
+    /// environments and loop-variable capture is value-at-creation, matching interp/KVM.
+    #[test]
+    fn native_higher_order_and_closure_depth() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\
+                   fun main() uses io {\n    let a3 = adder(3)\n    let a10 = adder(10)\n    \
+                   var fs: List[fn() -> Int] = []\n    var i = 0\n    \
+                   while i < 3 {\n        let captured = i\n        fs = fs.push(fn { captured })\n        i = i + 1\n    }\n    \
+                   let g0 = fs.get(0).unwrap_or(fn { 0 - 1 })\n    let g2 = fs.get(2).unwrap_or(fn { 0 - 1 })\n    \
+                   print(\"{a3(1)}|{a10(1)}|{g0()}|{g2()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "clo").trim(), "4|11|0|2");
+    }
+
     /// Native pattern matching (guards, or-patterns, ranges, nested destructure)
     /// matches interp/KVM.
     #[test]
