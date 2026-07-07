@@ -2104,6 +2104,32 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_sort_by_records_descending_via_negated_key() {
+        // A certification lock (it288): descending sort of records by a numeric field. sort_by is a
+        // key-extractor that sorts ASCENDING and is STABLE (locked generally); this pins the canonical
+        // way to get DESCENDING order -- negate the key with `0 - field` -- and confirms tie-stability
+        // survives the negation. This is the "leaderboard / rank by score, highest first" idiom, the
+        // single most common non-default sort direction an AI reaches for, and KUPL's sort_by has no
+        // reverse flag, so the negated-key trick IS the idiom.
+        //   players scored [amy:50, bob:90, cal:50, dan:70]
+        //   sort_by(0 - p.score) -> keys [-50, -90, -50, -70], ascending -> bob:90, dan:70, amy:50, cal:50
+        //   amy (50) stays before cal (50): negation is monotonic and the sort is stable, so the two
+        //   ties keep their original relative order rather than swapping.
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that reversing sort direction by
+        // key negation preserves stability on equal keys -- a backend whose sort was unstable, or that
+        // mishandled the negative key, would flip amy/cal while the strictly-ordered scores looked fine.
+        let src = r#"type Player = { name: Str, score: Int }
+fun probe() -> Str {
+    let ps = [Player(name: "amy", score: 50), Player(name: "bob", score: 90), Player(name: "cal", score: 50), Player(name: "dan", score: 70)]
+    let desc = ps.sort_by(fn p { 0 - p.score })
+    let names = desc.map(fn p { "{p.name}:{p.score}" })
+    "{names.join(",")}"
+}
+"#;
+        assert_eq!(differential(src), "bob:90,dan:70,amy:50,cal:50");
+    }
+
+    #[test]
     fn diff_map_of_records_lookup_and_aggregate() {
         // A certification lock (it286): the "entity store" idiom -- records indexed by a string ID
         // in a Map[Str, User], then looked up and aggregated. it276 transforms record VALUES in place
