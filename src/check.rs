@@ -2704,6 +2704,34 @@ mod generic_tests {
     }
 
     #[test]
+    fn contract_conformance_is_structurally_enforced() {
+        // A component that `fulfills` a contract must expose every method the contract
+        // requires, with a matching signature — structural conformance is checked at
+        // compile time with precise, distinct diagnostics (PR-it129).
+        let has = |src: &str, code: &str| errors(src).iter().any(|d| d.code == code);
+
+        // Missing a required method -> K0262, naming the method.
+        let missing = "contract Store {\n    expose fun put(k: Str, v: Str) -> Bool\n    expose fun size() -> Int\n}\n\
+                       component Bad fulfills Store {\n    state n: Int = 0\n    expose fun put(k: Str, v: Str) -> Bool { true }\n}\n";
+        assert!(has(missing, "K0262"), "missing contract method must be K0262");
+
+        // Implementing a method with the wrong signature (here the return type) -> K0263.
+        let sig = "contract Store {\n    expose fun put(k: Str, v: Str) -> Bool\n}\n\
+                   component Bad fulfills Store {\n    state n: Int = 0\n    expose fun put(k: Str, v: Str) -> Int { 5 }\n}\n";
+        assert!(has(sig, "K0263"), "signature mismatch must be K0263");
+
+        // Fulfilling an unknown contract -> K0261.
+        let unknown = "component Bad fulfills Nonexistent {\n    state n: Int = 0\n}\n";
+        assert!(has(unknown, "K0261"), "unknown contract must be K0261");
+
+        // A fully-conforming component is accepted (no conformance error).
+        let ok = "contract Greeter {\n    intent \"g\"\n    expose fun greet(name: Str) -> Str\n}\n\
+                  component Formal fulfills Greeter {\n    intent \"f\"\n    expose fun greet(name: Str) -> Str { \"hi {name}\" }\n}\n";
+        let codes: Vec<_> = errors(ok).into_iter().map(|d| d.code).collect();
+        assert!(!codes.iter().any(|c| c.starts_with("K026")), "conforming component must not error: {codes:?}");
+    }
+
+    #[test]
     fn deep_nesting_is_a_clean_error_not_a_hang() {
         // Pathologically deep expression nesting (which used to make the type
         // checker hang superlinearly on the owned Ty tree) now yields a clean

@@ -5158,6 +5158,21 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "clo").trim(), "4|11|0|2");
     }
 
+    /// Native contract dispatch: a function taking a contract-typed parameter calls the
+    /// right component's method (polymorphism over `fulfills`), matching interp/KVM (PR-it129).
+    #[test]
+    fn native_contract_polymorphic_dispatch() {
+        if !cc_available() {
+            return;
+        }
+        let src = "contract Greeter {\n    intent \"g\"\n    expose fun greet(name: Str) -> Str\n}\n\
+                   component Formal fulfills Greeter {\n    intent \"f\"\n    expose fun greet(name: Str) -> Str { \"Good day, {name}.\" }\n}\n\
+                   component Casual fulfills Greeter {\n    intent \"c\"\n    expose fun greet(name: Str) -> Str { \"hey {name}\" }\n}\n\
+                   fun welcome(g: Greeter, who: Str) -> Str { g.greet(who) }\n\
+                   fun main() uses io {\n    print(\"{welcome(Formal(), \"Ada\")}|{welcome(Casual(), \"Bob\")}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "contractdisp").trim(), "Good day, Ada.|hey Bob");
+    }
+
     /// Native if-let (expression + nested pattern) and while-let (termination) match
     /// interp/KVM (PR-it125).
     #[test]
