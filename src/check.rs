@@ -148,7 +148,7 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 const BUILTIN_METHODS: &[&str] = &[
     "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
     "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "cos", "count",
-    "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "filter",
+    "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "fract", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
     "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
@@ -2276,7 +2276,7 @@ impl Checker {
                 Some((vec![], Ty::Str))
             }
             (Ty::Int, "to_radix") => Some((vec![Ty::Int], Ty::Str)),
-            (Ty::Int, "isqrt") => Some((vec![], Ty::Int)),
+            (Ty::Int, "isqrt") | (Ty::Int, "factorial") => Some((vec![], Ty::Int)),
             (Ty::Float, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Float, "fmt") => Some((vec![Ty::Int], Ty::Str)),
             (Ty::Float, "to_int") => Some((vec![], Ty::Int)),

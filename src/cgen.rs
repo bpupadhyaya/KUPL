@@ -4011,6 +4011,15 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             if (recv.as.i < 0) k_panic("`isqrt` of a negative Int");
             return k_int(k_isqrt((uint64_t)recv.as.i));
         }
+        if (!strcmp(name, "factorial")) {
+            /* 0!=1!=1; negative -> panic; past 20! overflows i64 -> checked panic. */
+            int64_t v = recv.as.i;
+            if (v < 0) k_panic("`factorial` of a negative Int");
+            int64_t acc = 1;
+            for (int64_t k = 2; k <= v; k++)
+                if (__builtin_mul_overflow(acc, k, &acc)) k_panic("integer overflow in `factorial`");
+            return k_int(acc);
+        }
         if (!strcmp(name, "band")) return k_int(recv.as.i & args[0].as.i);
         if (!strcmp(name, "bor")) return k_int(recv.as.i | args[0].as.i);
         if (!strcmp(name, "bxor")) return k_int(recv.as.i ^ args[0].as.i);
@@ -5621,6 +5630,20 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native factorial() matches interp/KVM: exact values up to 20!, overflow panic at 21!,
+    /// negative panic (PR-it185).
+    #[test]
+    fn native_int_factorial() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{(0).factorial()}|{(5).factorial()}|{(20).factorial()}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "intfac").trim(), "1|120|2432902008176640000");
     }
 
     /// Native trunc/fract match interp/KVM: round-toward-zero and signed fractional part,

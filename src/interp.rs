@@ -2576,6 +2576,24 @@ pub fn shared_method(
                 Ok(Value::Int(int_isqrt(*v)))
             }
         }
+        (Value::Int(v), "factorial") => {
+            // 0! = 1! = 1; a negative is an error; anything past 20! overflows i64 and is a
+            // checked overflow panic (matching KUPL's Int arithmetic), never a wrapped value.
+            if *v < 0 {
+                Err("`factorial` of a negative Int".into())
+            } else {
+                let mut acc: i64 = 1;
+                let mut k: i64 = 2;
+                while k <= *v {
+                    match acc.checked_mul(k) {
+                        Some(x) => acc = x,
+                        None => return Err("integer overflow in `factorial`".into()),
+                    }
+                    k += 1;
+                }
+                Ok(Value::Int(acc))
+            }
+        }
         (Value::Int(v), "band") => match args.into_iter().next() {
             Some(Value::Int(w)) => Ok(Value::Int(v & w)),
             _ => Err("`band` needs an Int".into()),

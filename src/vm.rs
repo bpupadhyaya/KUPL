@@ -2134,6 +2134,25 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_int_factorial() {
+        // The NEW factorial() is byte-identical on interp/KVM: 0!=1!=1, 20! is the largest that
+        // fits i64, 21! is a checked-overflow panic, and a negative is a clean panic (PR-it185).
+        let src = r#"fun probe() -> Str {
+    "{(0).factorial()}|{(1).factorial()}|{(5).factorial()}|{(10).factorial()}|{(20).factorial()}"
+}
+"#;
+        assert_eq!(differential(src), "1|1|120|3628800|2432902008176640000");
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(21).factorial()}\" }\n"),
+            "panic: integer overflow in `factorial`"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(0 - 3).factorial()}\" }\n"),
+            "panic: `factorial` of a negative Int"
+        );
+    }
+
+    #[test]
     fn diff_float_trunc_fract() {
         // The NEW trunc/fract complete the floor/ceil/round rounding family, byte-identical on
         // interp/KVM: trunc rounds toward zero, fract is the signed fractional part (x-trunc(x)),
