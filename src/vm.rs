@@ -2082,6 +2082,31 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_rational_harmonic_accumulation() {
+        // The exact-fraction parallel to diff_bigint_fibonacci_accumulation (it230): the numeric
+        // tower (it169) certified single Rational ops (1/3 + 1/6 = 1/2) but not ACCUMULATION across
+        // a loop, where each addition of 1/i grows the common denominator and the running result must
+        // stay GCD-reduced. A harmonic-series generator sums 1/1 + 1/2 + ... + 1/n as an exact
+        // Rational: H(1)=1, H(4)=25/12, H(5)=137/60, H(10)=7381/2520 (the true harmonic numbers).
+        // Byte-identical on interp/KVM (and native, per the native test) — the native reduction must
+        // keep the same numerator/denominator at every step (PR-it231).
+        let src = r#"fun harmonic(n: Int) -> Rational {
+    var acc = rat(0, 1)
+    var i = 1
+    while i <= n {
+        acc = acc + rat(1, i)
+        i = i + 1
+    }
+    acc
+}
+fun probe() -> Str {
+    "{harmonic(1)}|{harmonic(4)}|{harmonic(5)}|{harmonic(10)}"
+}
+"#;
+        assert_eq!(differential(src), "1|25/12|137/60|7381/2520");
+    }
+
+    #[test]
     fn diff_bigint_fibonacci_accumulation() {
         // A bug-hunt-12 lock (it230): the numeric tower (it169) certified BigInt pow (2^70) and
         // factorial (25!) — multiplicative growth — but not ADDITIVE accumulation across a loop.

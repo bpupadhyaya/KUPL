@@ -6616,6 +6616,19 @@ fun main() uses io {
         );
     }
 
+    /// Rational ACCUMULATION with running GCD-reduction (it231): a harmonic-series loop adds 1/i each
+    /// turn; H(10)=7381/2520 requires the native reduction to keep numerator/denominator exact at
+    /// every step. Complements native_bigint_fibonacci (integer accumulation).
+    #[test]
+    fn native_rational_harmonic() {
+        let src = "fun harmonic(n: Int) -> Rational {\n    var acc = rat(0, 1)\n    var i = 1\n    \
+                   while i <= n { acc = acc + rat(1, i)\n        i = i + 1 }\n    acc\n}\n\
+                   fun main() uses io {\n    print(\"{harmonic(1)}|{harmonic(5)}|{harmonic(10)}\")\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "harmonic").trim(), "1|137/60|7381/2520");
+        }
+    }
+
     /// BigInt ADDITIVE accumulation (it230): a Fibonacci loop adds two BigInts each turn; fib(100) is
     /// a 21-digit number exceeding i64, so the native C bignum's carry propagation must match the
     /// interpreter's exactly. Complements native_bigint_and_rational_match (multiplicative factorial).
