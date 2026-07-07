@@ -1883,6 +1883,18 @@ mod tests {
     }
 
     #[test]
+    fn diff_json_surrogate_pair_parsing() {
+        // PR-it115: a `🎉` surrogate pair decodes to the single astral code
+        // point (🎉), a BMP escape is unchanged (é), and a lone surrogate becomes
+        // U+FFFD — byte-identical on interp/KVM.
+        let src = r#"fun d(j: Str) -> Str { match json_parse(j) { Ok(JStr(s)) => "{s}:{s.len()}"
+        _ => "ERR" } }
+fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD83C\"")}|{d("\"a\\uD83C\\uDF89b\"")}" }
+"#;
+        assert_eq!(differential(src), "🎉:1|café:4|\u{FFFD}:1|a🎉b:3");
+    }
+
+    #[test]
     fn diff_json_number_and_string_fidelity() {
         // PR-it114: JSON numbers format positionally (never scientific), byte-identical
         // on interp/KVM — a large integer-valued float is "100000000000000000000", not

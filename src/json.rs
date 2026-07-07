@@ -57,6 +57,16 @@ impl Parser<'_> {
         c
     }
 
+    /// Read exactly four hex digits (the body of a `\uXXXX` escape) into a code unit.
+    fn hex4(&mut self) -> Result<u32, String> {
+        let mut code = 0u32;
+        for _ in 0..4 {
+            let d = self.bump().ok_or("truncated \\u escape")?;
+            code = code * 16 + d.to_digit(16).ok_or("invalid \\u escape")?;
+        }
+        Ok(code)
+    }
+
     fn skip_ws(&mut self) {
         while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r')) {
             self.pos += 1;
@@ -142,13 +152,30 @@ impl Parser<'_> {
                     Some('b') => out.push('\u{0008}'),
                     Some('f') => out.push('\u{000C}'),
                     Some('u') => {
-                        let mut code = 0u32;
-                        for _ in 0..4 {
-                            let d = self.bump().ok_or("truncated \\u escape")?;
-                            code = code * 16
-                                + d.to_digit(16).ok_or("invalid \\u escape")?;
-                        }
-                        out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        let hi = self.hex4()?;
+                        // A `\uXXXX` high surrogate (D800..=DBFF) must be paired with a
+                        // following `\uYYYY` low surrogate (DC00..=DFFF) to form one astral
+                        // code point (e.g. an emoji). An unpaired surrogate -> U+FFFD.
+                        let cp = if (0xD800..=0xDBFF).contains(&hi) {
+                            if self.chars.get(self.pos) == Some(&'\\')
+                                && self.chars.get(self.pos + 1) == Some(&'u')
+                            {
+                                let save = self.pos;
+                                self.pos += 2; // consume the `\u` of the candidate low half
+                                let lo = self.hex4()?;
+                                if (0xDC00..=0xDFFF).contains(&lo) {
+                                    0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                                } else {
+                                    self.pos = save; // not a low surrogate — re-parse it
+                                    0xFFFD
+                                }
+                            } else {
+                                0xFFFD
+                            }
+                        } else {
+                            hi
+                        };
+                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                     }
                     _ => return Err("invalid escape".into()),
                 },

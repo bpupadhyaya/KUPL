@@ -1546,7 +1546,11 @@ static void kb_putcp(KBuf* b, unsigned int cp) {   /* UTF-8 encode a code point 
     if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;  /* lone surrogate -> replacement */
     if (cp < 0x80) kb_putc(b, (char)cp);
     else if (cp < 0x800) { kb_putc(b, (char)(0xC0 | (cp >> 6))); kb_putc(b, (char)(0x80 | (cp & 0x3F))); }
-    else { kb_putc(b, (char)(0xE0 | (cp >> 12))); kb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3F))); kb_putc(b, (char)(0x80 | (cp & 0x3F))); }
+    else if (cp < 0x10000) { kb_putc(b, (char)(0xE0 | (cp >> 12))); kb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3F))); kb_putc(b, (char)(0x80 | (cp & 0x3F))); }
+    else { /* astral plane (from a combined surrogate pair) -> 4-byte UTF-8 */
+        kb_putc(b, (char)(0xF0 | (cp >> 18))); kb_putc(b, (char)(0x80 | ((cp >> 12) & 0x3F)));
+        kb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3F))); kb_putc(b, (char)(0x80 | (cp & 0x3F)));
+    }
 }
 
 /* --- serialize (mirror json.rs write_value/format_num/write_string) --- */
@@ -1643,6 +1647,25 @@ static char* kjp_string(KJP* p) {  /* assumes current char is the opening quote 
                     code = code * 16 + hv;
                 }
                 if (bad) { p->failed = 1; break; }
+                /* combine a high surrogate (D800..DBFF) with a following \uLOW (DC00..DFFF)
+                   into one astral code point; an unpaired surrogate -> U+FFFD (mirrors
+                   json.rs). */
+                if (code >= 0xD800 && code <= 0xDBFF) {
+                    if (p->pos + 1 < p->len && p->s[p->pos] == '\\' && p->s[p->pos+1] == 'u') {
+                        long save = p->pos; p->pos += 2;
+                        unsigned int lo = 0; int bad2 = 0;
+                        for (int i = 0; i < 4; i++) {
+                            if (p->pos >= p->len) { bad2 = 1; break; }
+                            int d = p->s[p->pos++];
+                            int hv = (d>='0'&&d<='9')?d-'0':(d>='a'&&d<='f')?d-'a'+10:(d>='A'&&d<='F')?d-'A'+10:-1;
+                            if (hv < 0) { bad2 = 1; break; }
+                            lo = lo * 16 + hv;
+                        }
+                        if (!bad2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                        } else { p->pos = save; code = 0xFFFD; }
+                    } else { code = 0xFFFD; }
+                }
                 kb_putcp(&b, code);
             } else { p->failed = 1; break; }
         } else kb_putc(&b, (char)c);
@@ -4861,6 +4884,20 @@ mod tests {
                    print(\"{[1, 2] == [1, 2]}{Pt(1, 2) == Pt(1, 2)}{Red == Blue}{Some([1, 2]) == Some([1, 2])}\
                    {ma == mb}{nan == nan}{-0.0 == 0.0}{\"Z\" < \"a\"}\")\n}\n";
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
+    }
+
+    /// Native JSON \u surrogate-pair parsing combines pairs into one astral code point
+    /// (PR-it115), matching interp/KVM — including 4-byte UTF-8 output.
+    #[test]
+    fn native_json_surrogate_pair_parsing() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun d(j: Str) -> Str { match json_parse(j) { Ok(JStr(s)) => "{s}:{s.len()}"
+        _ => "ERR" } }
+fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD83C\"")}") }
+"#;
+        assert_eq!(native_main_stdout(src, "surr").trim(), "🎉:1|café:4|\u{FFFD}:1");
     }
 
     /// Native JSON number stringify is positional (never scientific) — PR-it114 fixed
