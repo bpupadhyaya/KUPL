@@ -159,7 +159,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "min", "min_by", "mul_add", "num", "ok", "ok_or", "pad_left", "pad_right", "par_each",
     "par_filter", "par_map", "parse_float", "parse_int", "parse_radix", "partition", "position",
     "pow", "product", "push", "recip", "rem_euclid", "remove", "repeat", "replace", "replace_first",
-    "reverse", "rfind", "round", "saturating_add", "saturating_mul", "saturating_sub",
+    "reverse", "rfind", "rotate_left", "rotate_right", "round", "saturating_add", "saturating_mul", "saturating_sub",
     "scale", "scan", "shl", "shr", "sign", "sin", "slice", "sort", "sort_by", "split",
     "split_once", "sqrt", "starts_with", "sum", "swapcase", "symmetric_difference", "tail", "take",
     "take_while", "tan", "to_binary", "to_degrees", "to_float", "to_hex", "to_int", "to_list",
@@ -2148,9 +2148,10 @@ impl Checker {
                 }
                 Some((vec![], Ty::List(t.clone())))
             }
-            (Ty::List(t), "take") | (Ty::List(t), "drop") => {
-                Some((vec![Ty::Int], Ty::List(t.clone())))
-            }
+            (Ty::List(t), "take")
+            | (Ty::List(t), "drop")
+            | (Ty::List(t), "rotate_left")
+            | (Ty::List(t), "rotate_right") => Some((vec![Ty::Int], Ty::List(t.clone()))),
             (Ty::List(t), "get") => Some((vec![Ty::Int], Ty::Option(t.clone()))),
             (Ty::List(t), "index_of") => {
                 Some((vec![(**t).clone()], Ty::Option(Box::new(Ty::Int))))

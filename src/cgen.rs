@@ -3441,6 +3441,19 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             for (int64_t i = 0; i < l->len; i++) out[i] = l->items[l->len - 1 - i];
             return k_list(out, (int)l->len);
         }
+        /* rotate_left(n) moves first n to the end; rotate_right(n) moves last n to front.
+           n taken as floor-mod of len so any shift is defined; empty list unchanged. */
+        if (!strcmp(name, "rotate_left") || !strcmp(name, "rotate_right")) {
+            if (args[0].tag != K_INT) k_panic("`rotate_left`/`rotate_right` needs an Int");
+            if (l->len == 0) return k_list(l->items, 0);
+            int64_t len = l->len;
+            int64_t k = args[0].as.i % len;
+            if (k < 0) k += len;
+            if (name[7] == 'r') k = (len - k) % len; /* rotate_Right */
+            KValue* out = k_alloc(sizeof(KValue) * len);
+            for (int64_t i = 0; i < len; i++) out[i] = l->items[(k + i) % len];
+            return k_list(out, (int)len);
+        }
         if (!strcmp(name, "join")) {
             KBuf b = {0};
             /* Hoist the separator's rendering out of the loop (it was re-rendered every
@@ -6184,6 +6197,24 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "numlit").trim(),
             "255|240|1000000|-1|150.0|0.0025|602200000000000027262976.0"
+        );
+    }
+
+    /// Native List.rotate_left/rotate_right cyclically shift with floor-mod n (full/over-length
+    /// rotations and negative n all defined), matching interp/KVM (PR-it208).
+    #[test]
+    fn native_list_rotate() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let a = [1, 2, 3, 4, 5]
+    print("{a.rotate_left(2)}|{a.rotate_right(1)}|{a.rotate_left(7)}|{a.rotate_right(0 - 1)}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "listrot").trim(),
+            "[3, 4, 5, 1, 2]|[5, 1, 2, 3, 4]|[3, 4, 5, 1, 2]|[2, 3, 4, 5, 1]"
         );
     }
 

@@ -2179,6 +2179,24 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_rotate() {
+        // The NEW rotate_left(n)/rotate_right(n) cyclically shift a list, byte-identical on
+        // interp/KVM. n is floor-modded by the length so a full rotation (n==len) and n>len are
+        // identities-mod-len, and a NEGATIVE n reverses direction (rotate_right(-1) == left-1).
+        // Empty and singleton lists are unchanged (PR-it208).
+        let src = r#"fun probe() -> Str {
+    let a = [1, 2, 3, 4, 5]
+    let empty: List[Int] = []
+    "{a.rotate_left(2)}|{a.rotate_right(1)}|{a.rotate_left(0)}|{a.rotate_left(5)}|{a.rotate_left(7)}|{a.rotate_right(0 - 1)}|{empty.rotate_left(3)}|{[9].rotate_left(1)}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[3, 4, 5, 1, 2]|[5, 1, 2, 3, 4]|[1, 2, 3, 4, 5]|[1, 2, 3, 4, 5]|[3, 4, 5, 1, 2]|[2, 3, 4, 5, 1]|[]|[9]"
+        );
+    }
+
+    #[test]
     fn diff_list_dedup() {
         // The NEW List.dedup collapses only CONSECUTIVE equal runs (Unix `uniq`), byte-identical
         // on interp/KVM — and is distinct from unique(): the trailing run of 1s reappears in dedup

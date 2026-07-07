@@ -1992,6 +1992,33 @@ pub fn shared_method(
             out.reverse();
             Ok(Value::List(Rc::new(out)))
         }
+        // Cyclically shift elements: rotate_left(n) moves the first n to the end,
+        // rotate_right(n) moves the last n to the front. n is taken modulo the length so any
+        // shift (including n > len) is well-defined; an empty list is unchanged.
+        (Value::List(items), "rotate_left") | (Value::List(items), "rotate_right") => {
+            match args.into_iter().next() {
+                Some(Value::Int(n)) => {
+                    let len = items.len();
+                    if len == 0 {
+                        return Ok(Value::List(Rc::new(items.as_ref().clone())));
+                    }
+                    // reduce n into [0, len) with a floor-mod so negative shifts also work
+                    let mut k = (n % len as i64) as isize;
+                    if k < 0 {
+                        k += len as isize;
+                    }
+                    let mut k = k as usize;
+                    if name == "rotate_right" {
+                        k = (len - k) % len;
+                    }
+                    let mut out = Vec::with_capacity(len);
+                    out.extend_from_slice(&items[k..]);
+                    out.extend_from_slice(&items[..k]);
+                    Ok(Value::List(Rc::new(out)))
+                }
+                _ => Err(format!("`{name}` needs an Int").into()),
+            }
+        }
         (Value::List(items), "join") => {
             let sep = match args.into_iter().next() {
                 Some(Value::Str(s)) => s.as_str().to_string(),
