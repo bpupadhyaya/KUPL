@@ -2018,6 +2018,17 @@ pub fn shared_method(
             }
             Ok(Value::List(Rc::new(out)))
         }
+        // Collapse runs of CONSECUTIVE equal elements (Unix `uniq`) — unlike `unique`, a value can
+        // reappear later if it isn't adjacent to its previous occurrence.
+        (Value::List(items), "dedup") => {
+            let mut out: Vec<Value> = Vec::new();
+            for it in items.iter() {
+                if out.last().is_none_or(|last| last != it) {
+                    out.push(it.clone());
+                }
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
         (Value::List(items), "init") => {
             let n = items.len().saturating_sub(1);
             Ok(Value::List(Rc::new(items[..n].to_vec())))

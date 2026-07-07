@@ -3474,6 +3474,15 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return k_list(out, (int)n);
         }
+        /* dedup: collapse only CONSECUTIVE equal elements (Unix uniq), unlike unique. */
+        if (!strcmp(name, "dedup")) {
+            KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+            int64_t n = 0;
+            for (int64_t i = 0; i < l->len; i++) {
+                if (n == 0 || !k_eq(out[n - 1], l->items[i])) out[n++] = l->items[i];
+            }
+            return k_list(out, (int)n);
+        }
         if (!strcmp(name, "product")) {
             int64_t pi = 1; double pf = 1; int isf = 0;
             for (int64_t i = 0; i < l->len; i++) {
@@ -6157,6 +6166,24 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "listxf").trim(),
             "[1, 2, 3, 4, 5]|[]|[[1, 2], [3, 4], [5]]|[1, 2, 3]|[11, 22]|[[2, 4], [1, 3]]"
+        );
+    }
+
+    /// Native List.dedup collapses only consecutive runs (Unix uniq), matching interp/KVM — and
+    /// differs from unique() when a value recurs non-adjacently (PR-it203).
+    #[test]
+    fn native_list_dedup() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let a = [1, 1, 2, 2, 2, 3, 1, 1]
+    print("{a.dedup()}|{a.unique()}|{["x", "x", "y", "x"].dedup()}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "listdedup").trim(),
+            r#"[1, 2, 3, 1]|[1, 2, 3]|["x", "y", "x"]"#
         );
     }
 

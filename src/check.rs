@@ -149,7 +149,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "abs", "abs_diff", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
     "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "copysign", "cos",
     "count", "count_ones",
-    "den", "difference", "div_euclid", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
+    "dedup", "den", "difference", "div_euclid", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "fract", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
     "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
@@ -2149,7 +2149,7 @@ impl Checker {
             }
             (Ty::List(_), "is_empty") => Some((vec![], Ty::Bool)),
             (Ty::List(t), "concat") => Some((vec![Ty::List(t.clone())], Ty::List(t.clone()))),
-            (Ty::List(t), "unique") | (Ty::List(t), "init") | (Ty::List(t), "tail") => {
+            (Ty::List(t), "unique") | (Ty::List(t), "dedup") | (Ty::List(t), "init") | (Ty::List(t), "tail") => {
                 Some((vec![], Ty::List(t.clone())))
             }
             (Ty::List(t), "product") => {

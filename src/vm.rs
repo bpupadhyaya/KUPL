@@ -2179,6 +2179,23 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_dedup() {
+        // The NEW List.dedup collapses only CONSECUTIVE equal runs (Unix `uniq`), byte-identical
+        // on interp/KVM — and is distinct from unique(): the trailing run of 1s reappears in dedup
+        // but not in unique (PR-it203).
+        let src = r#"fun probe() -> Str {
+    let a = [1, 1, 2, 2, 2, 3, 1, 1]
+    let empty: List[Int] = []
+    "{a.dedup()}|{a.unique()}|{[5].dedup()}|{empty.dedup()}|{["x", "x", "y", "x"].dedup()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"[1, 2, 3, 1]|[1, 2, 3]|[5]|[]|["x", "y", "x"]"#
+        );
+    }
+
+    #[test]
     fn diff_shadowing_and_closure_value_capture() {
         // Lexical scoping is byte-identical across interp/KVM: a `let` inside a block shadows an
         // outer binding of the same name and the outer value is RESTORED after the block; and a
