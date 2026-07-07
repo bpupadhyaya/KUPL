@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_nested_if_cascade_grade_classification() {
+        // A certification lock (it284): the cascading-threshold classification idiom -- a deep
+        // nested-if (if/else-if chain) that maps a numeric score into one of five named buckets by
+        // DESCENDING thresholds, applied over records, then group_by + count. it256 locks nested-if
+        // inside a match arm; this pins the standalone 4-deep if-else cascade as a range-bucketizer
+        // (grading, tiering, severity classification) composed with a histogram.
+        //   grade: s>=90 -> A ; else s>=80 -> B ; else s>=70 -> C ; else s>=60 -> D ; else F
+        //   scores [95, 82, 71, 55, 88, 90] -> [A, B, C, F, B, A]   (90 is boundary-inclusive -> A; 55 -> F)
+        //   group_by(grade) + map_values(len) -> Map{"A": 2, "B": 2, "C": 1, "F": 1}   (no "D" bucket, first-seen order)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the cascade picks the FIRST
+        // threshold met (outer-if wins, so 95 is A not B), the >=90 boundary is inclusive, and the
+        // empty "D" tier simply doesn't appear in the histogram.
+        let src = r#"type Student = { name: Str, score: Int }
+fun grade(s: Int) -> Str {
+    if s >= 90 { "A" } else {
+        if s >= 80 { "B" } else {
+            if s >= 70 { "C" } else {
+                if s >= 60 { "D" } else { "F" }
+            }
+        }
+    }
+}
+fun probe() -> Str {
+    let students = [Student(name: "amy", score: 95), Student(name: "bob", score: 82), Student(name: "cal", score: 71), Student(name: "dan", score: 55), Student(name: "eve", score: 88), Student(name: "fox", score: 90)]
+    let graded = students.map(fn s { grade(s.score) })
+    let byGrade = graded.group_by(fn g { g })
+    let counts = byGrade.map_values(fn gs { gs.len() })
+    "{graded.join(",")}|{counts}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"A,B,C,F,B,A|Map{"A": 2, "B": 2, "C": 1, "F": 1}"#
+        );
+    }
+
+    #[test]
     fn diff_take_while_drop_while_complementary_on_records() {
         // A bug-hunt-35 lock (it282): take_while and drop_while are COMPLEMENTARY -- they split a list
         // at exactly the same boundary (the first element failing the predicate), so taken ++ dropped
