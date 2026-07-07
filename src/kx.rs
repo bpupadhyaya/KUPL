@@ -888,6 +888,24 @@ mod tests {
     }
 
     #[test]
+    fn bundle_roundtrip_rich_module() {
+        // A feature-rich module (generics, closures, higher-order calls) survives the
+        // bundle trailer intact — PR-it122 certified `kupl bundle` runs such programs
+        // with the same output as `kupl run` end-to-end.
+        let src = "type Box[T] = Box(v: T)\n\
+                   fun fib(n: Int) -> Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n\
+                   fun main() uses io {\n    \
+                   let xs = [1, 2, 3].map(fn x { x * 2 })\n    \
+                   print(\"{fib(10)}|{xs.fold(0, fn(a, x) { a + x })}|{Box(42)}\")\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module");
+        let fake_exe = vec![0x7fu8; 2000];
+        let bundled = super::write_bundle(&fake_exe, &module);
+        let back = super::read_bundle(&bundled).expect("has trailer").expect("decodes");
+        assert_eq!(module.disassemble(), back.disassemble(), "rich module round-trips through the bundle");
+    }
+
+    #[test]
     fn bundle_roundtrip() {
         let src = "fun main() {\n    print(\"bundled!\")\n}\n";
         let compiled = crate::run::compile(src).expect("compiles");
