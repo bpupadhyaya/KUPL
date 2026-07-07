@@ -2104,6 +2104,40 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_fold_record_values_into_str_report() {
+        // A bug-hunt-40 lock (it295): Map.fold's 3-arg (acc, k, v) form building a STRING report over a
+        // RECORD-valued map, computing a derived stat per entry. it277 folds a scalar-valued map into a
+        // record; the older Map.fold-to-String locks use scalar values. This pins the "render a report
+        // line per entry from a map of stats records" idiom -- read the key AND a couple of the value
+        // record's fields, compute a percentage, and join with the first-entry-has-no-separator trick.
+        //   m = {"api": Stat(90,10), "db": Stat(40,60), "cache": Stat(99,1)}
+        //   fold("", (acc, k, v) -> line "k:pct%" where pct = v.hits*100/(v.hits+v.misses);
+        //                           acc=="" ? line : "acc|line")
+        //     api  : 90*100/100 = 90  -> "api:90%"
+        //     db   : 40*100/100 = 40  -> "api:90%|db:40%"
+        //     cache: 99*100/100 = 99  -> "api:90%|db:40%|cache:99%"
+        // Byte-identical on interp/KVM (native per the sweep). Confirms Map.fold exposes both the key
+        // and the record value to the closure, visits entries in insertion order, and that the
+        // empty-accumulator branch omits the leading separator so the report has N-1 separators for N
+        // entries (no leading "|"). This is the render-a-stats-table an AI writes for dashboards, log
+        // summaries, or health reports. A backend that iterated the map in the wrong order would list
+        // db before api, and one that mishandled the ac=="" guard would emit a leading separator.
+        let src = r#"type Stat = { hits: Int, misses: Int }
+fun probe() -> Str {
+    let m: Map[Str, Stat] = Map().insert("api", Stat(hits: 90, misses: 10)).insert("db", Stat(hits: 40, misses: 60)).insert("cache", Stat(hits: 99, misses: 1))
+    let report = m.fold("", fn(acc, k, v) {
+        let total = v.hits + v.misses
+        let pct = (v.hits * 100) / total
+        let line = "{k}:{pct}%"
+        if acc == "" { line } else { "{acc}|{line}" }
+    })
+    "{report}"
+}
+"#;
+        assert_eq!(differential(src), "api:90%|db:40%|cache:99%");
+    }
+
+    #[test]
     fn diff_chunk_over_records_per_batch_average() {
         // A certification lock (it294): per-batch AVERAGE of a record field over non-overlapping
         // chunks -- the batch-mean idiom. it259 chunks plain Ints for a sum/size; this chunks RECORDS
