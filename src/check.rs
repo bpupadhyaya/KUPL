@@ -977,7 +977,12 @@ impl Checker {
             let arg_ty = self.infer_expr(&arg.value, ctx);
             match target {
                 Some((pname, pty, _)) => {
-                    supplied.insert(pname.clone());
+                    // A prop supplied twice (two named, or a positional colliding with a named on
+                    // the same slot) was silently accepted, mirroring the record-field hole fixed
+                    // in PR-it213/214 — reject it here for the component-prop path too (PR-it215).
+                    if !supplied.insert(pname.clone()) {
+                        self.err("K0215", format!("duplicate prop `{pname}` when constructing `{comp_name}`"), arg.value.span);
+                    }
                     self.check_assign(&pty, &arg_ty, arg.value.span, &format!("prop `{pname}` of `{comp_name}`"));
                 }
                 None => {
@@ -2981,6 +2986,20 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_component_prop_is_rejected_at_check_time() {
+        // Sibling of the record-field hole (PR-it213/214): a component prop supplied twice used to
+        // be silently accepted when all required props were present. Now rejected (PR-it215).
+        let comp = "component Widget {\n    intent \"t\"\n    prop w: Int\n    prop h: Int\n    in tick: Event\n    out area: Int\n    state a: Int = 0\n    on tick { a = w * h\n        emit area(a) }\n}\n";
+        let dup = errors(&format!("{comp}fun main() {{ let _ = Widget(w: 5, h: 6, w: 7) }}\n"));
+        assert!(dup.iter().any(|d| d.code == "K0215" && d.message.contains("duplicate prop `w`")), "dup: {dup:?}");
+        // positional colliding with a named prop on the same slot is also a duplicate.
+        let mix = errors(&format!("{comp}fun main() {{ let _ = Widget(5, w: 6) }}\n"));
+        assert!(mix.iter().any(|d| d.code == "K0215" && d.message.contains("duplicate prop `w`")), "mix: {mix:?}");
+        // Valid constructions — named, positional, and mixed on distinct props — still type-check.
+        assert!(errors(&format!("{comp}fun main() {{ let _ = Widget(w: 5, h: 6)\n    let _ = Widget(5, 6)\n    let _ = Widget(5, h: 6) }}\n")).is_empty());
     }
 
     #[test]
