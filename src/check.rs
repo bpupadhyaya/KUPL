@@ -2799,6 +2799,30 @@ mod generic_tests {
     }
 
     #[test]
+    fn effect_declaration_is_enforced_on_public_functions() {
+        // A `pub`/`expose` function must declare every effect it performs (K0301),
+        // and the requirement propagates through the private helpers it calls.
+        // effects are a separate frontend pass (effects::check_effects), not the type checker
+        let eff = |src: &str| -> Vec<crate::diag::Diag> {
+            let (mut program, _) = crate::parser::parse(src);
+            crate::run::inject_prelude(&mut program);
+            crate::effects::check_effects(&program)
+        };
+        let has_k0301 = |src: &str| eff(src).iter().any(|d| d.code == "K0301");
+        // pub fun that does io but doesn't declare it -> K0301
+        assert!(has_k0301("pub fun f() -> Int { print(1)\n    2 }\n"));
+        // declaring the effect fixes it (no effect errors)
+        assert!(!eff("pub fun f() uses io -> Int { print(1)\n    2 }\n").iter().any(|d| d.code == "K0301"));
+        // the effect propagates: a pub fun calling a private io helper must declare io
+        assert!(has_k0301("fun helper() uses io { print(1) }\npub fun f() -> Int { helper()\n    0 }\n"));
+        // an ai fun call requires `uses ai` on a public caller (names the missing effect)
+        let ai = eff("ai fun classify(t: Str) -> Str tools [] {\n    intent \"c\"\n}\npub fun f(t: Str) -> Str { classify(t) }\n");
+        assert!(ai.iter().any(|d| d.code == "K0301" && d.message.contains("uses ai")));
+        // a NON-public function may freely perform effects without declaring them
+        assert!(!has_k0301("fun f() -> Int { print(1)\n    2 }\n"));
+    }
+
+    #[test]
     fn edit_distance_and_suggest() {
         assert_eq!(super::edit_distance("compute", "comptue"), 2);
         assert_eq!(super::edit_distance("total", "totl"), 1);
