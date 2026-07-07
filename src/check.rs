@@ -1324,7 +1324,11 @@ impl Checker {
                         self.uni.fresh()
                     }
                     other => {
-                        self.err("K0233", format!("{other} has no fields"), expr.span);
+                        self.err(
+                            "K0233",
+                            format!("{other} has no fields (only records and components have fields)"),
+                            expr.span,
+                        );
                         self.uni.fresh()
                     }
                 }
@@ -1455,7 +1459,11 @@ impl Checker {
                 let rt = self.infer_expr(recv, ctx);
                 let rt = self.uni.apply(&rt);
                 let Ty::Named(tn, args) = &rt else {
-                    self.err("K0233", format!("{rt} has no fields to update"), expr.span);
+                    self.err(
+                        "K0233",
+                        format!("{rt} has no fields to update (only records and components have fields)"),
+                        expr.span,
+                    );
                     return self.uni.fresh();
                 };
                 let sig = self.checked.types.get(tn).cloned();
@@ -2923,6 +2931,20 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    #[test]
+    fn no_fields_error_names_what_has_fields() {
+        // K0233 now tells the user which kinds of type DO have fields, so accessing a field on a
+        // non-record type points toward the fix (PR-it197). Message-text only — record field
+        // access is unchanged.
+        let hint = "only records and components have fields";
+        let on_int = errors("fun main() { let x = 5\n    let _ = x.field }\n");
+        assert!(on_int.iter().any(|d| d.code == "K0233" && d.message.contains(hint)), "int: {on_int:?}");
+        let on_str = errors("fun main() { let _ = \"hi\".foo }\n");
+        assert!(on_str.iter().any(|d| d.code == "K0233" && d.message.contains(hint)), "str: {on_str:?}");
+        // Real record field access still type-checks (no behavior change).
+        assert!(errors("type Item = { name: Str, qty: Int }\nfun main() { let it = Item(name: \"a\", qty: 1)\n    let _ = it.name\n    let _ = it.qty }\n").is_empty());
     }
 
     #[test]
