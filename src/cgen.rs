@@ -3480,12 +3480,21 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             KValue best = l->items[0];
             for (int64_t i = 1; i < l->len; i++) {
                 KValue it = l->items[i];
-                int lt;
-                if (it.tag == K_INT && best.tag == K_INT) lt = it.as.i < best.as.i;
-                else if (it.tag == K_FLOAT && best.tag == K_FLOAT) lt = it.as.f < best.as.f;
-                else if (it.tag == K_STR && best.tag == K_STR) lt = strcmp(it.as.s, best.as.s) < 0;
-                else { k_panic("`min`/`max` need Int, Float, or Str elements"); lt = 0; }
-                if (wmin ? lt : !lt && !k_eq(it, best)) best = it;
+                /* Seed with the first element and replace only on a STRICT it<best (min)
+                   or it>best (max), matching the interpreter's fold. Using strict `>`
+                   rather than `!(it<best)` keeps NaN inert (both comparisons are false),
+                   so NaN never displaces the running best and never cascades — a `!<` form
+                   would treat NaN's unordered result as "greater" and poison the result. */
+                int repl;
+                if (it.tag == K_INT && best.tag == K_INT)
+                    repl = wmin ? (it.as.i < best.as.i) : (it.as.i > best.as.i);
+                else if (it.tag == K_FLOAT && best.tag == K_FLOAT)
+                    repl = wmin ? (it.as.f < best.as.f) : (it.as.f > best.as.f);
+                else if (it.tag == K_STR && best.tag == K_STR) {
+                    int c = strcmp(it.as.s, best.as.s);
+                    repl = wmin ? (c < 0) : (c > 0);
+                } else { k_panic("`min`/`max` need Int, Float, or Str elements"); repl = 0; }
+                if (repl) best = it;
             }
             return k_some(best);
         }
@@ -5109,6 +5118,22 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(
             native_main_stdout(src, "f2iconv").trim(),
             "3.0|-3.0|2.0|3|9223372036854775807|0|9223372036854775807|-9223372036854775808|5.0"
+        );
+    }
+
+    /// Native NaN-in-collection behavior matches interp/KVM: sort is deterministic (the
+    /// PR-it148 k_cmp fix flows into the sort comparator), min/max skip NaN, and Set keeps
+    /// duplicate NaNs since nan != nan (PR-it149).
+    #[test]
+    fn native_nan_in_collections() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let nan = 0.0 / 0.0\n    let xs = [3.0, nan, 1.0, 2.0]\n    \
+                   print(\"{xs.sort()}|{xs.min()}|{xs.max()}|{[nan, nan, 1.0].unique()}|{Set([nan, nan, 1.0]).len()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "nancoll").trim(),
+            "[3.0, NaN, 1.0, 2.0]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|3"
         );
     }
 

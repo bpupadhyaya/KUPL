@@ -2536,6 +2536,22 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
     }
 
     #[test]
+    fn diff_nan_in_collections() {
+        // NaN in collections follows from `nan != nan` and its unordered comparisons — sort
+        // is deterministic and identical across engines (the PR-it148 k_cmp fix propagated),
+        // min/max SKIP NaN, and equality-based ops keep duplicate NaNs (PR-it149).
+        let src = "fun probe() -> Str { let nan = 0.0 / 0.0\n    let xs = [3.0, nan, 1.0, 2.0]\n    \
+                   let dup = [nan, nan, 1.0, 1.0]\n    \
+                   \"{xs.sort()}|{xs.min()}|{xs.max()}|{dup.unique()}|{dup.contains(nan)}|{[1.0, 2.0].contains(2.0)}\" }\n";
+        assert_eq!(differential(src), "[3.0, NaN, 1.0, 2.0]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|false|true");
+        // Set and Map are equality-keyed, and nan != nan, so duplicate NaN elements/keys are
+        // all kept and a NaN key can never be looked up.
+        let sm = "fun probe() -> Str { let nan = 0.0 / 0.0\n    let s = Set([nan, nan, 1.0])\n    \
+                  let m = Map().insert(nan, 1).insert(nan, 2)\n    \"{s.len()}|{m.len()}|{m.get_or(nan, 0 - 1)}\" }\n";
+        assert_eq!(differential(sm), "3|2|-1");
+    }
+
+    #[test]
     fn diff_comparison_operator_edges() {
         // NaN is IEEE-UNORDERED: every comparison against it (incl. <= and >=, and nan <= nan
         // / nan >= nan) is false, and nan != nan is true. -0.0 == 0.0 but is not < 0.0. inf
