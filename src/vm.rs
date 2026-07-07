@@ -2104,6 +2104,35 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_case_conversion_pipeline() {
+        // A certification lock (it279): identifier-case conversion between naming conventions, the
+        // split -> map(case-transform) -> join pipeline. it253 locked split-parse-join for NUMBERS;
+        // this pins the STRING case-transform composition an AI writes constantly for codegen, config
+        // mapping, and API-field translation -- snake_case to Title Case to CONSTANT_CASE and back.
+        //   snake = "hello_world_foo"
+        //   titled    = split("_").map(capitalize).join(" ")   == "Hello World Foo"
+        //   constant  = titled.split(" ").map(to_upper).join("_") == "HELLO_WORLD_FOO"
+        //   camelish  = snake.split("_").map(to_upper).join("")   == "HELLOWORLDFOO"
+        //   roundtrip = titled.to_lower().replace(" ", "_")       == "hello_world_foo"  (back to snake)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms capitalize (first-char upper,
+        // rest lower), to_upper/to_lower on words, join with varied separators ("_", " ", ""), and that
+        // the composition round-trips cleanly from snake through Title back to snake.
+        let src = r#"fun probe() -> Str {
+    let snake = "hello_world_foo"
+    let titled = snake.split("_").map(fn w { w.capitalize() }).join(" ")
+    let constant = titled.split(" ").map(fn w { w.to_upper() }).join("_")
+    let camelish = snake.split("_").map(fn w { w.to_upper() }).join("")
+    let roundtrip = titled.to_lower().replace(" ", "_")
+    "{titled}|{constant}|{camelish}|{roundtrip}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "Hello World Foo|HELLO_WORLD_FOO|HELLOWORLDFOO|hello_world_foo"
+        );
+    }
+
+    #[test]
     fn diff_window_map_fold_into_record_per_window() {
         // A bug-hunt-33 lock (it278): sliding-window aggregation where each window is folded into a
         // RECORD summary in a SINGLE pass. it257 locked window->scalar moving-stats (separate movsum
