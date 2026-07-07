@@ -2342,7 +2342,14 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                 }
                 k_call(k_fun(t->fnid), targs, t->nparams);   /* side effects; result discarded (mock) */
             }
-            if (!final_text) { snprintf(k_ai_err, sizeof k_ai_err, "mock provider ran out of scripted rounds"); k_ai_ok = 0; return k_unit(); }
+            if (!final_text) {
+                /* Match the interpreter/KVM: a script of >= 8 rounds is stopped by the
+                   MAX_TOOL_ROUNDS cap (the loop ran the full limit), while a shorter one
+                   genuinely exhausts the scripted rounds. */
+                if (rounds->len >= 8) snprintf(k_ai_err, sizeof k_ai_err, "tool loop exceeded 8 rounds without a final answer");
+                else snprintf(k_ai_err, sizeof k_ai_err, "mock provider ran out of scripted rounds");
+                k_ai_ok = 0; return k_unit();
+            }
         }
     }
     return k_ai_convert(f->shape, final_text);
@@ -4833,6 +4840,42 @@ mod tests {
                    print(\"{[1, 2] == [1, 2]}{Pt(1, 2) == Pt(1, 2)}{Red == Blue}{Some([1, 2]) == Some([1, 2])}\
                    {ma == mb}{nan == nan}{-0.0 == 0.0}{\"Z\" < \"a\"}\")\n}\n";
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
+    }
+
+    /// Native's mock tool-calling loop matches interp/KVM: a multi-step loop reaches
+    /// the final answer, and a no-final script is bounded by MAX_TOOL_ROUNDS (8) with
+    /// the same message the interpreter uses (PR-it110 aligned native's boundary).
+    #[test]
+    fn native_ai_tool_loop_bound_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun add(a: Int, b: Int) -> Int { a + b }\n\
+                   ai fun assist(q: Str) -> Str tools [add] {\n    intent \"Answer using tools.\"\n}\n\
+                   fun main() uses io { print(assist(\"q\")) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module");
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-ailoop-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status().unwrap().success());
+        let _ = std::fs::remove_file(&cpath);
+        let run = |mock: &str| -> (String, String) {
+            let out = std::process::Command::new(&bin).env("KUPL_AI_MOCK_ASSIST", mock).output().unwrap();
+            (String::from_utf8_lossy(&out.stdout).trim().to_string(), String::from_utf8_lossy(&out.stderr).to_string())
+        };
+        // multi-step loop reaches the final answer
+        assert_eq!(run("[{\"tool\":\"add\",\"input\":{\"a\":2,\"b\":3}},{\"final\":\"done\"}]").0, "done");
+        // a short no-final script exhausts; >= 8 rounds hits the round cap (same as interp)
+        let seven = "[".to_string() + &vec!["{\"tool\":\"add\",\"input\":{\"a\":1,\"b\":1}}"; 7].join(",") + "]";
+        assert!(run(&seven).1.contains("mock provider ran out of scripted rounds"), "7 rounds should exhaust");
+        let ten = "[".to_string() + &vec!["{\"tool\":\"add\",\"input\":{\"a\":1,\"b\":1}}"; 10].join(",") + "]";
+        assert!(run(&ten).1.contains("tool loop exceeded 8 rounds without a final answer"), "10 rounds should hit the cap");
+        let _ = std::fs::remove_file(&bin);
     }
 
     /// Native closures capture by value (PR-it76): returned closures keep independent
