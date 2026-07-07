@@ -2104,6 +2104,46 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_full_pivot_filter_sort_group_max_per_group() {
+        // A certification lock (it281): the complete analytics-query pipeline over records --
+        // filter -> sort_by -> group_by -> fold(max record per group) -> map_values(format). it280
+        // locked group_by+SUM in isolation; this pins the FULL five-stage chain an AI writes for a
+        // report, and specifically two interactions the isolated locks can't: (a) group_by's first-seen
+        // key order reflects the ORDER AFTER sorting (not the original list order), and (b) the
+        // per-group reduction picks the MAX record by a field (returning a whole record, not a scalar).
+        //   sales filtered to amt>=20 -> [west/amy/30, east/bob/50, west/cal/20, west/eve/40]
+        //   sort_by(amt) -> [west/cal/20, west/amy/30, west/eve/40, east/bob/50]
+        //   group_by(region) keys in post-sort first-seen order == ["west", "east"]   (west's cal/20 seen first)
+        //   fold each group to its max-amt record, format rep=amt -> {west: "eve=40", east: "bob=50"}
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the five stages compose: the
+        // filter drops dan/10, the sort reorders so west is first-seen, group_by buckets in that order,
+        // and the per-group fold returns the winning RECORD (eve for west, bob for east).
+        let src = r#"type Sale = { region: Str, rep: Str, amt: Int }
+fun probe() -> Str {
+    let sales = [
+        Sale(region: "west", rep: "amy", amt: 30),
+        Sale(region: "east", rep: "bob", amt: 50),
+        Sale(region: "west", rep: "cal", amt: 20),
+        Sale(region: "east", rep: "dan", amt: 10),
+        Sale(region: "west", rep: "eve", amt: 40)
+    ]
+    let big = sales.filter(fn s { s.amt >= 20 })
+    let sorted = big.sort_by(fn s { s.amt })
+    let byRegion = sorted.group_by(fn s { s.region })
+    let topPerRegion = byRegion.map_values(fn ss {
+        ss.fold(ss.first().unwrap_or(Sale(region: "", rep: "", amt: 0)), fn(best, s) { if s.amt > best.amt { s } else { best } })
+    })
+    let summary = topPerRegion.map_values(fn s { "{s.rep}={s.amt}" })
+    "{byRegion.keys()}|{summary}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"["west", "east"]|Map{"west": "eve=40", "east": "bob=50"}"#
+        );
+    }
+
+    #[test]
     fn diff_group_by_records_then_sum_field_per_group() {
         // A bug-hunt-34 lock (it280): the SQL "GROUP BY key, SUM(field)" aggregation over RECORDS.
         // it262 groups STRINGS by first-char then COUNTS (map_values(len)); this pins grouping RECORDS
