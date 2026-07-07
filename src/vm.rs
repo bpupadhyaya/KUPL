@@ -2063,6 +2063,25 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_component_state_persists_and_isolates() {
+        // A component's `state` persists across expose-fun calls on the same instance, and
+        // separate instances are isolated — byte-identical on interp/KVM (PR-it132).
+        let counter = "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    expose fun bump() -> Int { n = n + 1\n        n }\n}\n\
+                       fun probe() -> Str {\n    let c = Counter()\n    let d = Counter()\n    \"{c.bump()},{c.bump()},{c.bump()}|iso {d.bump()}\"\n}\n";
+        assert_eq!(differential(counter), "1,2,3|iso 1");
+        // Multiple state fields (an Int and a growing List) track independently.
+        let multi = "component Store {\n    intent \"s\"\n    state count: Int = 0\n    state items: List[Str] = []\n    \
+                     expose fun add(x: Str) -> Str {\n        count = count + 1\n        items = items.push(x)\n        \"{count}:{items}\"\n    }\n}\n\
+                     fun probe() -> Str {\n    let s = Store()\n    \"{s.add(\"a\")}|{s.add(\"b\")}\"\n}\n";
+        assert_eq!(differential(multi), "1:[\"a\"]|2:[\"a\", \"b\"]");
+        // Record-valued state updated via `with`; a Map-valued state that accumulates.
+        let rec = "type Pos = Pos(x: Int, y: Int)\ncomponent Robot {\n    intent \"r\"\n    state pos: Pos = Pos(x: 0, y: 0)\n    \
+                   expose fun move(dx: Int, dy: Int) -> Str {\n        pos = pos with x: pos.x + dx, y: pos.y + dy\n        \"({pos.x},{pos.y})\"\n    }\n}\n\
+                   fun probe() -> Str {\n    let r = Robot()\n    \"{r.move(1, 2)}|{r.move(3, 0 - 1)}\"\n}\n";
+        assert_eq!(differential(rec), "(1,2)|(4,1)");
+    }
+
+    #[test]
     fn diff_if_let_and_while_let() {
         // `if let` as an EXPRESSION (both branches yield a value), with a nested pattern
         // and a Result scrutinee — byte-identical on interp/KVM (PR-it125).

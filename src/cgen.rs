@@ -5192,6 +5192,23 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native component state persists across calls, isolates instances, and accumulates
+    /// Map state in insertion order — matching interp/KVM (PR-it132).
+    #[test]
+    fn native_component_state_persists_and_isolates() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Tally {\n    intent \"t\"\n    state counts: Map[Str, Int] = Map()\n    \
+                   expose fun hit(k: Str) -> Str {\n        let cur = counts.get_or(k, 0)\n        counts = counts.insert(k, cur + 1)\n        \"{counts}\"\n    }\n}\n\
+                   fun main() uses io {\n    let t = Tally()\n    let u = Tally()\n    \
+                   print(\"{t.hit(\"a\")}|{t.hit(\"b\")}|{t.hit(\"a\")}|iso {u.hit(\"a\")}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "compstate").trim(),
+            "Map{\"a\": 1}|Map{\"a\": 1, \"b\": 1}|Map{\"a\": 2, \"b\": 1}|iso Map{\"a\": 1}"
+        );
+    }
+
     /// Native contract dispatch: a function taking a contract-typed parameter calls the
     /// right component's method (polymorphism over `fulfills`), matching interp/KVM (PR-it129).
     #[test]
