@@ -2104,6 +2104,31 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_chunk_then_aggregate_batch_processing() {
+        // A certification lock (it259): the batch-processing idiom, the non-overlapping complement to
+        // it257's window->aggregate. chunk(k) splits a list into consecutive NON-overlapping groups
+        // (window's were overlapping), and the crucial edge is the PARTIAL LAST CHUNK when the length
+        // doesn't divide evenly. chunk(3) over [1..7] gives [[1,2,3],[4,5,6],[7]] — two full batches
+        // and a singleton tail — so folding each yields sums [6, 15, 7] and sizes [3, 3, 1]; chunk(2)
+        // gives a length-1 tail too (maxes [2, 4, 6, 7]); and [1,2,3,4].chunk(2) divides exactly
+        // ([3, 7], no partial). chunk(3).len() == 3 (ceil(7/3)). Byte-identical on interp/KVM (native
+        // per the sweep). This pins that the partial tail is neither dropped nor padded.
+        let src = r#"fun probe() -> Str {
+    let xs = [1, 2, 3, 4, 5, 6, 7]
+    let batchsums = xs.chunk(3).map(fn c { c.fold(0, fn(a, x) { a + x }) })
+    let batchsizes = xs.chunk(3).map(fn c { c.len() })
+    let batchmaxes = xs.chunk(2).map(fn c { c.fold(0, fn(m, x) { if x > m { x } else { m } }) })
+    let exact = [1, 2, 3, 4].chunk(2).map(fn c { c.fold(0, fn(a, x) { a + x }) })
+    "{batchsums}|{batchsizes}|{batchmaxes}|{exact}|{xs.chunk(3).len()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[6, 15, 7]|[3, 3, 1]|[2, 4, 6, 7]|[3, 7]|3"
+        );
+    }
+
+    #[test]
     fn diff_window_then_aggregate_moving_stats() {
         // A certification lock (it257): the sliding-window aggregation idiom. it165 locked window()
         // producing overlapping sub-lists; this composes it with map + fold to compute a MOVING
