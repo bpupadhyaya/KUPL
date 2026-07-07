@@ -906,6 +906,27 @@ mod tests {
     }
 
     #[test]
+    fn bundle_execution_roundtrip_is_byte_identical() {
+        // Beyond the structural (disassembly) round-trip above, the module EXTRACTED from a
+        // bundle trailer must EXECUTE to the exact same output as running the source — the
+        // end-to-end guarantee that `kupl bundle` ships behavior identical to the source, across
+        // ADT match, HOF map/fold, and numeric/string builtins (PR-it190).
+        let src = "type Shape = Circle(r: Float) | Rect(w: Float, h: Float)\n\
+                   fun area(s: Shape) -> Float {\n    match s {\n        Circle(r) => 3.0 * r * r\n        Rect(w, h) => w * h\n    }\n}\n\
+                   fun probe() -> Str {\n    let shapes = [Circle(2.0), Rect(3.0, 4.0)]\n    \
+                   let areas = shapes.map(fn s { area(s) })\n    \
+                   \"{areas}|{areas.fold(0.0, fn(a, x) { a + x })}|{(6).factorial()}|{\"Hi\".swapcase()}\"\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module");
+        let fake_exe = vec![0x7fu8; 2000];
+        let bundled = super::write_bundle(&fake_exe, &module);
+        let back = super::read_bundle(&bundled).expect("has trailer").expect("decodes");
+        let mut vm = crate::vm::Vm::new(&back);
+        let v = vm.call_named("probe", vec![]).expect("runs");
+        assert_eq!(v.to_string(), "[12.0, 12.0]|24.0|720|hI");
+    }
+
+    #[test]
     fn bundle_roundtrip() {
         let src = "fun main() {\n    print(\"bundled!\")\n}\n";
         let compiled = crate::run::compile(src).expect("compiles");
