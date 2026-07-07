@@ -2082,6 +2082,26 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_json_nested_mixed_roundtrip() {
+        // Extends diff_json_key_order_and_sort_stability (it162, a FLAT object's key order) to a
+        // NESTED object with MIXED value types: a string, an array of numbers, and a nested object
+        // with a bool. parse -> stringify round-trips the whole structure — key order preserved at
+        // each level, compact formatting (no spaces), numbers without trailing `.0`, and the nested
+        // object and array reproduced exactly. Byte-identical on interp/KVM (a bug-hunt-15 lock;
+        // the rest of the batch — List chunk/window/scan, date leap/century-nonleap, tensor
+        // reductions — was already locked/consistent) (PR-it238).
+        let src = r#"fun probe() -> Str {
+    let data = "\{\"name\": \"kupl\", \"nums\": [1, 2, 3], \"nested\": \{\"ok\": true\}\}"
+    match json_parse(data) {
+        Ok(v) => json_stringify(v)
+        Err(e) => "err:{e}"
+    }
+}
+"#;
+        assert_eq!(differential(src), r#"{"name":"kupl","nums":[1,2,3],"nested":{"ok":true}}"#);
+    }
+
+    #[test]
     fn diff_map_build_from_pairs_and_group_by() {
         // A common AI-generated data-processing idiom, byte-identical on interp/KVM (and native, per
         // the sweep): (a) build a Map by folding a list of [key, value] pairs in a for-loop; (b) the
