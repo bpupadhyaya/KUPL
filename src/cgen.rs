@@ -1551,11 +1551,18 @@ static void kb_putcp(KBuf* b, unsigned int cp) {   /* UTF-8 encode a code point 
 
 /* --- serialize (mirror json.rs write_value/format_num/write_string) --- */
 static void k_json_num(KBuf* b, double n) {
-    if (isfinite(n) && n == floor(n) && fabs(n) < 1e15) {
+    /* Non-finite: match json.rs::format_num's Rust `f64::to_string()` spelling. */
+    if (isnan(n)) { kb_puts(b, "NaN"); return; }
+    if (isinf(n)) { kb_puts(b, n < 0 ? "-inf" : "inf"); return; }
+    if (n == floor(n) && fabs(n) < 1e15) {
         char t[32]; snprintf(t, sizeof t, "%lld", (long long)n); kb_puts(b, t);
-    } else {  /* n.to_string(): shortest round-trip */
-        char t[64];
-        for (int p = 1; p <= 17; p++) { snprintf(t, sizeof t, "%.*g", p, n); if (strtod(t, 0) == n) break; }
+    } else {
+        /* Shortest POSITIONAL (never scientific) representation that round-trips —
+           matches Rust's `f64::to_string()` used by json.rs::format_num. `%g` diverged
+           to scientific (1e20 -> "1e+20") vs the interpreter's "100000000000000000000".
+           prec starts at 0 so a large whole value has no trailing ".0" (JSON style). */
+        char t[512];
+        for (int p = 0; p <= 340; p++) { snprintf(t, sizeof t, "%.*f", p, n); if (strtod(t, 0) == n) break; }
         kb_puts(b, t);
     }
 }
@@ -4854,6 +4861,21 @@ mod tests {
                    print(\"{[1, 2] == [1, 2]}{Pt(1, 2) == Pt(1, 2)}{Red == Blue}{Some([1, 2]) == Some([1, 2])}\
                    {ma == mb}{nan == nan}{-0.0 == 0.0}{\"Z\" < \"a\"}\")\n}\n";
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
+    }
+
+    /// Native JSON number stringify is positional (never scientific) — PR-it114 fixed
+    /// a `%g` divergence (1e20 -> "1e+20") to match interp's "100000000000000000000".
+    #[test]
+    fn native_json_number_positional() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{json_stringify(JNum(1e20))}|{json_stringify(JNum(0.1 + 0.2))}|{json_stringify(JNum(42.0))}|{json_stringify(JNum(0.00001))}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "jnum").trim(),
+            "100000000000000000000|0.30000000000000004|42|0.00001"
+        );
     }
 
     /// Native List.scan (prefix accumulation, PR-it113) matches interp/KVM.

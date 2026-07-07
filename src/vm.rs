@@ -1883,6 +1883,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_json_number_and_string_fidelity() {
+        // PR-it114: JSON numbers format positionally (never scientific), byte-identical
+        // on interp/KVM — a large integer-valued float is "100000000000000000000", not
+        // "1e+20"; whole numbers drop the ".0"; precision is shortest-round-trip.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{json_stringify(JNum(0.1 + 0.2))}|{json_stringify(JNum(1e20))}|{json_stringify(JNum(1.0 / 3.0))}|{json_stringify(JNum(1e-10))}|{json_stringify(JNum(42.0))}|{json_stringify(JNum(1.5))}\" }\n"),
+            "0.30000000000000004|100000000000000000000|0.3333333333333333|0.0000000001|42|1.5"
+        );
+        // string escaping: quote/backslash/newline/tab become JSON escapes.
+        assert_eq!(
+            differential("fun probe() -> Str { json_stringify(JStr(\"tab\\tnl\\nq\\\"end\")) }\n"),
+            "\"tab\\tnl\\nq\\\"end\""
+        );
+        // a value survives json_parse(json_stringify(x)) round-trip.
+        assert_eq!(
+            differential("fun probe() -> Str { let d = JObj(Map().insert(\"a\", JNum(1e20)).insert(\"b\", JArr([JBool(true), JNull])))\n    match json_parse(json_stringify(d)) { Ok(j) => json_stringify(j)\n        _ => \"ERR\" } }\n"),
+            "{\"a\":100000000000000000000,\"b\":[true,null]}"
+        );
+    }
+
+    #[test]
     fn diff_list_scan_prefix_accumulation() {
         // PR-it113: `scan` is `fold` that keeps every running accumulator, byte-identical
         // on interp/KVM. Prefix sums, running max, empty list, and non-numeric accumulators.
