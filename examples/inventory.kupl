@@ -1,0 +1,107 @@
+// A small inventory ledger: an end-to-end program composing records, a contract
+// fulfilled by a stateful component, pattern matching, collection higher-order
+// methods, Option/Result + `?`, string processing, and a generic helper.
+//
+// It parses a list of text commands ("add apple 5", "remove apple 2", "add pear 3"),
+// applies each to a stock Warehouse, and prints a summary. Errors (removing more than
+// on hand, malformed commands) are surfaced as Result, not crashes.
+
+type Item = { name: Str, qty: Int }
+
+// A parsed command is a small ADT.
+type Cmd = Add(name: Str, n: Int)
+        | Remove(name: Str, n: Int)
+
+// Contract: anything that stores stock. A consumer depends on this, not the component.
+contract Stock {
+    intent "Keyed integer stock levels."
+    expose fun apply(c: Cmd) -> Result[Int, Str]
+    expose fun total() -> Int
+}
+
+component Warehouse fulfills Stock {
+    intent "In-memory stock keyed by item name, insertion-ordered."
+    state levels: Map[Str, Int] = Map()
+
+    expose fun apply(c: Cmd) -> Result[Int, Str] {
+        match c {
+            Add(name, n) => {
+                let cur = levels.get_or(name, 0)
+                levels = levels.insert(name, cur + n)
+                Ok(cur + n)
+            }
+            Remove(name, n) => {
+                let cur = levels.get_or(name, 0)
+                if n > cur {
+                    Err("cannot remove {n} {name}: only {cur} on hand")
+                } else {
+                    levels = levels.insert(name, cur - n)
+                    Ok(cur - n)
+                }
+            }
+        }
+    }
+
+    expose fun total() -> Int {
+        levels.values().fold(0, fn(a, x) { a + x })
+    }
+
+    expose fun report() -> Str {
+        levels.keys().map(fn k { "{k}={levels.get_or(k, 0)}" }).join(", ")
+    }
+}
+
+// Generic helper: the first element of a list satisfying a predicate.
+fun first_where[T](xs: List[T], pred: fn(T) -> Bool) -> Option[T] {
+    xs.filter(pred).get(0)
+}
+
+// Parse one command line into a Cmd, or None if malformed.
+fun parse_cmd(line: Str) -> Option[Cmd] {
+    let parts = line.split(" ")
+    if parts.len() != 3 {
+        None
+    } else {
+        let verb = parts.get(0).unwrap_or("")
+        let name = parts.get(1).unwrap_or("")
+        match parts.get(2).unwrap_or("").parse_int() {
+            None => None
+            Some(n) => {
+                match verb {
+                    "add" => Some(Add(name, n))
+                    "remove" => Some(Remove(name, n))
+                    _ => None
+                }
+            }
+        }
+    }
+}
+
+fun main() uses io {
+    let script = ["add apple 5", "add pear 3", "remove apple 2", "remove pear 9", "bogus line", "add apple 4"]
+    let wh = Warehouse()
+    var log: List[Str] = []
+    for line in script {
+        match parse_cmd(line) {
+            None => { log = log.push("skip: {line}") }
+            Some(c) => {
+                match wh.apply(c) {
+                    Ok(v) => { log = log.push("ok: {line} -> {v}") }
+                    Err(e) => { log = log.push("err: {e}") }
+                }
+            }
+        }
+    }
+    for entry in log {
+        print(entry)
+    }
+    print("---")
+    print("stock: {wh.report()}")
+    print("total: {wh.total()}")
+    let items = [Item(name: "apple", qty: 7), Item(name: "pear", qty: 0)]
+    let qtys = items.map(fn it { it.qty })
+    match first_where(qtys, fn q { q == 0 }) {
+        Some(_) => print("some item is out of stock")
+        None => print("all in stock")
+    }
+}

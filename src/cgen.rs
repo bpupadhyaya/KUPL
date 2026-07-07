@@ -5209,6 +5209,32 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native end-to-end integration: an ADT command, a Stock contract fulfilled by a
+    /// stateful component with Map state, a method returning Result matched by the caller,
+    /// collection HOFs — the composition runs identically to interp/KVM (PR-it133,
+    /// examples/inventory.kupl). Feature-interaction regression guard.
+    #[test]
+    fn native_inventory_integration() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Cmd = Add(name: Str, n: Int) | Remove(name: Str, n: Int)\n\
+                   contract Stock {\n    intent \"s\"\n    expose fun apply(c: Cmd) -> Result[Int, Str]\n}\n\
+                   component Warehouse fulfills Stock {\n    intent \"w\"\n    state levels: Map[Str, Int] = Map()\n    \
+                   expose fun apply(c: Cmd) -> Result[Int, Str] {\n        match c {\n            \
+                   Add(name, n) => {\n                let cur = levels.get_or(name, 0)\n                levels = levels.insert(name, cur + n)\n                Ok(cur + n)\n            }\n            \
+                   Remove(name, n) => {\n                let cur = levels.get_or(name, 0)\n                if n > cur { Err(\"short {name}\") } else {\n                    levels = levels.insert(name, cur - n)\n                    Ok(cur - n)\n                }\n            }\n        }\n    }\n    \
+                   expose fun total() -> Int { levels.values().fold(0, fn(a, x) { a + x }) }\n}\n\
+                   fun main() uses io {\n    let wh = Warehouse()\n    var out: List[Str] = []\n    \
+                   for c in [Add(\"a\", 5), Remove(\"a\", 2), Remove(\"a\", 9), Add(\"b\", 3)] {\n        \
+                   match wh.apply(c) {\n            Ok(v) => { out = out.push(\"ok {v}\") }\n            Err(e) => { out = out.push(e) }\n        }\n    }\n    \
+                   print(\"{out.join(\" | \")} :: total {wh.total()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "inventory").trim(),
+            "ok 5 | ok 3 | short a | ok 3 :: total 6"
+        );
+    }
+
     /// Native contract dispatch: a function taking a contract-typed parameter calls the
     /// right component's method (polymorphism over `fulfills`), matching interp/KVM (PR-it129).
     #[test]
