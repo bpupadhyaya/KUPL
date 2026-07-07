@@ -2394,6 +2394,35 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_record_equality_set_dedup_emoji() {
+        // A ninth bug-hunt sweep (it219, ~10 probes) found no divergence; this locks its subtlest
+        // deterministic edges, byte-identical on interp/KVM: record equality is STRUCTURAL (deep,
+        // so a Set of records dedups by value and nested records compare field-by-field), and
+        // string length / casing / reversal are char-indexed and unicode-correct — an emoji counts
+        // as one char and survives to_upper and a double reverse (PR-it219).
+        let rec = r#"type Pt = { x: Int, y: Int }
+type Line = { a: Pt, b: Pt }
+fun probe() -> Str {
+    let s = Set([Pt(x: 1, y: 2), Pt(x: 1, y: 2), Pt(x: 3, y: 4)])
+    let l1 = Line(a: Pt(x: 0, y: 0), b: Pt(x: 1, y: 1))
+    let l2 = Line(a: Pt(x: 0, y: 0), b: Pt(x: 1, y: 1))
+    let l3 = Line(a: Pt(x: 0, y: 0), b: Pt(x: 2, y: 2))
+    "{s.len()}|{s.contains(Pt(x: 1, y: 2))}|{l1 == l2}|{l1 == l3}|{l1}"
+}
+"#;
+        assert_eq!(
+            differential(rec),
+            "2|true|true|false|Line(Pt(0, 0), Pt(1, 1))"
+        );
+        let emoji = r#"fun probe() -> Str {
+    let s = "héllo 🎉 wörld"
+    "{s.len()}|{s.chars().len()}|{s.to_upper()}|{s.reverse().reverse()}"
+}
+"#;
+        assert_eq!(differential(emoji), "13|13|HéLLO 🎉 WöRLD|héllo 🎉 wörld");
+    }
+
+    #[test]
     fn diff_tensor_elementwise_reductions_dot() {
         // Tensor elementwise ops, reductions, dot product, and scalar scaling are byte-identical
         // across interp/KVM — including the IEEE subtlety that scaling a +0.0 element by -1.0
