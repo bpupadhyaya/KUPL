@@ -2335,6 +2335,28 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_float_int_conversions() {
+        // round is half-away-from-zero and returns a Float; floor/ceil return Float and are
+        // correct on negatives (PR-it142).
+        assert_eq!(
+            differential("fun probe() -> Str { let n25 = 0.0 - 2.5\n    \"{(2.5).round()}|{(3.5).round()}|{n25.round()}|{(2.4).round()}|{(2.6).round()}|{(2.7).floor()}|{(0.0 - 2.7).floor()}|{(2.7).ceil()}|{(0.0 - 2.7).ceil()}\" }\n"),
+            "3.0|4.0|-3.0|2.0|3.0|2.0|-3.0|3.0|-2.0"
+        );
+        // to_int truncates toward zero and returns an Int; to_int of an out-of-range float
+        // SATURATES, NaN -> 0, +inf -> i64::MAX, -inf -> i64::MIN — the native C `(long)double`
+        // cast is UB for these, so this pins it to Rust's saturating `as i64`.
+        assert_eq!(
+            differential("fun probe() -> Str { let big = 1.0e20\n    let nan = 0.0 / 0.0\n    let inf = 1.0 / 0.0\n    \"{(3.9).to_int()}|{(0.0 - 3.9).to_int()}|{(0.9).to_int()}|{big.to_int()}|{nan.to_int()}|{inf.to_int()}|{(0.0 - inf).to_int()}\" }\n"),
+            "3|-3|0|9223372036854775807|0|9223372036854775807|-9223372036854775808"
+        );
+        // Int -> Float is exact for small ints and rounds for huge ones (i64::MAX rounds up).
+        assert_eq!(
+            differential("fun probe() -> Str { let half = (7).to_float() / 2.0\n    \"{(5).to_float()}|{half}|{half.round()}|{(9223372036854775807).to_float()}\" }\n"),
+            "5.0|3.5|4.0|9223372036854775808.0"
+        );
+    }
+
+    #[test]
     fn diff_float_formatting_extremes_and_specials() {
         // The manual decimal formatter is byte-identical on interp/KVM for special
         // values, IEEE semantics, shortest-round-trip precision, and negative zero.

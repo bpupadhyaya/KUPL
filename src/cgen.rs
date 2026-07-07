@@ -5065,6 +5065,22 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native float->int conversions match interp/KVM including the C-undefined cases: an
+    /// out-of-range float SATURATES, NaN -> 0, +/-inf -> i64::MAX/MIN (native must not use a
+    /// raw `(long)double` cast, which is UB here) — plus round/floor/to_int (PR-it142).
+    #[test]
+    fn native_float_int_conversions() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let big = 1.0e20\n    let nan = 0.0 / 0.0\n    let inf = 1.0 / 0.0\n    \
+                   print(\"{(2.5).round()}|{(0.0 - 2.5).round()}|{(2.7).floor()}|{(3.9).to_int()}|{big.to_int()}|{nan.to_int()}|{inf.to_int()}|{(0.0 - inf).to_int()}|{(5).to_float()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "f2iconv").trim(),
+            "3.0|-3.0|2.0|3|9223372036854775807|0|9223372036854775807|-9223372036854775808|5.0"
+        );
+    }
+
     /// Native's manual float formatter matches interp/KVM at the extremes: special
     /// values, IEEE semantics, negative zero, and exact round-trips of huge/tiny magnitudes.
     #[test]
