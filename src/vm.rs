@@ -2252,6 +2252,32 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_numeric_literal_forms() {
+        // Hex/binary/underscore int literals and scientific/underscore float literals all lex to
+        // the SAME runtime value on interp/KVM, and the hex i64 boundary wraps as two's-complement
+        // (0xFFFF_FFFF_FFFF_FFFF = -1, 0x8000...0 = i64::MIN) — a native test pins the float forms
+        // against native's own printer (PR-it207).
+        let ints = r#"fun probe() -> Str {
+    "{0xFF}|{0xff}|{0b1010}|{1_000_000}|{0x00FF_FF00}|{0b1111_0000}"
+}
+"#;
+        assert_eq!(differential(ints), "255|255|10|1000000|16776960|240");
+        let hexb = r#"fun probe() -> Str {
+    "{0xFFFFFFFFFFFFFFFF}|{0x7FFFFFFFFFFFFFFF}|{0x8000000000000000}"
+}
+"#;
+        assert_eq!(differential(hexb), "-1|9223372036854775807|-9223372036854775808");
+        let floats = r#"fun probe() -> Str {
+    "{1e3}|{1.5e2}|{2.5e-3}|{1_000.5}|{6.022e23}|{1E4}"
+}
+"#;
+        assert_eq!(
+            differential(floats),
+            "1000.0|150.0|0.0025|1000.5|602200000000000027262976.0|10000.0"
+        );
+    }
+
+    #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose
         // guard holds; a guard that fails falls through to later arms. This is byte-identical on

@@ -6169,6 +6169,24 @@ fun main() uses io {
         );
     }
 
+    /// Native lexes hex/binary/underscore ints and scientific/underscore floats to the same
+    /// values as interp/KVM, and prints the full-precision float form identically — 6.022e23
+    /// renders as 602200000000000027262976.0 on native's own printer too (PR-it207).
+    #[test]
+    fn native_numeric_literal_forms() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{0xFF}|{0b1111_0000}|{1_000_000}|{0xFFFFFFFFFFFFFFFF}|{1.5e2}|{2.5e-3}|{6.022e23}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "numlit").trim(),
+            "255|240|1000000|-1|150.0|0.0025|602200000000000027262976.0"
+        );
+    }
+
     /// Native List.dedup collapses only consecutive runs (Unix uniq), matching interp/KVM — and
     /// differs from unique() when a value recurs non-adjacently (PR-it203).
     #[test]
