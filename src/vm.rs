@@ -2252,6 +2252,44 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_loopvar_capture_negmod_try_propagation() {
+        // A fifth bug-hunt sweep (it205, ~10 probes) found no divergence; this locks its subtlest
+        // deterministic edges, byte-identical on interp/KVM. Each closure made in a loop captures
+        // that iteration's value of i (not the final i — the classic late-binding footgun), so
+        // adding 10 yields 10/11/12; negative % and / truncate toward zero with the remainder's
+        // sign following the dividend; and `?` on a Result short-circuits the whole function on
+        // the FIRST Err, propagating it unchanged (PR-it205).
+        let cap = r#"fun probe() -> Str {
+    var fns: List[fn(Int) -> Int] = []
+    for i in 0..3 { fns = fns.push(fn x { x + i }) }
+    "{fns.map(fn f { f(10) })}"
+}
+"#;
+        assert_eq!(differential(cap), "[10, 11, 12]");
+        let nm = r#"fun probe() -> Str {
+    "{(0 - 7) % 3}|{7 % (0 - 3)}|{(0 - 7) / 3}|{(0 - 7) / (0 - 3)}|{(0 - 8) % 4}"
+}
+"#;
+        assert_eq!(differential(nm), "-1|1|-2|2|0");
+        let tq = r#"fun parse_pos(s: Str) -> Result[Int, Str] {
+    match s.parse_int() {
+        Some(n) => if n > 0 { Ok(n) } else { Err("not positive") }
+        None => Err("not a number")
+    }
+}
+fun sum_two(a: Str, b: Str) -> Result[Int, Str] {
+    let x = parse_pos(a)?
+    let y = parse_pos(b)?
+    Ok(x + y)
+}
+fun probe() -> Str {
+    "{sum_two("3", "4")}|{sum_two("x", "4")}"
+}
+"#;
+        assert_eq!(differential(tq), r#"Ok(7)|Err("not a number")"#);
+    }
+
+    #[test]
     fn diff_replace_json_largelist_edges() {
         // A second bug-hunt sweep (it200, ~10 probes) found no divergence; this locks the
         // subtlest deterministic edges it exercised, byte-identical on interp/KVM: str replace
