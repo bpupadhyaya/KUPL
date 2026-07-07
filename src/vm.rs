@@ -2082,6 +2082,30 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_ackermann_nonprimitive_recursion() {
+        // A bug-hunt-11 lock (it227): the Ackermann function is the canonical NON-primitive-recursive
+        // function — its `ackermann(m - 1, ackermann(m, n - 1))` arm nests a recursive call inside
+        // another call's argument, so both the recursion depth AND the inner argument are themselves
+        // computed by recursion. This stresses call-stack management and argument-evaluation order far
+        // beyond simple or mutual recursion (it139), and is byte-identical on interp/KVM: A(1,5)=7,
+        // A(2,2)=7, A(2,4)=11, A(2,5)=13. (The deeper m=3 cases A(3,3)=61 and A(3,4)=125 are
+        // exercised by the native test in cgen.rs, which runs in a subprocess with a full stack.
+        // Ackermann nests a recursive call in argument position, holding several eval frames open per
+        // KUPL level, so even A(3,2) overflows the 2 MB test-thread stack in a debug build — hence the
+        // in-process differential stays at m<=2.) The rest of the batch-11 sweep (List.get OOB->None,
+        // flatten, try `?` chains, mutual recursion) was already locked and consistent.
+        let src = r#"fun ackermann(m: Int, n: Int) -> Int {
+    if m == 0 { n + 1 }
+    else { if n == 0 { ackermann(m - 1, 1) } else { ackermann(m - 1, ackermann(m, n - 1)) } }
+}
+fun probe() -> Str {
+    "{ackermann(0, 0)}|{ackermann(1, 5)}|{ackermann(2, 2)}|{ackermann(2, 4)}|{ackermann(2, 5)}"
+}
+"#;
+        assert_eq!(differential(src), "1|7|7|11|13");
+    }
+
+    #[test]
     fn diff_mutual_recursion() {
         // Mutually-recursive functions (a calls b, b calls a) work regardless of definition
         // order — is_odd is defined AFTER is_even yet each calls the other. Byte-identical on

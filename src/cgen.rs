@@ -4814,6 +4814,20 @@ mod tests {
         }
     }
 
+    /// Ackermann (it227): the canonical non-primitive-recursive function compiles to native and
+    /// matches the interpreter — nested recursive calls in an argument position exercise the C call
+    /// stack deeply. A(3,4)=125 alone makes ~10^4 calls.
+    #[test]
+    fn native_ackermann() {
+        let src = "fun ackermann(m: Int, n: Int) -> Int {\n    \
+                   if m == 0 { n + 1 }\n    \
+                   else { if n == 0 { ackermann(m - 1, 1) } else { ackermann(m - 1, ackermann(m, n - 1)) } }\n}\n\
+                   fun main() uses io {\n    print(\"{ackermann(2, 3)}|{ackermann(3, 3)}|{ackermann(3, 4)}\")\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "ackermann").trim(), "9|61|125");
+        }
+    }
+
     /// Option/Result combinators (it77) compile to native (callbacks via k_call):
     /// a map/and_then/ok_or/map_err/ok chain matches the interpreter.
     #[test]
