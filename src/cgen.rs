@@ -6206,6 +6206,25 @@ fun main() uses io {
         );
     }
 
+    /// Native tensor elementwise/reduction/dot output matches interp/KVM, including the -0.0 that
+    /// scaling a +0.0 element by -1.0 produces on native's own float printer (PR-it218).
+    #[test]
+    fn native_tensor_ops() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let a = tensor([1.0, 2.0, 3.0, 4.0])
+    let z = tensor([0.0, 1.0])
+    print("{a + a}|{a.sum()}|{a.dot(a)}|{z.scale(0.0 - 1.0)}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "tensorops").trim(),
+            "Tensor([2.0, 4.0, 6.0, 8.0])|10.0|30.0|Tensor([-0.0, -1.0])"
+        );
+    }
+
     /// Native lexes hex/binary/underscore ints and scientific/underscore floats to the same
     /// values as interp/KVM, and prints the full-precision float form identically — 6.022e23
     /// renders as 602200000000000027262976.0 on native's own printer too (PR-it207).

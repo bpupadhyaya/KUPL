@@ -2394,6 +2394,36 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_tensor_elementwise_reductions_dot() {
+        // Tensor elementwise ops, reductions, dot product, and scalar scaling are byte-identical
+        // across interp/KVM — including the IEEE subtlety that scaling a +0.0 element by -1.0
+        // yields -0.0, and that chained arange/scale/add compose exactly (PR-it218).
+        let ops = r#"fun probe() -> Str {
+    let a = tensor([1.0, 2.0, 3.0, 4.0])
+    let b = tensor([10.0, 20.0, 30.0, 40.0])
+    "{a + b}|{a * b}|{a - b}|{a.scale(2.0)}|{a.sum()}|{a.mean()}|{a.max()}|{a.min()}|{a.dot(b)}"
+}
+"#;
+        assert_eq!(
+            differential(ops),
+            "Tensor([11.0, 22.0, 33.0, 44.0])|Tensor([10.0, 40.0, 90.0, 160.0])|Tensor([-9.0, -18.0, -27.0, -36.0])|Tensor([2.0, 4.0, 6.0, 8.0])|10.0|2.5|4.0|1.0|300.0"
+        );
+        let negzero = r#"fun probe() -> Str {
+    let a = tensor([0.0 - 3.0, 0.0, 1.5, 0.0 - 0.5])
+    "{a.scale(0.0 - 1.0)}|{a.sum()}|{a.mean()}"
+}
+"#;
+        assert_eq!(differential(negzero), "Tensor([3.0, -0.0, -1.5, 0.5])|-2.0|-0.5");
+        let chained = r#"fun probe() -> Str {
+    let a = arange(5).scale(1.5)
+    let b = a + arange(5)
+    "{b}|{b.sum()}|{b.dot(arange(5))}"
+}
+"#;
+        assert_eq!(differential(chained), "Tensor([0.0, 2.5, 5.0, 7.5, 10.0])|25.0|75.0");
+    }
+
+    #[test]
     fn diff_map_set_iteration_order_after_mutation() {
         // Map and Set iterate in INSERTION order deterministically across interp/KVM, and the
         // order is stable through a mixed mutation sequence: a removed-then-reinserted key lands at
