@@ -2082,6 +2082,37 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_match_three_field_ctor_and_nested_if_arm() {
+        // A bug-hunt-22 lock (it256): two match shapes the existing Shape tests omit. Prior locks
+        // (it1808/3123/4951) use at most 2-field constructors and classify via match GUARDS
+        // (`Rect(w, h) if w == h`); this binds a THREE-field constructor `Tri(a, b, c)` and does the
+        // classification with a NESTED if in the arm BODY (equilateral -> isosceles -> scalene,
+        // deciding on a==b then b==c). The canonical triangle classifier: three simultaneous field
+        // bindings and an arm body that is itself a nested conditional. Byte-identical on interp/KVM
+        // (native per the sweep).
+        let src = r#"type Shape = Circle(r: Int) | Rect(w: Int, h: Int) | Tri(a: Int, b: Int, c: Int)
+fun area(s: Shape) -> Int {
+    match s {
+        Circle(r) => 3 * r * r
+        Rect(w, h) => w * h
+        Tri(a, b, c) => a + b + c
+    }
+}
+fun classify(s: Shape) -> Str {
+    match s {
+        Circle(r) => if r > 10 { "big circle" } else { "small circle" }
+        Rect(w, h) => if w == h { "square" } else { "rectangle" }
+        Tri(a, b, c) => if a == b { if b == c { "equilateral" } else { "isosceles" } } else { "scalene" }
+    }
+}
+fun probe() -> Str {
+    "{area(Circle(r: 5))}|{area(Rect(w: 3, h: 4))}|{classify(Rect(w: 5, h: 5))}|{classify(Tri(a: 2, b: 2, c: 2))}|{classify(Tri(a: 2, b: 2, c: 3))}|{classify(Tri(a: 1, b: 2, c: 3))}"
+}
+"#;
+        assert_eq!(differential(src), "75|12|square|equilateral|isosceles|scalene");
+    }
+
+    #[test]
     fn diff_result_railway_multistage_short_circuit() {
         // A certification lock (it255): railway-oriented validation — chain several user-defined
         // fallible functions with `and_then`, each returning Result, so the pipeline short-circuits
