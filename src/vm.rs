@@ -2134,6 +2134,21 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_sized_int_arithmetic_overflow_panics() {
+        // Sized-int arithmetic is CHECKED at the type width (like the default i64 in PR-it151):
+        // it panics on overflow/underflow rather than wrapping — byte-identical on interp/KVM,
+        // and (per the native test) native does NOT wrap despite C's silent sized overflow.
+        assert_eq!(differential("fun probe() -> Str { \"{(255u8) + (1u8)}\" }\n"), "panic: integer overflow in addition");
+        assert_eq!(differential("fun probe() -> Str { \"{(200u8) + (100u8)}\" }\n"), "panic: integer overflow in addition");
+        assert_eq!(differential("fun probe() -> Str { \"{(127i8) + (1i8)}\" }\n"), "panic: integer overflow in addition");
+        // u8 cannot go negative, so subtracting below zero is an overflow panic, not a wrap.
+        assert_eq!(differential("fun probe() -> Str { \"{(0u8) - (1u8)}\" }\n"), "panic: integer overflow in subtraction");
+        assert_eq!(differential("fun probe() -> Str { \"{(16u8) * (16u8)}\" }\n"), "panic: integer overflow in multiplication");
+        // A result that fits the width computes normally (no false panic).
+        assert_eq!(differential("fun probe() -> Str { \"{(200u8) + (55u8)}\" }\n"), "255");
+    }
+
+    #[test]
     fn diff_sized_int_bitwise_width_semantics() {
         // Sized-int bitwise ops respect the operand WIDTH (unlike the default i64 Int): bnot is
         // a width-wide complement, shifts wrap at the width, i8 shr is arithmetic (sign-

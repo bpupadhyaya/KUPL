@@ -5542,6 +5542,29 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native sized-int arithmetic panics on overflow (does NOT wrap despite C's silent sized
+    /// overflow), matching interp/KVM: a fitting result computes, an overflow leaves stdout
+    /// empty via a clean panic (PR-it157).
+    #[test]
+    fn native_sized_int_arithmetic_overflow_panics() {
+        if !cc_available() {
+            return;
+        }
+        // fits the width -> computes.
+        assert_eq!(
+            native_main_stdout("fun main() uses io {\n    print((200u8) + (55u8))\n}\n", "sizedok").trim(),
+            "255"
+        );
+        // overflow -> clean panic to stderr, empty stdout (a C wrap would have printed 0 / 44 / 0).
+        for (src, tag) in [
+            ("fun main() uses io {\n    print((255u8) + (1u8))\n}\n", "sizedadd"),
+            ("fun main() uses io {\n    print((0u8) - (1u8))\n}\n", "sizedsub"),
+            ("fun main() uses io {\n    print((16u8) * (16u8))\n}\n", "sizedmul"),
+        ] {
+            assert!(native_main_stdout(src, tag).trim().is_empty(), "{tag}: expected a panic");
+        }
+    }
+
     /// Native sized-int bitwise ops mask results to the operand WIDTH, matching interp/KVM —
     /// C promotes u8/i8 to int, so bnot/shl must re-narrow or high bits would leak (PR-it155).
     #[test]
