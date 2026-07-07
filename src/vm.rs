@@ -2104,6 +2104,33 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_match_newline_arms_in_varied_paren_positions() {
+        // A bug-hunt-27 lock (it266): broadens the it265 parser fix beyond the map/fold-closure case
+        // to every paren-nesting position a newline-separated `match` can appear in, guarding against
+        // a narrow regression. Three positions that all sit inside an open `(`/`[`: (1) a `match` in
+        // a `.map(fn x { ... })` closure body; (2) a `match` inside a predicate closure passed to
+        // `.all()` which is itself the condition of an `if`; (3) `match` expressions used directly as
+        // LIST-LITERAL elements with their arms split across lines. All parse with newline-separated
+        // arms and run byte-identically on interp/KVM (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    let a = [0, 1, 2].map(fn x {
+        match x {
+            0 => "zero"
+            1 => "one"
+            _ => "many"
+        }
+    })
+    let b = if [1, 2].all(fn x { match x { 0 => false, _ => true } }) { "allnz" } else { "has0" }
+    let c = [match 1 { 1 => "y"
+                       _ => "n" }, match 2 { 2 => "yy"
+                                             _ => "nn" }]
+    "{a}|{b}|{c}"
+}
+"#;
+        assert_eq!(differential(src), r#"["zero", "one", "many"]|allnz|["y", "yy"]"#);
+    }
+
+    #[test]
     fn diff_match_newline_arms_inside_call_arg_closure() {
         // A real parser fix (it265): a `match` with NEWLINE-separated arms inside a call-argument
         // closure (paren context) used to fail with a bogus K0109. The lexer suppresses newlines
