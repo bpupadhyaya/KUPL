@@ -2210,6 +2210,21 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_swapcase() {
+        // The NEW swapcase() completes the ASCII casing family, byte-identical on interp/KVM:
+        // each ASCII letter flips case, digits/punctuation/non-ASCII are unchanged, and a double
+        // swap is the identity (PR-it189).
+        let src = r#"fun probe() -> Str {
+    "[{"Hello, WORLD".swapcase()}]|[{"MixEd 123".swapcase()}]|[{"".swapcase()}]|[{"héllo WÖRLD".swapcase()}]|[{"ALLCAPS".swapcase().swapcase()}]"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[hELLO, world]|[mIXeD 123]|[]|[HéLLO wÖrld]|[ALLCAPS]"
+        );
+    }
+
+    #[test]
     fn diff_string_capitalize() {
         // The NEW capitalize() is ASCII-cased like to_upper/to_lower, byte-identical on
         // interp/KVM: first char up + rest down, empty stays empty, a digit or non-ASCII first

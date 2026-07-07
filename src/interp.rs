@@ -2225,6 +2225,23 @@ pub fn shared_method(
             }
             Ok(Value::str(out))
         }
+        (Value::Str(s), "swapcase") => {
+            // ASCII casing: swap the case of each ASCII letter; every other char (digits,
+            // punctuation, non-ASCII) is left unchanged. "Hello, WÖRLD" -> "hELLO, wÖRLD".
+            let out: String = s
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_uppercase() {
+                        c.to_ascii_lowercase()
+                    } else if c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            Ok(Value::str(out))
+        }
         (Value::Str(s), "trim") => Ok(Value::str(s.trim().to_string())),
         // trim ` \t\n\r` from one side (the same set as `trim`, matching the C mirror)
         (Value::Str(s), "trim_start") => {

@@ -3668,6 +3668,20 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             out[sl] = 0;
             return k_str(out);
         }
+        if (!strcmp(name, "swapcase")) {
+            /* Swap case of each ASCII letter; non-ASCII bytes (>=128) fall through unchanged,
+               matching the interpreter's char-wise ASCII-only swap. */
+            size_t sl = strlen(s);
+            char* out = k_alloc(sl + 1);
+            for (size_t i = 0; i < sl; i++) {
+                char c = s[i];
+                if (c >= 'A' && c <= 'Z') out[i] = c + 32;
+                else if (c >= 'a' && c <= 'z') out[i] = c - 32;
+                else out[i] = c;
+            }
+            out[sl] = 0;
+            return k_str(out);
+        }
         if (!strcmp(name, "trim") || !strcmp(name, "trim_start") || !strcmp(name, "trim_end")) {
             int do_start = strcmp(name, "trim_end") != 0;   /* trim + trim_start */
             int do_end = strcmp(name, "trim_start") != 0;   /* trim + trim_end */
@@ -5715,6 +5729,23 @@ fun main() uses io {
 }
 "#;
         assert_eq!(native_main_stdout(src, "setsup").trim(), "true|false|true|true");
+    }
+
+    /// Native swapcase() matches interp/KVM: ASCII letters flip case, non-ASCII bytes unchanged
+    /// (PR-it189).
+    #[test]
+    fn native_string_swapcase() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("[{"Hello, WORLD".swapcase()}]|[{"MixEd 123".swapcase()}]|[{"héllo WÖRLD".swapcase()}]")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "strswap").trim(),
+            "[hELLO, world]|[mIXeD 123]|[HéLLO wÖrld]"
+        );
     }
 
     /// Native capitalize() matches interp/KVM: ASCII first-up/rest-down, non-ASCII first char
