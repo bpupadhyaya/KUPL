@@ -2296,6 +2296,26 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_int_abs_diff() {
+        // The NEW abs_diff is byte-identical on interp/KVM: symmetric |a-b| computed without
+        // intermediate overflow, and a result past i64::MAX is a checked panic — including the
+        // subtle abs_diff(i64::MIN, 0) = 2^63, one past i64::MAX (PR-it196).
+        let src = r#"fun probe() -> Str {
+    "{(5).abs_diff(3)}|{(3).abs_diff(5)}|{(0 - 5).abs_diff(3)}|{(0 - 5).abs_diff(0 - 8)}|{(9223372036854775807).abs_diff(0)}"
+}
+"#;
+        assert_eq!(differential(src), "2|2|8|3|9223372036854775807");
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(9223372036854775807).abs_diff(0 - 9223372036854775807 - 1)}\" }\n"),
+            "panic: integer overflow in `abs_diff`"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(0 - 9223372036854775807 - 1).abs_diff(0)}\" }\n"),
+            "panic: integer overflow in `abs_diff`"
+        );
+    }
+
+    #[test]
     fn diff_int_rem_div_euclid() {
         // The NEW rem_euclid/div_euclid are byte-identical on interp/KVM and genuinely differ
         // from % / /: rem_euclid is ALWAYS non-negative ((-7).rem_euclid(3)=2, not -1) and

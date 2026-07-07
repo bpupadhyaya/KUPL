@@ -3975,6 +3975,14 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             if (recv.as.i == INT64_MIN) k_panic("integer overflow in abs");
             return k_int(recv.as.i < 0 ? -recv.as.i : recv.as.i);
         }
+        if (!strcmp(name, "abs_diff")) {
+            /* |a - b| in __int128 so no intermediate overflow; a result past i64::MAX panics
+               (matches interp; KUPL Ints are signed and never wrap). */
+            __int128 d = (__int128)recv.as.i - (__int128)args[0].as.i;
+            if (d < 0) d = -d;
+            if (d > (__int128)INT64_MAX) k_panic("integer overflow in `abs_diff`");
+            return k_int((int64_t)d);
+        }
         if (!strcmp(name, "min")) return k_int(recv.as.i < args[0].as.i ? recv.as.i : args[0].as.i);
         if (!strcmp(name, "max")) return k_int(recv.as.i > args[0].as.i ? recv.as.i : args[0].as.i);
         if (!strcmp(name, "pow")) {
@@ -5823,6 +5831,20 @@ fun main() uses io {
             native_main_stdout(src, "strcap").trim(),
             "[Hello world]|[]|[123abc]|[élan]"
         );
+    }
+
+    /// Native abs_diff matches interp/KVM, computed in __int128 so |a-b| never wraps, with the
+    /// same overflow panic past i64::MAX (PR-it196).
+    #[test]
+    fn native_int_abs_diff() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{(5).abs_diff(3)}|{(0 - 5).abs_diff(3)}|{(9223372036854775807).abs_diff(0)}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "intabsd").trim(), "2|8|9223372036854775807");
     }
 
     /// Native rem_euclid/div_euclid match interp/KVM including the negative-operand cases where

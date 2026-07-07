@@ -146,7 +146,7 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 /// if a newly added method is missing here the only effect is a missed hint, so
 /// it need not track the method-resolution match perfectly.
 const BUILTIN_METHODS: &[&str] = &[
-    "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
+    "abs", "abs_diff", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
     "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "copysign", "cos",
     "count", "count_ones",
     "den", "difference", "div_euclid", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
@@ -2262,6 +2262,7 @@ impl Checker {
             (Ty::F32, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Float, "to_f32") => Some((vec![], Ty::F32)),
             (Ty::Int, "abs") => Some((vec![], Ty::Int)),
+            (Ty::Int, "abs_diff") => Some((vec![Ty::Int], Ty::Int)),
             (Ty::Int, "min") | (Ty::Int, "max") | (Ty::Int, "pow") | (Ty::Int, "gcd")
             | (Ty::Int, "lcm") | (Ty::Int, "rem_euclid") | (Ty::Int, "div_euclid") => {
                 Some((vec![Ty::Int], Ty::Int))

@@ -2510,6 +2510,20 @@ pub fn shared_method(
             .checked_abs()
             .map(Value::Int)
             .ok_or_else(|| "integer overflow in abs".to_string()),
+        (Value::Int(v), "abs_diff") => match args.into_iter().next() {
+            // |a - b| computed in i128 so no intermediate overflow; a result that exceeds
+            // i64::MAX (e.g. abs_diff(i64::MIN, 0) = 2^63) is a checked panic, since KUPL Ints
+            // are signed and never wrap.
+            Some(Value::Int(w)) => {
+                let d = (*v as i128 - w as i128).unsigned_abs();
+                if d <= i64::MAX as u128 {
+                    Ok(Value::Int(d as i64))
+                } else {
+                    Err("integer overflow in `abs_diff`".into())
+                }
+            }
+            _ => Err("`abs_diff` needs an Int".into()),
+        },
         (Value::Int(v), "min") => match args.into_iter().next() {
             Some(Value::Int(w)) => Ok(Value::Int((*v).min(w))),
             _ => Err("`min` needs an Int".into()),
