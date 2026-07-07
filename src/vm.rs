@@ -2104,6 +2104,41 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_option_combinator_chain_over_records() {
+        // A certification lock (it290): the Option-combinator chain over records -- find an entity in a
+        // list (returns Option[Record]), then map a field / filter a predicate / unwrap_or a default,
+        // WITHOUT a match expression. it286 reaches record fields through Option via `match`; this pins
+        // the combinator style (map + filter + unwrap_or) and, crucially, the filter-rejects-to-None
+        // short-circuit that skips the subsequent map. The four cases cover every branch:
+        //   findByName("amy").map(age).unwrap_or(-1)                     -> 30      (found, mapped)
+        //   findByName("bob").filter(age>=18).map(name).unwrap_or("minor")-> minor  (found, FILTERED OUT -> None -> map skipped -> default)
+        //   findByName("cal").filter(active).map("name:age").unwrap_or(..)-> cal:45 (found, passes filter, mapped)
+        //   findByName("zzz").map(name).unwrap_or("not-found")           -> not-found (never found -> None from the start)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms filter on a Some whose payload
+        // fails the predicate collapses to None (so the chained map does not run and the default wins),
+        // a Some flows its record payload through map's field projection, and a None from an empty
+        // find().first() propagates untouched to unwrap_or. This is the null-safe "look up an entity and
+        // safely extract a field with a fallback" navigation an AI writes constantly; a backend that let
+        // a filtered-out Some leak into map, or that lost the record payload across the chain, would
+        // diverge on the "minor" case while the straight found/not-found cases looked fine.
+        let src = r#"type User = { name: Str, age: Int, active: Bool }
+fun findByName(users: List[User], target: Str) -> Option[User] {
+    let matches = users.filter(fn u { u.name == target })
+    matches.first()
+}
+fun probe() -> Str {
+    let users = [User(name: "amy", age: 30, active: true), User(name: "bob", age: 17, active: false), User(name: "cal", age: 45, active: true)]
+    let amyAge = findByName(users, "amy").map(fn u { u.age }).unwrap_or(0 - 1)
+    let bobAdult = findByName(users, "bob").filter(fn u { u.age >= 18 }).map(fn u { u.name }).unwrap_or("minor")
+    let calActive = findByName(users, "cal").filter(fn u { u.active }).map(fn u { "{u.name}:{u.age}" }).unwrap_or("inactive")
+    let ghost = findByName(users, "zzz").map(fn u { u.name }).unwrap_or("not-found")
+    "{amyAge}|{bobAdult}|{calActive}|{ghost}"
+}
+"#;
+        assert_eq!(differential(src), "30|minor|cal:45|not-found");
+    }
+
+    #[test]
     fn diff_zip_with_over_two_heterogeneous_record_lists() {
         // A bug-hunt-37 lock (it289): zip_with combining two lists of DIFFERENT record types by
         // position -- the "join two parallel streams positionally" idiom. it1983 locks zip_with's
