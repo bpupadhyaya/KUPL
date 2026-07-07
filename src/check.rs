@@ -151,7 +151,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "count", "count_ones",
     "dedup", "den", "difference", "digits", "div_euclid", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "fract", "gcd",
-    "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
+    "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect", "intersperse",
     "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
     "is_odd", "is_ok", "is_some", "is_subset", "is_superset", "isqrt", "join", "keys", "last", "lcm",
     "leading_zeros", "len",
@@ -2157,6 +2157,7 @@ impl Checker {
                 Some((vec![(**t).clone()], Ty::Option(Box::new(Ty::Int))))
             }
             (Ty::List(t), "push") => Some((vec![(**t).clone()], Ty::List(t.clone()))),
+            (Ty::List(t), "intersperse") => Some((vec![(**t).clone()], Ty::List(t.clone()))),
             (Ty::List(t), "first") | (Ty::List(t), "last") => Some((vec![], Ty::Option(t.clone()))),
             (Ty::List(t), "reverse") => Some((vec![], Ty::List(t.clone()))),
             (Ty::List(t), "join") => {

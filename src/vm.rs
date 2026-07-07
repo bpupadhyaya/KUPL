@@ -2196,6 +2196,23 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_intersperse() {
+        // The NEW intersperse(sep) inserts sep between each pair of adjacent elements,
+        // byte-identical on interp/KVM. Empty and singleton lists are unchanged (no separator to
+        // place), and it works for any element type (PR-it212).
+        let src = r#"fun probe() -> Str {
+    let a = [1, 2, 3, 4]
+    let empty: List[Int] = []
+    "{a.intersperse(0)}|{[9].intersperse(0)}|{empty.intersperse(0)}|{["a", "b", "c"].intersperse("-")}|{[1, 2].intersperse(99)}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"[1, 0, 2, 0, 3, 0, 4]|[9]|[]|["a", "-", "b", "-", "c"]|[1, 99, 2]"#
+        );
+    }
+
+    #[test]
     fn diff_list_rotate() {
         // The NEW rotate_left(n)/rotate_right(n) cyclically shift a list, byte-identical on
         // interp/KVM. n is floor-modded by the length so a full rotation (n==len) and n>len are

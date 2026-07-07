@@ -2019,6 +2019,21 @@ pub fn shared_method(
                 _ => Err(format!("`{name}` needs an Int").into()),
             }
         }
+        // Insert `sep` between each pair of adjacent elements: [1,2,3].intersperse(0) =
+        // [1,0,2,0,3]. Empty and singleton lists are returned unchanged.
+        (Value::List(items), "intersperse") => match args.into_iter().next() {
+            Some(sep) => {
+                let mut out: Vec<Value> = Vec::with_capacity(items.len().saturating_mul(2));
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(sep.clone());
+                    }
+                    out.push(it.clone());
+                }
+                Ok(Value::List(Rc::new(out)))
+            }
+            None => Err("`intersperse` needs a separator".into()),
+        },
         (Value::List(items), "join") => {
             let sep = match args.into_iter().next() {
                 Some(Value::Str(s)) => s.as_str().to_string(),

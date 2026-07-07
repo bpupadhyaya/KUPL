@@ -3454,6 +3454,18 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             for (int64_t i = 0; i < len; i++) out[i] = l->items[(k + i) % len];
             return k_list(out, (int)len);
         }
+        /* intersperse(sep): put sep between each pair of adjacent elements; empty/singleton
+           unchanged. Output length is 2*len-1 for len>=1, else 0. */
+        if (!strcmp(name, "intersperse")) {
+            int64_t n = l->len == 0 ? 0 : 2 * l->len - 1;
+            KValue* out = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+            int64_t j = 0;
+            for (int64_t i = 0; i < l->len; i++) {
+                if (i > 0) out[j++] = args[0];
+                out[j++] = l->items[i];
+            }
+            return k_list(out, (int)n);
+        }
         if (!strcmp(name, "join")) {
             KBuf b = {0};
             /* Hoist the separator's rendering out of the loop (it was re-rendered every
@@ -6227,6 +6239,24 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "intdigits").trim(),
             "[1, 2, 3, 4, 5]|[0]|[1, 0, 0]|[9, 2, 2, 3, 3, 7, 2, 0, 3, 6, 8, 5, 4, 7, 7, 5, 8, 0, 8]"
+        );
+    }
+
+    /// Native List.intersperse inserts sep between adjacent elements (empty/singleton unchanged),
+    /// matching interp/KVM (PR-it212).
+    #[test]
+    fn native_list_intersperse() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let empty: List[Int] = []
+    print("{[1, 2, 3, 4].intersperse(0)}|{[9].intersperse(0)}|{empty.intersperse(0)}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "listintsp").trim(),
+            "[1, 0, 2, 0, 3, 0, 4]|[9]|[]"
         );
     }
 
