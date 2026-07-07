@@ -5542,6 +5542,28 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native JSON serialize/parse of nested structures matches interp/KVM: JObj keys in
+    /// insertion order, whole JNum as int, nested round-trip, duplicate-key last-wins (it162).
+    #[test]
+    fn native_json_nested_roundtrip_and_key_order() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let doc = JObj(Map().insert("name", JStr("kupl")).insert("items", JArr([JNum(1.0), JNull])))
+    let rt = match json_parse("\{\"a\": 1, \"b\": \{\"d\": 2.5\}, \"k\": 1, \"k\": 2\}") {
+        Ok(j) => json_stringify(j)
+        Err(e) => "err"
+    }
+    print("{json_stringify(doc)}#{rt}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "jsonrt").trim(),
+            "{\"name\":\"kupl\",\"items\":[1,null]}#{\"a\":1,\"b\":{\"d\":2.5},\"k\":2}"
+        );
+    }
+
     /// Native sets preserve insertion order through mutation, matching interp/KVM: insert-
     /// existing is a no-op keeping order, remove-then-reinsert moves to end, dedup is
     /// first-occurrence, and set algebra is deterministically ordered (PR-it161).

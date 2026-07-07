@@ -2134,6 +2134,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_json_nested_roundtrip_and_key_order() {
+        // JSON serialize/parse of nested structures is byte-identical on interp/KVM: JObj keys
+        // stringify in insertion order (matching the map cert), a whole JNum renders as an int
+        // and a fractional one keeps its decimal, parse preserves nested structure and key
+        // order, duplicate object keys are last-wins, and empty object/array round-trip
+        // (PR-it162).
+        let src = r#"fun probe() -> Str {
+    let inner = JObj(Map().insert("x", JNum(1.0)).insert("y", JBool(true)))
+    let doc = JObj(Map().insert("name", JStr("kupl")).insert("items", JArr([JNum(1.0), JNull])).insert("nested", inner))
+    let s1 = json_stringify(doc)
+    let rt = match json_parse("\{\"a\": 1, \"b\": [true, null], \"c\": \{\"d\": 2.5\}\}") {
+        Ok(j) => json_stringify(j)
+        Err(e) => "err"
+    }
+    let dup = match json_parse("\{\"k\": 1, \"k\": 2\}") {
+        Ok(j) => json_stringify(j)
+        Err(e) => "err"
+    }
+    "{s1}#{rt}#{dup}#{json_stringify(JObj(Map()))}|{json_stringify(JArr([]))}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "{\"name\":\"kupl\",\"items\":[1,null],\"nested\":{\"x\":1,\"y\":true}}#{\"a\":1,\"b\":[true,null],\"c\":{\"d\":2.5}}#{\"k\":2}#{}|[]"
+        );
+    }
+
+    #[test]
     fn diff_set_ops_preserve_insertion_order() {
         // Sets are insertion-ordered and stable through mutation, byte-identical on interp/KVM
         // (parallel to the map cert in PR-it160): insert of an existing element is a no-op that
