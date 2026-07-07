@@ -5518,6 +5518,20 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "mutualrec").trim(), "true|true|true|abb");
     }
 
+    /// Native while-loops and break/continue match interp/KVM, including break/continue
+    /// affecting only the innermost of nested loops (PR-it153).
+    #[test]
+    fn native_while_break_continue() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    var w = 0\n    while w < 100 { if w == 7 { break }\n        w = w + 1 }\n    \
+                   var s = 0\n    for x in 1..10 { if x % 2 == 0 { continue }\n        s = s + x }\n    \
+                   var out: List[Int] = []\n    for p in 1..4 {\n        for q in 1..4 {\n            if q == 2 { continue }\n            if q == 3 { break }\n            out = out.push(p * 10 + q)\n        }\n    }\n    \
+                   print(\"{w}|{s}|{out}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "whilebc").trim(), "7|25|[11, 21, 31]");
+    }
+
     /// Native for-loop / range iteration matches interp/KVM: hi-exclusive ranges, empty and
     /// reversed ranges iterate zero times, negative bounds, list order, nesting (PR-it152).
     #[test]

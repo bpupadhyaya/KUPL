@@ -2134,6 +2134,21 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_while_loop_and_break_continue() {
+        // while runs while its condition holds (false-initial => zero iterations); break exits
+        // the innermost loop; continue skips the rest of the current iteration; in nested loops
+        // break/continue affect only the INNER loop — byte-identical on interp/KVM (PR-it153).
+        let src = "fun probe() -> Str {\n    var i = 0\n    while i < 5 { i = i + 1 }\n    \
+                   var j = 0\n    while false { j = j + 1 }\n    \
+                   var a = 48\n    var b = 36\n    while b != 0 { let t = b\n        b = a % b\n        a = t }\n    \
+                   var w = 0\n    while w < 100 { if w == 7 { break }\n        w = w + 1 }\n    \
+                   var s = 0\n    for x in 1..10 { if x % 2 == 0 { continue }\n        s = s + x }\n    \
+                   var out: List[Int] = []\n    for p in 1..4 {\n        for q in 1..4 {\n            if q == 2 { continue }\n            if q == 3 { break }\n            out = out.push(p * 10 + q)\n        }\n    }\n    \
+                   \"{i}|{j}|{a}|{w}|{s}|{out}\"\n}\n";
+        assert_eq!(differential(src), "5|0|12|7|25|[11, 21, 31]");
+    }
+
+    #[test]
     fn diff_range_and_for_loop_edges() {
         // Ranges are hi-EXCLUSIVE; an empty range (lo == hi) and a reversed range (lo > hi)
         // both iterate zero times; negative bounds work. `for` over a List preserves order;
