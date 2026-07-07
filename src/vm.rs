@@ -1883,6 +1883,36 @@ mod tests {
     }
 
     #[test]
+    fn diff_bigint_and_rational_edges() {
+        // Arbitrary-precision BigInt: exact huge products, truncated-toward-zero div/mod
+        // with negatives, and a clean div-by-zero panic — byte-identical on interp/KVM.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{big(1000000000000) * big(1000000000000)}\" }\n"),
+            "1000000000000000000000000"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{big(17) / big(5)}|{big(17) % big(5)}|{big(-17) / big(5)}|{big(-17) % big(5)}\" }\n"),
+            "3|2|-3|-2"
+        );
+        assert_eq!(differential("fun probe() -> Str { \"{big(5) / big(0)}\" }\n"), "panic: division by zero");
+        let fact = "fun fact(n: Int) -> BigInt {\n    var acc = big(1)\n    var i = 1\n    \
+                    while i <= n { acc = acc * big(i)\n        i = i + 1 }\n    acc\n}\n\
+                    fun probe() -> Str { \"{fact(30)}\" }\n";
+        assert_eq!(differential(fact), "265252859812191058636308480000000");
+        // Exact Rational: reduction (2/4->1/2, 6/3->2), sign normalized to the numerator,
+        // arithmetic, division, conversions, and a zero-denominator panic.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{rat(2, 4)}|{rat(1, 3) + rat(1, 6)}|{rat(1, 3) / rat(1, 2)}|{rat(6, 3)}|{rat(2, -4)}\" }\n"),
+            "1/2|1/2|2/3|2|-1/2"
+        );
+        assert_eq!(differential("fun probe() -> Str { \"{rat(1, 0)}\" }\n"), "panic: division by zero");
+        assert_eq!(
+            differential("fun probe() -> Str { let r = rat(3, 4)\n    \"{r.to_float()}|{r.recip()}|{r.num()}|{r.den()}\" }\n"),
+            "0.75|4/3|3|4"
+        );
+    }
+
+    #[test]
     fn diff_tensor_elementwise_arithmetic() {
         // Elementwise +,-,*,/ over equal-length tensors, byte-identical on interp/KVM.
         let src = "fun probe() -> Str {\n    let a = tensor([6.0, 8.0])\n    let b = tensor([2.0, 4.0])\n    \

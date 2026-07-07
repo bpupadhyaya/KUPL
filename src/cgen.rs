@@ -4835,6 +4835,24 @@ mod tests {
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
     }
 
+    /// Native has its own bignum runtime; BigInt/Rational results match interp/KVM
+    /// exactly (exact products, factorial, reduced rationals, conversions).
+    #[test]
+    fn native_bigint_and_rational_match() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun fact(n: Int) -> BigInt {\n    var acc = big(1)\n    var i = 1\n    \
+                   while i <= n { acc = acc * big(i)\n        i = i + 1 }\n    acc\n}\n\
+                   fun main() uses io {\n    let r = rat(3, 4)\n    \
+                   print(\"{fact(30)}|{big(17) / big(5)}|{big(-17) % big(5)}|{rat(2, 4)}|{rat(6, 3)}|\
+                   {rat(1, 3) + rat(1, 6)}|{r.to_float()}|{r.recip()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "bignum").trim(),
+            "265252859812191058636308480000000|3|-2|1/2|2|1/2|0.75|4/3"
+        );
+    }
+
     /// Native tensor elementwise arithmetic matches the interpreter/KVM.
     #[test]
     fn native_tensor_elementwise_arithmetic() {
