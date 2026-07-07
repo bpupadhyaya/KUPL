@@ -2130,6 +2130,36 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_split_replace_search_char_indexed() {
+        // split_once splits at the FIRST match (preserving an empty left part); a
+        // no-match yields None (PR-it130, extending the char-indexed guarantees of it105).
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\"a=b=c\".split_once(\"=\")}|{\"nope\".split_once(\"=\")}|{\"=lead\".split_once(\"=\")}\" }\n"),
+            "Some([\"a\", \"b=c\"])|None|Some([\"\", \"lead\"])"
+        );
+        // replace is non-overlapping left-to-right ("aaaa" -> "bb"); replace_first hits once.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\"aaaa\".replace(\"aa\", \"b\")}|{\"aXbXc\".replace_first(\"X\", \"-\")}|{\"aXbXc\".replace(\"X\", \"\")}\" }\n"),
+            "bb|a-bXc|abc"
+        );
+        // index_of/rfind return CHAR indices (é is one char, so "llo" starts at 2), count is
+        // non-overlapping, split preserves empty fields — all unicode-aware.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\"abcabc\".index_of(\"bc\")}|{\"abcabc\".rfind(\"bc\")}|{\"héllo\".index_of(\"llo\")}|{\"aaa\".count(\"aa\")}\" }\n"),
+            "Some(1)|Some(4)|Some(2)|1"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\"a,b,,c\".split(\",\")}|{\"aXXbXXc\".split(\"XX\")}|{\"héllo\".split(\"l\")}\" }\n"),
+            "[\"a\", \"b\", \"\", \"c\"]|[\"a\", \"b\", \"c\"]|[\"hé\", \"\", \"o\"]"
+        );
+        // pad counts characters (not bytes); reverse is char-aware.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\"hé\".pad_right(5, \"*\")}|{\"hé\".pad_left(5, \"*\")}|{\"héllo\".reverse()}\" }\n"),
+            "hé***|***hé|olléh"
+        );
+    }
+
+    #[test]
     fn diff_string_unicode_is_char_indexed() {
         // Every string op is CHAR-indexed (never byte-indexed), byte-identical on
         // interp/KVM, across 2-byte (é), 3-byte (世) and 4-byte (🎉) characters.

@@ -5158,6 +5158,23 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "clo").trim(), "4|11|0|2");
     }
 
+    /// Native string split/replace/search are char-indexed and match interp/KVM:
+    /// split_once at first match, non-overlapping replace, char-index index_of, char-aware
+    /// pad/reverse (PR-it130).
+    #[test]
+    fn native_string_split_replace_search() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{\"a=b=c\".split_once(\"=\")}|{\"aaaa\".replace(\"aa\", \"b\")}|{\"héllo\".index_of(\"llo\")}|\
+                   {\"a,b,,c\".split(\",\")}|{\"hé\".pad_right(5, \"*\")}|{\"héllo\".reverse()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "strsplit").trim(),
+            "Some([\"a\", \"b=c\"])|bb|Some(2)|[\"a\", \"b\", \"\", \"c\"]|hé***|olléh"
+        );
+    }
+
     /// Native contract dispatch: a function taking a contract-typed parameter calls the
     /// right component's method (polymorphism over `fulfills`), matching interp/KVM (PR-it129).
     #[test]
