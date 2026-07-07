@@ -2265,6 +2265,36 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_sort_stability_json_numbers_regex() {
+        // A sixth bug-hunt sweep (it211, ~10 probes) found no divergence; this locks its subtlest
+        // deterministic edges, byte-identical on interp/KVM: sort_by is STABLE (records with equal
+        // keys keep their original order), JSON serialization prints integer-valued floats without
+        // a trailing .0 while keeping fractional precision, and regex classes/anchors/alternation
+        // plus find_all agree (PR-it211).
+        let stable = r#"type P = { name: Str, age: Int }
+fun probe() -> Str {
+    let ps = [P(name: "a", age: 30), P(name: "b", age: 20), P(name: "c", age: 30), P(name: "d", age: 20)]
+    "{ps.sort_by(fn p { p.age }).map(fn p { p.name }).join(",")}"
+}
+"#;
+        assert_eq!(differential(stable), "b,d,a,c");
+        let js = r#"fun probe() -> Str {
+    let j = JArr([JNum(0.0 - 3.5), JNum(1000000.0), JNum(0.001), JNum(42.0)])
+    match json_parse(json_stringify(j)) {
+        Ok(v) => "{json_stringify(v)}"
+        Err(e) => "err:{e}"
+    }
+}
+"#;
+        assert_eq!(differential(js), "[-3.5,1000000,0.001,42]");
+        let rx = r#"fun probe() -> Str {
+    "{re_match("[a-z]+", "hello")}|{re_match("^\\d+$", "12345")}|{re_match("cat|dog", "dog")}|{re_find_all("\\d+", "a1b22c333")}"
+}
+"#;
+        assert_eq!(differential(rx), r#"true|true|true|["1", "22", "333"]"#);
+    }
+
+    #[test]
     fn diff_operator_precedence_and_short_circuit() {
         // The operator-precedence ladder and left-associativity evaluate identically on
         // interp/KVM, and && / || short-circuit — a RHS that would PANIC (1/0) is never reached
