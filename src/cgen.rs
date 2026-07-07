@@ -3443,9 +3443,14 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         }
         if (!strcmp(name, "join")) {
             KBuf b = {0};
+            /* Hoist the separator's rendering out of the loop (it was re-rendered every
+               iteration), and for String operands append the stored pointer directly —
+               k_show allocates a throwaway copy that kb_puts would then copy again. */
+            const char* sep = (args[0].tag == K_STR) ? args[0].as.s : k_show(args[0]);
             for (int64_t i = 0; i < l->len; i++) {
-                if (i) kb_puts(&b, k_show(args[0]));
-                kb_puts(&b, k_show(l->items[i]));
+                if (i) kb_puts(&b, sep);
+                KValue e = l->items[i];
+                kb_puts(&b, (e.tag == K_STR) ? e.as.s : k_show(e));
             }
             return k_str(b.buf ? b.buf : "");
         }
@@ -5522,6 +5527,19 @@ fun main() uses io {
                    fun b(n: Int) -> Str { if n <= 0 { \"b\" } else { a(n - 1) } }\n\
                    fun main() uses io {\n    print(\"{is_even(10)}|{is_odd(7)}|{is_even(1000)}|{a(0)}{a(1)}{a(5)}\")\n}\n";
         assert_eq!(native_main_stdout(src, "mutualrec").trim(), "true|true|true|abb");
+    }
+
+    /// Native List.join stays byte-identical after the k_show->direct-pointer + hoisted-
+    /// separator perf change: multi-element, empty, single, and empty-separator (PR-it156 perf).
+    #[test]
+    fn native_join_is_byte_identical() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print([\"a\", \"bb\", \"ccc\"].join(\"-\"))\n    \
+                   var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
+                   print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
     /// Native sized-int bitwise ops mask results to the operand WIDTH, matching interp/KVM —
