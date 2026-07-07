@@ -1494,6 +1494,15 @@ impl Parser {
                     return Ok(Expr { kind: ExprKind::Unit, span: span.merge(self.prev_span()) });
                 }
                 let inner = self.parse_expr()?;
+                // `(a, b)` is a common attempt to write a tuple — KUPL has none. Point at the
+                // list/record alternatives instead of the bare "expected `)`, found `,`".
+                if self.at(&Tok::Comma) {
+                    return Err(Diag::error(
+                        "K0100",
+                        "expected `)`, found `,` — KUPL has no tuples; use a list `[a, b]` or a record".to_string(),
+                        self.span(),
+                    ));
+                }
                 self.expect(Tok::RParen)?;
                 Ok(inner)
             }

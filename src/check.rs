@@ -2955,6 +2955,20 @@ mod generic_tests {
     }
 
     #[test]
+    fn tuple_attempt_points_to_list_or_record() {
+        // `(a, b)` is a common tuple attempt; KUPL has none, so the parse error now names the
+        // list/record alternatives instead of the bare "expected `)`, found `,`" (PR-it210).
+        let hint = "KUPL has no tuples; use a list `[a, b]` or a record";
+        let two = errors("fun main() { let x = (1, 2) }\n");
+        assert!(two.iter().any(|d| d.code == "K0100" && d.message.contains(hint)), "two: {two:?}");
+        let three = errors("fun main() { let p = (\"a\", 3, true) }\n");
+        assert!(three.iter().any(|d| d.code == "K0100" && d.message.contains(hint)), "three: {three:?}");
+        // Valid parenthesized expressions and unit still parse cleanly (no behavior change).
+        assert!(errors("fun main() { let a = (1 + 2) * 3\n    let b = ((4))\n    let c = (true) }\n").is_empty());
+        assert!(errors("fun noop() { () }\nfun main() { noop() }\n").is_empty());
+    }
+
+    #[test]
     fn calling_a_non_function_says_so_plainly() {
         // Calling a concrete non-function value now reports "cannot call a value of type X; it is
         // not a function" instead of the confusing "expected fn(Int) -> ?0, found Int" with a raw
