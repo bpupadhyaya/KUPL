@@ -2104,6 +2104,35 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_window_map_fold_into_record_per_window() {
+        // A bug-hunt-33 lock (it278): sliding-window aggregation where each window is folded into a
+        // RECORD summary in a SINGLE pass. it257 locked window->scalar moving-stats (separate movsum
+        // and movmax passes, each an Int); this pins window().map(fold-into-record), computing min, max,
+        // AND sum for each window together in one fold -- the "moving multi-field bar" idiom (a
+        // candlestick per window, a moving low/high/total). Composes window (it165/257) with the
+        // record-accumulator fold (it275).
+        //   xs = [3,1,4,1,5,9], window(3) -> [3,1,4] [1,4,1] [4,1,5] [1,5,9]
+        //   each folded to Win(lo, hi, sum):
+        //     [3,1,4] -> [1,4,8]   [1,4,1] -> [1,4,6]   [4,1,5] -> [1,5,10]   [1,5,9] -> [1,9,15]
+        // Byte-identical on interp/KVM (native per the sweep). Confirms each window's fold builds an
+        // independent record with all three fields advancing in one pass, and the per-window records
+        // render in window order.
+        let src = r#"type Win = { lo: Int, hi: Int, sum: Int }
+fun probe() -> Str {
+    let xs = [3, 1, 4, 1, 5, 9]
+    let wins = xs.window(3).map(fn w {
+        w.fold(Win(lo: 999, hi: 0 - 999, sum: 0), fn(a, x) {
+            Win(lo: if x < a.lo { x } else { a.lo }, hi: if x > a.hi { x } else { a.hi }, sum: a.sum + x)
+        })
+    })
+    let strs = wins.map(fn w { "[{w.lo},{w.hi},{w.sum}]" })
+    "{strs.join(" ")}"
+}
+"#;
+        assert_eq!(differential(src), "[1,4,8] [1,4,6] [1,5,10] [1,9,15]");
+    }
+
+    #[test]
     fn diff_map_fold_into_record_over_keys_and_values() {
         // A certification lock (it277): Map.fold's 3-arg (acc, k, v) form threading a RECORD
         // accumulator that reads BOTH the key and the value at each entry. Prior Map.fold locks build a
