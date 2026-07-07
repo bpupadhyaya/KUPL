@@ -1399,7 +1399,9 @@ impl Checker {
                                 "K0235",
                                 format!(
                                     "arithmetic needs Int or Float operands, found {t}{}",
-                                    if matches!(t, Ty::Named(..)) {
+                                    if *op == BinOp::Add && matches!(t, Ty::List(..)) {
+                                        " — `+` is arithmetic, not list concatenation; use `[a, b].flatten()` to join two lists".to_string()
+                                    } else if matches!(t, Ty::Named(..)) {
                                         format!(
                                             " — define `fun {}(a: {t}, b: {t}) -> {t}` to overload `{}`",
                                             crate::interp::op_overload_name(*op).unwrap_or("add"),
@@ -2888,6 +2890,26 @@ mod generic_tests {
             .into_iter()
             .filter(|d| d.severity == crate::diag::Severity::Error)
             .collect()
+    }
+
+    #[test]
+    fn k0235_list_plus_names_flatten_fix() {
+        // Error-msg round 19 (PR-it283): `a + b` on two lists is a common mistake -- users expect `+`
+        // to concatenate. The K0235 diagnostic now names the fix (`[a, b].flatten()`) instead of leaving
+        // "arithmetic needs Int or Float operands, found List[Int]" bare. Verify the code + the hint.
+        let src = "fun probe() -> List[Int] { let a = [1, 2]\n    let b = [3, 4]\n    a + b }\n";
+        let errs = errors(src);
+        let e = errs.iter().find(|d| d.code == "K0235").expect("list + must be K0235");
+        assert!(
+            e.message.contains("list concatenation") && e.message.contains("[a, b].flatten()"),
+            "K0235 for list `+` must name the flatten fix, got: {}",
+            e.message
+        );
+        // The named-type overload hint must still fire (not clobbered by the list branch).
+        let overload = "type P = { x: Int }\nfun probe() -> P { P(x: 1) + P(x: 2) }\n";
+        let oe = errors(overload);
+        let od = oe.iter().find(|d| d.code == "K0235").expect("record + must be K0235");
+        assert!(od.message.contains("to overload"), "record `+` must still suggest overload, got: {}", od.message);
     }
 
     #[test]
