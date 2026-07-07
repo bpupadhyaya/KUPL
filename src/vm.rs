@@ -2104,6 +2104,35 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_fold_into_record_over_keys_and_values() {
+        // A certification lock (it277): Map.fold's 3-arg (acc, k, v) form threading a RECORD
+        // accumulator that reads BOTH the key and the value at each entry. Prior Map.fold locks build a
+        // Map (it2370-2374) or a String (it4923); it275's fold-to-record uses List's 2-arg fold. This
+        // pins the distinct "reduce a map's entries into a summary record" idiom, where each step
+        // consumes k AND v -- summing values, accumulating key lengths, counting entries -- into a
+        // structured accumulator.
+        //   m = {"aa":5, "bbb":10, "c":3}, seed Agg(total:0, keyLens:0, entries:0)
+        //   total   = sum of values           == 5+10+3 == 18
+        //   keyLens = sum of key char-lengths == 2+3+1  == 6
+        //   entries = count                   == 3
+        //   avg = total/entries == 6 (integer division)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms Map.fold visits every entry
+        // exactly once, exposes both k and v to the closure, and threads a fresh record forward with
+        // all three fields advancing per entry.
+        let src = r#"type Agg = { total: Int, keyLens: Int, entries: Int }
+fun probe() -> Str {
+    let m = Map().insert("aa", 5).insert("bbb", 10).insert("c", 3)
+    let r = m.fold(Agg(total: 0, keyLens: 0, entries: 0), fn(a, k, v) {
+        Agg(total: a.total + v, keyLens: a.keyLens + k.chars().len(), entries: a.entries + 1)
+    })
+    let avgVal = r.total / r.entries
+    "total={r.total} keyLens={r.keyLens} entries={r.entries} avg={avgVal}"
+}
+"#;
+        assert_eq!(differential(src), "total=18 keyLens=6 entries=3 avg=6");
+    }
+
+    #[test]
     fn diff_map_values_record_transform_recompute_field() {
         // A bug-hunt-32 lock (it276): Map.map_values transforming RECORD values into new records.
         // Prior map_values locks use scalar (it4895: v*10) or list-len (it2468) transforms; this pins
