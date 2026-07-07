@@ -2082,6 +2082,28 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_lines_split_semantics() {
+        // A bug-hunt-13 lock (it233): `Str.lines()` follows Rust's `.lines()` semantics, which differ
+        // from `split("\n")` in two ways that are easy to get wrong on one engine — an EMPTY string
+        // yields an EMPTY list (`[]`, not `[""]`), and a TRAILING newline produces NO trailing empty
+        // element (`"a\nb\n"` -> `["a", "b"]`, whereas split would give `["a", "b", ""]`). Byte-
+        // identical on interp/KVM (and native, per the sweep). The rest of the batch-13 sweep (float
+        // inf/nan/-0 Display, Str split/join, ADT match guards, Option map/and_then/filter) was
+        // already locked/consistent.
+        let src = r#"fun probe() -> Str {
+    let s = "line1\nline2\nline3"
+    let empty = ""
+    let trailing = "a\nb\n"
+    "{s.lines()}|{s.lines().len()}|{empty.lines()}|{trailing.lines()}|{"abc".chars()}|{"abc".chars().len()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"["line1", "line2", "line3"]|3|[]|["a", "b"]|["a", "b", "c"]|3"#
+        );
+    }
+
+    #[test]
     fn diff_rational_harmonic_accumulation() {
         // The exact-fraction parallel to diff_bigint_fibonacci_accumulation (it230): the numeric
         // tower (it169) certified single Rational ops (1/3 + 1/6 = 1/2) but not ACCUMULATION across
