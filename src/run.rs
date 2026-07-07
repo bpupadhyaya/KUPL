@@ -672,6 +672,26 @@ pub fn run_module(module: &crate::bytecode::Module, origin: &str) -> i32 {
 
 /// `kupl dis`: disassemble the compiled module.
 pub fn disassemble(path: &str) -> i32 {
+    // A compiled `.kx` module is already bytecode — decode and disassemble it directly
+    // rather than trying to read it as UTF-8 source (which gave a confusing error).
+    if path.ends_with(".kx") {
+        return match std::fs::read(path) {
+            Ok(bytes) => match crate::kx::decode(&bytes) {
+                Ok(module) => {
+                    print!("{}", module.disassemble());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("error: cannot decode {path}: {e}");
+                    1
+                }
+            },
+            Err(e) => {
+                eprintln!("error: cannot read {path}: {e}");
+                1
+            }
+        };
+    }
     let Ok((compiled, map)) = load_compile(path) else { return 1 };
     match crate::compile::compile_module(&compiled.program, &compiled.checked) {
         Ok(m) => {
@@ -931,6 +951,29 @@ mod tests {
         let empty = super::manifest_json(&compile("fun main() {}\n").unwrap().program);
         let ev = crate::lsp::parse_json(&empty).expect("empty manifest is valid JSON");
         assert_eq!(arr_len(ev.get("components")), Some(0));
+    }
+
+    #[test]
+    fn disassemble_handles_source_and_compiled_modules() {
+        // `kupl dis` disassembles a .kupl source (compile -> disassemble)...
+        let dir = std::env::temp_dir().join(format!("kupl-dis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun fib(n: Int) -> Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\nfun main() uses io { print(fib(5)) }\n";
+        let sp = dir.join("m.kupl");
+        std::fs::write(&sp, src).unwrap();
+        assert_eq!(super::disassemble(sp.to_str().unwrap()), 0, "source disassembles");
+        // ...and a compiled .kx module directly (PR-it121 — previously a confusing UTF-8
+        // error). Truncated bytecode is a clean decode error, not a crash.
+        let compiled = compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module");
+        let bytes = crate::kx::encode(&module);
+        let kx = dir.join("m.kx");
+        std::fs::write(&kx, &bytes).unwrap();
+        assert_eq!(super::disassemble(kx.to_str().unwrap()), 0, "a .kx module disassembles");
+        let bad = dir.join("bad.kx");
+        std::fs::write(&bad, &bytes[..8]).unwrap();
+        assert_eq!(super::disassemble(bad.to_str().unwrap()), 1, "a truncated .kx is a clean error");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
