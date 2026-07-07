@@ -2394,6 +2394,22 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_string_escape_len_brace_split() {
+        // Extends diff_string_escape_sequences (it145) with three further guarantees, byte-identical
+        // on interp/KVM: (a) \r also decodes to a single char (so "a\rb".len() == 3, giving the
+        // 33333 run across \t \n \r \\ \"); (b) the BACKSLASH-brace escape "\{x\}" yields the literal
+        // text "{x}" with no interpolation — a mechanism distinct from the {{ }} double-brace escape
+        // certified in it144; (c) splitting on a real "\t"/"\n"/"\\" confirms each escape decoded to
+        // the actual control/backslash character rather than a two-char sequence (PR-it223).
+        let src = r#"fun probe() -> Str {
+    let sep = "\t"
+    "{"a\tb".len()}{"a\nb".len()}{"a\rb".len()}{"a\\b".len()}{"a\"b".len()}|{"\{x\}"}|{"x\ty\tz".split(sep).len()}|{"line1\nline2".split("\n").len()}|{"a\\b".split("\\").len()}"
+}
+"#;
+        assert_eq!(differential(src), "33333|{x}|3|2|2");
+    }
+
+    #[test]
     fn diff_generic_monomorphization_across_types() {
         // A single generic function instantiated at MANY types (Int, Str, Bool, record, List,
         // Option) produces byte-identical results on interp/KVM — the native backend must
