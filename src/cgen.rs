@@ -5241,6 +5241,26 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native string interpolation matches interp/KVM: every value type formats via Display
+    /// inside `{...}` (a Str unquoted, others as displayed), brace escaping works, and a
+    /// nested interpolation evaluates (PR-it144).
+    #[test]
+    fn native_string_interpolation_edges() {
+        if !cc_available() {
+            return;
+        }
+        let src = r##"type P = Pt(x: Int, y: Int)
+fun main() uses io {
+    let o: Option[Int] = Some(7)
+    print("{42}|{3.5}|{true}|{"s"}|{o}|{None}|{[1, 2]}|{Pt(1, 2)}|{{{42}}}|{"a{1 + 1}b"}")
+}
+"##;
+        assert_eq!(
+            native_main_stdout(src, "strinterp").trim(),
+            "42|3.5|true|s|Some(7)|None|[1, 2]|Pt(1, 2)|{42}|a2b"
+        );
+    }
+
     /// Native string split/replace/search are char-indexed and match interp/KVM:
     /// split_once at first match, non-overlapping replace, char-index index_of, char-aware
     /// pad/reverse (PR-it130).

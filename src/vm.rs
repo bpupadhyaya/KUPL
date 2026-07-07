@@ -2266,6 +2266,27 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_interpolation_edges() {
+        // Interpolation holds arbitrary expressions, method/function calls, and if-exprs;
+        // adjacent and interleaved interps concatenate cleanly (PR-it144).
+        let exprs = "fun dbl(x: Int) -> Int { x * 2 }\nfun probe() -> Str { let a = 3\n    let b = 4\n    let xs = [1, 2, 3]\n    \
+                     \"{a + b}|{xs.len()}|{dbl(a)}|{if a > b { \"hi\" } else { \"lo\" }}|{a}{b}|x{a}y{b}z\" }\n";
+        assert_eq!(differential(exprs), "7|3|6|lo|34|x3y4z");
+        // Brace escaping: {{ -> a literal {, }} -> a literal } — so a JSON-like string with an
+        // interpolation reads naturally.
+        let braces = r##"fun probe() -> Str { let a = 5
+    "{{|}}|{{{a}}}|a {{ b }} c|{{\"k\": {a}}}" }
+"##;
+        assert_eq!(differential(braces), "{|}|{5}|a { b } c|{\"k\": 5}");
+        // A string literal inside an interpolation (unescaped quotes), a function call with a
+        // string argument, and a NESTED interpolation all parse and evaluate correctly.
+        let nested = r##"fun greet(name: Str) -> Str { "hi {name}" }
+fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
+"##;
+        assert_eq!(differential(nested), "inner|hi Ada|a2b");
+    }
+
+    #[test]
     fn diff_string_split_replace_search_char_indexed() {
         // split_once splits at the FIRST match (preserving an empty left part); a
         // no-match yields None (PR-it130, extending the char-indexed guarantees of it105).
