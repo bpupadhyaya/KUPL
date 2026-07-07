@@ -2104,6 +2104,33 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_group_by_records_then_sum_field_per_group() {
+        // A bug-hunt-34 lock (it280): the SQL "GROUP BY key, SUM(field)" aggregation over RECORDS.
+        // it262 groups STRINGS by first-char then COUNTS (map_values(len)); this pins grouping RECORDS
+        // by one field and reducing each group by SUMMING a DIFFERENT field -- the canonical
+        // group-transactions-by-account, total-the-amounts idiom.
+        //   txns = [Txn(a,10), Txn(b,20), Txn(a,5), Txn(c,8), Txn(b,3)]
+        //   group_by(.user) -> {a:[Txn(a,10),Txn(a,5)], b:[Txn(b,20),Txn(b,3)], c:[Txn(c,8)]}  (first-seen order)
+        //   map_values(fold sum .amt) -> Map{"a": 15, "b": 23, "c": 8}
+        //   keys() == ["a", "b", "c"]  (bucket order = first appearance of each user)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms group_by keys records by a
+        // field-derived value in first-seen order, and that folding each group over a SECOND field
+        // (not a count) produces the correct per-group total.
+        let src = r#"type Txn = { user: Str, amt: Int }
+fun probe() -> Str {
+    let txns = [Txn(user: "a", amt: 10), Txn(user: "b", amt: 20), Txn(user: "a", amt: 5), Txn(user: "c", amt: 8), Txn(user: "b", amt: 3)]
+    let byUser = txns.group_by(fn t { t.user })
+    let totals = byUser.map_values(fn ts { ts.fold(0, fn(a, t) { a + t.amt }) })
+    "{byUser.keys()}|{totals}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"["a", "b", "c"]|Map{"a": 15, "b": 23, "c": 8}"#
+        );
+    }
+
+    #[test]
     fn diff_string_case_conversion_pipeline() {
         // A certification lock (it279): identifier-case conversion between naming conventions, the
         // split -> map(case-transform) -> join pipeline. it253 locked split-parse-join for NUMBERS;
