@@ -2538,6 +2538,25 @@ pub fn shared_method(
             }
             _ => Err("`gcd` needs an Int".into()),
         },
+        // Euclidean division: rem_euclid's result is ALWAYS non-negative (unlike `%`, which
+        // takes the sign of the dividend), and div_euclid rounds toward negative infinity for a
+        // positive divisor. Both panic on a zero divisor or the i64::MIN / -1 overflow.
+        (Value::Int(v), "rem_euclid") => match args.into_iter().next() {
+            Some(Value::Int(w)) => match v.checked_rem_euclid(w) {
+                Some(r) => Ok(Value::Int(r)),
+                None if w == 0 => Err("division by zero".into()),
+                None => Err("integer overflow in `rem_euclid`".into()),
+            },
+            _ => Err("`rem_euclid` needs an Int".into()),
+        },
+        (Value::Int(v), "div_euclid") => match args.into_iter().next() {
+            Some(Value::Int(w)) => match v.checked_div_euclid(w) {
+                Some(q) => Ok(Value::Int(q)),
+                None if w == 0 => Err("division by zero".into()),
+                None => Err("integer overflow in `div_euclid`".into()),
+            },
+            _ => Err("`div_euclid` needs an Int".into()),
+        },
         (Value::Int(v), "lcm") => match args.into_iter().next() {
             // Least common multiple, the natural companion to gcd: |v|/gcd(v,w) * |w|,
             // always non-negative. lcm(0, _) = lcm(_, 0) = 0 by convention. A result that

@@ -2296,6 +2296,27 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_int_rem_div_euclid() {
+        // The NEW rem_euclid/div_euclid are byte-identical on interp/KVM and genuinely differ
+        // from % / /: rem_euclid is ALWAYS non-negative ((-7).rem_euclid(3)=2, not -1) and
+        // div_euclid rounds toward negative infinity ((-7).div_euclid(3)=-3, not -2) (PR-it195).
+        let src = r#"fun probe() -> Str {
+    let r = "{(7).rem_euclid(3)}|{(0 - 7).rem_euclid(3)}|{(7).rem_euclid(0 - 3)}|{(0 - 7).rem_euclid(0 - 3)}"
+    let d = "{(7).div_euclid(3)}|{(0 - 7).div_euclid(3)}|{(7).div_euclid(0 - 3)}|{(0 - 7).div_euclid(0 - 3)}"
+    let cmp = "{(0 - 7) % 3}|{(0 - 7) / 3}"
+    "{r}#{d}#{cmp}"
+}
+"#;
+        assert_eq!(differential(src), "1|2|1|2#2|-3|-2|3#-1|-2");
+        // Zero divisor and the i64::MIN / -1 overflow are clean panics on both operations.
+        assert_eq!(differential("fun probe() -> Str { \"{(5).rem_euclid(0)}\" }\n"), "panic: division by zero");
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(0 - 9223372036854775807 - 1).div_euclid(0 - 1)}\" }\n"),
+            "panic: integer overflow in `div_euclid`"
+        );
+    }
+
+    #[test]
     fn diff_int_lcm() {
         // The NEW lcm() is the natural companion to gcd, byte-identical on interp/KVM:
         // |v|/gcd*|w|, always non-negative, lcm(0,_)=0, and an out-of-i64 result panics

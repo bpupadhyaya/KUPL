@@ -4004,6 +4004,29 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 k_panic("integer overflow in `lcm`");
             return k_int((int64_t)l);
         }
+        if (!strcmp(name, "rem_euclid")) {
+            /* Rust i64::rem_euclid: r = self % rhs; if r < 0, r += |rhs| (wrapping). Always
+               non-negative. Panic on rhs==0 and the MIN%-1 overflow. */
+            int64_t a = recv.as.i, b = args[0].as.i;
+            if (b == 0) k_panic("division by zero");
+            if (a == INT64_MIN && b == -1) k_panic("integer overflow in `rem_euclid`");
+            int64_t r = a % b;
+            if (r < 0) {
+                uint64_t absb = (b < 0) ? ((uint64_t)(-(b + 1)) + 1) : (uint64_t)b;
+                r = (int64_t)((uint64_t)r + absb);
+            }
+            return k_int(r);
+        }
+        if (!strcmp(name, "div_euclid")) {
+            /* Rust i64::div_euclid: q = self / rhs, adjusted so the remainder is non-negative.
+               Panic on rhs==0 and the MIN/-1 overflow. */
+            int64_t a = recv.as.i, b = args[0].as.i;
+            if (b == 0) k_panic("division by zero");
+            if (a == INT64_MIN && b == -1) k_panic("integer overflow in `div_euclid`");
+            int64_t q = a / b;
+            if (a % b < 0) q = (b > 0) ? q - 1 : q + 1;
+            return k_int(q);
+        }
         if (!strcmp(name, "clamp")) {
             int64_t lo = args[0].as.i, hi = args[1].as.i;
             if (lo > hi) k_panic("`clamp`: lo must not exceed hi");
@@ -5800,6 +5823,20 @@ fun main() uses io {
             native_main_stdout(src, "strcap").trim(),
             "[Hello world]|[]|[123abc]|[élan]"
         );
+    }
+
+    /// Native rem_euclid/div_euclid match interp/KVM including the negative-operand cases where
+    /// they differ from % and /, plus the div-by-zero and MIN/-1 panics (PR-it195).
+    #[test]
+    fn native_int_rem_div_euclid() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{(0 - 7).rem_euclid(3)}|{(0 - 7).div_euclid(3)}|{(7).div_euclid(0 - 3)}|{(0 - 7).rem_euclid(0 - 3)}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "intreuc").trim(), "2|-3|-2|2");
     }
 
     /// Native lcm() matches interp/KVM: non-negative result, lcm(0,_)=0, INT64_MIN-safe abs,

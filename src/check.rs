@@ -149,7 +149,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
     "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "copysign", "cos",
     "count", "count_ones",
-    "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
+    "den", "difference", "div_euclid", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "fract", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
     "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
@@ -158,7 +158,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "lines", "log", "map", "map_err", "map_values", "max", "max_by", "mean", "merge",
     "min", "min_by", "num", "ok", "ok_or", "pad_left", "pad_right", "par_each",
     "par_filter", "par_map", "parse_float", "parse_int", "parse_radix", "partition", "position",
-    "pow", "product", "push", "recip", "remove", "repeat", "replace", "replace_first",
+    "pow", "product", "push", "recip", "rem_euclid", "remove", "repeat", "replace", "replace_first",
     "reverse", "rfind", "round", "saturating_add", "saturating_mul", "saturating_sub",
     "scale", "scan", "shl", "shr", "sign", "sin", "slice", "sort", "sort_by", "split",
     "split_once", "sqrt", "starts_with", "sum", "swapcase", "symmetric_difference", "tail", "take",
@@ -2263,7 +2263,7 @@ impl Checker {
             (Ty::Float, "to_f32") => Some((vec![], Ty::F32)),
             (Ty::Int, "abs") => Some((vec![], Ty::Int)),
             (Ty::Int, "min") | (Ty::Int, "max") | (Ty::Int, "pow") | (Ty::Int, "gcd")
-            | (Ty::Int, "lcm") => {
+            | (Ty::Int, "lcm") | (Ty::Int, "rem_euclid") | (Ty::Int, "div_euclid") => {
                 Some((vec![Ty::Int], Ty::Int))
             }
             (Ty::Int, "clamp") => Some((vec![Ty::Int, Ty::Int], Ty::Int)),
