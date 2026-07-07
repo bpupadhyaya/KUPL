@@ -2104,6 +2104,36 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_of_records_lookup_and_aggregate() {
+        // A certification lock (it286): the "entity store" idiom -- records indexed by a string ID
+        // in a Map[Str, User], then looked up and aggregated. it276 transforms record VALUES in place
+        // (map_values); this pins the READ side: get() returns Option[the record], a match reaches a
+        // field on the Some branch (u.city), a missing key takes the None branch, and values() feeds
+        // fold/filter/map that project and aggregate record FIELDS.
+        //   byId = {"u1": User(amy,30,NYC), "u2": User(bob,25,LA), "u3": User(cal,35,NYC)}
+        //   get("u1") -> Some(User) -> .city == "NYC"      (present key, field reached through Option)
+        //   get("u9") -> None -> "none"                    (absent key takes the None arm)
+        //   values().fold(0, +age) == 90                   (30 + 25 + 35, aggregate over a record field)
+        //   values().filter(city=="NYC").map(name) == ["amy", "cal"]   (project a field, insertion order)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms Map values carry full record
+        // structure through get()/values(), field access composes on the Option's Some payload, and the
+        // dictionary-of-objects lookup-then-aggregate pattern agrees across engines.
+        let src = r#"type User = { name: Str, age: Int, city: Str }
+fun probe() -> Str {
+    let byId: Map[Str, User] = Map().insert("u1", User(name: "amy", age: 30, city: "NYC")).insert("u2", User(name: "bob", age: 25, city: "LA")).insert("u3", User(name: "cal", age: 35, city: "NYC"))
+    let amyCity = match byId.get("u1") { Some(u) => u.city
+        None => "?" }
+    let missing = match byId.get("u9") { Some(u) => u.name
+        None => "none" }
+    let totalAge = byId.values().fold(0, fn(a, u) { a + u.age })
+    let nycUsers = byId.values().filter(fn u { u.city == "NYC" }).map(fn u { u.name })
+    "{amyCity}|{missing}|{totalAge}|{nycUsers}"
+}
+"#;
+        assert_eq!(differential(src), r#"NYC|none|90|["amy", "cal"]"#);
+    }
+
+    #[test]
     fn diff_scan_over_records_with_record_accumulator() {
         // A bug-hunt-36 lock (it285): scan where BOTH the elements AND the accumulator are records --
         // the "running balance over a transaction ledger" idiom. it274 scans a list of Ints into a
