@@ -2082,6 +2082,37 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_invert_and_reverse_index() {
+        // Milestone lock (it250): the two Map-inversion idioms. (1) A pure key<->value SWAP turns
+        // Map[Str, Int] into Map[Int, Str] — the new keys are the old VALUES, iterated in the
+        // original map's key order, so inv.keys() == [1, 2, 3] and inv.get(2) == Some("b").
+        // (2) A REVERSE INDEX inverts a many-to-one Map[Str, Str] (name -> role) into a one-to-many
+        // Map[Str, List[Str]] (role -> names) by grouping keys under their value, keeping first-seen
+        // role order and per-bucket insertion order. Distinct from it237's group-by-a-list and
+        // it247's nested map: here the grouping key is another map's VALUE. Byte-identical on
+        // interp/KVM (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    let m = Map().insert("a", 1).insert("b", 2).insert("c", 3)
+    var inv: Map[Int, Str] = Map()
+    for k in m.keys() {
+        inv = inv.insert(m.get(k).unwrap_or(0), k)
+    }
+    let roles = Map().insert("alice", "admin").insert("bob", "user").insert("carol", "admin")
+    var byRole: Map[Str, List[Str]] = Map()
+    for name in roles.keys() {
+        let r = roles.get(name).unwrap_or("?")
+        byRole = byRole.insert(r, byRole.get(r).unwrap_or([]).push(name))
+    }
+    "{inv.get(2)}|{inv.keys()}|{byRole.get("admin")}|{byRole.keys()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Some("b")|[1, 2, 3]|Some(["alice", "carol"])|["admin", "user"]"#
+        );
+    }
+
+    #[test]
     fn diff_set_dedup_then_stable_sort() {
         // A bug-hunt-19 lock (it248): the "dedup a list keeping first occurrence, then sort by a
         // key" idiom, which threads sort_by's STABILITY through a Set's insertion-order dedup.
