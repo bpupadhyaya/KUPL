@@ -2134,6 +2134,31 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_numeric_tower_precision_and_conversions() {
+        // The numeric tower is byte-identical on interp/KVM (and native, per the native test):
+        // BigInt is arbitrary-precision (2^70, 2^64, 25! all exact and exceeding i64), Rational
+        // is exact and auto-reduces (1/3+1/6=1/2, 2/4->1/2) with num/den and to_float, and
+        // Int/Float conversions (to_float, to_int truncating toward zero, to_str) agree (PR-it169).
+        let src = r#"fun probe() -> Str {
+    let bignum = big(2).pow(70)
+    var f = big(1)
+    var i = 1
+    while i <= 25 { f = f * big(i)
+        i = i + 1 }
+    let third = rat(1, 3)
+    let half = third + rat(1, 6)
+    "{bignum}|{big(2).pow(64)}|{f}#{third}|{half}|{half.num()}/{half.den()}|{rat(2, 4)}|{third.to_float()}#{(5).to_float()}|{(2.9).to_int()}|{(0.0 - 2.9).to_int()}|{(7).to_str()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "1180591620717411303424|18446744073709551616|15511210043330985984000000#1/3|1/2|1/2|1/2|0.3333333333333333#5.0|2|-2|7"
+        );
+        // A zero-denominator Rational is a clean panic, not a bogus value.
+        assert_eq!(differential("fun probe() -> Str { \"{rat(1, 0)}\" }\n"), "panic: division by zero");
+    }
+
+    #[test]
     fn diff_generics_multiparam_and_adt() {
         // Multi-parameter generic funs, generic ADTs instantiated at varied types
         // (record/list/nested), generic-over-collection, and a multi-param generic ADT swap are

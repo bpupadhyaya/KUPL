@@ -5542,6 +5542,27 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native numeric tower matches interp/KVM: BigInt is arbitrary-precision (exact past i64),
+    /// Rational is exact and auto-reduces, and Int/Float conversions truncate toward zero (it169).
+    #[test]
+    fn native_numeric_tower_precision() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    var f = big(1)
+    var i = 1
+    while i <= 25 { f = f * big(i)
+        i = i + 1 }
+    print("{big(2).pow(70)}|{f}|{rat(1, 3) + rat(1, 6)}|{rat(2, 4)}|{(2.9).to_int()}|{(0.0 - 2.9).to_int()}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "numtower").trim(),
+            "1180591620717411303424|15511210043330985984000000|1/2|1/2|2|-2"
+        );
+    }
+
     /// Native generics (monomorphization) match interp/KVM's uniform representation: multi-param
     /// generic funs, generic ADTs at record/list/nested types, and a Pair[A,B] swap (PR-it167).
     #[test]
