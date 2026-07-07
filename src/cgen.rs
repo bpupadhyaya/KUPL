@@ -5241,6 +5241,21 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native emits escape sequences as their actual control bytes (a `\n` prints a real
+    /// newline, `\t` a real tab) and counts each as one character — matching interp/KVM.
+    /// NUL never reaches native (it's a compile error), so there is no C-string truncation
+    /// risk (PR-it145).
+    #[test]
+    fn native_string_escape_sequences() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let nl = \"a\\nb\"\n    \
+                   print(\"{nl.len()}|{\"a\\tb\".len()}|{\"a\\\\b\".len()}\")\n    print(\"L1\\nL2\\tT\")\n}\n";
+        // First line: the three lengths. Then "L1", newline, "L2", tab, "T".
+        assert_eq!(native_main_stdout(src, "strescape"), "3|3|3\nL1\nL2\tT\n");
+    }
+
     /// Native string interpolation matches interp/KVM: every value type formats via Display
     /// inside `{...}` (a Str unquoted, others as displayed), brace escaping works, and a
     /// nested interpolation evaluates (PR-it144).

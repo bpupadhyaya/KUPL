@@ -2266,6 +2266,15 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_escape_sequences() {
+        // Each escape (\n \t \r \\ \") decodes to a SINGLE character: "a\nb".len() == 3, and
+        // splitting on the decoded control char works — byte-identical on interp/KVM (PR-it145).
+        let src = "fun probe() -> Str {\n    let nl = \"a\\nb\"\n    let tb = \"a\\tb\"\n    let bs = \"a\\\\b\"\n    let qt = \"a\\\"b\"\n    \
+                   \"{nl.len()}|{tb.len()}|{bs.len()}|{qt.len()}|{nl.split(\"\\n\")}|{qt}\"\n}\n";
+        assert_eq!(differential(src), "3|3|3|3|[\"a\", \"b\"]|a\"b");
+    }
+
+    #[test]
     fn diff_string_interpolation_edges() {
         // Interpolation holds arbitrary expressions, method/function calls, and if-exprs;
         // adjacent and interleaved interps concatenate cleanly (PR-it144).
