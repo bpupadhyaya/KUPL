@@ -4835,6 +4835,20 @@ mod tests {
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
     }
 
+    /// Native Option/Result methods and the `?` operator match interp/KVM, including
+    /// `?` early-returning Err from the enclosing function.
+    #[test]
+    fn native_option_result_and_try_operator() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun half(n: Int) -> Result[Int, Str] { if n % 2 == 0 { Ok(n / 2) } else { Err(\"odd\") } }\n\
+                   fun chain(n: Int) -> Result[Int, Str] { let a = half(n)?\n    Ok(a) }\n\
+                   fun main() uses io {\n    let s: Option[Int] = Some(2)\n    let n: Option[Int] = None\n    \
+                   print(\"{s.map(fn x { x + 1 })}|{n.unwrap_or(0)}|{s.ok_or(\"e\")}|{chain(8)}|{chain(3)}|{Some(Some(7))}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "optres").trim(), "Some(3)|0|Ok(2)|Ok(4)|Err(\"odd\")|Some(Some(7))");
+    }
+
     /// Native's C string runtime decodes UTF-8: all string ops are char-indexed and
     /// match the interpreter/KVM across multibyte characters (no byte-index corruption).
     #[test]

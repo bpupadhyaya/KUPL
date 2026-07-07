@@ -1883,6 +1883,28 @@ mod tests {
     }
 
     #[test]
+    fn diff_option_result_and_try_operator() {
+        // Option/Result methods behave identically on interp/KVM.
+        let opt = "fun probe() -> Str {\n    let s: Option[Int] = Some(2)\n    let n: Option[Int] = None\n    \
+                   \"{s.map(fn x { x + 1 })}|{n.map(fn x { x + 1 })}|{s.unwrap_or(0)}|{n.unwrap_or(0)}|\
+                   {s.and_then(fn x { Some(x * 10) })}|{s.ok_or(\"e\")}|{n.ok_or(\"e\")}|{s.filter(fn x { x > 9 })}\"\n}\n";
+        assert_eq!(differential(opt), "Some(3)|None|2|0|Some(20)|Ok(2)|Err(\"e\")|None");
+        let res = "fun probe() -> Str {\n    let o: Result[Int, Str] = Ok(2)\n    let e: Result[Int, Str] = Err(\"bad\")\n    \
+                   \"{o.map(fn x { x + 1 })}|{e.map(fn x { x + 1 })}|{o.is_ok()}|{e.is_err()}|{o.ok()}|{e.ok()}|{e.unwrap_or(0)}\"\n}\n";
+        assert_eq!(differential(res), "Ok(3)|Err(\"bad\")|true|true|Some(2)|None|0");
+        // the `?` operator unwraps Ok and early-returns Err from the enclosing fun.
+        let try_op = "fun half(n: Int) -> Result[Int, Str] { if n % 2 == 0 { Ok(n / 2) } else { Err(\"odd\") } }\n\
+                      fun chain(n: Int) -> Result[Int, Str] { let a = half(n)?\n    let b = half(a)?\n    Ok(b) }\n\
+                      fun probe() -> Str { \"{chain(8)}|{chain(4)}|{chain(6)}\" }\n";
+        assert_eq!(differential(try_op), "Ok(2)|Ok(1)|Err(\"odd\")");
+        // equality and nested Option display.
+        assert_eq!(
+            differential("fun probe() -> Str { let a: Option[Int] = None\n    let b: Option[Int] = None\n    \"{a == b}|{Some(1) == Some(1)}|{Some(1) == Some(2)}|{Some(Some(7))}\" }\n"),
+            "true|true|false|Some(Some(7))"
+        );
+    }
+
+    #[test]
     fn diff_string_unicode_is_char_indexed() {
         // Every string op is CHAR-indexed (never byte-indexed), byte-identical on
         // interp/KVM, across 2-byte (é), 3-byte (世) and 4-byte (🎉) characters.
