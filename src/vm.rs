@@ -2104,6 +2104,30 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_all_any_vacuous_on_empty() {
+        // A bug-hunt-29 lock (it270): the vacuous-quantifier edge of all()/any(). Prior locks
+        // (it2941/2202/5800) exercise all/any on NON-empty lists; this pins the empty-list convention
+        // that trips many implementations: all() over an empty list is TRUE (a universal quantifier
+        // over no elements is vacuously satisfied — there is no counterexample), and any() over an
+        // empty list is FALSE (an existential over no elements has no witness). On [2,4,6,8]:
+        // all(even)=true, any(odd)=false; on []: all(>0)=true (vacuous), any(>0)=false (vacuous);
+        // and [2,4,5,6].all(even)=false because 5 is a real counterexample. Byte-identical on
+        // interp/KVM (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    let xs = [2, 4, 6, 8]
+    let mt: List[Int] = []
+    let allEven = xs.all(fn x { x % 2 == 0 })
+    let anyOdd = xs.any(fn x { x % 2 == 1 })
+    let allEmpty = mt.all(fn x { x > 0 })
+    let anyEmpty = mt.any(fn x { x > 0 })
+    let mixed = [2, 4, 5, 6].all(fn x { x % 2 == 0 })
+    "{allEven}|{anyOdd}|{allEmpty}|{anyEmpty}|{mixed}"
+}
+"#;
+        assert_eq!(differential(src), "true|false|true|false|false");
+    }
+
+    #[test]
     fn diff_result_and_then_map_map_err_interleaved() {
         // A certification lock (it269): the full Result-combinator interleaving in one chain, where
         // each of and_then/map/map_err exhibits its DUAL behavior (transform one variant, pass the
