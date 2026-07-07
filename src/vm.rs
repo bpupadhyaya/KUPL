@@ -2104,6 +2104,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_take_while_drop_while_complementary_on_records() {
+        // A bug-hunt-35 lock (it282): take_while and drop_while are COMPLEMENTARY -- they split a list
+        // at exactly the same boundary (the first element failing the predicate), so taken ++ dropped
+        // reconstructs the original. Prior take_while/drop_while locks (it1993/2824/4454) use SCALAR
+        // predicates; this pins the pair on RECORDS with a FIELD predicate, the "consume events until a
+        // field condition changes" idiom (log lines until the first error, samples until a threshold).
+        //   evs = [ok/1, ok/2, err/3, ok/4]
+        //   take_while(kind=="ok") stops at the first err -> [1, 2]   (does NOT resume at ok/4)
+        //   drop_while(kind=="ok") drops the leading oks   -> [3, 4]   (keeps everything from first err on)
+        //   [taken, dropped].flatten() == evs   (the two halves partition the list at the same cut)
+        //   taken.len() + dropped.len() == evs.len()
+        // Byte-identical on interp/KVM (native per the sweep). Confirms both scan left-to-right, both
+        // stop/start at the SAME first-failure boundary (not resuming after a later pass), and that the
+        // field predicate reads e.kind correctly on each record.
+        let src = r#"type Ev = { ts: Int, kind: Str }
+fun probe() -> Str {
+    let evs = [Ev(ts: 1, kind: "ok"), Ev(ts: 2, kind: "ok"), Ev(ts: 3, kind: "err"), Ev(ts: 4, kind: "ok")]
+    let taken = evs.take_while(fn e { e.kind == "ok" })
+    let dropped = evs.drop_while(fn e { e.kind == "ok" })
+    let rebuilt = [taken, dropped].flatten().map(fn e { e.ts })
+    let origTs = evs.map(fn e { e.ts })
+    "{taken.map(fn e { e.ts })}|{dropped.map(fn e { e.ts })}|{rebuilt == origTs}|{taken.len() + dropped.len() == evs.len()}"
+}
+"#;
+        assert_eq!(differential(src), "[1, 2]|[3, 4]|true|true");
+    }
+
+    #[test]
     fn diff_full_pivot_filter_sort_group_max_per_group() {
         // A certification lock (it281): the complete analytics-query pipeline over records --
         // filter -> sort_by -> group_by -> fold(max record per group) -> map_values(format). it280
