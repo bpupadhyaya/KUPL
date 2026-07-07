@@ -2104,6 +2104,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_values_record_transform_recompute_field() {
+        // A bug-hunt-32 lock (it276): Map.map_values transforming RECORD values into new records.
+        // Prior map_values locks use scalar (it4895: v*10) or list-len (it2468) transforms; this pins
+        // the "map of records -> recompute a derived field for every entry" idiom, where the closure
+        // reads a record's fields and constructs a FRESH record, and the map's keys and insertion order
+        // are preserved 1:1.
+        //   m = {"a": Item(qty:2, price:10), "b": Item(qty:3, price:5)}
+        //   map_values(it -> Item(qty: it.qty, price: it.qty * it.price))
+        //     == {"a": Item(2, 20), "b": Item(3, 15)}   // price recomputed = qty*price, qty kept
+        //   totals.get("a") == Some(Item(2, 20))        // value-by-key round-trips the new record
+        //   totals.keys()   == ["a", "b"]               // keys/order untouched
+        // Byte-identical on interp/KVM (native per the sweep). Confirms map_values applies the closure to
+        // each record value producing a new record, the record Display renders positionally, and the
+        // 1:1 key/order invariant holds through the transform.
+        let src = r#"type Item = { qty: Int, price: Int }
+fun probe() -> Str {
+    let m = Map().insert("a", Item(qty: 2, price: 10)).insert("b", Item(qty: 3, price: 5))
+    let totals = m.map_values(fn it { Item(qty: it.qty, price: it.qty * it.price) })
+    "{totals}|{totals.get("a")}|{totals.keys()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Map{"a": Item(2, 20), "b": Item(3, 15)}|Some(Item(2, 20))|["a", "b"]"#
+        );
+    }
+
+    #[test]
     fn diff_fold_with_record_stats_single_pass() {
         // A certification lock (it275): fold reducing to a RECORD accumulator that computes four
         // summary statistics (min/max/sum/count) in a SINGLE pass. This complements it274 (scan with a
