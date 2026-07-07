@@ -77,6 +77,22 @@ pub fn iso(epoch_secs: i64) -> String {
 /// Parse an ISO-8601-ish UTC timestamp into epoch seconds. Accepts
 /// `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`, and `YYYY-MM-DD HH:MM:SS`, each with an
 /// optional trailing `Z`. Returns `Err` with a message on malformed input.
+/// Whether `y` is a Gregorian leap year.
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Number of days in month `mo` (1..=12) of year `y`. Returns 0 for an out-of-range
+/// month so the caller's range check still rejects it.
+fn days_in_month(y: i64, mo: i64) -> i64 {
+    match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap(y) { 29 } else { 28 },
+        _ => 0,
+    }
+}
+
 pub fn parse_iso(s: &str) -> Result<i64, String> {
     let s = s.trim().trim_end_matches('Z');
     let bad = || format!("invalid ISO-8601 timestamp: {s}");
@@ -95,7 +111,10 @@ pub fn parse_iso(s: &str) -> Result<i64, String> {
     let y: i64 = yy.parse().map_err(|_| bad())?;
     let mo: i64 = mm.parse().map_err(|_| bad())?;
     let d: i64 = dd.parse().map_err(|_| bad())?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+    // Validate the day against the actual length of the month (leap-year aware) so
+    // an impossible calendar date — 2023-02-29, 2024-02-30, 2024-04-31 — is rejected
+    // rather than silently normalized into the following month.
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
         return Err(bad());
     }
     let (mut hh, mut mi, mut ss) = (0i64, 0i64, 0i64);

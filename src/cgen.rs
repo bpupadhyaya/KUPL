@@ -3017,7 +3017,10 @@ static KValue k_parse_iso(KValue sv) {
     y = strtol(p, &end, 10);   if (*end) return k_err(k_str(errbuf));  if (neg) y = -y;
     mo = strtol(mstr, &end, 10); if (*end) return k_err(k_str(errbuf));
     d = strtol(dstr, &end, 10);  if (*end || dstr[0] == 0) return k_err(k_str(errbuf));
-    if (mo < 1 || mo > 12 || d < 1 || d > 31) return k_err(k_str(errbuf));
+    /* reject an impossible day-of-month (leap-year aware), matching time::parse_iso */
+    long dim = (mo == 2) ? (((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 29 : 28)
+                         : ((mo == 4 || mo == 6 || mo == 9 || mo == 11) ? 30 : 31);
+    if (mo < 1 || mo > 12 || d < 1 || d > dim) return k_err(k_str(errbuf));
     if (time && *time) {
         char* c1 = strchr(time, ':');
         if (!c1) return k_err(k_str(errbuf));
@@ -4840,6 +4843,20 @@ mod tests {
                    print(\"{[1, 2] == [1, 2]}{Pt(1, 2) == Pt(1, 2)}{Red == Blue}{Some([1, 2]) == Some([1, 2])}\
                    {ma == mb}{nan == nan}{-0.0 == 0.0}{\"Z\" < \"a\"}\")\n}\n";
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
+    }
+
+    /// Native parse_iso rejects an impossible day-of-month (leap-year aware), matching
+    /// the interpreter (PR-it111).
+    #[test]
+    fn native_parse_iso_rejects_impossible_dates() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{parse_iso(\"2023-02-29\").is_ok()}|{parse_iso(\"2024-02-29\").is_ok()}|\
+                   {parse_iso(\"1900-02-29\").is_ok()}|{parse_iso(\"2000-02-29\").is_ok()}|\
+                   {parse_iso(\"2024-04-31\").is_ok()}|{parse_iso(\"2024-04-30\").is_ok()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "iso").trim(), "false|true|false|true|false|true");
     }
 
     /// Native's mock tool-calling loop matches interp/KVM: a multi-step loop reaches

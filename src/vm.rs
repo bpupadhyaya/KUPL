@@ -1972,6 +1972,26 @@ mod tests {
     }
 
     #[test]
+    fn diff_parse_iso_rejects_impossible_dates() {
+        // parse_iso validates the day against the actual month length (leap-year aware),
+        // byte-identical on interp/KVM — an impossible calendar date is Err, not silently
+        // normalized into the next month (PR-it111).
+        let src = "fun probe() -> Str {\n    \
+                   \"{parse_iso(\"2023-02-29\").is_ok()}|{parse_iso(\"2024-02-29\").is_ok()}|\
+                   {parse_iso(\"1900-02-29\").is_ok()}|{parse_iso(\"2000-02-29\").is_ok()}|\
+                   {parse_iso(\"2024-04-31\").is_ok()}|{parse_iso(\"2024-04-30\").is_ok()}|\
+                   {parse_iso(\"2024-02-30\").is_ok()}\"\n}\n";
+        // 2023-02 has 28 days; 2024 (leap) has 29; 1900 is NOT leap (century, not /400);
+        // 2000 IS leap (/400); April has 30 days.
+        assert_eq!(differential(src), "false|true|false|true|false|true|false");
+        // a valid leap-day round-trips through the calendar accessors.
+        assert_eq!(
+            differential("fun probe() -> Str { let t = parse_iso(\"2024-02-29T00:00:00Z\").unwrap_or(0)\n    \"{year_of(t)}-{month_of(t)}-{day_of(t)}\" }\n"),
+            "2024-2-29"
+        );
+    }
+
+    #[test]
     fn diff_bigint_and_rational_edges() {
         // Arbitrary-precision BigInt: exact huge products, truncated-toward-zero div/mod
         // with negatives, and a clean div-by-zero panic — byte-identical on interp/KVM.
