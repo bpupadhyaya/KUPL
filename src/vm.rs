@@ -2082,6 +2082,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_builder_report_in_loop() {
+        // Extends diff_string_self_append (it202, the `s = s + x` concat form) to the report-builder
+        // idiom an AI actually generates: accumulate a multiline string by INTERPOLATING the
+        // accumulator back into itself each iteration — `report = "{report}  - {name}: {qty}\n"` —
+        // while a parallel Int total accumulates. This composes string-interpolation accumulation
+        // (a different code path from `+`), newline escapes, get-with-default, and parse_int, and is
+        // byte-identical on interp/KVM (and native, per the sweep). The final `\n`-joined report reads
+        // back exactly (PR-it240).
+        let src = r#"fun probe() -> Str {
+    let items = [["apple", "3"], ["banana", "12"], ["cherry", "7"]]
+    var report = "Inventory:\n"
+    var total = 0
+    for row in items {
+        let name = row.get(0).unwrap_or("?")
+        let qty = row.get(1).unwrap_or("0").parse_int().unwrap_or(0)
+        report = "{report}  - {name}: {qty}\n"
+        total = total + qty
+    }
+    "{report}Total: {total}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "Inventory:\n  - apple: 3\n  - banana: 12\n  - cherry: 7\nTotal: 22"
+        );
+    }
+
+    #[test]
     fn diff_json_nested_mixed_roundtrip() {
         // Extends diff_json_key_order_and_sort_stability (it162, a FLAT object's key order) to a
         // NESTED object with MIXED value types: a string, an array of numbers, and a nested object
