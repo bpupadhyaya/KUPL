@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_tensor_ops_and_fp_accumulation() {
+        // The 1D-float-vector tensor surface (elementwise +/*, scale, dot, sum/mean/max/min/
+        // get/len) is byte-identical on interp/KVM, INCLUDING the floating-point accumulation
+        // order of reductions — sum of [1.0, 1e-7, 1e-7, 1e-7] is exactly 1.0000003000000002
+        // on every engine, and a 100k-element reduction agrees (PR-it173).
+        let src = r#"fun probe() -> Str {
+    let a = tensor([1.0, 2.0, 3.0, 4.0])
+    let b = tensor([10.0, 20.0, 30.0, 40.0])
+    let fp = tensor([1.0, 0.0000001, 0.0000001, 0.0000001])
+    let big = arange(100000)
+    "{a + b}|{a * b}|{a.scale(2.0)}|{a.dot(b)}#{a.sum()}|{a.mean()}|{a.max()}|{a.min()}|{a.get(2)}|{a.len()}#{fp.sum()}|{big.sum()}|{big.mean()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "Tensor([11.0, 22.0, 33.0, 44.0])|Tensor([10.0, 40.0, 90.0, 160.0])|Tensor([2.0, 4.0, 6.0, 8.0])|300.0#10.0|2.5|4.0|1.0|3.0|4#1.0000003000000002|4999950000.0|49999.5"
+        );
+        // Shape mismatch and out-of-bounds index are clean panics, not bogus values.
+        assert_eq!(differential("fun probe() -> Str { \"{tensor([1.0, 2.0]) + tensor([1.0, 2.0, 3.0])}\" }\n"), "panic: tensor length mismatch (2 vs 3)");
+        assert_eq!(differential("fun probe() -> Str { \"{tensor([1.0, 2.0]).get(5)}\" }\n"), "panic: tensor index 5 out of range for length 2");
+    }
+
+    #[test]
     fn diff_component_state_isolation_and_composition() {
         // Two instances of a stateful component keep INDEPENDENT state (a=5, b=2), and a
         // component that holds another component as state delegates to it correctly (an

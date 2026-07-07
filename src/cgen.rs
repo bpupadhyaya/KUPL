@@ -5542,6 +5542,26 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native tensor math matches interp/KVM including floating-point accumulation ORDER in
+    /// reductions (native must sum in the same order as interp's fold) (PR-it173).
+    #[test]
+    fn native_tensor_ops_and_fp_accumulation() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let a = tensor([1.0, 2.0, 3.0, 4.0])
+    let b = tensor([10.0, 20.0, 30.0, 40.0])
+    let fp = tensor([1.0, 0.0000001, 0.0000001, 0.0000001])
+    print("{a + b}|{a.dot(b)}|{a.sum()}|{fp.sum()}|{arange(100000).sum()}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "tensorfp").trim(),
+            "Tensor([11.0, 22.0, 33.0, 44.0])|300.0|10.0|1.0000003000000002|4999950000.0"
+        );
+    }
+
     /// Native components isolate per-instance state like interp/KVM: two Counter instances keep
     /// independent counts, and an Aggregator holding a Counter as state delegates (PR-it171).
     #[test]
