@@ -2104,6 +2104,31 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_adt_trees() {
+        // Recursive ADTs (self-referential ctor payloads) build, traverse, map, display
+        // nested, compare structurally, and recurse deeply — byte-identical on interp/KVM
+        // (PR-it137). A depth-12 tree is 4096 leaves; native heap-alloc + recursion holds.
+        let tree = "type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)\n\
+                    fun sum(t: Tree) -> Int { match t {\n        Leaf(v) => v\n        Node(l, r) => sum(l) + sum(r)\n    } }\n\
+                    fun mapt(t: Tree, f: fn(Int) -> Int) -> Tree { match t {\n        Leaf(v) => Leaf(f(v))\n        Node(l, r) => Node(l: mapt(l, f), r: mapt(r, f))\n    } }\n\
+                    fun build(n: Int) -> Tree { if n <= 0 { Leaf(1) } else { Node(l: build(n - 1), r: build(n - 1)) } }\n\
+                    fun probe() -> Str {\n    let t = Node(l: Node(l: Leaf(1), r: Leaf(2)), r: Leaf(3))\n    \
+                    \"{sum(t)}|{t}|{mapt(t, fn x { x * 10 })}|{sum(build(12))}\" }\n";
+        assert_eq!(differential(tree), "6|Node(Node(Leaf(1), Leaf(2)), Leaf(3))|Node(Node(Leaf(10), Leaf(20)), Leaf(30))|4096");
+        // An expression-tree evaluator + nested Display.
+        let expr = "type Expr = Num(n: Int) | Add(a: Expr, b: Expr) | Mul(a: Expr, b: Expr)\n\
+                    fun eval(e: Expr) -> Int { match e {\n        Num(n) => n\n        Add(a, b) => eval(a) + eval(b)\n        Mul(a, b) => eval(a) * eval(b)\n    } }\n\
+                    fun probe() -> Str {\n    let e = Mul(a: Add(a: Num(2), b: Num(3)), b: Num(4))\n    \"{eval(e)}|{e}\" }\n";
+        assert_eq!(differential(expr), "20|Mul(Add(Num(2), Num(3)), Num(4))");
+        // A cons-list (nullary Nil ctor displays without parens) + structural equality.
+        let cons = "type IntList = Nil | Cons(head: Int, tail: IntList)\n\
+                    fun rev(xs: IntList, acc: IntList) -> IntList { match xs {\n        Nil => acc\n        Cons(h, tail) => rev(tail, Cons(head: h, tail: acc))\n    } }\n\
+                    fun probe() -> Str {\n    let xs = Cons(head: 1, tail: Cons(head: 2, tail: Cons(head: 3, tail: Nil)))\n    \
+                    \"{xs}|{rev(xs, Nil)}|{xs == xs}\" }\n";
+        assert_eq!(differential(cons), "Cons(1, Cons(2, Cons(3, Nil)))|Cons(3, Cons(2, Cons(1, Nil)))|true");
+    }
+
+    #[test]
     fn diff_pattern_matching_depth() {
         // Guards (first-match-wins, may reference the bound variable), byte-identical.
         let guard = "fun cls(n: Int) -> Str { match n {\n        x if x > 10 => \"big\"\n        \

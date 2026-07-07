@@ -5279,6 +5279,27 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "iflet").trim(), "14|7|[9, 4, 1]");
     }
 
+    /// Native recursive ADTs (self-referential heap-allocated values) build, traverse,
+    /// display nested, and recurse deeply exactly like interp/KVM (PR-it137).
+    #[test]
+    fn native_recursive_adt_trees() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Expr = Num(n: Int) | Add(a: Expr, b: Expr) | Mul(a: Expr, b: Expr)\n\
+                   fun eval(e: Expr) -> Int { match e {\n        Num(n) => n\n        Add(a, b) => eval(a) + eval(b)\n        Mul(a, b) => eval(a) * eval(b)\n    } }\n\
+                   type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)\n\
+                   fun sum(t: Tree) -> Int { match t {\n        Leaf(v) => v\n        Node(l, r) => sum(l) + sum(r)\n    } }\n\
+                   fun build(n: Int) -> Tree { if n <= 0 { Leaf(1) } else { Node(l: build(n - 1), r: build(n - 1)) } }\n\
+                   fun main() uses io {\n    let e = Mul(a: Add(a: Num(2), b: Num(3)), b: Num(4))\n    \
+                   let t = Node(l: Node(l: Leaf(1), r: Leaf(2)), r: Leaf(3))\n    \
+                   print(\"{eval(e)}|{e}|{t}|{sum(build(12))}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "rectree").trim(),
+            "20|Mul(Add(Num(2), Num(3)), Num(4))|Node(Node(Leaf(1), Leaf(2)), Leaf(3))|4096"
+        );
+    }
+
     /// Native pattern matching (guards, or-patterns, ranges, nested destructure)
     /// matches interp/KVM.
     #[test]
