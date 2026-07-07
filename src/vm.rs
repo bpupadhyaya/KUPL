@@ -2121,6 +2121,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_set_algebra_preserves_insertion_order() {
+        // Set algebra is insertion-ordered and byte-identical on interp/KVM: union keeps
+        // a's order then b's new elements; intersect/difference keep a's order;
+        // symmetric_difference is a's uniques then b's uniques (PR-it123).
+        assert_eq!(
+            differential("fun probe() -> Str { \"{Set([3, 1, 2]).union(Set([2, 5, 4]))}\" }\n"),
+            "Set{3, 1, 2, 5, 4}"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{Set([3, 1, 2, 5]).intersect(Set([5, 2, 9]))}\" }\n"),
+            "Set{2, 5}"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{Set([3, 1, 2, 5]).difference(Set([2, 5]))}\" }\n"),
+            "Set{3, 1}"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{Set([1, 2, 3]).symmetric_difference(Set([3, 4, 5]))}\" }\n"),
+            "Set{1, 2, 4, 5}"
+        );
+        // subset checks + self/empty-set edge cases.
+        assert_eq!(
+            differential("fun probe() -> Str { let a = Set([1, 2, 3])\n    let e = Set([])\n    \"{Set([1, 2]).is_subset(a)}|{a.is_subset(a)}|{a.union(a)}|{a.difference(a)}|{a.union(e)}|{e.union(a)}|{a.intersect(e)}\" }\n"),
+            "true|true|Set{1, 2, 3}|Set{}|Set{1, 2, 3}|Set{1, 2, 3}|Set{}"
+        );
+    }
+
+    #[test]
     fn diff_bigint_and_rational_edges() {
         // Arbitrary-precision BigInt: exact huge products, truncated-toward-zero div/mod
         // with negatives, and a clean div-by-zero panic — byte-identical on interp/KVM.

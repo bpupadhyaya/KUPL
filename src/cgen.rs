@@ -4982,6 +4982,21 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "scan").trim(), "[1, 3, 6, 10]|[1, 2, 6, 24]|[]");
     }
 
+    /// Native set algebra preserves insertion order (not a hash set), matching
+    /// interp/KVM — union/intersect/difference/symmetric_difference (PR-it123).
+    #[test]
+    fn native_set_algebra_order() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let a = Set([3, 1, 2, 5])\n    let b = Set([5, 2, 9])\n    \
+                   print(\"{a.union(b)}|{a.intersect(b)}|{a.difference(b)}|{a.symmetric_difference(b)}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "setalg").trim(),
+            "Set{3, 1, 2, 5, 9}|Set{2, 5}|Set{3, 1}|Set{3, 1, 9}"
+        );
+    }
+
     /// Native's manual float formatter matches interp/KVM at the extremes: special
     /// values, IEEE semantics, negative zero, and exact round-trips of huge/tiny magnitudes.
     #[test]
