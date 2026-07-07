@@ -5065,6 +5065,24 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native transcendentals (C libm sqrt/sin/cos/exp/log/pow via <math.h>) produce
+    /// BIT-IDENTICAL results to the interpreter — Rust's f64 math methods delegate to the
+    /// same platform libm, so there is no last-ULP divergence, and the IEEE special values
+    /// (NaN / -inf / exact) match too (PR-it143).
+    #[test]
+    fn native_transcendental_math() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{(2.0).sqrt()}|{(27.0).cbrt()}|{(3.0).hypot(4.0)}|{(2.0).pow(10.0)}|{(1.0).sin()}|{(1.0).cos()}|{(1.0).exp()}|\
+                   {(2.718281828459045).log()}|{(0.0 - 1.0).sqrt()}|{(0.0).log()}|{(0.0).pow(0.0)}|{(1000.0).exp()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "transc").trim(),
+            "1.4142135623730951|3.0|5.0|1024.0|0.8414709848078965|0.5403023058681398|2.718281828459045|1.0|NaN|-inf|1.0|inf"
+        );
+    }
+
     /// Native float->int conversions match interp/KVM including the C-undefined cases: an
     /// out-of-range float SATURATES, NaN -> 0, +/-inf -> i64::MAX/MIN (native must not use a
     /// raw `(long)double` cast, which is UB here) — plus round/floor/to_int (PR-it142).

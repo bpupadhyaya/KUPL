@@ -2335,6 +2335,27 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_transcendental_math() {
+        // sqrt/cbrt/hypot are correctly-rounded (IEEE); sin/cos/tan/exp/log/pow share the
+        // platform libm, so interp and KVM (both Rust f64, which delegates to libm) agree
+        // exactly (PR-it143). The special-value edges are IEEE-defined and platform-stable.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(2.0).sqrt()}|{(27.0).cbrt()}|{(3.0).hypot(4.0)}|{(2.0).pow(10.0)}|{(0.0 - 8.0).cbrt()}|{(9.0).pow(0.5)}\" }\n"),
+            "1.4142135623730951|3.0|5.0|1024.0|-2.0|3.0"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(1.0).sin()}|{(1.0).cos()}|{(1.0).exp()}|{(2.718281828459045).log()}|{(0.5).sin()}\" }\n"),
+            "0.8414709848078965|0.5403023058681398|2.718281828459045|1.0|0.479425538604203"
+        );
+        // Special values: sqrt of a negative and log of <= 0 give NaN / -inf, pow(0,0) = 1,
+        // pow of a negative base to a fractional exp is NaN, exp overflow is +inf.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(0.0).sqrt()}|{(0.0 - 1.0).sqrt()}|{(0.0).log()}|{(0.0 - 1.0).log()}|{(0.0).pow(0.0)}|{(0.0 - 2.0).pow(0.5)}|{(1000.0).exp()}\" }\n"),
+            "0.0|NaN|-inf|NaN|1.0|NaN|inf"
+        );
+    }
+
+    #[test]
     fn diff_float_int_conversions() {
         // round is half-away-from-zero and returns a Float; floor/ceil return Float and are
         // correct on negatives (PR-it142).
