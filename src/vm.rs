@@ -2082,6 +2082,27 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_set_dedup_then_stable_sort() {
+        // A bug-hunt-19 lock (it248): the "dedup a list keeping first occurrence, then sort by a
+        // key" idiom, which threads sort_by's STABILITY through a Set's insertion-order dedup.
+        // it229 covered stable sort_by on a plain list; this composes it with Set([...]) dedup.
+        // Set(words) keeps first-seen order [banana, apple, cherry, fig] (the two "apple"s and two
+        // "banana"s collapse to their first appearance); to_list().sort() is alphabetical; and
+        // to_list().sort_by(len) is STABLE, so the two length-6 words "banana" and "cherry" keep
+        // the Set's order (banana first). Byte-identical on interp/KVM (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    let words = ["banana", "apple", "cherry", "apple", "fig", "banana"]
+    let uniq = Set(words)
+    "{uniq.len()}|{uniq.to_list().sort()}|{uniq.to_list().sort_by(fn s { s.len() })}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"4|["apple", "banana", "cherry", "fig"]|["fig", "apple", "banana", "cherry"]"#
+        );
+    }
+
+    #[test]
     fn diff_nested_map_of_maps_two_level() {
         // A certification lock (it247): a genuine two-level Map[Str, Map[Str, Int]] — the
         // object-of-objects / config-namespace idiom. Prior tests cover Map[Str, Set] and
