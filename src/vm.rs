@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_csv_parse_stringify_quoting() {
+        // csv_parse/csv_stringify follow RFC-4180-style quoting byte-identically on interp/KVM:
+        // an embedded comma keeps a quoted field as ONE field, a doubled "" un-doubles to a
+        // single " on parse, stringify quotes comma/quote fields (doubling embedded quotes), an
+        // empty field is preserved, and a parse->stringify round-trip is stable (PR-it178).
+        let src = r#"fun probe() -> Str {
+    let basic = csv_parse("a,b,c\nd,e,f")
+    let quoted = csv_parse("x,\"b,c\",z")
+    let emptyf = csv_parse("a,,c")
+    let dq = csv_parse("p,\"he said \"\"hi\"\"\",q")
+    let w1 = csv_stringify([["a", "b,c", "d"]])
+    let w2 = csv_stringify([["x", "say \"hi\"", "z"]])
+    let rt = csv_stringify(csv_parse("1,\"a,b\",3"))
+    "{basic}#{quoted}#{emptyf}#{dq}#{w1}#{w2}#{rt}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[[\"a\", \"b\", \"c\"], [\"d\", \"e\", \"f\"]]#[[\"x\", \"b,c\", \"z\"]]#[[\"a\", \"\", \"c\"]]#[[\"p\", \"he said \"hi\"\", \"q\"]]#a,\"b,c\",d#x,\"say \"\"hi\"\"\",z#1,\"a,b\",3"
+        );
+    }
+
+    #[test]
     fn diff_string_codec_roundtrip() {
         // base64/hex/url codecs are byte-identical on interp/KVM: encode produces standard
         // output (base64 padding, hex byte values, url percent-encoding), decode returns a

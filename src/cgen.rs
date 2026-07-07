@@ -5542,6 +5542,26 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native CSV parse/stringify matches interp/KVM's RFC-4180 quoting: embedded-comma
+    /// quoting, doubled-quote un-doubling on parse, and comma/quote quoting on write (PR-it178).
+    #[test]
+    fn native_csv_quoting() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let q = csv_parse("x,\"b,c\",z")
+    let dq = csv_parse("p,\"he said \"\"hi\"\"\",q")
+    let w = csv_stringify([["a", "b,c", "say \"hi\""]])
+    print("{q}#{dq}#{w}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "csvquote").trim(),
+            "[[\"x\", \"b,c\", \"z\"]]#[[\"p\", \"he said \"hi\"\", \"q\"]]#a,\"b,c\",\"say \"\"hi\"\"\""
+        );
+    }
+
     /// Native string codecs (base64/hex/url) match interp/KVM byte-for-byte: standard encoded
     /// output, unicode-preserving round-trip, and malformed decode -> Err (PR-it177).
     #[test]
