@@ -1945,6 +1945,40 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_higher_order_ordering() {
+        // sort_by is STABLE: elements with equal keys keep their original relative order.
+        // Sorting [[3,1],[1,2],[3,3],[1,4],[2,5]] by the first field yields second fields
+        // [2,4,5,1,3] (the two key-1 rows stay 2 before 4; the two key-3 rows stay 1 before 3).
+        let sortby = "fun probe() -> Str { let xs = [[3, 1], [1, 2], [3, 3], [1, 4], [2, 5]]\n    \
+                      \"{xs.sort_by(fn p { p.get(0).unwrap_or(0) }).map(fn p { p.get(1).unwrap_or(0) })}\" }\n";
+        assert_eq!(differential(sortby), "[2, 4, 5, 1, 3]");
+        // group_by keys by first-seen bucket order, elements within a bucket in original order.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{[1, 2, 3, 4, 5, 6, 7].group_by(fn x { x % 3 })}\" }\n"),
+            "Map{1: [1, 4, 7], 2: [2, 5], 0: [3, 6]}"
+        );
+        // zip_with truncates to the shorter list.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{[1, 2, 3, 4].zip_with([10, 20], fn(a, b) { a + b })}|{[1].zip_with([10, 20, 30], fn(a, b) { a * b })}\" }\n"),
+            "[11, 22]|[10]"
+        );
+        // flat_map preserves order (and an empty result filters); take_while/drop_while act on
+        // the leading run; partition keeps order in both halves; max_by breaks ties to the first.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{[1, 2, 3].flat_map(fn x { [x, x * 10] })}|{[1, 2, 3, 4].flat_map(fn x { if x % 2 == 0 { [x] } else { [] } })}\" }\n"),
+            "[1, 10, 2, 20, 3, 30]|[2, 4]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { let xs = [1, 2, 3, 4, 1, 2]\n    \"{xs.take_while(fn x { x < 3 })}|{xs.drop_while(fn x { x < 3 })}|{xs.partition(fn x { x % 2 == 0 })}\" }\n"),
+            "[1, 2]|[3, 4, 1, 2]|[[2, 4, 2], [1, 3, 1]]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { let xs = [[1, 5], [2, 5], [3, 1]]\n    \"{xs.min_by(fn p { p.get(1).unwrap_or(0) })}|{xs.max_by(fn p { p.get(1).unwrap_or(0) })}\" }\n"),
+            "Some([3, 1])|Some([1, 5])"
+        );
+    }
+
+    #[test]
     fn diff_list_scan_prefix_accumulation() {
         // PR-it113: `scan` is `fold` that keeps every running accumulator, byte-identical
         // on interp/KVM. Prefix sums, running max, empty list, and non-numeric accumulators.

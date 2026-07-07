@@ -4970,6 +4970,23 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native list higher-order methods preserve order/stability like interp/KVM:
+    /// stable sort_by, first-seen group_by, zip truncation, flat_map (PR-it127).
+    #[test]
+    fn native_list_higher_order_ordering() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let xs = [[3, 1], [1, 2], [3, 3], [1, 4], [2, 5]]\n    \
+                   print(\"{xs.sort_by(fn p { p.get(0).unwrap_or(0) }).map(fn p { p.get(1).unwrap_or(0) })}|\
+                   {[1, 2, 3, 4, 5, 6, 7].group_by(fn x { x % 3 })}|{[1, 2, 3, 4].zip_with([10, 20], fn(a, b) { a + b })}|\
+                   {[1, 2, 3].flat_map(fn x { [x, x * 10] })}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "listhof").trim(),
+            "[2, 4, 5, 1, 3]|Map{1: [1, 4, 7], 2: [2, 5], 0: [3, 6]}|[11, 22]|[1, 10, 2, 20, 3, 30]"
+        );
+    }
+
     /// Native List.scan (prefix accumulation, PR-it113) matches interp/KVM.
     #[test]
     fn native_list_scan_matches() {
