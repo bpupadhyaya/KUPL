@@ -2104,6 +2104,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_set_symmetric_difference_chain() {
+        // A bug-hunt-28 lock (it268): chaining symmetric_difference, which is associative and whose
+        // n-way chain yields the elements appearing in an ODD number of the sets (set XOR). Prior
+        // set-algebra locks (it123/161/183/205/216/235/242/251) cover union/intersect/difference and
+        // composed chains, but not symmetric_difference chained across three sets. a = {1,2,3,4},
+        // b = {3,4,5,6}, c = {5,6,7,8}. a △ b drops the shared {3,4}, keeping {1,2,5,6}; then
+        // (a △ b) △ c drops the shared {5,6} and adds {7,8}, yielding {1,2,7,8} — exactly the
+        // elements in an odd number of {a,b,c} (1,2 in a only; 7,8 in c only; 3,4 in two; 5,6 in
+        // two). Byte-identical on interp/KVM (native per the sweep); pins the associative XOR-over-sets
+        // behavior with insertion-order-preserving Set rendering.
+        let src = r#"fun probe() -> Str {
+    let a = Set([1, 2, 3, 4])
+    let b = Set([3, 4, 5, 6])
+    let c = Set([5, 6, 7, 8])
+    let sd1 = a.symmetric_difference(b)
+    let sd2 = a.symmetric_difference(b).symmetric_difference(c)
+    "{sd1}|{sd2}"
+}
+"#;
+        assert_eq!(differential(src), "Set{1, 2, 5, 6}|Set{1, 2, 7, 8}");
+    }
+
+    #[test]
     fn diff_map_entries_filter_rebuild() {
         // A certification lock (it267): the Map-rebuild-via-fold idiom. KUPL has no direct
         // Map.filter, so pruning or transforming a map's entries is done by folding over its
