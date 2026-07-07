@@ -2721,6 +2721,10 @@ pub fn shared_method(
         (Value::Float(v), "sin") => Ok(Value::Float(v.sin())),
         (Value::Float(v), "cos") => Ok(Value::Float(v.cos())),
         (Value::Float(v), "tan") => Ok(Value::Float(v.tan())),
+        // Angle conversions completing the trig surface; the native impl must use the SAME
+        // constants as Rust f64::to_degrees/to_radians to stay bit-identical.
+        (Value::Float(v), "to_degrees") => Ok(Value::Float(v.to_degrees())),
+        (Value::Float(v), "to_radians") => Ok(Value::Float(v.to_radians())),
         (Value::Float(v), "sign") => Ok(Value::Float(if *v > 0.0 {
             1.0
         } else if *v < 0.0 {

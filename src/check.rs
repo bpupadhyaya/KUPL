@@ -162,8 +162,8 @@ const BUILTIN_METHODS: &[&str] = &[
     "reverse", "rfind", "round", "saturating_add", "saturating_mul", "saturating_sub",
     "scale", "scan", "shl", "shr", "sign", "sin", "slice", "sort", "sort_by", "split",
     "split_once", "sqrt", "starts_with", "sum", "swapcase", "symmetric_difference", "tail", "take",
-    "take_while", "tan", "to_binary", "to_float", "to_hex", "to_int", "to_list",
-    "to_lower", "to_octal", "to_radix", "to_str", "to_upper", "trailing_zeros", "trim", "trim_end",
+    "take_while", "tan", "to_binary", "to_degrees", "to_float", "to_hex", "to_int", "to_list",
+    "to_lower", "to_octal", "to_radians", "to_radix", "to_str", "to_upper", "trailing_zeros", "trim", "trim_end",
     "trim_start", "trunc", "union", "unique", "unwrap_or", "ushr", "values", "window", "zip_with",
 ];
 
@@ -2290,7 +2290,8 @@ impl Checker {
             }
             (Ty::Float, "log") | (Ty::Float, "log10") | (Ty::Float, "exp") | (Ty::Float, "sin")
             | (Ty::Float, "cos") | (Ty::Float, "tan") | (Ty::Float, "sign")
-            | (Ty::Float, "log2") | (Ty::Float, "cbrt") => Some((vec![], Ty::Float)),
+            | (Ty::Float, "log2") | (Ty::Float, "cbrt") | (Ty::Float, "to_degrees")
+            | (Ty::Float, "to_radians") => Some((vec![], Ty::Float)),
             (Ty::Float, "atan2") | (Ty::Float, "hypot") | (Ty::Float, "copysign") => {
                 Some((vec![Ty::Float], Ty::Float))
             }

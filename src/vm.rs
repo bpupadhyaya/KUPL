@@ -2203,6 +2203,22 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_float_to_degrees_radians() {
+        // The NEW to_degrees/to_radians complete the trig surface, byte-identical on interp/KVM
+        // down to the last bit — the native impl uses M_PI (== Rust consts::PI) so the constant
+        // fold matches: 180deg = pi rad, 1 rad = 57.29577951308232 deg (PR-it194).
+        let src = r#"fun probe() -> Str {
+    let pi = 3.141592653589793
+    "{(180.0).to_radians()}|{pi.to_degrees()}|{(90.0).to_radians()}|{(1.0).to_degrees()}|{(0.0 - 45.0).to_radians()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "3.141592653589793|180.0|1.5707963267948966|57.29577951308232|-0.7853981633974483"
+        );
+    }
+
+    #[test]
     fn diff_float_copysign() {
         // The NEW copysign(x, y) is byte-identical on interp/KVM: magnitude of the receiver with
         // the SIGN BIT of the argument. Crucially the sign comes from the bit, so a genuine -0.0

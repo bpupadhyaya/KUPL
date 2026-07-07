@@ -4088,6 +4088,10 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "sin")) return k_float(sin(recv.as.f));
         if (!strcmp(name, "cos")) return k_float(cos(recv.as.f));
         if (!strcmp(name, "tan")) return k_float(tan(recv.as.f));
+        /* Match Rust f64::to_degrees (self * 180/PI) and to_radians (self * PI/180) exactly;
+           M_PI is the same f64 value as Rust's consts::PI, and the constant fold matches. */
+        if (!strcmp(name, "to_degrees")) return k_float(recv.as.f * (180.0 / M_PI));
+        if (!strcmp(name, "to_radians")) return k_float(recv.as.f * (M_PI / 180.0));
         if (!strcmp(name, "sign")) {
             double v = recv.as.f;
             return k_float(v > 0 ? 1.0 : (v < 0 ? -1.0 : v));
@@ -5696,6 +5700,23 @@ fun main() uses io {
 }
 "#;
         assert_eq!(native_main_stdout(src, "intfac").trim(), "1|120|2432902008176640000");
+    }
+
+    /// Native to_degrees/to_radians match interp/KVM bit-for-bit (M_PI == Rust consts::PI, so
+    /// the 180/PI and PI/180 constant folds agree) (PR-it194).
+    #[test]
+    fn native_float_to_degrees_radians() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{(180.0).to_radians()}|{(1.0).to_degrees()}|{(90.0).to_radians()}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "fdegrad").trim(),
+            "3.141592653589793|57.29577951308232|1.5707963267948966"
+        );
     }
 
     /// Native copysign matches interp/KVM including the sign bit of a genuine -0.0 argument
