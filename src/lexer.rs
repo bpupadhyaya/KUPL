@@ -268,7 +268,9 @@ impl<'a> Lexer<'a> {
                 Ok(v) => self.push(Tok::Int(v), start),
                 Err(_) => self.diags.push(Diag::error(
                     "K0004",
-                    format!("integer literal `{text}` does not fit in Int (64-bit)"),
+                    format!(
+                        "integer literal `{text}` does not fit in Int (64-bit) — use `big(\"{text}\")` for an arbitrary-precision BigInt"
+                    ),
                     self.span_from(start),
                 )),
             }
@@ -654,6 +656,29 @@ mod tests {
         // a trailing identifier that isn't a width name is NOT consumed as a suffix
         let toks: Vec<Tok> = lex("123index").0.into_iter().map(|t| t.tok).collect();
         assert_eq!(toks, vec![Tok::Int(123), Tok::Ident("index".into()), Tok::Newline, Tok::Eof]);
+    }
+
+    /// A decimal literal too large for i64 is a K0004, and the message now NAMES the fix:
+    /// wrap the digits in `big("...")` for an arbitrary-precision BigInt (it287). The suggested
+    /// call echoes the exact digits (underscores stripped) so it can be copy-pasted verbatim.
+    #[test]
+    fn int_overflow_literal_suggests_big() {
+        let (_, diags) = lex("99999999999999999999999");
+        let d = diags.iter().find(|d| d.code == "K0004").expect("expected K0004");
+        assert!(d.message.contains("does not fit in Int (64-bit)"), "{}", d.message);
+        assert!(
+            d.message.contains("big(\"99999999999999999999999\")"),
+            "message should name the big(...) fix with the literal digits: {}",
+            d.message
+        );
+        // underscores in the source literal are stripped from the suggested call
+        let (_, du) = lex("9_223_372_036_854_775_808");
+        let d2 = du.iter().find(|d| d.code == "K0004").expect("expected K0004");
+        assert!(
+            d2.message.contains("big(\"9223372036854775808\")"),
+            "underscores must be stripped in the suggestion: {}",
+            d2.message
+        );
     }
 
     #[test]
