@@ -2104,6 +2104,38 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_fold_with_record_stats_single_pass() {
+        // A certification lock (it275): fold reducing to a RECORD accumulator that computes four
+        // summary statistics (min/max/sum/count) in a SINGLE pass. This complements it274 (scan with a
+        // record acc) but pins fold's distinct contract: scan emits the state after every element;
+        // fold emits ONLY the final accumulator. It is the canonical "aggregate a list into a stats
+        // struct" idiom -- one traversal, four fields advancing independently, then derived values.
+        //   xs = [7, 2, 9, 4, 2, 8], seed Stats(lo:999, hi:-999, sum:0, cnt:0)
+        //   lo == 2  (running min)   hi == 9  (running max)   sum == 32   cnt == 6
+        //   mean = sum/cnt == 5 (integer division)   range = hi-lo == 7
+        // Byte-identical on interp/KVM (native per the sweep). Confirms fold threads a multi-field
+        // record through the whole list with each field's own update rule (conditional for min/max,
+        // additive for sum/cnt), and that only the final record survives to drive the derived stats.
+        let src = r#"type Stats = { lo: Int, hi: Int, sum: Int, cnt: Int }
+fun probe() -> Str {
+    let xs = [7, 2, 9, 4, 2, 8]
+    let s = xs.fold(Stats(lo: 999, hi: 0 - 999, sum: 0, cnt: 0), fn(a, x) {
+        Stats(
+            lo: if x < a.lo { x } else { a.lo },
+            hi: if x > a.hi { x } else { a.hi },
+            sum: a.sum + x,
+            cnt: a.cnt + 1
+        )
+    })
+    let mean = s.sum / s.cnt
+    let range = s.hi - s.lo
+    "lo={s.lo} hi={s.hi} sum={s.sum} cnt={s.cnt} mean={mean} range={range}"
+}
+"#;
+        assert_eq!(differential(src), "lo=2 hi=9 sum=32 cnt=6 mean=5 range=7");
+    }
+
+    #[test]
     fn diff_scan_with_record_shaped_accumulator() {
         // A bug-hunt-31 lock (it274): List.scan threading a RECORD-shaped running state. Prior scan
         // locks (it2007-2016) all use a SCALAR accumulator -- Int running-sum, running-max, String
