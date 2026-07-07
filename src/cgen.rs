@@ -1424,9 +1424,22 @@ static KValue k_rem(KValue a, KValue b) {
 }
 static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
     double x, y; int is_str = 0; int c = 0;
+    /* Floats need IEEE-correct comparison: NaN is UNORDERED, so `<=` and `>=`
+       against NaN must be false. A 3-way (-1/0/1) result would collapse NaN's
+       "unordered" into 0 (looks equal), making `<=`/`>=` wrongly true — so compare
+       directly with the C operators, which honor IEEE (all comparisons with NaN
+       are false), matching the interpreter/KVM. */
+    if (a.tag == K_FLOAT && b.tag == K_FLOAT) {
+        x = a.as.f; y = b.as.f;
+        switch (op) { case 0: return k_bool(x < y); case 1: return k_bool(x <= y);
+                      case 2: return k_bool(x > y); default: return k_bool(x >= y); }
+    }
+    if (a.tag == K_F32 && b.tag == K_F32) {
+        float p = a.as.f32v, q = b.as.f32v;
+        switch (op) { case 0: return k_bool(p < q); case 1: return k_bool(p <= q);
+                      case 2: return k_bool(p > q); default: return k_bool(p >= q); }
+    }
     if (a.tag == K_INT && b.tag == K_INT) { x = 0; y = 0; c = (a.as.i < b.as.i) ? -1 : (a.as.i > b.as.i); }
-    else if (a.tag == K_FLOAT && b.tag == K_FLOAT) { x = a.as.f; y = b.as.f; c = (x < y) ? -1 : (x > y); }
-    else if (a.tag == K_F32 && b.tag == K_F32) { float p = a.as.f32v, q = b.as.f32v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) { __int128 p = a.as.sized->v, q = b.as.sized->v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_STR && b.tag == K_STR) { is_str = 1; int r = strcmp(a.as.s, b.as.s); c = (r < 0) ? -1 : (r > 0); }
     else if (a.tag == K_BIGINT && b.tag == K_BIGINT) { c = k_big_cmp(a, b); }
@@ -5097,6 +5110,20 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
             native_main_stdout(src, "f2iconv").trim(),
             "3.0|-3.0|2.0|3|9223372036854775807|0|9223372036854775807|-9223372036854775808|5.0"
         );
+    }
+
+    /// Native float comparison is IEEE-correct for NaN (`<=`/`>=` against NaN are false, not
+    /// true) — a regression guard for PR-it148: k_cmp used to collapse NaN's unordered
+    /// result into a 3-way 0 (looks equal), making `nan <= nan` wrongly true. Now floats
+    /// compare with the C operators directly, matching interp/KVM.
+    #[test]
+    fn native_nan_comparison_is_ieee_correct() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let nan = 0.0 / 0.0\n    \
+                   print(\"{nan == nan}|{nan != nan}|{nan < 1.0}|{nan <= nan}|{nan >= nan}|{1.0 < nan}|{1.5 < 2.5}|{2.5 <= 2.5}|{3.0 >= 2.0}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "nancmp").trim(), "false|true|false|false|false|false|true|true|true");
     }
 
     /// Native's manual float formatter matches interp/KVM at the extremes: special

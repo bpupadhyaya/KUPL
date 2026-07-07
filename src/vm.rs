@@ -2536,6 +2536,19 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
     }
 
     #[test]
+    fn diff_comparison_operator_edges() {
+        // NaN is IEEE-UNORDERED: every comparison against it (incl. <= and >=, and nan <= nan
+        // / nan >= nan) is false, and nan != nan is true. -0.0 == 0.0 but is not < 0.0. inf
+        // orders above finite values (PR-it148).
+        let f = "fun probe() -> Str { let nan = 0.0 / 0.0\n    let inf = 1.0 / 0.0\n    let nz = 0.0 - 0.0\n    \
+                 \"{nan == nan}|{nan != nan}|{nan < 1.0}|{nan <= nan}|{nan >= nan}|{1.0 < nan}|{inf > 1.0e308}|{inf == inf}|{0.0 == nz}|{nz < 0.0}\" }\n";
+        assert_eq!(differential(f), "false|true|false|false|false|false|true|true|true|false");
+        // Ordinary float / int comparisons, and lexicographic Str ordering.
+        let ord = "fun probe() -> Str { \"{1.5 < 2.5}|{2.5 <= 2.5}|{3.0 >= 2.0}|{\"apple\" < \"banana\"}|{\"Apple\" < \"apple\"}|{\"a\" < \"ab\"}|{\"\" < \"a\"}\" }\n";
+        assert_eq!(differential(ord), "true|true|true|true|true|true|true");
+    }
+
+    #[test]
     fn diff_numeric_bitwise_shift_and_sized_arithmetic() {
         // Int bitwise/shift/number-theory methods, byte-identical on interp/KVM. The
         // key case: `shr` is ARITHMETIC (sign-extends) while `ushr` is LOGICAL — the
