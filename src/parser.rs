@@ -1879,6 +1879,45 @@ mod tests {
     }
 
     #[test]
+    fn malformed_input_never_panics_only_diagnoses() {
+        // A fuzz pass (PR-it146: ~2600 mutation-fuzzed + 31 structured-malformed inputs)
+        // found no Rust-level panic/abort/hang — the CLI always degrades to a clean
+        // diagnostic. These pin the nastiest structured cases: parse + type-check must
+        // RETURN (never panic / unwrap / index-oob), yielding error diagnostics.
+        let nasty = [
+            "",                              // empty file
+            "   \n\t\n  ",                   // only whitespace
+            "// just a comment\n",           // only a comment
+            "(((((((((((",                   // unbalanced open parens
+            "}}}}}}}}}}}",                   // unbalanced close braces
+            "[[[[[[[[[[[",                   // unbalanced open brackets
+            "\"unterminated string",         // unterminated string literal
+            "\"{a + ",                       // unterminated interpolation
+            "fun f() { match x { } }\n",     // match with no arms
+            "type = = =",                    // garbage type header
+            "fun fun fun",                   // repeated keywords
+            "app X {",                       // unterminated app
+            "contract C {",                  // unterminated contract
+            "component",                     // bare keyword
+            "1e999999999",                   // huge float literal
+            "0xffffffffffffffffffffff",      // huge hex literal
+            "fun f[",                        // truncated generic header
+            "let let let",                   // repeated let
+            "fun main() uses io { print(",   // unterminated call
+        ];
+        for src in nasty {
+            // Neither of these may panic; both must terminate and return.
+            let (program, pdiags) = parse(src);
+            let (_checked, cdiags) = crate::check::check(&program);
+            // Every one of these inputs is invalid, so at least one pass must complain
+            // (except the trivially-empty program forms, which are simply empty).
+            let has_err = pdiags.iter().chain(cdiags.iter()).any(|d| d.severity == crate::diag::Severity::Error);
+            let trivially_empty = matches!(src, "" | "   \n\t\n  " | "// just a comment\n");
+            assert!(has_err || trivially_empty, "expected a diagnostic for {src:?}");
+        }
+    }
+
+    #[test]
     fn eq_in_condition_suggests_double_equals() {
         // `=` (assignment) where `==` (comparison) was meant is a classic slip; the
         // K0100 error must point at the fix, not just say "expected `{`, found `=`".
