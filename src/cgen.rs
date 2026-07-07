@@ -5542,6 +5542,26 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native Option/Result combinators short-circuit like interp/KVM: map/filter skip the
+    /// closure on None/Err, ok_or converts, and a chain stops at the first None (PR-it164).
+    #[test]
+    fn native_option_result_combinators() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let n: Option[Int] = None
+    let er: Result[Int, Str] = Err("boom")
+    let chain = Some(10).map(fn x { x + 1 }).filter(fn x { x > 100 }).map(fn x { x * 2 })
+    print("{Some(3).map(fn x { x * 2 })}|{n.ok_or("e")}|{er.map_err(fn e { "w: {e}" })}|{er.unwrap_or(0)}|{chain}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "optres").trim(),
+            "Some(6)|Err(\"e\")|Err(\"w: boom\")|0|None"
+        );
+    }
+
     /// Native JSON serialize/parse of nested structures matches interp/KVM: JObj keys in
     /// insertion order, whole JNum as int, nested round-trip, duplicate-key last-wins (it162).
     #[test]

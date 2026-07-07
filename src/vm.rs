@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_option_result_combinators() {
+        // The Option/Result combinator surface (map/filter/and_then/ok_or/unwrap_or/map_err/ok)
+        // is byte-identical on interp/KVM with correct short-circuiting: map/filter do NOT call
+        // the closure on None/Err, ok_or converts Option->Result, and a chain short-circuits
+        // once it hits None (PR-it164).
+        let src = r#"fun probe() -> Str {
+    let n: Option[Int] = None
+    let opt = "{Some(3).map(fn x { x * 2 })}|{n.map(fn x { x * 2 })}|{Some(4).filter(fn x { x > 2 })}|{Some(1).filter(fn x { x > 2 })}"
+    let oc = "{Some(5).unwrap_or(0)}|{n.unwrap_or(0)}|{Some(3).ok_or("e")}|{n.ok_or("e")}"
+    let ok: Result[Int, Str] = Ok(3)
+    let er: Result[Int, Str] = Err("boom")
+    let res = "{ok.map(fn x { x + 1 })}|{er.map(fn x { x + 1 })}|{er.map_err(fn e { "w: {e}" })}|{er.unwrap_or(0)}|{ok.ok()}|{er.ok()}"
+    let chain = "{Some(10).map(fn x { x + 1 }).filter(fn x { x > 100 }).map(fn x { x * 2 })}"
+    "{opt}#{oc}#{res}#{chain}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "Some(6)|None|Some(4)|None#5|0|Ok(3)|Err(\"e\")#Ok(4)|Err(\"boom\")|Err(\"w: boom\")|0|Some(3)|None#None"
+        );
+    }
+
+    #[test]
     fn diff_json_nested_roundtrip_and_key_order() {
         // JSON serialize/parse of nested structures is byte-identical on interp/KVM: JObj keys
         // stringify in insertion order (matching the map cert), a whole JNum renders as an int
