@@ -1612,7 +1612,21 @@ static KValue k_json_stringify(KValue v) {
 }
 
 /* --- parse (mirror json.rs Parser); build Json ctors, wrap in Ok/Err --- */
-typedef struct { const unsigned char* s; long pos, len; int failed; int depth; } KJP;
+typedef struct { const unsigned char* s; long pos, len; int failed; int depth; char err[192]; } KJP;
+/* First error wins (mirrors the interpreter's `?` short-circuit) so the reported
+   message matches json.rs byte-for-byte. */
+static void kjp_fail(KJP* p, const char* m) { if (!p->failed) { p->failed = 1; snprintf(p->err, sizeof p->err, "%s", m); } }
+/* Character (not byte) offset of `pos` — json.rs positions are char indices. */
+static long kjp_cpos(KJP* p, long pos) { long n = 0; for (long i = 0; i < pos && i < p->len; i++) if ((p->s[i] & 0xC0) != 0x80) n++; return n; }
+/* Copy the whole UTF-8 character starting at `pos` into `out`. */
+static void kjp_char_at(KJP* p, long pos, char* out, int sz) {
+    if (pos >= p->len) { out[0] = 0; return; }
+    unsigned char c = p->s[pos];
+    int n = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+    if (pos + n > p->len) n = 1;
+    if (n >= sz) n = sz - 1;
+    memcpy(out, p->s + pos, n); out[n] = 0;
+}
 /* Same nesting cap as json::MAX_JSON_DEPTH — untrusted deep input fails cleanly
    instead of overflowing the (small) C stack. */
 #define K_MAX_JSON_DEPTH 500
@@ -1623,11 +1637,11 @@ static char* kjp_string(KJP* p) {  /* assumes current char is the opening quote 
     p->pos++;
     KBuf b = { 0, 0, 0 };
     for (;;) {
-        if (p->pos >= p->len) { p->failed = 1; break; }
+        if (p->pos >= p->len) { kjp_fail(p, "unterminated string"); break; }
         int c = p->s[p->pos++];
         if (c == '"') break;
         if (c == '\\') {
-            if (p->pos >= p->len) { p->failed = 1; break; }
+            if (p->pos >= p->len) { kjp_fail(p, "invalid escape"); break; }
             int e = p->s[p->pos++];
             if (e == '"') kb_putc(&b, '"');
             else if (e == '\\') kb_putc(&b, '\\');
@@ -1638,15 +1652,15 @@ static char* kjp_string(KJP* p) {  /* assumes current char is the opening quote 
             else if (e == 'b') kb_putc(&b, 0x08);
             else if (e == 'f') kb_putc(&b, 0x0C);
             else if (e == 'u') {
-                unsigned int code = 0; int bad = 0;
+                unsigned int code = 0; int bad = 0, trunc = 0;
                 for (int i = 0; i < 4; i++) {
-                    if (p->pos >= p->len) { bad = 1; break; }
+                    if (p->pos >= p->len) { bad = 1; trunc = 1; break; }
                     int d = p->s[p->pos++];
                     int hv = (d>='0'&&d<='9')?d-'0':(d>='a'&&d<='f')?d-'a'+10:(d>='A'&&d<='F')?d-'A'+10:-1;
                     if (hv < 0) { bad = 1; break; }
                     code = code * 16 + hv;
                 }
-                if (bad) { p->failed = 1; break; }
+                if (bad) { kjp_fail(p, trunc ? "truncated \\u escape" : "invalid \\u escape"); break; }
                 /* combine a high surrogate (D800..DBFF) with a following \uLOW (DC00..DFFF)
                    into one astral code point; an unpaired surrogate -> U+FFFD (mirrors
                    json.rs). */
@@ -1667,7 +1681,7 @@ static char* kjp_string(KJP* p) {  /* assumes current char is the opening quote 
                     } else { code = 0xFFFD; }
                 }
                 kb_putcp(&b, code);
-            } else { p->failed = 1; break; }
+            } else { kjp_fail(p, "invalid escape"); break; }
         } else kb_putc(&b, (char)c);
     }
     return b.buf ? b.buf : (char*)"";
@@ -1679,7 +1693,7 @@ static KValue kjp_number(KJP* p) {
     char buf[64]; long n = p->pos - start; if (n >= (long)sizeof buf) n = sizeof buf - 1;
     memcpy(buf, p->s + start, n); buf[n] = 0;
     char* end; double d = strtod(buf, &end);
-    if (end == buf || *end != 0) { p->failed = 1; return k_unit(); }
+    if (end == buf || *end != 0) { char m[96]; snprintf(m, sizeof m, "invalid number `%s`", buf); kjp_fail(p, m); return k_unit(); }
     KValue f = k_float(d); return k_jc_("JNum", &f, 1);
 }
 static KValue k_jc_(const char* name, KValue* fields, int n) { return k_ctor(k_ctor_by_name(name), fields, n); }
@@ -1700,7 +1714,7 @@ static KValue kjp_array(KJP* p) {
         int c = p->pos < p->len ? p->s[p->pos++] : -1;
         if (c == ',') continue;
         if (c == ']') break;
-        p->failed = 1; break;
+        kjp_fail(p, "expected `,` or `]` in array"); break;
     }
     KValue l = k_list(items, n);
     return k_jc_("JArr", &l, 1);
@@ -1714,11 +1728,11 @@ static KValue kjp_object(KJP* p) {
     if (kjp_peek(p) == '}') { p->pos++; KMap* m = k_alloc(sizeof(KMap)); m->len = 0; m->keys = k_alloc(1); m->vals = k_alloc(1); KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1); }
     for (;;) {
         kjp_ws(p);
-        if (kjp_peek(p) != '"') { p->failed = 1; break; }
+        if (kjp_peek(p) != '"') { kjp_fail(p, "expected string key in object"); break; }
         char* key = kjp_string(p);
         if (p->failed) break;
         kjp_ws(p);
-        if (!(p->pos < p->len && p->s[p->pos++] == ':')) { p->failed = 1; break; }
+        if (!(p->pos < p->len && p->s[p->pos++] == ':')) { kjp_fail(p, "expected `:` in object"); break; }
         KValue val = kjp_value(p);
         if (p->failed) break;
         KValue kv = k_str(key);
@@ -1738,7 +1752,7 @@ static KValue kjp_object(KJP* p) {
         int c = p->pos < p->len ? p->s[p->pos++] : -1;
         if (c == ',') continue;
         if (c == '}') break;
-        p->failed = 1; break;
+        kjp_fail(p, "expected `,` or `}` in object"); break;
     }
     KMap* m = k_alloc(sizeof(KMap));
     m->len = n; m->keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n)); m->vals = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
@@ -1749,26 +1763,33 @@ static KValue kjp_value(KJP* p) {
     kjp_ws(p);
     int c = kjp_peek(p);
     if (c == '{' || c == '[') {
-        if (++p->depth > K_MAX_JSON_DEPTH) { p->failed = 1; return k_unit(); }
+        if (++p->depth > K_MAX_JSON_DEPTH) { kjp_fail(p, "JSON nested too deeply"); return k_unit(); }
         KValue v = (c == '{') ? kjp_object(p) : kjp_array(p);
         p->depth--;
         return v;
     }
     if (c == '"') { char* s = kjp_string(p); KValue sv = k_str(s); return k_jc_("JStr", &sv, 1); }
-    if (c == 't') { if (p->pos+4<=p->len && !memcmp(p->s+p->pos,"true",4)) { p->pos+=4; KValue b=k_bool(1); return k_jc_("JBool",&b,1);} p->failed=1; return k_unit(); }
-    if (c == 'f') { if (p->pos+5<=p->len && !memcmp(p->s+p->pos,"false",5)) { p->pos+=5; KValue b=k_bool(0); return k_jc_("JBool",&b,1);} p->failed=1; return k_unit(); }
-    if (c == 'n') { if (p->pos+4<=p->len && !memcmp(p->s+p->pos,"null",4)) { p->pos+=4; return k_jc_("JNull",0,0);} p->failed=1; return k_unit(); }
+    if (c == 't') { if (p->pos+4<=p->len && !memcmp(p->s+p->pos,"true",4)) { p->pos+=4; KValue b=k_bool(1); return k_jc_("JBool",&b,1);} kjp_fail(p, "invalid literal (expected `true`)"); return k_unit(); }
+    if (c == 'f') { if (p->pos+5<=p->len && !memcmp(p->s+p->pos,"false",5)) { p->pos+=5; KValue b=k_bool(0); return k_jc_("JBool",&b,1);} kjp_fail(p, "invalid literal (expected `false`)"); return k_unit(); }
+    if (c == 'n') { if (p->pos+4<=p->len && !memcmp(p->s+p->pos,"null",4)) { p->pos+=4; return k_jc_("JNull",0,0);} kjp_fail(p, "invalid literal (expected `null`)"); return k_unit(); }
     if (c == '-' || (c >= '0' && c <= '9')) return kjp_number(p);
-    p->failed = 1; return k_unit();
+    if (c < 0) { kjp_fail(p, "unexpected end of input"); return k_unit(); }
+    { char ch[8]; kjp_char_at(p, p->pos, ch, sizeof ch);
+      char m[64]; snprintf(m, sizeof m, "unexpected character `%s` at position %ld", ch, kjp_cpos(p, p->pos));
+      kjp_fail(p, m); return k_unit(); }
 }
 static KValue k_json_parse(KValue s) {
     if (s.tag != K_STR) { const char* d = k_show(s); (void)d; }
     const char* str = (s.tag == K_STR) ? s.as.s : k_show(s);
-    KJP p; p.s = (const unsigned char*)str; p.pos = 0; p.len = (long)strlen(str); p.failed = 0; p.depth = 0;
+    KJP p; p.s = (const unsigned char*)str; p.pos = 0; p.len = (long)strlen(str); p.failed = 0; p.depth = 0; p.err[0] = 0;
     kjp_ws(&p);
     KValue v = kjp_value(&p);
     kjp_ws(&p);
-    if (p.failed || p.pos != p.len) return k_err(k_str("invalid JSON"));
+    if (p.failed) { char* e = (char*)k_alloc(strlen(p.err) + 1); strcpy(e, p.err); return k_err(k_str(e)); }
+    if (p.pos != p.len) {
+        char m[64]; snprintf(m, sizeof m, "unexpected trailing characters at position %ld", kjp_cpos(&p, p.pos));
+        char* e = (char*)k_alloc(strlen(m) + 1); strcpy(e, m); return k_err(k_str(e));
+    }
     return k_ok(v);
 }
 
@@ -4884,6 +4905,23 @@ mod tests {
                    print(\"{[1, 2] == [1, 2]}{Pt(1, 2) == Pt(1, 2)}{Red == Blue}{Some([1, 2]) == Some([1, 2])}\
                    {ma == mb}{nan == nan}{-0.0 == 0.0}{\"Z\" < \"a\"}\")\n}\n";
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
+    }
+
+    /// Native JSON parse errors match the interpreter's specific, positioned messages
+    /// (PR-it116 replaced a generic "invalid JSON" with per-site messages).
+    #[test]
+    fn native_json_parse_error_messages() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun e(j: Str) -> Str { match json_parse(j) { Ok(_) => "ok"
+        Err(m) => m } }
+fun main() uses io { print("{e("NaN")}|{e("[1,2")}|{e("1.2.3")}|{e("")}|{e("[1,2] x")}") }
+"#;
+        assert_eq!(
+            native_main_stdout(src, "jerr").trim(),
+            "unexpected character `N` at position 0|expected `,` or `]` in array|invalid number `1.2.3`|unexpected end of input|unexpected trailing characters at position 6"
+        );
     }
 
     /// Native JSON \u surrogate-pair parsing combines pairs into one astral code point

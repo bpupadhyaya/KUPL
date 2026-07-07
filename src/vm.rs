@@ -1883,6 +1883,20 @@ mod tests {
     }
 
     #[test]
+    fn diff_json_parse_error_messages() {
+        // PR-it116: malformed JSON gives the SAME specific, positioned error message on
+        // interp/KVM (and native) — not a generic "invalid JSON".
+        let src = r#"fun e(j: Str) -> Str { match json_parse(j) { Ok(_) => "ok"
+        Err(m) => m } }
+fun probe() -> Str { "{e("NaN")}|{e("[1,2")}|{e("1.2.3")}|{e("")}|{e("tru")}|{e("[1,2] x")}" }
+"#;
+        assert_eq!(
+            differential(src),
+            "unexpected character `N` at position 0|expected `,` or `]` in array|invalid number `1.2.3`|unexpected end of input|invalid literal (expected `true`)|unexpected trailing characters at position 6"
+        );
+    }
+
+    #[test]
     fn diff_json_surrogate_pair_parsing() {
         // PR-it115: a `🎉` surrogate pair decodes to the single astral code
         // point (🎉), a BMP escape is unchanged (é), and a lone surrogate becomes
