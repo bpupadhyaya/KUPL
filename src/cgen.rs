@@ -5196,6 +5196,22 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native heap-allocates escaping closure environments so first-class closures match
+    /// interp/KVM: a returned closure keeps its capture, a Map dispatch table of closures,
+    /// a closure stored in a record field, and currying all work (PR-it147).
+    #[test]
+    fn native_closures_as_first_class_values() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Box = Box(op: fn(Int) -> Int, base: Int)\n\
+                   fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\
+                   fun main() uses io {\n    let ops = Map().insert(\"inc\", fn x { x + 1 }).insert(\"neg\", fn x { 0 - x })\n    \
+                   let add5 = adder(5)\n    let b = Box(op: fn x { x * 3 }, base: 4)\n    \
+                   print(\"{ops.get(\"inc\").unwrap_or(fn x { x })(41)}|{ops.get(\"neg\").unwrap_or(fn x { x })(7)}|{add5(10)}|{(b.op)(b.base)}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "closures").trim(), "42|-7|15|12");
+    }
+
     /// Native monomorphizes a generic function used at multiple types and compiles
     /// generic ADTs, matching interp/KVM (PR-it120).
     #[test]

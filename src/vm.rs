@@ -2094,6 +2094,25 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_closures_as_first_class_values() {
+        // Closures are first-class: stored in a List and applied; RETURNED from a function
+        // capturing its argument (escaping the creating call) so add3 and add10 keep
+        // independent captures; composed; and curried three deep — byte-identical on
+        // interp/KVM (PR-it147).
+        let ret = "fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\
+                   fun compose(f: fn(Int) -> Int, g: fn(Int) -> Int) -> fn(Int) -> Int { fn x { f(g(x)) } }\n\
+                   fun add(a: Int) -> fn(Int) -> fn(Int) -> Int { fn b { fn c { a + b + c } } }\n\
+                   fun probe() -> Str {\n    let fns = [fn x { x + 1 }, fn x { x * 2 }, fn x { x * x }]\n    \
+                   let add3 = adder(3)\n    let add10 = adder(10)\n    \
+                   \"{fns.map(fn f { f(10) })}|{add3(4)}|{add10(4)}|{add3(100)}|{compose(add3, add10)(1)}|{add(1)(2)(3)}\"\n}\n";
+        assert_eq!(differential(ret), "[11, 20, 100]|7|14|103|14|6");
+        // Value-capture (it76) survives storage: each loop iteration's closure captures its
+        // own `i` by VALUE, so applying them gives [1, 2, 3], not [3, 3, 3].
+        let cap = "fun probe() -> Str {\n    var fns: List[fn() -> Int] = []\n    for i in 1..4 {\n        fns = fns.push(fn() { i })\n    }\n    \"{fns.map(fn f { f() })}\"\n}\n";
+        assert_eq!(differential(cap), "[1, 2, 3]");
+    }
+
+    #[test]
     fn diff_higher_order_and_closure_depth() {
         // A returned closure keeps its own captured environment; two are independent.
         let ret = "fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\
