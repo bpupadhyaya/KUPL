@@ -1,0 +1,97 @@
+// Component wiring & message-passing: cascade, fan-out, state accumulation, and a
+// bounded feedback loop. The tree-walking interpreter and the KVM drive components
+// with identical, deterministic message ordering (verified byte-identical by the
+// cross-engine sweep). Native compiles `fun main`, not the `app` model, so this
+// program is interpreter/KVM only. (cf. Swift's actors, Kotlin coroutines/channels —
+// here the wiring is declared statically and dispatched deterministically.)
+
+// A source kicks things off at startup and fans one value out to two sinks.
+component Source {
+    intent "Emits a starting value once at startup."
+
+    out go: Int
+
+    on start {
+        emit go(1)
+    }
+}
+
+// A relay forwards each message downstream (used to build a cascade).
+component Relay {
+    intent "Adds ten and forwards, so a value cascades through the graph."
+
+    in take: Int
+    out pass: Int
+
+    on take(n) {
+        print("relay saw {n}")
+        emit pass(n + 10)
+    }
+}
+
+// A counter accumulates state across every message it receives.
+component Counter {
+    intent "Sums every value it is sent and reports the running total."
+
+    in add: Int
+
+    state total: Int = 0
+
+    on add(n) {
+        total = total + n
+        print("total is now {total}")
+    }
+}
+
+// A pinger bounces against an echo a bounded number of times (feedback loop).
+component Pinger {
+    intent "Bounces a ball against the echo three times, then stops."
+
+    in pong: Int
+    out ping: Int
+
+    state hits: Int = 0
+
+    on start {
+        emit ping(0)
+    }
+
+    on pong(n) {
+        hits = hits + 1
+        if hits < 3 {
+            print("ping {n}")
+            emit ping(n + 1)
+        }
+    }
+}
+
+component Echo {
+    intent "Returns whatever it receives."
+
+    in ping: Int
+    out pong: Int
+
+    on ping(n) {
+        emit pong(n)
+    }
+}
+
+app Main {
+    intent "Wires a cascade, a fan-out, and a bounded feedback loop."
+
+    let source = Source()
+    let relay = Relay()
+    let left = Counter()
+    let right = Counter()
+    let pinger = Pinger()
+    let echo = Echo()
+
+    // fan-out: the source value reaches the relay AND the left counter.
+    wire source.go -> relay.take
+    wire source.go -> left.add
+    // cascade: relay's forwarded value lands in the right counter.
+    wire relay.pass -> right.add
+    // feedback: pinger and echo bounce until the pinger stops.
+    wire pinger.ping -> echo.ping
+    wire echo.pong -> pinger.pong
+}
