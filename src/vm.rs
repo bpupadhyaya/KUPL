@@ -2179,6 +2179,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_deep_feature_composition() {
+        // A bug-hunt sweep (it198, ~10 probes) found no divergence; this locks the deepest
+        // cross-feature compositions it exercised as a regression guard, all byte-identical on
+        // interp/KVM: a recursive Tree ADT folded via match, a Map of records accessed through
+        // Option, arbitrary-precision big(2)^100, and exact rational reduction (PR-it198).
+        let src = r#"type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)
+type P = { x: Int, y: Int }
+fun tsum(t: Tree) -> Int {
+    match t {
+        Leaf(v) => v
+        Node(l, r) => tsum(l) + tsum(r)
+    }
+}
+fun probe() -> Str {
+    let t = Node(Node(Leaf(1), Leaf(2)), Node(Leaf(3), Leaf(4)))
+    let m = Map().insert("a", P(x: 1, y: 2)).insert("b", P(x: 3, y: 4))
+    let rec = match m.get("b") { Some(p) => "{p.x},{p.y}"
+        None => "none" }
+    "{tsum(t)}#{rec}#{big(2).pow(100)}#{rat(1, 3) + rat(1, 3) + rat(1, 3)}#{rat(10, 4) * rat(2, 5)}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "10#3,4#1267650600228229401496703205376#1#1"
+        );
+    }
+
+    #[test]
     fn diff_numeric_collection_edges() {
         // Subtle numeric/collection edges surfaced by a bug-hunt sweep, all byte-identical on
         // interp/KVM (PR-it192): a NaN can be STORED in a Set (len grows) but contains(nan) is
