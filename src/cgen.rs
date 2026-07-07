@@ -4845,6 +4845,23 @@ mod tests {
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
     }
 
+    /// Native's manual float formatter matches interp/KVM at the extremes: special
+    /// values, IEEE semantics, negative zero, and exact round-trips of huge/tiny magnitudes.
+    #[test]
+    fn native_float_formatting_extremes_and_specials() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let z = 0.0\n    let nan = 0.0 / 0.0\n    let inf = 1.0 / 0.0\n    \
+                   let v = [0.1 + 0.2, 1e20, 1e-10, 1e308]\n    \
+                   print(\"{1.0/z}|{-1.0/z}|{z/z}|{nan == nan}|{0.1 + 0.2}|{0.0 * -1.0}|\
+                   {v.map(fn x { \"{x}\".parse_float().unwrap_or(0.0) == x })}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "flt").trim(),
+            "inf|-inf|NaN|false|0.30000000000000004|-0.0|[true, true, true, true]"
+        );
+    }
+
     /// Native parse_iso rejects an impossible day-of-month (leap-year aware), matching
     /// the interpreter (PR-it111).
     #[test]

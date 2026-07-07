@@ -1992,6 +1992,34 @@ mod tests {
     }
 
     #[test]
+    fn diff_float_formatting_extremes_and_specials() {
+        // The manual decimal formatter is byte-identical on interp/KVM for special
+        // values, IEEE semantics, shortest-round-trip precision, and negative zero.
+        assert_eq!(
+            differential("fun probe() -> Str { let z = 0.0\n    \"{1.0 / z}|{-1.0 / z}|{z / z}|{(1.0/z) - (1.0/z)}\" }\n"),
+            "inf|-inf|NaN|NaN"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { let nan = 0.0 / 0.0\n    let inf = 1.0 / 0.0\n    \"{nan == nan}|{nan != nan}|{inf == inf}|{inf > 1.0}\" }\n"),
+            "false|true|true|true"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{0.1 + 0.2}|{1.0 / 3.0}|{2.0 / 3.0}\" }\n"),
+            "0.30000000000000004|0.3333333333333333|0.6666666666666666"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{0.0 - 0.0}|{0.0 * -1.0}|{-1.5e-10}\" }\n"),
+            "0.0|-0.0|-0.00000000015"
+        );
+        // Every magnitude — including 1e308 and 1e-10 — round-trips through the
+        // formatter and parse_float exactly (positional, no exponent).
+        assert_eq!(
+            differential("fun probe() -> Str { let v = [0.1 + 0.2, 1e20, 1e-10, 1e308, 3.14159265358979]\n    \"{v.map(fn x { \"{x}\".parse_float().unwrap_or(0.0) == x })}\" }\n"),
+            "[true, true, true, true, true]"
+        );
+    }
+
+    #[test]
     fn diff_bigint_and_rational_edges() {
         // Arbitrary-precision BigInt: exact huge products, truncated-toward-zero div/mod
         // with negatives, and a clean div-by-zero panic — byte-identical on interp/KVM.
