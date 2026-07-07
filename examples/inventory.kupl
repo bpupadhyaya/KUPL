@@ -64,15 +64,11 @@ fun parse_cmd(line: Str) -> Option[Cmd] {
     } else {
         let verb = parts.get(0).unwrap_or("")
         let name = parts.get(1).unwrap_or("")
-        match parts.get(2).unwrap_or("").parse_int() {
-            None => None
-            Some(n) => {
-                match verb {
-                    "add" => Some(Add(name, n))
-                    "remove" => Some(Remove(name, n))
-                    _ => None
-                }
-            }
+        let n = parts.get(2).unwrap_or("").parse_int()?
+        match verb {
+            "add" => Some(Add(name, n))
+            "remove" => Some(Remove(name, n))
+            _ => None
         }
     }
 }

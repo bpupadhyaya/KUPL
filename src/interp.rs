@@ -1049,14 +1049,20 @@ impl Interp {
             ExprKind::Try(inner) => {
                 let v = self.eval(inner, env)?;
                 match &v {
-                    Value::Ctor { variant, fields, .. } if variant.as_str() == "Ok" => {
+                    // Ok(x)/Some(x) unwrap to x; Err(e)/None short-circuit the enclosing
+                    // function, returning the Err/None value unchanged.
+                    Value::Ctor { variant, fields, .. }
+                        if variant.as_str() == "Ok" || variant.as_str() == "Some" =>
+                    {
                         Ok(fields.first().cloned().unwrap_or(Value::Unit))
                     }
-                    Value::Ctor { variant, .. } if variant.as_str() == "Err" => {
+                    Value::Ctor { variant, .. }
+                        if variant.as_str() == "Err" || variant.as_str() == "None" =>
+                    {
                         Err(Flow::Return(v))
                     }
                     other => Err(Self::panic_flow(
-                        format!("`?` needs a Result, found {}", other.type_name()),
+                        format!("`?` needs a Result or Option, found {}", other.type_name()),
                         expr.span,
                     )),
                 }

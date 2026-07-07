@@ -5293,6 +5293,18 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "optres").trim(), "Some(3)|0|Ok(2)|Ok(4)|Err(\"odd\")|Some(Some(7))");
     }
 
+    /// Native `?` on Option (Some unwraps, None short-circuits the enclosing
+    /// Option-returning function) matches interp/KVM (PR-it135).
+    #[test]
+    fn native_try_operator_on_option() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun lookup(m: Map[Str, Int], k: Str) -> Option[Int] { let v = m.get(k)?\n    Some(v * 2) }\n\
+                   fun main() uses io {\n    let m = Map().insert(\"a\", 5)\n    print(\"{lookup(m, \"a\")}|{lookup(m, \"missing\")}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "tryopt").trim(), "Some(10)|None");
+    }
+
     /// Native's C string runtime decodes UTF-8: all string ops are char-indexed and
     /// match the interpreter/KVM across multibyte characters (no byte-index corruption).
     #[test]

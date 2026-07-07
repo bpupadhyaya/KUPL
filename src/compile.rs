@@ -1045,13 +1045,19 @@ impl<'s> FnCompiler<'s> {
                 cur
             }
             ExprKind::Try(inner) => {
+                // `?` short-circuits on the "failure" variant (Err for Result, None for
+                // Option) by returning it unchanged, and otherwise unwraps field 0 (the Ok
+                // or Some payload). Checking both tags lets one lowering serve both types
+                // without threading type information into the bytecode.
                 let r = self.expr(inner);
-                let err_idx = self.shared.ctor_idx["Err"];
-                let t = self.alloc(span);
-                self.emit(Op::TagIs { dst: t, obj: r, ctor: err_idx }, span);
-                let ok = self.emit(Op::JumpIfFalse(t, 0), span);
-                self.emit(Op::Ret(r), span);
-                self.patch_jump(ok);
+                for tag in ["Err", "None"] {
+                    let idx = self.shared.ctor_idx[tag];
+                    let t = self.alloc(span);
+                    self.emit(Op::TagIs { dst: t, obj: r, ctor: idx }, span);
+                    let cont = self.emit(Op::JumpIfFalse(t, 0), span);
+                    self.emit(Op::Ret(r), span);
+                    self.patch_jump(cont);
+                }
                 let dst = self.alloc(span);
                 self.emit(Op::GetField { dst, obj: r, idx: 0 }, span);
                 dst

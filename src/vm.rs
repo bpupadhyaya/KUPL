@@ -2127,6 +2127,18 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_try_operator_on_option() {
+        // `?` works on Option like it does on Result: Some(x) unwraps to x, None
+        // short-circuits the enclosing Option-returning function (PR-it135). Chained `?`
+        // and a None in the middle both short-circuit. Byte-identical on interp/KVM.
+        let src = "fun lookup(m: Map[Str, Int], k: Str) -> Option[Int] { let v = m.get(k)?\n    Some(v * 2) }\n\
+                   fun chain(m: Map[Str, Int]) -> Option[Int] { let a = lookup(m, \"a\")?\n    let b = lookup(m, \"b\")?\n    Some(a + b) }\n\
+                   fun probe() -> Str {\n    let m = Map().insert(\"a\", 5).insert(\"b\", 3)\n    \
+                   \"{lookup(m, \"a\")}|{lookup(m, \"missing\")}|{chain(m)}|{chain(Map().insert(\"a\", 1))}\" }\n";
+        assert_eq!(differential(src), "Some(10)|None|Some(16)|None");
+    }
+
+    #[test]
     fn diff_option_result_and_try_operator() {
         // Option/Result methods behave identically on interp/KVM.
         let opt = "fun probe() -> Str {\n    let s: Option[Int] = Some(2)\n    let n: Option[Int] = None\n    \

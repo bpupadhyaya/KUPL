@@ -1467,17 +1467,39 @@ impl Checker {
             }
             ExprKind::Try(inner) => {
                 let it = self.infer_expr(inner, ctx);
-                let ok = self.uni.fresh();
-                let err = self.uni.fresh();
-                let expected = Ty::Result(Box::new(ok.clone()), Box::new(err.clone()));
-                self.unify(&expected, &it, inner.span, "`?` operand (must be a Result)");
                 if ctx.in_handler {
                     self.err(
                         "K0237",
-                        "`?` is not allowed in handlers in v0.1 — handle the Result with `match`",
+                        "`?` is not allowed in handlers in v0.1 — handle the Result or Option with `match`",
                         expr.span,
                     );
+                    return match self.uni.apply(&it) {
+                        Ty::Option(t) => self.uni.apply(&t),
+                        Ty::Result(t, _) => self.uni.apply(&t),
+                        _ => self.uni.fresh(),
+                    };
+                }
+                // `?` works on both Option and Result. Dispatch on the operand's concrete
+                // type; when it is not yet known, default to Result (prior behavior). The
+                // enclosing function's return type must match the operand's family.
+                if let Ty::Option(inner_ty) = self.uni.apply(&it) {
+                    let ret_ok = self.uni.fresh();
+                    let want = Ty::Option(Box::new(ret_ok));
+                    let ret = ctx.ret.clone();
+                    if self.uni.unify(&want, &ret).is_err() {
+                        let r = self.uni.apply(&ret);
+                        self.err(
+                            "K0238",
+                            format!("`?` on an Option requires the enclosing function to return an Option, but it returns {r}"),
+                            expr.span,
+                        );
+                    }
+                    self.uni.apply(&inner_ty)
                 } else {
+                    let ok = self.uni.fresh();
+                    let err = self.uni.fresh();
+                    let expected = Ty::Result(Box::new(ok.clone()), Box::new(err.clone()));
+                    self.unify(&expected, &it, inner.span, "`?` operand (must be a Result or Option)");
                     let ret_err = self.uni.fresh();
                     let ret_ok = self.uni.fresh();
                     let want = Ty::Result(Box::new(ret_ok), Box::new(ret_err.clone()));
@@ -1492,8 +1514,8 @@ impl Checker {
                     } else {
                         let _ = self.uni.unify(&err, &ret_err);
                     }
+                    self.uni.apply(&ok)
                 }
-                self.uni.apply(&ok)
             }
             ExprKind::Await(inner) => self.infer_expr(inner, ctx),
             ExprKind::Par(branches) => {
@@ -2718,6 +2740,21 @@ mod generic_tests {
             .into_iter()
             .filter(|d| d.severity == crate::diag::Severity::Error)
             .collect()
+    }
+
+    #[test]
+    fn try_operator_accepts_option_and_matches_return_type() {
+        // `?` on an Option in an Option-returning function type-checks (PR-it135).
+        let ok = "fun lookup(m: Map[Str, Int], k: Str) -> Option[Int] { let v = m.get(k)?\n    Some(v * 2) }\n\
+                  fun main() uses io { print(\"{lookup(Map(), \"x\")}\") }\n";
+        assert!(errors(ok).is_empty(), "`?` on Option in an Option fun must compile: {:?}", errors(ok));
+        // `?` on an Option in a Result-returning function is a K0238 error.
+        let mismatch1 = "fun bad(m: Map[Str, Int]) -> Result[Int, Str] { let v = m.get(\"a\")?\n    Ok(v) }\n";
+        assert!(errors(mismatch1).iter().any(|d| d.code == "K0238"), "Option ? in a Result fun must be K0238");
+        // `?` on a Result in an Option-returning function is a K0238 error.
+        let mismatch2 = "fun half(n: Int) -> Result[Int, Str] { if n % 2 == 0 { Ok(n / 2) } else { Err(\"odd\") } }\n\
+                         fun bad(n: Int) -> Option[Int] { let v = half(n)?\n    Some(v) }\n";
+        assert!(errors(mismatch2).iter().any(|d| d.code == "K0238"), "Result ? in an Option fun must be K0238");
     }
 
     #[test]
