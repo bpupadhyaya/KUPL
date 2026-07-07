@@ -5542,6 +5542,27 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native generics (monomorphization) match interp/KVM's uniform representation: multi-param
+    /// generic funs, generic ADTs at record/list/nested types, and a Pair[A,B] swap (PR-it167).
+    #[test]
+    fn native_generics_depth() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"type Box[T] = Box(v: T)
+type P = P(x: Int, y: Int)
+type Pair[A, B] = Pair(fst: A, snd: B)
+fun both[A, B](a: A, b: B) -> Str { "{a},{b}" }
+fun unbox[T](b: Box[T]) -> T { match b { Box(v) => v } }
+fun swap[A, B](p: Pair[A, B]) -> Pair[B, A] { match p { Pair(a, b) => Pair(fst: b, snd: a) } }
+fun main() uses io {
+    let sw = match swap(Pair(fst: 1, snd: "hi")) { Pair(a, b) => "{a}/{b}" }
+    print("{both(1, "hi")}|{unbox(Box(P(x: 3, y: 4))).x}|{unbox(unbox(Box(Box(9))))}|{sw}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "gendepth").trim(), "1,hi|3|9|hi/1");
+    }
+
     /// Native pattern matching matches interp/KVM at depth: guard fall-through in source order,
     /// nested ADT destructuring bindings, guard-on-binding, and wildcard-in-ctor (PR-it166).
     #[test]

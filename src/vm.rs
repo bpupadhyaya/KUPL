@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_generics_multiparam_and_adt() {
+        // Multi-parameter generic funs, generic ADTs instantiated at varied types
+        // (record/list/nested), generic-over-collection, and a multi-param generic ADT swap are
+        // byte-identical on interp/KVM — the native monomorphization must agree with the
+        // interpreter's uniform representation at every instantiation (PR-it167).
+        let src = r#"type Box[T] = Box(v: T)
+type P = P(x: Int, y: Int)
+type Pair[A, B] = Pair(fst: A, snd: B)
+fun both[A, B](a: A, b: B) -> Str { "{a},{b}" }
+fun unbox[T](b: Box[T]) -> T { match b { Box(v) => v } }
+fun id[T](x: T) -> T { x }
+fun firstOf[T](xs: List[T]) -> Option[T] { xs.get(0) }
+fun swap[A, B](p: Pair[A, B]) -> Pair[B, A] { match p { Pair(a, b) => Pair(fst: b, snd: a) } }
+fun probe() -> Str {
+    let empty: List[Int] = []
+    let sw = match swap(Pair(fst: 1, snd: "hi")) { Pair(a, b) => "{a}/{b}" }
+    "{both(1, "hi")}|{both("x", true)}#{unbox(Box(P(x: 3, y: 4))).x}|{unbox(Box([1, 2, 3]))}|{unbox(unbox(Box(Box(9))))}#{id(id(42))}|{firstOf([10, 20])}|{firstOf(empty)}#{sw}"
+}
+"#;
+        assert_eq!(differential(src), "1,hi|x,true#3|[1, 2, 3]|9#42|Some(10)|None#hi/1");
+    }
+
+    #[test]
     fn diff_pattern_match_depth() {
         // Guards, nested destructuring, guard-on-binding, literal, and wildcard-in-constructor
         // patterns are byte-identical on interp/KVM: a failed guard falls through to the next
