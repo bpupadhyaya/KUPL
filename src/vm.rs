@@ -3395,6 +3395,51 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_while_data_dependent_termination_and_nested_break() {
+        // Complements diff_while_loop_and_break_continue (it153, fixed-bound loops + Euclid GCD)
+        // with loops whose iteration count is DATA-DEPENDENT — determined by runtime-computed values,
+        // not a static bound. A Collatz step-counter mutates n by a branch each turn and terminates
+        // only when n reaches 1 (27 famously takes 111 steps; a start of 1 takes 0). A trial-division
+        // prime counter nests a `while d*d <= i` inside an outer `while i < 100`, where an inner
+        // `break` on the first divisor must exit ONLY the inner loop and let the outer continue —
+        // 25 primes below 100. Byte-identical on interp/KVM (PR-it225).
+        let src = r#"fun collatz_steps(n0: Int) -> Int {
+    var n = n0
+    var steps = 0
+    while n != 1 {
+        if n % 2 == 0 { n = n / 2 } else { n = 3 * n + 1 }
+        steps = steps + 1
+    }
+    steps
+}
+fun count_primes_below(limit: Int) -> Int {
+    var found = 0
+    var i = 2
+    while i < limit {
+        var is_prime = true
+        var d = 2
+        while d * d <= i {
+            if i % d == 0 { is_prime = false
+                break }
+            d = d + 1
+        }
+        if is_prime { found = found + 1 }
+        i = i + 1
+    }
+    found
+}
+fun probe() -> Str {
+    var sum = 0
+    var i = 1
+    while i <= 10 { sum = sum + i
+        i = i + 1 }
+    "{sum}|{collatz_steps(27)}|{collatz_steps(1)}|{count_primes_below(100)}"
+}
+"#;
+        assert_eq!(differential(src), "55|111|0|25");
+    }
+
+    #[test]
     fn diff_range_and_for_loop_edges() {
         // Ranges are hi-EXCLUSIVE; an empty range (lo == hi) and a reversed range (lo > hi)
         // both iterate zero times; negative bounds work. `for` over a List preserves order;
