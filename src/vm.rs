@@ -2134,6 +2134,47 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_component_state_isolation_and_composition() {
+        // Two instances of a stateful component keep INDEPENDENT state (a=5, b=2), and a
+        // component that holds another component as state delegates to it correctly (an
+        // Aggregator holding a Counter reaches 3 after 3 bumps) — byte-identical on interp/KVM
+        // (PR-it171).
+        let src = r#"contract Count { intent "c"
+    expose fun inc() -> Int
+    expose fun get() -> Int }
+component Counter fulfills Count { intent "ctr"
+    state n: Int = 0
+    expose fun inc() -> Int { n = n + 1
+        n }
+    expose fun get() -> Int { n } }
+contract Agg { intent "a"
+    expose fun bump() -> Int
+    expose fun total() -> Int }
+component Aggregator fulfills Agg { intent "holds a counter"
+    state inner: Counter = Counter()
+    state calls: Int = 0
+    expose fun bump() -> Int { calls = calls + 1
+        inner.inc() }
+    expose fun total() -> Int { inner.get() } }
+fun probe() -> Str {
+    var a = Counter()
+    var b = Counter()
+    var i = 0
+    while i < 5 { a.inc()
+        i = i + 1 }
+    b.inc()
+    b.inc()
+    var agg = Aggregator()
+    agg.bump()
+    agg.bump()
+    agg.bump()
+    "a={a.get()} b={b.get()} agg={agg.total()}"
+}
+"#;
+        assert_eq!(differential(src), "a=5 b=2 agg=3");
+    }
+
+    #[test]
     fn diff_records_depth_nested_with_and_equality() {
         // Nested records, chained field access, a NESTED `with` update (updating an inner field
         // while preserving the outer's other fields), STRUCTURAL equality (shallow and deeply

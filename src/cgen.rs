@@ -5542,6 +5542,34 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native components isolate per-instance state like interp/KVM: two Counter instances keep
+    /// independent counts, and an Aggregator holding a Counter as state delegates (PR-it171).
+    #[test]
+    fn native_component_state_isolation() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"contract Count { intent "c"
+    expose fun inc() -> Int
+    expose fun get() -> Int }
+component Counter fulfills Count { intent "ctr"
+    state n: Int = 0
+    expose fun inc() -> Int { n = n + 1
+        n }
+    expose fun get() -> Int { n } }
+fun main() uses io {
+    var a = Counter()
+    var b = Counter()
+    a.inc()
+    a.inc()
+    a.inc()
+    b.inc()
+    print("a={a.get()} b={b.get()}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "compiso").trim(), "a=3 b=1");
+    }
+
     /// Native records match interp/KVM at depth: nested `with` update preserves the outer's
     /// other fields, and structural equality holds shallow and deeply nested (PR-it170).
     #[test]
