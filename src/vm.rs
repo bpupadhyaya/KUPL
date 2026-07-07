@@ -2104,6 +2104,33 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_position_first_match_and_none() {
+        // A bug-hunt-30 lock (it272): List.position's first-match guarantee and its None cases.
+        // it2992 tests position with a single predicate but not the FIRST-of-duplicates guarantee --
+        // when several elements satisfy the predicate, position returns the index of the FIRST one,
+        // not the last, and returns None when nothing matches or the list is empty.
+        //   [10,20,30,20,40].position(== 20) == Some(1)   // first 20 (index 1), NOT the one at index 3
+        //   [10,20,30,20,40].position(> 25)  == Some(2)   // first element > 25 is 30 at index 2
+        //   [10,20,30,20,40].position(== 99) == None      // no match
+        //   [].position(> 0)                 == None      // empty
+        //   [1,5,3,5,5].position(== 5)       == Some(1)   // first 5 (index 1), NOT index 3 or 4
+        // Byte-identical on interp/KVM (native per the sweep). Pins left-to-right scan returning the
+        // earliest index, and None (not a sentinel like -1) on absence.
+        let src = r#"fun probe() -> Str {
+    let xs = [10, 20, 30, 20, 40]
+    let exact = xs.position(fn x { x == 20 })
+    let pred = xs.position(fn x { x > 25 })
+    let missing = xs.position(fn x { x == 99 })
+    let mt: List[Int] = []
+    let empty = mt.position(fn x { x > 0 })
+    let firstBoth = [1, 5, 3, 5, 5].position(fn x { x == 5 })
+    "{exact}|{pred}|{missing}|{empty}|{firstBoth}"
+}
+"#;
+        assert_eq!(differential(src), "Some(1)|Some(2)|None|None|Some(1)");
+    }
+
+    #[test]
     fn diff_map_merge_conflict_resolution_noncommutative() {
         // A certification lock (it271): Map.merge's conflict-resolution and its NON-commutativity.
         // Prior locks (it4226/4742) exercise merge in a single direction; this pins that
