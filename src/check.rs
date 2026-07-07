@@ -2052,12 +2052,21 @@ impl Checker {
         for (i, arg) in args.iter().enumerate() {
             let target = match &arg.name {
                 Some(n) => {
-                    if !supplied.insert(n.clone()) {
+                    if fields.iter().any(|(fname, _)| fname == n) && !supplied.insert(n.clone()) {
                         self.err("K0244", format!("duplicate field `{n}` in `{ctor}`"), arg.value.span);
                     }
                     fields.iter().find(|(fname, _)| fname == n).cloned()
                 }
-                None => fields.get(i).cloned(),
+                None => {
+                    // A positional argument fills field `i`; record it so a later named arg for the
+                    // same field (or vice versa) is caught as a duplicate (PR-it214).
+                    if let Some((fname, _)) = fields.get(i) {
+                        if !supplied.insert(fname.clone()) {
+                            self.err("K0244", format!("duplicate field `{fname}` in `{ctor}`"), arg.value.span);
+                        }
+                    }
+                    fields.get(i).cloned()
+                }
             };
             let at = self.infer_expr(&arg.value, ctx);
             match target {
@@ -2075,9 +2084,10 @@ impl Checker {
                 }
             }
         }
-        // When every argument is named and the count lines up, a duplicate can hide a field that
-        // was never supplied — the count check above wouldn't fire, so name the missing field.
-        if args.len() == fields.len() && !args.is_empty() && args.iter().all(|a| a.name.is_some()) {
+        // When the argument count lines up, a duplicate can still hide a field that was never
+        // supplied — the count check above wouldn't fire, so name each field no argument reached.
+        // `supplied` now tracks positional slots too, so mixed positional+named cases are covered.
+        if args.len() == fields.len() && !args.is_empty() {
             for (fname, _) in fields {
                 if !supplied.contains(fname) {
                     self.err("K0243", format!("missing field `{fname}` in `{ctor}`"), span);
@@ -2984,9 +2994,16 @@ mod generic_tests {
         // A duplicate with a surplus arg still flags the duplicate.
         let e3 = errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(x: 1, x: 2, y: 3) }\n");
         assert!(e3.iter().any(|d| d.code == "K0244" && d.message.contains("duplicate field `x`")), "dup3: {e3:?}");
-        // Valid constructions — in order, out of order, and a generic ctor — still type-check.
+        // A positional argument colliding with a named one on the SAME field is also a duplicate
+        // that used to slip through and diverge (interp printed a value, KVM crashed) (PR-it214).
+        let em = errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(1, x: 2) }\n");
+        assert!(em.iter().any(|d| d.code == "K0244" && d.message.contains("duplicate field `x`")), "mixed dup: {em:?}");
+        assert!(em.iter().any(|d| d.code == "K0243" && d.message.contains("missing field `y`")), "mixed missing: {em:?}");
+        // Valid constructions — in order, out of order, a generic ctor, and a legitimate mixed
+        // positional+named form filling DISTINCT fields — all still type-check.
         assert!(errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(x: 1, y: 2)\n    let _ = P(y: 20, x: 10) }\n").is_empty());
         assert!(errors("type Box[T] = Box(v: T)\nfun main() { let _ = Box(v: 5) }\n").is_empty());
+        assert!(errors("type T = { a: Int, b: Int, c: Int }\nfun main() { let _ = T(1, 2, c: 3)\n    let _ = T(1, b: 2, c: 3) }\n").is_empty());
     }
 
     #[test]
