@@ -6616,6 +6616,19 @@ fun main() uses io {
         );
     }
 
+    /// BigInt ADDITIVE accumulation (it230): a Fibonacci loop adds two BigInts each turn; fib(100) is
+    /// a 21-digit number exceeding i64, so the native C bignum's carry propagation must match the
+    /// interpreter's exactly. Complements native_bigint_and_rational_match (multiplicative factorial).
+    #[test]
+    fn native_bigint_fibonacci() {
+        let src = "fun fib_big(n: Int) -> BigInt {\n    var a = big(0)\n    var b = big(1)\n    var i = 0\n    \
+                   while i < n { let t = a + b\n        a = b\n        b = t\n        i = i + 1 }\n    a\n}\n\
+                   fun main() uses io {\n    print(\"{fib_big(10)}|{fib_big(50)}|{fib_big(100)}\")\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "bigfib").trim(), "55|12586269025|354224848179261915075");
+        }
+    }
+
     /// Native tensor elementwise arithmetic matches the interpreter/KVM.
     #[test]
     fn native_tensor_elementwise_arithmetic() {

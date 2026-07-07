@@ -2082,6 +2082,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_bigint_fibonacci_accumulation() {
+        // A bug-hunt-12 lock (it230): the numeric tower (it169) certified BigInt pow (2^70) and
+        // factorial (25!) — multiplicative growth — but not ADDITIVE accumulation across a loop.
+        // A Fibonacci generator adds two BigInts each turn for n turns; fib(100) is a 21-digit number
+        // (354224848179261915075) that far exceeds i64::MAX, so every intermediate carry must be
+        // exact. Byte-identical on interp/KVM (and native, per the native test) — the native C bignum
+        // must produce the same digits (PR-it230). The rest of the batch-12 sweep (nested
+        // Option/Result Display, string replace/repeat, negative modulo) was already locked/consistent.
+        let src = r#"fun fib_big(n: Int) -> BigInt {
+    var a = big(0)
+    var b = big(1)
+    var i = 0
+    while i < n {
+        let t = a + b
+        a = b
+        b = t
+        i = i + 1
+    }
+    a
+}
+fun probe() -> Str {
+    "{fib_big(10)}|{fib_big(50)}|{fib_big(100)}"
+}
+"#;
+        assert_eq!(differential(src), "55|12586269025|354224848179261915075");
+    }
+
+    #[test]
     fn diff_hof_comprehension_pipeline() {
         // A composed higher-order pipeline — filter -> sort_by -> map -> fold, plus position/all/any
         // and sum — is byte-identical on interp/KVM (and native, per the sweep). This chains the
