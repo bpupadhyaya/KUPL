@@ -494,11 +494,19 @@ pub fn pkg_lock(path: &str) -> i32 {
 }
 
 pub fn emit_manifest(path: &str) -> i32 {
-    use crate::diag::json_escape as esc;
     let Ok((compiled, _map)) = load_compile(path) else { return 1 };
+    println!("{}", manifest_json(&compiled.program));
+    0
+}
+
+/// Serialize a program's components to the visual-tools manifest JSON (intent,
+/// ports, props, state, exposes, fulfills, children, wires). Every string field
+/// goes through `json_escape`, so the result is always valid, parseable JSON.
+pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
+    use crate::diag::json_escape as esc;
     let mut out = String::from("{\"components\":[");
     let mut first = true;
-    for item in &compiled.program.items {
+    for item in &program.items {
         let Item::Component(c) = item else { continue };
         if !first {
             out.push(',');
@@ -582,8 +590,7 @@ pub fn emit_manifest(path: &str) -> i32 {
         out.push_str(&format!(",\"examples\":{}}}", c.examples.len()));
     }
     out.push_str("]}");
-    println!("{out}");
-    0
+    out
 }
 
 /// `kupl native`: emit C from the bytecode and compile with the system cc.
@@ -892,6 +899,39 @@ fn snippet(src: &str, span: Span) -> String {
 mod tests {
     use super::{compile, sort_diags};
     use crate::diag::{Diag, Span};
+
+    #[test]
+    fn manifest_json_is_valid_and_escaped() {
+        // `kupl manifest` feeds visual tools — its output must be parseable JSON with
+        // every string field escaped, and the component's members must all be present.
+        let src = "component Counter {\n    intent \"Counts \\\"clicks\\\"\\nand \\\\slashes\\\\\\ttabs — é\"\n    \
+                   prop label: Str\n    in click: Int\n    out value: Int\n    state count: Int = 0\n    \
+                   on click(n) { count = count + n\n        emit value(count) }\n    \
+                   expose fun current() -> Int { count }\n}\n";
+        let compiled = compile(src).expect("compiles");
+        let json = super::manifest_json(&compiled.program);
+        // parses as JSON (equivalent to a real visual-tool consumer)
+        let v = crate::lsp::parse_json(&json).expect("manifest must be valid JSON");
+        let arr_len = |j: Option<&crate::lsp::Json>| match j {
+            Some(crate::lsp::Json::Arr(a)) => Some(a.len()),
+            _ => None,
+        };
+        assert_eq!(arr_len(v.get("components")), Some(1));
+        let c = v.get("components").and_then(|c| c.index(0)).expect("component 0");
+        // the tricky intent round-trips with its quotes/newline/tab decoded
+        let intent = c.get("intent").and_then(|i| i.str()).expect("intent");
+        assert!(intent.contains("\"clicks\"") && intent.contains('\n') && intent.contains('\t'),
+                "escaped chars must decode back: {intent:?}");
+        // members present + counted
+        assert_eq!(arr_len(c.get("ports")), Some(2));
+        assert_eq!(arr_len(c.get("props")), Some(1));
+        assert_eq!(arr_len(c.get("state")), Some(1));
+        assert_eq!(arr_len(c.get("exposes")), Some(1));
+        // a program with no components is still valid JSON with an empty array
+        let empty = super::manifest_json(&compile("fun main() {}\n").unwrap().program);
+        let ev = crate::lsp::parse_json(&empty).expect("empty manifest is valid JSON");
+        assert_eq!(arr_len(ev.get("components")), Some(0));
+    }
 
     #[test]
     fn emit_context_resolves_item_and_errors_on_missing() {
