@@ -4997,6 +4997,23 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native Int bitwise/shift methods match interp/KVM — arithmetic `shr` vs logical
+    /// `ushr` on negatives (C signed-shift is impl-defined; must match Rust), plus
+    /// sized-int saturating/wrapping arithmetic (PR-it124).
+    #[test]
+    fn native_numeric_shift_and_sized_arithmetic() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{(0 - 8).shr(1)}|{(0 - 8).ushr(1)}|{(0 - 1).ushr(60)}|{(5).bnot()}|{(0 - 255).to_hex()}|\
+                   {(255u8).saturating_add(1u8)}|{(255u8).wrapping_add(1u8)}|{(127i8).wrapping_add(1i8)}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "numbits").trim(),
+            "-4|9223372036854775804|15|-6|-ff|255|0|-128"
+        );
+    }
+
     /// Native's manual float formatter matches interp/KVM at the extremes: special
     /// values, IEEE semantics, negative zero, and exact round-trips of huge/tiny magnitudes.
     #[test]

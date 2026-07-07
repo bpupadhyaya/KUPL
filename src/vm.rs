@@ -2149,6 +2149,20 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_numeric_bitwise_shift_and_sized_arithmetic() {
+        // Int bitwise/shift/number-theory methods, byte-identical on interp/KVM. The
+        // key case: `shr` is ARITHMETIC (sign-extends) while `ushr` is LOGICAL — the
+        // classic Rust-vs-C signed-shift divergence, handled identically here (PR-it124).
+        let ints = "fun probe() -> Str { \"{(0 - 8).shr(1)}|{(0 - 8).ushr(1)}|{(0 - 1).ushr(60)}|{(0).bnot()}|{(5).bnot()}|{(0 - 1).band(5)}|{(0 - 255).to_hex()}|{(12).gcd(18)}|{(0 - 12).gcd(8)}|{(17).isqrt()}|{(0 - 5).sign()}\" }\n";
+        assert_eq!(differential(ints), "-4|9223372036854775804|15|-1|-6|5|-ff|6|4|4|-1");
+        // isqrt of a negative is a clean, identical panic.
+        assert_eq!(differential("fun probe() -> Str { \"{(0 - 5).isqrt()}\" }\n"), "panic: `isqrt` of a negative Int");
+        // sized-int saturating vs wrapping arithmetic clamps/wraps at the type bounds.
+        let sized = "fun probe() -> Str { \"{(255u8).saturating_add(1u8)}|{(255u8).wrapping_add(1u8)}|{(127i8).saturating_add(1i8)}|{(127i8).wrapping_add(1i8)}\" }\n";
+        assert_eq!(differential(sized), "255|0|127|-128");
+    }
+
+    #[test]
     fn diff_bigint_and_rational_edges() {
         // Arbitrary-precision BigInt: exact huge products, truncated-toward-zero div/mod
         // with negatives, and a clean div-by-zero panic — byte-identical on interp/KVM.
