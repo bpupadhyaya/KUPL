@@ -2104,6 +2104,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_window_over_records_high_low_range() {
+        // A bug-hunt-39 lock (it293): the sliding high-low RANGE idiom over a series of records -- the
+        // volatility-band / min-max-envelope shape. it257 windows plain Ints for a moving sum/max; this
+        // windows RECORDS (extract the price field first), then computes BOTH a max and a min per window
+        // via two folds with OPPOSITE sentinel seeds, and returns the range (hi - lo).
+        //   prices  = [10, 14, 9, 20, 15]   (from Tick records)
+        //   window(3) -> [[10,14,9], [14,9,20], [9,20,15]]
+        //     max fold (seed -1000): [14, 20, 20]
+        //     min fold (seed  1000): [ 9,  9,  9]
+        //     range   = hi - lo    : [ 5, 11, 11]
+        // Byte-identical on interp/KVM (native per the sweep). Confirms window() over records feeds each
+        // overlapping sub-list through a field-projection then two independent sentinel-seeded folds, and
+        // that the max-seed (-1000, low so any price wins) and min-seed (1000, high so any price wins)
+        // point the right way. This is the moving high-low channel an AI writes for price volatility,
+        // sensor min/max envelopes, or rolling range alerts. A backend that swapped the two seeds would
+        // return a negative range, and one that lost the per-window field projection would fold over the
+        // records themselves instead of the prices.
+        let src = r#"type Tick = { t: Int, price: Int }
+fun probe() -> Str {
+    let ticks = [Tick(t: 1, price: 10), Tick(t: 2, price: 14), Tick(t: 3, price: 9), Tick(t: 4, price: 20), Tick(t: 5, price: 15)]
+    let ranges = ticks.window(3).map(fn w {
+        let prices = w.map(fn tk { tk.price })
+        let hi = prices.fold(0 - 1000, fn(m, p) { if p > m { p } else { m } })
+        let lo = prices.fold(1000, fn(m, p) { if p < m { p } else { m } })
+        hi - lo
+    })
+    "{ranges}|{ranges.len()}"
+}
+"#;
+        assert_eq!(differential(src), "[5, 11, 11]|3");
+    }
+
+    #[test]
     fn diff_fold_records_into_map_tally_by_key() {
         // A certification lock (it292): the manual "tally/aggregate into a Map via fold" idiom -- fold
         // over records with an EMPTY Map() accumulator, reading each record's field, using
