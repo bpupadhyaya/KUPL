@@ -2526,6 +2526,27 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_map_update_existing_key_keeps_position() {
+        // Complements diff_map_set_iteration_order_after_mutation (it216, which covers
+        // remove-then-reinsert landing at the END): re-inserting an already-present key WITHOUT
+        // removing it first UPDATES the value in place and KEEPS the key's original insertion
+        // position — it does not move to the end. So inserting x,y,z then insert("y", 20) leaves
+        // y in slot 2 with value 20; after remove("x") the order is [y, z]. Byte-identical on
+        // interp/KVM (PR-it224, a tenth bug-hunt sweep that otherwise found every probed area — JSON
+        // nesting, Map merge, sized-int overflow panic/wrap/saturate, RNG determinism — already
+        // locked and consistent).
+        let src = r#"fun probe() -> Str {
+    let m = Map().insert("x", 1).insert("y", 2).insert("z", 3).insert("y", 20).remove("x")
+    "{m.keys()}|{m.values()}|{m}|{m.contains_key("x")}|{m.contains_key("y")}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"["y", "z"]|[20, 3]|Map{"y": 20, "z": 3}|false|true"#
+        );
+    }
+
+    #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose
         // guard holds; a guard that fails falls through to later arms. This is byte-identical on
