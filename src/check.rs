@@ -2499,11 +2499,18 @@ impl Checker {
                 match sig.exposes.get(name) {
                     Some((ps, r)) => Some((ps.clone(), r.clone())),
                     None => {
-                        self.err(
-                            "K0247",
-                            format!("component `{cname}` does not expose a function named `{name}`"),
-                            span,
-                        );
+                        // A frequent mistake is calling a PORT as a method (`c.click()`). Ports are
+                        // not methods: an in-port receives via `wire … -> inst.port` (or `send`),
+                        // an out-port is read via `wire inst.port -> …`. Name that instead of the
+                        // bare "does not expose a function" (PR-it232).
+                        let msg = if sig.in_ports.contains_key(name) {
+                            format!("`{name}` is an input port of `{cname}`, not a method — deliver to it with `wire … -> {name}` (or `send`), don't call it")
+                        } else if sig.out_ports.contains_key(name) {
+                            format!("`{name}` is an output port of `{cname}`, not a method — read it with `wire {name} -> …`, don't call it")
+                        } else {
+                            format!("component `{cname}` does not expose a function named `{name}`")
+                        };
+                        self.err("K0247", msg, span);
                         return self.uni.fresh();
                     }
                 }
@@ -3075,6 +3082,23 @@ mod generic_tests {
         // Valid parenthesized expressions and unit still parse cleanly (no behavior change).
         assert!(errors("fun main() { let a = (1 + 2) * 3\n    let b = ((4))\n    let c = (true) }\n").is_empty());
         assert!(errors("fun noop() { () }\nfun main() { noop() }\n").is_empty());
+    }
+
+    #[test]
+    fn calling_a_port_as_a_method_names_it_as_a_port() {
+        // Calling a component's PORT as a method (`c.click()`) is a frequent mistake — ports are
+        // wired/sent to, not called. K0247 now says which kind of port it is and how to reach it,
+        // instead of the bare "does not expose a function" (PR-it232).
+        let comp = "component Counter {\n    intent \"c\"\n    in click: Event\n    out value: Int\n    state n: Int = 0\n    on click { n = n + 1\n        emit value(n) }\n}\n";
+        let inp = errors(&format!("{comp}fun main() {{ let c = Counter()\n    c.click() }}\n"));
+        assert!(inp.iter().any(|d| d.code == "K0247" && d.message.contains("input port") && d.message.contains("wire")), "in-port: {inp:?}");
+        let out = errors(&format!("{comp}fun main() {{ let c = Counter()\n    c.value() }}\n"));
+        assert!(out.iter().any(|d| d.code == "K0247" && d.message.contains("output port")), "out-port: {out:?}");
+        // A genuinely unknown method keeps the plain "does not expose a function" wording.
+        let unk = errors(&format!("{comp}fun main() {{ let c = Counter()\n    c.frobnicate() }}\n"));
+        assert!(unk.iter().any(|d| d.code == "K0247" && d.message.contains("does not expose a function")), "unknown: {unk:?}");
+        // A real exposed function still type-checks.
+        assert!(errors("component C {\n    intent \"c\"\n    state n: Int = 0\n    expose fun bump() -> Int { n = n + 1\n        n }\n}\nfun main() { let c = C()\n    let _ = c.bump() }\n").is_empty());
     }
 
     #[test]
