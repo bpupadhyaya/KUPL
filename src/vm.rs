@@ -1964,6 +1964,26 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_generics_depth() {
+        // A generic fun used at several types, byte-identical on interp/KVM.
+        let id = "fun id[T](x: T) -> T { x }\nfun probe() -> Str { \"{id(5)}|{id(\"hi\")}|{id([1, 2, 3])}|{id(true)}\" }\n";
+        assert_eq!(differential(id), "5|hi|[1, 2, 3]|true");
+        // Generic ADT: construct/unbox at two types + nested Box(Box(x)) display.
+        let boxed = "type Box[T] = Box(v: T)\nfun unbox[T](b: Box[T]) -> T { match b { Box(x) => x } }\n\
+                     fun probe() -> Str { \"{unbox(Box(42))}|{unbox(Box(\"hi\"))}|{Box(42)}|{Box(\"hi\")}|{Box(Box(7))}\" }\n";
+        assert_eq!(differential(boxed), "42|hi|Box(42)|Box(\"hi\")|Box(Box(7))");
+        // Two type params, a generic higher-order fun, and a generic tree fold.
+        let pair = "type Pair[A, B] = Pair(fst: A, snd: B)\nfun probe() -> Str { match Pair(1, \"x\") { Pair(a, b) => \"{a}:{b}\" } }\n";
+        assert_eq!(differential(pair), "1:x");
+        let hof = "fun twice[T](f: fn(T) -> T, x: T) -> T { f(f(x)) }\nfun probe() -> Str { \"{twice(fn n { n + 1 }, 10)}|{twice(fn s { \"{s}!\" }, \"hi\")}\" }\n";
+        assert_eq!(differential(hof), "12|hi!!");
+        let tree = "type Tree[T] = Leaf(v: T) | Node(l: Tree[T], r: Tree[T])\n\
+                    fun sum(t: Tree[Int]) -> Int { match t { Leaf(v) => v\n        Node(l, r) => sum(l) + sum(r) } }\n\
+                    fun probe() -> Str { \"{sum(Node(Leaf(1), Node(Leaf(2), Leaf(3))))}\" }\n";
+        assert_eq!(differential(tree), "6");
+    }
+
+    #[test]
     fn diff_higher_order_and_closure_depth() {
         // A returned closure keeps its own captured environment; two are independent.
         let ret = "fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\

@@ -5049,6 +5049,20 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// Native monomorphizes a generic function used at multiple types and compiles
+    /// generic ADTs, matching interp/KVM (PR-it120).
+    #[test]
+    fn native_generics_monomorphize() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun id[T](x: T) -> T { x }\ntype Box[T] = Box(v: T)\n\
+                   fun unbox[T](b: Box[T]) -> T { match b { Box(x) => x } }\n\
+                   fun main() uses io {\n    \
+                   print(\"{id(5)}|{id(\"hi\")}|{id([1, 2])}|{unbox(Box(42))}|{unbox(Box(\"x\"))}|{Box(Box(7))}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "generics").trim(), "5|hi|[1, 2]|42|x|Box(Box(7))");
+    }
+
     /// Native closures capture by value (PR-it76): returned closures keep independent
     /// environments and loop-variable capture is value-at-creation, matching interp/KVM.
     #[test]
