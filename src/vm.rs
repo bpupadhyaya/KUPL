@@ -2082,6 +2082,26 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_split_parse_map_join_roundtrip() {
+        // A certification lock (it253): the canonical CSV-line / data-transform pipeline — split a
+        // delimited string, parse each field to a number, transform, and re-serialize with join.
+        // This chains Str.split -> parse_int (Option, unwrapped) -> List.map -> string interpolation
+        // -> List.join, plus a fold over the parsed numbers. Distinct from the JSON/codec/file-IO
+        // roundtrips and from it229's record HOF pipeline: this is the parse-transform-reserialize
+        // shape an AI writes for any delimited-text processing. Byte-identical on interp/KVM (native
+        // per the sweep).
+        let src = r#"fun probe() -> Str {
+    let csv = "10,20,30,40"
+    let nums = csv.split(",").map(fn s { s.parse_int().unwrap_or(0) })
+    let rebuilt = nums.map(fn n { n * 2 }).map(fn n { "{n}" }).join("-")
+    let total = nums.fold(0, fn(acc, n) { acc + n })
+    "{nums}|{rebuilt}|{total}|{csv.split(",").len()}"
+}
+"#;
+        assert_eq!(differential(src), "[10, 20, 30, 40]|20-40-60-80|100|4");
+    }
+
+    #[test]
     fn diff_list_of_sets_union_intersect_fold() {
         // A bug-hunt-20 lock (it251): reducing a variable-length List[Set] with union or intersect
         // accumulation — "merge all these sets" / "elements common to every group". it235 chained
