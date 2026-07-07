@@ -2104,6 +2104,38 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_zip_with_over_two_heterogeneous_record_lists() {
+        // A bug-hunt-37 lock (it289): zip_with combining two lists of DIFFERENT record types by
+        // position -- the "join two parallel streams positionally" idiom. it1983 locks zip_with's
+        // truncate-to-shorter on Int lists; this pins the closure destructuring fields off BOTH element
+        // records at once (Item AND Price) and confirms truncation still drops the tail of the longer
+        // list when the elements are records.
+        //   items  = [apple:3, pear:2, fig:5]   (3 Item records)
+        //   prices = [A:10, B:20]               (2 Price records)
+        //   zip_with((it, p) -> "{it.name}x{it.qty}@{p.cost}={it.qty * p.cost}")
+        //     -> ["applex3@10=30", "pearx2@20=40"]   (fig has no price partner, dropped)
+        //     -> length 2 (min of 3 and 2)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms zip_with reads fields from two
+        // distinct record types in the same closure and truncates to the shorter list even when both
+        // sides carry structured records -- the positional inventory/price-join an AI writes to combine
+        // two aligned tables. A backend that ran to the longer length would index past the price list on
+        // `fig`, and one that mishandled the two element types would cross the fields up.
+        let src = r#"type Item = { name: Str, qty: Int }
+type Price = { sku: Str, cost: Int }
+fun probe() -> Str {
+    let items = [Item(name: "apple", qty: 3), Item(name: "pear", qty: 2), Item(name: "fig", qty: 5)]
+    let prices = [Price(sku: "A", cost: 10), Price(sku: "B", cost: 20)]
+    let lines = items.zip_with(prices, fn(it, p) { "{it.name}x{it.qty}@{p.cost}={it.qty * p.cost}" })
+    "{lines}|{lines.len()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"["applex3@10=30", "pearx2@20=40"]|2"#
+        );
+    }
+
+    #[test]
     fn diff_sort_by_records_descending_via_negated_key() {
         // A certification lock (it288): descending sort of records by a numeric field. sort_by is a
         // key-extractor that sorts ASCENDING and is STABLE (locked generally); this pins the canonical
