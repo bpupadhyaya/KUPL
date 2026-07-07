@@ -2134,6 +2134,27 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_method_surface_is_char_aware() {
+        // The string-method surface is byte-identical on interp/KVM and consistently UTF-8
+        // CHAR-aware (not byte-based): reverse reverses by char, index_of/rfind return char
+        // indices, pad counts chars, case is ASCII-only (PR-it158).
+        let src = r#"fun probe() -> Str {
+    let a = "[{"  hi  ".trim()}]|[{"x  ".trim_end()}]|[{"   ".trim()}]"
+    let b = "{"hello".starts_with("he")}|{"hello".starts_with("")}|{"hi".starts_with("hello")}"
+    let c = "[{"ab".repeat(3)}]|[{"ab".repeat(0)}]"
+    let d = "[{"abé".reverse()}]"
+    let e = "{"héllo".index_of("llo")}|{"hello".index_of("z")}|{"héllo".rfind("l")}"
+    let f = "{"café".to_upper()}|[{"é".pad_left(4, "*")}]"
+    "{a}#{b}#{c}#{d}#{e}#{f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[hi]|[x]|[]#true|true|false#[ababab]|[]#[éba]#Some(2)|None|Some(3)#CAFé|[***é]"
+        );
+    }
+
+    #[test]
     fn diff_sized_int_arithmetic_overflow_panics() {
         // Sized-int arithmetic is CHECKED at the type width (like the default i64 in PR-it151):
         // it panics on overflow/underflow rather than wrapping — byte-identical on interp/KVM,

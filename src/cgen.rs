@@ -5542,6 +5542,21 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native string methods are UTF-8 char-aware, matching interp/KVM: reverse reverses by
+    /// char (not byte, which would corrupt UTF-8), index_of/rfind return char indices, pad
+    /// counts chars (PR-it158).
+    #[test]
+    fn native_string_methods_are_char_aware() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("[{"abé".reverse()}]|{"héllo".index_of("llo")}|{"héllo".rfind("l")}|[{"é".pad_left(4, "*")}]|{"café".to_upper()}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "strmeth").trim(), "[éba]|Some(2)|Some(3)|[***é]|CAFé");
+    }
+
     /// Native sized-int arithmetic panics on overflow (does NOT wrap despite C's silent sized
     /// overflow), matching interp/KVM: a fitting result computes, an overflow leaves stdout
     /// empty via a clean panic (PR-it157).
