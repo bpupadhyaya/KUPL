@@ -5542,6 +5542,23 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native regex matches interp/KVM's regex semantics: match/find/find_all/replace, char-
+    /// aware `.` (multibyte), and literal (non-backref) replacement (PR-it176).
+    #[test]
+    fn native_regex_match_find_replace() {
+        if !cc_available() {
+            return;
+        }
+        let src = r##"fun main() uses io {
+    print("{re_match("[0-9]+", "hello123")}|{re_find("[0-9]+", "abc123")}|{re_find_all("[0-9]+", "a1b22c333")}|{re_replace("[0-9]", "abc123", "#")}|{re_find_all(".", "héllo")}")
+}
+"##;
+        assert_eq!(
+            native_main_stdout(src, "regexops").trim(),
+            "true|Some(\"123\")|[\"1\", \"22\", \"333\"]|abc###|[\"h\", \"é\", \"l\", \"l\", \"o\"]"
+        );
+    }
+
     /// Native parallel HOF (par_map/par_filter) is deterministic and INPUT-ordered, matching
     /// interp/KVM — par_map produces the same result as a sequential map (PR-it175).
     #[test]

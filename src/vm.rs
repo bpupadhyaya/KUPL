@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_regex_match_find_replace() {
+        // The regex builtins (re_match/re_find/re_find_all/re_replace) are byte-identical on
+        // interp/KVM: match is a bool with anchors, find returns the first Some/None, find_all a
+        // list, replace substitutes ALL matches with LITERAL text (no `$1` backrefs), `.` is
+        // char-aware (multibyte), and an invalid pattern is a clean panic (PR-it176).
+        let src = r##"fun probe() -> Str {
+    let m = "{re_match("[0-9]+", "hello123")}|{re_match("^[a-z]+$", "hello123")}"
+    let f = "{re_find("[0-9]+", "abc123def456")}|{re_find("[0-9]", "abc")}"
+    let fa = "{re_find_all("[0-9]+", "a1b22c333")}|{re_find_all("[0-9]+", "abcdef")}"
+    let r = "{re_replace("[0-9]", "abc123", "#")}"
+    let u = "{re_find_all(".", "héllo")}"
+    "{m}#{f}#{fa}#{r}#{u}"
+}
+"##;
+        assert_eq!(
+            differential(src),
+            "true|false#Some(\"123\")|None#[\"1\", \"22\", \"333\"]|[]#abc####[\"h\", \"é\", \"l\", \"l\", \"o\"]"
+        );
+        // An invalid regex is a clean panic, identical across engines.
+        assert_eq!(differential("fun probe() -> Str { \"{re_match(\"[unclosed\", \"x\")}\" }\n"), "panic: invalid regex: unclosed character class `[`");
+    }
+
+    #[test]
     fn diff_parallel_hof_is_deterministic_and_input_ordered() {
         // par_map/par_filter are DETERMINISTIC and preserve INPUT order (not completion order)
         // despite parallel evaluation — byte-identical on interp/KVM, and par_map produces the
