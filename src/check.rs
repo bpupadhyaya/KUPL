@@ -2003,7 +2003,9 @@ impl Checker {
                     let want = self.uni.apply(&ps[i]);
                     let at = self.check_expr_expecting(&a.value, &want, ctx);
                     let want = self.uni.apply(&ps[i]);
-                    self.check_assign(&want, &at, span, "function call");
+                    // Name which argument mismatched (1-based) so a multi-arg call points at the
+                    // offending position instead of a bare "in function call" (PR-it236).
+                    self.check_assign(&want, &at, a.value.span, &format!("argument {}", i + 1));
                 }
                 self.uni.apply(&r)
             }
@@ -3082,6 +3084,19 @@ mod generic_tests {
         // Valid parenthesized expressions and unit still parse cleanly (no behavior change).
         assert!(errors("fun main() { let a = (1 + 2) * 3\n    let b = ((4))\n    let c = (true) }\n").is_empty());
         assert!(errors("fun noop() { () }\nfun main() { noop() }\n").is_empty());
+    }
+
+    #[test]
+    fn argument_type_mismatch_names_the_position() {
+        // A wrong-typed call argument now names WHICH argument (1-based) instead of a bare
+        // "type mismatch in function call", so a multi-arg call points at the offending slot
+        // (PR-it236).
+        let a2 = errors("fun add(a: Int, b: Int) -> Int { a + b }\nfun main() { let _ = add(1, \"two\") }\n");
+        assert!(a2.iter().any(|d| d.code == "K0200" && d.message.contains("argument 2") && d.message.contains("expected Int, found Str")), "{a2:?}");
+        let a1 = errors("fun add(a: Int, b: Int) -> Int { a + b }\nfun main() { let _ = add(\"one\", 2) }\n");
+        assert!(a1.iter().any(|d| d.code == "K0200" && d.message.contains("argument 1")), "{a1:?}");
+        // A correctly-typed call still type-checks.
+        assert!(errors("fun add(a: Int, b: Int) -> Int { a + b }\nfun main() { let _ = add(1, 2) }\n").is_empty());
     }
 
     #[test]
