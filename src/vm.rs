@@ -2179,6 +2179,40 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_shadowing_and_closure_value_capture() {
+        // Lexical scoping is byte-identical across interp/KVM: a `let` inside a block shadows an
+        // outer binding of the same name and the outer value is RESTORED after the block; and a
+        // closure captures the VALUE of a variable at creation, not a later mutation (PR-it202).
+        let shadow = r#"fun probe() -> Str {
+    let x = 1
+    let a = x
+    let inner = {
+        let x = 100
+        x + 5
+    }
+    let b = x
+    "{a}|{inner}|{b}"
+}
+"#;
+        assert_eq!(differential(shadow), "1|105|1");
+        // Curried closures each capture their own n; and mutating n after capture doesn't change
+        // an already-created closure (capture is by value: f(1) is 1+10, not 1+99).
+        let cap = r#"fun make_adder(n: Int) -> fn(Int) -> Int {
+    fn x { x + n }
+}
+fun probe() -> Str {
+    let add5 = make_adder(5)
+    let add10 = make_adder(10)
+    var n = 10
+    let f = fn x { x + n }
+    n = 99
+    "{add5(1)}|{add10(1)}|{add5(add10(0))}|{f(1)}"
+}
+"#;
+        assert_eq!(differential(cap), "6|11|15|11");
+    }
+
+    #[test]
     fn diff_operator_precedence_and_short_circuit() {
         // The operator-precedence ladder and left-associativity evaluate identically on
         // interp/KVM, and && / || short-circuit — a RHS that would PANIC (1/0) is never reached
