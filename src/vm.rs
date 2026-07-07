@@ -2134,6 +2134,26 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_int_lcm() {
+        // The NEW lcm() is the natural companion to gcd, byte-identical on interp/KVM:
+        // |v|/gcd*|w|, always non-negative, lcm(0,_)=0, and an out-of-i64 result panics
+        // (PR-it181).
+        let src = r#"fun probe() -> Str {
+    let basic = "{(4).lcm(6)}|{(21).lcm(6)}|{(12).lcm(12)}"
+    let zero = "{(0).lcm(5)}|{(5).lcm(0)}"
+    let neg = "{(0 - 4).lcm(6)}|{(4).lcm(0 - 6)}|{(0 - 4).lcm(0 - 6)}"
+    "{basic}#{zero}#{neg}"
+}
+"#;
+        assert_eq!(differential(src), "12|42|12#0|0#12|12|12");
+        // A result that overflows i64 is a clean panic, identical across engines.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(9223372036854775807).lcm(2)}\" }\n"),
+            "panic: integer overflow in `lcm`"
+        );
+    }
+
+    #[test]
     fn diff_string_center_alignment() {
         // The NEW center() completes the pad_left/pad_right trio, byte-identical on interp/KVM:
         // char-aware width, extra padding on the RIGHT when odd, width <= length is a no-op, and

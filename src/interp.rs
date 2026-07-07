@@ -2511,6 +2511,28 @@ pub fn shared_method(
             }
             _ => Err("`gcd` needs an Int".into()),
         },
+        (Value::Int(v), "lcm") => match args.into_iter().next() {
+            // Least common multiple, the natural companion to gcd: |v|/gcd(v,w) * |w|,
+            // always non-negative. lcm(0, _) = lcm(_, 0) = 0 by convention. A result that
+            // does not fit in i64 is an overflow panic (matching Int arithmetic).
+            Some(Value::Int(w)) => {
+                if *v == 0 || w == 0 {
+                    Ok(Value::Int(0))
+                } else {
+                    let (mut a, mut b) = (v.unsigned_abs(), w.unsigned_abs());
+                    while b != 0 {
+                        let t = b;
+                        b = a % b;
+                        a = t;
+                    }
+                    match (v.unsigned_abs() / a).checked_mul(w.unsigned_abs()) {
+                        Some(u) if u <= i64::MAX as u64 => Ok(Value::Int(u as i64)),
+                        _ => Err("integer overflow in `lcm`".into()),
+                    }
+                }
+            }
+            _ => Err("`lcm` needs an Int".into()),
+        },
         (Value::Int(v), "clamp") => {
             let mut it = args.into_iter();
             match (it.next(), it.next()) {

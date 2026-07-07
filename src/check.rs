@@ -152,7 +152,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
     "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
-    "is_odd", "is_ok", "is_some", "is_subset", "isqrt", "join", "keys", "last", "len",
+    "is_odd", "is_ok", "is_some", "is_subset", "isqrt", "join", "keys", "last", "lcm", "len",
     "lines", "log", "map", "map_err", "map_values", "max", "max_by", "mean", "merge",
     "min", "min_by", "num", "ok", "ok_or", "pad_left", "pad_right", "par_each",
     "par_filter", "par_map", "parse_float", "parse_int", "parse_radix", "partition", "position",
@@ -2260,7 +2260,8 @@ impl Checker {
             (Ty::F32, "to_str") => Some((vec![], Ty::Str)),
             (Ty::Float, "to_f32") => Some((vec![], Ty::F32)),
             (Ty::Int, "abs") => Some((vec![], Ty::Int)),
-            (Ty::Int, "min") | (Ty::Int, "max") | (Ty::Int, "pow") | (Ty::Int, "gcd") => {
+            (Ty::Int, "min") | (Ty::Int, "max") | (Ty::Int, "pow") | (Ty::Int, "gcd")
+            | (Ty::Int, "lcm") => {
                 Some((vec![Ty::Int], Ty::Int))
             }
             (Ty::Int, "clamp") => Some((vec![Ty::Int, Ty::Int], Ty::Int)),

@@ -3963,6 +3963,19 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             while (b) { uint64_t t = b; b = a % b; a = t; }
             return k_int((int64_t)a);
         }
+        if (!strcmp(name, "lcm")) {
+            /* |x|/gcd(x,y) * |y|, non-negative; lcm(0,_)=lcm(_,0)=0; overflow -> panic. */
+            int64_t x = recv.as.i, y = args[0].as.i;
+            if (x == 0 || y == 0) return k_int(0);
+            uint64_t a = x < 0 ? (uint64_t)(-(x + 1)) + 1 : (uint64_t)x;
+            uint64_t b = y < 0 ? (uint64_t)(-(y + 1)) + 1 : (uint64_t)y;
+            uint64_t ga = a, gb = b;
+            while (gb) { uint64_t t = gb; gb = ga % gb; ga = t; }
+            uint64_t l;
+            if (__builtin_mul_overflow(a / ga, b, &l) || l > (uint64_t)INT64_MAX)
+                k_panic("integer overflow in `lcm`");
+            return k_int((int64_t)l);
+        }
         if (!strcmp(name, "clamp")) {
             int64_t lo = args[0].as.i, hi = args[1].as.i;
             if (lo > hi) k_panic("`clamp`: lo must not exceed hi");
@@ -5581,6 +5594,20 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native lcm() matches interp/KVM: non-negative result, lcm(0,_)=0, INT64_MIN-safe abs,
+    /// and an out-of-i64 result panics (PR-it181).
+    #[test]
+    fn native_int_lcm() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{(4).lcm(6)}|{(21).lcm(6)}|{(0).lcm(5)}|{(0 - 4).lcm(0 - 6)}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "intlcm").trim(), "12|42|0|12");
     }
 
     /// Native center() matches interp/KVM: char-aware width, extra padding on the right when
