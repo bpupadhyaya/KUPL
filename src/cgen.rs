@@ -5542,6 +5542,27 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native sets preserve insertion order through mutation, matching interp/KVM: insert-
+    /// existing is a no-op keeping order, remove-then-reinsert moves to end, dedup is
+    /// first-occurrence, and set algebra is deterministically ordered (PR-it161).
+    #[test]
+    fn native_set_ops_preserve_insertion_order() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let s = Set([1, 2, 3])
+    let a = Set([1, 2, 3])
+    let b = Set([3, 4, 2])
+    print("{s.remove(1).insert(1)}|{Set([3, 1, 2, 1, 3])}|{a.union(b)}|{a.symmetric_difference(b)}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "setord").trim(),
+            "Set{2, 3, 1}|Set{3, 1, 2}|Set{1, 2, 3, 4}|Set{1, 4}"
+        );
+    }
+
     /// Native maps preserve insertion order through mutation, matching interp/KVM: update keeps
     /// position, remove preserves the rest's order, merge is left-first with right-wins (it160).
     #[test]

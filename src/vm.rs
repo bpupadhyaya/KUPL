@@ -2134,6 +2134,31 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_set_ops_preserve_insertion_order() {
+        // Sets are insertion-ordered and stable through mutation, byte-identical on interp/KVM
+        // (parallel to the map cert in PR-it160): insert of an existing element is a no-op that
+        // keeps order, remove preserves the rest's order, remove-then-reinsert moves to the
+        // end, the constructor dedups in first-occurrence order, and the algebra ops
+        // (union/intersect/difference/symmetric_difference) have deterministic order (PR-it161).
+        let src = r#"fun probe() -> Str {
+    let s = Set([1, 2, 3])
+    let ins = "{s.insert(4)}|{s.insert(2)}"
+    let rem = "{s.remove(2)}|{s.remove(9)}|{s.remove(1).insert(1)}"
+    let dedup = "{Set([3, 1, 2, 1, 3])}"
+    let a = Set([1, 2, 3])
+    let b = Set([3, 4, 2])
+    let alg = "{a.union(b)}|{a.intersect(b)}|{a.difference(b)}|{a.symmetric_difference(b)}"
+    let sub = "{Set([1, 2]).is_subset(b)}|{b.is_subset(Set([1, 2]))}"
+    "{ins}#{rem}#{dedup}#{alg}#{sub}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "Set{1, 2, 3, 4}|Set{1, 2, 3}#Set{1, 3}|Set{1, 2, 3}|Set{2, 3, 1}#Set{3, 1, 2}#Set{1, 2, 3, 4}|Set{2, 3}|Set{1}|Set{1, 4}#false|false"
+        );
+    }
+
+    #[test]
     fn diff_map_ops_preserve_insertion_order() {
         // Maps are insertion-ordered and that order is stable through mutation, byte-identical
         // on interp/KVM: updating an existing key keeps its position, remove preserves the
