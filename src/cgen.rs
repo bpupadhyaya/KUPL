@@ -5542,6 +5542,25 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native maps preserve insertion order through mutation, matching interp/KVM: update keeps
+    /// position, remove preserves the rest's order, merge is left-first with right-wins (it160).
+    #[test]
+    fn native_map_ops_preserve_insertion_order() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let upd = Map().insert("a", 1).insert("b", 2).insert("c", 3).insert("b", 20).remove("a").insert("a", 9)
+    let mg = Map().insert("a", 1).insert("b", 2).merge(Map().insert("b", 20).insert("c", 3))
+    print("{upd.keys()} {upd.values()}|{mg.keys()} {mg.values()}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "mapord").trim(),
+            "[\"b\", \"c\", \"a\"] [20, 3, 9]|[\"a\", \"b\", \"c\"] [1, 20, 3]"
+        );
+    }
+
     /// Native date/time math matches interp/KVM: components, ISO round-trip, month-boundary
     /// rollover, and leap-day arithmetic (2024 leap, 1900 not — the century rule) (PR-it159).
     #[test]

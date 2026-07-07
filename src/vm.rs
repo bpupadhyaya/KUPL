@@ -2134,6 +2134,28 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_ops_preserve_insertion_order() {
+        // Maps are insertion-ordered and that order is stable through mutation, byte-identical
+        // on interp/KVM: updating an existing key keeps its position, remove preserves the
+        // rest's order, remove-then-reinsert moves to the end, remove-missing is a no-op, and
+        // merge is left-order-first with the right map winning on key conflicts (PR-it160).
+        let src = r#"fun probe() -> Str {
+    let upd = Map().insert("a", 1).insert("b", 2).insert("c", 3).insert("b", 20)
+    let rem = Map().insert("a", 1).insert("b", 2).insert("c", 3).remove("b")
+    let reins = Map().insert("a", 1).insert("b", 2).insert("c", 3).remove("a").insert("a", 9)
+    let miss = Map().insert("a", 1).insert("b", 2).remove("z")
+    let l = Map().insert("a", 1).insert("b", 2)
+    let mg = l.merge(Map().insert("b", 20).insert("c", 3))
+    "{upd.keys()} {upd.values()}#{rem.keys()} {rem.values()}#{reins.keys()}#{miss.keys()} {miss.len()}#{mg.keys()} {mg.values()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[\"a\", \"b\", \"c\"] [1, 20, 3]#[\"a\", \"c\"] [1, 3]#[\"b\", \"c\", \"a\"]#[\"a\", \"b\"] 2#[\"a\", \"b\", \"c\"] [1, 20, 3]"
+        );
+    }
+
+    #[test]
     fn diff_date_time_arithmetic_and_components() {
         // The timestamp-based date API (date_make/date_iso/year_of/.../weekday_of) is
         // byte-identical on interp/KVM with correct Gregorian semantics: components, ISO
