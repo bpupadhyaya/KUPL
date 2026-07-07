@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_expr_evaluator_returning_result() {
+        // A bug-hunt-42 lock (it299): a FALLIBLE recursive AST evaluator -- each node's eval returns
+        // Result[Int, Str], and_then/map thread the recursive results, and Div returns Err on a zero
+        // divisor. it298 evaluates a total expr to an Int; this pins error propagation through recursion:
+        // a failing sub-expression's Err bubbles up and short-circuits the enclosing node.
+        //   e1 = Add(Num 10, Div(Num 20, Num 4))        -> Ok(10 + 5) = Ok(15)
+        //   e2 = Div(Num 8, Add(Num 3, Num -3))         -> divisor Add(3,-3) COMPUTES to 0 -> Err("div by zero")
+        //   e3 = Add(Div(Num 9, Num 0), Num 1)          -> inner Div errs -> and_then short-circuits the Add
+        // Byte-identical on interp/KVM (native per the sweep). Confirms Result threads through a recursive
+        // evaluator (each Add/Div sequences its two sub-evals with and_then/map), that the divisor subtree
+        // is fully evaluated before the zero check (e2's zero is computed, not a literal), and that an Err
+        // produced at arbitrary depth propagates to the top so the enclosing Add in e3 never runs its map.
+        // This is the fallible interpreter an AI writes for a spreadsheet formula engine or a calculator
+        // that reports errors instead of crashing; a backend that short-circuited on a literal-zero check
+        // only, or that let the Add in e3 complete despite the inner Err, would return a wrong Ok.
+        let src = r#"type Expr = Num(v: Int) | Add(l: Expr, r: Expr) | Div(l: Expr, r: Expr)
+fun eval(e: Expr) -> Result[Int, Str] {
+    match e { Num(v) => Ok(v)
+        Add(l, r) => eval(l).and_then(fn(a) { eval(r).map(fn(b) { a + b }) })
+        Div(l, r) => eval(l).and_then(fn(a) { eval(r).and_then(fn(b) {
+            if b == 0 { Err("div by zero") } else { Ok(a / b) } }) }) }
+}
+fun outcome(r: Result[Int, Str]) -> Str {
+    match r { Ok(v) => "ok:{v}"
+        Err(e) => "err:{e}" }
+}
+fun probe() -> Str {
+    let e1 = Add(l: Num(v: 10), r: Div(l: Num(v: 20), r: Num(v: 4)))
+    let e2 = Div(l: Num(v: 8), r: Add(l: Num(v: 3), r: Num(v: 0 - 3)))
+    let e3 = Add(l: Div(l: Num(v: 9), r: Num(v: 0)), r: Num(v: 1))
+    "{outcome(eval(e1))}|{outcome(eval(e2))}|{outcome(eval(e3))}"
+}
+"#;
+        assert_eq!(differential(src), "ok:15|err:div by zero|err:div by zero");
+    }
+
+    #[test]
     fn diff_recursive_expr_evaluator_four_variants() {
         // A certification lock (it298): a recursive ADT interpreter over a FOUR-variant expression type
         // with mixed arities -- the canonical tree-walking eval. it296 traverses a 2-variant Leaf/Branch
