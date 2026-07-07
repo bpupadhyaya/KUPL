@@ -2104,6 +2104,38 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_chunk_over_records_per_batch_average() {
+        // A certification lock (it294): per-batch AVERAGE of a record field over non-overlapping
+        // chunks -- the batch-mean idiom. it259 chunks plain Ints for a sum/size; this chunks RECORDS
+        // (project the val field), and the load-bearing edge is that each batch's average divides by the
+        // batch's OWN length, so the PARTIAL LAST CHUNK divides by its actual (smaller) size, not the
+        // nominal chunk width.
+        //   vals = [10, 20, 30, 44, 56, 100, 8]   (from Reading records)
+        //   chunk(3) -> [[10,20,30], [44,56,100], [8]]
+        //     sums / own-len: [60/3, 200/3, 8/1] == [20, 66, 8]
+        //       (200/3 truncates to 66 by integer division; the singleton tail divides by 1 -> 8, NOT 8/3=2)
+        //     nbatches = 3   (ceil(7/3))
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the per-batch mean uses
+        // vals.len() (the real chunk size) as the divisor -- so the incomplete final batch averages over
+        // 1 element, not 3 -- and that integer division truncates (200/3 -> 66). This is the batch/rolling
+        // mean an AI writes for sensor sampling, paginated aggregates, or per-page stats. A backend that
+        // divided every batch by the fixed chunk width would compute 8/3=2 for the tail, and one that
+        // rounded instead of truncating would report 67 for the middle batch.
+        let src = r#"type Reading = { sensor: Str, val: Int }
+fun probe() -> Str {
+    let rs = [Reading(sensor: "a", val: 10), Reading(sensor: "b", val: 20), Reading(sensor: "c", val: 30), Reading(sensor: "d", val: 44), Reading(sensor: "e", val: 56), Reading(sensor: "f", val: 100), Reading(sensor: "g", val: 8)]
+    let avgs = rs.chunk(3).map(fn batch {
+        let vals = batch.map(fn r { r.val })
+        let sum = vals.fold(0, fn(a, v) { a + v })
+        sum / vals.len()
+    })
+    "{avgs}|nbatches={avgs.len()}"
+}
+"#;
+        assert_eq!(differential(src), "[20, 66, 8]|nbatches=3");
+    }
+
+    #[test]
     fn diff_window_over_records_high_low_range() {
         // A bug-hunt-39 lock (it293): the sliding high-low RANGE idiom over a series of records -- the
         // volatility-band / min-max-envelope shape. it257 windows plain Ints for a moving sum/max; this
