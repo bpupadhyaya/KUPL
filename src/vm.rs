@@ -2536,6 +2536,27 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
     }
 
     #[test]
+    fn diff_nan_in_by_reductions_and_tensors() {
+        // max_by/min_by with a Float key that can be NaN use k_cmp's strict comparison (fixed
+        // in PR-it148/149), so a NaN key is inert — it wins only as the seed, matching the
+        // interpreter's first-seeded fold across every NaN position (PR-it150).
+        let mb = "type P = P(id: Int, key: Float)\n\
+                  fun wmax(xs: List[P]) -> Int { match xs.max_by(fn(p: P) { p.key }) {\n        Some(p) => p.id\n        None => 0 - 1\n    } }\n\
+                  fun wmin(xs: List[P]) -> Int { match xs.min_by(fn(p: P) { p.key }) {\n        Some(p) => p.id\n        None => 0 - 1\n    } }\n\
+                  fun probe() -> Str {\n    let nan = 0.0 / 0.0\n    \
+                  let mid = [P(id: 1, key: 1.0), P(id: 2, key: nan), P(id: 3, key: 2.0)]\n    \
+                  let first = [P(id: 1, key: nan), P(id: 2, key: 3.0), P(id: 3, key: 1.0)]\n    \
+                  let last = [P(id: 1, key: 3.0), P(id: 2, key: 1.0), P(id: 3, key: nan)]\n    \
+                  \"{wmax(mid)},{wmin(mid)}|{wmax(first)},{wmin(first)}|{wmax(last)},{wmin(last)}\"\n}\n";
+        assert_eq!(differential(mb), "3,1|1,1|1,2");
+        // Tensor reductions propagate NaN (a NaN element poisons sum/mean/dot).
+        assert_eq!(
+            differential("fun probe() -> Str { let t = tensor([1.0, 0.0 / 0.0, 2.0])\n    \"{t.sum()}|{t.mean()}|{t.dot(tensor([1.0, 1.0, 1.0]))}\" }\n"),
+            "NaN|NaN|NaN"
+        );
+    }
+
+    #[test]
     fn diff_nan_in_collections() {
         // NaN in collections follows from `nan != nan` and its unordered comparisons — sort
         // is deterministic and identical across engines (the PR-it148 k_cmp fix propagated),

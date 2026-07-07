@@ -5121,6 +5121,21 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native max_by/min_by with a NaN key (they use k_cmp's strict comparison, so the it148
+    /// fix covers them) and tensor reductions with NaN match interp/KVM (PR-it150).
+    #[test]
+    fn native_nan_by_reductions_and_tensors() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type P = P(id: Int, key: Float)\n\
+                   fun wmax(xs: List[P]) -> Int { match xs.max_by(fn(p: P) { p.key }) {\n        Some(p) => p.id\n        None => 0 - 1\n    } }\n\
+                   fun main() uses io {\n    let nan = 0.0 / 0.0\n    \
+                   let first = [P(id: 1, key: nan), P(id: 2, key: 3.0)]\n    let last = [P(id: 1, key: 3.0), P(id: 2, key: nan)]\n    \
+                   let t = tensor([1.0, nan, 2.0])\n    print(\"{wmax(first)}|{wmax(last)}|{t.sum()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "nanby").trim(), "1|1|NaN");
+    }
+
     /// Native NaN-in-collection behavior matches interp/KVM: sort is deterministic (the
     /// PR-it148 k_cmp fix flows into the sort comparator), min/max skip NaN, and Set keeps
     /// duplicate NaNs since nan != nan (PR-it149).
