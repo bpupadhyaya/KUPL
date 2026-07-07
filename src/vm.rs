@@ -2104,6 +2104,42 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_if_let_while_let_applied_idioms() {
+        // A certification lock (it264): the APPLIED if-let/while-let idioms, complementing it125's
+        // mechanics test (which covers if-let-as-expression with nested patterns, statement-scope
+        // binding, and counter-driven while-let). This pins three distinct real-world uses: (1)
+        // if-let over Map.get() with a mutating else branch — the lookup-with-fallback pattern where
+        // a hit adds the value and a miss adds a default (get("a")=Some(1) -> acc 1, get("z")=None ->
+        // else acc+10 = 11); (2) while-let DRAINING a list by peeking first() and dropping, consuming
+        // it front-to-back until empty ("5,7,9,4,3,"), distinct from it125's step(n) counter; (3)
+        // if-let DRIVING RECURSION — first_even walks a list via if-let on first() and recurses on
+        // drop(1), returning Some(8) for [1,3,5,8,9] and None for [1,3,5]. Byte-identical on
+        // interp/KVM (native per the sweep).
+        let src = r#"fun first_even(xs: List[Int]) -> Option[Int] {
+    if let Some(x) = xs.first() {
+        if x % 2 == 0 { Some(x) } else { first_even(xs.drop(1)) }
+    } else {
+        None
+    }
+}
+fun probe() -> Str {
+    let m = Map().insert("a", 1).insert("b", 2)
+    var acc = 0
+    if let Some(v) = m.get("a") { acc = acc + v } else { acc = acc - 1 }
+    if let Some(v) = m.get("z") { acc = acc + 100 } else { acc = acc + 10 }
+    var xs = [5, 7, 9, 4, 3]
+    var drained = ""
+    while let Some(h) = xs.first() {
+        drained = "{drained}{h},"
+        xs = xs.drop(1)
+    }
+    "{acc}|{drained}|{first_even([1, 3, 5, 8, 9])}|{first_even([1, 3, 5])}"
+}
+"#;
+        assert_eq!(differential(src), "11|5,7,9,4,3,|Some(8)|None");
+    }
+
+    #[test]
     fn diff_group_by_then_map_values_histogram() {
         // A bug-hunt-25 lock (it262): the frequency-table / count-by-category idiom. group_by alone
         // (it1978), map-from-pairs+group_by (it2553), and map_values alone (it4526) are locked; this
