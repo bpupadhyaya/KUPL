@@ -2779,7 +2779,9 @@ pub fn shared_method(
             if d.is_empty() {
                 return Err("mean of an empty tensor".into());
             }
-            Ok(Value::Float(d.iter().sum::<f64>() / d.len() as f64))
+            // fold from +0.0 to match native's accumulator (a tensor summing to zero
+            // yields +0.0, not Rust `Iterator::sum`'s -0.0 identity) — PR-it101/102.
+            Ok(Value::Float(d.iter().fold(0.0_f64, |s, x| s + x) / d.len() as f64))
         }
         (Value::Tensor(d), "max") => d
             .iter()
@@ -2798,7 +2800,9 @@ pub fn shared_method(
                 if a.len() != b.len() {
                     return Err(format!("dot: length mismatch ({} vs {})", a.len(), b.len()));
                 }
-                Ok(Value::Float(a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()))
+                // fold from +0.0 (not `Iterator::sum`, whose f64 identity is -0.0) so a
+                // dot of two empty tensors is +0.0, matching the native runtime (PR-it101).
+                Ok(Value::Float(a.iter().zip(b.iter()).map(|(x, y)| x * y).fold(0.0_f64, |s, p| s + p)))
             }
             _ => Err("`dot` needs a Tensor".into()),
         },

@@ -1869,6 +1869,17 @@ mod tests {
             differential("fun probe() -> Str { \"{tensor([1.0]).get(5)}\" }\n"),
             "panic: tensor index 5 out of range for length 1"
         );
+        // -0.0 bug class (PR-it102): dot of empty tensors and any dot/mean that sums to
+        // zero must be +0.0 (matching native), not Rust `Iterator::sum`'s -0.0 identity.
+        assert_eq!(differential("fun probe() -> Str { \"{zeros(0).dot(zeros(0))}\" }\n"), "0.0");
+        assert_eq!(
+            differential("fun probe() -> Str { \"{tensor([1.0, 0.0]).dot(tensor([0.0, 1.0]))}\" }\n"),
+            "0.0"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{tensor([1.0, 0.0 - 1.0]).mean()}\" }\n"),
+            "0.0"
+        );
     }
 
     #[test]
