@@ -1994,8 +1994,26 @@ impl Checker {
                 }
                 self.uni.apply(&r)
             }
-            // callee type not yet known (e.g. a type variable): fall back to
-            // whole-function unification to drive inference
+            // callee is a KNOWN concrete non-function type (e.g. calling `x(3)` where x: Int):
+            // say so plainly instead of unifying it against an invented `fn(Int) -> ?N`, which
+            // surfaced a confusing "expected fn(Int) -> ?0, found Int" with a raw type variable
+            // (PR-it204). Still walk the arguments so their sub-expressions are checked.
+            other if !matches!(other, Ty::Var(_)) => {
+                for a in args {
+                    if a.name.is_some() {
+                        self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+                    }
+                    self.infer_expr(&a.value, ctx);
+                }
+                self.err(
+                    "K0200",
+                    format!("cannot call a value of type {other}; it is not a function"),
+                    span,
+                );
+                self.uni.fresh()
+            }
+            // callee type not yet known (a type variable): fall back to whole-function
+            // unification to drive inference
             _ => {
                 let mut arg_tys = Vec::new();
                 for a in args {
@@ -2932,6 +2950,32 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    #[test]
+    fn calling_a_non_function_says_so_plainly() {
+        // Calling a concrete non-function value now reports "cannot call a value of type X; it is
+        // not a function" instead of the confusing "expected fn(Int) -> ?0, found Int" with a raw
+        // type variable (PR-it204). Still K0200 — message-text only, no accept/reject change.
+        let hint = "it is not a function";
+        for (src, ty) in [
+            ("fun main() { let x = 5\n    let _ = x(3) }\n", "Int"),
+            ("fun main() { let s = \"hi\"\n    let _ = s(3) }\n", "Str"),
+            ("fun main() { let xs = [1, 2, 3]\n    let _ = xs(0) }\n", "List[Int]"),
+        ] {
+            let e = errors(src);
+            assert!(
+                e.iter().any(|d| d.code == "K0200"
+                    && d.message.contains(hint)
+                    && d.message.contains(ty)),
+                "{ty}: {e:?}"
+            );
+        }
+        // Real function / closure / HOF calls still type-check (no behavior change).
+        assert!(errors(
+            "fun add(a: Int, b: Int) -> Int { a + b }\nfun main() { let f = fn x { x * 2 }\n    let _ = add(2, 3)\n    let _ = f(10)\n    let _ = [1, 2, 3].map(fn x { x + 1 }) }\n"
+        )
+        .is_empty());
     }
 
     #[test]
