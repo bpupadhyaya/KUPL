@@ -4907,6 +4907,23 @@ mod tests {
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
     }
 
+    /// Native codec decoders give the same specific error messages as the interpreter
+    /// (PR-it117 verified the generic-message class was JSON-only).
+    #[test]
+    fn native_codec_decode_error_messages() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun e(r: Result[Str, Str]) -> Str { match r { Ok(_) => "ok"
+        Err(m) => m } }
+fun main() uses io { print("{e(hex_decode("abc"))}|{e(hex_decode("zz"))}|{e(base64_decode("ab@d"))}|{e(url_decode("%zz"))}") }
+"#;
+        assert_eq!(
+            native_main_stdout(src, "codecerrmsg").trim(),
+            "invalid hex: odd length|invalid hex: bad digit|invalid base64: bad character|invalid percent-encoding: bad hex"
+        );
+    }
+
     /// Native JSON parse errors match the interpreter's specific, positioned messages
     /// (PR-it116 replaced a generic "invalid JSON" with per-site messages).
     #[test]

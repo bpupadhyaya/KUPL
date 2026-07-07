@@ -1883,6 +1883,21 @@ mod tests {
     }
 
     #[test]
+    fn diff_codec_decode_error_messages() {
+        // PR-it117: the codec decoders (hex/base64/url) already give specific, matching
+        // error messages on interp/KVM (native verified separately) — the generic-message
+        // class was JSON-only (fixed it116).
+        let src = r#"fun e(r: Result[Str, Str]) -> Str { match r { Ok(_) => "ok"
+        Err(m) => m } }
+fun probe() -> Str { "{e(hex_decode("abc"))}|{e(hex_decode("zz"))}|{e(base64_decode("ab@d"))}|{e(base64_decode("ab=c"))}|{e(url_decode("%zz"))}|{e(url_decode("%a"))}" }
+"#;
+        assert_eq!(
+            differential(src),
+            "invalid hex: odd length|invalid hex: bad digit|invalid base64: bad character|invalid base64: misplaced padding|invalid percent-encoding: bad hex|invalid percent-encoding: truncated escape"
+        );
+    }
+
+    #[test]
     fn diff_json_parse_error_messages() {
         // PR-it116: malformed JSON gives the SAME specific, positioned error message on
         // interp/KVM (and native) — not a generic "invalid JSON".
