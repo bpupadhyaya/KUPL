@@ -99,9 +99,8 @@ fun main() uses io {
     print("stock: {wh.report()}")
     print("total: {wh.total()}")
     let items = [Item(name: "apple", qty: 7), Item(name: "pear", qty: 0)]
-    let qtys = items.map(fn it { it.qty })
-    match first_where(qtys, fn q { q == 0 }) {
-        Some(_) => print("some item is out of stock")
+    match first_where(items, fn it { it.qty == 0 }) {
+        Some(item) => print("out of stock: {item.name}")
         None => print("all in stock")
     }
 }

@@ -1901,15 +1901,15 @@ impl Checker {
         }
         // general callable
         let ct = self.infer_expr(callee, ctx);
-        let mut arg_tys = Vec::new();
-        for a in args {
-            if a.name.is_some() {
-                self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
-            }
-            arg_tys.push(self.infer_expr(&a.value, ctx));
-        }
         match self.uni.apply(&ct) {
             Ty::Fun(ps, _) if ps.len() != args.len() => {
+                // still walk the arguments so their sub-expressions are checked
+                for a in args {
+                    if a.name.is_some() {
+                        self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+                    }
+                    self.infer_expr(&a.value, ctx);
+                }
                 self.err(
                     "K0242",
                     format!("this function takes {} argument(s), {} given", ps.len(), args.len()),
@@ -1917,16 +1917,33 @@ impl Checker {
                 );
                 self.uni.fresh()
             }
-            // concrete function: check each argument with contract assignability
+            // concrete function: check each argument LEFT-TO-RIGHT against its
+            // expected parameter type. Checking a concrete earlier argument (e.g. a
+            // `List[Item]`) binds the generic type variables a later argument depends
+            // on, so a trailing closure like `fn it { it.qty }` sees its parameter's
+            // real type instead of failing with K0232 (PR-it134).
             Ty::Fun(ps, r) => {
-                for (p, at) in ps.iter().zip(arg_tys.iter()) {
-                    self.check_assign(p, at, span, "function call");
+                for (i, a) in args.iter().enumerate() {
+                    if a.name.is_some() {
+                        self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+                    }
+                    let want = self.uni.apply(&ps[i]);
+                    let at = self.check_expr_expecting(&a.value, &want, ctx);
+                    let want = self.uni.apply(&ps[i]);
+                    self.check_assign(&want, &at, span, "function call");
                 }
                 self.uni.apply(&r)
             }
             // callee type not yet known (e.g. a type variable): fall back to
             // whole-function unification to drive inference
             _ => {
+                let mut arg_tys = Vec::new();
+                for a in args {
+                    if a.name.is_some() {
+                        self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+                    }
+                    arg_tys.push(self.infer_expr(&a.value, ctx));
+                }
                 let ret = self.uni.fresh();
                 let want = Ty::Fun(arg_tys, Box::new(ret.clone()));
                 self.unify(&want, &ct, span, "function call");
@@ -2701,6 +2718,19 @@ mod generic_tests {
             .into_iter()
             .filter(|d| d.severity == crate::diag::Severity::Error)
             .collect()
+    }
+
+    #[test]
+    fn generic_call_infers_type_var_before_checking_a_later_closure() {
+        // Calling a generic fun with a concrete argument followed by a closure that
+        // depends on the inferred type parameter now type-checks: the concrete `List[Item]`
+        // binds T = Item before the `fn it { it.qty }` closure body is checked, so the
+        // field access resolves instead of failing K0232 (PR-it134).
+        let src = "type Item = { name: Str, qty: Int }\n\
+                   fun first_where[T](xs: List[T], pred: fn(T) -> Bool) -> Option[T] { xs.filter(pred).get(0) }\n\
+                   fun main() uses io {\n    let items = [Item(name: \"a\", qty: 7), Item(name: \"b\", qty: 0)]\n    \
+                   match first_where(items, fn it { it.qty == 0 }) {\n        Some(_) => print(\"out\")\n        None => print(\"in\")\n    }\n}\n";
+        assert!(errors(src).is_empty(), "generic call with a field-accessing closure must type-check: {:?}", errors(src));
     }
 
     #[test]
