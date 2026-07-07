@@ -2104,6 +2104,45 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_binary_tree_traversals() {
+        // A certification lock (it296): three independent recursive traversals over a BINARY tree ADT
+        // -- sum, leaf-count, and depth -- each pattern-matching Leaf/Branch and recursing on both
+        // children. it166 locks a single shallow tree sum; it245 locks a UNARY-constructor depth; this
+        // pins the binary case where depth combines an if-expression with two recursive calls
+        // (1 + max(depth(l), depth(r))), the shape that actually recurses down both subtrees per node.
+        //   t = Branch(Branch(Leaf 3, Leaf 5), Branch(Leaf 2, Branch(Leaf 7, Leaf 1)))
+        //   sumT        = 3+5+2+7+1 = 18
+        //   countLeaves = 5
+        //   depth       = 4   (deepest path root -> Branch -> Branch(2,..) -> Branch(7,1) -> Leaf)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms a self-referential ADT
+        // (Branch(l: Tree, r: Tree)) constructs and destructures to arbitrary depth, that three
+        // distinct recursive functions over the same value agree across engines, and that depth's
+        // 1 + max(recurse-left, recurse-right) picks the taller subtree (right side here, which holds
+        // the extra nesting). This is the canonical walk-a-tree an AI writes for ASTs, file
+        // hierarchies, or decision trees. A backend with a shallow recursion cap or that mis-bound the
+        // second child in Branch(l, r) would under-count or mis-depth the asymmetric right subtree.
+        let src = r#"type Tree = Leaf(v: Int) | Branch(l: Tree, r: Tree)
+fun sumT(t: Tree) -> Int {
+    match t { Leaf(v) => v
+        Branch(l, r) => sumT(l) + sumT(r) }
+}
+fun countLeaves(t: Tree) -> Int {
+    match t { Leaf(v) => 1
+        Branch(l, r) => countLeaves(l) + countLeaves(r) }
+}
+fun depth(t: Tree) -> Int {
+    match t { Leaf(v) => 1
+        Branch(l, r) => 1 + (if depth(l) > depth(r) { depth(l) } else { depth(r) }) }
+}
+fun probe() -> Str {
+    let t = Branch(l: Branch(l: Leaf(v: 3), r: Leaf(v: 5)), r: Branch(l: Leaf(v: 2), r: Branch(l: Leaf(v: 7), r: Leaf(v: 1))))
+    "{sumT(t)}|leaves={countLeaves(t)}|depth={depth(t)}"
+}
+"#;
+        assert_eq!(differential(src), "18|leaves=5|depth=4");
+    }
+
+    #[test]
     fn diff_map_fold_record_values_into_str_report() {
         // A bug-hunt-40 lock (it295): Map.fold's 3-arg (acc, k, v) form building a STRING report over a
         // RECORD-valued map, computing a derived stat per entry. it277 folds a scalar-valued map into a
