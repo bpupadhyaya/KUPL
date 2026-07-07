@@ -2104,6 +2104,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_nested_flat_map_cartesian_product() {
+        // A bug-hunt-24 lock (it260): NESTED flat_map — the two-level monadic bind that generates a
+        // cartesian product / nested list comprehension. Single-level flat_map (1->N expand,
+        // empty-as-filter) is locked at it1989/3856; this pins flat_map INSIDE flat_map, where the
+        // outer closure's bound variable is still in scope in the inner closure. [1,2,3] x ["x","y"]
+        // yields the full cross product ["1x","1y",...,"3y"]; [0,1] x [0,1,2] yields grid coordinates
+        // [0,1,2,10,11,12]; and the third uses an empty-list return in the INNER flat_map as a filter
+        // to emit only upper-triangle pairs where b > a (["1-2","1-3","2-3"]). Byte-identical on
+        // interp/KVM (native per the sweep). This is the nested-comprehension / pair-generation idiom.
+        let src = r#"fun probe() -> Str {
+    let pairs = [1, 2, 3].flat_map(fn a { ["x", "y"].flat_map(fn b { ["{a}{b}"] }) })
+    let coords = [0, 1].flat_map(fn r { [0, 1, 2].flat_map(fn c { [r * 10 + c] }) })
+    let triangle = [1, 2, 3].flat_map(fn a { [1, 2, 3].flat_map(fn b { if b > a { ["{a}-{b}"] } else { [] } }) })
+    "{pairs}|{coords}|{triangle}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"["1x", "1y", "2x", "2y", "3x", "3y"]|[0, 1, 2, 10, 11, 12]|["1-2", "1-3", "2-3"]"#
+        );
+    }
+
+    #[test]
     fn diff_chunk_then_aggregate_batch_processing() {
         // A certification lock (it259): the batch-processing idiom, the non-overlapping complement to
         // it257's window->aggregate. chunk(k) splits a list into consecutive NON-overlapping groups
