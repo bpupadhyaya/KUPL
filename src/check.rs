@@ -77,6 +77,16 @@ impl Scopes {
 }
 
 /// Levenshtein edit distance (small strings — identifier names).
+/// Render a count with a correctly pluralized noun: `plural(1, "argument")` -> "1 argument",
+/// `plural(2, "argument")` -> "2 arguments". Clearer than a literal "argument(s)" in diagnostics.
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 /// Optimal-string-alignment (restricted Damerau-Levenshtein) edit distance. Unlike plain
 /// Levenshtein, a transposition of two adjacent characters costs 1, not 2 — so a common typo
 /// like `Itn` for `Int` or `lenght` for `length` is distance 1 and a "did you mean" fires even
@@ -574,7 +584,7 @@ impl Checker {
                         if params != ats.len() {
                             self.err(
                                 "K0206",
-                                format!("`{n}` takes {params} type argument(s), {} given", ats.len()),
+                                format!("`{n}` takes {}, {} given", plural(params, "type argument"), ats.len()),
                                 t.span,
                             );
                         }
@@ -583,7 +593,7 @@ impl Checker {
                     _ => {
                         self.err(
                             "K0206",
-                            format!("unknown generic type `{n}` with {} argument(s)", args.len()),
+                            format!("unknown generic type `{n}` with {}", plural(args.len(), "argument")),
                             t.span,
                         );
                         self.uni.fresh()
@@ -1952,7 +1962,7 @@ impl Checker {
                 }
                 self.err(
                     "K0242",
-                    format!("this function takes {} argument(s), {} given", ps.len(), args.len()),
+                    format!("this function takes {}, {} given", plural(ps.len(), "argument"), args.len()),
                     span,
                 );
                 self.uni.fresh()
@@ -2003,7 +2013,7 @@ impl Checker {
         if args.len() != fields.len() {
             self.err(
                 "K0243",
-                format!("`{ctor}` has {} field(s), {} argument(s) given", fields.len(), args.len()),
+                format!("`{ctor}` has {}, {} given", plural(fields.len(), "field"), plural(args.len(), "argument")),
                 span,
             );
         }
@@ -2477,7 +2487,7 @@ impl Checker {
                     }
                     self.err(
                         "K0250",
-                        format!("`.{name}` takes {} argument(s), {} given", params.len(), args.len()),
+                        format!("`.{name}` takes {}, {} given", plural(params.len(), "argument"), args.len()),
                         span,
                     );
                 } else {
@@ -2595,7 +2605,7 @@ impl Checker {
                         if args.len() != field_tys.len() {
                             self.err(
                                 "K0255",
-                                format!("`{other}` has {} field(s), pattern has {}", field_tys.len(), args.len()),
+                                format!("`{other}` has {}, pattern has {}", plural(field_tys.len(), "field"), args.len()),
                                 pat.span,
                             );
                         }
@@ -2872,6 +2882,33 @@ mod generic_tests {
             "type T = Foo | Bar\nfun f(x: T) -> Int { match x { Fooo => 1\n _ => 0 } }\nfun main() {}\n",
         );
         assert!(e3.iter().any(|d| d.message.contains("did you mean `Foo`?")), "{e3:?}");
+    }
+
+    #[test]
+    fn arity_diagnostics_pluralize_correctly() {
+        // Arg/field count diagnostics use proper pluralization ("1 argument" / "2 arguments")
+        // instead of a literal "argument(s)" (PR-it172).
+        let many = errors("fun add(a: Int, b: Int) -> Int { a + b }\nfun main() uses io { print(add(1, 2, 3)) }\n");
+        assert!(
+            many.iter().any(|d| d.code == "K0242" && d.message.contains("takes 2 arguments, 3 given")),
+            "{many:?}"
+        );
+        let one = errors("fun neg(a: Int) -> Int { 0 - a }\nfun main() uses io { print(neg(1, 2)) }\n");
+        assert!(
+            one.iter().any(|d| d.code == "K0242" && d.message.contains("takes 1 argument, 2 given")),
+            "{one:?}"
+        );
+        let ctor = errors("type P = P(x: Int, y: Int)\nfun main() uses io { let p = P(x: 1)\n print(p.x) }\n");
+        assert!(
+            ctor.iter().any(|d| d.code == "K0243" && d.message.contains("has 2 fields, 1 argument given")),
+            "{ctor:?}"
+        );
+        // Exhaustiveness already names the missing variants — certify it stays that way.
+        let exh = errors("type T = A | B | C\nfun f(t: T) -> Int { match t { A => 1 } }\nfun main() {}\n");
+        assert!(
+            exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
+            "{exh:?}"
+        );
     }
 
     #[test]
