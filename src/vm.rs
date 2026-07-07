@@ -1883,6 +1883,25 @@ mod tests {
     }
 
     #[test]
+    fn diff_list_scan_prefix_accumulation() {
+        // PR-it113: `scan` is `fold` that keeps every running accumulator, byte-identical
+        // on interp/KVM. Prefix sums, running max, empty list, and non-numeric accumulators.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{[1, 2, 3, 4].scan(0, fn(a, x) { a + x })}\" }\n"),
+            "[1, 3, 6, 10]"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { let xs = [3, 1, 4, 1, 5, 9, 2]\n    \"{xs.scan(0, fn(m, x) { if x > m { x } else { m } })}\" }\n"),
+            "[3, 3, 4, 4, 5, 9, 9]"
+        );
+        assert_eq!(differential("fun probe() -> Str { \"{[].scan(0, fn(a, x) { a + x })}\" }\n"), "[]");
+        assert_eq!(
+            differential("fun probe() -> Str { \"{[\"a\", \"b\", \"c\"].scan(\"\", fn(a, x) { \"{a}{x}\" })}\" }\n"),
+            "[\"a\", \"ab\", \"abc\"]"
+        );
+    }
+
+    #[test]
     fn diff_higher_order_and_closure_depth() {
         // A returned closure keeps its own captured environment; two are independent.
         let ret = "fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\

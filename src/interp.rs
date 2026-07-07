@@ -1888,6 +1888,20 @@ pub fn shared_method(
             }
             Ok(acc)
         }
+        // Like `fold`, but returns each running accumulator instead of just the last —
+        // e.g. [1, 2, 3].scan(0, fn a x { a + x }) == [1, 3, 6] (prefix sums). The
+        // initial value seeds the first step but is not itself included.
+        (Value::List(items), "scan") => {
+            let mut it = args.into_iter();
+            let mut acc = it.next().ok_or("`scan` needs an initial value")?;
+            let f = it.next().ok_or("`scan` needs a function")?;
+            let mut out = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                acc = call(f.clone(), vec![acc, item.clone()])?;
+                out.push(acc.clone());
+            }
+            Ok(Value::List(Rc::new(out)))
+        }
         (Value::List(items), "any") => {
             let f = args.into_iter().next().ok_or("`any` needs a function")?;
             for item in items.iter() {

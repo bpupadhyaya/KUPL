@@ -136,7 +136,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "par_filter", "par_map", "parse_float", "parse_int", "partition", "position",
     "pow", "product", "push", "recip", "remove", "repeat", "replace", "replace_first",
     "reverse", "rfind", "round", "saturating_add", "saturating_mul", "saturating_sub",
-    "scale", "shl", "shr", "sign", "sin", "slice", "sort", "sort_by", "split",
+    "scale", "scan", "shl", "shr", "sign", "sin", "slice", "sort", "sort_by", "split",
     "split_once", "sqrt", "starts_with", "sum", "symmetric_difference", "tail", "take",
     "take_while", "tan", "to_binary", "to_float", "to_hex", "to_int", "to_list",
     "to_lower", "to_octal", "to_radix", "to_str", "to_upper", "trim", "trim_end",
@@ -2029,6 +2029,17 @@ impl Checker {
                         Ty::Fun(vec![acc.clone(), (**t).clone()], Box::new(acc.clone())),
                     ],
                     acc,
+                ))
+            }
+            (Ty::List(t), "scan") => {
+                // fold that keeps every running accumulator: (acc, fn(acc, elem) -> acc) -> List[acc]
+                let acc = self.uni.fresh();
+                Some((
+                    vec![
+                        acc.clone(),
+                        Ty::Fun(vec![acc.clone(), (**t).clone()], Box::new(acc.clone())),
+                    ],
+                    Ty::List(Box::new(acc)),
                 ))
             }
             (Ty::List(t), "any") | (Ty::List(t), "all") => Some((

@@ -3304,6 +3304,17 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return acc;
         }
+        if (!strcmp(name, "scan")) {
+            /* fold that keeps every running accumulator (prefix scan) */
+            KValue acc = args[0];
+            KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+            for (int64_t i = 0; i < l->len; i++) {
+                KValue cb[2]; cb[0] = acc; cb[1] = l->items[i];
+                acc = k_call(args[1], cb, 2);
+                out[i] = acc;
+            }
+            return k_list(out, (int)l->len);
+        }
         if (!strcmp(name, "any")) {
             for (int64_t i = 0; i < l->len; i++)
                 if (k_truthy(k_call(args[0], &l->items[i], 1))) return k_bool(1);
@@ -4843,6 +4854,18 @@ mod tests {
                    print(\"{[1, 2] == [1, 2]}{Pt(1, 2) == Pt(1, 2)}{Red == Blue}{Some([1, 2]) == Some([1, 2])}\
                    {ma == mb}{nan == nan}{-0.0 == 0.0}{\"Z\" < \"a\"}\")\n}\n";
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
+    }
+
+    /// Native List.scan (prefix accumulation, PR-it113) matches interp/KVM.
+    #[test]
+    fn native_list_scan_matches() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{[1, 2, 3, 4].scan(0, fn(a, x) { a + x })}|{[1, 2, 3, 4].scan(1, fn(a, x) { a * x })}|\
+                   {[].scan(0, fn(a, x) { a + x })}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "scan").trim(), "[1, 3, 6, 10]|[1, 2, 6, 24]|[]");
     }
 
     /// Native's manual float formatter matches interp/KVM at the extremes: special
