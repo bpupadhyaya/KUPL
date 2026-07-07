@@ -1260,9 +1260,15 @@ static KValue k_to_str(KValue v) { return k_str(k_show(v)); }
 static void k_panic_v(KValue v) { k_panic(k_show(v)); }
 
 static KValue k_concat(KValue a, KValue b) {
-    const char* x = k_show(a); const char* y = k_show(b);
-    char* out = k_alloc(strlen(x) + strlen(y) + 1);
-    strcpy(out, x); strcat(out, y);
+    /* A String displays as its raw content, so for string operands use the stored
+       pointer directly instead of k_show (which allocates a fresh copy). Then splice
+       with two memcpy at known offsets — strcat would redundantly rescan the (growing)
+       left operand every call, making `s = "{s}x"` loops needlessly O(n^2)-heavy. */
+    const char* x = (a.tag == K_STR) ? a.as.s : k_show(a);
+    const char* y = (b.tag == K_STR) ? b.as.s : k_show(b);
+    size_t lx = strlen(x), ly = strlen(y);
+    char* out = k_alloc(lx + ly + 1);
+    memcpy(out, x, lx); memcpy(out + lx, y, ly); out[lx + ly] = '\0';
     return k_str(out);
 }
 
@@ -5516,6 +5522,19 @@ fun main() uses io {
                    fun b(n: Int) -> Str { if n <= 0 { \"b\" } else { a(n - 1) } }\n\
                    fun main() uses io {\n    print(\"{is_even(10)}|{is_odd(7)}|{is_even(1000)}|{a(0)}{a(1)}{a(5)}\")\n}\n";
         assert_eq!(native_main_stdout(src, "mutualrec").trim(), "true|true|true|abb");
+    }
+
+    /// Native string concatenation (k_concat's memcpy splice + direct-pointer fast path for
+    /// String operands) stays byte-identical to interp: repeated concat builds the exact
+    /// string, and a non-String operand still routes through k_show (PR-it154 perf).
+    #[test]
+    fn native_string_concat_is_byte_identical() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    var s = \"\"\n    for i in 1..5 { s = s + \"ab\" }\n    \
+                   let mixed = \"n=\" + \"{3 + 4}\" + \" end\"\n    print(\"{s}|{mixed}|{s.len()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "strconcat").trim(), "abababab|n=7 end|8");
     }
 
     /// Native while-loops and break/continue match interp/KVM, including break/continue
