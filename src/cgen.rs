@@ -4999,6 +4999,23 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "scan").trim(), "[1, 3, 6, 10]|[1, 2, 6, 24]|[]");
     }
 
+    /// Native map higher-order methods preserve insertion order like interp/KVM:
+    /// merge (override value, keep position), map_values, fold, filter (PR-it128).
+    #[test]
+    fn native_map_higher_order_ordering() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let a = Map().insert(\"x\", 1).insert(\"y\", 2).insert(\"z\", 3)\n    \
+                   let b = Map().insert(\"y\", 20).insert(\"w\", 40)\n    \
+                   let m = Map().insert(\"c\", 3).insert(\"a\", 1).insert(\"b\", 2)\n    \
+                   print(\"{a.merge(b)}|{m.map_values(fn v { v * 10 })}|{m.fold(\"\", fn(acc, k, v) { \"{acc}{k}={v};\" })}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "maphof").trim(),
+            "Map{\"x\": 1, \"y\": 20, \"z\": 3, \"w\": 40}|Map{\"c\": 30, \"a\": 10, \"b\": 20}|c=3;a=1;b=2;"
+        );
+    }
+
     /// Native set algebra preserves insertion order (not a hash set), matching
     /// interp/KVM — union/intersect/difference/symmetric_difference (PR-it123).
     #[test]

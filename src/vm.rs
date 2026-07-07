@@ -2197,6 +2197,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_higher_order_ordering() {
+        // Maps are insertion-ordered; every HOF preserves that order, byte-identical on
+        // interp/KVM (PR-it128, completing the collection-HOF trio with sets/lists).
+        // merge: a shared key takes the SECOND map's value but keeps the FIRST map's
+        // position; new keys are appended.
+        assert_eq!(
+            differential("fun probe() -> Str { let a = Map().insert(\"x\", 1).insert(\"y\", 2).insert(\"z\", 3)\n    let b = Map().insert(\"y\", 20).insert(\"w\", 40)\n    \"{a.merge(b)}\" }\n"),
+            "Map{\"x\": 1, \"y\": 20, \"z\": 3, \"w\": 40}"
+        );
+        // map_values keeps key order; fold visits entries in insertion order (a
+        // non-commutative string fold); filter keeps surviving entries in order.
+        assert_eq!(
+            differential("fun probe() -> Str { let m = Map().insert(\"c\", 3).insert(\"a\", 1).insert(\"b\", 2)\n    \"{m.map_values(fn v { v * 10 })}|{m.fold(\"\", fn(acc, k, v) { \"{acc}{k}={v};\" })}\" }\n"),
+            "Map{\"c\": 30, \"a\": 10, \"b\": 20}|c=3;a=1;b=2;"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { let m = Map().insert(\"a\", 1).insert(\"b\", 2).insert(\"c\", 3).insert(\"d\", 4)\n    \"{m.filter(fn(k, v) { v % 2 == 0 })}\" }\n"),
+            "Map{\"b\": 2, \"d\": 4}"
+        );
+        // keys()/values() are in insertion order; a duplicate-key insert updates in place
+        // (keeps position); get_or returns the value or the default.
+        assert_eq!(
+            differential("fun probe() -> Str { let m = Map().insert(\"z\", 26).insert(\"a\", 1).insert(\"m\", 13).insert(\"z\", 99)\n    \"{m.keys()}|{m.values()}|{m.get_or(\"z\", 0)}|{m.get_or(\"q\", 0 - 1)}\" }\n"),
+            "[\"z\", \"a\", \"m\"]|[99, 1, 13]|99|-1"
+        );
+    }
+
+    #[test]
     fn diff_set_algebra_preserves_insertion_order() {
         // Set algebra is insertion-ordered and byte-identical on interp/KVM: union keeps
         // a's order then b's new elements; intersect/difference keep a's order;
