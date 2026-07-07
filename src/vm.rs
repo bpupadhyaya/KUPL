@@ -2082,6 +2082,45 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_nested_closure_loop_capture_and_currying() {
+        // Extends diff_higher_order_and_closure_depth (it202/it3415, a 1-level returned closure and
+        // a no-arg loop-capture) with two deeper cases, byte-identical on interp/KVM (and native, per
+        // the sweep):
+        //   (a) Closures built in a loop each capture the loop variable BY VALUE at creation AND take
+        //       a call argument, then are applied AFTER the loop with the same arg — so the captured
+        //       value composes with the argument: maker_k(7) = k*100 + 7, giving 7, 107, 207 (not
+        //       the final loop value 2 three times).
+        //   (b) THREE-level currying: adder(base) returns a closure over base that returns a closure
+        //       over mid that returns a closure over inner, so adder(100)(20)(3) = 123 and each
+        //       nesting level's binding survives to the innermost call (PR-it234).
+        let loopcap = r#"fun probe() -> Str {
+    var makers: List[fn(Int) -> Int] = []
+    var i = 0
+    while i < 3 {
+        let captured = i
+        makers = makers.push(fn x { captured * 100 + x })
+        i = i + 1
+    }
+    let m0 = makers.get(0).unwrap_or(fn x { 0 - 1 })
+    let m1 = makers.get(1).unwrap_or(fn x { 0 - 1 })
+    let m2 = makers.get(2).unwrap_or(fn x { 0 - 1 })
+    "{m0(7)}|{m1(7)}|{m2(7)}"
+}
+"#;
+        assert_eq!(differential(loopcap), "7|107|207");
+        let curry = r#"fun adder(base: Int) -> fn(Int) -> fn(Int) -> Int {
+    fn mid { fn inner { base + mid + inner } }
+}
+fun probe() -> Str {
+    let a = adder(100)
+    let b = a(20)
+    "{b(3)}|{adder(1)(2)(3)}|{a(0)(5)}"
+}
+"#;
+        assert_eq!(differential(curry), "123|6|105");
+    }
+
+    #[test]
     fn diff_string_lines_split_semantics() {
         // A bug-hunt-13 lock (it233): `Str.lines()` follows Rust's `.lines()` semantics, which differ
         // from `split("\n")` in two ways that are easy to get wrong on one engine — an EMPTY string
