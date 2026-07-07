@@ -2134,6 +2134,22 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_float_trunc_fract() {
+        // The NEW trunc/fract complete the floor/ceil/round rounding family, byte-identical on
+        // interp/KVM: trunc rounds toward zero, fract is the signed fractional part (x-trunc(x)),
+        // and IEEE specials hold (inf.trunc()=inf, inf.fract()=NaN) (PR-it184).
+        let src = r#"fun probe() -> Str {
+    let t = "{(3.7).trunc()}|{(0.0 - 3.7).trunc()}|{(3.0).trunc()}|{(0.99).trunc()}"
+    let f = "{(3.75).fract()}|{(0.0 - 3.75).fract()}|{(3.0).fract()}"
+    let inf = 1.0 / 0.0
+    let sp = "{inf.trunc()}|{(0.0 / 0.0).trunc()}|{inf.fract()}"
+    "{t}#{f}#{sp}"
+}
+"#;
+        assert_eq!(differential(src), "3.0|-3.0|3.0|0.0#0.75|-0.75|0.0#inf|NaN|NaN");
+    }
+
+    #[test]
     fn diff_set_is_superset() {
         // The NEW is_superset() is the mirror of is_subset, byte-identical on interp/KVM: a is a
         // superset of b iff every element of b is in a; every set is a superset of the empty set

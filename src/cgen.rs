@@ -4032,6 +4032,9 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "floor")) return k_float(floor(recv.as.f));
         if (!strcmp(name, "ceil")) return k_float(ceil(recv.as.f));
         if (!strcmp(name, "round")) return k_float(round(recv.as.f));
+        if (!strcmp(name, "trunc")) return k_float(trunc(recv.as.f));
+        /* fract = x - trunc(x), matching Rust f64::fract (fract of +/-inf is NaN). */
+        if (!strcmp(name, "fract")) return k_float(recv.as.f - trunc(recv.as.f));
         if (!strcmp(name, "min")) return k_float(recv.as.f < args[0].as.f ? recv.as.f : args[0].as.f);
         if (!strcmp(name, "max")) return k_float(recv.as.f > args[0].as.f ? recv.as.f : args[0].as.f);
         if (!strcmp(name, "pow")) return k_float(pow(recv.as.f, args[0].as.f));
@@ -5618,6 +5621,24 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native trunc/fract match interp/KVM: round-toward-zero and signed fractional part,
+    /// including IEEE specials (inf.fract()=NaN) (PR-it184).
+    #[test]
+    fn native_float_trunc_fract() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let inf = 1.0 / 0.0
+    print("{(3.7).trunc()}|{(0.0 - 3.7).trunc()}|{(3.75).fract()}|{(0.0 - 3.75).fract()}|{inf.trunc()}|{inf.fract()}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "truncfract").trim(),
+            "3.0|-3.0|0.75|-0.75|inf|NaN"
+        );
     }
 
     /// Native is_superset() matches interp/KVM: mirror of is_subset, superset-of-empty and

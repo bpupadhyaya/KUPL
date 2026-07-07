@@ -2619,6 +2619,10 @@ pub fn shared_method(
         (Value::Float(v), "floor") => Ok(Value::Float(v.floor())),
         (Value::Float(v), "ceil") => Ok(Value::Float(v.ceil())),
         (Value::Float(v), "round") => Ok(Value::Float(v.round())),
+        // Completing the rounding family: trunc rounds toward zero, fract is the signed
+        // fractional part (x - trunc(x)). NaN/inf follow IEEE (fract of an infinity is NaN).
+        (Value::Float(v), "trunc") => Ok(Value::Float(v.trunc())),
+        (Value::Float(v), "fract") => Ok(Value::Float(v.fract())),
         (Value::Float(v), "min") => match args.into_iter().next() {
             Some(Value::Float(w)) => Ok(Value::Float(v.min(w))),
             _ => Err("`min` needs a Float".into()),

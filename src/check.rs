@@ -149,7 +149,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
     "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "cos", "count",
     "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "filter",
-    "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "gcd",
+    "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "fract", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
     "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
     "is_odd", "is_ok", "is_some", "is_subset", "is_superset", "isqrt", "join", "keys", "last", "lcm", "len",
@@ -162,7 +162,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "split_once", "sqrt", "starts_with", "sum", "symmetric_difference", "tail", "take",
     "take_while", "tan", "to_binary", "to_float", "to_hex", "to_int", "to_list",
     "to_lower", "to_octal", "to_radix", "to_str", "to_upper", "trim", "trim_end",
-    "trim_start", "union", "unique", "unwrap_or", "ushr", "values", "window", "zip_with",
+    "trim_start", "trunc", "union", "unique", "unwrap_or", "ushr", "values", "window", "zip_with",
 ];
 
 /// What surrounds the body being checked.
@@ -2281,7 +2281,8 @@ impl Checker {
             (Ty::Float, "fmt") => Some((vec![Ty::Int], Ty::Str)),
             (Ty::Float, "to_int") => Some((vec![], Ty::Int)),
             (Ty::Float, "abs") | (Ty::Float, "sqrt") => Some((vec![], Ty::Float)),
-            (Ty::Float, "floor") | (Ty::Float, "ceil") | (Ty::Float, "round") => {
+            (Ty::Float, "floor") | (Ty::Float, "ceil") | (Ty::Float, "round")
+            | (Ty::Float, "trunc") | (Ty::Float, "fract") => {
                 Some((vec![], Ty::Float))
             }
             (Ty::Float, "log") | (Ty::Float, "log10") | (Ty::Float, "exp") | (Ty::Float, "sin")
