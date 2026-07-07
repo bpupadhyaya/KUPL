@@ -2082,6 +2082,25 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_of_sets_union_intersect_fold() {
+        // A bug-hunt-20 lock (it251): reducing a variable-length List[Set] with union or intersect
+        // accumulation — "merge all these sets" / "elements common to every group". it235 chained
+        // set ops in one expression and it4327 covered empty-set edges, but neither folds a *list*
+        // of sets. union-all seeds with an empty Set([]) and grows; intersect-all seeds with the
+        // universe and shrinks to the common core {2, 3}. Result sets keep insertion order (union:
+        // first-seen across the whole list; intersect: the surviving elements in the seed's order).
+        // Byte-identical on interp/KVM (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    let groups = [Set([1, 2, 3]), Set([2, 3, 4]), Set([1, 2, 3])]
+    let allElems = groups.fold(Set([]), fn(acc, s) { acc.union(s) })
+    let common = groups.fold(Set([1, 2, 3, 4, 5]), fn(acc, s) { acc.intersect(s) })
+    "{allElems.to_list()}|{common.to_list()}|{groups.len()}"
+}
+"#;
+        assert_eq!(differential(src), "[1, 2, 3, 4]|[2, 3]|3");
+    }
+
+    #[test]
     fn diff_map_invert_and_reverse_index() {
         // Milestone lock (it250): the two Map-inversion idioms. (1) A pure key<->value SWAP turns
         // Map[Str, Int] into Map[Int, Str] — the new keys are the old VALUES, iterated in the
