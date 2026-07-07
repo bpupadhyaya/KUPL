@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_records_depth_nested_with_and_equality() {
+        // Nested records, chained field access, a NESTED `with` update (updating an inner field
+        // while preserving the outer's other fields), STRUCTURAL equality (shallow and deeply
+        // nested), nested record destructuring in match, and structural equality inside
+        // `.contains` are all byte-identical on interp/KVM (PR-it170).
+        let src = r#"type Inner = Inner(v: Int)
+type Outer = Outer(name: Str, inner: Inner)
+type P = P(x: Int, y: Int)
+fun probe() -> Str {
+    let o = Outer(name: "x", inner: Inner(v: 5))
+    let o2 = o with inner: (o.inner with v: 99)
+    let eq1 = P(x: 1, y: 2) == P(x: 1, y: 2)
+    let eq2 = P(x: 1, y: 2) == P(x: 1, y: 3)
+    let eqn = Outer(name: "a", inner: Inner(v: 1)) == Outer(name: "a", inner: Inner(v: 1))
+    let matched = match o2 { Outer(nm, Inner(vv)) => "{nm}:{vv}" }
+    let inList = [P(x: 1, y: 1), P(x: 2, y: 2)].contains(P(x: 2, y: 2))
+    "{o.inner.v}|{o2.inner.v}|{o2.name}#{eq1}|{eq2}|{eqn}#{matched}#{inList}#{o2}"
+}
+"#;
+        assert_eq!(differential(src), "5|99|x#true|false|true#x:99#true#Outer(\"x\", Inner(99))");
+    }
+
+    #[test]
     fn diff_numeric_tower_precision_and_conversions() {
         // The numeric tower is byte-identical on interp/KVM (and native, per the native test):
         // BigInt is arbitrary-precision (2^70, 2^64, 25! all exact and exceeding i64), Rational

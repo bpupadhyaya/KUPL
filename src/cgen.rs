@@ -5542,6 +5542,25 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native records match interp/KVM at depth: nested `with` update preserves the outer's
+    /// other fields, and structural equality holds shallow and deeply nested (PR-it170).
+    #[test]
+    fn native_records_depth() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"type Inner = Inner(v: Int)
+type Outer = Outer(name: Str, inner: Inner)
+type P = P(x: Int, y: Int)
+fun main() uses io {
+    let o = Outer(name: "x", inner: Inner(v: 5))
+    let o2 = o with inner: (o.inner with v: 99)
+    print("{o2.name}|{o2.inner.v}|{P(x: 1, y: 2) == P(x: 1, y: 2)}|{Outer(name: "a", inner: Inner(v: 1)) == Outer(name: "a", inner: Inner(v: 2))}|{o2}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "recdepth").trim(), "x|99|true|false|Outer(\"x\", Inner(99))");
+    }
+
     /// Native numeric tower matches interp/KVM: BigInt is arbitrary-precision (exact past i64),
     /// Rational is exact and auto-reduces, and Int/Float conversions truncate toward zero (it169).
     #[test]
