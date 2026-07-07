@@ -2360,6 +2360,31 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_map_set_iteration_order_after_mutation() {
+        // Map and Set iterate in INSERTION order deterministically across interp/KVM, and the
+        // order is stable through a mixed mutation sequence: a removed-then-reinserted key lands at
+        // the END (a fresh insertion, not its old slot), and reinserting an already-present element
+        // is a no-op that keeps its position (PR-it216).
+        let m = r#"fun probe() -> Str {
+    let m = Map().insert("a", 1).insert("b", 2).insert("c", 3).insert("d", 4)
+    let m2 = m.remove("b").remove("d").insert("b", 20).insert("e", 5)
+    "{m2.keys()}|{m2.values()}|{m2}"
+}
+"#;
+        assert_eq!(
+            differential(m),
+            r#"["a", "c", "b", "e"]|[1, 3, 20, 5]|Map{"a": 1, "c": 3, "b": 20, "e": 5}"#
+        );
+        let s = r#"fun probe() -> Str {
+    let s: Set[Int] = Set([3, 1, 4, 1, 5, 9, 2, 6])
+    let s2 = s.remove(4).insert(7).insert(1)
+    "{s2}|{s2.len()}"
+}
+"#;
+        assert_eq!(differential(s), "Set{3, 1, 5, 9, 2, 6, 7}|7");
+    }
+
+    #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose
         // guard holds; a guard that fails falls through to later arms. This is byte-identical on
