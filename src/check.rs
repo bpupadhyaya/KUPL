@@ -167,6 +167,17 @@ const BUILTIN_METHODS: &[&str] = &[
     "trim_start", "trunc", "union", "unique", "unwrap_or", "ushr", "values", "window", "zip_with",
 ];
 
+/// Every built-in free-function name (called as `name(...)`, no receiver), for "did you mean"
+/// suggestions on an unknown name (K0240). Suggestion-only and best-effort — same discipline as
+/// BUILTIN_METHODS: a missing entry only costs a hint, never changes resolution (PR-it249).
+const BUILTIN_FUNS: &[&str] = &[
+    "append_file", "arange", "args", "big", "delete_file", "env_var", "exec", "file_exists",
+    "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir", "make_dir",
+    "panic", "path_base", "path_dir", "path_ext", "path_join", "print", "random_floats",
+    "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace", "read_all",
+    "read_file", "read_line", "remove_dir", "shuffle", "tensor", "to_str", "write_file", "zeros",
+];
+
 /// What surrounds the body being checked.
 struct Ctx<'a> {
     scopes: Scopes,
@@ -1658,13 +1669,14 @@ impl Checker {
         let suggestion = {
             // in-scope locals, user functions, user constructors, and the built-in
             // Option/Result constructors
-            let builtins = ["Some", "None", "Ok", "Err"].into_iter();
+            let builtins = ["Some", "None", "Ok", "Err", "Map", "Set"].into_iter();
             let cands = ctx
                 .scopes
                 .names()
                 .chain(self.checked.funs.keys().map(String::as_str))
                 .chain(self.checked.ctors.keys().map(String::as_str))
-                .chain(builtins);
+                .chain(builtins)
+                .chain(BUILTIN_FUNS.iter().copied());
             suggest(name, cands)
         };
         let msg = match suggestion {
@@ -2962,6 +2974,24 @@ mod generic_tests {
         let e2 = errors("fun main() { let z = zzzzqqq }\n");
         assert!(e2.iter().any(|d| d.code == "K0240"));
         assert!(!e2.iter().any(|d| d.message.contains("did you mean")));
+    }
+
+    #[test]
+    fn did_you_mean_builtin_free_functions() {
+        // K0240 now suggests built-in free functions (print, json_parse, env_var, ...), not just
+        // user functions and constructors — a typo'd `prnt`/`json_pares` names the real one (PR-it249).
+        for (typo, want) in [("prnt", "print"), ("json_pares", "json_parse"), ("env_vr", "env_var"), ("tensr", "tensor")] {
+            let e = errors(&format!("fun main() uses io {{ let x = {typo}(5)\n    print(x) }}\n"));
+            assert!(
+                e.iter().any(|d| d.code == "K0240" && d.message.contains(&format!("did you mean `{want}`?"))),
+                "{typo}: {:?}",
+                e.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+        // A name far from every builtin still gets no spurious hint.
+        let none = errors("fun main() uses io { print(zzqqxx(5)) }\n");
+        assert!(none.iter().any(|d| d.code == "K0240"));
+        assert!(!none.iter().any(|d| d.message.contains("did you mean")));
     }
 
     #[test]
