@@ -6064,11 +6064,15 @@ fun main() uses io {
             return;
         }
         // each program overflows; a clean panic writes to stderr and leaves stdout
-        // empty (a C-UB wrap would have printed a bogus value).
+        // empty (a C-UB wrap would have printed a bogus value). add/sub/mul/div and the
+        // classic MIN/-1 must all panic in native, matching interp (PR-it151).
         for (src, tag) in [
             ("fun main() uses io {\n    print(300.to_i8())\n}\n", "toi8"),
             ("fun main() uses io {\n    print(2.pow(100))\n}\n", "pow"),
             ("fun main() uses io {\n    print(((0 - 9223372036854775807) - 1).abs())\n}\n", "absmin"),
+            ("fun main() uses io {\n    print(9223372036854775807 + 1)\n}\n", "addov"),
+            ("fun main() uses io {\n    print(9223372036854775807 * 2)\n}\n", "mulov"),
+            ("fun main() uses io {\n    print(((0 - 9223372036854775807) - 1) / (0 - 1))\n}\n", "divov"),
         ] {
             let out = native_main_stdout(src, tag);
             assert!(out.trim().is_empty(), "{tag}: expected a panic, got stdout {out:?}");

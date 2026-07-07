@@ -1621,6 +1621,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_integer_overflow_panics_and_boundaries() {
+        // KUPL uses CHECKED integer arithmetic: every operation panics (never wraps or
+        // saturates) on i64 overflow, with a distinct per-op message — byte-identical on
+        // interp/KVM, and (per the native test) native matches rather than wrapping via C's
+        // signed-overflow UB (PR-it151).
+        assert_eq!(differential("fun probe() -> Int { let mx = 9223372036854775807\n    mx + 1 }\n"), "panic: integer overflow in addition");
+        assert_eq!(differential("fun probe() -> Int { let mn = 0 - 9223372036854775807 - 1\n    mn - 1 }\n"), "panic: integer overflow in subtraction");
+        assert_eq!(differential("fun probe() -> Int { let mx = 9223372036854775807\n    mx * 2 }\n"), "panic: integer overflow in multiplication");
+        // The classic MIN / -1 and MIN % -1 overflows are caught (not wrapped to a bogus
+        // value); negating and abs of MIN overflow too.
+        assert_eq!(differential("fun probe() -> Int { let mn = 0 - 9223372036854775807 - 1\n    mn / (0 - 1) }\n"), "panic: integer overflow in division");
+        assert_eq!(differential("fun probe() -> Int { let mn = 0 - 9223372036854775807 - 1\n    mn % (0 - 1) }\n"), "panic: integer overflow in remainder");
+        assert_eq!(differential("fun probe() -> Int { 5 / 0 }\n"), "panic: division by zero");
+        // Boundary operations that do NOT overflow compute correctly (no false panic).
+        assert_eq!(
+            differential("fun probe() -> Str { let mx = 9223372036854775807\n    let mn = 0 - 9223372036854775807 - 1\n    \"{mx + 0}|{mx - 1}|{mn + 1}|{mn * 1}|{mn % 7}\" }\n"),
+            "9223372036854775807|9223372036854775806|-9223372036854775807|-9223372036854775808|-1"
+        );
+    }
+
+    #[test]
     fn diff_numeric_cast_and_overflow_panics() {
         // Sized-int narrowing that doesn't fit, integer .pow overflow, a negative
         // exponent, and i64::MIN.abs() all raise the SAME clean panic on both
