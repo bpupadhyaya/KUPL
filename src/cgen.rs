@@ -5542,6 +5542,30 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native pattern matching matches interp/KVM at depth: guard fall-through in source order,
+    /// nested ADT destructuring bindings, guard-on-binding, and wildcard-in-ctor (PR-it166).
+    #[test]
+    fn native_pattern_match_depth() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)
+fun cls(n: Int) -> Str { match n { x if x > 10 => "big"
+    x if x > 0 => "small"
+    _ => "neg" } }
+fun sumt(t: Tree) -> Int { match t { Leaf(v) => v
+    Node(Leaf(a), Leaf(b)) => a + b + 1000
+    Node(l, r) => sumt(l) + sumt(r) } }
+fun opt(o: Option[Int]) -> Str { match o { Some(x) if x > 5 => "big"
+    Some(_) => "small"
+    None => "none" } }
+fun main() uses io {
+    print("{cls(20)}|{cls(5)}|{sumt(Node(Leaf(2), Leaf(3)))}|{sumt(Node(Node(Leaf(1), Leaf(1)), Leaf(5)))}|{opt(Some(9))}|{opt(Some(2))}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "patdepth").trim(), "big|small|1005|1007|big|small");
+    }
+
     /// Native list transforms match interp/KVM on the edges: take/drop clamp past length, chunk
     /// yields a partial last group, zip_with stops at the shorter list, partition splits (it165).
     #[test]

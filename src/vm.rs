@@ -2134,6 +2134,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_pattern_match_depth() {
+        // Guards, nested destructuring, guard-on-binding, literal, and wildcard-in-constructor
+        // patterns are byte-identical on interp/KVM: a failed guard falls through to the next
+        // arm in SOURCE order, nested ADT/record patterns bind the inner fields, and a guard on
+        // a destructured binding falls through to the un-guarded arm of the same shape (PR-it166).
+        let src = r#"type P = P(x: Int, y: Int)
+type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)
+fun cls(n: Int) -> Str { match n { x if x > 10 => "big"
+    x if x > 0 => "small"
+    _ => "neg" } }
+fun sumt(t: Tree) -> Int { match t { Leaf(v) => v
+    Node(Leaf(a), Leaf(b)) => a + b + 1000
+    Node(l, r) => sumt(l) + sumt(r) } }
+fun opt(o: Option[Int]) -> Str { match o { Some(x) if x > 5 => "big:{x}"
+    Some(_) => "small"
+    None => "none" } }
+fun lit(n: Int) -> Str { match n { 0 => "zero"
+    1 => "one"
+    _ => "many" } }
+fun wild(p: P) -> Int { match p { P(_, y) => y } }
+fun probe() -> Str {
+    let px = match Some(P(x: 3, y: 7)) { Some(P(a, b)) => a + b
+        None => 0 - 1 }
+    "{cls(20)}|{cls(5)}|{cls(0 - 3)}#{sumt(Node(Leaf(2), Leaf(3)))}|{sumt(Node(Node(Leaf(1), Leaf(1)), Leaf(5)))}#{opt(Some(9))}|{opt(Some(2))}|{opt(None)}#{lit(0)}|{lit(1)}|{lit(9)}|{wild(P(x: 100, y: 42))}#{px}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "big|small|neg#1005|1007#big:9|small|none#zero|one|many|42#10"
+        );
+    }
+
+    #[test]
     fn diff_list_transformation_surface() {
         // The structural list transforms are byte-identical on interp/KVM with correct edge
         // semantics: take/drop CLAMP past the length (no error), take_while/drop_while split at
