@@ -2394,6 +2394,38 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_generic_monomorphization_across_types() {
+        // A single generic function instantiated at MANY types (Int, Str, Bool, record, List,
+        // Option) produces byte-identical results on interp/KVM — the native backend must
+        // monomorphize/dispatch each instantiation the same way the interpreter does, including
+        // nested generic instantiations like first(dup(record)) and unwrap_or(wrap(list)) (PR-it222).
+        let g = r#"type Pt = { x: Int, y: Int }
+fun id[T](x: T) -> T { x }
+fun dup[T](x: T) -> List[T] { [x, x] }
+fun first[T](xs: List[T]) -> Option[T] { xs.first() }
+fun probe() -> Str {
+    "{id(5)}|{id("hi")}|{id(true)}|{id(Pt(x: 1, y: 2))}|{dup(3)}|{dup("z")}|{first([10, 20])}|{first(dup(Pt(x: 9, y: 8)))}"
+}
+"#;
+        assert_eq!(
+            differential(g),
+            r#"5|hi|true|Pt(1, 2)|[3, 3]|["z", "z"]|Some(10)|Some(Pt(9, 8))"#
+        );
+        let opt = r#"fun wrap[T](x: T) -> Option[T] { Some(x) }
+fun unwrap_or[T](o: Option[T], d: T) -> T {
+    match o {
+        Some(v) => v
+        None => d
+    }
+}
+fun probe() -> Str {
+    "{wrap(42)}|{wrap("txt")}|{unwrap_or(wrap(1), 0)}|{unwrap_or(wrap([1, 2]), [])}|{unwrap_or(None, 99)}"
+}
+"#;
+        assert_eq!(differential(opt), r#"Some(42)|Some("txt")|1|[1, 2]|99"#);
+    }
+
+    #[test]
     fn diff_record_equality_set_dedup_emoji() {
         // A ninth bug-hunt sweep (it219, ~10 probes) found no divergence; this locks its subtlest
         // deterministic edges, byte-identical on interp/KVM: record equality is STRUCTURAL (deep,
