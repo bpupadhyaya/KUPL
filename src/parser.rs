@@ -2127,6 +2127,27 @@ app Main {
     }
 
     #[test]
+    fn match_with_newline_arms_parses_inside_call_arg_closure() {
+        // A `match` with newline-separated arms inside a call-argument closure used to fail to parse
+        // (the lexer suppressed newlines inside the enclosing `(`, so the arm separators vanished and
+        // a bogus K0109 fired). A `{` block now resets paren depth so newlines are significant again
+        // inside it (PR-it265). This is the everyday `map`/`fold`/`filter(fn x { match x { ... } })`
+        // shape — it must parse with newline-separated arms, not only with commas.
+        assert!(
+            parse("fun f() -> Str {\n    [1, 2].map(fn x {\n        match x {\n            1 => \"one\"\n            _ => \"other\"\n        }\n    }).join(\",\")\n}\n").1.is_empty(),
+            "newline-separated match arms inside a call-arg closure should parse cleanly"
+        );
+        // Nested match (arm body is itself a match) inside a fold closure — the Result-collect shape.
+        assert!(
+            parse("fun f(items: List[Str]) -> Result[List[Int], Str] {\n    items.fold(Ok([]), fn(acc, s) {\n        match acc {\n            Ok(ns) => match s.parse_int() {\n                Some(n) => Ok(ns.push(n))\n                None => Err(\"bad\")\n            }\n            Err(e) => Err(e)\n        }\n    })\n}\n").1.is_empty(),
+            "nested newline-arm match inside a fold closure should parse cleanly"
+        );
+        // Line continuation inside parens (the reason newlines are suppressed there) still works.
+        assert!(parse("fun f() -> Int {\n    let x = (1 +\n        2 +\n        3)\n    x\n}\n").1.is_empty());
+        assert!(parse("fun f() -> List[Int] {\n    [1,\n        2,\n        3]\n}\n").1.is_empty());
+    }
+
+    #[test]
     fn empty_list_inline_annotation_names_the_binding_fix() {
         // `[]: List[Int]` (annotating the expression) is a common attempt to give an empty list an
         // element type; KUPL has no inline expression ascription, so K0100 now names the fix —

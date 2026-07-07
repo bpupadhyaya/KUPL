@@ -21,6 +21,13 @@ pub struct Lexer<'a> {
     pos: usize,
     /// Depth of `(`/`[` nesting; newlines are suppressed while > 0.
     paren_depth: usize,
+    /// Saved paren depths, pushed on `{` and popped on `}`. A brace-delimited
+    /// block (closure body, `match`/`if` block, statement block) starts a fresh
+    /// statement context where newlines are significant again, even when the
+    /// block sits inside an open `(`/`[` — e.g. `xs.fold(seed, fn a { match a {
+    /// ...newline-separated arms... } })`. Without this a `match` with
+    /// newline-separated arms inside a call-argument closure fails to parse.
+    paren_stack: Vec<usize>,
     tokens: Vec<Token>,
     pub diags: Vec<Diag>,
 }
@@ -31,6 +38,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diag>) {
         bytes: src.as_bytes(),
         pos: 0,
         paren_depth: 0,
+        paren_stack: Vec::new(),
         tokens: Vec::new(),
         diags: Vec::new(),
     };
@@ -554,8 +562,19 @@ impl<'a> Lexer<'a> {
                 self.paren_depth = self.paren_depth.saturating_sub(1);
                 Tok::RBracket
             }
-            b'{' => Tok::LBrace,
-            b'}' => Tok::RBrace,
+            b'{' => {
+                // A block re-opens a statement context: save the surrounding
+                // paren depth and reset to 0 so newlines inside the block (e.g.
+                // match arms) are significant again.
+                self.paren_stack.push(self.paren_depth);
+                self.paren_depth = 0;
+                Tok::LBrace
+            }
+            b'}' => {
+                // Restore the paren depth that was in effect before this block.
+                self.paren_depth = self.paren_stack.pop().unwrap_or(0);
+                Tok::RBrace
+            }
             // `;` is an explicit statement separator, equivalent to a newline —
             // so `{ a; b }` on one line works (and the formatter's inline blocks
             // parse). It carries no other meaning.

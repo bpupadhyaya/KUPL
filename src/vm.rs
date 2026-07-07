@@ -2104,6 +2104,41 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_match_newline_arms_inside_call_arg_closure() {
+        // A real parser fix (it265): a `match` with NEWLINE-separated arms inside a call-argument
+        // closure (paren context) used to fail with a bogus K0109. The lexer suppresses newlines
+        // while inside `(`/`[` (for line continuation), but a `{` block — a closure body, match/if
+        // block, or statement block — re-opens a statement context where newlines are significant
+        // again. Before the fix, the newlines separating the match arms in
+        // `xs.map(fn x { match x { 1 => .. \n _ => .. } })` were swallowed and the second arm read as
+        // "another arm on the same line". The fix saves paren depth on `{` and resets it to 0.
+        // This certifies the fix AND the Result-collect idiom that motivated it: fold a List[Str]
+        // into a Result[List[Int], Str], short-circuiting to the FIRST parse error, all with
+        // newline-separated match arms inside the fold's closure. Byte-identical on interp/KVM
+        // (native per the sweep).
+        let src = r#"fun collect(items: List[Str]) -> Result[List[Int], Str] {
+    items.fold(Ok([]), fn(acc, s) {
+        match acc {
+            Ok(nums) => match s.parse_int() {
+                Some(n) => Ok(nums.push(n))
+                None => Err("bad: {s}")
+            }
+            Err(e) => Err(e)
+        }
+    })
+}
+fun probe() -> Str {
+    let mt: List[Str] = []
+    "{collect(["1", "2", "3"])}|{collect(["1", "x", "3"])}|{collect(["a", "b", "3"])}|{collect(mt)}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Ok([1, 2, 3])|Err("bad: x")|Err("bad: a")|Ok([])"#
+        );
+    }
+
+    #[test]
     fn diff_if_let_while_let_applied_idioms() {
         // A certification lock (it264): the APPLIED if-let/while-let idioms, complementing it125's
         // mechanics test (which covers if-let-as-expression with nested patterns, statement-scope
