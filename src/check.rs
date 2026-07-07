@@ -147,8 +147,8 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 /// it need not track the method-resolution match perfectly.
 const BUILTIN_METHODS: &[&str] = &[
     "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
-    "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "cos", "count",
-    "count_ones",
+    "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "copysign", "cos",
+    "count", "count_ones",
     "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "fract", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
@@ -2291,7 +2291,9 @@ impl Checker {
             (Ty::Float, "log") | (Ty::Float, "log10") | (Ty::Float, "exp") | (Ty::Float, "sin")
             | (Ty::Float, "cos") | (Ty::Float, "tan") | (Ty::Float, "sign")
             | (Ty::Float, "log2") | (Ty::Float, "cbrt") => Some((vec![], Ty::Float)),
-            (Ty::Float, "atan2") | (Ty::Float, "hypot") => Some((vec![Ty::Float], Ty::Float)),
+            (Ty::Float, "atan2") | (Ty::Float, "hypot") | (Ty::Float, "copysign") => {
+                Some((vec![Ty::Float], Ty::Float))
+            }
             (Ty::Float, "format") => Some((vec![Ty::Int], Ty::Str)),
             (Ty::Float, "clamp") => Some((vec![Ty::Float, Ty::Float], Ty::Float)),
             (Ty::Float, "is_nan") | (Ty::Float, "is_infinite") => Some((vec![], Ty::Bool)),

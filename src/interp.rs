@@ -2704,6 +2704,12 @@ pub fn shared_method(
             Some(Value::Float(w)) => Ok(Value::Float(v.hypot(w))),
             _ => Err("`hypot` needs a Float".into()),
         },
+        // Magnitude of the receiver with the sign of the argument (IEEE copysign): the sign
+        // comes from the argument's sign BIT, so a -0.0 argument yields a negative result.
+        (Value::Float(v), "copysign") => match args.into_iter().next() {
+            Some(Value::Float(w)) => Ok(Value::Float(v.copysign(w))),
+            _ => Err("`copysign` needs a Float".into()),
+        },
         (Value::Float(v), "format") => match args.into_iter().next() {
             Some(Value::Int(d)) if (0..=100).contains(&d) => {
                 Ok(Value::str(format!("{:.*}", d as usize, v)))

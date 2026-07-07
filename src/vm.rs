@@ -2179,6 +2179,22 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_float_copysign() {
+        // The NEW copysign(x, y) is byte-identical on interp/KVM: magnitude of the receiver with
+        // the SIGN BIT of the argument. Crucially the sign comes from the bit, so a genuine -0.0
+        // argument (from (0.0-1.0)*0.0) yields a negative result, and infinities carry through
+        // (PR-it191).
+        let src = r#"fun probe() -> Str {
+    let nz = (0.0 - 1.0) * 0.0
+    let a = "{(3.0).copysign(1.0)}|{(3.0).copysign(0.0 - 1.0)}|{(0.0 - 3.0).copysign(5.0)}"
+    let b = "{(3.0).copysign(nz)}|{(1.0 / 0.0).copysign(0.0 - 1.0)}|{(3.0).copysign(1.0 / 0.0)}"
+    "{a}#{b}"
+}
+"#;
+        assert_eq!(differential(src), "3.0|-3.0|3.0#-3.0|-inf|3.0");
+    }
+
+    #[test]
     fn diff_float_trunc_fract() {
         // The NEW trunc/fract complete the floor/ceil/round rounding family, byte-identical on
         // interp/KVM: trunc rounds toward zero, fract is the signed fractional part (x-trunc(x)),

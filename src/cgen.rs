@@ -4076,6 +4076,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "cbrt")) return k_float(cbrt(recv.as.f));
         if (!strcmp(name, "atan2")) return k_float(atan2(recv.as.f, args[0].as.f));
         if (!strcmp(name, "hypot")) return k_float(hypot(recv.as.f, args[0].as.f));
+        if (!strcmp(name, "copysign")) return k_float(copysign(recv.as.f, args[0].as.f));
         if (!strcmp(name, "format")) {
             int64_t d = args[0].as.i;
             if (d < 0 || d > 100) k_panic("`format` decimals must be in 0..=100");
@@ -5695,6 +5696,21 @@ fun main() uses io {
 }
 "#;
         assert_eq!(native_main_stdout(src, "intfac").trim(), "1|120|2432902008176640000");
+    }
+
+    /// Native copysign matches interp/KVM including the sign bit of a genuine -0.0 argument
+    /// (PR-it191).
+    #[test]
+    fn native_float_copysign() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let nz = (0.0 - 1.0) * 0.0
+    print("{(3.0).copysign(0.0 - 1.0)}|{(0.0 - 3.0).copysign(5.0)}|{(3.0).copysign(nz)}|{(1.0 / 0.0).copysign(0.0 - 1.0)}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "fcopysign").trim(), "-3.0|3.0|-3.0|-inf");
     }
 
     /// Native trunc/fract match interp/KVM: round-toward-zero and signed fractional part,
