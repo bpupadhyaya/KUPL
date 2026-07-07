@@ -2082,6 +2082,27 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_float_fmt_vs_format_rounding_modes() {
+        // A bug-hunt-17 lock (it244): KUPL has TWO fixed-precision float formatters with DIFFERENT
+        // half-way rounding, and both must be byte-identical across engines. `fmt(n)` rounds
+        // half-AWAY-from-zero (0.5->1, 2.5->3); `format(n)` rounds half-to-EVEN / banker's
+        // (0.5->0, 2.5->2, locked at it5120). On the exact .5 ties they diverge from each other but
+        // agree across interp/KVM (and native per the sweep). Pinning them side-by-side documents
+        // that the two methods are NOT interchangeable — picking the wrong one silently shifts
+        // rounding on financial/statistical output.
+        let src = r#"fun probe() -> Str {
+    "{(0.5).fmt(0)}/{(0.5).format(0)}|{(1.5).fmt(0)}/{(1.5).format(0)}|{(2.5).fmt(0)}/{(2.5).format(0)}|{(3.5).fmt(0)}/{(3.5).format(0)}"
+}
+"#;
+        assert_eq!(differential(src), "1/0|2/2|3/2|4/4");
+        // A few non-tie cases: fmt keeps n decimals, rounds the rest, negatives keep sign.
+        assert_eq!(
+            differential("fun probe() -> Str { let n = (0.0) - 3.14159\n    \"{(3.14159).fmt(4)}|{n.fmt(3)}|{(100.0).fmt(2)}|{(3.14159).fmt(0)}\" }\n"),
+            "3.1416|-3.142|100.00|3"
+        );
+    }
+
+    #[test]
     fn diff_set_algebra_on_records_structural() {
         // it219 locked a single Set of records dedup + `contains` by STRUCTURAL equality; this
         // extends it to set ALGEBRA between two record-Sets (it242). union/intersect/difference must
