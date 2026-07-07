@@ -2104,6 +2104,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_entries_filter_rebuild() {
+        // A certification lock (it267): the Map-rebuild-via-fold idiom. KUPL has no direct
+        // Map.filter, so pruning or transforming a map's entries is done by folding over its
+        // (key, value) pairs into a FRESH Map with conditional inserts — distinct from map_values
+        // (it4526), which keeps every key and transforms values 1:1 and cannot DROP entries. Three
+        // rebuilds over an insertion-ordered map: (1) FILTER — keep only v >= 10, dropping apple(3)
+        // and cherry(5), leaving Map{"banana": 12, "date": 20} with surviving entries in their
+        // original insertion order; (2) rebuild transforming VALUES (v * 2 -> [6, 24, 10, 40]); (3)
+        // rebuild transforming KEYS ("{k}!" -> ["apple!", "banana!", "cherry!", "date!"]). Byte-
+        // identical on interp/KVM (native per the sweep). Pins that a fold into a new Map preserves
+        // the survivors' insertion order and that entries can be dropped, re-valued, or re-keyed.
+        let src = r#"fun probe() -> Str {
+    let m = Map().insert("apple", 3).insert("banana", 12).insert("cherry", 5).insert("date", 20)
+    let kept = m.fold(Map(), fn(acc, k, v) {
+        if v >= 10 { acc.insert(k, v) } else { acc }
+    })
+    let doubled = m.fold(Map(), fn(acc, k, v) { acc.insert(k, v * 2) })
+    let renamed = m.fold(Map(), fn(acc, k, v) { acc.insert("{k}!", v) })
+    "{kept}|{doubled.values()}|{renamed.keys()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Map{"banana": 12, "date": 20}|[6, 24, 10, 40]|["apple!", "banana!", "cherry!", "date!"]"#
+        );
+    }
+
+    #[test]
     fn diff_match_newline_arms_in_varied_paren_positions() {
         // A bug-hunt-27 lock (it266): broadens the it265 parser fix beyond the map/fold-closure case
         // to every paren-nesting position a newline-separated `match` can appear in, guarding against
