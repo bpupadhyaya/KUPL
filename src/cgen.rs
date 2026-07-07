@@ -5081,6 +5081,19 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// Native records + immutable `with` update (incl. nested) match interp/KVM (PR-it126).
+    #[test]
+    fn native_records_and_with_update() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Inner = Inner(v: Int)\ntype Outer = Outer(name: Str, inner: Inner)\n\
+                   fun main() uses io {\n    let p = Outer(name: \"a\", inner: Inner(v: 1))\n    \
+                   let q = p with name: \"b\", inner: (p.inner with v: 99)\n    \
+                   print(\"{q.name},{q.inner.v}|orig={p.name},{p.inner.v}|{p}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "records").trim(), "b,99|orig=a,1|Outer(\"a\", Inner(1))");
+    }
+
     /// Native monomorphizes a generic function used at multiple types and compiles
     /// generic ADTs, matching interp/KVM (PR-it120).
     #[test]

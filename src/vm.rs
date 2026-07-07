@@ -1964,6 +1964,26 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_records_and_with_update() {
+        // `with` is an IMMUTABLE update: q/r are new values; the original p is unchanged
+        // (single field, multiple fields, and a field derived from the original) — PR-it126.
+        let upd = "type Point = Point(x: Int, y: Int)\nfun probe() -> Str {\n    let p = Point(x: 3, y: 4)\n    \
+                   let q = p with x: 5\n    let r = p with x: p.x + 10, y: p.y * 2\n    \
+                   \"{q.x},{q.y}|{r.x},{r.y}|orig={p.x},{p.y}\"\n}\n";
+        assert_eq!(differential(upd), "5,4|13,8|orig=3,4");
+        // Anonymous record type: field access, structural equality, display in decl order.
+        let anon = "type Entry = { key: Str, value: Int }\nfun probe() -> Str {\n    let e = Entry(key: \"k\", value: 10)\n    \
+                    let e2 = e with value: 20\n    \
+                    \"{e2.value}|orig={e.value}|{e}|{e == Entry(key: \"k\", value: 10)}|{e == e2}\"\n}\n";
+        assert_eq!(differential(anon), "20|orig=10|Entry(\"k\", 10)|true|false");
+        // Nested record: a deep `with` update leaves the original's inner record intact.
+        let nest = "type Inner = Inner(v: Int)\ntype Outer = Outer(name: Str, inner: Inner)\n\
+                    fun probe() -> Str {\n    let o = Outer(name: \"a\", inner: Inner(v: 1))\n    \
+                    let o2 = o with inner: (o.inner with v: 99)\n    \"{o.inner.v}|{o2.inner.v}|{o}\"\n}\n";
+        assert_eq!(differential(nest), "1|99|Outer(\"a\", Inner(1))");
+    }
+
+    #[test]
     fn diff_generics_depth() {
         // A generic fun used at several types, byte-identical on interp/KVM.
         let id = "fun id[T](x: T) -> T { x }\nfun probe() -> Str { \"{id(5)}|{id(\"hi\")}|{id([1, 2, 3])}|{id(true)}\" }\n";
