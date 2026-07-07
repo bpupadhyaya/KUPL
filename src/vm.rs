@@ -3683,6 +3683,31 @@ fun probe() -> Str {\n\
     }
 
     #[test]
+    fn kx_execution_roundtrip_is_byte_identical() {
+        // A .kx compiled module, after a full encode -> decode serialization round-trip, runs to
+        // the EXACT same output as the in-memory interp/KVM result — across ADT match, HOF
+        // map/fold, Map, and numeric/string builtins. This certifies the on-disk bytecode format
+        // preserves execution semantics byte-for-byte (PR-it187).
+        let src = "type Shape = Circle(r: Float) | Rect(w: Float, h: Float)\n\
+fun area(s: Shape) -> Float {\n    match s {\n        Circle(r) => 3.0 * r * r\n        Rect(w, h) => w * h\n    }\n}\n\
+fun probe() -> Str {\n    let shapes = [Circle(2.0), Rect(3.0, 4.0)]\n    \
+let areas = shapes.map(fn s { area(s) })\n    let m = Map().insert(\"n\", shapes.len())\n    \
+\"{areas}|{areas.fold(0.0, fn(a, x) { a + x })}|{m.keys()}|{(10).factorial()}|{(255).count_ones()}\"\n}\n";
+        // In-memory interp == KVM baseline.
+        let expected = differential(src);
+        assert_eq!(expected, "[12.0, 12.0]|24.0|[\"n\"]|3628800|8");
+        // Now compile, serialize to .kx bytes, deserialize, and run on the KVM.
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let bytes = crate::kx::encode(&module);
+        let decoded = crate::kx::decode(&bytes).expect("decodes");
+        let mut vm = Vm::new(&decoded);
+        let v = vm.call_named("probe", vec![]).expect("runs");
+        assert_eq!(v.to_string(), expected);
+    }
+
+    #[test]
     fn ai_fun_kx_roundtrip() {
         std::env::set_var("KUPL_AI_MOCK_KX_HAIKU", "one two three");
         let src = "ai fun kx_haiku(topic: Str) -> Str {\n    intent \"Haiku.\"\n}\n\
