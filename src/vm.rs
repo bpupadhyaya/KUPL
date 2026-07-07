@@ -2082,6 +2082,25 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_set_algebra_on_records_structural() {
+        // it219 locked a single Set of records dedup + `contains` by STRUCTURAL equality; this
+        // extends it to set ALGEBRA between two record-Sets (it242). union/intersect/difference must
+        // compare records field-by-field, not by identity — so intersect finds the shared
+        // Point(3, 4), difference finds the Point(1, 2) present only in `a`, and the duplicate
+        // Point(1, 2) in `a`'s constructor already deduped to one element. Byte-identical on
+        // interp/KVM (native per the sweep); a certification lock, the rest of the batch (Set-of-
+        // records via bug-hunt) was consistent.
+        let src = r#"type Point = { x: Int, y: Int }
+fun probe() -> Str {
+    let a = Set([Point(x: 1, y: 2), Point(x: 3, y: 4), Point(x: 1, y: 2)])
+    let b = Set([Point(x: 3, y: 4), Point(x: 5, y: 6)])
+    "{a.len()}|{a.union(b).len()}|{a.intersect(b).len()}|{a.difference(b).len()}|{a.contains(Point(x: 1, y: 2))}|{a.intersect(b).to_list()}"
+}
+"#;
+        assert_eq!(differential(src), "2|3|1|1|true|[Point(3, 4)]");
+    }
+
+    #[test]
     fn diff_map_merge_with_combiner_fold() {
         // A bug-hunt-16 lock (it241): plain `merge` (last-wins) is certified in it160/it4097; KUPL
         // has no builtin merge-with-fn, so the common "combine two count maps by SUMMING shared
