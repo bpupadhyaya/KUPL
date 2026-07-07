@@ -3096,6 +3096,31 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_deeply_nested_with_update_three_levels() {
+        // Extends diff_records_depth_nested_with_and_equality (it170, a 2-level `with`) to THREE
+        // levels: Team > Person > Addr. A deep immutable update `t with lead: (t.lead with addr:
+        // (t.lead.addr with zip: N))` rebuilds all three record layers while preserving EVERY
+        // sibling field at each level (name at level 2, city at level 3, size at the top), and a
+        // separate top-level `with` on the result composes cleanly. The original `t` is untouched
+        // throughout (t.lead.addr.zip stays 10001, t.size stays 5). Byte-identical on interp/KVM,
+        // including the nested Display Team(Person("Ann", Addr("NYC", 20002)), 5) (PR-it226).
+        let src = r#"type Addr = Addr(city: Str, zip: Int)
+type Person = Person(name: Str, addr: Addr)
+type Team = Team(lead: Person, size: Int)
+fun probe() -> Str {
+    let t = Team(lead: Person(name: "Ann", addr: Addr(city: "NYC", zip: 10001)), size: 5)
+    let t2 = t with lead: (t.lead with addr: (t.lead.addr with zip: 20002))
+    let t3 = t2 with size: 6
+    "{t.lead.addr.zip}|{t2.lead.addr.zip}|{t2.lead.name}|{t2.lead.addr.city}|{t3.size}|{t.size}|{t2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"10001|20002|Ann|NYC|6|5|Team(Person("Ann", Addr("NYC", 20002)), 5)"#
+        );
+    }
+
+    #[test]
     fn diff_numeric_tower_precision_and_conversions() {
         // The numeric tower is byte-identical on interp/KVM (and native, per the native test):
         // BigInt is arbitrary-precision (2^70, 2^64, 25! all exact and exceeding i64), Rational
