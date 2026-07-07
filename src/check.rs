@@ -1550,9 +1550,16 @@ impl Checker {
                     let ret = ctx.ret.clone();
                     if self.uni.unify(&want, &ret).is_err() {
                         let r = self.uni.apply(&ret);
+                        // When the enclosing function returns a Result, the fix is to convert the
+                        // Option to a Result before `?` (parse_int() etc. return Option) (PR-it252).
+                        let hint = if matches!(r, Ty::Result(..)) {
+                            " — convert it first with `.ok_or(err)?`"
+                        } else {
+                            ""
+                        };
                         self.err(
                             "K0238",
-                            format!("`?` on an Option requires the enclosing function to return an Option, but it returns {r}"),
+                            format!("`?` on an Option requires the enclosing function to return an Option, but it returns {r}{hint}"),
                             expr.span,
                         );
                     }
@@ -1568,9 +1575,16 @@ impl Checker {
                     let ret = ctx.ret.clone();
                     if self.uni.unify(&want, &ret).is_err() {
                         let r = self.uni.apply(&ret);
+                        // When the enclosing function returns an Option, the fix is to convert the
+                        // Result to an Option before `?` (PR-it252).
+                        let hint = if matches!(r, Ty::Option(_)) {
+                            " — convert it first with `.ok()?`"
+                        } else {
+                            ""
+                        };
                         self.err(
                             "K0238",
-                            format!("`?` requires the enclosing function to return a Result, but it returns {r}"),
+                            format!("`?` requires the enclosing function to return a Result, but it returns {r}{hint}"),
                             expr.span,
                         );
                     } else {
@@ -2885,10 +2899,22 @@ mod generic_tests {
         // `?` on an Option in a Result-returning function is a K0238 error.
         let mismatch1 = "fun bad(m: Map[Str, Int]) -> Result[Int, Str] { let v = m.get(\"a\")?\n    Ok(v) }\n";
         assert!(errors(mismatch1).iter().any(|d| d.code == "K0238"), "Option ? in a Result fun must be K0238");
+        // ...and it names the fix: convert the Option to a Result with `.ok_or(err)?` (PR-it252).
+        assert!(
+            errors(mismatch1).iter().any(|d| d.code == "K0238" && d.message.contains("`.ok_or(err)?`")),
+            "Option ? in a Result fun must hint .ok_or: {:?}",
+            errors(mismatch1).iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
         // `?` on a Result in an Option-returning function is a K0238 error.
         let mismatch2 = "fun half(n: Int) -> Result[Int, Str] { if n % 2 == 0 { Ok(n / 2) } else { Err(\"odd\") } }\n\
                          fun bad(n: Int) -> Option[Int] { let v = half(n)?\n    Some(v) }\n";
         assert!(errors(mismatch2).iter().any(|d| d.code == "K0238"), "Result ? in an Option fun must be K0238");
+        // ...and it names the fix: convert the Result to an Option with `.ok()?` (PR-it252).
+        assert!(
+            errors(mismatch2).iter().any(|d| d.code == "K0238" && d.message.contains("`.ok()?`")),
+            "Result ? in an Option fun must hint .ok: {:?}",
+            errors(mismatch2).iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
