@@ -2082,6 +2082,28 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_window_then_aggregate_moving_stats() {
+        // A certification lock (it257): the sliding-window aggregation idiom. it165 locked window()
+        // producing overlapping sub-lists; this composes it with map + fold to compute a MOVING
+        // STATISTIC over each window — the canonical time-series / signal-processing shape.
+        // window(3) over [1..6] yields 4 length-3 windows; folding each gives a moving sum
+        // [6, 9, 12, 15] and a moving max [3, 4, 5, 6]; window(2).map(first) takes the leading
+        // element of each pair. Byte-identical on interp/KVM (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    let xs = [1, 2, 3, 4, 5, 6]
+    let movsum = xs.window(3).map(fn w { w.fold(0, fn(a, x) { a + x }) })
+    let movmax = xs.window(3).map(fn w { w.fold(0, fn(m, x) { if x > m { x } else { m } }) })
+    let firsts = xs.window(2).map(fn w { w.first().unwrap_or(0) })
+    "{movsum}|{movmax}|{firsts}|{xs.window(3).len()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[6, 9, 12, 15]|[3, 4, 5, 6]|[1, 2, 3, 4, 5]|4"
+        );
+    }
+
+    #[test]
     fn diff_match_three_field_ctor_and_nested_if_arm() {
         // A bug-hunt-22 lock (it256): two match shapes the existing Shape tests omit. Prior locks
         // (it1808/3123/4951) use at most 2-field constructors and classify via match GUARDS
