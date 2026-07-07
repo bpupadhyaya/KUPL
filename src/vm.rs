@@ -2104,6 +2104,44 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_fold_records_into_map_of_lists_bucketing() {
+        // A certification lock (it300, milestone): fold records into a Map-of-LISTS -- bucket each item
+        // into a per-key list. it292 folds into a Map of Ints (get-or-0 + sum); this pins the
+        // group-into-lists variant where the accumulator VALUE is a List that grows via push and
+        // get().unwrap_or([]) supplies the empty-list default for a key's first sighting. This is the
+        // hand-rolled group_by returning Map[Str, List[Str]] (categorize into buckets), the shape an AI
+        // writes when it needs the grouped members, not just counts.
+        //   items = [apple/fruit, carrot/veg, banana/fruit, pea/veg, cherry/fruit]
+        //   fold(Map(), (acc, it) -> acc.insert(it.cat, acc.get(it.cat).unwrap_or([]).push(it.name)))
+        //     grouped == {"fruit": ["apple","banana","cherry"], "veg": ["carrot","pea"]}
+        //     keys()  == ["fruit", "veg"]   (first-seen category order)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms an empty Map() seed threads a
+        // List-valued accumulator, that get().unwrap_or([]) starts a fresh bucket on first sighting, that
+        // push appends within a bucket in encounter order (apple before banana before cherry), and that
+        // re-inserting an existing key keeps its position while replacing its list with the grown one.
+        // This is the categorize/bucket-by-field an AI writes for grouping records by type, files by
+        // extension, or events by day. A backend that dropped the get-or-empty default would panic on the
+        // first item of each category, and one that reordered a key on re-insert would list veg before
+        // fruit.
+        let src = r#"type Item = { name: Str, cat: Str }
+fun probe() -> Str {
+    let items = [Item(name: "apple", cat: "fruit"), Item(name: "carrot", cat: "veg"), Item(name: "banana", cat: "fruit"), Item(name: "pea", cat: "veg"), Item(name: "cherry", cat: "fruit")]
+    let grouped = items.fold(Map(), fn(acc, it) {
+        let prev = acc.get(it.cat).unwrap_or([])
+        acc.insert(it.cat, prev.push(it.name))
+    })
+    let fruits = grouped.get("fruit").unwrap_or([])
+    let veg = grouped.get("veg").unwrap_or([])
+    "{grouped.keys()}|fruit={fruits}|veg={veg}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"["fruit", "veg"]|fruit=["apple", "banana", "cherry"]|veg=["carrot", "pea"]"#
+        );
+    }
+
+    #[test]
     fn diff_recursive_expr_evaluator_returning_result() {
         // A bug-hunt-42 lock (it299): a FALLIBLE recursive AST evaluator -- each node's eval returns
         // Result[Int, Str], and_then/map thread the recursive results, and Div returns Err on a zero
