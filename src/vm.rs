@@ -2082,6 +2082,25 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_parse_float_scientific_notation() {
+        // A bug-hunt-18 lock (it246): parse_float accepts scientific notation (mantissa e exponent,
+        // lower- and upper-case E, negative exponents) and — critically — the resulting f64 prints
+        // POSITIONALLY, never in exponent form. it1755 only covered the 1e999->inf overflow. The
+        // sharp case is Avogadro's number "6.022e23", whose exact f64 renders as a 24-digit integer
+        // with a trailing ".0"; a native backend that let C's strtod+"%g" print "6.022e+23" would
+        // diverge here. "1.5e-3" exercises a negative exponent shrinking to 0.0015, and "1E3" the
+        // uppercase form. Byte-identical on interp/KVM (native per the sweep). "not" -> None.
+        let src = r#"fun probe() -> Str {
+    "{"1e10".parse_float()}|{"1.5e-3".parse_float()}|{"6.022e23".parse_float()}|{"1E3".parse_float()}|{"not".parse_float()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "Some(10000000000.0)|Some(0.0015)|Some(602200000000000027262976.0)|Some(1000.0)|None"
+        );
+    }
+
+    #[test]
     fn diff_recursive_adt_unary_ctor_and_depth() {
         // it3883 locked recursive-ADT eval over Num|Add|Mul (all leaf-or-binary ctors). This extends
         // it to two shapes real ASTs need but that test omits (it245): a UNARY self-referential
