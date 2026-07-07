@@ -2082,6 +2082,25 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_pagination_take_drop_composed() {
+        // A bug-hunt-21 lock (it254): the pagination / windowing idiom that CHAINS take and drop.
+        // it165 locked take/drop/take_while individually; this pins the compositions an AI writes
+        // for paging: `drop(offset).take(pageSize)` (skip 2, take 3 -> [3, 4, 5]) and a
+        // predicate-split then index-drop `take_while(< 6).drop(1)` -> [2, 3, 4, 5]. Past-the-end
+        // access clamps rather than erroring: drop(100) -> [], take(100).len() -> the full length.
+        // Byte-identical on interp/KVM (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    let xs = [1, 2, 3, 4, 5, 6, 7, 8]
+    "{xs.drop(2).take(3)}|{xs.take_while(fn n { n < 5 })}|{xs.drop_while(fn n { n < 5 })}|{xs.take_while(fn n { n < 6 }).drop(1)}|{xs.drop(100)}|{xs.take(100).len()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[3, 4, 5]|[1, 2, 3, 4]|[5, 6, 7, 8]|[2, 3, 4, 5]|[]|8"
+        );
+    }
+
+    #[test]
     fn diff_split_parse_map_join_roundtrip() {
         // A certification lock (it253): the canonical CSV-line / data-transform pipeline — split a
         // delimited string, parse each field to a number, transform, and re-serialize with join.
