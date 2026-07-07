@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_fold_records_into_map_tally_by_key() {
+        // A certification lock (it292): the manual "tally/aggregate into a Map via fold" idiom -- fold
+        // over records with an EMPTY Map() accumulator, reading each record's field, using
+        // get().unwrap_or(0) as the running total per key and insert() to update. it280 does sum-by-key
+        // through the group_by BUILTIN; this pins the by-hand version an AI writes when it builds the
+        // accumulator map directly (custom aggregation, or not knowing group_by exists).
+        //   sales = [west+100, east+50, west+30, north+70, east+20]
+        //   fold(Map(), (acc, s) -> acc.insert(s.region, acc.get(s.region).unwrap_or(0) + s.amt))
+        //     totals == Map{"west": 130, "east": 70, "north": 70}
+        //     keys()  == ["west", "east", "north"]   (FIRST-seen insertion order; west stays first
+        //                                              even though its value is updated later)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms an empty Map seed threads
+        // through fold, that inserting an EXISTING key updates its value in place WITHOUT moving it in
+        // iteration order (west first-seen -> still first after its second update), that a fresh key
+        // appends at the end, and that get().unwrap_or(0) supplies the zero for a key's first sighting.
+        // This is the hand-rolled sum-by-key / word-count / bucket-tally an AI writes constantly. A
+        // backend that re-ordered a key on update would list keys as east/north/west, and one that
+        // dropped the get-or-zero would panic or miscount the first occurrence of each region.
+        let src = r#"type Sale = { region: Str, amt: Int }
+fun probe() -> Str {
+    let sales = [Sale(region: "west", amt: 100), Sale(region: "east", amt: 50), Sale(region: "west", amt: 30), Sale(region: "north", amt: 70), Sale(region: "east", amt: 20)]
+    let totals = sales.fold(Map(), fn(acc, s) {
+        let prev = acc.get(s.region).unwrap_or(0)
+        acc.insert(s.region, prev + s.amt)
+    })
+    let regions = totals.keys()
+    let westTotal = totals.get("west").unwrap_or(0 - 1)
+    "{regions}|west={westTotal}|{totals}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"["west", "east", "north"]|west=130|Map{"west": 130, "east": 70, "north": 70}"#
+        );
+    }
+
+    #[test]
     fn diff_result_and_then_railway_over_record_payload() {
         // A bug-hunt-38 lock (it291): the Result railway (and_then) carrying a RECORD as the Ok
         // payload, updated at EACH step. it255 threads Int payloads through a validate pipeline; this
