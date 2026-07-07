@@ -1270,6 +1270,16 @@ impl Parser {
         let mut lhs = self.parse_range()?;
         while matches!(self.peek(), Tok::Ident(n) if n == "with") {
             self.bump();
+            // A record update lists fields directly: `p with x: 1, y: 2` — there are no braces.
+            // Users coming from other languages often reach for `p with { x: 1 }`; give them the
+            // real syntax instead of a bare "expected identifier, found `{`" (PR-it228).
+            if self.at(&Tok::LBrace) {
+                return Err(Diag::error(
+                    "K0101",
+                    "record update has no braces — write `x with field: value, field: value`".to_string(),
+                    self.span(),
+                ));
+            }
             let mut updates = Vec::new();
             loop {
                 let (field, _) = self.expect_ident()?;
@@ -2077,6 +2087,19 @@ app Main {
     fn ai_is_still_an_ordinary_identifier() {
         let p = ok("fun f(ai: Int) -> Int {\n    let ai = ai + 1\n    ai\n}\n");
         assert_eq!(p.items.len(), 1);
+    }
+
+    #[test]
+    fn record_update_with_braces_is_rejected_with_a_hint() {
+        // `p with { x: 5 }` (braces) is a common mistake from other languages; the parser should
+        // name the real brace-free syntax rather than emit a bare "expected identifier" (PR-it228).
+        let (_p, diags) = parse("type P = P(x: Int, y: Int)\nfun main() { let p = P(x: 1, y: 2)\n    let q = p with { x: 5 } }\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0101" && d.message.contains("record update has no braces")),
+            "{diags:?}"
+        );
+        // The correct brace-free forms still parse cleanly (single and multi-field).
+        assert!(parse("type P = P(x: Int, y: Int)\nfun main() { let p = P(x: 1, y: 2)\n    let q = p with x: 5\n    let r = p with x: 1, y: 2 }\n").1.is_empty());
     }
 
     #[test]
