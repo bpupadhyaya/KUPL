@@ -2104,6 +2104,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_result_and_then_map_map_err_interleaved() {
+        // A certification lock (it269): the full Result-combinator interleaving in one chain, where
+        // each of and_then/map/map_err exhibits its DUAL behavior (transform one variant, pass the
+        // other through). it255 locked a multi-stage all-and_then railway; it4098 locked map/map_err/
+        // unwrap_or/ok on single Results; neither pins the three interleaved so that map's
+        // Err-passthrough, map_err's Ok-passthrough, and an and_then producing a NEW error mid-chain
+        // all appear together. half(n) = Ok(n/2) if even else Err("odd: {n}").
+        //   a: Ok(40).and_then(half)=Ok(20).map(+1)=Ok(21).and_then(half) -> Err("odd: 21")  (new err mid-chain)
+        //   b: Ok(7).and_then(half)=Err.map(+1) -> Err("odd: 7")                             (map skips Err)
+        //   c: Ok(7).and_then(half)=Err.map_err(wrap) -> Err("wrapped[odd: 7]")              (map_err transforms Err)
+        //   d: Ok(40).and_then(half).and_then(half)=Ok(10).map_err(..)=Ok(10).unwrap_or(-1) -> 10  (map_err skips Ok)
+        // Byte-identical on interp/KVM (native per the sweep).
+        let src = r#"fun half(n: Int) -> Result[Int, Str] { if n % 2 == 0 { Ok(n / 2) } else { Err("odd: {n}") } }
+fun probe() -> Str {
+    let a = Ok(40).and_then(half).map(fn x { x + 1 }).and_then(half)
+    let b = Ok(7).and_then(half).map(fn x { x + 1 })
+    let c = Ok(7).and_then(half).map_err(fn e { "wrapped[{e}]" })
+    let d = Ok(40).and_then(half).and_then(half).map_err(fn e { "E:{e}" }).unwrap_or(0 - 1)
+    "{a}|{b}|{c}|{d}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Err("odd: 21")|Err("odd: 7")|Err("wrapped[odd: 7]")|10"#
+        );
+    }
+
+    #[test]
     fn diff_set_symmetric_difference_chain() {
         // A bug-hunt-28 lock (it268): chaining symmetric_difference, which is associative and whose
         // n-way chain yields the elements appearing in an ODD number of the sets (set XOR). Prior
