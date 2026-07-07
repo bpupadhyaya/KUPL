@@ -2104,6 +2104,46 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_result_and_then_railway_over_record_payload() {
+        // A bug-hunt-38 lock (it291): the Result railway (and_then) carrying a RECORD as the Ok
+        // payload, updated at EACH step. it255 threads Int payloads through a validate pipeline; this
+        // pins a stateful transaction -- an Account record flows through successive withdraw() calls,
+        // each returning Result[Account, Str] and threading the UPDATED record (a with balance: ...)
+        // via and_then. Three outcomes cover the railway's branches:
+        //   withdraw(100, 30).and_then(withdraw 20) -> Ok(Account bal 50)   (both succeed, record threaded + updated twice)
+        //   withdraw(100, 30).and_then(withdraw 200)-> Err("insufficient")  (first Ok, SECOND step fails mid-chain)
+        //   withdraw(100, -5).and_then(withdraw 10) -> Err("bad amount")    (FIRST step Err -> and_then closure never runs)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms and_then feeds the Ok record
+        // payload into the next fallible step and rebuilds it (100 -> 70 -> 50 across two withdrawals),
+        // that an Err produced mid-chain (step 2) propagates its own message out, and that an Err at
+        // step 1 short-circuits so the and_then closure is never invoked. This is the multi-step
+        // transaction-with-early-exit an AI writes for money transfers, state machines, or staged
+        // form submission -- where the thing flowing down the happy path is a structured record that
+        // each stage transforms. A backend that lost the record update between and_then stages would
+        // report bal 70 or 80 instead of 50, and one that ran the closure on an Err would misreport
+        // the "bad amount" case.
+        let src = r#"type Account = { id: Str, balance: Int }
+fun withdraw(a: Account, amt: Int) -> Result[Account, Str] {
+    if amt <= 0 { Err("bad amount") } else {
+        if amt > a.balance { Err("insufficient") } else { Ok(a with balance: a.balance - amt) }
+    }
+}
+fun outcome(r: Result[Account, Str]) -> Str {
+    match r { Ok(a) => "ok:{a.balance}"
+        Err(e) => "err:{e}" }
+}
+fun probe() -> Str {
+    let acc = Account(id: "x1", balance: 100)
+    let ok = withdraw(acc, 30).and_then(fn a { withdraw(a, 20) })
+    let fail = withdraw(acc, 30).and_then(fn a { withdraw(a, 200) })
+    let bad = withdraw(acc, 0 - 5).and_then(fn a { withdraw(a, 10) })
+    "{outcome(ok)}|{outcome(fail)}|{outcome(bad)}"
+}
+"#;
+        assert_eq!(differential(src), "ok:50|err:insufficient|err:bad amount");
+    }
+
+    #[test]
     fn diff_option_combinator_chain_over_records() {
         // A certification lock (it290): the Option-combinator chain over records -- find an entity in a
         // list (returns Option[Record]), then map a field / filter a predicate / unwrap_or a default,
