@@ -589,8 +589,13 @@ impl Checker {
                                 format!("`{n}` takes {}, {} given", plural(params, "type argument"), ats.len()),
                                 t.span,
                             );
+                            // The annotation is malformed; return an unconstrained type var so we
+                            // don't ALSO emit a confusing secondary K0200 "expected Box[Int, Str],
+                            // found Box[Int]" when this is later unified (PR-it221).
+                            self.uni.fresh()
+                        } else {
+                            Ty::Named(n.clone(), ats)
                         }
-                        Ty::Named(n.clone(), ats)
                     }
                     _ => {
                         self.err(
@@ -2989,6 +2994,21 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    #[test]
+    fn generic_arity_mismatch_shows_only_the_clear_error() {
+        // A wrong type-argument count now yields ONLY the clear K0206 "takes N type arguments",
+        // not also a confusing secondary K0200 "expected Box[Int, Str], found Box[Int]" — the
+        // malformed annotation resolves to a fresh var so it doesn't cascade (PR-it221).
+        let too_many = errors("type Box[T] = Box(v: T)\nfun main() { let b: Box[Int, Str] = Box(v: 5)\n    let _ = b }\n");
+        assert!(too_many.iter().any(|d| d.code == "K0206" && d.message.contains("takes 1 type argument, 2 given")), "K0206: {too_many:?}");
+        assert!(too_many.iter().all(|d| d.code != "K0200"), "no cascading K0200: {too_many:?}");
+        let too_few = errors("type Pair[A, B] = Pair(a: A, b: B)\nfun main() { let p: Pair[Int] = Pair(a: 1, b: 2)\n    let _ = p }\n");
+        assert!(too_few.iter().any(|d| d.code == "K0206" && d.message.contains("takes 2 type arguments, 1 given")), "K0206: {too_few:?}");
+        assert!(too_few.iter().all(|d| d.code != "K0200"), "no cascading K0200: {too_few:?}");
+        // Correct type-argument counts still type-check.
+        assert!(errors("type Box[T] = Box(v: T)\ntype Pair[A, B] = Pair(a: A, b: B)\nfun main() { let _: Box[Int] = Box(v: 5)\n    let _: Pair[Int, Str] = Pair(a: 1, b: \"x\") }\n").is_empty());
     }
 
     #[test]
