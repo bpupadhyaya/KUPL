@@ -2134,6 +2134,21 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_capitalize() {
+        // The NEW capitalize() is ASCII-cased like to_upper/to_lower, byte-identical on
+        // interp/KVM: first char up + rest down, empty stays empty, a digit or non-ASCII first
+        // char is left unchanged (PR-it182).
+        let src = r#"fun probe() -> Str {
+    "[{"hELLO world".capitalize()}]|[{"HELLO".capitalize()}]|[{"".capitalize()}]|[{"already Cap".capitalize()}]|[{"123abc".capitalize()}]|[{"élan".capitalize()}]|[{"a".capitalize()}]"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[Hello world]|[Hello]|[]|[Already cap]|[123abc]|[élan]|[A]"
+        );
+    }
+
+    #[test]
     fn diff_int_lcm() {
         // The NEW lcm() is the natural companion to gcd, byte-identical on interp/KVM:
         // |v|/gcd*|w|, always non-negative, lcm(0,_)=0, and an out-of-i64 result panics

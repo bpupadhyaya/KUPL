@@ -146,7 +146,7 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 /// if a newly added method is missing here the only effect is a missed hint, so
 /// it need not track the method-resolution match perfectly.
 const BUILTIN_METHODS: &[&str] = &[
-    "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "cbrt", "ceil",
+    "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
     "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "cos", "count",
     "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "filter",
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "gcd",
@@ -2204,7 +2204,7 @@ impl Checker {
             (Ty::Str, "len") => Some((vec![], Ty::Int)),
             (Ty::Str, "contains") => Some((vec![Ty::Str], Ty::Bool)),
             (Ty::Str, "starts_with") => Some((vec![Ty::Str], Ty::Bool)),
-            (Ty::Str, "to_upper") | (Ty::Str, "to_lower") | (Ty::Str, "trim") | (Ty::Str, "trim_start") | (Ty::Str, "trim_end") => Some((vec![], Ty::Str)),
+            (Ty::Str, "to_upper") | (Ty::Str, "to_lower") | (Ty::Str, "capitalize") | (Ty::Str, "trim") | (Ty::Str, "trim_start") | (Ty::Str, "trim_end") => Some((vec![], Ty::Str)),
             (Ty::Str, "split") => Some((vec![Ty::Str], Ty::List(Box::new(Ty::Str)))),
             (Ty::Str, "ends_with") => Some((vec![Ty::Str], Ty::Bool)),
             (Ty::Str, "replace") => Some((vec![Ty::Str, Ty::Str], Ty::Str)),

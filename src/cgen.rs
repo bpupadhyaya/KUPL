@@ -3654,6 +3654,20 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             out[strlen(s)] = 0;
             return k_str(out);
         }
+        if (!strcmp(name, "capitalize")) {
+            /* ASCII casing like to_upper/to_lower: lowercase all, then uppercase the first
+               byte iff it is a lowercase ASCII letter (a non-ASCII lead byte is left alone,
+               matching the interpreter's char-boundary check). */
+            size_t sl = strlen(s);
+            char* out = k_alloc(sl + 1);
+            for (size_t i = 0; i < sl; i++) {
+                char c = s[i];
+                out[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+            }
+            if (sl > 0 && out[0] >= 'a' && out[0] <= 'z') out[0] -= 32;
+            out[sl] = 0;
+            return k_str(out);
+        }
         if (!strcmp(name, "trim") || !strcmp(name, "trim_start") || !strcmp(name, "trim_end")) {
             int do_start = strcmp(name, "trim_end") != 0;   /* trim + trim_start */
             int do_end = strcmp(name, "trim_start") != 0;   /* trim + trim_end */
@@ -5594,6 +5608,23 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native capitalize() matches interp/KVM: ASCII first-up/rest-down, non-ASCII first char
+    /// unchanged (PR-it182).
+    #[test]
+    fn native_string_capitalize() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("[{"hELLO world".capitalize()}]|[{"".capitalize()}]|[{"123abc".capitalize()}]|[{"élan".capitalize()}]")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "strcap").trim(),
+            "[Hello world]|[]|[123abc]|[élan]"
+        );
     }
 
     /// Native lcm() matches interp/KVM: non-negative result, lcm(0,_)=0, INT64_MIN-safe abs,

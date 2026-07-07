@@ -2215,6 +2215,16 @@ pub fn shared_method(
         // keeps `to_upper`/`to_lower` byte-identical across interp/KVM/native).
         (Value::Str(s), "to_upper") => Ok(Value::str(s.to_ascii_uppercase())),
         (Value::Str(s), "to_lower") => Ok(Value::str(s.to_ascii_lowercase())),
+        (Value::Str(s), "capitalize") => {
+            // ASCII casing (matching to_upper/to_lower): the first char is uppercased and the
+            // rest lowercased; non-ASCII bytes are left unchanged, and an empty string stays
+            // empty. get_mut(0..1) is Some only when the first char is single-byte ASCII.
+            let mut out = s.to_ascii_lowercase();
+            if let Some(first) = out.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            Ok(Value::str(out))
+        }
         (Value::Str(s), "trim") => Ok(Value::str(s.trim().to_string())),
         // trim ` \t\n\r` from one side (the same set as `trim`, matching the C mirror)
         (Value::Str(s), "trim_start") => {
