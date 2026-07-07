@@ -423,6 +423,44 @@ mod tests {
     }
 
     #[test]
+    fn cross_module_types_funs_and_transitive_deps_resolve() {
+        // A cross-module program: util defines a TYPE (Point) + funs (add, manhattan calling
+        // add), geo `use util` and adds origin_dist calling manhattan, main `use util`/`use geo`
+        // -> the full TRANSITIVE chain (main -> geo -> util) resolves into one merged program
+        // and evaluates correctly (PR-it174).
+        let dir = std::env::temp_dir().join(format!("kupl-xmod-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("util.kupl"),
+            "type Point = Point(x: Int, y: Int)\nfun add(a: Int, b: Int) -> Int { a + b }\nfun manhattan(p: Point) -> Int { match p { Point(x, y) => add(x, y) } }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("geo.kupl"), "use util\nfun origin_dist(p: Point) -> Int { manhattan(p) }\n").unwrap();
+        std::fs::write(
+            dir.join("main.kupl"),
+            "use util\nuse geo\nfun compute() -> Int { origin_dist(Point(x: 3, y: 4)) }\nfun main() { }\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(dir.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("loads");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(diags.iter().all(|d| d.severity != crate::diag::Severity::Error), "{diags:?}");
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("compute".to_string()));
+        let r = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v,
+            Err(_) => panic!("compute() should run across the merged modules"),
+        };
+        // origin_dist(Point(3,4)) = manhattan = add(3,4) = 7, threading across all three modules.
+        assert_eq!(format!("{r}"), "7");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn malformed_manifest_is_a_clean_error_not_silently_ignored() {
         let dir = std::env::temp_dir().join(format!("kupl-loader-badtoml-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
