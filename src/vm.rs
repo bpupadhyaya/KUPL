@@ -2161,6 +2161,30 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_slice_and_index_edges() {
+        // Str.slice is char-indexed with a hi-EXCLUSIVE bound; out-of-bounds clamps, a
+        // reversed range (lo > hi) is empty, and it never splits a multibyte char (PR-it136).
+        assert_eq!(
+            differential("fun probe() -> Str { let s = \"abcde\"\n    \"{s.slice(1, 3)}|{s.slice(2, 2)}|{s.slice(1, 99)}|{s.slice(99, 100)}|{s.slice(3, 2)}\" }\n"),
+            "bc||bcde||"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { let s = \"aé世b\"\n    \"{s.slice(1, 3)}|{s.slice(2, 99)}|{\"\".slice(0, 5)}\" }\n"),
+            "é世|世b|"
+        );
+        // List.get returns an Option (None out of bounds); take/drop clamp to the length.
+        assert_eq!(
+            differential("fun probe() -> Str { let xs = [10, 20, 30]\n    \"{xs.get(0)}|{xs.get(3)}|{[].get(0)}|{xs.take(2)}|{xs.take(99)}|{xs.drop(2)}|{xs.drop(99)}\" }\n"),
+            "Some(10)|None|None|[10, 20]|[10, 20, 30]|[30]|[]"
+        );
+        // window slides; chunk splits into non-overlapping groups with a partial tail.
+        assert_eq!(
+            differential("fun probe() -> Str { let xs = [1, 2, 3, 4, 5]\n    \"{xs.window(2)}|{xs.chunk(2)}\" }\n"),
+            "[[1, 2], [2, 3], [3, 4], [4, 5]]|[[1, 2], [3, 4], [5]]"
+        );
+    }
+
+    #[test]
     fn diff_string_split_replace_search_char_indexed() {
         // split_once splits at the FIRST match (preserving an empty left part); a
         // no-match yields None (PR-it130, extending the char-indexed guarantees of it105).

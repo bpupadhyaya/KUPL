@@ -5175,6 +5175,21 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "clo").trim(), "4|11|0|2");
     }
 
+    /// Native slice/index edges match interp/KVM: char-indexed Str.slice with clamping
+    /// and reversed->empty, List.get Option, take/drop clamp, chunk partial tail (PR-it136).
+    #[test]
+    fn native_slice_and_index_edges() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let s = \"aé世b\"\n    let xs = [1, 2, 3, 4, 5]\n    \
+                   print(\"{s.slice(1, 3)}|{s.slice(2, 99)}|{s.slice(3, 2)}|{xs.get(4)}|{xs.get(5)}|{xs.take(99)}|{xs.drop(3)}|{xs.chunk(2)}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "sliceidx").trim(),
+            "é世|世b||Some(5)|None|[1, 2, 3, 4, 5]|[4, 5]|[[1, 2], [3, 4], [5]]"
+        );
+    }
+
     /// Native string split/replace/search are char-indexed and match interp/KVM:
     /// split_once at first match, non-overlapping replace, char-index index_of, char-aware
     /// pad/reverse (PR-it130).
