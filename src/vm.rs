@@ -2252,6 +2252,53 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_match_first_match_wins_and_guards() {
+        // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose
+        // guard holds; a guard that fails falls through to later arms. This is byte-identical on
+        // interp/KVM and holds even when a later arm would ALSO match (PR-it206).
+        let g = r#"fun classify(n: Int) -> Str {
+    match n {
+        0 => "zero"
+        x if x < 0 => "negative"
+        x if x % 2 == 0 => "even-positive"
+        _ => "odd-positive"
+    }
+}
+fun probe() -> Str {
+    "{classify(0)}|{classify(0 - 5)}|{classify(4)}|{classify(7)}"
+}
+"#;
+        assert_eq!(differential(g), "zero|negative|even-positive|odd-positive");
+        // A guarded arm placed BEFORE a literal that would also match still wins (order, not
+        // specificity, decides): f(1) is "pos-guard", never "one".
+        let o = r#"fun f(n: Int) -> Str {
+    match n {
+        x if x > 0 => "pos-guard"
+        1 => "one"
+        _ => "other"
+    }
+}
+fun probe() -> Str { "{f(1)}|{f(5)}|{f(0)}" }
+"#;
+        assert_eq!(differential(o), "pos-guard|pos-guard|other");
+        // Same for ADT variants: two arms on the same constructor resolve first-guard-wins.
+        let a = r#"type Shape = Circle(r: Int) | Rect(w: Int, h: Int)
+fun describe(s: Shape) -> Str {
+    match s {
+        Circle(r) if r == 0 => "point"
+        Circle(r) => "circle-{r}"
+        Rect(w, h) if w == h => "square-{w}"
+        Rect(w, h) => "rect-{w}x{h}"
+    }
+}
+fun probe() -> Str {
+    "{describe(Circle(0))}|{describe(Circle(5))}|{describe(Rect(3, 3))}|{describe(Rect(2, 4))}"
+}
+"#;
+        assert_eq!(differential(a), "point|circle-5|square-3|rect-2x4");
+    }
+
+    #[test]
     fn diff_loopvar_capture_negmod_try_propagation() {
         // A fifth bug-hunt sweep (it205, ~10 probes) found no divergence; this locks its subtlest
         // deterministic edges, byte-identical on interp/KVM. Each closure made in a loop captures
