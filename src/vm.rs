@@ -2082,6 +2082,36 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_result_railway_multistage_short_circuit() {
+        // A certification lock (it255): railway-oriented validation — chain several user-defined
+        // fallible functions with `and_then`, each returning Result, so the pipeline short-circuits
+        // on the FIRST Err and carries that stage's message all the way out. it164/217/3628 locked
+        // the Result combinator surface on single-expression chains; this pins a multi-stage
+        // parse -> validate-positive -> validate-small -> transform pipeline and demonstrates the
+        // short-circuit landing at EACH distinct stage (bad parse, non-positive, too-big) plus the
+        // all-success path. Byte-identical on interp/KVM (native per the sweep).
+        let src = r#"fun parseNum(s: Str) -> Result[Int, Str] {
+    match s.parse_int() {
+        Some(n) => Ok(n)
+        None => Err("not a number: {s}")
+    }
+}
+fun positive(n: Int) -> Result[Int, Str] { if n > 0 { Ok(n) } else { Err("not positive: {n}") } }
+fun small(n: Int) -> Result[Int, Str] { if n < 100 { Ok(n) } else { Err("too big: {n}") } }
+fun pipeline(s: Str) -> Result[Int, Str] {
+    parseNum(s).and_then(positive).and_then(small).map(fn n { n * 2 })
+}
+fun probe() -> Str {
+    "{pipeline("42")}|{pipeline("abc")}|{pipeline("-5")}|{pipeline("999")}|{pipeline("7").unwrap_or(0)}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Ok(84)|Err("not a number: abc")|Err("not positive: -5")|Err("too big: 999")|14"#
+        );
+    }
+
+    #[test]
     fn diff_list_pagination_take_drop_composed() {
         // A bug-hunt-21 lock (it254): the pagination / windowing idiom that CHAINS take and drop.
         // it165 locked take/drop/take_while individually; this pins the compositions an AI writes
