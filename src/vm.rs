@@ -2104,6 +2104,41 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_tree_map_with_higher_order_fn() {
+        // A bug-hunt-41 lock (it297): a recursive tree MAP that REBUILDS the ADT, driven by a
+        // higher-order fn parameter. it296 traverses a tree down to a scalar (sum/count/depth); this
+        // pins the functor-map shape -- mapT(t, f) recurses returning a NEW Tree with f applied at every
+        // Leaf and the Branch structure preserved, and f is passed in as a `fn(Int) -> Int` argument.
+        //   t = Branch(Leaf 3, Branch(Leaf 5, Leaf 2))    (sum 10)
+        //   mapT(t, x -> x*2)  rebuilds Branch(Leaf 6, Branch(Leaf 10, Leaf 4))   -> sum 20
+        //   mapT(t, x -> x+10) rebuilds Branch(Leaf 13, Branch(Leaf 15, Leaf 12)) -> sum 40
+        // Byte-identical on interp/KVM (native per the sweep). Confirms a recursive function can take a
+        // function-typed parameter and thread it through both recursive calls, that the closure fires
+        // once per leaf (3 leaves -> +6 doubled, +30 plus-ten over the original sum of 10), and that the
+        // rebuilt tree keeps the same Branch/Leaf shape so a follow-up sumT reads it back correctly. This
+        // is the map-over-a-recursive-structure an AI writes to rewrite an AST, rescale a scene graph,
+        // or transform a nested config. A backend that dropped the fn parameter across the recursion, or
+        // rebuilt the branches in the wrong shape, would return the original sum or a mis-structured tree.
+        let src = r#"type Tree = Leaf(v: Int) | Branch(l: Tree, r: Tree)
+fun mapT(t: Tree, f: fn(Int) -> Int) -> Tree {
+    match t { Leaf(v) => Leaf(v: f(v))
+        Branch(l, r) => Branch(l: mapT(l, f), r: mapT(r, f)) }
+}
+fun sumT(t: Tree) -> Int {
+    match t { Leaf(v) => v
+        Branch(l, r) => sumT(l) + sumT(r) }
+}
+fun probe() -> Str {
+    let t = Branch(l: Leaf(v: 3), r: Branch(l: Leaf(v: 5), r: Leaf(v: 2)))
+    let doubled = mapT(t, fn(x) { x * 2 })
+    let plus10 = mapT(t, fn(x) { x + 10 })
+    "{sumT(t)}|doubled={sumT(doubled)}|plus10={sumT(plus10)}"
+}
+"#;
+        assert_eq!(differential(src), "10|doubled=20|plus10=40");
+    }
+
+    #[test]
     fn diff_recursive_binary_tree_traversals() {
         // A certification lock (it296): three independent recursive traversals over a BINARY tree ADT
         // -- sum, leaf-count, and depth -- each pattern-matching Leaf/Branch and recursing on both
