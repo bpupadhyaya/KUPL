@@ -4835,6 +4835,21 @@ mod tests {
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
     }
 
+    /// Native tensor elementwise arithmetic matches the interpreter/KVM.
+    #[test]
+    fn native_tensor_elementwise_arithmetic() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let a = tensor([6.0, 8.0])\n    let b = tensor([2.0, 4.0])\n    \
+                   print(\"{(a + b).to_list()}|{(a - b).to_list()}|{(a * b).to_list()}|{(a / b).to_list()}|\
+                   {(tensor([1.0, 5.0]) - tensor([1.0, 5.0])).to_list()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "telem").trim(),
+            "[8.0, 12.0]|[4.0, 4.0]|[12.0, 32.0]|[3.0, 2.0]|[0.0, 0.0]"
+        );
+    }
+
     /// Native tensor ops match the interpreter/KVM, including empty-sum = +0.0
     /// (PR-it101 aligned the interp's Rust -0.0 identity to native's 0.0).
     #[test]

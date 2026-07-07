@@ -1883,6 +1883,25 @@ mod tests {
     }
 
     #[test]
+    fn diff_tensor_elementwise_arithmetic() {
+        // Elementwise +,-,*,/ over equal-length tensors, byte-identical on interp/KVM.
+        let src = "fun probe() -> Str {\n    let a = tensor([6.0, 8.0])\n    let b = tensor([2.0, 4.0])\n    \
+                   \"{(a + b).to_list()}|{(a - b).to_list()}|{(a * b).to_list()}|{(a / b).to_list()}\"\n}\n";
+        assert_eq!(differential(src), "[8.0, 12.0]|[4.0, 4.0]|[12.0, 32.0]|[3.0, 2.0]");
+        // subtraction that cancels stays +0.0 (no -0.0 hole), chained ops, empty+empty.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(tensor([1.0, 5.0]) - tensor([1.0, 5.0])).to_list()}\" }\n"),
+            "[0.0, 0.0]"
+        );
+        assert_eq!(differential("fun probe() -> Str { \"{(zeros(0) + zeros(0)).to_list()}\" }\n"), "[]");
+        // a length mismatch is a clean, identical panic on both engines.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(tensor([1.0, 2.0]) + tensor([1.0, 2.0, 3.0])).to_list()}\" }\n"),
+            "panic: tensor length mismatch (2 vs 3)"
+        );
+    }
+
+    #[test]
     fn diff_map_self_insert_in_place_preserves_aliasing() {
         // The `m = m.insert(k, v)` in-place fast path (PR-it91, O(n^2)->O(n) map
         // build) must only fire when the Map is uniquely owned. An aliased map must
