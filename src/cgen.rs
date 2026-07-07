@@ -5524,6 +5524,18 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "mutualrec").trim(), "true|true|true|abb");
     }
 
+    /// Native sized-int bitwise ops mask results to the operand WIDTH, matching interp/KVM —
+    /// C promotes u8/i8 to int, so bnot/shl must re-narrow or high bits would leak (PR-it155).
+    #[test]
+    fn native_sized_int_bitwise_width() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let neg = (0i8 - 8i8)\n    \
+                   print(\"{(0u8).bnot()}|{(255u8).shl(1)}|{(1u16).shl(15)}|{(12u8).band(10u8)}|{neg.shr(1)}|{neg.bnot()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "sizedbit").trim(), "255|254|32768|8|-4|7");
+    }
+
     /// Native string concatenation (k_concat's memcpy splice + direct-pointer fast path for
     /// String operands) stays byte-identical to interp: repeated concat builds the exact
     /// string, and a non-String operand still routes through k_show (PR-it154 perf).

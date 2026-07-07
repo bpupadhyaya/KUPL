@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_sized_int_bitwise_width_semantics() {
+        // Sized-int bitwise ops respect the operand WIDTH (unlike the default i64 Int): bnot is
+        // a width-wide complement, shifts wrap at the width, i8 shr is arithmetic (sign-
+        // extends), and a shift >= the width panics rather than hitting C's UB. Byte-identical
+        // on interp/KVM, and (per the native test) native masks to width too (PR-it155).
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(0u8).bnot()}|{(0u16).bnot()}|{(5i8).bnot()}|{(255u8).bnot()}\" }\n"),
+            "255|65535|-6|0"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(1u8).shl(7)}|{(255u8).shl(1)}|{(128u8).shr(1)}|{(1u16).shl(15)}\" }\n"),
+            "128|254|64|32768"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{(12u8).band(10u8)}|{(12u8).bor(10u8)}|{(12u8).bxor(10u8)}\" }\n"),
+            "8|14|6"
+        );
+        // i8 shr sign-extends; a shift amount at/above the width is a clean panic, not UB.
+        assert_eq!(differential("fun probe() -> Str { let neg = (0i8 - 8i8)\n    \"{neg.shr(1)}|{neg.bnot()}\" }\n"), "-4|7");
+        assert_eq!(differential("fun probe() -> Str { \"{(1u8).shl(8)}\" }\n"), "panic: shift amount must be in 0..=7");
+    }
+
+    #[test]
     fn diff_while_loop_and_break_continue() {
         // while runs while its condition holds (false-initial => zero iterations); break exits
         // the innermost loop; continue skips the rest of the current iteration; in nested loops
