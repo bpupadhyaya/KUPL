@@ -2082,6 +2082,31 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_merge_with_combiner_fold() {
+        // A bug-hunt-16 lock (it241): plain `merge` (last-wins) is certified in it160/it4097; KUPL
+        // has no builtin merge-with-fn, so the common "combine two count maps by SUMMING shared
+        // keys" idiom is written by hand — fold one map's keys into the other, adding the values.
+        // This exercises the ordering subtlety: the fold starts from `counts2` ({b, c}), updating a
+        // shared key ("b") IN PLACE keeps its slot, and a new key ("a") appends — so keys iterate
+        // [b, c, a], values [7, 7, 3]. Byte-identical on interp/KVM (native per the sweep); the rest
+        // of the batch-16 sweep (List partition/zip_with, Option<->Result ok_or/ok, tensor
+        // reductions) was already locked/consistent.
+        let src = r#"fun probe() -> Str {
+    let counts1 = Map().insert("a", 3).insert("b", 5)
+    let counts2 = Map().insert("b", 2).insert("c", 7)
+    let combined = counts1.keys().fold(counts2, fn(acc, k) {
+        acc.insert(k, acc.get(k).unwrap_or(0) + counts1.get(k).unwrap_or(0))
+    })
+    "{combined}|{combined.get("b")}|{combined.keys()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Map{"b": 7, "c": 7, "a": 3}|Some(7)|["b", "c", "a"]"#
+        );
+    }
+
+    #[test]
     fn diff_string_builder_report_in_loop() {
         // Extends diff_string_self_append (it202, the `s = s + x` concat form) to the report-builder
         // idiom an AI actually generates: accumulate a multiline string by INTERPOLATING the
