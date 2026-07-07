@@ -2771,7 +2771,10 @@ pub fn shared_method(
             }
             _ => Err("`get` needs an Int index".into()),
         },
-        (Value::Tensor(d), "sum") => Ok(Value::Float(d.iter().sum())),
+        // Accumulate from +0.0 (not Rust's `Iterator::sum`, whose f64 identity is
+        // -0.0) so an empty tensor sums to +0.0 — matching the native runtime's
+        // `double s = 0` byte-for-byte instead of printing "-0.0".
+        (Value::Tensor(d), "sum") => Ok(Value::Float(d.iter().fold(0.0_f64, |a, b| a + b))),
         (Value::Tensor(d), "mean") => {
             if d.is_empty() {
                 return Err("mean of an empty tensor".into());

@@ -4068,7 +4068,8 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_float(s / (double)t->len);
         }
         if (!strcmp(name, "max") || !strcmp(name, "min")) {
-            if (t->len == 0) k_panic("max/min of an empty tensor");
+            // per-op message to match the interpreter ("max of …" / "min of …").
+            if (t->len == 0) k_panic(name[1] == 'a' ? "max of an empty tensor" : "min of an empty tensor");
             double m = t->data[0];
             for (int64_t i = 1; i < t->len; i++) {
                 if (name[1] == 'a' ? t->data[i] > m : t->data[i] < m) m = t->data[i];
@@ -4832,6 +4833,23 @@ mod tests {
                    print(\"{[1, 2] == [1, 2]}{Pt(1, 2) == Pt(1, 2)}{Red == Blue}{Some([1, 2]) == Some([1, 2])}\
                    {ma == mb}{nan == nan}{-0.0 == 0.0}{\"Z\" < \"a\"}\")\n}\n";
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
+    }
+
+    /// Native tensor ops match the interpreter/KVM, including empty-sum = +0.0
+    /// (PR-it101 aligned the interp's Rust -0.0 identity to native's 0.0).
+    #[test]
+    fn native_tensor_ops_and_empty_sum() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let a = tensor([1.0, 2.0, 3.0, 4.0])\n    \
+                   let b = tensor([2.0, 0.0, 1.0, 3.0])\n    \
+                   print(\"{a.sum()}|{a.mean()}|{a.dot(b)}|{a.scale(0.5).to_list()}|{a.get(2)}|\
+                   {zeros(0).sum()}|{arange(4).to_list()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "tensor").trim(),
+            "10.0|2.5|17.0|[0.5, 1.0, 1.5, 2.0]|3.0|0.0|[0.0, 1.0, 2.0, 3.0]"
+        );
     }
 
     /// Native evaluates call arguments strictly left-to-right and short-circuits

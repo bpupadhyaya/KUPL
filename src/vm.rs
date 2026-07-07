@@ -1848,6 +1848,30 @@ mod tests {
     }
 
     #[test]
+    fn diff_tensor_ops_and_empty_edges() {
+        // Tensor construction, reductions, dot/scale/map and element access are
+        // byte-identical on interp and KVM — including float formatting.
+        let src = "fun probe() -> Str {\n    let a = tensor([1.0, 2.0, 3.0, 4.0])\n    \
+                   let b = tensor([2.0, 0.0, 1.0, 3.0])\n    \
+                   \"{a.sum()}|{a.mean()}|{a.max()}|{a.min()}|{a.dot(b)}|{a.scale(0.5).to_list()}|\
+                   {a.map(fn(x) { x * x }).to_list()}|{a.get(2)}|{arange(4).to_list()}\"\n}\n";
+        assert_eq!(
+            differential(src),
+            "10.0|2.5|4.0|1.0|17.0|[0.5, 1.0, 1.5, 2.0]|[1.0, 4.0, 9.0, 16.0]|3.0|[0.0, 1.0, 2.0, 3.0]"
+        );
+        // Empty-tensor edges: sum is +0.0 (PR-it101 fixed interp's Rust -0.0 identity to
+        // match native's 0.0), mean/max/min are clean per-op panics, out-of-range get.
+        assert_eq!(differential("fun probe() -> Str { \"{zeros(0).sum()}\" }\n"), "0.0");
+        assert_eq!(differential("fun probe() -> Str { \"{zeros(0).mean()}\" }\n"), "panic: mean of an empty tensor");
+        assert_eq!(differential("fun probe() -> Str { \"{zeros(0).max()}\" }\n"), "panic: max of an empty tensor");
+        assert_eq!(differential("fun probe() -> Str { \"{zeros(0).min()}\" }\n"), "panic: min of an empty tensor");
+        assert_eq!(
+            differential("fun probe() -> Str { \"{tensor([1.0]).get(5)}\" }\n"),
+            "panic: tensor index 5 out of range for length 1"
+        );
+    }
+
+    #[test]
     fn diff_map_self_insert_in_place_preserves_aliasing() {
         // The `m = m.insert(k, v)` in-place fast path (PR-it91, O(n^2)->O(n) map
         // build) must only fire when the Map is uniquely owned. An aliased map must
