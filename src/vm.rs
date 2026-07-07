@@ -2179,6 +2179,28 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_operator_precedence_and_short_circuit() {
+        // The operator-precedence ladder and left-associativity evaluate identically on
+        // interp/KVM, and && / || short-circuit — a RHS that would PANIC (1/0) is never reached
+        // when the LHS already decides the result (PR-it201).
+        let prec = r#"fun probe() -> Str {
+    "{2 + 3 * 4}|{(2 + 3) * 4}|{10 - 2 - 3}|{2 * 3 + 4 * 5}|{20 / 4 / 5}|{7 % 3 + 1}|{1 + 2 < 4 && 5 > 3}|{true || false && false}|{2 + 3 == 5 && 4 * 2 > 7}|{0 - 2 + 3}"
+}
+"#;
+        assert_eq!(differential(prec), "14|20|5|26|1|2|true|true|true|1");
+        // Short-circuit: boom() divides by zero, so if it were evaluated the program would panic.
+        let sc = r#"fun boom() -> Bool {
+    let x = 1 / 0
+    x > 0
+}
+fun probe() -> Str {
+    "{false && boom()}|{true || boom()}"
+}
+"#;
+        assert_eq!(differential(sc), "false|true");
+    }
+
+    #[test]
     fn diff_replace_json_largelist_edges() {
         // A second bug-hunt sweep (it200, ~10 probes) found no divergence; this locks the
         // subtlest deterministic edges it exercised, byte-identical on interp/KVM: str replace
