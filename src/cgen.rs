@@ -5542,6 +5542,26 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native date/time math matches interp/KVM: components, ISO round-trip, month-boundary
+    /// rollover, and leap-day arithmetic (2024 leap, 1900 not — the century rule) (PR-it159).
+    #[test]
+    fn native_date_time_arithmetic_and_components() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let t = date_make(2024, 2, 29, 12, 30, 45)
+    let leap = date_make(2024, 2, 28, 0, 0, 0) + 86400
+    let noleap = date_make(1900, 2, 28, 0, 0, 0) + 86400
+    print("{year_of(t)}-{month_of(t)}-{day_of(t)} wd={weekday_of(t)}|{date_iso(leap)}|{month_of(noleap)}-{day_of(noleap)}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "datetime").trim(),
+            "2024-2-29 wd=4|2024-02-29T00:00:00Z|3-1"
+        );
+    }
+
     /// Native string methods are UTF-8 char-aware, matching interp/KVM: reverse reverses by
     /// char (not byte, which would corrupt UTF-8), index_of/rfind return char indices, pad
     /// counts chars (PR-it158).

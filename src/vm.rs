@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_date_time_arithmetic_and_components() {
+        // The timestamp-based date API (date_make/date_iso/year_of/.../weekday_of) is
+        // byte-identical on interp/KVM with correct Gregorian semantics: components, ISO
+        // round-trip, month-boundary rollover, leap-day arithmetic (2024 leap, 1900 not — the
+        // century rule), and normalization of an out-of-range day (PR-it159).
+        let src = r#"fun probe() -> Str {
+    let t = date_make(2024, 2, 29, 12, 30, 45)
+    let comp = "{year_of(t)}-{month_of(t)}-{day_of(t)} wd={weekday_of(t)} yd={yearday_of(t)}"
+    let rt = date_iso(date_make(2024, 12, 31, 23, 59, 59))
+    let mb = date_make(2024, 1, 31, 0, 0, 0) + 86400
+    let leap = date_make(2024, 2, 28, 0, 0, 0) + 86400
+    let noleap = date_make(1900, 2, 28, 0, 0, 0) + 86400
+    let norm = date_iso(date_make(2023, 2, 29, 0, 0, 0))
+    "{comp}#{rt}#{month_of(mb)}-{day_of(mb)}#{month_of(leap)}-{day_of(leap)}#{month_of(noleap)}-{day_of(noleap)}#{norm}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "2024-2-29 wd=4 yd=60#2024-12-31T23:59:59Z#2-1#2-29#3-1#2023-03-01T00:00:00Z"
+        );
+    }
+
+    #[test]
     fn diff_string_method_surface_is_char_aware() {
         // The string-method surface is byte-identical on interp/KVM and consistently UTF-8
         // CHAR-aware (not byte-based): reverse reverses by char, index_of/rfind return char
