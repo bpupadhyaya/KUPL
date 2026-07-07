@@ -2134,6 +2134,21 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_range_and_for_loop_edges() {
+        // Ranges are hi-EXCLUSIVE; an empty range (lo == hi) and a reversed range (lo > hi)
+        // both iterate zero times; negative bounds work. `for` over a List preserves order;
+        // an empty iterable runs the body zero times; nested loops compose (PR-it152).
+        let src = "fun probe() -> Str {\n    var a = 0\n    for i in 1..4 { a = a + i }\n    \
+                   var b = 0\n    for i in 5..5 { b = b + 1 }\n    var c = 0\n    for i in 5..3 { c = c + 1 }\n    \
+                   var d = 0\n    for i in (0 - 3)..0 { d = d + i }\n    \
+                   var s = \"\"\n    for x in [3, 1, 2] { s = \"{s}{x}\" }\n    \
+                   var t = 0\n    for x in [] { t = t + 1 }\n    \
+                   var out: List[Int] = []\n    for i in 1..3 {\n        for j in 1..3 {\n            out = out.push(i * j)\n        }\n    }\n    \
+                   \"{a}|{b}|{c}|{d}|{s}|{t}|{out}\"\n}\n";
+        assert_eq!(differential(src), "6|0|0|-6|312|0|[1, 2, 2, 4]");
+    }
+
+    #[test]
     fn diff_higher_order_and_closure_depth() {
         // A returned closure keeps its own captured environment; two are independent.
         let ret = "fun adder(n: Int) -> fn(Int) -> Int { fn x { x + n } }\n\

@@ -5518,6 +5518,21 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "mutualrec").trim(), "true|true|true|abb");
     }
 
+    /// Native for-loop / range iteration matches interp/KVM: hi-exclusive ranges, empty and
+    /// reversed ranges iterate zero times, negative bounds, list order, nesting (PR-it152).
+    #[test]
+    fn native_range_and_for_loop_edges() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    var a = 0\n    for i in 1..4 { a = a + i }\n    \
+                   var c = 0\n    for i in 5..3 { c = c + 1 }\n    var d = 0\n    for i in (0 - 3)..0 { d = d + i }\n    \
+                   var s = \"\"\n    for x in [3, 1, 2] { s = \"{s}{x}\" }\n    \
+                   var out: List[Int] = []\n    for i in 1..3 {\n        for j in 1..3 {\n            out = out.push(i * j)\n        }\n    }\n    \
+                   print(\"{a}|{c}|{d}|{s}|{out}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "forloop").trim(), "6|0|-6|312|[1, 2, 2, 4]");
+    }
+
     /// Native recursive ADTs (self-referential heap-allocated values) build, traverse,
     /// display nested, and recurse deeply exactly like interp/KVM (PR-it137).
     #[test]
