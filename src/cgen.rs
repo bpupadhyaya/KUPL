@@ -3916,6 +3916,29 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return k_str(out);
         }
+        if (!strcmp(name, "center")) {
+            /* Center within `width` chars using the first CHAR of `fill`; extra padding on
+               the RIGHT when odd (lpad = total/2). Char-aware like pad_left/pad_right. */
+            if (args[0].tag != K_INT) k_panic("`center` needs an Int width");
+            int64_t width = args[0].as.i;
+            const char* fill = args[1].as.s;
+            const char* fc = fill[0] ? fill : " ";
+            int fcl = k_utf8_len((unsigned char)fc[0]);
+            int64_t cur = 0;
+            for (const char* p = s; *p; p++) if ((*p & 0xC0) != 0x80) cur++;
+            if (cur >= width || width > 100000000) return k_str(s);
+            int64_t total = width - cur;
+            int64_t lpad = total / 2;
+            int64_t rpad = total - lpad;
+            size_t sl = strlen(s);
+            char* out = k_alloc(sl + (size_t)total * fcl + 1);
+            for (int64_t i = 0; i < lpad; i++) memcpy(out + i * fcl, fc, fcl);
+            memcpy(out + (size_t)lpad * fcl, s, sl);
+            for (int64_t i = 0; i < rpad; i++)
+                memcpy(out + (size_t)lpad * fcl + sl + i * fcl, fc, fcl);
+            out[(size_t)lpad * fcl + sl + (size_t)rpad * fcl] = 0;
+            return k_str(out);
+        }
     }
     if (recv.tag == K_INT) {
         if (!strcmp(name, "to_str")) return k_to_str(recv);
@@ -5558,6 +5581,23 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native center() matches interp/KVM: char-aware width, extra padding on the right when
+    /// odd, and a multibyte fill placed as a full codepoint (PR-it180).
+    #[test]
+    fn native_string_center_alignment() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("[{"hi".center(6, "-")}]|[{"hi".center(7, "-")}]|[{"é".center(5, "*")}]|[{"x".center(4, "日")}]")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "centeral").trim(),
+            "[--hi--]|[--hi---]|[**é**]|[日x日日]"
+        );
     }
 
     /// Native to_radix and the NEW parse_radix match interp/KVM byte-for-byte, including the

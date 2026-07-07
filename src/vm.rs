@@ -2134,6 +2134,23 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_center_alignment() {
+        // The NEW center() completes the pad_left/pad_right trio, byte-identical on interp/KVM:
+        // char-aware width, extra padding on the RIGHT when odd, width <= length is a no-op, and
+        // a multibyte fill is placed as a full codepoint (PR-it180).
+        let src = r#"fun probe() -> Str {
+    let even = "hi".center(6, "-")
+    let odd = "hi".center(7, "-")
+    let noop = "hello".center(3, "-")
+    let uni = "é".center(5, "*")
+    let unifill = "x".center(4, "日")
+    "[{even}]|[{odd}]|[{noop}]|[{uni}]|[{unifill}]"
+}
+"#;
+        assert_eq!(differential(src), "[--hi--]|[--hi---]|[hello]|[**é**]|[日x日日]");
+    }
+
+    #[test]
     fn diff_radix_to_and_from_base() {
         // to_hex/to_binary/to_octal/to_radix and the NEW inverse parse_radix are byte-identical
         // on interp/KVM: lowercase digits, sign-prefixed negatives (not two's complement), 0 ->

@@ -147,7 +147,7 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 /// it need not track the method-resolution match perfectly.
 const BUILTIN_METHODS: &[&str] = &[
     "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "cbrt", "ceil",
-    "chars", "chunk", "clamp", "concat", "contains", "contains_key", "cos", "count",
+    "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "cos", "count",
     "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "filter",
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
@@ -2218,7 +2218,9 @@ impl Checker {
             (Ty::Str, "index_of") => Some((vec![Ty::Str], Ty::Option(Box::new(Ty::Int)))),
             (Ty::Str, "count") => Some((vec![Ty::Str], Ty::Int)),
             (Ty::Str, "slice") => Some((vec![Ty::Int, Ty::Int], Ty::Str)),
-            (Ty::Str, "pad_left") | (Ty::Str, "pad_right") => Some((vec![Ty::Int, Ty::Str], Ty::Str)),
+            (Ty::Str, "pad_left") | (Ty::Str, "pad_right") | (Ty::Str, "center") => {
+                Some((vec![Ty::Int, Ty::Str], Ty::Str))
+            }
             (Ty::Str, "lines") => Some((vec![], Ty::List(Box::new(Ty::Str)))),
             (Ty::Str, "rfind") => Some((vec![Ty::Str], Ty::Option(Box::new(Ty::Int)))),
             (Ty::Str, "replace_first") => Some((vec![Ty::Str, Ty::Str], Ty::Str)),

@@ -2362,6 +2362,28 @@ pub fn shared_method(
                 _ => Err("`pad_left`/`pad_right` need an Int width and a Str fill".into()),
             }
         }
+        (Value::Str(s), "center") => {
+            // Center within `width` (char count) using `fill`; when the padding is odd the
+            // extra fill goes on the RIGHT (lpad = total/2). Mirrors pad_left/pad_right: a
+            // width <= current length (or absurdly large) returns the string unchanged.
+            let mut it = args.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Int(width)), Some(Value::Str(ch))) => {
+                    let fill = ch.chars().next().unwrap_or(' ');
+                    let cur = s.chars().count() as i64;
+                    if cur >= width || width > 100_000_000 {
+                        Ok(Value::str(s.as_str().to_string()))
+                    } else {
+                        let total = (width - cur) as usize;
+                        let lpad = total / 2;
+                        let l: String = std::iter::repeat(fill).take(lpad).collect();
+                        let r: String = std::iter::repeat(fill).take(total - lpad).collect();
+                        Ok(Value::str(format!("{l}{s}{r}")))
+                    }
+                }
+                _ => Err("`center` needs an Int width and a Str fill".into()),
+            }
+        }
         (Value::Int(v), "to_str") => Ok(Value::str(v.to_string())),
         (Value::Int(v), "to_float") => Ok(Value::Float(*v as f64)),
         // Int -> sized int: checked narrowing, panics if out of range.
