@@ -2698,6 +2698,22 @@ pub fn shared_method(
         // Population count over the 64-bit two's-complement representation: a negative counts
         // the set bits of its i64 bit pattern ((-1).count_ones() = 64).
         (Value::Int(v), "count_ones") => Ok(Value::Int(v.count_ones() as i64)),
+        // Base-10 digits of |n|, most-significant first: 0 -> [0], and negatives use unsigned_abs
+        // so i64::MIN (whose .abs() would overflow) is handled — its magnitude is 2^63.
+        (Value::Int(v), "digits") => {
+            let mut n = v.unsigned_abs();
+            let mut ds: Vec<Value> = Vec::new();
+            if n == 0 {
+                ds.push(Value::Int(0));
+            } else {
+                while n > 0 {
+                    ds.push(Value::Int((n % 10) as i64));
+                    n /= 10;
+                }
+                ds.reverse();
+            }
+            Ok(Value::List(Rc::new(ds)))
+        }
         // Leading/trailing zero bits of the 64-bit pattern; both are 64 for 0 (matching Rust,
         // and the native impl must guard 0 since C clz/ctz of 0 is undefined behavior).
         (Value::Int(v), "leading_zeros") => Ok(Value::Int(v.leading_zeros() as i64)),

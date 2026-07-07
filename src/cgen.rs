@@ -4094,6 +4094,18 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         /* Population count over the 64-bit two's-complement pattern, matching Rust
            i64::count_ones ((-1).count_ones() = 64). */
         if (!strcmp(name, "count_ones")) return k_int(__builtin_popcountll((uint64_t)recv.as.i));
+        /* Base-10 digits of |n|, most-significant first. Use unsigned negation so i64::MIN's
+           magnitude (2^63) is well-defined; 0 -> [0]. Max 20 digits for a u64. */
+        if (!strcmp(name, "digits")) {
+            uint64_t n = recv.as.i < 0 ? (uint64_t)0 - (uint64_t)recv.as.i : (uint64_t)recv.as.i;
+            KValue tmp[20];
+            int cnt = 0;
+            if (n == 0) tmp[cnt++] = k_int(0);
+            else while (n > 0) { tmp[cnt++] = k_int((int64_t)(n % 10)); n /= 10; }
+            KValue* out = k_alloc(sizeof(KValue) * cnt);
+            for (int i = 0; i < cnt; i++) out[i] = tmp[cnt - 1 - i];
+            return k_list(out, cnt);
+        }
         /* Leading/trailing zeros; C __builtin_clzll/ctzll are UNDEFINED for 0, so return 64
            for 0 to match Rust i64::leading_zeros(0)/trailing_zeros(0) = 64. */
         if (!strcmp(name, "leading_zeros"))
@@ -6197,6 +6209,24 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "numlit").trim(),
             "255|240|1000000|-1|150.0|0.0025|602200000000000027262976.0"
+        );
+    }
+
+    /// Native Int.digits returns base-10 digits MSB-first, matching interp/KVM including the
+    /// i64::MIN edge (unsigned negation gives 2^63, not UB) (PR-it209).
+    #[test]
+    fn native_int_digits() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let imin = (0 - 9223372036854775807) - 1
+    print("{(12345).digits()}|{(0).digits()}|{(100).digits()}|{imin.digits()}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "intdigits").trim(),
+            "[1, 2, 3, 4, 5]|[0]|[1, 0, 0]|[9, 2, 2, 3, 3, 7, 2, 0, 3, 6, 8, 5, 4, 7, 7, 5, 8, 0, 8]"
         );
     }
 

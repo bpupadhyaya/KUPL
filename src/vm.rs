@@ -2179,6 +2179,23 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_int_digits() {
+        // The NEW Int.digits() returns the base-10 digits of |n| most-significant first,
+        // byte-identical on interp/KVM. Edges: 0 -> [0], negatives use the magnitude, and i64::MIN
+        // works because the impl takes unsigned_abs (2^63) rather than .abs() (which overflows)
+        // (PR-it209).
+        let src = r#"fun probe() -> Str {
+    let imin = (0 - 9223372036854775807) - 1
+    "{(12345).digits()}|{(0).digits()}|{(0 - 12345).digits()}|{(100).digits()}|{(9223372036854775807).digits()}|{imin.digits()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[1, 2, 3, 4, 5]|[0]|[1, 2, 3, 4, 5]|[1, 0, 0]|[9, 2, 2, 3, 3, 7, 2, 0, 3, 6, 8, 5, 4, 7, 7, 5, 8, 0, 7]|[9, 2, 2, 3, 3, 7, 2, 0, 3, 6, 8, 5, 4, 7, 7, 5, 8, 0, 8]"
+        );
+    }
+
+    #[test]
     fn diff_list_rotate() {
         // The NEW rotate_left(n)/rotate_right(n) cyclically shift a list, byte-identical on
         // interp/KVM. n is floor-modded by the length so a full rotation (n==len) and n>len are
