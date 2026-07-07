@@ -1883,6 +1883,25 @@ mod tests {
     }
 
     #[test]
+    fn diff_string_unicode_is_char_indexed() {
+        // Every string op is CHAR-indexed (never byte-indexed), byte-identical on
+        // interp/KVM, across 2-byte (é), 3-byte (世) and 4-byte (🎉) characters.
+        let src = "fun probe() -> Str {\n    let s = \"aé世b\"\n    \
+                   \"{\"aé世🎉\".len()}|{s.slice(1, 3)}|{s.index_of(\"世\")}|{s.slice(1, 99)}|\
+                   {\"a世b🎉\".reverse()}|{\"éxéxé\".count(\"é\")}|{\"éé世\".replace(\"é\", \"x\")}|\
+                   {\"世\".pad_left(3, \"-\")}\"\n}\n";
+        assert_eq!(
+            differential(src),
+            "4|é世|Some(2)|é世b|🎉b世a|3|xx世|--世"
+        );
+        // chars() yields whole characters; split keeps multibyte parts intact.
+        assert_eq!(
+            differential("fun probe() -> Str { let c = \"a世🎉\".chars()\n    \"{c.len()}|{c.get(1)}|{c.get(2)}\" }\n"),
+            "3|Some(\"世\")|Some(\"🎉\")"
+        );
+    }
+
+    #[test]
     fn diff_bigint_and_rational_edges() {
         // Arbitrary-precision BigInt: exact huge products, truncated-toward-zero div/mod
         // with negatives, and a clean div-by-zero panic — byte-identical on interp/KVM.

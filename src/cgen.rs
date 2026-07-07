@@ -4835,6 +4835,19 @@ mod tests {
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
     }
 
+    /// Native's C string runtime decodes UTF-8: all string ops are char-indexed and
+    /// match the interpreter/KVM across multibyte characters (no byte-index corruption).
+    #[test]
+    fn native_string_unicode_is_char_indexed() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let s = \"aé世b\"\n    \
+                   print(\"{\"aé世🎉\".len()}|{s.slice(1, 3)}|{s.index_of(\"世\")}|{\"a世b🎉\".reverse()}|\
+                   {\"éxéxé\".count(\"é\")}|{\"éé世\".replace(\"é\", \"x\")}|{\"世\".pad_left(3, \"-\")}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "uni").trim(), "4|é世|Some(2)|🎉b世a|3|xx世|--世");
+    }
+
     /// Native has its own bignum runtime; BigInt/Rational results match interp/KVM
     /// exactly (exact products, factorial, reduced rationals, conversions).
     #[test]
