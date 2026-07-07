@@ -2045,9 +2045,18 @@ impl Checker {
                 span,
             );
         }
+        // Track supplied field names so a repeated named field is caught rather than silently
+        // overwriting (interp) or crashing at runtime (KVM) — a duplicate can even mask a missing
+        // field when the argument count happens to match (PR-it213).
+        let mut supplied: HashSet<String> = HashSet::new();
         for (i, arg) in args.iter().enumerate() {
             let target = match &arg.name {
-                Some(n) => fields.iter().find(|(fname, _)| fname == n).cloned(),
+                Some(n) => {
+                    if !supplied.insert(n.clone()) {
+                        self.err("K0244", format!("duplicate field `{n}` in `{ctor}`"), arg.value.span);
+                    }
+                    fields.iter().find(|(fname, _)| fname == n).cloned()
+                }
                 None => fields.get(i).cloned(),
             };
             let at = self.infer_expr(&arg.value, ctx);
@@ -2063,6 +2072,15 @@ impl Checker {
                         };
                         self.err("K0244", msg, arg.value.span);
                     }
+                }
+            }
+        }
+        // When every argument is named and the count lines up, a duplicate can hide a field that
+        // was never supplied — the count check above wouldn't fire, so name the missing field.
+        if args.len() == fields.len() && !args.is_empty() && args.iter().all(|a| a.name.is_some()) {
+            for (fname, _) in fields {
+                if !supplied.contains(fname) {
+                    self.err("K0243", format!("missing field `{fname}` in `{ctor}`"), span);
                 }
             }
         }
@@ -2953,6 +2971,22 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_record_field_is_rejected_at_check_time() {
+        // A repeated named field used to slip past the checker (arg count matched) and then
+        // DIVERGE at runtime: interp silently left the missing field Unit while KVM crashed. Now
+        // it's rejected at check time — duplicate `x` AND the masked missing `y` (PR-it213).
+        let e = errors("type P = { x: Int, y: Int }\nfun main() { let p = P(x: 1, x: 2)\n    let _ = p.x }\n");
+        assert!(e.iter().any(|d| d.code == "K0244" && d.message.contains("duplicate field `x`")), "dup: {e:?}");
+        assert!(e.iter().any(|d| d.code == "K0243" && d.message.contains("missing field `y`")), "missing: {e:?}");
+        // A duplicate with a surplus arg still flags the duplicate.
+        let e3 = errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(x: 1, x: 2, y: 3) }\n");
+        assert!(e3.iter().any(|d| d.code == "K0244" && d.message.contains("duplicate field `x`")), "dup3: {e3:?}");
+        // Valid constructions — in order, out of order, and a generic ctor — still type-check.
+        assert!(errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(x: 1, y: 2)\n    let _ = P(y: 20, x: 10) }\n").is_empty());
+        assert!(errors("type Box[T] = Box(v: T)\nfun main() { let _ = Box(v: 5) }\n").is_empty());
     }
 
     #[test]
