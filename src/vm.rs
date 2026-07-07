@@ -2082,6 +2082,26 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_adt_unary_ctor_and_depth() {
+        // it3883 locked recursive-ADT eval over Num|Add|Mul (all leaf-or-binary ctors). This extends
+        // it to two shapes real ASTs need but that test omits (it245): a UNARY self-referential
+        // constructor `Neg(e: Expr)` (one recursive field, displays `Neg(...)`, negates via
+        // `0 - eval(e)`), and a `depth` traversal that combines children with MAX rather than sum —
+        // a distinct recursion shape from the sum-fold. Nested `Neg(Neg(Num(1)))` recurses through
+        // the unary ctor twice. Byte-identical on interp/KVM (native per the sweep).
+        let src = "type Expr = Num(n: Int) | Add(l: Expr, r: Expr) | Mul(l: Expr, r: Expr) | Neg(e: Expr)\n\
+                   fun eval(e: Expr) -> Int { match e {\n        Num(n) => n\n        Add(l, r) => eval(l) + eval(r)\n        Mul(l, r) => eval(l) * eval(r)\n        Neg(e) => 0 - eval(e)\n    } }\n\
+                   fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }\n\
+                   fun depth(e: Expr) -> Int { match e {\n        Num(n) => 1\n        Add(l, r) => 1 + maxi(depth(l), depth(r))\n        Mul(l, r) => 1 + maxi(depth(l), depth(r))\n        Neg(e) => 1 + depth(e)\n    } }\n\
+                   fun probe() -> Str {\n    let e = Add(l: Mul(l: Num(n: 3), r: Num(n: 4)), r: Neg(e: Num(n: 5)))\n    \
+                   \"{eval(e)}|{depth(e)}|{eval(Mul(l: e, r: Num(n: 10)))}|{depth(Neg(e: Neg(e: Num(n: 1))))}|{e}\" }\n";
+        assert_eq!(
+            differential(src),
+            "7|3|70|3|Add(Mul(Num(3), Num(4)), Neg(Num(5)))"
+        );
+    }
+
+    #[test]
     fn diff_float_fmt_vs_format_rounding_modes() {
         // A bug-hunt-17 lock (it244): KUPL has TWO fixed-precision float formatters with DIFFERENT
         // half-way rounding, and both must be byte-identical across engines. `fmt(n)` rounds
