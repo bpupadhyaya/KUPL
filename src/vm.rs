@@ -2082,6 +2082,36 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_build_from_pairs_and_group_by() {
+        // A common AI-generated data-processing idiom, byte-identical on interp/KVM (and native, per
+        // the sweep): (a) build a Map by folding a list of [key, value] pairs in a for-loop; (b) the
+        // canonical GROUP-BY — accumulate a Map[Str, List] where each key maps to the list of items
+        // sharing it, via get-or-empty-list, push, re-insert. This is a step beyond the scalar
+        // Map[Str, Int] word-count (it217): the value is a growing List, so it exercises the empty
+        // collection default `unwrap_or([])`, a List push that builds a new list, and a List-valued
+        // re-insert (which keeps the key's position per it224). Keys iterate in first-seen order and
+        // each bucket in encounter order (PR-it237).
+        let src = r#"fun probe() -> Str {
+    let pairs = [["a", "1"], ["b", "2"], ["c", "3"]]
+    var m = Map()
+    for p in pairs {
+        m = m.insert(p.get(0).unwrap_or(""), p.get(1).unwrap_or(""))
+    }
+    var groups = Map()
+    for w in ["apple", "ant", "bear", "bee", "cat"] {
+        let key = w.chars().get(0).unwrap_or("?")
+        groups = groups.insert(key, groups.get(key).unwrap_or([]).push(w))
+    }
+    "{m}|{m.len()}|{groups.get("a")}|{groups.get("b")}|{groups.get("c")}|{groups.keys()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Map{"a": "1", "b": "2", "c": "3"}|3|Some(["apple", "ant"])|Some(["bear", "bee"])|Some(["cat"])|["a", "b", "c"]"#
+        );
+    }
+
+    #[test]
     fn diff_set_algebra_composed_chain() {
         // A bug-hunt-14 lock (it235): it161/it123 certified each set operation in ISOLATION on a
         // freshly-constructed set; this certifies a COMPOSED chain where each op's result (a new set)
