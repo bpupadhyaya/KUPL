@@ -2082,6 +2082,37 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_hof_comprehension_pipeline() {
+        // A composed higher-order pipeline — filter -> sort_by -> map -> fold, plus position/all/any
+        // and sum — is byte-identical on interp/KVM (and native, per the sweep). This chains the
+        // individual list HOFs certified in it127/165/212 into the kind of comprehension an AI would
+        // generate, and critically exercises STABLE sort_by across ties: two people aged 25 (Bob,
+        // Di) keep insertion order, and two names of length 3 (Ann, Bob) do too (PR-it229).
+        let recs = r#"type P = { name: Str, age: Int }
+fun probe() -> Str {
+    let people = [P(name: "Ann", age: 30), P(name: "Bob", age: 25), P(name: "Cy", age: 35), P(name: "Di", age: 25)]
+    let adults = people.filter(fn p { p.age >= 25 }).sort_by(fn p { p.age }).map(fn p { p.name })
+    let total = people.map(fn p { p.age }).filter(fn a { a > 24 }).fold(0, fn(acc, a) { acc + a })
+    let names = people.map(fn p { p.name }).sort_by(fn s { s.len() })
+    "{adults}|{total}|{names}|{people.map(fn p { p.age }).sum()}"
+}
+"#;
+        assert_eq!(
+            differential(recs),
+            r#"["Bob", "Di", "Ann", "Cy"]|115|["Cy", "Di", "Ann", "Bob"]|115"#
+        );
+        let ints = r#"fun probe() -> Str {
+    let xs = [5, 3, 8, 1, 9, 2, 7]
+    let evens = xs.filter(fn x { x % 2 == 0 })
+    let sorted = xs.sort_by(fn x { x })
+    let firstBig = xs.position(fn x { x > 6 })
+    "{evens}|{sorted}|{firstBig}|{xs.all(fn x { x > 0 })}|{xs.any(fn x { x > 8 })}|{xs.map(fn x { x * x }).fold(0, fn(a, x) { a + x })}"
+}
+"#;
+        assert_eq!(differential(ints), "[8, 2]|[1, 2, 3, 5, 7, 8, 9]|Some(2)|true|true|233");
+    }
+
+    #[test]
     fn diff_ackermann_nonprimitive_recursion() {
         // A bug-hunt-11 lock (it227): the Ackermann function is the canonical NON-primitive-recursive
         // function — its `ackermann(m - 1, ackermann(m, n - 1))` arm nests a recursive call inside
