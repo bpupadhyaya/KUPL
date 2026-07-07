@@ -77,20 +77,32 @@ impl Scopes {
 }
 
 /// Levenshtein edit distance (small strings — identifier names).
+/// Optimal-string-alignment (restricted Damerau-Levenshtein) edit distance. Unlike plain
+/// Levenshtein, a transposition of two adjacent characters costs 1, not 2 — so a common typo
+/// like `Itn` for `Int` or `lenght` for `length` is distance 1 and a "did you mean" fires even
+/// for short names (which cap the allowed distance at 1). The distance is always <= the plain
+/// Levenshtein distance, so this only ever adds suggestions, never removes them.
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0usize; b.len() + 1];
-    for i in 1..=a.len() {
-        cur[0] = i;
-        for j in 1..=b.len() {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut cur);
+    let (n, m) = (a.len(), b.len());
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
     }
-    prev[b.len()]
+    for j in 0..=m {
+        d[0][j] = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[n][m]
 }
 
 /// The nearest candidate name to `name` within a small edit distance, for a
@@ -2857,6 +2869,22 @@ mod generic_tests {
     }
 
     #[test]
+    fn did_you_mean_handles_transpositions() {
+        // A transposition of two adjacent characters (a very common typo) is edit-distance 1
+        // under the Damerau-Levenshtein metric, so "did you mean" fires even for short names
+        // where the allowed distance is 1 — across types, methods, constructors, and names.
+        let ty = errors("fun f(x: Itn) -> Int { x }\nfun main() {}\n");
+        assert!(ty.iter().any(|d| d.code == "K0205" && d.message.contains("did you mean `Int`?")), "{ty:?}");
+        let meth = errors("fun main() uses io {\n    print([1, 2, 3].frist())\n}\n");
+        assert!(meth.iter().any(|d| d.code == "K0249" && d.message.contains("did you mean `first`?")), "{meth:?}");
+        let ctor = errors("type T = Foo | Bar\nfun f(x: T) -> Int { match x { Bra => 1\n _ => 0 } }\nfun main() {}\n");
+        assert!(ctor.iter().any(|d| d.message.contains("did you mean `Bar`?")), "{ctor:?}");
+        // A genuinely far-off name still gets no suggestion (no spurious hints).
+        let far = errors("fun main() { let z = zzzzqqq }\n");
+        assert!(!far.iter().any(|d| d.message.contains("did you mean")), "{far:?}");
+    }
+
+    #[test]
     fn did_you_mean_fields() {
         // K0230 field access -> nearest field name.
         let e = errors("type Point = Point(x: Int, y: Int)\nfun main() uses io {\n    let p = Point(x: 1, y: 2)\n    print(p.xx)\n}\n");
@@ -2919,7 +2947,8 @@ mod generic_tests {
 
     #[test]
     fn edit_distance_and_suggest() {
-        assert_eq!(super::edit_distance("compute", "comptue"), 2);
+        // A transposition of two adjacent chars is distance 1 (Damerau-Levenshtein), not 2.
+        assert_eq!(super::edit_distance("compute", "comptue"), 1);
         assert_eq!(super::edit_distance("total", "totl"), 1);
         assert_eq!(super::edit_distance("abc", "xyz"), 3);
         // ties broken alphabetically; nothing close -> None
