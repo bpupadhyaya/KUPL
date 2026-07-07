@@ -2082,6 +2082,28 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_set_algebra_composed_chain() {
+        // A bug-hunt-14 lock (it235): it161/it123 certified each set operation in ISOLATION on a
+        // freshly-constructed set; this certifies a COMPOSED chain where each op's result (a new set)
+        // feeds the next — a.union(b).difference(c).intersect(d). Insertion order must be preserved
+        // THROUGH the composition, not just for single ops, so the intermediate sets carry their
+        // order into the next operation. Byte-identical on interp/KVM (and native, per the sweep):
+        // {1,2,3,4,5} ∪ {4,5,6,7} = {1..7}, ∖ {2,4,6} = {1,3,5,7}, ∩ {1,3,5,7,9} = {1,3,5,7}. The rest
+        // of the batch-14 sweep (recursive-ADT tree sum/depth, Map values fold/map_values, Result `?`
+        // type-matching K0238) was already locked/consistent.
+        let src = r#"fun probe() -> Str {
+    let a = Set([1, 2, 3, 4, 5])
+    let b = Set([4, 5, 6, 7])
+    let c = Set([2, 4, 6])
+    let chain = a.union(b).difference(c).intersect(Set([1, 3, 5, 7, 9]))
+    let chain2 = b.union(c).symmetric_difference(a).difference(Set([7]))
+    "{chain}|{chain2}|{chain.len()}"
+}
+"#;
+        assert_eq!(differential(src), "Set{1, 3, 5, 7}|Set{6, 1, 3}|4");
+    }
+
+    #[test]
     fn diff_nested_closure_loop_capture_and_currying() {
         // Extends diff_higher_order_and_closure_depth (it202/it3415, a 1-level returned closure and
         // a no-arg loop-capture) with two deeper cases, byte-identical on interp/KVM (and native, per
