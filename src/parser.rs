@@ -180,6 +180,16 @@ impl Parser {
                 Ok(())
             }
             Tok::RBrace | Tok::Eof => Ok(()),
+            // A `{` right after an identifier is almost always an attempted record literal with
+            // braces (`Point{x: 1}`); KUPL builds records with parentheses. Name that fix rather
+            // than the bare "expected end of statement" (PR-it243, cf. it228 for `with`).
+            Tok::LBrace if matches!(&self.toks[self.pos.saturating_sub(1)].tok, Tok::Ident(_)) => {
+                Err(Diag::error(
+                    "K0102",
+                    "records are constructed with parentheses — write `Name(field: value)`, not `Name{field: value}`".to_string(),
+                    self.span(),
+                ))
+            }
             other => Err(Diag::error(
                 "K0102",
                 format!("expected end of statement, found {}", other.describe()),
@@ -2089,6 +2099,19 @@ app Main {
     fn ai_is_still_an_ordinary_identifier() {
         let p = ok("fun f(ai: Int) -> Int {\n    let ai = ai + 1\n    ai\n}\n");
         assert_eq!(p.items.len(), 1);
+    }
+
+    #[test]
+    fn record_literal_with_braces_names_the_paren_fix() {
+        // `Point{x: 1}` is a common mistake — records use parens. K0102 now names the fix rather
+        // than the bare "expected end of statement, found `{`" (PR-it243).
+        let (_p, diags) = parse("type Point = { x: Int, y: Int }\nfun f() -> Int {\n    let p = Point{x: 1, y: 2}\n    p.x\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0102" && d.message.contains("records are constructed with parentheses")),
+            "{diags:?}"
+        );
+        // The correct paren form still parses cleanly.
+        assert!(parse("type Point = { x: Int, y: Int }\nfun f() -> Int {\n    let p = Point(x: 1, y: 2)\n    p.x\n}\n").1.is_empty());
     }
 
     #[test]
