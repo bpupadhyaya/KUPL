@@ -934,6 +934,31 @@ mod tests {
     }
 
     #[test]
+    fn run_tests_reports_pass_fail_and_catches_panics() {
+        // `kupl test` runs `law` blocks: a satisfied law exits 0, a violated one exits 1,
+        // and a law that PANICS at runtime is caught and reported as a failure (exit 1),
+        // never crashing the runner. (PR-it118 certified; forall counterexamples are
+        // deterministic — verified end-to-end via the CLI.)
+        let dir = std::env::temp_dir().join(format!("kupl-runtests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_str().unwrap().to_string()
+        };
+        let pass = write("pass.kupl", "fun add(a: Int, b: Int) -> Int { a + b }\nlaw \"ok\" {\n    expect add(2, 3) == 5\n}\n");
+        assert_eq!(super::run_tests(&pass), 0, "a satisfied law exits 0");
+        let fail = write("fail.kupl", "fun add(a: Int, b: Int) -> Int { a + b }\nlaw \"bad\" {\n    expect add(2, 3) == 6\n}\n");
+        assert_eq!(super::run_tests(&fail), 1, "a violated law exits 1");
+        let panic = write("panic.kupl", "fun bad(n: Int) -> Int { n / 0 }\nlaw \"boom\" {\n    expect bad(5) == 0\n}\n");
+        assert_eq!(super::run_tests(&panic), 1, "a panicking law is a caught failure, not a crash");
+        // a file with no laws is not an error.
+        let none = write("none.kupl", "fun add(a: Int, b: Int) -> Int { a + b }\n");
+        assert_eq!(super::run_tests(&none), 0, "no tests is a clean pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn emit_context_resolves_item_and_errors_on_missing() {
         // `kupl context <file> <item>` emits the item + its direct-dependency closure
         // for an LLM. A present item resolves (rc 0); a name that doesn't exist is a
