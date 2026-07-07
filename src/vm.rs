@@ -2104,6 +2104,33 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_scan_over_records_with_record_accumulator() {
+        // A bug-hunt-36 lock (it285): scan where BOTH the elements AND the accumulator are records --
+        // the "running balance over a transaction ledger" idiom. it274 scans a list of Ints into a
+        // record accumulator; this pins the closure destructuring the ELEMENT record (t.delta) while
+        // threading the STATE record (Bal), including negative deltas that decrease the running total.
+        //   txns = [deposit +100, withdraw -30, deposit +50, fee -5]  (each a Txn record)
+        //   scan(Bal(total:0, count:0), (b,t) -> Bal(b.total + t.delta, b.count + 1))
+        //     running balances (scan excludes the seed) == [100, 70, 120, 115]
+        //     final == Bal(total: 115, count: 4)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms scan reads a field off each
+        // element record and constructs a fresh accumulator record per step, so a running-total that
+        // both rises (deposits) and falls (withdrawals/fees) tracks correctly, and .last() recovers the
+        // final state.
+        let src = r#"type Txn = { desc: Str, delta: Int }
+type Bal = { total: Int, count: Int }
+fun probe() -> Str {
+    let txns = [Txn(desc: "deposit", delta: 100), Txn(desc: "withdraw", delta: 0 - 30), Txn(desc: "deposit", delta: 50), Txn(desc: "fee", delta: 0 - 5)]
+    let running = txns.scan(Bal(total: 0, count: 0), fn(b, t) { Bal(total: b.total + t.delta, count: b.count + 1) })
+    let balances = running.map(fn b { b.total })
+    let final = running.last().unwrap_or(Bal(total: 0, count: 0))
+    "{balances}|final={final.total} n={final.count}"
+}
+"#;
+        assert_eq!(differential(src), "[100, 70, 120, 115]|final=115 n=4");
+    }
+
+    #[test]
     fn diff_nested_if_cascade_grade_classification() {
         // A certification lock (it284): the cascading-threshold classification idiom -- a deep
         // nested-if (if/else-if chain) that maps a numeric score into one of five named buckets by
