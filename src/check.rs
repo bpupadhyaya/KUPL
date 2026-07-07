@@ -1350,7 +1350,7 @@ impl Checker {
                         }
                         let t = self.default_numeric(t);
                         if !t.is_numeric() && t != Ty::Str {
-                            self.err("K0234", format!("cannot order values of type {t}"), expr.span);
+                            self.err("K0234", format!("cannot order values of type {t}; only Int, Float, and Str can be compared"), expr.span);
                         }
                         Ty::Bool
                     }
@@ -2118,7 +2118,7 @@ impl Checker {
             (Ty::List(t), "sort") => {
                 let elem = self.uni.apply(t);
                 if !matches!(elem, Ty::Int | Ty::Float | Ty::Str | Ty::Var(_)) {
-                    self.err("K0234", format!("cannot order values of type {elem}"), span);
+                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, and Str can be compared"), span);
                 }
                 Some((vec![], Ty::List(t.clone())))
             }
@@ -2161,7 +2161,7 @@ impl Checker {
             (Ty::List(t), "min") | (Ty::List(t), "max") => {
                 let elem = self.uni.apply(t);
                 if !matches!(elem, Ty::Int | Ty::Float | Ty::Str | Ty::Var(_)) {
-                    self.err("K0234", format!("cannot order values of type {elem}"), span);
+                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, and Str can be compared"), span);
                 }
                 Some((vec![], Ty::Option(t.clone())))
             }
@@ -2921,6 +2921,22 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    #[test]
+    fn order_error_names_the_orderable_types() {
+        // K0234 now names which types ARE orderable so the fix is obvious, at all three trigger
+        // sites: a comparison operator, List.sort, and List.min/max (PR-it193). The change is
+        // message-text only — orderable types (Int/Float/Str) still type-check.
+        let hint = "only Int, Float, and Str can be compared";
+        let cmp = errors("type P = P(x: Int)\nfun main() { let b = P(1) < P(2)\n    let _ = b }\n");
+        assert!(cmp.iter().any(|d| d.code == "K0234" && d.message.contains(hint)), "cmp: {cmp:?}");
+        let sort = errors("type P = P(x: Int)\nfun main() { let _ = [P(1), P(2)].sort() }\n");
+        assert!(sort.iter().any(|d| d.code == "K0234" && d.message.contains(hint)), "sort: {sort:?}");
+        let max = errors("type P = P(x: Int)\nfun main() { let _ = [P(1), P(2)].max() }\n");
+        assert!(max.iter().any(|d| d.code == "K0234" && d.message.contains(hint)), "max: {max:?}");
+        // Orderable element types are still accepted (no behavior change).
+        assert!(errors("fun main() { let _ = [3, 1, 2].sort()\n    let _ = \"a\" < \"b\" }\n").is_empty());
     }
 
     #[test]
