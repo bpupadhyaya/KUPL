@@ -1883,6 +1883,29 @@ mod tests {
     }
 
     #[test]
+    fn diff_pattern_matching_depth() {
+        // Guards (first-match-wins, may reference the bound variable), byte-identical.
+        let guard = "fun cls(n: Int) -> Str { match n {\n        x if x > 10 => \"big\"\n        \
+                     x if x > 0 => \"small\"\n        _ => \"nonpos\"\n    } }\n\
+                     fun probe() -> Str { \"{cls(50)}|{cls(5)}|{cls(-1)}\" }\n";
+        assert_eq!(differential(guard), "big|small|nonpos");
+        // Or-patterns (non-binding) and range patterns (lo..hi exclusive).
+        assert_eq!(
+            differential("fun f(n: Int) -> Str { match n {\n        1 | 2 | 3 => \"low\"\n        _ => \"other\"\n    } }\nfun probe() -> Str { \"{f(2)}|{f(9)}\" }\n"),
+            "low|other"
+        );
+        assert_eq!(
+            differential("fun g(n: Int) -> Str { match n {\n        0..60 => \"F\"\n        60..90 => \"B\"\n        _ => \"A\"\n    } }\nfun probe() -> Str { \"{g(50)}|{g(75)}|{g(95)}\" }\n"),
+            "F|B|A"
+        );
+        // Nested constructor destructuring binds inner fields.
+        let nested = "type Pt = Pt(x: Int, y: Int)\ntype Seg = Seg(a: Pt, b: Pt)\n\
+                      fun mid(s: Seg) -> Str { match s {\n        Seg(Pt(x1, y1), Pt(x2, y2)) => \"{(x1 + x2) / 2},{(y1 + y2) / 2}\"\n    } }\n\
+                      fun probe() -> Str { \"{mid(Seg(Pt(0, 0), Pt(10, 4)))}\" }\n";
+        assert_eq!(differential(nested), "5,2");
+    }
+
+    #[test]
     fn diff_option_result_and_try_operator() {
         // Option/Result methods behave identically on interp/KVM.
         let opt = "fun probe() -> Str {\n    let s: Option[Int] = Some(2)\n    let n: Option[Int] = None\n    \

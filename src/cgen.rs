@@ -4835,6 +4835,21 @@ mod tests {
         assert_eq!(native_main_stdout(src, "eqcmp").trim(), "truetruefalsetruetruefalsetruetrue");
     }
 
+    /// Native pattern matching (guards, or-patterns, ranges, nested destructure)
+    /// matches interp/KVM.
+    #[test]
+    fn native_pattern_matching_depth() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Pt = Pt(x: Int, y: Int)\ntype Seg = Seg(a: Pt, b: Pt)\n\
+                   fun cls(n: Int) -> Str { match n {\n        x if x > 10 => \"big\"\n        1 | 2 | 3 => \"low\"\n        \
+                   0..10 => \"mid\"\n        _ => \"neg\"\n    } }\n\
+                   fun mid(s: Seg) -> Str { match s {\n        Seg(Pt(a, b), Pt(c, d)) => \"{(a + c) / 2},{(b + d) / 2}\"\n    } }\n\
+                   fun main() uses io {\n    print(\"{cls(50)}|{cls(2)}|{cls(5)}|{cls(-1)}|{mid(Seg(Pt(0, 0), Pt(10, 4)))}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "pat").trim(), "big|low|mid|neg|5,2");
+    }
+
     /// Native Option/Result methods and the `?` operator match interp/KVM, including
     /// `?` early-returning Err from the enclosing function.
     #[test]
