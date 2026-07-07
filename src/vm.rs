@@ -2104,6 +2104,41 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_option_ok_or_result_bridge_in_function() {
+        // A certification lock (it273): the Option->Result BRIDGE. A lookup returns Option (Map.get),
+        // ok_or converts it to a Result with a DYNAMIC error message carrying the missing key, and the
+        // resulting Result then flows through map/and_then/unwrap_or as a railway. Prior locks cover
+        // ok_or in isolation (it4175/4552) and Result combinators without the bridge (it269); this pins
+        // the whole "optional lookup -> fallible pipeline" pattern in a typed function, which is how an
+        // AI turns a missing-key case into a contextualized error.
+        //   lookup(m,k) = m.get(k).ok_or("missing: {k}")   // Option -> Result[Int, Str]
+        //   lookup(m,"a").map(*10)                    == Ok(40)             // Some -> Ok, map transforms
+        //   lookup(m,"z").map(*10)                    == Err("missing: z")  // None -> Err (dynamic msg), map skips
+        //   lookup(m,"b").and_then(even?)             == Err("odd: 7")      // Ok(7) -> fresh Err mid-chain
+        //   lookup(m,"a").and_then(even?).unwrap_or(-1) == 4                // Ok(4) survives, unwrap
+        //   lookup(m,"z").unwrap_or(-99)              == -99                // Err recovers to default
+        // Byte-identical on interp/KVM (native per the sweep). The bridge is ok_or: it is the single
+        // point where "value might be absent" becomes "operation might fail with a reason".
+        let src = r#"fun lookup(m: Map[Str, Int], k: Str) -> Result[Int, Str] {
+    m.get(k).ok_or("missing: {k}")
+}
+fun probe() -> Str {
+    let m = Map().insert("a", 4).insert("b", 7)
+    let r1 = lookup(m, "a").map(fn x { x * 10 })
+    let r2 = lookup(m, "z").map(fn x { x * 10 })
+    let r3 = lookup(m, "b").and_then(fn x { if x % 2 == 0 { Ok(x) } else { Err("odd: {x}") } })
+    let r4 = lookup(m, "a").and_then(fn x { if x % 2 == 0 { Ok(x) } else { Err("odd: {x}") } }).unwrap_or(0 - 1)
+    let r5 = lookup(m, "z").unwrap_or(0 - 99)
+    "{r1}|{r2}|{r3}|{r4}|{r5}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Ok(40)|Err("missing: z")|Err("odd: 7")|4|-99"#
+        );
+    }
+
+    #[test]
     fn diff_list_position_first_match_and_none() {
         // A bug-hunt-30 lock (it272): List.position's first-match guarantee and its None cases.
         // it2992 tests position with a single predicate but not the FIRST-of-duplicates guarantee --
