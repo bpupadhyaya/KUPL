@@ -2082,6 +2082,28 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_values_sort_take_leaderboard() {
+        // A bug-hunt-23 lock (it258): the top-N leaderboard idiom, which composes four behaviors
+        // that must agree simultaneously across engines: Map.values() insertion-ordered extraction,
+        // a DESCENDING sort via a negated key (sort_by extracts `0 - v` so larger scores sort
+        // first), take() clamping to the top N, and STABLE tie-breaking (two entries scoring 92 keep
+        // their bob-before-dave insertion order rather than swapping). scores.keys().sort_by(len)
+        // likewise proves stable ordering among equal-length names. Byte-identical on interp/KVM
+        // (native per the sweep).
+        let src = r#"fun probe() -> Str {
+    let scores = Map().insert("alice", 85).insert("bob", 92).insert("carol", 78).insert("dave", 92)
+    let top2 = scores.values().sort_by(fn v { 0 - v }).take(2)
+    let names_sorted = scores.keys().sort_by(fn k { k.len() })
+    "{top2}|{names_sorted}|{scores.values().fold(0, fn(a, x) { a + x })}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"[92, 92]|["bob", "dave", "alice", "carol"]|347"#
+        );
+    }
+
+    #[test]
     fn diff_window_then_aggregate_moving_stats() {
         // A certification lock (it257): the sliding-window aggregation idiom. it165 locked window()
         // producing overlapping sub-lists; this composes it with map + fold to compute a MOVING
