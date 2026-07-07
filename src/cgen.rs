@@ -5145,6 +5145,23 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "records").trim(), "b,99|orig=a,1|Outer(\"a\", Inner(1))");
     }
 
+    /// Native deeply-nested generic containers display, access, and run HOFs identically
+    /// to interp/KVM: 3-level nesting, access chains, flatten, Set/Result nesting (PR-it140).
+    #[test]
+    fn native_deeply_nested_generic_containers() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let e: Option[List[Map[Str, List[Int]]]] = Some([Map().insert(\"k\", [9])])\n    \
+                   let m = Map().insert(\"k\", [10, 20, 30])\n    let r: List[Result[Int, Str]] = [Ok(1), Err(\"bad\")]\n    \
+                   let nested = [[1, 2], [3], [4, 5, 6]]\n    let s: Map[Str, Set[Int]] = Map().insert(\"a\", Set([1, 1, 2]))\n    \
+                   print(\"{e}|{m.get(\"k\").unwrap_or([]).get(1)}|{r}|{nested.flatten()}|{s}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "nestgen").trim(),
+            "Some([Map{\"k\": [9]}])|Some(20)|[Ok(1), Err(\"bad\")]|[1, 2, 3, 4, 5, 6]|Map{\"a\": Set{1, 2}}"
+        );
+    }
+
     /// Native monomorphizes a generic function used at multiple types and compiles
     /// generic ADTs, matching interp/KVM (PR-it120).
     #[test]

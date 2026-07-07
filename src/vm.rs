@@ -2018,6 +2018,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_deeply_nested_generic_containers() {
+        // Deeply-nested parametric containers display, access, and compare consistently on
+        // interp/KVM — the nested Display uses the right brackets/braces/parens/quotes at
+        // every level, including three levels deep (PR-it140).
+        let display = "fun probe() -> Str { let a: Option[List[Int]] = Some([1, 2, 3])\n    \
+                       let b: List[Option[Int]] = [Some(1), None, Some(3)]\n    \
+                       let e: Option[List[Map[Str, List[Int]]]] = Some([Map().insert(\"k\", [9])])\n    \
+                       \"{a}|{b}|{Map().insert(\"x\", [1, 2]).insert(\"y\", [3])}|{e}\" }\n";
+        assert_eq!(differential(display), "Some([1, 2, 3])|[Some(1), None, Some(3)]|Map{\"x\": [1, 2], \"y\": [3]}|Some([Map{\"k\": [9]}])");
+        // Access chains through nested containers, and Result/Set nesting Display.
+        let access = "fun probe() -> Str { let m = Map().insert(\"k\", [10, 20, 30])\n    \
+                      let r: List[Result[Int, Str]] = [Ok(1), Err(\"bad\"), Ok(3)]\n    \
+                      let s: Map[Str, Set[Int]] = Map().insert(\"a\", Set([1, 1, 2]))\n    \
+                      \"{m.get(\"k\").unwrap_or([]).get(1)}|{m.get(\"z\").unwrap_or([]).get(0)}|{r}|{s}\" }\n";
+        assert_eq!(differential(access), "Some(20)|None|[Ok(1), Err(\"bad\"), Ok(3)]|Map{\"a\": Set{1, 2}}");
+        // HOFs over nested collections + structural equality + empty containers at depth.
+        let hof = "fun probe() -> Str { let xs: List[Map[Str, Int]] = [Map().insert(\"a\", 1), Map().insert(\"a\", 5)]\n    \
+                   let nested = [[1, 2], [3], [4, 5, 6]]\n    let x = Some([1, 2])\n    let y = Some([1, 2])\n    let empty: Option[List[Int]] = Some([])\n    \
+                   \"{xs.map(fn m { m.get(\"a\").unwrap_or(0) })}|{nested.flatten()}|{nested.map(fn ys { ys.sum() })}|{x == y}|{empty}\" }\n";
+        assert_eq!(differential(hof), "[1, 5]|[1, 2, 3, 4, 5, 6]|[3, 3, 15]|true|Some([])");
+    }
+
+    #[test]
     fn diff_generics_depth() {
         // A generic fun used at several types, byte-identical on interp/KVM.
         let id = "fun id[T](x: T) -> T { x }\nfun probe() -> Str { \"{id(5)}|{id(\"hi\")}|{id([1, 2, 3])}|{id(true)}\" }\n";
