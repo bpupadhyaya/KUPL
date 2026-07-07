@@ -2847,6 +2847,13 @@ pub fn shared_method(
             }
             _ => Err("`is_subset` needs a Set".into()),
         },
+        (Value::Set(items), "is_superset") => match args.into_iter().next() {
+            // The mirror of is_subset: every element of `other` is contained in the receiver.
+            Some(Value::Set(other)) => {
+                Ok(Value::Bool(other.iter().all(|x| items.iter().any(|y| y == x))))
+            }
+            _ => Err("`is_superset` needs a Set".into()),
+        },
         (Value::Tensor(d), "len") => Ok(Value::Int(d.len() as i64)),
         (Value::Tensor(d), "get") => match args.into_iter().next() {
             Some(Value::Int(i)) if i >= 0 && (i as usize) < d.len() => Ok(Value::Float(d[i as usize])),

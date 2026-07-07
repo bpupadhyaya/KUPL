@@ -2134,6 +2134,21 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_set_is_superset() {
+        // The NEW is_superset() is the mirror of is_subset, byte-identical on interp/KVM: a is a
+        // superset of b iff every element of b is in a; every set is a superset of the empty set
+        // and of itself; disjoint/partial overlap is false (PR-it183).
+        let src = r#"fun probe() -> Str {
+    let big = Set([1, 2, 3, 4])
+    let el: List[Int] = []
+    let empty = Set(el)
+    "{big.is_superset(Set([2, 3]))}|{Set([2, 3]).is_superset(big)}|{big.is_superset(Set([2, 5]))}|{big.is_superset(empty)}|{big.is_superset(big)}|{empty.is_superset(empty)}"
+}
+"#;
+        assert_eq!(differential(src), "true|false|false|true|true|true");
+    }
+
+    #[test]
     fn diff_string_capitalize() {
         // The NEW capitalize() is ASCII-cased like to_upper/to_lower, byte-identical on
         // interp/KVM: first char up + rest down, empty stays empty, a digit or non-ASCII first

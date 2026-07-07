@@ -4219,6 +4219,16 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             }
             return k_bool(1);
         }
+        if (!strcmp(name, "is_superset")) {
+            /* Mirror of is_subset: every element of the argument set is in the receiver. */
+            KSet* o = args[0].as.set;
+            for (int64_t i = 0; i < o->len; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < st->len; j++) if (k_eq(o->items[i], st->items[j])) { found = 1; break; }
+                if (!found) return k_bool(0);
+            }
+            return k_bool(1);
+        }
     }
     if (recv.tag == K_TENSOR) {
         KTensor* t = recv.as.ten;
@@ -5608,6 +5618,22 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native is_superset() matches interp/KVM: mirror of is_subset, superset-of-empty and
+    /// self are true, disjoint is false (PR-it183).
+    #[test]
+    fn native_set_is_superset() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let big = Set([1, 2, 3, 4])
+    let el: List[Int] = []
+    print("{big.is_superset(Set([2, 3]))}|{big.is_superset(Set([2, 5]))}|{big.is_superset(Set(el))}|{big.is_superset(big)}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "setsup").trim(), "true|false|true|true");
     }
 
     /// Native capitalize() matches interp/KVM: ASCII first-up/rest-down, non-ASCII first char

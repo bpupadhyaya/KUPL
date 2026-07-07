@@ -152,7 +152,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
     "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
-    "is_odd", "is_ok", "is_some", "is_subset", "isqrt", "join", "keys", "last", "lcm", "len",
+    "is_odd", "is_ok", "is_some", "is_subset", "is_superset", "isqrt", "join", "keys", "last", "lcm", "len",
     "lines", "log", "map", "map_err", "map_values", "max", "max_by", "mean", "merge",
     "min", "min_by", "num", "ok", "ok_or", "pad_left", "pad_right", "par_each",
     "par_filter", "par_map", "parse_float", "parse_int", "parse_radix", "partition", "position",
@@ -2400,7 +2400,9 @@ impl Checker {
             }
             (Ty::Set(t), "to_list") => Some((vec![], Ty::List(t.clone()))),
             (Ty::Set(_), "is_empty") => Some((vec![], Ty::Bool)),
-            (Ty::Set(t), "is_subset") => Some((vec![Ty::Set(t.clone())], Ty::Bool)),
+            (Ty::Set(t), "is_subset") | (Ty::Set(t), "is_superset") => {
+                Some((vec![Ty::Set(t.clone())], Ty::Bool))
+            }
             (Ty::Tensor, "len") => Some((vec![], Ty::Int)),
             (Ty::Tensor, "get") => Some((vec![Ty::Int], Ty::Float)),
             (Ty::Tensor, "sum") | (Ty::Tensor, "mean") | (Ty::Tensor, "max") | (Ty::Tensor, "min") => {
