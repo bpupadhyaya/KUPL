@@ -679,12 +679,18 @@ impl Checker {
                         if let Some(decl) = decl {
                             for e in &decl.effects {
                                 if !effects.iter().any(|budget| covers_effect(budget, e)) {
+                                    // A contract with an empty effect budget reads more clearly
+                                    // as "allows no effects" than "allows only []".
+                                    let allowed = if effects.is_empty() {
+                                        "no effects".to_string()
+                                    } else {
+                                        format!("only [{}]", effects.join(", "))
+                                    };
                                     self.err(
                                         "K0264",
                                         format!(
-                                            "`{}`.`{fname}` uses `{e}` but contract `{contract_name}` allows only [{}]",
+                                            "`{}`.`{fname}` uses `{e}` but contract `{contract_name}` allows {allowed}",
                                             c.name,
-                                            effects.join(", ")
                                         ),
                                         decl.span,
                                     );
@@ -2866,6 +2872,27 @@ mod generic_tests {
             "type T = Foo | Bar\nfun f(x: T) -> Int { match x { Fooo => 1\n _ => 0 } }\nfun main() {}\n",
         );
         assert!(e3.iter().any(|d| d.message.contains("did you mean `Foo`?")), "{e3:?}");
+    }
+
+    #[test]
+    fn contract_effect_budget_message_is_clear() {
+        // A component method whose effects exceed the contract's budget is a K0264 error; the
+        // message reads "allows no effects" for an empty budget (clearer than "only []") and
+        // "allows only [<effects>]" otherwise (PR-it168).
+        let empty = errors(
+            "contract Pure {\n    intent \"none\"\n    expose fun compute() -> Int\n}\ncomponent Bad fulfills Pure {\n    intent \"io\"\n    expose fun compute() uses io -> Int { 42 }\n}\nfun main() {}\n",
+        );
+        assert!(
+            empty.iter().any(|d| d.code == "K0264" && d.message.contains("allows no effects")),
+            "{empty:?}"
+        );
+        let nonempty = errors(
+            "contract L {\n    intent \"log\"\n    expose fun act() uses io\n}\ncomponent C fulfills L {\n    intent \"io+exec\"\n    expose fun act() uses io, exec {}\n}\nfun main() {}\n",
+        );
+        assert!(
+            nonempty.iter().any(|d| d.code == "K0264" && d.message.contains("uses `exec`") && d.message.contains("allows only [io]")),
+            "{nonempty:?}"
+        );
     }
 
     #[test]
