@@ -5542,6 +5542,28 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native parallel HOF (par_map/par_filter) is deterministic and INPUT-ordered, matching
+    /// interp/KVM — par_map produces the same result as a sequential map (PR-it175).
+    #[test]
+    fn native_parallel_hof_is_input_ordered() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    var big: List[Int] = []
+    var i = 0
+    while i < 50 { big = big.push(i)
+        i = i + 1 }
+    let pm = big.par_map(fn x { x * 2 })
+    print("{[1, 2, 3, 4, 5].par_map(fn x { x * x })}|{[1, 2, 3, 4, 5, 6].par_filter(fn x { x % 2 == 0 })}|{pm == big.map(fn x { x * 2 })}|{pm.get(49)}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "parhof").trim(),
+            "[1, 4, 9, 16, 25]|[2, 4, 6]|true|Some(98)"
+        );
+    }
+
     /// Native tensor math matches interp/KVM including floating-point accumulation ORDER in
     /// reductions (native must sum in the same order as interp's fold) (PR-it173).
     #[test]

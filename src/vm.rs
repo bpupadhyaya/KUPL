@@ -2134,6 +2134,26 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_parallel_hof_is_deterministic_and_input_ordered() {
+        // par_map/par_filter are DETERMINISTIC and preserve INPUT order (not completion order)
+        // despite parallel evaluation — byte-identical on interp/KVM, and par_map produces the
+        // SAME result as a sequential map (PR-it175).
+        let src = r#"fun probe() -> Str {
+    let sq = [1, 2, 3, 4, 5].par_map(fn x { x * x })
+    let ev = [1, 2, 3, 4, 5, 6, 7, 8].par_filter(fn x { x % 2 == 0 })
+    var big: List[Int] = []
+    var i = 0
+    while i < 50 { big = big.push(i)
+        i = i + 1 }
+    let pm = big.par_map(fn x { x * 2 })
+    let seq = big.map(fn x { x * 2 })
+    "{sq}|{ev}#{pm == seq}|{pm.get(49)}|{pm.get(0)}"
+}
+"#;
+        assert_eq!(differential(src), "[1, 4, 9, 16, 25]|[2, 4, 6, 8]#true|Some(98)|Some(0)");
+    }
+
+    #[test]
     fn diff_tensor_ops_and_fp_accumulation() {
         // The 1D-float-vector tensor surface (elementwise +/*, scale, dot, sum/mean/max/min/
         // get/len) is byte-identical on interp/KVM, INCLUDING the floating-point accumulation
