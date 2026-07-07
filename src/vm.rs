@@ -2283,6 +2283,31 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_number_parsing_is_strict_and_consistent() {
+        // parse_int is Rust-strict (not lenient C strtoll): a leading sign is fine, but
+        // surrounding whitespace, trailing junk, and a decimal point all yield None; an
+        // OVERFLOW past i64 yields None (never a saturate or panic) — PR-it131.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\"42\".parse_int()}|{\"-42\".parse_int()}|{\"+42\".parse_int()}|{\"  42  \".parse_int()}|{\"42abc\".parse_int()}|{\"\".parse_int()}|{\"3.5\".parse_int()}\" }\n"),
+            "Some(42)|Some(-42)|Some(42)|None|None|None|None"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\"9223372036854775807\".parse_int()}|{\"9223372036854775808\".parse_int()}|{\"999999999999999999999999999999\".parse_int()}\" }\n"),
+            "Some(9223372036854775807)|None|None"
+        );
+        // parse_float accepts scientific notation and the specials inf/nan, overflows to inf,
+        // and rejects empty/whitespace/double-dot — identically on all engines.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\"3.14\".parse_float()}|{\"1e10\".parse_float()}|{\"inf\".parse_float()}|{\"nan\".parse_float()}|{\"\".parse_float()}|{\"1.2.3\".parse_float()}\" }\n"),
+            "Some(3.14)|Some(10000000000.0)|Some(inf)|Some(NaN)|None|None"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{\".5\".parse_float()}|{\"5.\".parse_float()}|{\"42\".parse_float()}|{\"1e400\".parse_float()}|{\"  1.5 \".parse_float()}\" }\n"),
+            "Some(0.5)|Some(5.0)|Some(42.0)|Some(inf)|None"
+        );
+    }
+
+    #[test]
     fn diff_numeric_bitwise_shift_and_sized_arithmetic() {
         // Int bitwise/shift/number-theory methods, byte-identical on interp/KVM. The
         // key case: `shr` is ARITHMETIC (sign-extends) while `ushr` is LOGICAL — the

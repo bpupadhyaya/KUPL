@@ -5031,6 +5031,23 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         );
     }
 
+    /// Native parse_int/parse_float are Rust-strict like interp/KVM — NOT lenient C
+    /// strtoll/strtod: overflow -> None, whitespace/partial rejected, specials parsed
+    /// (PR-it131). Guards against the native backend silently saturating on overflow.
+    #[test]
+    fn native_number_parsing_is_strict() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{\"42\".parse_int()}|{\"  42  \".parse_int()}|{\"9223372036854775808\".parse_int()}|\
+                   {\"3.14\".parse_float()}|{\"inf\".parse_float()}|{\"1e400\".parse_float()}|{\"1.2.3\".parse_float()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "numparse").trim(),
+            "Some(42)|None|None|Some(3.14)|Some(inf)|Some(inf)|None"
+        );
+    }
+
     /// Native Int bitwise/shift methods match interp/KVM — arithmetic `shr` vs logical
     /// `ushr` on negatives (C signed-shift is impl-defined; must match Rust), plus
     /// sized-int saturating/wrapping arithmetic (PR-it124).
