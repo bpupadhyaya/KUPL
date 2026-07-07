@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_list_transformation_surface() {
+        // The structural list transforms are byte-identical on interp/KVM with correct edge
+        // semantics: take/drop CLAMP past the length (no error), take_while/drop_while split at
+        // the predicate boundary, chunk yields a partial final group, window slides, flatten
+        // drops empty inner lists, zip_with stops at the shorter list, partition returns
+        // (matching, non-matching), and scan emits running accumulations (PR-it165).
+        let src = r#"fun probe() -> Str {
+    let xs = [1, 2, 3, 4, 5]
+    let td = "{xs.take(2)}|{xs.take(10)}|{xs.drop(2)}|{xs.drop(10)}"
+    let tw = "{[1, 2, 3, 4, 1].take_while(fn x { x < 3 })}|{[1, 2, 3, 4, 1].drop_while(fn x { x < 3 })}"
+    let cw = "{xs.chunk(2)}|{xs.window(2)}"
+    let ff = "{[[1, 2], [3], []].flatten()}|{[1, 2, 3].flat_map(fn x { [x, x * 10] })}"
+    let pz = "{[1, 2, 3, 4].partition(fn x { x % 2 == 0 })}|{[1, 2, 3].zip_with([10, 20], fn(a, b) { a + b })}|{[1, 2, 3].scan(0, fn(a, x) { a + x })}"
+    "{td}#{tw}#{cw}#{ff}#{pz}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "[1, 2]|[1, 2, 3, 4, 5]|[3, 4, 5]|[]#[1, 2]|[3, 4, 1]#[[1, 2], [3, 4], [5]]|[[1, 2], [2, 3], [3, 4], [4, 5]]#[1, 2, 3]|[1, 10, 2, 20, 3, 30]#[[2, 4], [1, 3]]|[11, 22]|[1, 3, 6]"
+        );
+    }
+
+    #[test]
     fn diff_option_result_combinators() {
         // The Option/Result combinator surface (map/filter/and_then/ok_or/unwrap_or/map_err/ok)
         // is byte-identical on interp/KVM with correct short-circuiting: map/filter do NOT call

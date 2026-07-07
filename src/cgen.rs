@@ -5542,6 +5542,24 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native list transforms match interp/KVM on the edges: take/drop clamp past length, chunk
+    /// yields a partial last group, zip_with stops at the shorter list, partition splits (it165).
+    #[test]
+    fn native_list_transformation_surface() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let xs = [1, 2, 3, 4, 5]
+    print("{xs.take(10)}|{xs.drop(10)}|{xs.chunk(2)}|{[[1, 2], [3], []].flatten()}|{[1, 2, 3].zip_with([10, 20], fn(a, b) { a + b })}|{[1, 2, 3, 4].partition(fn x { x % 2 == 0 })}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "listxf").trim(),
+            "[1, 2, 3, 4, 5]|[]|[[1, 2], [3, 4], [5]]|[1, 2, 3]|[11, 22]|[[2, 4], [1, 3]]"
+        );
+    }
+
     /// Native Option/Result combinators short-circuit like interp/KVM: map/filter skip the
     /// closure on None/Err, ok_or converts, and a chain stops at the first None (PR-it164).
     #[test]
