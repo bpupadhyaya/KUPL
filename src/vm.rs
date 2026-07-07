@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_string_codec_roundtrip() {
+        // base64/hex/url codecs are byte-identical on interp/KVM: encode produces standard
+        // output (base64 padding, hex byte values, url percent-encoding), decode returns a
+        // Result, round-trips preserve unicode, and malformed input decodes to Err not a panic
+        // (PR-it177).
+        let src = r#"fun probe() -> Str {
+    let enc = "{base64_encode("Hello")}|{hex_encode("AB")}|{url_encode("a b&c")}"
+    let rt = "{base64_decode(base64_encode("héllo café"))}|{hex_decode(hex_encode("héllo"))}|{url_decode(url_encode("a+b/c=d &e"))}"
+    let empty = "{base64_encode("")}|{hex_encode("")}"
+    let bad = match base64_decode("not!valid!") { Ok(s) => "ok"
+        Err(e) => "err" }
+    let badhex = match hex_decode("xyz") { Ok(s) => "ok"
+        Err(e) => "err" }
+    "{enc}#{rt}#{empty}#{bad}|{badhex}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "SGVsbG8=|4142|a%20b%26c#Ok(\"héllo café\")|Ok(\"héllo\")|Ok(\"a+b/c=d &e\")#|#err|err"
+        );
+    }
+
+    #[test]
     fn diff_regex_match_find_replace() {
         // The regex builtins (re_match/re_find/re_find_all/re_replace) are byte-identical on
         // interp/KVM: match is a bool with anchors, find returns the first Some/None, find_all a

@@ -5542,6 +5542,26 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
     }
 
+    /// Native string codecs (base64/hex/url) match interp/KVM byte-for-byte: standard encoded
+    /// output, unicode-preserving round-trip, and malformed decode -> Err (PR-it177).
+    #[test]
+    fn native_string_codec_roundtrip() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let rt = base64_decode(base64_encode("héllo café"))
+    let bad = match hex_decode("xyz") { Ok(s) => "ok"
+        Err(e) => "err" }
+    print("{base64_encode("Hello")}|{hex_encode("AB")}|{url_encode("a b&c")}|{rt}|{bad}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "codecrt").trim(),
+            "SGVsbG8=|4142|a%20b%26c|Ok(\"héllo café\")|err"
+        );
+    }
+
     /// Native regex matches interp/KVM's regex semantics: match/find/find_all/replace, char-
     /// aware `.` (multibyte), and literal (non-backref) replacement (PR-it176).
     #[test]
