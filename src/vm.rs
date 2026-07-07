@@ -2104,6 +2104,32 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_partition_then_process_each_side() {
+        // A certification lock (it261): the split-and-route idiom. partition() itself is locked
+        // (it1993/3857); this pins the common downstream pattern of extracting BOTH sides via
+        // first()/last() and running a DIFFERENT pipeline on each — the valid/invalid, pass/fail,
+        // in-range/out-of-range bucketing an AI writes constantly. partition(x >= 10) over
+        // [12,3,45,7,89,2,100] yields ([12,45,89,100], [3,7,2]) with each side preserving original
+        // relative order; then the big side is sorted ([12,45,89,100]) and the small side is doubled
+        // ([6,14,4]), with a count of the big side (4) and a sum of the small side (12). Byte-identical
+        // on interp/KVM (native per the sweep). Pins that partition is [matching, non-matching],
+        // order-preserving, and that the two sides route independently through distinct transforms.
+        let src = r#"fun probe() -> Str {
+    let nums = [12, 3, 45, 7, 89, 2, 100]
+    let parts = nums.partition(fn x { x >= 10 })
+    let big = parts.first().unwrap_or([])
+    let small = parts.last().unwrap_or([])
+    let bigsorted = big.sort_by(fn x { x })
+    let smalldoubled = small.map(fn x { x * 2 })
+    let bigcount = big.len()
+    let smallsum = small.fold(0, fn(a, x) { a + x })
+    "{bigsorted}|{smalldoubled}|{bigcount}|{smallsum}"
+}
+"#;
+        assert_eq!(differential(src), "[12, 45, 89, 100]|[6, 14, 4]|4|12");
+    }
+
+    #[test]
     fn diff_nested_flat_map_cartesian_product() {
         // A bug-hunt-24 lock (it260): NESTED flat_map — the two-level monadic bind that generates a
         // cartesian product / nested list comprehension. Single-level flat_map (1->N expand,
