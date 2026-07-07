@@ -2104,6 +2104,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_map_merge_conflict_resolution_noncommutative() {
+        // A certification lock (it271): Map.merge's conflict-resolution and its NON-commutativity.
+        // Prior locks (it4226/4742) exercise merge in a single direction; this pins that
+        // a.merge(b) != b.merge(a) in BOTH the winning values AND the key order, which is the property
+        // an AI must get right when layering config/overrides. The ARGUMENT wins on key collision; the
+        // receiver's existing keys keep their positions and the argument's NEW keys are appended.
+        //   base = {a:1, b:2, c:3}   over = {b:20, c:30, d:40}
+        //   base.merge(over) == {a:1, b:20, c:30, d:40}   // over wins b,c; a kept; d appended
+        //   over.merge(base) == {b:2, c:3, d:40, a:1}      // base wins b,c; d kept; a appended (different order!)
+        //   base.merge(over).keys()   == [a, b, c, d]      base.merge(over).values() == [1, 20, 30, 40]
+        // Byte-identical on interp/KVM (native per the sweep). The two directions produce different maps
+        // because merge is left-biased in ordering and right-biased in value — precedence depends on
+        // which map is the override.
+        let src = r#"fun probe() -> Str {
+    let base = Map().insert("a", 1).insert("b", 2).insert("c", 3)
+    let over = Map().insert("b", 20).insert("c", 30).insert("d", 40)
+    let merged = base.merge(over)
+    let mergedRev = over.merge(base)
+    "{merged}|{mergedRev}|{merged.keys()}|{merged.values()}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"Map{"a": 1, "b": 20, "c": 30, "d": 40}|Map{"b": 2, "c": 3, "d": 40, "a": 1}|["a", "b", "c", "d"]|[1, 20, 30, 40]"#
+        );
+    }
+
+    #[test]
     fn diff_list_all_any_vacuous_on_empty() {
         // A bug-hunt-29 lock (it270): the vacuous-quantifier edge of all()/any(). Prior locks
         // (it2941/2202/5800) exercise all/any on NON-empty lists; this pins the empty-list convention
