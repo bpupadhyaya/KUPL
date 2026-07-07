@@ -2134,6 +2134,29 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_radix_to_and_from_base() {
+        // to_hex/to_binary/to_octal/to_radix and the NEW inverse parse_radix are byte-identical
+        // on interp/KVM: lowercase digits, sign-prefixed negatives (not two's complement), 0 ->
+        // "0", parse_radix is case-insensitive and rejects 0x/whitespace/invalid-digit as None,
+        // and the pair round-trips (PR-it179).
+        let src = r#"fun probe() -> Str {
+    let to = "{(255).to_hex()}|{(8).to_binary()}|{(64).to_octal()}|{(35).to_radix(36)}|{(0 - 255).to_hex()}|{(0).to_radix(2)}"
+    let from = "{"ff".parse_radix(16)}|{"1010".parse_radix(2)}|{"-ff".parse_radix(16)}|{"FF".parse_radix(16)}"
+    let bad = "{"9".parse_radix(8)}|{"0xff".parse_radix(16)}|{" ff".parse_radix(16)}|{"".parse_radix(16)}"
+    let rt = "{(255).to_radix(16).parse_radix(16)}|{(0 - 42).to_radix(2).parse_radix(2)}"
+    "{to}#{from}#{bad}#{rt}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "ff|1000|100|z|-ff|0#Some(255)|Some(10)|Some(-255)|Some(255)#None|None|None|None#Some(255)|Some(-42)"
+        );
+        // Out-of-range base is a clean panic on both to_radix and parse_radix.
+        assert_eq!(differential("fun probe() -> Str { \"{(10).to_radix(37)}\" }\n"), "panic: `to_radix` base must be in 2..=36");
+        assert_eq!(differential("fun probe() -> Str { \"{\"10\".parse_radix(1)}\" }\n"), "panic: `parse_radix` base must be in 2..=36");
+    }
+
+    #[test]
     fn diff_csv_parse_stringify_quoting() {
         // csv_parse/csv_stringify follow RFC-4180-style quoting byte-identically on interp/KVM:
         // an embedded comma keeps a quoted field as ONE field, a doubled "" un-doubles to a

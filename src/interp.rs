@@ -2255,6 +2255,16 @@ pub fn shared_method(
             .parse::<i64>()
             .map(|v| Value::some(Value::Int(v)))
             .unwrap_or_else(|_| Value::none())),
+        (Value::Str(s), "parse_radix") => match args.into_iter().next() {
+            // Inverse of `to_radix`: parse an Int in base 2..=36 (accepts an optional +/-
+            // sign, digits/letters valid for the base case-insensitively; NO 0x prefix, NO
+            // whitespace — same strictness as `parse_int`). None on any malformed input.
+            Some(Value::Int(b)) if (2..=36).contains(&b) => Ok(i64::from_str_radix(s, b as u32)
+                .map(|v| Value::some(Value::Int(v)))
+                .unwrap_or_else(|_| Value::none())),
+            Some(Value::Int(_)) => Err("`parse_radix` base must be in 2..=36".into()),
+            _ => Err("`parse_radix` needs an Int base".into()),
+        },
         (Value::Str(s), "parse_float") => Ok(s
             .parse::<f64>()
             .map(|v| Value::some(Value::Float(v)))

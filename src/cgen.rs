@@ -3727,6 +3727,24 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             if (end == s || *end != 0 || errno == ERANGE) return k_none();
             return k_some(k_int((int64_t)v));
         }
+        if (!strcmp(name, "parse_radix")) {
+            /* Inverse of to_radix; mirrors Rust i64::from_str_radix: optional +/- sign,
+               digits valid for the base (case-insensitive), NO 0x prefix, NO whitespace,
+               overflow -> None. strtoll would skip whitespace and honor a 0x prefix for
+               base 16, so guard both to stay byte-identical with interp/KVM. */
+            int64_t b = args[0].as.i;
+            if (b < 2 || b > 36) k_panic("`parse_radix` base must be in 2..=36");
+            char c0 = s[0];
+            if (c0==' '||c0=='\t'||c0=='\n'||c0=='\r'||c0=='\v'||c0=='\f') return k_none();
+            const char* p = s;
+            if (*p=='+'||*p=='-') p++;
+            if (b==16 && p[0]=='0' && (p[1]=='x'||p[1]=='X')) return k_none();
+            char* end;
+            errno = 0;
+            long long v = strtoll(s, &end, (int)b);
+            if (end == s || *end != 0 || errno == ERANGE) return k_none();
+            return k_some(k_int((int64_t)v));
+        }
         if (!strcmp(name, "parse_float")) {
             /* Match Rust: no leading whitespace (strtod skips it). Overflow to
                inf is fine — Rust parses "1e999" as inf too. */
@@ -5540,6 +5558,25 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native to_radix and the NEW parse_radix match interp/KVM byte-for-byte, including the
+    /// tricky native edges (0x prefix rejected, whitespace rejected, case-insensitive, sign
+    /// prefix) and to_radix->parse_radix round-trip (PR-it179).
+    #[test]
+    fn native_radix_to_and_from_base() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let rt = (0 - 42).to_radix(16).parse_radix(16)
+    print("{(255).to_hex()}|{(0 - 255).to_hex()}|{"ff".parse_radix(16)}|{"FF".parse_radix(16)}|{"0xff".parse_radix(16)}|{"9".parse_radix(8)}|{rt}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "radixrt").trim(),
+            "ff|-ff|Some(255)|Some(255)|None|None|Some(-42)"
+        );
     }
 
     /// Native CSV parse/stringify matches interp/KVM's RFC-4180 quoting: embedded-comma
