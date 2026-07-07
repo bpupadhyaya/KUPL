@@ -2104,6 +2104,31 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_scan_with_record_shaped_accumulator() {
+        // A bug-hunt-31 lock (it274): List.scan threading a RECORD-shaped running state. Prior scan
+        // locks (it2007-2016) all use a SCALAR accumulator -- Int running-sum, running-max, String
+        // concat. This pins scan carrying a structured multi-field accumulator (running sum AND count
+        // together), the "running aggregate" idiom an AI writes for a moving average or a min/max pair.
+        //   scan(Acc(sum:0, cnt:0), fn(a,x) { Acc(sum: a.sum+x, cnt: a.cnt+1) }) over [10,20,30,40]
+        //   states.map(.sum)                 == [10, 30, 60, 100]   // scan EXCLUDES the seed (per it2007)
+        //   states.drop(1).map(.sum/.cnt)    == [15, 20, 25]        // running average from field 2 onward
+        //   states.len()                     == 4
+        // Byte-identical on interp/KVM (native per the sweep). Confirms scan constructs a fresh record
+        // per step, both fields advance in lockstep, and the seed is not emitted -- so downstream field
+        // access (a.sum / a.cnt) sees the correct paired state at every position.
+        let src = r#"type Acc = { sum: Int, cnt: Int }
+fun probe() -> Str {
+    let xs = [10, 20, 30, 40]
+    let states = xs.scan(Acc(sum: 0, cnt: 0), fn(a, x) { Acc(sum: a.sum + x, cnt: a.cnt + 1) })
+    let sums = states.map(fn a { a.sum })
+    let avgs = states.drop(1).map(fn a { a.sum / a.cnt })
+    "{sums}|{avgs}|{states.len()}"
+}
+"#;
+        assert_eq!(differential(src), "[10, 30, 60, 100]|[15, 20, 25]|4");
+    }
+
+    #[test]
     fn diff_option_ok_or_result_bridge_in_function() {
         // A certification lock (it273): the Option->Result BRIDGE. A lookup returns Option (Map.get),
         // ok_or converts it to a Result with a DYNAMIC error message carrying the missing key, and the
