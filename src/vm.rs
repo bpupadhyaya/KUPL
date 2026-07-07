@@ -2360,6 +2360,40 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_nested_match_shadow_map_wordcount_curry() {
+        // An eighth bug-hunt sweep (it217, ~10 probes) found no divergence; this locks its subtlest
+        // deterministic edges, byte-identical on interp/KVM: a match-arm binding shadows an outer
+        // binding of the same name and the outer is restored after (nested even within another
+        // match), a mutable Map accumulated in a for-loop counts occurrences in insertion order,
+        // and a curried closure captures each level's argument (PR-it217).
+        let shadow = r#"type Box = B(v: Int)
+fun probe() -> Str {
+    let v = 100
+    let r = match B(5) { B(v) => match B(v * 2) { B(v) => v } }
+    "{r}|{v}"
+}
+"#;
+        assert_eq!(differential(shadow), "10|100");
+        let wc = r#"fun probe() -> Str {
+    var m = Map()
+    for w in ["a", "b", "a", "c", "a", "b"] {
+        m = m.insert(w, m.get(w).unwrap_or(0) + 1)
+    }
+    "{m.get("a")}|{m.get("b")}|{m.get("c")}|{m.keys()}"
+}
+"#;
+        assert_eq!(differential(wc), r#"Some(3)|Some(2)|Some(1)|["a", "b", "c"]"#);
+        let curry = r#"fun adder(n: Int) -> fn(Int) -> fn(Int) -> Int {
+    fn a { fn b { n + a + b } }
+}
+fun probe() -> Str {
+    "{adder(100)(20)(3)}|{adder(1)(2)(3)}"
+}
+"#;
+        assert_eq!(differential(curry), "123|6");
+    }
+
+    #[test]
     fn diff_map_set_iteration_order_after_mutation() {
         // Map and Set iterate in INSERTION order deterministically across interp/KVM, and the
         // order is stable through a mixed mutation sequence: a removed-then-reinserted key lands at
