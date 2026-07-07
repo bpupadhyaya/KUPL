@@ -2134,6 +2134,20 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_int_leading_trailing_zeros() {
+        // The NEW leading_zeros/trailing_zeros are byte-identical on interp/KVM over the 64-bit
+        // pattern. The critical case is 0 -> 64 (both), which the native backend must guard
+        // because C clz/ctz of 0 is undefined behavior (PR-it188).
+        let src = r#"fun probe() -> Str {
+    let lz = "{(0).leading_zeros()}|{(1).leading_zeros()}|{(0 - 1).leading_zeros()}|{(9223372036854775807).leading_zeros()}|{(1024).leading_zeros()}"
+    let tz = "{(0).trailing_zeros()}|{(1).trailing_zeros()}|{(8).trailing_zeros()}|{(0 - 9223372036854775807 - 1).trailing_zeros()}|{(1024).trailing_zeros()}"
+    "{lz}#{tz}"
+}
+"#;
+        assert_eq!(differential(src), "64|63|0|1|53#64|0|3|63|10");
+    }
+
+    #[test]
     fn diff_int_count_ones() {
         // The NEW count_ones (popcount) is byte-identical on interp/KVM over the 64-bit two's-
         // complement pattern: (-1) has all 64 bits set, i64::MAX has 63, i64::MIN has 1

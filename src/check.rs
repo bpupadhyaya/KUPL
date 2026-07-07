@@ -153,7 +153,8 @@ const BUILTIN_METHODS: &[&str] = &[
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "fract", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
     "is_empty", "is_err", "is_even", "is_infinite", "is_nan", "is_negative", "is_none",
-    "is_odd", "is_ok", "is_some", "is_subset", "is_superset", "isqrt", "join", "keys", "last", "lcm", "len",
+    "is_odd", "is_ok", "is_some", "is_subset", "is_superset", "isqrt", "join", "keys", "last", "lcm",
+    "leading_zeros", "len",
     "lines", "log", "map", "map_err", "map_values", "max", "max_by", "mean", "merge",
     "min", "min_by", "num", "ok", "ok_or", "pad_left", "pad_right", "par_each",
     "par_filter", "par_map", "parse_float", "parse_int", "parse_radix", "partition", "position",
@@ -162,7 +163,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "scale", "scan", "shl", "shr", "sign", "sin", "slice", "sort", "sort_by", "split",
     "split_once", "sqrt", "starts_with", "sum", "symmetric_difference", "tail", "take",
     "take_while", "tan", "to_binary", "to_float", "to_hex", "to_int", "to_list",
-    "to_lower", "to_octal", "to_radix", "to_str", "to_upper", "trim", "trim_end",
+    "to_lower", "to_octal", "to_radix", "to_str", "to_upper", "trailing_zeros", "trim", "trim_end",
     "trim_start", "trunc", "union", "unique", "unwrap_or", "ushr", "values", "window", "zip_with",
 ];
 
@@ -2272,7 +2273,8 @@ impl Checker {
             | (Ty::Int, "shl") | (Ty::Int, "shr") | (Ty::Int, "ushr") => {
                 Some((vec![Ty::Int], Ty::Int))
             }
-            (Ty::Int, "bnot") | (Ty::Int, "count_ones") => Some((vec![], Ty::Int)),
+            (Ty::Int, "bnot") | (Ty::Int, "count_ones") | (Ty::Int, "leading_zeros")
+            | (Ty::Int, "trailing_zeros") => Some((vec![], Ty::Int)),
             (Ty::Int, "to_hex") | (Ty::Int, "to_binary") | (Ty::Int, "to_octal") => {
                 Some((vec![], Ty::Str))
             }

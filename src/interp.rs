@@ -2610,6 +2610,10 @@ pub fn shared_method(
         // Population count over the 64-bit two's-complement representation: a negative counts
         // the set bits of its i64 bit pattern ((-1).count_ones() = 64).
         (Value::Int(v), "count_ones") => Ok(Value::Int(v.count_ones() as i64)),
+        // Leading/trailing zero bits of the 64-bit pattern; both are 64 for 0 (matching Rust,
+        // and the native impl must guard 0 since C clz/ctz of 0 is undefined behavior).
+        (Value::Int(v), "leading_zeros") => Ok(Value::Int(v.leading_zeros() as i64)),
+        (Value::Int(v), "trailing_zeros") => Ok(Value::Int(v.trailing_zeros() as i64)),
         (Value::Int(v), "shl") => match args.into_iter().next() {
             Some(Value::Int(n)) if (0..=63).contains(&n) => Ok(Value::Int(v << n)),
             Some(Value::Int(_)) => Err("shift amount must be in 0..=63".into()),

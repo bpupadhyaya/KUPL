@@ -4027,6 +4027,12 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         /* Population count over the 64-bit two's-complement pattern, matching Rust
            i64::count_ones ((-1).count_ones() = 64). */
         if (!strcmp(name, "count_ones")) return k_int(__builtin_popcountll((uint64_t)recv.as.i));
+        /* Leading/trailing zeros; C __builtin_clzll/ctzll are UNDEFINED for 0, so return 64
+           for 0 to match Rust i64::leading_zeros(0)/trailing_zeros(0) = 64. */
+        if (!strcmp(name, "leading_zeros"))
+            return k_int(recv.as.i == 0 ? 64 : __builtin_clzll((uint64_t)recv.as.i));
+        if (!strcmp(name, "trailing_zeros"))
+            return k_int(recv.as.i == 0 ? 64 : __builtin_ctzll((uint64_t)recv.as.i));
         if (!strcmp(name, "shl") || !strcmp(name, "shr") || !strcmp(name, "ushr")) {
             int64_t n = args[0].as.i;
             if (n < 0 || n > 63) k_panic("shift amount must be in 0..=63");
@@ -5633,6 +5639,20 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native leading_zeros/trailing_zeros match interp/KVM, crucially the 0 -> 64 case where
+    /// C __builtin_clzll/ctzll are undefined and must be guarded (PR-it188).
+    #[test]
+    fn native_int_leading_trailing_zeros() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{(0).leading_zeros()}|{(1).leading_zeros()}|{(0 - 1).leading_zeros()}|{(0).trailing_zeros()}|{(8).trailing_zeros()}|{(0 - 9223372036854775807 - 1).trailing_zeros()}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "intlztz").trim(), "64|63|0|64|3|63");
     }
 
     /// Native count_ones (popcount) matches interp/KVM including negative two's-complement
