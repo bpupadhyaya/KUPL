@@ -5279,6 +5279,25 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "iflet").trim(), "14|7|[9, 4, 1]");
     }
 
+    /// Native `app` (the reactive dataflow entry point: component instances wired by
+    /// ports, driven by `on start`, auto-printing unwired `out` ports) runs exactly like
+    /// interp/KVM (PR-it138). The `app` construct is otherwise covered by the 9 app
+    /// examples in the sweep; this pins a self-contained one at the cargo level.
+    #[test]
+    fn native_app_dataflow() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Source {\n    intent \"e\"\n    out n: Int\n    on start {\n        for i in 1..4 {\n            emit n(i)\n        }\n    }\n}\n\
+                   component Squarer {\n    intent \"s\"\n    in input: Int\n    out squared: Int\n    state total: Int = 0\n    \
+                   on input(x) {\n        total = total + x * x\n        emit squared(x * x)\n    }\n}\n\
+                   app Demo {\n    intent \"d\"\n    let src = Source()\n    let sq = Squarer()\n    wire src.n -> sq.input\n}\n";
+        assert_eq!(
+            native_stdout(src, "appdemo").trim(),
+            "Squarer.squared = 1\nSquarer.squared = 4\nSquarer.squared = 9"
+        );
+    }
+
     /// Native recursive ADTs (self-referential heap-allocated values) build, traverse,
     /// display nested, and recurse deeply exactly like interp/KVM (PR-it137).
     #[test]
