@@ -2009,6 +2009,28 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_if_let_and_while_let() {
+        // `if let` as an EXPRESSION (both branches yield a value), with a nested pattern
+        // and a Result scrutinee — byte-identical on interp/KVM (PR-it125).
+        let iflet = "type Pt = Pt(x: Int, y: Int)\nfun probe() -> Str {\n    \
+                     let a: Option[Int] = Some(7)\n    let b: Option[Int] = None\n    \
+                     let p: Option[Pt] = Some(Pt(3, 4))\n    let res: Result[Int, Str] = Ok(9)\n    \
+                     \"{if let Some(x) = a { x * 2 } else { 0 - 1 }}|{if let Some(x) = b { x } else { 0 - 1 }}|\
+                     {if let Some(Pt(x, y)) = p { x + y } else { 0 }}|{if let Ok(v) = res { v } else { 0 - 1 }}\"\n}\n";
+        assert_eq!(differential(iflet), "14|-1|7|9");
+        // `if let` as a STATEMENT (no else -> does nothing on a failed match) + binding
+        // scope: the inner binding does not leak or mutate an outer variable of the same name.
+        let stmt = "fun probe() -> Str {\n    var log = \"\"\n    let x = 100\n    let a: Option[Int] = Some(5)\n    let b: Option[Int] = None\n    \
+                    if let Some(x) = a { log = \"{log}got{x}\" }\n    if let Some(x) = b { log = \"{log}never\" }\n    \"{log}|{x}\"\n}\n";
+        assert_eq!(differential(stmt), "got5|100");
+        // `while let` iterates until the pattern fails, building a result, then terminates.
+        let whilelet = "fun step(n: Int) -> Option[Int] { if n > 0 { Some(n * n) } else { None } }\n\
+                        fun probe() -> Str {\n    var n = 3\n    var acc: List[Int] = []\n    \
+                        while let Some(sq) = step(n) {\n        acc = acc.push(sq)\n        n = n - 1\n    }\n    \"{acc}\"\n}\n";
+        assert_eq!(differential(whilelet), "[9, 4, 1]");
+    }
+
+    #[test]
     fn diff_pattern_matching_depth() {
         // Guards (first-match-wins, may reference the bound variable), byte-identical.
         let guard = "fun cls(n: Int) -> Str { match n {\n        x if x > 10 => \"big\"\n        \

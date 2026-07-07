@@ -5111,6 +5111,20 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "clo").trim(), "4|11|0|2");
     }
 
+    /// Native if-let (expression + nested pattern) and while-let (termination) match
+    /// interp/KVM (PR-it125).
+    #[test]
+    fn native_if_let_and_while_let() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Pt = Pt(x: Int, y: Int)\nfun step(n: Int) -> Option[Int] { if n > 0 { Some(n * n) } else { None } }\n\
+                   fun main() uses io {\n    let a: Option[Int] = Some(7)\n    let p: Option[Pt] = Some(Pt(3, 4))\n    \
+                   var n = 3\n    var acc: List[Int] = []\n    while let Some(sq) = step(n) {\n        acc = acc.push(sq)\n        n = n - 1\n    }\n    \
+                   print(\"{if let Some(x) = a { x * 2 } else { 0 }}|{if let Some(Pt(x, y)) = p { x + y } else { 0 }}|{acc}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "iflet").trim(), "14|7|[9, 4, 1]");
+    }
+
     /// Native pattern matching (guards, or-patterns, ranges, nested destructure)
     /// matches interp/KVM.
     #[test]
