@@ -894,6 +894,23 @@ mod tests {
     use crate::diag::{Diag, Span};
 
     #[test]
+    fn emit_context_resolves_item_and_errors_on_missing() {
+        // `kupl context <file> <item>` emits the item + its direct-dependency closure
+        // for an LLM. A present item resolves (rc 0); a name that doesn't exist is a
+        // clean error (rc 1), not a crash. (Closure correctness — direct deps in,
+        // unrelated items out, ctor -> owning type, recursion/cycles terminate — is
+        // exercised end-to-end via the CLI.)
+        let dir = std::env::temp_dir().join(format!("kupl-ctx-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("p.kupl");
+        std::fs::write(&file, "fun helper(n: Int) -> Int {\n    n * 2\n}\nfun target() -> Int {\n    helper(1)\n}\n").unwrap();
+        let p = file.to_str().unwrap();
+        assert_eq!(super::emit_context(p, "target"), 0, "a present item resolves");
+        assert_eq!(super::emit_context(p, "does_not_exist"), 1, "a missing item is a clean error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn frontend_accepts_valid_and_rejects_invalid_across_features() {
         // Cross-command validity consistency (PR-it90): every command (check, run,
         // build, native) reaches the SAME frontend — compile() and check_cmd both
