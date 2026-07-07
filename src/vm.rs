@@ -2104,6 +2104,27 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_group_by_then_map_values_histogram() {
+        // A bug-hunt-25 lock (it262): the frequency-table / count-by-category idiom. group_by alone
+        // (it1978), map-from-pairs+group_by (it2553), and map_values alone (it4526) are locked; this
+        // pins the CHAIN group_by(key) -> map_values(len) that turns a list into a histogram of counts
+        // per bucket. Words bucketed by first letter give Map{"a": [apple, avocado, apricot],
+        // "b": [banana, blueberry], "c": [cherry]} in first-seen key order, then map_values reduces
+        // each bucket's list to its length, yielding Map{"a": 3, "b": 2, "c": 1}. Byte-identical on
+        // interp/KVM (native per the sweep). Pins that group_by's first-seen key order survives the
+        // map_values pass and that each bucket's element count is exact -- the word-frequency /
+        // tally-by-key idiom. (zip_with truncate-to-shorter was already locked at it1983.)
+        let src = r#"fun probe() -> Str {
+    let words = ["apple", "banana", "avocado", "cherry", "blueberry", "apricot"]
+    let byfirst = words.group_by(fn w { w.chars().first().unwrap_or("?") })
+    let counts = byfirst.map_values(fn ws { ws.len() })
+    "{counts}"
+}
+"#;
+        assert_eq!(differential(src), r#"Map{"a": 3, "b": 2, "c": 1}"#);
+    }
+
+    #[test]
     fn diff_partition_then_process_each_side() {
         // A certification lock (it261): the split-and-route idiom. partition() itself is locked
         // (it1993/3857); this pins the common downstream pattern of extracting BOTH sides via
