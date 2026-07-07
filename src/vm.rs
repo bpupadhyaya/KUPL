@@ -2179,6 +2179,30 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_replace_json_largelist_edges() {
+        // A second bug-hunt sweep (it200, ~10 probes) found no divergence; this locks the
+        // subtlest deterministic edges it exercised, byte-identical on interp/KVM: str replace
+        // consumes non-overlapping left-to-right (so "aaaa".replace("aa","b") = "bb" not "ba"),
+        // a nested JSON value built from the ADT stringifies with unicode intact and no spaces,
+        // and a 100-element fold/filter/map composition (PR-it200).
+        let src = r#"fun probe() -> Str {
+    let rep = "{"aaaa".replace("aa", "b")}|{"ababab".replace("ab", "X")}|{"xyx".replace("x", "xx")}"
+    let j = JArr([JNum(1.0), JObj(Map().insert("b", JStr("héllo"))), JNull])
+    var xs: List[Int] = []
+    var i = 1
+    while i <= 100 { xs = xs.push(i)
+        i = i + 1 }
+    let big = "{xs.fold(0, fn(a, x) { a + x })}|{xs.filter(fn x { x % 7 == 0 }).len()}|{xs.map(fn x { x * x }).last()}"
+    "{rep}#{json_stringify(j)}#{big}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "bb|XXX|xxyxx#[1,{\"b\":\"héllo\"},null]#5050|14|Some(10000)"
+        );
+    }
+
+    #[test]
     fn diff_deep_feature_composition() {
         // A bug-hunt sweep (it198, ~10 probes) found no divergence; this locks the deepest
         // cross-feature compositions it exercised as a regression guard, all byte-identical on
