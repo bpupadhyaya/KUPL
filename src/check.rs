@@ -1103,7 +1103,10 @@ impl Checker {
                             if !mutable {
                                 self.err(
                                     "K0221",
-                                    format!("`{name}` is immutable (declared with `let`; use `var` or `state`)"),
+                                    // Applies to both `let` bindings and function parameters, which
+                                    // are immutable by default — the old wording wrongly claimed a
+                                    // parameter was "declared with `let`" (PR-it220).
+                                    format!("`{name}` is immutable — use `var` for a reassignable local (or `state` in a component)"),
                                     target.span,
                                 );
                             }
@@ -2986,6 +2989,21 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    #[test]
+    fn immutable_assign_message_fits_params_and_lets() {
+        // K0221 fires for both `let` bindings and function parameters (both immutable by default).
+        // The old text wrongly claimed a parameter was "declared with `let`"; the new text just
+        // gives the fix and is accurate for either (PR-it220).
+        let fix = "use `var` for a reassignable local";
+        let on_param = errors("fun f(x: Int) -> Int { x = 5\n    x }\n");
+        assert!(on_param.iter().any(|d| d.code == "K0221" && d.message.contains(fix)), "param: {on_param:?}");
+        assert!(on_param.iter().all(|d| !d.message.contains("declared with `let`")), "param wrongly says let: {on_param:?}");
+        let on_let = errors("fun main() { let x = 5\n    x = 6 }\n");
+        assert!(on_let.iter().any(|d| d.code == "K0221" && d.message.contains(fix)), "let: {on_let:?}");
+        // Valid `var` reassignment (including `+=`) still type-checks.
+        assert!(errors("fun main() { var x = 5\n    x = 6\n    x += 10 }\n").is_empty());
     }
 
     #[test]
