@@ -1539,6 +1539,18 @@ impl Parser {
                     self.skip_newlines();
                 }
                 let end = self.expect(Tok::RBracket)?;
+                // An empty list immediately followed by `:` is the classic attempt to
+                // type-annotate the expression itself (`[]: List[Int]`). KUPL has no inline
+                // expression type-ascription — the element type comes from the binding — so
+                // name the fix: annotate the `let` instead. Without this the user gets a bare
+                // "expected `)`, found `:`" (call arg) or "expected end of statement" (let rhs).
+                if items.is_empty() && self.at(&Tok::Colon) {
+                    return Err(Diag::error(
+                        "K0100",
+                        "an empty list can't be type-annotated inline — write the type on the binding, e.g. `let xs: List[Int] = []`".to_string(),
+                        self.span(),
+                    ));
+                }
                 Ok(Expr { kind: ExprKind::List(items), span: span.merge(end) })
             }
             Tok::KwPar => {
@@ -2112,6 +2124,27 @@ app Main {
         );
         // The correct paren form still parses cleanly.
         assert!(parse("type Point = { x: Int, y: Int }\nfun f() -> Int {\n    let p = Point(x: 1, y: 2)\n    p.x\n}\n").1.is_empty());
+    }
+
+    #[test]
+    fn empty_list_inline_annotation_names_the_binding_fix() {
+        // `[]: List[Int]` (annotating the expression) is a common attempt to give an empty list an
+        // element type; KUPL has no inline expression ascription, so K0100 now names the fix —
+        // annotate the binding — rather than the bare "expected `)`, found `:`" / "expected end of
+        // statement" the user got before (PR-it263). Both the call-arg and let-rhs positions hit it.
+        let (_p, d1) = parse("fun f() -> Int {\n    let x = [1].zip_with([]: List[Int], fn(a, b) { a + b })\n    x.len()\n}\n");
+        assert!(
+            d1.iter().any(|d| d.code == "K0100" && d.message.contains("annotated inline") && d.message.contains("let xs: List[Int] = []")),
+            "{d1:?}"
+        );
+        let (_p, d2) = parse("fun f() -> Int {\n    let x = []: List[Int]\n    x.len()\n}\n");
+        assert!(
+            d2.iter().any(|d| d.code == "K0100" && d.message.contains("annotated inline")),
+            "{d2:?}"
+        );
+        // The correct binding-annotation form and non-empty list literals still parse cleanly.
+        assert!(parse("fun f() -> Int {\n    let xs: List[Int] = []\n    xs.len()\n}\n").1.is_empty());
+        assert!(parse("fun f() -> Int {\n    let ys = [1, 2, 3]\n    ys.len()\n}\n").1.is_empty());
     }
 
     #[test]
