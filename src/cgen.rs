@@ -5296,6 +5296,41 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "iflet").trim(), "14|7|[9, 4, 1]");
     }
 
+    /// Native `on`-handler dispatch matches interp/KVM: a handler binds its message arg,
+    /// mutates and reads state across successive messages, and a component with several
+    /// handlers dispatches each message to the handler for its own port (PR-it141).
+    #[test]
+    fn native_handler_dispatch_and_state() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Accum {\n    intent \"a\"\n    in pair: Int\n    out running: Int\n    state total: Int = 0\n    \
+                   on pair(x) {\n        total = total + x\n        emit running(total)\n    }\n}\n\
+                   component Feeder {\n    intent \"f\"\n    out val: Int\n    on start {\n        emit val(10)\n        emit val(20)\n        emit val(30)\n    }\n}\n\
+                   app A {\n    intent \"d\"\n    let f = Feeder()\n    let a = Accum()\n    wire f.val -> a.pair\n}\n";
+        assert_eq!(
+            native_stdout(src, "handleracc").trim(),
+            "Accum.running = 10\nAccum.running = 30\nAccum.running = 60"
+        );
+    }
+
+    /// Native bounded self-feedback: a handler emits an `out` port wired back to its own
+    /// `in`, driving a terminating loop identical to interp/KVM (PR-it141).
+    #[test]
+    fn native_handler_self_feedback() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Countdown {\n    intent \"c\"\n    in tick: Int\n    out step: Int\n    out back: Int\n    \
+                   on tick(n) {\n        emit step(n)\n        if n > 0 {\n            emit back(n - 1)\n        }\n    }\n}\n\
+                   component Kick {\n    intent \"k\"\n    out go: Int\n    on start { emit go(3) }\n}\n\
+                   app D {\n    intent \"d\"\n    let c = Countdown()\n    let k = Kick()\n    wire k.go -> c.tick\n    wire c.back -> c.tick\n}\n";
+        assert_eq!(
+            native_stdout(src, "handlerfb").trim(),
+            "Countdown.step = 3\nCountdown.step = 2\nCountdown.step = 1\nCountdown.step = 0"
+        );
+    }
+
     /// Native `app` (the reactive dataflow entry point: component instances wired by
     /// ports, driven by `on start`, auto-printing unwired `out` ports) runs exactly like
     /// interp/KVM (PR-it138). The `app` construct is otherwise covered by the 9 app
