@@ -2743,6 +2743,15 @@ pub fn shared_method(
             Some(Value::Float(w)) => Ok(Value::Float(v.copysign(w))),
             _ => Err("`copysign` needs a Float".into()),
         },
+        // Fused multiply-add: self * a + b with a SINGLE rounding (more accurate than a*b+c,
+        // and can differ in the last bit). The native impl must use C fma() to match.
+        (Value::Float(v), "mul_add") => {
+            let mut it = args.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Float(a)), Some(Value::Float(b))) => Ok(Value::Float(v.mul_add(a, b))),
+                _ => Err("`mul_add` needs two Floats".into()),
+            }
+        }
         (Value::Float(v), "format") => match args.into_iter().next() {
             Some(Value::Int(d)) if (0..=100).contains(&d) => {
                 Ok(Value::str(format!("{:.*}", d as usize, v)))

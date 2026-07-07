@@ -4108,6 +4108,8 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "atan2")) return k_float(atan2(recv.as.f, args[0].as.f));
         if (!strcmp(name, "hypot")) return k_float(hypot(recv.as.f, args[0].as.f));
         if (!strcmp(name, "copysign")) return k_float(copysign(recv.as.f, args[0].as.f));
+        /* Fused multiply-add via C fma() (single rounding), matching Rust f64::mul_add. */
+        if (!strcmp(name, "mul_add")) return k_float(fma(recv.as.f, args[0].as.f, args[1].as.f));
         if (!strcmp(name, "format")) {
             int64_t d = args[0].as.i;
             if (d < 0 || d > 100) k_panic("`format` decimals must be in 0..=100");
@@ -5747,6 +5749,23 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "fdegrad").trim(),
             "3.141592653589793|57.29577951308232|1.5707963267948966"
+        );
+    }
+
+    /// Native mul_add uses C fma() (genuinely fused), matching Rust f64::mul_add bit-for-bit —
+    /// verified on a case where the fused result differs from a*b+c (PR-it199).
+    #[test]
+    fn native_float_mul_add() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{(0.1).mul_add(0.1, 0.0 - 0.01)}|{(2.0).mul_add(0.0 - 3.0, 1.0)}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "fmuladd").trim(),
+            "0.0000000000000000009020562075079397|-5.0"
         );
     }
 

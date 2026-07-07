@@ -156,7 +156,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "is_odd", "is_ok", "is_some", "is_subset", "is_superset", "isqrt", "join", "keys", "last", "lcm",
     "leading_zeros", "len",
     "lines", "log", "map", "map_err", "map_values", "max", "max_by", "mean", "merge",
-    "min", "min_by", "num", "ok", "ok_or", "pad_left", "pad_right", "par_each",
+    "min", "min_by", "mul_add", "num", "ok", "ok_or", "pad_left", "pad_right", "par_each",
     "par_filter", "par_map", "parse_float", "parse_int", "parse_radix", "partition", "position",
     "pow", "product", "push", "recip", "rem_euclid", "remove", "repeat", "replace", "replace_first",
     "reverse", "rfind", "round", "saturating_add", "saturating_mul", "saturating_sub",
@@ -2304,6 +2304,7 @@ impl Checker {
             (Ty::Float, "atan2") | (Ty::Float, "hypot") | (Ty::Float, "copysign") => {
                 Some((vec![Ty::Float], Ty::Float))
             }
+            (Ty::Float, "mul_add") => Some((vec![Ty::Float, Ty::Float], Ty::Float)),
             (Ty::Float, "format") => Some((vec![Ty::Int], Ty::Str)),
             (Ty::Float, "clamp") => Some((vec![Ty::Float, Ty::Float], Ty::Float)),
             (Ty::Float, "is_nan") | (Ty::Float, "is_infinite") => Some((vec![], Ty::Bool)),

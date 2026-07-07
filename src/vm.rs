@@ -2247,6 +2247,24 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_float_mul_add() {
+        // The NEW mul_add is a FUSED multiply-add (self*a + b, single rounding), byte-identical
+        // on interp/KVM. The key case proves the fusion is real: (0.1).mul_add(0.1, -0.01) differs
+        // from 0.1*0.1 - 0.01 in the last bits because the product isn't doubly rounded — and all
+        // engines agree on the fused result, so the native fma() is genuinely fused (PR-it199).
+        let src = r#"fun probe() -> Str {
+    let fused = (0.1).mul_add(0.1, 0.0 - 0.01)
+    let unfused = 0.1 * 0.1 - 0.01
+    "{fused}|{unfused}|{fused == unfused}|{(2.0).mul_add(0.0 - 3.0, 1.0)}|{(1000000.0).mul_add(1000000.0, 1.0)}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "0.0000000000000000009020562075079397|0.000000000000000001734723475976807|false|-5.0|1000000000001.0"
+        );
+    }
+
+    #[test]
     fn diff_float_copysign() {
         // The NEW copysign(x, y) is byte-identical on interp/KVM: magnitude of the receiver with
         // the SIGN BIT of the argument. Crucially the sign comes from the bit, so a genuine -0.0
