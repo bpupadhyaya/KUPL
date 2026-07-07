@@ -148,6 +148,7 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 const BUILTIN_METHODS: &[&str] = &[
     "abs", "all", "and_then", "any", "band", "bnot", "bor", "bxor", "capitalize", "cbrt", "ceil",
     "center", "chars", "chunk", "clamp", "concat", "contains", "contains_key", "cos", "count",
+    "count_ones",
     "den", "difference", "dot", "drop", "drop_while", "ends_with", "exp", "factorial", "filter",
     "find", "first", "flat_map", "flatten", "floor", "fmt", "fold", "format", "fract", "gcd",
     "get", "get_or", "group_by", "hypot", "index_of", "init", "insert", "intersect",
@@ -2271,7 +2272,7 @@ impl Checker {
             | (Ty::Int, "shl") | (Ty::Int, "shr") | (Ty::Int, "ushr") => {
                 Some((vec![Ty::Int], Ty::Int))
             }
-            (Ty::Int, "bnot") => Some((vec![], Ty::Int)),
+            (Ty::Int, "bnot") | (Ty::Int, "count_ones") => Some((vec![], Ty::Int)),
             (Ty::Int, "to_hex") | (Ty::Int, "to_binary") | (Ty::Int, "to_octal") => {
                 Some((vec![], Ty::Str))
             }

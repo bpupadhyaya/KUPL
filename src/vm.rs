@@ -2134,6 +2134,18 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_int_count_ones() {
+        // The NEW count_ones (popcount) is byte-identical on interp/KVM over the 64-bit two's-
+        // complement pattern: (-1) has all 64 bits set, i64::MAX has 63, i64::MIN has 1
+        // (PR-it186).
+        let src = r#"fun probe() -> Str {
+    "{(0).count_ones()}|{(7).count_ones()}|{(255).count_ones()}|{(0 - 1).count_ones()}|{(1024).count_ones()}|{(9223372036854775807).count_ones()}|{(0 - 9223372036854775807 - 1).count_ones()}"
+}
+"#;
+        assert_eq!(differential(src), "0|3|8|64|1|63|1");
+    }
+
+    #[test]
     fn diff_int_factorial() {
         // The NEW factorial() is byte-identical on interp/KVM: 0!=1!=1, 20! is the largest that
         // fits i64, 21! is a checked-overflow panic, and a negative is a clean panic (PR-it185).

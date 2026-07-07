@@ -4024,6 +4024,9 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "bor")) return k_int(recv.as.i | args[0].as.i);
         if (!strcmp(name, "bxor")) return k_int(recv.as.i ^ args[0].as.i);
         if (!strcmp(name, "bnot")) return k_int(~recv.as.i);
+        /* Population count over the 64-bit two's-complement pattern, matching Rust
+           i64::count_ones ((-1).count_ones() = 64). */
+        if (!strcmp(name, "count_ones")) return k_int(__builtin_popcountll((uint64_t)recv.as.i));
         if (!strcmp(name, "shl") || !strcmp(name, "shr") || !strcmp(name, "ushr")) {
             int64_t n = args[0].as.i;
             if (n < 0 || n > 63) k_panic("shift amount must be in 0..=63");
@@ -5630,6 +5633,20 @@ fun main() uses io {
                    var empty: List[Str] = []\n    print(\"[{empty.join(\",\")}]\")\n    \
                    print([\"solo\"].join(\"|\"))\n    print([\"x\", \"y\"].join(\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "joinid").trim(), "a-bb-ccc\n[]\nsolo\nxy");
+    }
+
+    /// Native count_ones (popcount) matches interp/KVM including negative two's-complement
+    /// patterns ((-1)=64, i64::MIN=1) (PR-it186).
+    #[test]
+    fn native_int_count_ones() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    print("{(7).count_ones()}|{(255).count_ones()}|{(0 - 1).count_ones()}|{(0 - 9223372036854775807 - 1).count_ones()}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "intcones").trim(), "3|8|64|1");
     }
 
     /// Native factorial() matches interp/KVM: exact values up to 20!, overflow panic at 21!,

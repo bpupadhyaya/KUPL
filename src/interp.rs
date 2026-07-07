@@ -2607,6 +2607,9 @@ pub fn shared_method(
             _ => Err("`bxor` needs an Int".into()),
         },
         (Value::Int(v), "bnot") => Ok(Value::Int(!v)),
+        // Population count over the 64-bit two's-complement representation: a negative counts
+        // the set bits of its i64 bit pattern ((-1).count_ones() = 64).
+        (Value::Int(v), "count_ones") => Ok(Value::Int(v.count_ones() as i64)),
         (Value::Int(v), "shl") => match args.into_iter().next() {
             Some(Value::Int(n)) if (0..=63).contains(&n) => Ok(Value::Int(v << n)),
             Some(Value::Int(_)) => Err("shift amount must be in 0..=63".into()),
