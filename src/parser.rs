@@ -1578,7 +1578,9 @@ impl Parser {
                         if !matches!(self.peek(), Tok::Newline | Tok::RBrace) {
                             return Err(Diag::error(
                                 "K0109",
-                                format!("expected `,` or newline between match arms, found {}", self.peek().describe()),
+                                // The usual cause is two arms on one line (`Some(v) => v None => 0`);
+                                // name that fix rather than just reporting the next token (PR-it239).
+                                format!("match arms are separated by a newline or `,` — put each arm on its own line (found {} after an arm body)", self.peek().describe()),
                                 self.span(),
                             ));
                         }
@@ -2087,6 +2089,20 @@ app Main {
     fn ai_is_still_an_ordinary_identifier() {
         let p = ok("fun f(ai: Int) -> Int {\n    let ai = ai + 1\n    ai\n}\n");
         assert_eq!(p.items.len(), 1);
+    }
+
+    #[test]
+    fn two_match_arms_on_one_line_names_the_fix() {
+        // Putting two arms on one line (`Some(v) => v None => 0`) is a common mistake; K0109 now
+        // names the fix — one arm per line — rather than just reporting the next token (PR-it239).
+        let (_p, diags) = parse("fun f(o: Option[Int]) -> Int { match o { Some(v) => v None => 0 } }\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0109" && d.message.contains("put each arm on its own line")),
+            "{diags:?}"
+        );
+        // Both correct forms still parse: one arm per line, and comma-separated arms.
+        assert!(parse("fun f(o: Option[Int]) -> Int {\n    match o {\n        Some(v) => v\n        None => 0\n    }\n}\n").1.is_empty());
+        assert!(parse("fun f(n: Int) -> Str { match n { 0 => \"z\", 1 => \"o\", _ => \"m\" } }\n").1.is_empty());
     }
 
     #[test]
