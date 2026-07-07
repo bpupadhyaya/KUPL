@@ -2104,6 +2104,40 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_expr_evaluator_four_variants() {
+        // A certification lock (it298): a recursive ADT interpreter over a FOUR-variant expression type
+        // with mixed arities -- the canonical tree-walking eval. it296 traverses a 2-variant Leaf/Branch
+        // tree; this pins a richer ADT (Num holds an Int, Add/Mul hold two sub-Exprs, Neg holds one) with
+        // a single match dispatching all four arms recursively, so operator precedence falls out of the
+        // tree shape rather than any parsing.
+        //   e1 = Add(Num 3, Mul(Num 4, Num 5))            = 3 + (4*5)      = 23
+        //   e2 = Mul(Add(Num 2, Num 3), Neg(Num 6))       = (2+3) * (-6)   = -30
+        //   e3 = Neg(Add(Num 10, Neg(Num 4)))             = -(10 + (-4))   = -6
+        // Byte-identical on interp/KVM (native per the sweep). Confirms a four-constructor ADT with
+        // per-variant arities (one nullary-payload, two binary, one unary) evaluates recursively, that
+        // Neg's `0 - eval(e)` negation composes with nested Neg (e3's inner -4 flips back inside the sum),
+        // and that Add/Mul thread their two recursive results in the right order. This is the calculator /
+        // formula-engine / mini-language interpreter an AI writes constantly; a backend that mis-bound a
+        // binary constructor's second field or mishandled the unary Neg would miscompute e2 or e3 while
+        // the flat e1 looked fine.
+        let src = r#"type Expr = Num(v: Int) | Add(l: Expr, r: Expr) | Mul(l: Expr, r: Expr) | Neg(e: Expr)
+fun eval(e: Expr) -> Int {
+    match e { Num(v) => v
+        Add(l, r) => eval(l) + eval(r)
+        Mul(l, r) => eval(l) * eval(r)
+        Neg(e2) => 0 - eval(e2) }
+}
+fun probe() -> Str {
+    let e1 = Add(l: Num(v: 3), r: Mul(l: Num(v: 4), r: Num(v: 5)))
+    let e2 = Mul(l: Add(l: Num(v: 2), r: Num(v: 3)), r: Neg(e: Num(v: 6)))
+    let e3 = Neg(e: Add(l: Num(v: 10), r: Neg(e: Num(v: 4))))
+    "{eval(e1)}|{eval(e2)}|{eval(e3)}"
+}
+"#;
+        assert_eq!(differential(src), "23|-30|-6");
+    }
+
+    #[test]
     fn diff_recursive_tree_map_with_higher_order_fn() {
         // A bug-hunt-41 lock (it297): a recursive tree MAP that REBUILDS the ADT, driven by a
         // higher-order fn parameter. it296 traverses a tree down to a scalar (sum/count/depth); this
