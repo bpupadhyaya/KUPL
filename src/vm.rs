@@ -2220,6 +2220,56 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_tree_catamorphism() {
+        // A certification lock (it417): ADT CATAMORPHISM -- a single recursive fold over a binary-tree ADT that
+        // computes THREE aggregates at once (leaf-sum, node-count, max-depth) into a record accumulator. A
+        // catamorphism is the generalized "fold over a recursive type": the Leaf case supplies the base value,
+        // and the Node case COMBINES the two child aggregates -- summing the leaf sums, adding the child counts
+        // plus one for the node itself, and taking 1 + max of the child depths. Threading all three through one
+        // pass (rather than three separate traversals) is the point: the record accumulator Agg{sum,count,depth}
+        // carries every fold result up the recursion in a single bottom-up sweep. This is distinct from prior
+        // tree locks -- recursive-binary-tree (it296, one aggregate), tree-map (it297, rebuilds the ADT), and
+        // tree-balance (it312, a boolean) -- by folding a recursive ADT to a MULTI-FIELD summary.
+        //   cata(Leaf(7)) = 7,1,1                                  (base: sum 7, one node, depth 1)
+        //   cata(balanced 4-leaf tree {1,2,3,4}) = 10,7,3          (sum 10, 4 leaves+2 inner+1 root=7, depth 3)
+        //   cata(right-skewed 4-leaf {5,6,7,8}) = 26,7,4           (SAME node count, but depth 4 -- skew vs balance)
+        //   cata(Node(Leaf(10),Leaf(20))) = 30,3,2                 (sum 30, 2 leaves+1 node, depth 2)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the Leaf base case seeds each field,
+        // that the Node case combines both children's sums/counts/depths correctly, that depth is 1 + max of the
+        // child depths (so a balanced 4-leaf tree is depth 3 while a right-skewed one is depth 4 despite equal
+        // node counts), that count includes the internal node itself, that all three aggregates are computed in a
+        // single recursion, and that all three engines agree on the multi-field bottom-up fold. This is the tree
+        // catamorphism an AI writes to summarize a recursive structure in one pass -- AST analysis, tree
+        // statistics, evaluator aggregation; a backend whose match dispatch, record construction, or recursive
+        // combine was off would report a wrong summary. A non-sort lock folding an ADT to a multi-field record.
+        let src = r#"type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)
+type Agg = { sum: Int, count: Int, depth: Int }
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun cata(t: Tree) -> Agg {
+    match t {
+        Leaf(v) => Agg(sum: v, count: 1, depth: 1),
+        Node(l, r) => {
+            let la = cata(l)
+            let ra = cata(r)
+            Agg(sum: la.sum + ra.sum, count: la.count + ra.count + 1, depth: 1 + maxi(la.depth, ra.depth))
+        }
+    }
+}
+fun probe() -> Str {
+    let leaf = cata(Leaf(v: 7))
+    let bal = cata(Node(l: Node(l: Leaf(v: 1), r: Leaf(v: 2)), r: Node(l: Leaf(v: 3), r: Leaf(v: 4))))
+    let skew = cata(Node(l: Leaf(v: 5), r: Node(l: Leaf(v: 6), r: Node(l: Leaf(v: 7), r: Leaf(v: 8)))))
+    let two = cata(Node(l: Leaf(v: 10), r: Leaf(v: 20)))
+    "leaf={leaf.sum},{leaf.count},{leaf.depth}|bal={bal.sum},{bal.count},{bal.depth}|skew={skew.sum},{skew.count},{skew.depth}|two={two.sum},{two.count},{two.depth}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "leaf=7,1,1|bal=10,7,3|skew=26,7,4|two=30,3,2"
+        );
+    }
+
+    #[test]
     fn diff_cocktail_sort() {
         // A certification lock (it416): COCKTAIL SORT (bidirectional / shaker bubble sort) -- fixes bubble sort's
         // "turtle" weakness by a DIFFERENT mechanism than comb sort (it415). Plain bubble sort only sweeps in one
