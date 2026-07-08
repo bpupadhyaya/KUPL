@@ -2104,6 +2104,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_zip_with_index_enumerate() {
+        // A bug-hunt-62 lock (it345): zip-with-index -- the "enumerate" idiom. KUPL has no enumerate builtin,
+        // so the canonical replacement is to build a 0-based index list with rangeN(xs.len()) and zip_with it
+        // against the elements, pairing each index i with its element x. This is what an AI reaches for when it
+        // wants Python's enumerate() or Rust's .iter().enumerate() -- position + value together.
+        //   ["a","b","c","d"] -> [0:a, 1:b, 2:c, 3:d] ; firstIdx=0 ; lastIdx=3 ; n=4
+        // Byte-identical on interp/KVM (native per the sweep). Confirms rangeN(len) yields the 0..len-1 index
+        // list (first=0, last=len-1), that zip_with pairs index with element POSITIONALLY (0 with a, 3 with
+        // d -- no off-by-one, no reversal), that the "{i}:{x}" interpolation renders each pair, that join
+        // stitches them, and that all three engines agree on the index/element alignment. This is the
+        // enumerate an AI writes for numbered lists, position-aware maps, and index-tagged output; a backend
+        // whose rangeN was off-by-one or whose zip_with misaligned would shift every label.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun probe() -> Str {
+    let xs = ["a", "b", "c", "d"]
+    let idx = rangeN(xs.len())
+    let paired = idx.zip_with(xs, fn(i, x) { "{i}:{x}" })
+    let joined = paired.join(",")
+    let firstIdx = idx.first().unwrap_or(0 - 1)
+    let lastIdx = idx.last().unwrap_or(0 - 1)
+    let n = idx.len()
+    "paired={joined}|firstIdx={firstIdx}|lastIdx={lastIdx}|n={n}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "paired=0:a,1:b,2:c,3:d|firstIdx=0|lastIdx=3|n=4"
+        );
+    }
+
+    #[test]
     fn diff_histogram_buckets() {
         // A certification lock (it344): histogram into fixed-width buckets -- range binning. Each score is
         // mapped to a DERIVED bucket key by integer division (score / 10), then fold-tallied into a
