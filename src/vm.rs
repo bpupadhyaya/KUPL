@@ -2572,6 +2572,82 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_date_from_serial_roundtrip() {
+        // A certification lock (it443): DATE FROM SERIAL DAY-NUMBER -- the INVERSE of the it440 date->serial map,
+        // completing a serial<->date bijection (like the base64 it437/it438 and hex it439 codec roundtrips, but
+        // for calendar dates). Where it440 turned (y,m,d) into a proleptic-Gregorian day count, this reconstructs
+        // (y,m,d) FROM that count. The reconstruction is harder than the forward direction: it must recover the
+        // year (start from the estimate n/366, which undershoots because 366 exceeds the 365.2425 average, then
+        // step forward while the next year still starts at or before n -- a handful of iterations, not a scan from
+        // year 1), then the day-of-year (n minus days-before-year), then walk the month table subtracting each
+        // month's length until the remainder fits, leaving the day. The probe feeds serial(D) straight back into
+        // fromSerial and checks it recovers D, so it pins fromSerial . serial == identity on real dates.
+        //   fromSerial(serial(2000,1,1)) = 2000-1-1        (year boundary, first day)
+        //   fromSerial(serial(2024,2,29)) = 2024-2-29      (a leap day survives the round trip)
+        //   fromSerial(serial(1999,12,31)) = 1999-12-31    (last day of a common year, day-of-year 365)
+        //   fromSerial(serial(2001,9,11)) = 2001-9-11
+        //   fromSerial(serial(2023,7,8)) = 2023-7-8
+        //   fromSerial(serial(1900,3,1)) = 1900-3-1        (1900 is NOT leap, so March 1 is day-of-year 60)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the year is recovered from the
+        // day-count estimate and forward-stepping, that the day-of-year is the count minus the days before the
+        // year, that the month is found by subtracting each month's length (leap-aware), that the leftover is the
+        // day, that a leap day and a common-year late-February boundary both reconstruct exactly, that date and
+        // serial are mutual inverses on these dates, and that all three engines agree. This is the "turn an epoch
+        // day-number back into a calendar date" an AI writes for date-add, scheduling, or storage; a backend whose
+        // year search, day-of-year subtraction, or month walk was off would rebuild the wrong date. A non-sort
+        // lock certifying the serial->date inverse and the date<->serial roundtrip, complementing it440.
+        let src = r#"fun isLeap(y: Int) -> Bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+fun daysInMonth(y: Int, m: Int) -> Int {
+    if m == 2 { if isLeap(y) { 29 } else { 28 } }
+    else if m == 4 || m == 6 || m == 9 || m == 11 { 30 }
+    else { 31 }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun dayOfYear(y: Int, m: Int, d: Int) -> Int {
+    rangeIncl(1, m - 1).fold(0, fn(acc, mm) { acc + daysInMonth(y, mm) }) + d
+}
+fun daysBeforeYear(y: Int) -> Int {
+    let yy = y - 1
+    365 * yy + yy / 4 - yy / 100 + yy / 400
+}
+fun serial(y: Int, m: Int, d: Int) -> Int { daysBeforeYear(y) + dayOfYear(y, m, d) }
+fun findYear(n: Int, g: Int) -> Int {
+    if daysBeforeYear(g + 1) < n { findYear(n, g + 1) } else { g }
+}
+fun findMonth(y: Int, doy: Int, m: Int) -> Int {
+    let dim = daysInMonth(y, m)
+    if doy > dim { findMonth(y, doy - dim, m + 1) } else { m }
+}
+fun monthDay(y: Int, doy: Int, m: Int) -> Int {
+    let dim = daysInMonth(y, m)
+    if doy > dim { monthDay(y, doy - dim, m + 1) } else { doy }
+}
+fun fromSerial(n: Int) -> Str {
+    let y = findYear(n, n / 366)
+    let doy = n - daysBeforeYear(y)
+    let m = findMonth(y, doy, 1)
+    let d = monthDay(y, doy, 1)
+    "{y}-{m}-{d}"
+}
+fun probe() -> Str {
+    let a = fromSerial(serial(2000, 1, 1))
+    let b = fromSerial(serial(2024, 2, 29))
+    let c = fromSerial(serial(1999, 12, 31))
+    let d = fromSerial(serial(2001, 9, 11))
+    let e = fromSerial(serial(2023, 7, 8))
+    let f = fromSerial(serial(1900, 3, 1))
+    "y2000={a}|leap={b}|nye={c}|nine11={d}|d2023={e}|mar1900={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "y2000=2000-1-1|leap=2024-2-29|nye=1999-12-31|nine11=2001-9-11|d2023=2023-7-8|mar1900=1900-3-1"
+        );
+    }
+
+    #[test]
     fn diff_date_difference_days() {
         // A bug-hunt-109 lock (it440): DATE DIFFERENCE -- the number of days between two Gregorian dates, computed
         // by converting each date to a serial day-number and subtracting. This extends the date family (Zeller
