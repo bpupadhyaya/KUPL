@@ -141,6 +141,24 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
     best.map(|(_, c)| c.to_string())
 }
 
+/// Well-known method names from OTHER languages that edit-distance can't reach (too many
+/// edits from the KUPL name), mapped to the KUPL method an AI most likely meant. Suggestion-only
+/// and best-effort like `suggest` -- only consulted as a K0249 fallback, never changes resolution
+/// (PR-it318). `length`/`size` (Java/JS/C#/Swift) -> `len` is the canonical case.
+fn common_method_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "length" | "size" | "count_elements" => Some("len"),
+        "append" | "add" | "add_last" => Some("push"),
+        "has" | "includes" | "member" => Some("contains"),
+        "index_of_first" | "find_index" | "indexOf" => Some("position"),
+        "to_string" | "toString" | "str" => Some("to_str"),
+        "upper" | "uppercase" | "to_uppercase" => Some("to_upper"),
+        "lower" | "lowercase" | "to_lowercase" => Some("to_lower"),
+        "sort_asc" | "sorted" => Some("sort_by"),
+        _ => None,
+    }
+}
+
 /// Every built-in method name across all receiver types, for "did you mean"
 /// suggestions on an unknown method (K0249). Suggestion-only and best-effort —
 /// if a newly added method is missing here the only effect is a missed hint, so
@@ -2595,7 +2613,13 @@ impl Checker {
                     .iter()
                     .copied()
                     .chain(self.checked.funs.keys().map(String::as_str));
-                let msg = match suggest(name, cands) {
+                // A known cross-language alias (length/size/append/...) is a high-confidence intent, so
+                // prefer it over a coincidental edit-distance neighbor (e.g. `size` is 2 edits from `sign`
+                // but the user means `len`); fall back to edit-distance otherwise.
+                let hint = common_method_alias(name)
+                    .map(String::from)
+                    .or_else(|| suggest(name, cands));
+                let msg = match hint {
                     Some(s) => format!("{rt} has no method `{name}` (did you mean `{s}`?)"),
                     None => format!("{rt} has no method `{name}`"),
                 };
@@ -3322,6 +3346,18 @@ mod generic_tests {
             e3.iter().any(|d| d.code == "K0249" && !d.message.contains("did you mean")),
             "{e3:?}"
         );
+        // cross-language alias too far for edit-distance -> named via the common-alias table (PR-it318):
+        // `.length` (Java/JS/C#) is 3 edits from `len`, so only the alias table can name it.
+        let e4 = errors("fun main() uses io { print([1, 2, 3].length()) }\n");
+        assert!(
+            e4.iter().any(|d| d.code == "K0249" && d.message.contains("did you mean `len`?")),
+            "{e4:?}"
+        );
+        // `.size` -> `len` and `.append` -> `push` are the other common ones.
+        let e5 = errors("fun main() uses io { print([1].size()) }\n");
+        assert!(e5.iter().any(|d| d.message.contains("did you mean `len`?")), "{e5:?}");
+        let e6 = errors("fun main() uses io { print([1].append(2)) }\n");
+        assert!(e6.iter().any(|d| d.message.contains("did you mean `push`?")), "{e6:?}");
     }
 
     #[test]
