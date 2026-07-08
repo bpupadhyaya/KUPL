@@ -2220,6 +2220,45 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_tribonacci() {
+        // A certification lock (it376): the TRIBONACCI numbers via a THREE-term additive recurrence
+        // T(n) = T(n-1) + T(n-2) + T(n-3), with bases T(0) = 0, T(1) = 1, T(2) = 1. This generalizes the
+        // two-term Fibonacci recurrence of climbing-stairs (it373): where Fibonacci sums the previous TWO
+        // terms, tribonacci sums the previous THREE. It is a k-step counting DP -- the number of ways to reach
+        // step n taking 1, 2, or 3 steps follows this shape.
+        //   T(0) = 0, T(1) = 1, T(2) = 1, T(3) = 2, T(4) = 4, T(5) = 7, T(6) = 13
+        //   T(10) = 149
+        //   sequence: 0, 1, 1, 2, 4, 7, 13, 24, 44, 81, 149, ...
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the T(0)=0 base and the T(1)=T(2)=1
+        // bases (the three seeds a three-term recurrence needs), that each term SUMS the previous THREE (not
+        // two, not max, not multiply), that the exact tribonacci progression emerges (T(6)=13 = 7+4+2,
+        // T(10)=149), and that all three engines agree. This is the tribonacci / three-step counting DP an AI
+        // writes for k-step climbing, tiling with three tile lengths, and generalized-Fibonacci sequences; a
+        // backend whose three-term sum or triple base cases were off would break the progression. Extends the
+        // additive linear counting DPs from two-term (Fibonacci/climbing-stairs) to three-term.
+        let src = r#"fun trib(n: Int) -> Int {
+    if n == 0 { 0 }
+    else {
+        if n <= 2 { 1 }
+        else { trib(n - 1) + trib(n - 2) + trib(n - 3) }
+    }
+}
+fun probe() -> Str {
+    let a = trib(4)
+    let b = trib(10)
+    let c = trib(2)
+    let z = trib(0)
+    let seq = "0={trib(0)}|1={trib(1)}|2={trib(2)}|3={trib(3)}|4={trib(4)}|5={trib(5)}|6={trib(6)}"
+    "t4={a}|t10={b}|t2={c}|t0={z}|{seq}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "t4=4|t10=149|t2=1|t0=0|0=0|1=1|2=1|3=2|4=4|5=7|6=13"
+        );
+    }
+
+    #[test]
     fn diff_longest_common_substring() {
         // A bug-hunt-77 lock (it375): LONGEST COMMON SUBSTRING -- the length of the longest CONTIGUOUS run of
         // characters common to two strings. This is a two-string DP that is deliberately CONTRASTED with the
