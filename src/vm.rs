@@ -2220,6 +2220,67 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_trapping_rain_water() {
+        // A bug-hunt-81 lock (it383): TRAPPING RAIN WATER -- given an elevation map (bar heights), compute how
+        // much water is trapped between the bars after rain. This is a per-index BIDIRECTIONAL-MAX aggregation,
+        // distinct from the running-scan DPs: the water sitting ABOVE bar i is bounded by the SHORTER of the
+        // tallest bar to its left (inclusive) and the tallest bar to its right (inclusive), so
+        // water(i) = max(0, min(leftMax(i), rightMax(i)) - height[i]), and the answer sums that over all i.
+        // Both leftMax and rightMax INCLUDE index i, so at a bar that is itself the local peak the min equals
+        // its own height and it traps 0 (never negative -- the max(0, ...) clamp guards the shorter-wall case).
+        //   trap([0,1,0,2,1,0,1,3,2,1,2,1]) = 6    (the classic elevation map)
+        //   trap([4,2,0,3,2,5]) = 9                (a deeper basin)
+        //   trap([1,2,3,4]) = 0                    (monotonic ascending -- no left wall ever traps)
+        //   trap([3,0,3]) = 3                      (a single valley: min(3,3) - 0)
+        //   trap([]) = 0                           (empty)
+        //   trap([5]) = 0                          (a single bar traps nothing)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms each cell's water is the min of the two
+        // side-maxima minus its own height, clamped at 0 (no negative water where the bar exceeds one wall),
+        // that leftMax/rightMax both include the bar itself (so peaks trap 0), that a monotonic array traps
+        // nothing, that a simple valley traps the flooded depth, that empty and singleton inputs yield 0, and
+        // that all three engines agree on the O(n^2) bidirectional-max sum. This is the trapping-rain-water /
+        // histogram-basin routine an AI writes for terrain water-volume and container problems; a backend whose
+        // min-of-side-maxima, inclusive bounds, or zero clamp was off would over- or under-fill. Adds a
+        // bidirectional prefix/suffix-max aggregation, distinct from the single-direction running scans.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun mini(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+fun leftMax(h: List[Int], i: Int) -> Int {
+    rangeN(i + 1).fold(0, fn(m, j) { maxi(m, h.get(j).unwrap_or(0)) })
+}
+fun rightMax(h: List[Int], i: Int) -> Int {
+    let n = h.len()
+    rangeN(n).fold(0, fn(m, j) {
+        if j >= i { maxi(m, h.get(j).unwrap_or(0)) } else { m }
+    })
+}
+fun trap(h: List[Int]) -> Int {
+    let n = h.len()
+    rangeN(n).fold(0, fn(total, i) {
+        let hi = h.get(i).unwrap_or(0)
+        let water = mini(leftMax(h, i), rightMax(h, i)) - hi
+        total + maxi(0, water)
+    })
+}
+fun probe() -> Str {
+    let a = trap([0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1])
+    let b = trap([4, 2, 0, 3, 2, 5])
+    let c = trap([1, 2, 3, 4])
+    let d = trap([3, 0, 3])
+    let e = trap([])
+    let f = trap([5])
+    "classic={a}|b={b}|asc={c}|valley={d}|empty={e}|one={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "classic=6|b=9|asc=0|valley=3|empty=0|one=0"
+        );
+    }
+
+    #[test]
     fn diff_maximum_product_subarray() {
         // A certification lock (it382): MAXIMUM PRODUCT SUBARRAY -- the largest product of any contiguous
         // non-empty sub-slice. This is the MULTIPLICATIVE cousin of Kadane's additive max-subarray (it372), and
