@@ -2220,6 +2220,66 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_matrix_chain_multiplication() {
+        // A bug-hunt-72 lock (it365): MATRIX-CHAIN MULTIPLICATION -- the minimum number of scalar
+        // multiplications needed to multiply a chain of matrices, choosing the optimal PARENTHESIZATION. The
+        // matrices are given by a dimension list: dims[i] x dims[i+1] is the i-th matrix. This is an INTERVAL
+        // DP, structurally distinct from every prior DP in the family (which recursed on a prefix, suffix, or
+        // single-element choice): cost(i,j) recurses on SUBRANGES and SPLITS at every interior position.
+        // The recurrence: a single matrix (i == j) costs 0; otherwise try every split point k in [i, j) --
+        // multiplying the left group A[i..k] and the right group A[k+1..j] and then their two results costs
+        // cost(i,k) + cost(k+1,j) + dims[i]*dims[k+1]*dims[j+1] -- and take the MIN over all k. A -1 sentinel
+        // seeds the fold so the first candidate always wins.
+        //   mcm([10,20,30]) = 6000     (one product: 10*20*30)
+        //   mcm([10,20,30,40]) = 18000 ((AB)C = 6000 + 12000; beats A(BC) = 24000 + 8000 = 32000)
+        //   mcm([40,20,30,10,30]) = 26000  (classic 4-matrix chain -- the optimal split, not left-to-right)
+        //   mcm([5,10]) = 0            (a single matrix needs no multiplication)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the i==j base costs 0, that a two-matrix
+        // chain costs the single triple-product, that the MIN is taken over every interior split point (so the
+        // three-matrix chain picks (AB)C's 18000 over A(BC)'s 32000), that the split cost correctly sums the
+        // two sub-chain costs plus the dims[i]*dims[k+1]*dims[j+1] product of combining them, that the -1 fold
+        // sentinel is replaced by the first real candidate, and that all three engines agree on the classic
+        // 4-matrix optimum. This is the matrix-chain / optimal-parenthesization DP an AI writes for query
+        // planning, expression evaluation order, and tensor-contraction scheduling; a backend whose split
+        // enumeration, min-fold, or dimension indexing was off would pick a suboptimal parenthesization.
+        // Extends the DP family with an interval/split structure, distinct from prefix-choice (knapsack,
+        // coin-change), two-string (edit/LCS), and single-sequence (LIS) recurrences.
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [rangeIncl(lo, hi - 1), [hi]].flatten() }
+}
+fun mini(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+fun cost(dims: List[Int], i: Int, j: Int) -> Int {
+    if i == j { 0 }
+    else {
+        let splits = rangeIncl(i, j - 1)
+        splits.fold(0 - 1, fn(acc, k) {
+            let di = dims.get(i).unwrap_or(0)
+            let dk = dims.get(k + 1).unwrap_or(0)
+            let dj = dims.get(j + 1).unwrap_or(0)
+            let cand = cost(dims, i, k) + cost(dims, k + 1, j) + di * dk * dj
+            if acc < 0 { cand } else { mini(acc, cand) }
+        })
+    }
+}
+fun mcm(dims: List[Int]) -> Int {
+    let n = dims.len() - 1
+    cost(dims, 0, n - 1)
+}
+fun probe() -> Str {
+    let a = mcm([10, 20, 30])
+    let b = mcm([10, 20, 30, 40])
+    let c = mcm([40, 20, 30, 10, 30])
+    let d = mcm([5, 10])
+    "two={a}|three={b}|classic={c}|single={d}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "two=6000|three=18000|classic=26000|single=0"
+        );
+    }
+
+    #[test]
     fn diff_knapsack_01_value() {
         // A certification lock (it364): the 0/1 KNAPSACK VALUE maximization -- given items each with a weight
         // and a value, pick a subset whose total weight fits a capacity while MAXIMIZING total value, using
