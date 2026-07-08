@@ -2220,6 +2220,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_rod_cutting() {
+        // A bug-hunt-73 lock (it367): ROD CUTTING -- the maximum revenue from cutting a rod of length n into
+        // integer pieces, where prices[i] is the price of a piece of length i+1. This is an UNBOUNDED-choice
+        // MAXIMIZATION DP: it is the max-value sibling of coin-change (it362) -- both allow UNLIMITED reuse of
+        // each choice, but coin-change MINIMIZES a count while rod-cutting MAXIMIZES a value; and it differs
+        // from the 0/1 knapsack (it364), which allows each item at most once. The recurrence: a rod of length
+        // 0 yields 0; otherwise try every first-cut length c in [1, n] -- taking prices[c-1] for that piece
+        // plus the best revenue from the remaining length n-c -- and take the MAX. Recursing on n-c against the
+        // FULL price list (not a shrinking one) is what makes cut lengths reusable.
+        //   maxRev([1,5,8,9,10,17,17,20], 4) = 10   (two length-2 pieces at 5 each; beats one length-4 at 9)
+        //   maxRev([1,5,8,9,10,17,17,20], 8) = 22   (a length-2 + a length-6: 5 + 17; the classic CLRS answer)
+        //   maxRev([2,5,7,8], 5) = 12               (a length-2 + a length-3: 5 + 7)
+        //   maxRev([1,5,8,9,10,17,17,20], 0) = 0    (nothing to cut)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the n==0 base yields 0, that the fold
+        // takes the MAX over every first-cut length (not min, not sum), that a piece's price is added to the
+        // best revenue of the REMAINDER, that recursing on the full price list permits unlimited reuse of a cut
+        // length (so length 4 uses two 2-pieces, and length 8 the classic 2+6 split), that cutting into more
+        // pieces can beat leaving the rod whole (10 > 9 at length 4), and that all three engines agree. This is
+        // the rod-cutting / unbounded-knapsack DP an AI writes for revenue optimization and cutting-stock
+        // problems; a backend whose max-fold, price indexing, or unbounded recursion was off would leave money
+        // on the table. Rounds out the optimization DPs: unbounded-max (rod), unbounded-min (coin-change),
+        // 0/1-max (knapsack).
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [rangeIncl(lo, hi - 1), [hi]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun maxRev(prices: List[Int], n: Int) -> Int {
+    if n == 0 { 0 }
+    else {
+        rangeIncl(1, n).fold(0, fn(acc, c) {
+            let pc = prices.get(c - 1).unwrap_or(0)
+            let cand = pc + maxRev(prices, n - c)
+            maxi(acc, cand)
+        })
+    }
+}
+fun probe() -> Str {
+    let prices = [1, 5, 8, 9, 10, 17, 17, 20]
+    let a = maxRev(prices, 4)
+    let b = maxRev(prices, 8)
+    let c = maxRev([2, 5, 7, 8], 5)
+    let z = maxRev(prices, 0)
+    "len4={a}|len8={b}|len5={c}|zero={z}"
+}
+"#;
+        assert_eq!(differential(src), "len4=10|len8=22|len5=12|zero=0");
+    }
+
+    #[test]
     fn diff_longest_palindromic_subsequence() {
         // A certification lock (it366): LONGEST PALINDROMIC SUBSEQUENCE (LPS) -- the length of the longest
         // subsequence of a string that reads the same forwards and backwards. This is a TWO-ENDED string DP:
