@@ -2220,6 +2220,57 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_house_robber() {
+        // A bug-hunt-75 lock (it371): the HOUSE ROBBER DP -- the maximum sum selectable from a list such that
+        // no two chosen elements are ADJACENT. This is a linear-sequence take-or-skip optimization DP with a
+        // NO-ADJACENT constraint, structurally distinct from the prefix-choice DPs (which recurse by one) and
+        // the grid/interval/string shapes: at each index the choice is to TAKE the current value and jump TWO
+        // ahead (skipping the neighbor), or SKIP it and advance by one. The recurrence over rob(i): past the
+        // end (i >= n) yields 0; otherwise the best is max(nums[i] + rob(i+2), rob(i+1)) -- the +2 jump is what
+        // enforces "no two adjacent".
+        //   rob([1,2,3,1]) = 4        (houses 0 and 2: 1 + 3)
+        //   rob([2,7,9,3,1]) = 12     (houses 0, 2, 4: 2 + 9 + 1)
+        //   rob([5,5,10,100,10,5]) = 110  (houses 0, 3, 5: 5 + 100 + 5)
+        //   rob([2,1,1,2]) = 4        (the non-adjacent ENDS 0 and 3, beating the adjacent middles)
+        //   rob([]) = 0               (nothing to rob)
+        //   rob([7]) = 7              (a single house)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the i>=n base yields 0, that TAKING an
+        // element adds its value and skips exactly one neighbor via the +2 jump (never robbing adjacent
+        // houses), that SKIPPING advances by one, that the choice is the MAX of take vs skip (not min, not
+        // sum), that a non-adjacent pair of ends can beat adjacent interior picks ([2,1,1,2] -> 4 via 0+3),
+        // that the empty list yields 0 and a singleton yields itself, and that all three engines agree. This is
+        // the house-robber / max-independent-set-on-a-path DP an AI writes for scheduling with conflicts and
+        // non-adjacent selection; a backend whose +2 jump, take/skip max, or base case was off would rob
+        // adjacent houses or miss the optimum. Adds a linear no-adjacent take-or-skip recurrence to the DP
+        // family.
+        let src = r#"fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun rob(nums: List[Int], i: Int) -> Int {
+    if i >= nums.len() { 0 }
+    else {
+        let ni = nums.get(i).unwrap_or(0)
+        let take = ni + rob(nums, i + 2)
+        let skip = rob(nums, i + 1)
+        maxi(take, skip)
+    }
+}
+fun houseRob(nums: List[Int]) -> Int { rob(nums, 0) }
+fun probe() -> Str {
+    let a = houseRob([1, 2, 3, 1])
+    let b = houseRob([2, 7, 9, 3, 1])
+    let c = houseRob([5, 5, 10, 100, 10, 5])
+    let d = houseRob([2, 1, 1, 2])
+    let e = houseRob([])
+    let f = houseRob([7])
+    "a4={a}|b5={b}|c6={c}|d4={d}|empty={e}|single={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a4=4|b5=12|c6=110|d4=4|empty=0|single=7"
+        );
+    }
+
+    #[test]
     fn diff_unique_paths_grid() {
         // A certification lock (it370): UNIQUE PATHS in an m x n grid, counting the distinct routes from the
         // top-left to the bottom-right cell moving only RIGHT or DOWN. This is a 2-D LATTICE counting DP,
