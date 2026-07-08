@@ -2220,6 +2220,58 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_matrix_anti_transpose() {
+        // A bug-hunt-94 lock (it409): ANTI-DIAGONAL TRANSPOSE -- reflect a matrix across its ANTI-diagonal (the
+        // top-right-to-bottom-left diagonal), completing the matrix-transform family. The MAIN transpose (it353)
+        // reflects across the main diagonal via new[c][r] = old[r][c]; the anti-transpose reflects across the
+        // OTHER diagonal via new[c][r] = old[rows-1-r][cols-1-c] -- it swaps dimensions like the main transpose
+        // but ALSO reverses both indices, so it equals a main transpose composed with a 180-degree rotation
+        // (it393). Together with rotate-90 (it392) and rotate-180 these four span the square matrix's symmetry
+        // transforms. Output dimensions are cols x rows (swapped, as in the main transpose), and the
+        // anti-diagonal elements map onto the new matrix's anti-diagonal.
+        //   antiTranspose([[1,2],[3,4]]) = [[4,2],[3,1]]              (anti-diagonal 2,3 fixed; corners 1,4 swap)
+        //   antiTranspose([[1,2,3],[4,5,6],[7,8,9]]) = [[9,6,3],[8,5,2],[7,4,1]]   (anti-diagonal 3,5,7 preserved)
+        //   antiTranspose([[1,2,3]]) = [[3],[2],[1]]                 (1x3 row -> 3x1 reversed column)
+        //   antiTranspose([[1],[2],[3]]) = [[3,2,1]]                 (3x1 column -> 1x3 reversed row)
+        //   antiTranspose([[1,2,3],[4,5,6]]) = [[6,3],[5,2],[4,1]]   (2x3 -> 3x2, non-square dims swap)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the transform swaps dimensions like
+        // the main transpose while reversing both row and column indices, that the anti-diagonal is preserved
+        // onto the new anti-diagonal, that it is distinct from the main transpose (compare it353: main gives
+        // [[1,3],[2,4]] but anti gives [[4,2],[3,1]] on the same input) and from the rotations, that a row
+        // vector becomes a reversed column and vice versa, that rectangular non-square matrices swap dimensions
+        // correctly, and that all three engines agree on the coordinate reflection. This is the anti-transpose
+        // an AI writes for image/matrix reflection, coordinate-system flips, and symmetry operations; a backend
+        // whose index reversal or dimension swap was off would produce a rotated or mirrored result. Completes
+        // the matrix-transform family (main-transpose, rotate-90, rotate-180, anti-transpose).
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun cell(m: List[List[Int]], r: Int, c: Int) -> Int {
+    m.get(r).unwrap_or([]).get(c).unwrap_or(0)
+}
+fun antiTranspose(m: List[List[Int]]) -> List[List[Int]] {
+    let rows = m.len()
+    let cols = m.get(0).unwrap_or([]).len()
+    rangeN(cols).map(fn(c) {
+        rangeN(rows).map(fn(r) { cell(m, rows - 1 - r, cols - 1 - c) })
+    })
+}
+fun probe() -> Str {
+    let sq2 = antiTranspose([[1, 2], [3, 4]])
+    let sq3 = antiTranspose([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    let row = antiTranspose([[1, 2, 3]])
+    let col = antiTranspose([[1], [2], [3]])
+    let rect = antiTranspose([[1, 2, 3], [4, 5, 6]])
+    "sq2={sq2}|sq3={sq3}|row={row}|col={col}|rect={rect}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sq2=[[4, 2], [3, 1]]|sq3=[[9, 6, 3], [8, 5, 2], [7, 4, 1]]|row=[[3], [2], [1]]|col=[[3, 2, 1]]|rect=[[6, 3], [5, 2], [4, 1]]"
+        );
+    }
+
+    #[test]
     fn diff_quickselect_kth() {
         // A certification lock (it408): QUICKSELECT -- find the kth-smallest element (0-indexed) via
         // pivot-partitioning, the PARTIAL-SORT DUAL to the full quicksort (it325). Both use the same partition
