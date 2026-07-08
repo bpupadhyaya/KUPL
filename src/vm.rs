@@ -2220,6 +2220,60 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_coin_change_minimum() {
+        // A certification lock (it362): COIN-CHANGE MINIMUM -- the fewest coins (with unlimited supply of each
+        // denomination) that sum to a target amount, or -1 if impossible -- via the min-over-choices
+        // recurrence. This is the OPTIMIZATION sibling of the subset-sum COUNT (it359): where subset-sum ADDs
+        // the include/exclude branches to count solutions, coin-change takes the MIN over every coin choice to
+        // optimize the solution. The recurrence: amount 0 needs 0 coins (base); a negative amount overshot and
+        // is impossible (-1); otherwise fold over the coins, and for each coin c try minCoins(amount - c) --
+        // if that sub-problem is solvable (>= 0) it costs sub + 1, and we keep the running MINIMUM, carefully
+        // ignoring the -1 "impossible" sentinel so it never wins the min.
+        //   minCoins([1,2,5], 6) = 2     (5 + 1)
+        //   minCoins([2], 3) = -1        (impossible -- an odd amount from an even-only coin set)
+        //   minCoins([1,3,4], 6) = 2     (3 + 3 -- beats the GREEDY 4 + 1 + 1 = 3, the classic greedy-fails case)
+        //   minCoins([1,2,5], 0) = 0     (zero amount needs zero coins)
+        // Amounts are kept small (<=6) because the no-memo recursion, with a coin-fold closure per level, has
+        // heavy debug stack frames; the release binary handles larger amounts identically.
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the amount==0 base returns 0, the
+        // amount<0 base returns the -1 sentinel, that unlimited reuse is allowed (minCoins recurses on the FULL
+        // coin list, not a shrinking one), that the fold takes the true MINIMUM over coin choices, that the -1
+        // sentinel is excluded from the min (a solvable path always beats an impossible one), that a genuinely
+        // impossible target yields -1, and -- crucially -- that the DP finds the true optimum where a greedy
+        // largest-coin-first heuristic would fail ([1,3,4] making 6). All three engines agree. This is the
+        // coin-change / minimum-operations DP an AI writes for making change and optimization; a backend whose
+        // min-fold, sentinel handling, or unlimited-reuse recursion was off would over-count or miss the
+        // optimum.
+        let src = r#"fun minCoins(coins: List[Int], amount: Int) -> Int {
+    if amount == 0 { 0 }
+    else {
+        if amount < 0 { 0 - 1 }
+        else {
+            let best = coins.fold(0 - 1, fn(acc, c) {
+                let sub = minCoins(coins, amount - c)
+                if sub < 0 { acc }
+                else {
+                    let cand = sub + 1
+                    if acc < 0 { cand }
+                    else { if cand < acc { cand } else { acc } }
+                }
+            })
+            best
+        }
+    }
+}
+fun probe() -> Str {
+    let a = minCoins([1, 2, 5], 6)
+    let b = minCoins([2], 3)
+    let c = minCoins([1, 3, 4], 6)
+    let z = minCoins([1, 2, 5], 0)
+    "amt6a={a}|odd3={b}|amt6c={c}|zero={z}"
+}
+"#;
+        assert_eq!(differential(src), "amt6a=2|odd3=-1|amt6c=2|zero=0");
+    }
+
+    #[test]
     fn diff_subset_sum_count() {
         // A bug-hunt-69 lock (it359): SUBSET-SUM COUNT -- how many subsets of a list sum to a target -- via the
         // include/exclude counting recurrence. Distinct from the power set (it356, which ENUMERATES all 2^n
