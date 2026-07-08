@@ -2269,6 +2269,61 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_luhn_checksum() {
+        // A certification lock (it427): LUHN CHECKSUM -- the mod-10 validation used for credit-card numbers,
+        // IMEIs, and many national IDs. Reading the digits from the RIGHT, every SECOND digit (the ones at
+        // odd distance from the right end) is DOUBLED; if a doubled value exceeds 9 it has 9 subtracted (which is
+        // the same as summing its two decimal digits); all the resulting values are summed, and the number is
+        // valid exactly when that total is a multiple of 10. The doubling parity is keyed off "distance from the
+        // right" (n-1-i), not the left index, which is the subtle part most naive implementations get backwards.
+        //   valid("79927398713") = true         (the canonical Luhn example; digit-sum is 70)
+        //   valid("79927398710") = false        (same number, last digit 3->0: sum 67, not a multiple of 10)
+        //   valid("4532015112830366") = true     (a real Visa test PAN)
+        //   valid("1234567812345678") = false    (a sequential number that fails the check)
+        //   luhnSum("79927398713") = 70          (the raw checksum total, exposed to pin the arithmetic)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that digits are parsed per character, that
+        // the from-the-right parity selects exactly every second digit for doubling, that a doubled value over 9
+        // is reduced by 9, that the untouched digits are added as-is, that validity is total % 10 == 0, that a
+        // single-digit change flips the verdict (79927398713 valid vs 79927398710 invalid), and that all three
+        // engines agree on both the boolean verdict and the raw sum. This is the Luhn check an AI writes to
+        // validate a card or device number before hitting a payment or provisioning API; a backend whose doubling
+        // parity was off-by-one, or which forgot the subtract-9 step, would accept invalid numbers or reject
+        // valid ones. A non-sort lock certifying the mod-10 Luhn checksum with a per-digit doubling rule.
+        let src = r#"fun digits(s: Str) -> List[Int] {
+    s.chars().map(fn(c) { c.parse_int().unwrap_or(0) })
+}
+fun luhnSum(ds: List[Int]) -> Int {
+    let n = ds.len()
+    let idxs = rangeN(n)
+    idxs.fold(0, fn(acc, i) {
+        let d = ds.get(i).unwrap_or(0)
+        let fromRight = n - 1 - i
+        if fromRight % 2 == 1 {
+            let dbl = d * 2
+            acc + (if dbl > 9 { dbl - 9 } else { dbl })
+        } else { acc + d }
+    })
+}
+fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun valid(s: Str) -> Bool { luhnSum(digits(s)) % 10 == 0 }
+fun probe() -> Str {
+    let v1 = valid("79927398713")
+    let v2 = valid("79927398710")
+    let v3 = valid("4532015112830366")
+    let v4 = valid("1234567812345678")
+    let s1 = luhnSum(digits("79927398713"))
+    "v1={v1}|v2={v2}|v3={v3}|v4={v4}|sum1={s1}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "v1=true|v2=false|v3=true|v4=false|sum1=70"
+        );
+    }
+
+    #[test]
     fn diff_roman_numeral_codec() {
         // A bug-hunt-102 lock (it426): ROMAN-NUMERAL CODEC -- greedy subtractive ENCODE plus pairwise-lookahead
         // DECODE, with a roundtrip check. Encoding walks a value/symbol table ordered largest-first that BAKES IN
