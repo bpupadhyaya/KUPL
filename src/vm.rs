@@ -2104,6 +2104,42 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_word_frequency_count() {
+        // A certification lock (it342): word-frequency counting -- the canonical text-processing idiom. Split
+        // a sentence on spaces, fold the word list into a Map[Str, Int] tally where each word's running count
+        // is get(w).unwrap_or(0) + 1 re-inserted, then query individual counts, the distinct-word count
+        // (keys().len()), and the total word count (words.len()).
+        //   "the cat sat on the mat the cat ran" -> the=3, cat=2, mat=1, distinct=6, total=9
+        // Byte-identical on interp/KVM (native per the sweep). Confirms split(" ") tokenizes into 9 words, that
+        // folding from an empty Map() accumulates a tally (get-or-0 then insert overwrites the same key so
+        // repeats increment rather than duplicate), that a repeated word ("the" x3, "cat" x2) sums correctly,
+        // that a once-seen word ("mat") lands at 1, that keys().len() counts DISTINCT words (6: the/cat/sat/
+        // on/mat/ran) while words.len() counts ALL tokens (9), and that the three engines agree on Map
+        // insertion-overwrite semantics. This is the histogram an AI writes for any text-analysis task; a
+        // backend whose Map insert duplicated keys instead of overwriting, or whose get-or-default was off,
+        // would break the counts or the distinct total.
+        let src = r#"fun tally(words: List[Str]) -> Map[Str, Int] {
+    words.fold(Map(), fn(m, w) {
+        let c = m.get(w).unwrap_or(0)
+        m.insert(w, c + 1)
+    })
+}
+fun probe() -> Str {
+    let text = "the cat sat on the mat the cat ran"
+    let words = text.split(" ")
+    let counts = tally(words)
+    let the = counts.get("the").unwrap_or(0)
+    let cat = counts.get("cat").unwrap_or(0)
+    let mat = counts.get("mat").unwrap_or(0)
+    let distinct = counts.keys().len()
+    let total = words.len()
+    "the={the}|cat={cat}|mat={mat}|distinct={distinct}|total={total}"
+}
+"#;
+        assert_eq!(differential(src), "the=3|cat=2|mat=1|distinct=6|total=9");
+    }
+
+    #[test]
     fn diff_caesar_cipher_shift() {
         // A bug-hunt-60 lock (it341): the Caesar cipher -- character rotation by a fixed shift with modular
         // wraparound, plus an encode/decode round-trip. Since KUPL has no char->Int, each letter is mapped to
