@@ -2825,6 +2825,62 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_sieve_of_eratosthenes() {
+        // A bug-hunt-113 lock (it448): SIEVE OF ERATOSTHENES -- generate ALL primes up to n by crossing off
+        // multiples, cross-validated against the per-number trial-division primality test (isPrime, it340). This
+        // is a distinct algorithm from it340: the sieve is BATCH generation (take the smallest surviving number
+        // as prime, filter every multiple of it out of the rest, recurse on what remains), whereas isPrime tests
+        // ONE number by trial division up to its square root. The two share no logic, so the sieve's output
+        // matching the trial-division filter (cross == true) is strong evidence both are right. The functional
+        // sieve recurses once per prime found (about 8 levels for n=20), and the initial rangeIncl stays under the
+        // shallow-stack limit.
+        //   primesUpTo(20) = 2,3,5,7,11,13,17,19    (the 8 primes below 20)
+        //   primesUpTo(10) = 2,3,5,7
+        //   count = 8
+        //   cross = true                             (sieve == rangeIncl(2,20).filter(isPrime): the two agree)
+        //   isPrime(91) = false                      (91 = 7*13; the classic trial-division trap a wrong sqrt
+        //                                             bound would call prime)
+        //   sum of primesUpTo(20) = 77               (2+3+5+7+11+13+17+19)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the sieve takes each surviving head
+        // as prime and removes its multiples, that composites are eliminated, that the generated list equals the
+        // trial-division filter over the same range (batch generation agrees with per-number testing), that the
+        // 7*13 semiprime is correctly rejected, that the prime count and sum match, and that all three engines
+        // agree. This is the "list the primes up to n" an AI writes for factoring, number theory, or a primality
+        // table; the sieve and the individual test agreeing catches an off-by-one in either. A non-sort lock
+        // certifying the Sieve of Eratosthenes cross-checked against trial-division primality.
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun noDiv(n: Int, d: Int) -> Bool {
+    if d * d > n { true } else if n % d == 0 { false } else { noDiv(n, d + 1) }
+}
+fun isPrime(n: Int) -> Bool { if n < 2 { false } else { noDiv(n, 2) } }
+fun sieve(nums: List[Int]) -> List[Int] {
+    if nums.len() == 0 { [] }
+    else {
+        let p = nums.first().unwrap_or(0)
+        [[p], sieve(nums.drop(1).filter(fn(x) { x % p != 0 }))].flatten()
+    }
+}
+fun primesUpTo(n: Int) -> List[Int] { sieve(rangeIncl(2, n)) }
+fun shw(xs: List[Int]) -> Str { xs.map(fn(x) { x.to_str() }).join(",") }
+fun probe() -> Str {
+    let p20 = shw(primesUpTo(20))
+    let p10 = shw(primesUpTo(10))
+    let cnt = primesUpTo(20).len()
+    let cross = primesUpTo(20) == rangeIncl(2, 20).filter(fn(x) { isPrime(x) })
+    let trap91 = isPrime(91)
+    let sum20 = primesUpTo(20).fold(0, fn(a, x) { a + x })
+    "p20={p20}|p10={p10}|cnt={cnt}|cross={cross}|prime91={trap91}|sum20={sum20}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "p20=2,3,5,7,11,13,17,19|p10=2,3,5,7|cnt=8|cross=true|prime91=false|sum20=77"
+        );
+    }
+
+    #[test]
     fn diff_euler_totient() {
         // A certification lock (it447): EULER'S TOTIENT phi(n) -- the count of integers in [1,n] coprime to n --
         // computed TWO independent ways and cross-checked, extending the number-theory family (gcd it334,
