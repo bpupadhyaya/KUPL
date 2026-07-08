@@ -3029,6 +3029,56 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_horner_polynomial_eval() {
+        // A certification lock (it470): HORNER'S METHOD for polynomial evaluation -- the value of
+        // p(x) = c0 + c1*x + c2*x^2 + ... + cn*x^n computed by the nested (Ruffini) form
+        // (((cn)*x + c_{n-1})*x + c_{n-2})*x + ... + c0, which uses only n multiplications -- cross-validated
+        // against the DIRECT power-summation sum_i c_i * x^i, which recomputes each power separately. Continuing
+        // the classic-algorithm vein (Stein GCD it467, Russian peasant it468, Newton isqrt it469): these are two
+        // genuinely independent evaluation strategies for the same polynomial. Horner reverses the ascending
+        // coefficient list and folds acc <- acc*x + c from the leading coefficient down; the direct method indexes
+        // the coefficients and sums c_i * pow(x,i). Their agreement certifies the nested-multiplication logic
+        // against an obvious reference, and Horner is the efficient one (n mults, no repeated powering).
+        //   h1 = p(5) for 2 + 3x + x^2 = 42       (2 + 15 + 25)
+        //   h2 = p(2) for 1 + x^3 = 9              (sparse polynomial)
+        //   h3 = p(9) for the constant 7 = 7       (degree 0)
+        //   x1..x4: horner == direct for [2,3,1]@5, [1,0,0,1]@2, [5,4,3,2,1]@3 (=179), [0,1]@6 (=6)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that reversing the coefficients and folding
+        // acc*x+c reproduces the polynomial value, that the constant and sparse and dense and linear cases all
+        // agree with the direct sum-of-c_i*x^i, that the two independent evaluation orders match at four
+        // polynomials, and that all three engines agree. This is the efficient polynomial evaluation an AI writes
+        // for numerics, hashing (polynomial rolling), or CRC-style work; agreement with the naive power sum catches
+        // a coefficient-order or nesting bug. A non-sort lock certifying Horner's method against direct evaluation.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun pow(x: Int, k: Int) -> Int { if k <= 0 { 1 } else { x * pow(x, k - 1) } }
+fun horner(coeffs: List[Int], x: Int) -> Int {
+    let rev = coeffs.fold([], fn(acc: List[Int], c: Int) { [[c], acc].flatten() })
+    rev.fold(0, fn(acc: Int, c: Int) { acc * x + c })
+}
+fun direct(coeffs: List[Int], x: Int) -> Int {
+    let idx = rangeN(coeffs.len())
+    idx.zip_with(coeffs, fn(i: Int, c: Int) { c * pow(x, i) }).fold(0, fn(a: Int, b: Int) { a + b })
+}
+fun probe() -> Str {
+    let h1 = horner([2, 3, 1], 5)
+    let h2 = horner([1, 0, 0, 1], 2)
+    let h3 = horner([7], 9)
+    let x1 = horner([2, 3, 1], 5) == direct([2, 3, 1], 5)
+    let x2 = horner([1, 0, 0, 1], 2) == direct([1, 0, 0, 1], 2)
+    let x3 = horner([5, 4, 3, 2, 1], 3) == direct([5, 4, 3, 2, 1], 3)
+    let x4 = horner([0, 1], 6) == direct([0, 1], 6)
+    "h1={h1}|h2={h2}|h3={h3}|x1={x1}|x2={x2}|x3={x3}|x4={x4}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "h1=42|h2=9|h3=7|x1=true|x2=true|x3=true|x4=true"
+        );
+    }
+
+    #[test]
     fn diff_newton_isqrt() {
         // A bug-hunt-123 lock (it469): NEWTON'S INTEGER SQUARE ROOT -- the floor(sqrt(n)) computed by the
         // Newton-Raphson iteration x <- (x + n/x)/2 until it stops decreasing -- cross-validated against the
