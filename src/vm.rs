@@ -2104,6 +2104,52 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_memoized_fib_via_map() {
+        // A certification lock (it317): MEMOIZED Fibonacci -- dynamic programming with a Map[Int,Int] memo
+        // table threaded through the recursion. Prior Map locks fold INTO a Map (it292 tally, it300 buckets,
+        // it307 pivot) or read an entity store (it286); this uses a Map as a MEMO whose updated copy must
+        // thread through BOTH recursive calls so subproblems are computed once. Each call returns a record
+        // {val, cache} bundling the answer AND the grown cache.
+        //   fibMemo(n, cache): cache.get(n) Some(v) -> HIT (return v, cache unchanged);
+        //     None -> MISS: n<2 -> (n, cache.insert(n,n)); else
+        //       a = fibMemo(n-1, cache); b = fibMemo(n-2, a.cache);   // b threads a's updated cache
+        //       r = a.val+b.val; return (r, b.cache.insert(n, r))
+        //   fib8 = 21 ; fib12 = 144 ; cache after fib(12) holds fib(0)..fib(12) = 13 entries
+        //   (depth kept to fib(12): deeper memoized recursion overflows the 2MB DEBUG test-thread stack;
+        //    the release binary runs fib(20)=6765 fine -- this is a test-harness limit, not a language one)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the Some/None memo hit/miss split,
+        // that the cache THREADS through both recursive calls (b uses a.cache, not the original) so every
+        // subproblem is memoized exactly once (cache size 13, not the exponential recompute count), that the
+        // {val, cache} record carries the DP state functionally, and that base cases are cached too. This is
+        // the memoize-an-exponential-recursion-into-linear an AI writes for DP -- the Map as a memo table
+        // threaded as immutable state. A backend that didn't thread the cache through the second call would
+        // recompute subtrees (still correct value but a wrong, larger cache-touch count) or, on a naive
+        // build, blow up; one that mishandled the hit path would recompute a cached n. The cache size is the
+        // witness that memoization actually happened.
+        let src = r#"type Memo = { val: Int, cache: Map[Int, Int] }
+fun fibMemo(n: Int, cache: Map[Int, Int]) -> Memo {
+    match cache.get(n) { Some(v) => Memo(val: v, cache: cache)
+        None => {
+            if n < 2 { Memo(val: n, cache: cache.insert(n, n)) }
+            else {
+                let a = fibMemo(n - 1, cache)
+                let b = fibMemo(n - 2, a.cache)
+                let r = a.val + b.val
+                Memo(val: r, cache: b.cache.insert(n, r))
+            }
+        } }
+}
+fun probe() -> Str {
+    let m8 = fibMemo(8, Map())
+    let m12 = fibMemo(12, Map())
+    let hits = m12.cache.keys().len()
+    "fib8={m8.val}|fib12={m12.val}|cachesize={hits}"
+}
+"#;
+        assert_eq!(differential(src), "fib8=21|fib12=144|cachesize=13");
+    }
+
+    #[test]
     fn diff_graph_cycle_detection() {
         // A bug-hunt-50 lock (it316): GRAPH CYCLE DETECTION via DFS with an on-stack (recursion-path) set.
         // it315 does reachability with a single visited set; cycle detection needs a DIFFERENT set -- the
