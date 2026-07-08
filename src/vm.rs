@@ -2220,6 +2220,64 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_radix_sort_lsd() {
+        // A certification lock (it412): LSD RADIX SORT -- a multi-pass STABLE distribution sort, generalizing
+        // counting sort (it410) from a single value range to successive DIGIT positions. Counting sort buckets
+        // by the whole value; radix sort makes one stable pass PER DIGIT, least-significant first: pass k
+        // distributes into 10 buckets by digit k (ones, then tens, then hundreds) and concatenates. The crucial
+        // correctness property is that EACH PASS IS STABLE -- filter preserves the relative order of equal-digit
+        // elements -- so once the ones digit is sorted, the tens pass keeps ones-order within each tens bucket,
+        // and after `passes` passes the most-significant processed digit dominates while lower digits break ties.
+        // This trades counting sort's O(n+k) for O(passes * (n+10)), which wins when the value range is huge but
+        // the digit count is small.
+        //   radixSort([170,45,75,90,2,802,24,66], 3) = [2,24,45,66,75,90,170,802]  (classic 3-digit example)
+        //   radixSort([53,3,542,8,1], 3) = [1,3,8,53,542]        (mixed 1-to-3-digit numbers)
+        //   radixSort([9], 1) = [9]                              (single element)
+        //   radixSort([], 2) = []                                (empty)
+        //   radixSort([4,4,2,2,1], 1) = [1,2,2,4,4]              (single pass suffices for one-digit values)
+        //   radixSort([100,10,1], 3) = [1,10,100]                (powers of ten -- each dominated by a diff digit)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each pass distributes by exactly one
+        // digit position starting from least-significant, that the per-pass distribution is STABLE so
+        // lower-digit order survives into higher-digit passes (this is what makes the final order correct rather
+        // than scrambled), that numbers with fewer digits sort correctly (their absent high digits read as 0),
+        // that duplicates are preserved, that empty/single inputs are handled, and that all three engines agree
+        // on the multi-pass digit distribution. This is the LSD radix sort an AI writes for fast fixed-width
+        // integer/string key sorting; a backend whose digit extraction, bucket order, or per-pass stability was
+        // off would misorder the result. Adds the multi-pass distribution paradigm generalizing counting sort.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun pow10(k: Int) -> Int {
+    if k <= 0 { 1 } else { 10 * pow10(k - 1) }
+}
+fun digitAt(x: Int, k: Int) -> Int {
+    (x / pow10(k)) % 10
+}
+fun onePass(xs: List[Int], k: Int) -> List[Int] {
+    rangeN(10).flat_map(fn(d) {
+        xs.filter(fn(x) { digitAt(x, k) == d })
+    })
+}
+fun radixSort(xs: List[Int], passes: Int) -> List[Int] {
+    rangeN(passes).fold(xs, fn(acc, k) { onePass(acc, k) })
+}
+fun probe() -> Str {
+    let a = radixSort([170, 45, 75, 90, 2, 802, 24, 66], 3)
+    let b = radixSort([53, 3, 542, 8, 1], 3)
+    let c = radixSort([9], 1)
+    let d = radixSort([], 2)
+    let e = radixSort([4, 4, 2, 2, 1], 1)
+    let f = radixSort([100, 10, 1], 3)
+    "big={a}|mix={b}|single={c}|empty={d}|dups={e}|pow={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "big=[2, 24, 45, 66, 75, 90, 170, 802]|mix=[1, 3, 8, 53, 542]|single=[9]|empty=[]|dups=[1, 2, 2, 4, 4]|pow=[1, 10, 100]"
+        );
+    }
+
+    #[test]
     fn diff_selection_sort_extract_min() {
         // A bug-hunt-95 lock (it411): SELECTION SORT by repeated MINIMUM EXTRACTION -- the extract-the-extreme
         // paradigm that a binary heap accelerates (a heap is precisely an efficient priority queue for repeated
