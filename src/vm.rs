@@ -3029,6 +3029,58 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_karatsuba_multiplication() {
+        // A certification lock (it476): KARATSUBA MULTIPLICATION -- the divide-and-conquer product that computes
+        // x*y with THREE recursive sub-multiplications instead of four, via the identity, splitting each operand at
+        // a base B (here 1000) into x = x1*B + x0 and y = y1*B + y0:
+        //   z2 = x1*y1,  z0 = x0*y0,  z1 = (x1+x0)*(y1+y0) - z2 - z0,  and  x*y = z2*B^2 + z1*B + z0.
+        // The trick is z1: the middle term x1*y0 + x0*y1 is recovered from the single product (x1+x0)*(y1+y0) minus
+        // the two corner products, saving one multiply per level (the basis of its sub-quadratic bignum speed).
+        // Cross-validated against the language's own `*` operator -- a genuine SECOND-ALGORITHM cross-check (like
+        // russian-peasant it468 halve/double vs `*`, and distinct from it: Karatsuba is the recursive split, not
+        // repeated doubling). Continuing the classic-algorithm vein (Stein GCD it467 ... Newton cbrt it474).
+        //   kara(12345, 6789) = 83810205,  kara(999999, 999999) = 999998000001,  kara(1000000, 7) = 7000000
+        //   x1..x5: kara == `*` for (12345,6789), (999999,999999), (500,500), (123456,654321), (1000000,999999)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the three-way split reproduces the
+        // product, that the z1 = (x1+x0)(y1+y0) - z2 - z0 recombination recovers the cross terms without a fourth
+        // multiply, that operands straddling the base (x1+x0 >= B forces a deeper recursion) recombine correctly,
+        // that a base-multiple operand (1000000) and a mixed-size pair both agree with `*`, and that all three
+        // engines agree. This is the fast multiplication an AI writes for bignum or DSP kernels; agreement with the
+        // native `*` catches a wrong base power (B vs B^2) or a dropped corner term in the z1 subtraction. A
+        // non-sort lock certifying Karatsuba multiplication against the `*` operator.
+        let src = r#"fun kara(x: Int, y: Int) -> Int {
+    let b = 1000
+    if x < b && y < b { x * y }
+    else {
+        let x1 = x / b
+        let x0 = x % b
+        let y1 = y / b
+        let y0 = y % b
+        let z2 = kara(x1, y1)
+        let z0 = kara(x0, y0)
+        let z1 = kara(x1 + x0, y1 + y0) - z2 - z0
+        z2 * b * b + z1 * b + z0
+    }
+}
+fun probe() -> Str {
+    let a = kara(12345, 6789)
+    let b = kara(999999, 999999)
+    let c = kara(1000000, 7)
+    let x1 = kara(12345, 6789) == 12345 * 6789
+    let x2 = kara(999999, 999999) == 999999 * 999999
+    let x3 = kara(500, 500) == 250000
+    let x4 = kara(123456, 654321) == 123456 * 654321
+    let x5 = kara(1000000, 999999) == 1000000 * 999999
+    "a={a}|b={b}|c={c}|x1={x1}|x2={x2}|x3={x3}|x4={x4}|x5={x5}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a=83810205|b=999998000001|c=7000000|x1=true|x2=true|x3=true|x4=true|x5=true"
+        );
+    }
+
+    #[test]
     fn diff_bitwise_arithmetic_identities() {
         // A certification lock (it475, from bug-hunt batch 124 -- 16 probes across Float/BigInt/Rational/radix/
         // string/bit shapes came back byte-identical, so the subtlest untouched corner is locked instead of a fix):
