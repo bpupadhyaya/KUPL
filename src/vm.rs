@@ -2269,6 +2269,60 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_extended_euclidean_bezout() {
+        // A certification lock (it431): EXTENDED EUCLIDEAN ALGORITHM -- computes not just gcd(a,b) but the BEZOUT
+        // COEFFICIENTS x,y satisfying a*x + b*y = gcd(a,b), and applies them to compute the MODULAR INVERSE. This
+        // is distinct from the plain Euclidean gcd/lcm (it334) and from the div/rem Euclidean semantics test;
+        // here the recursion carries the coefficients back up. The base case b==0 returns (g=a, x=1, y=0); the
+        // recursive case solves extGcd(b, a%b) and back-substitutes the coefficients as x = y', y = x' - (a/b)*y'.
+        // The Bezout identity a*x + b*y = g is verified directly (chk1). The modular inverse of a mod m exists
+        // exactly when gcd(a,m)=1, and equals the x coefficient normalized into [0,m) via ((x % m) + m) % m;
+        // when the gcd is not 1 there is no inverse and the code returns -1.
+        //   extGcd(240,46) = g=2, x=-9, y=47      (240*-9 + 46*47 = -2160 + 2162 = 2)
+        //   240*(-9) + 46*47 = 2                  (the Bezout identity holds -- chk1)
+        //   extGcd(30,12) = g=6, x=1, y=-2        (30*1 + 12*-2 = 6)
+        //   modInverse(3,11) = 4                  (3*4 = 12 = 1 mod 11)
+        //   modInverse(10,17) = 12                (10*12 = 120 = 1 mod 17)
+        //   modInverse(4,8) = -1                  (gcd(4,8)=4 != 1, no inverse)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the base case seeds x=1,y=0, that the
+        // recursion back-substitutes the coefficients correctly (including with negative values), that the Bezout
+        // identity a*x+b*y=g is satisfied, that the modular inverse is derived from the x coefficient and
+        // normalized into the positive residue range, that a non-coprime pair yields the -1 no-inverse sentinel,
+        // and that all three engines agree on the coefficients and the inverses. This is the extended Euclid an AI
+        // writes for RSA/crypto modular inverses, CRT, or solving linear Diophantine equations; a backend whose
+        // back-substitution, integer division sign, or residue normalization was off would produce wrong
+        // coefficients or a wrong (or negative) inverse. A non-sort lock certifying Bezout coefficients and
+        // modular inverse via the extended Euclidean algorithm.
+        let src = r#"type Bez = { g: Int, x: Int, y: Int }
+fun extGcd(a: Int, b: Int) -> Bez {
+    if b == 0 { Bez(g: a, x: 1, y: 0) }
+    else {
+        let r = extGcd(b, a % b)
+        Bez(g: r.g, x: r.y, y: r.x - (a / b) * r.y)
+    }
+}
+fun modInverse(a: Int, m: Int) -> Int {
+    let r = extGcd(a, m)
+    if r.g != 1 { 0 - 1 }
+    else { ((r.x % m) + m) % m }
+}
+fun probe() -> Str {
+    let e1 = extGcd(240, 46)
+    let e2 = extGcd(30, 12)
+    let chk1 = 240 * e1.x + 46 * e1.y
+    let inv = modInverse(3, 11)
+    let inv2 = modInverse(10, 17)
+    let noinv = modInverse(4, 8)
+    "e1={e1.g},{e1.x},{e1.y}|chk1={chk1}|e2={e2.g},{e2.x},{e2.y}|inv3m11={inv}|inv10m17={inv2}|noinv={noinv}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "e1=2,-9,47|chk1=2|e2=6,1,-2|inv3m11=4|inv10m17=12|noinv=-1"
+        );
+    }
+
+    #[test]
     fn diff_hamming_distance() {
         // A bug-hunt-104 lock (it430): HAMMING DISTANCE -- the number of positions at which two EQUAL-LENGTH
         // sequences differ, in both its string and its bitwise forms. This is distinct from edit-distance /
