@@ -2220,6 +2220,47 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_climbing_stairs() {
+        // A bug-hunt-76 lock (it373): CLIMBING STAIRS -- the number of distinct ways to reach step n taking
+        // either 1 or 2 steps at a time. This is an ADDITIVE two-term linear counting DP (Fibonacci-shaped),
+        // distinct from the other linear DPs (house-robber's max take-or-skip it371, Kadane's running-best
+        // it372): the last move is either a single step from n-1 or a double step from n-2, so the count is
+        // ways(n-1) + ways(n-2). The base: reaching step 0 (already there) or step 1 is a single way each.
+        // The sequence ways(0), ways(1), ways(2), ... is exactly the Fibonacci numbers 1, 1, 2, 3, 5, 8, ...
+        //   ways(2) = 2    (1+1, or 2)
+        //   ways(3) = 3    (1+1+1, 1+2, 2+1)
+        //   ways(5) = 8
+        //   ways(10) = 89
+        //   ways(0) = 1    (one way: take no steps)
+        //   ways(1..5) = 1, 2, 3, 5, 8   (the shifted Fibonacci sequence)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the n<=1 base yields 1 (both step 0 and
+        // step 1 have one way), that each term SUMS the previous two (not max, not multiply), that the two-term
+        // self-recursion produces the exact Fibonacci sequence (ways(10) = 89 is the 11th Fibonacci number),
+        // and that all three engines agree. This is the climbing-stairs / step-count DP an AI writes for
+        // tiling counts, Fibonacci-family problems, and path enumeration with fixed step sizes; a backend whose
+        // additive two-term recurrence or base cases were off would break the Fibonacci progression. Adds an
+        // additive Fibonacci-shaped linear counting DP to the family.
+        let src = r#"fun ways(n: Int) -> Int {
+    if n <= 1 { 1 }
+    else { ways(n - 1) + ways(n - 2) }
+}
+fun probe() -> Str {
+    let a = ways(2)
+    let b = ways(3)
+    let c = ways(5)
+    let d = ways(10)
+    let z = ways(0)
+    let seq = "1={ways(1)}|2={ways(2)}|3={ways(3)}|4={ways(4)}|5={ways(5)}"
+    "s2={a}|s3={b}|s5={c}|s10={d}|s0={z}|{seq}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "s2=2|s3=3|s5=8|s10=89|s0=1|1=1|2=2|3=3|4=5|5=8"
+        );
+    }
+
+    #[test]
     fn diff_max_subarray_kadane() {
         // A certification lock (it372): MAXIMUM SUBARRAY SUM via Kadane's algorithm -- the largest sum of any
         // CONTIGUOUS (non-empty) sub-slice of a list. This is a running-best linear DP, distinct from the
