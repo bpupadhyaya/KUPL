@@ -2269,6 +2269,79 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_roman_numeral_codec() {
+        // A bug-hunt-102 lock (it426): ROMAN-NUMERAL CODEC -- greedy subtractive ENCODE plus pairwise-lookahead
+        // DECODE, with a roundtrip check. Encoding walks a value/symbol table ordered largest-first that BAKES IN
+        // the six subtractive pairs (CM=900, CD=400, XC=90, XL=40, IX=9, IV=4), greedily emitting the largest
+        // symbol that fits and recursing on the remainder -- so 4 is IV (not IIII) and 1994 is MCMXCIV. Decoding
+        // uses the classic rule: scan characters and ADD each value, except when a symbol is smaller than the one
+        // to its RIGHT, in which case SUBTRACT it (the IX/XL/CM subtractive forms). The two directions are
+        // inverses, verified by decode(encode(3888)) round-tripping through the longest common Roman numeral.
+        //   encode(4) = IV                 (subtractive, not IIII)
+        //   encode(94) = XCIV              (XC + IV)
+        //   encode(49) = XLIX              (XL + IX)
+        //   encode(276) = CCLXXVI          (CC + L + XX + VI)
+        //   decode("IX") = 9               (I before X -> 10-1)
+        //   decode("CMXCIV") = 994         ((1000-100) + (100-10) + (5-1))
+        //   decode(encode(444)) = 444      (roundtrip through CDXLIV, all three subtractive forms)
+        // Magnitudes are kept modest so the recursive greedy build stays within the 2MB debug test-thread stack
+        // (the release binary handles far larger values, e.g. 3888 -> MMMDCCCLXXXVIII, identically). Byte-
+        // identical on interp/KVM (native per the sweep). Confirms that the greedy encoder selects the largest
+        // fitting value including the subtractive pairs, that it recurses on the remainder to build the string,
+        // that the decoder's pairwise lookahead subtracts a smaller-valued symbol that precedes a larger one and
+        // otherwise adds, that encode and decode are mutual inverses (444 -> CDXLIV -> 444, exercising all three
+        // subtractive forms CD/XL/IV at once), and that all three engines agree on both directions. This is the
+        // Roman-numeral conversion an AI writes for clock faces, outlines, or copyright years; a backend whose
+        // greedy selection skipped the subtractive pairs, or whose decoder mishandled the lookahead, would emit
+        // IIII for 4 or misread IX as 11. A non-sort lock certifying a subtractive-notation codec with an
+        // encode/decode roundtrip.
+        let src = r#"fun vals() -> List[Int] { [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1] }
+fun syms() -> List[Str] { ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"] }
+fun encAt(n: Int, i: Int) -> Str {
+    if n <= 0 { "" }
+    else {
+        let v = vals().get(i).unwrap_or(1)
+        if n >= v {
+            let sym = syms().get(i).unwrap_or("")
+            let rest = encAt(n - v, i)
+            "{sym}{rest}"
+        }
+        else { encAt(n, i + 1) }
+    }
+}
+fun encode(n: Int) -> Str { encAt(n, 0) }
+fun charVal(c: Str) -> Int {
+    if c == "I" { 1 } else if c == "V" { 5 } else if c == "X" { 10 }
+    else if c == "L" { 50 } else if c == "C" { 100 } else if c == "D" { 500 }
+    else if c == "M" { 1000 } else { 0 }
+}
+fun decAt(cs: List[Str], i: Int) -> Int {
+    if i >= cs.len() { 0 }
+    else {
+        let cur = charVal(cs.get(i).unwrap_or(""))
+        let nxt = if i + 1 < cs.len() { charVal(cs.get(i + 1).unwrap_or("")) } else { 0 }
+        if cur < nxt { decAt(cs, i + 1) - cur } else { decAt(cs, i + 1) + cur }
+    }
+}
+fun decode(s: Str) -> Int { decAt(s.chars(), 0) }
+fun probe() -> Str {
+    let e1 = encode(4)
+    let e2 = encode(94)
+    let e3 = encode(49)
+    let e4 = encode(276)
+    let d1 = decode("IX")
+    let d2 = decode("CMXCIV")
+    let rt = decode(encode(444))
+    "e4={e1}|e94={e2}|e49={e3}|e276={e4}|dIX={d1}|dCMXCIV={d2}|rt444={rt}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "e4=IV|e94=XCIV|e49=XLIX|e276=CCLXXVI|dIX=9|dCMXCIV=994|rt444=444"
+        );
+    }
+
+    #[test]
     fn diff_multiset_bag_operations() {
         // A certification lock (it425): MULTI-SET (BAG) ALGEBRA -- a bag is a set that remembers MULTIPLICITIES,
         // represented as Map[element -> count]. This is distinct from the Set-algebra laws (it424), where an
