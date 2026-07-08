@@ -2220,6 +2220,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_partition_then_recombine() {
+        // A bug-hunt-100 lock (it422, the hundredth bug-hunt batch): PARTITION-THEN-RECOMBINE -- split a list
+        // into two groups by a predicate, apply a DIFFERENT transformation to each group, then concatenate the
+        // transformed groups back into one list. Here evens are multiplied by 10 and odds are offset by 100, then
+        // the evens block is placed before the odds block. This is the "process-by-class then reassemble" pattern
+        // an AI writes for things like applying one rule to premium rows and another to standard rows before
+        // emitting a combined result. Two properties matter: within each partition the ORIGINAL relative order is
+        // preserved (filter is stable), and the recombine REGROUPS into blocks (all evens, then all odds) rather
+        // than restoring the interleaved input order.
+        //   process([1,2,3,4,5]) = 20,40,101,103,105   (evens 2,4 ->*10; odds 1,3,5 ->+100; evens block first)
+        //   process([2,4,6]) = 20,40,60                 (all even -- odds block empty)
+        //   process([1,3,5]) = 101,103,105              (all odd -- evens block empty)
+        //   process([]) = (empty)                       (empty input -> empty output)
+        //   process([7]) = 107                          (single odd)
+        //   process([4,1,2,3]) = 40,20,101,103          (evens 4,2 keep input order -> 40,20; NOT resorted)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the predicate partitions the list
+        // into evens and odds, that each partition gets its own distinct map transform (x*10 vs x+100), that
+        // filter preserves within-group input order (the [4,1,2,3] case yields 40,20 -- 4 before 2, not sorted),
+        // that flatten concatenates the two transformed blocks with evens first (regrouping, not interleaving),
+        // that all-even / all-odd inputs leave one block empty, that an empty input yields an empty result, and
+        // that all three engines agree on the partition/transform/concat pipeline. This is the partition-then-
+        // recombine an AI writes to apply class-specific processing and reassemble; a backend whose filter
+        // reordered, or whose concat interleaved instead of block-appending, would produce a different sequence.
+        // A non-sort lock exercising predicate partition with per-side transform and block recombine.
+        let src = r#"fun process(xs: List[Int]) -> List[Int] {
+    let evens = xs.filter(fn(x) { x % 2 == 0 }).map(fn(x) { x * 10 })
+    let odds = xs.filter(fn(x) { x % 2 == 1 }).map(fn(x) { x + 100 })
+    [evens, odds].flatten()
+}
+fun show(xs: List[Int]) -> Str {
+    xs.map(fn(x) { x.to_str() }).join(",")
+}
+fun probe() -> Str {
+    let mixed = show(process([1, 2, 3, 4, 5]))
+    let alleven = show(process([2, 4, 6]))
+    let allodd = show(process([1, 3, 5]))
+    let empty = show(process([]))
+    let single = show(process([7]))
+    let order = show(process([4, 1, 2, 3]))
+    "mixed={mixed}|alleven={alleven}|allodd={allodd}|empty={empty}|single={single}|order={order}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mixed=20,40,101,103,105|alleven=20,40,60|allodd=101,103,105|empty=|single=107|order=40,20,101,103"
+        );
+    }
+
+    #[test]
     fn diff_option_traverse() {
         // A certification lock (it421): OPTION-TRAVERSE -- traverse a list applying a fallible (Option-returning)
         // operation and collect into a single Option[List[Int]] with ALL-OR-NOTHING semantics: every item must
