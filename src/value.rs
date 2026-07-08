@@ -45,6 +45,21 @@ impl IntW {
     pub fn check_range(self, v: i128) -> bool {
         v >= self.min() && v <= self.max()
     }
+    /// The narrowest built-in width whose range holds `v`, for suggesting a fix
+    /// when a literal overflows its declared width. Prefers the same signedness
+    /// family, but falls back to the signed widths when `v` is negative (no
+    /// unsigned width can hold a negative). Returns `None` when `v` is larger
+    /// than every fixed width (only reachable above the u64 / below the i64 range).
+    pub fn widen_to_fit(self, v: i128) -> Option<IntW> {
+        let signed = [IntW::I8, IntW::I16, IntW::I32, IntW::I64];
+        let unsigned = [IntW::U8, IntW::U16, IntW::U32, IntW::U64];
+        let order: &[IntW] = if self.is_signed() || v < 0 {
+            &signed
+        } else {
+            &unsigned
+        };
+        order.iter().copied().find(|w| w.check_range(v))
+    }
     /// Width in bits.
     pub fn bits(self) -> u32 {
         match self {

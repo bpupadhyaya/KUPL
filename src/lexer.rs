@@ -307,9 +307,27 @@ impl<'a> Lexer<'a> {
         if w.check_range(v) {
             self.push(Tok::SizedInt(v, w), start);
         } else {
+            let hint = match w.widen_to_fit(v) {
+                Some(wider) if wider != w => {
+                    format!(
+                        " — `{}` holds it (its range is {}..{})",
+                        wider.name(),
+                        wider.min(),
+                        wider.max()
+                    )
+                }
+                _ => " — too large for any fixed-width integer; use the default `Int` \
+                      or a `big(...)` BigInt"
+                    .to_string(),
+            };
             self.diags.push(Diag::error(
                 "K0009",
-                format!("literal `{v}` out of range for `{}`", w.name()),
+                format!(
+                    "literal `{v}` out of range for `{}` (its range is {}..{}){hint}",
+                    w.name(),
+                    w.min(),
+                    w.max()
+                ),
                 self.span_from(start),
             ));
         }
@@ -658,6 +676,29 @@ mod tests {
         // a trailing identifier that isn't a width name is NOT consumed as a suffix
         let toks: Vec<Tok> = lex("123index").0.into_iter().map(|t| t.tok).collect();
         assert_eq!(toks, vec![Tok::Int(123), Tok::Ident("index".into()), Tok::Newline, Tok::Eof]);
+    }
+
+    #[test]
+    fn sized_overflow_suggests_a_wider_width() {
+        // K0009 for an over-wide literal should not just say "out of range"; it should show
+        // the offending width's range AND name the narrowest width that would hold the value.
+        let d = |src: &str| {
+            lex(src)
+                .1
+                .into_iter()
+                .find(|d| d.code == "K0009")
+                .expect("K0009")
+                .message
+        };
+        // 256 overflows u8 (0..255) -> suggest u16.
+        let m = d("256u8");
+        assert!(m.contains("out of range for `u8`") && m.contains("0..255"), "shows u8 range: {m}");
+        assert!(m.contains("`u16` holds it") && m.contains("0..65535"), "suggests u16: {m}");
+        // 128 overflows i8 (-128..127) -> suggest i16 (same signedness family).
+        let s = d("128i8");
+        assert!(s.contains("`i16` holds it"), "signed literal suggests i16: {s}");
+        // 70000 overflows u16 -> suggest u32.
+        assert!(d("70000u16").contains("`u32` holds it"), "u16 overflow suggests u32");
     }
 
     /// A decimal literal too large for i64 is a K0004, and the message now NAMES the fix:
