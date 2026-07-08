@@ -2104,6 +2104,44 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_nested_option_flatten_via_and_then() {
+        // A bug-hunt-45 lock (it306): the Option-monad JOIN -- flattening Option[Option] and chaining
+        // and_then through a fallible lookup. it290 chains map/filter/unwrap_or over records; this pins the
+        // DOUBLE-Option case an AI hits when a lookup returns an Option and its value is itself optional
+        // (Map.get of an Option-valued entry, a config-of-configs).
+        //   deref(o) = o.and_then(lookup); lookup(k) = if k > 0 Some(k*10) else None
+        //     deref(Some(3))  -> lookup(3)  = Some(30) -> unwrap_or(-1) = 30
+        //     deref(Some(-1)) -> lookup(-1) = None     -> unwrap_or(-1) = -1  (inner lookup fails)
+        //     deref(None)     -> None (closure never runs) -> unwrap_or(-1) = -1
+        //   flatten via and_then(identity):
+        //     Some(Some(5)).and_then(id) = Some(5) -> unwrap_or(-9) = 5
+        //     Some(None).and_then(id)    = None    -> unwrap_or(-9) = -9
+        // Byte-identical on interp/KVM (native per the sweep). Confirms and_then flattens exactly one level
+        // (the closure returns an Option and the result is NOT Some(Some(..))), that None short-circuits at
+        // BOTH positions -- an outer None never invokes the closure (deref(None)), and an inner-lookup None
+        // propagates (deref(Some(-1))) -- and that the join idiom Some(Some x).and_then(id) collapses to
+        // Some x while Some(None).and_then(id) collapses to None. This is the Option monad an AI leans on
+        // for chained optional lookups; a backend that returned Some(Some 5) (no flatten) or ran the
+        // closure on None would break the chain.
+        let src = r#"fun lookup(k: Int) -> Option[Int] {
+    if k > 0 { Some(k * 10) } else { None }
+}
+fun deref(o: Option[Int]) -> Option[Int] {
+    o.and_then(fn(v) { lookup(v) })
+}
+fun probe() -> Str {
+    let a = deref(Some(3))
+    let b = deref(Some(0 - 1))
+    let c = deref(None)
+    let d = Some(Some(5)).and_then(fn(inner) { inner })
+    let e = Some(None).and_then(fn(inner) { inner })
+    "{a.unwrap_or(0 - 1)}|{b.unwrap_or(0 - 1)}|{c.unwrap_or(0 - 1)}|{d.unwrap_or(0 - 9)}|{e.unwrap_or(0 - 9)}"
+}
+"#;
+        assert_eq!(differential(src), "30|-1|-1|5|-9");
+    }
+
+    #[test]
     fn diff_sort_records_by_two_keys_composite() {
         // A certification lock (it305): a MULTI-KEY sort -- "ORDER BY dept ASC, salary DESC" encoded as a
         // single composite Int key. it288 sorts by a single negated key (one criterion, descending); this
