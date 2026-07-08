@@ -3029,6 +3029,57 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_newton_isqrt() {
+        // A bug-hunt-123 lock (it469): NEWTON'S INTEGER SQUARE ROOT -- the floor(sqrt(n)) computed by the
+        // Newton-Raphson iteration x <- (x + n/x)/2 until it stops decreasing -- cross-validated against the
+        // DEFINING INEQUALITY r^2 <= n < (r+1)^2. This continues the classic-algorithm vein (Stein GCD it467,
+        // Russian peasant it468): the Newton iteration is a nontrivial numerical method (each step roughly doubles
+        // the correct digits), and the cross-check is completely INDEPENDENT of how r was produced -- it verifies
+        // that the RETURNED value satisfies the mathematical definition of the integer square root, so a wrong
+        // convergence test or an off-by-one in the iteration yields an r that fails the bound. The base n<2 returns
+        // n directly (isqrt(0)=0, isqrt(1)=1), and the iteration seeds from x=n and halts when the next estimate
+        // would not decrease (integer fixed point / 2-cycle floor).
+        //   isqrt(0)=0, isqrt(1)=1, isqrt(99)=9, isqrt(100)=10, isqrt(1000)=31   (floor sqrt; 31^2=961<1000<1024)
+        //   exact: isqrt(144)=12 and isqrt(625)=25   (perfect squares hit exactly)
+        //   b1: r^2<=n<(r+1)^2 holds for n in {99,100,1000}   (defining inequality)
+        //   b2: the inequality holds for the small/edge cases n in {2,3,1,0}
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that (x+n/x)/2 with integer division
+        // converges to floor(sqrt n), that the next>=x stop returns the floor (not one too high), that the n<2 base
+        // handles 0 and 1, that perfect squares land exactly while non-squares floor correctly, that the result
+        // satisfies r^2<=n<(r+1)^2 at every tested value (a spec check independent of the iteration), and that all
+        // three engines agree. This is the integer square root an AI writes for number theory or geometry without
+        // floats; verifying the output against its defining inequality catches a convergence or off-by-one bug. A
+        // non-sort lock certifying Newton's integer isqrt against the r^2<=n<(r+1)^2 definition.
+        let src = r#"fun newtonStep(n: Int, x: Int) -> Int {
+    let next = (x + n / x) / 2
+    if next >= x { x } else { newtonStep(n, next) }
+}
+fun isqrt(n: Int) -> Int {
+    if n < 2 { n } else { newtonStep(n, n) }
+}
+fun bounds(n: Int) -> Bool {
+    let r = isqrt(n)
+    r * r <= n && (r + 1) * (r + 1) > n
+}
+fun probe() -> Str {
+    let s0 = isqrt(0)
+    let s1 = isqrt(1)
+    let s99 = isqrt(99)
+    let s100 = isqrt(100)
+    let s1000 = isqrt(1000)
+    let exact = isqrt(144) == 12 && isqrt(625) == 25
+    let b1 = bounds(99) && bounds(100) && bounds(1000)
+    let b2 = bounds(2) && bounds(3) && bounds(1) && bounds(0)
+    "s0={s0}|s1={s1}|s99={s99}|s100={s100}|s1000={s1000}|exact={exact}|b1={b1}|b2={b2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "s0=0|s1=1|s99=9|s100=10|s1000=31|exact=true|b1=true|b2=true"
+        );
+    }
+
+    #[test]
     fn diff_russian_peasant_mult() {
         // A bug-hunt-122 lock (it468): RUSSIAN PEASANT (Egyptian) MULTIPLICATION -- the product a*b computed using
         // ONLY halving, doubling, addition, and parity tests (no multiply instruction), cross-validated against
