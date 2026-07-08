@@ -2104,6 +2104,45 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_anagram_check_via_frequency_map() {
+        // A bug-hunt-55 lock (it331): anagram detection via character-FREQUENCY maps compared structurally.
+        // Each string is canonicalized to a Map[Str,Int] tallying how many times each char occurs (fold over
+        // chars(), get-or-0 + insert), and two strings are anagrams iff their frequency maps are ==. The
+        // load-bearing property is that Map equality is ORDER-INDEPENDENT: "listen" and "silent" insert their
+        // keys in different orders, yet their {char->count} maps compare equal -- the char multiset, not the
+        // sequence, is what matters. (Verified separately: Map().insert(c,1).insert(b,1).insert(a,1) ==
+        // Map().insert(a,1).insert(b,1).insert(c,1) is true.)
+        //   listen/silent -> true (same multiset)   hello/world -> false (different chars)
+        //   aabb/abab    -> true (both {a:2,b:2})   abc/abcd    -> false (abcd has an extra d)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the frequency fold builds a correct
+        // per-char tally from an empty typed Map seed, that structural Map == ignores key insertion order
+        // (so permutations of the same letters match), that differing letter SETS (hello/world) and differing
+        // COUNTS/lengths (abc/abcd) both compare unequal, and that a repeated-letter multiset (aabb vs its
+        // permutation abab) is recognized. This is the canonical frequency-map anagram check an AI writes; a
+        // backend whose Map == was order-sensitive would wrongly reject real anagrams.
+        let src = r#"fun freq(s: Str) -> Map[Str, Int] {
+    let seed: Map[Str, Int] = Map()
+    s.chars().fold(seed, fn(m, c) {
+        let n = m.get(c).unwrap_or(0)
+        m.insert(c, n + 1)
+    })
+}
+fun isAnagram(a: Str, b: Str) -> Bool { freq(a) == freq(b) }
+fun probe() -> Str {
+    let r1 = isAnagram("listen", "silent")
+    let r2 = isAnagram("hello", "world")
+    let r3 = isAnagram("aabb", "abab")
+    let r4 = isAnagram("abc", "abcd")
+    "listen/silent={r1}|hello/world={r2}|aabb/abab={r3}|abc/abcd={r4}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "listen/silent=true|hello/world=false|aabb/abab=true|abc/abcd=false"
+        );
+    }
+
+    #[test]
     fn diff_stack_lifo_vs_queue_fifo() {
         // A certification lock (it330, milestone): the two fundamental sequence abstractions -- a stack (LIFO)
         // and a queue (FIFO) -- built on a plain list, drained fully so the ORDERING DISCIPLINE is the
