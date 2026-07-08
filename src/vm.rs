@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_graph_adjacency_dfs_reachability() {
+        // A certification lock (it315): a GRAPH as an adjacency Map[Int, List[Int]] with recursive DFS
+        // reachability threading a visited Set through a fold. Prior tree locks (it313/it314 BST, it296-312)
+        // walk acyclic trees where every node has one parent; a graph has SHARED nodes (a diamond) and needs
+        // a visited-set revisit guard so a node reached by two paths isn't reprocessed.
+        //   adj = {1:[2,3], 2:[4], 3:[4], 4:[], 5:[6], 6:[]}   (two components; a 1->2->4 / 1->3->4 diamond)
+        //   dfs(node): if node already in visited -> return visited unchanged (guard);
+        //              else add node, then fold dfs over adj.get(node).unwrap_or([]) threading visited
+        //   reach(1) = {1,2,3,4}  (node 4 reached via BOTH 2 and 3 but counted once), sorted [1,2,3,4]
+        //   reach(5) = {5,6}      (disconnected from 1's component),                    sorted [5,6]
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the adjacency Map models out-edges
+        // (get.unwrap_or([]) for sink nodes 4 and 6), that the visited Set THREADS through the neighbor fold
+        // so each recursive call sees the accumulated set, that the revisit guard stops the diamond from
+        // double-processing 4 (membership tested via to_list().position().is_some()), and that DFS from 1
+        // never crosses into the {5,6} component. This is the graph traversal / reachability /
+        // connected-component an AI writes constantly; a backend whose visited set didn't thread through the
+        // fold would reprocess 4 (or loop forever on a cycle), and one that mishandled the sink's empty
+        // neighbor list would crash. Distinct from every tree lock: shared nodes + explicit visited state.
+        let src = r#"fun dfs(adj: Map[Int, List[Int]], node: Int, visited: Set[Int]) -> Set[Int] {
+    if visited.to_list().position(fn(x) { x == node }).is_some() { visited }
+    else {
+        let seen = Set([[node], visited.to_list()].flatten())
+        let neighbors = adj.get(node).unwrap_or([])
+        neighbors.fold(seen, fn(acc, n) { dfs(adj, n, acc) })
+    }
+}
+fun probe() -> Str {
+    let adj = Map().insert(1, [2, 3]).insert(2, [4]).insert(3, [4]).insert(4, []).insert(5, [6]).insert(6, [])
+    let reach1 = dfs(adj, 1, Set([])).to_list().sort_by(fn(x) { x })
+    let reach5 = dfs(adj, 5, Set([])).to_list().sort_by(fn(x) { x })
+    "from1={reach1}|from5={reach5}"
+}
+"#;
+        assert_eq!(differential(src), "from1=[1, 2, 3, 4]|from5=[5, 6]");
+    }
+
+    #[test]
     fn diff_bst_contains_membership() {
         // A bug-hunt-49 lock (it314): BST MEMBERSHIP query -- the read/search counterpart to it313's
         // insert+inorder. contains navigates the search tree by a 3-way comparison (x == v -> true, x < v ->
