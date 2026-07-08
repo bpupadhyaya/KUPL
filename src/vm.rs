@@ -2220,6 +2220,74 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_shell_sort() {
+        // A certification lock (it414): SHELL SORT -- gap-based insertion sort, GENERALIZING plain insertion sort
+        // (it321) with a diminishing gap sequence. Plain insertion sort only ever compares and shifts ADJACENT
+        // elements, so an element far from its home takes many single-step shifts. Shell sort inserts over a GAP
+        // instead: for each gap in a shrinking sequence (here 4, 2, 1), it runs a gapped insertion pass that
+        // compares elements `gap` apart and shifts them `gap` positions at a time, letting a small value near
+        // the end leap toward the front in big strides. Larger gaps do the coarse long-distance work cheaply;
+        // by the time the final gap=1 pass runs (which IS plain insertion sort), the array is nearly sorted so
+        // that pass does little work. Insertion sort is exactly shell sort with the single gap [1]; the gap
+        // sequence is the tunable parameter that makes it faster in practice.
+        //   shellSort([9,8,3,7,5,6,4,1], [4,2,1]) = [1,3,4,5,6,7,8,9]  (gap 4 leaps 1 toward the front early)
+        //   shellSort([5,2,8,1], [2,1]) = [1,2,5,8]                    (two-gap schedule)
+        //   shellSort([3,3,1,2,2], [2,1]) = [1,2,2,3,3]                (duplicates preserved)
+        //   shellSort([7], [1]) = [7]                                  (single element)
+        //   shellSort([], [1]) = []                                    (empty)
+        //   shellSort([4,3,2,1], [2,1]) = [1,2,3,4]                    (fully reversed)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each gap pass shifts elements gap
+        // positions apart (not just adjacent), that shiftBack walks j-gap while the gap-distant predecessor
+        // exceeds the key, that the diminishing sequence ending at gap=1 produces a fully sorted result, that
+        // the final gap-1 pass reduces to plain insertion sort on a pre-conditioned array, that duplicates are
+        // preserved, that empty/single/reversed inputs are handled, and that all three engines agree on the
+        // gapped-insertion recursion. This is the shell sort an AI writes as an in-place comparison sort that
+        // beats plain insertion on larger inputs; a backend whose gap stride or shift bound was off would
+        // misorder the result. Adds the gap-based insertion paradigm generalizing plain insertion sort.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun setAt(lst: List[Int], i: Int, v: Int) -> List[Int] {
+    rangeN(lst.len()).map(fn(k) { if k == i { v } else { lst.get(k).unwrap_or(0) } })
+}
+fun shiftBack(a: List[Int], j: Int, key: Int, gap: Int) -> List[Int] {
+    if j >= gap {
+        let prev = a.get(j - gap).unwrap_or(0)
+        if prev > key {
+            shiftBack(setAt(a, j, prev), j - gap, key, gap)
+        } else { setAt(a, j, key) }
+    } else { setAt(a, j, key) }
+}
+fun gapPass(a: List[Int], gap: Int, idxs: List[Int]) -> List[Int] {
+    idxs.fold(a, fn(acc, i) {
+        let key = acc.get(i).unwrap_or(0)
+        shiftBack(acc, i, key, gap)
+    })
+}
+fun shellSort(xs: List[Int], gaps: List[Int]) -> List[Int] {
+    let n = xs.len()
+    gaps.fold(xs, fn(acc, gap) {
+        let idxs = rangeN(n).filter(fn(i) { i >= gap })
+        gapPass(acc, gap, idxs)
+    })
+}
+fun probe() -> Str {
+    let a = shellSort([9, 8, 3, 7, 5, 6, 4, 1], [4, 2, 1])
+    let b = shellSort([5, 2, 8, 1], [2, 1])
+    let c = shellSort([3, 3, 1, 2, 2], [2, 1])
+    let d = shellSort([7], [1])
+    let e = shellSort([], [1])
+    let f = shellSort([4, 3, 2, 1], [2, 1])
+    "mixed={a}|small={b}|dups={c}|single={d}|empty={e}|rev={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mixed=[1, 3, 4, 5, 6, 7, 8, 9]|small=[1, 2, 5, 8]|dups=[1, 2, 2, 3, 3]|single=[7]|empty=[]|rev=[1, 2, 3, 4]"
+        );
+    }
+
+    #[test]
     fn diff_bucket_sort() {
         // A bug-hunt-96 lock (it413): BUCKET SORT -- a HYBRID distribution+comparison sort, distinct from both
         // pure-distribution non-comparison sorts already locked. Counting sort (it410) is single-pass with one
