@@ -2220,6 +2220,83 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_topological_sort_kahn() {
+        // A certification lock (it398): TOPOLOGICAL SORT via KAHN'S ALGORITHM -- linearize the nodes of a
+        // directed graph (0..n-1, edges [from,to]) so every edge points forward, or report a CYCLE if no such
+        // order exists. Kahn's method repeatedly emits a node whose IN-DEGREE is zero (no incoming edge from a
+        // not-yet-emitted predecessor), removing it from consideration. To make the output DETERMINISTIC across
+        // engines, each round picks the LOWEST-INDEX zero-indegree node. indegOf counts edges whose target is
+        // the node and whose source is NOT yet done; pickNext folds the node indices returning the first
+        // eligible one (or -1 if none); the driver loops until all n are emitted, and returns a sentinel -1 in
+        // the order when it gets stuck -- which topo() maps to "CYCLE". Distinct from the DFS reachability
+        // (it315) and cycle detection (it316) graph locks: this produces a full linear ORDER.
+        //   topo(4, [[0,1],[0,2],[1,3],[2,3]]) = "0,1,2,3"   (diamond: 0 first, then 1,2, then 3)
+        //   topo(3, [[0,1],[1,2],[2,0]]) = "CYCLE"           (a 3-cycle -- no valid order)
+        //   topo(3, []) = "0,1,2"                            (no edges -- index order)
+        //   topo(5, [[0,1],[1,2],[3,4]]) = "0,1,2,3,4"       (a FOREST of two chains, interleaved by index)
+        //   topo(2, [[1,0]]) = "1,0"                         (reverse edge -- 1 must precede 0)
+        //   topo(1, []) = "0"                                (a single node)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that a node is emitted only once all its
+        // predecessors are emitted (in-degree over remaining sources is zero), that ties break to the lowest
+        // index for a deterministic order, that a diamond emits the source, then both middles, then the sink,
+        // that a cycle where every remaining node has a live incoming edge yields the -1 sentinel mapped to
+        // CYCLE, that a disconnected forest interleaves its components by index, that a reversed edge flips the
+        // emission order, that no-edge and single-node graphs degrade to index order, and that all three engines
+        // agree on the pick-zero-indegree loop with an accumulating done list. This is the topological sort an
+        // AI writes for dependency resolution, build ordering, and task scheduling; a backend whose indegree
+        // count, lowest-index tie-break, or stuck/cycle detection was off would mis-order or hang. Adds Kahn's
+        // linearization to the graph family.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun indegOf(node: Int, edges: List[List[Int]], done: List[Int]) -> Int {
+    edges.filter(fn(e) {
+        let from = e.get(0).unwrap_or(0)
+        let to = e.get(1).unwrap_or(0)
+        to == node && done.contains(from) == false
+    }).len()
+}
+fun pickNext(n: Int, edges: List[List[Int]], done: List[Int]) -> Int {
+    rangeN(n).fold(0 - 1, fn(best, node) {
+        if best >= 0 { best }
+        else {
+            if done.contains(node) { best }
+            else {
+                if indegOf(node, edges, done) == 0 { node } else { best }
+            }
+        }
+    })
+}
+fun loop(n: Int, edges: List[List[Int]], done: List[Int]) -> List[Int] {
+    if done.len() == n { done }
+    else {
+        let nx = pickNext(n, edges, done)
+        if nx < 0 { [0 - 1] }
+        else { loop(n, edges, [done, [nx]].flatten()) }
+    }
+}
+fun topo(n: Int, edges: List[List[Int]]) -> Str {
+    let order = loop(n, edges, [])
+    if order.contains(0 - 1) { "CYCLE" }
+    else { order.map(fn(x) { x.to_str() }).join(",") }
+}
+fun probe() -> Str {
+    let a = topo(4, [[0, 1], [0, 2], [1, 3], [2, 3]])
+    let b = topo(3, [[0, 1], [1, 2], [2, 0]])
+    let c = topo(3, [])
+    let d = topo(5, [[0, 1], [1, 2], [3, 4]])
+    let e = topo(2, [[1, 0]])
+    let f = topo(1, [])
+    "diamond={a}|cycle={b}|none={c}|forest={d}|rev={e}|single={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "diamond=0,1,2,3|cycle=CYCLE|none=0,1,2|forest=0,1,2,3,4|rev=1,0|single=0"
+        );
+    }
+
+    #[test]
     fn diff_greedy_set_cover() {
         // A bug-hunt-88 lock (it397): GREEDY SET COVER -- given a universe of elements and a collection of sets,
         // choose as few sets as possible whose union covers the whole universe, using the classic GREEDY
