@@ -3029,6 +3029,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_rational_field_axioms() {
+        // A certification lock (it485, from bug-hunt batch 127 -- 10 probes across BigInt/Rational/tensor/json/
+        // string/radix/scan/float shapes came back byte-identical, so the subtlest untouched corner is locked):
+        // the FIELD AXIOMS over exact Rationals. Where rational_harmonic_accumulation and the bigint/rational-edge
+        // tests pin reduction, sign normalization, harmonic sums, and div-by-zero, THIS certifies that rat(...)
+        // arithmetic obeys the algebraic LAWS of a field -- an ALGEBRAIC-IDENTITY cross-check (like set_algebra_laws
+        // it424 and bitwise_arithmetic_identities it475), each law an equality of two structurally different
+        // expressions, not a restatement. With a=1/2, b=1/3, c=2/5:
+        //   commutativity:  a+b == b+a,  a*b == b*a
+        //   associativity:  (a+b)+c == a+(b+c)
+        //   distributivity: a*(b+c) == a*b + a*c
+        //   additive inverse & identity:  a - a == 0,  a + 0 == a
+        //   multiplicative identity:  a * 1 == a
+        //   negation:  0 - a == -1/2
+        // The auto-reduction to lowest terms is what makes `==` meaningful: a+b and b+a both canonicalize to 5/6,
+        // so a backend that skipped or mis-signed the GCD reduction would break an equality. Concrete values pinned:
+        // a+b=5/6, a*b=1/6, b+c=11/15.
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that Rational addition and multiplication
+        // commute, that addition associates, that multiplication distributes over addition, that subtracting a
+        // value gives zero and adding zero is the identity, that multiplying by one is the identity, that negation
+        // reduces correctly, and that all three engines agree on both the boolean laws and the canonical fraction
+        // values. This is the exact arithmetic an AI uses for probabilities, unit conversions, or symbolic fractions
+        // where float rounding is unacceptable; the field-law cross-checks catch a reduction or sign bug that a lone
+        // value test could pass. A non-sort lock certifying the Rational field axioms.
+        let src = r#"fun probe() -> Str {
+    let a = rat(1, 2)
+    let b = rat(1, 3)
+    let c = rat(2, 5)
+    let s = a + b
+    let p = a * b
+    let bc = b + c
+    let commAdd = a + b == b + a
+    let commMul = a * b == b * a
+    let assoc = (a + b) + c == a + (b + c)
+    let distrib = a * (b + c) == a * b + a * c
+    let invAdd = a - a == rat(0, 1)
+    let identMul = a * rat(1, 1) == a
+    let identAdd = a + rat(0, 1) == a
+    let neg = rat(0, 1) - a == rat(0 - 1, 2)
+    "s={s}|p={p}|bc={bc}|commAdd={commAdd}|commMul={commMul}|assoc={assoc}|distrib={distrib}|invAdd={invAdd}|identMul={identMul}|identAdd={identAdd}|neg={neg}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "s=5/6|p=1/6|bc=11/15|commAdd=true|commMul=true|assoc=true|distrib=true|invAdd=true|identMul=true|identAdd=true|neg=true"
+        );
+    }
+
+    #[test]
     fn diff_power_sum_identities() {
         // A certification lock (it483): the classic POWER-SUM IDENTITIES, each verifying a recursive summation
         // against an INDEPENDENT closed form or a structurally different sum (a MATHEMATICAL-IDENTITY cross-check,
