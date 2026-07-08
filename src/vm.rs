@@ -2104,6 +2104,40 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_gcd_of_list_fold() {
+        // A bug-hunt-65 lock (it351): the GCD of a WHOLE LIST via fold-reduction of the pairwise Euclidean
+        // GCD. This extends the pairwise gcd (it334) to many numbers: fold the list with gcd as the reducer,
+        // SEEDED WITH 0. The seed 0 is load-bearing and correct because gcd(0, x) = x -- the identity element
+        // of gcd -- so the accumulator initializes to the first element on the first step, then folds
+        // pairwise: gcd(0,12)=12, gcd(12,18)=6, gcd(6,24)=6, gcd(6,30)=6. gcd is associative and commutative,
+        // so the left fold gives the list's overall GCD.
+        //   [12,18,24,30] -> 6 (all divisible by 6) ; [17,34,51] -> 17 (17,2*17,3*17) ; [7,11,13] -> 1 (coprime)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the seed-0 identity kicks the fold off
+        // correctly (gcd(0,first)=first), that the pairwise Euclidean recursion runs at each step, that a
+        // shared factor emerges (6), that a single common prime factor is found (17), that pairwise-coprime
+        // numbers reduce to 1, and that all three engines agree. This is the whole-list GCD an AI writes to
+        // simplify fractions, find tiling sizes, or reduce ratios; a backend whose seed identity or modulo
+        // recursion was off would return 0 or the wrong common divisor.
+        let src = r#"fun gcd(a: Int, b: Int) -> Int {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+fun probe() -> Str {
+    let xs = [12, 18, 24, 30]
+    let g = xs.fold(0, fn(acc, x) { gcd(acc, x) })
+    let ys = [17, 34, 51]
+    let g2 = ys.fold(0, fn(acc, x) { gcd(acc, x) })
+    let zs = [7, 11, 13]
+    let g3 = zs.fold(0, fn(acc, x) { gcd(acc, x) })
+    "gcd_12_18_24_30={g}|gcd_17_34_51={g2}|gcd_coprime={g3}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "gcd_12_18_24_30=6|gcd_17_34_51=17|gcd_coprime=1"
+        );
+    }
+
+    #[test]
     fn diff_integer_variance() {
         // A certification lock (it350, milestone): population variance over integers -- the mean of the
         // SQUARED DEVIATIONS from the mean. First fold the sum and divide by n for the mean, then fold again
