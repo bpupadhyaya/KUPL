@@ -3029,6 +3029,54 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_bitwise_arithmetic_identities() {
+        // A certification lock (it475, from bug-hunt batch 124 -- 16 probes across Float/BigInt/Rational/radix/
+        // string/bit shapes came back byte-identical, so the subtlest untouched corner is locked instead of a fix):
+        // the BITWISE-ARITHMETIC IDENTITIES that reconstruct integer +/- from band/bor/bxor. Three identities,
+        // each an INDEPENDENT cross-check of the bit operations against ordinary arithmetic (not a restatement of
+        // the bit ops):
+        //   (1) full-adder / carry-propagation:   a + b == (a XOR b) + 2*(a AND b)
+        //       -- XOR is the sum with carries dropped, AND is the carry bits, shifted left one place (the *2).
+        //   (2) inclusion-exclusion on bit multiplicities:  a + b == (a OR b) + (a AND b)
+        //       -- OR counts bits set in either, AND counts bits set in both; their sum double-counts exactly the
+        //          shared bits, reproducing a + b.
+        //   (3) symmetric difference:  a XOR b == (a OR b) - (a AND b)
+        //       -- XOR keeps the bits in exactly one operand: union minus intersection.
+        // Existing bit-manip locks certify ENCODE/DECODE round-trips (gray_code, bit_reversal) or a popcount
+        // (count_set_bits); this certifies the bit ops against ARITHMETIC via algebraic identities -- a distinct
+        // cross-validation style. Checked at a small pair (46, 91) and a larger pair (12345, 6789) so carries span
+        // many bit positions. The raw ops are pinned too: 46 XOR 91 = 117, 46 AND 91 = 10, 46 OR 91 = 127.
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that XOR+2*AND rebuilds addition (the
+        // hardware adder identity), that OR+AND rebuilds addition (inclusion-exclusion), that OR-AND yields XOR,
+        // that these hold at both a small and a wide-carry pair, that the individual band/bor/bxor results are
+        // exact, and that all three engines agree. This is the bit-twiddling an AI writes for adders, hash mixing,
+        // or branchless arithmetic; checking against the arithmetic identity catches an AND/OR swap or a missing
+        // carry shift that a lone popcount would miss. A non-sort lock certifying the bitwise ops against integer
+        // arithmetic.
+        let src = r#"fun probe() -> Str {
+    let a = 46
+    let b = 91
+    let c = 12345
+    let d = 6789
+    let e1 = (a.bxor(b)) + 2 * (a.band(b)) == a + b
+    let e2 = (c.bxor(d)) + 2 * (c.band(d)) == c + d
+    let e3 = a.bor(b) + a.band(b) == a + b
+    let e4 = c.bor(d) + c.band(d) == c + d
+    let e5 = a.bxor(b) == a.bor(b) - a.band(b)
+    let e6 = c.bxor(d) == c.bor(d) - c.band(d)
+    let s1 = a.bxor(b)
+    let s2 = a.band(b)
+    let s3 = a.bor(b)
+    "s1={s1}|s2={s2}|s3={s3}|e1={e1}|e2={e2}|e3={e3}|e4={e4}|e5={e5}|e6={e6}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "s1=117|s2=10|s3=127|e1=true|e2=true|e3=true|e4=true|e5=true|e6=true"
+        );
+    }
+
+    #[test]
     fn diff_newton_icbrt() {
         // A certification lock (it474): NEWTON'S INTEGER CUBE ROOT -- floor(cbrt(n)) via the Newton iteration
         // x_{k+1} = (2*x_k + n / (x_k*x_k)) / 3 (all integer arithmetic), iterated until it stops decreasing and
