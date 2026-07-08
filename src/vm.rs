@@ -2104,6 +2104,49 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_median_of_sorted() {
+        // A certification lock (it348): the median -- sort the list, then index the middle. The two PARITY
+        // cases have different index arithmetic and this pins both. For ODD length the median is the single
+        // middle element at index len/2 (integer division: for len=5 that is index 2, the 3rd of 5). For EVEN
+        // length there is no single middle, so the median is the average of the two straddling elements at
+        // indices len/2 - 1 and len/2 (for len=4 that is indices 1 and 2), averaged with integer division.
+        //   odd  [7,1,3,9,5] -> sorted [1,3,5,7,9] -> median = s[2] = 5
+        //   even [8,2,6,4]   -> sorted [2,4,6,8]   -> median = (s[1]+s[2])/2 = (4+6)/2 = 5
+        // Byte-identical on interp/KVM (native per the sweep). Confirms sort_by(identity) orders the list, that
+        // len/2 lands on the correct middle index for odd length (not off by one), that the even case reads
+        // the two central elements (len/2-1 and len/2) and averages them, that integer division is used for
+        // both the index and the average, and that all three engines agree on the sorted order and both
+        // medians. This is the median an AI writes for stats summaries and outlier-robust centers; a backend
+        // whose sort was unstable at the boundary or whose middle-index arithmetic was off would return the
+        // wrong central value on one parity.
+        let src = r#"fun medianOdd(xs: List[Int]) -> Int {
+    let s = xs.sort_by(fn(x) { x })
+    s.get(s.len() / 2).unwrap_or(0 - 1)
+}
+fun medianEven(xs: List[Int]) -> Int {
+    let s = xs.sort_by(fn(x) { x })
+    let hi = s.len() / 2
+    let lo = hi - 1
+    let a = s.get(lo).unwrap_or(0)
+    let b = s.get(hi).unwrap_or(0)
+    (a + b) / 2
+}
+fun probe() -> Str {
+    let odd = [7, 1, 3, 9, 5]
+    let even = [8, 2, 6, 4]
+    let mOdd = medianOdd(odd)
+    let mEven = medianEven(even)
+    let sortedOdd = odd.sort_by(fn(x) { x })
+    "medianOdd={mOdd}|medianEven={mEven}|sorted={sortedOdd}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "medianOdd=5|medianEven=5|sorted=[1, 3, 5, 7, 9]"
+        );
+    }
+
+    #[test]
     fn diff_average_and_count_if() {
         // A bug-hunt-63 lock (it347): arithmetic mean of a list plus count-if with a complementary partition.
         // The mean is fold-sum / len (INTEGER division, truncating). Then two count-if predicates run over the
