@@ -2104,6 +2104,41 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_integer_variance() {
+        // A certification lock (it350, milestone): population variance over integers -- the mean of the
+        // SQUARED DEVIATIONS from the mean. First fold the sum and divide by n for the mean, then fold again
+        // accumulating (x - mean)^2 for each element, and divide that sum by n. The squaring is load-bearing:
+        // deviations below the mean are NEGATIVE (2 - 5 = -3), and d*d must turn them positive (9) so they add
+        // to the spread rather than cancel it. This is the canonical textbook dataset whose mean is exactly 5
+        // and variance exactly 4 (standard deviation 2), so both integer divisions land clean.
+        //   [2,4,4,4,5,5,7,9] -> sum=40, mean=5 ; sq-devs 9,1,1,1,0,0,4,16 sum=32 ; variance = 32/8 = 4
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the two-pass fold (sum then
+        // sum-of-squared-deviations) threads correctly, that x - mean is computed per element, that d*d makes
+        // NEGATIVE deviations contribute positively (the -3 from the value 2 becomes +9, not -9 or a
+        // cancellation), that the zero deviations (the two 5s) add nothing, and that all three engines agree on
+        // the mean, the squared-deviation sum, and the final variance. This completes the stats-aggregate
+        // family locked alongside mean (it347), median (it348), and mode (it349); a backend whose subtraction
+        // sign or squaring was off would collapse the spread to the wrong value.
+        let src = r#"fun probe() -> Str {
+    let xs = [2, 4, 4, 4, 5, 5, 7, 9]
+    let n = xs.len()
+    let sum = xs.fold(0, fn(a, x) { a + x })
+    let mean = sum / n
+    let sqDevSum = xs.fold(0, fn(a, x) {
+        let d = x - mean
+        a + d * d
+    })
+    let variance = sqDevSum / n
+    "n={n}|sum={sum}|mean={mean}|sqDevSum={sqDevSum}|variance={variance}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "n=8|sum=40|mean=5|sqDevSum=32|variance=4"
+        );
+    }
+
+    #[test]
     fn diff_mode_most_frequent() {
         // A bug-hunt-64 lock (it349): the mode (most-frequent element) via a frequency tally plus an argmax
         // over the map. First fold the list into a Map[Int, Int] count table (like word-count but Int keys).
