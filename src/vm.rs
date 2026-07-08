@@ -2104,6 +2104,40 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_palindrome_via_string_reverse() {
+        // A bug-hunt-56 lock (it333): string reversal via a chars-fold that PREPENDS, plus palindrome
+        // detection by reverse-and-compare. reverse folds over chars() building the accumulator by prepending
+        // each char (`[[c], acc].flatten()`) -- so the first char ends up last -- then join("") reassembles
+        // it into a Str. isPalin is just reverse(s) == s (structural string equality). Distinct from the
+        // append-folds certified earlier (dedup appends, RLE builds runs): this is a PREPEND fold, which is
+        // exactly what reverses order.
+        //   reverse("abcde") = "edcba"
+        //   racecar -> true (odd len)  noon -> true (even len)  a -> true (single)  hello -> false
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the prepend fold reverses char order
+        // (not append, which would be identity), that join("") turns the char list back into a string, that
+        // Str == compares content, and that palindromes of odd length (racecar, 7), even length (noon, 4),
+        // and length 1 (a) are all recognized while a non-palindrome (hello) is rejected. This is the
+        // canonical reverse-and-compare palindrome check an AI writes; a backend whose fold appended instead
+        // of prepended would call every string a palindrome, and one whose join mis-ordered would break the
+        // reversal.
+        let src = r#"fun reverse(s: Str) -> Str {
+    let empty: List[Str] = []
+    s.chars().fold(empty, fn(acc, c) { [[c], acc].flatten() }).join("")
+}
+fun isPalin(s: Str) -> Bool { reverse(s) == s }
+fun probe() -> Str {
+    let a = isPalin("racecar")
+    let b = isPalin("hello")
+    let c = isPalin("noon")
+    let d = isPalin("a")
+    let rev = reverse("abcde")
+    "racecar={a}|hello={b}|noon={c}|a={d}|rev={rev}"
+}
+"#;
+        assert_eq!(differential(src), "racecar=true|hello=false|noon=true|a=true|rev=edcba");
+    }
+
+    #[test]
     fn diff_two_sum_via_map_complement_lookup() {
         // A certification lock (it332): two-sum via a Map complement-lookup -- the canonical O(n) hash-table
         // pattern (find two indices whose values sum to a target). As it scans, for each value x it looks up
