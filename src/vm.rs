@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_priority_queue_sorted_insert() {
+        // A bug-hunt-51 lock (it321): a priority queue via ORDERED INSERTION into a sorted list. Each insert
+        // splits the queue at the position where the new task's priority belongs -- take_while(prio <=
+        // t.prio) is the prefix, drop_while(prio <= t.prio) is the suffix -- and reassembles [prefix, [t],
+        // suffix] to keep the queue sorted by priority. Building the whole queue is a fold of insert over an
+        // unsorted task list; the front is the highest-priority (min-prio) task. This is the sorted-insert
+        // priority queue an AI writes for scheduling / event queues / a Dijkstra frontier -- distinct from a
+        // BST (it313) or a composite-key sort (it305): the invariant is maintained incrementally at each
+        // insert via a take_while/drop_while split, not by re-sorting.
+        //   insert c(3), a(1), e(5), b(2), d(4) one at a time -> queue ordered by prio: a,b,c,d,e
+        //   order = "abcde" ; front = a@1 (min priority)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms take_while collects the <=-priority
+        // prefix and drop_while the strictly-greater suffix (complementary at the same boundary, per it282),
+        // that flatten reassembles the list with t inserted at the right spot, that folding insert from an
+        // empty seed threads the growing sorted queue, and that first() returns the min-priority front. This
+        // is insertion into a sorted structure keeping an ordering invariant per-step; a backend where
+        // take_while/drop_while disagreed on the split point would insert t at the wrong position and the
+        // drained order would be scrambled.
+        let src = r#"type Task = { name: Str, prio: Int }
+fun pqInsert(q: List[Task], t: Task) -> List[Task] {
+    let lo = q.take_while(fn(x) { x.prio <= t.prio })
+    let hi = q.drop_while(fn(x) { x.prio <= t.prio })
+    [lo, [t], hi].flatten()
+}
+fun probe() -> Str {
+    let seed: List[Task] = []
+    let tasks = [Task(name: "c", prio: 3), Task(name: "a", prio: 1), Task(name: "e", prio: 5), Task(name: "b", prio: 2), Task(name: "d", prio: 4)]
+    let q = tasks.fold(seed, fn(acc, t) { pqInsert(acc, t) })
+    let order = q.map(fn(t) { t.name }).join("")
+    let top = q.first().unwrap_or(Task(name: "none", prio: 0))
+    "order={order}|top={top.name}@{top.prio}"
+}
+"#;
+        assert_eq!(differential(src), "order=abcde|top=a@1");
+    }
+
+    #[test]
     fn diff_run_length_encode_decode_roundtrip() {
         // A certification lock (it320, milestone): run-length encoding + decoding round-trip. encode folds a
         // char list into a List[Run] (Run = {ch, n}) by GROUPING consecutive equal chars -- inspecting the
