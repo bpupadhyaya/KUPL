@@ -2269,6 +2269,69 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_multiset_bag_operations() {
+        // A certification lock (it425): MULTI-SET (BAG) ALGEBRA -- a bag is a set that remembers MULTIPLICITIES,
+        // represented as Map[element -> count]. This is distinct from the Set-algebra laws (it424), where an
+        // element is simply present or absent; here each element carries a count and the operations combine those
+        // counts. It is also distinct from a plain frequency tally (word_frequency, anagram) because it certifies
+        // the BINARY bag operations, each with its own multiplicity rule:
+        //   bagOf     -- fold a list into per-element counts
+        //   intersect -- MIN multiplicity per shared element, dropping zeros (how many of each are in BOTH)
+        //   sum       -- ADD multiplicities across the union of keys (concatenate the two bags)
+        //   diff      -- SUBTRACT multiplicities, floored at 0, dropping zeros (what remains after removing b)
+        // With x = bag([a,a,b,c,c,c]) = {a:2,b:1,c:3} and y = bag([a,c,c,d]) = {a:1,c:2,d:1}.
+        //   bag=a:2,b:1,c:3          (x's own counts)
+        //   inter=a:1,c:2            (min: a=min(2,1), c=min(3,2); b dropped since min(1,0)=0)
+        //   sum=a:3,b:1,c:5,d:1      (add: a=2+1, c=3+2, b=1+0, d new from y)
+        //   diff=a:1,b:1,c:1         (subtract floored: a=2-1, b=1-0, c=3-2; d absent from x)
+        // Keys render in first-seen (insertion) order so the output is deterministic and byte-stable. Byte-
+        // identical on interp/KVM (native per the sweep). Confirms that the tally fold accumulates per-element
+        // counts, that bag intersection takes the minimum multiplicity and drops elements that reach zero, that
+        // bag sum adds multiplicities over the union of keys, that bag difference subtracts and floors at zero
+        // (never going negative), that keys stay in insertion order, and that all three engines agree on the
+        // multiset algebra. This is the bag arithmetic an AI writes for inventory reconciliation, resource
+        // accounting, or "how many of each do both carts share" -- a backend whose min/add/subtract-floor rule was
+        // off would over- or under-count. A non-sort lock certifying multiplicity-aware multiset operations,
+        // complementing the boolean Set-algebra laws.
+        let src = r#"fun bagOf(xs: List[Str]) -> Map[Str, Int] {
+    let seed: Map[Str, Int] = Map()
+    xs.fold(seed, fn(acc, x) { acc.insert(x, acc.get(x).unwrap_or(0) + 1) })
+}
+fun shw(b: Map[Str, Int]) -> Str {
+    b.keys().map(fn(k) { "{k}:{b.get(k).unwrap_or(0)}" }).join(",")
+}
+fun bagInter(a: Map[Str, Int], b: Map[Str, Int]) -> Map[Str, Int] {
+    let seed: Map[Str, Int] = Map()
+    a.keys().fold(seed, fn(acc, k) {
+        let av = a.get(k).unwrap_or(0)
+        let bv = b.get(k).unwrap_or(0)
+        let m = if av < bv { av } else { bv }
+        if m > 0 { acc.insert(k, m) } else { acc }
+    })
+}
+fun bagSum(a: Map[Str, Int], b: Map[Str, Int]) -> Map[Str, Int] {
+    b.keys().fold(a, fn(acc, k) { acc.insert(k, acc.get(k).unwrap_or(0) + b.get(k).unwrap_or(0)) })
+}
+fun bagDiff(a: Map[Str, Int], b: Map[Str, Int]) -> Map[Str, Int] {
+    let seed: Map[Str, Int] = Map()
+    a.keys().fold(seed, fn(acc, k) {
+        let d = a.get(k).unwrap_or(0) - b.get(k).unwrap_or(0)
+        if d > 0 { acc.insert(k, d) } else { acc }
+    })
+}
+fun probe() -> Str {
+    let x = bagOf(["a", "a", "b", "c", "c", "c"])
+    let y = bagOf(["a", "c", "c", "d"])
+    "bag={shw(x)}|inter={shw(bagInter(x, y))}|sum={shw(bagSum(x, y))}|diff={shw(bagDiff(x, y))}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "bag=a:2,b:1,c:3|inter=a:1,c:2|sum=a:3,b:1,c:5,d:1|diff=a:1,b:1,c:1"
+        );
+    }
+
+    #[test]
     fn diff_set_algebra_laws() {
         // A bug-hunt-101 lock (it423->it424): SET-ALGEBRA LAWS -- verify that KUPL's Set operations obey the
         // classical Boolean-algebra identities, as a property/law test rather than a single-output check. Prior
