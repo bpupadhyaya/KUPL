@@ -2104,6 +2104,53 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_two_sum_via_map_complement_lookup() {
+        // A certification lock (it332): two-sum via a Map complement-lookup -- the canonical O(n) hash-table
+        // pattern (find two indices whose values sum to a target). As it scans, for each value x it looks up
+        // the COMPLEMENT (target - x) in a value->index Map: a hit means the earlier index j pairs with the
+        // current i; a miss records x -> i and moves on. An Acc record threads BOTH the seen-Map and the
+        // found-result through one fold, and the fold short-circuits (leaves acc untouched) once a pair is
+        // found. Distinct from the memoized-fib Map (a pure memo table) and the anagram freq-Map (tally +
+        // compare): this is Map-as-seen-set with complement lookup and first-match-wins.
+        //   xs = [2,7,11,15]: target 9 -> "0,1" (2+7)  ; target 26 -> "2,3" (11+15) ; target 100 -> "none"
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the complement get() finds a value
+        // stored on an EARLIER index (so 7 at i=1 matches the 2 recorded at i=0), that a value is only
+        // recorded after its complement misses (no element pairs with itself), that the record-`with` threads
+        // the growing seen-Map and the found string through the fold, that the found-guard short-circuits
+        // remaining iterations, and that a target with no valid pair yields the "none" sentinel. This is the
+        // classic hash-map two-sum an AI writes constantly; a backend that recorded before looking up, or
+        // whose Map get missed a present complement, would return a wrong pair or "none".
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+type Acc = { seen: Map[Int, Int], found: Str }
+fun twoSum(xs: List[Int], target: Int) -> Str {
+    let idxs = rangeN(xs.len())
+    let init = Acc(seen: Map(), found: "none")
+    let out = idxs.fold(init, fn(acc, i) {
+        if acc.found == "none" {
+            let x = xs.get(i).unwrap_or(0)
+            let need = target - x
+            match acc.seen.get(need) {
+                Some(j) => acc with found: "{j},{i}"
+                None => acc with seen: acc.seen.insert(x, i)
+            }
+        } else { acc }
+    })
+    out.found
+}
+fun probe() -> Str {
+    let xs = [2, 7, 11, 15]
+    let a = twoSum(xs, 9)
+    let b = twoSum(xs, 26)
+    let c = twoSum(xs, 100)
+    "t9={a}|t26={b}|t100={c}"
+}
+"#;
+        assert_eq!(differential(src), "t9=0,1|t26=2,3|t100=none");
+    }
+
+    #[test]
     fn diff_anagram_check_via_frequency_map() {
         // A bug-hunt-55 lock (it331): anagram detection via character-FREQUENCY maps compared structurally.
         // Each string is canonicalized to a Map[Str,Int] tallying how many times each char occurs (fold over
