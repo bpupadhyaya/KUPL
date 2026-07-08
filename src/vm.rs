@@ -2104,6 +2104,44 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_caesar_cipher_shift() {
+        // A bug-hunt-60 lock (it341): the Caesar cipher -- character rotation by a fixed shift with modular
+        // wraparound, plus an encode/decode round-trip. Since KUPL has no char->Int, each letter is mapped to
+        // its ALPHABET INDEX via position() over "a".."z", shifted with (i + k) % 26 (the mod is the
+        // wraparound), and mapped back with get(). caesar(s, k) maps shiftChar over the string and joins.
+        //   caesar("hello",3)="khoor"  ; caesar("khoor",23)="hello" (23 = -3 mod 26, decrypt) ; caesar("xyz",3)="abc"
+        // Byte-identical on interp/KVM (native per the sweep). Confirms position() finds a letter's 0-based
+        // index, that (i+k)%26 rotates WITH wraparound -- the load-bearing "xyz"->"abc" case (x is index 23,
+        // 23+3=26, 26%26=0='a'), that get() maps the shifted index back to a letter, that non-letters (none
+        // here) would pass through via the None arm, and -- the round-trip -- that encrypting by 3 then by 23
+        // (=-3 mod 26) recovers the original ("hello"). A backend whose % wraparound or index lookup was off
+        // would corrupt the wrap letters or break the round-trip. This is the classic cipher an AI writes for
+        // encoding puzzles; also re-confirms KUPL has no char->Int so the alphabet-index idiom is required.
+        let src = r#"fun alphabet() -> List[Str] {
+    "abcdefghijklmnopqrstuvwxyz".chars()
+}
+fun shiftChar(c: Str, k: Int) -> Str {
+    let ab = alphabet()
+    match ab.position(fn(x) { x == c }) {
+        None => c
+        Some(i) => ab.get((i + k) % 26).unwrap_or(c)
+    }
+}
+fun caesar(s: Str, k: Int) -> Str {
+    s.chars().map(fn(c) { shiftChar(c, k) }).join("")
+}
+fun probe() -> Str {
+    let enc = caesar("hello", 3)
+    let dec = caesar(enc, 23)
+    let wrap = caesar("xyz", 3)
+    let rt = dec == "hello"
+    "enc={enc}|dec={dec}|wrap={wrap}|roundtrip={rt}"
+}
+"#;
+        assert_eq!(differential(src), "enc=khoor|dec=hello|wrap=abc|roundtrip=true");
+    }
+
+    #[test]
     fn diff_is_prime_trial_division() {
         // A certification lock (it340, milestone): primality by trial division with a sqrt(n) early-exit
         // bound. divides(n, d) recurses the trial divisor d up from 2: if d*d > n no divisor exists (base ->
