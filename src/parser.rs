@@ -1803,6 +1803,14 @@ impl Parser {
                     Ok(Pattern { kind: PatternKind::Bind(name), span })
                 }
             }
+            Tok::LBracket => Err(Diag::error(
+                "K0113",
+                "expected a pattern, found `[` — KUPL has no list/cons patterns; \
+                 recurse over a list with `match xs.first() { None => ... Some(h) => ... }` \
+                 and `xs.drop(1)` for the tail"
+                    .to_string(),
+                span,
+            )),
             other => Err(Diag::error(
                 "K0113",
                 format!("expected a pattern, found {}", other.describe()),
@@ -2180,6 +2188,20 @@ app Main {
         // Both correct forms still parse: one arm per line, and comma-separated arms.
         assert!(parse("fun f(o: Option[Int]) -> Int {\n    match o {\n        Some(v) => v\n        None => 0\n    }\n}\n").1.is_empty());
         assert!(parse("fun f(n: Int) -> Str { match n { 0 => \"z\", 1 => \"o\", _ => \"m\" } }\n").1.is_empty());
+    }
+
+    #[test]
+    fn cons_pattern_is_rejected_with_first_drop_hint() {
+        // `[h, ..t]` (list/cons destructuring) is a common reflex from Haskell/Rust/Scala; KUPL has no
+        // list patterns, so the parser should name the real recursion idiom (xs.first()/xs.drop(1))
+        // rather than emit a bare "expected a pattern, found `[`" (PR-it304).
+        let (_p, diags) = parse("fun f(xs: List[Int]) -> Int {\n    match xs {\n        [h, ..t] => 1\n    }\n}\n");
+        let m = &diags.iter().find(|d| d.code == "K0113").expect("K0113").message;
+        assert!(m.contains("no list/cons patterns"), "{m}");
+        assert!(m.contains("xs.first()"), "{m}");
+        assert!(m.contains("xs.drop(1)"), "{m}");
+        // The real idiom (match on xs.first(), recurse on xs.drop(1)) still parses cleanly.
+        assert!(parse("fun f(xs: List[Int]) -> Int {\n    match xs.first() {\n        None => 0\n        Some(h) => h + f(xs.drop(1))\n    }\n}\n").1.is_empty());
     }
 
     #[test]
