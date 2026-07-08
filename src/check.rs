@@ -627,11 +627,20 @@ impl Checker {
                         }
                     }
                     _ => {
-                        self.err(
-                            "K0206",
-                            format!("unknown generic type `{n}` with {}", plural(args.len(), "argument")),
-                            t.span,
-                        );
+                        // Suggest the closest known type (user-declared or a builtin generic) so a
+                        // typo like `Opton[Int]` points at `Option` (PR-it480).
+                        let mut m = format!("unknown generic type `{n}` with {}", plural(args.len(), "argument"));
+                        let builtins = ["List", "Set", "Map", "Option", "Result"];
+                        let cands = self
+                            .checked
+                            .types
+                            .keys()
+                            .map(|k| k.as_str())
+                            .chain(builtins.iter().copied());
+                        if let Some(s) = suggest(n, cands) {
+                            m.push_str(&format!(" — did you mean `{s}`?"));
+                        }
+                        self.err("K0206", m, t.span);
                         self.uni.fresh()
                     }
                 }
@@ -3132,6 +3141,18 @@ mod generic_tests {
         assert!(too_few.iter().all(|d| d.code != "K0200"), "no cascading K0200: {too_few:?}");
         // Correct type-argument counts still type-check.
         assert!(errors("type Box[T] = Box(v: T)\ntype Pair[A, B] = Pair(a: A, b: B)\nfun main() { let _: Box[Int] = Box(v: 5)\n    let _: Pair[Int, Str] = Pair(a: 1, b: \"x\") }\n").is_empty());
+        // An unknown generic type close to a known one now suggests it (PR-it480): a user type...
+        let ut = errors("type Pair[A, B] = Pair(a: A, b: B)\nfun f(x: Pare[Int, Str]) -> Int { 0 }\nfun main() { }\n");
+        assert!(
+            ut.iter().any(|d| d.code == "K0206" && d.message.contains("unknown generic type `Pare`") && d.message.contains("did you mean `Pair`?")),
+            "unknown user generic suggests the type: {ut:?}"
+        );
+        // ...and a builtin generic (Option/List/...).
+        let bt = errors("fun f(x: Opton[Int]) -> Int { 0 }\nfun main() { }\n");
+        assert!(bt.iter().any(|d| d.code == "K0206" && d.message.contains("did you mean `Option`?")), "builtin generic suggestion: {bt:?}");
+        // Nothing close -> no suggestion, just the bare K0206.
+        let none = errors("fun f(x: Zqxw[Int]) -> Int { 0 }\nfun main() { }\n");
+        assert!(none.iter().any(|d| d.code == "K0206" && !d.message.contains("did you mean")), "no bogus suggestion: {none:?}");
     }
 
     #[test]
