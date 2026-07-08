@@ -3029,6 +3029,50 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_integer_partition_count() {
+        // A certification lock (it455): INTEGER PARTITION COUNT p(n) -- the number of ways to write n as an
+        // UNORDERED sum of positive integers (3 = 3 = 2+1 = 1+1+1, so p(3)=3). This is DISTINCT from Stirling
+        // (it453), which counts partitions of a LABELLED set into blocks; here the objects being summed are
+        // indistinguishable and only the multiset of part sizes matters. It is computed by the parts-bounded
+        // recurrence: part(n,k) is the number of partitions of n using parts each at most k, and
+        // part(n,k) = part(n,k-1) + part(n-k,k) -- every such partition either avoids the part k entirely
+        // (part(n,k-1)) or uses at least one k, leaving n-k still bounded by k (part(n-k,k)). The base cases are
+        // part(0,k)=1 (the empty sum), part(n,k)=0 for n<0 or k=0 with n>0, and p(n) = part(n,n).
+        //   p(1)=1, p(2)=2, p(3)=3, p(4)=5, p(5)=7, p(6)=11, p(7)=15    (OEIS A000041, the partition numbers)
+        //   part(6,3)=7   (partitions of 6 into parts <= 3: 3+3, 3+2+1, 3+1+1+1, 2+2+2, 2+2+1+1, 2+1+1+1+1, 1x6)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the empty sum seeds part(0,*)=1, that
+        // negative remainders and zero-part budgets contribute nothing, that the exclude-k / include-at-least-one-k
+        // split covers every partition exactly once, that the diagonal part(n,n) gives the unrestricted partition
+        // number, that the intermediate parts-bounded value part(6,3)=7 is right, that the p(n) values match the
+        // known partition-number sequence, and that all three engines agree. This is the "how many ways to break n
+        // into a sum" count an AI writes for combinatorics, coin/change enumeration, or generating-function work;
+        // it is a different partition notion from Stirling's set partitions. A non-sort lock certifying the integer
+        // partition function via the parts-bounded recurrence.
+        let src = r#"fun part(n: Int, k: Int) -> Int {
+    if n == 0 { 1 }
+    else if n < 0 || k == 0 { 0 }
+    else { part(n, k - 1) + part(n - k, k) }
+}
+fun p(n: Int) -> Int { part(n, n) }
+fun probe() -> Str {
+    let p1 = p(1)
+    let p2 = p(2)
+    let p3 = p(3)
+    let p4 = p(4)
+    let p5 = p(5)
+    let p6 = p(6)
+    let p7 = p(7)
+    let r63 = part(6, 3)
+    "p1={p1}|p2={p2}|p3={p3}|p4={p4}|p5={p5}|p6={p6}|p7={p7}|parts6_3={r63}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "p1=1|p2=2|p3=3|p4=5|p5=7|p6=11|p7=15|parts6_3=7"
+        );
+    }
+
+    #[test]
     fn diff_stirling_second_kind() {
         // A certification lock (it453): STIRLING NUMBERS OF THE SECOND KIND S(n,k) -- the number of ways to
         // partition a set of n elements into exactly k non-empty, unlabelled blocks -- cross-validated by the Bell
