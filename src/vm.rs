@@ -2220,6 +2220,78 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_floyd_warshall_all_pairs() {
+        // A bug-hunt-90 lock (it401): FLOYD-WARSHALL ALL-PAIRS SHORTEST PATHS -- the shortest distance between
+        // EVERY ordered pair of nodes in a weighted directed graph, computed by an intermediate-vertex DP. This
+        // is the ALL-PAIRS DP counterpart to Dijkstra's single-source greedy (it400): where Dijkstra grows one
+        // source's distances by repeatedly finalizing the closest node, Floyd-Warshall builds an N-by-N distance
+        // matrix and, for each candidate intermediate vertex k, relaxes dist[i][j] = min(dist[i][j],
+        // dist[i][k] + dist[k][j]) across all pairs. The matrix starts at 0 on the diagonal, the edge weight for
+        // a direct edge (min over parallel edges), and INF=99999 otherwise; after considering every k as an
+        // intermediate, dist holds the true shortest paths. Addition is INF-SAFE (a path through an unreachable
+        // node stays INF, never overflows), and unreachable pairs render as -1.
+        //   floyd(4,[[0,1,3],[1,2,1],[2,3,2],[0,3,10]]):  0->3 is 6 via 0->1->2->3, NOT 10 direct
+        //        rows -> "0,3,4,6" | "-1,0,1,3" | "-1,-1,0,2" | "-1,-1,-1,0"  (upper-triangular reachability)
+        //   floyd(3,[[0,1,5]]):  node 2 unreachable from all -> "0,5,-1" | "-1,0,-1" | "-1,-1,0"
+        //   floyd(2,[[0,1,4],[1,0,1]]):  a 2-cycle -> "0,4" | "1,0"  (each reaches the other)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the diagonal is zero, that a direct
+        // edge seeds the initial distance, that routing through intermediate vertices finds transitively shorter
+        // paths (the 0->1->2->3 chain of total 6 beats the direct edge of 10), that the min-relaxation runs for
+        // every intermediate k across every pair, that INF-safe addition keeps unreachable pairs at the sentinel
+        // (rendered -1) instead of wrapping, that a cyclic graph yields finite distances both ways, and that all
+        // three engines agree on the triply-nested all-pairs relaxation over an immutable distance matrix. This
+        // is the Floyd-Warshall an AI writes for all-pairs shortest paths, transitive closure, and dense-graph
+        // routing; a backend whose intermediate-vertex loop, min-relaxation, or INF arithmetic was off would
+        // mis-compute a distance. Extends the graph family with the all-pairs DP dual of single-source Dijkstra.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun mini(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+fun cell(m: List[List[Int]], i: Int, j: Int) -> Int {
+    m.get(i).unwrap_or([]).get(j).unwrap_or(99999)
+}
+fun edgeW(i: Int, j: Int, edges: List[List[Int]]) -> Int {
+    edges.filter(fn(e) { e.get(0).unwrap_or(0) == i && e.get(1).unwrap_or(0) == j })
+        .fold(99999, fn(acc, e) { mini(acc, e.get(2).unwrap_or(99999)) })
+}
+fun step(n: Int, m: List[List[Int]], k: Int) -> List[List[Int]] {
+    rangeN(n).map(fn(i) {
+        rangeN(n).map(fn(j) {
+            let ik = cell(m, i, k)
+            let kj = cell(m, k, j)
+            let thru = if ik >= 99999 { 99999 } else { if kj >= 99999 { 99999 } else { ik + kj } }
+            mini(cell(m, i, j), thru)
+        })
+    })
+}
+fun loop(n: Int, m: List[List[Int]], k: Int) -> List[List[Int]] {
+    if k >= n { m } else { loop(n, step(n, m, k), k + 1) }
+}
+fun floyd(n: Int, edges: List[List[Int]]) -> Str {
+    let init = rangeN(n).map(fn(i) {
+        rangeN(n).map(fn(j) {
+            if i == j { 0 } else { edgeW(i, j, edges) }
+        })
+    })
+    let d = loop(n, init, 0)
+    d.map(fn(row) {
+        row.map(fn(x) { if x >= 99999 { (0 - 1).to_str() } else { x.to_str() } }).join(",")
+    }).join(";")
+}
+fun probe() -> Str {
+    let a = floyd(4, [[0, 1, 3], [1, 2, 1], [2, 3, 2], [0, 3, 10]])
+    let b = floyd(3, [[0, 1, 5]])
+    let c = floyd(2, [[0, 1, 4], [1, 0, 1]])
+    "chain={a}|unreach={b}|cyc={c}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "chain=0,3,4,6;-1,0,1,3;-1,-1,0,2;-1,-1,-1,0|unreach=0,5,-1;-1,0,-1;-1,-1,0|cyc=0,4;1,0"
+        );
+    }
+
+    #[test]
     fn diff_dijkstra_shortest_path() {
         // A certification lock (it400, MILESTONE): DIJKSTRA'S SHORTEST PATH -- single-source shortest distances
         // in a directed graph with NON-NEGATIVE edge weights (edges [from,to,w]). This is the WEIGHTED extension
