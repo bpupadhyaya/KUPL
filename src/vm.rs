@@ -3029,6 +3029,54 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_casting_out_nines() {
+        // A certification lock (it481): CASTING OUT NINES -- the classical arithmetic-verification technique
+        // resting on the fact that 10 ≡ 1 (mod 9), so a base-10 digit sum is congruent to the number itself mod 9.
+        // Where diff_digit_sum_and_digital_root (it336) pins the digit-sum / digital-root VALUES and recursion,
+        // THIS certifies the number-theoretic PROPERTY those digit sums obey -- an INDEPENDENT cross-check of the
+        // digit extraction (%10, /10) against modular arithmetic (% 9), two entirely different computations that
+        // must agree by the 10 ≡ 1 congruence (cf. bitwise-arithmetic-identities it475 certifying bit ops against
+        // arithmetic). Three checks:
+        //   congruence:  digitSum(n) % 9 == n % 9   -- x1, x2, x7 (the load-bearing law)
+        //   digital root: digitRoot of a nonzero multiple of 9 is 9 (not 0) -- x3; and 10^k has root 1 -- x6
+        //   casting out nines (multiplication):  (digitSum(a) * digitSum(b)) % 9 == digitSum(a*b) % 9 -- x4
+        //     i.e. the historical hand-check that catches most multiplication errors: 123*456=56088, digit sums
+        //     6 and 15 give (6*15) mod 9 = 0, and digitSum(56088)=27 gives 27 mod 9 = 0 -- they match.
+        //   ds=digitSum(12345)=15, dr1=digitRoot(123)=6, dr2=digitRoot(9999)=9
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the base-10 digit sum is congruent to
+        // the value mod 9 across several magnitudes, that the digital root of a multiple of 9 is 9 (not the naive
+        // 9999 % 9 = 0), that a power of ten has digital root 1, that the casting-out-nines multiplication identity
+        // holds (digit-sum computation agrees with modular arithmetic on a product), and that all three engines
+        // agree. This is the checksum/error-detection an AI uses for hand-verifying arithmetic or teaching
+        // number theory; the congruence cross-check catches a digit-extraction bug (wrong %10 or /10) that a lone
+        // value test could pass by luck. A non-sort lock certifying casting out nines (digit sum ≡ n mod 9).
+        let src = r#"fun digitSum(n: Int) -> Int {
+    if n < 10 { n } else { n % 10 + digitSum(n / 10) }
+}
+fun digitRoot(n: Int) -> Int {
+    if n < 10 { n } else { digitRoot(digitSum(n)) }
+}
+fun probe() -> Str {
+    let ds = digitSum(12345)
+    let dr1 = digitRoot(123)
+    let dr2 = digitRoot(9999)
+    let x1 = digitSum(12345) % 9 == 12345 % 9
+    let x2 = digitSum(987654) % 9 == 987654 % 9
+    let x3 = digitRoot(9999) == 9
+    let x4 = (digitSum(123) * digitSum(456)) % 9 == digitSum(123 * 456) % 9
+    let x5 = digitRoot(0) == 0
+    let x6 = digitRoot(1000000) == 1
+    let x7 = digitSum(100000) % 9 == 100000 % 9
+    "ds={ds}|dr1={dr1}|dr2={dr2}|x1={x1}|x2={x2}|x3={x3}|x4={x4}|x5={x5}|x6={x6}|x7={x7}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "ds=15|dr1=6|dr2=9|x1=true|x2=true|x3=true|x4=true|x5=true|x6=true|x7=true"
+        );
+    }
+
+    #[test]
     fn diff_modular_exponentiation() {
         // A certification lock (it479): MODULAR EXPONENTIATION -- b^e mod m by binary exponentiation that reduces
         // mod m at every squaring step, so all intermediates stay below m^2 and huge powers never overflow.
