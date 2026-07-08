@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_list_via_first_drop_and_fold_reverse() {
+        // A bug-hunt-44 lock (it303): STRUCTURAL recursion over a List. KUPL has no cons-pattern
+        // (`[h, ..t]` is K0113), so the idiom is to match `xs.first()` -> None (base) / Some(h) (recurse
+        // on `xs.drop(1)`). Prior recursion locks walk ADTs (it296 tree, it298 expr); this pins recursion
+        // driven by list head/tail via first()/drop(), plus a fold-based reverse that PREPENDS each element
+        // by flattening [[x], acc] -- the accumulator-prepend reversal an AI writes constantly.
+        //   sumR([1..5]) = 15, lenR([1..5]) = 5   (recurse: Some(h) => h(or 1) + f(drop 1); None => 0)
+        //   revF([1..5]) = [5,4,3,2,1]            (fold([], (acc,x) -> [[x], acc].flatten()))
+        //   empty list: sumR/lenR = 0, revF = []  (base cases fire on first() == None)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms first() returns None on [] and
+        // Some(head) otherwise across all engines, that drop(1) yields the tail so the recursion terminates,
+        // that a fold seeded with [] threads a growing list while [[x], acc].flatten() prepends (giving
+        // reversal, not append), and that all three empty-list base cases agree. This is the hand-rolled
+        // list-recursion + reverse an AI reaches for when it wants explicit control instead of a builtin; a
+        // backend where first()/drop() disagreed on the boundary would loop forever or drop an element, and
+        // one that flattened [[x], acc] in the wrong order would append instead of reverse.
+        let src = r#"fun sumR(xs: List[Int]) -> Int {
+    match xs.first() { None => 0
+        Some(h) => h + sumR(xs.drop(1)) }
+}
+fun lenR(xs: List[Int]) -> Int {
+    match xs.first() { None => 0
+        Some(h) => 1 + lenR(xs.drop(1)) }
+}
+fun revF(xs: List[Int]) -> List[Int] {
+    xs.fold([], fn(acc, x) { [[x], acc].flatten() })
+}
+fun probe() -> Str {
+    let xs = [1, 2, 3, 4, 5]
+    let empty: List[Int] = []
+    "{sumR(xs)}|{lenR(xs)}|{revF(xs)}|{sumR(empty)}|{lenR(empty)}|{revF(empty)}"
+}
+"#;
+        assert_eq!(differential(src), "15|5|[5, 4, 3, 2, 1]|0|0|[]");
+    }
+
+    #[test]
     fn diff_tabular_report_from_records_header_body_footer() {
         // A certification lock (it302): a multi-line tabular REPORT from records -- header + column-aligned
         // rows + grand-total footer, assembled declaratively. it240 builds a report by interpolating the
