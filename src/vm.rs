@@ -2220,6 +2220,81 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_kadane_2d_max_submatrix() {
+        // A bug-hunt-91 lock (it403): 2-D KADANE MAXIMUM SUBMATRIX SUM -- the largest sum of any axis-aligned
+        // rectangular sub-block of an integer matrix. This LIFTS the 1-D Kadane (it372, maximum contiguous
+        // subarray) to two dimensions by ROW-BAND COMPRESSION: fix a top row t and a bottom row b >= t, collapse
+        // every column of that horizontal band into a single number (the sum of the band's entries in that
+        // column), and run ordinary 1-D Kadane on the resulting compressed row -- its best contiguous run is the
+        // best submatrix spanning exactly rows t..b. Doing this for every (t,b) pair and taking the global max
+        // finds the overall answer. The band enumeration is an O(rows^2) double fold; colSum reduces the band to
+        // a 1-D List[Int]; kadane carries the running (cur,best) state and, like the 1-D lock, returns the
+        // LARGEST SINGLE element when all sums are negative (so an all-negative matrix yields its least-negative
+        // cell, not zero).
+        //   maxSubmatrix([[1,2,-1],[-3,4,2],[1,-1,5]]) = 11   (columns 1..2 over all 3 rows: colSums [5,6] -> 11)
+        //   maxSubmatrix([[-1,-2],[-3,-4]]) = -1              (ALL NEGATIVE -> the least-negative single cell)
+        //   maxSubmatrix([[1,2],[3,4]]) = 10                 (all positive -> the whole matrix)
+        //   maxSubmatrix([[5]]) = 5                          (a 1x1 matrix)
+        //   maxSubmatrix([[2,-1,2]]) = 3                     (single row -> plain 1-D Kadane, 2-1+2)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each row band is compressed to a 1-D
+        // column-sum array, that 1-D Kadane on that array gives the best submatrix for the band, that the max
+        // over every (top,bottom) band pair is the answer (the 11 case beats the full-matrix 10 by dropping
+        // column 0), that an all-negative matrix returns its largest single cell rather than an empty zero, that
+        // an all-positive matrix takes the whole thing, that a single row degenerates to 1-D Kadane, and that
+        // all three engines agree on the band-compress-then-Kadane pipeline. This is the maximum-submatrix an AI
+        // writes for max-sum rectangle, image region scoring, and 2-D signal peaks; a backend whose band sum,
+        // Kadane state, or all-negative handling was off would find the wrong rectangle. Extends the running-best
+        // family from 1-D to 2-D via row-band compression.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [rangeIncl(lo, hi - 1), [hi]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun cell(m: List[List[Int]], r: Int, c: Int) -> Int {
+    m.get(r).unwrap_or([]).get(c).unwrap_or(0)
+}
+fun kadane(xs: List[Int]) -> Int {
+    let first = xs.get(0).unwrap_or(0)
+    xs.drop(1).fold([first, first], fn(st, x) {
+        let cur = st.get(0).unwrap_or(0)
+        let best = st.get(1).unwrap_or(0)
+        let nc = maxi(x, cur + x)
+        [nc, maxi(best, nc)]
+    }).get(1).unwrap_or(first)
+}
+fun colSum(m: List[List[Int]], t: Int, b: Int, cols: Int) -> List[Int] {
+    rangeN(cols).map(fn(c) {
+        rangeIncl(t, b).fold(0, fn(acc, r) { acc + cell(m, r, c) })
+    })
+}
+fun maxSubmatrix(m: List[List[Int]]) -> Int {
+    let rows = m.len()
+    let cols = m.first().unwrap_or([]).len()
+    rangeN(rows).fold(0 - 100000, fn(best1, t) {
+        rangeIncl(t, rows - 1).fold(best1, fn(best2, b) {
+            let compressed = colSum(m, t, b, cols)
+            maxi(best2, kadane(compressed))
+        })
+    })
+}
+fun probe() -> Str {
+    let a = maxSubmatrix([[1, 2, 0 - 1], [0 - 3, 4, 2], [1, 0 - 1, 5]])
+    let b = maxSubmatrix([[0 - 1, 0 - 2], [0 - 3, 0 - 4]])
+    let c = maxSubmatrix([[1, 2], [3, 4]])
+    let d = maxSubmatrix([[5]])
+    let e = maxSubmatrix([[2, 0 - 1, 2]])
+    "mix={a}|allneg={b}|allpos={c}|single={d}|row={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mix=11|allneg=-1|allpos=10|single=5|row=3"
+        );
+    }
+
+    #[test]
     fn diff_union_find_components() {
         // A certification lock (it402): UNION-FIND CONNECTED COMPONENTS -- count the connected components of an
         // undirected graph using a DISJOINT-SET forest, the alternative to the flood-fill (it388) approach. Each
