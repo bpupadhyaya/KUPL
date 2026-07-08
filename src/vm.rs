@@ -2220,6 +2220,86 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_bellman_ford() {
+        // A bug-hunt-92 lock (it405): BELLMAN-FORD single-source shortest paths -- distances from a source that,
+        // unlike Dijkstra (it400), tolerate NEGATIVE edge weights and can report a NEGATIVE CYCLE. Where Dijkstra
+        // greedily finalizes the closest node (correct only for non-negative weights) and Floyd-Warshall (it401)
+        // is an all-pairs DP, Bellman-Ford simply RELAXES every edge n-1 times: after k passes, dist holds the
+        // shortest path using at most k edges, and since a simple shortest path has at most n-1 edges, n-1
+        // passes suffice. Each relaxation lowers dist[v] to du + w when the path through u is cheaper (INF-safe:
+        // an edge from an unreachable node is skipped). A FINAL n-th pass that can still relax any edge proves a
+        // negative-weight cycle exists (distances would decrease forever), reported as "NEGCYCLE"; otherwise
+        // unreachable nodes render as -1.
+        //   bellman(5,0,[[0,1,6],[0,2,7],[1,2,8],[1,3,5],[2,3,-4],[3,1,-2]]) = "0,1,7,3,-1"
+        //        (the classic CLRS graph; node 1 is 1 via 0->2->3->1 using the -4 and -2 edges; node 4 unreachable)
+        //   bellman(3,0,[[0,1,4],[1,2,-10],[2,0,3]]) = "NEGCYCLE"   (cycle 0->1->2->0 sums to 4-10+3 = -3 < 0)
+        //   bellman(3,0,[[0,1,5]]) = "0,5,-1"                       (node 2 unreachable)
+        //   bellman(4,0,[[0,1,1],[1,2,-3],[2,3,2]]) = "0,1,-2,0"    (a NEGATIVE-weight chain, no cycle)
+        //   bellman(1,0,[]) = "0"                                   (a single source node)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that all edges are relaxed n-1 times
+        // rather than one node finalized per round, that negative edge weights are handled correctly (the chain
+        // reaches -2), that a shorter path through a negative edge overrides an earlier longer estimate (node 1
+        // drops from 6 to 1 via the -4/-2 shortcut), that a cycle whose edge weights sum negative is detected by
+        // the n-th relaxation pass and reported as NEGCYCLE, that INF-safe relaxation skips edges from
+        // unreachable sources, that unreachable nodes render as -1, and that all three engines agree on the
+        // relax-n-1-times then cycle-check pipeline. This is the Bellman-Ford an AI writes for shortest paths
+        // with negative edges, arbitrage/currency-cycle detection, and difference constraints; a backend whose
+        // pass count, negative-weight relaxation, or cycle detection was off would find wrong distances or miss
+        // a cycle. Adds the negative-weight single-source shortest-path paradigm to the weighted-graph family.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun setAt(lst: List[Int], i: Int, v: Int) -> List[Int] {
+    rangeN(lst.len()).map(fn(k) { if k == i { v } else { lst.get(k).unwrap_or(0) } })
+}
+fun relaxAll(dist: List[Int], edges: List[List[Int]]) -> List[Int] {
+    edges.fold(dist, fn(d, e) {
+        let u = e.get(0).unwrap_or(0)
+        let v = e.get(1).unwrap_or(0)
+        let w = e.get(2).unwrap_or(0)
+        let du = d.get(u).unwrap_or(99999)
+        let dv = d.get(v).unwrap_or(99999)
+        if du >= 99999 { d }
+        else { if du + w < dv { setAt(d, v, du + w) } else { d } }
+    })
+}
+fun passes(dist: List[Int], edges: List[List[Int]], k: Int) -> List[Int] {
+    if k <= 0 { dist } else { passes(relaxAll(dist, edges), edges, k - 1) }
+}
+fun hasNegCycle(dist: List[Int], edges: List[List[Int]]) -> Bool {
+    edges.any(fn(e) {
+        let u = e.get(0).unwrap_or(0)
+        let v = e.get(1).unwrap_or(0)
+        let w = e.get(2).unwrap_or(0)
+        let du = dist.get(u).unwrap_or(99999)
+        let dv = dist.get(v).unwrap_or(99999)
+        du < 99999 && du + w < dv
+    })
+}
+fun bellman(n: Int, src: Int, edges: List[List[Int]]) -> Str {
+    let init = rangeN(n).map(fn(i) { if i == src { 0 } else { 99999 } })
+    let final = passes(init, edges, n - 1)
+    if hasNegCycle(final, edges) { "NEGCYCLE" }
+    else {
+        final.map(fn(d) { if d >= 99999 { (0 - 1).to_str() } else { d.to_str() } }).join(",")
+    }
+}
+fun probe() -> Str {
+    let a = bellman(5, 0, [[0, 1, 6], [0, 2, 7], [1, 2, 8], [1, 3, 5], [2, 3, 0 - 4], [3, 1, 0 - 2]])
+    let b = bellman(3, 0, [[0, 1, 4], [1, 2, 0 - 10], [2, 0, 3]])
+    let c = bellman(3, 0, [[0, 1, 5]])
+    let d = bellman(4, 0, [[0, 1, 1], [1, 2, 0 - 3], [2, 3, 2]])
+    let e = bellman(1, 0, [])
+    "neg={a}|cycle={b}|unreach={c}|chain={d}|single={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "neg=0,1,7,3,-1|cycle=NEGCYCLE|unreach=0,5,-1|chain=0,1,-2,0|single=0"
+        );
+    }
+
+    #[test]
     fn diff_kruskal_mst() {
         // A certification lock (it404): KRUSKAL'S MINIMUM SPANNING TREE -- the least-total-weight set of edges
         // that connects every node of a weighted undirected graph, computed greedily. This COMPOSES two earlier
