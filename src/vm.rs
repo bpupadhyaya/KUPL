@@ -3029,6 +3029,48 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_russian_peasant_mult() {
+        // A bug-hunt-122 lock (it468): RUSSIAN PEASANT (Egyptian) MULTIPLICATION -- the product a*b computed using
+        // ONLY halving, doubling, addition, and parity tests (no multiply instruction), cross-validated against
+        // the `*` operator. Continuing the classic-algorithm vein opened by Stein's binary GCD (it467): the
+        // algorithm repeatedly halves a (a.shr(1)) and doubles b (b.shl(1)), adding the current b into the
+        // accumulator whenever a is odd -- so it sums exactly the powers-of-two-scaled b's that correspond to the
+        // set bits of a (a's binary expansion), which is precisely the shift-and-add definition of multiplication.
+        // Its agreement with the built-in `*` at every tested pair certifies the shift/parity logic; this is an
+        // INDEPENDENT algorithm, not a restatement, distinct from binary-gcd (GCD) and fastPow (exponentiation).
+        //   mul(13,7)=91, mul(25,4)=100, mul(0,99)=0 (zero base), mul(1,47)=47 (identity)
+        //   x1..x4: rpm == a*b for (13,7), (25,4), (19,23), (64,5)   (peasant product == the `*` operator)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that a.band(1)==1 adds b for the odd steps,
+        // that a.shr(1) halves and b.shl(1) doubles, that the a==0 base returns the accumulator, that zero and one
+        // multiplicands are handled, that the accumulated shift-and-add sum equals the true product at four pairs,
+        // and that all three engines agree. This is the multiply-free product an AI writes for bit-oriented or
+        // hardware-flavored arithmetic; agreement with `*` catches a wrong shift direction or a mishandled parity.
+        // A non-sort lock certifying Russian peasant multiplication against the `*` operator.
+        let src = r#"fun rpm(a: Int, b: Int, acc: Int) -> Int {
+    if a == 0 { acc }
+    else if a.band(1) == 1 { rpm(a.shr(1), b.shl(1), acc + b) }
+    else { rpm(a.shr(1), b.shl(1), acc) }
+}
+fun mul(a: Int, b: Int) -> Int { rpm(a, b, 0) }
+fun probe() -> Str {
+    let m1 = mul(13, 7)
+    let m2 = mul(25, 4)
+    let m3 = mul(0, 99)
+    let m4 = mul(1, 47)
+    let x1 = mul(13, 7) == 13 * 7
+    let x2 = mul(25, 4) == 25 * 4
+    let x3 = mul(19, 23) == 19 * 23
+    let x4 = mul(64, 5) == 64 * 5
+    "m1={m1}|m2={m2}|m3={m3}|m4={m4}|x1={x1}|x2={x2}|x3={x3}|x4={x4}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "m1=91|m2=100|m3=0|m4=47|x1=true|x2=true|x3=true|x4=true"
+        );
+    }
+
+    #[test]
     fn diff_binary_gcd_stein() {
         // A certification lock (it467): STEIN'S BINARY GCD -- the greatest common divisor computed using ONLY
         // right-shifts, subtraction, and parity tests (no division or modulo), cross-validated against the
