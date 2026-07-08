@@ -3029,6 +3029,60 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_modular_exponentiation() {
+        // A certification lock (it479): MODULAR EXPONENTIATION -- b^e mod m by binary exponentiation that reduces
+        // mod m at every squaring step, so all intermediates stay below m^2 and huge powers never overflow.
+        // Continuing the classic-algorithm vein (Stein GCD it467 ... Karatsuba it476), and distinct from
+        // exponentiation_by_squaring / fastPow (which compute the full b^e, no modulus). Cross-validated TWO
+        // genuinely independent ways:
+        //   (1) SECOND-ALGORITHM: modpow == naivePowMod (an e-step repeated (*b % m) loop) for small e -- x1, x2.
+        //   (2) SPEC-PROPERTY (Fermat's little theorem): for a prime p and base coprime to p, a^(p-1) ≡ 1 (mod p)
+        //       -- x3/x4/x5 at p = 11, 7, 13; and its exponent-reduction corollary a^e ≡ a^(e mod (p-1)) (mod p)
+        //       -- x6: 7^100 ≡ 7^4 (mod 13), since 100 ≡ 4 (mod 12).
+        // The Fermat checks are the important half: they exercise LARGE exponents (7^100) that a naive i64 power
+        // could never hold, yet modpow returns the right residue -- verified against a mathematical law, not a
+        // re-run of the algorithm (the it462 circular-check discipline). Concrete residues are pinned too:
+        // 3^7 mod 50 = 37, 7^100 mod 13 = 9, 2^10 mod 11 = 1.
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that reducing mod m at each squaring
+        // reproduces b^e mod m, that the odd/even branch multiplies in the base only on odd bits, that the result
+        // agrees with the naive repeated-multiply for small e, that Fermat's little theorem holds at three primes,
+        // that the exponent-reduction corollary holds for a large exponent, that the e=0 base case is 1 mod m, and
+        // that all three engines agree. This is the modpow an AI writes for RSA-style crypto, hashing, or primality
+        // testing; the Fermat cross-check catches an intermediate that forgot to reduce (silently overflowing) or a
+        // wrong odd-bit multiply. A non-sort lock certifying modular exponentiation against naive power-mod and
+        // Fermat's little theorem.
+        let src = r#"fun modpow(b: Int, e: Int, m: Int) -> Int {
+    if e <= 0 { 1 % m }
+    else {
+        let half = modpow(b, e / 2, m)
+        let sq = (half * half) % m
+        if e % 2 == 0 { sq } else { (sq * b) % m }
+    }
+}
+fun naivePowMod(b: Int, e: Int, m: Int) -> Int {
+    if e <= 0 { 1 % m } else { (b * naivePowMod(b, e - 1, m)) % m }
+}
+fun probe() -> Str {
+    let a = modpow(3, 7, 50)
+    let b = modpow(7, 100, 13)
+    let c = modpow(2, 10, 11)
+    let x1 = modpow(3, 7, 50) == naivePowMod(3, 7, 50)
+    let x2 = modpow(4, 13, 100) == naivePowMod(4, 13, 100)
+    let x3 = modpow(2, 10, 11) == 1
+    let x4 = modpow(3, 6, 7) == 1
+    let x5 = modpow(5, 12, 13) == 1
+    let x6 = modpow(7, 100, 13) == modpow(7, 4, 13)
+    let x7 = modpow(10, 0, 7) == 1
+    "a={a}|b={b}|c={c}|x1={x1}|x2={x2}|x3={x3}|x4={x4}|x5={x5}|x6={x6}|x7={x7}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a=37|b=9|c=1|x1=true|x2=true|x3=true|x4=true|x5=true|x6=true|x7=true"
+        );
+    }
+
+    #[test]
     fn diff_set_cardinality_inclusion_exclusion() {
         // A certification lock (it478, from bug-hunt batch 125 -- 8 probes across tensor/Rational/BigInt/Set/Map/
         // regex/string shapes came back byte-identical, so the subtlest untouched corner is locked): the
