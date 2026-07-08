@@ -2983,6 +2983,52 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_derangement_subfactorial() {
+        // A bug-hunt-116 lock (it454): DERANGEMENTS (the subfactorial !n) -- the number of permutations of n
+        // elements with NO fixed point (no element left in its original position) -- certified by cross-validating
+        // TWO independent recurrences. This extends the combinatorics family with a COUNT distinct from its
+        // neighbors: permutations (it357) ENUMERATE all n! orderings, Stirling (it453) counts set partitions,
+        // whereas the derangement count is the fixed-point-free subset. Recurrence one is the classic
+        // D(n) = (n-1)*(D(n-1) + D(n-2)) (the displaced-element argument); recurrence two is the equivalent
+        // D(n) = n*D(n-1) + (-1)^n (the inclusion-exclusion alternating form). They share no structure -- one is a
+        // two-term branching recurrence, the other a linear recurrence with an alternating +/-1 correction -- so
+        // their agreement (cross == true) is strong evidence both are right.
+        //   !0=1 (the empty permutation vacuously deranges) / !1=0 (the one fixed point is unavoidable)
+        //   !2=1, !3=2, !4=9, !5=44, !6=265    (the standard subfactorial values)
+        //   cross = true                        (d1(6) == d2(6): the two recurrences agree at 265)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the base cases seed !0=1 and !1=0,
+        // that the two-term recurrence weights (D(n-1)+D(n-2)) by n-1, that the alternating-sign recurrence adds
+        // +1 for even n and -1 for odd n (the 0-1 negative-literal form), that the two formulas produce the same
+        // subfactorial, that the values match the known sequence, and that all three engines agree. This is the
+        // "how many ways can nobody get their own hat back" count an AI writes for probability or combinatorics;
+        // two independent recurrences agreeing catches an off-by-one or a sign error in either. A non-sort lock
+        // certifying the derangement count via two cross-checked recurrences.
+        let src = r#"fun d1(n: Int) -> Int {
+    if n == 0 { 1 } else if n == 1 { 0 } else { (n - 1) * (d1(n - 1) + d1(n - 2)) }
+}
+fun d2(n: Int) -> Int {
+    if n == 0 { 1 }
+    else { let sign = if n % 2 == 0 { 1 } else { 0 - 1 }; n * d2(n - 1) + sign }
+}
+fun probe() -> Str {
+    let a0 = d1(0)
+    let a1 = d1(1)
+    let a2 = d1(2)
+    let a3 = d1(3)
+    let a4 = d1(4)
+    let a5 = d1(5)
+    let a6 = d1(6)
+    let cross = d1(6) == d2(6)
+    "d0={a0}|d1={a1}|d2={a2}|d3={a3}|d4={a4}|d5={a5}|d6={a6}|cross={cross}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "d0=1|d1=0|d2=1|d3=2|d4=9|d5=44|d6=265|cross=true"
+        );
+    }
+
+    #[test]
     fn diff_stirling_second_kind() {
         // A certification lock (it453): STIRLING NUMBERS OF THE SECOND KIND S(n,k) -- the number of ways to
         // partition a set of n elements into exactly k non-empty, unlabelled blocks -- cross-validated by the Bell
