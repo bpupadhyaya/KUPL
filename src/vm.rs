@@ -2104,6 +2104,49 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_run_length_encode_decode_roundtrip() {
+        // A certification lock (it320, milestone): run-length encoding + decoding round-trip. encode folds a
+        // char list into a List[Run] (Run = {ch, n}) by GROUPING consecutive equal chars -- inspecting the
+        // LAST accumulated run and either bumping its count (take all-but-last, push the updated Run) or
+        // starting a new run; decode maps each run to ch.repeat(n) and joins. The round-trip decode(encode s)
+        // == s is the correctness witness.
+        //   "aaabbbcccd" -> [Run(a,3), Run(b,3), Run(c,3), Run(d,1)]  (summary "a3,b3,c3,d1")
+        //   decode -> "aaabbbcccd"  => roundtrip true
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the fold reads acc.last() to decide
+        // extend-vs-new, that extending a run replaces the tail element via `acc.take(acc.len()-1).push(r
+        // with n: r.n+1)` (record update inside a fold), that a new char starts a fresh Run, and that decode
+        // reconstructs the exact original via repeat+join. This is the classic string-compression RLE an AI
+        // writes; a backend that mishandled the last-element inspection would fail to merge runs (emitting
+        // a1,a1,a1... ) or the round-trip would break. Two gotchas documented by construction: the fold seed
+        // needs a type annotation (`let init: List[Run] = []`) or the record-field access is K0232, and
+        // `drop(len-1)` drops from the FRONT (keeping the last) -- `take(len-1)` is all-but-last.
+        let src = r#"type Run = { ch: Str, n: Int }
+fun encode(cs: List[Str]) -> List[Run] {
+    let init: List[Run] = []
+    cs.fold(init, fn(acc, c) {
+        match acc.last() { Some(r) => {
+                if r.ch == c { acc.take(acc.len() - 1).push(r with n: r.n + 1) }
+                else { acc.push(Run(ch: c, n: 1)) }
+            }
+            None => acc.push(Run(ch: c, n: 1)) }
+    })
+}
+fun decode(rs: List[Run]) -> Str {
+    rs.map(fn(r) { r.ch.repeat(r.n) }).join("")
+}
+fun probe() -> Str {
+    let s = "aaabbbcccd"
+    let cs = s.chars()
+    let runs = encode(cs)
+    let summary = runs.map(fn(r) { "{r.ch}{r.n}" }).join(",")
+    let back = decode(runs)
+    "{summary}|roundtrip={back == s}"
+}
+"#;
+        assert_eq!(differential(src), "a3,b3,c3,d1|roundtrip=true");
+    }
+
+    #[test]
     fn diff_matrix_transpose_and_matmul_nested_lists() {
         // A certification lock (it319): matrix operations on List[List[Int]] -- the nested-list matrix an AI
         // writes when it wants plain lists, NOT the builtin Tensor (it101-103/150/173/218 cover Tensor).
