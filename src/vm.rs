@@ -2104,6 +2104,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_collatz_step_count() {
+        // A bug-hunt-57 lock (it335): the Collatz (3n+1) sequence step count -- CONDITIONAL recursion driven
+        // by parity, distinct from the modulo-reduction of GCD (it334). At each step even n recurses on n/2,
+        // odd n recurses on 3*n+1, and a steps accumulator threads through until n reaches 1 (the base). The
+        // path length is the certified value.
+        //   collatz(1)=0 (already 1)  collatz(6)=8  collatz(7)=16
+        //   6: 6->3->10->5->16->8->4->2->1 (8 steps) ; 7 takes 16
+        // (27, the famous 111-step trajectory, is verified separately in release -- its ~111-frame interp
+        // depth would risk the 2MB DEBUG test-thread stack, so the differential test keeps depth modest.)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the parity branch (n % 2 == 0)
+        // selects halving vs 3n+1, that the steps accumulator counts every transition, that the n<=1 base
+        // stops the recursion, and that the two witnessed trajectories (6->8, 7->16) reach 1 in exactly the
+        // right number of steps. This is the canonical hailstone/Collatz an AI writes; a backend whose parity
+        // test or accumulator was off would report a wrong step count or fail to terminate.
+        let src = r#"fun collatz(n: Int, steps: Int) -> Int {
+    if n <= 1 { steps }
+    else {
+        if n % 2 == 0 { collatz(n / 2, steps + 1) }
+        else { collatz(3 * n + 1, steps + 1) }
+    }
+}
+fun steps(n: Int) -> Int { collatz(n, 0) }
+fun probe() -> Str {
+    let s1 = steps(1)
+    let s6 = steps(6)
+    let s7 = steps(7)
+    "c1={s1}|c6={s6}|c7={s7}"
+}
+"#;
+        assert_eq!(differential(src), "c1=0|c6=8|c7=16");
+    }
+
+    #[test]
     fn diff_euclidean_gcd_and_lcm() {
         // A certification lock (it334): the Euclidean GCD recursion plus LCM built on it -- integer recursion
         // over MODULO, distinct from the structural (list/tree) and memo recursions certified earlier. gcd
