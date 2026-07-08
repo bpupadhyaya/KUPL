@@ -2104,6 +2104,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_running_minimum_scan() {
+        // A certification lock (it346): running minimum via scan -- the monotone NON-INCREASING low-water
+        // mark, the exact dual of running-max (it343). scan(seed, min) threads the min-so-far through the
+        // list. The SEED CHOICE is load-bearing: for a min-accumulator the seed must be the FIRST element
+        // (xs.first()), not 0 -- seeding with 0 would wrongly floor every prefix-min to 0 (or below). Because
+        // scan EXCLUDES the seed, the output length equals the input length, and the LAST scan element equals
+        // the overall fold-min.
+        //   [9,7,8,3,5,1,4,2] -> running=[9,7,7,3,3,1,1,1] ; last=1 = fold-min=1 ; scan.len()==xs.len()=8
+        // Byte-identical on interp/KVM (native per the sweep). Confirms scan produces one output per input
+        // (seed excluded), that the sequence is monotone non-increasing (9,7,7,3,3,1,1,1 never rises), that
+        // the low-water mark sticks after the trough (1 then 4 -> still 1, then 2 -> still 1), that
+        // last(scan) agrees with the whole-list fold-min, and that seeding from the first element (not 0)
+        // keeps the running min correct. This is the running-min an AI writes for streaming stats, stock
+        // low-water marks, and monotonic floors; paired with it343's running-max it pins both directions of
+        // the idempotent-scan idiom.
+        let src = r#"fun mn(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+fun probe() -> Str {
+    let xs = [9, 7, 8, 3, 5, 1, 4, 2]
+    let seed = xs.first().unwrap_or(0)
+    let running = xs.scan(seed, fn(acc, x) { mn(acc, x) })
+    let last = running.last().unwrap_or(0 - 1)
+    let overall = xs.fold(seed, fn(a, x) { mn(a, x) })
+    let sameLen = running.len() == xs.len()
+    "running={running}|last={last}|overall={overall}|sameLen={sameLen}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "running=[9, 7, 7, 3, 3, 1, 1, 1]|last=1|overall=1|sameLen=true"
+        );
+    }
+
+    #[test]
     fn diff_zip_with_index_enumerate() {
         // A bug-hunt-62 lock (it345): zip-with-index -- the "enumerate" idiom. KUPL has no enumerate builtin,
         // so the canonical replacement is to build a 0-based index list with rangeN(xs.len()) and zip_with it
