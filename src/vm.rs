@@ -2269,6 +2269,51 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_set_algebra_laws() {
+        // A bug-hunt-101 lock (it423->it424): SET-ALGEBRA LAWS -- verify that KUPL's Set operations obey the
+        // classical Boolean-algebra identities, as a property/law test rather than a single-output check. Prior
+        // set_algebra tests exercise composed chains and insertion-order preservation; this one pins the AXIOMS
+        // themselves, each computed as the equality of two structurally-DIFFERENT set expressions:
+        //   de Morgan 1:  U \ (A ∪ B) == (U \ A) ∩ (U \ B)
+        //   de Morgan 2:  U \ (A ∩ B) == (U \ A) ∪ (U \ B)
+        //   distributivity: A ∩ (B ∪ C) == (A ∩ B) ∪ (A ∩ C)
+        //   absorption:   A ∪ (A ∩ B) == A
+        //   symmetric diff: A △ B == (A \ B) ∪ (B \ A)
+        // with U={1..6}, A={1,2,3,4}, B={3,4,5,6}, C={2,5}. Set equality is compared as sorted to_list() so the
+        // check is content-based and order-independent. The concrete contents of A∪B (={1..6}), A∩B (={3,4}), and
+        // A△B (={1,2,5,6}) are also emitted so the lock pins real values, not just booleans.
+        //   dm1=true dm2=true dist=true absorb=true symd=true | AuB=1,2,3,4,5,6 AnB=3,4 symdAB=1,2,5,6
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that union, intersect, difference, and
+        // symmetric_difference each produce correct results that jointly satisfy both de Morgan laws, the
+        // distributive law of intersection over union, the absorption law, and the symmetric-difference
+        // decomposition -- and that all three engines agree on both the boolean law outcomes and the concrete set
+        // contents. This is the Set algebra an AI relies on when reasoning about permissions, tags, or feature
+        // flags; a backend whose difference or symmetric_difference was subtly wrong would break one of the laws
+        // (yielding false) or diverge on the emitted contents. A non-sort lock certifying Boolean-algebra axioms
+        // over Set operations.
+        let src = r#"fun sorted(s: Set[Int]) -> List[Int] { s.to_list().sort_by(fn(x) { x }) }
+fun eq(a: Set[Int], b: Set[Int]) -> Bool { sorted(a) == sorted(b) }
+fun shw(s: Set[Int]) -> Str { sorted(s).map(fn(x) { x.to_str() }).join(",") }
+fun probe() -> Str {
+    let u = Set([1, 2, 3, 4, 5, 6])
+    let a = Set([1, 2, 3, 4])
+    let b = Set([3, 4, 5, 6])
+    let c = Set([2, 5])
+    let dm1 = eq(u.difference(a.union(b)), u.difference(a).intersect(u.difference(b)))
+    let dm2 = eq(u.difference(a.intersect(b)), u.difference(a).union(u.difference(b)))
+    let dist = eq(a.intersect(b.union(c)), a.intersect(b).union(a.intersect(c)))
+    let absorb = eq(a.union(a.intersect(b)), a)
+    let symd = eq(a.symmetric_difference(b), a.difference(b).union(b.difference(a)))
+    "dm1={dm1}|dm2={dm2}|dist={dist}|absorb={absorb}|symd={symd}|AuB={shw(a.union(b))}|AnB={shw(a.intersect(b))}|symdAB={shw(a.symmetric_difference(b))}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "dm1=true|dm2=true|dist=true|absorb=true|symd=true|AuB=1,2,3,4,5,6|AnB=3,4|symdAB=1,2,5,6"
+        );
+    }
+
+    #[test]
     fn diff_state_machine_fold() {
         // A certification lock (it423): FINITE-STATE-MACHINE as a pure FOLD -- process a sequence of events
         // through a transition function, threading the machine's state (and side-effect counters) as a record
