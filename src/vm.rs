@@ -2104,6 +2104,44 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_adt_variant_with_record_typed_field() {
+        // A bug-hunt-43 lock (it301): an ADT whose variants carry RECORD-typed fields (not scalars).
+        // Prior REC-ADT locks (it296 Leaf(v: Int), it298 Num(v: Int)) wrap Ints; this pins a tagged union
+        // of structs -- a Shape ADT where Circle wraps a Pt center, Rect wraps two Pts (tl/br), and Dot
+        // wraps a Pt. A match binds the record-typed field and the arm body reads its NESTED fields.
+        //   Circle(center=Pt(2,3), r=5) -> area 3*r*r = 75, originX = c.x = 2
+        //   Rect(tl=Pt(1,1), br=Pt(4,6)) -> area (br.x-tl.x)*(br.y-tl.y) = 3*5 = 15, originX = tl.x = 1
+        //   Dot(at=Pt(9,9))             -> area 0,                                    originX = at.x = 9
+        // Byte-identical on interp/KVM (native per the sweep). Confirms a constructor field can be a full
+        // record, that the match arm binds that record and reads its fields (c.x, and br.x-tl.x combining
+        // two bound records' fields), and that all three engines lay out and access the nested Pt
+        // identically. This is the geometry/shape tagged-union an AI writes constantly -- variants wrapping
+        // structs (an AST node holding a Span record, an event holding a Payload). A backend that mis-laid
+        // a record-in-variant would misread br.x/tl.x and get the Rect area or origin wrong while the
+        // scalar-free Dot still looked fine.
+        let src = r#"type Pt = { x: Int, y: Int }
+type Shape = Circle(center: Pt, r: Int) | Rect(tl: Pt, br: Pt) | Dot(at: Pt)
+fun area(s: Shape) -> Int {
+    match s { Circle(c, r) => 3 * r * r
+        Rect(tl, br) => (br.x - tl.x) * (br.y - tl.y)
+        Dot(at) => 0 }
+}
+fun originX(s: Shape) -> Int {
+    match s { Circle(c, r) => c.x
+        Rect(tl, br) => tl.x
+        Dot(at) => at.x }
+}
+fun probe() -> Str {
+    let c = Circle(center: Pt(x: 2, y: 3), r: 5)
+    let rc = Rect(tl: Pt(x: 1, y: 1), br: Pt(x: 4, y: 6))
+    let d = Dot(at: Pt(x: 9, y: 9))
+    "{area(c)}|{area(rc)}|{area(d)}|ox={originX(c)},{originX(rc)},{originX(d)}"
+}
+"#;
+        assert_eq!(differential(src), "75|15|0|ox=2,1,9");
+    }
+
+    #[test]
     fn diff_fold_records_into_map_of_lists_bucketing() {
         // A certification lock (it300, milestone): fold records into a Map-of-LISTS -- bucket each item
         // into a per-key list. it292 folds into a Map of Ints (get-or-0 + sum); this pins the
