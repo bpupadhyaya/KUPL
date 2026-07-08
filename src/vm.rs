@@ -3029,6 +3029,49 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_power_sum_identities() {
+        // A certification lock (it483): the classic POWER-SUM IDENTITIES, each verifying a recursive summation
+        // against an INDEPENDENT closed form or a structurally different sum (a MATHEMATICAL-IDENTITY cross-check,
+        // like Bell row-sums or the FTA product -- not a restatement of the sum). Four identities:
+        //   Nicomachus:   1^3 + 2^3 + ... + n^3 == (1 + 2 + ... + n)^2   (sum of cubes = square of the triangular
+        //                 number) -- n1/n2/n3 at n = 5, 10, 8. The left side is a cube sum; the right is a
+        //                 completely different computation (triangular number, squared) -- their agreement is the check.
+        //   Odd squares: 1 + 3 + 5 + ... + (2n-1) == n^2   -- o1/o2 at n = 7, 12 (sum of the first n odds is a perfect square).
+        //   Triangular:  1 + 2 + ... + n == n(n+1)/2   -- t1: the recursive sum matches Gauss's closed form.
+        //   Sum of squares: 1^2 + 2^2 + ... + n^2 == n(n+1)(2n+1)/6   -- s1 at n = 6 (= 91).
+        //   sc5=sumCubes(5)=225, so5=sumOdds(5)=25, ss5=sumSquares(5)=55.
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the cube sum equals the squared
+        // triangular number (Nicomachus) at three sizes, that the first n odd numbers sum to n^2, that the linear
+        // sum matches the n(n+1)/2 closed form, that the square sum matches the n(n+1)(2n+1)/6 closed form, and that
+        // all three engines agree. These are the summation identities an AI leans on for series math, complexity
+        // analysis, or closed-form optimizations; checking the recursive accumulation against the closed form
+        // catches an off-by-one in the loop bound or a wrong term that a lone value test could miss. A non-sort
+        // lock certifying the power-sum identities.
+        let src = r#"fun sumCubes(n: Int) -> Int { if n <= 0 { 0 } else { n * n * n + sumCubes(n - 1) } }
+fun sumTo(n: Int) -> Int { if n <= 0 { 0 } else { n + sumTo(n - 1) } }
+fun sumOdds(n: Int) -> Int { if n <= 0 { 0 } else { (2 * n - 1) + sumOdds(n - 1) } }
+fun sumSquares(n: Int) -> Int { if n <= 0 { 0 } else { n * n + sumSquares(n - 1) } }
+fun probe() -> Str {
+    let sc5 = sumCubes(5)
+    let so5 = sumOdds(5)
+    let ss5 = sumSquares(5)
+    let n1 = sumCubes(5) == sumTo(5) * sumTo(5)
+    let n2 = sumCubes(10) == sumTo(10) * sumTo(10)
+    let n3 = sumCubes(8) == sumTo(8) * sumTo(8)
+    let o1 = sumOdds(7) == 7 * 7
+    let o2 = sumOdds(12) == 12 * 12
+    let t1 = sumTo(10) == 10 * 11 / 2
+    let s1 = sumSquares(6) == 6 * 7 * 13 / 6
+    "sc5={sc5}|so5={so5}|ss5={ss5}|n1={n1}|n2={n2}|n3={n3}|o1={o1}|o2={o2}|t1={t1}|s1={s1}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sc5=225|so5=25|ss5=55|n1=true|n2=true|n3=true|o1=true|o2=true|t1=true|s1=true"
+        );
+    }
+
+    #[test]
     fn diff_integer_digit_reversal() {
         // A certification lock (it482, from bug-hunt batch 126 -- 10 probes across tensor/regex/json/path/Option/
         // Result/string/bit/float/Map shapes came back byte-identical, so the subtlest untouched corner is locked):
