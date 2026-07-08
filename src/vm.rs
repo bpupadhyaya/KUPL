@@ -2220,6 +2220,49 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_count_set_bits_kernighan() {
+        // A bug-hunt-79 lock (it379): COUNT SET BITS (population count / Hamming weight) via BRIAN KERNIGHAN's
+        // algorithm -- popcount(n) = n == 0 ? 0 : 1 + popcount(n & (n-1)). The identity n & (n-1) clears the
+        // LOWEST set bit of n, so each recursion removes exactly one 1-bit and the loop runs EXACTLY as many
+        // times as there are set bits (not once per bit position). This exercises the bitwise-AND builtin
+        // (.band) under recursion -- a bit-manipulation recurrence distinct from the arithmetic recursions
+        // (collatz it335, digit-sum it336) and the DP recurrences.
+        //   popcount(0) = 0        (no bits)
+        //   popcount(1) = 1        (binary 1)
+        //   popcount(7) = 3        (binary 111)
+        //   popcount(255) = 8      (binary 11111111 -- a full byte)
+        //   popcount(1024) = 1     (2^10 -- a single bit)
+        //   popcount(1023) = 10    (2^10 - 1 -- ten 1s)
+        //   popcount(21) = 3       (binary 10101)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the n==0 base yields 0, that n & (n-1)
+        // clears exactly the lowest set bit each step (so a power of two counts as 1 and 2^k - 1 counts as k),
+        // that the recursion terminates in exactly popcount(n) steps, that .band computes bitwise AND
+        // identically under recursion, and that all three engines agree. This is the popcount / Hamming-weight
+        // routine an AI writes for bit-set cardinality, parity, sparse-vector counting, and low-level bit
+        // tricks; a backend whose bitwise AND, subtraction borrow, or zero base was off would miscount. Adds a
+        // bit-manipulation recurrence exercising cross-engine bitwise-operator identity.
+        let src = r#"fun popcount(n: Int) -> Int {
+    if n == 0 { 0 }
+    else { 1 + popcount(n.band(n - 1)) }
+}
+fun probe() -> Str {
+    let a = popcount(0)
+    let b = popcount(1)
+    let c = popcount(7)
+    let d = popcount(255)
+    let e = popcount(1024)
+    let f = popcount(1023)
+    let g = popcount(21)
+    "z={a}|one={b}|seven={c}|ff={d}|pow2={e}|lo10={f}|c21={g}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "z=0|one=1|seven=3|ff=8|pow2=1|lo10=10|c21=3"
+        );
+    }
+
+    #[test]
     fn diff_word_break() {
         // A certification lock (it378): WORD BREAK -- decide whether a string can be segmented into a sequence
         // of dictionary words (with reuse allowed). This is a BOOLEAN / EXISTENTIAL segmentation DP, distinct
