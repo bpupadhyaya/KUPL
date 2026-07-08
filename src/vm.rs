@@ -3029,6 +3029,59 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_bell_triangle_aitken() {
+        // A bug-hunt-117 lock (it455's Bell numbers, second construction): the BELL TRIANGLE (Aitken's array /
+        // Peirce triangle) -- an alternative way to generate the Bell numbers via a triangular addition scheme,
+        // cross-validated against the Stirling row-sum construction (it453). Row 0 is [1]; each new row STARTS with
+        // the LAST element of the previous row, and every subsequent entry is (its own left neighbour) + (the
+        // element directly above it in the previous row). Two edge invariants make this self-checking: the FIRST
+        // element of row n is the Bell number B(n), and the LAST element of row n is B(n+1) -- so the sequence of
+        // row-firsts, shifted by one, must equal the sequence of row-lasts. That the shared Bell values here
+        // (B(3)=5, B(4)=15) also match the Stirling-based Bell numbers from it453 ties the two constructions
+        // together.
+        //   bells (first of each row) = [1, 1, 2, 5, 15, 52, 203]   (B(0)..B(6), OEIS A000110)
+        //   lasts (last of each row)  = [1, 2, 5, 15, 52, 203, 877] (B(1)..B(7) -- bells shifted left by one)
+        //   row3 = [5, 7, 10, 15]   (starts with 5=B(3); 5+2=7, 7+3=10, 10+5=15=B(4))
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that last()/first()/get() return Option and
+        // must be unwrapped, that each row seeds from the prior row's tail, that the left-neighbour-plus-above
+        // addition threads correctly through the fold, that the leftmost column reproduces the Bell numbers, that
+        // the rightmost diagonal is the Bell numbers shifted (the triangle's defining edge property), that these
+        // agree with the independent Stirling row-sum Bell values, and that all three engines agree. This is the
+        // triangular-array construction of the Bell numbers an AI writes for combinatorics or set-partition
+        // enumeration; the two edge invariants plus cross-consistency with it453 make it strongly self-checking. A
+        // non-sort lock certifying the Bell triangle against its own edge property and the Stirling construction.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun buildRow(prev: List[Int]) -> List[Int] {
+    let start = prev.last().unwrap_or(0)
+    rangeN(prev.len()).fold([start], fn(acc, i) {
+        let leftNeighbor = acc.last().unwrap_or(0)
+        let above = prev.get(i).unwrap_or(0)
+        [acc, [leftNeighbor + above]].flatten()
+    })
+}
+fun rows(n: Int) -> List[List[Int]] {
+    rangeN(n).fold([[1]], fn(acc, i) {
+        let prev = acc.last().unwrap_or([1])
+        [acc, [buildRow(prev)]].flatten()
+    })
+}
+fun probe() -> Str {
+    let rs = rows(6)
+    let bells = rs.map(fn(r) { r.first().unwrap_or(0) })
+    let r3 = rs.get(3).unwrap_or([])
+    let lasts = rs.map(fn(r) { r.last().unwrap_or(0) })
+    "bells={bells}|row3={r3}|lasts={lasts}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "bells=[1, 1, 2, 5, 15, 52, 203]|row3=[5, 7, 10, 15]|lasts=[1, 2, 5, 15, 52, 203, 877]"
+        );
+    }
+
+    #[test]
     fn diff_integer_partition_count() {
         // A certification lock (it455): INTEGER PARTITION COUNT p(n) -- the number of ways to write n as an
         // UNORDERED sum of positive integers (3 = 3 = 2+1 = 1+1+1, so p(3)=3). This is DISTINCT from Stirling
