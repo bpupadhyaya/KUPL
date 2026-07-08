@@ -2104,6 +2104,51 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_is_prime_trial_division() {
+        // A certification lock (it340, milestone): primality by trial division with a sqrt(n) early-exit
+        // bound. divides(n, d) recurses the trial divisor d up from 2: if d*d > n no divisor exists (base ->
+        // false), if n % d == 0 a divisor is found (-> true), else try d+1. isPrime is n >= 2 AND not
+        // divides(n, 2). The sqrt bound (d*d > n rather than d >= n) is what makes it efficient and is the
+        // subtle part -- a composite's smallest factor is always <= sqrt(n).
+        //   primes below 20 = [2,3,5,7,11,13,17,19]  ; isPrime(97)=true ; isPrime(91)=false (91=7*13)
+        // (The prime FILTER runs over rangeN(20) not rangeN(30): rangeN's depth-N recursion at 30 overflows
+        // the 2MB DEBUG test-thread stack -- same limit noted for other deep recursions -- so the sieved
+        // range stays shallow while the interesting is97/is91 checks recurse only to sqrt-depth.)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the trial loop stops at the sqrt(n)
+        // bound (so it terminates and stays cheap), that n%d==0 detects a factor, that n<2 is not prime (0/1
+        // excluded), that filtering isPrime over 0..19 yields exactly the eight primes, that a genuine prime
+        // (97, checked against divisors 2..9 since 10*10>97) passes, and -- the load-bearing trap -- that 91
+        // is correctly composite: 91 "looks prime" but 7*13=91, and the sqrt bound still finds 7 (7*7=49<=91).
+        // A backend that used d>=n instead of d*d>n would still be correct but slow; one whose % or bound was
+        // off would misclassify 91 or 97. This is the primality test an AI writes constantly.
+        let src = r#"fun divides(n: Int, d: Int) -> Bool {
+    if d * d > n { false }
+    else {
+        if n % d == 0 { true }
+        else { divides(n, d + 1) }
+    }
+}
+fun isPrime(n: Int) -> Bool {
+    if n < 2 { false } else { divides(n, 2) == false }
+}
+fun rangeN(k: Int) -> List[Int] {
+    if k <= 0 { [] } else { [rangeN(k - 1), [k - 1]].flatten() }
+}
+fun probe() -> Str {
+    let nums = rangeN(20).map(fn(i) { i })
+    let primes = nums.filter(fn(n) { isPrime(n) })
+    let p97 = isPrime(97)
+    let p91 = isPrime(91)
+    "primes={primes}|is97={p97}|is91={p91}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "primes=[2, 3, 5, 7, 11, 13, 17, 19]|is97=true|is91=false"
+        );
+    }
+
+    #[test]
     fn diff_fizzbuzz_modulo_cascade() {
         // A bug-hunt-59 lock (it339): FizzBuzz -- the canonical modulo-driven conditional cascade, mapped over
         // a range and joined. The ORDER of the checks is load-bearing: %15 must be tested FIRST (else 15 would
