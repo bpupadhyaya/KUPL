@@ -2220,6 +2220,63 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_jump_game_reachability() {
+        // A bug-hunt-82 lock (it385): JUMP GAME reachability -- given a list where each value is the MAXIMUM
+        // forward jump length from that index, decide whether the LAST index is reachable starting from index 0.
+        // This is a GREEDY furthest-reach scan, distinct from the DP recurrences: a single left-to-right fold
+        // tracks the furthest index reachable so far (reach). At each index i, if i is BEYOND the current reach
+        // it can never be stood on (skip -- carry reach unchanged); otherwise it extends the frontier to
+        // max(reach, i + nums[i]). The last index is reachable iff the final reach covers n-1.
+        //   canJump([2,3,1,1,4]) = true       (0 -> reach spreads to cover index 4)
+        //   canJump([3,2,1,0,4]) = false      (the 0 at index 3 caps reach at 3; index 4 unreachable)
+        //   canJump([0]) = true               (already at the last index)
+        //   canJump([1,0,1]) = false          (reach caps at 1; the 0 blocks crossing to index 2)
+        //   canJump([2,0,0]) = true           (the 2 at index 0 jumps clear over both zeros)
+        //   canJump([0,1]) = false            (index 0's zero jump leaves index 1 unreachable)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the greedy frontier extends by
+        // i + nums[i] only when i is within reach, that an index beyond reach is skipped (a 0 or a run of small
+        // jumps can strand the frontier), that reaching exactly n-1 counts as success, that a big early jump
+        // clears intervening zeros (2,0,0 = true) while a 0 that caps the frontier before the end fails
+        // (3,2,1,0,4 = false), that a single element trivially reaches itself, and that all three engines agree
+        // on the greedy reach fold. This is the jump-game reachability routine an AI writes for
+        // interval-coverage, game-state reachability, and can-I-get-there checks; a backend whose frontier
+        // extension, skip-if-unreachable guard, or final compare was off would mis-decide. Adds a greedy
+        // furthest-reach scan, distinct from the DP and running-scan shapes.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun canJump(nums: List[Int]) -> Bool {
+    let n = nums.len()
+    if n == 0 { true }
+    else {
+        let reach = rangeN(n).fold(0, fn(r, i) {
+            if i > r { r }
+            else {
+                let ni = nums.get(i).unwrap_or(0)
+                maxi(r, i + ni)
+            }
+        })
+        reach >= n - 1
+    }
+}
+fun probe() -> Str {
+    let a = canJump([2, 3, 1, 1, 4])
+    let b = canJump([3, 2, 1, 0, 4])
+    let c = canJump([0])
+    let d = canJump([1, 0, 1])
+    let e = canJump([2, 0, 0])
+    let f = canJump([0, 1])
+    "reach={a}|stuck={b}|single={c}|zerogap={d}|jumpover={e}|firstzero={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "reach=true|stuck=false|single=true|zerogap=false|jumpover=true|firstzero=false"
+        );
+    }
+
+    #[test]
     fn diff_partition_equal_subset_sum() {
         // A certification lock (it384): PARTITION EQUAL SUBSET SUM -- decide whether a list of positive integers
         // can be split into TWO subsets with EQUAL sums. This is a BOOLEAN subset-sum variant, the decide-versus
