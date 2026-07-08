@@ -2220,6 +2220,53 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_unique_paths_grid() {
+        // A certification lock (it370): UNIQUE PATHS in an m x n grid, counting the distinct routes from the
+        // top-left to the bottom-right cell moving only RIGHT or DOWN. This is a 2-D LATTICE counting DP,
+        // structurally distinct from every prior DP in the family (which recursed on one index, a prefix, an
+        // interval, or two converging string ends): here the recurrence walks TWO grid coordinates (row, col)
+        // that both advance toward the bottom-right corner. The recurrence over paths(r, c): on the LAST ROW
+        // (r == m-1) there is exactly one route (keep going right); on the LAST COLUMN (c == n-1) there is
+        // exactly one route (keep going down); otherwise the count is paths going DOWN (r+1, c) PLUS paths
+        // going RIGHT (r, c+1). The answer for an m x n grid is C(m+n-2, m-1), a central binomial coefficient.
+        //   unique(3,2) = 3     (C(3,1))
+        //   unique(3,3) = 6     (C(4,2))
+        //   unique(3,7) = 28    (C(8,2) -- the classic 3x7 example)
+        //   unique(1,5) = 1     (a single row -- only one straight path)
+        //   unique(4,4) = 20    (C(6,3))
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the last-row and last-column bases each
+        // yield exactly 1 (a degenerate line has one path), that an interior cell SUMS the down-move and
+        // right-move sub-counts (not max, not multiply), that the two coordinates advance independently toward
+        // the corner, that a 1xN or Mx1 grid collapses to a single path, that the counts match the central
+        // binomial coefficients (3x7 -> 28, 4x4 -> 20), and that all three engines agree. This is the
+        // unique-paths / lattice-counting DP an AI writes for grid navigation, robot path planning, and
+        // combinatorial lattice problems; a backend whose two-coordinate recursion, boundary bases, or additive
+        // combination was off would miscount the routes. Adds a 2-D grid recurrence to the DP family, distinct
+        // from the 1-D string/sequence/interval shapes.
+        let src = r#"fun paths(m: Int, n: Int, r: Int, c: Int) -> Int {
+    if r == m - 1 { 1 }
+    else {
+        if c == n - 1 { 1 }
+        else { paths(m, n, r + 1, c) + paths(m, n, r, c + 1) }
+    }
+}
+fun unique(m: Int, n: Int) -> Int { paths(m, n, 0, 0) }
+fun probe() -> Str {
+    let a = unique(3, 2)
+    let b = unique(3, 3)
+    let c = unique(3, 7)
+    let d = unique(1, 5)
+    let e = unique(4, 4)
+    "g3x2={a}|g3x3={b}|g3x7={c}|g1x5={d}|g4x4={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "g3x2=3|g3x3=6|g3x7=28|g1x5=1|g4x4=20"
+        );
+    }
+
+    #[test]
     fn diff_decode_ways() {
         // A bug-hunt-74 lock (it369): WAYS TO DECODE a digit string, where 1->A, 2->B, ..., 26->Z -- count the
         // distinct letter strings a digit sequence can decode to. This is an ADDITIVE string-counting DP,
