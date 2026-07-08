@@ -2104,6 +2104,33 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_prefix_sums_via_scan() {
+        // A bug-hunt-54 lock (it329): prefix sums (running cumulative totals) via scan, cross-checked against
+        // fold. scan(0, +) emits the running accumulation at each step; per the scan contract the seed is
+        // EXCLUDED, so the output length equals the input length (not len+1), and scan's LAST element equals
+        // the full fold-sum. This is the cumulative-sum an AI writes for prefix sums, a running balance, or a
+        // cumulative distribution.
+        //   xs = [3,1,4,1,5,9,2]
+        //   scan(0,+) -> [3, 4, 8, 9, 14, 23, 25]  (0+3, +1, +4, +1, +5, +9, +2; seed 0 not emitted)
+        //   len 7 (== input len) ; last 25 == fold-sum 25
+        // Byte-identical on interp/KVM (native per the sweep). Confirms scan threads the accumulator left to
+        // right emitting each intermediate, that the seed is not included in the output (len stays 7), that
+        // each prefix is the sum of all elements up to and including that position, and that the final prefix
+        // reconciles with the independent fold total (25) -- a scan/fold consistency check. A backend that
+        // included the seed would give len 8 starting with 0, and one that mis-threaded the accumulator would
+        // break the running totals or the last==total reconciliation.
+        let src = r#"fun probe() -> Str {
+    let xs = [3, 1, 4, 1, 5, 9, 2]
+    let prefix = xs.scan(0, fn(acc, x) { acc + x })
+    let total = xs.fold(0, fn(a, x) { a + x })
+    let last = prefix.last().unwrap_or(0)
+    "prefix={prefix}|len={prefix.len()}|last={last}|total={total}"
+}
+"#;
+        assert_eq!(differential(src), "prefix=[3, 4, 8, 9, 14, 23, 25]|len=7|last=25|total=25");
+    }
+
+    #[test]
     fn diff_manual_dedup_preserve_order() {
         // A certification lock (it328): manual dedup preserving first-seen order -- a fold that threads a
         // "seen" accumulator which doubles as the output. For each element, membership is tested by scanning
