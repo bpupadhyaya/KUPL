@@ -3029,6 +3029,48 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_lucas_numbers() {
+        // A certification lock (it457): the LUCAS NUMBERS L(n) -- the Fibonacci COMPANION sequence, same
+        // recurrence L(n) = L(n-1) + L(n-2) but seeded L(0)=2, L(1)=1 instead of 0,1 -- cross-validated against
+        // the Fibonacci identity L(n) = F(n-1) + F(n+1). This is DISTINCT from the several Fibonacci locks
+        // (recursion_fib, memoized_fib it317, fibonacci_matrix_power it445): those all compute F(n); the Lucas
+        // sequence is a different second-order recurrence with the same addition rule but different seeds, and it
+        // interlocks with Fibonacci through the identity used here as the cross-check. Two independent computations
+        // -- the direct Lucas recurrence and F(n-1)+F(n+1) built from a separate Fibonacci function -- must agree.
+        //   L(0)=2, L(1)=1, L(5)=11, L(10)=123, L(13)=521    (OEIS A000032, the Lucas numbers)
+        //   cross:  L(10) == F(9)+F(11) = 34 + 89 = 123
+        //   cross2: L(7)  == F(6)+F(8)  = 8  + 21 = 29
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the seeds L(0)=2 and L(1)=1 (not the
+        // Fibonacci 0,1) drive the sequence, that the shared addition recurrence threads correctly, that the
+        // computed Lucas values match the known sequence, that the Fibonacci-companion identity L(n)=F(n-1)+F(n+1)
+        // holds at two separate points against an independently-defined fib(), and that all three engines agree.
+        // This is the Lucas sequence an AI writes for number theory, primality testing (Lucas-Lehmer), or
+        // recurrence work; the F(n-1)+F(n+1) cross-check ties it to the certified Fibonacci family and catches a
+        // wrong seed. A non-sort lock certifying the Lucas numbers against the Fibonacci-companion identity.
+        let src = r#"fun lucas(n: Int) -> Int {
+    if n == 0 { 2 } else if n == 1 { 1 } else { lucas(n - 1) + lucas(n - 2) }
+}
+fun fib(n: Int) -> Int {
+    if n <= 0 { 0 } else if n == 1 { 1 } else { fib(n - 1) + fib(n - 2) }
+}
+fun probe() -> Str {
+    let l0 = lucas(0)
+    let l1 = lucas(1)
+    let l5 = lucas(5)
+    let l10 = lucas(10)
+    let l13 = lucas(13)
+    let cross = lucas(10) == fib(9) + fib(11)
+    let cross2 = lucas(7) == fib(6) + fib(8)
+    "l0={l0}|l1={l1}|l5={l5}|l10={l10}|l13={l13}|cross={cross}|cross2={cross2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "l0=2|l1=1|l5=11|l10=123|l13=521|cross=true|cross2=true"
+        );
+    }
+
+    #[test]
     fn diff_bell_triangle_aitken() {
         // A bug-hunt-117 lock (it455's Bell numbers, second construction): the BELL TRIANGLE (Aitken's array /
         // Peirce triangle) -- an alternative way to generate the Bell numbers via a triangular addition scheme,
