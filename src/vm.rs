@@ -3029,6 +3029,56 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_binary_gcd_stein() {
+        // A certification lock (it467): STEIN'S BINARY GCD -- the greatest common divisor computed using ONLY
+        // right-shifts, subtraction, and parity tests (no division or modulo), cross-validated against the
+        // certified Euclidean GCD (it334, which uses modulo). This is a genuinely INDEPENDENT algorithm for the
+        // same quantity, not a restatement: the binary algorithm was designed for hardware without fast division,
+        // and it factors out shared powers of two (both even -> 2*gcd(a/2,b/2)), strips lone factors of two (one
+        // even -> halve it), and for two odd numbers replaces the larger with (|a-b|)/2. Its agreement with the
+        // modulo-based Euclidean GCD at every tested pair is strong evidence both are correct. This connects the
+        // bit-manipulation family (band/shr, it432/it433) to number theory (GCD, it334).
+        //   bgcd(48,36)=12, bgcd(100,60)=20, bgcd(17,5)=1 (coprime), bgcd(81,27)=27
+        //   x1..x4: bgcd == egcd for (48,36), (100,60), (17,5), (84,30)   (binary == Euclidean at every pair)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that a.band(1)==0 correctly tests parity,
+        // that a.shr(1) halves, that the both-even branch pulls out a factor of two, that the odd-odd branch
+        // subtracts and halves toward the base a==b, that the coprime pair yields 1, and that the binary result
+        // matches the independent Euclidean GCD at four pairs (a factor case, a mixed case, a coprime case), and
+        // that all three engines agree. This is the division-free GCD an AI writes for embedded or bit-oriented
+        // number theory; agreement with the modulo Euclidean GCD catches a wrong parity test or shift. A non-sort
+        // lock certifying Stein's binary GCD against the Euclidean GCD.
+        let src = r#"fun bgcd(a: Int, b: Int) -> Int {
+    if a == b { a }
+    else if a == 0 { b }
+    else if b == 0 { a }
+    else if a.band(1) == 0 && b.band(1) == 0 { 2 * bgcd(a.shr(1), b.shr(1)) }
+    else if a.band(1) == 0 { bgcd(a.shr(1), b) }
+    else if b.band(1) == 0 { bgcd(a, b.shr(1)) }
+    else if a > b { bgcd((a - b).shr(1), b) }
+    else { bgcd((b - a).shr(1), a) }
+}
+fun egcd(a: Int, b: Int) -> Int {
+    if b == 0 { a } else { egcd(b, a % b) }
+}
+fun probe() -> Str {
+    let g1 = bgcd(48, 36)
+    let g2 = bgcd(100, 60)
+    let g3 = bgcd(17, 5)
+    let g4 = bgcd(81, 27)
+    let x1 = bgcd(48, 36) == egcd(48, 36)
+    let x2 = bgcd(100, 60) == egcd(100, 60)
+    let x3 = bgcd(17, 5) == egcd(17, 5)
+    let x4 = bgcd(84, 30) == egcd(84, 30)
+    "g1={g1}|g2={g2}|g3={g3}|g4={g4}|x1={x1}|x2={x2}|x3={x3}|x4={x4}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "g1=12|g2=20|g3=1|g4=27|x1=true|x2=true|x3=true|x4=true"
+        );
+    }
+
+    #[test]
     fn diff_centered_hexagonal_numbers() {
         // A certification lock (it465): the CENTERED HEXAGONAL NUMBERS CH(n) = 3n(n-1) + 1 -- the count of dots in
         // n nested hexagonal rings around a single center -- certified by TWO independent and striking identities.
