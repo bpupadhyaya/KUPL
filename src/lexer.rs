@@ -179,16 +179,31 @@ impl<'a> Lexer<'a> {
                 return;
             }
             let radixed = u64::from_str_radix(&text, radix);
-            let fit_err = |lx: &mut Self| lx.diags.push(Diag::error(
-                "K0004",
-                "integer literal does not fit in Int (64-bit)".to_string(),
-                lx.span_from(start),
-            ));
+            let fit_err = |lx: &mut Self, text: &str, radix: u32| {
+                let kind = if radix == 16 { "hex" } else { "binary" };
+                let prefix = if radix == 16 { "0x" } else { "0b" };
+                // A hex/binary literal must fit 64 bits (they map to Int, and `0xFFFF..`
+                // patterns are common). For a larger value, point at big(...) -- and show
+                // the exact decimal for it when the value still fits in i128.
+                let hint = match i128::from_str_radix(text, radix) {
+                    Ok(v) => format!(
+                        " — a {kind} literal must fit 64 bits; use `big(\"{v}\")` for an arbitrary-precision BigInt"
+                    ),
+                    Err(_) => format!(
+                        " — a {kind} literal must fit 64 bits; for a larger value use a decimal `big(\"...\")` BigInt"
+                    ),
+                };
+                lx.diags.push(Diag::error(
+                    "K0004",
+                    format!("{kind} integer literal `{prefix}{text}` does not fit in Int (64-bit){hint}"),
+                    lx.span_from(start),
+                ));
+            };
             match (self.peek_num_suffix(), radixed) {
                 (NumSuffix::Int(w), Ok(v)) => self.emit_sized(v as i128, w, start),
                 (NumSuffix::F32, Ok(v)) => self.push(Tok::F32Lit(v as f32), start),
                 (NumSuffix::None, Ok(v)) => self.push(Tok::Int(v as i64), start),
-                (_, Err(_)) => fit_err(self),
+                (_, Err(_)) => fit_err(self, &text, radix),
             }
             return;
         }
@@ -722,6 +737,25 @@ mod tests {
             "underscores must be stripped in the suggestion: {}",
             d2.message
         );
+    }
+
+    #[test]
+    fn radixed_overflow_names_literal_and_big() {
+        // A hex/binary literal wider than 64 bits is a K0004; the message should name the
+        // radix and the literal, and -- when the value still fits i128 -- suggest big(...)
+        // with the exact DECIMAL value (big takes a decimal string, not the hex text).
+        let (_, dh) = lex("0x1FFFFFFFFFFFFFFFF"); // 2^65-1
+        let h = dh.iter().find(|d| d.code == "K0004").expect("K0004 hex");
+        assert!(h.message.contains("hex integer literal `0x1FFFFFFFFFFFFFFFF`"), "names hex literal: {}", h.message);
+        assert!(h.message.contains("big(\"36893488147419103231\")"), "suggests big with decimal: {}", h.message);
+        // A binary literal for the same value gets the same decimal suggestion.
+        let (_, db) = lex("0b11111111111111111111111111111111111111111111111111111111111111111");
+        let b = db.iter().find(|d| d.code == "K0004").expect("K0004 bin");
+        assert!(b.message.contains("binary integer literal") && b.message.contains("big(\"36893488147419103231\")"), "binary big: {}", b.message);
+        // Too large even for i128 -> a generic big(...) hint, no bogus decimal.
+        let (_, dbig) = lex("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+        let big = dbig.iter().find(|d| d.code == "K0004").expect("K0004 huge");
+        assert!(big.message.contains("for a larger value use a decimal `big(\"...\")`"), "generic hint: {}", big.message);
     }
 
     #[test]
