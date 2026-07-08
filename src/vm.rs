@@ -2220,6 +2220,70 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_longest_bitonic_subsequence() {
+        // A bug-hunt-78 lock (it377): LONGEST BITONIC SUBSEQUENCE -- the longest subsequence that first strictly
+        // INCREASES and then strictly DECREASES (a "mountain" shape; a purely increasing or purely decreasing
+        // run counts, taking the other half as length 1). This is a TWO-DIRECTION extension of the single-pass
+        // LIS (it363): at each index i treated as the PEAK, it combines the longest increasing subsequence
+        // ENDING at i (scanning predecessors to the left, a[j] < a[i] for j < i) with the longest DECREASING
+        // subsequence STARTING at i (scanning successors to the right, a[j] < a[i] for j > i), then subtracts 1
+        // because the peak element is counted in both halves. The answer is the MAX over all peaks.
+        //   bitonic([1,11,2,10,4,5,2,1]) = 6   (e.g. 1,2,10,4,2,1 -- the classic example)
+        //   bitonic([12,11,40,5,3,1]) = 5      (12,40,5,3,1 -- up once then down)
+        //   bitonic([80,60,30,40,20,10]) = 5   (80,60,40,20,10 -- nearly all-decreasing, up-part length 1)
+        //   bitonic([1,2,3,4]) = 4             (purely increasing -- down-part is just the last element)
+        //   bitonic([5]) = 1                   (a single element)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the left-scanning increasing pass and
+        // the right-scanning decreasing pass are STRICT (a[j] < a[i]), that the two half-lengths are ADDED with
+        // the shared peak subtracted once (not double-counted), that the global answer is the MAX over every
+        // index as peak, that a purely monotone sequence still yields its full length (the opposite half
+        // collapses to 1), and that all three engines agree. This is the longest-bitonic-subsequence / mountain
+        // DP an AI writes for peak-shaped run detection and mountain-array problems; a backend whose two-pass
+        // combine, strictness, or peak-subtraction was off would over- or under-count. Extends the single-seq
+        // LIS shape to a two-direction peak-combining DP.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun lisEndAt(a: List[Int], i: Int) -> Int {
+    let ai = a.get(i).unwrap_or(0)
+    rangeN(i).fold(1, fn(best, j) {
+        let aj = a.get(j).unwrap_or(0)
+        if aj < ai { maxi(best, 1 + lisEndAt(a, j)) } else { best }
+    })
+}
+fun ldsStartAt(a: List[Int], i: Int) -> Int {
+    let ai = a.get(i).unwrap_or(0)
+    let n = a.len()
+    rangeN(n).fold(1, fn(best, j) {
+        let aj = a.get(j).unwrap_or(0)
+        if j > i {
+            if aj < ai { maxi(best, 1 + ldsStartAt(a, j)) } else { best }
+        } else { best }
+    })
+}
+fun bitonic(a: List[Int]) -> Int {
+    let n = a.len()
+    if n == 0 { 0 }
+    else {
+        rangeN(n).fold(0, fn(best, i) {
+            maxi(best, lisEndAt(a, i) + ldsStartAt(a, i) - 1)
+        })
+    }
+}
+fun probe() -> Str {
+    let a = bitonic([1, 11, 2, 10, 4, 5, 2, 1])
+    let b = bitonic([12, 11, 40, 5, 3, 1])
+    let c = bitonic([80, 60, 30, 40, 20, 10])
+    let d = bitonic([1, 2, 3, 4])
+    let e = bitonic([5])
+    "a={a}|b={b}|c={c}|inc={d}|one={e}"
+}
+"#;
+        assert_eq!(differential(src), "a=6|b=5|c=5|inc=4|one=1");
+    }
+
+    #[test]
     fn diff_tribonacci() {
         // A certification lock (it376): the TRIBONACCI numbers via a THREE-term additive recurrence
         // T(n) = T(n-1) + T(n-2) + T(n-3), with bases T(0) = 0, T(1) = 1, T(2) = 1. This generalizes the
