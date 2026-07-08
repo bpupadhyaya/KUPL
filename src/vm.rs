@@ -2104,6 +2104,47 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_quicksort_pivot_partition() {
+        // A bug-hunt-52 lock (it325): quicksort via PIVOT PARTITION -- the other classic divide-and-conquer
+        // sort, structurally distinct from merge sort (it324). The pivot is the head; the rest is partitioned
+        // by VALUE into `< pivot` and `>= pivot` (two filters), each recursively sorted, then concatenated
+        // lo ++ [pivot] ++ hi. Where merge sort splits by POSITION (midpoint) and does work on the way up
+        // (merge), quicksort splits by VALUE (pivot) and does its work on the way down (partition), needing
+        // no merge -- the concatenation is already ordered because everything in lo is < pivot <= everything
+        // in hi.
+        //   qsort([5,2,8,1,9,3,7,4,6,2,5]) = [1,2,2,3,4,5,5,6,7,8,9]  (len 11, dups preserved, sorted)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the head pivot plus the two
+        // complementary filters (`< p` and `>= p`) partition the tail with no element lost or duplicated,
+        // that `>= p` (not `> p`) keeps values equal to the pivot so duplicates survive (two 2s, two 5s ->
+        // length stays 11), that both partitions recurse to the empty base case, and that
+        // flatten([lo, [p], hi]) concatenates in sorted order without a merge step. The window(2) check
+        // witnesses global sortedness. A backend that used `> p` for the hi side would DROP pivot-equal
+        // duplicates (len < 11); one that mis-ordered the concat would leave an inversion (ok=false).
+        let src = r#"fun qsort(xs: List[Int]) -> List[Int] {
+    match xs.first() {
+        None => xs
+        Some(p) => {
+            let rest = xs.drop(1)
+            let lo = qsort(rest.filter(fn(x) { x < p }))
+            let hi = qsort(rest.filter(fn(x) { x >= p }))
+            [lo, [p], hi].flatten()
+        }
+    }
+}
+fun probe() -> Str {
+    let xs = [5, 2, 8, 1, 9, 3, 7, 4, 6, 2, 5]
+    let sorted = qsort(xs)
+    let ok = sorted.window(2).all(fn(w) { w.first().unwrap_or(0) <= w.last().unwrap_or(0) })
+    "sorted={sorted}|len={sorted.len()}|ok={ok}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sorted=[1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 9]|len=11|ok=true"
+        );
+    }
+
+    #[test]
     fn diff_full_merge_sort_divide_and_conquer() {
         // A certification lock (it324): the FULL recursive merge sort -- divide-and-conquer built on top of
         // the two-list merge (it322). msort splits the list at the midpoint (take(mid) / drop(mid)), recurses
