@@ -2104,6 +2104,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_manual_dedup_preserve_order() {
+        // A certification lock (it328): manual dedup preserving first-seen order -- a fold that threads a
+        // "seen" accumulator which doubles as the output. For each element, membership is tested by scanning
+        // the accumulator (position(...).is_some()); a new value is pushed, a repeat is dropped. Distinct
+        // from the builtin Set([list]) dedup (which also keeps first-seen but hides the mechanism): this is
+        // the explicit O(n^2) fold+scan an AI writes when it wants full control or is threading extra state.
+        //   [3,1,4,1,5,9,2,6,5,3,5] -> [3,1,4,5,9,2,6]  (len 7; the 2nd 1, 2nd/3rd 5, 2nd 3 dropped)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the accumulator plays the dual role
+        // of seen-set and result, that position()-based membership correctly detects a value already emitted,
+        // that push appends a first occurrence at the end (preserving encounter order), that repeats leave
+        // the accumulator unchanged, and that the final length counts distinct values only. This is the
+        // order-preserving dedup an AI writes for de-duplicating a stream while keeping first appearance; a
+        // backend whose membership scan or push mis-fired would either keep duplicates (len > 7) or reorder
+        // the survivors.
+        let src = r#"fun seen(acc: List[Int], x: Int) -> Bool {
+    acc.position(fn(y) { y == x }).is_some()
+}
+fun dedup(xs: List[Int]) -> List[Int] {
+    let seed: List[Int] = []
+    xs.fold(seed, fn(acc, x) {
+        if seen(acc, x) { acc } else { acc.push(x) }
+    })
+}
+fun probe() -> Str {
+    let xs = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5]
+    let out = dedup(xs)
+    "out={out}|len={out.len()}"
+}
+"#;
+        assert_eq!(differential(src), "out=[3, 1, 4, 5, 9, 2, 6]|len=7");
+    }
+
+    #[test]
     fn diff_sliding_window_maximum() {
         // A bug-hunt-53 lock (it327): the sliding-window maximum -- for each contiguous length-k window of a
         // list, its maximum. window(3) produces the overlapping windows, and each is reduced to its max via a
