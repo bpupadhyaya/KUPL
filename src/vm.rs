@@ -2511,6 +2511,67 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_weekday_via_serial_mod7() {
+        // A bug-hunt-110 lock (it442): WEEKDAY via SERIAL-DAY-NUMBER mod 7 -- a SECOND, independent weekday
+        // algorithm that cross-validates Zeller's congruence (it435). Where Zeller uses a closed-form modular
+        // formula with the January/February month shift and a 0=Saturday result mapping, this method takes the
+        // proleptic-Gregorian serial day-number from the it440 date machinery (daysBeforeYear + dayOfYear) and
+        // reduces it mod 7, indexing a 0=Sunday name table. The two derivations share no arithmetic -- one is a
+        // congruence on (day, shifted-month, century), the other a cumulative day count -- yet they must name the
+        // same weekday for every date, so agreement is strong evidence both are correct rather than merely
+        // self-consistent. The expected values are exactly the weekdays Zeller produced at it435:
+        //   weekday(2000,1,1) = Sat      (matches Zeller y2000)
+        //   weekday(1969,7,20) = Sun     (the Apollo 11 landing; matches Zeller moon)
+        //   weekday(2023,7,8) = Sat      (matches Zeller d2023)
+        //   weekday(2024,2,29) = Thu     (a leap day; matches Zeller leap)
+        //   weekday(2001,9,11) = Tue     (matches Zeller nine11)
+        //   weekday(1900,1,1) = Mon      (matches Zeller y1900)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the serial day-number reduced mod 7
+        // selects the correct weekday from a Sunday-indexed table, that this matches Zeller's congruence on the
+        // same six checkable dates despite using entirely different arithmetic (cross-algorithm validation), that
+        // leap days and century boundaries land on the right day, and that all three engines agree. This is the
+        // "what day of the week is this date" an AI writes from an epoch day-count rather than a congruence; two
+        // independent methods agreeing is exactly the redundancy that catches a subtle off-by-one. A non-sort lock
+        // certifying weekday-by-serial-mod-7 and cross-validating the Zeller weekday lock.
+        let src = r#"fun isLeap(y: Int) -> Bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+fun daysInMonth(y: Int, m: Int) -> Int {
+    if m == 2 { if isLeap(y) { 29 } else { 28 } }
+    else if m == 4 || m == 6 || m == 9 || m == 11 { 30 }
+    else { 31 }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun dayOfYear(y: Int, m: Int, d: Int) -> Int {
+    let before = rangeIncl(1, m - 1).fold(0, fn(acc, mm) { acc + daysInMonth(y, mm) })
+    before + d
+}
+fun daysBeforeYear(y: Int) -> Int {
+    let yy = y - 1
+    365 * yy + yy / 4 - yy / 100 + yy / 400
+}
+fun serial(y: Int, m: Int, d: Int) -> Int { daysBeforeYear(y) + dayOfYear(y, m, d) }
+fun weekday(y: Int, m: Int, d: Int) -> Str {
+    let days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    days.get(serial(y, m, d) % 7).unwrap_or("?")
+}
+fun probe() -> Str {
+    let a = weekday(2000, 1, 1)
+    let b = weekday(1969, 7, 20)
+    let c = weekday(2023, 7, 8)
+    let d = weekday(2024, 2, 29)
+    let e = weekday(2001, 9, 11)
+    let f = weekday(1900, 1, 1)
+    "y2000={a}|moon={b}|d2023={c}|leap={d}|nine11={e}|y1900={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "y2000=Sat|moon=Sun|d2023=Sat|leap=Thu|nine11=Tue|y1900=Mon"
+        );
+    }
+
+    #[test]
     fn diff_date_difference_days() {
         // A bug-hunt-109 lock (it440): DATE DIFFERENCE -- the number of days between two Gregorian dates, computed
         // by converting each date to a serial day-number and subtracting. This extends the date family (Zeller
