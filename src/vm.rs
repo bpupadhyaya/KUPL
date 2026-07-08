@@ -2220,6 +2220,62 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_longest_consecutive_run() {
+        // A bug-hunt-80 lock (it381): LONGEST RUN of identical ADJACENT elements -- the length of the longest
+        // maximal streak of equal consecutive values in a list. This is a single-pass fold that carries a
+        // MULTI-FIELD RECORD accumulator St(prev, cur, best, started): at each element, if it equals the
+        // previous value the current run extends (cur + 1), otherwise the run resets to 1; best tracks the
+        // running maximum. The `started` boolean handles the empty-list and first-element edges (an empty list
+        // yields 0, the first element seeds a run of 1). This exercises record CONSTRUCTION and field access
+        // inside a hot fold loop -- distinct from the running-max scan over plain values (it343), which carries
+        // a single Int.
+        //   longestRun([1,1,2,3,3,3,4]) = 3    (the run of three 3s)
+        //   longestRun([5,5,5,5]) = 4          (one run of four)
+        //   longestRun([1,2,3,4]) = 1          (all singletons)
+        //   longestRun([7]) = 1                (a single element)
+        //   longestRun([]) = 0                 (empty -- started never flips)
+        //   longestRun([2,2,1,1,1,3,3]) = 3    (the run of three 1s beats the pairs)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms an equal-to-previous element EXTENDS the
+        // current run while a differing element RESETS it to 1, that best is the max over all runs (not just the
+        // final or first run), that the empty list yields 0 via the started flag (no element ever sets a run),
+        // that a single element and an all-distinct list both yield 1, that a mid-list run beats earlier and
+        // later shorter runs, and that all three engines agree on the record-carrying fold. This is the
+        // longest-run / streak-length routine an AI writes for run-length analysis, streak detection, and
+        // repetition scanning; a backend whose record construction, field read-back, or reset logic was off
+        // inside the fold would mis-length the run. Exercises a multi-field record accumulator threaded through
+        // a fold.
+        let src = r#"type St = { prev: Int, cur: Int, best: Int, started: Bool }
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun longestRun(xs: List[Int]) -> Int {
+    let init = St(prev: 0, cur: 0, best: 0, started: false)
+    let final = xs.fold(init, fn(s, x) {
+        if s.started {
+            if x == s.prev {
+                let nc = s.cur + 1
+                St(prev: x, cur: nc, best: maxi(s.best, nc), started: true)
+            } else {
+                St(prev: x, cur: 1, best: maxi(s.best, 1), started: true)
+            }
+        } else {
+            St(prev: x, cur: 1, best: 1, started: true)
+        }
+    })
+    final.best
+}
+fun probe() -> Str {
+    let a = longestRun([1, 1, 2, 3, 3, 3, 4])
+    let b = longestRun([5, 5, 5, 5])
+    let c = longestRun([1, 2, 3, 4])
+    let d = longestRun([7])
+    let e = longestRun([])
+    let f = longestRun([2, 2, 1, 1, 1, 3, 3])
+    "a={a}|b={b}|c={c}|d={d}|empty={e}|f={f}"
+}
+"#;
+        assert_eq!(differential(src), "a=3|b=4|c=1|d=1|empty=0|f=3");
+    }
+
+    #[test]
     fn diff_count_palindromic_substrings() {
         // A certification lock (it380): COUNT PALINDROMIC SUBSTRINGS via the EXPAND-AROUND-CENTER technique --
         // count every contiguous substring that reads the same forwards and backwards. This is distinct from the
