@@ -2104,6 +2104,68 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_edit_distance_levenshtein() {
+        // A certification lock (it360): EDIT DISTANCE (Levenshtein) -- the minimum number of single-character
+        // insertions, deletions, or substitutions to turn one string into another -- via the classic
+        // three-way-min recurrence over character lists. This is a STRING dynamic program, distinct from the
+        // numeric subset-sum DP (it359). The recurrence: if either string is empty the distance is the other's
+        // length (all inserts or all deletes); when the leading characters MATCH, no edit is needed there so
+        // recurse on both tails at zero cost; otherwise it costs 1 plus the minimum of the three edits --
+        // DELETE from a (recurse on a's tail vs b), INSERT into a (recurse on a vs b's tail), or REPLACE
+        // (recurse on both tails). Characters come from a.chars() (unicode-aware, char-indexed) compared with
+        // ==. Recursion depth is bounded by the combined length, safe for the debug stack.
+        //   edit("horse","ros") = 3     (replace h->r, replace o->o kept, delete... classic result 3)
+        //   edit("cat","cat") = 0       (identical -- every char matches, zero cost)
+        //   edit("cat","dog") = 3       (all three characters substituted)
+        //   edit("","abc") = 3          (three insertions from empty)
+        //   edit("kitten","sittin") = 2 (replace k->s and e->i; the shared i,t,t and trailing n cost nothing)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the empty-string base returns the
+        // other length, that a leading-character MATCH recurses at zero added cost (not 1), that a mismatch
+        // adds exactly 1 to the min of the three sub-distances, that min3 picks the true minimum of
+        // delete/insert/replace, that char equality is compared correctly (so identical strings cost 0 and
+        // fully-disjoint equal-length strings cost their length), and that all three engines agree on the
+        // distance. This is the Levenshtein an AI writes for fuzzy matching, spell-check, and diffing; a
+        // backend whose char comparison, base case, or three-way min was off would misreport the distance.
+        let src = r#"fun min3(a: Int, b: Int, c: Int) -> Int {
+    let m = if a < b { a } else { b }
+    if m < c { m } else { c }
+}
+fun editRec(a: List[Str], b: List[Str]) -> Int {
+    if a.len() == 0 { b.len() }
+    else {
+        if b.len() == 0 { a.len() }
+        else {
+            let ha = a.first().unwrap_or("")
+            let hb = b.first().unwrap_or("")
+            let ra = a.drop(1)
+            let rb = b.drop(1)
+            if ha == hb { editRec(ra, rb) }
+            else {
+                let del = editRec(ra, b)
+                let ins = editRec(a, rb)
+                let rep = editRec(ra, rb)
+                1 + min3(del, ins, rep)
+            }
+        }
+    }
+}
+fun editDist(a: Str, b: Str) -> Int { editRec(a.chars(), b.chars()) }
+fun probe() -> Str {
+    let d1 = editDist("horse", "ros")
+    let d2 = editDist("cat", "cat")
+    let d3 = editDist("cat", "dog")
+    let d4 = editDist("", "abc")
+    let d5 = editDist("kitten", "sittin")
+    "horse_ros={d1}|same={d2}|alldiff={d3}|empty={d4}|kitten={d5}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "horse_ros=3|same=0|alldiff=3|empty=3|kitten=2"
+        );
+    }
+
+    #[test]
     fn diff_subset_sum_count() {
         // A bug-hunt-69 lock (it359): SUBSET-SUM COUNT -- how many subsets of a list sum to a target -- via the
         // include/exclude counting recurrence. Distinct from the power set (it356, which ENUMERATES all 2^n
