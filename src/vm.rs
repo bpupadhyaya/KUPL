@@ -2220,6 +2220,67 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_counting_sort() {
+        // A certification lock (it410): COUNTING SORT -- a NON-COMPARISON distribution sort, a fundamentally
+        // different paradigm from the comparison sorts already locked (quicksort it325, merge sort it324,
+        // insertion via PQ it321). Every comparison sort is bounded below by O(n log n) because it can only
+        // learn order by comparing pairs; counting sort SIDESTEPS that bound entirely by using each value AS AN
+        // INDEX: tally how many times each value 0..maxV appears (counts[v] = how many x equal v), then emit
+        // each value v exactly counts[v] times in ascending key order. No element is ever compared to another;
+        // order comes from the natural ordering of the bucket indices. This runs in O(n + k) where k is the
+        // value range, beating O(n log n) when k is bounded, and it is naturally STABLE.
+        //   countingSort([4,2,2,8,3,3,1]) = [1,2,2,3,3,4,8]   (duplicates 2 and 3 tallied and re-emitted)
+        //   countingSort([0,0,0]) = [0,0,0]                   (all in bucket 0)
+        //   countingSort([5]) = [5]                           (single element; buckets 0..5, only bucket 5 hit)
+        //   countingSort([]) = []                             (empty input short-circuits)
+        //   countingSort([3,1,2,1,3,2]) = [1,1,2,2,3,3]       (every value duplicated)
+        //   countingSort([9,0,5]) = [0,5,9]                   (SPARSE -- empty buckets 1-4,6-8 skipped)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that values are tallied into buckets
+        // indexed by the value with no pairwise comparison, that each value is re-emitted exactly its count of
+        // times (duplicates preserved), that empty buckets in a sparse range contribute nothing (the [9,0,5]
+        // case skips buckets 1-4 and 6-8), that all-equal, single-element, and empty inputs are handled, that
+        // the output is fully ascending, and that all three engines agree on the distribution sort. This is the
+        // counting sort an AI writes for bounded-integer sorting, radix-sort subroutines, and histogram-order
+        // output; a backend whose bucket indexing, count emission, or key ordering was off would drop, duplicate,
+        // or misorder elements. Adds the non-comparison distribution paradigm distinct from all comparison sorts.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun repeat(v: Int, n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [[v], repeat(v, n - 1)].flatten() }
+}
+fun countingSort(xs: List[Int]) -> List[Int] {
+    if xs.len() == 0 { [] }
+    else {
+        let maxV = xs.fold(0, fn(m, x) { if x > m { x } else { m } })
+        let counts = rangeIncl(0, maxV).map(fn(v) {
+            xs.filter(fn(x) { x == v }).len()
+        })
+        rangeIncl(0, maxV).flat_map(fn(v) {
+            repeat(v, counts.get(v).unwrap_or(0))
+        })
+    }
+}
+fun probe() -> Str {
+    let a = countingSort([4, 2, 2, 8, 3, 3, 1])
+    let b = countingSort([0, 0, 0])
+    let c = countingSort([5])
+    let d = countingSort([])
+    let e = countingSort([3, 1, 2, 1, 3, 2])
+    let f = countingSort([9, 0, 5])
+    "mixed={a}|zeros={b}|single={c}|empty={d}|dups={e}|sparse={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mixed=[1, 2, 2, 3, 3, 4, 8]|zeros=[0, 0, 0]|single=[5]|empty=[]|dups=[1, 1, 2, 2, 3, 3]|sparse=[0, 5, 9]"
+        );
+    }
+
+    #[test]
     fn diff_matrix_anti_transpose() {
         // A bug-hunt-94 lock (it409): ANTI-DIAGONAL TRANSPOSE -- reflect a matrix across its ANTI-diagonal (the
         // top-right-to-bottom-left diagonal), completing the matrix-transform family. The MAIN transpose (it353)
