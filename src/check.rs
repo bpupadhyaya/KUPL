@@ -2671,11 +2671,20 @@ impl Checker {
                     for a in args {
                         self.infer_expr(a, ctx);
                     }
-                    self.err(
-                        "K0250",
-                        format!("`.{name}` takes {}, {} given", plural(params.len(), "argument"), args.len()),
-                        span,
-                    );
+                    // Name the expected parameter TYPES, not just the count, so a wrong-arity call
+                    // shows the signature -- e.g. `.center` takes 2 arguments (Int, Str) -- instead of
+                    // leaving the user to guess which args and in what order (PR-it490).
+                    let mut msg = format!("`.{name}` takes {}", plural(params.len(), "argument"));
+                    if !params.is_empty() {
+                        let sig = params
+                            .iter()
+                            .map(|p| self.uni.apply(p).to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        msg.push_str(&format!(" ({sig})"));
+                    }
+                    msg.push_str(&format!(", {} given", args.len()));
+                    self.err("K0250", msg, span);
                 } else {
                     // Bidirectional: check each argument AGAINST its expected type,
                     // so lambda parameters get their types from the method signature
@@ -3309,6 +3318,25 @@ mod generic_tests {
             "fun add(a: Int, b: Int) -> Int { a + b }\nfun main() { let f = fn x { x * 2 }\n    let _ = add(2, 3)\n    let _ = f(10)\n    let _ = [1, 2, 3].map(fn x { x + 1 }) }\n"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn method_arity_error_names_the_parameter_types() {
+        // K0250 for a wrong-argument-count method call now shows the expected parameter TYPES, not just
+        // the count, so the user sees the signature -- e.g. `.center` takes 2 arguments (Int, Str) (PR-it490).
+        let c = errors("fun main() { let _ = \"hi\".center(5) }\n");
+        assert!(
+            c.iter().any(|d| d.code == "K0250" && d.message.contains("takes 2 arguments (Int, Str)") && d.message.contains("1 given")),
+            "center arity names the types: {c:?}"
+        );
+        // A zero-parameter method called with an argument keeps the bare count (no empty `()`).
+        let z = errors("fun main() { let _ = \"hi\".to_upper(3) }\n");
+        assert!(
+            z.iter().any(|d| d.code == "K0250" && d.message.contains("takes 0 arguments") && !d.message.contains("()")),
+            "zero-param keeps bare count: {z:?}"
+        );
+        // A correct-arity call still type-checks.
+        assert!(errors("fun main() { let _ = \"hi\".center(5, \"*\")\n    let _ = \"x\".to_upper() }\n").is_empty());
     }
 
     #[test]
