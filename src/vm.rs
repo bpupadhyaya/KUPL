@@ -2220,6 +2220,83 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_greedy_set_cover() {
+        // A bug-hunt-88 lock (it397): GREEDY SET COVER -- given a universe of elements and a collection of sets,
+        // choose as few sets as possible whose union covers the whole universe, using the classic GREEDY
+        // approximation: repeatedly pick the set that covers the MOST currently-UNCOVERED elements, add its
+        // elements to the covered set, and repeat until everything is covered. This is a genuine greedy
+        // OPTIMIZATION (maximize marginal gain at each step), distinct from the greedy frontier SCAN of jump-game
+        // (it385): here each round rescans all sets and selects the argmax-gain one. bestIdx folds over the set
+        // indices tracking the best-so-far (ties broken toward the LOWER index via a strict > test), returning
+        // -1 when every set has zero new coverage; the driver returns the pick count, or -1 if the universe can
+        // never be fully covered (some element is in no set).
+        //   cover([1..5], [[1,2,3],[2,4],[3,4],[4,5]]) = 2   (pick [1,2,3] gain 3, then [4,5] gain 2)
+        //   cover([1,2,3], [[1,2,3]]) = 1                    (one set covers everything)
+        //   cover([1,2,3,4], [[1,2],[3,4]]) = 2              (two disjoint halves, both needed)
+        //   cover([1,2,3], [[1],[2]]) = -1                   (element 3 is in no set -- IMPOSSIBLE)
+        //   cover([], [[1]]) = 0                             (empty universe -- already covered, no picks)
+        //   cover([1..6], [[1,2,3,4],[1,2,3,4,5],[5,6]]) = 2 (greedy takes the 5-elem set first, then [5,6])
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each round selects the set of
+        // maximum NEW coverage (not maximum size -- already-covered elements do not count), that ties resolve to
+        // the earliest set, that a set contributing zero new elements is never chosen, that a universe with an
+        // uncoverable element returns -1 rather than looping, that an empty universe needs zero picks (vacuous
+        // .all), that a single covering set gives 1 and two disjoint halves give 2, and that all three engines
+        // agree on the rescan-argmax greedy loop with an accumulating covered list. This is the greedy
+        // set-cover an AI writes for minimum-cover approximation, resource/feature selection, and test-suite
+        // reduction; a backend whose gain counting, tie-breaking, zero-gain guard, or impossibility base was off
+        // would over-pick or loop. Adds a rescan-argmax greedy optimization distinct from the frontier scans.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun newCover(s: List[Int], covered: List[Int]) -> Int {
+    s.filter(fn(x) { covered.contains(x) == false }).len()
+}
+fun bestIdx(sets: List[List[Int]], covered: List[Int]) -> Int {
+    let n = sets.len()
+    rangeN(n).fold(0 - 1, fn(best, i) {
+        let gain = newCover(sets.get(i).unwrap_or([]), covered)
+        if gain == 0 { best }
+        else {
+            if best < 0 { i }
+            else {
+                let bestGain = newCover(sets.get(best).unwrap_or([]), covered)
+                if gain > bestGain { i } else { best }
+            }
+        }
+    })
+}
+fun solve(universe: List[Int], sets: List[List[Int]], covered: List[Int], picks: Int) -> Int {
+    if universe.all(fn(x) { covered.contains(x) }) { picks }
+    else {
+        let idx = bestIdx(sets, covered)
+        if idx < 0 { 0 - 1 }
+        else {
+            let chosen = sets.get(idx).unwrap_or([])
+            let nc = [covered, chosen].flatten()
+            solve(universe, sets, nc, picks + 1)
+        }
+    }
+}
+fun cover(universe: List[Int], sets: List[List[Int]]) -> Int {
+    solve(universe, sets, [], 0)
+}
+fun probe() -> Str {
+    let a = cover([1, 2, 3, 4, 5], [[1, 2, 3], [2, 4], [3, 4], [4, 5]])
+    let b = cover([1, 2, 3], [[1, 2, 3]])
+    let c = cover([1, 2, 3, 4], [[1, 2], [3, 4]])
+    let d = cover([1, 2, 3], [[1], [2]])
+    let e = cover([], [[1]])
+    let f = cover([1, 2, 3, 4, 5, 6], [[1, 2, 3, 4], [1, 2, 3, 4, 5], [5, 6]])
+    "a={a}|full={b}|split={c}|nocover={d}|empty={e}|greedy={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a=2|full=1|split=2|nocover=-1|empty=0|greedy=2"
+        );
+    }
+
+    #[test]
     fn diff_merge_overlapping_intervals() {
         // A certification lock (it396): MERGE OVERLAPPING INTERVALS -- coalesce a set of closed integer
         // intervals so that any that overlap or touch are combined into one. The canonical two-phase shape:
