@@ -2269,6 +2269,57 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_zeller_weekday() {
+        // A certification lock (it435): ZELLER'S CONGRUENCE -- compute the day of the week for any Gregorian date
+        // by a closed-form modular formula, opening a fresh date-arithmetic family. The formula is
+        //   h = (d + floor(13*(m+1)/5) + K + floor(K/4) + floor(J/4) + 5*J) mod 7
+        // where the two notorious subtleties are: (1) January and February are treated as months 13 and 14 of the
+        // PREVIOUS year (so m<3 => m+12 and y-1), and (2) the result maps 0=Saturday, 1=Sunday, ... 6=Friday
+        // (an unusual offset that trips people who expect 0=Sunday or 0=Monday). K is the year within its century
+        // (yy % 100) and J is the zero-based century (yy / 100), both taken AFTER the Jan/Feb year adjustment. All
+        // divisions are integer (floor) division. Verified against famous, checkable dates:
+        //   zeller(2000, 1, 1) = Sat     (Jan 1 2000 -- and the Jan adjustment shifts it into year 1999)
+        //   zeller(1969, 7, 20) = Sun    (the Apollo 11 moon landing was a Sunday)
+        //   zeller(2023, 7, 8) = Sat
+        //   zeller(2024, 2, 29) = Thu    (a leap day; Feb counts as month 14 of 2023)
+        //   zeller(1900, 1, 1) = Mon
+        //   zeller(2001, 9, 11) = Tue    (September 11 2001 was a Tuesday)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that January/February are shifted into the
+        // prior year's months 13/14, that K and J are derived after that shift, that the floor divisions and the
+        // mod-7 reduction match the standard formula, that the 0=Saturday day mapping names the right weekday, that
+        // leap days and century boundaries are handled, and that all three engines agree on the weekday for every
+        // date. This is the weekday calculation an AI writes for a calendar, scheduler, or date utility without a
+        // date library; a backend whose integer division, month-shift, or mod offset was off would name the wrong
+        // day. A non-sort lock certifying Gregorian weekday computation via Zeller's congruence.
+        let src = r#"fun zeller(y: Int, mo: Int, d: Int) -> Int {
+    let m = if mo < 3 { mo + 12 } else { mo }
+    let yy = if mo < 3 { y - 1 } else { y }
+    let k = yy % 100
+    let j = yy / 100
+    let h = (d + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7
+    h
+}
+fun name(h: Int) -> Str {
+    let days = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]
+    days.get(h).unwrap_or("?")
+}
+fun probe() -> Str {
+    let a = name(zeller(2000, 1, 1))
+    let b = name(zeller(1969, 7, 20))
+    let c = name(zeller(2023, 7, 8))
+    let d = name(zeller(2024, 2, 29))
+    let e = name(zeller(1900, 1, 1))
+    let f = name(zeller(2001, 9, 11))
+    "y2000={a}|moon={b}|d2023={c}|leap={d}|y1900={e}|nine11={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "y2000=Sat|moon=Sun|d2023=Sat|leap=Thu|y1900=Mon|nine11=Tue"
+        );
+    }
+
+    #[test]
     fn diff_dutch_flag_three_way_partition() {
         // A bug-hunt-106 lock (it434): DUTCH NATIONAL FLAG -- a THREE-way partition that splits a list into the
         // elements LESS than a pivot, EQUAL to it, and GREATER than it, then concatenates those three ordered
