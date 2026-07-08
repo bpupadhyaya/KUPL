@@ -2220,6 +2220,70 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_comb_sort() {
+        // A bug-hunt-97 lock (it415): COMB SORT -- bubble sort with a SHRINKING gap, the bubble-sort analogue of
+        // shell sort's insertion generalization (it414). Plain bubble sort only ever compares ADJACENT elements
+        // and swaps them, so a small value stranded near the END of the array (a "turtle") crawls forward one
+        // step per full pass. Comb sort compares a[i] against a[i+GAP] instead: for each gap in a shrinking
+        // schedule (here 4, 2, then repeated 1s), one gapped-bubble pass sweeps left-to-right swapping any
+        // out-of-order gap-apart pair. Large gaps kill turtles in big strides; the gap=1 passes are plain bubble
+        // passes. IMPORTANT SUBTLETY (a consistent-but-wrong trap this probe first hit): a SINGLE gap=1 pass is
+        // just one bubble pass -- it only guarantees the maximum bubbles to the end -- so full sorting needs
+        // ENOUGH gap=1 passes (up to n-1, as in bubble sort). The schedules below pad with sufficient trailing 1s.
+        //   combSort([8,4,1,6,3,7,2,5], [4,2,1,1,1,1,1,1,1]) = [1,2,3,4,5,6,7,8]  (gap 4 kills the turtle early)
+        //   combSort([5,2,8,1], [2,1,1,1]) = [1,2,5,8]        (two-gap-then-bubble schedule)
+        //   combSort([3,3,1,2,2], [2,1,1,1,1]) = [1,2,2,3,3]  (duplicates preserved)
+        //   combSort([7], [1]) = [7]                          (single element)
+        //   combSort([], [1]) = []                            (empty)
+        //   combSort([4,3,2,1], [2,1,1,1]) = [1,2,3,4]        (fully reversed)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each gapped pass compares and swaps
+        // elements gap apart (not just adjacent), that a large early gap moves a far-out-of-place value a long
+        // way in one pass (the turtle-killing that distinguishes comb from bubble), that a SUFFICIENT number of
+        // gap=1 passes is required to finish (an under-provisioned schedule leaves the array only partly sorted
+        // -- caught here before locking), that duplicates are preserved, that empty/single/reversed inputs are
+        // handled, and that all three engines agree on the shrinking-gap bubble pipeline. This is the comb sort
+        // an AI writes as an in-place bubble-sort improvement; a backend whose gap stride or swap logic was off
+        // would misorder the result. Adds the gapped-bubble paradigm, bubble's analogue of shell's gapped
+        // insertion.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun setAt(lst: List[Int], i: Int, v: Int) -> List[Int] {
+    rangeN(lst.len()).map(fn(k) { if k == i { v } else { lst.get(k).unwrap_or(0) } })
+}
+fun combPass(a: List[Int], gap: Int, idxs: List[Int]) -> List[Int] {
+    idxs.fold(a, fn(acc, i) {
+        let x = acc.get(i).unwrap_or(0)
+        let y = acc.get(i + gap).unwrap_or(0)
+        if x > y {
+            setAt(setAt(acc, i, y), i + gap, x)
+        } else { acc }
+    })
+}
+fun combSort(xs: List[Int], gaps: List[Int]) -> List[Int] {
+    let n = xs.len()
+    gaps.fold(xs, fn(acc, gap) {
+        let idxs = rangeN(n).filter(fn(i) { i + gap < n })
+        combPass(acc, gap, idxs)
+    })
+}
+fun probe() -> Str {
+    let a = combSort([8, 4, 1, 6, 3, 7, 2, 5], [4, 2, 1, 1, 1, 1, 1, 1, 1])
+    let b = combSort([5, 2, 8, 1], [2, 1, 1, 1])
+    let c = combSort([3, 3, 1, 2, 2], [2, 1, 1, 1, 1])
+    let d = combSort([7], [1])
+    let e = combSort([], [1])
+    let f = combSort([4, 3, 2, 1], [2, 1, 1, 1])
+    "mixed={a}|small={b}|dups={c}|single={d}|empty={e}|rev={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mixed=[1, 2, 3, 4, 5, 6, 7, 8]|small=[1, 2, 5, 8]|dups=[1, 2, 2, 3, 3]|single=[7]|empty=[]|rev=[1, 2, 3, 4]"
+        );
+    }
+
+    #[test]
     fn diff_shell_sort() {
         // A certification lock (it414): SHELL SORT -- gap-based insertion sort, GENERALIZING plain insertion sort
         // (it321) with a diminishing gap sequence. Plain insertion sort only ever compares and shifts ADJACENT
