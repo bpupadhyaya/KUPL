@@ -2104,6 +2104,60 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_longest_common_subsequence() {
+        // A bug-hunt-70 lock (it361): LONGEST COMMON SUBSEQUENCE (LCS) length -- the length of the longest
+        // sequence appearing (in order, not necessarily contiguous) in both strings -- via the two-way-MAX
+        // recurrence. This is the companion two-string DP to edit distance (it360), but with a distinct
+        // structure: where Levenshtein takes the three-way MIN of edits (a cost to MINIMIZE), LCS takes the
+        // two-way MAX of a shared length (a length to MAXIMIZE). The recurrence: an empty string shares
+        // nothing (0); when the leading characters MATCH they extend the common subsequence, so 1 +
+        // LCS(both tails); otherwise the best is the MAX of dropping a's head (LCS(a-tail, b)) or dropping b's
+        // head (LCS(a, b-tail)). Characters come from a.chars() compared with ==.
+        //   lcs("ABCBDAB","BDCAB") = 4   (e.g. "BCAB" or "BDAB")
+        //   lcs("abc","abc") = 3         (identical -- the whole string is the common subsequence)
+        //   lcs("abc","xyz") = 0         (no shared character)
+        //   lcs("","abc") = 0            (empty shares nothing)
+        //   lcs("AGGTAB","GXTXAB") = 4   (the classic "GTAB")
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the empty base yields 0, that a
+        // leading-character MATCH adds exactly 1 and advances BOTH strings (not one), that a mismatch takes the
+        // MAX (not min, not sum) of the two single-advance sub-problems, that subsequences need not be
+        // contiguous (so "ABCBDAB"/"BDCAB" finds length 4 by skipping interleaved characters), that identical
+        // strings give the full length and disjoint strings give 0, and that all three engines agree. This is
+        // the LCS an AI writes for diff tools, version-control merges, and DNA/sequence alignment; a backend
+        // whose match-extend, max-branch, or base case was off would misreport the shared length. Pairs with
+        // edit distance to cover both canonical two-string DPs (min-cost transform vs max-length overlap).
+        let src = r#"fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun lcsRec(a: List[Str], b: List[Str]) -> Int {
+    if a.len() == 0 { 0 }
+    else {
+        if b.len() == 0 { 0 }
+        else {
+            let ha = a.first().unwrap_or("")
+            let hb = b.first().unwrap_or("")
+            let ra = a.drop(1)
+            let rb = b.drop(1)
+            if ha == hb { 1 + lcsRec(ra, rb) }
+            else { maxi(lcsRec(ra, b), lcsRec(a, rb)) }
+        }
+    }
+}
+fun lcs(a: Str, b: Str) -> Int { lcsRec(a.chars(), b.chars()) }
+fun probe() -> Str {
+    let l1 = lcs("ABCBDAB", "BDCAB")
+    let l2 = lcs("abc", "abc")
+    let l3 = lcs("abc", "xyz")
+    let l4 = lcs("", "abc")
+    let l5 = lcs("AGGTAB", "GXTXAB")
+    "abcbdab={l1}|same={l2}|none={l3}|empty={l4}|agg={l5}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "abcbdab=4|same=3|none=0|empty=0|agg=4"
+        );
+    }
+
+    #[test]
     fn diff_edit_distance_levenshtein() {
         // A certification lock (it360): EDIT DISTANCE (Levenshtein) -- the minimum number of single-character
         // insertions, deletions, or substitutions to turn one string into another -- via the classic
