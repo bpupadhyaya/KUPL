@@ -2104,6 +2104,57 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_full_merge_sort_divide_and_conquer() {
+        // A certification lock (it324): the FULL recursive merge sort -- divide-and-conquer built on top of
+        // the two-list merge (it322). msort splits the list at the midpoint (take(mid) / drop(mid)), recurses
+        // on BOTH halves independently, and merges the two sorted results; the base case is a list of length
+        // <= 1 (already sorted). This composes the merge primitive into a complete O(n log n) sort -- a
+        // different structure from it322 (which only merged two ALREADY-sorted lists) and from insertion or
+        // BST sorts: here the recursion tree splits top-down and rebuilds sorted bottom-up.
+        //   msort([5,2,8,1,9,3,7,4,6,2,5]) = [1,2,2,3,4,5,5,6,7,8,9]  (len 11, dups preserved, sorted)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the midpoint split partitions the
+        // list with no element lost or duplicated (take(mid) ++ drop(mid) reconstructs the whole), that both
+        // halves recurse to the length-<=1 base case, that merge stitches them back in order, and that
+        // duplicates survive (two 2s and two 5s -> length stays 11). The window(2) non-decreasing check
+        // witnesses global sortedness. This is the canonical divide-and-conquer sort an AI writes; a backend
+        // that mis-split (off-by-one on mid), dropped the base case, or mis-merged would either lose elements
+        // (len != 11) or leave an inversion (ok=false).
+        let src = r#"fun merge(a: List[Int], b: List[Int]) -> List[Int] {
+    match a.first() {
+        None => b
+        Some(x) => match b.first() {
+            None => a
+            Some(y) => {
+                if x <= y { [[x], merge(a.drop(1), b)].flatten() }
+                else { [[y], merge(a, b.drop(1))].flatten() }
+            }
+        }
+    }
+}
+fun msort(xs: List[Int]) -> List[Int] {
+    let n = xs.len()
+    if n <= 1 { xs }
+    else {
+        let mid = n / 2
+        let left = msort(xs.take(mid))
+        let right = msort(xs.drop(mid))
+        merge(left, right)
+    }
+}
+fun probe() -> Str {
+    let xs = [5, 2, 8, 1, 9, 3, 7, 4, 6, 2, 5]
+    let sorted = msort(xs)
+    let ok = sorted.window(2).all(fn(w) { w.first().unwrap_or(0) <= w.last().unwrap_or(0) })
+    "sorted={sorted}|len={sorted.len()}|ok={ok}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sorted=[1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 9]|len=11|ok=true"
+        );
+    }
+
+    #[test]
     fn diff_merge_two_sorted_lists() {
         // A certification lock (it322): merging two already-sorted lists into one sorted list via the
         // recursive two-pointer merge -- the merge step of merge sort. At each step it peeks the front of
