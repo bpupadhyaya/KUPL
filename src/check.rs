@@ -1360,7 +1360,11 @@ impl Checker {
                     Ty::Var(_) => {
                         self.err(
                             "K0232",
-                            format!("cannot infer the type of this value to access field `{name}` — add a type annotation"),
+                            format!(
+                                "cannot infer the type of this value to access field `{name}` — \
+                                 annotate its binding or parameter so the record type is known \
+                                 (e.g. `let acc: List[Row] = []` for an empty-list fold seed)"
+                            ),
                             recv.span,
                         );
                         self.uni.fresh()
@@ -3256,6 +3260,25 @@ mod generic_tests {
         assert!(on_str.iter().any(|d| d.code == "K0233" && d.message.contains(hint)), "str: {on_str:?}");
         // Real record field access still type-checks (no behavior change).
         assert!(errors("type Item = { name: Str, qty: Int }\nfun main() { let it = Item(name: \"a\", qty: 1)\n    let _ = it.name\n    let _ = it.qty }\n").is_empty());
+    }
+
+    #[test]
+    fn uninferred_field_access_names_the_annotation_fix() {
+        // K0232 now points at the concrete fix -- annotate the binding/parameter so the record type is
+        // known -- naming the empty-list fold-seed case that most often triggers it (PR-it323). The typo
+        // trail: an untyped `[]` flows into a higher-order fn and the field access can't resolve the
+        // element type. Message-text only; the annotated form still type-checks unchanged.
+        let e = errors("type Row = { n: Int }\nfun main() uses io {\n    let _ = [].fold(0, fn(s, r) { s + r.n })\n}\n");
+        assert!(
+            e.iter().any(|d| d.code == "K0232"
+                && d.message.contains("annotate its binding or parameter")
+                && d.message.contains("List[Row]")),
+            "{e:?}"
+        );
+        // The annotated fold seed the hint recommends type-checks cleanly (the fix works, no behavior change).
+        assert!(errors(
+            "type Row = { n: Int }\nfun main() uses io {\n    let seed: List[Row] = []\n    let _ = seed.fold(0, fn(s, r) { s + r.n })\n}\n"
+        ).is_empty());
     }
 
     #[test]
