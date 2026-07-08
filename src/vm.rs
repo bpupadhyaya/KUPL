@@ -2220,6 +2220,69 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_partition_equal_subset_sum() {
+        // A certification lock (it384): PARTITION EQUAL SUBSET SUM -- decide whether a list of positive integers
+        // can be split into TWO subsets with EQUAL sums. This is a BOOLEAN subset-sum variant, the decide-versus
+        // -count twin of subset-sum-count (it359): where subset-sum-count COUNTS how many subsets reach a target,
+        // this asks only WHETHER ANY subset reaches HALF the total (short-circuiting via a boolean OR). It is a
+        // two-stage reduction: (1) if the total sum is ODD, an equal split is impossible so return false
+        // immediately (a whole-number half cannot exist); (2) otherwise the question reduces to canReach(items,
+        // total/2) -- a boolean include/exclude DP where target 0 is reachable (true), a negative target or an
+        // exhausted list with positive target is unreachable (false), and each item is either taken
+        // (target - head) or skipped (target).
+        //   canPartition([1,5,11,5]) = true    ({11} vs {1,5,5}, each summing to 11)
+        //   canPartition([1,2,3,5]) = false     (total 11 is odd -- no equal split)
+        //   canPartition([1,1]) = true          ({1} vs {1})
+        //   canPartition([1,2,5]) = false        (total 8 is EVEN, yet no subset reaches 4)
+        //   canPartition([]) = true             (two empty halves, sum 0 each)
+        //   canPartition([2,2,2,2]) = true      ({2,2} vs {2,2})
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the odd-total short-circuit returns false
+        // without recursing, that an even total reduces to reaching exactly half, that the boolean include/
+        // exclude reachability handles target==0 (true), target<0 (false), and empty-list-with-positive-target
+        // (false), that the crucial EVEN-but-UNREACHABLE case is false (an even sum alone does NOT guarantee a
+        // partition -- [1,2,5] sums to 8 but no subset makes 4), that the empty list trivially partitions, and
+        // that all three engines agree on the boolean subset-reachability recursion. This is the
+        // partition-equal-subset-sum / balanced-partition routine an AI writes for fair division and load
+        // balancing; a backend whose odd-sum guard, half-target reduction, or boolean include/exclude was off
+        // would mis-decide. Adds the boolean-decision twin of the counting subset-sum.
+        let src = r#"fun canReach(xs: List[Int], target: Int) -> Bool {
+    if target == 0 { true }
+    else {
+        if target < 0 { false }
+        else {
+            let n = xs.len()
+            if n == 0 { false }
+            else {
+                let head = xs.first().unwrap_or(0)
+                let rest = xs.drop(1)
+                if canReach(rest, target - head) { true }
+                else { canReach(rest, target) }
+            }
+        }
+    }
+}
+fun canPartition(xs: List[Int]) -> Bool {
+    let total = xs.fold(0, fn(s, x) { s + x })
+    if total % 2 == 1 { false }
+    else { canReach(xs, total / 2) }
+}
+fun probe() -> Str {
+    let a = canPartition([1, 5, 11, 5])
+    let b = canPartition([1, 2, 3, 5])
+    let c = canPartition([1, 1])
+    let d = canPartition([1, 2, 5])
+    let e = canPartition([])
+    let f = canPartition([2, 2, 2, 2])
+    "a={a}|oddsum={b}|equal={c}|evenNoReach={d}|empty={e}|f={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a=true|oddsum=false|equal=true|evenNoReach=false|empty=true|f=true"
+        );
+    }
+
+    #[test]
     fn diff_trapping_rain_water() {
         // A bug-hunt-81 lock (it383): TRAPPING RAIN WATER -- given an elevation map (bar heights), compute how
         // much water is trapped between the bars after rain. This is a per-index BIDIRECTIONAL-MAX aggregation,
