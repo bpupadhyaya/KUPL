@@ -2770,6 +2770,61 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_binomial_pascal_vs_multiplicative() {
+        // A bug-hunt-112 lock (it446): BINOMIAL COEFFICIENT VALUES computed TWO independent ways and cross-checked
+        // against each other -- distinct from it358, which ENUMERATES the size-k subsets; this computes the COUNT
+        // C(n,k) itself. Method one builds Pascal's triangle row by row from the recurrence
+        // C(n,k) = C(n-1,k-1) + C(n-1,k): each new row is [1] then the pairwise sums of adjacent entries of the
+        // previous row (via zip_with of the row with its own tail) then [1]. Method two is the multiplicative
+        // formula C(n,k) = prod_{i=1..k} (n-i+1)/i, evaluated multiply-before-divide so every partial product
+        // stays an exact integer. The two derivations share no arithmetic, so their agreement (and agreement with
+        // the sum-of-row = 2^n identity from the binomial theorem) is strong evidence both are right.
+        //   pascalRow(4) = 1,4,6,4,1
+        //   pascalRow(6) = 1,6,15,20,15,6,1
+        //   binom(10,5) = 252 / binom(6,3) = 20     (the multiplicative formula's values)
+        //   cross = true                            (pascalRow(6)[3] == binom(6,3): the two methods agree)
+        //   sum of pascalRow(10) = 1024 = 2^10       (the binomial theorem row-sum identity)
+        //   binom(0,0) = 1 / binom(5,0) = 1          (the empty-choice base cases)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the Pascal recurrence builds each row
+        // by flanking the adjacent-sum interior with ones, that the multiplicative formula computes the same
+        // coefficients with integer-exact partial products, that the row entry and the closed form agree, that the
+        // row sums to a power of two, that the k=0 base cases are 1, and that all three engines agree. This is the
+        // "how many ways to choose k of n" an AI writes for combinatorics, probability, or a coefficient table;
+        // two independent methods agreeing catches an off-by-one in either. A non-sort lock certifying binomial
+        // coefficient computation by Pascal's recurrence cross-checked against the multiplicative formula.
+        let src = r#"fun nextRow(prev: List[Int]) -> List[Int] {
+    let mid = prev.zip_with(prev.drop(1), fn(a, b) { a + b })
+    [[1], mid, [1]].flatten()
+}
+fun pascalRow(n: Int) -> List[Int] {
+    if n <= 0 { [1] } else { nextRow(pascalRow(n - 1)) }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun binom(n: Int, k: Int) -> Int {
+    rangeIncl(1, k).fold(1, fn(acc, i) { acc * (n - i + 1) / i })
+}
+fun shw(xs: List[Int]) -> Str { xs.map(fn(x) { x.to_str() }).join(",") }
+fun probe() -> Str {
+    let r4 = shw(pascalRow(4))
+    let r6 = shw(pascalRow(6))
+    let b_10_5 = binom(10, 5)
+    let b_6_3 = binom(6, 3)
+    let cross = pascalRow(6).get(3).unwrap_or(0) == binom(6, 3)
+    let sum10 = pascalRow(10).fold(0, fn(a, x) { a + x })
+    let b_0_0 = binom(0, 0)
+    let b_5_0 = binom(5, 0)
+    "r4={r4}|r6={r6}|b10_5={b_10_5}|b6_3={b_6_3}|cross={cross}|sum10={sum10}|b00={b_0_0}|b50={b_5_0}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "r4=1,4,6,4,1|r6=1,6,15,20,15,6,1|b10_5=252|b6_3=20|cross=true|sum10=1024|b00=1|b50=1"
+        );
+    }
+
+    #[test]
     fn diff_date_difference_days() {
         // A bug-hunt-109 lock (it440): DATE DIFFERENCE -- the number of days between two Gregorian dates, computed
         // by converting each date to a serial day-number and subtracting. This extends the date family (Zeller
