@@ -2220,6 +2220,60 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_knapsack_01_value() {
+        // A certification lock (it364): the 0/1 KNAPSACK VALUE maximization -- given items each with a weight
+        // and a value, pick a subset whose total weight fits a capacity while MAXIMIZING total value, using
+        // each item AT MOST ONCE. Items are List[List[Int]] as [weight, value] pairs. This is the
+        // constrained-optimization DP: unlike coin-change (it362, which allows UNLIMITED reuse and MINIMIZES a
+        // count), knapsack is 0/1 (each item once) and MAXIMIZES a value under a WEIGHT constraint. The
+        // recurrence: no items -> value 0; if the head item is heavier than the remaining capacity it must be
+        // SKIPPED (recurse on the rest with the same capacity); otherwise take the MAX of INCLUDING it
+        // (its value + knap(rest, capacity - its weight)) versus EXCLUDING it (knap(rest, capacity)). The
+        // recursion is on the REST (not the full list), which is exactly what enforces the 0/1 "each item at
+        // most once" rule -- the opposite of coin-change's full-list reuse.
+        //   knap([[1,1],[3,4],[4,5],[5,7]], 7) = 9   (take weights 3+4 = 7 for values 4+5 = 9)
+        //   knap([[1,1],[3,4],[4,5],[5,7]], 0) = 0   (zero capacity fits nothing)
+        //   knap([[10,100]], 5) = 0                  (the only item is too heavy -- skipped, value 0)
+        //   knap([[2,3],[2,3],[2,3]], 4) = 6         (two of the three fit -- each item counted ONCE, by position)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the empty base yields value 0, that an
+        // item heavier than the capacity is skipped (its include-branch is never taken), that the choice is the
+        // MAX of include-value vs exclude-value (not min, not sum), that including an item subtracts its weight
+        // from the remaining capacity AND adds its value, that recursing on the REST enforces 0/1 selection
+        // (so three identical [2,3] items under capacity 4 yield 6, not 9 -- only two fit and none is reused),
+        // that a zero capacity yields 0, and that all three engines agree. This is the 0/1 knapsack an AI
+        // writes for budget allocation, cargo loading, and resource selection; a backend whose weight
+        // constraint, include/exclude max, or single-use recursion was off would over- or under-value. Extends
+        // the DP family with constrained maximization, distinct from coin-change's unlimited-reuse minimization
+        // and subset-sum's unconstrained counting.
+        let src = r#"fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun knap(items: List[List[Int]], cap: Int) -> Int {
+    if items.len() == 0 { 0 }
+    else {
+        let head = items.first().unwrap_or([0, 0])
+        let w = head.get(0).unwrap_or(0)
+        let v = head.get(1).unwrap_or(0)
+        let rest = items.drop(1)
+        let without = knap(rest, cap)
+        if w > cap { without }
+        else {
+            let with = v + knap(rest, cap - w)
+            maxi(with, without)
+        }
+    }
+}
+fun probe() -> Str {
+    let items = [[1, 1], [3, 4], [4, 5], [5, 7]]
+    let a = knap(items, 7)
+    let b = knap(items, 0)
+    let c = knap([[10, 100]], 5)
+    let d = knap([[2, 3], [2, 3], [2, 3]], 4)
+    "cap7={a}|cap0={b}|tooheavy={c}|dup={d}"
+}
+"#;
+        assert_eq!(differential(src), "cap7=9|cap0=0|tooheavy=0|dup=6");
+    }
+
+    #[test]
     fn diff_longest_increasing_subsequence() {
         // A bug-hunt-71 lock (it363): LONGEST INCREASING SUBSEQUENCE (LIS) length -- the length of the longest
         // strictly-increasing subsequence (order preserved, not necessarily contiguous) of a list. Unlike the
