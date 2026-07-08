@@ -2220,6 +2220,61 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_matrix_rotate_180() {
+        // A bug-hunt-86 lock (it393): MATRIX ROTATE 180 -- rotate a 2-D matrix a half turn (a point reflection
+        // through the center). This is a COORDINATE-TRANSFORM grid op like rotate-90 (it392) but with a crucial
+        // structural difference: rotate-180 reverses BOTH axes, new[r][c] = old[rows-1-r][cols-1-c], so the
+        // dimensions are UNCHANGED (an R-by-C matrix stays R-by-C) -- contrast rotate-90, which SWAPS the
+        // dimensions to C-by-R. Equivalently it reverses the row order and reverses each row; the first cell
+        // becomes the last and the last becomes the first, a full reversal of the flattened matrix. Two 90-degree
+        // rotations compose to this, but the direct double-reversal index map is its own distinct transform.
+        //   rotate180([[1,2],[3,4]]) = [[4,3],[2,1]]                        (2x2)
+        //   rotate180([[1,2,3],[4,5,6],[7,8,9]]) = [[9,8,7],[6,5,4],[3,2,1]] (3x3: full reversal)
+        //   rotate180([[1,2,3]]) = [[3,2,1]]                                (single row reversed, shape kept)
+        //   rotate180([[1],[2],[3]]) = [[3],[2],[1]]                        (single column reversed, shape kept)
+        //   rotate180([[5]]) = [[5]]                                        (1x1 fixed point)
+        //   rotate180([[1,2,3,4],[5,6,7,8]]) = [[8,7,6,5],[4,3,2,1]]        (2x4 stays 2x4)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that BOTH axes reverse (the row order
+        // flips and each row's elements flip), that the output shape EQUALS the input shape (dims are NOT
+        // swapped, unlike rotate-90), that the top-left cell moves to the bottom-right and vice versa, that a
+        // lone row or column keeps its 1-D shape while reversing its contents, that a 1x1 is a fixed point, that
+        // a rectangle preserves its R-by-C shape, and that all three engines agree on the double-index reversal.
+        // This is the rotate-180 an AI writes for image flips, half-turn transforms, and point reflections; a
+        // backend that reversed only one axis (yielding a horizontal or vertical mirror) or swapped dimensions
+        // would produce the wrong orientation. Complements the rotate-90 lock with a dimension-preserving grid
+        // transform.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun cell(m: List[List[Int]], r: Int, c: Int) -> Int {
+    m.get(r).unwrap_or([]).get(c).unwrap_or(0)
+}
+fun rotate180(m: List[List[Int]]) -> List[List[Int]] {
+    let rows = m.len()
+    let cols = m.first().unwrap_or([]).len()
+    rangeN(rows).map(fn(r) {
+        rangeN(cols).map(fn(c) {
+            cell(m, rows - 1 - r, cols - 1 - c)
+        })
+    })
+}
+fun probe() -> Str {
+    let a = rotate180([[1, 2], [3, 4]])
+    let b = rotate180([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    let c = rotate180([[1, 2, 3]])
+    let d = rotate180([[1], [2], [3]])
+    let e = rotate180([[5]])
+    let f = rotate180([[1, 2, 3, 4], [5, 6, 7, 8]])
+    "sq2={a}|sq3={b}|row={c}|col={d}|one={e}|rect={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sq2=[[4, 3], [2, 1]]|sq3=[[9, 8, 7], [6, 5, 4], [3, 2, 1]]|row=[[3, 2, 1]]|col=[[3], [2], [1]]|one=[[5]]|rect=[[8, 7, 6, 5], [4, 3, 2, 1]]"
+        );
+    }
+
+    #[test]
     fn diff_matrix_rotate_90_clockwise() {
         // A certification lock (it392): MATRIX ROTATE 90 CLOCKWISE -- rotate a 2-D matrix a quarter turn to the
         // right. This is a COORDINATE-TRANSFORM grid operation, distinct from the plain transpose (it353): a
