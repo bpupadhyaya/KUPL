@@ -3029,6 +3029,57 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_jacobsthal_numbers() {
+        // A certification lock (it459): the JACOBSTHAL NUMBERS J(n) -- a second-order recurrence with a
+        // coefficient of 2 on the SECOND term, J(n) = J(n-1) + 2*J(n-2), seeded J(0)=0, J(1)=1 -- certified
+        // against its exact CLOSED FORM J(n) = (2^n - (-1)^n) / 3. This completes a trio of distinct coefficient
+        // placements among the certified second-order recurrences: Fibonacci/Lucas put the 1s on both terms, Pell
+        // (it458) doubles the FIRST term (2*x(n-1)), and Jacobsthal doubles the SECOND term (2*x(n-2)) -- three
+        // genuinely different recurrence shapes, each guarded by its own identity. The closed-form cross-check is
+        // especially strong here: it verifies the linear recurrence against a completely different computation
+        // built from powers of two and an alternating sign, and it exercises exact integer division (2^n - (-1)^n
+        // is always divisible by 3 because 2 = -1 mod 3, so the numerator is 0 mod 3 -- a truncating division bug
+        // would surface immediately).
+        //   J(0)=0, J(1)=1, J(5)=11, J(8)=85, J(10)=341    (OEIS A001045, the Jacobsthal numbers)
+        //   closed(5)  = (2^5 - (-1))/3  = 33/3   = 11  = J(5)
+        //   closed(8)  = (2^8 - 1)/3     = 255/3  = 85  = J(8)
+        //   closed(10) = (2^10 - 1)/3    = 1023/3 = 341 = J(10)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the coefficient 2 sits on the SECOND
+        // term (not the first -- which would give Pell), that the seeds J(0)=0, J(1)=1 drive the sequence, that the
+        // computed values match the known Jacobsthal sequence, that the alternating-sign closed form (2^n-(-1)^n)/3
+        // agrees at three separate points via an independent power-of-two computation, that the division stays
+        // exact, and that all three engines agree. This is the Jacobsthal sequence an AI writes for number theory
+        // or recurrence work; the closed form catches a wrong coefficient placement or a sign error. A non-sort
+        // lock certifying the Jacobsthal numbers against their (2^n-(-1)^n)/3 closed form.
+        let src = r#"fun jac(n: Int) -> Int {
+    if n == 0 { 0 } else if n == 1 { 1 } else { jac(n - 1) + 2 * jac(n - 2) }
+}
+fun pow2(n: Int) -> Int {
+    if n == 0 { 1 } else { 2 * pow2(n - 1) }
+}
+fun closed(n: Int) -> Int {
+    let sign = if n % 2 == 0 { 1 } else { 0 - 1 }
+    (pow2(n) - sign) / 3
+}
+fun probe() -> Str {
+    let j0 = jac(0)
+    let j1 = jac(1)
+    let j5 = jac(5)
+    let j8 = jac(8)
+    let j10 = jac(10)
+    let c5 = closed(5) == jac(5)
+    let c8 = closed(8) == jac(8)
+    let c10 = closed(10) == jac(10)
+    "j0={j0}|j1={j1}|j5={j5}|j8={j8}|j10={j10}|c5={c5}|c8={c8}|c10={c10}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "j0=0|j1=1|j5=11|j8=85|j10=341|c5=true|c8=true|c10=true"
+        );
+    }
+
+    #[test]
     fn diff_pell_numbers() {
         // A bug-hunt-118 lock (it458): the PELL NUMBERS P(n) -- a second-order recurrence with a COEFFICIENT of 2
         // on the leading term, P(n) = 2*P(n-1) + P(n-2), seeded P(0)=0, P(1)=1 -- certified against TWO
