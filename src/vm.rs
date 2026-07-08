@@ -2459,6 +2459,69 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_date_difference_days() {
+        // A bug-hunt-109 lock (it440): DATE DIFFERENCE -- the number of days between two Gregorian dates, computed
+        // by converting each date to a serial day-number and subtracting. This extends the date family (Zeller
+        // it435, leap/days-in-month it436) with the standard way real code measures durations. Each date's serial
+        // number is daysBeforeYear(y) + dayOfYear(y,m,d), where daysBeforeYear counts every day before January 1
+        // of year y in the proleptic Gregorian calendar: 365*(y-1) plus the accumulated leap days via the same
+        // /4 - /100 + /400 century rule as the leap-year test, but in CUMULATIVE form. Subtracting two serials
+        // gives the signed day gap, independent of the epoch chosen.
+        //   diff(2020,2,28 -> 2020,3,1) = 2    (a leap year: Feb 28 -> Feb 29 -> Mar 1)
+        //   diff(2019,2,28 -> 2019,3,1) = 1    (a common year: Feb 28 -> Mar 1, no Feb 29)
+        //   diff(2000,1,1 -> 2001,1,1) = 366   (all of year 2000, which is leap)
+        //   diff(2001,1,1 -> 2002,1,1) = 365   (all of year 2001, common)
+        //   diff(2000,1,1 -> 2000,2,1) = 31    (January's length)
+        //   diff(2000,1,1 -> 2000,1,1) = 0     (same date)
+        //   diff(1999,12,31 -> 2000,1,1) = 1   (crossing the year boundary)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the leap day is counted between
+        // Feb 28 and Mar 1 only in leap years (2 vs 1), that a full leap year spans 366 days and a common year 365
+        // via the cumulative daysBeforeYear accounting, that a single month's length is measured correctly, that a
+        // date differs from itself by zero, that the count crosses the year boundary correctly, and that all three
+        // engines agree. This is the "days until the deadline" / age / duration arithmetic an AI writes without a
+        // date library; a backend whose cumulative leap accounting or day-of-year accumulation was off would
+        // miscount the gap. A non-sort lock certifying date-difference via proleptic Gregorian serial day-numbers.
+        let src = r#"fun isLeap(y: Int) -> Bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+fun daysInMonth(y: Int, m: Int) -> Int {
+    if m == 2 { if isLeap(y) { 29 } else { 28 } }
+    else if m == 4 || m == 6 || m == 9 || m == 11 { 30 }
+    else { 31 }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun dayOfYear(y: Int, m: Int, d: Int) -> Int {
+    let before = rangeIncl(1, m - 1).fold(0, fn(acc, mm) { acc + daysInMonth(y, mm) })
+    before + d
+}
+fun daysBeforeYear(y: Int) -> Int {
+    let yy = y - 1
+    365 * yy + yy / 4 - yy / 100 + yy / 400
+}
+fun serial(y: Int, m: Int, d: Int) -> Int {
+    daysBeforeYear(y) + dayOfYear(y, m, d)
+}
+fun diff(y1: Int, m1: Int, d1: Int, y2: Int, m2: Int, d2: Int) -> Int {
+    serial(y2, m2, d2) - serial(y1, m1, d1)
+}
+fun probe() -> Str {
+    let a = diff(2020, 2, 28, 2020, 3, 1)
+    let b = diff(2019, 2, 28, 2019, 3, 1)
+    let c = diff(2000, 1, 1, 2001, 1, 1)
+    let d = diff(2001, 1, 1, 2002, 1, 1)
+    let e = diff(2000, 1, 1, 2000, 2, 1)
+    let f = diff(2000, 1, 1, 2000, 1, 1)
+    let g = diff(1999, 12, 31, 2000, 1, 1)
+    "leap28to1={a}|noleap28to1={b}|y2000full={c}|y2001full={d}|jan={e}|same={f}|newyear={g}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "leap28to1=2|noleap28to1=1|y2000full=366|y2001full=365|jan=31|same=0|newyear=1"
+        );
+    }
+
+    #[test]
     fn diff_leap_year_days_in_month() {
         // A bug-hunt-107 lock (it436): GREGORIAN CALENDAR ARITHMETIC -- leap-year test, days-in-month, and
         // day-of-year ordinal, extending the date family beyond Zeller (it435). The leap-year rule is the full
