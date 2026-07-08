@@ -2269,6 +2269,69 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_base64_encode() {
+        // A certification lock (it437): BASE64 ENCODING, hand-rolled from bit operations (distinct from any
+        // builtin codec). Base64 packs bytes into 6-bit groups: every 3 input bytes (24 bits) become 4 output
+        // characters drawn from the alphabet A-Z (values 0-25), a-z (26-51), 0-9 (52-61), '+' (62), '/' (63).
+        // When the input length is not a multiple of 3, the final group is padded with '=' -- a 1-byte tail
+        // yields two chars plus "==", a 2-byte tail yields three chars plus "=". The bit surgery crosses byte
+        // boundaries: char0 = top 6 bits of byte a; char1 = low 2 bits of a joined with top 4 of b; char2 = low 4
+        // of b joined with top 2 of c; char3 = low 6 of c. It uses shr/band/shl/bor together.
+        //   encode("Man" = 77,97,110) = TWFu       (the canonical RFC 4648 example -- full 3-byte group)
+        //   encode("Ma" = 77,97) = TWE=            (2-byte tail -> 3 chars + one pad)
+        //   encode("M" = 77) = TQ==                (1-byte tail -> 2 chars + two pads)
+        //   encode("foo") = Zm9v
+        //   encode("foobar") = Zm9vYmFy
+        //   encode("") = (empty)                   (no bytes -> empty string)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that three bytes map to four alphabet
+        // characters, that the 6-bit slices are extracted correctly across byte boundaries, that the alphabet
+        // indexing covers upper/lower/digit/'+'/'/', that a 1-byte tail pads with "==" and a 2-byte tail with "=",
+        // that the empty input yields the empty string, and that all three engines agree on the encoding. These
+        // match the canonical base64 test vectors, so the byte-identity is also correctness against the standard.
+        // This is the base64 an AI writes to embed binary in JSON, data URIs, or email; a backend whose shift/mask
+        // bit-plumbing or padding rule was off would emit a corrupt or unpadded string. A non-sort lock certifying
+        // hand-rolled base64 encoding via 6-bit grouping and '=' padding.
+        let src = r#"fun alphabet() -> Str { "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" }
+fun b64char(v: Int) -> Str { alphabet().chars().get(v).unwrap_or("?") }
+fun encChunk(a: Int, b: Int, c: Int, n: Int) -> Str {
+    let c0 = b64char(a.shr(2))
+    let c1 = b64char((a.band(3)).shl(4).bor(b.shr(4)))
+    let c2 = if n < 2 { "=" } else { b64char((b.band(15)).shl(2).bor(c.shr(6))) }
+    let c3 = if n < 3 { "=" } else { b64char(c.band(63)) }
+    "{c0}{c1}{c2}{c3}"
+}
+fun rangeN(k: Int) -> List[Int] {
+    if k <= 0 { [] } else { [rangeN(k - 1), [k - 1]].flatten() }
+}
+fun encode(bytes: List[Int]) -> Str {
+    let n = bytes.len()
+    let chunks = (n + 2) / 3
+    rangeN(chunks).map(fn(i) {
+        let base = i * 3
+        let rem = n - base
+        let a = bytes.get(base).unwrap_or(0)
+        let b = bytes.get(base + 1).unwrap_or(0)
+        let c = bytes.get(base + 2).unwrap_or(0)
+        encChunk(a, b, c, rem)
+    }).join("")
+}
+fun probe() -> Str {
+    let man = encode([77, 97, 110])
+    let ma = encode([77, 97])
+    let m = encode([77])
+    let foo = encode([102, 111, 111])
+    let foobar = encode([102, 111, 111, 98, 97, 114])
+    let empty = encode([])
+    "Man={man}|Ma={ma}|M={m}|foo={foo}|foobar={foobar}|empty=[{empty}]"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "Man=TWFu|Ma=TWE=|M=TQ==|foo=Zm9v|foobar=Zm9vYmFy|empty=[]"
+        );
+    }
+
+    #[test]
     fn diff_leap_year_days_in_month() {
         // A bug-hunt-107 lock (it436): GREGORIAN CALENDAR ARITHMETIC -- leap-year test, days-in-month, and
         // day-of-year ordinal, extending the date family beyond Zeller (it435). The leap-year rule is the full
