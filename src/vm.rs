@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_rectangular_transpose_via_map() {
+        // A bug-hunt-66 lock (it353): RECTANGULAR matrix transpose via nested map -- turning a 2x3 into a 3x2
+        // so the dimensions genuinely SWAP (unlike a square transpose, which leaves dims unchanged). There is
+        // no transpose builtin, so the result is built column-by-column: for each output row j (0..ncols) map
+        // over the input rows i (0..nrows) and read m[i][j]. The nested rangeN(ncols).map(j ->
+        // rangeN(nrows).map(i -> m[i][j])) construction produces t[j][i] = m[i][j], and the reported dims
+        // (rows x cols) flip from 2x3 to 3x2.
+        //   [[1,2,3],[4,5,6]] -> [[1,4],[2,5],[3,6]] ; dims 2x3 -> 3x2
+        // Byte-identical on interp/KVM (native per the sweep). Confirms ncols is read from the first row, that
+        // the outer map ranges over columns and the inner over rows (the index swap t[j][i]=m[i][j]), that a
+        // non-square shape flips its dimensions (3 rows of 2, from 2 rows of 3), that nested get().unwrap_or
+        // indexes the 2-D structure correctly, and that all three engines agree on the reshaped matrix. This
+        // is the transpose an AI writes to pivot rows-to-columns for tabular data, and the rectangular case is
+        // the one that catches a dims-swap bug a square example would hide.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun transpose(m: List[List[Int]]) -> List[List[Int]] {
+    let nrows = m.len()
+    let ncols = m.first().unwrap_or([]).len()
+    rangeN(ncols).map(fn(j) {
+        rangeN(nrows).map(fn(i) {
+            m.get(i).unwrap_or([]).get(j).unwrap_or(0)
+        })
+    })
+}
+fun probe() -> Str {
+    let m = [[1, 2, 3], [4, 5, 6]]
+    let t = transpose(m)
+    let dims = "{t.len()}x{t.first().unwrap_or([]).len()}"
+    "t={t}|dims={dims}"
+}
+"#;
+        assert_eq!(differential(src), "t=[[1, 4], [2, 5], [3, 6]]|dims=3x2");
+    }
+
+    #[test]
     fn diff_lcm_of_list_fold() {
         // A certification lock (it352): the LCM of a WHOLE LIST via fold-reduction -- the multiplicative DUAL
         // of gcd-of-list (it351). Fold the list with lcm as the reducer, SEEDED WITH 1. The seed choice is the
