@@ -2104,6 +2104,53 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_tree_prune_to_option() {
+        // A certification lock (it311): a recursive tree PRUNE that returns Option[Tree] -- it drops leaves
+        // failing a predicate and COLLAPSES branches when a subtree prunes to nothing, returning None if the
+        // whole tree vanishes. it297's tree MAP always rebuilds every node 1:1; this conditionally REMOVES
+        // structure: a Branch whose child pruned away becomes just the surviving child.
+        //   prune(Leaf v)     = if v > 0 Some(Leaf v) else None
+        //   prune(Branch l r) = merge(prune l, prune r):  None/None -> None,  Some/None -> Some(l),
+        //                                                 None/Some -> Some(r), Some/Some -> Some(Branch)
+        //   t      = Branch(Branch(Leaf 5, Leaf -3), Leaf 7)
+        //            -> Branch(Leaf 5, Leaf 7)  (the -3 leaf drops; its Branch collapses to Leaf 5), sum 12
+        //   allneg = Branch(Leaf -1, Leaf -2)   -> None (both leaves fail) -> "empty"
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the leaf predicate keeps/drops,
+        // that the four-way Branch merge collapses a one-child branch to the surviving subtree (Branch(Leaf
+        // 5, Leaf -3) becomes Leaf 5, NOT Branch(Leaf 5)), that a fully-pruned tree returns None, and that
+        // the nested Option-matching threads through the recursion. sumT over the result witnesses the
+        // surviving structure (5 + 7 = 12, the -3 gone). This is the filter/prune-a-tree an AI writes for
+        // dead-node elimination, decision-tree pruning, or stripping empty nodes from an AST; a backend that
+        // left an empty branch instead of collapsing it would keep a phantom node, and one that mishandled
+        // the all-pruned case would return Some of an empty tree instead of None.
+        let src = r#"type Tree = Leaf(v: Int) | Branch(l: Tree, r: Tree)
+fun prune(t: Tree) -> Option[Tree] {
+    match t { Leaf(v) => { if v > 0 { Some(Leaf(v: v)) } else { None } }
+        Branch(l, r) => {
+            let pl = prune(l)
+            let pr = prune(r)
+            match pl { None => pr
+                Some(lt) => match pr { None => Some(lt)
+                    Some(rt) => Some(Branch(l: lt, r: rt)) } } } }
+}
+fun sumT(t: Tree) -> Int {
+    match t { Leaf(v) => v
+        Branch(l, r) => sumT(l) + sumT(r) }
+}
+fun report(o: Option[Tree]) -> Str {
+    match o { None => "empty"
+        Some(t) => to_str(sumT(t)) }
+}
+fun probe() -> Str {
+    let t = Branch(l: Branch(l: Leaf(v: 5), r: Leaf(v: 0 - 3)), r: Leaf(v: 7))
+    let allneg = Branch(l: Leaf(v: 0 - 1), r: Leaf(v: 0 - 2))
+    "{report(prune(t))}|{report(prune(allneg))}"
+}
+"#;
+        assert_eq!(differential(src), "12|empty");
+    }
+
+    #[test]
     fn diff_recursive_adt_to_json_serialize_and_parse() {
         // A bug-hunt-47 lock (it310): recursive ADT-to-JSON SERIALIZATION -- a function that renders a Tree
         // ADT to a JSON string, then json_parse validates the result is well-formed. it309 pretty-prints to
