@@ -2220,6 +2220,70 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_maximum_product_subarray() {
+        // A certification lock (it382): MAXIMUM PRODUCT SUBARRAY -- the largest product of any contiguous
+        // non-empty sub-slice. This is the MULTIPLICATIVE cousin of Kadane's additive max-subarray (it372), and
+        // it is genuinely harder because it must carry a DUAL state: BOTH a running maximum AND a running
+        // minimum product ending at the current position. The reason is sign flips -- multiplying by a NEGATIVE
+        // number swaps the roles of max and min (a large-magnitude negative running-min becomes a large
+        // positive product), so the running-min must be tracked to feed future maxima. At each element x the
+        // three candidates for the best product ending here are {x, x*cmax, x*cmin}; the new running max is the
+        // max of those three, the new running min is the min of those three, and best tracks the running max
+        // across all positions. (Additive Kadane needs only a single running state -- this needs two.)
+        //   maxProduct([2,3,-2,4]) = 6      (2*3; the -2 breaks the run)
+        //   maxProduct([-2,0,-1]) = 0       (the zero beats both negatives)
+        //   maxProduct([-2,3,-4]) = 24      (the whole array -- two negatives cancel)
+        //   maxProduct([2,3,4]) = 24        (all positive -- the whole array)
+        //   maxProduct([-1]) = -1           (a single negative element)
+        //   maxProduct([-2,-3,-4]) = 12     (the 2-element window -2*-3 beats the whole array's -24)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the DUAL max/min state is threaded
+        // correctly, that a negative element swaps the contributions (x*cmin can become the new max),
+        // that a zero collapses both running products (best falls back to a non-zero elsewhere or 0),
+        // that two negatives across the whole array cancel to a positive (-2,3,-4 = 24) while three negatives
+        // favor a 2-element window (-2,-3,-4 = 12 not -24), that an all-positive array takes the whole product,
+        // that a single negative returns itself, and that all three engines agree on the record-carrying fold
+        // with sign-sensitive min/max tracking. This is the max-product-subarray an AI writes for
+        // running-product analysis and signal-gain windows; a backend whose dual-state tracking, three-way
+        // min/max, or sign handling was off would miss the negative-cancellation optimum. Adds the
+        // multiplicative dual-state twin of additive Kadane.
+        let src = r#"type St = { cmax: Int, cmin: Int, best: Int, started: Bool }
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun mini(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+fun max3(a: Int, b: Int, c: Int) -> Int { maxi(a, maxi(b, c)) }
+fun min3(a: Int, b: Int, c: Int) -> Int { mini(a, mini(b, c)) }
+fun maxProduct(xs: List[Int]) -> Int {
+    let init = St(cmax: 0, cmin: 0, best: 0, started: false)
+    let final = xs.fold(init, fn(s, x) {
+        if s.started {
+            let a = x
+            let b = x * s.cmax
+            let c = x * s.cmin
+            let nmax = max3(a, b, c)
+            let nmin = min3(a, b, c)
+            St(cmax: nmax, cmin: nmin, best: maxi(s.best, nmax), started: true)
+        } else {
+            St(cmax: x, cmin: x, best: x, started: true)
+        }
+    })
+    final.best
+}
+fun probe() -> Str {
+    let a = maxProduct([2, 3, 0 - 2, 4])
+    let b = maxProduct([0 - 2, 0, 0 - 1])
+    let c = maxProduct([0 - 2, 3, 0 - 4])
+    let d = maxProduct([2, 3, 4])
+    let e = maxProduct([0 - 1])
+    let f = maxProduct([0 - 2, 0 - 3, 0 - 4])
+    "a={a}|b={b}|c={c}|allpos={d}|neg={e}|f={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a=6|b=0|c=24|allpos=24|neg=-1|f=12"
+        );
+    }
+
+    #[test]
     fn diff_longest_consecutive_run() {
         // A bug-hunt-80 lock (it381): LONGEST RUN of identical ADJACENT elements -- the length of the longest
         // maximal streak of equal consecutive values in a list. This is a single-pass fold that carries a
