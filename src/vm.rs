@@ -2104,6 +2104,44 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_mode_most_frequent() {
+        // A bug-hunt-64 lock (it349): the mode (most-frequent element) via a frequency tally plus an argmax
+        // over the map. First fold the list into a Map[Int, Int] count table (like word-count but Int keys).
+        // Then find the key with the highest count using Map.fold's 3-arg reducer (acc, k, v): the accumulator
+        // carries the current BEST KEY, and at each entry we compare the entry's count v against the stored
+        // best's count (counts.get(acc)), keeping k when strictly greater. This is argmax-over-map-values,
+        // where only the key is threaded through the accumulator and the count is re-looked-up.
+        //   [3,1,3,2,3,1,4,1,3] -> counts {3:4, 1:3, 2:1, 4:1} -> mode=3 (count 4, beats 1's count 3)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the tally fold builds the right counts
+        // (3 appears 4x, 1 appears 3x), that Map.fold's 3-arg form threads (acc, key, value), that the argmax
+        // updates only on a STRICT improvement (v > best), that re-looking-up the incumbent's count via
+        // get(acc) works mid-fold, and that all three engines agree on both the winning key and its count.
+        // This is the mode an AI writes for "most common value" -- top-seller, plurality vote, hot key; a
+        // backend whose Map iteration order or 3-arg fold binding differed could pick the wrong argmax.
+        let src = r#"fun tally(xs: List[Int]) -> Map[Int, Int] {
+    xs.fold(Map(), fn(m, x) {
+        let c = m.get(x).unwrap_or(0)
+        m.insert(x, c + 1)
+    })
+}
+fun probe() -> Str {
+    let xs = [3, 1, 3, 2, 3, 1, 4, 1, 3]
+    let counts = tally(xs)
+    let seed = 0 - 1
+    let best = counts.fold(seed, fn(acc, k, v) {
+        let bestCount = counts.get(acc).unwrap_or(0 - 1)
+        if v > bestCount { k } else { acc }
+    })
+    let bestCount = counts.get(best).unwrap_or(0)
+    let count3 = counts.get(3).unwrap_or(0)
+    let count1 = counts.get(1).unwrap_or(0)
+    "mode={best}|modeCount={bestCount}|c3={count3}|c1={count1}"
+}
+"#;
+        assert_eq!(differential(src), "mode=3|modeCount=4|c3=4|c1=3");
+    }
+
+    #[test]
     fn diff_median_of_sorted() {
         // A certification lock (it348): the median -- sort the list, then index the middle. The two PARITY
         // cases have different index arithmetic and this pins both. For ODD length the median is the single
