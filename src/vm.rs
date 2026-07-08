@@ -3029,6 +3029,54 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_narayana_cows() {
+        // A bug-hunt-120 lock (it462): NARAYANA'S COWS sequence a(n) = a(n-1) + a(n-3), seeded a(0)=a(1)=a(2)=1
+        // -- a THIRD-order recurrence that references n-1 and n-3 while SKIPPING n-2, cross-validated against the
+        // partial-sum identity sum_{i=0..n} a(i) = a(n+3) - 1. This adds a genuinely new structural shape to the
+        // certified recurrence family: Fibonacci/Lucas/Pell/Jacobsthal are all second-order (n-1, n-2), tribonacci
+        // sums all three of n-1/n-2/n-3, but Narayana's cows uniquely skips the n-2 term. The sequence
+        // (1,1,1,2,3,4,6,9,13,19,28,...) counts the cows in Narayana's classic problem and its growth ratio tends
+        // to the supergolden ratio. The partial-sum cross-check is INDEPENDENT of the defining recurrence: it is a
+        // telescoping consequence (summing a(i)=a(i-1)+a(i-3) collapses to a(n+3)-1), so it catches an off-by-one
+        // in the seeds or a wrong lag that a bare recurrence self-check would miss.
+        //   a(0)=1, a(3)=2, a(5)=4, a(8)=13, a(10)=28    (OEIS A000930, Narayana's cows)
+        //   sum5: a(0)+..+a(5) = 1+1+1+2+3+4 = 12 == a(8)-1 = 13-1
+        //   sum7: a(0)+..+a(7) = 27          == a(10)-1 = 28-1
+        //   rec:  a(10)=28 == a(9)+a(7) = 19+9   (the n-1, n-3 recurrence self-check)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the recurrence adds the n-1 and n-3
+        // terms (skipping n-2), that the three-fold base a(0)=a(1)=a(2)=1 seeds it, that the values match the known
+        // Narayana sequence, that the running total equals a(n+3)-1 at two separate points (an identity independent
+        // of the definition), and that all three engines agree. This is the third-order "skip-one" recurrence an AI
+        // writes for combinatorial growth or number theory; the partial-sum identity catches a wrong lag or seed.
+        // A non-sort lock certifying Narayana's cows against its recurrence and the a(n+3)-1 partial-sum identity.
+        let src = r#"fun nara(n: Int) -> Int {
+    if n <= 2 { 1 } else { nara(n - 1) + nara(n - 3) }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun partialSum(n: Int) -> Int {
+    rangeIncl(0, n).fold(0, fn(acc, i) { acc + nara(i) })
+}
+fun probe() -> Str {
+    let a0 = nara(0)
+    let a3 = nara(3)
+    let a5 = nara(5)
+    let a8 = nara(8)
+    let a10 = nara(10)
+    let sum5 = partialSum(5) == nara(8) - 1
+    let sum7 = partialSum(7) == nara(10) - 1
+    let rec = nara(10) == nara(9) + nara(7)
+    "a0={a0}|a3={a3}|a5={a5}|a8={a8}|a10={a10}|sum5={sum5}|sum7={sum7}|rec={rec}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a0=1|a3=2|a5=4|a8=13|a10=28|sum5=true|sum7=true|rec=true"
+        );
+    }
+
+    #[test]
     fn diff_square_pyramidal_numbers() {
         // A certification lock (it461): the SQUARE PYRAMIDAL NUMBERS SP(n) -- the 3D figurate numbers counting
         // spheres stacked in a square-based pyramid (each layer a square) -- certified by THREE independent
