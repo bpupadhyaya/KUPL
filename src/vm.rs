@@ -3029,6 +3029,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_centered_hexagonal_numbers() {
+        // A certification lock (it465): the CENTERED HEXAGONAL NUMBERS CH(n) = 3n(n-1) + 1 -- the count of dots in
+        // n nested hexagonal rings around a single center -- certified by TWO independent and striking identities.
+        // This opens a new branch of the figurate family: where the earlier locks covered REGULAR polygonal
+        // (it452) and pyramidal (it460/it461) numbers, these are CENTERED figurate numbers, built as rings around
+        // a central point rather than filling a corner. The two cross-checks are: the ring identity
+        // CH(n) = 1 + 6*T(n-1) (one center dot plus six triangular arms, the hexagonal-ring construction), and the
+        // remarkable cube identity sum_{k=1..n} CH(k) = n^3 -- the centered hexagonal numbers are exactly the first
+        // differences of consecutive cubes, so their partial sums telescope to a perfect cube. Both are wholly
+        // independent of the 3n(n-1)+1 closed form.
+        //   CH(1)=1, CH(2)=7, CH(4)=37, CH(6)=91    (OEIS A003215, the centered hexagonal numbers)
+        //   ring:  CH(4)=37 == 1 + 6*T(3) = 1 + 6*6      (center dot + six triangular arms)
+        //   ring2: CH(6)=91 == 1 + 6*T(5) = 1 + 6*15
+        //   cube:  CH(1)+CH(2)+CH(3)+CH(4) = 1+7+19+37 = 64  == 4^3   (partial sums are perfect cubes)
+        //   cube2: sum of CH(1..6) = 216 == 6^3
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that 3n(n-1)+1 equals one plus six times the
+        // (n-1)-th triangular number (the ring decomposition), that the running sum of centered hexagonal numbers
+        // telescopes exactly to n^3 (the cube-difference identity, an independent and non-obvious property), that
+        // both identities hold at multiple points, and that all three engines agree. This is the "hexagonal
+        // packing / nested rings" count an AI writes for figurate geometry, hex grids, or combinatorics; the
+        // cube-sum identity in particular catches any error the ring form would share. A non-sort lock certifying
+        // the centered hexagonal numbers against their ring decomposition and the sum-to-cubes identity.
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun tri(k: Int) -> Int { k * (k + 1) / 2 }
+fun chex(n: Int) -> Int { 3 * n * (n - 1) + 1 }
+fun sumChex(n: Int) -> Int {
+    rangeIncl(1, n).fold(0, fn(acc, k) { acc + chex(k) })
+}
+fun probe() -> Str {
+    let c1 = chex(1)
+    let c2 = chex(2)
+    let c4 = chex(4)
+    let c6 = chex(6)
+    let ring = chex(4) == 1 + 6 * tri(3)
+    let cube = sumChex(4) == 4 * 4 * 4
+    let cube2 = sumChex(6) == 6 * 6 * 6
+    let ring2 = chex(6) == 1 + 6 * tri(5)
+    "c1={c1}|c2={c2}|c4={c4}|c6={c6}|ring={ring}|cube={cube}|cube2={cube2}|ring2={ring2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "c1=1|c2=7|c4=37|c6=91|ring=true|cube=true|cube2=true|ring2=true"
+        );
+    }
+
+    #[test]
     fn diff_pronic_numbers() {
         // A bug-hunt-121 lock (it464): the PRONIC (oblong / rectangular) NUMBERS Pr(n) = n(n+1) -- the count of
         // dots in an n by (n+1) rectangle -- certified by THREE independent characterizations plus a parity
