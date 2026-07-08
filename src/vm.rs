@@ -2269,6 +2269,71 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_base64_decode() {
+        // A bug-hunt-108 lock (it438): BASE64 DECODING, the exact inverse of the it437 encoder, forming a
+        // roundtrip codec pair (like Gray code it433 and Roman numerals it426). Decoding maps each character back
+        // to its 6-bit value by its POSITION in the alphabet, regroups every 4 characters (24 bits) into 3 output
+        // bytes, and STRIPS padding: one trailing '=' means the group carried only 2 bytes, two '=' means only 1.
+        // The bit surgery mirrors the encoder in reverse: byte0 = v0<<2 | v1>>4, byte1 = (v1&15)<<4 | v2>>2,
+        // byte2 = (v2&3)<<6 | v3. The expected byte lists are exactly the inputs the it437 encoder produced these
+        // strings from, so this pins decode(encode(x)) == x on the RFC 4648 test vectors.
+        //   decode("TWFu") = 77,97,110         ("Man" -- inverse of the canonical example)
+        //   decode("TWE=") = 77,97             ("Ma" -- one pad strips to 2 bytes)
+        //   decode("TQ==") = 77                ("M" -- two pads strip to 1 byte)
+        //   decode("Zm9vYmFy") = 102,111,111,98,97,114   ("foobar")
+        //   decode("") = (empty)               (empty string -> no bytes)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each character is mapped back to its
+        // 6-bit value by alphabet position, that four characters regroup into three bytes via the reverse bit
+        // splices, that one '=' yields two output bytes and two '=' yields one (the padding-strip rule), that the
+        // empty string decodes to no bytes, that the results are the exact byte lists the it437 encoder started
+        // from (so the codec round-trips on the standard vectors), and that all three engines agree. This is the
+        // base64 decode an AI writes to pull binary back out of JSON, a data URI, or an email; a backend whose
+        // position lookup, reverse bit-plumbing, or padding-strip was off would recover the wrong bytes. A
+        // non-sort lock certifying hand-rolled base64 decoding and the encode/decode roundtrip.
+        let src = r#"fun alphabet() -> Str { "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" }
+fun charVal(c: Str) -> Int { alphabet().chars().position(fn(x) { x == c }).unwrap_or(0) }
+fun rangeN(k: Int) -> List[Int] {
+    if k <= 0 { [] } else { [rangeN(k - 1), [k - 1]].flatten() }
+}
+fun decode(s: Str) -> List[Int] {
+    let cs = s.chars()
+    let n = cs.len()
+    let groups = n / 4
+    rangeN(groups).flat_map(fn(g) {
+        let base = g * 4
+        let e0 = cs.get(base).unwrap_or("A")
+        let e1 = cs.get(base + 1).unwrap_or("A")
+        let e2 = cs.get(base + 2).unwrap_or("=")
+        let e3 = cs.get(base + 3).unwrap_or("=")
+        let v0 = charVal(e0)
+        let v1 = charVal(e1)
+        let v2 = if e2 == "=" { 0 } else { charVal(e2) }
+        let v3 = if e3 == "=" { 0 } else { charVal(e3) }
+        let b0 = v0.shl(2).bor(v1.shr(4))
+        let b1 = v1.band(15).shl(4).bor(v2.shr(2))
+        let b2 = v2.band(3).shl(6).bor(v3)
+        if e2 == "=" { [b0] }
+        else if e3 == "=" { [b0, b1] }
+        else { [b0, b1, b2] }
+    })
+}
+fun shw(xs: List[Int]) -> Str { xs.map(fn(x) { x.to_str() }).join(",") }
+fun probe() -> Str {
+    let man = shw(decode("TWFu"))
+    let ma = shw(decode("TWE="))
+    let m = shw(decode("TQ=="))
+    let foobar = shw(decode("Zm9vYmFy"))
+    let empty = shw(decode(""))
+    "man={man}|ma={ma}|m={m}|foobar={foobar}|empty=[{empty}]"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "man=77,97,110|ma=77,97|m=77|foobar=102,111,111,98,97,114|empty=[]"
+        );
+    }
+
+    #[test]
     fn diff_base64_encode() {
         // A certification lock (it437): BASE64 ENCODING, hand-rolled from bit operations (distinct from any
         // builtin codec). Base64 packs bytes into 6-bit groups: every 3 input bytes (24 bits) become 4 output
