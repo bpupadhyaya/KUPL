@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_fizzbuzz_modulo_cascade() {
+        // A bug-hunt-59 lock (it339): FizzBuzz -- the canonical modulo-driven conditional cascade, mapped over
+        // a range and joined. The ORDER of the checks is load-bearing: %15 must be tested FIRST (else 15 would
+        // match %3 and print "Fizz" instead of "FizzBuzz"); then %3 -> Fizz, %5 -> Buzz, else the number. The
+        // 1..15 range is built by mapping (i+1) over rangeN(15), each mapped through fb, and joined with ",".
+        //   1,2,Fizz,4,Buzz,Fizz,7,8,Fizz,Buzz,11,Fizz,13,14,FizzBuzz
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the nested if-else cascade evaluates
+        // in source order so the %15 case wins for 15 (FizzBuzz, not Fizz), that %3 and %5 tag their multiples
+        // (3/6/9/12 -> Fizz, 5/10 -> Buzz), that the else branch stringifies the number via to_str, and that
+        // map+join stitch the 15 results into one comma-separated line. This is the most-written beginner
+        // program and a real precedence trap; a backend that evaluated the cascade out of order, or mishandled
+        // %, would mislabel 15 or the multiples.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun fb(n: Int) -> Str {
+    if n % 15 == 0 { "FizzBuzz" }
+    else {
+        if n % 3 == 0 { "Fizz" }
+        else {
+            if n % 5 == 0 { "Buzz" }
+            else { n.to_str() }
+        }
+    }
+}
+fun probe() -> Str {
+    let nums = rangeN(15).map(fn(i) { i + 1 })
+    nums.map(fn(n) { fb(n) }).join(",")
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "1,2,Fizz,4,Buzz,Fizz,7,8,Fizz,Buzz,11,Fizz,13,14,FizzBuzz"
+        );
+    }
+
+    #[test]
     fn diff_base_conversion_roundtrip() {
         // A certification lock (it338): base-conversion round-trip -- to_radix (Int -> Str in a given base)
         // and parse_radix (Str -> Option[Int] from a given base) are INVERSES, cross-checked against the
