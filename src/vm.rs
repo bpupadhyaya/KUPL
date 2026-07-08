@@ -2269,6 +2269,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_bit_reversal() {
+        // A bug-hunt-105 lock (it432): BIT REVERSAL within a fixed width -- reverse the order of the low `width`
+        // bits of an integer. This is the permutation at the heart of the iterative FFT (the bit-reversal
+        // shuffle), and it also shows up in Gray-code and hardware-register work. The algorithm repeatedly peels
+        // the LOW bit off the input (n.band(1), then n.shr(1)) and shifts it into the LOW end of an accumulator
+        // that is itself shifted left first (acc.shl(1).bor(bit)) -- so the first bit taken ends up in the highest
+        // reversed position and vice versa. The result depends on the chosen width: reversing 6 in 3 bits differs
+        // from reversing 6 in 8 bits. It exercises the Int bit-operation METHODS band/shr/shl/bor together.
+        //   revBits(1,8) = 128     (00000001 -> 10000000)
+        //   revBits(3,4) = 12      (0011 -> 1100)
+        //   revBits(6,3) = 3       (110 -> 011)
+        //   revBits(0,8) = 0       (all zero -- unchanged)
+        //   revBits(255,8) = 255   (all ones -- a palindrome under reversal)
+        //   revBits(11,4) = 13     (1011 -> 1101)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the low bit is extracted with band 1,
+        // that the input is right-shifted to advance, that the accumulator is left-shifted then or-ed with the
+        // extracted bit (so bit order is reversed within the width), that the width bounds how many bits
+        // participate (6 reverses to 3 in width 3), that zero and all-ones are handled (all-ones is a palindrome),
+        // and that all three engines agree on the reversal. This is the bit reversal an AI writes for FFT index
+        // permutation, Gray codes, or bit-twiddling; a backend whose shift direction, width bound, or bit
+        // extraction was off would scramble the result. A non-sort lock certifying fixed-width bit reversal via
+        // band/shr/shl/bor.
+        let src = r#"fun revBits(n: Int, width: Int) -> Int {
+    revHelper(n, width, 0)
+}
+fun revHelper(n: Int, remaining: Int, acc: Int) -> Int {
+    if remaining <= 0 { acc }
+    else {
+        let bit = n.band(1)
+        revHelper(n.shr(1), remaining - 1, acc.shl(1).bor(bit))
+    }
+}
+fun probe() -> Str {
+    let a = revBits(1, 8)
+    let b = revBits(3, 4)
+    let c = revBits(6, 3)
+    let d = revBits(0, 8)
+    let e = revBits(255, 8)
+    let f = revBits(11, 4)
+    "r1w8={a}|r3w4={b}|r6w3={c}|r0w8={d}|r255w8={e}|r11w4={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "r1w8=128|r3w4=12|r6w3=3|r0w8=0|r255w8=255|r11w4=13"
+        );
+    }
+
+    #[test]
     fn diff_extended_euclidean_bezout() {
         // A certification lock (it431): EXTENDED EUCLIDEAN ALGORITHM -- computes not just gcd(a,b) but the BEZOUT
         // COEFFICIENTS x,y satisfying a*x + b*y = gcd(a,b), and applies them to compute the MODULAR INVERSE. This
