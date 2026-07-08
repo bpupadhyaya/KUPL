@@ -3029,6 +3029,48 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_pell_numbers() {
+        // A bug-hunt-118 lock (it458): the PELL NUMBERS P(n) -- a second-order recurrence with a COEFFICIENT of 2
+        // on the leading term, P(n) = 2*P(n-1) + P(n-2), seeded P(0)=0, P(1)=1 -- certified against TWO
+        // independent identities. This is DISTINCT from Lucas (it457) and the Fibonacci family: those all use the
+        // coefficient-1 recurrence x(n) = x(n-1) + x(n-2); Pell doubles the previous term, giving the
+        // rational-approximation-to-sqrt(2) sequence 0,1,2,5,12,29,70,169,408,985,2378. Two cross-checks, each
+        // tying Pell to a separate identity, guard it: the companion Pell (Pell-Lucas) number Q(n) = P(n-1)+P(n+1)
+        // (so Q(3)=P(2)+P(4)=14), and the sum-of-squares identity P(n)^2 + P(n+1)^2 = P(2n+1).
+        //   P(0)=0, P(1)=1, P(5)=29, P(8)=408, P(10)=2378    (OEIS A000129, the Pell numbers)
+        //   q3 = P(2)+P(4) = 2+12 = 14   (the companion Pell number Q(3))
+        //   sq:  P(2)^2+P(3)^2 = 4+25   = 29  = P(5)
+        //   sq2: P(3)^2+P(4)^2 = 25+144 = 169 = P(7)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the leading coefficient is 2 (not 1 --
+        // the single most likely error, which would collapse Pell into Fibonacci), that the seeds P(0)=0, P(1)=1
+        // drive the sequence, that the computed values match the known Pell sequence, that the companion-Pell
+        // relation holds, that the sum-of-squares identity P(n)^2+P(n+1)^2=P(2n+1) holds at two separate points,
+        // and that all three engines agree. This is the Pell sequence an AI writes for sqrt(2) rational
+        // approximations, Pell's equation, or recurrence work; the two identities catch a wrong coefficient or
+        // seed. A non-sort lock certifying the Pell numbers against the companion-Pell and sum-of-squares
+        // identities.
+        let src = r#"fun pell(n: Int) -> Int {
+    if n == 0 { 0 } else if n == 1 { 1 } else { 2 * pell(n - 1) + pell(n - 2) }
+}
+fun probe() -> Str {
+    let p0 = pell(0)
+    let p1 = pell(1)
+    let p5 = pell(5)
+    let p8 = pell(8)
+    let p10 = pell(10)
+    let q3 = pell(2) + pell(4)
+    let sq = pell(2) * pell(2) + pell(3) * pell(3) == pell(5)
+    let sq2 = pell(3) * pell(3) + pell(4) * pell(4) == pell(7)
+    "p0={p0}|p1={p1}|p5={p5}|p8={p8}|p10={p10}|q3={q3}|sq={sq}|sq2={sq2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "p0=0|p1=1|p5=29|p8=408|p10=2378|q3=14|sq=true|sq2=true"
+        );
+    }
+
+    #[test]
     fn diff_lucas_numbers() {
         // A certification lock (it457): the LUCAS NUMBERS L(n) -- the Fibonacci COMPANION sequence, same
         // recurrence L(n) = L(n-1) + L(n-2) but seeded L(0)=2, L(1)=1 instead of 0,1 -- cross-validated against
