@@ -2104,6 +2104,50 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_combinations_choose_k() {
+        // A certification lock (it358): COMBINATIONS (choose-k) via the include-first/exclude-first recursion --
+        // subsets of a FIXED SIZE k, the middle ground between the power set (it356, all 2^n subsets) and
+        // permutations (it357, all n! orderings). The recursion embodies Pascal's rule
+        // C(n,k) = C(n-1,k-1) + C(n-1,k): choosing nothing (k==0) yields [[]] (one empty combination); when
+        // fewer than k elements remain it is impossible ([]); otherwise split into combinations that INCLUDE
+        // the head (prepend head to each C(rest, k-1)) and those that EXCLUDE it (C(rest, k)).
+        //   choose([1,2,3,4], 2) -> [[1,2],[1,3],[1,4],[2,3],[2,4],[3,4]]  (C(4,2) = 6)
+        //   choose([1,2,3], 0) -> [[]]         (C(n,0) = 1, the empty combination)
+        //   choose([1,2,3], 3) -> [[1,2,3]]    (C(3,3) = 1, the whole set)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the k==0 base yields the singleton
+        // empty combination, the len<k base yields the empty list (no combination possible), that the
+        // include/exclude split reconstructs Pascal's rule so C(4,2) produces exactly 6, that prepending the
+        // head to each smaller combination builds size-k subsets, that the enumeration is lexicographic
+        // ([1,*] before [2,*] before [3,*]), and that all three engines agree on count and order. This is the
+        // choose-k an AI writes for lottery draws, team selection, and fixed-size subset problems; a backend
+        // whose include/exclude recursion or base cases were off would miscount or mis-order the combinations.
+        let src = r#"fun combos(xs: List[Int], k: Int) -> List[List[Int]] {
+    if k == 0 { [[]] }
+    else {
+        if xs.len() < k { [] }
+        else {
+            let head = xs.first().unwrap_or(0)
+            let rest = xs.drop(1)
+            let withHead = combos(rest, k - 1).map(fn(c) { [[head], c].flatten() })
+            let withoutHead = combos(rest, k)
+            [withHead, withoutHead].flatten()
+        }
+    }
+}
+fun probe() -> Str {
+    let c2 = combos([1, 2, 3, 4], 2)
+    let c0 = combos([1, 2, 3], 0)
+    let cAll = combos([1, 2, 3], 3)
+    "c2={c2}|c2count={c2.len()}|c0={c0}|cAll={cAll}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "c2=[[1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]]|c2count=6|c0=[[]]|cAll=[[1, 2, 3]]"
+        );
+    }
+
+    #[test]
     fn diff_permutations_recursive() {
         // A bug-hunt-68 lock (it357): all PERMUTATIONS (orderings) of a list via recursive flat_map. Distinct
         // from the power set (it356, which counts 2^n subsets by doubling): permutations produce n! orderings.
