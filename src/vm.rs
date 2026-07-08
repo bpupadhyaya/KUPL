@@ -2220,6 +2220,62 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_longest_common_subsequence_three() {
+        // A bug-hunt-85 lock (it391): THREE-STRING LONGEST COMMON SUBSEQUENCE -- the length of the longest
+        // subsequence common to ALL THREE input strings. This is a 3-D DP that GENERALIZES the two-string LCS
+        // (it361) by one more dimension: where two-string LCS recurses over a pair of suffixes, this recurses
+        // over a TRIPLE. The recurrence over lcs3(a, b, c): if ANY of the three is empty the answer is 0;
+        // if the three leading characters are ALL EQUAL, that character is in the common subsequence, so it is
+        // 1 + lcs3 on all three tails; otherwise it is the MAX over the three ways of dropping one leading
+        // character (drop a's head, or b's head, or c's head) -- exactly the two-string skip-forward rule
+        // lifted to three sequences.
+        //   solve("abcd","acbd","abd") = 3                          ("abd" -- a subsequence of all three)
+        //   solve("geeks","geeksfor","geeksforgeeks") = 5           ("geeks" -- the classic example)
+        //   solve("abc","abc","abc") = 3                            (identical -- the whole string)
+        //   solve("abc","def","ghi") = 0                            (no character shared by all three)
+        //   solve("","abc","abc") = 0                               (an empty string forces 0)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that a matching character requires
+        // agreement across ALL THREE heads (not just two), that a mismatch branches into three drop-one-head
+        // subproblems and takes their max, that any empty sequence terminates at 0, that identical strings
+        // yield the full length, that three pairwise-disjoint strings yield 0, and that all three engines agree
+        // on the 3-D subsequence recursion. This is the three-string LCS an AI writes for multi-sequence
+        // alignment, three-way diff, and shared-pattern detection across three sources; a backend whose triple
+        // head-match, three-way max branch, or empty base was off would mis-measure. Extends the two-string LCS
+        // to a three-dimensional common-subsequence DP.
+        let src = r#"fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun lcs3(a: List[Str], b: List[Str], c: List[Str]) -> Int {
+    if a.len() == 0 { 0 }
+    else {
+        if b.len() == 0 { 0 }
+        else {
+            if c.len() == 0 { 0 }
+            else {
+                let ha = a.first().unwrap_or("")
+                let hb = b.first().unwrap_or("")
+                let hc = c.first().unwrap_or("")
+                if ha == hb {
+                    if hb == hc {
+                        1 + lcs3(a.drop(1), b.drop(1), c.drop(1))
+                    } else { maxi(maxi(lcs3(a.drop(1), b, c), lcs3(a, b.drop(1), c)), lcs3(a, b, c.drop(1))) }
+                } else { maxi(maxi(lcs3(a.drop(1), b, c), lcs3(a, b.drop(1), c)), lcs3(a, b, c.drop(1))) }
+            }
+        }
+    }
+}
+fun solve(x: Str, y: Str, z: Str) -> Int { lcs3(x.chars(), y.chars(), z.chars()) }
+fun probe() -> Str {
+    let a = solve("abcd", "acbd", "abd")
+    let b = solve("geeks", "geeksfor", "geeksforgeeks")
+    let c = solve("abc", "abc", "abc")
+    let d = solve("abc", "def", "ghi")
+    let e = solve("", "abc", "abc")
+    "a={a}|geeks={b}|same={c}|none={d}|empty={e}"
+}
+"#;
+        assert_eq!(differential(src), "a=3|geeks=5|same=3|none=0|empty=0");
+    }
+
+    #[test]
     fn diff_spiral_matrix_traversal() {
         // A certification lock (it390): SPIRAL MATRIX TRAVERSAL -- read a 2-D matrix in CLOCKWISE SPIRAL order
         // (top row left-to-right, right column top-to-bottom, bottom row right-to-left, left column
