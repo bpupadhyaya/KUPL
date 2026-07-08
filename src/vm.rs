@@ -3029,6 +3029,44 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_quantifier_duality() {
+        // A certification lock (it488, from bug-hunt batch 128 -- 10 probes across string/tensor/list-HOF/Map/bit/
+        // float shapes came back byte-identical, so the subtlest untouched corner is locked): the QUANTIFIER DUALITY
+        // (De Morgan for quantifiers) between List.all and List.any. Where diff_list_all_any_vacuous_on_empty
+        // (it270) pins the VALUES and the empty-list vacuous convention, THIS certifies the LOGICAL LAW relating the
+        // two -- an ALGEBRAIC-IDENTITY cross-check (like set_algebra_laws it424 and bitwise_arithmetic_identities
+        // it475), each an equality of two structurally different quantifier expressions:
+        //   all(p) == not any(not p)   -- a universal holds iff there is no counterexample (d1, d3)
+        //   any(p) == not all(not p)   -- an existential holds iff not everything fails it (d2)
+        // Checked on [2,4,6,8] and [1,2,3,4] with predicates on parity and magnitude; the empty-list vacuous
+        // endpoints are pinned too (all([]) = true, any([]) = false) since the duality must still hold there
+        // (both sides collapse consistently). Byte-identical on interp/KVM (native per the sweep). Confirms that
+        // all(p) equals the negation of any(not p), that any(p) equals the negation of all(not p), that these hold
+        // for several predicates, that the vacuous empty-list endpoints are true/false respectively, and that all
+        // three engines agree. This is the boolean reasoning an AI relies on when refactoring `all`/`any` guards or
+        // proving loop invariants; a backend whose all short-circuited wrongly or whose any missed the last element
+        // would break the duality (yielding false). A non-sort lock certifying the all/any quantifier duality.
+        let src = r#"fun probe() -> Str {
+    let xs = [2, 4, 6, 8]
+    let ys = [1, 2, 3, 4]
+    let empty: List[Int] = []
+    let allEven = xs.all(fn(x: Int) { x % 2 == 0 })
+    let anyOdd = ys.any(fn(x: Int) { x % 2 == 1 })
+    let d1 = xs.all(fn(x: Int) { x % 2 == 0 }) == (xs.any(fn(x: Int) { x % 2 != 0 }) == false)
+    let d2 = ys.any(fn(x: Int) { x > 3 }) == (ys.all(fn(x: Int) { x <= 3 }) == false)
+    let d3 = ys.all(fn(x: Int) { x > 0 }) == (ys.any(fn(x: Int) { x <= 0 }) == false)
+    let e1 = empty.all(fn(x: Int) { x > 0 })
+    let e2 = empty.any(fn(x: Int) { x > 0 })
+    "allEven={allEven}|anyOdd={anyOdd}|d1={d1}|d2={d2}|d3={d3}|e1={e1}|e2={e2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "allEven=true|anyOdd=true|d1=true|d2=true|d3=true|e1=true|e2=false"
+        );
+    }
+
+    #[test]
     fn diff_sum_of_two_squares() {
         // A certification lock (it487): SUM OF TWO SQUARES -- decide whether n = a^2 + b^2 for some integers a,b by
         // a bounded search (for each a with a^2 <= n, test whether n - a^2 is a perfect square) -- cross-validated
