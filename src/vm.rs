@@ -2220,6 +2220,73 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_union_find_components() {
+        // A certification lock (it402): UNION-FIND CONNECTED COMPONENTS -- count the connected components of an
+        // undirected graph using a DISJOINT-SET forest, the alternative to the flood-fill (it388) approach. Each
+        // node starts as its own singleton (parent[i] = i, the identity). Processing each edge (a,b) UNIONS the
+        // two sets: find(a) walks parent pointers to a's root, find(b) to b's root, and if the roots differ the
+        // union attaches one root under the other (parent[ra] = rb); equal roots mean already-connected, a
+        // no-op. After all unions, the number of components is the count of DISTINCT roots across all nodes. The
+        // parent array is an immutable List[Int] rebuilt on each union (setAt = rangeN().map with one index
+        // replaced); distinct-count folds a seen list (Set-dedup would need a receiver annotation here).
+        //   components(5, [[0,1],[1,2],[3,4]]) = 2     ({0,1,2} and {3,4})
+        //   components(4, []) = 4                       (no edges -- four singletons)
+        //   components(3, [[0,1],[1,2],[0,2]]) = 1     (the 0-2 edge is REDUNDANT -- already connected, no-op)
+        //   components(6, [[0,1],[2,3],[4,5],[1,3]]) = 2  (the 1-3 edge MERGES {0,1} and {2,3} -> {0,1,2,3})
+        //   components(1, []) = 1                       (a single node)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each node begins in its own set,
+        // that find follows parent pointers to a canonical root, that union links two roots only when they
+        // differ, that a redundant edge between already-connected nodes changes nothing, that a bridging edge
+        // TRANSITIVELY merges two previously-separate sets (the 1-3 edge joining {0,1} and {2,3}), that isolated
+        // nodes each count as their own component, that the component count equals the number of distinct roots,
+        // and that all three engines agree on the disjoint-set union/find over an immutable parent array. This
+        // is the union-find an AI writes for connected components, Kruskal's MST, undirected cycle detection,
+        // and equivalence classes; a backend whose find recursion, root-merge condition, or distinct count was
+        // off would mis-count. Adds a disjoint-set-forest component count distinct from the flood-fill traversal.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun find(parent: List[Int], x: Int) -> Int {
+    let p = parent.get(x).unwrap_or(x)
+    if p == x { x } else { find(parent, p) }
+}
+fun setAt(lst: List[Int], i: Int, v: Int) -> List[Int] {
+    rangeN(lst.len()).map(fn(k) { if k == i { v } else { lst.get(k).unwrap_or(0) } })
+}
+fun union(parent: List[Int], a: Int, b: Int) -> List[Int] {
+    let ra = find(parent, a)
+    let rb = find(parent, b)
+    if ra == rb { parent } else { setAt(parent, ra, rb) }
+}
+fun distinct(xs: List[Int]) -> Int {
+    xs.fold([], fn(acc, x) {
+        if acc.contains(x) { acc } else { [acc, [x]].flatten() }
+    }).len()
+}
+fun components(n: Int, edges: List[List[Int]]) -> Int {
+    let init = rangeN(n)
+    let finalP = edges.fold(init, fn(p, e) {
+        union(p, e.get(0).unwrap_or(0), e.get(1).unwrap_or(0))
+    })
+    let roots = rangeN(n).map(fn(x) { find(finalP, x) })
+    distinct(roots)
+}
+fun probe() -> Str {
+    let a = components(5, [[0, 1], [1, 2], [3, 4]])
+    let b = components(4, [])
+    let c = components(3, [[0, 1], [1, 2], [0, 2]])
+    let d = components(6, [[0, 1], [2, 3], [4, 5], [1, 3]])
+    let e = components(1, [])
+    "two={a}|iso={b}|one={c}|merge={d}|single={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "two=2|iso=4|one=1|merge=2|single=1"
+        );
+    }
+
+    #[test]
     fn diff_floyd_warshall_all_pairs() {
         // A bug-hunt-90 lock (it401): FLOYD-WARSHALL ALL-PAIRS SHORTEST PATHS -- the shortest distance between
         // EVERY ordered pair of nodes in a weighted directed graph, computed by an intermediate-vertex DP. This
