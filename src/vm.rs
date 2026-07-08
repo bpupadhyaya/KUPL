@@ -3029,6 +3029,54 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_sum_of_two_squares() {
+        // A certification lock (it487): SUM OF TWO SQUARES -- decide whether n = a^2 + b^2 for some integers a,b by
+        // a bounded search (for each a with a^2 <= n, test whether n - a^2 is a perfect square) -- cross-validated
+        // against FERMAT'S TWO-SQUARE THEOREM: an odd prime p is a sum of two squares iff p ≡ 1 (mod 4), and 2 = 1+1
+        // is as well. Continuing the classic-algorithm vein and the spec-property cross-check style (Fermat's little
+        // theorem it479): the search is a concrete computation, the theorem is an independent number-theoretic law
+        // -- their agreement certifies the search, not a restatement (it462 discipline).
+        //   s5 = isSumTwoSq(5) = true (1+4),  s25 = true (9+16),  s50 = true (25+25 or 1+49)
+        //   p1..p8: isSumTwoSq(p) == (p==2 || p%4==1) for primes p = 2, 5, 13, 17 (all sums) and 3, 7, 11, 19 (none)
+        // The perfect-square test itself is a nested bounded search (r from 0 while r*r <= m). Byte-identical on
+        // interp/KVM (native per the sweep). Confirms that the search finds a representation when one exists (5, 25,
+        // 50), that no representation is found for the p ≡ 3 (mod 4) primes, that the search verdict matches Fermat's
+        // theorem at four representable and four non-representable primes, that 2 is handled as the even prime, and
+        // that all three engines agree. This is the number-theory search an AI writes for Gaussian-integer or
+        // lattice-point problems; checking against Fermat's theorem catches an off-by-one in the a-range or a wrong
+        // perfect-square test that a lone value check could pass. A non-sort lock certifying sum-of-two-squares
+        // against Fermat's two-square theorem.
+        let src = r#"fun perfGo(n: Int, r: Int) -> Bool {
+    if r * r > n { false } else { if r * r == n { true } else { perfGo(n, r + 1) } }
+}
+fun isPerfSq(n: Int) -> Bool { if n < 0 { false } else { perfGo(n, 0) } }
+fun sumGo(n: Int, a: Int) -> Bool {
+    if a * a > n { false } else { if isPerfSq(n - a * a) { true } else { sumGo(n, a + 1) } }
+}
+fun isSumTwoSq(n: Int) -> Bool { sumGo(n, 0) }
+fun fermat(p: Int) -> Bool { p == 2 || p % 4 == 1 }
+fun probe() -> Str {
+    let s5 = isSumTwoSq(5)
+    let s25 = isSumTwoSq(25)
+    let s50 = isSumTwoSq(50)
+    let p1 = isSumTwoSq(2) == fermat(2)
+    let p2 = isSumTwoSq(5) == fermat(5)
+    let p3 = isSumTwoSq(13) == fermat(13)
+    let p4 = isSumTwoSq(17) == fermat(17)
+    let p5 = isSumTwoSq(3) == fermat(3)
+    let p6 = isSumTwoSq(7) == fermat(7)
+    let p7 = isSumTwoSq(11) == fermat(11)
+    let p8 = isSumTwoSq(19) == fermat(19)
+    "s5={s5}|s25={s25}|s50={s50}|p1={p1}|p2={p2}|p3={p3}|p4={p4}|p5={p5}|p6={p6}|p7={p7}|p8={p8}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "s5=true|s25=true|s50=true|p1=true|p2=true|p3=true|p4=true|p5=true|p6=true|p7=true|p8=true"
+        );
+    }
+
+    #[test]
     fn diff_rational_field_axioms() {
         // A certification lock (it485, from bug-hunt batch 127 -- 10 probes across BigInt/Rational/tensor/json/
         // string/radix/scan/float shapes came back byte-identical, so the subtlest untouched corner is locked):
