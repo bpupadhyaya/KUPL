@@ -2220,6 +2220,97 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_count_islands_flood_fill() {
+        // A certification lock (it388): COUNT ISLANDS -- the number of connected components of land cells (1s)
+        // in a 2-D grid of land/water (1/0), where cells connect 4-DIRECTIONALLY (up/down/left/right, NOT
+        // diagonally). This is a functional FLOOD-FILL connected-components traversal, distinct from the
+        // adjacency-list graph DFS (it315) and the grid-lattice counting/optimization DPs (it370/it374): it
+        // threads an IMMUTABLE visited-set (a List[Int] of flattened r*cols+c indices) through a 4-way
+        // recursive DFS. flood() returns the grown seen-set: it stops at out-of-bounds cells, water cells (0),
+        // and already-seen cells; otherwise it marks the cell and recurses into all four neighbors, chaining the
+        // seen-set (s1 -> s2 -> s3 -> s4 -> return) so each branch sees the marks of the previous. The outer
+        // double fold sweeps every cell, and each time it finds an UNVISITED land cell it floods that whole
+        // component and increments the count.
+        //   countIslands([[1,1,0],[0,1,0],[0,0,1]]) = 2   (an L-shaped island + a lone corner)
+        //   countIslands([[1,0,1],[0,0,0],[1,0,1]]) = 4   (four corners, none touching -> four islands)
+        //   countIslands([[0,0],[0,0]]) = 0               (all water)
+        //   countIslands([[1,1],[1,1]]) = 1               (all land, fully connected)
+        //   countIslands([[1]]) = 1                       (a single land cell)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms 4-directional connectivity (diagonal
+        // corners count as SEPARATE islands -> the checkerboard yields 4), that the immutable seen-set threaded
+        // through the recursive branches prevents double-counting and infinite loops, that flood-fill marks the
+        // whole component before the outer sweep resumes (an L-shape counts once), that all-water yields 0 and
+        // all-land yields 1, and that all three engines agree on the functional flood-fill. This is the
+        // count-islands / connected-components routine an AI writes for map-region counting, flood modeling,
+        // and blob detection; a backend whose 4-way recursion, seen-set threading, or bounds/water guards were
+        // off would over- or under-count. Adds a functional grid flood-fill, distinct from graph DFS and grid
+        // DP.
+        let src = r#"type St = { seen: List[Int], count: Int }
+fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun cell(g: List[List[Int]], r: Int, c: Int) -> Int {
+    g.get(r).unwrap_or([]).get(c).unwrap_or(0)
+}
+fun flood(g: List[List[Int]], seen: List[Int], r: Int, c: Int) -> List[Int] {
+    let rows = g.len()
+    let cols = g.first().unwrap_or([]).len()
+    if r < 0 { seen }
+    else {
+        if r >= rows { seen }
+        else {
+            if c < 0 { seen }
+            else {
+                if c >= cols { seen }
+                else {
+                    let idx = r * cols + c
+                    if cell(g, r, c) == 0 { seen }
+                    else {
+                        if seen.contains(idx) { seen }
+                        else {
+                            let s1 = [seen, [idx]].flatten()
+                            let s2 = flood(g, s1, r + 1, c)
+                            let s3 = flood(g, s2, r - 1, c)
+                            let s4 = flood(g, s3, r, c + 1)
+                            flood(g, s4, r, c - 1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+fun countIslands(g: List[List[Int]]) -> Int {
+    let rows = g.len()
+    let cols = g.first().unwrap_or([]).len()
+    let init: List[Int] = []
+    let res = rangeN(rows).fold(St(seen: init, count: 0), fn(outer, r) {
+        rangeN(cols).fold(outer, fn(st, c) {
+            let idx = r * cols + c
+            if cell(g, r, c) == 1 {
+                if st.seen.contains(idx) { st }
+                else {
+                    let ns = flood(g, st.seen, r, c)
+                    St(seen: ns, count: st.count + 1)
+                }
+            } else { st }
+        })
+    })
+    res.count
+}
+fun probe() -> Str {
+    let a = countIslands([[1, 1, 0], [0, 1, 0], [0, 0, 1]])
+    let b = countIslands([[1, 0, 1], [0, 0, 0], [1, 0, 1]])
+    let c = countIslands([[0, 0], [0, 0]])
+    let d = countIslands([[1, 1], [1, 1]])
+    let e = countIslands([[1]])
+    "a={a}|four={b}|zero={c}|one={d}|single={e}"
+}
+"#;
+        assert_eq!(differential(src), "a=2|four=4|zero=0|one=1|single=1");
+    }
+
+    #[test]
     fn diff_longest_common_prefix() {
         // A bug-hunt-83 lock (it387): LONGEST COMMON PREFIX -- the longest leading substring shared by ALL words
         // in a list. This is a HORIZONTAL fold-reduction over the word list (distinct from the DP recurrences
