@@ -2104,6 +2104,53 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_bst_contains_membership() {
+        // A bug-hunt-49 lock (it314): BST MEMBERSHIP query -- the read/search counterpart to it313's
+        // insert+inorder. contains navigates the search tree by a 3-way comparison (x == v -> true, x < v ->
+        // recurse left, x > v -> recurse right), using the BST invariant to descend only ONE subtree per
+        // node (pruning the other half), with Empty -> false the not-found base case. Composed with .all /
+        // .any HOFs over lists of query keys, present and absent.
+        //   t = fold(Empty, insert) over [5,3,8,1,4,7]
+        //   [1,4,5,8].all(contains t)  -> true   (every present key is found)
+        //   [2,6,9,0].any(contains t)  -> false  (no absent key is found)
+        //   contains(t, 7) -> true ; contains(t, 99) -> false
+        // Byte-identical on interp/KVM (native per the sweep). Confirms contains routes by comparison and
+        // descends a single child per node (a present key deep in the tree like 7 is found; an absent key
+        // like 99 bottoms out at Empty), that the not-found base returns false, and that .all over the
+        // present keys is true while .any over the absent keys is false. This is the "is x in the set" /
+        // search-tree lookup an AI writes as the query half of an ordered set; a backend that mis-routed the
+        // comparison would miss a present key (present_all would go false) or spuriously match an absent one
+        // (absent_any would go true). it313 builds and flattens to sorted order; this is the Bool-returning
+        // navigate-by-compare search it never exercises.
+        let src = r#"type BST = Empty | Node(v: Int, l: BST, r: BST)
+fun insert(t: BST, x: Int) -> BST {
+    match t { Empty => Node(v: x, l: Empty, r: Empty)
+        Node(v, l, r) => {
+            if x < v { Node(v: v, l: insert(l, x), r: r) }
+            else { if x > v { Node(v: v, l: l, r: insert(r, x)) } else { Node(v: v, l: l, r: r) } }
+        } }
+}
+fun contains(t: BST, x: Int) -> Bool {
+    match t { Empty => false
+        Node(v, l, r) => {
+            if x == v { true }
+            else { if x < v { contains(l, x) } else { contains(r, x) } }
+        } }
+}
+fun probe() -> Str {
+    let t = [5, 3, 8, 1, 4, 7].fold(Empty, fn(acc, x) { insert(acc, x) })
+    let present = [1, 4, 5, 8].all(fn(x) { contains(t, x) })
+    let absent = [2, 6, 9, 0].any(fn(x) { contains(t, x) })
+    "present_all={present}|absent_any={absent}|has7={contains(t, 7)}|has99={contains(t, 99)}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "present_all=true|absent_any=false|has7=true|has99=false"
+        );
+    }
+
+    #[test]
     fn diff_bst_insert_and_inorder() {
         // A certification lock (it313): a binary SEARCH tree -- recursive ordered insert maintaining the BST
         // invariant, built by fold, then inorder traversal producing sorted+deduped output. Prior tree
