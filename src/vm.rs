@@ -2220,6 +2220,59 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_boolean_cnf_sat_eval() {
+        // A bug-hunt-87 lock (it395): BOOLEAN CNF-SAT EVALUATION -- given a formula in Conjunctive Normal Form
+        // (an AND of clauses, each clause an OR of literals) and a truth assignment, decide whether the
+        // assignment SATISFIES the formula. A literal is a SIGNED 1-based variable index: +k means "variable k
+        // is true", -k means "variable k is false". A literal is true under the assignment when its variable
+        // has the matching polarity; a clause is satisfied when ANY of its literals is true (a disjunction, via
+        // .any); the whole formula is satisfied when ALL clauses are satisfied (a conjunction, via .all). This
+        // is a two-level short-circuit fold over signed integers -- distinct from every prior lock.
+        //   f = [[1,2],[-1,3],[-2,-3]] with [T,F,F] -> false   (clause [-1,3] has no true literal)
+        //   f with [T,T,T] -> false                            (clause [-2,-3] fails)
+        //   f with [F,T,F] -> true                             (every clause has a true literal)
+        //   [[1],[-1]] with [T] -> false                       (a CONTRADICTION -- unsatisfiable for any value)
+        //   [[1,-1]] with [T] -> true                          (a TAUTOLOGY clause -- always satisfied)
+        //   [] with [T] -> true                                (the EMPTY formula is vacuously satisfied)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that a positive literal reads the
+        // variable directly while a negative literal reads its complement, that a clause is a disjunction that
+        // succeeds on the first true literal, that the formula is a conjunction that fails on the first
+        // unsatisfied clause, that a variable appearing both asserted and negated across clauses forces
+        // unsatisfiability (contradiction), that a clause containing a literal and its negation is a tautology,
+        // that the EMPTY conjunction is TRUE (vacuous truth of .all over no clauses), and that all three engines
+        // agree on the nested any/all short-circuit over signed-literal encoding. This is the CNF-SAT checker an
+        // AI writes for constraint validation, propositional-logic evaluation, and verifying candidate
+        // solutions; a backend whose literal polarity, disjunction/conjunction nesting, or vacuous-truth base
+        // was off would mis-decide. Adds a signed-literal boolean-formula evaluator.
+        let src = r#"fun litTrue(lit: Int, assign: List[Bool]) -> Bool {
+    let v = if lit < 0 { 0 - lit } else { lit }
+    let val = assign.get(v - 1).unwrap_or(false)
+    if lit < 0 { val == false } else { val }
+}
+fun clauseSat(clause: List[Int], assign: List[Bool]) -> Bool {
+    clause.any(fn(lit) { litTrue(lit, assign) })
+}
+fun formulaSat(cnf: List[List[Int]], assign: List[Bool]) -> Bool {
+    cnf.all(fn(clause) { clauseSat(clause, assign) })
+}
+fun probe() -> Str {
+    let f = [[1, 2], [0 - 1, 3], [0 - 2, 0 - 3]]
+    let a = formulaSat(f, [true, false, false])
+    let b = formulaSat(f, [true, true, true])
+    let c = formulaSat(f, [false, true, false])
+    let d = formulaSat([[1], [0 - 1]], [true])
+    let e = formulaSat([[1, 0 - 1]], [true])
+    let g = formulaSat([], [true])
+    "a={a}|b={b}|c={c}|contra={d}|taut={e}|empty={g}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a=false|b=false|c=true|contra=false|taut=true|empty=true"
+        );
+    }
+
+    #[test]
     fn diff_count_islands_eight_way() {
         // A certification lock (it394): COUNT ISLANDS with 8-WAY (DIAGONAL) CONNECTIVITY -- the number of
         // connected components of land cells (1s) where cells connect in ALL EIGHT directions (orthogonal PLUS
