@@ -2220,6 +2220,70 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_merge_overlapping_intervals() {
+        // A certification lock (it396): MERGE OVERLAPPING INTERVALS -- coalesce a set of closed integer
+        // intervals so that any that overlap or touch are combined into one. The canonical two-phase shape:
+        // SORT the intervals by start, then FOLD left maintaining an output list; for each interval, if its
+        // start is <= the END of the last output interval the two overlap (or touch), so REPLACE that last
+        // interval with one spanning from the last start to max(last end, current end); otherwise APPEND it as
+        // a new disjoint interval. The accumulator is a record Acc{out: List[Iv]} of record intervals Iv{s,e},
+        // and the "replace last" step is take(n-1) ++ [merged]. Sorting first is essential -- overlap detection
+        // relies on non-decreasing starts.
+        //   [1,3],[2,6],[8,10],[15,18] -> [1,6][8,10][15,18]   (the classic: first two merge, rest disjoint)
+        //   [1,4],[4,5]               -> [1,5]                 (TOUCHING endpoints merge, since 4 <= 4)
+        //   [1,4],[2,3]               -> [1,4]                 (a fully NESTED interval is absorbed)
+        //   [5,6],[1,2],[3,4]         -> [1,2][3,4][5,6]       (UNSORTED input -- the sort reorders, none merge)
+        //   [1,10],[2,3],[4,5]        -> [1,10]                (a wide interval SWALLOWS several inside it)
+        //   []                        -> (empty)              (no intervals -> nothing)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that intervals are sorted by start
+        // before merging (the unsorted case would mis-merge without it), that overlap uses <= so ADJACENT
+        // touching intervals coalesce, that the merged end is the MAX of the two ends (so a nested interval
+        // leaves the end unchanged), that one wide interval can absorb multiple following ones in sequence, that
+        // truly disjoint intervals stay separate, that an empty input yields an empty result, and that all three
+        // engines agree on the sort-then-fold with a record accumulator and take(n-1)++[merged] replacement.
+        // This is the interval-merge an AI writes for calendar/meeting consolidation, numeric range coalescing,
+        // and free-list compaction; a backend whose sort, <=-overlap test, max-end, or last-replace was off
+        // would split or over-merge. Adds a sort-then-fold interval-coalescing shape over record intervals.
+        let src = r#"type Iv = { s: Int, e: Int }
+type Acc = { out: List[Iv] }
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun mergeInts(raw: List[Iv]) -> List[Iv] {
+    let sorted = raw.sort_by(fn(iv) { iv.s })
+    sorted.fold(Acc(out: []), fn(acc, cur) {
+        let n = acc.out.len()
+        if n == 0 {
+            Acc(out: [cur])
+        } else {
+            let last = acc.out.get(n - 1).unwrap_or(Iv(s: 0, e: 0))
+            if cur.s <= last.e {
+                let merged = Iv(s: last.s, e: maxi(last.e, cur.e))
+                Acc(out: [acc.out.take(n - 1), [merged]].flatten())
+            } else {
+                Acc(out: [acc.out, [cur]].flatten())
+            }
+        }
+    }).out
+}
+fun show(ivs: List[Iv]) -> Str {
+    ivs.map(fn(iv) { "[{iv.s},{iv.e}]" }).join("")
+}
+fun probe() -> Str {
+    let a = show(mergeInts([Iv(s: 1, e: 3), Iv(s: 2, e: 6), Iv(s: 8, e: 10), Iv(s: 15, e: 18)]))
+    let b = show(mergeInts([Iv(s: 1, e: 4), Iv(s: 4, e: 5)]))
+    let c = show(mergeInts([Iv(s: 1, e: 4), Iv(s: 2, e: 3)]))
+    let d = show(mergeInts([Iv(s: 5, e: 6), Iv(s: 1, e: 2), Iv(s: 3, e: 4)]))
+    let e = show(mergeInts([Iv(s: 1, e: 10), Iv(s: 2, e: 3), Iv(s: 4, e: 5)]))
+    let f = show(mergeInts([]))
+    "a={a}|touch={b}|nest={c}|unsorted={d}|contain={e}|empty={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "a=[1,6][8,10][15,18]|touch=[1,5]|nest=[1,4]|unsorted=[1,2][3,4][5,6]|contain=[1,10]|empty="
+        );
+    }
+
+    #[test]
     fn diff_boolean_cnf_sat_eval() {
         // A bug-hunt-87 lock (it395): BOOLEAN CNF-SAT EVALUATION -- given a formula in Conjunctive Normal Form
         // (an AND of clauses, each clause an OR of literals) and a truth assignment, decide whether the
