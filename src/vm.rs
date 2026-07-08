@@ -3029,6 +3029,54 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_pronic_numbers() {
+        // A bug-hunt-121 lock (it464): the PRONIC (oblong / rectangular) NUMBERS Pr(n) = n(n+1) -- the count of
+        // dots in an n by (n+1) rectangle -- certified by THREE independent characterizations plus a parity
+        // property. A pronic number is exactly TWICE the n-th triangular number (two copies of a triangle tile the
+        // rectangle), equal to the sum of the first n even integers, and of the form n^2 + n; all three views are
+        // cross-checked against the closed form, and every pronic number is even. This complements the figurate
+        // family (2D polygonal it452, tetrahedral it460, square pyramidal it461): the pronic is the "double
+        // triangular" rectangle number, and its 2*T(n) identity links it directly to the triangular numbers the
+        // other figurate locks build on.
+        //   Pr(1)=2, Pr(5)=30, Pr(7)=56, Pr(10)=110    (OEIS A002378, the pronic/oblong numbers)
+        //   c5:  n(n+1) = 30  == 2*T(5) = 2*15         (pronic == twice the triangular number)
+        //   c10: n(n+1) = 110 == 2+4+6+...+20          (pronic == sum of the first n even integers)
+        //   sq:  Pr(4)=20 == 4^2 + 4                   (the n^2 + n form)
+        //   ev:  Pr(7)=56 and Pr(3)=12 are both even   (every pronic is even)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that n(n+1) equals twice the triangular
+        // number (a geometric decomposition), that it equals the running sum of even integers, that the n^2+n form
+        // agrees, that pronic numbers are always even (the product of two consecutive integers), that the four
+        // independent views agree at multiple points, and that all three engines agree. This is the "rectangular
+        // dot count" an AI writes for figurate geometry or combinatorics; the 2*triangular and sum-of-evens
+        // identities catch a wrong (n+1) offset or an off-by-one. A non-sort lock certifying the pronic numbers
+        // against their twice-triangular, sum-of-evens, and n^2+n characterizations.
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun tri(k: Int) -> Int { k * (k + 1) / 2 }
+fun pronic(n: Int) -> Int { n * (n + 1) }
+fun sumEvens(n: Int) -> Int {
+    rangeIncl(1, n).fold(0, fn(acc, k) { acc + 2 * k })
+}
+fun probe() -> Str {
+    let pr1 = pronic(1)
+    let pr5 = pronic(5)
+    let pr7 = pronic(7)
+    let pr10 = pronic(10)
+    let c5 = pronic(5) == 2 * tri(5)
+    let c10 = pronic(10) == sumEvens(10)
+    let sq = pronic(4) == 4 * 4 + 4
+    let ev = pronic(7) % 2 == 0 && pronic(3) % 2 == 0
+    "pr1={pr1}|pr5={pr5}|pr7={pr7}|pr10={pr10}|c5={c5}|c10={c10}|sq={sq}|ev={ev}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "pr1=2|pr5=30|pr7=56|pr10=110|c5=true|c10=true|sq=true|ev=true"
+        );
+    }
+
+    #[test]
     fn diff_perrin_numbers() {
         // A certification lock (it463): the PERRIN NUMBERS P(n) = P(n-2) + P(n-3), seeded P(0)=3, P(1)=0, P(2)=2
         // -- a third-order recurrence that SKIPS the n-1 term (complementing Narayana's cows it462, which skips
