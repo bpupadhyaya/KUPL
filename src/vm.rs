@@ -2983,6 +2983,57 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_stirling_second_kind() {
+        // A certification lock (it453): STIRLING NUMBERS OF THE SECOND KIND S(n,k) -- the number of ways to
+        // partition a set of n elements into exactly k non-empty, unlabelled blocks -- cross-validated by the Bell
+        // number identity. This extends the combinatorics family (binomial it446, Catalan it368, combinations
+        // it358) with a DISTINCT count: binomial C(n,k) counts size-k SUBSETS, whereas S(n,k) counts SET
+        // PARTITIONS into k blocks. The recurrence is S(n,k) = k*S(n-1,k) + S(n-1,k-1): the n-th element either
+        // joins one of the k existing blocks (k ways) or starts a new block with the remaining n-1 partitioned
+        // into k-1. The base cases are S(0,0)=1, S(n,0)=0 for n>0, and S(n,k)=0 for k>n. Summing a row gives the
+        // Bell number B(n) = sum_k S(n,k), the TOTAL number of set partitions, which cross-checks the values.
+        //   S(3,2)=3, S(4,2)=7, S(5,2)=15, S(5,3)=25    (textbook Stirling values)
+        //   S(4,4)=1 (each element alone) / S(5,1)=1 (all in one block)
+        //   bell(3)=5  (S(3,1)+S(3,2)+S(3,3) = 1+3+1)
+        //   bell(4)=15 (1+7+6+1 -- the fourth Bell number)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the two-term recurrence weights the
+        // "join existing block" branch by k, that the base cases seed the empty set to 1 and forbid zero blocks or
+        // too-many blocks, that the singleton and all-in-one partitions each count once, that the row sums equal
+        // the known Bell numbers (cross-validating the whole row against a second identity), and that all three
+        // engines agree. This is the set-partition count an AI writes for combinatorics, clustering enumeration,
+        // or occupancy problems; the Bell-number row-sum is the cross-check that catches an off-by-one in the
+        // recurrence. A non-sort lock certifying Stirling numbers of the second kind against the Bell identity.
+        let src = r#"fun stirling(n: Int, k: Int) -> Int {
+    if n == 0 && k == 0 { 1 }
+    else if n == 0 || k == 0 { 0 }
+    else if k > n { 0 }
+    else { k * stirling(n - 1, k) + stirling(n - 1, k - 1) }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun bell(n: Int) -> Int {
+    rangeIncl(0, n).fold(0, fn(acc, k) { acc + stirling(n, k) })
+}
+fun probe() -> Str {
+    let s32 = stirling(3, 2)
+    let s42 = stirling(4, 2)
+    let s53 = stirling(5, 3)
+    let s44 = stirling(4, 4)
+    let s51 = stirling(5, 1)
+    let s52 = stirling(5, 2)
+    let b4 = bell(4)
+    let b3 = bell(3)
+    "s32={s32}|s42={s42}|s53={s53}|s44={s44}|s51={s51}|s52={s52}|bell4={b4}|bell3={b3}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "s32=3|s42=7|s53=25|s44=1|s51=1|s52=15|bell4=15|bell3=5"
+        );
+    }
+
+    #[test]
     fn diff_figurate_numbers() {
         // A bug-hunt-115 lock (it452): FIGURATE (POLYGONAL) NUMBERS -- triangular, pentagonal, and hexagonal --
         // with a closed-form-versus-summation cross-check and the classic square identity. These count dots
