@@ -3029,6 +3029,57 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_square_pyramidal_numbers() {
+        // A certification lock (it461): the SQUARE PYRAMIDAL NUMBERS SP(n) -- the 3D figurate numbers counting
+        // spheres stacked in a square-based pyramid (each layer a square) -- certified by THREE independent
+        // characterizations. This is the square-layered sibling of the tetrahedral lock (it460, triangular
+        // layers): where a tetrahedral number is the running sum of TRIANGULAR numbers, a square pyramidal number
+        // is the running sum of SQUARES. The three views are: the closed form SP(n) = n(n+1)(2n+1)/6; the sum of
+        // squares SP(n) = sum_{k=1..n} k^2; and the tetrahedral identity SP(n) = Te(n) + Te(n-1) -- a square
+        // pyramid splits into two consecutive tetrahedra, which directly cross-links this lock to it460's
+        // tetrahedral numbers.
+        //   SP(1)=1, SP(4)=30, SP(5)=55, SP(10)=385    (OEIS A000330, the square pyramidal numbers)
+        //   c5:  n(n+1)(2n+1)/6 = 55  == 1+4+9+16+25   (closed form == sum of squares)
+        //   c10: n(n+1)(2n+1)/6 = 385 == sum of k^2 for k=1..10
+        //   ct:  SP(4)=30 == Te(4)+Te(3) = 20+10       (square pyramid = two consecutive tetrahedra)
+        //   ct2: SP(5)=55 == Te(5)+Te(4) = 35+20
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that n(n+1)(2n+1) divides exactly by 6,
+        // that the closed form equals the running sum of squares layer-by-layer, that the sum of two consecutive
+        // tetrahedral numbers reproduces the square pyramidal number (the geometric decomposition), that the three
+        // independent computations agree at multiple points, and that all three engines agree. This is the 3D
+        // square-pyramid / "stacked cannonballs in a square base" count an AI writes for combinatorics or geometric
+        // enumeration; three agreeing characterizations -- one of which reuses the certified tetrahedral numbers --
+        // catch an off-by-one in the layering or a wrong 2n+1 factor. A non-sort lock certifying the square
+        // pyramidal numbers against their closed form, sum of squares, and tetrahedral decomposition.
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun spClosed(n: Int) -> Int { n * (n + 1) * (2 * n + 1) / 6 }
+fun spSum(n: Int) -> Int {
+    rangeIncl(1, n).fold(0, fn(acc, k) { acc + k * k })
+}
+fun tetra(n: Int) -> Int {
+    if n <= 0 { 0 } else { n * (n + 1) * (n + 2) / 6 }
+}
+fun probe() -> Str {
+    let sp1 = spClosed(1)
+    let sp4 = spClosed(4)
+    let sp5 = spClosed(5)
+    let sp10 = spClosed(10)
+    let c5 = spClosed(5) == spSum(5)
+    let c10 = spClosed(10) == spSum(10)
+    let ct = spClosed(4) == tetra(4) + tetra(3)
+    let ct2 = spClosed(5) == tetra(5) + tetra(4)
+    "sp1={sp1}|sp4={sp4}|sp5={sp5}|sp10={sp10}|c5={c5}|c10={c10}|ct={ct}|ct2={ct2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sp1=1|sp4=30|sp5=55|sp10=385|c5=true|c10=true|ct=true|ct2=true"
+        );
+    }
+
+    #[test]
     fn diff_tetrahedral_numbers() {
         // A bug-hunt-119 lock (it460): the TETRAHEDRAL NUMBERS Te(n) -- the 3D figurate numbers counting spheres
         // stacked in a triangular pyramid -- certified by THREE independent characterizations that must all agree.
