@@ -2104,6 +2104,46 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_histogram_buckets() {
+        // A certification lock (it344): histogram into fixed-width buckets -- range binning. Each score is
+        // mapped to a DERIVED bucket key by integer division (score / 10), then fold-tallied into a
+        // Map[Int, Int]. Distinct from word-frequency (it342, string keys with identity bucketing): here the
+        // key is COMPUTED (a range bin), so multiple distinct inputs collapse into the same bucket. The
+        // conservation check -- sum of all bucket counts equals the input length -- proves no score is lost
+        // or double-counted.
+        //   [5,12,15,23,27,29,34,8,19] -> b0(0-9)=2, b1(10-19)=3, b2(20-29)=3, b3(30-39)=1 ; buckets=4, total=9
+        // Byte-identical on interp/KVM (native per the sweep). Confirms score/10 assigns each value to its
+        // decade bucket (5,8 -> 0; 12,15,19 -> 1; 23,27,29 -> 2; 34 -> 3), that folding from an empty Map()
+        // accumulates per-bucket counts (insert overwrites so same-bucket hits increment), that keys().len()
+        // counts the 4 occupied buckets (empty ranges never appear), that values().fold(+) sums to 9 = the
+        // input length (conservation: every score lands in exactly one bucket), and that all three engines
+        // agree on the derived-key tally. This is the histogram an AI writes for score distributions, latency
+        // buckets, and age brackets; a backend whose integer division or Map tally was off would misbin a
+        // score or break the conservation total.
+        let src = r#"fun bucketOf(score: Int) -> Int { score / 10 }
+fun histogram(scores: List[Int]) -> Map[Int, Int] {
+    scores.fold(Map(), fn(m, s) {
+        let b = bucketOf(s)
+        let c = m.get(b).unwrap_or(0)
+        m.insert(b, c + 1)
+    })
+}
+fun probe() -> Str {
+    let scores = [5, 12, 15, 23, 27, 29, 34, 8, 19]
+    let h = histogram(scores)
+    let b0 = h.get(0).unwrap_or(0)
+    let b1 = h.get(1).unwrap_or(0)
+    let b2 = h.get(2).unwrap_or(0)
+    let b3 = h.get(3).unwrap_or(0)
+    let buckets = h.keys().len()
+    let total = h.values().fold(0, fn(a, x) { a + x })
+    "b0={b0}|b1={b1}|b2={b2}|b3={b3}|buckets={buckets}|total={total}"
+}
+"#;
+        assert_eq!(differential(src), "b0=2|b1=3|b2=3|b3=1|buckets=4|total=9");
+    }
+
+    #[test]
     fn diff_running_maximum_scan() {
         // A bug-hunt-61 lock (it343): running maximum via scan -- the cumulative (prefix) max at each
         // position, a monotone non-decreasing high-water mark. scan(0, max) threads the max-so-far through the
