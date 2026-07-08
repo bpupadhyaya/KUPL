@@ -2269,6 +2269,62 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_hamming_distance() {
+        // A bug-hunt-104 lock (it430): HAMMING DISTANCE -- the number of positions at which two EQUAL-LENGTH
+        // sequences differ, in both its string and its bitwise forms. This is distinct from edit-distance /
+        // Levenshtein (it360), which permits insertions and deletions to compare strings of DIFFERENT lengths;
+        // Hamming is defined only for equal-length inputs and counts substitutions alone. The string variant
+        // walks both char lists position by position and tallies mismatches; unequal lengths make the distance
+        // undefined and return -1. The bitwise variant XORs the two integers (so bits differ exactly where the
+        // inputs differ) and popcounts the result via the Kernighan n & (n-1) trick.
+        //   hammingStr("karolin","kathrin") = 3   (r/t, o/h, l/r differ -- the textbook example)
+        //   hammingStr("1011101","1001001") = 2   (two bit positions differ)
+        //   hammingStr("abc","abc") = 0           (identical)
+        //   hammingStr("abc","ab") = -1           (length mismatch -> undefined)
+        //   hammingBits(9,14) = 3                 (1001 ^ 1110 = 0111, three set bits)
+        //   hammingBits(255,0) = 8                (all eight bits differ)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the string form compares character by
+        // character over equal-length inputs, that a length mismatch yields the -1 undefined sentinel, that
+        // identical strings score 0, that the bitwise form XORs then popcounts to count differing bits, that the
+        // Kernighan popcount clears the lowest set bit each step, and that all three engines agree on both forms.
+        // This is the Hamming distance an AI writes for error-correcting codes, DNA/sequence comparison, or
+        // locality-sensitive hashing; a backend whose length guard, per-position compare, or XOR/popcount was off
+        // would miscount the differences. A non-sort lock certifying same-length positional/bitwise difference
+        // counting, distinct from the insert/delete edit distance.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun hammingStr(a: Str, b: Str) -> Int {
+    let ca = a.chars()
+    let cb = b.chars()
+    if ca.len() != cb.len() { 0 - 1 }
+    else {
+        rangeN(ca.len()).fold(0, fn(acc, i) {
+            if ca.get(i).unwrap_or("") == cb.get(i).unwrap_or("") { acc } else { acc + 1 }
+        })
+    }
+}
+fun popcount(n: Int) -> Int {
+    if n == 0 { 0 } else { popcount(n.band(n - 1)) + 1 }
+}
+fun hammingBits(a: Int, b: Int) -> Int { popcount(a.bxor(b)) }
+fun probe() -> Str {
+    let s1 = hammingStr("karolin", "kathrin")
+    let s2 = hammingStr("1011101", "1001001")
+    let s3 = hammingStr("abc", "abc")
+    let s4 = hammingStr("abc", "ab")
+    let b1 = hammingBits(9, 14)
+    let b2 = hammingBits(255, 0)
+    "str1={s1}|str2={s2}|same={s3}|mismatch={s4}|bits1={b1}|bits2={b2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "str1=3|str2=2|same=0|mismatch=-1|bits1=3|bits2=8"
+        );
+    }
+
+    #[test]
     fn diff_activity_selection_greedy() {
         // A certification lock (it429): ACTIVITY SELECTION / INTERVAL SCHEDULING MAXIMIZATION -- the classic
         // greedy that picks the MAXIMUM number of mutually non-overlapping intervals. This is distinct from
