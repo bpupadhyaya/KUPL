@@ -2269,6 +2269,51 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_gray_code_encode_decode() {
+        // A certification lock (it433): GRAY CODE (binary-reflected) encode/decode with a roundtrip. A Gray code
+        // orders the integers so that CONSECUTIVE values differ in exactly ONE bit -- used in rotary/position
+        // encoders, Karnaugh maps, error mitigation, and combinatorial generation. This is a different bit
+        // transform than bit reversal (it432): encoding is n XOR (n >> 1), a single xor-with-shift, and decoding
+        // is the cumulative XOR of all right-shifted copies (b ^= b>>1 ^ b>>2 ^ ...), implemented here by folding
+        // an XOR with a shrinking mask. The two are inverses, which the roundtrips verify.
+        //   grayEncode(0..7) = 0,1,3,2,6,7,5,4    (consecutive codes differ by one bit -- here e0,e1,e2,e3,e4,e7)
+        //   grayEncode(4) = 6  (100 XOR 010 = 110)
+        //   grayEncode(7) = 4  (111 XOR 011 = 100)
+        //   grayDecode(grayEncode(6)) = 6         (roundtrip identity)
+        //   grayDecode(grayEncode(13)) = 13       (roundtrip on a wider value)
+        //   grayDecode(7) = 5  (Gray 111 -> binary 101)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that encode xors n with n>>1 (so the
+        // reflected-binary sequence 0,1,3,2,6,7,5,4 comes out), that decode accumulates the xor of successive
+        // right shifts, that encode and decode are mutual inverses over several values, that a raw Gray value
+        // decodes to the right binary, and that all three engines agree on both directions. This is the Gray code
+        // an AI writes for a hardware encoder interface, a Karnaugh-map tool, or minimal-change enumeration; a
+        // backend whose xor, shift, or decode fold was off would break the single-bit-change property or the
+        // roundtrip. A non-sort lock certifying binary-reflected Gray-code encode/decode via bxor/shr.
+        let src = r#"fun grayEncode(n: Int) -> Int { n.bxor(n.shr(1)) }
+fun grayDecode(g: Int) -> Int { decodeHelper(g, g.shr(1)) }
+fun decodeHelper(b: Int, mask: Int) -> Int {
+    if mask == 0 { b } else { decodeHelper(b.bxor(mask), mask.shr(1)) }
+}
+fun probe() -> Str {
+    let e0 = grayEncode(0)
+    let e1 = grayEncode(1)
+    let e2 = grayEncode(2)
+    let e3 = grayEncode(3)
+    let e4 = grayEncode(4)
+    let e7 = grayEncode(7)
+    let d = grayDecode(grayEncode(6))
+    let d2 = grayDecode(grayEncode(13))
+    let dg = grayDecode(7)
+    "e0={e0}|e1={e1}|e2={e2}|e3={e3}|e4={e4}|e7={e7}|rt6={d}|rt13={d2}|dec7={dg}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "e0=0|e1=1|e2=3|e3=2|e4=6|e7=4|rt6=6|rt13=13|dec7=5"
+        );
+    }
+
+    #[test]
     fn diff_bit_reversal() {
         // A bug-hunt-105 lock (it432): BIT REVERSAL within a fixed width -- reverse the order of the low `width`
         // bits of an integer. This is the permutation at the heart of the iterative FFT (the bit-reversal
