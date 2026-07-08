@@ -2220,6 +2220,70 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_longest_common_substring() {
+        // A bug-hunt-77 lock (it375): LONGEST COMMON SUBSTRING -- the length of the longest CONTIGUOUS run of
+        // characters common to two strings. This is a two-string DP that is deliberately CONTRASTED with the
+        // longest common SUBSEQUENCE (it361): LCS allows skipping (a subsequence need not be contiguous), so a
+        // mismatch CARRIES the best forward; here the substring must be CONTIGUOUS, so a mismatch RESETS the
+        // run to 0. The recurrence over matchLen(i, j) = the length of the common suffix ending at a[i] and
+        // b[j]: past either start (i < 0 or j < 0) it is 0; if a[i] == b[j] the run extends the diagonal
+        // (1 + matchLen(i-1, j-1)); otherwise it RESETS to 0. The answer is the MAX of matchLen over EVERY cell
+        // pair (not just the corner -- the longest run can end anywhere).
+        //   lcSubstr("abcde", "abfce") = 2      ("ab")
+        //   lcSubstr("GeeksforGeeks", "GeeksQuiz") = 5   ("Geeks" -- the classic example)
+        //   lcSubstr("abcdef", "abcdef") = 6    (identical -- the whole string)
+        //   lcSubstr("abc", "xyz") = 0          (no shared character)
+        //   lcSubstr("ababc", "babc") = 4       ("babc")
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the i<0/j<0 base yields 0, that a
+        // character MATCH extends the diagonal run by 1, that a MISMATCH RESETS the run to 0 (the defining
+        // difference from LCS, which would carry a max forward), that the overall answer is the MAX of the
+        // per-cell run lengths across the whole grid (so the longest contiguous match ending anywhere is
+        // found), that identical strings give the full length and disjoint strings give 0, and that all three
+        // engines agree. This is the longest-common-substring an AI writes for plagiarism/near-duplicate
+        // detection, diff hunks, and contiguous DNA alignment; a backend whose reset-on-mismatch, diagonal
+        // extend, or global-max was off would confuse substring with subsequence. Pairs with LCS to cover both
+        // contiguous (substring) and skip-allowed (subsequence) two-string overlaps.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun matchLen(a: List[Str], b: List[Str], i: Int, j: Int) -> Int {
+    if i < 0 { 0 }
+    else {
+        if j < 0 { 0 }
+        else {
+            let ai = a.get(i).unwrap_or("")
+            let bj = b.get(j).unwrap_or("")
+            if ai == bj { 1 + matchLen(a, b, i - 1, j - 1) }
+            else { 0 }
+        }
+    }
+}
+fun lcSubstr(sa: Str, sb: Str) -> Int {
+    let a = sa.chars()
+    let b = sb.chars()
+    let m = a.len()
+    let n = b.len()
+    rangeN(m).fold(0, fn(acc, i) {
+        rangeN(n).fold(acc, fn(inner, j) { maxi(inner, matchLen(a, b, i, j)) })
+    })
+}
+fun probe() -> Str {
+    let a = lcSubstr("abcde", "abfce")
+    let b = lcSubstr("GeeksforGeeks", "GeeksQuiz")
+    let c = lcSubstr("abcdef", "abcdef")
+    let d = lcSubstr("abc", "xyz")
+    let e = lcSubstr("ababc", "babc")
+    "abcde={a}|geeks={b}|same={c}|none={d}|ababc={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "abcde=2|geeks=5|same=6|none=0|ababc=4"
+        );
+    }
+
+    #[test]
     fn diff_min_path_sum_grid() {
         // A certification lock (it374): MINIMUM PATH SUM in a grid -- the least total cost to travel from the
         // top-left to the bottom-right cell of an m x n grid of costs, moving only RIGHT or DOWN. This is the
