@@ -2220,6 +2220,71 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_kruskal_mst() {
+        // A certification lock (it404): KRUSKAL'S MINIMUM SPANNING TREE -- the least-total-weight set of edges
+        // that connects every node of a weighted undirected graph, computed greedily. This COMPOSES two earlier
+        // locks: the union-find disjoint-set (it402) for the cycle test, and a sort-by-weight greedy. Sort all
+        // edges by ascending weight, then fold over them: for each edge, find the roots of its two endpoints; if
+        // they are in DIFFERENT components (roots differ), the edge joins two trees without forming a cycle, so
+        // UNION them, add the weight to the running total, and increment an edge counter; if the endpoints are
+        // already connected (same root), the edge would close a cycle and is SKIPPED. After processing, a valid
+        // spanning tree has exactly n-1 edges -- if fewer were added the graph is DISCONNECTED, reported as -1.
+        // The fold accumulates a record St{parent, total, count}; setAt rebuilds the immutable parent array.
+        //   kruskal(4, [[0,1,1],[1,2,2],[0,2,2],[2,3,3],[0,3,4]]) = 6   (edges 0-1,1-2,2-3; the 0-2,0-3 cycles skipped)
+        //   kruskal(3, [[0,1,5]]) = -1                                  (node 2 unreachable -> DISCONNECTED)
+        //   kruskal(4, [[0,1,10],[1,2,6],[2,3,5],[0,3,15],[0,2,4]]) = 15 (picks weights 4+5+6, skips 10 and 15)
+        //   kruskal(1, []) = 0                                          (single node needs 0 edges)
+        //   kruskal(2, [[0,1,7]]) = 7                                   (one edge spans two nodes)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that edges are considered in ascending
+        // weight order, that an edge is taken only when its endpoints lie in different disjoint sets (the greedy
+        // cycle-avoidance), that a heavier edge duplicating an existing connection is skipped even when a
+        // lighter path already joined those nodes, that the accumulated weight is the true MST cost (the classic
+        // case takes 4+5+6=15 not the direct 0-1=10 or 0-3=15 edges), that a graph missing an edge to some node
+        // yields -1 for disconnected, that a single node needs zero edges, and that all three engines agree on
+        // the sort-then-union-find greedy. This is the Kruskal an AI writes for minimum spanning trees, network
+        // design, and single-linkage clustering; a backend whose edge sort, union-find cycle test, or n-1
+        // connectivity check was off would build the wrong tree. Composes the disjoint-set with a weight-greedy
+        // to extend the graph family with minimum spanning trees.
+        let src = r#"type St = { parent: List[Int], total: Int, count: Int }
+fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun find(parent: List[Int], x: Int) -> Int {
+    let p = parent.get(x).unwrap_or(x)
+    if p == x { x } else { find(parent, p) }
+}
+fun setAt(lst: List[Int], i: Int, v: Int) -> List[Int] {
+    rangeN(lst.len()).map(fn(k) { if k == i { v } else { lst.get(k).unwrap_or(0) } })
+}
+fun kruskal(n: Int, edges: List[List[Int]]) -> Int {
+    let sorted = edges.sort_by(fn(e) { e.get(2).unwrap_or(0) })
+    let result = sorted.fold(St(parent: rangeN(n), total: 0, count: 0), fn(st, e) {
+        let a = e.get(0).unwrap_or(0)
+        let b = e.get(1).unwrap_or(0)
+        let w = e.get(2).unwrap_or(0)
+        let ra = find(st.parent, a)
+        let rb = find(st.parent, b)
+        if ra == rb { st }
+        else { St(parent: setAt(st.parent, ra, rb), total: st.total + w, count: st.count + 1) }
+    })
+    if result.count == n - 1 { result.total } else { 0 - 1 }
+}
+fun probe() -> Str {
+    let a = kruskal(4, [[0, 1, 1], [1, 2, 2], [0, 2, 2], [2, 3, 3], [0, 3, 4]])
+    let b = kruskal(3, [[0, 1, 5]])
+    let c = kruskal(4, [[0, 1, 10], [1, 2, 6], [2, 3, 5], [0, 3, 15], [0, 2, 4]])
+    let d = kruskal(1, [])
+    let e = kruskal(2, [[0, 1, 7]])
+    "mst={a}|disc={b}|classic={c}|single={d}|edge={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mst=6|disc=-1|classic=15|single=0|edge=7"
+        );
+    }
+
+    #[test]
     fn diff_kadane_2d_max_submatrix() {
         // A bug-hunt-91 lock (it403): 2-D KADANE MAXIMUM SUBMATRIX SUM -- the largest sum of any axis-aligned
         // rectangular sub-block of an integer matrix. This LIFTS the 1-D Kadane (it372, maximum contiguous
