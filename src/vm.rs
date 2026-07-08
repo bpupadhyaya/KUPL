@@ -2881,6 +2881,59 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_prime_factorization() {
+        // A certification lock (it449): PRIME FACTORIZATION -- decompose n into its prime factors WITH
+        // MULTIPLICITY by trial division, cross-validated by the Fundamental Theorem of Arithmetic (the product of
+        // the factors must equal n). This extends the number-theory family (gcd it334, isPrime it340,
+        // ext-euclid it431, totient it447, sieve it448) with the actual FACTOR LIST -- distinct from the totient
+        // (which only counts coprimes) and the sieve (which generates primes, not a number's factors). The
+        // algorithm divides out the smallest divisor d repeatedly (keeping d while it divides so repeated factors
+        // are emitted), advances d when it no longer divides, and once d*d exceeds the remaining value that value
+        // is itself the last prime factor. Trial division from 2 upward emits the factors in nondecreasing order.
+        //   primeFactors(12) = 2,2,3          (12 = 2^2 * 3)
+        //   primeFactors(100) = 2,2,5,5       (100 = 2^2 * 5^2)
+        //   primeFactors(17) = 17             (a prime is its own only factor)
+        //   primeFactors(360) = 2,2,2,3,3,5   (360 = 2^3 * 3^2 * 5)
+        //   primeFactors(1) = (empty)         (the unit has no prime factors)
+        //   primeFactors(2) = 2               (the smallest prime)
+        //   cross = true                      (product of primeFactors(360) == 360: the FTA check)
+        //   count of primeFactors(360) = 6    (Omega(360), factors counted with multiplicity)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that repeated factors are emitted as many
+        // times as they divide, that a leftover value past the square-root bound is recorded as a prime factor,
+        // that the factors come out in nondecreasing order, that the product of the factors reconstructs n (the
+        // Fundamental Theorem of Arithmetic), that the unit and the smallest prime are handled, that the factor
+        // count with multiplicity is right, and that all three engines agree. This is the factorization an AI
+        // writes for cryptography, simplifying fractions, or number theory; the product-equals-n cross-check
+        // catches a dropped or spurious factor. A non-sort lock certifying trial-division prime factorization
+        // against the Fundamental Theorem of Arithmetic.
+        let src = r#"fun factor(n: Int, d: Int) -> List[Int] {
+    if n <= 1 { [] }
+    else if d * d > n { [n] }
+    else if n % d == 0 { [[d], factor(n / d, d)].flatten() }
+    else { factor(n, d + 1) }
+}
+fun primeFactors(n: Int) -> List[Int] { if n < 2 { [] } else { factor(n, 2) } }
+fun shw(xs: List[Int]) -> Str { xs.map(fn(x) { x.to_str() }).join(",") }
+fun prod(xs: List[Int]) -> Int { xs.fold(1, fn(a, x) { a * x }) }
+fun probe() -> Str {
+    let f12 = shw(primeFactors(12))
+    let f100 = shw(primeFactors(100))
+    let f17 = shw(primeFactors(17))
+    let f360 = shw(primeFactors(360))
+    let f1 = shw(primeFactors(1))
+    let f2 = shw(primeFactors(2))
+    let cross = prod(primeFactors(360)) == 360
+    let nf360 = primeFactors(360).len()
+    "f12=[{f12}]|f100=[{f100}]|f17=[{f17}]|f360=[{f360}]|f1=[{f1}]|f2=[{f2}]|cross={cross}|nf360={nf360}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "f12=[2,2,3]|f100=[2,2,5,5]|f17=[17]|f360=[2,2,2,3,3,5]|f1=[]|f2=[2]|cross=true|nf360=6"
+        );
+    }
+
+    #[test]
     fn diff_euler_totient() {
         // A certification lock (it447): EULER'S TOTIENT phi(n) -- the count of integers in [1,n] coprime to n --
         // computed TWO independent ways and cross-checked, extending the number-theory family (gcd it334,
