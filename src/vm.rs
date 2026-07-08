@@ -2104,6 +2104,44 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_digit_sum_and_digital_root() {
+        // A certification lock (it336): digit-sum + digital-root -- integer recursion that extracts base-10
+        // digits via %10 (last digit) and /10 (the rest), distinct from gcd (pair modulo-reduction) and
+        // Collatz (parity branch). digitSum returns n when n<10 else n%10 + digitSum(n/10); digitalRoot
+        // returns n when n<10 else digitalRoot(digitSum(n)) -- a TWO-LEVEL recursion where the root loops the
+        // sum until a single digit remains.
+        //   digitSum(12345)=15  digitSum(9999)=36
+        //   digitalRoot(12345)=6 (15->6)  digitalRoot(9999)=9 (36->9)  digitalRoot(0)=0  digitalRoot(9)=9
+        // Byte-identical on interp/KVM (native per the sweep). Confirms %10 peels the last digit and /10 drops
+        // it (integer division), that the n<10 base returns the single digit, that digitSum accumulates all
+        // digits (1+2+3+4+5=15 ; 9*4=36), and -- the load-bearing case -- that digitalRoot(9999) is the TRUE
+        // digital root 9, NOT 9999 % 9 which is 0: a backend that shortcut via a plain mod-9 would return 0
+        // for every nonzero multiple of 9. Edge cases 0 (returns 0) and a single digit 9 (returns 9) are
+        // pinned too. This is the digit-manipulation recursion an AI writes for checksums and digital-root
+        // puzzles.
+        let src = r#"fun digitSum(n: Int) -> Int {
+    if n < 10 { n } else { n % 10 + digitSum(n / 10) }
+}
+fun digitalRoot(n: Int) -> Int {
+    if n < 10 { n } else { digitalRoot(digitSum(n)) }
+}
+fun probe() -> Str {
+    let s1 = digitSum(12345)
+    let s2 = digitSum(9999)
+    let r1 = digitalRoot(12345)
+    let r2 = digitalRoot(9999)
+    let r3 = digitalRoot(0)
+    let r4 = digitalRoot(9)
+    "ds12345={s1}|ds9999={s2}|dr12345={r1}|dr9999={r2}|dr0={r3}|dr9={r4}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "ds12345=15|ds9999=36|dr12345=6|dr9999=9|dr0=0|dr9=9"
+        );
+    }
+
+    #[test]
     fn diff_collatz_step_count() {
         // A bug-hunt-57 lock (it335): the Collatz (3n+1) sequence step count -- CONDITIONAL recursion driven
         // by parity, distinct from the modulo-reduction of GCD (it334). At each step even n recurses on n/2,
