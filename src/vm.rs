@@ -3029,6 +3029,59 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_sum_of_divisors_multiplicative() {
+        // A certification lock (it491): the sum-of-divisors function sigma(n) = sum of all positive divisors of n
+        // is MULTIPLICATIVE -- sigma(m*n) = sigma(m)*sigma(n) whenever gcd(m,n) = 1 -- cross-validated against that
+        // number-theoretic property. This is an ALGEBRAIC/ARITHMETIC-FUNCTION-PROPERTY cross-check (like
+        // casting_out_nines it481 and rational_field_axioms it485): sigma is computed one way (a divisor sum), and
+        // the multiplicativity law is a SEPARATE fact it must satisfy, so agreement certifies sigma rather than
+        // restating it (it462 discipline). Distinct from perfect_number_sigma (it450), which checks sigma(n) = 2n
+        // for perfect numbers -- a different property of the same function. sigGo sums divisors via sqrt-bounded
+        // PAIRING (for each d <= sqrt(n) dividing n, add d and n/d, counting a square root once) so recursion stays
+        // ~sqrt(n) deep, not n deep.
+        //   s6 = sigma(6) = 1+2+3+6 = 12,  s12 = sigma(12) = 1+2+3+4+6+12 = 28
+        //   m1..m4: sigma(m*n) == sigma(m)*sigma(n) for the COPRIME pairs (3,4),(5,6),(8,9),(7,10)
+        //   n1: gcd(4,6) = 2 (the pairs above are genuinely coprime; this one is not)
+        //   bad = false: sigma(2*6) == sigma(2)*sigma(6) is FALSE because gcd(2,6) = 2 -- multiplicativity needs
+        //         coprimality, and sigma(12)=28 != sigma(2)*sigma(6)=3*12=36
+        // Byte-identical on interp/KVM (native per the sweep). Confirms sigma's values, that multiplicativity holds
+        // for coprime arguments, that it FAILS for a non-coprime pair (guarding against a check that would pass for
+        // any m,n), that the sqrt-pairing divisor sum is correct, and that all three engines agree. This is the
+        // arithmetic-function reasoning an AI uses when factoring divisor sums or reasoning about perfect/abundant
+        // numbers; the negative case makes the coprimality hypothesis load-bearing. A non-sort lock certifying
+        // sigma's multiplicativity.
+        let src = r#"fun sigGo(n: Int, d: Int, acc: Int) -> Int {
+    if d * d > n { acc } else {
+        if n % d == 0 {
+            let q = n / d
+            let add = if q == d { d } else { d + q }
+            sigGo(n, d + 1, acc + add)
+        } else {
+            sigGo(n, d + 1, acc)
+        }
+    }
+}
+fun sigma(n: Int) -> Int { sigGo(n, 1, 0) }
+fun gcdGo(a: Int, b: Int) -> Int { if b == 0 { a } else { gcdGo(b, a % b) } }
+fun probe() -> Str {
+    let s6 = sigma(6)
+    let s12 = sigma(12)
+    let m1 = sigma(3 * 4) == sigma(3) * sigma(4)
+    let m2 = sigma(5 * 6) == sigma(5) * sigma(6)
+    let m3 = sigma(8 * 9) == sigma(8) * sigma(9)
+    let m4 = sigma(7 * 10) == sigma(7) * sigma(10)
+    let n1 = gcdGo(4, 6) == 2
+    let bad = sigma(2 * 6) == sigma(2) * sigma(6)
+    "s6={s6}|s12={s12}|m1={m1}|m2={m2}|m3={m3}|m4={m4}|n1={n1}|bad={bad}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "s6=12|s12=28|m1=true|m2=true|m3=true|m4=true|n1=true|bad=false"
+        );
+    }
+
+    #[test]
     fn diff_wilson_theorem() {
         // A certification lock (it489): WILSON'S THEOREM -- an integer p > 1 is prime if and only if
         // (p-1)! ≡ -1 (mod p), i.e. (p-1)! mod p == p-1 -- cross-validated against an independent TRIAL-DIVISION
