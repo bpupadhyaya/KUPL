@@ -2104,6 +2104,45 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_mutual_recursion_over_adt_with_list_variant() {
+        // A bug-hunt-46 lock (it308): MUTUAL recursion over an ADT whose variant holds a List of itself.
+        // Prior mutual-recursion locks (it139/205/219/227) are even/odd style over Int; single-function ADT
+        // recursion is it296 (binary tree) / it298 (expr). This pins the container-ADT shape: sizeN walks
+        // Node variants and its Many arm delegates to sizeList, while sizeList walks the List[Node] via
+        // first/drop (the it303 idiom) and calls back into sizeN on each element -- the two functions
+        // recurse THROUGH each other.
+        //   Node = Leaf(v: Int) | Pair(a: Node, b: Node) | Many(items: List[Node])
+        //   t  = Many([Leaf 1, Pair(Leaf 2, Leaf 3), Many([Leaf 4, Leaf 5])])
+        //        sizeN = 1 + 2 + 2 = 5  (Many -> sizeList -> sizeN per child, nested Many recurses again)
+        //   t2 = Pair(Many([]), Leaf 9)
+        //        sizeN = 0 + 1 = 1      (empty Many -> sizeList([]) = 0 base case, then the Leaf)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the Many arm hands a List[Node] to
+        // sizeList, that sizeList's first()/drop(1) recursion calls sizeN on the head and terminates on
+        // None, that an EMPTY Many bottoms out at sizeList([]) = 0, and that a nested Many inside the list
+        // recurses back through both functions to its Leaves. This is the JSON-like value tree / AST with a
+        // variadic node / filesystem tree an AI models constantly -- a variant carrying a list of children
+        // needs exactly this fn<->fn dispatch. A backend that lost the mutual linkage would fail to descend
+        // into Many's children, undercounting t as 3 (or crashing on the list-valued field).
+        let src = r#"type Node = Leaf(v: Int) | Pair(a: Node, b: Node) | Many(items: List[Node])
+fun sizeN(n: Node) -> Int {
+    match n { Leaf(v) => 1
+        Pair(a, b) => sizeN(a) + sizeN(b)
+        Many(items) => sizeList(items) }
+}
+fun sizeList(xs: List[Node]) -> Int {
+    match xs.first() { None => 0
+        Some(h) => sizeN(h) + sizeList(xs.drop(1)) }
+}
+fun probe() -> Str {
+    let t = Many(items: [Leaf(v: 1), Pair(a: Leaf(v: 2), b: Leaf(v: 3)), Many(items: [Leaf(v: 4), Leaf(v: 5)])])
+    let t2 = Pair(a: Many(items: []), b: Leaf(v: 9))
+    "{sizeN(t)}|{sizeN(t2)}"
+}
+"#;
+        assert_eq!(differential(src), "5|1");
+    }
+
+    #[test]
     fn diff_fold_into_nested_map_of_maps_pivot() {
         // A certification lock (it307): fold records into a NESTED Map-of-Maps -- a 2-level pivot /
         // cross-tabulation (region x product). it300 folds into a Map of LISTS (one level); it292 into a
