@@ -1379,9 +1379,17 @@ impl Checker {
                         self.uni.fresh()
                     }
                     other => {
+                        // A field access on a LIST is a frequent mistake -- e.g. reaching for `.fst`/`.snd`
+                        // on a `split_once` result (which returns a List[Str], not a record). Point at the
+                        // list accessors instead of the bare "has no fields" (PR-it486).
+                        let hint = if matches!(other, Ty::List(_)) {
+                            " — a list is indexed, not field-accessed: use `.get(i)` (returns Option), `.first()`, or `.last()`"
+                        } else {
+                            ""
+                        };
                         self.err(
                             "K0233",
-                            format!("{other} has no fields (only records and components have fields)"),
+                            format!("{other} has no fields (only records and components have fields){hint}"),
                             expr.span,
                         );
                         self.uni.fresh()
@@ -3313,6 +3321,14 @@ mod generic_tests {
         assert!(on_int.iter().any(|d| d.code == "K0233" && d.message.contains(hint)), "int: {on_int:?}");
         let on_str = errors("fun main() { let _ = \"hi\".foo }\n");
         assert!(on_str.iter().any(|d| d.code == "K0233" && d.message.contains(hint)), "str: {on_str:?}");
+        // A field access on a LIST also names the list accessors (a frequent split_once mistake) (PR-it486).
+        let on_list = errors("fun main() { let xs = [1, 2, 3]\n    let _ = xs.fst }\n");
+        assert!(
+            on_list.iter().any(|d| d.code == "K0233" && d.message.contains("a list is indexed") && d.message.contains(".get(i)")),
+            "list hint: {on_list:?}"
+        );
+        // A non-list keeps the bare message (no bogus list hint).
+        assert!(on_int.iter().all(|d| !d.message.contains("a list is indexed")), "int has no list hint: {on_int:?}");
         // Real record field access still type-checks (no behavior change).
         assert!(errors("type Item = { name: Str, qty: Int }\nfun main() { let it = Item(name: \"a\", qty: 1)\n    let _ = it.name\n    let _ = it.qty }\n").is_empty());
     }
