@@ -2720,6 +2720,56 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_fibonacci_matrix_power() {
+        // A certification lock (it445): FIBONACCI via 2x2 MATRIX EXPONENTIATION -- a logarithmic-time algorithm
+        // distinct in kind from the accumulation (bigint), memoization (Map), and plain-recursion Fibonacci locks
+        // already present. It rests on the identity that raising the matrix [[1,1],[1,0]] to the n-th power yields
+        // [[F(n+1), F(n)], [F(n), F(n-1)]], so F(n) is the top-right entry. The power is computed by fast
+        // exponentiation: the identity matrix for n=0, the square of the half-power for even n, and M times the
+        // (n-1) power for odd n -- O(log n) matrix multiplications rather than O(n) additions. The 2x2 product is
+        // the usual row-by-column dot products over a four-field record (records use PARENS -- braces raise K0102).
+        // The results match the canonical Fibonacci numbers, cross-validating the linear methods via entirely
+        // different arithmetic:
+        //   fib(0)=0, fib(1)=1, fib(2)=1     (the base of the sequence; n=0 is the identity matrix's top-right 0)
+        //   fib(10)=55                        (a textbook value)
+        //   fib(15)=610, fib(20)=6765, fib(30)=832040
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the identity matrix seeds n=0 to 0,
+        // that even and odd exponents recurse through squaring and one extra multiply, that the 2x2 record
+        // multiplication computes the four entries correctly, that the top-right entry is F(n), that the values
+        // agree with the standard Fibonacci sequence (so the matrix method cross-checks the accumulation and
+        // memoization methods), and that all three engines agree. The fast-exponentiation recursion is only
+        // O(log n) deep, staying well within the shallow-stack limit. This is the log-time Fibonacci (and, more
+        // broadly, the linear-recurrence-via-matrix-power technique) an AI writes when it needs a far term without
+        // iterating; a backend whose matrix multiply or exponent halving was off would compute the wrong term. A
+        // non-sort lock certifying Fibonacci by matrix exponentiation.
+        let src = r#"type Mat = { a: Int, b: Int, c: Int, d: Int }
+fun mul(m: Mat, n: Mat) -> Mat {
+    Mat(a: m.a * n.a + m.b * n.c, b: m.a * n.b + m.b * n.d, c: m.c * n.a + m.d * n.c, d: m.c * n.b + m.d * n.d)
+}
+fun mpow(m: Mat, n: Int) -> Mat {
+    if n == 0 { Mat(a: 1, b: 0, c: 0, d: 1) }
+    else if n % 2 == 0 { let h = mpow(m, n / 2); mul(h, h) }
+    else { mul(m, mpow(m, n - 1)) }
+}
+fun fib(n: Int) -> Int { mpow(Mat(a: 1, b: 1, c: 1, d: 0), n).b }
+fun probe() -> Str {
+    let f0 = fib(0)
+    let f1 = fib(1)
+    let f2 = fib(2)
+    let f10 = fib(10)
+    let f15 = fib(15)
+    let f20 = fib(20)
+    let f30 = fib(30)
+    "f0={f0}|f1={f1}|f2={f2}|f10={f10}|f15={f15}|f20={f20}|f30={f30}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "f0=0|f1=1|f2=1|f10=55|f15=610|f20=6765|f30=832040"
+        );
+    }
+
+    #[test]
     fn diff_date_difference_days() {
         // A bug-hunt-109 lock (it440): DATE DIFFERENCE -- the number of days between two Gregorian dates, computed
         // by converting each date to a serial day-number and subtracting. This extends the date family (Zeller
