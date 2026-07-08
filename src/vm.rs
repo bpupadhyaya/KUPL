@@ -2220,6 +2220,72 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_graph_bfs_level_order() {
+        // A bug-hunt-89 lock (it399): GRAPH BFS in LEVEL ORDER -- breadth-first traversal from a start node,
+        // emitting nodes layer by layer (all nodes at distance 1, then distance 2, ...). This completes the
+        // graph traversal trio: DFS reachability (it315, goes DEEP first), Kahn topological order (it398,
+        // by in-degree), and now BFS (goes BROAD first). Each round expands the current FRONTIER to its
+        // neighbours (via flat_map over an edge-list adjacency), filters out already-visited nodes, DEDUPES
+        // within the new layer (a node reachable from two frontier nodes appears once), marks them visited, and
+        // recurses on that next layer -- an accumulating St{order, visited} record. Crucially neighbours are
+        // produced in EDGE-DECLARATION order, not sorted, so the traversal follows adjacency as given.
+        //   run(0, [[0,1],[0,2],[1,3],[2,3],[3,4]]) = "0,1,2,3,4"  (diamond: layer by layer, 3 deduped)
+        //   run(0, [[0,1],[1,2],[2,3]]) = "0,1,2,3"                (a chain: one node per layer)
+        //   run(0, []) = "0"                                       (isolated start -- just itself)
+        //   run(0, [[0,1],[0,2],[1,2],[2,0]]) = "0,1,2"           (a CYCLE -- visited guard blocks revisits)
+        //   run(0, [[0,2],[0,1],[1,3],[2,4]]) = "0,2,1,4,3"       (neighbours follow EDGE ORDER: 2 before 1)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that nodes are emitted in increasing
+        // distance from the start (layer order), that within a layer they follow edge-declaration order rather
+        // than sorted order (the 0,2,1,4,3 case), that a node reachable from multiple frontier nodes is emitted
+        // once (the diamond's shared node 3), that the visited set makes cycles terminate without revisiting,
+        // that an isolated start yields just itself, that a chain yields one-per-layer, and that all three
+        // engines agree on the frontier-expansion recursion with an accumulating order/visited record. This is
+        // the BFS an AI writes for shortest-unweighted-path, level-order tree walks, and reachability layering;
+        // a backend whose neighbour order, layer dedup, or visited guard was off would reorder or loop. Adds
+        // breadth-first traversal to the graph family.
+        let src = r#"type St = { order: List[Int], visited: List[Int] }
+fun neighbors(node: Int, edges: List[List[Int]]) -> List[Int] {
+    edges.filter(fn(e) { e.get(0).unwrap_or(0) == node }).map(fn(e) { e.get(1).unwrap_or(0) })
+}
+fun expand(frontier: List[Int], edges: List[List[Int]], visited: List[Int]) -> List[Int] {
+    frontier.flat_map(fn(node) { neighbors(node, edges) })
+        .filter(fn(nb) { visited.contains(nb) == false })
+}
+fun dedup(xs: List[Int]) -> List[Int] {
+    xs.fold([], fn(acc, x) {
+        if acc.contains(x) { acc } else { [acc, [x]].flatten() }
+    })
+}
+fun bfs(frontier: List[Int], edges: List[List[Int]], st: St) -> St {
+    if frontier.len() == 0 { st }
+    else {
+        let nextRaw = expand(frontier, edges, st.visited)
+        let next = dedup(nextRaw).filter(fn(nb) { st.visited.contains(nb) == false })
+        let nv = [st.visited, next].flatten()
+        let no = [st.order, next].flatten()
+        bfs(next, edges, St(order: no, visited: nv))
+    }
+}
+fun run(start: Int, edges: List[List[Int]]) -> Str {
+    let st = bfs([start], edges, St(order: [start], visited: [start]))
+    st.order.map(fn(x) { x.to_str() }).join(",")
+}
+fun probe() -> Str {
+    let a = run(0, [[0, 1], [0, 2], [1, 3], [2, 3], [3, 4]])
+    let b = run(0, [[0, 1], [1, 2], [2, 3]])
+    let c = run(0, [])
+    let d = run(0, [[0, 1], [0, 2], [1, 2], [2, 0]])
+    let e = run(0, [[0, 2], [0, 1], [1, 3], [2, 4]])
+    "diamond={a}|chain={b}|iso={c}|cyc={d}|order={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "diamond=0,1,2,3,4|chain=0,1,2,3|iso=0|cyc=0,1,2|order=0,2,1,4,3"
+        );
+    }
+
+    #[test]
     fn diff_topological_sort_kahn() {
         // A certification lock (it398): TOPOLOGICAL SORT via KAHN'S ALGORITHM -- linearize the nodes of a
         // directed graph (0..n-1, edges [from,to]) so every edge points forward, or report a CYCLE if no such
