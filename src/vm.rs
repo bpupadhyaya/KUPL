@@ -3029,6 +3029,54 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_set_cardinality_inclusion_exclusion() {
+        // A certification lock (it478, from bug-hunt batch 125 -- 8 probes across tensor/Rational/BigInt/Set/Map/
+        // regex/string shapes came back byte-identical, so the subtlest untouched corner is locked): the
+        // INCLUSION-EXCLUSION COUNTING IDENTITIES over Set cardinalities. Where set_algebra_laws (it424) pins the
+        // Boolean-algebra IDENTITIES as set-equalities (de Morgan, distributivity, absorption), this pins the
+        // CARDINALITY identities -- an arithmetic cross-check of the SIZES, independent of how union/intersect/
+        // difference are computed (a counting property, not a restatement of the set ops; cf. the bitwise
+        // inclusion-exclusion it475). With A={1,2,3,4}, B={3,4,5,6}, C={2,5}:
+        //   ie2:  |A ∪ B| == |A| + |B| - |A ∩ B|                              (two-set inclusion-exclusion)
+        //   sd1:  |A △ B| == |A ∪ B| - |A ∩ B|                                (symmetric-difference cardinality)
+        //   sd2:  |A △ B| == |A \ B| + |B \ A|                               (disjoint halves of the sym-diff)
+        //   part: |A ∪ B| == |A \ B| + |B \ A| + |A ∩ B|                      (union split into 3 disjoint parts)
+        //   ie3:  |A∪B∪C| == |A|+|B|+|C| - |A∩B| - |A∩C| - |B∩C| + |A∩B∩C|   (three-set inclusion-exclusion)
+        // The concrete cardinalities are pinned too: |A|=4, |A∪B|=6, |A∩B|=2, |A△B|=4, |A∪B∪C|=6.
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that union/intersect/difference/
+        // symmetric_difference produce sets whose SIZES satisfy the two- and three-set inclusion-exclusion
+        // principle, that the symmetric difference splits into two disjoint set-differences, that the union
+        // partitions into (A only) + (B only) + (both), and that all three engines agree on both the boolean
+        // identity outcomes and the raw counts. This is the counting an AI does for audience overlap, tag coverage,
+        // or deduplicated totals; a backend whose intersect double-counted or whose difference dropped an element
+        // would break one of the arithmetic identities (yielding false). A non-sort lock certifying Set
+        // cardinalities against the inclusion-exclusion principle.
+        let src = r#"fun card(s: Set[Int]) -> Int { s.to_list().len() }
+fun probe() -> Str {
+    let a = Set([1, 2, 3, 4])
+    let b = Set([3, 4, 5, 6])
+    let c = Set([2, 5])
+    let ca = card(a)
+    let cb = card(b)
+    let cAuB = card(a.union(b))
+    let cAnB = card(a.intersect(b))
+    let cAxB = card(a.symmetric_difference(b))
+    let ie2 = cAuB == ca + cb - cAnB
+    let sd1 = cAxB == cAuB - cAnB
+    let sd2 = cAxB == card(a.difference(b)) + card(b.difference(a))
+    let part = cAuB == card(a.difference(b)) + card(b.difference(a)) + cAnB
+    let cAuBuC = card(a.union(b).union(c))
+    let ie3 = cAuBuC == ca + cb + card(c) - card(a.intersect(b)) - card(a.intersect(c)) - card(b.intersect(c)) + card(a.intersect(b).intersect(c))
+    "ca={ca}|cAuB={cAuB}|cAnB={cAnB}|cAxB={cAxB}|cAuBuC={cAuBuC}|ie2={ie2}|sd1={sd1}|sd2={sd2}|part={part}|ie3={ie3}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "ca=4|cAuB=6|cAnB=2|cAxB=4|cAuBuC=6|ie2=true|sd1=true|sd2=true|part=true|ie3=true"
+        );
+    }
+
+    #[test]
     fn diff_karatsuba_multiplication() {
         // A certification lock (it476): KARATSUBA MULTIPLICATION -- the divide-and-conquer product that computes
         // x*y with THREE recursive sub-multiplications instead of four, via the identity, splitting each operand at
