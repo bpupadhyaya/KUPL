@@ -2269,6 +2269,69 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_isbn_check_digits() {
+        // A bug-hunt-103 lock (it428): ISBN-10 and ISBN-13 CHECK-DIGIT validation -- two weighted-sum schemes
+        // that complement the Luhn checksum (it427) with DIFFERENT weightings, moduli, and a special check
+        // character. ISBN-10 weights each of its ten digits by a DESCENDING positional factor (10 for the first
+        // digit down to 1 for the last), sums them, and is valid when the total is divisible by 11; its final
+        // check position may be the letter X, which stands for the value 10 (needed because 10 is a valid
+        // mod-11 residue but not a single decimal digit). ISBN-13 instead weights digits by ALTERNATING 1 and 3
+        // and is valid when the total is divisible by 10 (the same modulus as Luhn but a fixed 1/3 weighting
+        // rather than Luhn's every-other-doubling). Both guard their length (10 vs 13).
+        //   isbn10("0306406152") = true    (weighted sum 132, divisible by 11)
+        //   isbn10("0306406153") = false   (last digit 2->3: sum 133, not divisible by 11)
+        //   isbn10("097522980X") = true    (X check digit = value 10; sum 264 divisible by 11)
+        //   isbn13("9780306406157") = true (alternating 1/3 weights sum to 100, divisible by 10)
+        //   isbn13("9780306406158") = false(last digit 7->8: sum 101, not divisible by 10)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that ISBN-10 applies the descending
+        // positional weights and the mod-11 rule, that X is decoded as 10 in the check position, that a
+        // single-digit change breaks the mod-11 divisibility, that ISBN-13 applies the alternating 1/3 weights
+        // and the mod-10 rule, that a single-digit change breaks that too, that both length-guard their input,
+        // and that all three engines agree on both schemes. This is the ISBN validation an AI writes for a
+        // library catalog, bookstore importer, or metadata pipeline; a backend whose weight direction, modulus,
+        // or X-handling was off would accept malformed ISBNs or reject valid ones. A non-sort lock certifying two
+        // distinct weighted check-digit schemes, complementing the Luhn mod-10 checksum.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun charVal10(c: Str) -> Int { if c == "X" { 10 } else { c.parse_int().unwrap_or(0) } }
+fun isbn10(s: Str) -> Bool {
+    let cs = s.chars()
+    if cs.len() != 10 { false }
+    else {
+        let total = rangeN(10).fold(0, fn(acc, i) {
+            acc + charVal10(cs.get(i).unwrap_or("0")) * (10 - i)
+        })
+        total % 11 == 0
+    }
+}
+fun isbn13(s: Str) -> Bool {
+    let cs = s.chars()
+    if cs.len() != 13 { false }
+    else {
+        let total = rangeN(13).fold(0, fn(acc, i) {
+            let w = if i % 2 == 0 { 1 } else { 3 }
+            acc + cs.get(i).unwrap_or("0").parse_int().unwrap_or(0) * w
+        })
+        total % 10 == 0
+    }
+}
+fun probe() -> Str {
+    let a = isbn10("0306406152")
+    let b = isbn10("0306406153")
+    let c = isbn10("097522980X")
+    let d = isbn13("9780306406157")
+    let e = isbn13("9780306406158")
+    "isbn10ok={a}|isbn10bad={b}|isbn10X={c}|isbn13ok={d}|isbn13bad={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "isbn10ok=true|isbn10bad=false|isbn10X=true|isbn13ok=true|isbn13bad=false"
+        );
+    }
+
+    #[test]
     fn diff_luhn_checksum() {
         // A certification lock (it427): LUHN CHECKSUM -- the mod-10 validation used for credit-card numbers,
         // IMEIs, and many national IDs. Reading the digits from the RIGHT, every SECOND digit (the ones at
