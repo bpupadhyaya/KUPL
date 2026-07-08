@@ -2104,6 +2104,48 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_tabular_report_from_records_header_body_footer() {
+        // A certification lock (it302): a multi-line tabular REPORT from records -- header + column-aligned
+        // rows + grand-total footer, assembled declaratively. it240 builds a report by interpolating the
+        // accumulator back into itself in a LOOP (imperative, no alignment, no footer-fold); this pins the
+        // map->join table an AI actually generates: map each record to a pad-aligned row string, join("\n")
+        // the body, fold a SEPARATE grand total, and compose header\nbody\nfooter.
+        //   rows = [apple q3 p50, pear q2 p70, kiwi q5 p30]
+        //   each row: name.pad_right(10) + qty.pad_left(3) + total.pad_left(5); total = qty*price
+        //   grand = fold(0, +qty*price) = 150+140+150 = 440
+        // Byte-identical on interp/KVM (native per the sweep). Confirms map-over-records yields the row
+        // strings in order, that pad_right/pad_left column alignment lands identically on all engines
+        // (fixed-width columns are where a stringify-width bug would show), that join("\n") assembles the
+        // body without a trailing separator, and that a fold over the SAME rows produces the grand total
+        // independently of the row mapping. The row formatter is a helper fn (interp exprs stay simple --
+        // nested quotes inside {..} would trip K0007), so this also exercises map(fn-by-name). This is the
+        // invoice / receipt / summary-table an AI emits for a CLI or report; a backend that mis-padded a
+        // column or left a trailing newline in the join would desync the whole table.
+        let src = r#"type Row = { name: Str, qty: Int, price: Int }
+fun fmtRow(r: Row) -> Str {
+    let sp = " "
+    let total = r.qty * r.price
+    let nm = r.name.pad_right(10, sp)
+    let q = to_str(r.qty).pad_left(3, sp)
+    let t = to_str(total).pad_left(5, sp)
+    "{nm} {q}  {t}"
+}
+fun probe() -> Str {
+    let rows = [Row(name: "apple", qty: 3, price: 50), Row(name: "pear", qty: 2, price: 70), Row(name: "kiwi", qty: 5, price: 30)]
+    let header = "ITEM       QTY  TOTAL"
+    let body = rows.map(fmtRow).join("\n")
+    let grand = rows.fold(0, fn(acc, r) { acc + r.qty * r.price })
+    let footer = "TOTAL: {grand}"
+    "{header}\n{body}\n{footer}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "ITEM       QTY  TOTAL\napple        3    150\npear         2    140\nkiwi         5    150\nTOTAL: 440"
+        );
+    }
+
+    #[test]
     fn diff_adt_variant_with_record_typed_field() {
         // A bug-hunt-43 lock (it301): an ADT whose variants carry RECORD-typed fields (not scalars).
         // Prior REC-ADT locks (it296 Leaf(v: Int), it298 Num(v: Int)) wrap Ints; this pins a tagged union
