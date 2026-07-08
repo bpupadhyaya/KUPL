@@ -3029,6 +3029,49 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_perrin_numbers() {
+        // A certification lock (it463): the PERRIN NUMBERS P(n) = P(n-2) + P(n-3), seeded P(0)=3, P(1)=0, P(2)=2
+        // -- a third-order recurrence that SKIPS the n-1 term (complementing Narayana's cows it462, which skips
+        // n-2) -- certified against the famous PERRIN PRIMALITY PROPERTY: n divides P(n) whenever n is prime. This
+        // is a genuinely independent and striking cross-check that connects the sequence to primality itself
+        // (Perrin's sequence is the basis of the Perrin primality test). Within the tested range every prime n
+        // divides P(n), and no composite does (the smallest Perrin pseudoprime, 271441, is far beyond the probe).
+        // Perrin shares its recurrence shape with the Padovan sequence but uses the distinct seeds (3,0,2) that
+        // give it the trace-of-a-companion-matrix structure behind the divisibility property.
+        //   P(0)=3, P(5)=5, P(7)=7, P(10)=17, P(11)=22    (OEIS A001608, the Perrin sequence 3,0,2,3,2,5,5,7,10,12,17,22)
+        //   primeOK: for n in {2,3,5,7,11} (all prime), n divides P(n)   (2|2, 3|3, 5|5, 7|7, 11|22)
+        //   compOK:  for n in {4,6,8,9}   (all composite), n does NOT divide P(n)   (no pseudoprimes here)
+        //   rec:     P(10)=17 == P(8)+P(7) = 10+7   (the n-2, n-3 recurrence self-check)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the recurrence adds the n-2 and n-3
+        // terms (skipping n-1), that the seeds 3,0,2 drive the sequence, that the values match the known Perrin
+        // sequence, that every prime index divides its Perrin number while composites do not (the primality
+        // property, an identity wholly independent of the defining recurrence), and that all three engines agree.
+        // This is the third-order "skip-n-1" recurrence with a built-in primality signature an AI writes for number
+        // theory; the divisibility property catches a wrong seed or lag that a bare recurrence check would miss. A
+        // non-sort lock certifying the Perrin numbers against the Perrin primality property.
+        let src = r#"fun perrin(n: Int) -> Int {
+    if n == 0 { 3 } else if n == 1 { 0 } else if n == 2 { 2 }
+    else { perrin(n - 2) + perrin(n - 3) }
+}
+fun probe() -> Str {
+    let p0 = perrin(0)
+    let p5 = perrin(5)
+    let p7 = perrin(7)
+    let p10 = perrin(10)
+    let p11 = perrin(11)
+    let primeOK = perrin(2) % 2 == 0 && perrin(3) % 3 == 0 && perrin(5) % 5 == 0 && perrin(7) % 7 == 0 && perrin(11) % 11 == 0
+    let compOK = perrin(4) % 4 != 0 && perrin(6) % 6 != 0 && perrin(8) % 8 != 0 && perrin(9) % 9 != 0
+    let rec = perrin(10) == perrin(8) + perrin(7)
+    "p0={p0}|p5={p5}|p7={p7}|p10={p10}|p11={p11}|primeOK={primeOK}|compOK={compOK}|rec={rec}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "p0=3|p5=5|p7=7|p10=17|p11=22|primeOK=true|compOK=true|rec=true"
+        );
+    }
+
+    #[test]
     fn diff_narayana_cows() {
         // A bug-hunt-120 lock (it462): NARAYANA'S COWS sequence a(n) = a(n-1) + a(n-3), seeded a(0)=a(1)=a(2)=1
         // -- a THIRD-order recurrence that references n-1 and n-3 while SKIPPING n-2, cross-validated against the
