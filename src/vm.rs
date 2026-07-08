@@ -2104,6 +2104,52 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_graph_cycle_detection() {
+        // A bug-hunt-50 lock (it316): GRAPH CYCLE DETECTION via DFS with an on-stack (recursion-path) set.
+        // it315 does reachability with a single visited set; cycle detection needs a DIFFERENT set -- the
+        // nodes currently ON the DFS recursion stack -- because a cycle is a BACK EDGE: a neighbor that is
+        // already on the current path. Reaching a node twice is NOT a cycle (the diamond); reaching a node
+        // that is still in-progress on the stack IS.
+        //   hasCycleFrom(node, onStack): add node to onStack; for each neighbor n:
+        //     if n is already on the stack -> back edge -> cycle (true); else recurse. .any short-circuits.
+        //   dag = {1:[2,3], 2:[4], 3:[4], 4:[]}   -> false  (4 reached via both 2 and 3 but never on the
+        //                                                     stack when checked -- a diamond, not a cycle)
+        //   cyc = {1:[2], 2:[3], 3:[1]}           -> true   (3's neighbor 1 is on the stack {1,2,3})
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the on-stack Set threads down the
+        // recursion path (add before recursing on neighbors), that a neighbor already on the stack is the
+        // cycle signal (member test), that .any over neighbors short-circuits on the first back edge, and
+        // -- crucially -- that a re-reached-but-not-on-stack node (4 in the diamond) is NOT flagged. This is
+        // the DAG-check / dependency-cycle detector an AI writes for build graphs, module imports, or task
+        // scheduling; a backend that used a plain visited set (like reachability) instead of an on-stack set
+        // would falsely report the diamond DAG as cyclic, and one whose .any didn't short-circuit could miss
+        // or mis-time the back-edge signal. it315's reachability can't distinguish a diamond from a cycle.
+        let src = r#"fun member(s: Set[Int], x: Int) -> Bool {
+    s.to_list().position(fn(y) { y == x }).is_some()
+}
+fun add(s: Set[Int], x: Int) -> Set[Int] {
+    Set([[x], s.to_list()].flatten())
+}
+fun hasCycleFrom(adj: Map[Int, List[Int]], node: Int, onStack: Set[Int], done: Set[Int]) -> Bool {
+    if member(done, node) { false }
+    else {
+        let stack2 = add(onStack, node)
+        let neighbors = adj.get(node).unwrap_or([])
+        neighbors.any(fn(n) {
+            if member(stack2, n) { true }
+            else { hasCycleFrom(adj, n, stack2, done) }
+        })
+    }
+}
+fun probe() -> Str {
+    let dag = Map().insert(1, [2, 3]).insert(2, [4]).insert(3, [4]).insert(4, [])
+    let cyc = Map().insert(1, [2]).insert(2, [3]).insert(3, [1])
+    "dag={hasCycleFrom(dag, 1, Set([]), Set([]))}|cyc={hasCycleFrom(cyc, 1, Set([]), Set([]))}"
+}
+"#;
+        assert_eq!(differential(src), "dag=false|cyc=true");
+    }
+
+    #[test]
     fn diff_graph_adjacency_dfs_reachability() {
         // A certification lock (it315): a GRAPH as an adjacency Map[Int, List[Int]] with recursive DFS
         // reachability threading a visited Set through a fold. Prior tree locks (it313/it314 BST, it296-312)
