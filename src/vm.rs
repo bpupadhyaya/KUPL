@@ -2220,6 +2220,59 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_selection_sort_extract_min() {
+        // A bug-hunt-95 lock (it411): SELECTION SORT by repeated MINIMUM EXTRACTION -- the extract-the-extreme
+        // paradigm that a binary heap accelerates (a heap is precisely an efficient priority queue for repeated
+        // extract-min, turning this O(n^2) selection into O(n log n) heap sort; the OBSERVABLE ORDER is identical
+        // either way). This is a distinct sorting paradigm from every prior sort lock: insertion sort (it321)
+        // BUILDS the output by inserting each element into its sorted position; quicksort (it325) and quickselect
+        // (it408) PARTITION around a pivot; merge sort (it324) DIVIDES and merges; counting sort (it410)
+        // DISTRIBUTES by value-index. Selection instead repeatedly finds the minimum of the remaining elements,
+        // emits it, and recurses on the rest with that one occurrence removed. removeFirst deletes only the FIRST
+        // occurrence of the chosen minimum, so duplicate minima are extracted one per recursion rather than all
+        // at once.
+        //   selectionSort([5,2,8,1,9,3]) = [1,2,3,5,8,9]   (each pass pulls the next-smallest)
+        //   selectionSort([3,3,1,2,2]) = [1,2,2,3,3]       (duplicate 2s and 3s each extracted in turn)
+        //   selectionSort([7]) = [7]                       (single element)
+        //   selectionSort([]) = []                         (empty short-circuits)
+        //   selectionSort([4,3,2,1]) = [1,2,3,4]           (fully reversed input)
+        //   selectionSort([0,0,0]) = [0,0,0]               (all equal -- min extracted three times)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each recursion selects the true
+        // minimum of the remaining elements, that only one occurrence of that minimum is removed per step (so
+        // duplicates survive to later passes rather than vanishing), that the emitted sequence is fully
+        // ascending, that empty/single/reversed/all-equal inputs are handled, and that all three engines agree
+        // on the extract-min recursion. This is the selection sort (heap sort's algorithmic essence) an AI
+        // writes for simple in-place ordering and as the mental model behind priority-queue-backed sorting; a
+        // backend whose min-selection or single-occurrence removal was off would misorder or drop duplicates.
+        // Adds the selection / extract-min paradigm distinct from insertion, partition, merge, and distribution.
+        let src = r#"fun removeFirst(xs: List[Int], v: Int) -> List[Int] {
+    let p = xs.position(fn(x) { x == v }).unwrap_or(0)
+    [xs.take(p), xs.drop(p + 1)].flatten()
+}
+fun selectionSort(xs: List[Int]) -> List[Int] {
+    if xs.len() == 0 { [] }
+    else {
+        let m = xs.fold(xs.first().unwrap_or(0), fn(acc, x) { if x < acc { x } else { acc } })
+        [[m], selectionSort(removeFirst(xs, m))].flatten()
+    }
+}
+fun probe() -> Str {
+    let a = selectionSort([5, 2, 8, 1, 9, 3])
+    let b = selectionSort([3, 3, 1, 2, 2])
+    let c = selectionSort([7])
+    let d = selectionSort([])
+    let e = selectionSort([4, 3, 2, 1])
+    let f = selectionSort([0, 0, 0])
+    "mixed={a}|dups={b}|single={c}|empty={d}|rev={e}|zeros={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mixed=[1, 2, 3, 5, 8, 9]|dups=[1, 2, 2, 3, 3]|single=[7]|empty=[]|rev=[1, 2, 3, 4]|zeros=[0, 0, 0]"
+        );
+    }
+
+    #[test]
     fn diff_counting_sort() {
         // A certification lock (it410): COUNTING SORT -- a NON-COMPARISON distribution sort, a fundamentally
         // different paradigm from the comparison sorts already locked (quicksort it325, merge sort it324,
