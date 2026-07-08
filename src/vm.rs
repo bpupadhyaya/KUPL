@@ -2220,6 +2220,62 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_quickselect_kth() {
+        // A certification lock (it408): QUICKSELECT -- find the kth-smallest element (0-indexed) via
+        // pivot-partitioning, the PARTIAL-SORT DUAL to the full quicksort (it325). Both use the same partition
+        // machinery -- pick a pivot (here the first element), split the rest into LESS-than, EQUAL-to, and
+        // GREATER-than the pivot -- but where quicksort recurses into BOTH sides to fully order the list,
+        // quickselect recurses into only the ONE side that contains rank k. If k falls within the less
+        // partition, recurse left; if k lands in the equal band [nl, nl+ne) the pivot itself is the answer;
+        // otherwise recurse right with the rank shifted down by nl+ne. This one-sided recursion is why
+        // quickselect averages O(n) versus quicksort's O(n log n) -- it never sorts the parts it doesn't need.
+        //   quickselect([7,2,9,4,1,8,3], 0) = 1   (the minimum; sorted order is [1,2,3,4,7,8,9])
+        //   quickselect([7,2,9,4,1,8,3], 3) = 4   (the median at 0-indexed rank 3)
+        //   quickselect([7,2,9,4,1,8,3], 6) = 9   (the maximum)
+        //   quickselect([5,5,5,2,8], 2) = 5       (duplicates -- the equal band absorbs rank 2 -> pivot 5)
+        //   quickselect([42], 0) = 42             (a single element)
+        //   quickselect([3,1,2], 1) = 2           (the middle of three)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the pivot splits into less/equal/
+        // greater exactly as quicksort does, that recursion descends into only the partition holding rank k
+        // (the partial-sort optimization), that the equal band correctly resolves duplicates without infinite
+        // recursion (the [5,5,5,2,8] case terminates at the pivot rather than re-partitioning equal elements),
+        // that the rank is shifted by nl+ne when recursing right, that min/median/max ranks all resolve on the
+        // same input, and that all three engines agree on the one-sided partition recursion. This is the
+        // quickselect an AI writes for order statistics, median finding, and top-k selection; a backend whose
+        // partition, rank arithmetic, or equal-band handling was off would return the wrong element or loop.
+        // Adds partial-sort selection as the one-sided dual of the full quicksort.
+        let src = r#"fun quickselect(xs: List[Int], k: Int) -> Int {
+    let pivot = xs.first().unwrap_or(0)
+    let rest = xs.drop(1)
+    let less = rest.filter(fn(x) { x < pivot })
+    let equal = [[pivot], rest.filter(fn(x) { x == pivot })].flatten()
+    let greater = rest.filter(fn(x) { x > pivot })
+    let nl = less.len()
+    let ne = equal.len()
+    if k < nl { quickselect(less, k) }
+    else {
+        if k < nl + ne { pivot }
+        else { quickselect(greater, k - nl - ne) }
+    }
+}
+fun probe() -> Str {
+    let xs = [7, 2, 9, 4, 1, 8, 3]
+    let a = quickselect(xs, 0)
+    let b = quickselect(xs, 3)
+    let c = quickselect(xs, 6)
+    let d = quickselect([5, 5, 5, 2, 8], 2)
+    let e = quickselect([42], 0)
+    let f = quickselect([3, 1, 2], 1)
+    "min={a}|median={b}|max={c}|dup={d}|single={e}|mid={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "min=1|median=4|max=9|dup=5|single=42|mid=2"
+        );
+    }
+
+    #[test]
     fn diff_prim_mst() {
         // A bug-hunt-93 lock (it407): PRIM'S MINIMUM SPANNING TREE -- the same least-total-weight spanning tree
         // as Kruskal (it404), but grown by a DIFFERENT strategy, completing the MST dual pairing. Where Kruskal
