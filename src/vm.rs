@@ -2104,6 +2104,51 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_adt_to_json_serialize_and_parse() {
+        // A bug-hunt-47 lock (it310): recursive ADT-to-JSON SERIALIZATION -- a function that renders a Tree
+        // ADT to a JSON string, then json_parse validates the result is well-formed. it309 pretty-prints to
+        // S-expressions (no braces/JSON); it238 roundtrips a LITERAL JSON value through parse/stringify.
+        // This pins ADT-driven JSON construction: the serializer recurses over Node/Leaf building object and
+        // array syntax with `{{`/`}}` literal-brace escapes and `\"` quotes inside interpolated strings.
+        //   toJson(Leaf v)     = {"leaf": v}
+        //   toJson(Node l r)   = {"node": [toJson(l), toJson(r)]}
+        //   t = Node(Leaf 1, Node(Leaf 2, Leaf 3))
+        //     -> {"node": [{"leaf": 1}, {"node": [{"leaf": 2}, {"leaf": 3}]}]}
+        //   json_parse(that) -> Ok  (well-formed)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the recursive serializer emits
+        // literal braces via `{{`/`}}` (not interpolation markers), that `\"` produces real quotes in the
+        // JSON keys, that the two recursive results thread into the array in order, and that json_parse
+        // accepts the machine-generated string (returns Ok, not an Err). This is the "serialize my data
+        // structure to JSON" an AI writes for an API payload or a config dump; a backend that mis-handled
+        // the brace escapes would emit malformed JSON that json_parse rejects, and one that lost recursion
+        // order would swap the subtrees. (json_parse returns Result[Json, Str] -- matched here, not fed
+        // straight to json_stringify, which is K0200.)
+        let src = r##"type Tree = Leaf(v: Int) | Node(l: Tree, r: Tree)
+fun toJson(t: Tree) -> Str {
+    match t { Leaf(v) => "{{\"leaf\": {v}}}"
+        Node(l, r) => {
+            let ls = toJson(l)
+            let rs = toJson(r)
+            "{{\"node\": [{ls}, {rs}]}}"
+        } }
+}
+fun checkParse(j: Str) -> Str {
+    match json_parse(j) { Ok(v) => "ok"
+        Err(e) => "err:{e}" }
+}
+fun probe() -> Str {
+    let t = Node(l: Leaf(v: 1), r: Node(l: Leaf(v: 2), r: Leaf(v: 3)))
+    let j = toJson(t)
+    "{j}|parse={checkParse(j)}"
+}
+"##;
+        assert_eq!(
+            differential(src),
+            r#"{"node": [{"leaf": 1}, {"node": [{"leaf": 2}, {"leaf": 3}]}]}|parse=ok"#
+        );
+    }
+
+    #[test]
     fn diff_adt_pretty_printer_sexpr() {
         // A certification lock (it309): a mutual-recursive ADT PRETTY-PRINTER -- rendering an S-expression
         // tree back to a Str. it308's mutual recursion computes a scalar SIZE; this renders to text with
