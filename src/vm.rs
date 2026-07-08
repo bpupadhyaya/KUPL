@@ -2104,6 +2104,38 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_exponentiation_by_squaring() {
+        // A bug-hunt-58 lock (it337): exponentiation by squaring -- the O(log n) fast-power, integer recursion
+        // that HALVES the exponent by squaring the base, distinct from the modulo/parity/digit int recursions
+        // (it334/335/336). e==0 returns 1; an even e recurses on (b*b, e/2) -- squaring the base and halving
+        // the exponent; an odd e strips one factor via b * fastPow(b, e-1). The hand-rolled result is
+        // cross-checked against the builtin Int.pow, so two independent implementations must agree.
+        //   fastPow(2,10)=1024  fastPow(3,5)=243  fastPow(5,0)=1  fastPow(7,3)=343  ; 2.pow(10)=1024 (matches)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the e==0 base returns 1 (not 0), that
+        // the even branch squares the base and halves the exponent (2->b*b, 10/2) so 2^10 collapses in ~log2
+        // steps, that the odd branch peels one factor, and -- the key cross-check -- that the fast-power
+        // agrees with the builtin .pow (both 1024). A backend whose even/odd branch or the e/2 halving was
+        // wrong would diverge from the builtin, and one that returned 0 at e==0 would zero every result.
+        let src = r#"fun fastPow(b: Int, e: Int) -> Int {
+    if e == 0 { 1 }
+    else {
+        if e % 2 == 0 { let h = fastPow(b * b, e / 2); h }
+        else { b * fastPow(b, e - 1) }
+    }
+}
+fun probe() -> Str {
+    let a = fastPow(2, 10)
+    let b = fastPow(3, 5)
+    let c = fastPow(5, 0)
+    let d = fastPow(7, 3)
+    let chk = 2.pow(10)
+    "p2_10={a}|p3_5={b}|p5_0={c}|p7_3={d}|builtin2_10={chk}"
+}
+"#;
+        assert_eq!(differential(src), "p2_10=1024|p3_5=243|p5_0=1|p7_3=343|builtin2_10=1024");
+    }
+
+    #[test]
     fn diff_digit_sum_and_digital_root() {
         // A certification lock (it336): digit-sum + digital-root -- integer recursion that extracts base-10
         // digits via %10 (last digit) and /10 (the rest), distinct from gcd (pair modulo-reduction) and
