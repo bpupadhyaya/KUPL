@@ -2934,6 +2934,60 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_perfect_number_sigma() {
+        // A bug-hunt-114 lock (it450, campaign midpoint): PERFECT NUMBERS via the SUM-OF-DIVISORS function sigma,
+        // with deficient/perfect/abundant classification. This extends the number-theory family (prime-fact it449,
+        // sieve it448, totient it447, ...) with a new technique: DIVISOR PAIRING. sigma(n), the sum of ALL divisors
+        // of n, is computed by trial d only up to sqrt(n): whenever d divides n, BOTH d and its cofactor n/d are
+        // divisors, so add them together -- except when d*d == n (n is a perfect square) the square root is a
+        // single divisor and must be added ONCE, not twice. The proper-divisor sum is sigma(n) - n, and a number
+        // is perfect when that equals n, abundant when it exceeds n, deficient when it falls short.
+        //   sigma(6) = 12, properSum(6) = 6      (6 = 1+2+3, the smallest PERFECT number)
+        //   sigma(28) = 56, properSum(28) = 28   (28 = 1+2+4+7+14, the second perfect number)
+        //   classify(6) = perfect / classify(28) = perfect
+        //   classify(12) = abundant              (proper divisors 1+2+3+4+6 = 16 > 12)
+        //   classify(10) = deficient             (1+2+5 = 8 < 10)
+        //   classify(16) = deficient             (16 = 2^4; sigma = 31, proper = 15 -- the sqrt(16)=4 added once)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that divisor pairing sums d and n/d for
+        // each divisor below the square root, that a perfect square adds its root exactly once (not double-counted),
+        // that the proper-divisor sum subtracts n from sigma, that 6 and 28 are recognized as perfect, that an
+        // abundant and two deficient numbers classify correctly, and that all three engines agree. The sqrt bound
+        // keeps the recursion shallow. This is the "is this number perfect / how do its divisors sum" an AI writes
+        // for number theory or recreational math; the perfect-square single-count is the subtle case a naive
+        // pairing double-counts. A non-sort lock certifying the sum-of-divisors function and perfect-number
+        // classification via sqrt-bounded divisor pairing.
+        let src = r#"fun divSum(n: Int, d: Int, acc: Int) -> Int {
+    if d * d > n { acc }
+    else if d * d == n { divSum(n, d + 1, acc + d) }
+    else if n % d == 0 { divSum(n, d + 1, acc + d + n / d) }
+    else { divSum(n, d + 1, acc) }
+}
+fun sigma(n: Int) -> Int { divSum(n, 1, 0) }
+fun properSum(n: Int) -> Int { sigma(n) - n }
+fun classify(n: Int) -> Str {
+    let p = properSum(n)
+    if p == n { "perfect" } else if p > n { "abundant" } else { "deficient" }
+}
+fun probe() -> Str {
+    let s6 = sigma(6)
+    let s28 = sigma(28)
+    let p6 = properSum(6)
+    let p28 = properSum(28)
+    let c6 = classify(6)
+    let c28 = classify(28)
+    let c12 = classify(12)
+    let c10 = classify(10)
+    let c16 = classify(16)
+    "sig6={s6}|sig28={s28}|pd6={p6}|pd28={p28}|c6={c6}|c28={c28}|c12={c12}|c10={c10}|c16={c16}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sig6=12|sig28=56|pd6=6|pd28=28|c6=perfect|c28=perfect|c12=abundant|c10=deficient|c16=deficient"
+        );
+    }
+
+    #[test]
     fn diff_euler_totient() {
         // A certification lock (it447): EULER'S TOTIENT phi(n) -- the count of integers in [1,n] coprime to n --
         // computed TWO independent ways and cross-checked, extending the number-theory family (gcd it334,
