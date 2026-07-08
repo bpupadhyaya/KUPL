@@ -2269,6 +2269,64 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_state_machine_fold() {
+        // A certification lock (it423): FINITE-STATE-MACHINE as a pure FOLD -- process a sequence of events
+        // through a transition function, threading the machine's state (and side-effect counters) as a record
+        // accumulator. This is distinct from diff_component_state_machine, which drives the component/emit/port
+        // actor runtime; here the FSM is a plain fold over an event list with NO component system -- the pattern
+        // an AI writes for a turnstile, a protocol handler, a parser, or UI state. The classic turnstile has two
+        // states (Locked / Unlocked) and two events (coin / push), and crucially the SAME event has a
+        // STATE-DEPENDENT effect: a push while Locked triggers an alarm, a push while Unlocked records an entry
+        // and re-locks; a coin unlocks (or, if already unlocked, is a no-op "thank you"). The accumulator carries
+        // the boolean state plus two counters (alarms, entries).
+        //   run(["coin","push"]) = LOCKED,alarms=0,entries=1          (unlock then pass through)
+        //   run(["push","push"]) = LOCKED,alarms=2,entries=0          (two pushes while locked -> two alarms)
+        //   run(["coin","push","coin","coin","push"]) = LOCKED,alarms=0,entries=2  (extra coin is a no-op)
+        //   run(["push","coin","push","push"]) = LOCKED,alarms=2,entries=1         (interleaved alarms + entry)
+        //   run([]) = LOCKED,alarms=0,entries=0                       (no events -> seed state)
+        //   run(["coin","coin","coin"]) = OPEN,alarms=0,entries=0     (stays unlocked; extra coins no-op)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the transition function branches on
+        // the CURRENT state so one event has different effects in different states (push -> alarm when locked,
+        // push -> entry when unlocked), that the record accumulator threads the boolean state plus the alarm and
+        // entry counters through the fold, that a coin while already unlocked is a no-op, that the terminal state
+        // reflects the entire event history, that an empty event list yields the seed state unchanged, and that
+        // all three engines agree on the state-machine fold. This is the FSM an AI writes to track protocol or UI
+        // state without reaching for the component runtime; a backend whose state-dependent branching or counter
+        // threading was off would end in the wrong state or miscount the transitions. A non-sort lock exercising
+        // a pure fold-based finite state machine with state-dependent transitions.
+        let src = r#"type St = { locked: Bool, alarms: Int, entries: Int }
+fun step(s: St, ev: Str) -> St {
+    if s.locked {
+        if ev == "coin" { St(locked: false, alarms: s.alarms, entries: s.entries) }
+        else { St(locked: true, alarms: s.alarms + 1, entries: s.entries) }
+    } else {
+        if ev == "push" { St(locked: true, alarms: s.alarms, entries: s.entries + 1) }
+        else { St(locked: false, alarms: s.alarms, entries: s.entries) }
+    }
+}
+fun run(events: List[Str]) -> Str {
+    let seed = St(locked: true, alarms: 0, entries: 0)
+    let final = events.fold(seed, fn(s, ev) { step(s, ev) })
+    let state = if final.locked { "LOCKED" } else { "OPEN" }
+    "{state},alarms={final.alarms},entries={final.entries}"
+}
+fun probe() -> Str {
+    let normal = run(["coin", "push"])
+    let alarm = run(["push", "push"])
+    let multi = run(["coin", "push", "coin", "coin", "push"])
+    let sneaky = run(["push", "coin", "push", "push"])
+    let empty = run([])
+    let coinsOnly = run(["coin", "coin", "coin"])
+    "normal={normal}|alarm={alarm}|multi={multi}|sneaky={sneaky}|empty={empty}|coins={coinsOnly}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "normal=LOCKED,alarms=0,entries=1|alarm=LOCKED,alarms=2,entries=0|multi=LOCKED,alarms=0,entries=2|sneaky=LOCKED,alarms=2,entries=1|empty=LOCKED,alarms=0,entries=0|coins=OPEN,alarms=0,entries=0"
+        );
+    }
+
+    #[test]
     fn diff_option_traverse() {
         // A certification lock (it421): OPTION-TRAVERSE -- traverse a list applying a fallible (Option-returning)
         // operation and collect into a single Option[List[Int]] with ALL-OR-NOTHING semantics: every item must
