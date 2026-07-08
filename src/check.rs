@@ -2560,7 +2560,13 @@ impl Checker {
                         } else if sig.out_ports.contains_key(name) {
                             format!("`{name}` is an output port of `{cname}`, not a method — read it with `wire {name} -> …`, don't call it")
                         } else {
-                            format!("component `{cname}` does not expose a function named `{name}`")
+                            // Not a port either — a plain typo on an exposed function. Suggest the
+                            // closest exposed name so the fix is one edit away (PR-it477).
+                            let mut m = format!("component `{cname}` does not expose a function named `{name}`");
+                            if let Some(s) = suggest(name, sig.exposes.keys().map(|k| k.as_str())) {
+                                m.push_str(&format!(" — did you mean `{s}`?"));
+                            }
+                            m
                         };
                         self.err("K0247", msg, span);
                         return self.uni.fresh();
@@ -2573,11 +2579,13 @@ impl Checker {
                 match sig.sigs.get(name) {
                     Some((ps, r, _)) => Some((ps.clone(), r.clone())),
                     None => {
-                        self.err(
-                            "K0247",
-                            format!("contract `{cname}` has no function named `{name}`"),
-                            span,
-                        );
+                        // Same courtesy for contract dynamic dispatch: name the closest
+                        // contract function instead of a bare "has no function" (PR-it477).
+                        let mut m = format!("contract `{cname}` has no function named `{name}`");
+                        if let Some(s) = suggest(name, sig.sigs.keys().map(|k| k.as_str())) {
+                            m.push_str(&format!(" — did you mean `{s}`?"));
+                        }
+                        self.err("K0247", m, span);
                         return self.uni.fresh();
                     }
                 }
@@ -3218,6 +3226,12 @@ mod generic_tests {
         // A genuinely unknown method keeps the plain "does not expose a function" wording.
         let unk = errors(&format!("{comp}fun main() {{ let c = Counter()\n    c.frobnicate() }}\n"));
         assert!(unk.iter().any(|d| d.code == "K0247" && d.message.contains("does not expose a function")), "unknown: {unk:?}");
+        // A close TYPO on an exposed function now names the closest exposed name (PR-it477).
+        let typo = errors("component C {\n    intent \"c\"\n    state n: Int = 0\n    expose fun total() -> Int { n }\n}\nfun main() { let c = C()\n    let _ = c.totl() }\n");
+        assert!(
+            typo.iter().any(|d| d.code == "K0247" && d.message.contains("does not expose a function named `totl`") && d.message.contains("did you mean `total`?")),
+            "typo should suggest the exposed name: {typo:?}"
+        );
         // A real exposed function still type-checks.
         assert!(errors("component C {\n    intent \"c\"\n    state n: Int = 0\n    expose fun bump() -> Int { n = n + 1\n        n }\n}\nfun main() { let c = C()\n    let _ = c.bump() }\n").is_empty());
     }
