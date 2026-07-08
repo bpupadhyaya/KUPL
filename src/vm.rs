@@ -2220,6 +2220,70 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_minimum_jumps_to_end() {
+        // A certification lock (it386): MINIMUM JUMPS TO END -- the FEWEST jumps needed to reach the last index,
+        // where each value is the maximum forward jump from that index. This is the OPTIMIZATION twin of the
+        // boolean jump-game (it385): jump-game DECIDES whether the end is reachable, whereas this COUNTS the
+        // minimum number of jumps, returning -1 when unreachable. It is a min-over-reachable-landings DP:
+        // minJumps(i) is 0 at the last index; from an index with a 0 jump (and not already at the end) it is
+        // unreachable (a large sentinel); otherwise it is 1 + the MIN of minJumps(j) over every landing spot
+        // j in (i, i+nums[i]] (clamped to the last index), skipping landings that are themselves unreachable.
+        // solve() maps a surviving sentinel to -1.
+        //   solve([2,3,1,1,4]) = 2      (0 -> index 1 -> index 4)
+        //   solve([2,3,0,1,4]) = 2      (0 -> 1 -> 4, routing around the 0 at index 2)
+        //   solve([0]) = 0              (already at the last index)
+        //   solve([1,1,1,1]) = 3        (must step one at a time: 0->1->2->3)
+        //   solve([3,2,1,0,4]) = -1     (the 0 at index 3 strands the end -- unreachable)
+        //   solve([1,2]) = 1            (a single jump from index 0 to index 1)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the last-index base is 0 jumps, that a
+        // jump costs 1 plus the best continuation, that the minimum is taken over ALL reachable landing spots
+        // (not just the furthest -- greedy-furthest is a heuristic; the true minimum considers every reach),
+        // that an index with a 0 jump before the end is unreachable, that an unreachable end yields -1 via the
+        // sentinel, that all-ones forces one jump per step, and that all three engines agree on the
+        // min-over-choices recursion. This is the minimum-jumps / fewest-hops routine an AI writes for
+        // shortest-path-on-a-line and least-cost reachability; a backend whose min-over-landings, unit jump
+        // cost, or unreachable sentinel was off would mis-count. Completes the jump-game pair: reachability
+        // DECIDES (boolean it385), minimum-jumps OPTIMIZES (count).
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [rangeIncl(lo, hi - 1), [hi]].flatten() }
+}
+fun mini(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+fun minJumps(nums: List[Int], i: Int) -> Int {
+    let n = nums.len()
+    if i >= n - 1 { 0 }
+    else {
+        let ni = nums.get(i).unwrap_or(0)
+        if ni == 0 { 100000 }
+        else {
+            let hi = mini(i + ni, n - 1)
+            rangeIncl(i + 1, hi).fold(100000, fn(best, j) {
+                let sub = minJumps(nums, j)
+                if sub >= 100000 { best } else { mini(best, 1 + sub) }
+            })
+        }
+    }
+}
+fun solve(nums: List[Int]) -> Int {
+    let r = minJumps(nums, 0)
+    if r >= 100000 { 0 - 1 } else { r }
+}
+fun probe() -> Str {
+    let a = solve([2, 3, 1, 1, 4])
+    let b = solve([2, 3, 0, 1, 4])
+    let c = solve([0])
+    let d = solve([1, 1, 1, 1])
+    let e = solve([3, 2, 1, 0, 4])
+    let f = solve([1, 2])
+    "classic={a}|b={b}|single={c}|ones={d}|stuck={e}|two={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "classic=2|b=2|single=0|ones=3|stuck=-1|two=1"
+        );
+    }
+
+    #[test]
     fn diff_jump_game_reachability() {
         // A bug-hunt-82 lock (it385): JUMP GAME reachability -- given a list where each value is the MAXIMUM
         // forward jump length from that index, decide whether the LAST index is reachable starting from index 0.
