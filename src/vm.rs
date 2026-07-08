@@ -2648,6 +2648,78 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_iso_week_number() {
+        // A bug-hunt-111 lock (it444): ISO 8601 WEEK NUMBER -- the week-of-year an AI writes for business, finance,
+        // and scheduling, and one of the most error-prone date computations because a week belongs to the ISO year
+        // of its Thursday, so early-January and late-December dates can fall in the ADJACENT calendar year's week
+        // numbering. Extends the date family with the serial machinery from it440/it442/it443. The ISO weekday is
+        // Monday=1..Sunday=7 (serial mod 7 with 0 mapped to 7). The raw week is (dayOfYear - isoWeekday + 10) / 7,
+        // which can come out 0 (the date is really in the last week of the PRIOR year) or one past the year's week
+        // count (it is really week 1 of the NEXT year). A year's week count is isoWeekRaw(y,12,28), because
+        // December 28 is always in the final ISO week, sidestepping the boundary logic. Verified against the ISO
+        // standard, boundary cases included:
+        //   isoWeek(2024,1,1) = 1       (2024 opens on a Monday, so Jan 1 is week 1)
+        //   isoWeek(2023,1,1) = 52      (a Sunday -- belongs to 2022's week 52, the PRIOR ISO year)
+        //   isoWeek(2021,1,1) = 53      (a Friday -- belongs to 2020's week 53)
+        //   isoWeek(2020,12,31) = 53    (a Thursday -- 2020 is a 53-week ISO year)
+        //   isoWeek(2024,12,30) = 1     (a Monday -- belongs to 2025's week 1, the NEXT ISO year)
+        //   isoWeek(2024,6,15) = 24     (an ordinary mid-year date)
+        //   weeksInYear(2020) = 53 / weeksInYear(2024) = 52
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the ISO weekday runs Monday..Sunday as
+        // 1..7, that the raw week formula lands ordinary dates correctly, that a raw week of 0 rolls back to the
+        // prior year's final week (52 or 53), that a raw week beyond the year's count rolls forward to week 1, that
+        // 53-week years (2020) are distinguished from 52-week years (2024) via the December-28 anchor, that both
+        // the prior-year and next-year January/December boundary cases resolve to the standard values, and that
+        // all three engines agree. A subtle, high-value calendar computation; a backend whose weekday offset,
+        // boundary rollover, or 53-week detection was off would misnumber weeks near the year boundary. A non-sort
+        // lock certifying ISO 8601 week numbering.
+        let src = r#"fun isLeap(y: Int) -> Bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+fun daysInMonth(y: Int, m: Int) -> Int {
+    if m == 2 { if isLeap(y) { 29 } else { 28 } }
+    else if m == 4 || m == 6 || m == 9 || m == 11 { 30 }
+    else { 31 }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun dayOfYear(y: Int, m: Int, d: Int) -> Int {
+    rangeIncl(1, m - 1).fold(0, fn(acc, mm) { acc + daysInMonth(y, mm) }) + d
+}
+fun daysBeforeYear(y: Int) -> Int { let yy = y - 1; 365 * yy + yy / 4 - yy / 100 + yy / 400 }
+fun serial(y: Int, m: Int, d: Int) -> Int { daysBeforeYear(y) + dayOfYear(y, m, d) }
+fun isoWeekday(y: Int, m: Int, d: Int) -> Int {
+    let r = serial(y, m, d) % 7
+    if r == 0 { 7 } else { r }
+}
+fun isoWeekRaw(y: Int, m: Int, d: Int) -> Int {
+    (dayOfYear(y, m, d) - isoWeekday(y, m, d) + 10) / 7
+}
+fun weeksInYear(y: Int) -> Int { isoWeekRaw(y, 12, 28) }
+fun isoWeek(y: Int, m: Int, d: Int) -> Int {
+    let w = isoWeekRaw(y, m, d)
+    if w < 1 { weeksInYear(y - 1) }
+    else if w > weeksInYear(y) { 1 }
+    else { w }
+}
+fun probe() -> Str {
+    let a = isoWeek(2024, 1, 1)
+    let b = isoWeek(2023, 1, 1)
+    let c = isoWeek(2021, 1, 1)
+    let d = isoWeek(2020, 12, 31)
+    let e = isoWeek(2024, 12, 30)
+    let f = isoWeek(2024, 6, 15)
+    let g = weeksInYear(2020)
+    let h = weeksInYear(2024)
+    "y2024jan1={a}|y2023jan1={b}|y2021jan1={c}|y2020dec31={d}|y2024dec30={e}|jun15={f}|wk2020={g}|wk2024={h}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "y2024jan1=1|y2023jan1=52|y2021jan1=53|y2020dec31=53|y2024dec30=1|jun15=24|wk2020=53|wk2024=52"
+        );
+    }
+
+    #[test]
     fn diff_date_difference_days() {
         // A bug-hunt-109 lock (it440): DATE DIFFERENCE -- the number of days between two Gregorian dates, computed
         // by converting each date to a serial day-number and subtracting. This extends the date family (Zeller
