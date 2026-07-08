@@ -3029,6 +3029,67 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_newton_icbrt() {
+        // A certification lock (it474): NEWTON'S INTEGER CUBE ROOT -- floor(cbrt(n)) via the Newton iteration
+        // x_{k+1} = (2*x_k + n / (x_k*x_k)) / 3 (all integer arithmetic), iterated until it stops decreasing and
+        // then nudged by one to land exactly on the floor -- cross-validated against the DEFINING SPEC-INEQUALITY
+        // r^3 <= n < (r+1)^3. Continuing the classic-algorithm vein (Stein GCD it467 ... fast-doubling fib it472)
+        // and mirroring newton-isqrt (it469) with the cube analog: the cross-check is a genuine SPEC-PREDICATE, not
+        // a restatement of the iteration -- it verifies the returned r bounds n between consecutive cubes, which is
+        // the very definition of the integer cube root, independent of how r was computed. The Newton recurrence
+        // for cube roots (derived from f(x)=x^3-n, so x - f/f' = x - (x^3-n)/(3x^2) = (2x + n/x^2)/3) converges
+        // quadratically; integer flooring can land one off, so icbrt adjusts up or down to guarantee the invariant.
+        //   icbrt(27)=3, icbrt(64)=4, icbrt(1000)=10   (exact cubes)
+        //   icbrt(26)=2, icbrt(63)=3                    (just below the next cube: 26<27, 63<64)
+        //   s1..s6: r^3 <= n < (r+1)^3 holds for n = 27, 63, 64, 999, 1, 1330
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the Newton recurrence lands on the
+        // integer cube root, that the +/-1 adjustment restores the floor when the iteration overshoots or stops
+        // short, that exact cubes map to their root, that just-below-cube inputs floor correctly, that the
+        // spec-inequality r^3 <= n < (r+1)^3 holds across exact cubes / near-misses / the n=1 edge / a mid-range
+        // value (1330, whose root is 10 since 11^3=1331>1330), and that all three engines agree. This is the
+        // integer cube root an AI writes for volume/scaling math without floats; checking the between-cubes
+        // inequality catches an off-by-one in the floor adjustment. A non-sort lock certifying Newton's integer
+        // cube root against its defining inequality.
+        let src = r#"fun cbrtStep(n: Int, x: Int) -> Int {
+    let nx = (2 * x + n / (x * x)) / 3
+    if nx >= x { x } else { cbrtStep(n, nx) }
+}
+fun icbrt(n: Int) -> Int {
+    if n <= 0 { 0 }
+    else {
+        let r = cbrtStep(n, n)
+        if (r + 1) * (r + 1) * (r + 1) <= n { r + 1 }
+        else { if r * r * r > n { r - 1 } else { r } }
+    }
+}
+fun spec(n: Int) -> Bool {
+    let r = icbrt(n)
+    let lo = r * r * r <= n
+    let hi = n < (r + 1) * (r + 1) * (r + 1)
+    lo && hi
+}
+fun probe() -> Str {
+    let c27 = icbrt(27)
+    let c64 = icbrt(64)
+    let c1000 = icbrt(1000)
+    let c26 = icbrt(26)
+    let c63 = icbrt(63)
+    let s1 = spec(27)
+    let s2 = spec(63)
+    let s3 = spec(64)
+    let s4 = spec(999)
+    let s5 = spec(1)
+    let s6 = spec(1330)
+    "c27={c27}|c64={c64}|c1000={c1000}|c26={c26}|c63={c63}|s1={s1}|s2={s2}|s3={s3}|s4={s4}|s5={s5}|s6={s6}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "c27=3|c64=4|c1000=10|c26=2|c63=3|s1=true|s2=true|s3=true|s4=true|s5=true|s6=true"
+        );
+    }
+
+    #[test]
     fn diff_fast_doubling_fibonacci() {
         // A certification lock (it472): FAST-DOUBLING FIBONACCI -- F(n) in O(log n) via the doubling identities
         // F(2k) = F(k)*(2*F(k+1) - F(k)) and F(2k+1) = F(k+1)^2 + F(k)^2, computed by recursing on n/2 and
