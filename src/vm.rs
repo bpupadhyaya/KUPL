@@ -2934,6 +2934,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_amicable_pair() {
+        // A certification lock (it451): AMICABLE PAIRS -- two DISTINCT numbers where each equals the sum of the
+        // other's proper divisors. This reuses the proper-divisor-sum machinery from the perfect-number lock
+        // (it450, divisor pairing up to sqrt(n)) but certifies a MUTUAL relation rather than a self-relation: a
+        // perfect number equals ITS OWN proper-divisor sum, whereas an amicable pair (a, b) satisfies
+        // properSum(a) == b AND properSum(b) == a with a != b. The classic smallest pair (220, 284) has been known
+        // since antiquity (attributed to the Pythagoreans): the proper divisors of 220 sum to 284, and those of
+        // 284 sum back to 220.
+        //   isAmicable(220, 284) = true / isAmicable(284, 220) = true   (symmetric; the classic pair)
+        //   properSum(220) = 284 / properSum(284) = 220
+        //   isAmicable(6, 6) = false     (6 is PERFECT -- properSum(6)=6 -- but a==b fails the distinctness guard)
+        //   isAmicable(10, 8) = false    (properSum(10)=8 but properSum(8)=7 != 10 -- one-directional, not mutual)
+        //   properSum(6) = 6 (a perfect number equals its own proper-divisor sum) / properSum(10) = 8
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the proper-divisor sums of 220 and 284
+        // map to each other, that the amicable test requires BOTH the mutual condition and distinctness, that a
+        // perfect number is NOT amicable with itself (the a != b guard is what separates amicable from perfect),
+        // that a one-directional near-miss is rejected, that the relation is symmetric in its arguments, and that
+        // all three engines agree. This is the "are these two numbers amicable" an AI writes for number theory or
+        // recreational math; the a != b guard distinguishing amicable from perfect is the subtle case. A non-sort
+        // lock certifying amicable-pair detection built on the sum-of-divisors function.
+        let src = r#"fun divSum(n: Int, d: Int, acc: Int) -> Int {
+    if d * d > n { acc }
+    else if d * d == n { divSum(n, d + 1, acc + d) }
+    else if n % d == 0 { divSum(n, d + 1, acc + d + n / d) }
+    else { divSum(n, d + 1, acc) }
+}
+fun properSum(n: Int) -> Int { divSum(n, 1, 0) - n }
+fun isAmicable(a: Int, b: Int) -> Bool {
+    a != b && properSum(a) == b && properSum(b) == a
+}
+fun probe() -> Str {
+    let a1 = isAmicable(220, 284)
+    let a2 = isAmicable(284, 220)
+    let ps220 = properSum(220)
+    let ps284 = properSum(284)
+    let a3 = isAmicable(6, 6)
+    let a4 = isAmicable(10, 8)
+    let ps6 = properSum(6)
+    let ps10 = properSum(10)
+    "am220={a1}|am284={a2}|ps220={ps220}|ps284={ps284}|perf6={a3}|not10_8={a4}|ps6={ps6}|ps10={ps10}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "am220=true|am284=true|ps220=284|ps284=220|perf6=false|not10_8=false|ps6=6|ps10=8"
+        );
+    }
+
+    #[test]
     fn diff_perfect_number_sigma() {
         // A bug-hunt-114 lock (it450, campaign midpoint): PERFECT NUMBERS via the SUM-OF-DIVISORS function sigma,
         // with deficient/perfect/abundant classification. This extends the number-theory family (prime-fact it449,
