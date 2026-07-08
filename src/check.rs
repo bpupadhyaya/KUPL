@@ -2113,11 +2113,22 @@ impl Checker {
         ctx: &mut Ctx,
     ) {
         if args.len() != fields.len() {
-            self.err(
-                "K0243",
-                format!("`{ctor}` has {}, {} given", plural(fields.len(), "field"), plural(args.len(), "argument")),
-                span,
-            );
+            let mut m = format!("`{ctor}` has {}, {} given", plural(fields.len(), "field"), plural(args.len(), "argument"));
+            // When too few arguments are given AND every one is named, we know exactly which
+            // fields were left out -- name them instead of leaving the user to diff the two
+            // lists (a far more actionable message than a bare count) (PR-it484).
+            if args.len() < fields.len() && !args.is_empty() && args.iter().all(|a| a.name.is_some()) {
+                let named: HashSet<&str> = args.iter().filter_map(|a| a.name.as_deref()).collect();
+                let missing: Vec<String> = fields
+                    .iter()
+                    .filter(|(f, _)| !named.contains(f.as_str()))
+                    .map(|(f, _)| format!("`{f}`"))
+                    .collect();
+                if !missing.is_empty() {
+                    m.push_str(&format!(" — missing {}", missing.join(", ")));
+                }
+            }
+            self.err("K0243", m, span);
         }
         // Track supplied field names so a repeated named field is caught rather than silently
         // overwriting (interp) or crashing at runtime (KVM) — a duplicate can even mask a missing
@@ -3205,6 +3216,15 @@ mod generic_tests {
         assert!(errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(x: 1, y: 2)\n    let _ = P(y: 20, x: 10) }\n").is_empty());
         assert!(errors("type Box[T] = Box(v: T)\nfun main() { let _ = Box(v: 5) }\n").is_empty());
         assert!(errors("type T = { a: Int, b: Int, c: Int }\nfun main() { let _ = T(1, 2, c: 3)\n    let _ = T(1, b: 2, c: 3) }\n").is_empty());
+        // Too FEW all-named args now names the missing field(s) in the arity K0243 (PR-it484).
+        let mf = errors("type T = { a: Int, b: Int, c: Int }\nfun main() { let _ = T(a: 1, c: 3) }\n");
+        assert!(
+            mf.iter().any(|d| d.code == "K0243" && d.message.contains("3 fields, 2 arguments given") && d.message.contains("missing `b`")),
+            "arity K0243 should name the missing field: {mf:?}"
+        );
+        // A POSITIONAL too-few call keeps the bare count (no reliable field->slot naming).
+        let pf = errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(1) }\n");
+        assert!(pf.iter().any(|d| d.code == "K0243" && d.message.contains("2 fields, 1 argument given") && !d.message.contains("missing")), "positional keeps bare count: {pf:?}");
     }
 
     #[test]
