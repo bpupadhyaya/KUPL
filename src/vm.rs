@@ -2220,6 +2220,60 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_boyer_moore_majority() {
+        // A certification lock (it406): BOYER-MOORE MAJORITY VOTE -- find the element that appears MORE than n/2
+        // times (a strict majority), in a single pass with O(1) extra state. This is distinct from the mode
+        // (it349, a full tally via a Map then argmax): Boyer-Moore keeps only a CANDIDATE and a COUNT. Folding
+        // left: if the count is 0, adopt the current element as the candidate with count 1; otherwise increment
+        // the count when the element matches the candidate, or DECREMENT it when it differs (a matching and a
+        // non-matching element cancel out). If a strict majority exists it out-votes everything else and ends
+        // as the survivor -- but the vote alone does NOT prove a majority exists, so a second VERIFICATION pass
+        // counts the candidate's actual occurrences and returns it only when occ*2 > n; otherwise -1.
+        //   majority([3,3,4,2,3,3,3]) = 3   (3 occurs 5 of 7 -- a strict majority)
+        //   majority([1,2,3,4]) = -1        (no element repeats -- the surviving candidate fails verification)
+        //   majority([2,2,2,2]) = 2         (all identical)
+        //   majority([1,1,2,2,1]) = 1       (1 occurs 3 of 5)
+        //   majority([7]) = 7               (a single element is trivially the majority)
+        //   majority([5,5,5,6,6,6,6]) = 6   (6 occurs 4 of 7; 5 occurs 3 and would fail)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the voting fold cancels a matching
+        // against a non-matching element, that the candidate is replaced only when the count reaches zero, that
+        // a genuine strict majority survives the cancellation and passes verification, that the crucial
+        // VERIFICATION pass rejects a survivor with no true majority (the [1,2,3,4] case returns -1 rather than a
+        // spurious element), that a strict majority requires occ*2 > n (so 4-of-7 qualifies but 3-of-7 does
+        // not), that all-equal and single-element inputs return that element, and that all three engines agree
+        // on the vote-then-verify pipeline. This is the Boyer-Moore an AI writes for majority/dominant-element
+        // detection, consensus, and stream summarization; a backend whose vote cancellation, zero-count
+        // replacement, or majority verification was off would return a wrong or unverified element. Adds a
+        // single-pass streaming majority distinct from the tally-based mode.
+        let src = r#"type St = { cand: Int, count: Int }
+fun majority(xs: List[Int]) -> Int {
+    let st = xs.fold(St(cand: 0, count: 0), fn(s, x) {
+        if s.count == 0 { St(cand: x, count: 1) }
+        else {
+            if s.cand == x { St(cand: s.cand, count: s.count + 1) }
+            else { St(cand: s.cand, count: s.count - 1) }
+        }
+    })
+    let occ = xs.filter(fn(x) { x == st.cand }).len()
+    if occ * 2 > xs.len() { st.cand } else { 0 - 1 }
+}
+fun probe() -> Str {
+    let a = majority([3, 3, 4, 2, 3, 3, 3])
+    let b = majority([1, 2, 3, 4])
+    let c = majority([2, 2, 2, 2])
+    let d = majority([1, 1, 2, 2, 1])
+    let e = majority([7])
+    let f = majority([5, 5, 5, 6, 6, 6, 6])
+    "maj={a}|none={b}|all={c}|edge={d}|single={e}|half={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "maj=3|none=-1|all=2|edge=1|single=7|half=6"
+        );
+    }
+
+    #[test]
     fn diff_bellman_ford() {
         // A bug-hunt-92 lock (it405): BELLMAN-FORD single-source shortest paths -- distances from a source that,
         // unlike Dijkstra (it400), tolerate NEGATIVE edge weights and can report a NEGATIVE CYCLE. Where Dijkstra
