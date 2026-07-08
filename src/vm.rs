@@ -2220,6 +2220,71 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_cocktail_sort() {
+        // A certification lock (it416): COCKTAIL SORT (bidirectional / shaker bubble sort) -- fixes bubble sort's
+        // "turtle" weakness by a DIFFERENT mechanism than comb sort (it415). Plain bubble sort only sweeps in one
+        // direction, so a small value near the END (a turtle) crawls leftward one step per pass. Comb sort attacks
+        // this with large GAPS that leap turtles forward; cocktail sort instead alternates DIRECTION: each round
+        // is a FORWARD pass that bubbles the current maximum rightward to its final slot, then a BACKWARD pass
+        // that bubbles the current minimum leftward to its final slot. So every round settles TWO elements -- one
+        // at each end -- and after ceil(n/2) rounds the whole array is sorted. The backward pass is what kills
+        // turtles: a small value stranded at the right end is swept all the way left in a single backward sweep.
+        //   cocktailSort([8,4,1,6,3,7,2,5], 4) = [1,2,3,4,5,6,7,8]  (n=8 -> 4 rounds, each settling both ends)
+        //   cocktailSort([5,2,8,1], 2) = [1,2,5,8]                  (n=4 -> 2 rounds)
+        //   cocktailSort([3,3,1,2,2], 3) = [1,2,2,3,3]              (n=5 -> ceil(5/2)=3 rounds; dups preserved)
+        //   cocktailSort([7], 1) = [7]                              (single element)
+        //   cocktailSort([], 1) = []                               (empty)
+        //   cocktailSort([4,3,2,1], 2) = [1,2,3,4]                  (fully reversed)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the forward pass bubbles the maximum
+        // to the right by adjacent swaps, that the backward pass bubbles the minimum to the left (the
+        // turtle-killing that distinguishes cocktail from plain bubble), that each round settles both extremes so
+        // ceil(n/2) rounds suffice, that this is a DIFFERENT bubble improvement than comb's gaps (both reach the
+        // same sorted result by different sweep strategies), that duplicates are preserved, that
+        // empty/single/reversed inputs are handled, and that all three engines agree on the bidirectional bubble
+        // pipeline. This is the cocktail sort an AI writes as a symmetric bubble-sort improvement; a backend whose
+        // forward/backward sweep order or swap logic was off would misorder the result. Adds the bidirectional
+        // bubble paradigm alongside comb's gapped bubble.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun rangeDecl(hi: Int, lo: Int) -> List[Int] {
+    if hi < lo { [] } else { [[hi], rangeDecl(hi - 1, lo)].flatten() }
+}
+fun setAt(lst: List[Int], i: Int, v: Int) -> List[Int] {
+    rangeN(lst.len()).map(fn(k) { if k == i { v } else { lst.get(k).unwrap_or(0) } })
+}
+fun swapIfGt(a: List[Int], i: Int) -> List[Int] {
+    let x = a.get(i).unwrap_or(0)
+    let y = a.get(i + 1).unwrap_or(0)
+    if x > y { setAt(setAt(a, i, y), i + 1, x) } else { a }
+}
+fun fwdPass(a: List[Int], n: Int) -> List[Int] {
+    rangeN(n - 1).fold(a, fn(acc, i) { swapIfGt(acc, i) })
+}
+fun backPass(a: List[Int], n: Int) -> List[Int] {
+    rangeDecl(n - 2, 0).fold(a, fn(acc, i) { swapIfGt(acc, i) })
+}
+fun cocktailSort(xs: List[Int], rounds: Int) -> List[Int] {
+    let n = xs.len()
+    rangeN(rounds).fold(xs, fn(acc, r) { backPass(fwdPass(acc, n), n) })
+}
+fun probe() -> Str {
+    let a = cocktailSort([8, 4, 1, 6, 3, 7, 2, 5], 4)
+    let b = cocktailSort([5, 2, 8, 1], 2)
+    let c = cocktailSort([3, 3, 1, 2, 2], 3)
+    let d = cocktailSort([7], 1)
+    let e = cocktailSort([], 1)
+    let f = cocktailSort([4, 3, 2, 1], 2)
+    "mixed={a}|small={b}|dups={c}|single={d}|empty={e}|rev={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mixed=[1, 2, 3, 4, 5, 6, 7, 8]|small=[1, 2, 5, 8]|dups=[1, 2, 2, 3, 3]|single=[7]|empty=[]|rev=[1, 2, 3, 4]"
+        );
+    }
+
+    #[test]
     fn diff_comb_sort() {
         // A bug-hunt-97 lock (it415): COMB SORT -- bubble sort with a SHRINKING gap, the bubble-sort analogue of
         // shell sort's insertion generalization (it414). Plain bubble sort only ever compares ADJACENT elements
