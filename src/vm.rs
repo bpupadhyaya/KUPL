@@ -3029,6 +3029,56 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_integer_digit_reversal() {
+        // A certification lock (it482, from bug-hunt batch 126 -- 10 probes across tensor/regex/json/path/Option/
+        // Result/string/bit/float/Map shapes came back byte-identical, so the subtlest untouched corner is locked):
+        // INTEGER DIGIT REVERSAL by pure arithmetic (a tail-recursive acc*10 + n%10 that peels digits off the
+        // bottom of n and pushes them onto acc) cross-validated against STRING reversal (to_str, reverse the char
+        // list by fold-prepend, parse_int back). These are two genuinely independent computations of the same
+        // value: one never leaves integer arithmetic, the other goes out to text and back -- they must agree, and
+        // that agreement is the cross-check (not a restatement; cf. karatsuba it476 vs `*`). Distinct from
+        // palindrome_via_string_reverse (string, not integer arithmetic) and bit_reversal (bits, not digits).
+        //   x1/x2/x7: revDigits(n) == revStr(n) for 12345, 9876, and 1000 (both drop the reversed leading zeros)
+        //   x3: revDigits(1000) == 1        (1000 reversed is 0001 = 1 -- trailing zeros vanish)
+        //   x4: revDigits(revDigits(121)) == 121   (reversal is an involution on trailing-zero-free numbers)
+        //   x5: revDigits(12321) == 12321   (numeric palindrome fixed point)
+        //   x6: revDigits(12345) == 54321
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the arithmetic peel-and-push reverses
+        // the digits, that it agrees with the round-trip through a string at several magnitudes, that trailing
+        // zeros collapse the same way in both methods, that double reversal is the identity, that a numeric
+        // palindrome is its own reversal, and that all three engines agree. This is the digit reversal an AI writes
+        // for palindrome checks, number puzzles, or reversing place values; the arithmetic-vs-string cross-check
+        // catches a wrong %10 / *10 or an off-by-one in the string reverse that a lone value test could miss. A
+        // non-sort lock certifying integer digit reversal against string reversal.
+        let src = r#"fun revGo(n: Int, acc: Int) -> Int {
+    if n == 0 { acc } else { revGo(n / 10, acc * 10 + n % 10) }
+}
+fun revDigits(n: Int) -> Int { revGo(n, 0) }
+fun revStr(n: Int) -> Int {
+    let s = n.to_str()
+    let r = s.chars().fold("", fn(acc: Str, c: Str) { "{c}{acc}" })
+    r.parse_int().unwrap_or(0)
+}
+fun probe() -> Str {
+    let rd = revDigits(12345)
+    let rs = revStr(12345)
+    let x1 = revDigits(12345) == revStr(12345)
+    let x2 = revDigits(9876) == revStr(9876)
+    let x3 = revDigits(1000) == 1
+    let x4 = revDigits(revDigits(121)) == 121
+    let x5 = revDigits(12321) == 12321
+    let x6 = revDigits(12345) == 54321
+    let x7 = revStr(1000) == revDigits(1000)
+    "rd={rd}|rs={rs}|x1={x1}|x2={x2}|x3={x3}|x4={x4}|x5={x5}|x6={x6}|x7={x7}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "rd=54321|rs=54321|x1=true|x2=true|x3=true|x4=true|x5=true|x6=true|x7=true"
+        );
+    }
+
+    #[test]
     fn diff_casting_out_nines() {
         // A certification lock (it481): CASTING OUT NINES -- the classical arithmetic-verification technique
         // resting on the fact that 10 ≡ 1 (mod 9), so a base-10 digit sum is congruent to the number itself mod 9.
