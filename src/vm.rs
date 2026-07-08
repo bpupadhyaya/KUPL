@@ -2104,6 +2104,51 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_matrix_transpose_and_matmul_nested_lists() {
+        // A certification lock (it319): matrix operations on List[List[Int]] -- the nested-list matrix an AI
+        // writes when it wants plain lists, NOT the builtin Tensor (it101-103/150/173/218 cover Tensor).
+        // transpose extracts each column (map over rows, get(j)); matmul transposes b then dots each row of
+        // a with each column of b via zip_with(*) + fold(+). Composed HOFs over a jagged-safe 2-D structure.
+        //   transpose([[1,2],[3,4]]) = [[1,3],[2,4]]
+        //   [[1,2],[3,4]] x [[5,6],[7,8]] = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19,22],[43,50]]
+        // Byte-identical on interp/KVM (native per the sweep). Confirms transpose's column-extraction
+        // (m.map(row -> row.get(j).unwrap_or(0)) over an index range), that matmul's nested map (outer over
+        // a's rows, inner over b-transposed's columns) pairs the right row with the right column, and that
+        // the per-cell dot product (zip_with multiply then fold-sum) computes each entry. The rangeN helper
+        // builds the index list [0..ncols-1] because arange(n) returns a Tensor[Float], not List[Int] (so an
+        // integer index range is hand-rolled). This is linear algebra on plain nested lists -- the matrix an
+        // AI writes for a small transform, a rotation, or a layer without reaching for the tensor type; a
+        // backend that mis-paired rows/columns in the nested map would transpose the product, and one that
+        // mis-extracted a column would corrupt every cell.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun col(m: List[List[Int]], j: Int) -> List[Int] {
+    m.map(fn(row) { row.get(j).unwrap_or(0) })
+}
+fun transpose(m: List[List[Int]]) -> List[List[Int]] {
+    let ncols = m.first().unwrap_or([]).len()
+    rangeN(ncols).map(fn(j) { col(m, j) })
+}
+fun dotRow(row: List[Int], c: List[Int]) -> Int {
+    row.zip_with(c, fn(a, b) { a * b }).fold(0, fn(s, x) { s + x })
+}
+fun matmul(a: List[List[Int]], b: List[List[Int]]) -> List[List[Int]] {
+    let bt = transpose(b)
+    a.map(fn(row) { bt.map(fn(bcol) { dotRow(row, bcol) }) })
+}
+fun probe() -> Str {
+    let a = [[1, 2], [3, 4]]
+    let b = [[5, 6], [7, 8]]
+    let t = transpose(a)
+    let p = matmul(a, b)
+    "T={t}|P={p}"
+}
+"#;
+        assert_eq!(differential(src), "T=[[1, 3], [2, 4]]|P=[[19, 22], [43, 50]]");
+    }
+
+    #[test]
     fn diff_memoized_fib_via_map() {
         // A certification lock (it317): MEMOIZED Fibonacci -- dynamic programming with a Map[Int,Int] memo
         // table threaded through the recursion. Prior Map locks fold INTO a Map (it292 tally, it300 buckets,
