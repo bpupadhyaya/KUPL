@@ -2220,6 +2220,56 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_longest_increasing_subsequence() {
+        // A bug-hunt-71 lock (it363): LONGEST INCREASING SUBSEQUENCE (LIS) length -- the length of the longest
+        // strictly-increasing subsequence (order preserved, not necessarily contiguous) of a list. Unlike the
+        // two-string DPs (edit distance it360, LCS it361) or the choice DPs (subset-sum it359, coin-change
+        // it362), this is a SINGLE-sequence DP with a "best predecessor" structure: the LIS ENDING at position
+        // i is 1 + the max LIS ending at any earlier position j (< i) whose value is strictly smaller than
+        // a[i]; positions with no smaller predecessor contribute just 1 (the element alone). The overall answer
+        // is the MAX of the per-position bests. The predecessor scan uses rangeN(i) to visit indices 0..i.
+        //   lis([10,9,2,5,3,7]) = 3   (e.g. 2,3,7 or 2,5,7)
+        //   lis([1,2,3,4]) = 4        (already increasing -- the whole list)
+        //   lis([5,4,3,2,1]) = 1      (strictly decreasing -- every element stands alone)
+        //   lis([3,3,3]) = 1          (equal values are NOT increasing -- the comparison is STRICT <)
+        //   lis([]) = 0               (empty list has no subsequence)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the per-position best starts at 1 (the
+        // element itself), that only STRICTLY-smaller earlier values (vj < vi, not <=) can extend a
+        // subsequence -- so equal runs like [3,3,3] give 1, not 3 -- that the extension takes the MAX over all
+        // valid predecessors, that the final answer is the MAX over all ending positions (not just the last),
+        // that a fully-increasing list yields its length and a fully-decreasing one yields 1, that the empty
+        // list yields 0, and that all three engines agree. This is the LIS an AI writes for patience-sorting,
+        // trend analysis, and scheduling; a backend whose strict-comparison, per-position max, or final max was
+        // off would over- or under-count. Rounds out the DP family: single-sequence best-predecessor alongside
+        // two-string overlap (LCS), two-string transform (edit distance), and choice optimization (coin-change).
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun lisEndAt(xs: List[Int], i: Int) -> Int {
+    let vi = xs.get(i).unwrap_or(0)
+    let best = rangeN(i).fold(0, fn(acc, j) {
+        let vj = xs.get(j).unwrap_or(0)
+        if vj < vi { maxi(acc, lisEndAt(xs, j)) } else { acc }
+    })
+    best + 1
+}
+fun lis(xs: List[Int]) -> Int {
+    rangeN(xs.len()).fold(0, fn(acc, i) { maxi(acc, lisEndAt(xs, i)) })
+}
+fun probe() -> Str {
+    let a = lis([10, 9, 2, 5, 3, 7])
+    let b = lis([1, 2, 3, 4])
+    let c = lis([5, 4, 3, 2, 1])
+    let d = lis([3, 3, 3])
+    let e = lis([])
+    "mix={a}|inc={b}|dec={c}|dup={d}|empty={e}"
+}
+"#;
+        assert_eq!(differential(src), "mix=3|inc=4|dec=1|dup=1|empty=0");
+    }
+
+    #[test]
     fn diff_coin_change_minimum() {
         // A certification lock (it362): COIN-CHANGE MINIMUM -- the fewest coins (with unlimited supply of each
         // denomination) that sum to a target amount, or -1 if impossible -- via the min-over-choices
