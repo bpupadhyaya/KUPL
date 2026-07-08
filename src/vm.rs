@@ -2220,6 +2220,61 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_max_subarray_kadane() {
+        // A certification lock (it372): MAXIMUM SUBARRAY SUM via Kadane's algorithm -- the largest sum of any
+        // CONTIGUOUS (non-empty) sub-slice of a list. This is a running-best linear DP, distinct from the
+        // house-robber take-or-skip (it371) and the counting/grid shapes: the best subarray ENDING at position
+        // i either starts fresh at i or extends the best subarray ending at i-1, and the overall answer is the
+        // MAX of those per-position bests. bestEnd(i) = max(nums[i], nums[i] + bestEnd(i-1)); answer = max over
+        // all i of bestEnd(i).
+        //   maxSub([-2,1,-3,4,-1,2,1,-5,4]) = 6   (the classic subarray [4,-1,2,1])
+        //   maxSub([1,2,3,4]) = 10                (all positive -- take everything)
+        //   maxSub([-5,-2,-8,-1]) = -1            (ALL NEGATIVE -- the least-negative single element, NOT 0)
+        //   maxSub([5,-3,5]) = 7                  (extending through the -3 dip beats either 5 alone)
+        //   maxSub([7]) = 7                       (a single element)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the bestEnd(0)=nums[0] base, that each
+        // step takes the MAX of STARTING FRESH (nums[i]) versus EXTENDING (nums[i] + bestEnd(i-1)), that the
+        // final answer is the MAX over ALL ending positions (not just the last, and not seeded at 0), and --
+        // crucially -- that an ALL-NEGATIVE input returns the largest single element (-1), the classic edge
+        // case a 0-seeded or max-with-0 implementation gets wrong. Also confirms that extending a running sum
+        // through a negative dip ([5,-3,5] -> 7) can beat restarting, that all-positive sums the whole list,
+        // and that all three engines agree. This is the max-subarray / Kadane DP an AI writes for
+        // best-profit-window, signal-peak, and contiguous-sum problems; a backend whose start-fresh-vs-extend
+        // max, all-negative handling, or global-max was off would misreport. Adds a running-best linear DP to
+        // the family.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun bestEnd(nums: List[Int], i: Int) -> Int {
+    let ni = nums.get(i).unwrap_or(0)
+    if i == 0 { ni }
+    else { maxi(ni, ni + bestEnd(nums, i - 1)) }
+}
+fun maxSub(nums: List[Int]) -> Int {
+    let n = nums.len()
+    if n == 0 { 0 }
+    else {
+        let seed = bestEnd(nums, 0)
+        rangeN(n).fold(seed, fn(acc, i) { maxi(acc, bestEnd(nums, i)) })
+    }
+}
+fun probe() -> Str {
+    let a = maxSub([-2, 1, -3, 4, -1, 2, 1, -5, 4])
+    let b = maxSub([1, 2, 3, 4])
+    let c = maxSub([0 - 5, 0 - 2, 0 - 8, 0 - 1])
+    let d = maxSub([5, 0 - 3, 5])
+    let e = maxSub([7])
+    "classic={a}|allpos={b}|allneg={c}|dip={d}|single={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "classic=6|allpos=10|allneg=-1|dip=7|single=7"
+        );
+    }
+
+    #[test]
     fn diff_house_robber() {
         // A bug-hunt-75 lock (it371): the HOUSE ROBBER DP -- the maximum sum selectable from a list such that
         // no two chosen elements are ADJACENT. This is a linear-sequence take-or-skip optimization DP with a
