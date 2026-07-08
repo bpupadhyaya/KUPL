@@ -2104,6 +2104,38 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_running_maximum_scan() {
+        // A bug-hunt-61 lock (it343): running maximum via scan -- the cumulative (prefix) max at each
+        // position, a monotone non-decreasing high-water mark. scan(0, max) threads the max-so-far through the
+        // list; because scan EXCLUDES the seed, the output length equals the input length, and the LAST scan
+        // element equals the overall fold-max. This is distinct from prefix-sums (it329, cumulative ADDITION):
+        // here the accumulator is idempotent MAX, so once a new high (9) appears it never decreases even as
+        // smaller values (2, 6) follow.
+        //   [3,1,4,1,5,9,2,6] -> running=[3,3,4,4,5,9,9,9] ; last=9 = fold-max=9 ; scan.len()==xs.len()=8
+        // Byte-identical on interp/KVM (native per the sweep). Confirms scan produces one output per input
+        // (seed excluded), that the sequence is monotone non-decreasing (3,3,4,4,5,9,9,9 never drops), that
+        // the high-water mark sticks after the peak (9 then 2 -> still 9, then 6 -> still 9), that last(scan)
+        // agrees with the whole-list fold-max, and that all three engines thread the scan accumulator
+        // identically. This is the running-max an AI writes for streaming stats, stock high-water marks, and
+        // monotonic envelopes; a backend whose scan emitted the seed, dropped an element, or reset the
+        // accumulator would break the length check or the monotonicity.
+        let src = r#"fun mx(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun probe() -> Str {
+    let xs = [3, 1, 4, 1, 5, 9, 2, 6]
+    let running = xs.scan(0, fn(acc, x) { mx(acc, x) })
+    let last = running.last().unwrap_or(0 - 1)
+    let overall = xs.fold(0, fn(a, x) { mx(a, x) })
+    let sameLen = running.len() == xs.len()
+    "running={running}|last={last}|overall={overall}|sameLen={sameLen}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "running=[3, 3, 4, 4, 5, 9, 9, 9]|last=9|overall=9|sameLen=true"
+        );
+    }
+
+    #[test]
     fn diff_word_frequency_count() {
         // A certification lock (it342): word-frequency counting -- the canonical text-processing idiom. Split
         // a sentence on spaces, fold the word list into a Map[Str, Int] tally where each word's running count
