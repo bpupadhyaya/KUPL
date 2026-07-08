@@ -3029,6 +3029,46 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_euclidean_division_identity() {
+        // A certification lock (it492, from bug-hunt batch 129 -- 10 probes across string/int/float/list/Map/Set/
+        // Option shapes came back byte-identical, so the subtlest untouched corner is locked): the EUCLIDEAN DIVISION
+        // IDENTITY for div_euclid/rem_euclid. Where diff_int_rem_div_euclid (it195) pins the VALUES for the four
+        // sign combinations (and contrasts them with % and /), THIS certifies the two defining INVARIANTS that make
+        // (q, r) a valid Euclidean division -- a SPEC-PROPERTY cross-check (like newton_isqrt's r^2 <= n < (r+1)^2):
+        //   RECONSTRUCTION:  div_euclid(n,d) * d + rem_euclid(n,d) == n   (the pair actually divides n)
+        //   BOUNDED REMAINDER:  0 <= rem_euclid(n,d) < |d|                (the Euclidean remainder is non-negative
+        //                                                                 and strictly less than the divisor's magnitude)
+        // Checked across all four sign combinations of (7,3) plus (20,6),(-20,6),(0,5),(100,7). The remainder bound
+        // is what distinguishes Euclidean division from truncating (%): (-7).rem_euclid(3) = 2 lies in [0,3), and
+        // 2 + (-3)*3 = -7 reconstructs. Byte-identical on interp/KVM (native per the sweep). Confirms that q*d + r
+        // reconstructs n for every sign of n and d, that r is always in [0,|d|), that these hold at the n=0 edge,
+        // and that all three engines agree. This is the division invariant an AI relies on when reasoning about
+        // modular arithmetic or clock/index wrapping; a backend whose div_euclid rounded toward zero instead of
+        // negative infinity would satisfy neither invariant for negative n. A non-sort lock certifying the
+        // Euclidean division identity.
+        let src = r#"fun absI(x: Int) -> Int { if x < 0 { 0 - x } else { x } }
+fun recon(n: Int, d: Int) -> Bool { n.div_euclid(d) * d + n.rem_euclid(d) == n }
+fun bounded(n: Int, d: Int) -> Bool {
+    let r = n.rem_euclid(d)
+    r >= 0 && r < absI(d)
+}
+fun probe() -> Str {
+    let r1 = recon(7, 3) && recon(0 - 7, 3) && recon(7, 0 - 3) && recon(0 - 7, 0 - 3)
+    let r2 = recon(20, 6) && recon(0 - 20, 6) && recon(0, 5) && recon(100, 7)
+    let b1 = bounded(7, 3) && bounded(0 - 7, 3) && bounded(7, 0 - 3) && bounded(0 - 7, 0 - 3)
+    let b2 = bounded(20, 6) && bounded(0 - 20, 6) && bounded(0, 5) && bounded(100, 7)
+    let e7 = (0 - 7).rem_euclid(3)
+    let q7 = (0 - 7).div_euclid(3)
+    "r1={r1}|r2={r2}|b1={b1}|b2={b2}|e7={e7}|q7={q7}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "r1=true|r2=true|b1=true|b2=true|e7=2|q7=-3"
+        );
+    }
+
+    #[test]
     fn diff_sum_of_divisors_multiplicative() {
         // A certification lock (it491): the sum-of-divisors function sigma(n) = sum of all positive divisors of n
         // is MULTIPLICATIVE -- sigma(m*n) = sigma(m)*sigma(n) whenever gcd(m,n) = 1 -- cross-validated against that
