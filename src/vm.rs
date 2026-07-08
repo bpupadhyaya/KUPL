@@ -2104,6 +2104,55 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_recursive_tree_balance_check() {
+        // A bug-hunt-48 lock (it312): a recursive tree BALANCE predicate -- balanced() returns Bool, testing
+        // the AVL invariant |height(l) - height(r)| <= 1 at EVERY node with `&&` short-circuit conjunction
+        // over both subtrees. it296 computes a scalar depth-via-max; it311 prunes returning Option. This
+        // pins a Bool-returning recursion that COMBINES a per-node height comparison with a recursive AND
+        // over the children -- a node is balanced iff its two subtree heights differ by <=1 AND both
+        // subtrees are themselves balanced.
+        //   height(Leaf)=1; height(Branch)=1+max(height l, height r)
+        //   balanced(Leaf)=true; balanced(Branch)= |h(l)-h(r)|<=1 && balanced(l) && balanced(r)
+        //   bal  = Branch(Branch(Leaf 1, Leaf 2), Leaf 3)                     -> height 3, balanced true
+        //   skew = Branch(Branch(Branch(Leaf 1, Leaf 2), Leaf 3), Leaf 4)     -> height 4, balanced FALSE
+        //          (root: left subtree height 3, right height 1, |3-1|=2 > 1)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms height's `if hl > hr` max threads up
+        // the tree, that the balance test fires the imbalance check at the root of skew (left height 3 vs
+        // right 1) AND descends via `&&` so a deep imbalance anywhere fails the whole tree, and that Leaf is
+        // the true base case. This is the "is my tree balanced" / AVL-or-red-black invariant check an AI
+        // writes; a backend that only checked the root's immediate children (not recursing with &&) would
+        // pass a tree with a deep imbalance, and one whose `&&` didn't short-circuit correctly would
+        // mis-report. it296's depth is a single Int with no Bool combinator; it311's prune returns Option
+        // and never conjuncts subtree predicates.
+        let src = r#"type Tree = Leaf(v: Int) | Branch(l: Tree, r: Tree)
+fun height(t: Tree) -> Int {
+    match t { Leaf(v) => 1
+        Branch(l, r) => {
+            let hl = height(l)
+            let hr = height(r)
+            if hl > hr { 1 + hl } else { 1 + hr }
+        } }
+}
+fun absDiff(a: Int, b: Int) -> Int {
+    if a > b { a - b } else { b - a }
+}
+fun balanced(t: Tree) -> Bool {
+    match t { Leaf(v) => true
+        Branch(l, r) => {
+            if absDiff(height(l), height(r)) > 1 { false }
+            else { balanced(l) && balanced(r) }
+        } }
+}
+fun probe() -> Str {
+    let bal = Branch(l: Branch(l: Leaf(v: 1), r: Leaf(v: 2)), r: Leaf(v: 3))
+    let skew = Branch(l: Branch(l: Branch(l: Leaf(v: 1), r: Leaf(v: 2)), r: Leaf(v: 3)), r: Leaf(v: 4))
+    "h_bal={height(bal)}|bal={balanced(bal)}|h_skew={height(skew)}|skew={balanced(skew)}"
+}
+"#;
+        assert_eq!(differential(src), "h_bal=3|bal=true|h_skew=4|skew=false");
+    }
+
+    #[test]
     fn diff_recursive_tree_prune_to_option() {
         // A certification lock (it311): a recursive tree PRUNE that returns Option[Tree] -- it drops leaves
         // failing a predicate and COLLAPSES branches when a subtree prunes to nothing, returning None if the
