@@ -2104,6 +2104,42 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_euclidean_gcd_and_lcm() {
+        // A certification lock (it334): the Euclidean GCD recursion plus LCM built on it -- integer recursion
+        // over MODULO, distinct from the structural (list/tree) and memo recursions certified earlier. gcd
+        // recurses gcd(a,b) = gcd(b, a % b) until b == 0, at which point a is the answer; lcm is
+        // a / gcd(a,b) * b (divide BEFORE multiply to avoid overflow). The recursion always shrinks b (the
+        // remainder is < b) so it terminates.
+        //   gcd(48,36)=12  gcd(17,5)=1 (coprime)  gcd(100,0)=100 (base)  gcd(0,7)=7 (one swap: gcd(0,7)->gcd(7,0))
+        //   lcm(4,6)=12    lcm(21,6)=42
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the modulo step drives the recursion
+        // to the b==0 base, that a common divisor is found (48,36 -> 12), that coprime inputs yield 1, that
+        // both base-case shapes work -- b already 0 (100,0 -> 100) and a<b so the first step swaps them
+        // (0,7 -> 7) -- and that lcm composes gcd correctly with divide-before-multiply (21/3*6 = 42, not
+        // 21*6/3). This is the canonical number-theory recursion an AI writes (reduce fractions, tile sizing,
+        // scheduling periods); a backend whose % or recursion base was off would loop forever or return a
+        // wrong divisor.
+        let src = r#"fun gcd(a: Int, b: Int) -> Int {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+fun lcm(a: Int, b: Int) -> Int { a / gcd(a, b) * b }
+fun probe() -> Str {
+    let g1 = gcd(48, 36)
+    let g2 = gcd(17, 5)
+    let g3 = gcd(100, 0)
+    let g4 = gcd(0, 7)
+    let l1 = lcm(4, 6)
+    let l2 = lcm(21, 6)
+    "gcd48_36={g1}|gcd17_5={g2}|gcd100_0={g3}|gcd0_7={g4}|lcm4_6={l1}|lcm21_6={l2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "gcd48_36=12|gcd17_5=1|gcd100_0=100|gcd0_7=7|lcm4_6=12|lcm21_6=42"
+        );
+    }
+
+    #[test]
     fn diff_palindrome_via_string_reverse() {
         // A bug-hunt-56 lock (it333): string reversal via a chars-fold that PREPENDS, plus palindrome
         // detection by reverse-and-compare. reverse folds over chars() building the accumulator by prepending
