@@ -2104,6 +2104,34 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_sort_records_by_two_keys_composite() {
+        // A certification lock (it305): a MULTI-KEY sort -- "ORDER BY dept ASC, salary DESC" encoded as a
+        // single composite Int key. it288 sorts by a single negated key (one criterion, descending); this
+        // pins TWO criteria in one key: a primary (dept, ascending) scaled past the secondary's range so it
+        // dominates, minus the secondary (salary) so it sorts descending WITHIN a dept. Plus stability on a
+        // full tie.
+        //   key(e) = e.dept*1000 - e.salary
+        //     b(d1,s90)=910  d(d1,s70)=930  c(d2,s80)=1920  e(d2,s80)=1920  a(d2,s50)=1950
+        //   sort_by ascending+stable -> b, d, c, e, a
+        //     dept 1 before dept 2 (primary asc); within a dept higher salary first (b90 before d70);
+        //     c and e have an IDENTICAL composite key (both d2/s80) -> source order preserved (c before e).
+        // Byte-identical on interp/KVM (native per the sweep). Confirms sort_by is ascending and STABLE,
+        // that a composite key with a dominating multiplier orders the primary key first and the scaled-
+        // then-subtracted secondary descending within each group, and that two records colliding on the
+        // full composite key keep their original relative order (c before e, not e before c). This is the
+        // multi-column ORDER BY an AI writes for any table/leaderboard/ranking; a backend with an unstable
+        // sort would flip c/e, and one that mis-scaled the key would interleave the depts.
+        let src = r#"type Emp = { dept: Int, salary: Int, name: Str }
+fun probe() -> Str {
+    let emps = [Emp(dept: 2, salary: 50, name: "a"), Emp(dept: 1, salary: 90, name: "b"), Emp(dept: 2, salary: 80, name: "c"), Emp(dept: 1, salary: 70, name: "d"), Emp(dept: 2, salary: 80, name: "e")]
+    let sorted = emps.sort_by(fn(e) { e.dept * 1000 - e.salary })
+    sorted.map(fn(e) { e.name }).join(",")
+}
+"#;
+        assert_eq!(differential(src), "b,d,c,e,a");
+    }
+
+    #[test]
     fn diff_recursive_list_via_first_drop_and_fold_reverse() {
         // A bug-hunt-44 lock (it303): STRUCTURAL recursion over a List. KUPL has no cons-pattern
         // (`[h, ..t]` is K0113), so the idiom is to match `xs.first()` -> None (base) / Some(h) (recurse
