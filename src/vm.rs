@@ -2220,6 +2220,61 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_word_break() {
+        // A certification lock (it378): WORD BREAK -- decide whether a string can be segmented into a sequence
+        // of dictionary words (with reuse allowed). This is a BOOLEAN / EXISTENTIAL segmentation DP, distinct
+        // from the counting DPs already locked: where decode-ways (it369) COUNTS the number of segmentations,
+        // word-break only asks WHETHER at least one exists, so it short-circuits via `.any()` on the first
+        // success. The recurrence over canBreak(s): the empty string is trivially breakable (true); otherwise
+        // it is breakable iff THERE EXISTS a prefix that is in the dictionary AND the remaining suffix is itself
+        // breakable. (Working over a char list with take/drop+join, since take/drop are List methods, not Str.)
+        //   wb("leetcode") = true        ("leet" + "code")
+        //   wb("applepenapple") = true   ("apple" + "pen" + "apple" -- reuse of "apple")
+        //   wb("catsandog") = false      (no segmentation: "cats"/"and" leave "og"; "cat"/"sand" leave "og")
+        //   wb("catsanddog") = true      ("cats" + "and" + "dog", or "cat" + "sand" + "dog")
+        //   wb("") = true                (the empty string base case)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the empty-string base is true, that a
+        // split succeeds only when the prefix is a dictionary word AND the recursive remainder also breaks
+        // (conjunction, not just prefix membership), that `.any()` correctly reports existence across all split
+        // points (and short-circuits), that dictionary words may be REUSED (applepenapple), that the classic
+        // "catsandog" is correctly UNbreakable (the leftover "og" dooms every path), and that all three engines
+        // agree. This is the word-break / tokenization DP an AI writes for sentence segmentation, dictionary
+        // matching, and input validation; a backend whose existential quantifier, prefix-plus-remainder
+        // conjunction, or base case was off would mis-segment. Adds a boolean/existential segmentation DP,
+        // complementing decode-ways' counting form.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun canBreak(cs: List[Str], dict: List[Str]) -> Bool {
+    let n = cs.len()
+    if n == 0 { true }
+    else {
+        rangeN(n).any(fn(i) {
+            let prefix = cs.take(i + 1).join("")
+            if dict.contains(prefix) {
+                canBreak(cs.drop(i + 1), dict)
+            } else { false }
+        })
+    }
+}
+fun wb(s: Str, dict: List[Str]) -> Bool { canBreak(s.chars(), dict) }
+fun probe() -> Str {
+    let d = ["leet", "code", "apple", "pen", "cat", "cats", "and", "sand", "dog"]
+    let a = wb("leetcode", d)
+    let b = wb("applepenapple", d)
+    let c = wb("catsandog", d)
+    let e = wb("catsanddog", d)
+    let f = wb("", d)
+    "leetcode={a}|applepenapple={b}|catsandog={c}|catsanddog={e}|empty={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "leetcode=true|applepenapple=true|catsandog=false|catsanddog=true|empty=true"
+        );
+    }
+
+    #[test]
     fn diff_longest_bitonic_subsequence() {
         // A bug-hunt-78 lock (it377): LONGEST BITONIC SUBSEQUENCE -- the longest subsequence that first strictly
         // INCREASES and then strictly DECREASES (a "mountain" shape; a purely increasing or purely decreasing
