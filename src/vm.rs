@@ -3029,6 +3029,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_wilson_theorem() {
+        // A certification lock (it489): WILSON'S THEOREM -- an integer p > 1 is prime if and only if
+        // (p-1)! ≡ -1 (mod p), i.e. (p-1)! mod p == p-1 -- cross-validated against an independent TRIAL-DIVISION
+        // primality test. Continuing the classic-algorithm vein and the number-theoretic-theorem-as-oracle style
+        // (Fermat's little theorem it479, Fermat's two-square theorem it487): the factorial congruence and the
+        // divisor search are two completely different primality tests that share no logic, so their agreement
+        // certifies both -- not a restatement (it462 discipline). factMod builds (p-1)! reducing mod p at each step
+        // (so it never overflows); isPrimeT trial-divides up to sqrt(n).
+        //   w2 = wilson(2) = true (1! mod 2 = 1 = 2-1),  w7 = wilson(7) = true (6! mod 7 = 720 mod 7 = 6),
+        //   w9 = wilson(9) = false (8! mod 9 = 0, not 8 -- composites > 4 give 0)
+        //   x2..x15: wilson(n) == isPrimeT(n) for n = 2,3,4,5,7,9,11,13,15 (primes AND composites)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the factorial congruence holds exactly
+        // for primes (giving p-1 ≡ -1), that composites break it (8! mod 9 = 0), that Wilson's verdict matches
+        // trial division at every tested value, that the mod-at-each-step factorial avoids overflow, and that all
+        // three engines agree. This is the primality characterization an AI cites in number-theory proofs or uses
+        // to cross-check a sieve; agreement with trial division catches a factorial or modular-reduction bug that a
+        // lone value test could pass. A non-sort lock certifying Wilson's theorem against trial-division primality.
+        let src = r#"fun factModGo(i: Int, n: Int, m: Int, acc: Int) -> Int {
+    if i > n { acc } else { factModGo(i + 1, n, m, (acc * i) % m) }
+}
+fun factMod(n: Int, m: Int) -> Int { factModGo(1, n, m, 1 % m) }
+fun wilson(p: Int) -> Bool { if p < 2 { false } else { factMod(p - 1, p) == p - 1 } }
+fun trialGo(n: Int, d: Int) -> Bool {
+    if d * d > n { true } else { if n % d == 0 { false } else { trialGo(n, d + 1) } }
+}
+fun isPrimeT(n: Int) -> Bool { if n < 2 { false } else { trialGo(n, 2) } }
+fun probe() -> Str {
+    let w2 = wilson(2)
+    let w7 = wilson(7)
+    let w9 = wilson(9)
+    let x2 = wilson(2) == isPrimeT(2)
+    let x3 = wilson(3) == isPrimeT(3)
+    let x4 = wilson(4) == isPrimeT(4)
+    let x5 = wilson(5) == isPrimeT(5)
+    let x7 = wilson(7) == isPrimeT(7)
+    let x9 = wilson(9) == isPrimeT(9)
+    let x11 = wilson(11) == isPrimeT(11)
+    let x13 = wilson(13) == isPrimeT(13)
+    let x15 = wilson(15) == isPrimeT(15)
+    "w2={w2}|w7={w7}|w9={w9}|x2={x2}|x3={x3}|x4={x4}|x5={x5}|x7={x7}|x9={x9}|x11={x11}|x13={x13}|x15={x15}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "w2=true|w7=true|w9=false|x2=true|x3=true|x4=true|x5=true|x7=true|x9=true|x11=true|x13=true|x15=true"
+        );
+    }
+
+    #[test]
     fn diff_quantifier_duality() {
         // A certification lock (it488, from bug-hunt batch 128 -- 10 probes across string/tensor/list-HOF/Map/bit/
         // float shapes came back byte-identical, so the subtlest untouched corner is locked): the QUANTIFIER DUALITY
