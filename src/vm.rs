@@ -2104,6 +2104,52 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_fold_into_nested_map_of_maps_pivot() {
+        // A certification lock (it307): fold records into a NESTED Map-of-Maps -- a 2-level pivot /
+        // cross-tabulation (region x product). it300 folds into a Map of LISTS (one level); it292 into a
+        // Map of Ints (one level); this pins TWO levels of nesting where the accumulator is
+        // Map[Str, Map[Str, Int]], built with get-or-Map() at the OUTER level and get-or-0 at the inner.
+        //   sales = [west/a/10, east/a/20, west/b/5, west/a/3, east/b/7]
+        //   fold(Map(), (acc, s) ->
+        //     inner = acc.get(s.region).unwrap_or(Map())         // fresh inner Map on a region's 1st sighting
+        //     prev  = inner.get(s.product).unwrap_or(0)          // tally within (region, product)
+        //     acc.insert(s.region, inner.insert(s.product, prev + s.amt)))
+        //   nested = {west: {a: 13, b: 5}, east: {a: 20, b: 7}}, keys() = [west, east]
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the outer get-or-Map() default
+        // creates a fresh inner map per new region, the inner get-or-0 accumulates a cell, the
+        // insert(region, inner.insert(product, ..)) functionally updates BOTH levels, that west/a
+        // accumulates across two NON-adjacent sightings (10 then 3 = 13, not last-wins 3), and that the
+        // outer region keys stay in first-seen order (west before east). This is the 2-D group-by / pivot
+        // table an AI writes to cross-tabulate sales by region and product, events by day and type, or
+        // metrics by host and metric-name. A backend that dropped the get-or-Map() default would panic on
+        // each region's first row, and one that overwrote instead of accumulating the inner cell would
+        // report west/a = 3.
+        // (Inner lookups are bound to plain lets before interpolation -- nested quotes inside {..} trip
+        // K0007, a gotcha this test sidesteps by construction.)
+        let src = r#"type Sale = { region: Str, product: Str, amt: Int }
+fun probe() -> Str {
+    let sales = [Sale(region: "west", product: "a", amt: 10), Sale(region: "east", product: "a", amt: 20), Sale(region: "west", product: "b", amt: 5), Sale(region: "west", product: "a", amt: 3), Sale(region: "east", product: "b", amt: 7)]
+    let nested = sales.fold(Map(), fn(acc, s) {
+        let inner = acc.get(s.region).unwrap_or(Map())
+        let prev = inner.get(s.product).unwrap_or(0)
+        acc.insert(s.region, inner.insert(s.product, prev + s.amt))
+    })
+    let west = nested.get("west").unwrap_or(Map())
+    let east = nested.get("east").unwrap_or(Map())
+    let wa = west.get("a").unwrap_or(0)
+    let wb = west.get("b").unwrap_or(0)
+    let ea = east.get("a").unwrap_or(0)
+    let eb = east.get("b").unwrap_or(0)
+    "regions={nested.keys()}|west.a={wa}|west.b={wb}|east.a={ea}|east.b={eb}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            r#"regions=["west", "east"]|west.a=13|west.b=5|east.a=20|east.b=7"#
+        );
+    }
+
+    #[test]
     fn diff_nested_option_flatten_via_and_then() {
         // A bug-hunt-45 lock (it306): the Option-monad JOIN -- flattening Option[Option] and chaining
         // and_then through a fallible lookup. it290 chains map/filter/unwrap_or over records; this pins the
