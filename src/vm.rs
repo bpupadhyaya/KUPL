@@ -2104,6 +2104,41 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_matrix_vector_multiply() {
+        // A bug-hunt-67 lock (it355): matrix-vector multiplication M*v, composing the certified dot product
+        // (it354) with a map over rows. Each output element is the dot product of one matrix ROW with the
+        // vector: matvec(m, v) = m.map(row -> dot(row, v)). A 2x3 matrix times a 3-vector collapses to a
+        // 2-vector (the inner dimension 3 is summed away), and the IDENTITY matrix times a vector returns the
+        // vector unchanged (I*v = v), the defining property of the identity.
+        //   [[1,2,3],[4,5,6]] * [1,0,1] = [1*1+2*0+3*1, 4*1+5*0+6*1] = [4, 10]
+        //   [[1,0],[0,1]] * [7,9] = [7, 9]   (identity preserves the vector)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms map produces one output per row, that
+        // each row is dotted (zip_with-multiply then fold-sum) against the shared vector, that the result
+        // dimension equals the ROW COUNT (not the column count -- the inner dim is contracted), that the
+        // identity matrix acts as the multiplicative identity (I*v=v), and that all three engines agree. This
+        // composes it354's dot product into the core linear-algebra kernel an AI writes for transforms,
+        // projections, and neural-net layers; a backend whose map or dot was off would break the collapse or
+        // the identity invariant.
+        let src = r#"fun dot(a: List[Int], b: List[Int]) -> Int {
+    a.zip_with(b, fn(x, y) { x * y }).fold(0, fn(s, p) { s + p })
+}
+fun matvec(m: List[List[Int]], v: List[Int]) -> List[Int] {
+    m.map(fn(row) { dot(row, v) })
+}
+fun probe() -> Str {
+    let m = [[1, 2, 3], [4, 5, 6]]
+    let v = [1, 0, 1]
+    let r = matvec(m, v)
+    let id = [[1, 0], [0, 1]]
+    let v2 = [7, 9]
+    let r2 = matvec(id, v2)
+    "matvec={r}|identity={r2}"
+}
+"#;
+        assert_eq!(differential(src), "matvec=[4, 10]|identity=[7, 9]");
+    }
+
+    #[test]
     fn diff_dot_product_zip() {
         // A certification lock (it354): the vector DOT PRODUCT over List[Int] via zip_with (element-wise
         // multiply) then fold (sum). dot(a,b) = a.zip_with(b, *).fold(0, +). Four cases pin the meaningful
