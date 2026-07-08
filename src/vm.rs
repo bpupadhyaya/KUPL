@@ -2220,6 +2220,90 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_dijkstra_shortest_path() {
+        // A certification lock (it400, MILESTONE): DIJKSTRA'S SHORTEST PATH -- single-source shortest distances
+        // in a directed graph with NON-NEGATIVE edge weights (edges [from,to,w]). This is the WEIGHTED extension
+        // of the unweighted BFS (it399): where BFS counts hops in level order, Dijkstra accumulates edge weights
+        // and always expands the closest not-yet-finalized node. Each round pickMin selects the unvisited node
+        // of minimum tentative distance (skipping unreachable INF=99999 nodes), then relax scans that node's
+        // outgoing edges and lowers a neighbour's distance whenever du + w beats the current dv. The distance
+        // vector is an immutable List[Int] rebuilt on each relaxation; the loop finalizes one node per round
+        // until no reachable unvisited node remains, then maps the INF sentinel to -1 for unreachable nodes.
+        //   dijkstra(5,0,[[0,1,4],[0,2,1],[2,1,2],[1,3,1],[2,3,5],[3,4,3]]) = "0,3,1,4,7"
+        //        (node 1 is 3 via 0->2->1 not 4 direct; node 3 is 4 via 0->2->1->3 not 6 via 0->2->3)
+        //   dijkstra(3,0,[[0,1,5]]) = "0,5,-1"            (node 2 is UNREACHABLE -> -1)
+        //   dijkstra(4,0,[[0,1,1],[1,2,1],[2,3,1]]) = "0,1,2,3"   (a unit-weight chain)
+        //   dijkstra(3,0,[[0,1,10],[0,2,3],[2,1,2]]) = "0,5,3"    (indirect 0->2->1=5 beats direct 0->1=10)
+        //   dijkstra(1,0,[]) = "0"                        (a single source node)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the node of minimum tentative
+        // distance is finalized each round, that relaxation lowers a neighbour only when the path THROUGH the
+        // current node is cheaper (du+w < dv), that a longer direct edge loses to a cheaper two-hop path, that
+        // accumulated weights (not hop counts) drive the order, that unreachable nodes stay at the INF sentinel
+        // and render as -1, that a unit-weight chain yields increasing distances, and that all three engines
+        // agree on the pick-min / relax loop over an immutable distance vector. This is the Dijkstra an AI
+        // writes for weighted shortest-path, routing, and least-cost search; a backend whose min-selection,
+        // relaxation comparison, or INF handling was off would find wrong distances. Extends the graph family
+        // to weighted shortest paths -- a fitting 400th-iteration lock.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun pickMin(n: Int, dist: List[Int], done: List[Int]) -> Int {
+    rangeN(n).fold(0 - 1, fn(best, node) {
+        if done.contains(node) { best }
+        else {
+            let d = dist.get(node).unwrap_or(99999)
+            if d >= 99999 { best }
+            else {
+                if best < 0 { node }
+                else {
+                    let bd = dist.get(best).unwrap_or(99999)
+                    if d < bd { node } else { best }
+                }
+            }
+        }
+    })
+}
+fun relax(u: Int, dist: List[Int], edges: List[List[Int]]) -> List[Int] {
+    let du = dist.get(u).unwrap_or(99999)
+    edges.filter(fn(e) { e.get(0).unwrap_or(0) == u }).fold(dist, fn(d, e) {
+        let v = e.get(1).unwrap_or(0)
+        let w = e.get(2).unwrap_or(0)
+        let cand = du + w
+        let dv = d.get(v).unwrap_or(99999)
+        if cand < dv {
+            rangeN(d.len()).map(fn(i) { if i == v { cand } else { d.get(i).unwrap_or(99999) } })
+        } else { d }
+    })
+}
+fun loop(n: Int, dist: List[Int], done: List[Int], edges: List[List[Int]]) -> List[Int] {
+    let u = pickMin(n, dist, done)
+    if u < 0 { dist }
+    else {
+        let nd = relax(u, dist, edges)
+        loop(n, nd, [done, [u]].flatten(), edges)
+    }
+}
+fun dijkstra(n: Int, src: Int, edges: List[List[Int]]) -> Str {
+    let init = rangeN(n).map(fn(i) { if i == src { 0 } else { 99999 } })
+    let final = loop(n, init, [], edges)
+    final.map(fn(d) { if d >= 99999 { (0 - 1).to_str() } else { d.to_str() } }).join(",")
+}
+fun probe() -> Str {
+    let a = dijkstra(5, 0, [[0, 1, 4], [0, 2, 1], [2, 1, 2], [1, 3, 1], [2, 3, 5], [3, 4, 3]])
+    let b = dijkstra(3, 0, [[0, 1, 5]])
+    let c = dijkstra(4, 0, [[0, 1, 1], [1, 2, 1], [2, 3, 1]])
+    let d = dijkstra(3, 0, [[0, 1, 10], [0, 2, 3], [2, 1, 2]])
+    let e = dijkstra(1, 0, [])
+    "graph={a}|unreach={b}|chain={c}|shorter={d}|single={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "graph=0,3,1,4,7|unreach=0,5,-1|chain=0,1,2,3|shorter=0,5,3|single=0"
+        );
+    }
+
+    #[test]
     fn diff_graph_bfs_level_order() {
         // A bug-hunt-89 lock (it399): GRAPH BFS in LEVEL ORDER -- breadth-first traversal from a start node,
         // emitting nodes layer by layer (all nodes at distance 1, then distance 2, ...). This completes the
