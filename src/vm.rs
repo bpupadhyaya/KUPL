@@ -2983,6 +2983,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_figurate_numbers() {
+        // A bug-hunt-115 lock (it452): FIGURATE (POLYGONAL) NUMBERS -- triangular, pentagonal, and hexagonal --
+        // with a closed-form-versus-summation cross-check and the classic square identity. These count dots
+        // arranged in nested polygons and are a distinct number-theory strand from the divisor-based perfect/
+        // amicable locks (they use closed-form polygonal formulas, not sigma). The n-th triangular number is
+        // n(n+1)/2 (also 1+2+...+n), the n-th pentagonal is n(3n-1)/2, and the n-th hexagonal is n(2n-1). The
+        // cross-check confirms the closed form equals the running sum; the square identity T(n-1)+T(n) == n^2 is
+        // the well-known fact that two consecutive triangular numbers tile a square.
+        //   tri(5) = 15, tri(10) = 55                (10*11/2)
+        //   cross = true                             (triSum(10) == tri(10): closed form equals 1+...+10)
+        //   sqId = true                              (tri(9)+tri(10) = 45+55 = 100 = 10^2)
+        //   pent(5) = 35, pent(6) = 51               (n(3n-1)/2)
+        //   hex(4) = 28, hex(5) = 45                 (n(2n-1); note 28 is ALSO the perfect number from it450 --
+        //                                             every hexagonal number is triangular, and 28 is both
+        //                                             hexagonal and perfect)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the triangular closed form n(n+1)/2
+        // matches the summation 1..n, that consecutive triangular numbers sum to a perfect square, that the
+        // pentagonal and hexagonal formulas produce their standard values, that the halving in the triangular and
+        // pentagonal formulas stays integer-exact (one of n, n+1 is even), that hexagonal 28 coincides with the
+        // perfect number, and that all three engines agree. This is the figurate-number arithmetic an AI writes
+        // for combinatorics, sequence generation, or recreational math; the closed-form/summation cross-check
+        // catches an off-by-one in the formula. A non-sort lock certifying polygonal-number formulas and the
+        // consecutive-triangular square identity.
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun tri(n: Int) -> Int { n * (n + 1) / 2 }
+fun triSum(n: Int) -> Int { rangeIncl(1, n).fold(0, fn(a, x) { a + x }) }
+fun pent(n: Int) -> Int { n * (3 * n - 1) / 2 }
+fun hex(n: Int) -> Int { n * (2 * n - 1) }
+fun probe() -> Str {
+    let t5 = tri(5)
+    let t10 = tri(10)
+    let cross = triSum(10) == tri(10)
+    let sqId = tri(9) + tri(10) == 100
+    let p5 = pent(5)
+    let p6 = pent(6)
+    let h4 = hex(4)
+    let h5 = hex(5)
+    "t5={t5}|t10={t10}|cross={cross}|sqId={sqId}|p5={p5}|p6={p6}|h4={h4}|h5={h5}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "t5=15|t10=55|cross=true|sqId=true|p5=35|p6=51|h4=28|h5=45"
+        );
+    }
+
+    #[test]
     fn diff_perfect_number_sigma() {
         // A bug-hunt-114 lock (it450, campaign midpoint): PERFECT NUMBERS via the SUM-OF-DIVISORS function sigma,
         // with deficient/perfect/abundant classification. This extends the number-theory family (prime-fact it449,
