@@ -2269,6 +2269,68 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_hex_encode_decode() {
+        // A certification lock (it439): HEXADECIMAL encode + decode, hand-rolled from bit operations and pinned as
+        // a codec roundtrip (like base64 it437/it438, Gray code it433, Roman numerals it426). Hex encoding splits
+        // each byte into two 4-bit nibbles -- the high nibble (byte >> 4) and low nibble (byte & 15) -- and maps
+        // each to a character in "0123456789abcdef", so every byte becomes exactly two lowercase hex digits.
+        // Decoding reverses it: each pair of characters looks up its 4-bit value by POSITION in that alphabet and
+        // recombines them as hi<<4 | lo. The roundtrip case pins decode(encode(bytes)) == bytes across boundary
+        // values (0, 127, 128, 255) that exercise the high-bit nibble split.
+        //   encode([255,0,16,171]) = ff0010ab     (0xff, 0x00, 0x10, 0xab)
+        //   encode([72,105]) = 4869               ("Hi" -- 0x48, 0x69)
+        //   decode("ff00108a") = 255,0,16,138
+        //   decode("deadbeef") = 222,173,190,239  (the famous 0xdeadbeef sentinel)
+        //   decode(encode([0,127,128,255,15,240])) = 0,127,128,255,15,240   (roundtrip identity)
+        //   encode([]) = (empty)                  (no bytes -> empty string)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each byte splits into a high and low
+        // nibble, that the nibbles map to the correct lowercase hex characters, that decoding looks each digit
+        // back up by alphabet position and recombines hi<<4 | lo, that 0xdeadbeef decodes to its canonical bytes,
+        // that encode/decode round-trip on boundary bytes spanning the high-bit split, that the empty input yields
+        // the empty string, and that all three engines agree. This is the hex codec an AI writes to render a hash,
+        // a byte buffer, or a color value as text and parse it back; a backend whose nibble shift/mask or digit
+        // lookup was off would emit or read the wrong bytes. A non-sort lock certifying hand-rolled hex
+        // encode/decode and the roundtrip.
+        let src = r#"fun hexDigits() -> Str { "0123456789abcdef" }
+fun nib(v: Int) -> Str { hexDigits().chars().get(v).unwrap_or("?") }
+fun hexVal(c: Str) -> Int { hexDigits().chars().position(fn(x) { x == c }).unwrap_or(0) }
+fun encode(bytes: List[Int]) -> Str {
+    bytes.map(fn(b) {
+        let hi = nib(b.shr(4))
+        let lo = nib(b.band(15))
+        "{hi}{lo}"
+    }).join("")
+}
+fun rangeN(k: Int) -> List[Int] {
+    if k <= 0 { [] } else { [rangeN(k - 1), [k - 1]].flatten() }
+}
+fun decode(s: Str) -> List[Int] {
+    let cs = s.chars()
+    let pairs = cs.len() / 2
+    rangeN(pairs).map(fn(i) {
+        let hi = hexVal(cs.get(i * 2).unwrap_or("0"))
+        let lo = hexVal(cs.get(i * 2 + 1).unwrap_or("0"))
+        hi.shl(4).bor(lo)
+    })
+}
+fun shw(xs: List[Int]) -> Str { xs.map(fn(x) { x.to_str() }).join(",") }
+fun probe() -> Str {
+    let e1 = encode([255, 0, 16, 171])
+    let e2 = encode([72, 105])
+    let d1 = shw(decode("ff00108a"))
+    let d2 = shw(decode("deadbeef"))
+    let rt = shw(decode(encode([0, 127, 128, 255, 15, 240])))
+    let empty = encode([])
+    "e1={e1}|e2={e2}|d1={d1}|d2={d2}|rt={rt}|empty=[{empty}]"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "e1=ff0010ab|e2=4869|d1=255,0,16,138|d2=222,173,190,239|rt=0,127,128,255,15,240|empty=[]"
+        );
+    }
+
+    #[test]
     fn diff_base64_decode() {
         // A bug-hunt-108 lock (it438): BASE64 DECODING, the exact inverse of the it437 encoder, forming a
         // roundtrip codec pair (like Gray code it433 and Roman numerals it426). Decoding maps each character back
