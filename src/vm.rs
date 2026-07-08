@@ -2220,6 +2220,65 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_min_path_sum_grid() {
+        // A certification lock (it374): MINIMUM PATH SUM in a grid -- the least total cost to travel from the
+        // top-left to the bottom-right cell of an m x n grid of costs, moving only RIGHT or DOWN. This is the
+        // OPTIMIZATION twin of unique-paths (it370): the two share the exact same right/down grid recurrence
+        // structure, but where unique-paths SUMS the two incoming route COUNTS (a counting DP), min-path-sum
+        // takes the MIN of the two incoming path COSTS and adds the current cell (an optimization DP). The
+        // recurrence over minPath(r, c) = grid[r][c] + <continuation>: at the bottom-right cell the cost is
+        // just grid[r][c]; on the last row only RIGHT is possible (+ minPath(r, c+1)); on the last column only
+        // DOWN is possible (+ minPath(r+1, c)); otherwise + MIN(down, right).
+        //   solve([[1,3,1],[1,5,1],[4,2,1]]) = 7   (the classic path 1->3->1->1->1)
+        //   solve([[1,2,3],[4,5,6]]) = 12          (1->2->3->6, cheaper than going down early)
+        //   solve([[5]]) = 5                       (a single cell)
+        //   solve([[1,2,3,4]]) = 10                (a single row -- forced right, 1+2+3+4)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the bottom-right base is just the cell
+        // cost, that the last-row and last-column boundaries each allow exactly one direction, that an interior
+        // cell adds the MIN (not max, not sum) of the down and right continuations to its own cost, that a
+        // degenerate single row/column sums the whole line, that the classic 3x3 optimum is 7 (choosing the
+        // cheaper of competing paths at each junction), and that all three engines agree. This is the
+        // min-path-sum / cheapest-grid-route DP an AI writes for weighted-lattice routing and cost minimization;
+        // a backend whose two-coordinate recursion, boundary directions, or min-combine was off would pick a
+        // costlier route. Completes the grid pair: unique-paths COUNTS routes (sum), min-path-sum OPTIMIZES cost
+        // (min), over the identical right/down structure.
+        let src = r#"fun mini(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+fun cell(g: List[List[Int]], r: Int, c: Int) -> Int {
+    g.get(r).unwrap_or([]).get(c).unwrap_or(0)
+}
+fun minPath(g: List[List[Int]], r: Int, c: Int) -> Int {
+    let m = g.len()
+    let n = g.first().unwrap_or([]).len()
+    let here = cell(g, r, c)
+    if r == m - 1 {
+        if c == n - 1 { here }
+        else { here + minPath(g, r, c + 1) }
+    }
+    else {
+        if c == n - 1 { here + minPath(g, r + 1, c) }
+        else {
+            let down = minPath(g, r + 1, c)
+            let right = minPath(g, r, c + 1)
+            here + mini(down, right)
+        }
+    }
+}
+fun solve(g: List[List[Int]]) -> Int { minPath(g, 0, 0) }
+fun probe() -> Str {
+    let a = solve([[1, 3, 1], [1, 5, 1], [4, 2, 1]])
+    let b = solve([[1, 2, 3], [4, 5, 6]])
+    let c = solve([[5]])
+    let d = solve([[1, 2, 3, 4]])
+    "classic={a}|two={b}|single={c}|row={d}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "classic=7|two=12|single=5|row=10"
+        );
+    }
+
+    #[test]
     fn diff_climbing_stairs() {
         // A bug-hunt-76 lock (it373): CLIMBING STAIRS -- the number of distinct ways to reach step n taking
         // either 1 or 2 steps at a time. This is an ADDITIVE two-term linear counting DP (Fibonacci-shaped),
