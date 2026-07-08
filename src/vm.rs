@@ -2104,6 +2104,44 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_stack_lifo_vs_queue_fifo() {
+        // A certification lock (it330, milestone): the two fundamental sequence abstractions -- a stack (LIFO)
+        // and a queue (FIFO) -- built on a plain list, drained fully so the ORDERING DISCIPLINE is the
+        // certified property. drainStack repeatedly pops the LAST element (last() + take(len-1)) and records
+        // it, so draining reverses the sequence; drainQueue repeatedly dequeues the FIRST element (first() +
+        // drop(1)) and records it, so draining preserves the sequence. Same input, opposite output order --
+        // the defining difference between the two structures.
+        //   items [1,2,3,4,5]: stack drains LIFO -> [5,4,3,2,1] ; queue drains FIFO -> [1,2,3,4,5]
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that a stack pop reads/removes from
+        // the END (last() + take-all-but-last) while a queue dequeue reads/removes from the FRONT (first() +
+        // drop-first), that both recurse to the empty base case emitting every element exactly once (no loss,
+        // no duplication -- both outputs have all five), and that the LIFO drain is exactly the reverse of the
+        // FIFO drain. This is the stack/queue an AI writes for undo history, a work list, a BFS/DFS frontier;
+        // a backend that took from the wrong end would collapse the two disciplines into the same order.
+        let src = r#"fun drainStack(s: List[Int], out: List[Int]) -> List[Int] {
+    match s.last() {
+        None => out
+        Some(top) => drainStack(s.take(s.len() - 1), out.push(top))
+    }
+}
+fun drainQueue(q: List[Int], out: List[Int]) -> List[Int] {
+    match q.first() {
+        None => out
+        Some(front) => drainQueue(q.drop(1), out.push(front))
+    }
+}
+fun probe() -> Str {
+    let items = [1, 2, 3, 4, 5]
+    let empty: List[Int] = []
+    let stackOrder = drainStack(items, empty)
+    let queueOrder = drainQueue(items, empty)
+    "stackLIFO={stackOrder}|queueFIFO={queueOrder}"
+}
+"#;
+        assert_eq!(differential(src), "stackLIFO=[5, 4, 3, 2, 1]|queueFIFO=[1, 2, 3, 4, 5]");
+    }
+
+    #[test]
     fn diff_prefix_sums_via_scan() {
         // A bug-hunt-54 lock (it329): prefix sums (running cumulative totals) via scan, cross-checked against
         // fold. scan(0, +) emits the running accumulation at each step; per the scan contract the seed is
