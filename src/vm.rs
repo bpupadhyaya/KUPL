@@ -2104,6 +2104,44 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_lcm_of_list_fold() {
+        // A certification lock (it352): the LCM of a WHOLE LIST via fold-reduction -- the multiplicative DUAL
+        // of gcd-of-list (it351). Fold the list with lcm as the reducer, SEEDED WITH 1. The seed choice is the
+        // pedagogical counterpart to gcd's seed 0: 1 is the identity element of lcm (lcm(1, x) = x), so the
+        // accumulator initializes to the first element on the first step. lcm itself is a/gcd(a,b)*b, and the
+        // DIVIDE-BEFORE-MULTIPLY order matters -- dividing a by gcd first keeps the intermediate small and
+        // avoids the overflow that (a*b)/gcd would risk.
+        //   [2,3,4,6] -> 12 (lcm(1,2)=2,lcm(2,3)=6,lcm(6,4)=12,lcm(12,6)=12) ; [4,5,10] -> 20 ; [3,5,7] -> 105 (coprime, 3*5*7)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the seed-1 identity kicks the fold off
+        // (lcm(1,first)=first), that lcm reuses the Euclidean gcd with divide-before-multiply, that shared
+        // factors collapse (2,3,4,6 share factors so lcm is 12 not 144), that a nested multiple folds in
+        // without growth (10 into lcm(4,5)=20 stays 20), that pairwise-coprime numbers multiply out fully
+        // (3*5*7=105), and that all three engines agree. Paired with it351's gcd-of-list this pins BOTH
+        // number-theoretic fold-reductions and their contrasting identity seeds (0 for gcd, 1 for lcm); this is
+        // the whole-list LCM an AI writes for common denominators, cycle alignment, and scheduling periods.
+        let src = r#"fun gcd(a: Int, b: Int) -> Int {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+fun lcm(a: Int, b: Int) -> Int {
+    a / gcd(a, b) * b
+}
+fun probe() -> Str {
+    let xs = [2, 3, 4, 6]
+    let l = xs.fold(1, fn(acc, x) { lcm(acc, x) })
+    let ys = [4, 5, 10]
+    let l2 = ys.fold(1, fn(acc, x) { lcm(acc, x) })
+    let zs = [3, 5, 7]
+    let l3 = zs.fold(1, fn(acc, x) { lcm(acc, x) })
+    "lcm_2_3_4_6={l}|lcm_4_5_10={l2}|lcm_coprime={l3}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "lcm_2_3_4_6=12|lcm_4_5_10=20|lcm_coprime=105"
+        );
+    }
+
+    #[test]
     fn diff_gcd_of_list_fold() {
         // A bug-hunt-65 lock (it351): the GCD of a WHOLE LIST via fold-reduction of the pairwise Euclidean
         // GCD. This extends the pairwise gcd (it334) to many numbers: fold the list with gcd as the reducer,
