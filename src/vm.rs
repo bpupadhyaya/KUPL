@@ -2104,6 +2104,43 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_base_conversion_roundtrip() {
+        // A certification lock (it338): base-conversion round-trip -- to_radix (Int -> Str in a given base)
+        // and parse_radix (Str -> Option[Int] from a given base) are INVERSES, cross-checked against the
+        // dedicated to_hex/to_binary builtins. roundtrip(n, base) = n.to_radix(base).parse_radix(base) == n
+        // must hold across bases 2, 16, and 36; to_radix(16) must equal to_hex; to_radix(2) must equal
+        // to_binary; and parse_radix must decode ALPHABETIC digits (z is the digit worth 35 in base 36).
+        //   roundtrip(42,2)=true  roundtrip(255,16)=true  roundtrip(1000,36)=true
+        //   255.to_radix(16)="ff"==to_hex ; 42.to_radix(2)="101010"==to_binary ; "z".parse_radix(36)=35
+        // Byte-identical on interp/KVM (native per the sweep). Confirms to_radix and parse_radix invert each
+        // other (no digit dropped or mis-weighted) at the low (binary), common (hex), and maximum (36) bases,
+        // that the general to_radix agrees with the specialized to_hex/to_binary (independent implementations
+        // land on the same string), and that alphabetic base-36 digits parse to the right value (z=35, not
+        // some ASCII code). This is the radix conversion an AI writes for serialization, short IDs, and
+        // encoding; a backend whose to_radix/parse_radix disagreed, or that mishandled letter-digits, would
+        // break the round-trip or the builtin cross-check.
+        let src = r#"fun roundtrip(n: Int, base: Int) -> Bool {
+    n.to_radix(base).parse_radix(base).unwrap_or(0 - 1) == n
+}
+fun probe() -> Str {
+    let r2 = roundtrip(42, 2)
+    let r16 = roundtrip(255, 16)
+    let r36 = roundtrip(1000, 36)
+    let hex = 255.to_radix(16)
+    let hexBuiltin = 255.to_hex()
+    let bin = 42.to_radix(2)
+    let binBuiltin = 42.to_binary()
+    let back = "z".parse_radix(36).unwrap_or(0 - 1)
+    "rt2={r2}|rt16={r16}|rt36={r36}|hex={hex}|hexEq={hex == hexBuiltin}|bin={bin}|binEq={bin == binBuiltin}|z36={back}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "rt2=true|rt16=true|rt36=true|hex=ff|hexEq=true|bin=101010|binEq=true|z36=35"
+        );
+    }
+
+    #[test]
     fn diff_exponentiation_by_squaring() {
         // A bug-hunt-58 lock (it337): exponentiation by squaring -- the O(log n) fast-power, integer recursion
         // that HALVES the exponent by squaring the base, distinct from the modulo/parity/digit int recursions
