@@ -2104,6 +2104,46 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_merge_two_sorted_lists() {
+        // A certification lock (it322): merging two already-sorted lists into one sorted list via the
+        // recursive two-pointer merge -- the merge step of merge sort. At each step it peeks the front of
+        // each list (a.first()/b.first()), emits the smaller head, and recurses on the rest (drop(1) on the
+        // list it consumed); when either side is empty it appends the whole remaining other side. Distinct
+        // from the sorted-insert priority queue (it321), which inserts ONE element into a sorted list -- this
+        // interleaves two WHOLE sorted lists in a single linear pass.
+        //   merge([1,3,5,7,9], [2,4,6,8]) = [1,2,3,4,5,6,7,8,9]  (len 9, globally sorted)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the two-way head comparison picks the
+        // smaller front, that `x <= y` keeps the merge stable (ties take from `a` first), that consuming a
+        // side recurses on drop(1) while the other side stays put, that an exhausted side (None) short-
+        // circuits to the remaining tail, and that flatten([[head], merged-rest]) prepends in order. The
+        // sortedness check (every adjacent window non-decreasing) witnesses the global invariant. This is the
+        // merge an AI writes for merge sort, k-way merges, or combining sorted streams; a backend that
+        // mishandled the head comparison or the drop-which-side choice would interleave out of order and the
+        // window check would fail.
+        let src = r#"fun merge(a: List[Int], b: List[Int]) -> List[Int] {
+    match a.first() {
+        None => b
+        Some(x) => match b.first() {
+            None => a
+            Some(y) => {
+                if x <= y { [[x], merge(a.drop(1), b)].flatten() }
+                else { [[y], merge(a, b.drop(1))].flatten() }
+            }
+        }
+    }
+}
+fun probe() -> Str {
+    let a = [1, 3, 5, 7, 9]
+    let b = [2, 4, 6, 8]
+    let m = merge(a, b)
+    let sorted = m.window(2).all(fn(w) { w.first().unwrap_or(0) <= w.last().unwrap_or(0) })
+    "merged={m}|len={m.len()}|sorted={sorted}"
+}
+"#;
+        assert_eq!(differential(src), "merged=[1, 2, 3, 4, 5, 6, 7, 8, 9]|len=9|sorted=true");
+    }
+
+    #[test]
     fn diff_priority_queue_sorted_insert() {
         // A bug-hunt-51 lock (it321): a priority queue via ORDERED INSERTION into a sorted list. Each insert
         // splits the queue at the position where the new task's priority belongs -- take_while(prio <=
