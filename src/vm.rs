@@ -2459,6 +2459,58 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_exponential_moving_average() {
+        // A certification lock (it441): EXPONENTIAL MOVING AVERAGE (EMA) -- a recursive IIR smoothing filter,
+        // distinct in kind from the FIR window aggregation locked at it257 (moving sum/max). Where a window
+        // statistic looks at a fixed span of raw inputs, an EMA feeds its OWN previous output back in:
+        //   ema[0] = x[0];   ema[i] = alpha*x[i] + (1-alpha)*ema[i-1]
+        // so every past sample influences the present with geometrically decaying weight. Using alpha = 0.5 makes
+        // every value an exact binary fraction (0.5, 0.25, ...), so the float results are reproducible bit-for-bit
+        // across engines with no rounding ambiguity. Formatted to 3 decimals.
+        //   ema([10,20,30,40]) = 10, 15, 22.5, 31.25       (a rising ramp; the average lags the input)
+        //   ema([100,0,0,0]) = 100, 50, 25, 12.5           (the IMPULSE RESPONSE -- a spike decays by half each
+        //                                                    step, the exponential decay that names the filter)
+        //   ema([4,4,4]) = 4, 4, 4                          (a constant input is a fixed point -- DC is preserved)
+        //   ema([8]) = 8                                    (a single sample is its own average)
+        //   ema([]) = (empty)                               (no samples -> empty series)
+        //   ema([0,16,0,16]) = 0, 8, 4, 10                  (an alternating input, smoothed with lag)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the first output equals the first
+        // input, that each subsequent output blends the new sample with the prior output at the alpha/(1-alpha)
+        // ratio, that an impulse decays geometrically (the defining IIR behavior), that a constant input maps to
+        // itself (unity DC gain), that the empty and singleton series are handled, that the alpha=0.5 arithmetic
+        // is exact across engines, and that all three agree. This is the smoothing an AI writes for a time-series
+        // trend line, a sensor low-pass, or a metrics dashboard; a backend whose recursive feedback or blend
+        // weights were off would produce a wrong or unstable series. A non-sort lock certifying the exponential
+        // moving average as a recursive filter, complementing the window-aggregation lock at it257.
+        let src = r#"fun emaAt(xs: List[Int], i: Int) -> Float {
+    let xi = xs.get(i).unwrap_or(0).to_float()
+    if i <= 0 { xi }
+    else { 0.5 * xi + 0.5 * emaAt(xs, i - 1) }
+}
+fun rangeN(k: Int) -> List[Int] {
+    if k <= 0 { [] } else { [rangeN(k - 1), [k - 1]].flatten() }
+}
+fun ema(xs: List[Int]) -> List[Float] {
+    rangeN(xs.len()).map(fn(i) { emaAt(xs, i) })
+}
+fun shw(xs: List[Float]) -> Str { xs.map(fn(x) { x.fmt(3) }).join(",") }
+fun probe() -> Str {
+    let a = shw(ema([10, 20, 30, 40]))
+    let b = shw(ema([100, 0, 0, 0]))
+    let c = shw(ema([4, 4, 4]))
+    let d = shw(ema([8]))
+    let e = shw(ema([]))
+    let f = shw(ema([0, 16, 0, 16]))
+    "ramp={a}|impulse={b}|flat={c}|single={d}|empty=[{e}]|alt={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "ramp=10.000,15.000,22.500,31.250|impulse=100.000,50.000,25.000,12.500|flat=4.000,4.000,4.000|single=8.000|empty=[]|alt=0.000,8.000,4.000,10.000"
+        );
+    }
+
+    #[test]
     fn diff_date_difference_days() {
         // A bug-hunt-109 lock (it440): DATE DIFFERENCE -- the number of days between two Gregorian dates, computed
         // by converting each date to a serial day-number and subtracting. This extends the date family (Zeller
