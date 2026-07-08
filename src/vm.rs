@@ -2104,6 +2104,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_average_and_count_if() {
+        // A bug-hunt-63 lock (it347): arithmetic mean of a list plus count-if with a complementary partition.
+        // The mean is fold-sum / len (INTEGER division, truncating). Then two count-if predicates run over the
+        // same list -- how many elements are strictly ABOVE the mean (filter(x>mean).len()) and how many are
+        // AT OR BELOW it (filter(x<=mean).len()). Because ">" and "<=" are exact complements, the two counts
+        // must sum back to the list length: a partition-conservation invariant that proves no element is
+        // dropped or double-counted by either filter.
+        //   [4,8,15,16,23,42] -> total=108, n=6, mean=18 ; above(>18)=2 (23,42) ; beloweq(<=18)=4 (4,8,15,16) ; 2+4=6=n
+        // Byte-identical on interp/KVM (native per the sweep). Confirms fold sums to 108, len is 6, integer
+        // division yields the mean 18, that filter+len counts elements matching a predicate, that the two
+        // complementary predicates (> and <=) partition the list exactly (above + beloweq == n, no overlap and
+        // no gap), and that all three engines agree on the mean and both counts. This is the average +
+        // "how many beat the average" an AI writes for stats summaries and thresholding; a backend whose
+        // integer division rounded, or whose filter boundary was off at x==mean, would break the counts or the
+        // conservation total.
+        let src = r#"fun probe() -> Str {
+    let xs = [4, 8, 15, 16, 23, 42]
+    let total = xs.fold(0, fn(a, x) { a + x })
+    let n = xs.len()
+    let mean = total / n
+    let aboveMean = xs.filter(fn(x) { x > mean }).len()
+    let belowOrEq = xs.filter(fn(x) { x <= mean }).len()
+    let sum = aboveMean + belowOrEq
+    "total={total}|n={n}|mean={mean}|above={aboveMean}|beloweq={belowOrEq}|sum={sum}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "total=108|n=6|mean=18|above=2|beloweq=4|sum=6"
+        );
+    }
+
+    #[test]
     fn diff_running_minimum_scan() {
         // A certification lock (it346): running minimum via scan -- the monotone NON-INCREASING low-water
         // mark, the exact dual of running-max (it343). scan(seed, min) threads the min-so-far through the
