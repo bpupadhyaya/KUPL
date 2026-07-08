@@ -3029,6 +3029,57 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_fast_doubling_fibonacci() {
+        // A certification lock (it472): FAST-DOUBLING FIBONACCI -- F(n) in O(log n) via the doubling identities
+        // F(2k) = F(k)*(2*F(k+1) - F(k)) and F(2k+1) = F(k+1)^2 + F(k)^2, computed by recursing on n/2 and
+        // returning the pair (F(n), F(n+1)) in a record -- cross-validated against the naive recursive definition
+        // F(n) = F(n-1) + F(n-2). Continuing the classic-algorithm vein (Stein GCD it467 ... Horner it470), this is
+        // a FIFTH genuinely distinct Fibonacci algorithm in the suite alongside naive recursion (recursion_fib),
+        // memoization (memoized_fib_via_map it317), matrix exponentiation (fibonacci_matrix_power it445), and the
+        // bigint accumulation (bigint_fibonacci_accumulation): fast-doubling is the fastest, halving n each step
+        // (depth ~log2 n) with only a couple of multiplies per level. Its agreement with the exponential-time naive
+        // recursion at four indices certifies the doubling identities and the even/odd pair-combination logic.
+        //   fastFib(10)=55, fastFib(20)=6765, fastFib(30)=832040   (F(30) in ~5 halving steps, not 30)
+        //   x1..x4: fastFib == recFib for n = 10, 15, 18, 20   (log-time doubling == naive recursion)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that recursing on n/2 and combining via the
+        // doubling identities reproduces Fibonacci, that the even branch keeps (F(2k), F(2k+1)) while the odd branch
+        // shifts to (F(2k+1), F(2k)+F(2k+1)), that the Pair record threads the (F(n),F(n+1)) state, that the base
+        // fd(0)=(0,1) seeds it, that the log-time result matches the naive recursion at four indices, and that all
+        // three engines agree. This is the efficient Fibonacci an AI writes when n is large and matrix power feels
+        // heavy; agreement with the naive definition catches a wrong doubling identity or an even/odd swap. A
+        // non-sort lock certifying fast-doubling Fibonacci against the recursive definition.
+        let src = r#"type Pair = { fst: Int, snd: Int }
+fun fd(n: Int) -> Pair {
+    if n == 0 { Pair(fst: 0, snd: 1) }
+    else {
+        let p = fd(n / 2)
+        let a = p.fst
+        let b = p.snd
+        let c = a * (2 * b - a)
+        let d = a * a + b * b
+        if n % 2 == 0 { Pair(fst: c, snd: d) } else { Pair(fst: d, snd: c + d) }
+    }
+}
+fun fastFib(n: Int) -> Int { fd(n).fst }
+fun recFib(n: Int) -> Int { if n <= 1 { n } else { recFib(n - 1) + recFib(n - 2) } }
+fun probe() -> Str {
+    let f10 = fastFib(10)
+    let f20 = fastFib(20)
+    let f30 = fastFib(30)
+    let x1 = fastFib(10) == recFib(10)
+    let x2 = fastFib(15) == recFib(15)
+    let x3 = fastFib(18) == recFib(18)
+    let x4 = fastFib(20) == recFib(20)
+    "f10={f10}|f20={f20}|f30={f30}|x1={x1}|x2={x2}|x3={x3}|x4={x4}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "f10=55|f20=6765|f30=832040|x1=true|x2=true|x3=true|x4=true"
+        );
+    }
+
+    #[test]
     fn diff_horner_polynomial_eval() {
         // A certification lock (it470): HORNER'S METHOD for polynomial evaluation -- the value of
         // p(x) = c0 + c1*x + c2*x^2 + ... + cn*x^n computed by the nested (Ruffini) form
