@@ -2220,6 +2220,43 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_json_build_stringify() {
+        // A certification lock (it419): JSON CONSTRUCTION via json_stringify on a programmatically-built Json
+        // value -- the reverse of json_parse. Rather than parsing text into a Json ADT, this BUILDS a Json value
+        // in code from the constructors JObj(Map), JArr(List), JStr(Str), JNum(Float), JBool(Bool), then
+        // serializes it to a canonical JSON string. This exercises the serialization codepath end to end: object
+        // keys emit in the Map's INSERTION order (so the output is deterministic and byte-stable across engines),
+        // integer-valued numbers like JNum(1.0) render WITHOUT a decimal point ("1" not "1.0"), strings are
+        // quoted, arrays and objects nest, booleans emit true/false, and an empty array emits "[]".
+        //   json_stringify(JObj name=JStr("kupl"), version=JNum(1.0)) = {"name":"kupl","version":1}
+        //   json_stringify(JArr [1.0,2.0,3.0]) = [1,2,3]                (integer-valued floats, no decimals)
+        //   json_stringify(JObj items=JArr[JStr a,JStr b], count=JNum(2.0)) = {"items":["a","b"],"count":2}
+        //   json_stringify(JArr []) = []                                (empty array)
+        //   json_stringify(JObj ok=JBool(true), done=JBool(false)) = {"ok":true,"done":false}
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that JObj serializes its Map with keys in
+        // insertion order (name before version, items before count -- deterministic, not hash-order), that
+        // JNum(1.0) prints as "1" (integer-valued float without a trailing decimal), that JStr values are quoted,
+        // that JArr renders a bracketed comma list including the empty [] case, that nested arrays inside objects
+        // serialize correctly, that JBool emits lowercase true/false, and that all three engines agree on the
+        // constructed-value serialization. This is the JSON building an AI writes to emit API responses, config,
+        // and structured logs; a backend whose key ordering, number formatting, or nesting was off would produce
+        // non-canonical or diverging JSON. A non-sort lock exercising json_stringify on a built Json value.
+        let src = r#"fun probe() -> Str {
+    let obj = json_stringify(JObj(Map().insert("name", JStr("kupl")).insert("version", JNum(1.0))))
+    let arr = json_stringify(JArr([JNum(1.0), JNum(2.0), JNum(3.0)]))
+    let nested = json_stringify(JObj(Map().insert("items", JArr([JStr("a"), JStr("b")])).insert("count", JNum(2.0))))
+    let empty = json_stringify(JArr([]))
+    let flags = json_stringify(JObj(Map().insert("ok", JBool(true)).insert("done", JBool(false))))
+    "obj={obj}|arr={arr}|nested={nested}|empty={empty}|flags={flags}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "obj={\"name\":\"kupl\",\"version\":1}|arr=[1,2,3]|nested={\"items\":[\"a\",\"b\"],\"count\":2}|empty=[]|flags={\"ok\":true,\"done\":false}"
+        );
+    }
+
+    #[test]
     fn diff_group_then_sort_buckets() {
         // A bug-hunt-98 lock (it418): GROUP-THEN-SORT EACH BUCKET -- the SQL "GROUP BY cat ... ORDER BY val
         // within each group" pattern, composing group_by (partition records into buckets keyed by a category)
