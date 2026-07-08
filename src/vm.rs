@@ -2220,6 +2220,62 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_longest_palindromic_subsequence() {
+        // A certification lock (it366): LONGEST PALINDROMIC SUBSEQUENCE (LPS) -- the length of the longest
+        // subsequence of a string that reads the same forwards and backwards. This is a TWO-ENDED string DP:
+        // unlike LCS/edit distance (which walk TWO separate strings with one pointer each) or LIS (a single
+        // forward scan), LPS walks a SINGLE string with TWO pointers converging from both ends. The recurrence
+        // over lps(i, j): if i > j the range is empty (0); if i == j a single character is a palindrome of
+        // length 1; if the two END characters MATCH they both contribute, giving 2 + lps(i+1, j-1) (shrink
+        // both ends); otherwise the best is the MAX of dropping the left end (lps(i+1, j)) or the right end
+        // (lps(i, j-1)).
+        //   lps("bbbab") = 4     ("bbbb")
+        //   lps("cbbd") = 2      ("bb")
+        //   lps("racecar") = 7   (the whole string is already a palindrome)
+        //   lps("abcde") = 1     (no repeated characters -- any single char is a length-1 palindrome)
+        //   lps("aa") = 2        ("aa")
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the i>j base yields 0, the i==j base
+        // yields 1 (a lone character counts), that a matching pair of ENDS adds exactly 2 and recurses on the
+        // strictly-inner range (i+1, j-1), that a mismatch takes the MAX of the two single-end-drop
+        // sub-problems (not min, not sum), that a fully-palindromic string returns its whole length, that a
+        // string with no repeats returns 1, and that all three engines agree. This is the LPS an AI writes for
+        // palindrome analysis, DNA/RNA secondary-structure symmetry, and sequence restoration; a backend whose
+        // end-match, max-branch, or converging-pointer base cases were off would mis-measure the palindrome.
+        // Adds a two-ended converging structure to the DP family, distinct from two-string lockstep (LCS/edit),
+        // single-sequence scan (LIS), prefix-choice (knapsack/coin), and interval-split (matrix-chain).
+        let src = r#"fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun lpsRec(cs: List[Str], i: Int, j: Int) -> Int {
+    if i > j { 0 }
+    else {
+        if i == j { 1 }
+        else {
+            let ci = cs.get(i).unwrap_or("")
+            let cj = cs.get(j).unwrap_or("")
+            if ci == cj { 2 + lpsRec(cs, i + 1, j - 1) }
+            else { maxi(lpsRec(cs, i + 1, j), lpsRec(cs, i, j - 1)) }
+        }
+    }
+}
+fun lps(s: Str) -> Int {
+    let cs = s.chars()
+    lpsRec(cs, 0, cs.len() - 1)
+}
+fun probe() -> Str {
+    let a = lps("bbbab")
+    let b = lps("cbbd")
+    let c = lps("racecar")
+    let d = lps("abcde")
+    let e = lps("aa")
+    "bbbab={a}|cbbd={b}|racecar={c}|abcde={d}|aa={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "bbbab=4|cbbd=2|racecar=7|abcde=1|aa=2"
+        );
+    }
+
+    #[test]
     fn diff_matrix_chain_multiplication() {
         // A bug-hunt-72 lock (it365): MATRIX-CHAIN MULTIPLICATION -- the minimum number of scalar
         // multiplications needed to multiply a chain of matrices, choosing the optimal PARENTHESIZATION. The
