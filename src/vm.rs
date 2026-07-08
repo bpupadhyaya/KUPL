@@ -2104,6 +2104,45 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_binary_search_sorted_list() {
+        // A certification lock (it326): binary search over a sorted list -- the O(log n) search counterpart
+        // to the sort locks (it324/325). It recurses on INDEX BOUNDS (a half-open interval [lo, hi)) rather
+        // than on list structure (first/drop): the overflow-safe midpoint lo + (hi-lo)/2 is peeked with
+        // get(mid), and a three-way compare either returns the hit index, narrows to the right half
+        // [mid+1, hi), or the left half [lo, mid). The base case lo >= hi means the target is absent -> -1.
+        //   xs = [1,3,5,7,9,11,13,15,17,19]
+        //   find 1/9/19/7 -> indices 0/4/9/3 ; find 0/8/20/2 (all absent) -> -1
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the midpoint computation, that get()
+        // reads the element at the probed index, that the three-way branch narrows to the correct half (the
+        // half-open [lo, mid) / [mid+1, hi) split loses no index and always shrinks the window so it
+        // terminates), that a found value returns its position, and that the lo>=hi base case reports the
+        // sentinel -1 for a miss. This is the canonical index-recursion binary search an AI writes to look up
+        // a value in sorted data; a backend with an off-by-one in the midpoint or the half bounds would miss
+        // a present value (returning -1) or loop past termination.
+        let src = r#"fun bsearch(xs: List[Int], target: Int, lo: Int, hi: Int) -> Int {
+    if lo >= hi { 0 - 1 }
+    else {
+        let mid = lo + (hi - lo) / 2
+        let v = xs.get(mid).unwrap_or(0)
+        if v == target { mid }
+        else {
+            if v < target { bsearch(xs, target, mid + 1, hi) }
+            else { bsearch(xs, target, lo, mid) }
+        }
+    }
+}
+fun find(xs: List[Int], t: Int) -> Int { bsearch(xs, t, 0, xs.len()) }
+fun probe() -> Str {
+    let xs = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+    let hits = [1, 9, 19, 7].map(fn(t) { find(xs, t) })
+    let misses = [0, 8, 20, 2].map(fn(t) { find(xs, t) })
+    "hits={hits}|misses={misses}"
+}
+"#;
+        assert_eq!(differential(src), "hits=[0, 4, 9, 3]|misses=[-1, -1, -1, -1]");
+    }
+
+    #[test]
     fn diff_quicksort_pivot_partition() {
         // A bug-hunt-52 lock (it325): quicksort via PIVOT PARTITION -- the other classic divide-and-conquer
         // sort, structurally distinct from merge sort (it324). The pivot is the head; the rest is partitioned
