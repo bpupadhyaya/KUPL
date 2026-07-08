@@ -2220,6 +2220,71 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_count_palindromic_substrings() {
+        // A certification lock (it380): COUNT PALINDROMIC SUBSTRINGS via the EXPAND-AROUND-CENTER technique --
+        // count every contiguous substring that reads the same forwards and backwards. This is distinct from the
+        // longest-palindromic-SUBSEQUENCE interval DP (it366): LPS finds the longest skip-allowed palindromic
+        // subsequence, whereas this COUNTS all contiguous palindromic SUBSTRINGS. The technique enumerates all
+        // 2n-1 centers -- n ODD-length centers (a single index i,i) and n-1 EVEN-length centers (a gap i,i+1) --
+        // and from each center expands outward one step at a time while the boundary characters match
+        // (s[lo] == s[hi]) and stay in bounds, counting 1 for each successful expansion.
+        //   countPal("abc") = 3        (only the 3 single characters)
+        //   countPal("aaa") = 6        ("a" x3, "aa" x2, "aaa" -- every substring is a palindrome)
+        //   countPal("abba") = 6       ("a","b","b","a", plus "bb", plus "abba")
+        //   countPal("aba") = 4        ("a","b","a", plus "aba")
+        //   countPal("") = 0           (empty string)
+        //   countPal("racecar") = 10   (7 singles + "cec" + "aceca" + "racecar")
+        // Byte-identical on interp/KVM (native per the sweep). Confirms every single character counts as a
+        // palindrome (odd centers seed at length 1), that even centers only fire when the two adjacent
+        // characters match, that expansion stops at the first boundary mismatch OR when either index leaves the
+        // string (lo < 0 or hi >= n), that each successful expansion adds exactly one to the count, that a
+        // run of identical characters counts every substring (aaa = 6 = 3+2+1) while an all-distinct string
+        // counts only the singles (abc = 3), and that all three engines agree. This is the
+        // count-palindromic-substrings routine an AI writes for palindrome analysis and string-structure
+        // detection; a backend whose center enumeration, boundary-match expansion, or bounds check was off would
+        // miscount. Adds an expand-around-center counting technique, complementing the palindrome interval DP.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun expand(cs: List[Str], lo: Int, hi: Int) -> Int {
+    if lo < 0 { 0 }
+    else {
+        let n = cs.len()
+        if hi >= n { 0 }
+        else {
+            let cl = cs.get(lo).unwrap_or("")
+            let ch = cs.get(hi).unwrap_or("")
+            if cl == ch { 1 + expand(cs, lo - 1, hi + 1) }
+            else { 0 }
+        }
+    }
+}
+fun countPal(s: Str) -> Int {
+    let cs = s.chars()
+    let n = cs.len()
+    rangeN(n).fold(0, fn(acc, i) {
+        let odd = expand(cs, i, i)
+        let even = expand(cs, i, i + 1)
+        acc + odd + even
+    })
+}
+fun probe() -> Str {
+    let a = countPal("abc")
+    let b = countPal("aaa")
+    let c = countPal("abba")
+    let d = countPal("aba")
+    let e = countPal("")
+    let f = countPal("racecar")
+    "abc={a}|aaa={b}|abba={c}|aba={d}|empty={e}|racecar={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "abc=3|aaa=6|abba=6|aba=4|empty=0|racecar=10"
+        );
+    }
+
+    #[test]
     fn diff_count_set_bits_kernighan() {
         // A bug-hunt-79 lock (it379): COUNT SET BITS (population count / Hamming weight) via BRIAN KERNIGHAN's
         // algorithm -- popcount(n) = n == 0 ? 0 : 1 + popcount(n & (n-1)). The identity n & (n-1) clears the
