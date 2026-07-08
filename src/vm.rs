@@ -2104,6 +2104,52 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_bst_insert_and_inorder() {
+        // A certification lock (it313): a binary SEARCH tree -- recursive ordered insert maintaining the BST
+        // invariant, built by fold, then inorder traversal producing sorted+deduped output. Prior tree
+        // locks read (it296 sum/depth), rebuild 1:1 (it297 map), prune (it311), or test a predicate (it312);
+        // none maintains an ORDERING invariant on insert. insert does a 3-way compare (x < v -> recurse
+        // left, x > v -> recurse right, x == v -> no-op DEDUP) and functionally rebuilds the path; inorder
+        // flattens [left, [v], right] so the BST reads out in sorted order.
+        //   build([5,3,8,1,4,7,9,3]) folds insert from Empty; inorder -> [1,3,4,5,7,8,9]
+        //     (the second 3 is dropped by the x == v no-op; the output is sorted AND deduplicated)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms insert routes each value to the
+        // correct subtree by comparison and rebuilds only the touched path (the other subtree is shared
+        // structurally), that Empty is the leaf-creating base case, that a duplicate key is a no-op (3
+        // appears once), and that inorder's left-self-right flatten yields ascending order -- i.e. building
+        // a search tree and reading it back sorts the input. This is the "sort via BST" / ordered-set an AI
+        // writes as a data-structure exercise or an ordered index; a backend that mis-routed the comparison
+        // would produce an unsorted inorder, and one that inserted duplicates would emit 3 twice.
+        let src = r#"type BST = Empty | Node(v: Int, l: BST, r: BST)
+fun insert(t: BST, x: Int) -> BST {
+    match t { Empty => Node(v: x, l: Empty, r: Empty)
+        Node(v, l, r) => {
+            if x < v { Node(v: v, l: insert(l, x), r: r) }
+            else { if x > v { Node(v: v, l: l, r: insert(r, x)) }
+                else { Node(v: v, l: l, r: r) } }
+        } }
+}
+fun inorder(t: BST) -> List[Int] {
+    match t { Empty => []
+        Node(v, l, r) => {
+            let left = inorder(l)
+            let right = inorder(r)
+            [left, [v], right].flatten()
+        } }
+}
+fun build(xs: List[Int]) -> BST {
+    xs.fold(Empty, fn(acc, x) { insert(acc, x) })
+}
+fun probe() -> Str {
+    let t = build([5, 3, 8, 1, 4, 7, 9, 3])
+    let sorted = inorder(t)
+    "{sorted}"
+}
+"#;
+        assert_eq!(differential(src), "[1, 3, 4, 5, 7, 8, 9]");
+    }
+
+    #[test]
     fn diff_recursive_tree_balance_check() {
         // A bug-hunt-48 lock (it312): a recursive tree BALANCE predicate -- balanced() returns Bool, testing
         // the AVL invariant |height(l) - height(r)| <= 1 at EVERY node with `&&` short-circuit conjunction
