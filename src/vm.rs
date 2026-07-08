@@ -2104,6 +2104,49 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_subset_sum_count() {
+        // A bug-hunt-69 lock (it359): SUBSET-SUM COUNT -- how many subsets of a list sum to a target -- via the
+        // include/exclude counting recurrence. Distinct from the power set (it356, which ENUMERATES all 2^n
+        // subsets) and combinations (it358, fixed-SIZE subsets): this COUNTS subsets meeting a VALUE
+        // constraint. Base case: an empty list contributes 1 if the remaining target is exactly 0 (the empty
+        // subset works) and 0 otherwise. Recursive case: count subsets that INCLUDE the head (count the rest
+        // against target - head) plus those that EXCLUDE it (count the rest against the same target). This is
+        // the counting form of the 0/1 knapsack / partition recurrence.
+        //   count([2,3,5,7], 10) = 2   ({3,7} and {2,3,5})
+        //   count([1,2,3], 6) = 1      (only the full set {1,2,3})
+        //   count([1,1,1,1], 2) = 6    (choose any 2 of the 4 ones -- duplicates counted BY POSITION, C(4,2))
+        //   count([1,2,3], 0) = 1      (the empty subset always sums to 0)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the len==0 base splits on target==0
+        // (empty subset counts once) vs nonzero (contributes nothing), that the include branch subtracts the
+        // head from the target while the exclude branch keeps it, that the two branch counts ADD (not max, not
+        // or), that equal values at different positions are counted as distinct subsets (so [1,1,1,1] target 2
+        // gives C(4,2)=6 not 1), that target 0 always yields at least the empty subset, and that all three
+        // engines agree on the count. This is the subset-sum / partition-count an AI writes for coin-change
+        // counting, knapsack feasibility, and combinatorial counting; a backend whose add/subtract recurrence
+        // or base case was off would miscount.
+        let src = r#"fun countSubsets(xs: List[Int], target: Int) -> Int {
+    if xs.len() == 0 {
+        if target == 0 { 1 } else { 0 }
+    } else {
+        let head = xs.first().unwrap_or(0)
+        let rest = xs.drop(1)
+        let withHead = countSubsets(rest, target - head)
+        let withoutHead = countSubsets(rest, target)
+        withHead + withoutHead
+    }
+}
+fun probe() -> Str {
+    let a = countSubsets([2, 3, 5, 7], 10)
+    let b = countSubsets([1, 2, 3], 6)
+    let c = countSubsets([1, 1, 1, 1], 2)
+    let z = countSubsets([1, 2, 3], 0)
+    "sum10={a}|sum6={b}|dup2={c}|empty={z}"
+}
+"#;
+        assert_eq!(differential(src), "sum10=2|sum6=1|dup2=6|empty=1");
+    }
+
+    #[test]
     fn diff_combinations_choose_k() {
         // A certification lock (it358): COMBINATIONS (choose-k) via the include-first/exclude-first recursion --
         // subsets of a FIXED SIZE k, the middle ground between the power set (it356, all 2^n subsets) and
