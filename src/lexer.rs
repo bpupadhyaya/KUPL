@@ -354,7 +354,9 @@ impl<'a> Lexer<'a> {
                         self.diags.push(Diag::error(
                             "K0006",
                             format!(
-                                "unknown escape sequence `\\{}`",
+                                "unknown escape sequence `\\{}` — the valid escapes are \
+                                 `\\n`, `\\t`, `\\r`, `\\\\`, `\\\"`, `\\{{` and `\\}}` \
+                                 (a literal backslash is `\\\\`)",
                                 other.map(|c| c as char).unwrap_or(' ')
                             ),
                             self.span_from(self.pos.saturating_sub(2)),
@@ -776,6 +778,24 @@ mod tests {
         // the reduced trigger emits a clean unterminated-interpolation diagnostic
         let (_t, diags) = lex("\"{");
         assert!(diags.iter().any(|d| d.code == "K0007"), "expected K0007, got {diags:?}");
+    }
+
+    #[test]
+    fn unknown_escape_lists_the_valid_escapes() {
+        // K0006 should not just name the offending escape; it should tell the user which
+        // escapes ARE valid so they can fix it without consulting docs. `\q` is unknown.
+        let (_t, diags) = lex("\"bad\\q\"");
+        let m = &diags
+            .iter()
+            .find(|d| d.code == "K0006")
+            .expect("K0006")
+            .message;
+        assert!(m.contains("`\\q`"), "names the bad escape: {m}");
+        // the valid set is enumerated (spot-check the newline and brace escapes) and the
+        // backslash-doubling hint is present.
+        assert!(m.contains("`\\n`"), "lists \\n: {m}");
+        assert!(m.contains("`\\{`"), "lists brace escape: {m}");
+        assert!(m.contains("a literal backslash is"), "backslash hint: {m}");
     }
 
     #[test]
