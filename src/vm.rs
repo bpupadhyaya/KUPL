@@ -2220,6 +2220,63 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_result_collect_railway() {
+        // A bug-hunt-99 lock (it420): RESULT-COLLECT RAILWAY -- traverse a list applying a fallible operation and
+        // fold the per-item Results into a single Result[List[Int], Str], SHORT-CIRCUITING on the FIRST error
+        // (railway-oriented programming / the `traverse` of Haskell's Traversable). The fold seed is Ok([]); each
+        // step calls acc.and_then(...) so once the accumulator becomes Err it stays Err and no later item can
+        // change it -- the FIRST failure wins and downstream items are effectively skipped. Inside the and_then,
+        // parseOne(s).map appends the freshly-parsed Int to the accumulated list. This is the error-handling
+        // backbone an AI writes for input validation: parse every field, but abort with the first bad one.
+        //   collectAll(["1","2","3"]) = OK:6           (all parse; sum 1+2+3)
+        //   collectAll(["1","x","3"]) = ERR:bad:x      (middle fails; "3" never contributes -- short-circuit)
+        //   collectAll(["z","2"]) = ERR:bad:z          (FIRST fails; aborts before "2")
+        //   collectAll([]) = OK:0                      (empty -> Ok([]), vacuous success)
+        //   collectAll(["42"]) = OK:42                 (single element)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the Ok([]) seed threads an
+        // accumulating list, that and_then propagates an Err unchanged so the FIRST failure short-circuits the
+        // rest (bad:x not bad:3, and firstbad aborts on z before reaching 2), that map appends a parsed value on
+        // the success track, that an empty input is vacuously Ok, that a single element round-trips, and that all
+        // three engines agree on the railway fold. This is the Result-collect an AI writes to validate a batch of
+        // inputs and fail fast on the first bad one; a backend whose and_then didn't short-circuit, or whose map
+        // ran on the error track, would keep processing past the failure or report the wrong error. A non-sort
+        // lock exercising Result railway short-circuit over a fallible traversal.
+        let src = r#"fun parseOne(s: Str) -> Result[Int, Str] {
+    match s.parse_int() {
+        Some(n) => Ok(n),
+        None => Err("bad:{s}")
+    }
+}
+fun collectAll(xs: List[Str]) -> Result[List[Int], Str] {
+    let seed: Result[List[Int], Str] = Ok([])
+    xs.fold(seed, fn(acc, s) {
+        acc.and_then(fn(sofar) {
+            parseOne(s).map(fn(n) { [sofar, [n]].flatten() })
+        })
+    })
+}
+fun show(r: Result[List[Int], Str]) -> Str {
+    match r {
+        Ok(lst) => "OK:{lst.fold(0, fn(a, x) { a + x })}",
+        Err(e) => "ERR:{e}"
+    }
+}
+fun probe() -> Str {
+    let good = show(collectAll(["1", "2", "3"]))
+    let bad = show(collectAll(["1", "x", "3"]))
+    let firstbad = show(collectAll(["z", "2"]))
+    let empty = show(collectAll([]))
+    let single = show(collectAll(["42"]))
+    "good={good}|bad={bad}|firstbad={firstbad}|empty={empty}|single={single}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "good=OK:6|bad=ERR:bad:x|firstbad=ERR:bad:z|empty=OK:0|single=OK:42"
+        );
+    }
+
+    #[test]
     fn diff_json_build_stringify() {
         // A certification lock (it419): JSON CONSTRUCTION via json_stringify on a programmatically-built Json
         // value -- the reverse of json_parse. Rather than parsing text into a Json ADT, this BUILDS a Json value
