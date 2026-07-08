@@ -2104,6 +2104,48 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_adt_pretty_printer_sexpr() {
+        // A certification lock (it309): a mutual-recursive ADT PRETTY-PRINTER -- rendering an S-expression
+        // tree back to a Str. it308's mutual recursion computes a scalar SIZE; this renders to text with
+        // separator and delimiter logic. show walks Sx variants (Atom -> name, Num -> to_str, Lst ->
+        // parenthesized), and its Lst arm wraps showList's output in parens; showList walks the List[Sx] via
+        // first/drop and space-JOINS each element's rendering with no leading/trailing space -- the two
+        // functions recurse through each other.
+        //   e     = Lst([Atom "add", Num 1, Lst([Atom "mul", Num 2, Num 3])])  ->  "(add 1 (mul 2 3))"
+        //   empty = Lst([])                                                    ->  "()"
+        // Byte-identical on interp/KVM (native per the sweep). Confirms each variant renders by its own arm,
+        // that show<->showList mutual recursion parenthesizes nested Lists to arbitrary depth (the inner
+        // (mul 2 3) sits inside the outer list), that showList space-joins WITHOUT a trailing space (it
+        // checks the recursive tail for "" and omits the separator on the last element), and that an EMPTY
+        // Lst renders as "()" (showList([]) = ""). This is the AST / config / S-expression pretty-printer an
+        // AI writes to serialize a value tree back to source; a backend that left a trailing space would
+        // emit "(add 1 (mul 2 3) )", and one that lost the mutual linkage would fail to parenthesize the
+        // nested list. it308 computes a number and never builds a string with separators; it302's report is
+        // over FLAT records with no recursion.
+        let src = r#"type Sx = Atom(name: Str) | Num(v: Int) | Lst(items: List[Sx])
+fun show(s: Sx) -> Str {
+    match s { Atom(name) => name
+        Num(v) => to_str(v)
+        Lst(items) => "({showList(items)})" }
+}
+fun showList(xs: List[Sx]) -> Str {
+    match xs.first() { None => ""
+        Some(h) => {
+            let rest = xs.drop(1)
+            let tail = showList(rest)
+            if tail == "" { show(h) } else { "{show(h)} {tail}" }
+        } }
+}
+fun probe() -> Str {
+    let e = Lst(items: [Atom(name: "add"), Num(v: 1), Lst(items: [Atom(name: "mul"), Num(v: 2), Num(v: 3)])])
+    let empty = Lst(items: [])
+    "{show(e)}|{show(empty)}"
+}
+"#;
+        assert_eq!(differential(src), "(add 1 (mul 2 3))|()");
+    }
+
+    #[test]
     fn diff_mutual_recursion_over_adt_with_list_variant() {
         // A bug-hunt-46 lock (it308): MUTUAL recursion over an ADT whose variant holds a List of itself.
         // Prior mutual-recursion locks (it139/205/219/227) are even/odd style over Int; single-function ADT
