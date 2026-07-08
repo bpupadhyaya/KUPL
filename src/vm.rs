@@ -2220,6 +2220,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_catalan_numbers() {
+        // A certification lock (it368): the CATALAN NUMBERS via the CONVOLUTION recurrence
+        // C(n) = sum over i in [0, n-1] of C(i) * C(n-1-i), with C(0) = 1. The Catalan numbers count an
+        // enormous family of combinatorial structures: distinct binary search trees on n nodes, valid
+        // parenthesizations of n pairs, Dyck (balanced-bracket) paths, and triangulations of an (n+2)-gon. This
+        // is a COUNTING DP with a self-convolution structure -- distinct from the optimization DPs (which take
+        // a min/max over choices) and from the plain additive counting of subset-sum. The recurrence splits a
+        // structure of size n by choosing the root/split point: a left part of size i and a right part of size
+        // n-1-i, whose independent counts MULTIPLY, summed over all split positions. It is the counting
+        // companion to matrix-chain's interval split (it365): matrix-chain MINIMIZES a cost over the same
+        // splits, while Catalan COUNTS them.
+        //   C(0) = 1, C(1) = 1, C(3) = 5, C(5) = 42
+        //   C(0..5) = [1, 1, 2, 5, 14, 42]   (the classic Catalan sequence)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the C(0)=1 base, that each term sums
+        // over every split position i in [0, n), that the left and right sub-counts are MULTIPLIED (not added
+        // or maxed) and then the products are SUMMED, that the split indices C(i) and C(n-1-i) are paired
+        // correctly (a mis-offset would break the symmetry and corrupt the sequence), that the classic
+        // sequence 1,1,2,5,14,42 emerges, and that all three engines agree. This is the Catalan-number counting
+        // an AI writes for enumerating binary trees, balanced-parenthesis strings, and triangulations; a
+        // backend whose product/sum convolution or split pairing was off would break the sequence. Adds a
+        // multiplicative self-convolution counting DP to the family, distinct from additive counting
+        // (subset-sum) and optimization (matrix-chain/knapsack/rod).
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun catalan(n: Int) -> Int {
+    if n == 0 { 1 }
+    else {
+        rangeN(n).fold(0, fn(acc, i) {
+            acc + catalan(i) * catalan(n - 1 - i)
+        })
+    }
+}
+fun probe() -> Str {
+    let c0 = catalan(0)
+    let c1 = catalan(1)
+    let c3 = catalan(3)
+    let c5 = catalan(5)
+    let seq = rangeN(6).map(fn(k) { catalan(k) })
+    "c0={c0}|c1={c1}|c3={c3}|c5={c5}|seq={seq}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "c0=1|c1=1|c3=5|c5=42|seq=[1, 1, 2, 5, 14, 42]"
+        );
+    }
+
+    #[test]
     fn diff_rod_cutting() {
         // A bug-hunt-73 lock (it367): ROD CUTTING -- the maximum revenue from cutting a rod of length n into
         // integer pieces, where prices[i] is the price of a piece of length i+1. This is an UNBOUNDED-choice
