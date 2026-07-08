@@ -2220,6 +2220,58 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_matrix_rotate_90_clockwise() {
+        // A certification lock (it392): MATRIX ROTATE 90 CLOCKWISE -- rotate a 2-D matrix a quarter turn to the
+        // right. This is a COORDINATE-TRANSFORM grid operation, distinct from the plain transpose (it353): a
+        // rotation is a transpose FOLLOWED BY a row reversal, expressed here directly as the index map
+        // new[c][r] = old[rows-1-r][c]. Output row c is built from input COLUMN c read BOTTOM-TO-TOP (the last
+        // input row supplies the first element), so the leftmost column becomes the top row. For a non-square
+        // R-by-C matrix the result is C-by-R -- the dimensions SWAP, exactly as with transpose, but the fill
+        // order is reversed along one axis. The build is a nested map over rangeN(cols) x rangeN(rows).
+        //   rotate90([[1,2],[3,4]]) = [[3,1],[4,2]]                         (2x2)
+        //   rotate90([[1,2,3],[4,5,6],[7,8,9]]) = [[7,4,1],[8,5,2],[9,6,3]] (3x3 classic: col 0 -> row 0)
+        //   rotate90([[1,2,3]]) = [[1],[2],[3]]                             (1x3 row -> 3x1 column)
+        //   rotate90([[1],[2],[3]]) = [[3,2,1]]                             (3x1 column -> 1x3 row, reversed)
+        //   rotate90([[5]]) = [[5]]                                         (1x1 fixed point)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that each output row is an input column
+        // read from the BOTTOM up (the rows-1-r index), that the leftmost column lands as the top row and the
+        // bottom-left corner lands at the top-left, that the output shape is the transpose shape C-by-R (dims
+        // swap for a rectangle), that a single row rotates into a single column and a single column into a
+        // reversed single row, that a 1x1 matrix is a fixed point, and that all three engines agree on the
+        // index transform. This is the rotate-90 an AI writes for image rotation, matrix-transform puzzles, and
+        // grid-orientation changes; a backend whose row-reversal, dimension swap, or index arithmetic was off
+        // would mis-place cells. Adds a coordinate-transform grid rotation atop the transpose already locked.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun cell(m: List[List[Int]], r: Int, c: Int) -> Int {
+    m.get(r).unwrap_or([]).get(c).unwrap_or(0)
+}
+fun rotate90(m: List[List[Int]]) -> List[List[Int]] {
+    let rows = m.len()
+    let cols = m.first().unwrap_or([]).len()
+    rangeN(cols).map(fn(c) {
+        rangeN(rows).map(fn(r) {
+            cell(m, rows - 1 - r, c)
+        })
+    })
+}
+fun probe() -> Str {
+    let a = rotate90([[1, 2], [3, 4]])
+    let b = rotate90([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    let c = rotate90([[1, 2, 3]])
+    let d = rotate90([[1], [2], [3]])
+    let e = rotate90([[5]])
+    "sq2={a}|sq3={b}|row={c}|col={d}|one={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sq2=[[3, 1], [4, 2]]|sq3=[[7, 4, 1], [8, 5, 2], [9, 6, 3]]|row=[[1], [2], [3]]|col=[[3, 2, 1]]|one=[[5]]"
+        );
+    }
+
+    #[test]
     fn diff_longest_common_subsequence_three() {
         // A bug-hunt-85 lock (it391): THREE-STRING LONGEST COMMON SUBSEQUENCE -- the length of the longest
         // subsequence common to ALL THREE input strings. This is a 3-D DP that GENERALIZES the two-string LCS
