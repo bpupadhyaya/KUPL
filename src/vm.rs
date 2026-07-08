@@ -2220,6 +2220,75 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_largest_rectangle_histogram() {
+        // A bug-hunt-84 lock (it389): LARGEST RECTANGLE IN HISTOGRAM -- the maximum-area axis-aligned rectangle
+        // that fits under a row of bars of varying heights. This is an area-maximization by treating EACH bar
+        // as the LIMITING (shortest) height of a candidate rectangle: from bar i, expand LEFT and RIGHT as far
+        // as neighbors stay >= h[i], then the widest rectangle of height h[i] spans that run and its area is
+        // h[i] * width. expandLeft returns the first index to the left whose bar is SHORTER than h[i] (or -1 if
+        // none), expandRight the first shorter index to the right (or n); the inclusive span is therefore
+        // width = right - left - 1 (the cells strictly between the two shorter boundaries). The answer is the
+        // MAX area over all bars. Distinct from the running scans and grid DPs -- an expand-both-ways area max.
+        //   largestRect([2,1,5,6,2,3]) = 10       (bars 5 and 6: height 5 over width 2)
+        //   largestRect([2,4]) = 4                (either the 2 over width 2 or the 4 over width 1)
+        //   largestRect([5,5,5]) = 15             (flat bars: full height over full width)
+        //   largestRect([1]) = 1                  (a single bar)
+        //   largestRect([]) = 0                   (no bars)
+        //   largestRect([6,2,5,4,5,1,6]) = 12     (bars 5,4,5: height 4 over width 3)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms each bar anchors a rectangle at its own
+        // height, that the left/right expansion stops at the first STRICTLY shorter bar (equal-height neighbors
+        // are included, so a flat run spans fully), that width is the exclusive gap between the two shorter
+        // boundaries (right - left - 1), that the answer is the max area across all anchors (a short-but-wide
+        // rectangle can beat a tall-but-narrow one -- 5*2=10 beats 6*1=6), that a flat histogram uses the whole
+        // width, that empty gives 0 and a single bar gives its own height, and that all three engines agree on
+        // the expand-both-ways area maximization. This is the largest-rectangle-in-histogram routine an AI
+        // writes for skyline/area problems and maximal-rectangle-in-a-binary-matrix; a backend whose expansion
+        // bounds, strict-shorter stop, or width arithmetic was off would mis-size the rectangle. Adds an
+        // expand-around-each-anchor area maximization.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fun expandLeft(h: List[Int], i: Int, hi: Int) -> Int {
+    if i < 0 { 0 - 1 }
+    else {
+        if h.get(i).unwrap_or(0) < hi { i } else { expandLeft(h, i - 1, hi) }
+    }
+}
+fun expandRight(h: List[Int], i: Int, hi: Int) -> Int {
+    let n = h.len()
+    if i >= n { n }
+    else {
+        if h.get(i).unwrap_or(0) < hi { i } else { expandRight(h, i + 1, hi) }
+    }
+}
+fun largestRect(h: List[Int]) -> Int {
+    let n = h.len()
+    rangeN(n).fold(0, fn(best, i) {
+        let hi = h.get(i).unwrap_or(0)
+        let l = expandLeft(h, i - 1, hi)
+        let r = expandRight(h, i + 1, hi)
+        let width = r - l - 1
+        maxi(best, hi * width)
+    })
+}
+fun probe() -> Str {
+    let a = largestRect([2, 1, 5, 6, 2, 3])
+    let b = largestRect([2, 4])
+    let c = largestRect([5, 5, 5])
+    let d = largestRect([1])
+    let e = largestRect([])
+    let f = largestRect([6, 2, 5, 4, 5, 1, 6])
+    "classic={a}|two={b}|flat={c}|one={d}|empty={e}|f={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "classic=10|two=4|flat=15|one=1|empty=0|f=12"
+        );
+    }
+
+    #[test]
     fn diff_count_islands_flood_fill() {
         // A certification lock (it388): COUNT ISLANDS -- the number of connected components of land cells (1s)
         // in a 2-D grid of land/water (1/0), where cells connect 4-DIRECTIONALLY (up/down/left/right, NOT
