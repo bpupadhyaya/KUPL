@@ -2220,6 +2220,58 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_group_then_sort_buckets() {
+        // A bug-hunt-98 lock (it418): GROUP-THEN-SORT EACH BUCKET -- the SQL "GROUP BY cat ... ORDER BY val
+        // within each group" pattern, composing group_by (partition records into buckets keyed by a category)
+        // with a per-bucket sort_by (order the values inside each bucket). This is a data-processing lock, not a
+        // sort lock: the sort is only the inner step of a group/aggregate pipeline over records. group_by returns
+        // a Map whose keys are in FIRST-SEEN order (the order each distinct category first appears in the input);
+        // for each key its members preserve input order, then map extracts the val field and sort_by orders them
+        // ascending. The result renders one "cat:v,v,v" line per group joined by '|'.
+        //   groupThenSort([b:3,a:5,b:1,a:2,b:2,c:9]) = "b:1,2,3|a:2,5|c:9"  (groups first-seen b,a,c; vals sorted)
+        //   groupThenSort([x:7]) = "x:7"                                    (single record)
+        //   groupThenSort([z:3,z:1,z:2]) = "z:1,2,3"                        (one group, three values sorted)
+        //   groupThenSort([p:9,q:8,p:1]) = "p:1,9|q:8"                      (p's 9,1 sort to 1,9; q's lone 8)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that group_by partitions records by the
+        // category field with keys in first-seen order (b before a before c even though a sorts first), that each
+        // bucket's values are extracted from the record field and sorted ascending independently, that the
+        // per-group render joins values with commas and groups with pipes, that a single record and a
+        // single-category input are handled, that duplicate categories accumulate into one bucket, and that all
+        // three engines agree on the group/extract/sort/join pipeline. This is the group-then-sort an AI writes
+        // for report generation, leaderboard-by-category, and ETL aggregation; a backend whose group-key order,
+        // per-bucket sort, or field extraction was off would misgroup or misorder the output. A non-sort lock
+        // composing group_by with a per-bucket sort over records.
+        let src = r#"type Rec = { cat: Str, val: Int }
+fun groupThenSort(recs: List[Rec]) -> Str {
+    let groups = recs.group_by(fn(r) { r.cat })
+    let lines = groups.keys().map(fn(c) {
+        let members = groups.get(c).unwrap_or([])
+        let sortedVals = members.map(fn(r) { r.val }).sort_by(fn(v) { v })
+        let joined = sortedVals.map(fn(v) { v.to_str() }).join(",")
+        "{c}:{joined}"
+    })
+    lines.join("|")
+}
+fun probe() -> Str {
+    let a = groupThenSort([
+        Rec(cat: "b", val: 3), Rec(cat: "a", val: 5), Rec(cat: "b", val: 1),
+        Rec(cat: "a", val: 2), Rec(cat: "b", val: 2), Rec(cat: "c", val: 9)
+    ])
+    let b = groupThenSort([Rec(cat: "x", val: 7)])
+    let c = groupThenSort([Rec(cat: "z", val: 3), Rec(cat: "z", val: 1), Rec(cat: "z", val: 2)])
+    let d = groupThenSort([
+        Rec(cat: "p", val: 9), Rec(cat: "q", val: 8), Rec(cat: "p", val: 1)
+    ])
+    "mixed={a}|single={b}|onegroup={c}|dups={d}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mixed=b:1,2,3|a:2,5|c:9|single=x:7|onegroup=z:1,2,3|dups=p:1,9|q:8"
+        );
+    }
+
+    #[test]
     fn diff_tree_catamorphism() {
         // A certification lock (it417): ADT CATAMORPHISM -- a single recursive fold over a binary-tree ADT that
         // computes THREE aggregates at once (leaf-sum, node-count, max-depth) into a record accumulator. A
