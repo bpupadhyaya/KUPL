@@ -2220,6 +2220,71 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_longest_common_prefix() {
+        // A bug-hunt-83 lock (it387): LONGEST COMMON PREFIX -- the longest leading substring shared by ALL words
+        // in a list. This is a HORIZONTAL fold-reduction over the word list (distinct from the DP recurrences
+        // and single-array scans): begin with the first word's full length as the candidate prefix length, then
+        // fold over the remaining words, shrinking the candidate to min(candidate, commonLen(prefix, word)) at
+        // each step. commonLen counts the matching LEADING characters of two char lists: it folds over the
+        // shorter length and, guarded by acc == i, increments only while every earlier position matched -- so
+        // the FIRST mismatch freezes the count (acc falls behind i and never advances again). The surviving
+        // length slices the shared prefix out of the first word.
+        //   lcp(["flower","flow","flight"]) = "fl"           ("flow"/"flight" diverge at index 2: o vs i)
+        //   lcp(["dog","racecar","car"]) = ""                (no shared leading character)
+        //   lcp(["interspecies","interstellar","interstate"]) = "inters"   (diverge at index 6: p/t/t)
+        //   lcp(["single"]) = "single"                       (a single word is its own prefix)
+        //   lcp([]) = ""                                     (empty list)
+        //   lcp(["same","same","same"]) = "same"             (identical words -> the whole word)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the prefix only ever SHRINKS across the
+        // fold (never grows), that commonLen freezes at the first differing character via the acc==i guard,
+        // that a single word yields itself, an empty list yields the empty string, fully-identical words yield
+        // the whole word, and a set with no shared first character yields the empty string, and that all three
+        // engines agree on the horizontal char-by-char reduction. This is the longest-common-prefix routine an
+        // AI writes for autocomplete, shared-path extraction, and string clustering; a backend whose
+        // min-shrink, first-mismatch freeze, or char slicing was off would over- or under-trim. Adds a
+        // horizontal fold-reduction over strings, distinct from the DP and running-scan shapes.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun mini(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+fun commonLen(a: List[Str], b: List[Str]) -> Int {
+    let m = mini(a.len(), b.len())
+    rangeN(m).fold(0, fn(acc, i) {
+        if acc == i {
+            let ca = a.get(i).unwrap_or("")
+            let cb = b.get(i).unwrap_or("")
+            if ca == cb { acc + 1 } else { acc }
+        } else { acc }
+    })
+}
+fun lcp(words: List[Str]) -> Str {
+    if words.len() == 0 { "" }
+    else {
+        let firstChars = words.first().unwrap_or("").chars()
+        let restWords = words.drop(1)
+        let plen = restWords.fold(firstChars.len(), fn(p, w) {
+            mini(p, commonLen(firstChars.take(p), w.chars()))
+        })
+        firstChars.take(plen).join("")
+    }
+}
+fun probe() -> Str {
+    let a = lcp(["flower", "flow", "flight"])
+    let b = lcp(["dog", "racecar", "car"])
+    let c = lcp(["interspecies", "interstellar", "interstate"])
+    let d = lcp(["single"])
+    let e = lcp([])
+    let f = lcp(["same", "same", "same"])
+    "abc={a}|none={b}|inter={c}|single={d}|empty={e}|same={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "abc=fl|none=|inter=inters|single=single|empty=|same=same"
+        );
+    }
+
+    #[test]
     fn diff_minimum_jumps_to_end() {
         // A certification lock (it386): MINIMUM JUMPS TO END -- the FEWEST jumps needed to reach the last index,
         // where each value is the maximum forward jump from that index. This is the OPTIMIZATION twin of the
