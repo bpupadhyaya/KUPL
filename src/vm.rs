@@ -2269,6 +2269,62 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_leap_year_days_in_month() {
+        // A bug-hunt-107 lock (it436): GREGORIAN CALENDAR ARITHMETIC -- leap-year test, days-in-month, and
+        // day-of-year ordinal, extending the date family beyond Zeller (it435). The leap-year rule is the full
+        // Gregorian one: a year is leap if divisible by 4, EXCEPT centuries, which are leap only if divisible by
+        // 400. days-in-month returns 28/29 for February (depending on leap), 30 for Apr/Jun/Sep/Nov, and 31 for
+        // the rest. day-of-year sums the days of all months BEFORE the given month plus the day, so a leap day
+        // shifts every date from March onward by one in a leap year.
+        //   isLeap(2000) = true    (divisible by 400 -- the century that IS leap)
+        //   isLeap(1900) = false   (divisible by 100 but not 400 -- the century that is NOT leap)
+        //   isLeap(2024) = true / isLeap(2023) = false   (ordinary divisible-by-4 rule)
+        //   daysInMonth(2024,2) = 29 / daysInMonth(2023,2) = 28   (leap vs non-leap February)
+        //   daysInMonth(2023,4) = 30                              (April -- a 30-day month)
+        //   dayOfYear(2023,3,1) = 60 / dayOfYear(2024,3,1) = 61   (March 1 shifts by the leap day)
+        //   dayOfYear(2023,12,31) = 365                           (last day of a common year)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the leap rule handles the century
+        // exception (2000 leap, 1900 not -- the case naive %4 checks get wrong), that February flips 28<->29 with
+        // the leap flag, that the 30- and 31-day months are classified correctly, that day-of-year accumulates
+        // the preceding months' lengths and that a leap February pushes March 1 from ordinal 60 to 61, that
+        // December 31 of a common year is day 365, and that all three engines agree. This is the calendar
+        // arithmetic an AI writes for date validation, scheduling, or age/duration math without a date library; a
+        // backend whose leap-century rule, month table, or ordinal accumulation was off would miscount days. A
+        // non-sort lock certifying Gregorian leap-year, days-in-month, and day-of-year computation.
+        let src = r#"fun isLeap(y: Int) -> Bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+fun daysInMonth(y: Int, m: Int) -> Int {
+    if m == 2 { if isLeap(y) { 29 } else { 28 } }
+    else if m == 4 || m == 6 || m == 9 || m == 11 { 30 }
+    else { 31 }
+}
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun dayOfYear(y: Int, m: Int, d: Int) -> Int {
+    let before = rangeIncl(1, m - 1).fold(0, fn(acc, mm) { acc + daysInMonth(y, mm) })
+    before + d
+}
+fun probe() -> Str {
+    let l2000 = isLeap(2000)
+    let l1900 = isLeap(1900)
+    let l2024 = isLeap(2024)
+    let l2023 = isLeap(2023)
+    let feb24 = daysInMonth(2024, 2)
+    let feb23 = daysInMonth(2023, 2)
+    let apr = daysInMonth(2023, 4)
+    let doy1 = dayOfYear(2023, 3, 1)
+    let doy2 = dayOfYear(2024, 3, 1)
+    let doyEnd = dayOfYear(2023, 12, 31)
+    "l2000={l2000}|l1900={l1900}|l2024={l2024}|l2023={l2023}|feb24={feb24}|feb23={feb23}|apr={apr}|mar1_2023={doy1}|mar1_2024={doy2}|dec31={doyEnd}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "l2000=true|l1900=false|l2024=true|l2023=false|feb24=29|feb23=28|apr=30|mar1_2023=60|mar1_2024=61|dec31=365"
+        );
+    }
+
+    #[test]
     fn diff_zeller_weekday() {
         // A certification lock (it435): ZELLER'S CONGRUENCE -- compute the day of the week for any Gregorian date
         // by a closed-form modular formula, opening a fresh date-arithmetic family. The formula is
