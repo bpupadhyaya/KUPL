@@ -2104,6 +2104,39 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_dot_product_zip() {
+        // A certification lock (it354): the vector DOT PRODUCT over List[Int] via zip_with (element-wise
+        // multiply) then fold (sum). dot(a,b) = a.zip_with(b, *).fold(0, +). Four cases pin the meaningful
+        // behaviors: a general pair, orthogonal vectors, a self-dot, and unequal-length truncation.
+        //   [1,2,3].[4,5,6] = 4+10+18 = 32
+        //   [1,0,0].[0,1,0] = 0 (ORTHOGONAL -- perpendicular vectors dot to zero)
+        //   [2,3].[2,3] = 4+9 = 13 (SELF-DOT = sum of squares)
+        //   [1,2,3,4].[10,20] = 10+40 = 50 (zip_with TRUNCATES to the shorter length 2, ignoring 3 and 4)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms zip_with pairs elements positionally
+        // and multiplies, that fold sums the products from seed 0, that perpendicular vectors correctly yield
+        // 0, that a vector dotted with itself gives the sum of its squares, that zip_with truncates to the
+        // shorter operand (so the 4-element vector contributes only its first two components against the
+        // 2-element one), and that all three engines agree. This is the dot product an AI writes for linear
+        // algebra, cosine-similarity numerators, and projections; a backend whose zip_with mis-truncated or
+        // whose fold seed was wrong would corrupt the result on the ragged or orthogonal case.
+        let src = r#"fun dot(a: List[Int], b: List[Int]) -> Int {
+    a.zip_with(b, fn(x, y) { x * y }).fold(0, fn(s, p) { s + p })
+}
+fun probe() -> Str {
+    let d1 = dot([1, 2, 3], [4, 5, 6])
+    let d2 = dot([1, 0, 0], [0, 1, 0])
+    let d3 = dot([2, 3], [2, 3])
+    let d4 = dot([1, 2, 3, 4], [10, 20])
+    "d1={d1}|orthogonal={d2}|selfdot={d3}|truncated={d4}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "d1=32|orthogonal=0|selfdot=13|truncated=50"
+        );
+    }
+
+    #[test]
     fn diff_rectangular_transpose_via_map() {
         // A bug-hunt-66 lock (it353): RECTANGULAR matrix transpose via nested map -- turning a 2x3 into a 3x2
         // so the dimensions genuinely SWAP (unlike a square transpose, which leaves dims unchanged). There is
