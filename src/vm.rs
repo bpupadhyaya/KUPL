@@ -2220,6 +2220,65 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_bucket_sort() {
+        // A bug-hunt-96 lock (it413): BUCKET SORT -- a HYBRID distribution+comparison sort, distinct from both
+        // pure-distribution non-comparison sorts already locked. Counting sort (it410) is single-pass with one
+        // bucket per VALUE and no internal sort; radix sort (it412) is multi-pass by DIGIT with no internal sort.
+        // Bucket sort instead scatters elements into buckets by VALUE RANGE (bucket index = v / width, so
+        // bucket b holds every value in [b*width, (b+1)*width)), then sorts EACH bucket with a comparison sort
+        // (insertion here), and concatenates the buckets in index order. The distribution gives coarse ordering
+        // (bucket b < bucket b+1 for all their elements) and the per-bucket comparison sort refines within each
+        // range -- so it is the "distribute then sort-each-group" pattern, hybridizing the distribution and
+        // comparison paradigms.
+        //   bucketSort([29,25,3,49,9,37,21,43], 5, 10) = [3,9,21,25,29,37,43,49]  (5 range buckets of width 10)
+        //   bucketSort([15,12,18,11,19], 2, 10) = [11,12,15,18,19]  (all land in bucket 1 -> pure insertion)
+        //   bucketSort([7], 1, 10) = [7]                            (single element)
+        //   bucketSort([], 3, 10) = []                              (empty)
+        //   bucketSort([5,5,5,2,8], 1, 10) = [2,5,5,5,8]            (one bucket -> degenerates to insertion sort)
+        //   bucketSort([33,11,22,3,1,2], 4, 10) = [1,2,3,11,22,33]  (bucket 0 sorts 3,1,2 internally)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that elements scatter into the correct
+        // range bucket by integer division, that each bucket is internally comparison-sorted (the [33,11,22,3,1,2]
+        // case sorts bucket 0's 3,1,2 into 1,2,3), that concatenating buckets in index order yields a globally
+        // sorted result (bucket ordering provides the coarse sort, insertion the fine), that a single bucket
+        // degenerates to plain insertion sort, that duplicates are preserved, that empty/single inputs are
+        // handled, and that all three engines agree on the distribute-then-sort-each pipeline. This is the bucket
+        // sort an AI writes for uniformly-distributed data where range-bucketing gives near-linear performance; a
+        // backend whose bucket assignment or per-bucket ordering was off would misorder the result. Adds the
+        // hybrid distribution+comparison paradigm distinct from pure-distribution (counting, radix) sorts.
+        let src = r#"fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun insert(sorted: List[Int], x: Int) -> List[Int] {
+    let less = sorted.filter(fn(y) { y <= x })
+    let more = sorted.filter(fn(y) { y > x })
+    [less, [x], more].flatten()
+}
+fun insertionSort(xs: List[Int]) -> List[Int] {
+    xs.fold([], fn(acc, x) { insert(acc, x) })
+}
+fun bucketSort(xs: List[Int], nBuckets: Int, width: Int) -> List[Int] {
+    rangeN(nBuckets).flat_map(fn(b) {
+        let inBucket = xs.filter(fn(x) { (x / width) == b })
+        insertionSort(inBucket)
+    })
+}
+fun probe() -> Str {
+    let a = bucketSort([29, 25, 3, 49, 9, 37, 21, 43], 5, 10)
+    let b = bucketSort([15, 12, 18, 11, 19], 2, 10)
+    let c = bucketSort([7], 1, 10)
+    let d = bucketSort([], 3, 10)
+    let e = bucketSort([5, 5, 5, 2, 8], 1, 10)
+    let f = bucketSort([33, 11, 22, 3, 1, 2], 4, 10)
+    "spread={a}|twobucket={b}|single={c}|empty={d}|dups={e}|mix={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "spread=[3, 9, 21, 25, 29, 37, 43, 49]|twobucket=[11, 12, 15, 18, 19]|single=[7]|empty=[]|dups=[2, 5, 5, 5, 8]|mix=[1, 2, 3, 11, 22, 33]"
+        );
+    }
+
+    #[test]
     fn diff_radix_sort_lsd() {
         // A certification lock (it412): LSD RADIX SORT -- a multi-pass STABLE distribution sort, generalizing
         // counting sort (it410) from a single value range to successive DIGIT positions. Counting sort buckets
