@@ -2220,6 +2220,60 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_option_traverse() {
+        // A certification lock (it421): OPTION-TRAVERSE -- traverse a list applying a fallible (Option-returning)
+        // operation and collect into a single Option[List[Int]] with ALL-OR-NOTHING semantics: every item must
+        // parse to Some (and the values collect into a list) or ANY single None collapses the whole result to
+        // None. This is the Option analogue of the it420 Result railway, and the key distinction is that Option
+        // carries NO error payload -- it is pure presence/absence, so the result is "all valid, here's the list"
+        // or "something was invalid, nothing" with no indication of WHICH item failed or WHY. The fold seed is
+        // Some([]); each step calls acc.and_then(...), which on a None accumulator returns None unchanged, so the
+        // first failure short-circuits and no later item can revive it; inside, s.parse_int().map appends.
+        //   traverse(["1","2","3"]) = SOME:6      (all Some; values collect, sum 1+2+3)
+        //   traverse(["1","x","3"]) = NONE        (middle fails -> whole result None)
+        //   traverse(["z","2"]) = NONE            (FIRST fails -> None)
+        //   traverse(["4","5","q"]) = NONE        (LAST fails -> None; a late None still collapses everything)
+        //   traverse([]) = SOME:0                 (empty -> Some([]), vacuous all-valid)
+        //   traverse(["9"]) = SOME:9              (single element)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the Some([]) seed threads an
+        // accumulating list, that and_then propagates a None unchanged so any single failure -- first, middle, OR
+        // last -- collapses the whole traverse to None (all-or-nothing, position-independent), that map appends a
+        // value on the Some track, that an empty input is vacuously Some([]), that a single element round-trips,
+        // and that all three engines agree on the Option traverse. This is the Option-traverse an AI writes to
+        // validate that EVERY element is present/parseable before proceeding -- distinct from the Result railway
+        // (it420) which reports the first error; here the answer is simply present-or-absent. A non-sort lock
+        // exercising Option all-or-nothing collection over a fallible traversal.
+        let src = r#"fun traverse(xs: List[Str]) -> Option[List[Int]] {
+    let seed: Option[List[Int]] = Some([])
+    xs.fold(seed, fn(acc, s) {
+        acc.and_then(fn(sofar) {
+            s.parse_int().map(fn(n) { [sofar, [n]].flatten() })
+        })
+    })
+}
+fun show(o: Option[List[Int]]) -> Str {
+    match o {
+        Some(lst) => "SOME:{lst.fold(0, fn(a, x) { a + x })}",
+        None => "NONE"
+    }
+}
+fun probe() -> Str {
+    let all = show(traverse(["1", "2", "3"]))
+    let mid = show(traverse(["1", "x", "3"]))
+    let first = show(traverse(["z", "2"]))
+    let last = show(traverse(["4", "5", "q"]))
+    let empty = show(traverse([]))
+    let single = show(traverse(["9"]))
+    "all={all}|mid={mid}|first={first}|last={last}|empty={empty}|single={single}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "all=SOME:6|mid=NONE|first=NONE|last=NONE|empty=SOME:0|single=SOME:9"
+        );
+    }
+
+    #[test]
     fn diff_result_collect_railway() {
         // A bug-hunt-99 lock (it420): RESULT-COLLECT RAILWAY -- traverse a list applying a fallible operation and
         // fold the per-item Results into a single Result[List[Int], Str], SHORT-CIRCUITING on the FIRST error
