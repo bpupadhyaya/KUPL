@@ -2220,6 +2220,93 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_count_islands_eight_way() {
+        // A certification lock (it394): COUNT ISLANDS with 8-WAY (DIAGONAL) CONNECTIVITY -- the number of
+        // connected components of land cells (1s) where cells connect in ALL EIGHT directions (orthogonal PLUS
+        // the four diagonals), not just the four orthogonal ones of the it388 flood-fill. This is the same
+        // functional flood-fill threading an IMMUTABLE seen-List[Int] (flattened r*cols+c indices) through a
+        // recursive DFS, but the neighbour fan-out chains EIGHT recursive calls s0->s1->...->s7 (the four
+        // diagonals added) instead of four. The diagonal links merge components that 4-way connectivity would
+        // leave separate, so an X or a diagonal chain becomes a single island.
+        //   countIslands([[1,0,1],[0,0,0],[1,0,1]]) = 4   (corners two cells apart diagonally -- still separate)
+        //   countIslands([[1,1],[1,1]]) = 1               (a solid block)
+        //   countIslands([[0,0],[0,0]]) = 0               (all water)
+        //   countIslands([[1,0,0],[0,1,0],[0,0,1]]) = 1   (main-diagonal chain -- 8-way JOINS, 4-way would give 3)
+        //   countIslands([[1,0,1],[0,1,0],[1,0,1]]) = 1   (X: center diagonally touches all 4 corners -- 4-way=5)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the two DIAGONAL discriminators
+        // collapse to a single component under 8-way where 4-way would report 3 and 5 respectively (directly
+        // witnessing that all four diagonal neighbours are visited), that cells two steps apart on a diagonal
+        // are NOT adjacent so the checkerboard still yields 4, that a solid block is one island, that all water
+        // is zero, and that all three engines agree on the eight-neighbour flood-fill with immutable seen-set
+        // threading. This is the diagonal-connectivity island count an AI writes for blob detection, connected-
+        // component labeling with 8-connectivity, and image segmentation; a backend that dropped a diagonal
+        // branch or mis-threaded the seen set would over-count. Complements the 4-way flood-fill (it388) with
+        // the 8-connectivity variant.
+        let src = r#"type St = { seen: List[Int], count: Int }
+fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun cell(g: List[List[Int]], r: Int, c: Int) -> Int {
+    g.get(r).unwrap_or([]).get(c).unwrap_or(0)
+}
+fun flood(g: List[List[Int]], seen: List[Int], r: Int, c: Int) -> List[Int] {
+    let rows = g.len()
+    let cols = g.first().unwrap_or([]).len()
+    if r < 0 { seen }
+    else {
+        if r >= rows { seen }
+        else {
+            if c < 0 { seen }
+            else {
+                if c >= cols { seen }
+                else {
+                    let idx = r * cols + c
+                    if cell(g, r, c) == 0 { seen }
+                    else {
+                        if seen.contains(idx) { seen }
+                        else {
+                            let s0 = [seen, [idx]].flatten()
+                            let s1 = flood(g, s0, r - 1, c - 1)
+                            let s2 = flood(g, s1, r - 1, c)
+                            let s3 = flood(g, s2, r - 1, c + 1)
+                            let s4 = flood(g, s3, r, c - 1)
+                            let s5 = flood(g, s4, r, c + 1)
+                            let s6 = flood(g, s5, r + 1, c - 1)
+                            let s7 = flood(g, s6, r + 1, c)
+                            flood(g, s7, r + 1, c + 1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+fun countIslands(g: List[List[Int]]) -> Int {
+    let rows = g.len()
+    let cols = g.first().unwrap_or([]).len()
+    rangeN(rows).fold(St(seen: [], count: 0), fn(outer, r) {
+        rangeN(cols).fold(outer, fn(st, c) {
+            let idx = r * cols + c
+            if cell(g, r, c) == 1 {
+                if st.seen.contains(idx) { st }
+                else { St(seen: flood(g, st.seen, r, c), count: st.count + 1) }
+            } else { st }
+        })
+    }).count
+}
+fun probe() -> Str {
+    let a = countIslands([[1, 0, 1], [0, 0, 0], [1, 0, 1]])
+    let b = countIslands([[1, 1], [1, 1]])
+    let c = countIslands([[0, 0], [0, 0]])
+    let d = countIslands([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    let e = countIslands([[1, 0, 1], [0, 1, 0], [1, 0, 1]])
+    "checker={a}|full={b}|empty={c}|diag={d}|x={e}"
+}
+"#;
+        assert_eq!(differential(src), "checker=4|full=1|empty=0|diag=1|x=1");
+    }
+
+    #[test]
     fn diff_matrix_rotate_180() {
         // A bug-hunt-86 lock (it393): MATRIX ROTATE 180 -- rotate a 2-D matrix a half turn (a point reflection
         // through the center). This is a COORDINATE-TRANSFORM grid op like rotate-90 (it392) but with a crucial
