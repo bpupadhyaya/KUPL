@@ -2269,6 +2269,59 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_activity_selection_greedy() {
+        // A certification lock (it429): ACTIVITY SELECTION / INTERVAL SCHEDULING MAXIMIZATION -- the classic
+        // greedy that picks the MAXIMUM number of mutually non-overlapping intervals. This is distinct from
+        // merge-overlapping-intervals (it396), which COALESCES overlapping intervals into fewer; here we COUNT the
+        // largest set of intervals none of which overlap. The greedy strategy is the interesting part: sort the
+        // intervals by FINISH time, then walk them, selecting each interval whose start is >= the finish of the
+        // last one selected. Sorting by finish (not by start or by length) is what makes the greedy OPTIMAL --
+        // always taking the interval that frees up the resource earliest leaves the most room for the rest.
+        // The state is a record threading the last selected finish time and the running count.
+        //   selectMax([(1,3),(2,5),(4,7),(1,8),(5,9),(8,10)]) = 3   (picks (1,3),(4,7),(8,10))
+        //   selectMax([(1,2),(3,4),(5,6)]) = 3                      (already disjoint -- all fit)
+        //   selectMax([(1,10),(2,3),(4,5)]) = 2                     (KEY: 2 short beat the 1 long, greedy by finish)
+        //   selectMax([(1,4)]) = 1                                  (single interval)
+        //   selectMax([]) = 0                                       (empty -> nothing to schedule)
+        //   selectMax([(1,5),(1,5),(1,5)]) = 1                      (all identical/overlapping -> only one fits)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that intervals are sorted by finish time,
+        // that the greedy selects an interval exactly when its start is at least the last selected finish, that
+        // the record accumulator threads the finish/count state through the fold, that picking two short
+        // intervals beats one long overlapping one (the (1,10) case yields 2, proving the algorithm MAXIMIZES the
+        // count rather than taking the first available), that a single interval and an empty list are handled,
+        // that fully-overlapping duplicates collapse to one, and that all three engines agree on the greedy
+        // schedule. This is the interval scheduling an AI writes for meeting-room booking, task scheduling, or
+        // resource allocation; a backend whose sort key or overlap test was off would over- or under-count the
+        // schedulable set. A non-sort lock certifying earliest-finish-first greedy interval scheduling.
+        let src = r#"type Iv = { s: Int, f: Int }
+type St = { lastF: Int, count: Int }
+fun selectMax(ivs: List[Iv]) -> Int {
+    let sorted = ivs.sort_by(fn(iv) { iv.f })
+    let seed = St(lastF: 0 - 1000, count: 0)
+    let final = sorted.fold(seed, fn(acc, iv) {
+        if iv.s >= acc.lastF {
+            St(lastF: iv.f, count: acc.count + 1)
+        } else { acc }
+    })
+    final.count
+}
+fun probe() -> Str {
+    let a = selectMax([Iv(s: 1, f: 3), Iv(s: 2, f: 5), Iv(s: 4, f: 7), Iv(s: 1, f: 8), Iv(s: 5, f: 9), Iv(s: 8, f: 10)])
+    let b = selectMax([Iv(s: 1, f: 2), Iv(s: 3, f: 4), Iv(s: 5, f: 6)])
+    let c = selectMax([Iv(s: 1, f: 10), Iv(s: 2, f: 3), Iv(s: 4, f: 5)])
+    let d = selectMax([Iv(s: 1, f: 4)])
+    let e = selectMax([])
+    let f = selectMax([Iv(s: 1, f: 5), Iv(s: 1, f: 5), Iv(s: 1, f: 5)])
+    "mixed={a}|disjoint={b}|greedy={c}|single={d}|empty={e}|overlap={f}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mixed=3|disjoint=3|greedy=2|single=1|empty=0|overlap=1"
+        );
+    }
+
+    #[test]
     fn diff_isbn_check_digits() {
         // A bug-hunt-103 lock (it428): ISBN-10 and ISBN-13 CHECK-DIGIT validation -- two weighted-sum schemes
         // that complement the Luhn checksum (it427) with DIFFERENT weightings, moduli, and a special check
