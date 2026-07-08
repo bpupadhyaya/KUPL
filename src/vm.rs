@@ -3029,6 +3029,55 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_tetrahedral_numbers() {
+        // A bug-hunt-119 lock (it460): the TETRAHEDRAL NUMBERS Te(n) -- the 3D figurate numbers counting spheres
+        // stacked in a triangular pyramid -- certified by THREE independent characterizations that must all agree.
+        // This extends the 2D figurate lock (it452: triangular/pentagonal/hexagonal) into three dimensions: a
+        // tetrahedral number is the running total of triangular numbers (each layer of the pyramid is a triangular
+        // number), so it sits at the intersection of figurate geometry, cumulative sums, and combinatorics. The
+        // three views are: the closed form Te(n) = n(n+1)(n+2)/6; the cumulative sum Te(n) = sum_{k=1..n} T(k)
+        // where T(k)=k(k+1)/2 is the k-th triangular number; and the binomial Te(n) = C(n+2, 3). All three are
+        // cross-checked to produce the same value.
+        //   Te(1)=1, Te(5)=35, Te(6)=56, Te(10)=220    (OEIS A000292, the tetrahedral numbers)
+        //   c5:  n(n+1)(n+2)/6 = 35  == T(1)+..+T(5)  = 1+3+6+10+15  (closed form == triangular running total)
+        //   c10: n(n+1)(n+2)/6 = 220 == sum of T(1..10)
+        //   cb:  Te(4)=20  == C(6,3)  = 6*5*4/6      (binomial characterization)
+        //   cb2: Te(10)=220 == C(12,3) = 12*11*10/6
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the product of three consecutive
+        // integers divides exactly by 6 (a truncating-division bug would break it), that the closed form equals the
+        // cumulative triangular sum layer-by-layer, that the C(n+2,3) binomial form gives the same number, that the
+        // three independent computations agree at multiple points, and that all three engines agree. This is the
+        // 3D figurate / "stacked cannonballs" count an AI writes for combinatorics or geometric enumeration; three
+        // agreeing characterizations catch an off-by-one in the pyramid layering or a wrong binomial offset. A
+        // non-sort lock certifying the tetrahedral numbers against their closed form, triangular sum, and binomial.
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun tri(k: Int) -> Int { k * (k + 1) / 2 }
+fun tetraClosed(n: Int) -> Int { n * (n + 1) * (n + 2) / 6 }
+fun tetraSum(n: Int) -> Int {
+    rangeIncl(1, n).fold(0, fn(acc, k) { acc + tri(k) })
+}
+fun binom3(n: Int) -> Int { n * (n - 1) * (n - 2) / 6 }
+fun probe() -> Str {
+    let te1 = tetraClosed(1)
+    let te5 = tetraClosed(5)
+    let te6 = tetraClosed(6)
+    let te10 = tetraClosed(10)
+    let c5 = tetraClosed(5) == tetraSum(5)
+    let c10 = tetraClosed(10) == tetraSum(10)
+    let cb = tetraClosed(4) == binom3(6)
+    let cb2 = tetraClosed(10) == binom3(12)
+    "te1={te1}|te5={te5}|te6={te6}|te10={te10}|c5={c5}|c10={c10}|cb={cb}|cb2={cb2}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "te1=1|te5=35|te6=56|te10=220|c5=true|c10=true|cb=true|cb2=true"
+        );
+    }
+
+    #[test]
     fn diff_jacobsthal_numbers() {
         // A certification lock (it459): the JACOBSTHAL NUMBERS J(n) -- a second-order recurrence with a
         // coefficient of 2 on the SECOND term, J(n) = J(n-1) + 2*J(n-2), seeded J(0)=0, J(1)=1 -- certified
