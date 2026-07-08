@@ -2825,6 +2825,63 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_euler_totient() {
+        // A certification lock (it447): EULER'S TOTIENT phi(n) -- the count of integers in [1,n] coprime to n --
+        // computed TWO independent ways and cross-checked, extending the number-theory family (gcd it334,
+        // ext-euclid it431, fib-matrix it445). Method one is the DIRECT definition: count the k in 1..n with
+        // gcd(k,n) == 1. Method two is the PRODUCT FORMULA phi(n) = n * prod_{p | n} (1 - 1/p) over the distinct
+        // prime factors, implemented by trial division: for each prime p that divides n, multiply the accumulator
+        // by (p-1)/p (as acc/p*(p-1), integer-exact) and strip every copy of p; after the sqrt bound, any leftover
+        // factor is itself a prime and contributes its (p-1)/p. The two methods share no arithmetic -- one gcd-tests
+        // every residue, the other factorises -- so their agreement (and agreement with the known totient values)
+        // is strong evidence both are right.
+        //   phi(1)=1, phi(7)=6              (phi(prime)=prime-1: every smaller number is coprime)
+        //   phi(6)=2, phi(9)=6, phi(10)=4   (composites with small factor sets)
+        //   phi(12)=4                        (coprimes 1,5,7,11)
+        //   phi(36)=12, phi(100)=40          (higher composites: 36=2^2*3^2, 100=2^2*5^2)
+        //   cross = true                     (totientCount(12) == totient(12): the two methods agree)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the direct method counts coprime
+        // residues by gcd, that the formula multiplies (p-1)/p over each distinct prime with integer-exact partial
+        // products, that all copies of a prime are stripped so each factor counts once, that a leftover prime past
+        // the square-root bound is handled, that the count and the formula agree, that the values match the
+        // standard totient sequence, and that all three engines agree. This is the coprime count an AI writes for
+        // RSA-style modular arithmetic, cyclic-group order, or number theory; two independent methods agreeing
+        // catches a missed factor or an off-by-one. A non-sort lock certifying Euler's totient by direct count
+        // cross-checked against the prime-factorization product formula.
+        let src = r#"fun gcd(a: Int, b: Int) -> Int { if b == 0 { a } else { gcd(b, a % b) } }
+fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
+}
+fun totientCount(n: Int) -> Int {
+    rangeIncl(1, n).filter(fn(k) { gcd(k, n) == 1 }).len()
+}
+fun dropFactor(n: Int, p: Int) -> Int { if n % p == 0 { dropFactor(n / p, p) } else { n } }
+fun tot(n: Int, p: Int, acc: Int) -> Int {
+    if p * p > n { if n > 1 { acc / n * (n - 1) } else { acc } }
+    else if n % p == 0 { tot(dropFactor(n, p), p + 1, acc / p * (p - 1)) }
+    else { tot(n, p + 1, acc) }
+}
+fun totient(n: Int) -> Int { tot(n, 2, n) }
+fun probe() -> Str {
+    let t1 = totient(1)
+    let t6 = totient(6)
+    let t9 = totient(9)
+    let t10 = totient(10)
+    let t12 = totient(12)
+    let t7 = totient(7)
+    let t36 = totient(36)
+    let t100 = totient(100)
+    let cross = totientCount(12) == totient(12)
+    "t1={t1}|t6={t6}|t9={t9}|t10={t10}|t12={t12}|t7={t7}|t36={t36}|t100={t100}|cross={cross}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "t1=1|t6=2|t9=6|t10=4|t12=4|t7=6|t36=12|t100=40|cross=true"
+        );
+    }
+
+    #[test]
     fn diff_date_difference_days() {
         // A bug-hunt-109 lock (it440): DATE DIFFERENCE -- the number of days between two Gregorian dates, computed
         // by converting each date to a serial day-number and subtracting. This extends the date family (Zeller
