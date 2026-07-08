@@ -2269,6 +2269,52 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_dutch_flag_three_way_partition() {
+        // A bug-hunt-106 lock (it434): DUTCH NATIONAL FLAG -- a THREE-way partition that splits a list into the
+        // elements LESS than a pivot, EQUAL to it, and GREATER than it, then concatenates those three ordered
+        // blocks. This is the heart of 3-way quicksort (which is efficient on duplicate-heavy input because it
+        // groups ALL equal keys into the middle in one pass) and the classic 0/1/2 flag-sorting problem. It is
+        // distinct from the existing 2-way partition tests (quicksort_pivot_partition it325, partition_then_
+        // recombine it422 even/odd, partition_then_process_each_side): the defining feature is the THREE bands
+        // with equals collected in the middle. Crucially the partition is STABLE within each band -- filter
+        // preserves input order, so it groups by relation to the pivot without sorting inside a band.
+        //   dutch([2,0,2,1,1,0,2,1,0], 1) = 0,0,0,1,1,1,2,2,2   (the classic Dutch-flag sort of 0/1/2)
+        //   dutch([5,3,8,3,1,9,3], 3) = 1,3,3,3,5,8,9           (three 3s collected in the middle band)
+        //   dutch([1,1,1], 1) = 1,1,1                           (all equal -> all middle)
+        //   dutch([], 5) = (empty)                              (empty input)
+        //   dutch([4,2,6], 5) = 4,2,6                           (no equals; low band keeps 4 BEFORE 2 -- STABLE)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the less-than band, the equal band,
+        // and the greater-than band are each built by filtering the pivot relation, that the three are
+        // concatenated in low/mid/high order, that equal elements collect in the middle (the 3s in the dup case),
+        // that within a band the original relative order is preserved (the [4,2,6] case yields 4,2 NOT 2,4 -- no
+        // sorting inside a band), that empty and all-equal inputs are handled, and that all three engines agree on
+        // the three-way split. This is the Dutch-flag partition an AI writes for 3-way quicksort, bucketing by
+        // comparison, or the 0/1/2 sort; a backend whose band assignment or concatenation order was off, or that
+        // reordered within a band, would misgroup the output. A non-sort lock certifying stable three-way
+        // pivot partitioning.
+        let src = r#"fun dutch(xs: List[Int], pivot: Int) -> List[Int] {
+    let lo = xs.filter(fn(x) { x < pivot })
+    let mid = xs.filter(fn(x) { x == pivot })
+    let hi = xs.filter(fn(x) { x > pivot })
+    [lo, mid, hi].flatten()
+}
+fun shw(xs: List[Int]) -> Str { xs.map(fn(x) { x.to_str() }).join(",") }
+fun probe() -> Str {
+    let a = dutch([2, 0, 2, 1, 1, 0, 2, 1, 0], 1)
+    let b = dutch([5, 3, 8, 3, 1, 9, 3], 3)
+    let c = dutch([1, 1, 1], 1)
+    let d = dutch([], 5)
+    let e = dutch([4, 2, 6], 5)
+    "flag={shw(a)}|dup={shw(b)}|allmid={shw(c)}|empty={shw(d)}|nomid={shw(e)}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "flag=0,0,0,1,1,1,2,2,2|dup=1,3,3,3,5,8,9|allmid=1,1,1|empty=|nomid=4,2,6"
+        );
+    }
+
+    #[test]
     fn diff_gray_code_encode_decode() {
         // A certification lock (it433): GRAY CODE (binary-reflected) encode/decode with a roundtrip. A Gray code
         // orders the integers so that CONSECUTIVE values differ in exactly ONE bit -- used in rotary/position
