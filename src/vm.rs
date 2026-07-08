@@ -2220,6 +2220,86 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_prim_mst() {
+        // A bug-hunt-93 lock (it407): PRIM'S MINIMUM SPANNING TREE -- the same least-total-weight spanning tree
+        // as Kruskal (it404), but grown by a DIFFERENT strategy, completing the MST dual pairing. Where Kruskal
+        // sorts ALL edges globally and uses union-find to reject cycles (an edge-centric forest merge), Prim is
+        // vertex-centric: start with node 0 in the tree, then repeatedly add the single CHEAPEST edge that
+        // CROSSES THE CUT -- one endpoint already in the tree, the other outside -- growing one vertex per step
+        // for n-1 steps. This is the direct MST analogue of Dijkstra (it400): both greedily pick the minimum
+        // frontier edge, but Prim minimizes the edge weight itself while Dijkstra minimizes cumulative distance.
+        // The graph is an adjacency matrix (w=0 means no edge). If at some step no cut-crossing edge exists the
+        // graph is DISCONNECTED (fewer than n vertices absorbed), reported as -1. bestEdge scans every in-tree u
+        // against every out-of-tree v for the minimum positive weight; grow recurses, absorbing that v.
+        //   prim(5x5 classic graph) = 16   (edges 0-1=2, 1-2=3, 1-4=5, 0-3=6 -- IDENTICAL cost to Kruskal it404)
+        //   prim([[0,1,0],[1,0,0],[0,0,0]], 3) = -1   (node 2 has no edge -> DISCONNECTED)
+        //   prim([[0,5],[5,0]], 2) = 5                (one edge spans two nodes)
+        //   prim([[0]], 1) = 0                        (single node needs no edges)
+        //   prim([[0,1,4],[1,0,2],[4,2,0]], 3) = 3    (picks 0-1=1 then 1-2=2, skipping the direct 0-2=4)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the tree grows one vertex per step
+        // by the minimum cut-crossing edge, that a cheaper indirect path is chosen over a direct heavier edge
+        // (the triangle takes 1+2=3 not the 0-2=4 edge), that Prim and Kruskal agree on the MST cost via wholly
+        // different mechanisms (both yield 16 on the classic graph -- an independent cross-check of both locks),
+        // that a graph with an unreachable vertex yields -1 for disconnected, that single-node and single-edge
+        // inputs return 0 and the edge weight, and that all three engines agree on the vertex-centric cut greedy.
+        // This is the Prim an AI writes for minimum spanning trees, network/cluster design, and approximate TSP;
+        // a backend whose cut-edge selection or connectivity check was off would build the wrong tree. Completes
+        // the MST dual pairing (edge-sort union-find vs vertex-grow cut) and mirrors Dijkstra's frontier greedy.
+        let src = r#"type St = { inTree: List[Int], total: Int, count: Int }
+fun rangeN(n: Int) -> List[Int] {
+    if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
+}
+fun w(g: List[List[Int]], i: Int, j: Int) -> Int {
+    g.get(i).unwrap_or([]).get(j).unwrap_or(0)
+}
+fun setAt(lst: List[Int], i: Int, v: Int) -> List[Int] {
+    rangeN(lst.len()).map(fn(k) { if k == i { v } else { lst.get(k).unwrap_or(0) } })
+}
+fun bestEdge(g: List[List[Int]], inTree: List[Int], n: Int) -> List[Int] {
+    rangeN(n).fold([0 - 1, 0 - 1, 99999], fn(best, u) {
+        if inTree.get(u).unwrap_or(0) == 1 {
+            rangeN(n).fold(best, fn(b, v) {
+                let wt = w(g, u, v)
+                if inTree.get(v).unwrap_or(0) == 0 {
+                    if wt > 0 {
+                        if wt < b.get(2).unwrap_or(99999) { [u, v, wt] } else { b }
+                    } else { b }
+                } else { b }
+            })
+        } else { best }
+    })
+}
+fun grow(g: List[List[Int]], st: St, n: Int, k: Int) -> St {
+    if k <= 0 { st }
+    else {
+        let e = bestEdge(g, st.inTree, n)
+        let v = e.get(1).unwrap_or(0 - 1)
+        let wt = e.get(2).unwrap_or(99999)
+        if v == 0 - 1 { st }
+        else { grow(g, St(inTree: setAt(st.inTree, v, 1), total: st.total + wt, count: st.count + 1), n, k - 1) }
+    }
+}
+fun prim(g: List[List[Int]], n: Int) -> Int {
+    let init = St(inTree: setAt(rangeN(n).map(fn(i) { 0 }), 0, 1), total: 0, count: 1)
+    let fin = grow(g, init, n, n - 1)
+    if fin.count == n { fin.total } else { 0 - 1 }
+}
+fun probe() -> Str {
+    let a = prim([[0, 2, 0, 6, 0], [2, 0, 3, 8, 5], [0, 3, 0, 0, 7], [6, 8, 0, 0, 9], [0, 5, 7, 9, 0]], 5)
+    let b = prim([[0, 1, 0], [1, 0, 0], [0, 0, 0]], 3)
+    let c = prim([[0, 5], [5, 0]], 2)
+    let d = prim([[0]], 1)
+    let e = prim([[0, 1, 4], [1, 0, 2], [4, 2, 0]], 3)
+    "mst={a}|disc={b}|edge={c}|single={d}|tri={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "mst=16|disc=-1|edge=5|single=0|tri=3"
+        );
+    }
+
+    #[test]
     fn diff_boyer_moore_majority() {
         // A certification lock (it406): BOYER-MOORE MAJORITY VOTE -- find the element that appears MORE than n/2
         // times (a strict majority), in a single pass with O(1) extra state. This is distinct from the mode
