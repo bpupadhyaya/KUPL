@@ -2220,6 +2220,61 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_decode_ways() {
+        // A bug-hunt-74 lock (it369): WAYS TO DECODE a digit string, where 1->A, 2->B, ..., 26->Z -- count the
+        // distinct letter strings a digit sequence can decode to. This is an ADDITIVE string-counting DP,
+        // distinct from Catalan's MULTIPLICATIVE self-convolution (it368) and from subset-sum's value-based
+        // include/exclude (it359): at each position the count SUMS a single-digit path and a valid two-digit
+        // path. The recurrence over ways(i): reaching the end (i == n) is one complete decoding (1); a leading
+        // ZERO at position i has no single-letter decoding (0 -- 0 never maps to a letter); otherwise take the
+        // single-digit path ways(i+1) PLUS, when a two-digit window exists and forms a value in [10, 26], the
+        // two-digit path ways(i+2). The [10,26] bound is the crux -- a pair like 27 or 30 has no letter, and a
+        // second digit of 0 (as in "10", "20") is only decodable as the two-digit letter, never split.
+        //   decode([1,2]) = 2       (AB or L)
+        //   decode([2,2,6]) = 3     (BBF, BZ, VF -- the classic example)
+        //   decode([1,2,1,2]) = 5   (five distinct splits of 1212)
+        //   decode([0,6]) = 0       (a leading 0 cannot start any decoding)
+        //   decode([2,7]) = 1       (only 2,7 -- 27 > 26 so no two-digit path)
+        //   decode([1,0,6]) = 1     (10 then 6 -- the 0 is only decodable inside "10", never alone)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the i==n base counts one decoding, that
+        // a leading 0 contributes 0 (no single-letter path), that the single- and two-digit paths are SUMMED
+        // (not maxed, not multiplied), that the two-digit path is taken ONLY when the pair is in [10, 26]
+        // (so 27 and larger are rejected), that a 0 forces the two-digit interpretation (106 -> 10,6 = 1 not
+        // 2), that "12" splits two ways, and that all three engines agree. This is the decode-ways / A-Z
+        // string-counting DP an AI writes for message-decoding and parsing-count problems; a backend whose
+        // zero-handling, [10,26] bound, or additive combination was off would over- or under-count.
+        let src = r#"fun ways(ds: List[Int], i: Int) -> Int {
+    let n = ds.len()
+    if i == n { 1 }
+    else {
+        let di = ds.get(i).unwrap_or(0)
+        if di == 0 { 0 }
+        else {
+            let single = ways(ds, i + 1)
+            if i + 1 < n {
+                let dj = ds.get(i + 1).unwrap_or(0)
+                let two = di * 10 + dj
+                if two >= 10 { if two <= 26 { single + ways(ds, i + 2) } else { single } }
+                else { single }
+            } else { single }
+        }
+    }
+}
+fun decode(ds: List[Int]) -> Int { ways(ds, 0) }
+fun probe() -> Str {
+    let a = decode([1, 2])
+    let b = decode([2, 2, 6])
+    let c = decode([1, 2, 1, 2])
+    let d = decode([0, 6])
+    let e = decode([2, 7])
+    let f = decode([1, 0, 6])
+    "12={a}|226={b}|1212={c}|06={d}|27={e}|106={f}"
+}
+"#;
+        assert_eq!(differential(src), "12=2|226=3|1212=5|06=0|27=1|106=1");
+    }
+
+    #[test]
     fn diff_catalan_numbers() {
         // A certification lock (it368): the CATALAN NUMBERS via the CONVOLUTION recurrence
         // C(n) = sum over i in [0, n-1] of C(i) * C(n-1-i), with C(0) = 1. The Catalan numbers count an
