@@ -2220,6 +2220,78 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_spiral_matrix_traversal() {
+        // A certification lock (it390): SPIRAL MATRIX TRAVERSAL -- read a 2-D matrix in CLOCKWISE SPIRAL order
+        // (top row left-to-right, right column top-to-bottom, bottom row right-to-left, left column
+        // bottom-to-top), then spiral inward. This is a BOUNDARY-SHRINKING 2-D ring walk, distinct from the
+        // grid flood-fill (it388) and the grid DPs: each recursion reads exactly one RING bounded by
+        // top/bot/left/right, then shrinks all four bounds by one (top+1, bot-1, left+1, right-1) and recurses
+        // on the inner sub-matrix. The bottom row is read only when bot > top (else it would re-read the top
+        // row of a single-row band), and the left column only when right > left (else it would re-read the
+        // right column of a single-column band) -- the two guards are what make degenerate rings correct.
+        //   spiralOrder([[1,2,3],[4,5,6],[7,8,9]]) = [1,2,3,6,9,8,7,4,5]        (3x3: ends at the center 5)
+        //   spiralOrder([[1,2,3,4],[5,6,7,8],[9,10,11,12]]) = [1,2,3,4,8,12,11,10,9,5,6,7]  (3x4 rectangle)
+        //   spiralOrder([[1]]) = [1]                                          (single cell)
+        //   spiralOrder([[1,2,3]]) = [1,2,3]                                  (single row -- just the top run)
+        //   spiralOrder([[1],[2],[3]]) = [1,2,3]                              (single column -- just the descent)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the four edges are emitted in clockwise
+        // order, that the right column starts BELOW the top-right corner (top+1) and the left column stops ABOVE
+        // the top-left corner (top+1) so corners are not double-counted, that the bot>top guard prevents a
+        // single-row band from re-reading its row and the right>left guard prevents a single-column band from
+        // re-reading its column, that the bounds shrink inward each ring until they cross, that a 1x1/1xN/Nx1
+        // matrix degenerates to a straight run, and that all three engines agree on the recursive ring peel.
+        // This is the spiral-matrix routine an AI writes for matrix serialization, spiral-order printing, and
+        // image/scan patterns; a backend whose edge ordering, corner offsets, degenerate-band guards, or bound
+        // shrink was off would mis-order or duplicate cells. Adds a boundary-shrinking 2-D ring traversal.
+        // (Probing this caught a bug in the harness's own descending-range helper -- fixed before locking.)
+        let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
+    if lo > hi { [] } else { [rangeIncl(lo, hi - 1), [hi]].flatten() }
+}
+fun rangeDecl(hi: Int, lo: Int) -> List[Int] {
+    if hi < lo { [] } else { [[hi], rangeDecl(hi - 1, lo)].flatten() }
+}
+fun cell(m: List[List[Int]], r: Int, c: Int) -> Int {
+    m.get(r).unwrap_or([]).get(c).unwrap_or(0)
+}
+fun spiral(m: List[List[Int]], top: Int, bot: Int, left: Int, right: Int) -> List[Int] {
+    if top > bot { [] }
+    else {
+        if left > right { [] }
+        else {
+            let topRow = rangeIncl(left, right).map(fn(c) { cell(m, top, c) })
+            let rightCol = rangeIncl(top + 1, bot).map(fn(r) { cell(m, r, right) })
+            let bottomRow = if bot > top {
+                rangeDecl(right - 1, left).map(fn(c) { cell(m, bot, c) })
+            } else { [] }
+            let leftCol = if right > left {
+                rangeDecl(bot - 1, top + 1).map(fn(r) { cell(m, r, left) })
+            } else { [] }
+            let ring = [topRow, rightCol, bottomRow, leftCol].flatten()
+            [ring, spiral(m, top + 1, bot - 1, left + 1, right - 1)].flatten()
+        }
+    }
+}
+fun spiralOrder(m: List[List[Int]]) -> List[Int] {
+    let rows = m.len()
+    let cols = m.first().unwrap_or([]).len()
+    spiral(m, 0, rows - 1, 0, cols - 1)
+}
+fun probe() -> Str {
+    let a = spiralOrder([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    let b = spiralOrder([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
+    let c = spiralOrder([[1]])
+    let d = spiralOrder([[1, 2, 3]])
+    let e = spiralOrder([[1], [2], [3]])
+    "sq={a}|rect={b}|one={c}|row={d}|col={e}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "sq=[1, 2, 3, 6, 9, 8, 7, 4, 5]|rect=[1, 2, 3, 4, 8, 12, 11, 10, 9, 5, 6, 7]|one=[1]|row=[1, 2, 3]|col=[1, 2, 3]"
+        );
+    }
+
+    #[test]
     fn diff_largest_rectangle_histogram() {
         // A bug-hunt-84 lock (it389): LARGEST RECTANGLE IN HISTOGRAM -- the maximum-area axis-aligned rectangle
         // that fits under a row of bars of varying heights. This is an area-maximization by treating EACH bar
