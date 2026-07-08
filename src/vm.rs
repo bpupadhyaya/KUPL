@@ -2104,6 +2104,36 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_sliding_window_maximum() {
+        // A bug-hunt-53 lock (it327): the sliding-window maximum -- for each contiguous length-k window of a
+        // list, its maximum. window(3) produces the overlapping windows, and each is reduced to its max via a
+        // fold seeded with the window's own first element. Distinct from the whole-list sliding hi-lo lock
+        // (which runs two opposite-sentinel folds over the ENTIRE list): this maps a per-window reduction
+        // over window(k)'s overlapping slices -- the moving-max an AI writes for signal smoothing, a rolling
+        // stat, or a stock-price high.
+        //   xs = [4,2,7,1,8,3,6], window(3) -> [[4,2,7],[2,7,1],[7,1,8],[1,8,3],[8,3,6]]  (5 windows)
+        //   max of each -> [7, 7, 8, 8, 8]
+        // Byte-identical on interp/KVM (native per the sweep). Confirms window(3) yields exactly len-k+1 = 5
+        // overlapping windows (not len/k disjoint chunks), that each window keeps its k elements in order,
+        // that the per-window fold seeded with first() computes the true max (7 dominates the first two
+        // windows, 8 the last three), and that map applies the reduction window-by-window. A backend that
+        // produced disjoint chunks instead of a sliding window would give the wrong window count (3, not 5),
+        // and one whose fold mis-seeded or mis-compared would report a wrong max per window.
+        let src = r#"fun listMax(xs: List[Int]) -> Int {
+    xs.fold(xs.first().unwrap_or(0), fn(m, x) { if x > m { x } else { m } })
+}
+fun probe() -> Str {
+    let xs = [4, 2, 7, 1, 8, 3, 6]
+    let wins = xs.window(3)
+    let maxes = wins.map(fn(w) { listMax(w) })
+    let count = wins.len()
+    "wins={count}|maxes={maxes}"
+}
+"#;
+        assert_eq!(differential(src), "wins=5|maxes=[7, 7, 8, 8, 8]");
+    }
+
+    #[test]
     fn diff_binary_search_sorted_list() {
         // A certification lock (it326): binary search over a sorted list -- the O(log n) search counterpart
         // to the sort locks (it324/325). It recurses on INDEX BOUNDS (a half-open interval [lo, hi)) rather
