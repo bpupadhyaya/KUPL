@@ -3069,6 +3069,51 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_totient_multiplicative() {
+        // A certification lock (it493): EULER'S TOTIENT phi is MULTIPLICATIVE -- phi(m*n) = phi(m)*phi(n) whenever
+        // gcd(m,n) = 1 -- cross-validated against that number-theoretic property, using the gcd-COUNT DEFINITION of
+        // phi (phi(n) = #{k in [1,n] : gcd(k,n) = 1}), NOT the product formula. This independence matters: computing
+        // phi via n * prod(1 - 1/p) would make multiplicativity true BY CONSTRUCTION (circular, per the it462
+        // discipline); the count definition knows nothing about the multiplicative structure, so its agreement with
+        // the law genuinely certifies it. This is the ARITHMETIC-FUNCTION-PROPERTY style of sigma_multiplicativity
+        // (it491), on a different function and via the definition rather than a formula. Distinct from euler_totient
+        // (it447), which cross-checks two ways of COMPUTING phi against known values -- this certifies the LAW.
+        // Products are kept small (<= 12) so the count recursion (phiGo goes 1..n) stays shallow in the 2MB thread.
+        //   p3 = phi(3) = 2,  p12 = phi(12) = 4
+        //   m1..m4: phi(m*n) == phi(m)*phi(n) for the COPRIME pairs (3,4),(2,5),(4,3),(2,3)
+        //   n1: gcd(2,4) = 2
+        //   bad = false: phi(2*4) == phi(2)*phi(4) is FALSE because gcd(2,4) = 2 -- phi(8)=4, not phi(2)*phi(4)=2
+        // Byte-identical on interp/KVM (native per the sweep). Confirms phi's values, that multiplicativity holds
+        // for coprime arguments computed by the count definition, that it FAILS for a non-coprime pair (the
+        // negative case makes coprimality load-bearing), and that all three engines agree. This is the totient
+        // reasoning an AI relies on when computing phi of a factored modulus (RSA-style) or reasoning about the
+        // multiplicative group of integers mod n. A non-sort lock certifying totient multiplicativity.
+        let src = r#"fun gcdGo(a: Int, b: Int) -> Int { if b == 0 { a } else { gcdGo(b, a % b) } }
+fun phiGo(n: Int, k: Int, acc: Int) -> Int {
+    if k > n { acc } else {
+        if gcdGo(k, n) == 1 { phiGo(n, k + 1, acc + 1) } else { phiGo(n, k + 1, acc) }
+    }
+}
+fun phi(n: Int) -> Int { phiGo(n, 1, 0) }
+fun probe() -> Str {
+    let p3 = phi(3)
+    let p12 = phi(12)
+    let m1 = phi(3 * 4) == phi(3) * phi(4)
+    let m2 = phi(2 * 5) == phi(2) * phi(5)
+    let m3 = phi(4 * 3) == phi(4) * phi(3)
+    let m4 = phi(2 * 3) == phi(2) * phi(3)
+    let n1 = gcdGo(2, 4) == 2
+    let bad = phi(2 * 4) == phi(2) * phi(4)
+    "p3={p3}|p12={p12}|m1={m1}|m2={m2}|m3={m3}|m4={m4}|n1={n1}|bad={bad}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "p3=2|p12=4|m1=true|m2=true|m3=true|m4=true|n1=true|bad=false"
+        );
+    }
+
+    #[test]
     fn diff_sum_of_divisors_multiplicative() {
         // A certification lock (it491): the sum-of-divisors function sigma(n) = sum of all positive divisors of n
         // is MULTIPLICATIVE -- sigma(m*n) = sigma(m)*sigma(n) whenever gcd(m,n) = 1 -- cross-validated against that
