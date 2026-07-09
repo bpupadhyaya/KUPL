@@ -7250,6 +7250,55 @@ fun main() uses io {
         );
     }
 
+    /// SOUNDNESS-SYMMETRY CHECK (PR-it501): unlike interp.rs's call_value (which had a real bug fixed
+    /// in PR-it500 -- a NAMED-function call routed through call_fun's call_depth guard, but a CLOSURE
+    /// call skipped it entirely, so interp/KVM disagreed on a well-typed closure-recursion program),
+    /// native codegen's depth guard is architecturally symmetric BY CONSTRUCTION: emit_chunk wraps
+    /// EVERY compiled chunk (named function OR closure prototype -- both are just "chunks" in the
+    /// bytecode model) with the SAME `fun_i` guard wrapper around `fun_i_impl`, and the CHUNKS[] function-
+    /// pointer table (used by both a direct Call and an indirect CallValue/k_call dispatch) always
+    /// points at the guarded `fun_i`, never the raw `_impl`. So there was no equivalent gap to find here
+    /// -- a genuine NEGATIVE result confirming native was already correct, completing the 3-engine
+    /// verification for the it500 bug class: this uses the SAME closure-wrapped-in-a-recursive-ADT
+    /// self-application/fixed-point pattern as diff_closure_recursion_hits_the_same_stack_overflow_guard
+    /// (a raw Y-combinator is rejected by the checker with K0200 -- a bare closure type can't unify with
+    /// itself -- but wrapping the self-reference in a named recursive ADT field sidesteps that).
+    #[test]
+    fn native_closure_recursion_hits_the_same_stack_overflow_guard() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Rec = R(f: fn(Rec, Int) -> Int)\n\
+                   fun main() uses io {\n    \
+                   let r = R(f: fn (self, n) {\n        \
+                   if n <= 0 { 0 } else {\n            \
+                   match self { R(g) => g(self, n - 1) }\n        \
+                   }\n    })\n    \
+                   match r { R(g) => print(\"{g(r, 15000)}\") }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-clorec-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let out = std::process::Command::new(&bin).output().unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("stack overflow (10000 frames)"),
+            "closure recursion must hit the same clean guard as named-function recursion, got stderr={stderr:?} status={:?}",
+            out.status
+        );
+    }
+
     /// List.take_while / drop_while (it95) compile to native.
     #[test]
     fn native_take_drop_while() {
