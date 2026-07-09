@@ -2817,11 +2817,20 @@ impl Checker {
                         let (field_tys, result) = self.instantiate_ctor(&tyname, &fields);
                         self.unify(expected, &result, pat.span, "pattern");
                         if args.len() != field_tys.len() {
-                            self.err(
-                                "K0255",
-                                format!("`{other}` has {}, pattern has {}", plural(field_tys.len(), "field"), args.len()),
-                                pat.span,
-                            );
+                            // Ctor patterns are positional, so when the pattern under-specifies
+                            // (args.len() < fields.len()) the missing fields are exactly the
+                            // trailing ones by position -- name them, mirroring K0243's
+                            // missing-field hint for constructor calls (PR-it484).
+                            let mut msg = format!("`{other}` has {}, pattern has {}", plural(field_tys.len(), "field"), args.len());
+                            if args.len() < fields.len() {
+                                let missing = fields[args.len()..]
+                                    .iter()
+                                    .map(|(n, _)| format!("`{n}`"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                msg.push_str(&format!(" — missing {missing}"));
+                            }
+                            self.err("K0255", msg, pat.span);
                         }
                         for (a, fty) in args.iter().zip(field_tys.iter()) {
                             self.check_pattern(a, fty, ctx);
@@ -3286,6 +3295,39 @@ mod generic_tests {
         // A POSITIONAL too-few call keeps the bare count (no reliable field->slot naming).
         let pf = errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(1) }\n");
         assert!(pf.iter().any(|d| d.code == "K0243" && d.message.contains("2 fields, 1 argument given") && !d.message.contains("missing")), "positional keeps bare count: {pf:?}");
+    }
+
+    #[test]
+    fn k0255_ctor_pattern_arity_names_the_missing_fields() {
+        // Error-msg round 34 (PR-it503): a ctor PATTERN with too few sub-patterns (e.g.
+        // `match r { R(x) => x }` when R has 3 fields) was bare "`R` has 3 fields, pattern
+        // has 1" -- didn't say WHICH fields the pattern left unmatched. Ctor patterns are
+        // strictly positional, so an under-specified pattern's missing fields are exactly
+        // the trailing ones by position -- name them, mirroring K0243's missing-field hint
+        // for constructor CALLS (PR-it484), now extended to constructor PATTERNS.
+        let too_few = errors(
+            "type Rec = R(a: Int, b: Str, c: Bool)\nfun probe() -> Int { let r = R(a: 1, b: \"x\", c: true)\n    match r { R(x) => x } }\n",
+        );
+        assert!(
+            too_few.iter().any(|d| d.code == "K0255"
+                && d.message.contains("3 fields, pattern has 1")
+                && d.message.contains("missing `b`, `c`")),
+            "under-specified ctor pattern should name the missing fields: {too_few:?}"
+        );
+        // Too MANY sub-patterns keeps the bare count -- there's no field beyond the last one
+        // to name, so a "missing" hint would be meaningless here.
+        let too_many = errors(
+            "type Rec = R(a: Int, b: Str)\nfun probe() -> Int { let r = R(a: 1, b: \"x\")\n    match r { R(x, y, z) => x } }\n",
+        );
+        assert!(
+            too_many.iter().any(|d| d.code == "K0255" && d.message.contains("2 fields, pattern has 3") && !d.message.contains("missing")),
+            "over-specified ctor pattern keeps bare count: {too_many:?}"
+        );
+        // Correct arity still type-checks cleanly.
+        assert!(errors(
+            "type Rec = R(a: Int, b: Str)\nfun probe() -> Int { let r = R(a: 1, b: \"x\")\n    match r { R(x, _) => x } }\n"
+        )
+        .is_empty());
     }
 
     #[test]
