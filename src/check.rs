@@ -1355,10 +1355,13 @@ impl Checker {
                                     }
                                 }
                             }
-                            Some(_) => {
+                            Some(sig) => {
+                                // Name the actual variants so the fix is immediately visible instead of
+                                // leaving the user to look up the type definition (PR-it498).
+                                let names = sig.variants.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ");
                                 self.err(
                                     "K0231",
-                                    format!("`{tn}` has multiple variants — use `match` to access fields"),
+                                    format!("`{tn}` has multiple variants ({names}) — use `match` to access `.{name}`"),
                                     expr.span,
                                 );
                                 self.uni.fresh()
@@ -1558,7 +1561,17 @@ impl Checker {
                         }
                         rt
                     }
-                    _ => {
+                    Some(sig) => {
+                        // Name the actual variants, same as the field-access K0231 (PR-it498).
+                        let names = sig.variants.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ");
+                        self.err(
+                            "K0231",
+                            format!("`{tn}` has multiple variants ({names}) — use `match` to rebuild"),
+                            expr.span,
+                        );
+                        self.uni.fresh()
+                    }
+                    None => {
                         self.err(
                             "K0231",
                             format!("`{tn}` has multiple variants — use `match` to rebuild"),
@@ -3368,6 +3381,36 @@ mod generic_tests {
         );
         // A correct-arity call still type-checks.
         assert!(errors("fun main() { let _ = \"hi\".center(5, \"*\")\n    let _ = \"x\".to_upper() }\n").is_empty());
+    }
+
+    #[test]
+    fn k0231_names_the_variants() {
+        // Error-message round 33 (PR-it498): K0231 (field access or `with`-rebuild on a multi-variant
+        // ADT, which requires `match` instead) said only "`Shape` has multiple variants -- use `match`
+        // to access fields" -- naming neither the actual variants nor the field the user tried. Now it
+        // names both the variant list and the attempted field:
+        //   `Shape` has multiple variants (Circle, Square, Rect) -- use `match` to access `.r`
+        let field_access = errors(
+            "type Shape = Circle(r: Int) | Square(side: Int) | Rect(w: Int, h: Int)\n\
+             fun probe(s: Shape) -> Int { s.r }\n\
+             fun main() { 0 }\n",
+        );
+        assert!(
+            field_access.iter().any(|d| d.code == "K0231"
+                && d.message.contains("(Circle, Square, Rect)")
+                && d.message.contains("access `.r`")),
+            "field-access K0231 must name the variants and the attempted field: {field_access:?}"
+        );
+        // The `with`-rebuild path (a separate call site) gets the same treatment.
+        let with_update = errors(
+            "type Shape = Circle(r: Int) | Square(side: Int)\n\
+             fun probe(s: Shape) -> Shape { s with r: 5 }\n\
+             fun main() { 0 }\n",
+        );
+        assert!(
+            with_update.iter().any(|d| d.code == "K0231" && d.message.contains("(Circle, Square)") && d.message.contains("rebuild")),
+            "with-update K0231 must name the variants: {with_update:?}"
+        );
     }
 
     #[test]
