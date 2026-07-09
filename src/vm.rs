@@ -3167,6 +3167,70 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_reservoir_sampling_size_invariant() {
+        // A certification lock (it497, from bug-hunt batch 130 -- 10+ probes across regex/exec/date/tensor/list
+        // shapes came back byte-identical (with two probe-authoring slips of my own along the way: re_replace's
+        // real argument order is (pattern, TEXT, replacement) not (pattern, replacement, text), and it's already
+        // covered by diff_regex_match_find_replace; zeros() takes an Int not a List -- both confirmed correct,
+        // not bugs), so the fresh corner locked this round is Algorithm R (reservoir sampling)'s SIZE INVARIANT --
+        // this is the "reservoir-count-deterministic" item flagged in the roadmap. reservoirSample(n, k) streams
+        // items 1..n into a reservoir of capacity k: the first k items fill it, and each subsequent item i has a
+        // (normally RANDOM) index j drawn to decide whether it replaces a slot. To keep this test fully
+        // deterministic and cross-engine-safe (no reliance on the RNG builtins matching bit-for-bit), the "random"
+        // draw is replaced by a fixed hash-like formula j = (i*2654435761 + 17) % i -- this preserves Algorithm R's
+        // real CONTROL FLOW (fill-then-conditionally-replace) while making the whole run reproducible by hand.
+        // Two things are certified together: the SIZE invariant (the reservoir always ends at exactly min(n,k),
+        // regardless of the replacement policy -- a structural guarantee of the algorithm's shape) AND the exact
+        // CONTENTS for four (n,k) pairs, hand-verified against an independent Python re-implementation of the same
+        // deterministic formula, so this isn't just checking the trivially-true size claim but a real algorithm run.
+        //   r1=reservoirSample(9,3)=[1,8,5], s1=3=min(9,3)
+        //   r2=reservoirSample(4,8)=[1,2,3,4], s2=4=min(4,8) (stream shorter than capacity: no replacement ever fires)
+        //   r3=reservoirSample(1,1)=[1], s3=1=min(1,1)
+        //   s4=reservoirSample(12,5).len()=5=min(12,5)
+        // Stream lengths kept small (<=12) so the ~n-deep recursion (each frame also builds a fresh list via
+        // take/drop/flatten) stays within the 2MB debug test-thread; n=20 overflowed it empirically.
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the fill phase, the replacement phase, the
+        // size invariant across four capacity/stream-length relationships (capacity < stream, capacity > stream,
+        // both size 1, a larger case), and that all three engines agree. Immutable list "replace at index j" is
+        // built via take(j)/drop(j+1)/flatten (KUPL has no in-place mutation). A non-sort lock certifying reservoir
+        // sampling's structural size invariant plus a concrete deterministic run.
+        let src = r#"fun resGo(n: Int, k: Int, i: Int, reservoir: List[Int]) -> List[Int] {
+    if i > n {
+        reservoir
+    } else {
+        if i <= k {
+            resGo(n, k, i + 1, [reservoir, [i]].flatten())
+        } else {
+            let j = (i * 2654435761 + 17) % i
+            if j < k {
+                let updated = [reservoir.take(j), [i], reservoir.drop(j + 1)].flatten()
+                resGo(n, k, i + 1, updated)
+            } else {
+                resGo(n, k, i + 1, reservoir)
+            }
+        }
+    }
+}
+fun reservoirSample(n: Int, k: Int) -> List[Int] { resGo(n, k, 1, []) }
+fun probe() -> Str {
+    let r1 = reservoirSample(9, 3)
+    let r2 = reservoirSample(4, 8)
+    let r3 = reservoirSample(1, 1)
+    let r4 = reservoirSample(12, 5)
+    let s1 = r1.len()
+    let s2 = r2.len()
+    let s3 = r3.len()
+    let s4 = r4.len()
+    "r1={r1}|s1={s1}|r2={r2}|s2={s2}|r3={r3}|s3={s3}|s4={s4}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "r1=[1, 8, 5]|s1=3|r2=[1, 2, 3, 4]|s2=4|r3=[1]|s3=1|s4=5"
+        );
+    }
+
+    #[test]
     fn diff_lagrange_four_square_theorem() {
         // A certification lock (it496): LAGRANGE'S FOUR-SQUARE THEOREM -- every non-negative integer n can be
         // written as a sum of (at most) four integer squares, a²+b²+c²+d² = n -- verified by BOUNDED SEARCH and
