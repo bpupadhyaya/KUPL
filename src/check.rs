@@ -1629,7 +1629,13 @@ impl Checker {
                             expr.span,
                         );
                     } else {
-                        let _ = self.uni.unify(&err, &ret_err);
+                        // The operand's Err type must match the enclosing function's Err type --
+                        // `?` propagates it as-is. This was previously unified and DISCARDED (`let _ =`),
+                        // so a mismatched Err type (e.g. inner returns Result[_, Int], outer returns
+                        // Result[_, Str]) silently type-checked; propagating Err(42) through `?` produced
+                        // no diagnostic even though a direct `Err(42)` return in the same function was
+                        // correctly rejected as K0200 (PR-it494).
+                        self.unify(&ret_err, &err, expr.span, "`?` error type (propagated by `?` into the return type)");
                     }
                     self.uni.apply(&ok)
                 }
@@ -3010,6 +3016,31 @@ mod generic_tests {
             "Result ? in an Option fun must hint .ok: {:?}",
             errors(mismatch2).iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn try_operator_on_result_checks_the_propagated_error_type() {
+        // SOUNDNESS FIX (PR-it494): `?` on a Result propagates the operand's Err type into the
+        // enclosing function's Err type. That unification result was previously DISCARDED
+        // (`let _ = self.uni.unify(&err, &ret_err);`), so a mismatched Err type silently
+        // type-checked -- `inner() -> Result[Int, Int]` propagated through `?` into a function
+        // declared `-> Result[Int, Str]` produced NO diagnostic, even though a direct
+        // `Err(42)` return in the same function is correctly rejected as K0200. Found via
+        // bug-hunt probing: a direct-return mismatch is caught, but the identical mismatch
+        // propagated through `?` was not -- an asymmetry between two paths to the same invalid
+        // program. Now K0200 fires at the `?` site, naming the expected/found Err types.
+        let mismatched = "fun inner() -> Result[Int, Int] { Err(42) }\n\
+                           fun outer() -> Result[Int, Str] {\n    let x = inner()?\n    Ok(x)\n}\n";
+        let ds = errors(mismatched);
+        assert!(
+            ds.iter().any(|d| d.code == "K0200" && d.message.contains("expected Str") && d.message.contains("found Int")),
+            "`?` must catch a propagated Err-type mismatch: {ds:?}"
+        );
+        // A matching Err type still type-checks (no regression).
+        let matching = "fun inner() -> Result[Int, Str] { Err(\"bad\") }\n\
+                         fun outer() -> Result[Int, Str] {\n    let x = inner()?\n    Ok(x)\n}\n\
+                         fun main() uses io { print(\"{outer()}\") }\n";
+        assert!(errors(matching).is_empty(), "matching Err type via `?` must still compile: {:?}", errors(matching));
     }
 
     #[test]
