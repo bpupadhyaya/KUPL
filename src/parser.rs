@@ -1184,7 +1184,9 @@ impl Parser {
             self.depth -= 1;
             return Err(Diag::error(
                 "K0121",
-                "expression nesting too deep".to_string(),
+                format!(
+                    "expression nesting too deep (limit is {MAX_EXPR_DEPTH}) — break it into intermediate `let` bindings"
+                ),
                 self.span(),
             ));
         }
@@ -1859,7 +1861,9 @@ impl Parser {
             self.depth -= 1;
             return Err(Diag::error(
                 "K0121",
-                "type nesting too deep".to_string(),
+                format!(
+                    "type nesting too deep (limit is {MAX_EXPR_DEPTH}) — break it into a named `type` alias"
+                ),
                 self.span(),
             ));
         }
@@ -1927,6 +1931,36 @@ mod tests {
         let (p, diags) = parse(src);
         assert!(diags.is_empty(), "diags: {diags:#?}");
         p
+    }
+
+    #[test]
+    fn k0121_names_the_limit_and_the_fix() {
+        // Error-message round 32 (PR-it495): K0121 (expression/type nesting too deep) said only
+        // "expression nesting too deep" / "type nesting too deep" -- no limit, no fix. Now it names
+        // the limit (MAX_EXPR_DEPTH = 128) and suggests the concrete remedy: intermediate `let`
+        // bindings for deep expressions, a named `type` alias for deep type annotations. Run on a
+        // production-sized (8 MiB) stack, matching check.rs's deep_nesting_is_a_clean_error_not_a_hang
+        // -- the default 2 MiB test-thread stack is smaller than the real CLI main thread, and the
+        // recursive-descent parser recurses (bounded by K0121) while building the pathological input.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let deep_expr = format!("fun main() {{ let x = {}1{} }}\n", "[".repeat(200), "]".repeat(200));
+                let (_, diags) = parse(&deep_expr);
+                assert!(
+                    diags.iter().any(|d| d.code == "K0121" && d.message.contains("limit is 128") && d.message.contains("`let` bindings")),
+                    "expr nesting K0121 must name the limit and the let-binding fix: {diags:?}"
+                );
+                let deep_ty = format!("fun f(x: {}Int{}) -> Int {{ 0 }}\nfun main() {{ 0 }}\n", "List[".repeat(200), "]".repeat(200));
+                let (_, diags) = parse(&deep_ty);
+                assert!(
+                    diags.iter().any(|d| d.code == "K0121" && d.message.contains("limit is 128") && d.message.contains("`type` alias")),
+                    "type nesting K0121 must name the limit and the type-alias fix: {diags:?}"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
