@@ -1399,6 +1399,24 @@ impl Interp {
                         span,
                     ));
                 }
+                // SOUNDNESS FIX (PR-it500): unlike the named-function path just above
+                // (which routes through call_fun's call_depth guard), invoking a closure
+                // used to skip the recursion-depth check entirely -- a closure that
+                // recurses (e.g. a self-application/fixed-point closure wrapped in a
+                // recursive ADT, or any HOF callback that recurses, since map/filter/etc.
+                // all funnel through this same call_value) never hit the 10 000-frame
+                // limit and instead ran until it exhausted the REAL native Rust stack --
+                // an uncatchable abort, exactly what call_depth exists to prevent. Worse,
+                // the KVM's equivalent path (push_closure_frame -> push_frame) DOES
+                // enforce the same limit, so this was also a genuine interp/KVM
+                // byte-identity divergence on a well-typed program (confirmed via a
+                // closure wrapped in a recursive ADT: KVM panics "stack overflow (10000
+                // frames)"; interp previously ran to completion). Now symmetric with
+                // call_fun.
+                if self.call_depth >= MAX_CALL_DEPTH {
+                    return Err(Self::panic_flow("stack overflow (10000 frames)".to_string(), span));
+                }
+                self.call_depth += 1;
                 // Fresh scope over the module globals: bind the captured snapshot
                 // then the params. Rebinding the captures per call (rather than
                 // sharing an env) gives value-capture semantics — a mutation of a
@@ -1410,10 +1428,12 @@ impl Interp {
                 for (p, a) in c.params.iter().zip(args) {
                     scope.define(p, a);
                 }
-                match self.exec_block(&c.body, &scope) {
+                let result = match self.exec_block(&c.body, &scope) {
                     Err(Flow::Return(v)) => Ok(v),
                     other => other,
-                }
+                };
+                self.call_depth -= 1;
+                result
             }
             other => Err(Self::panic_flow(
                 format!("{} is not callable", other.type_name()),

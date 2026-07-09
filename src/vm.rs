@@ -1798,6 +1798,50 @@ mod tests {
     }
 
     #[test]
+    fn diff_closure_recursion_hits_the_same_stack_overflow_guard() {
+        // SOUNDNESS FIX (PR-it500), found via a soundness-symmetry pass on interp.rs: unbounded
+        // recursion through a NAMED function (diff_deep_recursion_stack_overflow, above) correctly
+        // hits the same clean "stack overflow (10000 frames)" panic on both engines. But unbounded
+        // recursion through a CLOSURE used to bypass the guard ENTIRELY on the interpreter --
+        // interp.rs's call_value routed named-function calls through call_fun (which increments/
+        // checks call_depth) but invoked a Value::Closure directly via exec_block, never touching
+        // call_depth. Since map/filter/every function-taking method funnels through this same
+        // call_value, this bug affected not just direct closure calls but every HOF callback.
+        //
+        // The KVM's equivalent path (push_closure_frame -> push_frame) DOES enforce the same limit,
+        // so this was a genuine interp/KVM BYTE-IDENTITY DIVERGENCE on a well-typed program, not just
+        // an interp-only gap: confirmed by running a closure wrapped in a recursive ADT (a
+        // self-application/fixed-point pattern -- KUPL rejects a raw Y-combinator with K0200 since a
+        // bare closure type can't unify with itself, but wrapping the self-reference in a named
+        // recursive ADT field sidesteps that) at depth 15000 -- the KVM panicked cleanly while the
+        // interpreter ran to completion, silently growing the REAL native Rust stack instead.
+        //
+        // Fixed by adding the same call_depth guard to call_value's Value::Closure branch. Verified:
+        // NO example program was newly rejected/behaves-differently (this only changes what was
+        // previously an uncatchable-abort-risk into the same clean panic named recursion already
+        // gets); a large NON-recursive .map() over 50000 elements (built via a native `for` loop, not
+        // user recursion) still runs to completion unaffected, since call_depth increments/decrements
+        // symmetrically around each call and never accumulates across sequential (non-nested) calls.
+        let src = r#"type Rec = R(f: fn(Rec, Int) -> Int)
+fun probe() -> Int {
+    let r = R(f: fn (self, n) {
+        if n <= 0 { 0 } else {
+            match self { R(g) => g(self, n - 1) }
+        }
+    })
+    match r { R(g) => g(r, 15000) }
+}
+"#;
+        let out = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(move || differential(src))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(out, "panic: stack overflow (10000 frames)");
+    }
+
+    #[test]
     fn diff_recursion_fib() {
         let src = "fun fib(n: Int) -> Int {\n    if n < 2 {\n        n\n    } else {\n        fib(n - 1) + fib(n - 2)\n    }\n}\nfun probe() -> Int {\n    fib(15)\n}\n";
         assert_eq!(differential(src), "610");
