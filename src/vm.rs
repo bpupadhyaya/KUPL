@@ -3275,6 +3275,72 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_mobius_multiplicative() {
+        // A certification lock (it502): the MOBIUS FUNCTION is MULTIPLICATIVE -- mu(m*n) = mu(m)*mu(n) whenever
+        // gcd(m,n) = 1 -- a fresh angle on mu distinct from diff_mobius_divisor_sum_identity (it499, which
+        // certifies the DIVISOR-SUM identity sum_{d|n} mu(d) = [n=1]). This is the same ARITHMETIC-FUNCTION-
+        // MULTIPLICATIVITY style as sigma_mult (it491) and totient_mult (it493): mu is computed one way (trial
+        // factorization: 0 if any prime's square divides n, else (-1)^(distinct prime factors)), and
+        // multiplicativity is a SEPARATE fact about how two INDEPENDENT computations of mu combine -- computing
+        // mu(m), mu(n), and mu(m*n) as three SEPARATE factorizations and checking their product relationship is
+        // not a restatement of the factorization algorithm itself (it462 discipline).
+        //
+        // Test values are chosen SQUAREFREE so the check is non-trivial: a pair like (4,9) would give mu=0 on
+        // both sides trivially (since mu(4)=mu(9)=0 from their own repeated factors), which wouldn't actually
+        // exercise the multiplicativity relationship. Every coprime pair here has mu(m), mu(n), and mu(m*n) all
+        // nonzero.
+        //   m6 = mobius(6) = 1    (6 = 2*3, two distinct primes, (-1)^2 = 1)
+        //   m10 = mobius(10) = 1  (10 = 2*5, two distinct primes)
+        //   m1..m4: mobius(m*n) == mobius(m)*mobius(n) for the COPRIME SQUAREFREE pairs (2,3),(2,5),(3,5),(6,5)
+        //   n1: gcd(2,6) = 2
+        //   bad = false: mobius(2*6) == mobius(2)*mobius(6) is FALSE because gcd(2,6) = 2 -- mobius(12) = 0
+        //         (12 = 2^2*3 has a repeated factor) but mobius(2)*mobius(6) = (-1)*1 = -1 -- a genuinely
+        //         INFORMATIVE negative case (0 != -1, not two trivial zeros), making the coprimality
+        //         hypothesis load-bearing rather than vacuously satisfied.
+        // Byte-identical on interp/KVM (native per the sweep), hand-verified against an independent Python
+        // re-implementation. Confirms mobius's classic values, that multiplicativity holds for coprime
+        // squarefree arguments, that it genuinely fails for a non-coprime pair, and that all three engines
+        // agree. This is the arithmetic-function reasoning an AI relies on for Dirichlet-convolution-style
+        // manipulations (mu is the Dirichlet inverse of the constant function 1). A non-sort lock certifying
+        // the Mobius function's multiplicativity.
+        let src = r#"fun mobFactorGo(n: Int, p: Int, distinct: Int) -> Int {
+    if p * p > n {
+        if n > 1 { distinct + 1 } else { distinct }
+    } else {
+        if n % p == 0 {
+            let n2 = n / p
+            if n2 % p == 0 { 0 - 1000 } else { mobFactorGo(n2, p + 1, distinct + 1) }
+        } else {
+            mobFactorGo(n, p + 1, distinct)
+        }
+    }
+}
+fun mobius(n: Int) -> Int {
+    if n == 1 { 1 } else {
+        let d = mobFactorGo(n, 2, 0)
+        if d == 0 - 1000 { 0 } else { if d % 2 == 0 { 1 } else { 0 - 1 } }
+    }
+}
+fun gcdGo(a: Int, b: Int) -> Int { if b == 0 { a } else { gcdGo(b, a % b) } }
+fun probe() -> Str {
+    let m6 = mobius(6)
+    let m10 = mobius(10)
+    let m1 = mobius(2 * 3) == mobius(2) * mobius(3)
+    let m2 = mobius(2 * 5) == mobius(2) * mobius(5)
+    let m3 = mobius(3 * 5) == mobius(3) * mobius(5)
+    let m4 = mobius(6 * 5) == mobius(6) * mobius(5)
+    let n1 = gcdGo(2, 6) == 2
+    let bad = mobius(2 * 6) == mobius(2) * mobius(6)
+    "m6={m6}|m10={m10}|m1={m1}|m2={m2}|m3={m3}|m4={m4}|n1={n1}|bad={bad}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "m6=1|m10=1|m1=true|m2=true|m3=true|m4=true|n1=true|bad=false"
+        );
+    }
+
+    #[test]
     fn diff_mobius_divisor_sum_identity() {
         // A certification lock (it499): the MOBIUS FUNCTION's DIVISOR-SUM IDENTITY -- for every positive integer n,
         // the sum of mu(d) over all divisors d of n equals 1 if n = 1 and 0 otherwise (sum_{d|n} mu(d) = [n=1]).
