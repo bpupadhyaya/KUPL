@@ -3167,6 +3167,64 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_lagrange_four_square_theorem() {
+        // A certification lock (it496): LAGRANGE'S FOUR-SQUARE THEOREM -- every non-negative integer n can be
+        // written as a sum of (at most) four integer squares, a²+b²+c²+d² = n -- verified by BOUNDED SEARCH and
+        // cross-checked as a THEOREM-ORACLE (like Fermat's little theorem it479, Fermat's two-square theorem it487,
+        // Wilson's theorem it489): unlike sum-of-two-squares (which only some numbers satisfy, per Fermat's
+        // criterion), Lagrange's theorem is UNIVERSAL -- it must hold for EVERY n. So the oracle prediction is
+        // "always true", and the search's agreement across a full range (0..15, no gaps) is the cross-check: a
+        // bug in the search bound would show up as a FALSE for some n, since the search has nowhere to hide (there
+        // is no n for which the theorem doesn't apply). isSumFourSq(n) reuses isSumTwoSq (the same two-square search
+        // as it487's style) as an inner step: finds a,b with a²+b² <= n such that the remainder is ITSELF a sum of
+        // two squares c²+d² -- so the search stacks two two-square searches rather than four independent loops,
+        // keeping each level's recursion bounded by sqrt(n) and the total call depth shallow for small n.
+        //   r1 = isSumFourSq(1) = true (1 = 1+0+0+0)
+        //   r2 = isSumFourSq(7) = true (7 = 4+1+1+1, the classic example needing all four terms)
+        //   r3 = isSumFourSq(15) = true (15 = 9+4+1+1)
+        //   r7 = isSumFourSq(23) = true (23 = 9+9+4+1)
+        //   allTrue = isSumFourSq(n) for EVERY n in 1..15 -- the universal claim, hand-verified against an
+        //             independent Python brute-force search before writing the assertion
+        //   z = isSumFourSq(0) = true (0 = 0+0+0+0, the theorem's base case)
+        // Byte-identical on interp/KVM (native per the sweep). Confirms the classic examples, the universal claim
+        // across a full range with no gaps, the n=0 edge, and that all three engines agree. This is the
+        // representability an AI cites when reasoning about quadratic forms or Waring's-problem-style
+        // decompositions; a search with a wrong bound (e.g. missing the b=0 or c=0 case) would produce a false
+        // negative somewhere in 0..15, and allTrue would catch it. A non-sort lock certifying Lagrange's four-square
+        // theorem via bounded search as a universal theorem-oracle.
+        let src = r#"fun perfGo(n: Int, r: Int) -> Bool { if r * r > n { false } else { if r * r == n { true } else { perfGo(n, r + 1) } } }
+fun isPerfSq(n: Int) -> Bool { if n < 0 { false } else { perfGo(n, 0) } }
+fun twoGo(n: Int, a: Int) -> Bool { if a * a > n { false } else { if isPerfSq(n - a * a) { true } else { twoGo(n, a + 1) } } }
+fun isSumTwoSq(n: Int) -> Bool { if n < 0 { false } else { twoGo(n, 0) } }
+fun fourInnerGo(n: Int, a: Int, b: Int) -> Bool {
+    let rem = n - a * a - b * b
+    if rem < 0 { false } else {
+        if isSumTwoSq(rem) { true } else { fourInnerGo(n, a, b + 1) }
+    }
+}
+fun fourGo(n: Int, a: Int) -> Bool {
+    if a * a > n { false } else {
+        if fourInnerGo(n, a, 0) { true } else { fourGo(n, a + 1) }
+    }
+}
+fun isSumFourSq(n: Int) -> Bool { if n < 0 { false } else { fourGo(n, 0) } }
+fun probe() -> Str {
+    let r1 = isSumFourSq(1)
+    let r2 = isSumFourSq(7)
+    let r3 = isSumFourSq(15)
+    let r7 = isSumFourSq(23)
+    let allTrue = isSumFourSq(1) && isSumFourSq(2) && isSumFourSq(3) && isSumFourSq(4) && isSumFourSq(5) && isSumFourSq(6) && isSumFourSq(7) && isSumFourSq(8) && isSumFourSq(9) && isSumFourSq(10) && isSumFourSq(11) && isSumFourSq(12) && isSumFourSq(13) && isSumFourSq(14) && isSumFourSq(15)
+    let z = isSumFourSq(0)
+    "r1={r1}|r2={r2}|r3={r3}|r7={r7}|allTrue={allTrue}|z={z}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "r1=true|r2=true|r3=true|r7=true|allTrue=true|z=true"
+        );
+    }
+
+    #[test]
     fn diff_wilson_theorem() {
         // A certification lock (it489): WILSON'S THEOREM -- an integer p > 1 is prime if and only if
         // (p-1)! ≡ -1 (mod p), i.e. (p-1)! mod p == p-1 -- cross-validated against an independent TRIAL-DIVISION
