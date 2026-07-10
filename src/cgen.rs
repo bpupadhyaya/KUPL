@@ -5,14 +5,18 @@
 //! sharing display/operator semantics with the interpreter and KVM (asserted
 //! by differential tests). v0 memory model: arena-style — allocations are not
 //! freed (fine for batch programs; the per-component GC arrives with KIR).
-//! Components are not compiled natively yet — use `kupl bundle` for apps.
+//! The full component model compiles natively — state, children, wires,
+//! emit, timers, supervision, and expose calls (a C mirror of the KVM,
+//! byte-identical to `kupl run`), as does `ai fun` (mock path only; a
+//! real provider's network call defers to `kupl bundle`).
 
 use std::fmt::Write as _;
 
 use crate::bytecode::*;
 use crate::value::Value;
 
-/// How a native binary starts: a plain `fun main`, or a single-component `app`.
+/// How a native binary starts: a plain `fun main`, or an `app` (any number
+/// of components/children — the component model compiles natively in full).
 enum Entry {
     Main(usize),
     App(usize),
@@ -24,11 +28,10 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     let entry = if let Some(&main_idx) = module.funs.get("main") {
         Entry::Main(main_idx as usize)
     } else if let Some(app_idx) = module.components.iter().position(|c| c.is_app) {
-        // slice 1: single-component apps only — children/wires/emit/timers defer
         check_native_component(module, app_idx)?;
         Entry::App(app_idx)
     } else {
-        return Err("`kupl native` needs a `fun main()` or a single-component `app` (multi-component apps: use `kupl bundle`)".into());
+        return Err("`kupl native` needs a `fun main()` or an `app`".into());
     };
 
     let mut out = String::new();
@@ -4771,6 +4774,28 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// The "no entry point" error message doesn't claim multi-component apps
+    /// need `kupl bundle` -- bug-hunt batch 152 (PR-it544): the message used
+    /// to say `"...or a single-component `app` (multi-component apps: use
+    /// `kupl bundle`)"`, but that's been misleading since it39 -- the full
+    /// component model (state/children/wires/emit/timers/supervision/expose)
+    /// has compiled natively for a long time (see `native_multi_component_wires`
+    /// and the it537-543 native-pair-testing tests), so there is NO
+    /// component-count restriction to warn about. The doc comment directly on
+    /// `check_native_component` already knew this ("nothing to defer... kept
+    /// as the hook for any future construct"); the module-level doc comment,
+    /// the `Entry` enum's doc, and THIS error message had simply never been
+    /// updated to match -- an internal inconsistency within the same file,
+    /// not a functional bug (multi-component apps always compiled fine).
+    #[test]
+    fn native_missing_entry_point_message_does_not_claim_a_component_limit() {
+        let src = "contract C {\n    expose fun get() -> Int\n}\ncomponent M fulfills C {\n    intent \"m\"\n    expose fun get() -> Int {\n        1\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles (no entry point needed to type-check)");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let err = super::emit_c(&module).expect_err("no fun main or app -> emit_c must fail");
+        assert_eq!(err, "`kupl native` needs a `fun main()` or an `app`", "{err}");
     }
 
     /// A single-component app compiles to native and prints the same as the
