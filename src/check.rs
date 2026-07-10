@@ -701,11 +701,15 @@ impl Checker {
     fn check_fulfills(&mut self, c: &ComponentDecl) {
         for contract_name in &c.fulfills {
             let Some(contract) = self.checked.contracts.get(contract_name).cloned() else {
-                self.err(
-                    "K0261",
-                    format!("`{}` fulfills unknown contract `{contract_name}`", c.name),
-                    c.span,
-                );
+                // Did-you-mean, matching the same courtesy already given to unknown
+                // free-fns/methods/fields/types/ctors/child-components (K0249/K0100/
+                // K0206/K0247/K0254/K0208) -- a typo'd `fulfills` contract name got
+                // left bare (PR-it512).
+                let mut msg = format!("`{}` fulfills unknown contract `{contract_name}`", c.name);
+                if let Some(s) = suggest(contract_name, self.checked.contracts.keys().map(String::as_str)) {
+                    msg.push_str(&format!(" — did you mean `{s}`?"));
+                }
+                self.err("K0261", msg, c.span);
                 continue;
             };
             let comp_sig = self.checked.components.get(&c.name).cloned().unwrap_or_default();
@@ -3117,6 +3121,26 @@ mod generic_tests {
                   component Formal fulfills Greeter {\n    intent \"f\"\n    expose fun greet(name: Str) -> Str { \"hi {name}\" }\n}\n";
         let codes: Vec<_> = errors(ok).into_iter().map(|d| d.code).collect();
         assert!(!codes.iter().any(|c| c.starts_with("K026")), "conforming component must not error: {codes:?}");
+    }
+
+    #[test]
+    fn k0261_unknown_contract_suggests_closest_name() {
+        // Error-msg round 37 (PR-it512): a typo'd `fulfills` contract name in `component
+        // MemStore fulfills Stor { ... }` was flat "fulfills unknown contract `Stor`" -- named
+        // the miss, not the fix. Extends did-you-mean already on free-fns/methods/fields/types/
+        // ctors/child-components (K0249/K0100/K0206/K0247/K0254/K0208) to K0261.
+        let typo = errors("contract Store {\n    intent \"s\"\n    expose fun get(k: Str) -> Int\n}\n\
+                           component MemStore fulfills Stor {\n    intent \"m\"\n    expose fun get(k: Str) -> Int {\n        0\n    }\n}\n");
+        assert!(
+            typo.iter().any(|d| d.code == "K0261" && d.message.contains("unknown contract `Stor`") && d.message.contains("did you mean `Store`?")),
+            "typo'd contract name should suggest the close match: {typo:?}"
+        );
+        // Nothing close -> no suggestion (no false-positive did-you-mean).
+        let none = errors("component MemStore fulfills Zqxwbly {\n    intent \"m\"\n}\n");
+        assert!(
+            none.iter().any(|d| d.code == "K0261" && !d.message.contains("did you mean")),
+            "unrelated name should stay bare: {none:?}"
+        );
     }
 
     #[test]
