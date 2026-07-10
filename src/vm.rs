@@ -16145,6 +16145,47 @@ fun probe() -> Str {\n    m_assist5(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_ai_fun_tool_panic_inside_wire_handler_triggers_supervised_restart() {
+        // Bug-hunt batch 138: a genuinely fresh 3-way feature intersection never tested
+        // before -- an ai-fun TOOL panic, propagating up through a WIRE-triggered component
+        // HANDLER, under `supervise ... restart on_failure`. Does supervision correctly catch
+        // an ai-fun tool-loop panic (as opposed to an "ordinary" arithmetic/builtin panic,
+        // which is all prior supervise tests exercise -- see examples/supervise.kupl's
+        // division-by-zero) and restart the component, or does something about the ai-fun call
+        // path bypass the restart_on_failure interception? Confirmed via a real CLI run FIRST
+        // (both engines exit 0 -- the panic is fully caught, not a crash) before locking as a
+        // Rust-API-level test: Worker's `on trigger` handler calls a tool-using ai fun whose
+        // tool divides by zero; Driver emits `go` on start, wired to Worker's `trigger`, so the
+        // panic happens INSIDE drain()'s wire-dispatch loop, exactly where restart_on_failure
+        // is checked. With supervision, start_all() must return Ok(()), not propagate the panic.
+        let src = "fun tool_x6() -> Int {\n    100 / 0\n}\n\
+ai fun helper6() -> Str tools [tool_x6] {\n    intent \"h\"\n}\n\
+component Worker6 {\n    intent \"w\"\n    in trigger: Int\n    out result: Str\n\
+    on trigger(n) {\n        emit result(helper6())\n    }\n}\n\
+component Driver6 {\n    intent \"d\"\n    out go: Int\n\
+    on start {\n        emit go(1)\n    }\n}\n\
+component Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driver6()\n\
+    wire driver.go -> worker.trigger\n    supervise worker restart on_failure\n}\n";
+        std::env::set_var("KUPL_AI_MOCK_HELPER6", "[{\"tool\":\"tool_x6\",\"input\":{}},{\"final\":\"done\"}]");
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        match interp.instantiate("Main6", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(_)) => {}
+            _ => panic!("interp instantiate failed"),
+        }
+        assert!(interp.start_all().is_ok(), "supervision must catch the ai-fun tool panic, not propagate it");
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        assert!(vm.run_app("Main6").is_ok(), "KVM supervision must catch the ai-fun tool panic too");
+    }
+
+    #[test]
     fn diff_ai_fun_tool_failure_messages() {
         // Bug-hunt batch 136: ai-fun tool-loop FAILURE paths (as opposed to the happy-path
         // already covered by diff_ai_fun_tool_loop above) were never probed. Each of these
