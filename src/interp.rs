@@ -1475,17 +1475,17 @@ impl Interp {
             return Err(Self::panic_flow("stack overflow (10000 frames)".to_string(), span));
         }
         self.call_depth += 1;
-        let result = self.call_fun_body(decl, args, base_env, span);
+        let result = self.call_fun_body(decl, args, base_env);
         self.call_depth -= 1;
         result
     }
 
-    fn call_fun_body(&mut self, decl: &FunDecl, args: Vec<Value>, base_env: &Env, span: Span) -> EvalResult {
+    fn call_fun_body(&mut self, decl: &FunDecl, args: Vec<Value>, base_env: &Env) -> EvalResult {
         if let Some(ai) = &decl.ai {
             let Some(meta) = self.db.ai_funs.get(&decl.name).cloned() else {
                 return Err(Self::panic_flow(
                     format!("ai fun `{}` has no runtime signature", decl.name),
-                    span,
+                    decl.span,
                 ));
             };
             // resolve the interpolated intent in a scope holding the arguments
@@ -1494,8 +1494,19 @@ impl Interp {
                 scope.define(&p.name, a.clone());
             }
             let intent = self.eval(&ai.intent_expr, &scope)?.to_string();
+            // SOUNDNESS FIX (PR-it522): a tool-loop/provider failure inside `ai_call` (unknown
+            // tool, missing tool argument, tool-loop round limit exceeded, the underlying tool
+            // itself panicking, ...) used to attribute the panic to the CALL SITE's span --
+            // but the KVM's equivalent path (Op::CallAi, compiled with the ai fun's OWN
+            // declaration span baked in, since the "call" the model makes has no KUPL-syntax
+            // call-site of its own) always attributed it to the ai fun's DECLARATION. Same
+            // panic MESSAGE on both engines (the part differential() checks), but a DIFFERENT
+            // reported location -- confirmed via a real multi-scenario probe (unknown tool,
+            // missing arg, round-limit exceeded, tool-internal panic) before fixing. Use the
+            // declaration span here too, matching the KVM -- byte-identical full CLI output,
+            // not just the message.
             return crate::ai::ai_call(&meta, &intent, &args, self)
-                .map_err(|m| Self::panic_flow(m, span));
+                .map_err(|m| Self::panic_flow(m, decl.span));
         }
         let scope = base_env.child();
         for (p, a) in decl.params.iter().zip(args) {

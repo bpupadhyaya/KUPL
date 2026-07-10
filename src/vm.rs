@@ -16109,6 +16109,76 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
         assert_eq!(differential(src), "done");
     }
 
+    #[test]
+    fn diff_ai_fun_tool_failure_messages() {
+        // Bug-hunt batch 136: ai-fun tool-loop FAILURE paths (as opposed to the happy-path
+        // already covered by diff_ai_fun_tool_loop above) were never probed. Each of these
+        // confirms the panic MESSAGE is identical across engines -- the part `differential()`
+        // (and this campaign's established convention) has always checked; PR-it522 below
+        // additionally fixes a SPAN divergence found while probing these same scenarios.
+        let src = "fun diff_add2(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+fun diff_div2(a: Int, b: Int) -> Int {\n    a / b\n}\n\
+ai fun diff_assist2(q: Str) -> Str tools [diff_add2, diff_div2] {\n    intent \"Assist.\"\n}\n\
+fun probe() -> Str {\n    diff_assist2(\"x\")\n}\n";
+
+        std::env::set_var("KUPL_AI_MOCK_DIFF_ASSIST2", "[{\"tool\":\"nope\",\"input\":{}},{\"final\":\"done\"}]");
+        assert_eq!(differential(src), "panic: ai `diff_assist2`: model called unknown tool `nope`");
+
+        std::env::set_var("KUPL_AI_MOCK_DIFF_ASSIST2", "[{\"tool\":\"diff_add2\",\"input\":{\"a\":1}},{\"final\":\"done\"}]");
+        assert_eq!(differential(src), "panic: ai `diff_assist2`: tool `diff_add2` is missing argument `b`");
+
+        std::env::set_var("KUPL_AI_MOCK_DIFF_ASSIST2", "[{\"tool\":\"diff_div2\",\"input\":{\"a\":1,\"b\":0}},{\"final\":\"done\"}]");
+        assert_eq!(differential(src), "panic: ai `diff_assist2`: division by zero");
+
+        // 8 rounds is MAX_TOOL_ROUNDS -- a 9th tool round without a final answer must panic.
+        let rounds: Vec<String> = (0..9).map(|_| "{\"tool\":\"diff_add2\",\"input\":{\"a\":1,\"b\":2}}".to_string()).collect();
+        std::env::set_var("KUPL_AI_MOCK_DIFF_ASSIST2", format!("[{}]", rounds.join(",")));
+        assert_eq!(differential(src), "panic: ai `diff_assist2`: tool loop exceeded 8 rounds without a final answer");
+    }
+
+    #[test]
+    fn ai_fun_tool_failure_panic_span_matches_across_engines() {
+        // A REAL soundness fix (PR-it522), found while probing tool-loop failures above: the
+        // panic MESSAGE for an ai-fun tool-loop failure was always identical across engines
+        // (confirmed by diff_ai_fun_tool_failure_messages), but the reported SPAN was not --
+        // `differential()` deliberately discards spans (`Err(Flow::Panic { msg, .. })`), so
+        // this divergence was invisible to every prior differential test. interp.rs's
+        // call_fun_body attributed the panic to the CALL SITE (`decl.span` -> `span`, the
+        // original call expression's span, e.g. `diff_assist2("x")` in main); the KVM's
+        // Op::CallAi is compiled with the ai fun's OWN DECLARATION span baked in (there's no
+        // KUPL-syntax call site for the "call" the model itself makes to a tool), so it always
+        // attributed the SAME panic to the ai fun's declaration. Confirmed via a real CLI diff
+        // (`kupl run` vs `kupl run --vm`) before fixing: same message, genuinely different
+        // `-->` location and underline. Fixed by using `decl.span` on the interp side too.
+        std::env::set_var("KUPL_AI_MOCK_DIFF_ASSIST3", "[{\"tool\":\"nope3\",\"input\":{}},{\"final\":\"done\"}]");
+        let src = "fun diff_add3(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+ai fun diff_assist3(q: Str) -> Str tools [diff_add3] {\n    intent \"Assist.\"\n}\n\
+fun probe() -> Str {\n    diff_assist3(\"x\")\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let f = Value::Fun(std::rc::Rc::new("probe".to_string()));
+        let i_span = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Err(Flow::Panic { span, .. }) => span,
+            other => panic!("expected a panic, got {other:?}", other = other.is_ok()),
+        };
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let v_span = match vm.call_named("probe", vec![]) {
+            Err(e) => e.span,
+            Ok(_) => panic!("expected a panic"),
+        };
+
+        assert_eq!(i_span, v_span, "interp and KVM must attribute the same tool-loop panic to the same span");
+        // the shared span is the ai fun's OWN declaration, not the call site inside probe().
+        let decl_line = src.lines().position(|l| l.contains("ai fun diff_assist3")).unwrap();
+        let (l0, _) = crate::diag::line_col(src, i_span.start);
+        assert_eq!(l0 - 1, decl_line, "the panic must point at the ai fun's declaration, not the call site");
+    }
+
     // helper: source that builds List[Int] = [0, 1, …, n-1] via a loop
     #[cfg(test)]
     const MK: &str = "fun mk(n: Int) -> List[Int] {\n    \
