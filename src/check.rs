@@ -933,7 +933,18 @@ impl Checker {
                         self.err("K0210", format!("`on {kw}` (a timer) takes no parameter"), h.span);
                     }
                     if *ms <= 0 {
-                        self.err("K0266", "timer duration must be positive", h.span);
+                        // Name the trigger keyword and the actual (always-zero -- a negative
+                        // duration is already rejected earlier by parse_duration, which only
+                        // accepts a bare Int token, so `-5ms` fails to parse as a duration at
+                        // all) duration, and say WHY it's rejected: a zero-duration timer would
+                        // become due again the instant it fires, an infinite tight loop every
+                        // time the clock advances (PR-it521).
+                        let kw = if matches!(h.trigger, Trigger::Every(_)) { "every" } else { "after" };
+                        self.err(
+                            "K0266",
+                            format!("`on {kw} {ms}ms` — timer duration must be positive (a zero-duration timer would refire on every tick, an infinite loop)"),
+                            h.span,
+                        );
                     }
                 }
                 Trigger::Port(p) => {
@@ -3200,6 +3211,28 @@ mod generic_tests {
             crate::run::compile("fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() {\n    print(add(a: 1, b: 2))\n}\n").is_ok(),
             "direct named call must compile cleanly through the real pipeline (resolve_call_args rewrites it to positional form)"
         );
+    }
+
+    #[test]
+    fn k0266_names_the_trigger_keyword_and_the_duration() {
+        // Error-msg round 39 (PR-it521): `on every 0ms` / `on after 0s` was flat "timer
+        // duration must be positive" -- didn't say WHICH trigger keyword or WHAT duration was
+        // rejected, and didn't explain WHY. A NEGATIVE duration can never actually reach this
+        // check: `parse_duration` only accepts a bare Int token as the FIRST token, so `on
+        // every -5ms` fails to parse as a duration at all (K0120) before this check ever runs
+        // -- meaning K0266 is, in practice, ALWAYS about a ZERO duration specifically.
+        let every0 = errors("component T {\n    intent \"t\"\n    on every 0ms {\n        print(\"x\")\n    }\n}\n");
+        assert!(
+            every0.iter().any(|d| d.code == "K0266" && d.message.contains("`on every 0ms`") && d.message.contains("infinite loop")),
+            "K0266 should name the `every` keyword, the 0ms duration, and explain why: {every0:?}"
+        );
+        let after0 = errors("component T {\n    intent \"t\"\n    on after 0s {\n        print(\"x\")\n    }\n}\n");
+        assert!(
+            after0.iter().any(|d| d.code == "K0266" && d.message.contains("`on after 0ms`")),
+            "K0266 should name the `after` keyword (0s converts to 0ms internally): {after0:?}"
+        );
+        // Positive durations for both keywords still type-check cleanly (no behavior change).
+        assert!(errors("component T {\n    intent \"t\"\n    on every 5ms {\n        print(\"x\")\n    }\n    on after 1s {\n        print(\"y\")\n    }\n}\n").is_empty());
     }
 
     #[test]
