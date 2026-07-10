@@ -562,7 +562,21 @@ pub fn completions(text: &str) -> Vec<(String, u8, String)> {
                     out.push((v.name.clone(), 4, sig)); // 4 = Constructor
                 }
             }
-            Item::Component(c) => out.push((c.name.clone(), 7, format!("component {}", c.name))), // 7 = Class
+            Item::Component(c) => {
+                out.push((c.name.clone(), 7, format!("component {}", c.name))); // 7 = Class
+                // Component methods (exposed or private) and state fields used to be
+                // completely invisible to completion -- only the component's OWN name
+                // was listed, the same gap class fixed in item_signature/item_definition
+                // for hover/go-to-definition (PR-it513); extend the same nested search
+                // here so typing `n` or `greet` inside a component body autocompletes
+                // (PR-it514).
+                for f in c.exposes.iter().chain(&c.funs) {
+                    out.push((f.name.clone(), 3, fun_sig_str(f))); // 3 = Function
+                }
+                for s in &c.state {
+                    out.push((s.name.clone(), 6, format!("state {}", s.name))); // 6 = Variable
+                }
+            }
             Item::Contract(c) => out.push((c.name.clone(), 8, format!("contract {}", c.name))), // 8 = Interface
             _ => {}
         }
@@ -868,6 +882,34 @@ mod tests {
         let ch4 = src.lines().nth(comp_line).unwrap().find("Greeter").unwrap() + 1;
         let h_comp = resolve_hover(src, comp_line, ch4).expect("hover on component ctor call");
         assert!(h_comp.contains("component Greeter"), "{h_comp}");
+    }
+
+    #[test]
+    fn completions_include_component_methods_and_state() {
+        // The same gap class as it513's hover/go-to-definition fix, found by applying the
+        // same scratch-probe methodology to `completions`: component methods (exposed or
+        // private) and state fields were completely invisible to completion -- only the
+        // component's OWN name was listed, since `completions` matched `Item::Component`
+        // and pushed just the component name, never looking inside `c.exposes`/`c.funs`/
+        // `c.state`. Typing `n` or `greet` inside a component body (the most common place
+        // to type in a component-heavy KUPL program) got no completions for its own
+        // members. Fixed by extending the Component arm to also emit each exposed/private
+        // method (kind 3 = Function, reusing the shared fun_sig_str detail) and each state
+        // field (kind 6 = Variable) (PR-it514).
+        let src = "component Greeter {\n    intent \"g\"\n    state n: Int = 0\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\n";
+        let items = completions(src);
+        let labels: Vec<&str> = items.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert!(labels.contains(&"Greeter"), "the component's own name is still listed: {labels:?}");
+        assert!(labels.contains(&"greet"), "exposed method must be a completion candidate: {labels:?}");
+        assert!(labels.contains(&"helper"), "private method must be a completion candidate: {labels:?}");
+        assert!(labels.contains(&"n"), "state field must be a completion candidate: {labels:?}");
+        // the exposed method's completion carries its real signature as detail, like a
+        // top-level function does.
+        let greet = items.iter().find(|(l, _, _)| l == "greet").unwrap();
+        assert_eq!(greet.1, 3, "method completion kind must be Function (3)");
+        assert!(greet.2.contains("fun greet(name: Str) -> Str"), "{greet:?}");
+        let n = items.iter().find(|(l, _, _)| l == "n").unwrap();
+        assert_eq!(n.1, 6, "state field completion kind must be Variable (6)");
     }
 
     #[test]
