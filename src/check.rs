@@ -1167,7 +1167,13 @@ impl Checker {
                 let value_ty = self.infer_expr(value, ctx);
                 match &target.kind {
                     ExprKind::Ident(name) => match ctx.scopes.get(name) {
-                        None => self.err("K0220", format!("unknown variable `{name}`"), target.span),
+                        None => {
+                            let mut msg = format!("unknown variable `{name}`");
+                            if let Some(s) = suggest(name, ctx.scopes.names()) {
+                                msg.push_str(&format!(" — did you mean `{s}`?"));
+                            }
+                            self.err("K0220", msg, target.span);
+                        }
                         Some((ty, mutable)) => {
                             if !mutable {
                                 self.err(
@@ -3529,6 +3535,40 @@ mod generic_tests {
         // A correct wire reference still type-checks cleanly.
         let ok_src = "component Src {\n    intent \"s\"\n    out val: Int\n}\ncomponent Sink {\n    intent \"k\"\n    in val: Int\n}\ncomponent Main {\n    intent \"m\"\n    let producer = Src()\n    let consumer = Sink()\n    wire producer.val -> consumer.val\n}\n";
         assert!(errors(ok_src).is_empty());
+    }
+
+    #[test]
+    fn k0220_unknown_assignment_target_suggests_closest_name() {
+        // Error-msg round 41 (PR-it533): `countr = 5` (typo'd assignment target,
+        // distinct from K0240's unknown NAME in an expression/read position, which
+        // already got the full did-you-mean treatment) was flat "unknown variable
+        // `countr`" -- the exact same `ctx.scopes.names()` candidate set K0240
+        // already uses was sitting right there, just never threaded through this
+        // second unknown-variable site. `Scopes::names()` includes STATE FIELDS
+        // too (inserted into scope alongside locals when checking a component), so
+        // the fix covers `state n: Int = 0 ... on start { m = 5 }` as well, not
+        // just plain function-local `var`s.
+        let src = "fun main() {\n    var counter = 0\n    countr = 5\n}\n";
+        let typo = errors(src);
+        assert!(
+            typo.iter().any(|d| d.code == "K0220" && d.message.contains("unknown variable `countr`") && d.message.contains("did you mean `counter`?")),
+            "typo'd assignment target should suggest the close match: {typo:?}"
+        );
+        // Component STATE field candidates are included too.
+        let state_src = "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    on start {\n        m = 5\n    }\n}\n";
+        let state_typo = errors(state_src);
+        assert!(
+            state_typo.iter().any(|d| d.code == "K0220" && d.message.contains("unknown variable `m`") && d.message.contains("did you mean `n`?")),
+            "typo'd assignment to a state field should suggest the close match: {state_typo:?}"
+        );
+        // Nothing close -> no suggestion (no false-positive did-you-mean).
+        let none = errors("fun main() {\n    zqxwbly = 5\n}\n");
+        assert!(
+            none.iter().any(|d| d.code == "K0220" && !d.message.contains("did you mean")),
+            "unrelated name should stay bare: {none:?}"
+        );
+        // A correct assignment still type-checks cleanly.
+        assert!(errors("fun main() {\n    var counter = 0\n    counter = 5\n}\n").is_empty());
     }
 
     #[test]
