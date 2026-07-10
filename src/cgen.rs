@@ -1957,8 +1957,10 @@ static KValue k_query_build(KValue lst) {
 static KValue k_csv_parse(KValue s) {
     const char* in = k_as_str(s);
     long n = (long)strlen(in), i = 0;
-    KValue rows[4096]; int nrows = 0;
-    KValue row[4096]; int ncols = 0;
+    /* growable (PR-it558: were fixed 4096-slot stack arrays, silently dropping any
+       row or column past the 4096th -- the same bug class as it555-557). */
+    int rows_cap = 16; KValue* rows = (KValue*)k_alloc(sizeof(KValue) * rows_cap); int nrows = 0;
+    int row_cap = 16; KValue* row = (KValue*)k_alloc(sizeof(KValue) * row_cap); int ncols = 0;
     KBuf field = { 0, 0, 0 };
     while (i < n) {
         char c = in[i];
@@ -1973,22 +1975,29 @@ static KValue k_csv_parse(KValue s) {
                 } else { kb_putc(&field, q); i++; }
             }
         } else if (c == ',') {
-            if (ncols < 4096) row[ncols++] = k_str(kb_take(&field));
+            if (ncols == row_cap) { row_cap *= 2; row = (KValue*)realloc(row, sizeof(KValue) * row_cap); }
+            row[ncols++] = k_str(kb_take(&field));
             field = (KBuf){ 0, 0, 0 }; i++;
         } else if (c == '\n' || c == '\r') {
             if (c == '\r' && i + 1 < n && in[i + 1] == '\n') i++;
-            if (ncols < 4096) row[ncols++] = k_str(kb_take(&field));
+            if (ncols == row_cap) { row_cap *= 2; row = (KValue*)realloc(row, sizeof(KValue) * row_cap); }
+            row[ncols++] = k_str(kb_take(&field));
             field = (KBuf){ 0, 0, 0 };
-            if (nrows < 4096) rows[nrows++] = k_list(row, ncols);
+            if (nrows == rows_cap) { rows_cap *= 2; rows = (KValue*)realloc(rows, sizeof(KValue) * rows_cap); }
+            rows[nrows++] = k_list(row, ncols);
             ncols = 0; i++;
         } else { kb_putc(&field, c); i++; }
     }
     // flush the final field/record unless input ended exactly on a newline
     if (field.len > 0 || ncols > 0) {
-        if (ncols < 4096) row[ncols++] = k_str(kb_take(&field));
-        if (nrows < 4096) rows[nrows++] = k_list(row, ncols);
+        if (ncols == row_cap) { row_cap *= 2; row = (KValue*)realloc(row, sizeof(KValue) * row_cap); }
+        row[ncols++] = k_str(kb_take(&field));
+        if (nrows == rows_cap) { rows_cap *= 2; rows = (KValue*)realloc(rows, sizeof(KValue) * rows_cap); }
+        rows[nrows++] = k_list(row, ncols);
     }
-    return k_list(rows, nrows);
+    KValue r = k_list(rows, nrows);
+    free(row); free(rows);
+    return r;
 }
 static void k_csv_field(KBuf* b, const char* f) {
     int needs = 0;
@@ -2957,6 +2966,31 @@ static int k_utf8_len(unsigned char c) {
     if ((c & 0xF8) == 0xF0) return 4;
     return 1;
 }
+/* Decompose `s` into per-character UTF-8 byte spans (start pointer + length),
+   growing as needed -- shared by `.chars()`/`.reverse()`/`.slice()`, which used
+   to each independently cap at a fixed 4096/8192-element stack array and
+   silently drop everything past it (PR-it558, the same bug class as
+   it555-557's regex/query_parse fixes: a Str longer than the cap produced a
+   TRUNCATED result with no error). Caller must free() both output arrays.
+   Returns the character count. */
+static int k_str_char_spans(const char* s, const char*** out_starts, int** out_lens) {
+    int cap = 16, n = 0;
+    const char** starts = (const char**)k_alloc(sizeof(char*) * cap);
+    int* lens = (int*)k_alloc(sizeof(int) * cap);
+    const char* p = s;
+    while (*p) {
+        int len = k_utf8_len((unsigned char)*p);
+        if (n == cap) {
+            cap *= 2;
+            starts = (const char**)realloc((void*)starts, sizeof(char*) * cap);
+            lens = (int*)realloc(lens, sizeof(int) * cap);
+        }
+        starts[n] = p; lens[n] = len; n++;
+        p += len;
+    }
+    *out_starts = starts; *out_lens = lens;
+    return n;
+}
 static int64_t k_isqrt(uint64_t n) {
     if (n == 0) return 0;
     uint64_t x = (uint64_t)sqrt((double)n);
@@ -3775,20 +3809,26 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_int(n);
         }
         if (!strcmp(name, "flat_map")) {
-            KValue subs[4096]; int ns = 0; int64_t total = 0;
-            for (int64_t i = 0; i < l->len && ns < 4096; i++) {
+            /* the receiver's length is known upfront, so `subs` can be sized exactly --
+               no fixed cap (PR-it558: used to be `KValue subs[4096]`, silently skipping
+               calling the mapping function at all on any element past the 4096th). */
+            KValue* subs = (KValue*)k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+            int64_t total = 0;
+            for (int64_t i = 0; i < l->len; i++) {
                 KValue r = k_call(args[0], &l->items[i], 1);
                 if (r.tag != K_LIST) k_panic("`flat_map` function must return a List");
-                subs[ns++] = r; total += r.as.list->len;
+                subs[i] = r; total += r.as.list->len;
             }
             KValue* out = k_alloc(sizeof(KValue) * (total < 1 ? 1 : total));
             int64_t n = 0;
-            for (int i = 0; i < ns; i++) {
+            for (int64_t i = 0; i < l->len; i++) {
                 KList* inner = subs[i].as.list;
                 memcpy(out + n, inner->items, sizeof(KValue) * inner->len);
                 n += inner->len;
             }
-            return k_list(out, (int)total);
+            KValue r = k_list(out, (int)total);
+            free(subs);
+            return r;
         }
         if (!strcmp(name, "sort_by")) {
             int64_t n = l->len;
@@ -3949,20 +3989,17 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_str(b.buf ? b.buf : "");
         }
         if (!strcmp(name, "chars")) {
-            KValue tmp_items[4096];
-            int n = 0;
-            const char* p = s;
-            while (*p && n < 4096) {
-                int len = 1;
-                if ((*p & 0xF8) == 0xF0) len = 4;
-                else if ((*p & 0xF0) == 0xE0) len = 3;
-                else if ((*p & 0xE0) == 0xC0) len = 2;
-                char* c = k_alloc((size_t)len + 1);
-                memcpy(c, p, (size_t)len); c[len] = 0;
-                tmp_items[n++] = k_str(c);
-                p += len;
+            const char** starts; int* lens;
+            int n = k_str_char_spans(s, &starts, &lens);
+            KValue* items = (KValue*)k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+            for (int i = 0; i < n; i++) {
+                char* c = k_alloc((size_t)lens[i] + 1);
+                memcpy(c, starts[i], (size_t)lens[i]); c[lens[i]] = 0;
+                items[i] = k_str(c);
             }
-            return k_list(tmp_items, n);
+            KValue r = k_list(items, n);
+            free((void*)starts); free(lens); free(items);
+            return r;
         }
         if (!strcmp(name, "repeat")) {
             if (args[0].tag != K_INT || args[0].as.i < 0) k_panic("`repeat` needs a non-negative Int");
@@ -4018,13 +4055,14 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "split")) {
             const char* sep = args[0].as.s;
             size_t seplen = strlen(sep);
-            KValue parts[1024];
+            int cap = 16; KValue* parts = (KValue*)k_alloc(sizeof(KValue) * cap);
             int n = 0;
             const char* p = s;
             if (seplen == 0) k_panic("`split` needs a non-empty separator");
             for (;;) {
                 const char* q = strstr(p, sep);
-                if (!q || n >= 1023) {
+                if (n == cap) { cap *= 2; parts = (KValue*)realloc(parts, sizeof(KValue) * cap); }
+                if (!q) {
                     parts[n++] = k_str(p);
                     break;
                 }
@@ -4034,43 +4072,41 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 parts[n++] = k_str(piece);
                 p = q + seplen;
             }
-            return k_list(parts, n);
+            KValue r = k_list(parts, n);
+            free(parts);
+            return r;
         }
         if (!strcmp(name, "is_empty")) return k_bool(s[0] == 0);
         if (!strcmp(name, "reverse")) {
             /* collect UTF-8 char boundaries, then emit in reverse */
-            const char* starts[8192]; int lens[8192]; int nc = 0;
-            const char* p = s;
-            while (*p && nc < 8192) {
-                int len = 1;
-                if ((*p & 0xF8) == 0xF0) len = 4;
-                else if ((*p & 0xF0) == 0xE0) len = 3;
-                else if ((*p & 0xE0) == 0xC0) len = 2;
-                starts[nc] = p; lens[nc] = len; nc++;
-                p += len;
-            }
+            const char** starts; int* lens;
+            int nc = k_str_char_spans(s, &starts, &lens);
             size_t sl = strlen(s);
             char* out = k_alloc(sl + 1);
             size_t o = 0;
             for (int i = nc - 1; i >= 0; i--) { memcpy(out + o, starts[i], (size_t)lens[i]); o += lens[i]; }
             out[o] = 0;
+            free((void*)starts); free(lens);
             return k_str(out);
         }
         if (!strcmp(name, "lines")) {
-            KValue parts[4096]; int n = 0;
+            int cap = 16; KValue* parts = (KValue*)k_alloc(sizeof(KValue) * cap); int n = 0;
             const char* p = s;
-            while (*p && n < 4095) {
+            while (*p) {
                 const char* q = strchr(p, '\n');
                 const char* end = q ? q : p + strlen(p);
                 const char* z = end;
                 if (z > p && z[-1] == '\r') z--;              /* strip trailing CR */
                 char* piece = k_alloc((size_t)(z - p) + 1);
                 memcpy(piece, p, (size_t)(z - p)); piece[z - p] = 0;
+                if (n == cap) { cap *= 2; parts = (KValue*)realloc(parts, sizeof(KValue) * cap); }
                 parts[n++] = k_str(piece);
                 if (!q) break;
                 p = q + 1;
             }
-            return k_list(parts, n);
+            KValue r = k_list(parts, n);
+            free(parts);
+            return r;
         }
         if (!strcmp(name, "rfind")) {
             const char* sub = args[0].as.s;
@@ -4130,16 +4166,8 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         }
         if (!strcmp(name, "slice")) {
             int64_t a = args[0].as.i, b = args[1].as.i;
-            const char* starts[8192]; int lens[8192]; int nc = 0;
-            const char* p = s;
-            while (*p && nc < 8192) {
-                int len = 1;
-                if ((*p & 0xF8) == 0xF0) len = 4;
-                else if ((*p & 0xF0) == 0xE0) len = 3;
-                else if ((*p & 0xE0) == 0xC0) len = 2;
-                starts[nc] = p; lens[nc] = len; nc++;
-                p += len;
-            }
+            const char** starts; int* lens;
+            int nc = k_str_char_spans(s, &starts, &lens);
             int64_t lo = a < 0 ? 0 : (a > nc ? nc : a);
             int64_t amax = a < 0 ? 0 : a;
             int64_t hi = b < amax ? amax : (b > nc ? nc : b);
@@ -4148,6 +4176,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 char c[5]; memcpy(c, starts[i], (size_t)lens[i]); c[lens[i]] = 0;
                 kb_puts(&buf, c);
             }
+            free((void*)starts); free(lens);
             return k_str(buf.buf ? buf.buf : "");
         }
         if (!strcmp(name, "pad_left") || !strcmp(name, "pad_right")) {
@@ -8408,6 +8437,49 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
                    while i < 4200 {\n        if i > 0 { s = s + \"&\" }\n        s = s + \"k{i}=v{i}\"\n        i = i + 1\n    }\n    \
                    let m = query_parse(s)\n    print(\"{m.len()}\")\n}\n";
         assert_eq!(native_main_stdout(src, "queryparse4200").trim(), "4200");
+    }
+
+    /// A GREP SWEEP for the same fixed-buffer-truncation signature (bug-hunt batch
+    /// 166, PR-it558) found SIX more real instances beyond regex/query_parse
+    /// (it555-557): `Str.chars()` (was `KValue tmp_items[4096]`), `Str.reverse()`
+    /// and `Str.slice()` (both `const char* starts[8192]`), `Str.lines()` (`KValue
+    /// parts[4096]`), `Str.split()` (`KValue parts[1024]`, though this one at least
+    /// coalesced the overflow into a final piece rather than losing data outright),
+    /// and `List.flat_map()` (`KValue subs[4096]`, which is worse than the others --
+    /// it stopped CALLING the mapping function at all past the 4096th element, not
+    /// just truncating the collected output). Confirmed via real 3-engine CLI probes
+    /// first for every one of the six: e.g. `"a".repeat(9000).chars().len()` returned
+    /// `9000` on interp/vm, `4096` on native; `.reverse()`/`.slice()` on the same
+    /// 9000-char string returned `8192`; a 5000-line string's `.lines().len()`
+    /// returned `4095`; a 2001-piece `.split(",")` returned `1024`; a 5000-element
+    /// `.flat_map()` returned `4096`. Fixed with the same growable-heap-buffer idiom
+    /// as it556-557, PLUS a new shared `k_str_char_spans` helper (decomposes a Str
+    /// into UTF-8 character byte-spans, growably) that `.chars()`/`.reverse()`/
+    /// `.slice()` all now call instead of each independently re-implementing the
+    /// same fixed-size char-boundary scan -- eliminating the duplicated logic, not
+    /// just the duplicated bug.
+    #[test]
+    fn native_str_and_list_methods_are_not_truncated_by_fixed_buffers() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let s = \"a\".repeat(9000)\n    \
+                   print(\"{s.chars().len()}\")\n    \
+                   print(\"{s.reverse().len()}\")\n    \
+                   print(\"{s.slice(0, 9000).len()}\")\n    \
+                   let s2 = \"x\\n\".repeat(5000)\n    \
+                   print(\"{s2.lines().len()}\")\n    \
+                   let s3 = \"a,\".repeat(2000)\n    \
+                   print(\"{s3.split(\",\").len()}\")\n    \
+                   var big: List[Int] = []\n    \
+                   var i = 0\n    \
+                   while i < 5000 {\n        big = big.push(i)\n        i = i + 1\n    }\n    \
+                   print(\"{big.flat_map(fn x { [x] }).len()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "bufsweep558").trim(),
+            "9000\n9000\n9000\n5000\n2001\n5000"
+        );
     }
 
     /// The regex engine compiles to native, byte-identical to src/regex.rs —
