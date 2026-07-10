@@ -2410,7 +2410,22 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                     targs[p] = k_ai_from_json(t->pshapes[p], pj);
                     if (!k_ai_ok) return k_unit();
                 }
-                k_call(k_fun(t->fnid), targs, t->nparams);   /* side effects; result discarded (mock) */
+                /* Catch a REAL panic from the tool's own body and convert it to
+                   k_ai_err -- mirrors interp.rs/vm.rs's ToolHost::call_tool, which
+                   explicitly catches a tool's panic and turns it into Err(msg)
+                   rather than letting it propagate raw past k_ai_call's own
+                   "ai `name`: " wrapping (same setjmp/k_pad pattern as k_dispatch's
+                   supervision landing pad). */
+                jmp_buf tool_pad; jmp_buf* prev_pad = k_pad; k_pad = &tool_pad;
+                if (setjmp(tool_pad) == 0) {
+                    k_call(k_fun(t->fnid), targs, t->nparams);   /* side effects; result discarded (mock) */
+                    k_pad = prev_pad;
+                } else {
+                    k_pad = prev_pad;
+                    snprintf(k_ai_err, sizeof k_ai_err, "%s", k_panic_buf);
+                    k_ai_ok = 0;
+                    return k_unit();
+                }
             }
             if (!final_text) {
                 /* Match the interpreter/KVM: a script of >= 8 rounds is stopped by the
@@ -4767,6 +4782,60 @@ mod tests {
                    fun main() uses io {\n    print(\"{classify(\"x\")}\")\n}\n";
         let out = native_main_stdout_env(src, "aifun", &[("KUPL_AI_MOCK_CLASSIFY", "42")]);
         assert_eq!(out, "42\n");
+    }
+
+    /// A REAL BUG found+fixed (bug-hunt batch 147, PR-it539): an ai-fun TOOL's
+    /// own panic, under `supervise ... restart on_failure`, produced a
+    /// DIFFERENT message on native than on interp/KVM. `k_ai_tool_call`'s tool
+    /// invocation (`k_call(...)`) let a real panic from the tool's body
+    /// propagate straight past `k_ai_call`'s own "ai `name`: " wrapping to the
+    /// OUTER supervision landing pad, unlike interp.rs/vm.rs's `ToolHost::
+    /// call_tool`, which explicitly catches the tool's panic and converts it
+    /// to `Err(msg)` first. Confirmed via a real CLI probe first: `kupl run`/
+    /// `kupl run --vm` printed `[supervise] Worker6 restarted after panic: ai
+    /// \`helper6\`: division by zero`; native printed the bare `division by
+    /// zero`, missing the "ai `helper6`: " prefix entirely. Fixed by wrapping
+    /// the tool call in its OWN setjmp/k_pad pad (the same pattern
+    /// `k_dispatch` already uses for supervision), catching the panic and
+    /// feeding it through `k_ai_err` before `k_ai_call` builds its wrapped
+    /// message, instead of letting it reach the outer pad unwrapped.
+    #[test]
+    fn native_ai_fun_tool_panic_message_matches_interp_under_supervise() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun tool_x6() -> Int {\n    100 / 0\n}\n\
+ai fun helper6() -> Str tools [tool_x6] {\n    intent \"h\"\n}\n\
+component Worker6 {\n    intent \"w\"\n    in trigger: Int\n    out result: Str\n\
+    on trigger(n) {\n        emit result(helper6())\n    }\n}\n\
+component Driver6 {\n    intent \"d\"\n    out go: Int\n    on start {\n        emit go(1)\n    }\n}\n\
+app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driver6()\n\
+    wire driver.go -> worker.trigger\n    supervise worker restart on_failure\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aisup-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_HELPER6", "[{\"tool\":\"tool_x6\",\"input\":{}},{\"final\":\"done\"}]")
+            .output()
+            .expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("[supervise] Worker6 restarted after panic: ai `helper6`: division by zero"),
+            "native must wrap the tool's panic with the SAME \"ai `name`: \" prefix as interp/KVM: {stderr:?}"
+        );
+        assert!(out.status.success(), "supervision must catch the tool panic, not exit non-zero: {out:?}");
     }
 
     /// A multi-component app (children + wires + emit) compiles to native and
