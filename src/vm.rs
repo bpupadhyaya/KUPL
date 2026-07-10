@@ -17385,6 +17385,69 @@ component Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counte
     }
 
     #[test]
+    fn diff_supervised_restart_resurrects_an_already_fired_one_shot_timer() {
+        // Bug-hunt batch 162 (PR-it554): a DIFFERENT combination from
+        // diff_supervised_restart_does_not_double_delay_timers above -- that test's panic
+        // comes from the TIMER's own handler on a RECURRING `on every`; this one's panic
+        // comes from a SEPARATE WIRE-triggered handler, and the timer in play is a ONE-SHOT
+        // `on after` that has ALREADY fired (and deactivated) before the first restart. Is
+        // this intentional reference design or a bug? Confirmed by reading interp.rs's own
+        // `restart` (interp.rs:459): it unconditionally calls `arm_timers`, which rebuilds
+        // EVERY timer on the instance from scratch (`active: true`) regardless of whether a
+        // one-shot had already fired -- this IS the interpreter's documented reference
+        // semantics (restart = full fresh re-instantiation of state AND timers), not an
+        // oversight. So the one-shot timer correctly fires AGAIN after each restart. Locked
+        // here (not previously tested: every existing supervised-restart-timer test used
+        // ONLY a recurring `on every` whose own handler panics) so this intentional
+        // resurrection behavior can't silently regress on either engine, and confirmed
+        // byte-identical against native in the companion cgen.rs test.
+        let src = "component Combo {\n    intent \"x\"\n    in tick: Int\n    out fired: Int\n    state n: Int = 0\n\
+    on after 1ms {\n        n = n + 1\n        emit fired(n)\n    }\n\
+    on tick(v) {\n        panic(\"boom\")\n    }\n}\n\
+component Driver {\n    intent \"x\"\n    out pulse: Int\n\
+    on after 5ms { emit pulse(1) }\n    on after 10ms { emit pulse(2) }\n    on after 15ms { emit pulse(3) }\n}\n\
+component Accumulator {\n    intent \"x\"\n    in tick: Int\n    state count: Int = 0\n\
+    on tick(v) {\n        count = count + 1\n    }\n    expose fun get() -> Int {\n        count\n    }\n}\n\
+component Main {\n    intent \"x\"\n    let combo = Combo()\n    let driver = Driver()\n    let acc = Accumulator()\n\
+    wire driver.pulse -> combo.tick\n    wire combo.fired -> acc.tick\n    supervise combo restart on_failure\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        match it.instantiate("Main", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(_)) => {}
+            _ => panic!("interp instantiate failed"),
+        }
+        it.start_all().ok();
+        assert!(it.advance(20).is_ok(), "advance must survive repeated supervised restarts");
+        let acc_id = it.instances.iter().position(|i| i.comp.name == "Accumulator").expect("Accumulator instance");
+        let f = Value::Bound(acc_id, std::rc::Rc::new("get".to_string()));
+        let i_count = match it.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v.to_string(),
+            Err(_) => panic!("get() call failed"),
+        };
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let idx = *module.component_names.get("Main").expect("Main in module");
+        vm.instantiate(idx, Vec::new()).expect("kvm instantiate");
+        for id in 0..vm.instances.len() {
+            vm.run_lifecycle(id, "@start").expect("kvm lifecycle");
+            vm.arm_timers(id);
+        }
+        vm.drain().expect("kvm drain");
+        vm.advance(20).expect("kvm advance must survive repeated supervised restarts");
+        let vacc_id = vm.instances.iter().position(|i| module.components[i.comp as usize].name == "Accumulator").expect("Accumulator instance");
+        let v_count = vm.call_expose(vacc_id, "get", vec![]).unwrap().to_string();
+
+        assert_eq!(i_count, v_count, "interpreter and KVM disagree on one-shot-resurrection count");
+        // fires once initially (t=1ms), then once after each of the 3 wire-triggered
+        // restarts (t=5,10,15ms) -- 4 total.
+        assert_eq!(i_count, "4");
+    }
+
+    #[test]
     fn diff_par_branch_state_mutation_commits_sequentially_then_restart_resets() {
         // Runtime soundness-symmetry (PR-it527): earlier campaign notes assumed
         // `emit`/state-mutation could not appear inside `par` branches at all ("DEAD

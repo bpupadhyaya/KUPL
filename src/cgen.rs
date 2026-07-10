@@ -8076,6 +8076,60 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         assert_eq!(out.lines().count(), 100, "{out:?}");
     }
 
+    /// Native ONE-SHOT `on after` timers (bug-hunt batch 162, PR-it554): had ZERO native
+    /// test coverage before this (grepped cgen.rs's test module for "on after" -- no hits;
+    /// every prior native timer test used only recurring `on every`). Two combinations
+    /// checked: (1) a one-shot `on after` interleaved with a recurring `on every` on the
+    /// SAME component -- exercises `k_advance`'s tie-break priority scan (cgen.rs) for the
+    /// `every`-flag branch that decides recurring-vs-deactivate, never exercised with a
+    /// one-shot in the mix before. (2) a one-shot timer + a WIRE-triggered panic under
+    /// `supervise ... restart on_failure` on the SAME component -- confirmed via a real
+    /// 3-engine CLI probe that a supervised restart intentionally RE-ARMS every timer on
+    /// the instance, including an already-fired one-shot (interp.rs's `restart` calls
+    /// `arm_timers` unconditionally at interp.rs:459, its own reference semantics) -- so the
+    /// one-shot correctly fires AGAIN after each restart on interp/vm, and native must match
+    /// this exactly rather than (incorrectly) leaving it consumed. Both CLEAN, byte-identical
+    /// stdout across all three engines.
+    #[test]
+    fn native_one_shot_after_timer_bare_and_under_supervised_restart() {
+        if !cc_available() {
+            return;
+        }
+        let bare_src = "app A {\n    intent \"x\"\n    state n: Int = 0\n    \
+                        on after 5ms {\n        n = n + 1\n        print(\"fired {n}\")\n    }\n    \
+                        on every 3ms {\n        n = n + 1\n        print(\"tick {n}\")\n    }\n}\n";
+        let out = native_stdout(bare_src, "onafter1");
+        assert!(out.starts_with("tick 1\nfired 2\ntick 3\n"), "head: {out:?}");
+        assert_eq!(out.lines().count(), 100, "{out:?}");
+        let restart_src = "component Combo {\n    intent \"x\"\n    in tick: Int\n    out fired: Int\n    state n: Int = 0\n    \
+                           on after 1ms {\n        n = n + 1\n        emit fired(n)\n    }\n    \
+                           on tick(v) {\n        panic(\"boom\")\n    }\n}\n\
+                           component Driver {\n    intent \"x\"\n    out pulse: Int\n    \
+                           on after 5ms { emit pulse(1) }\n    on after 10ms { emit pulse(2) }\n    on after 15ms { emit pulse(3) }\n}\n\
+                           app Main {\n    intent \"x\"\n    let combo = Combo()\n    let driver = Driver()\n    \
+                           supervise combo restart on_failure\n    wire driver.pulse -> combo.tick\n}\n";
+        // check STDOUT ONLY (stderr's `[supervise]` lines interleave with a DIFFERENT
+        // flush ordering on native than interp/vm, but stdout content must still match).
+        let compiled = crate::run::compile(restart_src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-onafter2-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let ran = std::process::Command::new(&bin).output().expect("runs");
+        // the one-shot timer resurrects (per interp/vm's own reference semantics) once per
+        // restart -- fires once initially, then once after each of the 3 wire-triggered panics.
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout),
+            "Combo.fired = 1\nCombo.fired = 1\nCombo.fired = 1\nCombo.fired = 1\n"
+        );
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
     /// Compile a `fun main` program to native, run it, return stdout.
     #[cfg(test)]
     fn native_main_stdout(src: &str, tag: &str) -> String {
