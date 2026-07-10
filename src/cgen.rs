@@ -8547,6 +8547,52 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         );
     }
 
+    /// Native ai-fun List[Record], Record-nesting-Record, Record-containing-List, and the
+    /// `{"value":...}` envelope wrapping a List[Record] (bug-hunt batch 161, PR-it553,
+    /// companion to the vm.rs differential test, it552's flagged candidate C). Every prior
+    /// native ai-fun Record test used only a flat 2-field record; every prior List test used
+    /// flat scalar elements. Confirmed via a real CLI probe FIRST that all four stack the
+    /// C `k_ai_from_json`'s List (kind 4) and Record (kind 6) recursion together for the
+    /// first time, plus the envelope-unwrap retry in `k_ai_convert` -- CLEAN on native.
+    #[test]
+    fn native_ai_list_of_records_and_nested_records_including_value_envelope() {
+        if !cc_available() {
+            return;
+        }
+        let points_src = "type Point553 = Point553(x: Int, y: Int)\n\
+                          ai fun points553(q: Str) -> List[Point553] { intent \"p\" }\n\
+                          fun main() uses io { print(points553(\"q\")) }\n";
+        assert_eq!(
+            native_main_stdout_env(points_src, "airec1", &[("KUPL_AI_MOCK_POINTS553", "[{\"x\":1,\"y\":2},{\"x\":3,\"y\":4}]")]).trim(),
+            "[Point553(1, 2), Point553(3, 4)]"
+        );
+        let line_src = "type Point553 = Point553(x: Int, y: Int)\n\
+                        type Line553 = Line553(a: Point553, b: Point553)\n\
+                        ai fun line553(q: Str) -> Line553 { intent \"l\" }\n\
+                        fun main() uses io { print(line553(\"q\")) }\n";
+        assert_eq!(
+            native_main_stdout_env(line_src, "airec2", &[("KUPL_AI_MOCK_LINE553", "{\"a\":{\"x\":0,\"y\":0},\"b\":{\"x\":5,\"y\":5}}")]).trim(),
+            "Line553(Point553(0, 0), Point553(5, 5))"
+        );
+        let basket_src = "type Basket553 = Basket553(items: List[Int], label: Str)\n\
+                          ai fun basket553(q: Str) -> Basket553 { intent \"b\" }\n\
+                          fun main() uses io { print(basket553(\"q\")) }\n";
+        assert_eq!(
+            native_main_stdout_env(basket_src, "airec3", &[("KUPL_AI_MOCK_BASKET553", "{\"items\":[7,8,9],\"label\":\"x\"}")]).trim(),
+            "Basket553([7, 8, 9], \"x\")"
+        );
+        // the deepest stacking: a `{"value":...}` envelope wrapping a List[Record].
+        assert_eq!(
+            native_main_stdout_env(
+                points_src,
+                "airec4",
+                &[("KUPL_AI_MOCK_POINTS553", "{\"value\": [{\"x\":1,\"y\":2},{\"x\":3,\"y\":4}]}")]
+            )
+            .trim(),
+            "[Point553(1, 2), Point553(3, 4)]"
+        );
+    }
+
     /// `kupl native` correctly resolves `use` imports across files -- a
     /// capability bug-hunt batch 151 (PR-it543) checked SPECIFICALLY on
     /// native since `main.rs`'s own `build_resolves_multi_file_use_imports`

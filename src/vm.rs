@@ -16330,6 +16330,59 @@ fun probe() -> Str {\n    m_assist5(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_ai_fun_list_of_records_and_nested_records_including_value_envelope() {
+        // Bug-hunt batch 161 (PR-it553), it552's flagged-but-uninvestigated candidate C:
+        // every prior ai-fun Record test used only a FLAT 2-field record, and every prior
+        // List test used only flat Int/Str/Option[Int] elements -- a List[Record] (stacking
+        // List and Record conversion), a Record nesting ANOTHER Record (recursive Record
+        // conversion), a Record containing a List field, and the `{"value":...}`
+        // envelope-unwrap-retry fallback wrapping a List[Record] (the deepest stacking:
+        // envelope -> List -> Record) were all completely untested. Plausible bug site:
+        // ai.rs::convert's retry-against-the-whole-raw-object fallback (triggered when the
+        // unwrapped `value` doesn't match the shape) could behave differently once the
+        // shape itself is a List rather than a scalar/flat Record. Verified CLEAN via real
+        // 3-engine CLI probes first (native in the companion cgen.rs test).
+        std::env::set_var("KUPL_AI_MOCK_POINTS553", "[{\"x\":1,\"y\":2},{\"x\":3,\"y\":4}]");
+        assert_eq!(
+            differential(
+                "type Point553 = Point553(x: Int, y: Int)\n\
+                 ai fun points553(q: Str) -> List[Point553] { intent \"p\" }\n\
+                 fun probe() -> Str { \"{points553(\"q\")}\" }\n"
+            ),
+            "[Point553(1, 2), Point553(3, 4)]"
+        );
+        std::env::set_var("KUPL_AI_MOCK_LINE553", "{\"a\":{\"x\":0,\"y\":0},\"b\":{\"x\":5,\"y\":5}}");
+        assert_eq!(
+            differential(
+                "type Point553 = Point553(x: Int, y: Int)\n\
+                 type Line553 = Line553(a: Point553, b: Point553)\n\
+                 ai fun line553(q: Str) -> Line553 { intent \"l\" }\n\
+                 fun probe() -> Str { \"{line553(\"q\")}\" }\n"
+            ),
+            "Line553(Point553(0, 0), Point553(5, 5))"
+        );
+        std::env::set_var("KUPL_AI_MOCK_BASKET553", "{\"items\":[7,8,9],\"label\":\"x\"}");
+        assert_eq!(
+            differential(
+                "type Basket553 = Basket553(items: List[Int], label: Str)\n\
+                 ai fun basket553(q: Str) -> Basket553 { intent \"b\" }\n\
+                 fun probe() -> Str { \"{basket553(\"q\")}\" }\n"
+            ),
+            "Basket553([7, 8, 9], \"x\")"
+        );
+        // the deepest stacking: a `{"value":...}` envelope wrapping a List[Record].
+        std::env::set_var("KUPL_AI_MOCK_POINTS553", "{\"value\": [{\"x\":1,\"y\":2},{\"x\":3,\"y\":4}]}");
+        assert_eq!(
+            differential(
+                "type Point553 = Point553(x: Int, y: Int)\n\
+                 ai fun points553(q: Str) -> List[Point553] { intent \"p\" }\n\
+                 fun probe() -> Str { \"{points553(\"q\")}\" }\n"
+            ),
+            "[Point553(1, 2), Point553(3, 4)]"
+        );
+    }
+
+    #[test]
     fn diff_ai_fun_tool_panic_inside_wire_handler_triggers_supervised_restart() {
         // Bug-hunt batch 138: a genuinely fresh 3-way feature intersection never tested
         // before -- an ai-fun TOOL panic, propagating up through a WIRE-triggered component
