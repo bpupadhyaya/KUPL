@@ -2377,11 +2377,56 @@ static int k_map_field(KMap* m, const char* key, KValue* out) {
     return 0;
 }
 
+/* Run ONE scripted tool call (`m` is the `{"tool": ..., "input": {...}}`
+   object's map, whether it came directly from a round or from an entry
+   inside a `"tools": [...]` array). Returns 1 on success (k_ai_ok stays 1),
+   0 on failure (k_ai_err/k_ai_ok already set by this function -- caller must
+   `return k_unit()` immediately without touching them further). */
+static int k_ai_call_one_tool(const KAiFun* f, KMap* m) {
+    KValue tn;
+    if (!k_map_field(m, "tool", &tn) || strcmp(k_json_var(tn), "JStr")) {
+        snprintf(k_ai_err, sizeof k_ai_err, "mock round must be `{\"tool\": ...}` or `{\"final\": ...}`");
+        k_ai_ok = 0; return 0;
+    }
+    const char* name = tn.as.ctor->fields[0].as.s;
+    const KAiTool* t = 0;
+    for (int k = 0; k < f->ntools; k++) if (!strcmp(f->tools[k].name, name)) { t = &f->tools[k]; break; }
+    if (!t) { snprintf(k_ai_err, sizeof k_ai_err, "model called unknown tool `%s`", name); k_ai_ok = 0; return 0; }
+    KValue input; int has_input = k_map_field(m, "input", &input);
+    KMap* im = (has_input && !strcmp(k_json_var(input), "JObj")) ? k_json_field0(input).as.map : 0;
+    KValue* targs = (KValue*)k_alloc(sizeof(KValue) * (t->nparams < 1 ? 1 : t->nparams));
+    for (int p = 0; p < t->nparams; p++) {
+        KValue pj;
+        if (!im || !k_map_field(im, t->pnames[p], &pj)) { snprintf(k_ai_err, sizeof k_ai_err, "tool `%s` is missing argument `%s`", name, t->pnames[p]); k_ai_ok = 0; return 0; }
+        targs[p] = k_ai_from_json(t->pshapes[p], pj);
+        if (!k_ai_ok) return 0;
+    }
+    /* Catch a REAL panic from the tool's own body and convert it to k_ai_err
+       -- mirrors interp.rs/vm.rs's ToolHost::call_tool, which explicitly
+       catches a tool's panic and turns it into Err(msg) rather than letting
+       it propagate raw past k_ai_call's own "ai `name`: " wrapping (same
+       setjmp/k_pad pattern as k_dispatch's supervision landing pad). */
+    jmp_buf tool_pad; jmp_buf* prev_pad = k_pad; k_pad = &tool_pad;
+    if (setjmp(tool_pad) == 0) {
+        k_call(k_fun(t->fnid), targs, t->nparams);   /* side effects; result discarded (mock) */
+        k_pad = prev_pad;
+    } else {
+        k_pad = prev_pad;
+        snprintf(k_ai_err, sizeof k_ai_err, "%s", k_panic_buf);
+        k_ai_ok = 0;
+        return 0;
+    }
+    return 1;
+}
+
 /* the tool-use mock path (mirrors ai.rs::tool_response + run_tool_loop with the
-   MockProvider): the mock env value is a JSON array of rounds — {"tool": …} calls
-   a KUPL function for its side effects (result discarded, as the mock ignores it)
-   and {"final": …} ends the loop. The final text is converted via the return
-   shape exactly like the non-tool path. */
+   MockProvider): the mock env value is a JSON array of rounds — {"tool": …}
+   calls a KUPL function for its side effects (result discarded, as the mock
+   ignores it), {"tools": [...]} calls SEVERAL in the same round (mirrors
+   ai.rs's MockProvider `{"tools": [...]}` shape, added it524 -- native never
+   learned this shape and would panic on it until it542), and {"final": …}
+   ends the loop. The final text is converted via the return shape exactly
+   like the non-tool path. */
 static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
     k_ai_ok = 1;
     KValue parsed = k_json_parse(k_str(script));
@@ -2404,36 +2449,21 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                     final_text = !strcmp(k_json_var(fin), "JStr") ? fin.as.ctor->fields[0].as.s : k_json_stringify(fin).as.s;
                     break;
                 }
-                KValue tn;
-                if (!k_map_field(m, "tool", &tn) || strcmp(k_json_var(tn), "JStr")) { snprintf(k_ai_err, sizeof k_ai_err, "mock round must be `{\"tool\": ...}` or `{\"final\": ...}`"); k_ai_ok = 0; return k_unit(); }
-                const char* name = tn.as.ctor->fields[0].as.s;
-                const KAiTool* t = 0;
-                for (int k = 0; k < f->ntools; k++) if (!strcmp(f->tools[k].name, name)) { t = &f->tools[k]; break; }
-                if (!t) { snprintf(k_ai_err, sizeof k_ai_err, "model called unknown tool `%s`", name); k_ai_ok = 0; return k_unit(); }
-                KValue input; int has_input = k_map_field(m, "input", &input);
-                KMap* im = (has_input && !strcmp(k_json_var(input), "JObj")) ? k_json_field0(input).as.map : 0;
-                KValue* targs = (KValue*)k_alloc(sizeof(KValue) * (t->nparams < 1 ? 1 : t->nparams));
-                for (int p = 0; p < t->nparams; p++) {
-                    KValue pj;
-                    if (!im || !k_map_field(im, t->pnames[p], &pj)) { snprintf(k_ai_err, sizeof k_ai_err, "tool `%s` is missing argument `%s`", name, t->pnames[p]); k_ai_ok = 0; return k_unit(); }
-                    targs[p] = k_ai_from_json(t->pshapes[p], pj);
-                    if (!k_ai_ok) return k_unit();
-                }
-                /* Catch a REAL panic from the tool's own body and convert it to
-                   k_ai_err -- mirrors interp.rs/vm.rs's ToolHost::call_tool, which
-                   explicitly catches a tool's panic and turns it into Err(msg)
-                   rather than letting it propagate raw past k_ai_call's own
-                   "ai `name`: " wrapping (same setjmp/k_pad pattern as k_dispatch's
-                   supervision landing pad). */
-                jmp_buf tool_pad; jmp_buf* prev_pad = k_pad; k_pad = &tool_pad;
-                if (setjmp(tool_pad) == 0) {
-                    k_call(k_fun(t->fnid), targs, t->nparams);   /* side effects; result discarded (mock) */
-                    k_pad = prev_pad;
+                KValue tools_arr;
+                if (k_map_field(m, "tools", &tools_arr) && !strcmp(k_json_var(tools_arr), "JArr")) {
+                    /* {"tools": [...]}: several simultaneous tool calls in the
+                       SAME round (mirrors ai.rs's MockProvider, it524). */
+                    KList* items = k_json_field0(tools_arr).as.list;
+                    for (long ti = 0; ti < items->len; ti++) {
+                        KValue item = items->items[ti];
+                        if (strcmp(k_json_var(item), "JObj")) {
+                            snprintf(k_ai_err, sizeof k_ai_err, "mock round: each entry in `tools` must have a `tool` name");
+                            k_ai_ok = 0; return k_unit();
+                        }
+                        if (!k_ai_call_one_tool(f, k_json_field0(item).as.map)) return k_unit();
+                    }
                 } else {
-                    k_pad = prev_pad;
-                    snprintf(k_ai_err, sizeof k_ai_err, "%s", k_panic_buf);
-                    k_ai_ok = 0;
-                    return k_unit();
+                    if (!k_ai_call_one_tool(f, m)) return k_unit();
                 }
             }
             if (!final_text) {
@@ -8148,6 +8178,63 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
             .output()
             .expect("runs");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A REAL BUG found+fixed (bug-hunt batch 150, PR-it542): `{"tools":
+    /// [...]}` -- multiple simultaneous tool calls in the SAME round (added
+    /// to ai.rs's `MockProvider` in it524) -- was never taught to native's
+    /// `k_ai_tool_call`, which only ever recognized the singular `{"tool":
+    /// ...}` shape. A mock script using `"tools"` PANICKED on native
+    /// ("mock round must be `{\"tool\": ...}` or `{\"final\": ...}`") while
+    /// interp/KVM ran it cleanly. Fixed by extracting the per-tool-call logic
+    /// into `k_ai_call_one_tool` and looping it over each entry when a round
+    /// has a `"tools"` array, mirroring `MockProvider::round()`'s Rust logic
+    /// (and its own "each entry in `tools` must have a `tool` name" error for
+    /// a malformed entry).
+    #[test]
+    fn native_ai_multi_tool_round() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun m_add5(n: Int) -> Int { n + 5 }\n\
+                   fun m_greet5(name: Str) -> Str { \"hi {name}\" }\n\
+                   ai fun helper5(q: Str) -> Str tools [m_add5, m_greet5] { intent \"h\" }\n\
+                   fun main() uses io { print(helper5(\"x\")) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("multi-tool-round ai fun compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aimt-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        // happy path: two tools in one round -> final answer
+        let ok = std::process::Command::new(&bin)
+            .env(
+                "KUPL_AI_MOCK_HELPER5",
+                "[{\"tools\":[{\"tool\":\"m_add5\",\"input\":{\"n\":10}},{\"tool\":\"m_greet5\",\"input\":{\"name\":\"bob\"}}]},{\"final\":\"done\"}]",
+            )
+            .output()
+            .expect("runs");
+        assert!(ok.status.success(), "multi-tool round must run cleanly, not panic: {ok:?}");
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), "done\n");
+        // a missing argument in the SECOND tool of the round is still a clean,
+        // correctly-attributed panic
+        let bad = std::process::Command::new(&bin)
+            .env(
+                "KUPL_AI_MOCK_HELPER5",
+                "[{\"tools\":[{\"tool\":\"m_add5\",\"input\":{\"n\":10}},{\"tool\":\"m_greet5\",\"input\":{}}]},{\"final\":\"done\"}]",
+            )
+            .output()
+            .expect("runs");
+        assert!(!bad.status.success());
+        assert!(
+            String::from_utf8_lossy(&bad.stderr).contains("ai `helper5`: tool `m_greet5` is missing argument `name`"),
+            "{bad:?}"
+        );
         let _ = std::fs::remove_file(&cp);
         let _ = std::fs::remove_file(&bin);
     }
