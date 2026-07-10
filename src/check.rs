@@ -861,7 +861,14 @@ impl Checker {
                 self.err("K0207", format!("child `{}` declared twice", child.name), child.span);
             }
             let Some(sig) = self.checked.components.get(&child.component).cloned() else {
-                self.err("K0208", format!("unknown component `{}`", child.component), child.span);
+                // Did-you-mean, matching the same courtesy already given to unknown
+                // free-fns/methods/fields/types/ctors/contract-fns (K0249/K0100/K0206/
+                // K0247/K0254) -- a typo'd child-component name got left bare (PR-it511).
+                let mut msg = format!("unknown component `{}`", child.component);
+                if let Some(s) = suggest(&child.component, self.checked.components.keys().map(String::as_str)) {
+                    msg.push_str(&format!(" — did you mean `{s}`?"));
+                }
+                self.err("K0208", msg, child.span);
                 continue;
             };
             child_types.insert(child.name.clone(), child.component.clone());
@@ -3356,6 +3363,28 @@ mod generic_tests {
         // `break`/`continue` INSIDE a loop still type-check cleanly (no behavior change).
         assert!(errors("fun probe() -> Int { while false { break }\n    5 }\n").is_empty());
         assert!(errors("fun probe() -> Int { while false { continue }\n    5 }\n").is_empty());
+    }
+
+    #[test]
+    fn k0208_unknown_child_component_suggests_closest_name() {
+        // Error-msg round 36 (PR-it511): a typo'd child-component name in `let w = Widgt()`
+        // was flat "unknown component `Widgt`" -- named the miss, not the fix. Extends the
+        // did-you-mean courtesy already given to unknown free-fns/methods/fields/types/ctors/
+        // contract-fns (K0249/K0100/K0206/K0247/K0254) to K0208, the one unknown-name site that
+        // still lacked it.
+        let typo = errors("component Widget {\n    intent \"w\"\n}\ncomponent Main {\n    intent \"m\"\n    let w = Widgt()\n}\n");
+        assert!(
+            typo.iter().any(|d| d.code == "K0208" && d.message.contains("unknown component `Widgt`") && d.message.contains("did you mean `Widget`?")),
+            "typo'd child component should suggest the close match: {typo:?}"
+        );
+        // Nothing close -> no suggestion (no false-positive did-you-mean).
+        let none = errors("component Main {\n    intent \"m\"\n    let w = Zqxwbly()\n}\n");
+        assert!(
+            none.iter().any(|d| d.code == "K0208" && !d.message.contains("did you mean")),
+            "unrelated name should stay bare: {none:?}"
+        );
+        // A correct child-component reference still type-checks cleanly.
+        assert!(errors("component Widget {\n    intent \"w\"\n}\ncomponent Main {\n    intent \"m\"\n    let w = Widget()\n}\n").is_empty());
     }
 
     #[test]
