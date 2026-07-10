@@ -961,6 +961,13 @@ static KRat* k_rat_mul(KValue av, KValue bv) {
     return k_rat_norm(k_big_mul(k_big_v(a->num), k_big_v(b->num)),
                       k_big_mul(k_big_v(a->den), k_big_v(b->den)));
 }
+/* already reduced -- negating the numerator alone can't change gcd(num, den), no re-norm needed. */
+static KRat* k_rat_negate(KRat* a) {
+    KRat* r = (KRat*)k_alloc(sizeof(KRat));
+    r->num = k_big_negate(a->num);
+    r->den = a->den;
+    return r;
+}
 static KRat* k_rat_div(KValue av, KValue bv) {
     KRat* a = av.as.rat; KRat* b = bv.as.rat;
     if (b->num->n == 0) k_panic("division by zero");
@@ -1002,6 +1009,29 @@ static KValue k_list(KValue* items, int n) {
 }
 
 extern const KCtorMeta CTORS[];
+
+/* mirrors value.rs Value::type_name() exactly, for panic messages that name the operand type. */
+static const char* k_type_name(KValue v) {
+    switch (v.tag) {
+        case K_INT: return "Int";
+        case K_SIZEDINT: return k_iw_name(v.as.sized->width);
+        case K_F32: return "f32";
+        case K_BIGINT: return "BigInt";
+        case K_RATIONAL: return "Rational";
+        case K_FLOAT: return "Float";
+        case K_BOOL: return "Bool";
+        case K_STR: return "Str";
+        case K_UNIT: return "Unit";
+        case K_LIST: return "List";
+        case K_CTOR: return CTORS[v.as.ctor->ctor].type_name;
+        case K_CLOSURE: case K_FUN: return "fn";
+        case K_COMPONENT: return "component";
+        case K_TENSOR: return "Tensor";
+        case K_MAP: return "Map";
+        case K_SET: return "Set";
+        default: return "Range";
+    }
+}
 
 static KValue k_ctor(int idx, KValue* fields, int n) {
     KCtor* c = k_alloc(sizeof(KCtor));
@@ -1474,10 +1504,23 @@ static KValue k_neg(KValue a) {
         return k_int(-a.as.i);
     }
     if (a.tag == K_FLOAT) return k_float(-a.as.f);
-    k_panic("cannot negate"); return k_unit();
+    if (a.tag == K_F32) return k_f32(-a.as.f32v);
+    if (a.tag == K_SIZEDINT) {
+        int w = a.as.sized->width;
+        __int128 r = -a.as.sized->v;
+        if (r < k_iw_min(w) || r > k_iw_max(w)) k_panic("integer overflow in negation");
+        return k_sized(r, w);
+    }
+    if (a.tag == K_BIGINT) return k_big_v(k_big_negate(a.as.big));
+    if (a.tag == K_RATIONAL) return k_rat_v(k_rat_negate(a.as.rat));
+    char buf[80]; snprintf(buf, sizeof buf, "invalid operand type %s", k_type_name(a));
+    k_panic(buf); return k_unit();
 }
 static KValue k_not(KValue a) {
-    if (a.tag != K_BOOL) k_panic("cannot `!` non-Bool");
+    if (a.tag != K_BOOL) {
+        char buf[80]; snprintf(buf, sizeof buf, "invalid operand type %s", k_type_name(a));
+        k_panic(buf);
+    }
     return k_bool(!a.as.b);
 }
 
@@ -6633,6 +6676,32 @@ fun main() uses io {
         let src = "fun main() uses io {\n    let neg = (0i8 - 8i8)\n    \
                    print(\"{(0u8).bnot()}|{(255u8).shl(1)}|{(1u16).shl(15)}|{(12u8).band(10u8)}|{neg.shr(1)}|{neg.bnot()}\")\n}\n";
         assert_eq!(native_main_stdout(src, "sizedbit").trim(), "255|254|32768|8|-4|7");
+    }
+
+    /// Native unary `-` matches interp/KVM for EVERY numeric type, not just Int/Float
+    /// (PR-it547 real bug: the C runtime's `k_neg` used to fall straight to the generic
+    /// "invalid operand type" panic for SizedInt/f32/BigInt/Rational, even though the checker
+    /// happily type-checks `-x` for all of them). Signed sized ints compute and re-check the
+    /// width, unsigned sized ints only accept negating 0 (anything else overflows), f32/BigInt/
+    /// Rational gained real native negation, and 0 fits every width so it's not a false panic.
+    #[test]
+    fn native_unary_neg_supports_every_numeric_type() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let x: i32 = 5i32\n    let f: f32 = 2.5f32\n    \
+                   print(\"{-x}|{-f}|{-big(42)}|{-rat(3, 4)}|{-(0u8)}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "unegok").trim(), "-5|-2.5|-42|-3/4|0");
+        // unsigned overflow and signed-MIN overflow both panic, matching interp/KVM.
+        for (bad, tag) in [
+            ("fun main() uses io {\n    print(\"{-(5u8)}\")\n}\n", "unegu8"),
+            (
+                "fun main() uses io {\n    let m = (-127i8) - (1i8)\n    print(\"{-m}\")\n}\n",
+                "unegmin",
+            ),
+        ] {
+            assert!(native_main_stdout(bad, tag).trim().is_empty(), "{tag}: expected a panic");
+        }
     }
 
     /// Native string concatenation (k_concat's memcpy splice + direct-pointer fast path for

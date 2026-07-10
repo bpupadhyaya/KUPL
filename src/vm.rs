@@ -8,7 +8,8 @@ use std::rc::Rc;
 
 use crate::bytecode::*;
 use crate::diag::Span;
-use crate::interp::{raw_binary_op, shared_method};
+use crate::ast::UnOp;
+use crate::interp::{raw_binary_op, raw_unary_op, shared_method};
 use crate::value::Value;
 
 #[derive(Debug)]
@@ -496,24 +497,13 @@ impl<'m> Vm<'m> {
                 Op::Le(d, a, b) => bin!(d, a, b, B::Le),
                 Op::Gt(d, a, b) => bin!(d, a, b, B::Gt),
                 Op::Ge(d, a, b) => bin!(d, a, b, B::Ge),
-                Op::Neg(d, a) => match reg!(a) {
-                    Value::Int(v) => match v.checked_neg() {
-                        Some(n) => set!(d, Value::Int(n)),
-                        None => return Err(VmError { msg: "integer overflow in negation".into(), span }),
-                    },
-                    Value::Float(v) => set!(d, Value::Float(-v)),
-                    other => {
-                        return Err(VmError {
-                            msg: format!("cannot negate {}", other.type_name()),
-                            span,
-                        })
-                    }
+                Op::Neg(d, a) => match raw_unary_op(UnOp::Neg, reg!(a)) {
+                    Ok(v) => set!(d, v),
+                    Err(msg) => return Err(VmError { msg, span }),
                 },
-                Op::Not(d, a) => match reg!(a) {
-                    Value::Bool(v) => set!(d, Value::Bool(!v)),
-                    other => {
-                        return Err(VmError { msg: format!("cannot `!` {}", other.type_name()), span })
-                    }
+                Op::Not(d, a) => match raw_unary_op(UnOp::Not, reg!(a)) {
+                    Ok(v) => set!(d, v),
+                    Err(msg) => return Err(VmError { msg, span }),
                 },
                 Op::Jump(t) => frame!().ip = t,
                 Op::JumpIfFalse(r, t) => match reg!(r) {
@@ -15053,6 +15043,43 @@ fun probe() -> Str {
         // i8 shr sign-extends; a shift amount at/above the width is a clean panic, not UB.
         assert_eq!(differential("fun probe() -> Str { let neg = (0i8 - 8i8)\n    \"{neg.shr(1)}|{neg.bnot()}\" }\n"), "-4|7");
         assert_eq!(differential("fun probe() -> Str { \"{(1u8).shl(8)}\" }\n"), "panic: shift amount must be in 0..=7");
+    }
+
+    #[test]
+    fn diff_unary_neg_supports_every_numeric_type_not_just_int_float() {
+        // A REAL BUG found+fixed (bug-hunt batch 155, PR-it547): `Ty::is_numeric()` (check.rs)
+        // treats SizedInt/F32/BigInt/Rational as numeric and lets unary `-` type-check on them
+        // (K0236 only fires for genuinely non-numeric types), but the runtime `UnOp::Neg`
+        // handler in BOTH interp.rs and vm.rs only ever implemented Int and Float -- every
+        // other numeric type fell through to the generic "invalid operand type" panic, so
+        // `-x` for x: i32/f32/BigInt/Rational (or `-x` for an unsigned sized int, which is
+        // reachable and should panic on overflow rather than a blanket type error) ALWAYS
+        // panicked despite type-checking cleanly. Confirmed via a real 3-engine CLI probe
+        // first (interp/vm/native all agreed on the SAME wrong panic). Fixed by extracting
+        // the whole match into a new shared `raw_unary_op` (interp.rs, mirroring the existing
+        // shared `raw_binary_op` pattern so vm.rs can no longer drift from interp's wording)
+        // and implementing Neg for every numeric Value variant: signed sized ints compute
+        // (checked against the width, matching binary Sub's own overflow check), unsigned
+        // sized ints panic on any nonzero value (only 0 fits an unsigned width when negated),
+        // F32 negates directly, and BigInt/Rational gained real `negate()` methods.
+        assert_eq!(differential("fun probe() -> Str { let x: i32 = 5i32\n    \"{-x}\" }\n"), "-5");
+        assert_eq!(differential("fun probe() -> Str { let f: f32 = 2.5f32\n    \"{-f}\" }\n"), "-2.5");
+        assert_eq!(differential("fun probe() -> Str { \"{-big(42)}\" }\n"), "-42");
+        assert_eq!(differential("fun probe() -> Str { \"{-rat(3, 4)}\" }\n"), "-3/4");
+        // double negation returns the original value (identity), across every fixed type.
+        assert_eq!(differential("fun probe() -> Str { let x: i32 = 5i32\n    \"{- -x}\" }\n"), "5");
+        assert_eq!(differential("fun probe() -> Str { \"{- -big(42)}\" }\n"), "42");
+        // 0 is representable in every unsigned width, so negating it is NOT an overflow.
+        assert_eq!(differential("fun probe() -> Str { \"{-(0u8)}\" }\n"), "0");
+        // any nonzero unsigned sized int overflows on negation, same as subtracting past 0.
+        assert_eq!(differential("fun probe() -> Str { \"{-(5u8)}\" }\n"), "panic: integer overflow in negation");
+        // i8::MIN (built via subtraction -- the MIN literal itself doesn't parse as a single
+        // token) negates to i8::MAX + 1, which overflows i8 the same way `checked_neg` panics
+        // for plain Int at i64::MIN.
+        assert_eq!(
+            differential("fun probe() -> Str { let m = (-127i8) - (1i8)\n    \"{-m}\" }\n"),
+            "panic: integer overflow in negation"
+        );
     }
 
     #[test]

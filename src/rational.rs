@@ -52,6 +52,10 @@ impl Rational {
         Rational::new(n, self.den.mul(&o.den)).unwrap()
     }
 
+    pub fn negate(&self) -> Rational {
+        Rational { num: self.num.negate(), den: self.den.clone() }
+    }
+
     pub fn mul(&self, o: &Rational) -> Rational {
         Rational::new(self.num.mul(&o.num), self.den.mul(&o.den)).unwrap()
     }

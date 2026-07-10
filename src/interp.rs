@@ -966,18 +966,7 @@ impl Interp {
             }
             ExprKind::Unary { op, operand } => {
                 let v = self.eval(operand, env)?;
-                match (op, v) {
-                    (UnOp::Neg, Value::Int(i)) => i
-                        .checked_neg()
-                        .map(Value::Int)
-                        .ok_or_else(|| Self::panic_flow("integer overflow in negation", expr.span)),
-                    (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
-                    (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (_, other) => Err(Self::panic_flow(
-                        format!("invalid operand type {}", other.type_name()),
-                        expr.span,
-                    )),
-                }
+                raw_unary_op(*op, v).map_err(|msg| Self::panic_flow(msg, expr.span))
             }
             ExprKind::If { cond, then_block, else_block } => {
                 let c = self.eval(cond, env)?;
@@ -1573,6 +1562,28 @@ impl crate::ai::ToolHost for Interp {
 // ---------------- operators, patterns, builtin methods ----------------
 // The raw (span-free) semantics live here and are SHARED by the tree-walking
 // interpreter and the KVM — one implementation, no drift.
+
+pub fn raw_unary_op(op: UnOp, v: Value) -> Result<Value, String> {
+    match (op, v) {
+        (UnOp::Neg, Value::Int(i)) => {
+            i.checked_neg().map(Value::Int).ok_or_else(|| "integer overflow in negation".to_string())
+        }
+        (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
+        (UnOp::Neg, Value::F32(f)) => Ok(Value::F32(-f)),
+        (UnOp::Neg, Value::SizedInt(b)) => {
+            let (v, w) = *b;
+            if w.check_range(-v) {
+                Ok(Value::SizedInt(Box::new((-v, w))))
+            } else {
+                Err("integer overflow in negation".into())
+            }
+        }
+        (UnOp::Neg, Value::BigInt(b)) => Ok(Value::BigInt(Rc::new(b.negate()))),
+        (UnOp::Neg, Value::Rational(r)) => Ok(Value::Rational(Rc::new(r.negate()))),
+        (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+        (_, other) => Err(format!("invalid operand type {}", other.type_name())),
+    }
+}
 
 pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     use BinOp::*;
