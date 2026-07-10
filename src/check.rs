@@ -999,7 +999,11 @@ impl Checker {
     ) -> Option<Ty> {
         let (child, port) = end;
         let Some(comp_name) = child_types.get(child) else {
-            self.err("K0213", format!("`wire` references unknown child `{child}`"), span);
+            let mut msg = format!("`wire` references unknown child `{child}`");
+            if let Some(s) = suggest(child, child_types.keys().map(String::as_str)) {
+                msg.push_str(&format!(" — did you mean `{s}`?"));
+            }
+            self.err("K0213", msg, span);
             return None;
         };
         let sig = self.checked.components.get(comp_name).cloned().unwrap_or_default();
@@ -3501,6 +3505,30 @@ mod generic_tests {
         );
         // A correct child-component reference still type-checks cleanly.
         assert!(errors("component Widget {\n    intent \"w\"\n}\ncomponent Main {\n    intent \"m\"\n    let w = Widget()\n}\n").is_empty());
+    }
+
+    #[test]
+    fn k0213_unknown_wire_child_suggests_closest_name() {
+        // Error-msg round 40 (PR-it526): a typo'd child NAME on the left/right end of a
+        // `wire` statement (distinct from K0208's unknown child-COMPONENT-TYPE, fixed
+        // it511) was flat "unknown child `producr`" -- extends the same did-you-mean
+        // courtesy to the one remaining unknown-child-name site that lacked it.
+        let src = "component Src {\n    intent \"s\"\n    out val: Int\n}\ncomponent Sink {\n    intent \"k\"\n    in val: Int\n}\ncomponent Main {\n    intent \"m\"\n    let producer = Src()\n    let consumer = Sink()\n    wire producr.val -> consumer.val\n}\n";
+        let typo = errors(src);
+        assert!(
+            typo.iter().any(|d| d.code == "K0213" && d.message.contains("unknown child `producr`") && d.message.contains("did you mean `producer`?")),
+            "typo'd wire-endpoint child name should suggest the close match: {typo:?}"
+        );
+        // Nothing close -> no suggestion (no false-positive did-you-mean).
+        let none_src = "component Src {\n    intent \"s\"\n    out val: Int\n}\ncomponent Main {\n    intent \"m\"\n    let producer = Src()\n    wire zqxwbly.val -> producer.val\n}\n";
+        let none = errors(none_src);
+        assert!(
+            none.iter().any(|d| d.code == "K0213" && !d.message.contains("did you mean")),
+            "unrelated name should stay bare: {none:?}"
+        );
+        // A correct wire reference still type-checks cleanly.
+        let ok_src = "component Src {\n    intent \"s\"\n    out val: Int\n}\ncomponent Sink {\n    intent \"k\"\n    in val: Int\n}\ncomponent Main {\n    intent \"m\"\n    let producer = Src()\n    let consumer = Sink()\n    wire producer.val -> consumer.val\n}\n";
+        assert!(errors(ok_src).is_empty());
     }
 
     #[test]
