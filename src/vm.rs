@@ -16434,6 +16434,44 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
     }
 
     #[test]
+    fn diff_par_map_panic_crosses_real_thread_threshold() {
+        // Bug-hunt batch 140 (PR-it528): every prior par_map/par_filter panic test
+        // stayed BELOW the 256-element THRESHOLD (diff_par_determinism_and_panic uses
+        // 4 elements) -- so the interpreter's REAL multi-threaded fast path
+        // (try_par_map/try_par_filter in parallel.rs, gated on `image` being set,
+        // which Interp::new always does) never actually panicked through a live OS
+        // thread in any differential() test; only `vm_parallel_par_map_absolute_it35`
+        // exercised a threaded panic, and only on the KVM side in isolation (via a
+        // dedicated `vm_parallel` helper that calls `vm.set_image`), never cross-
+        // engine. Here: 400 elements (> THRESHOLD) so the interpreter genuinely
+        // spawns worker threads via std::thread::scope (vm.rs's `image` stays unset
+        // in differential(), so the KVM takes the ordinary sequential shared_method
+        // path) -- and the panic is on a NON-boundary index (n=137, mid-chunk, not
+        // the first or last element of any worker's slice) so this isn't just
+        // "trivially the first item panics". Confirms: (1) `eval_one`'s
+        // `Err(Flow::Panic{msg,..}) => Err(msg)` correctly converts a real in-thread
+        // KUPL-level panic to a plain Result (no actual Rust thread unwind, so
+        // `h.join().expect(...)` never fires), (2) par_eval's index-order collection
+        // (workers' slices concatenated in range order, not completion order) means
+        // the panic surfaces deterministically regardless of which OS thread finishes
+        // first, and (3) the resulting message is byte-identical to the KVM's
+        // sequential evaluation of the exact same failing element.
+        let boom = format!(
+            "{MK}fun bad(n: Int) -> Int {{\n    100 / (n - 137)\n}}\n\
+             fun probe() -> Int {{\n    mk(400).par_map(bad).sum()\n}}\n"
+        );
+        assert_eq!(differential(&boom), "panic: division by zero");
+
+        // par_filter's real-thread path panics the same way, over a predicate
+        // that fails to evaluate (not just returns false) on a mid-range element.
+        let boom_filter = format!(
+            "{MK}fun bad_pred(n: Int) -> Bool {{\n    100 / (n - 271) > 0\n}}\n\
+             fun probe() -> Int {{\n    mk(300).par_filter(bad_pred).len()\n}}\n"
+        );
+        assert_eq!(differential(&boom_filter), "panic: division by zero");
+    }
+
+    #[test]
     fn diff_sized_methods_it29() {
         // wrapping
         assert_eq!(differential("fun probe() -> u8 {\n    (200u8).wrapping_add(100u8)\n}\n"), "44");
