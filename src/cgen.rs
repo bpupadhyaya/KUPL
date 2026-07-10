@@ -8239,6 +8239,42 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// `kupl native` correctly resolves `use` imports across files -- a
+    /// capability bug-hunt batch 151 (PR-it543) checked SPECIFICALLY on
+    /// native since `main.rs`'s own `build_resolves_multi_file_use_imports`
+    /// (PR-it507) only ever exercised `kupl build`/`.kx`, never `kupl
+    /// native`. `run::native` (src/run.rs) already routes through the same
+    /// multi-file-aware `load_compile` loader `build`/`bundle`/`run`/`check`
+    /// use, so this was never structurally at risk the way it507's bug was --
+    /// confirmed clean via a real CLI probe FIRST (`kupl native
+    /// examples/multifile/main.kupl` compiled and ran byte-identical to
+    /// `kupl run`) before locking it as a genuinely untested combination, not
+    /// a bug fix.
+    #[test]
+    fn native_resolves_multi_file_use_imports() {
+        if !cc_available() {
+            return;
+        }
+        let entry = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multifile/main.kupl");
+        let (compiled, _map) = crate::run::load_compile(entry.to_str().unwrap()).expect("multi-file program loads");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("multi-file module compiles (cross-module fn calls resolved)");
+        let c = super::emit_c(&module).expect("multi-file program compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-multifile-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin).output().expect("runs");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "mean of [4, 8, 15, 16, 23, 42] is 18.0 (high)\n"
+        );
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
     /// A `Result`-wrapped ai fun's TOOL panicking is swallowed into a clean
     /// `Err(msg)` VALUE, not a hard process crash -- native matches interp/KVM
     /// (it523's finding). Bug-hunt batch 148 (PR-it540): this combination
