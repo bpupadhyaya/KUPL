@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::diag::{json_escape, line_col, Severity};
 
@@ -482,6 +482,35 @@ pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String
     Some(format!("```kupl\n{sig}\n```"))
 }
 
+/// Cross-file hover: try the current file first (identical to `resolve_hover`),
+/// then fall back to the same locally-`use`d sibling files that
+/// `resolve_definition_cross_file` searches (see its doc comment for scope).
+pub fn resolve_hover_cross_file(
+    text: &str,
+    line: usize,
+    character: usize,
+    dir: &std::path::Path,
+    buffers: &HashMap<PathBuf, String>,
+) -> Option<String> {
+    if let Some(h) = resolve_hover(text, line, character) {
+        return Some(h);
+    }
+    let off = offset_at(text, line, character);
+    let (name, _, _) = ident_at(text, off)?;
+    let (program, _diags) = crate::parser::parse(text);
+    for (use_path, _span) in &program.uses {
+        let rel: PathBuf = use_path.split('.').collect();
+        let mut fs_path = dir.join(rel);
+        fs_path.set_extension("kupl");
+        let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
+        let (other_program, _diags) = crate::parser::parse(&other_text);
+        if let Some(sig) = item_signature(&other_program, &name) {
+            return Some(format!("```kupl\n{sig}\n```"));
+        }
+    }
+    None
+}
+
 /// Every occurrence of the identifier `name`, as 0-based LSP ranges. Uses the
 /// LEXER, so it matches only real identifier tokens — never text inside string
 /// literals or comments (an identifier inside a `{…}` interpolation IS a real
@@ -544,6 +573,46 @@ pub fn resolve_definition(text: &str, line: usize, character: usize) -> Option<(
     item_definition(text, &program, &name)
 }
 
+/// Cross-file go-to-definition: try the current file first (identical to
+/// `resolve_definition`), then fall back to every file this document reaches
+/// via its own `use` statements, resolved LOCALLY (relative to `dir`, the
+/// document's own directory -- the common multi-file-module case demonstrated
+/// by examples/multifile; `kupl.toml`-based package dependencies are out of
+/// scope here and simply fall through to `None` on a miss, same as before).
+/// Before this (PR-it516), a symbol pulled in via `use` -- e.g. `mean(xs)` in
+/// a file that does `use lib.stats` -- had NO hover and NO go-to-definition
+/// at all, since resolve_hover/resolve_definition only ever see the single
+/// buffer they're handed.
+///
+/// Returns `(target_uri, l0, c0, l1, c1)` where an EMPTY `target_uri` means
+/// "the current file" (the caller reuses the request's own uri); a non-empty
+/// one names the OTHER file the definition actually lives in.
+pub fn resolve_definition_cross_file(
+    text: &str,
+    line: usize,
+    character: usize,
+    dir: &std::path::Path,
+    buffers: &HashMap<PathBuf, String>,
+) -> Option<(String, usize, usize, usize, usize)> {
+    if let Some((l0, c0, l1, c1)) = resolve_definition(text, line, character) {
+        return Some((String::new(), l0, c0, l1, c1));
+    }
+    let off = offset_at(text, line, character);
+    let (name, _, _) = ident_at(text, off)?;
+    let (program, _diags) = crate::parser::parse(text);
+    for (use_path, _span) in &program.uses {
+        let rel: PathBuf = use_path.split('.').collect();
+        let mut fs_path = dir.join(rel);
+        fs_path.set_extension("kupl");
+        let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
+        let (other_program, _diags) = crate::parser::parse(&other_text);
+        if let Some((l0, c0, l1, c1)) = item_definition(&other_text, &other_program, &name) {
+            return Some((path_to_uri(&fs_path), l0, c0, l1, c1));
+        }
+    }
+    None
+}
+
 /// A completion candidate: (label, LSP CompletionItemKind, detail).
 pub fn completions(text: &str) -> Vec<(String, u8, String)> {
     use crate::ast::Item;
@@ -603,10 +672,34 @@ fn position_of(params: &Json) -> Option<(&str, usize, usize)> {
 /// Current text of a document: the unsaved editor buffer if present, else disk.
 fn doc_text(uri: &str, buffers: &HashMap<PathBuf, String>) -> Option<String> {
     let path = uri_to_path(uri)?;
-    if let Some(buf) = buffers.get(&path) {
+    text_at_path(&path, buffers)
+}
+
+/// Current text at a filesystem path: the unsaved editor buffer if that file
+/// happens to be open, else disk. Shared by `doc_text` (uri-keyed, the normal
+/// per-request entry point) and cross-file lookups (path-keyed, since a `use`
+/// target is resolved to a path before we know whether it's open).
+fn text_at_path(path: &std::path::Path, buffers: &HashMap<PathBuf, String>) -> Option<String> {
+    if let Some(buf) = buffers.get(path) {
         return Some(buf.clone());
     }
-    std::fs::read_to_string(&path).ok()
+    std::fs::read_to_string(path).ok()
+}
+
+/// The inverse of `uri_to_path`: percent-encode a filesystem path into a
+/// `file://` URI. Only bytes outside the RFC 3986 "unreserved" set are
+/// escaped, so ordinary paths round-trip through `uri_to_path` unchanged.
+fn path_to_uri(path: &std::path::Path) -> String {
+    let mut out = String::from("file://");
+    for b in path.to_string_lossy().as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 pub fn serve() -> i32 {
@@ -703,7 +796,11 @@ pub fn serve() -> i32 {
                     let p = msg.get("params")?;
                     let (uri, line, ch) = position_of(p)?;
                     let text = doc_text(uri, &buffers)?;
-                    let md = resolve_hover(&text, line, ch)?;
+                    // Cross-file fallback (PR-it516): a symbol pulled in via `use` (e.g. a
+                    // helper defined in another module) used to have no hover at all --
+                    // resolve_hover only ever sees this one buffer's text.
+                    let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+                    let md = resolve_hover_cross_file(&text, line, ch, &dir, &buffers)?;
                     Some(format!(
                         "{{\"contents\":{{\"kind\":\"markdown\",\"value\":\"{}\"}}}}",
                         json_escape(&md)
@@ -718,10 +815,15 @@ pub fn serve() -> i32 {
                     let p = msg.get("params")?;
                     let (uri, line, ch) = position_of(p)?;
                     let text = doc_text(uri, &buffers)?;
-                    let (l0, c0, l1, c1) = resolve_definition(&text, line, ch)?;
+                    // Cross-file fallback (PR-it516): same rationale as hover above -- an
+                    // empty target_uri means "this file" (reuse the request's own uri),
+                    // a non-empty one names the OTHER file the definition lives in.
+                    let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+                    let (target_uri, l0, c0, l1, c1) = resolve_definition_cross_file(&text, line, ch, &dir, &buffers)?;
+                    let target_uri = if target_uri.is_empty() { uri.to_string() } else { target_uri };
                     Some(format!(
                         "{{\"uri\":\"{}\",\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}}}}",
-                        json_escape(uri)
+                        json_escape(&target_uri)
                     ))
                 })()
                 .unwrap_or_else(|| "null".into());
@@ -882,6 +984,59 @@ mod tests {
         let ch4 = src.lines().nth(comp_line).unwrap().find("Greeter").unwrap() + 1;
         let h_comp = resolve_hover(src, comp_line, ch4).expect("hover on component ctor call");
         assert!(h_comp.contains("component Greeter"), "{h_comp}");
+    }
+
+    #[test]
+    fn hover_and_definition_reach_across_use_imports() {
+        // A real, well-scoped LSP capability gap (PR-it516): resolve_hover/resolve_definition
+        // only ever see the ONE buffer they're handed, so a symbol pulled in via `use` (e.g.
+        // `mean(xs)` in a file that does `use lib.stats`) had NO hover and NO go-to-definition
+        // at all -- even though `kupl run`/`kupl check`/`kupl build` had already been fixed
+        // (PR-it507) to resolve the SAME `use` imports for compilation. Fixed by adding
+        // resolve_hover_cross_file/resolve_definition_cross_file: try the current file first
+        // (identical to the plain functions, so single-file behavior is unchanged), then walk
+        // this file's own `use` statements (resolved locally, relative to the document's
+        // directory -- the examples/multifile case) and search each target file in turn.
+        //
+        // Uses the REAL examples/multifile/main.kupl (`use util` / `use lib.stats`) and its
+        // sibling files on disk -- exercising the actual filesystem-resolution path, not just
+        // an in-memory fixture.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let main_path = manifest_dir.join("examples/multifile/main.kupl");
+        let dir = main_path.parent().unwrap();
+        let text = std::fs::read_to_string(&main_path).expect("read examples/multifile/main.kupl");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+
+        // `mean` lives in lib/stats.kupl, reached via `use lib.stats`.
+        let mean_line = text.lines().position(|l| l.contains("let m = mean")).unwrap();
+        let ch = text.lines().nth(mean_line).unwrap().find("mean").unwrap() + 1;
+        let hover = resolve_hover_cross_file(&text, mean_line, ch, dir, &empty_buffers)
+            .expect("cross-file hover on `mean` must find lib/stats.kupl's definition");
+        assert!(hover.contains("fun mean(xs: List[Int]) -> Float"), "{hover}");
+        let (target_uri, l0, c0, _, _) = resolve_definition_cross_file(&text, mean_line, ch, dir, &empty_buffers)
+            .expect("cross-file definition on `mean` must find lib/stats.kupl");
+        assert!(target_uri.starts_with("file://") && target_uri.ends_with("lib/stats.kupl"), "{target_uri}");
+        assert_eq!(l0, 0, "mean is declared on line 0 of lib/stats.kupl");
+        assert_eq!(c0, 4, "the name starts after `fun `");
+
+        // `label` lives in util.kupl, reached via `use util`.
+        let label_line = text.lines().position(|l| l.contains("({label(m)})")).unwrap();
+        let ch2 = text.lines().nth(label_line).unwrap().find("label").unwrap() + 1;
+        let hover2 = resolve_hover_cross_file(&text, label_line, ch2, dir, &empty_buffers)
+            .expect("cross-file hover on `label` must find util.kupl's definition");
+        assert!(hover2.contains("fun label(x: Float) -> Str"), "{hover2}");
+
+        // Same-file symbols are completely unaffected -- the cross-file fallback only kicks
+        // in when the current-file search misses.
+        let comp_line = text.lines().position(|l| l.contains("component Reporter")).unwrap();
+        let ch3 = text.lines().nth(comp_line).unwrap().find("Reporter").unwrap() + 1;
+        let h_local = resolve_hover_cross_file(&text, comp_line, ch3, dir, &empty_buffers)
+            .expect("same-file component hover unaffected");
+        assert!(h_local.contains("component Reporter"), "{h_local}");
+
+        // An unresolvable identifier (not in this file, not in any `use`d file) still cleanly
+        // returns None -- no panic on a missing/unreadable sibling file.
+        assert!(resolve_hover_cross_file("fun probe() -> Int {\n    zzz_nonexistent\n}\n", 1, 5, dir, &empty_buffers).is_none());
     }
 
     #[test]
