@@ -580,8 +580,12 @@ fn openai_tools_json(tools: &[ToolMeta]) -> String {
     format!("[{}]", arr.join(","))
 }
 
-/// Deterministic tool provider: a scripted array of rounds, each either
-/// `{"tool": name, "input": {...}}` or `{"final": <payload>}`.
+/// Deterministic tool provider: a scripted array of rounds, each one of
+/// `{"tool": name, "input": {...}}` (a single tool call), `{"tools": [{"tool":
+/// name, "input": {...}}, ...]}` (MULTIPLE tool calls in the same round --
+/// mirrors what a real provider can do when a model requests several tools at
+/// once, e.g. Anthropic's `content` array carrying more than one `tool_use`
+/// block; PR-it524), or `{"final": <payload>}`.
 struct MockProvider {
     rounds: Vec<Json>,
     idx: usize,
@@ -609,7 +613,22 @@ impl ToolProvider for MockProvider {
                 input,
             }]));
         }
-        Err("mock round must be `{\"tool\": ...}` or `{\"final\": ...}`".into())
+        if let Some(Json::Arr(items)) = r.get("tools") {
+            let mut reqs = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let Some(Json::Str(name)) = item.get("tool") else {
+                    return Err("mock round: each entry in `tools` must have a `tool` name".into());
+                };
+                let input = item.get("input").cloned().unwrap_or(Json::Obj(Vec::new()));
+                reqs.push(ToolReq {
+                    id: format!("mock_tool_{}_{i}", self.idx),
+                    name: name.clone(),
+                    input,
+                });
+            }
+            return Ok(Reply::Tools(reqs));
+        }
+        Err("mock round must be `{\"tool\": ...}`, `{\"tools\": [...]}`, or `{\"final\": ...}`".into())
     }
     fn push_results(&mut self, _results: Vec<(ToolReq, String)>) {}
 }

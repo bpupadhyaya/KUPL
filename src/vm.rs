@@ -16110,6 +16110,41 @@ fun probe() -> Str {\n    diff_assist(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_ai_fun_multi_tool_round() {
+        // Bug-hunt batch 136/137: MULTIPLE tool requests in the SAME round -- a real,
+        // documented capability (run_tool_loop's `Reply::Tools(reqs)` is a Vec and already
+        // loops over ALL of them; AnthropicProvider::round() already collects every
+        // `tool_use` block from a real API response into that Vec) that had NO deterministic
+        // test coverage at all: MockProvider only ever scripted a SINGLE tool per round
+        // (`{"tool": name, ...}`), so the multi-tool-round path in run_tool_loop/execute_tool
+        // was completely unverified. Extended MockProvider with a new, purely ADDITIVE
+        // `{"tools": [{"tool": name, "input": {...}}, ...]}` round shape (PR-it524) so this
+        // path can finally be tested deterministically.
+        std::env::set_var(
+            "KUPL_AI_MOCK_M_ASSIST5",
+            "[{\"tools\":[{\"tool\":\"m_add5\",\"input\":{\"a\":2,\"b\":3}},\
+{\"tool\":\"m_greet5\",\"input\":{\"who\":\"Ada\"}}]},\
+{\"final\":\"done\"}]",
+        );
+        let src = "fun m_add5(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+fun m_greet5(who: Str) -> Str {\n    \"hi {who}\"\n}\n\
+ai fun m_assist5(q: Str) -> Str tools [m_add5, m_greet5] {\n    intent \"Assist.\"\n}\n\
+fun probe() -> Str {\n    m_assist5(\"x\")\n}\n";
+        assert_eq!(differential(src), "done");
+
+        // a failure in the SECOND of several simultaneous tool calls still propagates
+        // correctly (same message on both engines) -- not silently dropped or misattributed
+        // to the wrong tool.
+        std::env::set_var(
+            "KUPL_AI_MOCK_M_ASSIST5",
+            "[{\"tools\":[{\"tool\":\"m_add5\",\"input\":{\"a\":2,\"b\":3}},\
+{\"tool\":\"m_greet5\",\"input\":{}}]},\
+{\"final\":\"done\"}]",
+        );
+        assert_eq!(differential(src), "panic: ai `m_assist5`: tool `m_greet5` is missing argument `who`");
+    }
+
+    #[test]
     fn diff_ai_fun_tool_failure_messages() {
         // Bug-hunt batch 136: ai-fun tool-loop FAILURE paths (as opposed to the happy-path
         // already covered by diff_ai_fun_tool_loop above) were never probed. Each of these
