@@ -827,6 +827,121 @@ fn item_symbol(text: &str, item: &crate::ast::Item) -> String {
     }
 }
 
+/// Below this many collected files, `collect_kupl_files` keeps recursing --
+/// a hard ceiling so a huge or symlink-cyclic tree can't hang the server.
+const MAX_WORKSPACE_FILES: usize = 5000;
+
+/// Recursively collect every `.kupl` file under `root`, skipping hidden
+/// directories (`.git`, editor dirs) and `target` -- this repo's OWN build
+/// output is enormous; scanning it would make `workspace/symbol` pathologically
+/// slow on a real KUPL checkout, for files that were never source anyway.
+fn collect_kupl_files(root: &std::path::Path, out: &mut Vec<PathBuf>) {
+    if out.len() >= MAX_WORKSPACE_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_WORKSPACE_FILES {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            collect_kupl_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "kupl") {
+            out.push(path);
+        }
+    }
+}
+
+/// `workspace/symbol`: every item (top-level or nested inside a component)
+/// across every `.kupl` file under `root` whose name contains `query`
+/// (case-insensitive substring -- the common simple-server convention),
+/// rendered as FLAT `SymbolInformation` JSON. Genuinely different response
+/// SHAPE from `document_symbols`' nested per-file `DocumentSymbol`s: each
+/// entry here carries its own `location.uri` since results span many files.
+/// A file with parse errors is silently skipped (nothing safe to index),
+/// mirroring `document_symbols`'s own per-file gate.
+fn workspace_symbols(root: &std::path::Path, query: &str, buffers: &HashMap<PathBuf, String>) -> String {
+    let mut files = Vec::new();
+    collect_kupl_files(root, &mut files);
+    let needle = query.to_lowercase();
+    let mut out = Vec::new();
+    for path in files {
+        let Some(text) = text_at_path(&path, buffers) else { continue };
+        let (program, diags) = crate::parser::parse(&text);
+        if diags.iter().any(|d| d.severity == Severity::Error) {
+            continue;
+        }
+        let uri = path_to_uri(&path);
+        for item in &program.items {
+            collect_workspace_symbol_matches(&text, &uri, item, &needle, &mut out);
+        }
+    }
+    format!("[{}]", out.join(","))
+}
+
+fn maybe_push_symbol_info(
+    out: &mut Vec<String>,
+    text: &str,
+    uri: &str,
+    name: &str,
+    kind: u8,
+    span: crate::diag::Span,
+    needle: &str,
+) {
+    if needle.is_empty() || name.to_lowercase().contains(needle) {
+        out.push(format!(
+            "{{\"name\":\"{}\",\"kind\":{kind},\"location\":{{\"uri\":\"{}\",\"range\":{}}}}}",
+            json_escape(name),
+            json_escape(uri),
+            lsp_range(text, span)
+        ));
+    }
+}
+
+fn collect_workspace_symbol_matches(
+    text: &str,
+    uri: &str,
+    item: &crate::ast::Item,
+    needle: &str,
+    out: &mut Vec<String>,
+) {
+    use crate::ast::Item;
+    match item {
+        Item::Fun(f) => maybe_push_symbol_info(out, text, uri, &f.name, 12, f.span, needle),
+        Item::Type(t) => {
+            maybe_push_symbol_info(out, text, uri, &t.name, 10, t.span, needle);
+            for v in &t.variants {
+                maybe_push_symbol_info(out, text, uri, &v.name, 22, v.span, needle);
+            }
+        }
+        Item::Contract(c) => {
+            maybe_push_symbol_info(out, text, uri, &c.name, 11, c.span, needle);
+            for s in &c.sigs {
+                maybe_push_symbol_info(out, text, uri, &s.name, 6, s.span, needle);
+            }
+        }
+        Item::Law(l) => maybe_push_symbol_info(out, text, uri, &l.name, 12, l.span, needle),
+        Item::Component(c) => {
+            maybe_push_symbol_info(out, text, uri, &c.name, 5, c.span, needle);
+            for s in &c.state {
+                maybe_push_symbol_info(out, text, uri, &s.name, 8, s.span, needle);
+            }
+            for f in &c.exposes {
+                maybe_push_symbol_info(out, text, uri, &f.name, 6, f.span, needle);
+            }
+            for f in &c.funs {
+                maybe_push_symbol_info(out, text, uri, &f.name, 6, f.span, needle);
+            }
+        }
+    }
+}
+
 /// `textDocument/documentHighlight`: every occurrence of the identifier under
 /// the cursor, WITHIN THE CURRENT DOCUMENT ONLY. Deliberately single-file,
 /// unlike `references`/`rename` (it518's cross-file fix) -- the LSP spec
@@ -922,6 +1037,10 @@ pub fn serve() -> i32 {
 
     // open editor buffers (unsaved contents)
     let mut buffers: HashMap<PathBuf, String> = HashMap::new();
+    // workspace root, for `workspace/symbol`'s whole-project file enumeration
+    // -- unset until `initialize` supplies `rootUri` (`rootPath` as a fallback
+    // for older clients); `workspace/symbol` is a safe no-op ("[]") without it.
+    let mut workspace_root: Option<PathBuf> = None;
 
     while let Some(body) = read_message(&mut stdin) {
         let Ok(msg) = parse_json(&body) else { continue };
@@ -931,10 +1050,21 @@ pub fn serve() -> i32 {
         match method {
             "initialize" => {
                 let id = id.map(render_id).unwrap_or_else(|| "null".into());
+                workspace_root = msg
+                    .get("params")
+                    .and_then(|p| p.get("rootUri"))
+                    .and_then(Json::str)
+                    .and_then(uri_to_path)
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("rootPath"))
+                            .and_then(Json::str)
+                            .map(PathBuf::from)
+                    });
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -1162,6 +1292,15 @@ pub fn serve() -> i32 {
                     document_symbols(&text)
                 })()
                 .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "workspace/symbol" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let query = msg.get("params").and_then(|p| p.get("query")).and_then(Json::str).unwrap_or("");
+                let result = match &workspace_root {
+                    Some(root) => workspace_symbols(root, query, &buffers),
+                    None => "[]".to_string(),
+                };
                 send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
             }
             _ => {
@@ -1728,5 +1867,37 @@ mod tests {
         // LEXED token stream for `Tok::Ident` -- "fun" always lexes as `Tok::KwFun`,
         // never an identifier, so this correctly returns zero highlights, not a crash.
         assert_eq!(resolve_document_highlight(src, 0, 0), Some("[]".to_string()));
+    }
+
+    #[test]
+    fn workspace_symbol_searches_every_file_under_the_root() {
+        // A real LSP capability gap (bug-hunt batch 144, PR-it532): no
+        // `workspace/symbol` support -- editors' "Go to Symbol in Workspace"
+        // (searching by name across the WHOLE project, not just the open
+        // file) had nothing to query. This is the natural whole-project
+        // analog to it530's per-document `textDocument/documentSymbol`, but a
+        // genuinely different response SHAPE (flat `SymbolInformation` with
+        // its own `location.uri` per entry, since matches span many files) --
+        // not just documentSymbol run in a loop.
+        let dir = std::env::temp_dir().join(format!("kupl-lsp-ws-test-{}", std::process::id()));
+        let nested = dir.join("lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("main.kupl"), "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n").unwrap();
+        std::fs::write(nested.join("util.kupl"), "fun addTwo(a: Int) -> Int {\n    a + 2\n}\n").unwrap();
+        // a broken file must be silently skipped, not abort the whole search
+        std::fs::write(dir.join("broken.kupl"), "fun bad(a: Int -> Int {\n    a\n}\n").unwrap();
+
+        let matches = workspace_symbols(&dir, "add", &HashMap::new());
+        assert!(matches.contains("\"name\":\"add\""), "{matches}");
+        assert!(matches.contains("\"name\":\"addTwo\""), "{matches}"); // found in the NESTED file
+        assert!(matches.contains("main.kupl"), "{matches}");
+        assert!(matches.contains("lib/util.kupl") || matches.contains("lib%2Futil.kupl"), "{matches}");
+        // case-insensitive substring match, not exact-name
+        assert_eq!(workspace_symbols(&dir, "ADD", &HashMap::new()), matches, "query matching must be case-insensitive");
+
+        // a query matching nothing returns an empty (not null/error) result
+        assert_eq!(workspace_symbols(&dir, "zzz_nonexistent", &HashMap::new()), "[]");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
