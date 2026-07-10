@@ -1340,6 +1340,7 @@ static int k_eq(KValue a, KValue b) {
         case K_FLOAT: return a.as.f == b.as.f;
         case K_BOOL: return a.as.b == b.as.b;
         case K_UNIT: return 1;
+        case K_COMPONENT: return a.as.i == b.as.i;
         case K_STR: return strcmp(a.as.s, b.as.s) == 0;
         case K_LIST:
             if (a.as.list->len != b.as.list->len) return 0;
@@ -6536,6 +6537,38 @@ fun main() uses io {
 }
 "#;
         assert_eq!(native_main_stdout(src, "compiso").trim(), "a=3 b=1");
+    }
+
+    /// Native `k_eq` did not have a case for K_COMPONENT (fell into the `default: return 0`
+    /// arm), so component values always compared unequal -- even a component compared to
+    /// itself -- unlike interp/KVM, which compare components by instance id (PR-it561). This
+    /// broke `==` on component-typed values and any Set/Map keyed or valued by them.
+    #[test]
+    fn native_component_equality_is_instance_identity_not_always_false() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"contract Count { intent "c"
+    expose fun inc() -> Int
+    expose fun get() -> Int }
+component Counter fulfills Count { intent "ctr"
+    state n: Int = 0
+    expose fun inc() -> Int { n = n + 1
+        n }
+    expose fun get() -> Int { n } }
+fun main() uses io {
+    var a = Counter()
+    var b = Counter()
+    var c = a
+    print("a==a:{a == a} a==b:{a == b} a==c:{a == c}")
+    let s = Set([a, b, c])
+    print("set_len:{s.len()}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "compeq").trim(),
+            "a==a:true a==b:false a==c:true\nset_len:2"
+        );
     }
 
     /// Native records match interp/KVM at depth: nested `with` update preserves the outer's
