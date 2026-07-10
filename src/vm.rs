@@ -16161,6 +16161,36 @@ let areas = shapes.map(fn s { area(s) })\n    let m = Map().insert(\"n\", shapes
     }
 
     #[test]
+    fn kx_roundtrip_preserves_sized_int_f32_bigint_rational_sort_and_ordering() {
+        // A CLEAN CERT (bug-hunt batch 158, PR-it550), the natural next step after it549
+        // widened sort/min/max/min_by to SizedInt/F32/BigInt/Rational: no existing `.kx`
+        // roundtrip test had EVER exercised any of these four value kinds -- every prior
+        // kx_roundtrip test used only Int/Float/Str/ADT/Map literals. Since `.kx` encodes
+        // the compiled bytecode's CONSTANT POOL (including big()/rat()/sized-int literals)
+        // and the checker-widened method dispatch, this is a genuinely untested combination:
+        // does a big()/rat()/i32/f32 literal survive encode->decode, and does the NEWLY
+        // FIXED sort/min/min_by dispatch still resolve correctly after a fresh decode (not
+        // just a fresh compile)? Verified CLEAN: the compiled+encoded+decoded KVM module
+        // produces the exact same output as the in-memory interp/KVM baseline.
+        let src = "fun probe() -> Str {\n    \
+                   let si: List[i32] = [30i32, 10i32, 20i32]\n    \
+                   let fs: List[f32] = [3.5f32, 1.5f32]\n    \
+                   let bs = [big(30), big(10), big(20)]\n    \
+                   let rs = [rat(3, 4), rat(1, 4)]\n    \
+                   \"{si.sort()}|{si.min()}|{fs.sort()}|{bs.sort()}|{bs.min_by(fn x { x })}|{rs.sort()}\"\n}\n";
+        let expected = differential(src);
+        assert_eq!(expected, "[10, 20, 30]|Some(10)|[1.5, 3.5]|[10, 20, 30]|Some(10)|[1/4, 3/4]");
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let bytes = crate::kx::encode(&module);
+        let decoded = crate::kx::decode(&bytes).expect("decodes");
+        let mut vm = Vm::new(&decoded);
+        let v = vm.call_named("probe", vec![]).expect("runs");
+        assert_eq!(v.to_string(), expected);
+    }
+
+    #[test]
     fn ai_fun_kx_roundtrip() {
         std::env::set_var("KUPL_AI_MOCK_KX_HAIKU", "one two three");
         let src = "ai fun kx_haiku(topic: Str) -> Str {\n    intent \"Haiku.\"\n}\n\
