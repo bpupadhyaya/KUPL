@@ -243,7 +243,7 @@ pub fn print_diags(diags: &[Diag], src: &str, file: &str) {
     }
 }
 
-fn print_diags_map(diags: &[Diag], map: &crate::loader::SourceMap) {
+pub fn print_diags_map(diags: &[Diag], map: &crate::loader::SourceMap) {
     for d in diags {
         eprint!("{}", map.render(d));
     }

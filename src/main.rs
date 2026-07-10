@@ -121,12 +121,8 @@ fn run_cli() -> ExitCode {
                 2
             }
         },
-        Some("build") => with_file(&args, |src, file| {
-            build_module(&args, src, file, false)
-        }),
-        Some("bundle") => with_file(&args, |src, file| {
-            build_module(&args, src, file, true)
-        }),
+        Some("build") => with_path(&args, |file| build_module(&args, file, false)),
+        Some("bundle") => with_path(&args, |file| build_module(&args, file, true)),
         Some("test") => with_path(&args, run::run_tests),
         Some("check") => with_path(&args, |path| run::check_cmd(path, json)),
         Some("fmt") => with_file(&args, |src, file| {
@@ -182,19 +178,22 @@ fn run_cli() -> ExitCode {
 
 /// `kupl build` / `kupl bundle`: compile to a .kx module; bundle additionally
 /// wraps it in a copy of this executable for a self-contained program.
-fn build_module(args: &[String], src: &str, file: &str, bundle: bool) -> i32 {
-    let compiled = match run::compile(src) {
-        Ok(c) => c,
-        Err(errors) => {
-            run::print_diags(&errors, src, file);
-            return 1;
-        }
+///
+/// Uses `load_compile` (the multi-file-aware loader, same as `kupl run`/`kupl
+/// check`) rather than a raw single-file read -- before PR-it507, `build`/
+/// `bundle` read the entry file directly and never resolved `use` imports, so
+/// a valid multi-file program that `kupl run`/`kupl check` accepted failed to
+/// even compile to a `.kx` module or bundled executable ("unknown name"
+/// errors for every cross-module function).
+fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
+    let (compiled, map) = match run::load_compile(file) {
+        Ok(ok) => ok,
+        Err(code) => return code,
     };
-    run::print_diags(&compiled.warnings, src, file);
     let module = match kupl::compile::compile_module(&compiled.program, &compiled.checked) {
         Ok(m) => m,
         Err(diags) => {
-            run::print_diags(&diags, src, file);
+            run::print_diags_map(&diags, &map);
             return 1;
         }
     };
@@ -319,7 +318,38 @@ fn with_file(args: &[String], f: impl Fn(&str, &str) -> i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_project_name;
+    use super::{build_module, valid_project_name};
+
+    #[test]
+    fn build_resolves_multi_file_use_imports() {
+        // A real capability bug (PR-it507): `kupl build`/`kupl bundle` read the entry file
+        // directly (`with_file` -> raw `std::fs::read_to_string` + single-file `run::compile`)
+        // and never resolved `use` imports -- while `kupl run`/`kupl check` route through the
+        // multi-file-aware `run::load_compile` (which calls the loader). So a valid multi-file
+        // program (examples/multifile/main.kupl, which does `use util` / `use lib.stats`) that
+        // `kupl run`/`kupl check` accepted FAILED to even compile to a `.kx` module: "unknown
+        // name `mean`" / "unknown name `label`" for the cross-module functions. Fixed by
+        // switching `build`/`bundle` to `with_path` + `run::load_compile` (same loader as run/
+        // check), so `build_module` now sees the resolved multi-file program.
+        let entry = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/multifile/main.kupl");
+        let out = std::env::temp_dir().join(format!("kupl_it507_test_{}.kx", std::process::id()));
+        let args = vec![
+            "build".to_string(),
+            entry.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+        ];
+        let code = build_module(&args, entry.to_str().unwrap(), false);
+        assert_eq!(code, 0, "build_module must succeed on a valid multi-file program");
+        let bytes = std::fs::read(&out).expect("build_module must have written the .kx file");
+        let module = kupl::kx::decode(&bytes).expect("compiled module must decode");
+        // The cross-module functions (from util.kupl and lib/stats.kupl, pulled in via `use`)
+        // must actually be present in the compiled module -- not just "didn't crash".
+        assert!(module.funs.contains_key("mean"), "compiled module must resolve `use lib.stats`'s `mean`");
+        assert!(module.funs.contains_key("label"), "compiled module must resolve `use util`'s `label`");
+        let _ = std::fs::remove_file(&out);
+    }
 
     #[test]
     fn project_name_rejects_traversal_injection_and_empty() {
