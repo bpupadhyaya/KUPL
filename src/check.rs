@@ -2081,8 +2081,15 @@ impl Checker {
             Ty::Fun(ps, _) if ps.len() != args.len() => {
                 // still walk the arguments so their sub-expressions are checked
                 for a in args {
-                    if a.name.is_some() {
-                        self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+                    if let Some(n) = &a.name {
+                        self.err(
+                            "K0241",
+                            format!(
+                                "`{n}:` is a named argument, but named arguments are only allowed for constructors and props here -- call positionally instead: `{}`",
+                                crate::fmt::expr_str(&a.value, 0)
+                            ),
+                            a.value.span,
+                        );
                     }
                     self.infer_expr(&a.value, ctx);
                 }
@@ -2100,8 +2107,15 @@ impl Checker {
             // real type instead of failing with K0232 (PR-it134).
             Ty::Fun(ps, r) => {
                 for (i, a) in args.iter().enumerate() {
-                    if a.name.is_some() {
-                        self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+                    if let Some(n) = &a.name {
+                        self.err(
+                            "K0241",
+                            format!(
+                                "`{n}:` is a named argument, but named arguments are only allowed for constructors and props here -- call positionally instead: `{}`",
+                                crate::fmt::expr_str(&a.value, 0)
+                            ),
+                            a.value.span,
+                        );
                     }
                     let want = self.uni.apply(&ps[i]);
                     let at = self.check_expr_expecting(&a.value, &want, ctx);
@@ -2118,8 +2132,15 @@ impl Checker {
             // (PR-it204). Still walk the arguments so their sub-expressions are checked.
             other if !matches!(other, Ty::Var(_)) => {
                 for a in args {
-                    if a.name.is_some() {
-                        self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+                    if let Some(n) = &a.name {
+                        self.err(
+                            "K0241",
+                            format!(
+                                "`{n}:` is a named argument, but named arguments are only allowed for constructors and props here -- call positionally instead: `{}`",
+                                crate::fmt::expr_str(&a.value, 0)
+                            ),
+                            a.value.span,
+                        );
                     }
                     self.infer_expr(&a.value, ctx);
                 }
@@ -2135,8 +2156,15 @@ impl Checker {
             _ => {
                 let mut arg_tys = Vec::new();
                 for a in args {
-                    if a.name.is_some() {
-                        self.err("K0241", "named arguments are only allowed for constructors and props", a.value.span);
+                    if let Some(n) = &a.name {
+                        self.err(
+                            "K0241",
+                            format!(
+                                "`{n}:` is a named argument, but named arguments are only allowed for constructors and props here -- call positionally instead: `{}`",
+                                crate::fmt::expr_str(&a.value, 0)
+                            ),
+                            a.value.span,
+                        );
                     }
                     arg_tys.push(self.infer_expr(&a.value, ctx));
                 }
@@ -3140,6 +3168,37 @@ mod generic_tests {
         assert!(
             none.iter().any(|d| d.code == "K0261" && !d.message.contains("did you mean")),
             "unrelated name should stay bare: {none:?}"
+        );
+    }
+
+    #[test]
+    fn k0241_names_the_argument_and_the_positional_fix() {
+        // Error-msg round 38 (PR-it520): named arguments through an INDIRECT function value
+        // (e.g. `let f = add; f(a: 1, b: 2)` -- the checker only has `f`'s structural type,
+        // Fun(Int,Int)->Int, not the original `add` declaration's parameter NAMES, so named-arg
+        // resolution is impossible in general) reported a bare "named arguments are only
+        // allowed for constructors and props" -- didn't say WHICH argument, or how to fix it.
+        // Direct calls to a named function/constructor (`add(a: 1, b: 2)`) are unaffected --
+        // `callargs::resolve_call_args` already resolves those into positional form before the
+        // checker even sees them, so K0241 only fires on this indirect-call path.
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() {\n    let f = add\n    print(f(a: 1, b: 2))\n}\n";
+        let e = errors(src);
+        assert!(
+            e.iter().any(|d| d.code == "K0241" && d.message.contains("`a:` is a named argument") && d.message.contains("call positionally instead: `1`")),
+            "K0241 should name the argument and show the positional fix: {e:?}"
+        );
+        assert!(
+            e.iter().any(|d| d.code == "K0241" && d.message.contains("`b:` is a named argument") && d.message.contains("call positionally instead: `2`")),
+            "K0241 should report EACH named argument separately: {e:?}"
+        );
+        // A DIRECT named call to `add` itself still type-checks cleanly (`kupl check`'s real
+        // pipeline runs `callargs::resolve_call_args` BEFORE the checker, rewriting a direct
+        // named call into positional form -- so the checker itself never sees a named arg
+        // here at all, unlike `errors()`'s bare parse+check harness above which skips that
+        // pass and would otherwise misleadingly show K0241 even for the direct case).
+        assert!(
+            crate::run::compile("fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() {\n    print(add(a: 1, b: 2))\n}\n").is_ok(),
+            "direct named call must compile cleanly through the real pipeline (resolve_call_args rewrites it to positional form)"
         );
     }
 
