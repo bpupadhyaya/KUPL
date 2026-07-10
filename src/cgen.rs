@@ -2540,16 +2540,21 @@ static KValue k_ai_call(int info) {
     char b[320]; snprintf(b, sizeof b, "ai `%s`: %s", f->name, k_ai_err); k_panic(b); return k_unit();
 }
 
-/* ---- regex (mirrors src/regex.rs; byte-oriented — ASCII-correct, which is
-   what the KUPL regex examples use; multi-byte class ranges would differ) ---- */
+/* ---- regex (mirrors src/regex.rs, which matches over Unicode scalars via
+   `pattern.chars()`). Atoms/ranges store a full codepoint (not a raw byte) so
+   a multi-byte literal or class-range boundary in the PATTERN itself, and a
+   multi-byte character in the SUBJECT text, both match as one unit -- see
+   `kre_utf8_cp` below (PR-it555: was byte-oriented, silently mis-parsed any
+   non-ASCII pattern character, e.g. `é+` only bound `+` to `é`'s trailing
+   continuation byte instead of the whole character). ---- */
 typedef struct KReAtom KReAtom;
 typedef struct { KReAtom* atom; int quant; } KRePiece;    /* quant: 0 One 1 * 2 + 3 ? */
 typedef struct { KRePiece* p; int n; } KReSeq;
 typedef struct { KReSeq* a; int n; } KReAlts;
-typedef struct { unsigned char lo, hi; } KReRange;
+typedef struct { long lo, hi; } KReRange;
 struct KReAtom {
     int kind;                 /* 0 Any, 1 Char, 2 Class, 3 Group */
-    unsigned char ch;
+    long ch;                  /* a Unicode codepoint, not a raw byte */
     int negated; KReRange* ranges; int nranges;
     KReAlts group;
 };
@@ -2559,6 +2564,24 @@ typedef struct { const unsigned char* s; int pos, len, aend, err; const char* ms
 static KReAlts kre_alternation(KReP* p);
 static void kre_fail(KReP* p, const char* m) { if (!p->err) { p->err = 1; p->msg = m; } }
 static int kre_peek(KReP* p) { return p->pos < p->len ? p->s[p->pos] : -1; }
+static int k_utf8_len(unsigned char c); /* defined later in the runtime */
+/* Decode the Unicode codepoint at byte offset `pos` of `s` (length `len`);
+   `*outlen` receives how many bytes it took. A truncated/invalid lead byte
+   falls back to treating that single byte as its own "codepoint" (matches
+   `k_utf8_len`'s own fallback), same as the interpreter's lossy behavior on
+   malformed input. Used for BOTH decoding the pattern string (so a
+   multi-byte literal/range-boundary parses as one atom) and the subject
+   text (so matching advances a whole character per step). */
+static long kre_utf8_cp(const unsigned char* s, int len, int pos, int* outlen) {
+    unsigned char c = s[pos];
+    int n = k_utf8_len(c);
+    if (pos + n > len) n = 1;
+    *outlen = n;
+    if (n == 1) return c;
+    long cp = (n == 2) ? (c & 0x1F) : (n == 3) ? (c & 0x0F) : (c & 0x07);
+    for (int i = 1; i < n; i++) cp = (cp << 6) | (s[pos + i] & 0x3F);
+    return cp;
+}
 
 static void kre_class(KReP* p, KReAtom* a) {
     p->pos++;                 /* '[' */
@@ -2586,15 +2609,15 @@ static void kre_class(KReP* p, KReAtom* a) {
                 default: REPUSH((unsigned char)e, (unsigned char)e); break;
             }
         } else {
-            p->pos++;
+            int clen; long cp = kre_utf8_cp(p->s, p->len, p->pos, &clen); p->pos += clen;
             /* range lo-hi when `-` is followed by a non-`]` */
             if (kre_peek(p) == '-' && p->pos + 1 < p->len && p->s[p->pos + 1] != ']') {
                 p->pos++;
-                int hi = kre_peek(p); p->pos++;
-                if ((unsigned char)c <= (unsigned char)hi) REPUSH((unsigned char)c, (unsigned char)hi);
-                else REPUSH((unsigned char)hi, (unsigned char)c);
+                int hlen; long hi = kre_utf8_cp(p->s, p->len, p->pos, &hlen); p->pos += hlen;
+                if (cp <= hi) REPUSH(cp, hi);
+                else REPUSH(hi, cp);
             } else {
-                REPUSH((unsigned char)c, (unsigned char)c);
+                REPUSH(cp, cp);
             }
         }
     }
@@ -2615,6 +2638,13 @@ static KReAtom* kre_atom(KReP* p) {
         p->pos++;
         int e = kre_peek(p);
         if (e < 0) { kre_fail(p, "dangling `\\` at end of pattern"); return a; }
+        if ((unsigned char)e >= 0x80) {
+            /* a multi-byte escaped literal, e.g. `\é` -- decode the whole codepoint
+               rather than consuming just its lead byte. */
+            int elen; long ecp = kre_utf8_cp(p->s, p->len, p->pos, &elen);
+            p->pos += elen; a->kind = 1; a->ch = ecp;
+            return a;
+        }
         p->pos++;
         switch (e) {
             case 'd': a->kind = 2; a->negated = 0; a->ranges = (KReRange*)k_alloc(sizeof(KReRange)); a->ranges[0].lo = '0'; a->ranges[0].hi = '9'; a->nranges = 1; break;
@@ -2635,7 +2665,7 @@ static KReAtom* kre_atom(KReP* p) {
     } else if (c == ')' || c == '|') { kre_fail(p, "unexpected metacharacter"); }
     else if (c == '*' || c == '+' || c == '?') { kre_fail(p, "quantifier with nothing to repeat"); }
     else if (c < 0) { kre_fail(p, "unexpected end of pattern"); }
-    else { p->pos++; a->kind = 1; a->ch = (unsigned char)c; }
+    else { int clen; long cp = kre_utf8_cp(p->s, p->len, p->pos, &clen); p->pos += clen; a->kind = 1; a->ch = cp; }
     return a;
 }
 
@@ -2679,7 +2709,6 @@ static KRegex k_re_compile(const char* pat) {
 }
 
 /* matcher — recursive, mirrors regex.rs match_here/seq/piece/atom exactly */
-static int k_utf8_len(unsigned char c); /* defined earlier in the runtime; fwd-decl for `.` */
 static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, int* out);
 static int kre_atom_match(KReAtom* a, const unsigned char* t, int tlen, int pos, int* np) {
     switch (a->kind) {
@@ -2687,12 +2716,16 @@ static int kre_atom_match(KReAtom* a, const unsigned char* t, int tlen, int pos,
            one byte, so it mirrors the interpreter (which matches over chars) and
            never returns an invalid-UTF-8 byte fragment. */
         case 0: if (pos < tlen) { *np = pos + k_utf8_len(t[pos]); return 1; } return 0;
-        case 1: if (pos < tlen && t[pos] == a->ch) { *np = pos + 1; return 1; } return 0;
+        case 1: {
+            if (pos >= tlen) return 0;
+            int clen; long cp = kre_utf8_cp(t, tlen, pos, &clen);
+            if (cp == a->ch) { *np = pos + clen; return 1; } return 0;
+        }
         case 2: {
             if (pos >= tlen) return 0;
-            unsigned char ch = t[pos]; int inside = 0;
-            for (int i = 0; i < a->nranges; i++) if (ch >= a->ranges[i].lo && ch <= a->ranges[i].hi) { inside = 1; break; }
-            if (inside != a->negated) { *np = pos + 1; return 1; } return 0;
+            int clen; long cp = kre_utf8_cp(t, tlen, pos, &clen); int inside = 0;
+            for (int i = 0; i < a->nranges; i++) if (cp >= a->ranges[i].lo && cp <= a->ranges[i].hi) { inside = 1; break; }
+            if (inside != a->negated) { *np = pos + clen; return 1; } return 0;
         }
         default: { /* group */
             for (int i = 0; i < a->group.n; i++) {
@@ -7314,6 +7347,39 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "regex").trim(),
             "[\"1\", \"22\", \"333\"]\na#b#c\nSome(\"日\")\nSome(\"a日本z\")"
+        );
+    }
+
+    /// A REAL BUG found+fixed (bug-hunt batch 163, PR-it555): native's regex engine
+    /// (`kre_*` in cgen.rs) used to parse PATTERN characters byte-by-byte, unlike
+    /// regex.rs's Rust engine which matches over `char`s (full Unicode scalars). A
+    /// multi-byte pattern literal like `é` (2 UTF-8 bytes) silently split into TWO
+    /// separate atoms, so `é+` bound the `+` quantifier to only é's trailing
+    /// continuation byte instead of the whole character -- `re_find("é+", "xééé y")`
+    /// returned `Some("é")` (one character) on native instead of `Some("ééé")` (all
+    /// three) on interp/vm. A multi-byte class range like `[à-ÿ]` was even worse:
+    /// its lo/hi bounds parsed as raw bytes, producing garbage (mojibake) matches.
+    /// Confirmed via a real 3-engine CLI probe first: interp and vm agreed (correct),
+    /// native alone diverged -- every prior native regex test put non-ASCII only in
+    /// the SUBJECT text, never in the PATTERN itself. Fixed by widening
+    /// `KReAtom.ch`/`KReRange.lo,hi` from a raw byte to a full codepoint and adding
+    /// `kre_utf8_cp` (decodes one UTF-8 codepoint, used symmetrically when parsing
+    /// the pattern string AND when matching the subject text), matching regex.rs's
+    /// char-based semantics exactly.
+    #[test]
+    fn native_regex_pattern_supports_multi_byte_literals_and_class_ranges() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(re_find(\"é+\", \"xééé y\"))\n    \
+                   print(re_find_all(\"[à-ÿ]\", \"café\"))\n    \
+                   print(re_match(\"日+\", \"日本語\"))\n    \
+                   print(re_match(\"\\\\é\", \"é\"))\n    \
+                   print(re_match(\"[^é]+\", \"aéc\"))\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "regexutf8").trim(),
+            "Some(\"ééé\")\n[\"é\"]\ntrue\ntrue\ntrue"
         );
     }
 
