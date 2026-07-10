@@ -757,6 +757,76 @@ fn position_of(params: &Json) -> Option<(&str, usize, usize)> {
     Some((uri, line, ch))
 }
 
+/// `textDocument/documentSymbol`: an outline of the file's items (functions,
+/// types, components, contracts, top-level `law`s), for "Go to Symbol"/
+/// breadcrumbs/outline-view support. `None` on parse errors (nothing safe to
+/// outline). Components are expanded into NESTED children (state fields,
+/// exposed/private methods) -- built that way from the start, rather than as
+/// a top-level-only pass needing a follow-up fix, since exactly that gap
+/// (searching only `program.items`, blind to `Item::Component`'s nested
+/// members) was the root cause behind THREE separate real bugs already this
+/// campaign (hover/definition it513, completions it514).
+fn document_symbols(text: &str) -> Option<String> {
+    let (program, diags) = crate::parser::parse(text);
+    if diags.iter().any(|d| d.severity == Severity::Error) {
+        return None;
+    }
+    let syms: Vec<String> = program.items.iter().map(|item| item_symbol(text, item)).collect();
+    Some(format!("[{}]", syms.join(",")))
+}
+
+/// LSP `Range` for a span, rendered inline as a JSON object literal.
+fn lsp_range(text: &str, span: crate::diag::Span) -> String {
+    let (l0, c0) = line_col(text, span.start);
+    let (l1, c1) = line_col(text, span.end);
+    format!(
+        "{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}",
+        l0 - 1,
+        c0 - 1,
+        l1 - 1,
+        c1 - 1
+    )
+}
+
+/// `DocumentSymbol` JSON. `range`/`selectionRange` are the same span here (no
+/// separate name-only span is tracked on these AST nodes) -- valid per spec
+/// (selectionRange must be contained in range; equal satisfies that trivially).
+fn symbol_json(name: &str, kind: u8, range: &str, children: &[String]) -> String {
+    let children_part =
+        if children.is_empty() { String::new() } else { format!(",\"children\":[{}]", children.join(",")) };
+    format!(
+        "{{\"name\":\"{}\",\"kind\":{kind},\"range\":{range},\"selectionRange\":{range}{children_part}}}",
+        json_escape(name)
+    )
+}
+
+/// LSP `SymbolKind` numeric codes used here: Method=6, Function=12, Field=8,
+/// EnumMember=22, Enum=10, Class=5, Interface=11.
+fn item_symbol(text: &str, item: &crate::ast::Item) -> String {
+    use crate::ast::Item;
+    match item {
+        Item::Fun(f) => symbol_json(&f.name, 12, &lsp_range(text, f.span), &[]),
+        Item::Type(t) => {
+            let children: Vec<String> =
+                t.variants.iter().map(|v| symbol_json(&v.name, 22, &lsp_range(text, v.span), &[])).collect();
+            symbol_json(&t.name, 10, &lsp_range(text, t.span), &children)
+        }
+        Item::Contract(c) => {
+            let children: Vec<String> =
+                c.sigs.iter().map(|s| symbol_json(&s.name, 6, &lsp_range(text, s.span), &[])).collect();
+            symbol_json(&c.name, 11, &lsp_range(text, c.span), &children)
+        }
+        Item::Law(l) => symbol_json(&l.name, 12, &lsp_range(text, l.span), &[]),
+        Item::Component(c) => {
+            let mut children: Vec<String> =
+                c.state.iter().map(|s| symbol_json(&s.name, 8, &lsp_range(text, s.span), &[])).collect();
+            children.extend(c.exposes.iter().map(|f| symbol_json(&f.name, 6, &lsp_range(text, f.span), &[])));
+            children.extend(c.funs.iter().map(|f| symbol_json(&f.name, 6, &lsp_range(text, f.span), &[])));
+            symbol_json(&c.name, 5, &lsp_range(text, c.span), &children)
+        }
+    }
+}
+
 /// Current text of a document: the unsaved editor buffer if present, else disk.
 fn doc_text(uri: &str, buffers: &HashMap<PathBuf, String>) -> Option<String> {
     let path = uri_to_path(uri)?;
@@ -847,7 +917,7 @@ pub fn serve() -> i32 {
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -1051,6 +1121,17 @@ pub fn serve() -> i32 {
                     let uri = p.get("textDocument")?.get("uri")?.str()?;
                     let text = doc_text(uri, &buffers)?;
                     resolve_formatting(&text)
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/documentSymbol" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let uri = p.get("textDocument")?.get("uri")?.str()?;
+                    let text = doc_text(uri, &buffers)?;
+                    document_symbols(&text)
                 })()
                 .unwrap_or_else(|| "null".into());
                 send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
@@ -1554,5 +1635,42 @@ mod tests {
 
         // unparseable source: nothing safe to format at all
         assert_eq!(resolve_formatting("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
+    }
+
+    #[test]
+    fn document_symbols_outline_includes_nested_component_members() {
+        // A real LSP capability gap (bug-hunt batch 142, PR-it530): no
+        // `textDocument/documentSymbol` support at all -- so "Go to Symbol in
+        // File" / breadcrumbs / outline-view had nothing to show for any
+        // `.kupl` file, despite hover/definition/completion all working.
+        // Built NESTED from the start (component state/methods as children of
+        // the component symbol) rather than top-level-only, since exactly that
+        // gap (blind to `Item::Component`'s nested members) caused THREE real
+        // bugs already this campaign (it513/it514) -- an outline that only
+        // shows component NAMES, none of their methods, would repeat the same
+        // mistake in a fourth place.
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\ntype Shape = Circle(r: Float) | Square(s: Float)\ncomponent Greeter {\n    intent \"g\"\n    state n: Int = 0\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\ncontract Store {\n    expose fun get(k: Str) -> Int\n}\n";
+        let syms = document_symbols(src).expect("parses cleanly, should outline");
+
+        // top-level items present with the right kinds
+        assert!(syms.contains("\"name\":\"add\",\"kind\":12"), "{syms}"); // Function
+        assert!(syms.contains("\"name\":\"Shape\",\"kind\":10"), "{syms}"); // Enum
+        assert!(syms.contains("\"name\":\"Greeter\",\"kind\":5"), "{syms}"); // Class
+        assert!(syms.contains("\"name\":\"Store\",\"kind\":11"), "{syms}"); // Interface
+
+        // ADT variants nested under the type
+        assert!(syms.contains("\"name\":\"Circle\",\"kind\":22"), "{syms}"); // EnumMember
+        assert!(syms.contains("\"name\":\"Square\",\"kind\":22"), "{syms}");
+
+        // component state + BOTH exposed and private methods nested under the component
+        assert!(syms.contains("\"name\":\"n\",\"kind\":8"), "{syms}"); // Field
+        assert!(syms.contains("\"name\":\"greet\",\"kind\":6"), "{syms}"); // Method
+        assert!(syms.contains("\"name\":\"helper\",\"kind\":6"), "{syms}");
+
+        // contract signature nested under the contract
+        assert!(syms.contains("\"name\":\"get\",\"kind\":6"), "{syms}");
+
+        // unparseable source: nothing safe to outline
+        assert_eq!(document_symbols("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
     }
 }
