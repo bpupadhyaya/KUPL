@@ -17085,6 +17085,54 @@ component Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counte
     }
 
     #[test]
+    fn diff_par_branch_state_mutation_commits_sequentially_then_restart_resets() {
+        // Runtime soundness-symmetry (PR-it527): earlier campaign notes assumed
+        // `emit`/state-mutation could not appear inside `par` branches at all ("DEAD
+        // END, don't pursue"). CORRECTED here: a `par` branch is just an Expr position,
+        // and `{ stmt; stmt; expr }` (a BlockExpr) is a valid Expr -- so both check.rs
+        // and both engines happily accept `n = n + 1` and `emit x(...)` inside a `par`
+        // branch. This was previously UNVERIFIED at runtime. Locks two properties,
+        // confirmed identical on both engines via a real CLI diff FIRST: (1) branches
+        // commit their mutations SEQUENTIALLY in declared order -- a later branch's
+        // panic does NOT roll back mutations already committed by earlier branches
+        // (there is no transaction/rollback machinery, by design: "v1.0-alpha runs
+        // them in deterministic branch order"), and (2) `supervise ... restart
+        // on_failure` still correctly resets that partially-mutated state to its init
+        // value, so a subsequent successful trigger starts from a clean `n = 0` on
+        // both engines, not from the partially-mutated value.
+        let src = "component Counter527 {\n    intent \"c\"\n    state n: Int = 0\n    in trigger: Int\n    expose fun peek() -> Int {\n        n\n    }\n    on trigger(v) {\n        par {\n            { n = n + 1; 1 }\n            { n = n + 100; 10 / v }\n            { n = n + 2; 2 }\n        }\n    }\n}\ncomponent Driver527 {\n    intent \"d\"\n    out go: Int\n    on start {\n        emit go(0)\n        emit go(5)\n    }\n}\ncomponent Main527 {\n    intent \"m\"\n    let counter = Counter527()\n    let driver = Driver527()\n    wire driver.go -> counter.trigger\n    supervise counter restart on_failure\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter: go(0) panics (n partially committed to 1+100=101 before the
+        // divide-by-zero), triggering a restart that resets n to 0; go(5) then
+        // succeeds cleanly (n = 0+1=1, 1+100=101, 101+2=103).
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        match it.instantiate("Main527", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(_)) => {}
+            _ => panic!("interp instantiate failed"),
+        }
+        assert!(it.start_all().is_ok(), "supervision must catch the mid-par panic");
+        let counter_id = it.instances.iter().position(|i| i.comp.name == "Counter527").expect("Counter527 instance");
+        let f = Value::Bound(counter_id, std::rc::Rc::new("peek".to_string()));
+        let i_peek = match it.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v.to_string(),
+            Err(_) => panic!("peek() call failed"),
+        };
+
+        // KVM -- mirrors interp's instantiate + start_all.
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        assert!(vm.run_app("Main527").is_ok(), "KVM supervision must catch the mid-par panic too");
+        let vcounter_id = vm.instances.iter().position(|i| module.components[i.comp as usize].name == "Counter527").expect("Counter527 instance");
+        let v_peek = vm.call_expose(vcounter_id, "peek", vec![]).unwrap().to_string();
+
+        assert_eq!(i_peek, v_peek, "interpreter and KVM disagree on post-restart state after a partially-mutating panicked par");
+        assert_eq!(i_peek, "103", "restart must reset state to init (n=0) before the second, successful trigger commits 1+100+2=103 -- not 101(leftover)+1+100+2");
+    }
+
+    #[test]
     fn diff_supervised_restart_timer_fix_survives_kx_roundtrip() {
         // Bug-hunt batch 135: a genuinely untested combination -- does it509's
         // timer-double-delay fix survive a FULL `.kx` encode/decode round-trip (not just
