@@ -2271,13 +2271,33 @@ static KValue k_http_serve(KValue port, KValue handler) {
             }
         }
         KValue hargs[2] = { k_str(method), k_str(path) };
-        KValue rv = k_call(handler, hargs, 2);
-        const char* body = rv.tag == K_STR ? rv.as.s : "";
+        /* Catch a REAL panic from the handler and convert it to a 500 response
+           (PR-it559 fix): mirrors interp.rs's serve_http caller
+           (interp.rs:1219-1225), which explicitly catches the handler's panic
+           and turns it into Err(msg) -> "500 Internal Server Error", keeping
+           the server alive to serve the NEXT connection. Native had NO
+           landing pad here before, so a single panicking request took down
+           the WHOLE server process (k_panic's no-pad path: exit 101) instead
+           of surviving like interp/vm -- a real availability divergence, not
+           just a message-wording one. Same setjmp/k_pad pattern as
+           k_ai_call_one_tool's tool-call pad and k_dispatch's supervision pad. */
+        const char* status; const char* body;
+        jmp_buf handler_pad; jmp_buf* prev_pad = k_pad; k_pad = &handler_pad;
+        if (setjmp(handler_pad) == 0) {
+            KValue rv = k_call(handler, hargs, 2);
+            k_pad = prev_pad;
+            status = "200 OK";
+            body = rv.tag == K_STR ? rv.as.s : "";
+        } else {
+            k_pad = prev_pad;
+            status = "500 Internal Server Error";
+            body = k_panic_buf;
+        }
         KBuf resp = { 0, 0, 0 };
         char hdr[192];
         int hn = snprintf(hdr, sizeof hdr,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-            strlen(body));
+            "HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+            status, strlen(body));
         kb_write(&resp, hdr, hn);
         kb_write(&resp, body, (long)strlen(body));
         long off = 0;
@@ -7959,6 +7979,78 @@ fun main() uses io {
             let _ = s.read_to_string(&mut resp);
             if !resp.contains("HTTP/1.1 200 OK") || !resp.ends_with("GET /world") {
                 return Err(format!("bad response: {resp}"));
+            }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
+    /// A REAL BUG found+fixed (bug-hunt batch 167, PR-it559, found via an Explore-agent
+    /// survey of tensors [exhausted, clean] vs HTTP [this]): native's `k_http_serve` had
+    /// NO panic-catching landing pad around the handler call, unlike interp.rs's
+    /// `serve_http` caller (interp.rs:1219-1225), which explicitly catches the handler's
+    /// panic and converts it to a "500 Internal Server Error" response, keeping the
+    /// server alive to serve the NEXT connection. Confirmed via a real 3-engine probe
+    /// first: hitting a panicking handler on native took down the ENTIRE server process
+    /// (`k_panic`'s no-pad path: `exit(101)`), so a second request got "connection
+    /// refused" -- interp/vm instead returned a 500 with the panic message as the body
+    /// and kept serving. A single malformed/adversarial request that trips a bug in the
+    /// handler would take down a native-compiled KUPL HTTP server entirely -- a real
+    /// availability divergence, not just a message-wording one, and completely untested
+    /// before this (the only prior native_http_serve test only exercised the happy path).
+    /// Fixed with the SAME setjmp/k_pad landing-pad pattern already used for ai-fun tool
+    /// calls (it539) and supervision restarts.
+    #[test]
+    fn native_http_serve_survives_a_panicking_handler() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str) -> Str {\n    \
+                   if p == \"/boom\" {\n        let x = 1 / 0\n        \"unreached {x}\"\n    } else {\n        \"ok {p}\"\n    }\n}\n\
+                   fun main() uses io { let _ = http_serve(38122, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srvpanic-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let connect = || {
+            for _ in 0..300 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38122u16)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        let result = (|| {
+            // request 1: the handler panics -> must get a 500, not a dropped connection.
+            let mut s1 = connect().ok_or("server should be listening")?;
+            s1.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s1.write_all(b"GET /boom HTTP/1.1\r\nHost: x\r\n\r\n").map_err(|e| e.to_string())?;
+            let mut resp1 = String::new();
+            let _ = s1.read_to_string(&mut resp1);
+            if !resp1.contains("HTTP/1.1 500 Internal Server Error") || !resp1.ends_with("division by zero") {
+                return Err(format!("bad panic response: {resp1:?}"));
+            }
+            // request 2: a FRESH connection after the panic -- the server must still be
+            // alive and serving normally, proving it survived the first request's panic.
+            let mut s2 = connect().ok_or("server should still be listening after the panic")?;
+            s2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s2.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n").map_err(|e| e.to_string())?;
+            let mut resp2 = String::new();
+            let _ = s2.read_to_string(&mut resp2);
+            if !resp2.contains("HTTP/1.1 200 OK") || !resp2.ends_with("ok /ok") {
+                return Err(format!("bad post-panic response: {resp2:?}"));
             }
             Ok::<(), String>(())
         })();
