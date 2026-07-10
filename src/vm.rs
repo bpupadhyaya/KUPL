@@ -16179,6 +16179,41 @@ fun probe() -> Str {\n    diff_assist3(\"x\")\n}\n";
         assert_eq!(l0 - 1, decl_line, "the panic must point at the ai fun's declaration, not the call site");
     }
 
+    #[test]
+    fn diff_ai_fun_result_wrapping_swallows_tool_panics() {
+        // Bug-hunt batch 136, continued: a non-obvious, previously-UNTESTED interaction
+        // between two existing features -- `ai fun ... -> Result[T, E]` (wraps_result) and a
+        // tool that panics internally. Both engines' ToolHost::call_tool implementations
+        // ALREADY catch a real panic from the tool's own body and convert it to a plain
+        // Result<Value,String> Err (interp: `Err(Flow::Panic{msg,..}) => Err(msg)`; KVM:
+        // `.map_err(|e| e.msg)`) -- so `ai_call`'s `Err(msg) if meta.wraps_result =>
+        // Ok(Value::err(...))` branch means a TOOL'S INTERNAL PANIC (e.g. division by zero) is
+        // SWALLOWED into a normal `Err(msg)` Result value for a Result-returning ai fun,
+        // rather than propagating as a hard program-halting panic. Confirmed clean (both
+        // engines already agree) via a real CLI diff before locking -- not a bug, but a
+        // genuinely surprising, previously-unverified property worth certifying: this makes a
+        // `Result`-wrapped ai fun implicitly "exception-safe" with respect to its own declared
+        // tools, in clear CONTRAST to the SAME failure with a bare (non-Result) return type,
+        // which DOES propagate as a hard panic (locked separately by
+        // diff_ai_fun_tool_failure_messages / ai_fun_tool_failure_panic_span_matches_across_engines
+        // above).
+        let src = "fun tool_div4(a: Int, b: Int) -> Int {\n    a / b\n}\n\
+ai fun assist4(q: Str) -> Result[Int, Str] tools [tool_div4] {\n    intent \"Assist.\"\n}\n\
+fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n        Err(e) => \"err:{e}\"\n    }\n}\n";
+
+        // the tool panics internally (division by zero) -- swallowed into Err, not a panic.
+        std::env::set_var("KUPL_AI_MOCK_ASSIST4", "[{\"tool\":\"tool_div4\",\"input\":{\"a\":1,\"b\":0}},{\"final\":\"5\"}]");
+        assert_eq!(differential(src), "err:division by zero");
+
+        // an unknown-tool failure is ALSO swallowed the same way, not just a real panic.
+        std::env::set_var("KUPL_AI_MOCK_ASSIST4", "[{\"tool\":\"nope4\",\"input\":{}},{\"final\":\"5\"}]");
+        assert_eq!(differential(src), "err:model called unknown tool `nope4`");
+
+        // the happy path (tool succeeds, final answer parses) still produces Ok(...).
+        std::env::set_var("KUPL_AI_MOCK_ASSIST4", "[{\"tool\":\"tool_div4\",\"input\":{\"a\":10,\"b\":2}},{\"final\":\"5\"}]");
+        assert_eq!(differential(src), "ok:5");
+    }
+
     // helper: source that builds List[Int] = [0, 1, …, n-1] via a loop
     #[cfg(test)]
     const MK: &str = "fun mk(n: Int) -> List[Int] {\n    \
