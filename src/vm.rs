@@ -16904,6 +16904,42 @@ component Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counte
     }
 
     #[test]
+    fn diff_supervised_restart_timer_fix_survives_kx_roundtrip() {
+        // Bug-hunt batch 135: a genuinely untested combination -- does it509's
+        // timer-double-delay fix survive a FULL `.kx` encode/decode round-trip (not just
+        // the in-memory `compile_module` that diff_supervised_restart_does_not_double_delay_timers
+        // exercises), and does `kupl build`/`kupl run x.kx` preserve `supervise ...
+        // restart on_failure` + timer semantics end to end? Manually verified clean via
+        // the actual CLI first (kupl build examples/supervise.kupl -> kupl run the .kx,
+        // byte-identical to running the source directly); this locks the SAME Ticker/
+        // Counter/Main scenario as the fix's own regression test, but driven through
+        // `kx::encode`/`kx::decode` (matching the on-disk `.kx` module format) instead of
+        // a fresh in-memory `compile_module` result.
+        let src = "component Ticker {\n    intent \"ticker\"\n    out tick: Int\n\
+    on every 10ms {\n        emit tick(1)\n        panic(\"boom\")\n    }\n}\n\
+component Counter {\n    intent \"counter\"\n    in tick: Int\n    out total: Int\n    state n: Int = 0\n\
+    on tick(v) {\n        n += v\n        emit total(n)\n    }\n    expose fun count() -> Int {\n        n\n    }\n}\n\
+component Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Counter()\n\
+    wire ticker.tick -> counter.tick\n    supervise ticker restart on_failure\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let decoded = crate::kx::decode(&crate::kx::encode(&module)).expect("kx round-trip decodes");
+        let mut vm = Vm::new(&decoded);
+        let idx = *decoded.component_names.get("Main").expect("Main in decoded module");
+        vm.instantiate(idx, Vec::new()).expect("kvm instantiate");
+        for id in 0..vm.instances.len() {
+            vm.run_lifecycle(id, "@start").expect("kvm lifecycle");
+            vm.arm_timers(id);
+        }
+        vm.drain().expect("kvm drain");
+        vm.advance(100).expect("kvm advance must survive repeated supervised restarts after a kx round-trip");
+        let counter_id = vm.instances.iter().position(|i| decoded.components[i.comp as usize].name == "Counter").expect("Counter instance");
+        let count = vm.call_expose(counter_id, "count", vec![]).unwrap().to_string();
+        assert_eq!(count, "10", "the timer-double-delay fix must survive a full .kx encode/decode round-trip");
+    }
+
+    #[test]
     fn timers_kx_roundtrip() {
         let src = "component T {\n    intent \"t\"\n    out tick: Int\n    state n: Int = 0\n\
     on every 3s {\n        n += 1\n        emit tick(n)\n    }\n}\n";
