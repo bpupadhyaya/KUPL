@@ -3457,6 +3457,85 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_continued_fraction_sqrt_convergents() {
+        // A certification lock (it508, classic-algo/number-theory vein, fresh axis -- continued
+        // fractions were an open candidate alongside Stern-Brocot/toom-cook): the CONTINUED
+        // FRACTION expansion of sqrt(N) for non-square N, and its CONVERGENTS p_k/q_k, computed
+        // via the standard (m,d,a) recurrence for the CF digits and the standard (p,q) linear
+        // recurrence for the convergents built FROM those digits. MATHEMATICAL-IDENTITY /
+        // SPEC-PROPERTY cross-check (like power-sum-identities it483, rational-field-axioms
+        // it485): the DETERMINANT IDENTITY p_k*q_(k-1) - p_(k-1)*q_k = (-1)^(k+1) is a classical
+        // fact about continued-fraction convergents, provable by induction from the recurrence
+        // but NOT restated BY the recurrence itself (the recurrence only defines how to build the
+        // NEXT p,q from the current ones; the determinant identity is a separate invariant about
+        // the whole sequence) -- checking it independently (by direct multiplication of the
+        // generated p,q,pPrev,qPrev) certifies the CF-digit computation and the convergent
+        // recurrence agree, not a tautology (it462 discipline).
+        //   N=2 (period-1 CF [1;2,2,2,...], the simplest case): convergents 1/1, 3/2, 7/5, 17/12
+        //   match the textbook sqrt(2) approximations. Because the period is exactly 1, EVERY
+        //   convergent here ALSO solves Pell's equation p^2 - 2*q^2 = +-1 EXACTLY (a SECOND,
+        //   independent classical fact, checked as a bonus: pell0=-1, pell1=1, pell2=-1, pell3=1,
+        //   alternating -- the concrete Pell-equation payoff of continued fractions of sqrt(N)).
+        //   N=3 (period-2 CF [1;1,2,1,2,...]): convergents 1/1, 2/1, 5/3, 7/4 -- the determinant
+        //   identity is checked here WITHOUT relying on period-1's special exactness, confirming
+        //   it holds regardless of the CF's period (unlike the Pell shortcut, which only holds at
+        //   period boundaries in general).
+        // isqrtT trial-divides upward from 0 (n<=3, ~2 deep); the (m,d,a)/(p,q) chains are 4
+        // sequential (non-recursive) steps each -- no stack-depth concern. Confirms the CF-digit
+        // recurrence, the convergent-building recurrence, the determinant identity across BOTH a
+        // period-1 and a period-2 case, and the Pell-equation connection for N=2, byte-identical
+        // on interp/KVM (native per the sweep). The convergent machinery an AI reaches for when
+        // reasoning about best rational approximations / Pell's equation; a wrong CF digit or an
+        // off-by-one in the (p,q) recurrence breaks the determinant identity immediately. A
+        // non-sort continued-fraction-convergents lock, opening the continued-fraction axis.
+        let src = r#"type CFState = { m: Int, d: Int, a: Int, p: Int, q: Int, pPrev: Int, qPrev: Int, k: Int }
+fun isqrtGo(n: Int, r: Int) -> Int {
+    if (r + 1) * (r + 1) > n { r } else { isqrtGo(n, r + 1) }
+}
+fun isqrtT(n: Int) -> Int { isqrtGo(n, 0) }
+fun cfInit(n: Int) -> CFState {
+    let a0 = isqrtT(n)
+    CFState(m: 0, d: 1, a: a0, p: a0, q: 1, pPrev: 1, qPrev: 0, k: 0)
+}
+fun cfStep(n: Int, s: CFState) -> CFState {
+    let m2 = s.d * s.a - s.m
+    let d2 = (n - m2 * m2) / s.d
+    let a0 = isqrtT(n)
+    let a2 = (a0 + m2) / d2
+    let p2 = a2 * s.p + s.pPrev
+    let q2 = a2 * s.q + s.qPrev
+    CFState(m: m2, d: d2, a: a2, p: p2, q: q2, pPrev: s.p, qPrev: s.q, k: s.k + 1)
+}
+fun detOk(s: CFState) -> Bool {
+    let det = s.p * s.qPrev - s.pPrev * s.q
+    let expected = if s.k % 2 == 0 { -1 } else { 1 }
+    det == expected
+}
+fun probe() -> Str {
+    let n = 2
+    let s0 = cfInit(n)
+    let s1 = cfStep(n, s0)
+    let s2 = cfStep(n, s1)
+    let s3 = cfStep(n, s2)
+    let dets2 = "{detOk(s0)}|{detOk(s1)}|{detOk(s2)}|{detOk(s3)}"
+    let pells = "{s0.p * s0.p - n * s0.q * s0.q}|{s1.p * s1.p - n * s1.q * s1.q}|{s2.p * s2.p - n * s2.q * s2.q}|{s3.p * s3.p - n * s3.q * s3.q}"
+
+    let n3 = 3
+    let t0 = cfInit(n3)
+    let t1 = cfStep(n3, t0)
+    let t2 = cfStep(n3, t1)
+    let t3 = cfStep(n3, t2)
+    let dets3 = "{detOk(t0)}|{detOk(t1)}|{detOk(t2)}|{detOk(t3)}"
+    "p={s0.p},{s1.p},{s2.p},{s3.p}|q={s0.q},{s1.q},{s2.q},{s3.q}|dets2={dets2}|pells={pells}|t.p={t0.p},{t1.p},{t2.p},{t3.p}|t.q={t0.q},{t1.q},{t2.q},{t3.q}|dets3={dets3}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "p=1,3,7,17|q=1,2,5,12|dets2=true|true|true|true|pells=-1|1|-1|1|t.p=1,2,5,7|t.q=1,1,3,4|dets3=true|true|true|true"
+        );
+    }
+
+    #[test]
     fn diff_carmichael_korselt_vs_fermat() {
         // A certification lock (it505, classic-algo/number-theory-theorem-oracle vein, fresh axis per the
         // it501/it504 roadmap): the CARMICHAEL FUNCTION property, cross-validated via SPEC-PROPERTY /
