@@ -7056,6 +7056,32 @@ fun main() uses io {
         );
     }
 
+    /// Native url_decode's OTHER two malformed-escape error paths (truncated
+    /// `%`-escape at end of string, and non-hex digits after `%`) match
+    /// interp/vm exactly -- only the NUL-byte path had a dedicated native
+    /// test before this (PR-it546). Confirmed via a real 3-engine CLI probe
+    /// first, not assumed: these were CLEAN (url.rs already bounds-checks and
+    /// hex-validates every `%XX` escape), unlike PR-it545's lsp::parse_json
+    /// literal-sniffing bug in the same "lenient shared parser" bug class.
+    #[test]
+    fn native_url_decode_truncated_escape_and_bad_hex_rejected() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{url_decode(\"a%\")}\")\n    \
+                   print(\"{url_decode(\"a%2\")}\")\n    \
+                   print(\"{url_decode(\"a%zz\")}\")\n    \
+                   print(\"{url_decode(\"a%2g\")}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "urldecbad").trim(),
+            "Err(\"invalid percent-encoding: truncated escape\")\n\
+             Err(\"invalid percent-encoding: truncated escape\")\n\
+             Err(\"invalid percent-encoding: bad hex\")\n\
+             Err(\"invalid percent-encoding: bad hex\")"
+        );
+    }
+
     /// Native radix formatting (to_hex/to_radix) matches the interpreter incl. the
     /// i64::MIN edge (no negate-overflow) and sign-magnitude negatives. PR-it44.
     #[test]
