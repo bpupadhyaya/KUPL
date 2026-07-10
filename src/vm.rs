@@ -232,17 +232,28 @@ impl<'m> Vm<'m> {
             let Some((fire_time, iid, ti)) = best else { break };
             self.now = fire_time;
             let chunk = self.instances[iid].timers[ti].chunk;
-            match self.call_chunk_nested(chunk, Vec::new(), Some(iid)) {
-                Ok(_) => {}
-                Err(e) if self.instances[iid].restart_on_failure => self.restart(iid, &e.msg)?,
+            // SOUNDNESS FIX (PR-it509): mirrors the interp fix -- `restart` already
+            // calls `arm_timers`, which freshly re-schedules EVERY timer on this
+            // instance relative to the current virtual time, so the ordinary
+            // post-fire update below must NOT also run on a restart (it would
+            // double-delay a recurring timer, or immediately deactivate a freshly
+            // re-armed one-shot).
+            let restarted = match self.call_chunk_nested(chunk, Vec::new(), Some(iid)) {
+                Ok(_) => false,
+                Err(e) if self.instances[iid].restart_on_failure => {
+                    self.restart(iid, &e.msg)?;
+                    true
+                }
                 Err(e) => return Err(e),
-            }
+            };
             self.drain()?;
-            let t = &mut self.instances[iid].timers[ti];
-            if t.every {
-                t.next_fire += t.interval;
-            } else {
-                t.active = false;
+            if !restarted {
+                let t = &mut self.instances[iid].timers[ti];
+                if t.every {
+                    t.next_fire += t.interval;
+                } else {
+                    t.active = false;
+                }
             }
         }
         self.now = target;
@@ -16755,6 +16766,73 @@ fun probe() -> Str {\n    par { par_label(\"a\")  par_label(\"b\") }.join(\",\")
         assert_eq!(i_ticks, "2"); // every 5s fired at 5s and 10s within 12s
         assert_eq!(i_ready, "1");
         assert_eq!(i_tick, "2");
+    }
+
+    #[test]
+    fn diff_supervised_restart_does_not_double_delay_timers() {
+        // A REAL soundness fix (PR-it509), found via a runtime resource-cleanup-adjacent
+        // soundness-symmetry angle (does `advance`'s post-fire timer update behave correctly on
+        // the SUCCESS path vs the SUPERVISED-RESTART path?): a panicking `on every`/`on after`
+        // handler that triggers `restart` (via `supervise ... restart on_failure`) got its timer
+        // DOUBLE-DELAYED. `restart` calls `arm_timers`, which freshly re-schedules EVERY timer on
+        // the instance (next_fire = now + interval, active = true) relative to the CURRENT
+        // virtual time -- but `advance`'s ordinary post-fire update (`next_fire += interval` for
+        // Every, `active = false` for After) ALSO ran unconditionally right after, stacking on
+        // top of the fresh restart state: a recurring timer's next_fire ended up `now + 2*interval`
+        // instead of `now + interval` (skipping an entire cycle every restart), and a freshly
+        // re-armed one-shot got IMMEDIATELY deactivated again.
+        // CONFIRMED EMPIRICALLY before fixing: an always-panicking `on every 10ms` timer,
+        // supervised with `restart on_failure`, fired only 5 times in a 100ms `advance` window
+        // instead of the correct 10 (10,20,...,100) -- each restart silently ate an extra 10ms.
+        // This bug was PRESENT IDENTICALLY in both interp.rs and vm.rs (KVM) -- symmetric, so it
+        // never showed up as a cross-engine byte-identity divergence, only as a genuine
+        // supervision-under-load correctness bug: a component crash-looping under `restart
+        // on_failure` would silently starve its own timers at HALF the intended rate, worse the
+        // more it failed. FIX: track whether the handler's Err path went through `restart` and
+        // skip the ordinary post-fire update in that case -- `arm_timers` already fully
+        // re-established fresh, correct timer state; there is nothing left to adjust.
+        let src = "component Ticker {\n    intent \"ticker\"\n    out tick: Int\n\
+    on every 10ms {\n        emit tick(1)\n        panic(\"boom\")\n    }\n}\n\
+component Counter {\n    intent \"counter\"\n    in tick: Int\n    out total: Int\n    state n: Int = 0\n\
+    on tick(v) {\n        n += v\n        emit total(n)\n    }\n    expose fun count() -> Int {\n        n\n    }\n}\n\
+component Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Counter()\n\
+    wire ticker.tick -> counter.tick\n    supervise ticker restart on_failure\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        match it.instantiate("Main", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(_)) => {}
+            _ => panic!("interp instantiate failed"),
+        }
+        it.start_all().ok();
+        assert!(it.advance(100).is_ok(), "advance must survive repeated supervised restarts");
+        let counter_id = it.instances.iter().position(|i| i.comp.name == "Counter").expect("Counter instance");
+        let f = Value::Bound(counter_id, std::rc::Rc::new("count".to_string()));
+        let i_count = match it.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v.to_string(),
+            Err(_) => panic!("count() call failed"),
+        };
+
+        // KVM -- mirrors interp's instantiate + start_all (no auto timer-firing, so
+        // `advance` below gets a clean, precisely-controlled 100ms window).
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let idx = *module.component_names.get("Main").expect("Main in module");
+        vm.instantiate(idx, Vec::new()).expect("kvm instantiate");
+        for id in 0..vm.instances.len() {
+            vm.run_lifecycle(id, "@start").expect("kvm lifecycle");
+            vm.arm_timers(id);
+        }
+        vm.drain().expect("kvm drain");
+        vm.advance(100).expect("kvm advance must survive repeated supervised restarts");
+        let vcounter_id = vm.instances.iter().position(|i| module.components[i.comp as usize].name == "Counter").expect("Counter instance");
+        let v_count = vm.call_expose(vcounter_id, "count", vec![]).unwrap().to_string();
+
+        assert_eq!(i_count, v_count, "interpreter and KVM disagree on post-restart timer count");
+        assert_eq!(i_count, "10", "an every-10ms timer must fire exactly 10 times in a 100ms window, even under repeated supervised restarts (was 5 before the fix)");
     }
 
     #[test]

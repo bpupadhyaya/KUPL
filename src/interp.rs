@@ -336,19 +336,34 @@ impl Interp {
             let handler_idx = self.instances[iid].timers[ti].handler_idx;
             let comp = self.instances[iid].comp.clone();
             let h = comp.handlers[handler_idx].clone();
-            match self.run_handler(iid, &h, Value::Unit) {
-                Ok(()) => {}
+            // SOUNDNESS FIX (PR-it509): a panicking timer handler that triggers a
+            // supervised restart must NOT also get the ordinary post-fire update
+            // below -- `restart` already calls `arm_timers`, which freshly
+            // re-schedules EVERY timer on this instance (next_fire = now +
+            // interval, active = true) relative to the CURRENT virtual time.
+            // Applying `next_fire += interval` / `active = false` on TOP of that
+            // fresh state double-delayed every recurring timer by a full extra
+            // interval per restart (and immediately deactivated a freshly
+            // re-armed one-shot), silently starving a supervised component's
+            // timers under repeated failures -- confirmed empirically: an
+            // always-panicking `on every 10ms` timer fired only 5 times in a
+            // 100ms window instead of the correct 10.
+            let restarted = match self.run_handler(iid, &h, Value::Unit) {
+                Ok(()) => false,
                 Err(Flow::Panic { msg, .. }) if self.instances[iid].restart_on_failure => {
                     self.restart(iid, &msg)?;
+                    true
                 }
                 Err(other) => return Err(other),
-            }
+            };
             self.drain()?;
-            let t = &mut self.instances[iid].timers[ti];
-            if t.every {
-                t.next_fire += t.interval;
-            } else {
-                t.active = false;
+            if !restarted {
+                let t = &mut self.instances[iid].timers[ti];
+                if t.every {
+                    t.next_fire += t.interval;
+                } else {
+                    t.active = false;
+                }
             }
         }
         self.now = target;
