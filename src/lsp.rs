@@ -544,6 +544,50 @@ pub fn occurrences(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> 
     out
 }
 
+/// Every occurrence of `name` in the current file, PLUS every occurrence in a
+/// file this one reaches via `use` (a real correctness hazard fixed by
+/// PR-it518: `textDocument/rename` advertises `renameProvider: true` but was
+/// previously 100% single-file -- renaming a cross-file symbol from a CALL
+/// SITE would silently rename ONLY that call, leaving the actual declaration
+/// (in the `use`d file) untouched and the program broken).
+///
+/// Returns `(target_uri, l0, c0, l1, c1)` per occurrence, empty `target_uri`
+/// meaning "the current file" (mirrors `resolve_definition_cross_file`'s
+/// convention) so a caller building per-file edits can group by URI.
+///
+/// SCOPE (documented, not silently assumed): this searches ONE HOP outward
+/// along the CURRENT file's own `use` statements -- the common case of
+/// renaming from a call site correctly reaches the declaration. It does
+/// NOT discover sibling importers (other files that also `use` the same
+/// module) or reach callers when renaming FROM the declaration site itself;
+/// either would require a project-wide reverse-dependency scan (enumerating
+/// every `.kupl` file in the workspace), which is a genuinely bigger
+/// feature and out of scope here. This is strictly additive over the prior
+/// (100% single-file) behavior -- it never turns a correct rename into an
+/// incorrect one, only finds MORE of the correct occurrences.
+pub fn occurrences_cross_file(
+    text: &str,
+    name: &str,
+    dir: &std::path::Path,
+    buffers: &HashMap<PathBuf, String>,
+) -> Vec<(String, usize, usize, usize, usize)> {
+    let mut out: Vec<(String, usize, usize, usize, usize)> = occurrences(text, name)
+        .into_iter()
+        .map(|(l0, c0, l1, c1)| (String::new(), l0, c0, l1, c1))
+        .collect();
+    let (program, _diags) = crate::parser::parse(text);
+    for fs_path in used_file_paths(&program, dir) {
+        let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
+        let uri = path_to_uri(&fs_path);
+        out.extend(
+            occurrences(&other_text, name)
+                .into_iter()
+                .map(move |(l0, c0, l1, c1)| (uri.clone(), l0, c0, l1, c1)),
+        );
+    }
+    out
+}
+
 /// Scan `text` (a full document, or the raw source of a string-interpolation
 /// `{expr}` at absolute byte offset `base`) for identifier uses of `name`,
 /// recursing into nested interpolations. Positions are line/col in `full`.
@@ -880,12 +924,17 @@ pub fn serve() -> i32 {
                     let (uri, line, ch) = position_of(p)?;
                     let text = doc_text(uri, &buffers)?;
                     let name = ident_under(&text, line, ch)?;
-                    let locs: Vec<String> = occurrences(&text, &name)
+                    // Cross-file fallback (PR-it518): same rationale as hover/definition/
+                    // completion, plus a correctness angle -- see occurrences_cross_file's
+                    // doc comment for why this matters for rename specifically.
+                    let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+                    let locs: Vec<String> = occurrences_cross_file(&text, &name, &dir, &buffers)
                         .into_iter()
-                        .map(|(l0, c0, l1, c1)| {
+                        .map(|(target_uri, l0, c0, l1, c1)| {
+                            let u = if target_uri.is_empty() { uri.to_string() } else { target_uri };
                             format!(
                                 "{{\"uri\":\"{}\",\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}}}}",
-                                json_escape(uri)
+                                json_escape(&u)
                             )
                         })
                         .collect();
@@ -902,20 +951,29 @@ pub fn serve() -> i32 {
                     let new_name = p.get("newName")?.str()?;
                     let text = doc_text(uri, &buffers)?;
                     let name = ident_under(&text, line, ch)?;
-                    let edits: Vec<String> = occurrences(&text, &name)
+                    // Cross-file fallback (PR-it518): a real correctness hazard, not just a
+                    // scope gap -- renaming a cross-file symbol from a call site used to
+                    // silently rename ONLY that call, leaving its actual declaration (in the
+                    // `use`d file) untouched and the program broken. Group edits by target
+                    // file into a proper multi-file WorkspaceEdit.
+                    let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+                    let mut by_file: Vec<(String, Vec<String>)> = Vec::new();
+                    for (target_uri, l0, c0, l1, c1) in occurrences_cross_file(&text, &name, &dir, &buffers) {
+                        let u = if target_uri.is_empty() { uri.to_string() } else { target_uri };
+                        let edit = format!(
+                            "{{\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}},\"newText\":\"{}\"}}",
+                            json_escape(new_name)
+                        );
+                        match by_file.iter_mut().find(|(fu, _)| fu == &u) {
+                            Some((_, edits)) => edits.push(edit),
+                            None => by_file.push((u, vec![edit])),
+                        }
+                    }
+                    let changes: Vec<String> = by_file
                         .into_iter()
-                        .map(|(l0, c0, l1, c1)| {
-                            format!(
-                                "{{\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}},\"newText\":\"{}\"}}",
-                                json_escape(new_name)
-                            )
-                        })
+                        .map(|(u, edits)| format!("\"{}\":[{}]", json_escape(&u), edits.join(",")))
                         .collect();
-                    Some(format!(
-                        "{{\"changes\":{{\"{}\":[{}]}}}}",
-                        json_escape(uri),
-                        edits.join(",")
-                    ))
+                    Some(format!("{{\"changes\":{{{}}}}}", changes.join(",")))
                 })()
                 .unwrap_or_else(|| "null".into());
                 send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
@@ -1114,6 +1172,48 @@ mod tests {
         assert!(mean.2.contains("fun mean(xs: List[Int]) -> Float"), "{mean:?}");
         // this document's own names are still present (no regression).
         assert!(labels.contains(&"Reporter"), "{labels:?}");
+    }
+
+    #[test]
+    fn occurrences_and_rename_reach_across_use_imports() {
+        // A REAL correctness hazard, not just a scope gap (PR-it518): `textDocument/rename`
+        // advertises `renameProvider: true`, but renaming a cross-file symbol FROM A CALL SITE
+        // used to silently rename ONLY that call, leaving the actual declaration (in the
+        // `use`d file) completely untouched -- the resulting program would call an undefined
+        // name. Confirmed empirically first: plain `occurrences(main_text, "mean")` in
+        // examples/multifile/main.kupl returns exactly ONE location (the call site), not the
+        // declaration in lib/stats.kupl.
+        //
+        // Fixed by occurrences_cross_file: current-file occurrences PLUS occurrences in every
+        // file reached via this file's own `use` statements (one hop outward -- see its doc
+        // comment for the documented, NOT-fully-solved remaining direction: renaming FROM the
+        // declaration site doesn't reach back out to callers, which would need a project-wide
+        // reverse-dependency scan).
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let main_path = manifest_dir.join("examples/multifile/main.kupl");
+        let dir = main_path.parent().unwrap();
+        let text = std::fs::read_to_string(&main_path).expect("read examples/multifile/main.kupl");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+
+        // plain (non-cross-file) occurrences confirms the hazard: only the call site.
+        let local_only = occurrences(&text, "mean");
+        assert_eq!(local_only.len(), 1, "plain occurrences must NOT see the cross-file declaration: {local_only:?}");
+
+        let locs = occurrences_cross_file(&text, "mean", dir, &empty_buffers);
+        assert_eq!(locs.len(), 2, "call site (this file) + declaration (lib/stats.kupl): {locs:?}");
+        let local = locs.iter().filter(|(u, ..)| u.is_empty()).count();
+        let cross = locs.iter().filter(|(u, ..)| !u.is_empty()).count();
+        assert_eq!(local, 1, "exactly one same-file occurrence (the call site): {locs:?}");
+        assert_eq!(cross, 1, "exactly one cross-file occurrence (the declaration): {locs:?}");
+        let (cross_uri, l0, c0, _, _) = locs.iter().find(|(u, ..)| !u.is_empty()).unwrap().clone();
+        assert!(cross_uri.starts_with("file://") && cross_uri.ends_with("lib/stats.kupl"), "{cross_uri}");
+        assert_eq!((l0, c0), (0, 4), "declaration is `fun mean` on line 0, name starts after `fun `");
+
+        // A same-file-only symbol (no `use` involvement) is completely unaffected.
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() {\n    print(add(1, 2))\n}\n";
+        let same_file = occurrences_cross_file(src, "add", dir, &empty_buffers);
+        assert_eq!(same_file.len(), 2, "decl + call, both same-file: {same_file:?}");
+        assert!(same_file.iter().all(|(u, ..)| u.is_empty()), "{same_file:?}");
     }
 
     #[test]
