@@ -2340,7 +2340,16 @@ static KValue k_ai_convert(const KAiShape* shape, const char* text) {
     const char* payload = k_ai_strip(text);
     KValue parsed = k_json_parse(k_str(payload));
     if (!strcmp(CTORS[parsed.as.ctor->ctor].variant, "Err")) {
-        snprintf(k_ai_err, sizeof k_ai_err, "model response is not valid JSON"); k_ai_ok = 0; return k_unit();
+        /* mirror ai.rs::convert's "model response is not valid JSON (REASON):
+           PAYLOAD" -- names the parser's own failure reason and echoes the raw
+           text, instead of a bare "not valid JSON" with no detail at all (the
+           C and Rust JSON parsers won't always phrase REASON identically for
+           the same malformed input, but native previously included NEITHER
+           the reason NOR the payload -- a real information loss, not just a
+           wording difference). */
+        const char* reason = k_json_field0(parsed).as.s;
+        snprintf(k_ai_err, sizeof k_ai_err, "model response is not valid JSON (%s): %s", reason, payload);
+        k_ai_ok = 0; return k_unit();
     }
     KValue json = k_json_field0(parsed);
     /* accept a {"value": …} wrapper or a bare payload */
@@ -6846,6 +6855,40 @@ fun main() uses io {
             .trim(),
             "sum done"
         );
+    }
+
+    /// A REAL message-quality gap found+fixed (bug-hunt batch 149, PR-it541):
+    /// when a non-tool, non-`Str`-return `ai fun`'s mock response isn't valid
+    /// JSON, native's error USED TO be a bare "model response is not valid
+    /// JSON" -- dropping BOTH the parser's own failure reason AND the raw
+    /// payload text entirely, while interp/KVM's `ai.rs::convert` always
+    /// includes both (`"...JSON (REASON): PAYLOAD"`). This is examples/ai.kupl's
+    /// own scenario -- sweep2.sh explicitly SKIPS that example with a "C-vs-
+    /// Rust JSON error text on malformed mock" comment (flagged, uninvestigated,
+    /// in it539/it540's memory notes). Investigated: the two independently-
+    /// written JSON parsers (Rust's `json.rs`, the C mirror in cgen.rs) will
+    /// NEVER phrase the SAME failure identically -- Rust's parser tries an
+    /// unrecognized bare token as a number and fails with `invalid number
+    /// \`positive\`` while C's parser has an explicit unexpected-character
+    /// fallback (`unexpected character \`p\` at position 0`) -- so exact
+    /// wording parity is NOT the fixable part (and sweep2.sh's skip correctly
+    /// stays in place for that reason). What WAS a real, fixable gap: native
+    /// including NEITHER a reason NOR the payload at all, a genuine information
+    /// loss beyond just wording. Fixed by threading `k_json_parse`'s own Err
+    /// payload (its honest, C-native reason string) through, plus the raw
+    /// payload text, matching the STRUCTURE of the interpreter's message.
+    #[test]
+    fn native_ai_malformed_json_names_reason_and_payload() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Sentiment = { label: Str, score: Float }\n\
+                   ai fun classify(review: Str) -> Result[Sentiment, Str] { intent \"x\" }\n\
+                   fun main() uses io {\n    match classify(\"x\") {\n        \
+                   Ok(s) => print(\"ok\"),\n        Err(e) => print(\"err: {e}\"),\n    }\n}\n";
+        let out = native_main_stdout_env(src, "aimalformedjson", &[("KUPL_AI_MOCK_CLASSIFY", "positive")]);
+        assert!(out.starts_with("err: model response is not valid JSON ("), "{out:?}");
+        assert!(out.trim_end().ends_with("): positive"), "{out:?}");
     }
 
     /// Native `expect` failure names the failing expression (via the KVM module's
