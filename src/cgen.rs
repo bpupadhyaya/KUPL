@@ -574,6 +574,7 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
@@ -2026,6 +2027,40 @@ static KValue k_csv_stringify(KValue lst) {
 
 /* ---- HTTP (mirror interp::http_builtin — shell out to `curl`) ---- */
 static void kb_write(KBuf* b, const char* s, long n) { kb_grow(b, n); memcpy(b->buf + b->len, s, n); b->len += n; b->buf[b->len] = 0; }
+/* Drain a child's stdout+stderr pipes CONCURRENTLY via poll(), not sequentially.
+   Draining stdout to EOF before touching stderr (or vice versa) deadlocks the
+   moment the child fills the OS pipe buffer on the side being ignored (e.g. a
+   large stderr write while stdout is still open): the child blocks on its
+   write(2), and the parent blocks forever waiting for stdout EOF that can only
+   arrive once the child (now stuck) exits. Rust's `Command::output()` — used by
+   the interpreter/KVM's shared `exec_builtin` — avoids this by reading both
+   streams on separate threads; poll() gets the same "never block on the wrong
+   fd" property without needing real threads in the generated C. */
+static void k_drain_two_pipes(int out_fd, int err_fd, KBuf* out, KBuf* er) {
+    char buf[4096];
+    struct pollfd pfds[2] = { { out_fd, POLLIN, 0 }, { err_fd, POLLIN, 0 } };
+    int open_count = 2;
+    while (open_count > 0) {
+        int pr = poll(pfds, 2, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        for (int i = 0; i < 2; i++) {
+            if (pfds[i].fd < 0 || !pfds[i].revents) continue;
+            ssize_t n = read(pfds[i].fd, buf, sizeof buf);
+            if (n > 0) {
+                kb_write(i == 0 ? out : er, buf, n);
+            } else {
+                close(pfds[i].fd);
+                pfds[i].fd = -1;
+                open_count--;
+            }
+        }
+    }
+    if (pfds[0].fd >= 0) close(pfds[0].fd);
+    if (pfds[1].fd >= 0) close(pfds[1].fd);
+}
 /* run curl via fork/exec (no shell — argv matches the interpreter's Command);
    optional `body` is piped to stdin. Ok(stdout) on exit 0, else Err(stderr|msg). */
 static KValue k_run_curl(char* const argv[], const char* body) {
@@ -2044,10 +2079,7 @@ static KValue k_run_curl(char* const argv[], const char* body) {
     close(outp[1]); close(errp[1]);
     if (body) { close(inp[0]); long bl = (long)strlen(body); long off = 0; while (off < bl) { ssize_t w = write(inp[1], body + off, bl - off); if (w <= 0) break; off += w; } close(inp[1]); }
     KBuf out = { 0, 0, 0 }, er = { 0, 0, 0 };
-    char buf[4096]; ssize_t n;
-    while ((n = read(outp[0], buf, sizeof buf)) > 0) kb_write(&out, buf, n);
-    while ((n = read(errp[0], buf, sizeof buf)) > 0) kb_write(&er, buf, n);
-    close(outp[0]); close(errp[0]);
+    k_drain_two_pipes(outp[0], errp[0], &out, &er);
     int status = 0; waitpid(pid, &status, 0);
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code == 127) return k_err(k_str("cannot run curl: command not found"));
@@ -2104,10 +2136,7 @@ static KValue k_exec(KValue prog, KValue arglist) {
         return k_err(k_str(k_strdup(m)));
     }
     KBuf out = { 0, 0, 0 }, er = { 0, 0, 0 };
-    char buf[4096]; ssize_t n;
-    while ((n = read(outp[0], buf, sizeof buf)) > 0) kb_write(&out, buf, n);
-    while ((n = read(errp[0], buf, sizeof buf)) > 0) kb_write(&er, buf, n);
-    close(outp[0]); close(errp[0]);
+    k_drain_two_pipes(outp[0], errp[0], &out, &er);
     int status = 0; waitpid(pid, &status, 0);
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code != 0) {
@@ -2168,10 +2197,11 @@ static int k_cmp_cstr(const void* a, const void* b) { return strcmp(*(const char
 static KValue k_list_dir(KValue path) {
     DIR* d = opendir(path.as.s);
     if (!d) return k_os_error(); /* matches interp's fs::read_dir io::Error */
-    char** names = (char**)k_alloc(sizeof(char*) * 8192); int n = 0;
+    int cap = 64; char** names = (char**)k_alloc(sizeof(char*) * cap); int n = 0;
     struct dirent* e;
-    while ((e = readdir(d)) && n < 8192) {
+    while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (n == cap) { cap *= 2; names = (char**)realloc(names, sizeof(char*) * cap); }
         names[n++] = k_strdup(e->d_name);
     }
     closedir(d);
@@ -2900,14 +2930,18 @@ static KValue k_read_file(KValue path) {
         errno = EISDIR;
         return k_os_error();
     }
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (n < 0) { fclose(f); return k_os_error(); }
-    char* buf = k_alloc((size_t)n + 1);
-    size_t got = fread(buf, 1, (size_t)n, f);
-    buf[got] = 0;
+    /* Read via a growable read-until-EOF loop (like k_read_all/k_read_line),
+       NOT fseek+ftell presizing: ftell fails with ESPIPE on any non-seekable
+       stream (FIFOs, sockets, TTYs, many procfs/sysfs pseudo-files), which
+       interp's `read_to_string` has no trouble with since it just loops
+       read() to EOF regardless of seekability — a `read_file` on a FIFO must
+       succeed in native exactly like it does in interp/KVM. */
+    KBuf b = { 0, 0, 0 };
+    char chunk[4096]; size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) kb_write(&b, chunk, (long)n);
     fclose(f);
+    char* buf = b.buf ? b.buf : (char*)"";
+    size_t got = b.len;
     /* a KUPL Str is NUL-free valid UTF-8 — reject rather than truncate at a NUL
        (native) / embed it (interp), and reject invalid UTF-8 (the interpreter's
        fs::read_to_string does). Same messages as the interpreter. */
@@ -2922,8 +2956,13 @@ static KValue k_write_file(KValue path, KValue content, int append) {
     const char* s = content.as.s;
     size_t len = strlen(s);
     size_t w = fwrite(s, 1, len, f);
-    fclose(f);
-    if (w != len) return k_err(k_str("write error"));
+    /* fopen's stdio buffering means fwrite can report full success without a
+       single write(2) reaching the OS yet — the actual flush (and its failure
+       mode, e.g. ENOSPC/disk full) happens inside fclose(). Checking fclose's
+       return value is required to match std::fs::write's guarantee that a
+       returned Ok means the bytes were actually written, not just buffered. */
+    int close_failed = fclose(f) != 0;
+    if (w != len || close_failed) return k_err(k_str("write error"));
     return k_ok(k_unit());
 }
 static KValue k_delete_file(KValue path) {
@@ -8213,6 +8252,115 @@ fun main() uses io {
         if cc_available() {
             assert_eq!(native_main_stdout(src, "exec"), "[a b\n]\nmissing\n");
         }
+    }
+
+    /// exec() drained stdout to EOF *before* touching stderr -- with a child
+    /// that fills the OS stderr pipe buffer while stdout stays open, the child
+    /// blocks writing stderr and the parent blocks forever waiting for a stdout
+    /// EOF that can only come once the (now-stuck) child exits: a total
+    /// deadlock. interp/KVM's shared `exec_builtin` avoids this via
+    /// `Command::output()`, which reads both streams concurrently. Fixed by
+    /// draining both pipes with `poll()` instead of sequentially (PR-it562).
+    /// Bounded by a channel + timeout so a regression fails fast instead of
+    /// hanging the whole test suite.
+    #[test]
+    fn native_exec_does_not_deadlock_on_large_stderr_before_stdout_closes() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   match exec(\"sh\", [\"-c\", \"yes e | head -c 300000 1>&2\"]) {\n        \
+                       Ok(s) => print(\"ok:{s.len()}\")\n        Err(e) => print(\"err:{e.len()}\")\n    }\n    \
+                   print(\"done\")\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-execdl-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bin2 = bin.clone();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(&bin2).output();
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("exec() must not deadlock draining stdout+stderr concurrently")
+            .expect("binary runs");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok:0\ndone");
+    }
+
+    /// list_dir used a fixed 8192-slot buffer -- past that point it silently
+    /// DROPPED entries instead of growing, unlike interp's unbounded Vec
+    /// (PR-it562, same fixed-buffer-truncation shape already fixed elsewhere
+    /// in this file for regex/CSV/string/list methods, just missed here since
+    /// it lives in the file-I/O section).
+    #[test]
+    fn native_list_dir_is_not_truncated_past_8192_entries() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let _ = exec("sh", ["-c", "rm -rf /tmp/kupl_it562_bigdir && mkdir -p /tmp/kupl_it562_bigdir && cd /tmp/kupl_it562_bigdir && seq 1 8300 | while read i; do : > f$i; done"])
+    match list_dir("/tmp/kupl_it562_bigdir") {
+        Ok(names) => print("count:{names.len()}")
+        Err(e) => print("err:{e}")
+    }
+    let _ = exec("rm", ["-rf", "/tmp/kupl_it562_bigdir"])
+}
+"#;
+        assert_eq!(native_main_stdout(src, "listdirbig").trim(), "count:8300");
+    }
+
+    /// read_file presized its buffer via fseek/ftell, which fails with
+    /// "Illegal seek" (ESPIPE) on any non-seekable stream (FIFOs, sockets,
+    /// many procfs/sysfs pseudo-files) -- unlike interp's `read_to_string`,
+    /// which loops read() to EOF regardless of seekability. Fixed by switching
+    /// to the same growable read-until-EOF loop already used by read_all/
+    /// read_line (PR-it562). The FIFO writer is spawned from the Rust test
+    /// harness (not from within the compiled binary via exec()) because a
+    /// backgrounded shell job launched via the binary's own exec() inherits
+    /// exec()'s pipe fds, which would deadlock exec() itself waiting for an
+    /// EOF that can't arrive until the (still-blocked-on-the-FIFO) background
+    /// job exits -- an unrelated self-deadlock, not this bug.
+    #[test]
+    fn native_read_file_succeeds_on_a_non_seekable_fifo() {
+        if !cc_available() {
+            return;
+        }
+        let fifo = std::env::temp_dir().join(format!("kupl-it562-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&fifo);
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let writer = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 0.2; printf '%s' hello-from-fifo > {}",
+                fifo.display()
+            ))
+            .spawn()
+            .expect("writer spawns");
+        let src = format!(
+            "fun main() uses io {{\n    \
+             match read_file(\"{}\") {{\n        Ok(s) => print(\"ok:{{s}}\")\n        Err(e) => print(\"err:{{e}}\")\n    }}\n}}\n",
+            fifo.display()
+        );
+        let stdout = native_main_stdout(&src, "readfifo");
+        let mut w = writer;
+        let _ = w.wait();
+        let _ = std::fs::remove_file(&fifo);
+        assert_eq!(stdout.trim(), "ok:hello-from-fifo");
     }
 
     /// Stdin builtins (it59): read_line strips the newline and returns None at
