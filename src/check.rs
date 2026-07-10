@@ -794,7 +794,7 @@ impl Checker {
             // The block's tail value must match the return type (unless Unit-returning).
             let ret = self.uni.apply(&ctx.ret.clone());
             if ret != Ty::Unit {
-                self.unify(&ret, &body_ty, f.body.span, &format!("return value of `{}`", f.name));
+                self.check_assign(&ret, &body_ty, f.body.span, &format!("return value of `{}`", f.name));
             }
         }
         self.tyvars.clear();
@@ -850,7 +850,7 @@ impl Checker {
                 let init_ty = self.infer_expr(&s.init, &mut ctx);
                 if let Some(t) = &s.ty {
                     let ann = self.resolve_ty(t);
-                    self.unify(&ann, &init_ty, s.span, &format!("state `{}`", s.name));
+                    self.check_assign(&ann, &init_ty, s.span, &format!("state `{}`", s.name));
                     ctx.scopes.insert(&s.name, ann, true);
                 } else {
                     ctx.scopes.insert(&s.name, self.uni.apply(&init_ty), true);
@@ -1185,7 +1185,7 @@ impl Checker {
                                     target.span,
                                 );
                             }
-                            self.unify(&ty, &value_ty, *span, &format!("assignment to `{name}`"));
+                            self.check_assign(&ty, &value_ty, *span, &format!("assignment to `{name}`"));
                             if *op != AssignOp::Set {
                                 let rt = self.uni.apply(&ty);
                                 let rt = self.default_numeric(rt);
@@ -1209,7 +1209,7 @@ impl Checker {
                     None => Ty::Unit,
                 };
                 let ret = ctx.ret.clone();
-                self.unify(&ret, &vt, *span, "return value");
+                self.check_assign(&ret, &vt, *span, "return value");
                 Ty::Unit
             }
             Stmt::While { cond, body, span: _ } => {
@@ -1583,7 +1583,7 @@ impl Checker {
                             let vt = self.infer_expr(value, ctx);
                             match sig.variants[0].fields.iter().find(|(f, _)| f == field) {
                                 Some((_, fty)) => {
-                                    self.unify(&Self::subst_ty(fty, &m), &vt, value.span, &format!("field `{field}`"));
+                                    self.check_assign(&Self::subst_ty(fty, &m), &vt, value.span, &format!("field `{field}`"));
                                 }
                                 None => {
                                     let msg = match suggest(
@@ -2249,7 +2249,7 @@ impl Checker {
             let at = self.infer_expr(&arg.value, ctx);
             match target {
                 Some((fname, fty)) => {
-                    self.unify(&fty, &at, arg.value.span, &format!("field `{fname}` of `{ctor}`"));
+                    self.check_assign(&fty, &at, arg.value.span, &format!("field `{fname}` of `{ctor}`"));
                 }
                 None => {
                     if let Some(n) = &arg.name {

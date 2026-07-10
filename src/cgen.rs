@@ -6142,6 +6142,36 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "contractdisp").trim(), "Good day, Ada.|hey Bob");
     }
 
+    /// Contract-assignability (component fulfilling a contract -> the contract
+    /// type) used to only be checked at 4 sites (component props, initial let/var
+    /// binding, positional/method call args); reassigning a contract-typed `var`
+    /// to a DIFFERENT fulfilling component, a function's tail-expression return, a
+    /// component `state` field annotated with a contract type, and a record/ADT
+    /// field (both at construction and via `with`) typed as a contract were all
+    /// wrongly rejected at compile time (PR-it565, fixed in the shared checker so
+    /// this exercises native codegen for patterns it had never compiled before --
+    /// a contract-typed state field, and constructing/`with`-updating a
+    /// contract-typed record field).
+    #[test]
+    fn native_contract_assignable_beyond_component_props_and_call_args() {
+        if !cc_available() {
+            return;
+        }
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get() -> Int\n}\n\
+                   component Mem fulfills Store {\n    intent \"mem\"\n    expose fun get() -> Int { 1 }\n}\n\
+                   component Prefix fulfills Store {\n    intent \"prefix\"\n    expose fun get() -> Int { 2 }\n}\n\
+                   component Holder {\n    intent \"h\"\n    state inner: Store = Mem()\n    expose fun peek() -> Int { inner.get() }\n}\n\
+                   type Box = B(g: Store)\n\
+                   fun mk() -> Store { Mem() }\n\
+                   fun main() uses io {\n    \
+                   var v: Store = Mem()\n    let r1 = v.get()\n    v = Prefix()\n    let r2 = v.get()\n    \
+                   let h = Holder()\n    let r3 = h.peek()\n    let r4 = mk().get()\n    \
+                   let b = B(g: Mem())\n    let b2 = b with g: Prefix()\n    \
+                   let r5 = match b { B(g) => g.get() }\n    let r6 = match b2 { B(g) => g.get() }\n    \
+                   print(\"{r1}|{r2}|{r3}|{r4}|{r5}|{r6}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "contractassign").trim(), "1|2|1|1|1|2");
+    }
+
     /// Native if-let (expression + nested pattern) and while-let (termination) match
     /// interp/KVM (PR-it125).
     #[test]

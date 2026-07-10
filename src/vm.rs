@@ -17741,6 +17741,50 @@ fun main() {\n    let c = Cache(store: NotAStore())\n    let _ = c\n}\n";
     }
 
     #[test]
+    fn diff_contract_assignable_beyond_component_props_and_call_args() {
+        // The component->contract widening rule (`check_assign`, contract_assignable)
+        // was only wired up at 4 of ~13 sites that need it (component-prop injection,
+        // the initial `let`/`var` binding, and positional/method call arguments) --
+        // everywhere else used plain `unify`, which has NO contract-assignability
+        // case at all, so it rejected perfectly valid, documented KUPL: reassigning a
+        // `var` of a contract type to a DIFFERENT fulfilling component, a function
+        // whose tail expression returns a bare component where a contract is
+        // declared, a component `state` field initialized/annotated with a contract
+        // type, and a record/ADT field (both at construction and via `with`) typed as
+        // a contract (PR-it565). Fixed by swapping `unify` -> `check_assign` at each
+        // of those sites -- a strict superset of what `unify` already accepted, so
+        // nothing that used to compile can stop compiling.
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get() -> Int\n}\n\
+component Mem fulfills Store {\n    intent \"mem\"\n    expose fun get() -> Int { 1 }\n}\n\
+component Prefix fulfills Store {\n    intent \"prefix\"\n    expose fun get() -> Int { 2 }\n}\n\
+component Holder {\n    intent \"h\"\n    state inner: Store = Mem()\n    expose fun peek() -> Int { inner.get() }\n}\n\
+type Box = B(g: Store)\n\
+fun mk() -> Store { Mem() }\n\
+fun probe() -> Str {\n    \
+var v: Store = Mem()\n    let r1 = v.get()\n    v = Prefix()\n    let r2 = v.get()\n    \
+let h = Holder()\n    let r3 = h.peek()\n    let r4 = mk().get()\n    \
+let b = B(g: Mem())\n    let b2 = b with g: Prefix()\n    \
+let r5 = match b { B(g) => g.get() }\n    let r6 = match b2 { B(g) => g.get() }\n    \
+\"{r1}|{r2}|{r3}|{r4}|{r5}|{r6}\"\n}\n";
+        assert_eq!(differential(src), "1|2|1|1|1|2");
+    }
+
+    #[test]
+    fn contract_assign_still_rejects_a_non_fulfilling_component() {
+        // The widened `check_assign` sites (PR-it565) are a strict superset of
+        // `unify` -- a component that does NOT fulfill the target contract must
+        // still be rejected everywhere the fix touched (reassignment here; the
+        // symmetric case for component props was already covered by
+        // `contract_prop_rejects_non_fulfilling`).
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get() -> Int\n}\n\
+component Mem fulfills Store {\n    intent \"mem\"\n    expose fun get() -> Int { 1 }\n}\n\
+component NotAStore {\n    intent \"n\"\n    expose fun other() -> Int { 9 }\n}\n\
+fun main() {\n    var v: Store = Mem()\n    v = NotAStore()\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(src).0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+    }
+
+    #[test]
     fn forall_property_passes_and_fails_with_shrunk_counterexample() {
         // run a top-level law body on the interpreter and inspect the outcome
         let run_law = |src: &str| -> Result<(), String> {
