@@ -16258,6 +16258,78 @@ fun probe() -> Str {\n    m_assist5(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_ai_fun_option_shapes_and_compound_tool_args() {
+        // Bug-hunt batch 160 (PR-it552): `Option[T]` as an ai-fun RETURN shape had ZERO
+        // coverage anywhere in the codebase (grepped `ai fun` + `Option[` across ai.rs,
+        // interp.rs, vm.rs, cgen.rs -- no hits), despite `AiShape::Option` being fully
+        // implemented on all three engines; same for a TOOL PARAMETER of a compound shape
+        // (every existing tool test used only Int/Str params). Both are structurally
+        // plausible bug sites: Option's JNull<->None mapping has to survive the
+        // `{"value":...}` envelope-unwrap-then-retry fallback (ai.rs::convert's `or_else`,
+        // mirrored in cgen.rs's k_ai_convert), and a tool argument goes through the SAME
+        // shape-directed JSON conversion as a return value but at a different call site
+        // (k_ai_call_one_tool vs k_ai_convert on native) that could have silently drifted.
+        // Verified CLEAN via real 3-engine CLI probes first (interp/vm here; native in the
+        // companion cgen.rs test) -- locking as a genuine, non-redundant cert.
+        std::env::set_var("KUPL_AI_MOCK_MAYBE_SCORE552", "null");
+        assert_eq!(
+            differential("ai fun maybe_score552(x: Str) -> Option[Int] { intent \"m\" }\n\
+                          fun probe() -> Str { \"{maybe_score552(\"a\")}\" }\n"),
+            "None"
+        );
+        std::env::set_var("KUPL_AI_MOCK_MAYBE_SCORE552", "42");
+        assert_eq!(
+            differential("ai fun maybe_score552(x: Str) -> Option[Int] { intent \"m\" }\n\
+                          fun probe() -> Str { \"{maybe_score552(\"a\")}\" }\n"),
+            "Some(42)"
+        );
+        // List[Option[T]] stacks the List and Option conversion paths for the first time.
+        std::env::set_var("KUPL_AI_MOCK_SCORES552", "[1, null, 3]");
+        assert_eq!(
+            differential("ai fun scores552(x: Str) -> List[Option[Int]] { intent \"s\" }\n\
+                          fun probe() -> Str { \"{scores552(\"a\")}\" }\n"),
+            "[Some(1), None, Some(3)]"
+        );
+        // Result[Option[T], Str] (wraps_result + Option stacked) -- both a bare `null` and a
+        // `{"value": null}`-enveloped null must map to `Ok(None)`, not a shape-mismatch panic.
+        let opt_result_src = "ai fun maybe_result552(x: Str) -> Result[Option[Int], Str] { intent \"m\" }\n\
+                               fun probe() -> Str { \"{maybe_result552(\"a\")}\" }\n";
+        std::env::set_var("KUPL_AI_MOCK_MAYBE_RESULT552", "null");
+        assert_eq!(differential(opt_result_src), "Ok(None)");
+        std::env::set_var("KUPL_AI_MOCK_MAYBE_RESULT552", "{\"value\": null}");
+        assert_eq!(differential(opt_result_src), "Ok(None)");
+        // A tool parameter of a compound shape (List[Int], then Option[Int]) is parsed to
+        // the CORRECT value, not just "didn't crash": each tool self-checks what it
+        // received and deliberately divides by zero if it's wrong, so a mis-parsed argument
+        // would surface as a division-by-zero panic instead of the scripted "final" text --
+        // MockProvider's script is purely index-driven (the tool's return value is NEVER
+        // fed back into a later round, confirmed by diff_ai_fun_multi_tool_round above,
+        // whose tools' actual return values never appear in its asserted output), so this
+        // self-check is the only way to prove correctness through the pure differential()
+        // return-value API without a raw-stdout CLI harness.
+        let tool_src = "fun sum_list552(xs: List[Int]) -> Int { if xs.sum() == 6 { 999 } else { 1 / 0 } }\n\
+                         fun maybe_add552(x: Option[Int]) -> Int {\n    \
+                         match x {\n        Some(v) => if v == 7 { 999 } else { 1 / 0 }\n        None => 999\n    }\n}\n\
+                         ai fun assist552(q: Str) -> Str tools [sum_list552, maybe_add552] { intent \"a\" }\n\
+                         fun probe() -> Str { assist552(\"q\") }\n";
+        std::env::set_var(
+            "KUPL_AI_MOCK_ASSIST552",
+            "[{\"tool\": \"sum_list552\", \"input\": {\"xs\": [1,2,3]}}, {\"final\": \"done1\"}]",
+        );
+        assert_eq!(differential(tool_src), "done1");
+        std::env::set_var(
+            "KUPL_AI_MOCK_ASSIST552",
+            "[{\"tool\": \"maybe_add552\", \"input\": {\"x\": null}}, {\"final\": \"done2\"}]",
+        );
+        assert_eq!(differential(tool_src), "done2");
+        std::env::set_var(
+            "KUPL_AI_MOCK_ASSIST552",
+            "[{\"tool\": \"maybe_add552\", \"input\": {\"x\": 7}}, {\"final\": \"done3\"}]",
+        );
+        assert_eq!(differential(tool_src), "done3");
+    }
+
+    #[test]
     fn diff_ai_fun_tool_panic_inside_wire_handler_triggers_supervised_restart() {
         // Bug-hunt batch 138: a genuinely fresh 3-way feature intersection never tested
         // before -- an ai-fun TOOL panic, propagating up through a WIRE-triggered component

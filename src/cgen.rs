@@ -8480,6 +8480,73 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// Native ai-fun `Option[T]` return shapes and compound-shaped tool parameters
+    /// (bug-hunt batch 160, PR-it552, companion to the vm.rs differential test): confirmed
+    /// via a real 3-engine CLI probe FIRST that `Option[Int]`/`List[Option[Int]]`/
+    /// `Result[Option[Int], Str]` return shapes and `List[Int]`/`Option[Int]` tool
+    /// arguments -- both genuinely untested combinations (grepped the whole repo for
+    /// `ai fun` + `Option[`: zero hits before this) -- were already CLEAN on native's
+    /// independently-reimplemented `k_ai_from_json`/`k_ai_call_one_tool`. Locked here so a
+    /// future regression in either C conversion path is caught.
+    #[test]
+    fn native_ai_option_shapes_and_compound_tool_args() {
+        if !cc_available() {
+            return;
+        }
+        let opt_src = "ai fun maybe_score552(x: Str) -> Option[Int] { intent \"m\" }\n\
+                       fun main() uses io { print(maybe_score552(\"a\")) }\n";
+        assert_eq!(native_main_stdout_env(opt_src, "aiopt1", &[("KUPL_AI_MOCK_MAYBE_SCORE552", "null")]).trim(), "None");
+        assert_eq!(native_main_stdout_env(opt_src, "aiopt2", &[("KUPL_AI_MOCK_MAYBE_SCORE552", "42")]).trim(), "Some(42)");
+        let list_opt_src = "ai fun scores552(x: Str) -> List[Option[Int]] { intent \"s\" }\n\
+                            fun main() uses io { print(scores552(\"a\")) }\n";
+        assert_eq!(
+            native_main_stdout_env(list_opt_src, "aiopt3", &[("KUPL_AI_MOCK_SCORES552", "[1, null, 3]")]).trim(),
+            "[Some(1), None, Some(3)]"
+        );
+        let result_opt_src = "ai fun maybe_result552(x: Str) -> Result[Option[Int], Str] { intent \"m\" }\n\
+                              fun main() uses io { print(maybe_result552(\"a\")) }\n";
+        assert_eq!(native_main_stdout_env(result_opt_src, "aiopt4", &[("KUPL_AI_MOCK_MAYBE_RESULT552", "null")]).trim(), "Ok(None)");
+        assert_eq!(
+            native_main_stdout_env(result_opt_src, "aiopt5", &[("KUPL_AI_MOCK_MAYBE_RESULT552", "{\"value\": null}")]).trim(),
+            "Ok(None)"
+        );
+        // tool args of a compound shape: each tool self-checks and divides by zero if it
+        // received the wrong value, so a mis-parsed argument surfaces as a distinct panic
+        // instead of the scripted "final" text.
+        let tool_src = "fun sum_list552(xs: List[Int]) -> Int { if xs.sum() == 6 { 999 } else { 1 / 0 } }\n\
+                        fun maybe_add552(x: Option[Int]) -> Int {\n    \
+                        match x {\n        Some(v) => if v == 7 { 999 } else { 1 / 0 }\n        None => 999\n    }\n}\n\
+                        ai fun assist552(q: Str) -> Str tools [sum_list552, maybe_add552] { intent \"a\" }\n\
+                        fun main() uses io { print(assist552(\"q\")) }\n";
+        assert_eq!(
+            native_main_stdout_env(
+                tool_src,
+                "aiopt6",
+                &[("KUPL_AI_MOCK_ASSIST552", "[{\"tool\": \"sum_list552\", \"input\": {\"xs\": [1,2,3]}}, {\"final\": \"done1\"}]")]
+            )
+            .trim(),
+            "done1"
+        );
+        assert_eq!(
+            native_main_stdout_env(
+                tool_src,
+                "aiopt7",
+                &[("KUPL_AI_MOCK_ASSIST552", "[{\"tool\": \"maybe_add552\", \"input\": {\"x\": null}}, {\"final\": \"done2\"}]")]
+            )
+            .trim(),
+            "done2"
+        );
+        assert_eq!(
+            native_main_stdout_env(
+                tool_src,
+                "aiopt8",
+                &[("KUPL_AI_MOCK_ASSIST552", "[{\"tool\": \"maybe_add552\", \"input\": {\"x\": 7}}, {\"final\": \"done3\"}]")]
+            )
+            .trim(),
+            "done3"
+        );
+    }
+
     /// `kupl native` correctly resolves `use` imports across files -- a
     /// capability bug-hunt batch 151 (PR-it543) checked SPECIFICALLY on
     /// native since `main.rs`'s own `build_resolves_multi_file_use_imports`
