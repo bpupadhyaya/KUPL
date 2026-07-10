@@ -3526,17 +3526,18 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "sort")) {
             KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
             memcpy(out, l->items, sizeof(KValue) * l->len);
-            /* insertion sort: stable, no globals needed for the comparator */
+            /* insertion sort: stable, no globals needed for the comparator. Delegates to
+               k_cmp (PR-it549) -- the same comparator `<`/`<=`/etc and min_by/max_by already
+               use, and which already supports SizedInt/f32/BigInt/Rational alongside
+               Int/Float/Str -- instead of a narrower duplicated Int/Float/Str-only check, so
+               `.sort()` no longer rejects types the checker (and every other comparison)
+               already accepts. */
             for (int64_t i = 1; i < l->len; i++) {
                 KValue key = out[i];
                 int64_t j = i - 1;
                 while (j >= 0) {
-                    int gt;
-                    if (out[j].tag == K_INT && key.tag == K_INT) gt = out[j].as.i > key.as.i;
-                    else if (out[j].tag == K_FLOAT && key.tag == K_FLOAT) gt = out[j].as.f > key.as.f;
-                    else if (out[j].tag == K_STR && key.tag == K_STR) gt = strcmp(out[j].as.s, key.as.s) > 0;
-                    else { k_panic("`sort` needs Int, Float, or Str elements"); gt = 0; }
-                    if (!gt) break;
+                    KValue c = k_cmp(out[j], key, 2); /* out[j] > key */
+                    if (c.tag != K_BOOL || !c.as.b) break;
                     out[j + 1] = out[j];
                     j--;
                 }
@@ -3682,17 +3683,11 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                    or it>best (max), matching the interpreter's fold. Using strict `>`
                    rather than `!(it<best)` keeps NaN inert (both comparisons are false),
                    so NaN never displaces the running best and never cascades — a `!<` form
-                   would treat NaN's unordered result as "greater" and poison the result. */
-                int repl;
-                if (it.tag == K_INT && best.tag == K_INT)
-                    repl = wmin ? (it.as.i < best.as.i) : (it.as.i > best.as.i);
-                else if (it.tag == K_FLOAT && best.tag == K_FLOAT)
-                    repl = wmin ? (it.as.f < best.as.f) : (it.as.f > best.as.f);
-                else if (it.tag == K_STR && best.tag == K_STR) {
-                    int c = strcmp(it.as.s, best.as.s);
-                    repl = wmin ? (c < 0) : (c > 0);
-                } else { k_panic("`min`/`max` need Int, Float, or Str elements"); repl = 0; }
-                if (repl) best = it;
+                   would treat NaN's unordered result as "greater" and poison the result.
+                   Delegates to k_cmp (PR-it549), same as min_by/max_by below and `.sort()`
+                   above, so SizedInt/f32/BigInt/Rational elements are supported too. */
+                KValue c = k_cmp(it, best, wmin ? 0 : 2);
+                if (c.tag == K_BOOL && c.as.b) best = it;
             }
             return k_some(best);
         }
@@ -6774,6 +6769,29 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "sumprodok").trim(), "6|6|4.0|3.75|60|6000|5/6|1/6");
         let bad = "fun main() uses io {\n    let xs: List[u8] = [200u8, 100u8]\n    print(\"{xs.sum()}\")\n}\n";
         assert!(native_main_stdout(bad, "sumprodbad").trim().is_empty(), "expected a panic");
+    }
+
+    /// Native `.sort()`/`.min()`/`.max()`/`.min_by()` support SizedInt/f32/BigInt/Rational
+    /// (PR-it549 real cross-engine DIVERGENCE: native's `min_by`/`max_by` already used the
+    /// fully general `k_cmp` comparator -- the same one `<`/`<=`/`>`/`>=` use -- so a
+    /// BigInt-keyed `min_by` already worked here BEFORE this fix, while interp/vm panicked
+    /// on the identical program; `.sort()`/`.min()`/`.max()` were narrower on ALL THREE
+    /// engines and needed widening everywhere). Now delegates `.sort()`/`.min()`/`.max()` to
+    /// the same `k_cmp` comparator too, matching min_by/max_by and removing the old
+    /// Int/Float/Str-only duplicated checks.
+    #[test]
+    fn native_sort_min_max_support_every_numeric_type() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let xs: List[i32] = [30i32, 10i32, 20i32]\n    \
+                   let fs: List[f32] = [3.5f32, 1.5f32, 2.5f32]\n    let bs = [big(30), big(10), big(20)]\n    \
+                   let rs = [rat(3, 4), rat(1, 4), rat(1, 2)]\n    \
+                   print(\"{xs.sort()}|{xs.min()}|{xs.max()}|{fs.sort()}|{bs.sort()}|{bs.min_by(fn x { x })}|{rs.sort()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "ordok").trim(),
+            "[10, 20, 30]|Some(10)|Some(30)|[1.5, 2.5, 3.5]|[10, 20, 30]|Some(10)|[1/4, 1/2, 3/4]"
+        );
     }
 
     /// Native string concatenation (k_concat's memcpy splice + direct-pointer fast path for

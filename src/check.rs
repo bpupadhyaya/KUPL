@@ -1458,7 +1458,7 @@ impl Checker {
                         }
                         let t = self.default_numeric(t);
                         if !t.is_numeric() && t != Ty::Str {
-                            self.err("K0234", format!("cannot order values of type {t}; only Int, Float, and Str can be compared"), expr.span);
+                            self.err("K0234", format!("cannot order values of type {t}; only Int, Float, Str, and other numeric types can be compared"), expr.span);
                         }
                         Ty::Bool
                     }
@@ -2317,7 +2317,7 @@ impl Checker {
                 let elem = self.uni.apply(t);
                 let elem = self.default_numeric(elem);
                 if !elem.is_numeric() {
-                    self.err("K0245", format!("`sum` needs a List[Int] or List[Float], found List[{elem}]"), span);
+                    self.err("K0245", format!("`sum` needs a numeric List (Int/Float/sized int/f32/BigInt/Rational), found List[{elem}]"), span);
                 }
                 Some((vec![], elem))
             }
@@ -2349,8 +2349,12 @@ impl Checker {
             )),
             (Ty::List(t), "sort") => {
                 let elem = self.uni.apply(t);
-                if !matches!(elem, Ty::Int | Ty::Float | Ty::Str | Ty::Var(_)) {
-                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, and Str can be compared"), span);
+                // Widened PR-it549: sized ints/f32/BigInt/Rational are all orderable (the
+                // runtime's `list_order` already backs `min`/`max`/min_by/max_by with them,
+                // and native's k_cmp always supported them) — `.sort()` was needlessly
+                // narrower than what the language could already do.
+                if !(elem.is_numeric() || elem == Ty::Str || matches!(elem, Ty::Var(_))) {
+                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, and other numeric types can be compared"), span);
                 }
                 Some((vec![], Ty::List(t.clone())))
             }
@@ -2381,7 +2385,7 @@ impl Checker {
             (Ty::List(t), "product") => {
                 let elem = self.default_numeric(self.uni.apply(t));
                 if !elem.is_numeric() {
-                    self.err("K0245", format!("`product` needs a List[Int] or List[Float], found List[{elem}]"), span);
+                    self.err("K0245", format!("`product` needs a numeric List (Int/Float/sized int/f32/BigInt/Rational), found List[{elem}]"), span);
                 }
                 Some((vec![], elem))
             }
@@ -2394,8 +2398,8 @@ impl Checker {
             }
             (Ty::List(t), "min") | (Ty::List(t), "max") => {
                 let elem = self.uni.apply(t);
-                if !matches!(elem, Ty::Int | Ty::Float | Ty::Str | Ty::Var(_)) {
-                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, and Str can be compared"), span);
+                if !(elem.is_numeric() || elem == Ty::Str || matches!(elem, Ty::Var(_))) {
+                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, and other numeric types can be compared"), span);
                 }
                 Some((vec![], Ty::Option(t.clone())))
             }
@@ -3740,9 +3744,11 @@ mod generic_tests {
     #[test]
     fn order_error_names_the_orderable_types() {
         // K0234 now names which types ARE orderable so the fix is obvious, at all three trigger
-        // sites: a comparison operator, List.sort, and List.min/max (PR-it193). The change is
-        // message-text only — orderable types (Int/Float/Str) still type-check.
-        let hint = "only Int, Float, and Str can be compared";
+        // sites: a comparison operator, List.sort, and List.min/max (PR-it193). Widened again
+        // in PR-it549 to also name the numeric types beyond Int/Float (sized ints, f32,
+        // BigInt, Rational are all orderable now too) — the wording here was updated to
+        // match, and the final assertion below now also covers the newly-accepted types.
+        let hint = "only Int, Float, Str, and other numeric types can be compared";
         let cmp = errors("type P = P(x: Int)\nfun main() { let b = P(1) < P(2)\n    let _ = b }\n");
         assert!(cmp.iter().any(|d| d.code == "K0234" && d.message.contains(hint)), "cmp: {cmp:?}");
         let sort = errors("type P = P(x: Int)\nfun main() { let _ = [P(1), P(2)].sort() }\n");
@@ -3751,6 +3757,12 @@ mod generic_tests {
         assert!(max.iter().any(|d| d.code == "K0234" && d.message.contains(hint)), "max: {max:?}");
         // Orderable element types are still accepted (no behavior change).
         assert!(errors("fun main() { let _ = [3, 1, 2].sort()\n    let _ = \"a\" < \"b\" }\n").is_empty());
+        // Sized ints, f32, BigInt, and Rational are ALL orderable too (PR-it549) — sort/
+        // min/max no longer wrongly reject types the comparison operators already accept.
+        assert!(errors("fun main() { let xs: List[i32] = [3i32, 1i32]\n    let _ = xs.sort() }\n").is_empty());
+        assert!(errors("fun main() { let xs: List[f32] = [3.0f32, 1.0f32]\n    let _ = xs.max() }\n").is_empty());
+        assert!(errors("fun main() { let xs = [big(3), big(1)]\n    let _ = xs.min() }\n").is_empty());
+        assert!(errors("fun main() { let xs = [rat(1, 2), rat(1, 3)]\n    let _ = xs.sort() }\n").is_empty());
     }
 
     #[test]

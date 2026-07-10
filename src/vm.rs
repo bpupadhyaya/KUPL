@@ -15111,6 +15111,34 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_sort_min_max_support_every_numeric_type_not_just_int_float_str() {
+        // A REAL cross-engine DIVERGENCE found+fixed (bug-hunt batch 157, PR-it549), a step
+        // beyond it547/it548: `min_by`/`max_by`'s key type isn't restricted by the checker at
+        // all (any type unifies), and NATIVE's comparator for it (`k_cmp`, shared with the
+        // `<`/`<=`/`>`/`>=` operators) already supported SizedInt/f32/BigInt/Rational keys --
+        // so `[big(30), big(10), big(20)].min_by(fn x { x })` returned `Some(10)` on native
+        // while interp/vm PANICKED on the identical program (`list_order`, their shared
+        // comparator, only ever handled Int/Float/Str). Confirmed via a real 3-engine CLI
+        // probe: this was an actual behavioral divergence, not just a shared gap. Separately,
+        // `.sort()`/`.min()`/`.max()`'s own checker signatures (and matching runtime
+        // comparators) were narrower than necessary too -- Int/Float/Str only, even though
+        // sized ints/f32/BigInt/Rational are all fully orderable via the SAME `<`/`<=`
+        // machinery it548 already confirmed is comprehensive.
+        // Fixed by widening `list_order` (interp.rs) to cover the four missing types --
+        // this alone fixes min/max/min_by/max_by at once, since all four call it -- and
+        // widening `.sort()`'s checker signature (check.rs) plus its runtime comparator
+        // (now delegates to `list_order` instead of a separate duplicated match).
+        assert_eq!(differential("fun probe() -> Str { let xs: List[i32] = [30i32, 10i32, 20i32]\n    \"{xs.sort()}|{xs.min()}|{xs.max()}\" }\n"), "[10, 20, 30]|Some(10)|Some(30)");
+        assert_eq!(differential("fun probe() -> Str { let xs: List[f32] = [3.5f32, 1.5f32, 2.5f32]\n    \"{xs.sort()}|{xs.min()}|{xs.max()}\" }\n"), "[1.5, 2.5, 3.5]|Some(1.5)|Some(3.5)");
+        assert_eq!(differential("fun probe() -> Str { let xs = [big(30), big(10), big(20)]\n    \"{xs.sort()}|{xs.min()}|{xs.max()}|{xs.min_by(fn x { x })}\" }\n"), "[10, 20, 30]|Some(10)|Some(30)|Some(10)");
+        assert_eq!(differential("fun probe() -> Str { let xs = [rat(3, 4), rat(1, 4), rat(1, 2)]\n    \"{xs.sort()}|{xs.min()}|{xs.max()}\" }\n"), "[1/4, 1/2, 3/4]|Some(1/4)|Some(3/4)");
+        // existing Int/Float/Str behavior is completely unchanged.
+        assert_eq!(differential("fun probe() -> Str { \"{[3, 1, 2].sort()}|{[3, 1, 2].min()}|{[3, 1, 2].max()}|{[\"b\", \"a\"].sort()}\" }\n"), "[1, 2, 3]|Some(1)|Some(3)|[\"a\", \"b\"]");
+        // a genuinely non-orderable element type still rejects at compile time (K0234).
+        assert!(crate::run::compile("type P = P(x: Int)\nfun main() { let _ = [P(1), P(2)].sort() }\n").is_err());
+    }
+
+    #[test]
     fn diff_while_loop_and_break_continue() {
         // while runs while its condition holds (false-initial => zero iterations); break exits
         // the innermost loop; continue skips the rest of the current iteration; in nested loops

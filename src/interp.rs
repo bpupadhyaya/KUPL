@@ -2032,16 +2032,15 @@ pub fn shared_method(
             Ok(Value::Bool(true))
         }
         (Value::List(items), "sort") => {
+            // Delegates to `list_order` (also used by min/max/min_by/max_by) so every
+            // orderable element type -- Int/Float/Str plus SizedInt/F32/BigInt/Rational as
+            // of PR-it549 -- stays in sync across all four methods from one place.
             let mut out = items.as_ref().clone();
             let mut err = None;
-            out.sort_by(|a, b| match (a, b) {
-                (Value::Int(x), Value::Int(y)) => x.cmp(y),
-                (Value::Float(x), Value::Float(y)) => {
-                    x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-                }
-                (Value::Str(x), Value::Str(y)) => x.cmp(y),
-                _ => {
-                    err = Some("`sort` needs Int, Float, or Str elements".to_string());
+            out.sort_by(|a, b| match list_order(a, b) {
+                Ok(ord) => ord,
+                Err(e) => {
+                    err = Some(e);
                     std::cmp::Ordering::Equal
                 }
             });
@@ -3350,7 +3349,17 @@ fn list_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
         (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
         (Value::Float(x), Value::Float(y)) => Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal)),
         (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
-        _ => Err("`min`/`max` need Int, Float, or Str elements".into()),
+        // A REAL cross-engine DIVERGENCE found+fixed, PR-it549: min_by/max_by's key type
+        // isn't restricted by the checker (any type unifies), and native's comparator
+        // (k_cmp, shared with `<`/`<=`/etc) already handled these — so a BigInt-keyed
+        // min_by already worked on native while interp/vm panicked on the identical
+        // program. Bringing list_order up to k_cmp's coverage closes the divergence AND
+        // (via `.min()`/`.max()`, which also call this) extends direct min/max the same way.
+        (Value::SizedInt(x), Value::SizedInt(y)) if x.1 == y.1 => Ok(x.0.cmp(&y.0)),
+        (Value::F32(x), Value::F32(y)) => Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal)),
+        (Value::BigInt(x), Value::BigInt(y)) => Ok(x.cmp(y)),
+        (Value::Rational(x), Value::Rational(y)) => Ok(x.cmp(y)),
+        _ => Err("`min`/`max` need Int, Float, Str, or another orderable type".into()),
     }
 }
 
