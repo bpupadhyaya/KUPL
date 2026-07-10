@@ -8109,6 +8109,46 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// A `Result`-wrapped ai fun's TOOL panicking is swallowed into a clean
+    /// `Err(msg)` VALUE, not a hard process crash -- native matches interp/KVM
+    /// (it523's finding). Bug-hunt batch 148 (PR-it540): this combination
+    /// (`wraps_result` + a tool that panics) was UNTESTED on native, and it539's
+    /// fix (wrapping the tool call in its own setjmp/k_pad) turned out to ALSO
+    /// be load-bearing for correctness here, not just message quality -- before
+    /// that fix, the tool's panic would have propagated straight past
+    /// `k_ai_call`'s `f->wraps_result` check entirely (which only runs AFTER
+    /// `k_ai_tool_call` returns cleanly with `k_ai_ok`/`k_ai_err` set), crashing
+    /// the whole process with `exit(101)` instead of producing `Err(...)`.
+    #[test]
+    fn native_ai_fun_result_wrapping_swallows_tool_panic() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun tool_div4() -> Int { 100 / 0 }\n\
+                   ai fun assist4(q: Str) -> Result[Int, Str] tools [tool_div4] { intent \"x\" }\n\
+                   fun main() uses io { print(\"{assist4(\"q\")}\") }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("wraps_result ai fun with tools compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aiwrap-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_ASSIST4", "[{\"tool\":\"tool_div4\",\"input\":{}},{\"final\":\"5\"}]")
+            .output()
+            .expect("runs");
+        assert!(
+            out.status.success(),
+            "a wraps_result ai fun's tool panic must be a clean Err VALUE, not a process crash: {out:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "Err(\"division by zero\")\n");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
     /// Direct cross-component expose calls compile to native and dispatch to the
     /// right instance's state — native stdout == the interpreter.
     #[test]
