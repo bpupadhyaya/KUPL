@@ -3457,6 +3457,63 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_josephus_problem() {
+        // A certification lock (it504, bug-hunt batch 131 -- 20+ fresh probes across Str/List/Map/Set/tensor/
+        // BigInt/Result shapes came back byte-identical, so a fresh classic-algorithm axis is locked instead): the
+        // JOSEPHUS PROBLEM, cross-validated via SECOND-ALGORITHM (like karatsuba it476 vs `*`, modpow it479 vs
+        // naive, wilson it489 vs trial-division): n people stand in a circle, every k-th is eliminated going
+        // around, and the question is which (0-indexed) position survives. josephusRec is the classic closed-form
+        // RECURRENCE (J(1)=0, J(n)=(J(n-1)+k) mod n) -- pure integer arithmetic, no data structure. josephusSim
+        // instead ACTUALLY SIMULATES the elimination over a real list (take/drop/flatten to remove the eliminated
+        // position each round, tracking the next-index modulo the shrinking list). These are two completely
+        // different computations -- a derived recurrence vs. brute-force simulation -- sharing no logic, so their
+        // agreement certifies both, not a restatement (it462 discipline). n kept small (<=7): elimGo's per-frame
+        // take/drop/flatten is list-rebuild-heavy like reservoir sampling's replace step (it497 lesson -- per-frame
+        // COST matters for stack safety, not just depth), verified empirically clean on the default 2MB test-stack.
+        //   j7=josephusRec(7,3)=3, s7=josephusSim(7,3)=3 (the classic n=7,k=3 example: 0-indexed survivor 3)
+        //   j5=josephusRec(5,2)=2, s5=josephusSim(5,2)=2 (hand-verified: eliminate 1,3,0,4 in turn, 2 survives)
+        //   j6=josephusRec(6,4)=4, s6=josephusSim(6,4)=4 (hand-verified: eliminate 3,1,0,2,5 in turn, 4 survives)
+        //   j1=josephusRec(1,5)=0, s1=josephusSim(1,5)=0 (n=1 base case: the sole person always survives)
+        // Confirms recurrence==simulation across 4 distinct (n,k) pairs incl. the classic textbook case and the
+        // n=1 edge, byte-identical on interp/KVM (native per the sweep). The recurrence an AI reaches for when
+        // reasoning about elimination/scheduling puzzles; agreement with an actual simulation catches an
+        // off-by-one in the mod-k step or the wraparound index that a lone closed-form value can't self-detect.
+        // A non-sort Josephus-problem lock, continuing the classic-algorithm vein.
+        let src = r#"fun josephusRec(n: Int, k: Int) -> Int {
+    if n == 1 { 0 } else { (josephusRec(n - 1, k) + k) % n }
+}
+fun buildGo(i: Int, n: Int, acc: List[Int]) -> List[Int] {
+    if i >= n { acc } else { buildGo(i + 1, n, acc.push(i)) }
+}
+fun elimGo(people: List[Int], idx: Int, k: Int) -> Int {
+    if people.len() == 1 {
+        people.get(0).unwrap_or(-1)
+    } else {
+        let i = (idx + k - 1) % people.len()
+        let remaining = [people.take(i), people.drop(i + 1)].flatten()
+        elimGo(remaining, i % remaining.len(), k)
+    }
+}
+fun josephusSim(n: Int, k: Int) -> Int { elimGo(buildGo(0, n, []), 0, k) }
+fun probe() -> Str {
+    let j7 = josephusRec(7, 3)
+    let s7 = josephusSim(7, 3)
+    let j5 = josephusRec(5, 2)
+    let s5 = josephusSim(5, 2)
+    let j6 = josephusRec(6, 4)
+    let s6 = josephusSim(6, 4)
+    let j1 = josephusRec(1, 5)
+    let s1 = josephusSim(1, 5)
+    "j7={j7}|s7={s7}|j5={j5}|s5={s5}|j6={j6}|s6={s6}|j1={j1}|s1={s1}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "j7=3|s7=3|j5=2|s5=2|j6=4|s6=4|j1=0|s1=0"
+        );
+    }
+
+    #[test]
     fn diff_wilson_theorem() {
         // A certification lock (it489): WILSON'S THEOREM -- an integer p > 1 is prime if and only if
         // (p-1)! ≡ -1 (mod p), i.e. (p-1)! mod p == p-1 -- cross-validated against an independent TRIAL-DIVISION
