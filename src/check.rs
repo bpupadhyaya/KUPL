@@ -1249,9 +1249,15 @@ impl Checker {
                 self.unify(&Ty::Bool, &t, *span, "`expect` condition");
                 Ty::Unit
             }
-            Stmt::Break(span) | Stmt::Continue(span) => {
+            Stmt::Break(span) => {
                 if ctx.loop_depth == 0 {
-                    self.err("K0229", "`break`/`continue` outside of a loop", *span);
+                    self.err("K0229", "`break` outside of a loop", *span);
+                }
+                Ty::Unit
+            }
+            Stmt::Continue(span) => {
+                if ctx.loop_depth == 0 {
+                    self.err("K0229", "`continue` outside of a loop", *span);
                 }
                 Ty::Unit
             }
@@ -3328,6 +3334,28 @@ mod generic_tests {
             "type Rec = R(a: Int, b: Str)\nfun probe() -> Int { let r = R(a: 1, b: \"x\")\n    match r { R(x, _) => x } }\n"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn k0229_names_the_actual_keyword() {
+        // Error-msg round 35 (PR-it506): `break`/`continue` outside a loop used to report the
+        // AMBIGUOUS bare "`break`/`continue` outside of a loop" for BOTH keywords -- even though
+        // the checker matched `Stmt::Break` and `Stmt::Continue` as separate AST nodes and knew
+        // exactly which one the user wrote. Split the match arms so K0229 names the actual
+        // keyword: "`break` outside of a loop" / "`continue` outside of a loop".
+        let b = errors("fun probe() -> Int { break\n    5 }\n");
+        assert!(
+            b.iter().any(|d| d.code == "K0229" && d.message == "`break` outside of a loop"),
+            "bare `break` should name itself, not `break`/`continue`: {b:?}"
+        );
+        let c = errors("fun probe() -> Int { continue\n    5 }\n");
+        assert!(
+            c.iter().any(|d| d.code == "K0229" && d.message == "`continue` outside of a loop"),
+            "bare `continue` should name itself, not `break`/`continue`: {c:?}"
+        );
+        // `break`/`continue` INSIDE a loop still type-check cleanly (no behavior change).
+        assert!(errors("fun probe() -> Int { while false { break }\n    5 }\n").is_empty());
+        assert!(errors("fun probe() -> Int { while false { continue }\n    5 }\n").is_empty());
     }
 
     #[test]
