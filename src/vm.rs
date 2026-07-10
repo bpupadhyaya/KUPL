@@ -3547,6 +3547,74 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_stern_brocot_tree_coprimality_and_order() {
+        // A certification lock (it510, classic-algo/number-theory vein, fresh axis -- Stern-Brocot
+        // was an open candidate alongside toom-cook): the STERN-BROCOT TREE, which enumerates every
+        // positive rational EXACTLY ONCE via repeated mediants: starting from bounds lo=0/1,
+        // hi=1/0(=infinity), an L-move narrows hi to mediant(lo,hi), an R-move narrows lo to
+        // mediant(lo,hi); each node's own value is mediant(lo,hi) at that point. mediant(a,b) is
+        // JUST NAIVE COMPONENT-WISE ADDITION (p1+p2)/(q1+q2) -- nothing about it looks like it
+        // should produce a REDUCED fraction. Two INDEPENDENT cross-checks (neither restates the
+        // mediant/addition logic itself -- it462 discipline): (1) COPRIMALITY via gcdT (Euclidean
+        // algorithm, a completely different computation from addition) -- every tree node IS in
+        // lowest terms, a deep, non-obvious fact about Stern-Brocot specifically (its lo/hi bounds
+        // always satisfy the determinant invariant q_lo*p_hi - p_lo*q_hi = 1, which forces the
+        // mediant to be coprime -- but the WALK never computes that determinant, so agreement
+        // certifies it holds implicitly); (2) PARENT-CHILD ORDERING via cross-multiplication
+        // (a*d vs b*c, exact-integer rational comparison) -- an R-child must be > its parent, an
+        // L-child must be < its parent (the defining binary-search-tree property), checked via a
+        // SEPARATE comparison operation, not anything the mediant construction asserts directly.
+        // NEGATIVE case makes the coprimality result genuinely informative, not a trivial always-1:
+        // mediant(1/3, 1/3) = 2/6 (gcd 2, NOT reduced) -- naive component-wise addition does NOT
+        // preserve lowest terms for an ARBITRARY fraction pair, only for genuine Stern-Brocot
+        // lo/hi neighbors (determinant exactly 1); (1/3,1/3) has determinant 1*3-1*3=0, not 1, so
+        // the guarantee correctly does NOT apply there -- the walk-derived pairs are special.
+        //   root(path=[])=1/1, r(R)=2/1, l(L)=1/2, rr(RR)=3/1, rl(RL)=3/2, lr(LR)=2/3, ll(LL)=1/3
+        //   -- matches the textbook Stern-Brocot tree layout (root 1/1; children 1/2, 2/1; their
+        //   children 1/3, 2/3, 3/2, 3/1). sbWalk recursion depth = path length (<=2 here, trivially
+        //   shallow); gcdT recursion depth <=3 for these small values -- no stack concern.
+        // Confirms mediant-construction, coprimality-via-independent-gcd across 7 nodes incl 2
+        // depth levels, parent-child ordering across 6 pairs, a genuine non-coprime negative case
+        // for an arbitrary (non-adjacent) pair, byte-identical on interp/KVM (native per the
+        // sweep). Rational-enumeration reasoning for Farey sequences/continued-fraction convergents
+        // (it508)/binary-search-over-rationals; a wrong lo/hi update on L vs R would break either
+        // coprimality or ordering immediately. A non-sort Stern-Brocot lock.
+        let src = r#"type Frac = { p: Int, q: Int }
+fun mediant(a: Frac, b: Frac) -> Frac { Frac(p: a.p + b.p, q: a.q + b.q) }
+fun sbWalk(path: List[Bool], lo: Frac, hi: Frac) -> Frac {
+    if path.is_empty() {
+        mediant(lo, hi)
+    } else {
+        let m = mediant(lo, hi)
+        let rest = path.drop(1)
+        if path.get(0).unwrap_or(false) { sbWalk(rest, m, hi) } else { sbWalk(rest, lo, m) }
+    }
+}
+fun sbFrac(path: List[Bool]) -> Frac { sbWalk(path, Frac(p: 0, q: 1), Frac(p: 1, q: 0)) }
+fun gcdT(a: Int, b: Int) -> Int { if b == 0 { a } else { gcdT(b, a % b) } }
+fun lt(a: Frac, b: Frac) -> Bool { a.p * b.q < b.p * a.q }
+fun probe() -> Str {
+    let root = sbFrac([])
+    let r = sbFrac([true])
+    let l = sbFrac([false])
+    let rr = sbFrac([true, true])
+    let rl = sbFrac([true, false])
+    let lr = sbFrac([false, true])
+    let ll = sbFrac([false, false])
+    let coprime = gcdT(root.p, root.q) == 1 && gcdT(r.p, r.q) == 1 && gcdT(l.p, l.q) == 1 && gcdT(rr.p, rr.q) == 1 && gcdT(rl.p, rl.q) == 1 && gcdT(lr.p, lr.q) == 1 && gcdT(ll.p, ll.q) == 1
+    let order = lt(root, r) && lt(l, root) && lt(r, rr) && lt(rl, r) && lt(l, lr) && lt(ll, l)
+    let bad = mediant(Frac(p: 1, q: 3), Frac(p: 1, q: 3))
+    let badGcd = gcdT(bad.p, bad.q)
+    "root={root.p}/{root.q}|r={r.p}/{r.q}|l={l.p}/{l.q}|rr={rr.p}/{rr.q}|rl={rl.p}/{rl.q}|lr={lr.p}/{lr.q}|ll={ll.p}/{ll.q}|coprime={coprime}|order={order}|bad={bad.p}/{bad.q}|badGcd={badGcd}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "root=1/1|r=2/1|l=1/2|rr=3/1|rl=3/2|lr=2/3|ll=1/3|coprime=true|order=true|bad=2/6|badGcd=2"
+        );
+    }
+
+    #[test]
     fn diff_carmichael_korselt_vs_fermat() {
         // A certification lock (it505, classic-algo/number-theory-theorem-oracle vein, fresh axis per the
         // it501/it504 roadmap): the CARMICHAEL FUNCTION property, cross-validated via SPEC-PROPERTY /
