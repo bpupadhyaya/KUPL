@@ -119,7 +119,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// "did you mean `…`?" hint. Deterministic: closest wins, ties broken
 /// alphabetically. Returns `None` if nothing is close enough (so it never fires
 /// spuriously). Short names require a closer match.
-fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<String> {
+pub(crate) fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<String> {
     let max_dist = if name.chars().count() <= 3 { 1 } else { 2 };
     let mut best: Option<(usize, &str)> = None;
     for cand in candidates {

@@ -47,7 +47,7 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
         if let ExprKind::Call { callee, args } = &mut e.kind {
             if let ExprKind::Ident(name) = &callee.kind {
                 if let Some(params) = funs.get(name) {
-                    resolve_one(params, args, span, &mut diags);
+                    resolve_one(name, params, args, span, &mut diags);
                 }
             }
         }
@@ -77,7 +77,7 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
 /// Resolve one call's args against `params`, in place. Only runs when there are
 /// named args or missing trailing args; leaves well-formed positional calls and
 /// over-full calls (arity errors) to the checker.
-fn resolve_one(params: &[Param], args: &mut Vec<Arg>, span: Span, diags: &mut Vec<Diag>) {
+fn resolve_one(fun_name: &str, params: &[Param], args: &mut Vec<Arg>, span: Span, diags: &mut Vec<Diag>) {
     let has_named = args.iter().any(|a| a.name.is_some());
     if !has_named && args.len() == params.len() {
         return;
@@ -109,7 +109,17 @@ fn resolve_one(params: &[Param], args: &mut Vec<Arg>, span: Span, diags: &mut Ve
                             slots[i] = Some(a.value);
                         }
                     }
-                    None => diags.push(Diag::error("K0273", format!("no parameter named `{n}`"), span)),
+                    None => {
+                        let mut msg = format!("`{fun_name}` has no parameter named `{n}`");
+                        // Only suggest a parameter that isn't ALREADY filled -- e.g. `add(a: 1,
+                        // c: 2)` suggesting `a` (already given) would be a red herring; the
+                        // useful suggestion is the remaining unfilled one, `b`.
+                        let unfilled = params.iter().enumerate().filter(|(i, _)| slots[*i].is_none()).map(|(_, p)| p.name.as_str());
+                        if let Some(s) = crate::check::suggest(&n, unfilled) {
+                            msg.push_str(&format!(" — did you mean `{s}`?"));
+                        }
+                        diags.push(Diag::error("K0273", msg, span));
+                    }
                 }
             }
         }
@@ -230,5 +240,48 @@ fn walk_expr(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
         }
         ExprKind::Try(e) | ExprKind::Await(e) => walk_expr(e, f),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `resolve_call_args` only runs as part of the real `kupl check`/`run`
+    // pipeline (`crate::run::compile`) -- check.rs's own bare `errors()` test
+    // harness does NOT call it (the same discrepancy K0241's it520 fix hit),
+    // so these tests go through the full pipeline instead.
+    fn errors(src: &str) -> Vec<crate::diag::Diag> {
+        crate::run::compile(src).err().unwrap_or_default()
+    }
+
+    #[test]
+    fn k0273_unknown_named_argument_names_the_function_and_suggests_closest_unfilled_param() {
+        // Error-message round 43 (PR-it536): `add(a: 1, c: 2)` (typo'd named
+        // argument) was flat "no parameter named `c`" -- named neither the
+        // function being called nor the fix. Found by widening the err-msg scan
+        // beyond check.rs (confirmed exhausted it535) into callargs.rs, a
+        // pre-check pass that resolves named/default arguments before the
+        // checker ever sees the call.
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() uses io {\n    print(\"{add(a: 1, c: 2)}\")\n}\n";
+        let typo = errors(src);
+        assert!(
+            typo.iter().any(|d| d.code == "K0273" && d.message.contains("`add` has no parameter named `c`") && d.message.contains("did you mean `b`?")),
+            "typo'd named argument should name the function and suggest the closest UNFILLED param: {typo:?}"
+        );
+        // The already-given `a` must NOT be suggested (a red herring: the user
+        // already provided it, the useful fix is the remaining unfilled one).
+        assert!(
+            !typo.iter().any(|d| d.code == "K0273" && d.message.contains("did you mean `a`?")),
+            "must not suggest a parameter that's already been filled: {typo:?}"
+        );
+        // Nothing close -> no suggestion (no false-positive did-you-mean).
+        let none_src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() uses io {\n    print(\"{add(a: 1, zqxwbly: 2)}\")\n}\n";
+        let none = errors(none_src);
+        assert!(
+            none.iter().any(|d| d.code == "K0273" && !d.message.contains("did you mean")),
+            "unrelated name should stay bare: {none:?}"
+        );
+        // A correct named call still type-checks cleanly.
+        let ok_src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() uses io {\n    print(\"{add(a: 1, b: 2)}\")\n}\n";
+        assert!(errors(ok_src).is_empty());
     }
 }
