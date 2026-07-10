@@ -362,23 +362,29 @@ fn ident_at(text: &str, offset: usize) -> Option<(String, usize, usize)> {
 }
 
 /// Human-readable signature of a top-level item named `name`, if found.
+/// Render a function declaration's signature (`fun name(params) -> ret uses effects`),
+/// shared by top-level functions and component methods (exposed or private) so hover
+/// shows the identical format regardless of where the function lives.
+fn fun_sig_str(f: &crate::ast::FunDecl) -> String {
+    use crate::fmt::ty_str;
+    let params: Vec<String> =
+        f.params.iter().map(|p| format!("{}: {}", p.name, ty_str(&p.ty))).collect();
+    let ret = f.ret.as_ref().map(|r| format!(" -> {}", ty_str(r))).unwrap_or_default();
+    let eff = if f.effects.is_empty() {
+        String::new()
+    } else {
+        format!(" uses {}", f.effects.join(", "))
+    };
+    let kw = if f.ai.is_some() { "ai fun" } else { "fun" };
+    format!("{kw} {}({}){ret}{eff}", f.name, params.join(", "))
+}
+
 fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
     use crate::ast::Item;
     use crate::fmt::ty_str;
     for item in &program.items {
         match item {
-            Item::Fun(f) if f.name == name => {
-                let params: Vec<String> =
-                    f.params.iter().map(|p| format!("{}: {}", p.name, ty_str(&p.ty))).collect();
-                let ret = f.ret.as_ref().map(|r| format!(" -> {}", ty_str(r))).unwrap_or_default();
-                let eff = if f.effects.is_empty() {
-                    String::new()
-                } else {
-                    format!(" uses {}", f.effects.join(", "))
-                };
-                let kw = if f.ai.is_some() { "ai fun" } else { "fun" };
-                return Some(format!("{kw} {}({}){ret}{eff}", f.name, params.join(", ")));
-            }
+            Item::Fun(f) if f.name == name => return Some(fun_sig_str(f)),
             Item::Type(t) if t.name == name => {
                 let variants: Vec<String> = t
                     .variants
@@ -429,6 +435,16 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
                 }
             }
         }
+        // A method (exposed or private) of a component -- before this fix, hovering
+        // on ANY component method (its own declaration OR a `recv.method(...)` call
+        // site) returned no hover at all, since item_signature only ever searched
+        // TOP-LEVEL items; component methods live nested inside Item::Component's
+        // `exposes`/`funs` lists (PR-it513).
+        if let Item::Component(c) = item {
+            if let Some(f) = c.exposes.iter().chain(&c.funs).find(|f| f.name == name) {
+                return Some(format!("{}\n// method of component {}", fun_sig_str(f), c.name));
+            }
+        }
     }
     None
 }
@@ -443,6 +459,10 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
         Item::Component(c) if c.name == name => Some(c.span),
         Item::Contract(c) if c.name == name => Some(c.span),
         Item::Type(t) => t.variants.iter().find(|v| v.name == name).map(|v| v.span),
+        // A method (exposed or private) of a component -- same gap as item_signature
+        // above: "go to definition" on a component method used to find nothing
+        // because only TOP-LEVEL items were searched (PR-it513).
+        Item::Component(c) => c.exposes.iter().chain(&c.funs).find(|f| f.name == name).map(|f| f.span),
         _ => None,
     })?;
     // locate the name token within the declaration for a precise range
@@ -804,6 +824,51 @@ mod tests {
     const PROG: &str = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
                         type Shape = Circle(r: Float) | Square(s: Float)\n\
                         fun main() uses io {\n    print(add(1, 2))\n}\n";
+
+    #[test]
+    fn hover_and_definition_work_on_component_methods() {
+        // A real LSP capability gap (PR-it513, bug-hunt batch 134): hovering on ANY
+        // component method -- exposed or private, at its own declaration OR at a
+        // `recv.method(...)` call site -- returned NO hover at all, and "go to
+        // definition" found nothing either. Root cause: item_signature/item_definition
+        // only ever searched TOP-LEVEL program items; component methods live nested
+        // inside Item::Component's `exposes`/`funs` lists, which neither function
+        // looked at. Only hovering on the component's OWN name (e.g. its constructor
+        // call `Greeter()`) worked. Fixed by adding a component-method fallthrough to
+        // both functions, sharing a new `fun_sig_str` helper with the existing
+        // top-level-function case so the rendered signature is identical either way.
+        let src = "component Greeter {\n    intent \"g\"\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\nfun main() {\n    let g = Greeter()\n    print(g.greet(\"x\"))\n}\n";
+
+        // hover on the exposed method's own declaration
+        let decl_line = src.lines().position(|l| l.contains("expose fun greet")).unwrap();
+        let ch = src.lines().nth(decl_line).unwrap().find("greet").unwrap() + 1;
+        let h_decl = resolve_hover(src, decl_line, ch).expect("hover on exposed method decl");
+        assert!(h_decl.contains("fun greet(name: Str) -> Str"), "{h_decl}");
+        assert!(h_decl.contains("method of component Greeter"), "{h_decl}");
+
+        // hover on a PRIVATE (non-exposed) component method's declaration
+        let helper_line = src.lines().position(|l| l.contains("fun helper")).unwrap();
+        let ch2 = src.lines().nth(helper_line).unwrap().find("helper").unwrap() + 1;
+        let h_priv = resolve_hover(src, helper_line, ch2).expect("hover on private method decl");
+        assert!(h_priv.contains("fun helper() -> Int"), "{h_priv}");
+
+        // hover on a `recv.method(...)` CALL SITE, not just the declaration
+        let call_line = src.lines().position(|l| l.contains("g.greet")).unwrap();
+        let ch3 = src.lines().nth(call_line).unwrap().find("greet").unwrap() + 1;
+        let h_call = resolve_hover(src, call_line, ch3).expect("hover on method call site");
+        assert!(h_call.contains("fun greet(name: Str) -> Str"), "{h_call}");
+
+        // go-to-definition on the call site resolves to the method's OWN declaration line
+        let (l0, c0, _, _) = resolve_definition(src, call_line, ch3).expect("definition of greet");
+        assert_eq!(l0, decl_line, "definition should point at the `expose fun greet` line");
+        assert_eq!(c0, src.lines().nth(decl_line).unwrap().find("greet").unwrap());
+
+        // the component's own name still hovers as before (no regression)
+        let comp_line = src.lines().position(|l| l.contains("let g = Greeter")).unwrap();
+        let ch4 = src.lines().nth(comp_line).unwrap().find("Greeter").unwrap() + 1;
+        let h_comp = resolve_hover(src, comp_line, ch4).expect("hover on component ctor call");
+        assert!(h_comp.contains("component Greeter"), "{h_comp}");
+    }
 
     #[test]
     fn dispatch_helpers_reject_malformed_params_without_panic() {
