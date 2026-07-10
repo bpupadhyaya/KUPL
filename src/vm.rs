@@ -3457,6 +3457,74 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_carmichael_korselt_vs_fermat() {
+        // A certification lock (it505, classic-algo/number-theory-theorem-oracle vein, fresh axis per the
+        // it501/it504 roadmap): the CARMICHAEL FUNCTION property, cross-validated via SPEC-PROPERTY /
+        // THEOREM-ORACLE (like Fermat's little theorem it479, Fermat's two-square theorem it487, Wilson's theorem
+        // it489): a composite n is a Carmichael number iff it satisfies Korselt's criterion (n squarefree, and for
+        // every prime p | n, (p-1) | (n-1)) -- and by Fermat's little theorem, that criterion GUARANTEES
+        // a^(n-1) == 1 (mod n) for EVERY base a coprime to n, i.e. n is a Fermat PSEUDOPRIME to every coprime base.
+        // korselt(n) computes the criterion via INDEPENDENT trial-factorization (smallestPrimeFactor +
+        // incremental squarefree/Korselt check per prime factor) -- completely different logic from cmodpow's
+        // binary modular exponentiation used for the Fermat side. Two unrelated computations (a factorization-based
+        // criterion vs. repeated modular squaring) agreeing certifies both, not a restatement (it462 discipline).
+        //   561 = 3*11*17 is the SMALLEST Carmichael number (a textbook example): korselt(561)=true (squarefree,
+        //   2|560, 10|560, 16|560), and EVERY one of 8 coprime bases (2,5,7,10,13,16,19,20) satisfies
+        //   a^560 mod 561 == 1 -- the defining Fermat-pseudoprime property, genuinely EXERCISED (not assumed) via
+        //   real modular exponentiation with a 560-bit-ish exponent.
+        //   15 = 3*5 is an ordinary composite that FAILS Korselt (5-1=4 does not divide 14) -- korselt(15)=false,
+        //   and the negative case is made genuinely informative (not a trivial mismatch) by exhibiting an actual
+        //   Fermat WITNESS: cmodpow(2,14,15)=4 != 1, so base 2 already fails the pseudoprime property for 15,
+        //   confirming the Korselt=false verdict corresponds to a real, checkable failure (not merely an unproven
+        //   claim). smallestPrimeFactor trial-divides up to sqrt(n) (~24 deep for 561, pure int arithmetic, no
+        //   list/string rebuild) and korseltGo peels off <=3 prime factors -- verified empirically clean on the
+        //   default 2MB test-stack (per-frame cost is cheap arithmetic, unlike reservoir-sampling's list rebuilds).
+        // Confirms Korselt's criterion, a genuine large-exponent modular-exponentiation Fermat check across 8 bases,
+        // a non-Carmichael negative case with a concrete witness, byte-identical on interp/KVM (native per sweep).
+        // The theorem an AI cites when reasoning about Fermat-primality-test false positives / RSA-adjacent
+        // number theory; agreement with the factorization criterion catches a squarefree-check or (p-1)-divisor
+        // bug that a lone base-2 pseudoprime test wouldn't surface. A non-sort Carmichael/Korselt lock.
+        let src = r#"fun smallestPrimeFactor(n: Int, d: Int) -> Int {
+    if d * d > n { n } else { if n % d == 0 { d } else { smallestPrimeFactor(n, d + 1) } }
+}
+fun korseltGo(n: Int, orig: Int) -> Bool {
+    if n == 1 { true } else {
+        let p = smallestPrimeFactor(n, 2)
+        if n % (p * p) == 0 { false }
+        else if (orig - 1) % (p - 1) != 0 { false }
+        else { korseltGo(n / p, orig) }
+    }
+}
+fun korselt(n: Int) -> Bool { korseltGo(n, n) }
+fun cmodpow(b: Int, e: Int, m: Int) -> Int {
+    if e == 0 { 1 % m }
+    else if e % 2 == 0 { let h = cmodpow(b, e / 2, m)
+        (h * h) % m }
+    else { (b * cmodpow(b, e - 1, m)) % m }
+}
+fun probe() -> Str {
+    let k561 = korselt(561)
+    let f2 = cmodpow(2, 560, 561)
+    let f5 = cmodpow(5, 560, 561)
+    let f7 = cmodpow(7, 560, 561)
+    let f10 = cmodpow(10, 560, 561)
+    let f13 = cmodpow(13, 560, 561)
+    let f16 = cmodpow(16, 560, 561)
+    let f19 = cmodpow(19, 560, 561)
+    let f20 = cmodpow(20, 560, 561)
+    let allPass561 = f2 == 1 && f5 == 1 && f7 == 1 && f10 == 1 && f13 == 1 && f16 == 1 && f19 == 1 && f20 == 1
+    let k15 = korselt(15)
+    let f2_15 = cmodpow(2, 14, 15)
+    "k561={k561}|f2={f2}|f5={f5}|f7={f7}|allPass561={allPass561}|k15={k15}|f2_15={f2_15}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "k561=true|f2=1|f5=1|f7=1|allPass561=true|k15=false|f2_15=4"
+        );
+    }
+
+    #[test]
     fn diff_josephus_problem() {
         // A certification lock (it504, bug-hunt batch 131 -- 20+ fresh probes across Str/List/Map/Set/tensor/
         // BigInt/Result shapes came back byte-identical, so a fresh classic-algorithm axis is locked instead): the
