@@ -2815,14 +2815,24 @@ static KValue k_re_find_all(KValue pat, KValue text) {
     KRegex re = k_re_compile(k_as_str(pat));
     kre_steps = 10000000;
     const unsigned char* t = (const unsigned char*)k_as_str(text); int tlen = (int)strlen((const char*)t);
-    KValue items[8192]; int n = 0; int i = 0;
+    /* growable, mirroring regex.rs's unbounded Vec (PR-it556 fix: a fixed 8192-slot
+       stack array used to silently TRUNCATE past that many matches -- a zero-width
+       pattern like `x?` over a >8192-char string returned only the first 8192
+       matches on native instead of the correct count). */
+    int cap = 16; KValue* items = (KValue*)k_alloc(sizeof(KValue) * cap); int n = 0; int i = 0;
     while (i <= tlen) {
         int e = k_re_match_here(&re, t, tlen, i);
-        if (e >= 0) { if (n < 8192) items[n++] = k_substr(t, i, e); i = e > i ? e : i + 1; }
+        if (e >= 0) {
+            if (n == cap) { cap *= 2; items = (KValue*)realloc(items, sizeof(KValue) * cap); }
+            items[n++] = k_substr(t, i, e);
+            i = e > i ? e : i + 1;
+        }
         else if (re.astart) break;
         else i++;
     }
-    return k_list(items, n);
+    KValue r = k_list(items, n);
+    free(items);
+    return r;
 }
 static KValue k_re_replace(KValue pat, KValue text, KValue repl) {
     KRegex re = k_re_compile(k_as_str(pat));
@@ -7381,6 +7391,28 @@ fun main() uses io {
             native_main_stdout(src, "regexutf8").trim(),
             "Some(\"ééé\")\n[\"é\"]\ntrue\ntrue\ntrue"
         );
+    }
+
+    /// A REAL BUG found+fixed (bug-hunt batch 164, PR-it556, from the same it555 Explore
+    /// survey of cgen.rs's regex engine): `re_find_all`'s native C implementation used a
+    /// FIXED 8192-slot stack array (`KValue items[8192]`) that silently TRUNCATED matches
+    /// beyond that count, unlike regex.rs's unbounded `Vec`. A zero-width pattern (`x?`)
+    /// over a 9000-char string produces 9001 matches (one at every position, since `x`
+    /// never appears) -- interp/vm correctly return all 9001, native silently returned only
+    /// the first 8192 with no error/panic at all. Confirmed via a real 3-engine CLI probe
+    /// first. Fixed by making `items` a growable heap buffer (`k_alloc`/`realloc`, freed
+    /// after `k_list` copies it), the SAME doubling pattern the file already uses elsewhere
+    /// (`kre_class`'s `REPUSH` macro, `kre_match_piece`'s `ends` array).
+    #[test]
+    fn native_re_find_all_is_not_truncated_past_8192_matches() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let s = \"a\".repeat(9000)\n    \
+                   let matches = re_find_all(\"x?\", s)\n    \
+                   print(\"{matches.len()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "regexbuf").trim(), "9001");
     }
 
     /// Native par_map / par{} produce the SAME order-preserving result as the
