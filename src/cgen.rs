@@ -760,12 +760,18 @@ static KBig* k_big_from_i64(int64_t v) {
     return k_big_norm(neg, tmp, n);
 }
 static KBig* k_big_from_str(const char* s) {
+    /* mirror bigint.rs's from_str, which trims BOTH ends (s.trim()) before
+       checking the sign+digits -- this used to only strip leading whitespace,
+       so a trailing space (e.g. big("123 ")) panicked here while interp/vm
+       (sharing bigint.rs) accepted it. */
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
     int neg = 0;
     if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
     if (!*s) return 0;
-    for (const char* p = s; *p; p++) if (*p < '0' || *p > '9') return 0;
     int len = (int)strlen(s);
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\n' || s[len-1] == '\r')) len--;
+    if (len == 0) return 0;
+    for (int i = 0; i < len; i++) if (s[i] < '0' || s[i] > '9') return 0;
     int cap = (len + 8) / 9; if (cap < 1) cap = 1;
     uint32_t* limbs = (uint32_t*)k_alloc(sizeof(uint32_t) * cap);
     int li = 0, i = len;
@@ -7266,6 +7272,31 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "closurecap").trim(), "1|111");
     }
 
+    /// A closure referencing component `state` used to compile to a bare live
+    /// `k_state_get(k_cur_inst, ...)` read resolved at CALL time -- state isn't a
+    /// local, so it was silently dropped from MakeClosure's by-value capture list
+    /// entirely. Calling the closure with NO current instance (escaped to
+    /// `fun main`, past the call that created it) read `k_cur_inst == -1` with no
+    /// bounds check: an out-of-bounds array read, SIGSEGV on native (a clean
+    /// K0900 panic on the KVM, but interp just returns the snapshot -- so this was
+    /// a 3-way divergence, not merely a native crash). Calling it from a DIFFERENT
+    /// instance's context silently returned that instance's state instead (no
+    /// crash, no error, just a wrong answer) -- covered on the KVM/interp side by
+    /// `diff_closure_captures_component_state_by_value_not_live_current_instance`
+    /// (vm.rs); this locks the native side, including the crash-vs-clean-value
+    /// case that only reproduces where there's truly no current instance (PR-it563,
+    /// fixed in compile.rs's shared MakeClosure capture-list logic).
+    #[test]
+    fn native_closure_captures_component_state_by_value_not_live_current_instance() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
+                   expose fun bump() -> fn() -> Int {\n        let getter = fn { n }\n        n = n + 1\n        getter\n    }\n}\n\
+                   fun main() uses io {\n    let c = Counter()\n    let g = c.bump()\n    print(\"{g()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "closurestate").trim(), "0");
+    }
+
     /// Deeply nested JSON is rejected by the native runtime's depth guard
     /// (K_MAX_JSON_DEPTH) — a clean Err, never a stack-overflow/segfault on the
     /// recursive C descent. PR-it73 (certifies the untrusted-input JSON path).
@@ -8193,6 +8224,19 @@ fun main() uses io {
                 "265252859812191058636308480000000\n340282366920938463463374607431768211456\n142857142857142857142\n6\n"
             );
         }
+    }
+
+    /// `k_big_from_str` used to strip only LEADING whitespace before validating
+    /// digits, so a trailing space panicked ("invalid BigInt: 123 ") while
+    /// interp/vm (sharing bigint.rs's `from_str`, which calls `.trim()` on both
+    /// ends) accept it -- fixed by trimming both ends to match (PR-it563).
+    #[test]
+    fn native_bigint_from_str_trims_trailing_whitespace() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print(big(\"123 \"))\n    print(big(\"  -45\\t\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "bigtrim"), "123\n-45\n");
     }
 
     /// The static-site-generator's markdown transformer (it63) — string-ops

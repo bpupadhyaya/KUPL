@@ -15907,6 +15907,31 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
     }
 
     #[test]
+    fn diff_closure_captures_component_state_by_value_not_live_current_instance() {
+        // A lambda referencing component `state` used to compile that reference as
+        // a bare live StateGet resolved at CALL time against whatever instance
+        // happens to be "current" then -- state isn't a local register, so it
+        // never made it into MakeClosure's by-value capture list at all. interp
+        // gets this right "for free" since state is just another Env binding, so
+        // its equivalent env.get-based capture snapshots the value at CREATION
+        // time like any other free variable. The fix teaches the KVM compiler to
+        // do the same: snapshot the state slot via StateGet in the ENCLOSING
+        // scope at closure-creation time and capture that, exactly like a local.
+        // Instance `a` bumps to 2 and hands out a closure over that snapshot;
+        // instance `b` then bumps three times to 3 and invokes `a`'s closure while
+        // `b` is the "current" instance -- before the fix the KVM silently
+        // returned `b`'s state (3) instead of `a`'s captured snapshot (2).
+        let src = "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
+                   expose fun bump() -> fn() -> Int { n = n + 1\n        fn { n } }\n    \
+                   expose fun run_other(g: fn() -> Int) -> Int { g() }\n}\n\
+                   fun probe() -> Int {\n    let a = Counter()\n    let b = Counter()\n    \
+                   let _ = a.bump()\n    let ga = a.bump()\n    \
+                   let _ = b.bump()\n    let _ = b.bump()\n    let _ = b.bump()\n    \
+                   b.run_other(ga)\n}\n";
+        assert_eq!(differential(src), "2");
+    }
+
+    #[test]
     fn diff_csv_pathological_input() {
         // csv_parse handles hostile/edge input identically on both engines without
         // panicking: an unterminated quoted field takes the rest of the row, doubled

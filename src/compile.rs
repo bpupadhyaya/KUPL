@@ -992,7 +992,27 @@ impl<'s> FnCompiler<'s> {
                 free_vars_block(body, &mut bound, &mut free);
                 let captures: Vec<(String, Reg)> = free
                     .into_iter()
-                    .filter_map(|n| self.lookup(&n).map(|r| (n, r)))
+                    .filter_map(|n| {
+                        if let Some(r) = self.lookup(&n) {
+                            return Some((n, r));
+                        }
+                        // Component state isn't a local register, so it never
+                        // matched `self.lookup` above -- it used to fall through
+                        // uncaptured, leaving a fresh Op::StateGet baked into the
+                        // lambda's own chunk that re-reads whatever instance is
+                        // "current" at CALL time. interp captures state correctly
+                        // because it stores state as an ordinary Env binding, so
+                        // its equivalent `env.get(n)` capture (see interp.rs's
+                        // Lambda case) snapshots the value at CREATION time like
+                        // any other free variable. Mirror that here: snapshot the
+                        // slot NOW via StateGet in the enclosing scope and treat
+                        // it exactly like a captured local from here on, instead
+                        // of leaving a live cross-instance read inside the lambda.
+                        let slot = self.comp.as_ref()?.slots.get(&n).copied()?;
+                        let dst = self.alloc(span);
+                        self.emit(Op::StateGet(dst, slot), span);
+                        Some((n, dst))
+                    })
                     .collect();
 
                 // compile the lambda body as its own chunk
