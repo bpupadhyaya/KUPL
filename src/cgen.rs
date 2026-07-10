@@ -1914,7 +1914,11 @@ static KValue k_url_decode_lossy(const char* seg) {
 }
 static KValue k_query_parse(KValue s) {
     const char* in = k_as_str(s);
-    KValue pairs[4096]; int np = 0;
+    /* growable, mirroring url.rs's unbounded Vec (PR-it557 fix: a fixed 4096-slot
+       stack array used to silently TRUNCATE past that many `key=value` pairs,
+       the same class of bug found+fixed in the regex engine's re_find_all,
+       it556). */
+    int cap = 16; KValue* pairs = (KValue*)k_alloc(sizeof(KValue) * cap); int np = 0;
     long start = 0, n = (long)strlen(in), i = 0;
     for (i = 0; i <= n; i++) {
         if (i == n || in[i] == '&') {
@@ -1926,12 +1930,15 @@ static KValue k_query_parse(KValue s) {
                 if (eq) { *eq = 0; kv = k_url_decode_lossy(seg); vv = k_url_decode_lossy(eq + 1); }
                 else { kv = k_url_decode_lossy(seg); vv = k_str(""); }
                 KValue pair[2] = { kv, vv };
-                if (np < 4096) pairs[np++] = k_list(pair, 2);
+                if (np == cap) { cap *= 2; pairs = (KValue*)realloc(pairs, sizeof(KValue) * cap); }
+                pairs[np++] = k_list(pair, 2);
             }
             start = i + 1;
         }
     }
-    return k_list(pairs, np);
+    KValue r = k_list(pairs, np);
+    free(pairs);
+    return r;
 }
 static KValue k_query_build(KValue lst) {
     if (lst.tag != K_LIST) k_panic("query_build needs a list");
@@ -8376,6 +8383,31 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
             ),
             "2\n1|2\nx,y|z\n"
         );
+    }
+
+    /// A REAL BUG found+fixed (bug-hunt batch 165, PR-it557): the SAME fixed-buffer
+    /// silent-truncation class found in the regex engine (it556), this time in
+    /// `query_parse`. Native's `k_query_parse` used a FIXED 4096-slot stack array
+    /// (`KValue pairs[4096]`) to collect `key=value` pairs, unlike url.rs's Rust
+    /// reference which uses an unbounded `Vec` -- a query string with more than 4096
+    /// pairs silently dropped everything past the 4096th, with no error/panic. This
+    /// had ZERO dedicated native test coverage before this (found via an Explore-agent
+    /// survey of CSV/URL/JSON that specifically flagged `query_parse` as HIGHER risk
+    /// than CSV's identical-pattern buffers, since CSV at least had 3 existing native
+    /// tests probing its behavior while `query_parse` had none at all). Confirmed via a
+    /// real 3-engine CLI probe first: a 4200-pair query string returned `4200` pairs on
+    /// interp/vm, `4096` on native. Fixed with the SAME growable-heap-buffer pattern
+    /// used for `re_find_all` in it556 (`k_alloc` + doubling `realloc`, freed after
+    /// `k_list` copies its contents).
+    #[test]
+    fn native_query_parse_is_not_truncated_past_4096_pairs() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    var s = \"\"\n    var i = 0\n    \
+                   while i < 4200 {\n        if i > 0 { s = s + \"&\" }\n        s = s + \"k{i}=v{i}\"\n        i = i + 1\n    }\n    \
+                   let m = query_parse(s)\n    print(\"{m.len()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "queryparse4200").trim(), "4200");
     }
 
     /// The regex engine compiles to native, byte-identical to src/regex.rs —
