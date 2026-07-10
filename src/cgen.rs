@@ -579,7 +579,12 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 typedef struct KValue KValue;
 typedef struct { int64_t len; KValue* items; } KList;
 typedef struct { int32_t ctor; KValue* fields; int32_t nfields; } KCtor;
-typedef struct { int32_t proto; int32_t ncaps; KValue* caps; } KClosure;
+/* origin_inst: the component instance that was "current" when this closure
+   was made (-1 outside any component). A call to a component-local function
+   FROM WITHIN the closure body must resolve against THIS instance, not
+   whatever instance is ambiently "current" (k_cur_inst) at the CALL site --
+   a closure is bound to its creator, not to its caller. */
+typedef struct { int32_t proto; int32_t ncaps; KValue* caps; int origin_inst; } KClosure;
 typedef struct { int64_t len; double* data; } KTensor;
 typedef struct { int64_t len; KValue* keys; KValue* vals; } KMap;
 typedef struct { int64_t len; KValue* items; } KSet;
@@ -1048,11 +1053,17 @@ static KValue k_ctor(int idx, KValue* fields, int n) {
     KValue x; x.tag = K_CTOR; x.as.ctor = c; return x;
 }
 
+/* which component instance is "current" -- defined here (moved up from its
+   original spot near the component-driver types) so k_closure can snapshot it
+   at closure-creation time; the single definition lives here now. */
+static int k_cur_inst = -1;
+
 static KValue k_closure(int proto, KValue* caps, int n) {
     KClosure* c = k_alloc(sizeof(KClosure));
     c->proto = proto; c->ncaps = n;
     c->caps = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
     memcpy(c->caps, caps, sizeof(KValue) * n);
+    c->origin_inst = k_cur_inst;
     KValue x; x.tag = K_CLOSURE; x.as.clo = c; return x;
 }
 
@@ -1539,7 +1550,16 @@ extern KValue (*CHUNKS[])(KValue*, KValue*);
 static KValue k_call(KValue f, KValue* args, int argc) {
     (void)argc;
     if (f.tag == K_FUN) return CHUNKS[f.as.fun](0, args);
-    if (f.tag == K_CLOSURE) return CHUNKS[f.as.clo->proto](f.as.clo->caps, args);
+    if (f.tag == K_CLOSURE) {
+        /* a component-local function call INSIDE the closure body must resolve
+           against the instance that CREATED the closure, not whatever instance
+           is ambiently "current" (k_cur_inst) at this CALL site. */
+        int saved = k_cur_inst;
+        k_cur_inst = f.as.clo->origin_inst;
+        KValue r = CHUNKS[f.as.clo->proto](f.as.clo->caps, args);
+        k_cur_inst = saved;
+        return r;
+    }
     k_panic("value is not callable"); return k_unit();
 }
 
@@ -4800,7 +4820,6 @@ typedef struct { int comp; KValue* slots; int nslots;
                  KTimer* timers; int ntimers; } KInstance;
 static KInstance* k_insts = 0;
 static int k_ninsts = 0;
-static int k_cur_inst = -1;
 static int k_print_unwired = 0;
 static long long k_vnow = 0;  /* virtual clock (ms), advanced explicitly */
 
@@ -7295,6 +7314,36 @@ fun main() uses io {
                    expose fun bump() -> fn() -> Int {\n        let getter = fn { n }\n        n = n + 1\n        getter\n    }\n}\n\
                    fun main() uses io {\n    let c = Counter()\n    let g = c.bump()\n    print(\"{g()}\")\n}\n";
         assert_eq!(native_main_stdout(src, "closurestate").trim(), "0");
+    }
+
+    /// Sibling of the above bug: a call to a component-local `fun` (not `expose
+    /// fun`) from WITHIN a closure body used to resolve against `k_cur_inst`
+    /// (the process-global "current instance"), which reflects whatever
+    /// instance is ambient at the closure's CALL site -- not the instance that
+    /// CREATED the closure. `KClosure` now snapshots `origin_inst` (`k_cur_inst`
+    /// at `k_closure()` construction time) and `k_call` temporarily rebinds
+    /// `k_cur_inst` to that origin for the duration of the call. Instance `a`
+    /// bumps to 2 and hands out a closure calling `helper()` (an indirect state
+    /// read); instance `b` bumps three times to 3 and invokes `a`'s closure
+    /// while `b` is current -- before the fix this silently returned `3` on
+    /// EVERY engine, not just native (see
+    /// `diff_closure_calls_a_component_local_fun_bound_to_the_creating_instance`
+    /// in vm.rs for the interp/KVM side; PR-it564, fixed by adding an
+    /// `origin_inst` field to `KClosure` and `Value::VmClosure`/`Closure`).
+    #[test]
+    fn native_closure_calls_a_component_local_fun_bound_to_the_creating_instance() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
+                   fun helper() -> Int { n }\n    \
+                   expose fun bump() -> fn() -> Int { n = n + 1\n        fn { helper() } }\n    \
+                   expose fun run_other(g: fn() -> Int) -> Int { g() }\n}\n\
+                   fun main() uses io {\n    let a = Counter()\n    let b = Counter()\n    \
+                   let _ = a.bump()\n    let ga = a.bump()\n    \
+                   let _ = b.bump()\n    let _ = b.bump()\n    let _ = b.bump()\n    \
+                   print(\"{b.run_other(ga)}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "closurehelper").trim(), "2");
     }
 
     /// Deeply nested JSON is rejected by the native runtime's depth guard

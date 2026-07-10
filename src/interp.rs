@@ -1019,6 +1019,7 @@ impl Interp {
                     params: params.iter().map(|p| p.name.clone()).collect(),
                     body: Rc::new(body.clone()),
                     captures,
+                    origin_instance: self.current,
                 })))
             }
             ExprKind::With { recv, updates } => {
@@ -1432,10 +1433,19 @@ impl Interp {
                 for (p, a) in c.params.iter().zip(args) {
                     scope.define(p, a);
                 }
+                // A component-local function called FROM WITHIN this closure's
+                // body must resolve against the instance that CREATED the
+                // closure, not whatever instance is ambiently "current" at the
+                // call site — bind `self.current` to the closure's origin for
+                // the duration of the call, matching the KVM's push_closure_frame
+                // (which threads the closure's captured origin_inst, not the
+                // caller's cur_inst) and native's k_cur_inst save/restore.
+                let saved_current = std::mem::replace(&mut self.current, c.origin_instance);
                 let result = match self.exec_block(&c.body, &scope) {
                     Err(Flow::Return(v)) => Ok(v),
                     other => other,
                 };
+                self.current = saved_current;
                 self.call_depth -= 1;
                 result
             }

@@ -197,8 +197,13 @@ pub enum Value {
     Component(usize),
     /// An expose function bound to a live instance (used by laws/tests).
     Bound(usize, Rc<String>),
-    /// A KVM closure: prototype index + captured values (captured by value).
-    VmClosure(u16, Rc<Vec<Value>>),
+    /// A KVM closure: prototype index + captured values (captured by value) +
+    /// the component instance that was "current" when the closure was made
+    /// (None outside any component). Component-local function calls made from
+    /// WITHIN the closure body resolve against THIS instance, not whatever
+    /// instance happens to be ambiently "current" at the closure's CALL site
+    /// -- a closure is bound to its creator, not to its caller.
+    VmClosure(u16, Rc<Vec<Value>>, Option<usize>),
     /// A rank-1 tensor of f64 (shapes/dtypes arrive with KIR; ops are native loops).
     Tensor(Rc<Vec<f64>>),
     /// Insertion-ordered immutable map (association pairs; updates keep position).
@@ -215,6 +220,12 @@ pub struct Closure {
     /// every call — matching the KVM/native `MakeClosure` semantics. (A live env
     /// clone would give reference capture, which diverges across engines.)
     pub captures: Vec<(Box<str>, Value)>,
+    /// The component instance that was "current" when this closure was made
+    /// (None outside any component). A call to a component-local function
+    /// FROM WITHIN the closure body resolves against THIS instance, not
+    /// whatever instance is ambiently "current" at the closure's CALL site —
+    /// a closure is bound to its creator, not to its caller.
+    pub origin_instance: Option<usize>,
 }
 
 impl Value {
@@ -363,7 +374,7 @@ impl fmt::Display for Value {
             Value::Fun(name) => write!(f, "<fn {name}>"),
             Value::Component(id) => write!(f, "<component #{id}>"),
             Value::Bound(id, name) => write!(f, "<fn {name} of #{id}>"),
-            Value::VmClosure(proto, _) => write!(f, "<fn @{proto}>"),
+            Value::VmClosure(proto, _, _) => write!(f, "<fn @{proto}>"),
             Value::Map(pairs) => {
                 write!(f, "Map{{")?;
                 for (i, (k, v)) in pairs.iter().enumerate() {

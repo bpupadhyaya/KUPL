@@ -385,7 +385,6 @@ impl<'m> Vm<'m> {
     /// Call a callable value re-entrantly (used by Method callbacks).
     fn call_value_nested(&mut self, f: Value, args: Vec<Value>) -> Result<Value, String> {
         let depth = self.frames.len();
-        let inst = self.frames.last().and_then(|f| f.inst);
         match f {
             Value::Fun(name) => {
                 let Some(&idx) = self.module.funs.get(name.as_str()) else {
@@ -393,8 +392,8 @@ impl<'m> Vm<'m> {
                 };
                 self.push_frame(idx, &args, 0, None).map_err(|e| e.msg)?;
             }
-            Value::VmClosure(proto, caps) => {
-                self.push_closure_frame(proto, &caps, &args, 0, inst).map_err(|e| e.msg)?;
+            Value::VmClosure(proto, caps, origin_inst) => {
+                self.push_closure_frame(proto, &caps, &args, 0, origin_inst).map_err(|e| e.msg)?;
             }
             other => return Err(format!("{} is not callable", other.type_name())),
         }
@@ -786,8 +785,8 @@ impl<'m> Vm<'m> {
                                 e
                             })?;
                         }
-                        Value::VmClosure(proto, caps) => {
-                            self.push_closure_frame(proto, &caps, &args, dst, cur_inst)
+                        Value::VmClosure(proto, caps, origin_inst) => {
+                            self.push_closure_frame(proto, &caps, &args, dst, origin_inst)
                                 .map_err(|mut e| {
                                     e.span = span;
                                     e
@@ -1047,7 +1046,7 @@ impl<'m> Vm<'m> {
                 }
                 Op::MakeClosure { dst, proto, start, ncaps } => {
                     let caps: Vec<Value> = (0..ncaps).map(|i| reg!(start + i)).collect();
-                    set!(dst, Value::VmClosure(proto, Rc::new(caps)));
+                    set!(dst, Value::VmClosure(proto, Rc::new(caps), cur_inst));
                 }
                 Op::MakeRange { dst, lo, hi, inclusive } => {
                     match (reg!(lo), reg!(hi)) {
@@ -15923,6 +15922,37 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
         // returned `b`'s state (3) instead of `a`'s captured snapshot (2).
         let src = "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
                    expose fun bump() -> fn() -> Int { n = n + 1\n        fn { n } }\n    \
+                   expose fun run_other(g: fn() -> Int) -> Int { g() }\n}\n\
+                   fun probe() -> Int {\n    let a = Counter()\n    let b = Counter()\n    \
+                   let _ = a.bump()\n    let ga = a.bump()\n    \
+                   let _ = b.bump()\n    let _ = b.bump()\n    let _ = b.bump()\n    \
+                   b.run_other(ga)\n}\n";
+        assert_eq!(differential(src), "2");
+    }
+
+    #[test]
+    fn diff_closure_calls_a_component_local_fun_bound_to_the_creating_instance() {
+        // Sibling of the state-capture bug above, but SILENT ON ALL THREE
+        // ENGINES (not just KVM/native), since interp shares the exact same
+        // ambient-instance-resolution shape: a call to a component-local `fun`
+        // (not `expose fun`) from WITHIN a closure body used to resolve against
+        // whichever instance is "current" at the closure's CALL site, not the
+        // instance that CREATED the closure. `Value::VmClosure`/`Value::Closure`
+        // now carry an `origin_instance` snapshotted at MakeClosure/Lambda-eval
+        // time, and invoking the closure temporarily rebinds "current instance"
+        // to that origin for the duration of the call (mirroring `push_frame`'s
+        // `inst` threading and interp's `self.current` save/restore) instead of
+        // inheriting the caller's ambient instance. `a` bumps to 2 (via `n = n
+        // + 1`) and hands out a closure that calls `helper()` (which reads `n`
+        // indirectly); `b` then bumps three times to 3 and invokes `a`'s closure
+        // while `b` is "current" -- before the fix ALL THREE engines silently
+        // returned `b`'s state (3) with no error at all, since this bug wasn't a
+        // cross-engine divergence (nothing for differential() to catch) but a
+        // shared correctness gap in the ambient-instance-resolution model
+        // itself.
+        let src = "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
+                   fun helper() -> Int { n }\n    \
+                   expose fun bump() -> fn() -> Int { n = n + 1\n        fn { helper() } }\n    \
                    expose fun run_other(g: fn() -> Int) -> Int { g() }\n}\n\
                    fun probe() -> Int {\n    let a = Counter()\n    let b = Counter()\n    \
                    let _ = a.bump()\n    let ga = a.bump()\n    \
