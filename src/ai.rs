@@ -283,7 +283,23 @@ pub fn value_from_json(shape: &AiShape, json: &Json) -> Result<Value, String> {
                 fields: std::rc::Rc::new(vals),
             })
         }
-        (want, got) => Err(format!("expected {want:?}, model returned {got:?}")),
+        (want, got) => Err(format!("expected {}, model returned {}", shape_name(want), dump_json(got))),
+    }
+}
+
+/// A KUPL-syntax rendering of an `AiShape`, for user-facing shape-mismatch
+/// messages -- the fallback error used to dump the shape via Rust's `{:?}`
+/// (e.g. `Record { ty: "Shape", variant: "Circle", fields: [...] }`, exposing
+/// internal representation instead of the KUPL type the user actually wrote).
+fn shape_name(shape: &AiShape) -> String {
+    match shape {
+        AiShape::Str => "Str".to_string(),
+        AiShape::Int => "Int".to_string(),
+        AiShape::Float => "Float".to_string(),
+        AiShape::Bool => "Bool".to_string(),
+        AiShape::List(inner) => format!("List[{}]", shape_name(inner)),
+        AiShape::Option(inner) => format!("Option[{}]", shape_name(inner)),
+        AiShape::Record { ty, .. } => ty.clone(),
     }
 }
 
@@ -914,6 +930,36 @@ mod tests {
         );
         let v = run(&meta("t_rec", shape, false), &[Value::str("great")]).unwrap();
         assert_eq!(v.to_string(), "Sentiment(\"positive\", 0.9)");
+    }
+
+    #[test]
+    fn shape_mismatch_message_is_kupl_syntax_not_rust_debug() {
+        // Bug-hunt (ai-fun 5th round, PR-it534): the fallback arm of
+        // `value_from_json` used Rust's `{:?}` Debug formatting for BOTH the
+        // expected `AiShape` and the model's actual `Json` -- for a Record
+        // shape this dumped the internal representation verbatim (`Record {
+        // ty: "Shape", variant: "Circle", fields: [...] }` instead of just
+        // `Shape`), and for the json side `Str("hello")` instead of KUPL/JSON
+        // syntax `"hello"`. Confirmed via a real CLI run FIRST (both engines
+        // byte-identical, so this was a message-QUALITY issue, not a
+        // cross-engine divergence). Fixed with `shape_name`/`dump_json`.
+        std::env::set_var("KUPL_AI_MOCK_T_MISMATCH_INT", "\"hello\"");
+        let err = run(&meta("t_mismatch_int", AiShape::Int, false), &[Value::Int(1)]).unwrap_err();
+        assert_eq!(err, "ai `t_mismatch_int`: expected Int, model returned \"hello\"", "{err}");
+
+        let shape = AiShape::Record {
+            ty: "Shape".into(),
+            variant: "Circle".into(),
+            fields: vec![("r".into(), AiShape::Float)],
+        };
+        std::env::set_var("KUPL_AI_MOCK_T_MISMATCH_REC", "42");
+        let err2 = run(&meta("t_mismatch_rec", shape, false), &[Value::Int(1)]).unwrap_err();
+        assert_eq!(err2, "ai `t_mismatch_rec`: expected Shape, model returned 42", "{err2}");
+
+        // nested shapes render as KUPL generic syntax too
+        std::env::set_var("KUPL_AI_MOCK_T_MISMATCH_LIST", "false");
+        let err3 = run(&meta("t_mismatch_list", AiShape::List(Box::new(AiShape::Int)), false), &[Value::Int(1)]).unwrap_err();
+        assert_eq!(err3, "ai `t_mismatch_list`: expected List[Int], model returned false", "{err3}");
     }
 
     #[test]
