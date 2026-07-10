@@ -763,6 +763,43 @@ fn doc_text(uri: &str, buffers: &HashMap<PathBuf, String>) -> Option<String> {
     text_at_path(&path, buffers)
 }
 
+/// `textDocument/formatting`: `None` if the source has parse errors (nothing
+/// safe to format, matches `kupl fmt`'s own gate). Otherwise a JSON array of
+/// LSP `TextEdit`s (a single whole-document replacement, or `[]` if already
+/// formatted).
+///
+/// SAFETY GATE: `[]` (a safe no-op) is also returned when the source contains
+/// comments -- `fmt::format_program` renders from the AST, which has no
+/// comment nodes, so it silently DROPS every comment (the CLI's `kupl fmt`
+/// only gets away with this because it prints a `note:` the user sees before
+/// deciding to `--write`). Format-on-save triggers with no such chance to
+/// warn first: wiring this straight to `format_program` would mean opening
+/// an editor with format-on-save enabled SILENTLY deletes every comment in
+/// the file on the very first keystroke+save. That is a correctness hazard
+/// on the same footing as it518's cross-file rename gap (a MUTATING LSP
+/// operation firing incorrectly, not just a missing capability) -- so this
+/// stays a no-op for commented files until the formatter preserves them.
+fn resolve_formatting(text: &str) -> Option<String> {
+    let (program, diags) = crate::parser::parse(text);
+    if diags.iter().any(|d| d.severity == Severity::Error) {
+        return None;
+    }
+    if crate::fmt::source_has_comments(text) {
+        return Some("[]".to_string());
+    }
+    let formatted = crate::fmt::format_program(&program);
+    if formatted == text {
+        return Some("[]".to_string());
+    }
+    let (end_line, end_col) = line_col(text, text.len() as u32);
+    Some(format!(
+        "[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":{},\"character\":{}}}}},\"newText\":\"{}\"}}]",
+        end_line - 1,
+        end_col - 1,
+        json_escape(&formatted)
+    ))
+}
+
 /// Current text at a filesystem path: the unsaved editor buffer if that file
 /// happens to be open, else disk. Shared by `doc_text` (uri-keyed, the normal
 /// per-request entry point) and cross-file lookups (path-keyed, since a `use`
@@ -810,7 +847,7 @@ pub fn serve() -> i32 {
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -1006,6 +1043,17 @@ pub fn serve() -> i32 {
                         entries.join(",")
                     ),
                 );
+            }
+            "textDocument/formatting" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let uri = p.get("textDocument")?.get("uri")?.str()?;
+                    let text = doc_text(uri, &buffers)?;
+                    resolve_formatting(&text)
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
             }
             _ => {
                 // politely answer unknown REQUESTS (those with an id)
@@ -1470,5 +1518,41 @@ mod tests {
         let note2 = diagnostics_notification(&file, &uri, &HashMap::new());
         assert!(note2.contains("\"diagnostics\":[]"), "{note2}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn formatting_reformats_comment_free_source_and_is_idempotent() {
+        // A real LSP capability gap (bug-hunt batch 141, PR-it529): `kupl fmt`
+        // has existed as a CLI command all along, but the LSP server never
+        // advertised `documentFormattingProvider` or handled
+        // `textDocument/formatting` at all -- so no editor's "Format Document"
+        // command (or format-on-save) could ever reach it, only the CLI.
+        let messy = "fun add(a:Int,b:Int)->Int{\n  a+b\n}\n";
+        let edits = resolve_formatting(messy).expect("parses cleanly, should format");
+        assert!(edits.contains("fun add(a: Int, b: Int) -> Int"), "{edits}");
+        assert!(edits.contains("\"line\":0,\"character\":0"), "whole-document range should start at (0,0): {edits}");
+        // end-of-range is the position right after the LAST character (3 lines +
+        // trailing newline -> end line index 3, column 0)
+        assert!(edits.contains("\"line\":3,\"character\":0"), "{edits}");
+
+        // running the formatter's OWN output back through itself is a no-op —
+        // format-on-save must not thrash a file it just formatted
+        let formatted = crate::fmt::format_program(&crate::parser::parse(messy).0);
+        assert_eq!(resolve_formatting(&formatted), Some("[]".to_string()), "already-formatted source must be a no-op, not a spurious edit");
+    }
+
+    #[test]
+    fn formatting_never_touches_a_file_with_comments() {
+        // SAFETY GATE (same class as it518's rename hazard): `format_program`
+        // renders from the AST, which drops comments entirely. Format-on-save
+        // fires with no CLI-style warning the user could see first, so
+        // formatting a commented file must be a SAFE NO-OP, never a silent
+        // comment-deleting edit.
+        let commented = "// keeps the sum\nfun add(a:Int,b:Int)->Int{\n  a+b\n}\n";
+        assert!(crate::fmt::source_has_comments(commented));
+        assert_eq!(resolve_formatting(commented), Some("[]".to_string()), "must not silently drop comments via format-on-save");
+
+        // unparseable source: nothing safe to format at all
+        assert_eq!(resolve_formatting("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
     }
 }
