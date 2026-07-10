@@ -4748,6 +4748,27 @@ mod tests {
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// `ai fun` compiles and RUNS on native, agreeing byte-for-byte with the
+    /// interpreter/KVM. Bug-hunt batch 145 (PR-it537): LANGUAGE-REFERENCE.md's
+    /// own execution-modes table marked "ai fun **[design]**" for native --
+    /// implying it was still a future/unimplemented item -- but a real probe
+    /// (compile+run an ai-fun-calling program through `kupl native`, mock via
+    /// the SAME `KUPL_AI_MOCK_<NAME>` env var convention the interpreter/KVM
+    /// use) showed it already works end to end and had ZERO native test
+    /// coverage anywhere in cgen.rs. Confirmed the doc claim was stale, not
+    /// the code -- fixed the doc; this locks the previously-untested
+    /// capability so it doesn't regress silently.
+    #[test]
+    fn native_ai_fun_basic_call() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun classify(text: Str) -> Int {\n    intent \"classify {text}\"\n}\n\
+                   fun main() uses io {\n    print(\"{classify(\"x\")}\")\n}\n";
+        let out = native_main_stdout_env(src, "aifun", &[("KUPL_AI_MOCK_CLASSIFY", "42")]);
+        assert_eq!(out, "42\n");
+    }
+
     /// A multi-component app (children + wires + emit) compiles to native and
     /// matches the interpreter, exercising the message queue and drain.
     #[test]

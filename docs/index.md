@@ -33,8 +33,9 @@ KUPL is open source and **free forever**.
 - **Four engines, one language.** The same program runs on a REPL, a
   tree-walking interpreter, a register-based bytecode VM, and a native
   machine-code compiler — and produces **byte-identical output** on each, enforced
-  by differential tests. `kupl native` compiles the whole language (bar `ai fun`)
-  to machine code.
+  by differential tests. `kupl native` compiles the whole language, including
+  components and `ai fun`, to machine code (real-provider network calls for
+  `ai fun` defer to `bundle`).
 - **Components as the unit.** A `component` is an isolated actor with typed ports,
   private state, message handlers, timers, supervision, and `example` blocks that
   are tests you write inline. Contracts give interfaces with dynamic dispatch.

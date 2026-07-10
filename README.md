@@ -152,7 +152,7 @@ kupl run app.kx                    # run a compiled module (no source needed)
 kupl bundle app.kupl -o app        # ONE self-contained executable (runtime + module)
 ./app                              # runs anywhere the binary runs — no kupl needed
 
-kupl native prog.kupl -o prog      # true machine code via C (the whole language bar `ai fun`)
+kupl native prog.kupl -o prog      # true machine code via C, incl. components + `ai fun` (real-provider network calls defer to `bundle`)
 ./prog                             # add --keep-c to inspect the generated C
 
 kupl dis app.kupl                  # human-readable disassembly of the bytecode

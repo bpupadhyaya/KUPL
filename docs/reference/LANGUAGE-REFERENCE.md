@@ -739,7 +739,7 @@ let b = Cache(store: LoudStore())              // …or another — same consume
 | REPL | `kupl repl` | expressions, definitions, live redefinition |
 | Interpreter | `kupl run` | everything (reference semantics) |
 | KVM bytecode VM | `kupl run --vm`, `.kx`, `bundle` | everything |
-| Native (C) | `kupl native` | `fun main` programs (components and `ai fun` **[design]** for native) |
+| Native (C) | `kupl native` | `fun main` programs, components (incl. `wire`/`supervise`/timers), and `ai fun` (incl. `tools`) |
 
 The interpreter defines the semantics; the VM and native backend are held to
 it by differential tests. Known intentional VM/native limits: assignment to a

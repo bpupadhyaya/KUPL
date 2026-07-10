@@ -145,9 +145,10 @@ mock path (real-provider network calls aside) (JSON, CSV, URL, regex, and HTTP
 all lower to machine code, byte-identical to the interpreter), and the LSP serves
 the everyday IDE feature set (hover, go-to-definition, completion, find-
 references, rename) on top of diagnostics. What remains open is honest and named:
-`ai fun` on the native backend, a hosted package registry, general async/await +
-coroutines, a WASM target, the GPU/kernel + systems/ownership tiers, and the
-KValue-unboxing perf IR (KIR).
+real-provider network calls for `ai fun` on the native backend (mock path is
+complete; use `bundle` for a live provider), a hosted package registry,
+general async/await + coroutines, a WASM target, the GPU/kernel +
+systems/ownership tiers, and the KValue-unboxing perf IR (KIR).
 
 ### What changed since the first (it10) audit
 
@@ -271,7 +272,9 @@ the VM, byte-identical to `kupl run`). So a realistic KUPL application now runs
 at native speed, not VM speed — the previous "components run on the VM" weak
 spot is closed. As of it40–47 the native backend compiles the **entire language except `ai fun`**
 — components, sized numerics/f32, JSON, CSV, URL, regex, file I/O, and HTTP all
-lower to machine code, byte-identical to the interpreter. What keeps this a 3
+lower to machine code, byte-identical to the interpreter (as of it51–52, `ai fun`
+itself compiles natively too — the mock path is complete; only a real
+provider's network call defers to `bundle`). What keeps this a 3
 rather than a 4–5 is that native values are still the **boxed 16-byte tagged
 `KValue`**: monomorphic numeric loops pay
 tag-dispatch instead of running in raw registers. The typed SSA IR (**KIR**)
