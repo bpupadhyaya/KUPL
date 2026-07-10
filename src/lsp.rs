@@ -1063,6 +1063,31 @@ mod tests {
     }
 
     #[test]
+    fn occurrences_and_rename_work_on_component_methods() {
+        // Follow-up to it513/it514 (which found item_signature/item_definition/completions
+        // all shared the same bug: they only ever searched TOP-LEVEL program.items, blind to
+        // methods nested inside Item::Component). occurrences (and therefore rename, which is
+        // built entirely on occurrences) is architecturally DIFFERENT -- it works over the
+        // LEXER's flat token stream, not the AST's item list, so it has no notion of
+        // "top-level" at all and was never susceptible to that bug class. Locked here as a
+        // genuine CLEAN finding (PR-it515), not an assumption: verified both the declaration
+        // site (inside `expose fun greet`) and the call site (`g.greet(...)`) are found, and
+        // that `ident_under` at the call site resolves to the same name rename would target.
+        let src = "component Greeter {\n    intent \"g\"\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n}\nfun main() {\n    let g = Greeter()\n    print(g.greet(\"x\"))\n}\n";
+        let occ = occurrences(src, "greet");
+        assert_eq!(occ.len(), 2, "declaration + call site, both found via the token stream: {occ:?}");
+        let decl_line = src.lines().position(|l| l.contains("expose fun greet")).unwrap();
+        let call_line = src.lines().position(|l| l.contains("g.greet")).unwrap();
+        assert!(occ.iter().any(|(l, _, _, _)| *l == decl_line), "declaration site missing: {occ:?}");
+        assert!(occ.iter().any(|(l, _, _, _)| *l == call_line), "call site missing: {occ:?}");
+        let ch = src.lines().nth(call_line).unwrap().find("greet").unwrap() + 1;
+        assert_eq!(ident_under(src, call_line, ch).as_deref(), Some("greet"));
+        // rename would produce one edit per occurrence (same count) -- unaffected by which
+        // component the method lives in.
+        assert_eq!(occurrences(src, "greet").len(), occ.len());
+    }
+
+    #[test]
     fn references_include_string_interpolation() {
         // A variable used inside a `"{x}"` interpolation is a REAL reference that
         // rename must update — but plain string TEXT and comments must not be touched.
