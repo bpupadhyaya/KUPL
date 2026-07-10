@@ -827,6 +827,23 @@ fn item_symbol(text: &str, item: &crate::ast::Item) -> String {
     }
 }
 
+/// `textDocument/documentHighlight`: every occurrence of the identifier under
+/// the cursor, WITHIN THE CURRENT DOCUMENT ONLY. Deliberately single-file,
+/// unlike `references`/`rename` (it518's cross-file fix) -- the LSP spec
+/// defines `documentHighlight` as highlighting occurrences in the current
+/// document, so `occurrences` (not `occurrences_cross_file`) is the
+/// spec-correct choice here, not a scope cut.
+fn resolve_document_highlight(text: &str, line: usize, character: usize) -> Option<String> {
+    let name = ident_under(text, line, character)?;
+    let locs: Vec<String> = occurrences(text, &name)
+        .into_iter()
+        .map(|(l0, c0, l1, c1)| {
+            format!("{{\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}}}}")
+        })
+        .collect();
+    Some(format!("[{}]", locs.join(",")))
+}
+
 /// Current text of a document: the unsaved editor buffer if present, else disk.
 fn doc_text(uri: &str, buffers: &HashMap<PathBuf, String>) -> Option<String> {
     let path = uri_to_path(uri)?;
@@ -917,7 +934,7 @@ pub fn serve() -> i32 {
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -1046,6 +1063,17 @@ pub fn serve() -> i32 {
                         })
                         .collect();
                     Some(format!("[{}]", locs.join(",")))
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/documentHighlight" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let (uri, line, ch) = position_of(p)?;
+                    let text = doc_text(uri, &buffers)?;
+                    resolve_document_highlight(&text, line, ch)
                 })()
                 .unwrap_or_else(|| "null".into());
                 send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
@@ -1672,5 +1700,33 @@ mod tests {
 
         // unparseable source: nothing safe to outline
         assert_eq!(document_symbols("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
+    }
+
+    #[test]
+    fn document_highlight_finds_every_occurrence_in_current_file_only() {
+        // A real LSP capability gap (bug-hunt batch 143, PR-it531): no
+        // `textDocument/documentHighlight` support at all -- editors couldn't
+        // highlight "every use of the symbol under my cursor" as the user
+        // moves around a file, a standard feature every mainstream LSP server
+        // provides. Reuses the already-tested `occurrences`/`ident_under`
+        // exactly as `references` does, but deliberately stays SINGLE-FILE
+        // (not `occurrences_cross_file`) since that is the LSP spec's own
+        // definition of this request -- unlike `references`/`rename`
+        // (it518), reaching into `use`-imported files here would be scope
+        // creep, not a fix.
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() uses io {\n    print(add(1, 2))\n    print(add(3, 4))\n}\n";
+        let decl_line = src.lines().position(|l| l.contains("fun add")).unwrap();
+        let decl_ch = src.lines().nth(decl_line).unwrap().find("add").unwrap() + 1;
+        let highlights = resolve_document_highlight(src, decl_line, decl_ch).expect("cursor is on an identifier");
+        // declaration + both call sites = 3 occurrences, none carrying a "uri"
+        // field (documentHighlight ranges are implicitly this document)
+        assert_eq!(highlights.matches("\"range\":").count(), 3, "{highlights}");
+        assert!(!highlights.contains("\"uri\""), "documentHighlight must not carry cross-file uris: {highlights}");
+
+        // cursor on the `fun` KEYWORD: `ident_under` extracts it as a word (it's
+        // character-class-based, not token-aware), but `occurrences` searches the
+        // LEXED token stream for `Tok::Ident` -- "fun" always lexes as `Tok::KwFun`,
+        // never an identifier, so this correctly returns zero highlights, not a crash.
+        assert_eq!(resolve_document_highlight(src, 0, 0), Some("[]".to_string()));
     }
 }
