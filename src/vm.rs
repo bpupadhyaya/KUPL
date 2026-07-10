@@ -15083,6 +15083,34 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_sum_and_product_support_every_numeric_type_not_just_int_float() {
+        // A REAL BUG found+fixed (bug-hunt batch 156, PR-it548): the SAME checker/runtime
+        // completeness gap as it547's unary `-`, this time in a List method instead of an
+        // operator. `Ty::is_numeric()` (check.rs) lets `.sum()`/`.product()` type-check on
+        // List[SizedInt]/List[F32]/List[BigInt]/List[Rational] just like List[Int]/List[Float]
+        // (K0245 only fires for genuinely non-numeric element types) — but the shared runtime
+        // method (`shared_method` in interp.rs, called by BOTH interp and vm) only ever
+        // implemented Int/Float, falling to "cannot sum <type>"/"cannot multiply <type>" for
+        // every other numeric list. Since lists are homogeneous under KUPL's type system,
+        // fixed by dispatching on the FIRST element's variant to a dedicated accumulator for
+        // each of the four missing types, while leaving the EXISTING Int/Float loop (and its
+        // established overflow wording, "integer overflow in sum"/"in product") completely
+        // untouched -- confirmed the untouched wording still matches via
+        // `stdlib_batch_it12_overflow_panics`'s existing Int-overflow assertion, which this
+        // change must not regress.
+        assert_eq!(differential("fun probe() -> Str { let xs: List[i32] = [1i32, 2i32, 3i32]\n    \"{xs.sum()}|{xs.product()}\" }\n"), "6|6");
+        assert_eq!(differential("fun probe() -> Str { let xs: List[f32] = [1.5f32, 2.5f32]\n    \"{xs.sum()}|{xs.product()}\" }\n"), "4.0|3.75");
+        assert_eq!(differential("fun probe() -> Str { let xs = [big(10), big(20), big(30)]\n    \"{xs.sum()}|{xs.product()}\" }\n"), "60|6000");
+        assert_eq!(differential("fun probe() -> Str { let xs = [rat(1, 2), rat(1, 3)]\n    \"{xs.sum()}|{xs.product()}\" }\n"), "5/6|1/6");
+        // an empty numeric-typed list still falls through to the untouched Int(0)/Int(1)
+        // default (a pre-existing, unrelated wart this fix does not change or regress).
+        assert_eq!(differential("fun probe() -> Str { let xs: List[i32] = []\n    \"{xs.sum()}\" }\n"), "0");
+        // overflow panics identically to the existing Int path, and doesn't false-panic on 0.
+        assert_eq!(differential("fun probe() -> Str { let xs: List[u8] = [200u8, 100u8]\n    \"{xs.sum()}\" }\n"), "panic: integer overflow in sum");
+        assert_eq!(differential("fun probe() -> Str { let xs: List[u8] = [0u8, 0u8]\n    \"{xs.sum()}\" }\n"), "0");
+    }
+
+    #[test]
     fn diff_while_loop_and_break_continue() {
         // while runs while its condition holds (false-initial => zero iterations); break exits
         // the innermost loop; continue skips the rest of the current iteration; in nested loops

@@ -3445,6 +3445,34 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_none();
         }
         if (!strcmp(name, "sum")) {
+            /* SizedInt/f32/BigInt/Rational sum (PR-it548 real bug: these all type-check
+               `.sum()` per Ty::is_numeric() but the runtime only ever handled Int/Float,
+               same class of gap as it547's unary `-`). Dispatch on the first element;
+               Int/Float keep their EXISTING loop below, unchanged. */
+            if (l->len > 0 && l->items[0].tag == K_SIZEDINT) {
+                int w = l->items[0].as.sized->width;
+                __int128 acc = 0;
+                for (int64_t i = 0; i < l->len; i++) {
+                    acc += l->items[i].as.sized->v;
+                    if (acc < k_iw_min(w) || acc > k_iw_max(w)) k_panic("integer overflow in sum");
+                }
+                return k_sized(acc, w);
+            }
+            if (l->len > 0 && l->items[0].tag == K_F32) {
+                float acc = 0;
+                for (int64_t i = 0; i < l->len; i++) acc += l->items[i].as.f32v;
+                return k_f32(acc);
+            }
+            if (l->len > 0 && l->items[0].tag == K_BIGINT) {
+                KBig* acc = k_big_from_i64(0);
+                for (int64_t i = 0; i < l->len; i++) acc = k_big_add(k_big_v(acc), l->items[i]);
+                return k_big_v(acc);
+            }
+            if (l->len > 0 && l->items[0].tag == K_RATIONAL) {
+                KRat* acc = k_rat_norm(k_big_from_i64(0), k_big_from_i64(1));
+                for (int64_t i = 0; i < l->len; i++) acc = k_rat_add(k_rat_v(acc), l->items[i]);
+                return k_rat_v(acc);
+            }
             int64_t si = 0; double sf = 0; int isf = 0;
             for (int64_t i = 0; i < l->len; i++) {
                 KValue it = l->items[i];
@@ -3609,6 +3637,31 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_list(out, (int)n);
         }
         if (!strcmp(name, "product")) {
+            /* SizedInt/f32/BigInt/Rational product -- same it548 fix as `sum` above. */
+            if (l->len > 0 && l->items[0].tag == K_SIZEDINT) {
+                int w = l->items[0].as.sized->width;
+                __int128 acc = 1;
+                for (int64_t i = 0; i < l->len; i++) {
+                    acc *= l->items[i].as.sized->v;
+                    if (acc < k_iw_min(w) || acc > k_iw_max(w)) k_panic("integer overflow in product");
+                }
+                return k_sized(acc, w);
+            }
+            if (l->len > 0 && l->items[0].tag == K_F32) {
+                float acc = 1;
+                for (int64_t i = 0; i < l->len; i++) acc *= l->items[i].as.f32v;
+                return k_f32(acc);
+            }
+            if (l->len > 0 && l->items[0].tag == K_BIGINT) {
+                KBig* acc = k_big_from_i64(1);
+                for (int64_t i = 0; i < l->len; i++) acc = k_big_mul(k_big_v(acc), l->items[i]);
+                return k_big_v(acc);
+            }
+            if (l->len > 0 && l->items[0].tag == K_RATIONAL) {
+                KRat* acc = k_rat_norm(k_big_from_i64(1), k_big_from_i64(1));
+                for (int64_t i = 0; i < l->len; i++) acc = k_rat_mul(k_rat_v(acc), l->items[i]);
+                return k_rat_v(acc);
+            }
             int64_t pi = 1; double pf = 1; int isf = 0;
             for (int64_t i = 0; i < l->len; i++) {
                 KValue it = l->items[i];
@@ -6702,6 +6755,25 @@ fun main() uses io {
         ] {
             assert!(native_main_stdout(bad, tag).trim().is_empty(), "{tag}: expected a panic");
         }
+    }
+
+    /// Native `.sum()`/`.product()` support SizedInt/f32/BigInt/Rational, not just Int/Float
+    /// (PR-it548 real bug: same class as it547 -- these all type-check per Ty::is_numeric()
+    /// but the C runtime only ever handled Int/Float, panicking "cannot sum non-numeric" for
+    /// every other numeric list). Overflow still panics with the SAME wording the existing
+    /// Int path already used, and 0/1 don't false-panic.
+    #[test]
+    fn native_sum_and_product_support_every_numeric_type() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let xs: List[i32] = [1i32, 2i32, 3i32]\n    \
+                   let fs: List[f32] = [1.5f32, 2.5f32]\n    let bs = [big(10), big(20), big(30)]\n    \
+                   let rs = [rat(1, 2), rat(1, 3)]\n    \
+                   print(\"{xs.sum()}|{xs.product()}|{fs.sum()}|{fs.product()}|{bs.sum()}|{bs.product()}|{rs.sum()}|{rs.product()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "sumprodok").trim(), "6|6|4.0|3.75|60|6000|5/6|1/6");
+        let bad = "fun main() uses io {\n    let xs: List[u8] = [200u8, 100u8]\n    print(\"{xs.sum()}\")\n}\n";
+        assert!(native_main_stdout(bad, "sumprodbad").trim().is_empty(), "expected a panic");
     }
 
     /// Native string concatenation (k_concat's memcpy splice + direct-pointer fast path for

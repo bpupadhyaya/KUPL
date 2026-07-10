@@ -1918,6 +1918,54 @@ pub fn shared_method(
             }
             Ok(Value::none())
         }
+        // `sum`/`product` on List[SizedInt]/List[F32]/List[BigInt]/List[Rational] (a REAL
+        // bug found+fixed, PR-it548: `Ty::is_numeric()` type-checks `.sum()`/`.product()` on
+        // ANY of these element types, but the runtime only ever implemented Int/Float,
+        // panicking "cannot sum <type>" for every other numeric list -- the exact same
+        // checker/runtime completeness gap as it547's unary `-`, just in a List method
+        // instead of an operator). Dispatch on the first element's variant; Int/Float keep
+        // their EXISTING loop (and its own overflow wording) below, unchanged.
+        (Value::List(items), "sum") if matches!(items.first(), Some(Value::SizedInt(_) | Value::F32(_) | Value::BigInt(_) | Value::Rational(_))) => {
+            match items.first().unwrap() {
+                Value::SizedInt(b) => {
+                    let w = b.1;
+                    let mut acc: i128 = 0;
+                    for item in items.iter() {
+                        let Value::SizedInt(b) = item else { unreachable!() };
+                        acc += b.0;
+                        if !w.check_range(acc) {
+                            return Err("integer overflow in sum".into());
+                        }
+                    }
+                    Ok(Value::SizedInt(Box::new((acc, w))))
+                }
+                Value::F32(_) => {
+                    let mut acc: f32 = 0.0;
+                    for item in items.iter() {
+                        let Value::F32(v) = item else { unreachable!() };
+                        acc += v;
+                    }
+                    Ok(Value::F32(acc))
+                }
+                Value::BigInt(_) => {
+                    let mut acc = crate::bigint::BigInt::zero();
+                    for item in items.iter() {
+                        let Value::BigInt(b) = item else { unreachable!() };
+                        acc = acc.add(b);
+                    }
+                    Ok(Value::BigInt(Rc::new(acc)))
+                }
+                Value::Rational(_) => {
+                    let mut acc = crate::rational::Rational::from_ints(0, 1).unwrap();
+                    for item in items.iter() {
+                        let Value::Rational(r) = item else { unreachable!() };
+                        acc = acc.add(r);
+                    }
+                    Ok(Value::Rational(Rc::new(acc)))
+                }
+                _ => unreachable!(),
+            }
+        }
         (Value::List(items), "sum") => {
             let mut int_sum: i64 = 0;
             let mut float_sum: f64 = 0.0;
@@ -2135,6 +2183,47 @@ pub fn shared_method(
         (Value::List(items), "tail") => {
             let start = if items.is_empty() { 0 } else { 1 };
             Ok(Value::List(Rc::new(items[start..].to_vec())))
+        }
+        (Value::List(items), "product") if matches!(items.first(), Some(Value::SizedInt(_) | Value::F32(_) | Value::BigInt(_) | Value::Rational(_))) => {
+            match items.first().unwrap() {
+                Value::SizedInt(b) => {
+                    let w = b.1;
+                    let mut acc: i128 = 1;
+                    for item in items.iter() {
+                        let Value::SizedInt(b) = item else { unreachable!() };
+                        acc *= b.0;
+                        if !w.check_range(acc) {
+                            return Err("integer overflow in product".into());
+                        }
+                    }
+                    Ok(Value::SizedInt(Box::new((acc, w))))
+                }
+                Value::F32(_) => {
+                    let mut acc: f32 = 1.0;
+                    for item in items.iter() {
+                        let Value::F32(v) = item else { unreachable!() };
+                        acc *= v;
+                    }
+                    Ok(Value::F32(acc))
+                }
+                Value::BigInt(_) => {
+                    let mut acc = crate::bigint::BigInt::from_i64(1);
+                    for item in items.iter() {
+                        let Value::BigInt(b) = item else { unreachable!() };
+                        acc = acc.mul(b);
+                    }
+                    Ok(Value::BigInt(Rc::new(acc)))
+                }
+                Value::Rational(_) => {
+                    let mut acc = crate::rational::Rational::from_ints(1, 1).unwrap();
+                    for item in items.iter() {
+                        let Value::Rational(r) = item else { unreachable!() };
+                        acc = acc.mul(r);
+                    }
+                    Ok(Value::Rational(Rc::new(acc)))
+                }
+                _ => unreachable!(),
+            }
         }
         (Value::List(items), "product") => {
             let mut int_prod: i64 = 1;
