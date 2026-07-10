@@ -170,16 +170,47 @@ fn parse_value(b: &[u8], pos: &mut usize) -> Result<Json, String> {
             Err("unterminated string".into())
         }
         b't' => {
-            *pos += 4;
-            Ok(Json::Bool(true))
+            // A REAL BUG found+fixed (bug-hunt batch 153, PR-it545): the
+            // literal-matching arms below used to just check the FIRST byte
+            // (`t`/`f`/`n`) and blindly advance `pos` by the literal's length,
+            // with no check that the following bytes actually spelled
+            // "true"/"false"/"null" -- garbage input like "not json" (starts
+            // with `n`) silently "parsed" as `Json::Null` instead of failing.
+            // ai.rs reuses this parser (via `crate::lsp::parse_json`) for
+            // ai-fun mock-response text, where malformed input is EXPECTED
+            // and deliberately tested -- the leniency here (fine for
+            // well-formed JSON-RPC messages, this parser's original purpose)
+            // caused interp/KVM's ai-fun shape-mismatch message to read
+            // "expected Int, model returned null" for input that isn't valid
+            // JSON at all, while native's stricter C mirror (`k_json_parse`)
+            // correctly reported "not valid JSON (invalid literal...)" for
+            // the SAME input -- a real cross-engine behavioral divergence,
+            // not just wording. `starts_with` is bounds-safe even if the
+            // remaining input is shorter than the literal, so this also
+            // closes a latent out-of-bounds risk in the unchecked `*pos +=
+            // N` advance on truncated input.
+            if b[*pos..].starts_with(b"true") {
+                *pos += 4;
+                Ok(Json::Bool(true))
+            } else {
+                Err("invalid literal (expected `true`)".into())
+            }
         }
         b'f' => {
-            *pos += 5;
-            Ok(Json::Bool(false))
+            if b[*pos..].starts_with(b"false") {
+                *pos += 5;
+                Ok(Json::Bool(false))
+            } else {
+                Err("invalid literal (expected `false`)".into())
+            }
         }
         b'n' => {
-            *pos += 4;
-            Ok(Json::Null)
+            if b[*pos..].starts_with(b"null") {
+                *pos += 4;
+                Ok(Json::Null)
+            } else {
+                Err("invalid literal (expected `null`)".into())
+            }
         }
         _ => {
             let start = *pos;
@@ -1624,6 +1655,34 @@ mod tests {
             let _ = completions(doc);
             let _ = occurrences(doc, "f");
         }
+    }
+
+    #[test]
+    fn parse_json_literal_keywords_are_validated_not_just_sniffed() {
+        // A REAL BUG found+fixed (bug-hunt batch 153, PR-it545): the
+        // true/false/null arms of `parse_value` used to check only the FIRST
+        // byte and blindly advance `pos` by the literal's length, with no
+        // check that the rest actually spelled the keyword -- garbage like
+        // "not json" (starts with `n`) silently "parsed" as `Json::Null`
+        // instead of failing. `ai.rs` reuses THIS parser (via
+        // `crate::lsp::parse_json`) for ai-fun mock-response text, where
+        // malformed input is deliberately tested (see
+        // `ai::tests::shape_mismatch_message_is_kupl_syntax_not_rust_debug`
+        // and friends) -- the leniency here (harmless for well-formed
+        // JSON-RPC messages, this parser's original purpose) caused
+        // interp/KVM's ai-fun error message to read "expected Int, model
+        // returned null" for input that isn't valid JSON at all, while
+        // native's stricter C mirror correctly reported "not valid JSON".
+        // Valid literals still parse; garbage (incl. TRUNCATED input
+        // shorter than the literal, e.g. a lone "t") now fails cleanly
+        // instead of over-reading past the end of the buffer.
+        assert_eq!(parse_json("true"), Ok(Json::Bool(true)));
+        assert_eq!(parse_json("false"), Ok(Json::Bool(false)));
+        assert_eq!(parse_json("null"), Ok(Json::Null));
+        assert_eq!(parse_json("not json"), Err("invalid literal (expected `null`)".into()));
+        assert_eq!(parse_json("tomato"), Err("invalid literal (expected `true`)".into()));
+        assert_eq!(parse_json("foobar"), Err("invalid literal (expected `false`)".into()));
+        assert_eq!(parse_json("t"), Err("invalid literal (expected `true`)".into()));
     }
 
     #[test]

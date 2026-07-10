@@ -16213,6 +16213,30 @@ fun probe() -> Str {\n    diff_assist2(\"x\")\n}\n";
     }
 
     #[test]
+    fn diff_ai_fun_mock_garbage_literal_prefix_is_a_clean_json_error() {
+        // A REAL BUG found+fixed (bug-hunt batch 153, PR-it545): `lsp::parse_json`
+        // (reused by ai.rs for mock-response parsing) used to check only the
+        // FIRST byte of a literal token and blindly assume "t"/"f"/"n" meant a
+        // valid true/false/null, advancing past it unconditionally -- garbage
+        // starting with one of those letters (e.g. "not json", starting with
+        // `n`) silently "parsed" as `Json::Null` instead of failing, giving a
+        // MISLEADING shape-mismatch message ("expected Int, model returned
+        // null") for input that was never valid JSON at all. Confirmed via a
+        // real 3-engine CLI probe FIRST: interp/KVM agreed with EACH OTHER
+        // (both wrong the same way) but native's independently-stricter C
+        // JSON parser correctly reported "not valid JSON" for the identical
+        // input -- a genuine cross-engine BEHAVIORAL divergence, not just
+        // wording. Fixed the shared parser to validate the full literal.
+        let src = "ai fun diff_classify9(x: Str) -> Int { intent \"c\" }\n\
+                   fun probe() -> Int { diff_classify9(\"x\") }\n";
+        std::env::set_var("KUPL_AI_MOCK_DIFF_CLASSIFY9", "not json");
+        assert_eq!(
+            differential(src),
+            "panic: ai `diff_classify9`: model response is not valid JSON (invalid literal (expected `null`)): not json"
+        );
+    }
+
+    #[test]
     fn ai_fun_tool_failure_panic_span_matches_across_engines() {
         // A REAL soundness fix (PR-it522), found while probing tool-loop failures above: the
         // panic MESSAGE for an ai-fun tool-loop failure was always identical across engines
