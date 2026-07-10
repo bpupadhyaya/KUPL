@@ -482,6 +482,27 @@ pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String
     Some(format!("```kupl\n{sig}\n```"))
 }
 
+/// Resolve every `use` target in `program` to a local sibling-file path
+/// relative to `dir` (the document's own directory). Shared by every
+/// cross-file LSP fallback (hover/definition/completion) -- the same simple,
+/// non-package resolution rule (dot-separated path segments + `.kupl`) each
+/// would otherwise reimplement independently. `kupl.toml`-based package
+/// dependencies are out of scope here; a `use` naming a package dependency
+/// resolves to a nonexistent local path and is silently skipped by callers
+/// (via `text_at_path` returning `None`), same as before this existed.
+fn used_file_paths(program: &crate::ast::Program, dir: &std::path::Path) -> Vec<PathBuf> {
+    program
+        .uses
+        .iter()
+        .map(|(use_path, _span)| {
+            let rel: PathBuf = use_path.split('.').collect();
+            let mut fs_path = dir.join(rel);
+            fs_path.set_extension("kupl");
+            fs_path
+        })
+        .collect()
+}
+
 /// Cross-file hover: try the current file first (identical to `resolve_hover`),
 /// then fall back to the same locally-`use`d sibling files that
 /// `resolve_definition_cross_file` searches (see its doc comment for scope).
@@ -498,10 +519,7 @@ pub fn resolve_hover_cross_file(
     let off = offset_at(text, line, character);
     let (name, _, _) = ident_at(text, off)?;
     let (program, _diags) = crate::parser::parse(text);
-    for (use_path, _span) in &program.uses {
-        let rel: PathBuf = use_path.split('.').collect();
-        let mut fs_path = dir.join(rel);
-        fs_path.set_extension("kupl");
+    for fs_path in used_file_paths(&program, dir) {
         let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
         let (other_program, _diags) = crate::parser::parse(&other_text);
         if let Some(sig) = item_signature(&other_program, &name) {
@@ -600,10 +618,7 @@ pub fn resolve_definition_cross_file(
     let off = offset_at(text, line, character);
     let (name, _, _) = ident_at(text, off)?;
     let (program, _diags) = crate::parser::parse(text);
-    for (use_path, _span) in &program.uses {
-        let rel: PathBuf = use_path.split('.').collect();
-        let mut fs_path = dir.join(rel);
-        fs_path.set_extension("kupl");
+    for fs_path in used_file_paths(&program, dir) {
         let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
         let (other_program, _diags) = crate::parser::parse(&other_text);
         if let Some((l0, c0, l1, c1)) = item_definition(&other_text, &other_program, &name) {
@@ -613,21 +628,21 @@ pub fn resolve_definition_cross_file(
     None
 }
 
-/// A completion candidate: (label, LSP CompletionItemKind, detail).
-pub fn completions(text: &str) -> Vec<(String, u8, String)> {
+/// Completion candidates from this document's own declared items (no keywords) --
+/// the part of `completions` that's meaningful to merge across files.
+fn item_completions(program: &crate::ast::Program) -> Vec<(String, u8, String)> {
     use crate::ast::Item;
-    let (program, _diags) = crate::parser::parse(text);
     let mut out: Vec<(String, u8, String)> = Vec::new();
     for item in &program.items {
         match item {
             Item::Fun(f) => {
-                let sig = item_signature(&program, &f.name).unwrap_or_default();
+                let sig = item_signature(program, &f.name).unwrap_or_default();
                 out.push((f.name.clone(), 3, sig)); // 3 = Function
             }
             Item::Type(t) => {
                 out.push((t.name.clone(), 22, format!("type {}", t.name))); // 22 = Struct
                 for v in &t.variants {
-                    let sig = item_signature(&program, &v.name).unwrap_or_default();
+                    let sig = item_signature(program, &v.name).unwrap_or_default();
                     out.push((v.name.clone(), 4, sig)); // 4 = Constructor
                 }
             }
@@ -650,12 +665,41 @@ pub fn completions(text: &str) -> Vec<(String, u8, String)> {
             _ => {}
         }
     }
+    out
+}
+
+/// A completion candidate: (label, LSP CompletionItemKind, detail).
+pub fn completions(text: &str) -> Vec<(String, u8, String)> {
+    let (program, _diags) = crate::parser::parse(text);
+    let mut out = item_completions(&program);
     // language keywords (14 = Keyword)
     for kw in [
         "fun", "type", "component", "app", "contract", "match", "if", "else", "for", "while",
         "let", "var", "return", "true", "false", "uses", "expose", "state", "on", "emit", "wire",
     ] {
         out.push((kw.to_string(), 14, String::new()));
+    }
+    out
+}
+
+/// Cross-file completion: this document's own candidates (identical to
+/// `completions`, keywords included), PLUS the item-level candidates
+/// (functions/types/constructors/components/contracts/methods/state) from
+/// every locally-`use`d sibling file. Before this (PR-it517), a name pulled
+/// in via `use` -- e.g. `mean`/`label` in a file that does `use lib.stats` /
+/// `use util` -- never autocompleted at all, the same gap class already
+/// fixed for hover/go-to-definition (PR-it516).
+pub fn completions_cross_file(
+    text: &str,
+    dir: &std::path::Path,
+    buffers: &HashMap<PathBuf, String>,
+) -> Vec<(String, u8, String)> {
+    let (program, _diags) = crate::parser::parse(text);
+    let mut out = completions(text);
+    for fs_path in used_file_paths(&program, dir) {
+        let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
+        let (other_program, _diags) = crate::parser::parse(&other_text);
+        out.extend(item_completions(&other_program));
     }
     out
 }
@@ -882,7 +926,9 @@ pub fn serve() -> i32 {
                     let p = msg.get("params")?;
                     let uri = p.get("textDocument")?.get("uri")?.str()?;
                     let text = doc_text(uri, &buffers)?;
-                    Some(completions(&text))
+                    // Cross-file fallback (PR-it517): same rationale as hover/definition.
+                    let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+                    Some(completions_cross_file(&text, &dir, &buffers))
                 })()
                 .unwrap_or_default();
                 let entries: Vec<String> = items
@@ -1037,6 +1083,37 @@ mod tests {
         // An unresolvable identifier (not in this file, not in any `use`d file) still cleanly
         // returns None -- no panic on a missing/unreadable sibling file.
         assert!(resolve_hover_cross_file("fun probe() -> Int {\n    zzz_nonexistent\n}\n", 1, 5, dir, &empty_buffers).is_none());
+    }
+
+    #[test]
+    fn completions_reach_across_use_imports() {
+        // Same gap class as it516's hover/definition fix, applied to completions: a name
+        // pulled in via `use` (e.g. `mean`/`label` in examples/multifile/main.kupl, which does
+        // `use lib.stats` / `use util`) never autocompleted -- `completions` only ever looked
+        // at the current buffer. Fixed by `completions_cross_file`, reusing the SAME
+        // used_file_paths/text_at_path helpers as the hover/definition fix (PR-it517).
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let main_path = manifest_dir.join("examples/multifile/main.kupl");
+        let dir = main_path.parent().unwrap();
+        let text = std::fs::read_to_string(&main_path).expect("read examples/multifile/main.kupl");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+
+        // plain (non-cross-file) completions still miss them -- confirms the gap existed and
+        // that completions() itself is unchanged (no regression on single-file behavior).
+        let plain = completions(&text);
+        let local_only: Vec<&str> = plain.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert!(!local_only.contains(&"mean"), "plain completions must NOT see cross-file names: {local_only:?}");
+
+        let items = completions_cross_file(&text, dir, &empty_buffers);
+        let labels: Vec<&str> = items.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert!(labels.contains(&"mean"), "mean (lib/stats.kupl via `use lib.stats`) must autocomplete: {labels:?}");
+        assert!(labels.contains(&"label"), "label (util.kupl via `use util`) must autocomplete: {labels:?}");
+        // the real signature is carried as detail, like any other function completion.
+        let mean = items.iter().find(|(l, _, _)| l == "mean").unwrap();
+        assert_eq!(mean.1, 3, "kind must be Function (3)");
+        assert!(mean.2.contains("fun mean(xs: List[Int]) -> Float"), "{mean:?}");
+        // this document's own names are still present (no regression).
+        assert!(labels.contains(&"Reporter"), "{labels:?}");
     }
 
     #[test]
