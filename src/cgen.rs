@@ -7666,6 +7666,33 @@ fun main() uses io {
         assert_eq!(out, "", "supervised panics keep stdout clean: {out:?}");
     }
 
+    /// A TIMER-triggered supervised restart (the exact it509 double-delay
+    /// scenario -- an always-panicking `on every 10ms` handler, supervised
+    /// with `restart on_failure`, wired to a Counter) compiles and runs on
+    /// native, reaching the correct 100/100 fires in a bounded window --
+    /// distinct from `native_supervision_restart` above (WIRE-triggered, no
+    /// timer involved) and `native_timers_run` (plain timer, no supervision).
+    /// The it509 fix lives in vm.rs's `advance`/`restart`; cgen.rs mirrors
+    /// that logic in C, so this had never been exercised on native before.
+    #[test]
+    fn native_supervised_restart_does_not_double_delay_timers() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Ticker {\n    intent \"ticker\"\n    out tick: Int\n\
+    on every 10ms {\n        emit tick(1)\n        panic(\"boom\")\n    }\n}\n\
+component Counter {\n    intent \"counter\"\n    in tick: Int\n    out total: Int\n    state n: Int = 0\n\
+    on tick(v) {\n        n += v\n        emit total(n)\n    }\n}\n\
+app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Counter()\n\
+    wire ticker.tick -> counter.tick\n    supervise ticker restart on_failure\n}\n";
+        let out = native_stdout(src, "supt");
+        // the CLI auto-prints "Counter.total = N" on every emitted `total` value;
+        // an every-10ms timer must fire exactly 100 times in the bounded window
+        // even under repeated supervised restarts (was 50 before the it509 fix).
+        assert!(out.ends_with("Counter.total = 100\n"), "{out:?}");
+        assert_eq!(out.lines().count(), 100, "{out:?}");
+    }
+
     /// Compile a `fun main` program to native, run it, return stdout.
     #[cfg(test)]
     fn native_main_stdout(src: &str, tag: &str) -> String {
