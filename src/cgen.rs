@@ -3260,6 +3260,18 @@ static KValue k_date_iso(KValue tv) {
                  (long long)y, (long long)m, (long long)d, (long long)hh, (long long)mm, (long long)ss);
     return k_str(buf);
 }
+/* strtol, but rejecting overflow like Rust's i64::parse() (PR-it560): plain `strtol`
+   silently CLAMPS an out-of-range numeral to LONG_MIN/LONG_MAX and still reports
+   success (`*end` unchanged) -- `time::parse_iso`'s year field has no subsequent
+   range check the way month/day/hour/min/sec incidentally do, so an absurdly large
+   year string (e.g. 20+ digits) used to silently parse as a clamped epoch on native
+   instead of the `Err` interp.rs/vm.rs correctly return. */
+static long k_strtol_checked(const char* s, char** end, int* ok) {
+    errno = 0;
+    long v = strtol(s, end, 10);
+    *ok = (errno != ERANGE);
+    return v;
+}
 /* parse "YYYY-MM-DD[(T| )HH:MM:SS][Z]" -> Ok(epoch) | Err(msg); mirrors time::parse_iso */
 static KValue k_parse_iso(KValue sv) {
     const char* raw = sv.as.s;
@@ -3287,10 +3299,10 @@ static KValue k_parse_iso(KValue sv) {
     char* dash2 = strchr(mstr, '-');
     if (!dash2) return k_err(k_str(errbuf));
     *dash2 = 0; char* dstr = dash2 + 1;
-    char* end;
-    y = strtol(p, &end, 10);   if (*end) return k_err(k_str(errbuf));  if (neg) y = -y;
-    mo = strtol(mstr, &end, 10); if (*end) return k_err(k_str(errbuf));
-    d = strtol(dstr, &end, 10);  if (*end || dstr[0] == 0) return k_err(k_str(errbuf));
+    char* end; int ok;
+    y = k_strtol_checked(p, &end, &ok);   if (!ok || *end) return k_err(k_str(errbuf));  if (neg) y = -y;
+    mo = k_strtol_checked(mstr, &end, &ok); if (!ok || *end) return k_err(k_str(errbuf));
+    d = k_strtol_checked(dstr, &end, &ok);  if (!ok || *end || dstr[0] == 0) return k_err(k_str(errbuf));
     /* reject an impossible day-of-month (leap-year aware), matching time::parse_iso */
     long dim = (mo == 2) ? (((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 29 : 28)
                          : ((mo == 4 || mo == 6 || mo == 9 || mo == 11) ? 30 : 31);
@@ -3302,9 +3314,9 @@ static KValue k_parse_iso(KValue sv) {
         char* c2 = strchr(mstr2, ':');
         if (!c2) return k_err(k_str(errbuf));
         *c2 = 0; char* sstr = c2 + 1;
-        hh = strtol(time, &end, 10);  if (*end) return k_err(k_str(errbuf));
-        mi = strtol(mstr2, &end, 10); if (*end) return k_err(k_str(errbuf));
-        ss = strtol(sstr, &end, 10);  if (*end || sstr[0] == 0) return k_err(k_str(errbuf));
+        hh = k_strtol_checked(time, &end, &ok);  if (!ok || *end) return k_err(k_str(errbuf));
+        mi = k_strtol_checked(mstr2, &end, &ok); if (!ok || *end) return k_err(k_str(errbuf));
+        ss = k_strtol_checked(sstr, &end, &ok);  if (!ok || *end || sstr[0] == 0) return k_err(k_str(errbuf));
         if (hh < 0 || hh > 23 || mi < 0 || mi > 59 || ss < 0 || ss > 60) return k_err(k_str(errbuf));
     }
     return k_ok(k_int(k_make(y, mo, d, hh, mi, ss)));
@@ -5792,6 +5804,40 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
                    {parse_iso(\"1900-02-29\").is_ok()}|{parse_iso(\"2000-02-29\").is_ok()}|\
                    {parse_iso(\"2024-04-31\").is_ok()}|{parse_iso(\"2024-04-30\").is_ok()}\")\n}\n";
         assert_eq!(native_main_stdout(src, "iso").trim(), "false|true|false|true|false|true");
+    }
+
+    /// A REAL BUG found+fixed (bug-hunt batch 168, PR-it560, found via an Explore-agent
+    /// survey of datetime [this] vs encoding [confirmed a faithful, already-well-tested
+    /// mirror -- no divergence found]): native's `k_parse_iso` used plain `strtol` for
+    /// every numeric field (year/month/day/hour/minute/second), which silently CLAMPS an
+    /// out-of-range numeral to `LONG_MIN`/`LONG_MAX` and still reports success (`*end`
+    /// unchanged) -- unlike Rust's `i64::parse()` (time.rs's reference), which always
+    /// rejects a numeral that doesn't fit. Month/day/hour/minute/second all get an
+    /// EXPLICIT range check afterward (e.g. `mo < 1 || mo > 12`) that incidentally also
+    /// catches a clamped LONG_MAX/LONG_MIN, but the YEAR field has no such check anywhere
+    /// in `k_parse_iso` -- confirmed via a real 3-engine CLI probe that
+    /// `parse_iso("99999999999999999999-01-01")` (a 20-digit year) correctly returned
+    /// `Err(...)` on interp/vm but silently `Ok(-62198793216)` (a clamped, nonsensical
+    /// epoch) on native. Fixed with a new `k_strtol_checked` helper (checks
+    /// `errno == ERANGE` after `strtol`, matching `i64::parse()`'s stricter contract)
+    /// applied to ALL SIX numeric fields for consistency, not just the year.
+    #[test]
+    fn native_parse_iso_rejects_strtol_overflow_in_every_field() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{parse_iso(\"99999999999999999999-01-01\").is_ok()}|\
+                   {parse_iso(\"2024-99999999999999999999-01\").is_ok()}|\
+                   {parse_iso(\"2024-01-99999999999999999999\").is_ok()}|\
+                   {parse_iso(\"2024-01-01T99999999999999999999:00:00\").is_ok()}|\
+                   {parse_iso(\"2024-01-01T00:99999999999999999999:00\").is_ok()}|\
+                   {parse_iso(\"2024-01-01T00:00:99999999999999999999\").is_ok()}|\
+                   {parse_iso(\"-100-01-01\").is_ok()}|{parse_iso(\"2024-01-01\").is_ok()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "isooverflow").trim(),
+            "false|false|false|false|false|false|true|true"
+        );
     }
 
     /// Native's mock tool-calling loop matches interp/KVM: a multi-step loop reaches
