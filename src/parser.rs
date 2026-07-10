@@ -485,7 +485,11 @@ impl Parser {
             }
         };
         n.checked_mul(per).ok_or_else(|| {
-            Diag::error("K0120", "duration is too large".to_string(), span.merge(self.prev_span()))
+            Diag::error(
+                "K0120",
+                format!("`{n}{unit}` is too large — durations are stored as milliseconds in a 64-bit integer, and this overflows it"),
+                span.merge(self.prev_span()),
+            )
         })
     }
 
@@ -1961,6 +1965,24 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn k0120_overflowing_duration_names_the_value_and_the_reason() {
+        // Error-message round 42 (PR-it535): `on every 99999999999999999h` -- a duration
+        // literal whose millisecond value overflows i64 -- was flat "duration is too
+        // large", not naming the offending literal or explaining WHY (durations are
+        // stored as milliseconds in a 64-bit integer internally, so a huge `h`/`m`
+        // value times its per-unit multiplier can overflow even though the source
+        // digits themselves parsed fine as an Int).
+        let src = "component T {\n    intent \"t\"\n    out tick: Int\n    on every 99999999999999999h {\n        emit tick(1)\n    }\n}\n";
+        let (_, diags) = parse(src);
+        assert!(
+            diags.iter().any(|d| d.code == "K0120" && d.message.contains("`99999999999999999h`") && d.message.contains("overflows")),
+            "overflowing duration must name the literal and explain the overflow: {diags:?}"
+        );
+        // A normal, non-overflowing duration still parses cleanly.
+        ok("component T {\n    intent \"t\"\n    out tick: Int\n    on every 10ms {\n        emit tick(1)\n    }\n}\n");
     }
 
     #[test]
