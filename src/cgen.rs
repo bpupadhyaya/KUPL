@@ -5048,6 +5048,37 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Native component STATE fields and cross-component `emit`/`wire` messages carry
+    /// BigInt/Rational/sized-int values correctly -- a genuinely untested combination
+    /// (bug-hunt batch 159, PR-it551): every prior native component test used only Int
+    /// state/messages, and every prior BigInt/Rational/sized-int test used only local
+    /// variables or List elements, never a component's heap-allocated instance state or a
+    /// message payload crossing a wire (which native compiles to a distinct C code path --
+    /// struct-field storage and an emit/dispatch queue -- from a local C variable). CLEAN:
+    /// no bug found; BigInt/Rational's boxed representation survives both state mutation
+    /// across a loop and copying across the wire dispatch queue correctly.
+    #[test]
+    fn native_component_state_and_wires_support_bigint_rational_sized_int() {
+        if !cc_available() {
+            return;
+        }
+        let state_src = "app Ticker {\n    state total: BigInt = big(0)\n    state r: Rational = rat(0, 1)\n    state sizedvals: List[i32] = []\n    \
+                   on start {\n        var i = 0\n        while i < 5 {\n            total = total + big(i)\n            r = r + rat(1, i + 1)\n            sizedvals = sizedvals.push(i.to_i32())\n            i = i + 1\n        }\n        \
+                   print(\"total = {total}\")\n        print(\"r = {r}\")\n        print(\"sorted = {sizedvals.sort()}\")\n}\n}\n";
+        assert_eq!(
+            native_stdout(state_src, "compnumstate"),
+            "total = 10\nr = 137/60\nsorted = [0, 1, 2, 3, 4]\n"
+        );
+        let wire_src = "component Source {\n    out total: BigInt\n    out frac: Rational\n    \
+                   on start {\n        emit total(big(42))\n        emit frac(rat(3, 4))\n    }\n}\n\
+                   component Sink {\n    in total: BigInt\n    in frac: Rational\n    \
+                   on total(x) {\n        print(\"total = {x * big(2)}\")\n    }\n    \
+                   on frac(y) {\n        print(\"frac = {y * rat(2, 1)}\")\n    }\n}\n\
+                   app Main {\n    let src = Source()\n    let sink = Sink()\n    \
+                   wire src.total -> sink.total\n    wire src.frac -> sink.frac\n}\n";
+        assert_eq!(native_stdout(wire_src, "compnumwire"), "total = 84\nfrac = 3/2\n");
+    }
+
     /// Float.fmt (it73) compiles to native and matches the interpreter's manual
     /// fixed-precision formatting byte-for-byte.
     #[test]
