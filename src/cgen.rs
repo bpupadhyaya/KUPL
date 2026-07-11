@@ -916,7 +916,18 @@ static KValue k_big_builtin(KValue v) {
     if (v.tag == K_BIGINT) return v;
     if (v.tag == K_STR) {
         KBig* b = k_big_from_str(v.as.s);
-        if (!b) { char m[128]; snprintf(m, sizeof m, "invalid BigInt: %s", v.as.s); k_panic(m); }
+        if (!b) {
+            /* A REAL cross-engine bug (PR-it597, from the SAME sweep as it595/it596):
+               interp.rs's `format!("invalid BigInt: {s}")` echoes the FULL malformed
+               string, unbounded -- this used to copy into a fixed `char m[128]`,
+               silently truncating any input over ~111 bytes. Heap-allocate the
+               message sized to the ACTUAL input instead of guessing a fixed cap. */
+            const char* prefix = "invalid BigInt: ";
+            size_t need = strlen(prefix) + strlen(v.as.s) + 1;
+            char* m = (char*)k_alloc(need);
+            snprintf(m, need, "%s%s", prefix, v.as.s);
+            k_panic(m);
+        }
         return k_big_v(b);
     }
     k_panic("`big` needs an Int or a Str"); return k_unit();
@@ -3466,13 +3477,20 @@ static KValue k_parse_iso(KValue sv) {
     long n = (long)strlen(raw);
     while (n > 0 && (raw[n-1] == ' ' || raw[n-1] == '\t' || raw[n-1] == '\n' || raw[n-1] == '\r')) n--;
     if (n > 0 && raw[n-1] == 'Z') n--;
-    char s[128];
-    if (n >= (long)sizeof s) n = (long)sizeof s - 1;
+    /* A REAL cross-engine bug (PR-it597, from the SAME sweep as it595/it596):
+       interp.rs's `format!("invalid ISO-8601 timestamp: {s}")` echoes the FULL
+       trimmed input, unbounded -- this used to copy into a fixed `char s[128]`,
+       silently truncating any input over 127 bytes (both for the working parse
+       buffer AND the echoed error text). Heap-allocate `s` sized to the ACTUAL
+       trimmed input instead of guessing a fixed cap; `errbuf` (used for every
+       Err return below) is sized off `s`'s real length the same way. */
+    char* s = (char*)k_alloc((size_t)n + 1);
     memcpy(s, raw, n); s[n] = 0;
     /* Heap-allocated: k_str stores the pointer without copying, so a stack buffer
        here would DANGLE after return and the Err message read as "" (empty). */
-    char* errbuf = (char*)k_alloc(160);
-    snprintf(errbuf, 160, "invalid ISO-8601 timestamp: %s", s);
+    size_t errcap = strlen("invalid ISO-8601 timestamp: ") + (size_t)n + 1;
+    char* errbuf = (char*)k_alloc(errcap);
+    snprintf(errbuf, errcap, "invalid ISO-8601 timestamp: %s", s);
     long y, mo, d, hh = 0, mi = 0, ss = 0;
     int neg = 0; char* p = s;
     if (*p == '-') { neg = 1; p++; }         /* negative year */
@@ -9501,6 +9519,75 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
             stderr.contains("Rational remainder is not supported"),
             "native must match the interpreter's specific message, not the generic \"invalid operand types\": {stderr:?}"
         );
+    }
+
+    /// Runs `src` (which must panic) through BOTH the interpreter and a freshly
+    /// compiled native binary, asserting their panic message TEXT is identical --
+    /// the shared shape behind `native_regex_trailing_char_panic_matches_interp_wording`
+    /// (it595) and `native_rational_remainder_panic_matches_interp_wording` (it596),
+    /// factored out here since it597 needed it twice more for the SAME sweep.
+    fn assert_panic_wording_matches(src: &str, tag: &str) {
+        if !cc_available() {
+            return;
+        }
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let interp_msg = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Err(crate::interp::Flow::Panic { msg, .. }) => msg,
+            Ok(_) => panic!("{tag}: must panic, not succeed"),
+            Err(_) => panic!("{tag}: must panic with Flow::Panic specifically"),
+        };
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-{tag}-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let out = std::process::Command::new(&bin).output().unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&interp_msg),
+            "{tag}: native must echo the SAME (untruncated) message as the interpreter -- \
+             interp said {interp_msg:?}, native stderr was {stderr:?}"
+        );
+    }
+
+    /// A REAL cross-engine bug (PR-it597, same broad sweep as it595/it596): native's
+    /// `k_parse_iso` used to copy the trimmed input into a fixed `char s[128]`,
+    /// silently truncating the echoed text in its Err message for any input over 127
+    /// bytes -- interp.rs's `format!("invalid ISO-8601 timestamp: {s}")` never
+    /// truncates. Fixed by heap-allocating the working/error buffers to the actual
+    /// input length instead of guessing a fixed cap.
+    #[test]
+    fn native_parse_iso_long_input_panic_matches_interp_wording_untruncated() {
+        let long = "x".repeat(200);
+        let src = format!(
+            "fun main() uses io {{\n    match parse_iso(\"{long}\") {{\n        Ok(_) => print(\"ok\"),\n        Err(e) => panic(e),\n    }}\n}}\n"
+        );
+        assert_panic_wording_matches(&src, "isotrail");
+    }
+
+    /// A REAL cross-engine bug (PR-it597, same sweep): native's `k_big_builtin` used
+    /// to `snprintf` the malformed decimal string into a fixed `char m[128]`,
+    /// silently truncating the echoed text for any input over ~111 bytes --
+    /// interp.rs's `format!("invalid BigInt: {s}")` never truncates. Fixed by
+    /// heap-allocating the message sized to the actual input.
+    #[test]
+    fn native_big_long_input_panic_matches_interp_wording_untruncated() {
+        let long = "x".repeat(200);
+        let src = format!("fun main() uses io {{\n    print(big(\"{long}\"))\n}}\n");
+        assert_panic_wording_matches(&src, "bigtrail");
     }
 
     /// `if let` / `while let` (it58) desugar to match, so they compile to
