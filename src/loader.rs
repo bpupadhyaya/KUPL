@@ -183,9 +183,21 @@ pub struct ResolvedDep {
 
 /// Resolve the direct dependencies declared in the project owning `entry`.
 /// Returns them sorted by name (deterministic). Errors if a dependency's
-/// manifest or entry source cannot be read.
+/// manifest or entry source cannot be read -- and, just as much, if `entry`
+/// ITSELF cannot be read. A REAL bug (PR-it593): this function already holds
+/// every DEPENDENCY's entry to that standard (below), but never checked its
+/// OWN entry the same way, since it only ever touches `entry`'s PARENT
+/// directory (to find the enclosing `kupl.toml`) and otherwise never reads
+/// `entry` at all -- so `kupl pkg tree`/`kupl pkg lock` on a typo'd or
+/// missing entry path silently reported "no dependencies" / wrote an empty
+/// `kupl.lock` with exit 0, instead of the same "cannot read" error every
+/// other subcommand (`run`/`check`/`native`/`test`/`build`, all routed
+/// through `load`/`load_compile`) gives for a bad entry path.
 pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
     let entry_path = PathBuf::from(entry);
+    if let Err(e) = std::fs::read_to_string(&entry_path) {
+        return Err(format!("entry {}: {e}", entry_path.display()));
+    }
     let dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
     let ctx = pkg_ctx(&dir, true, "");
     if let Some(e) = &ctx.err {
@@ -667,5 +679,40 @@ mod tests {
             .expect("bare file loads");
         assert_eq!(program.items.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_deps_errors_on_a_missing_entry_instead_of_silently_reporting_none() {
+        // A REAL bug found+fixed (PR-it593): `resolve_deps` (which backs `kupl pkg
+        // tree`/`kupl pkg lock`) already validates every DEPENDENCY's entry file is
+        // readable, but never validated its OWN `entry` the same way -- since it only
+        // ever reads `entry`'s PARENT directory (to find `kupl.toml`), a typo'd or
+        // missing entry path used to silently resolve to "no dependencies" instead of
+        // the same "cannot read" error every other subcommand gives.
+        let missing = "/definitely/does/not/exist/kupl-it593-repro.kupl";
+        match super::resolve_deps(missing) {
+            Ok(deps) => panic!("a missing entry file must error, not resolve to {} deps", deps.len()),
+            Err(e) => assert!(e.contains(missing), "{e}"),
+        }
+
+        // a project WITH real dependencies still resolves correctly -- the new
+        // entry-readability check doesn't regress the happy path.
+        let base = std::env::temp_dir().join(format!("kupl-pkg-missing-entry-{}", std::process::id()));
+        let math = base.join("math");
+        let app = base.join("app");
+        std::fs::create_dir_all(&math).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(math.join("kupl.toml"), "[project]\nname = \"math\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(math.join("main.kupl"), "pub fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = { path = \"../math\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use math\nfun main() {}\n").unwrap();
+        let deps = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).expect("resolves fine");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "math");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
