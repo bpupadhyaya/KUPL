@@ -17833,6 +17833,55 @@ fun main() {\n    let v = if true { OnlyA() } else { OnlyB() }\n    let _ = v\n}
     }
 
     #[test]
+    fn diff_contract_list_literal_widens_to_the_one_shared_fulfilled_contract() {
+        // List-literal element unification (check.rs's ExprKind::List case) has
+        // the exact same fold-style-accumulator shape as match-arm merging
+        // (PR-it566), just simpler (no guard handling) -- `[Mem(), Prefix(),
+        // Cached()]` (all fulfilling one contract) used to reject with a bare
+        // K0200 since no single element is pre-typed as the contract; now
+        // widens to `List[Store]`, with a 3-element literal proving the merge
+        // threads correctly (the 3rd element merges against the ALREADY-widened
+        // type from elements 1+2, not a stale first-element type) (PR-it567).
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get() -> Int\n}\n\
+component Mem fulfills Store {\n    intent \"mem\"\n    expose fun get() -> Int { 1 }\n}\n\
+component Prefix fulfills Store {\n    intent \"prefix\"\n    expose fun get() -> Int { 2 }\n}\n\
+component Cached fulfills Store {\n    intent \"cache\"\n    expose fun get() -> Int { 3 }\n}\n\
+fun probe() -> Str {\n    \
+let gs: List[Store] = [Mem(), Prefix(), Cached()]\n    \
+var out = \"\"\n    \
+for g in gs {\n        out = out + \"{g.get()}\"\n    }\n    \
+out\n}\n";
+        assert_eq!(differential(src), "123");
+    }
+
+    #[test]
+    fn contract_list_literal_still_rejects_ambiguous_or_absent_shared_contract_and_a_genuine_mismatch() {
+        // Same three safety guards as the branch-merge fix (PR-it566), now
+        // proven for list literals too: 2+ shared contracts is ambiguous (still
+        // K0200, not a silent guess), no shared contract is still K0200, and a
+        // genuinely unrelated type pair (Int vs Str) is completely unaffected.
+        let ambiguous = "contract A {\n    intent \"a\"\n    expose fun x() -> Int\n}\n\
+contract B {\n    intent \"b\"\n    expose fun y() -> Int\n}\n\
+component Both1 fulfills A, B {\n    intent \"b1\"\n    expose fun x() -> Int { 1 }\n    expose fun y() -> Int { 1 }\n}\n\
+component Both2 fulfills A, B {\n    intent \"b2\"\n    expose fun x() -> Int { 2 }\n    expose fun y() -> Int { 2 }\n}\n\
+fun main() {\n    let xs = [Both1(), Both2()]\n    let _ = xs\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(ambiguous).0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+
+        let no_common = "contract A {\n    intent \"a\"\n    expose fun x() -> Int\n}\n\
+contract B {\n    intent \"b\"\n    expose fun y() -> Int\n}\n\
+component OnlyA fulfills A {\n    intent \"oa\"\n    expose fun x() -> Int { 1 }\n}\n\
+component OnlyB fulfills B {\n    intent \"ob\"\n    expose fun y() -> Int { 1 }\n}\n\
+fun main() {\n    let xs = [OnlyA(), OnlyB()]\n    let _ = xs\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(no_common).0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+
+        let mismatch = "fun main() {\n    let xs = [1, \"two\"]\n    let _ = xs\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(mismatch).0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+    }
+
+    #[test]
     fn forall_property_passes_and_fails_with_shrunk_counterexample() {
         // run a top-level law body on the interpreter and inspect the outcome
         let run_law = |src: &str| -> Result<(), String> {

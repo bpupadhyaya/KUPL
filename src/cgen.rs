@@ -6198,6 +6198,29 @@ fun main() uses io {
         );
     }
 
+    /// List-literal element unification has the same fold-style-accumulator
+    /// shape as match-arm merging -- `[Mem(), Prefix(), Cached()]` (all
+    /// fulfilling one contract) used to reject with a bare K0200 since no
+    /// element is pre-typed as the contract; now widens to `List[Store]`
+    /// (PR-it567, same `check_merge` mechanism as it566's branch merging,
+    /// applied to `ExprKind::List`'s accumulator).
+    #[test]
+    fn native_contract_list_literal_widens_to_the_one_shared_fulfilled_contract() {
+        if !cc_available() {
+            return;
+        }
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get() -> Int\n}\n\
+                   component Mem fulfills Store {\n    intent \"mem\"\n    expose fun get() -> Int { 1 }\n}\n\
+                   component Prefix fulfills Store {\n    intent \"prefix\"\n    expose fun get() -> Int { 2 }\n}\n\
+                   component Cached fulfills Store {\n    intent \"cache\"\n    expose fun get() -> Int { 3 }\n}\n\
+                   fun main() uses io {\n    \
+                   let gs: List[Store] = [Mem(), Prefix(), Cached()]\n    \
+                   var out = \"\"\n    \
+                   for g in gs {\n        out = out + \"{g.get()}\"\n    }\n    \
+                   print(out)\n}\n";
+        assert_eq!(native_main_stdout(src, "contractlist").trim(), "123");
+    }
+
     /// Native if-let (expression + nested pattern) and while-let (termination) match
     /// interp/KVM (PR-it125).
     #[test]

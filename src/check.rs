@@ -1396,12 +1396,31 @@ impl Checker {
                 Ty::Str
             }
             ExprKind::List(items) => {
-                let elem = self.uni.fresh();
+                // Threaded as a plain Rust value once any two elements widen to a
+                // shared `fulfills` contract via check_merge (same shape as the
+                // match-arm merge, PR-it566): that widening doesn't rebind the
+                // Unifier's own type variable, so a THIRD element must merge
+                // against the already-widened contract type, not a stale
+                // first-element type. `[Mem(), Prefix()]` (all fulfilling one
+                // contract) now infers `List[Contract]` instead of a bare K0200.
+                let mut elem: Option<Ty> = None;
                 for item in items {
                     let t = self.infer_expr(item, ctx);
-                    self.unify(&elem, &t, item.span, "list element");
+                    elem = Some(match elem {
+                        None => {
+                            let fresh = self.uni.fresh();
+                            self.check_merge(&fresh, &t, item.span, "list element")
+                        }
+                        Some(e) => self.check_merge(&e, &t, item.span, "list element"),
+                    });
                 }
-                Ty::List(Box::new(self.uni.apply(&elem)))
+                match elem {
+                    Some(e) => Ty::List(Box::new(self.uni.apply(&e))),
+                    // an empty list literal `[]` stays a fresh, unresolved
+                    // element type -- inferred later from context (e.g. the
+                    // `let`/`var` annotation it's assigned to).
+                    None => Ty::List(Box::new(self.uni.fresh())),
+                }
             }
             ExprKind::Range { lo, hi, .. } => {
                 let lt = self.infer_expr(lo, ctx);
