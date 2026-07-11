@@ -794,6 +794,14 @@ impl Checker {
                         self.err("K0262", msg, c.span);
                     }
                     Some((cp, cr)) => {
+                        // The component's own `expose fun {fname}` declaration, used
+                        // below by BOTH the K0263 signature-mismatch span AND the
+                        // K0264 effect-budget check right after it -- K0264 already
+                        // correctly points at `decl.span` (the specific offending
+                        // method), but K0263 used the whole `c.span` (the component's
+                        // header line) instead, even though this exact tighter span
+                        // was available two lines below it (PR-it585).
+                        let decl = c.exposes.iter().find(|f| &f.name == fname);
                         let want = Ty::Fun(params.clone(), Box::new(ret.clone()));
                         let got = Ty::Fun(cp.clone(), Box::new(cr.clone()));
                         if self.uni.unify(&want, &got).is_err() {
@@ -803,11 +811,10 @@ impl Checker {
                                     "`{}` exposes `{fname}` as {got} but contract `{contract_name}` requires {want}",
                                     c.name
                                 ),
-                                c.span,
+                                decl.map(|d| d.span).unwrap_or(c.span),
                             );
                         }
                         // the component's declared effects must fit the contract's budget
-                        let decl = c.exposes.iter().find(|f| &f.name == fname);
                         if let Some(decl) = decl {
                             for e in &decl.effects {
                                 if !effects.iter().any(|budget| covers_effect(budget, e)) {
@@ -2457,7 +2464,12 @@ impl Checker {
                 let elem = self.uni.apply(t);
                 let elem = self.default_numeric(elem);
                 if !elem.is_numeric() {
-                    self.err("K0245", format!("`sum` needs a numeric List (Int/Float/sized int/f32/BigInt/Rational), found List[{elem}]"), span);
+                    // The receiver LIST's element type is wrong, not the `.sum()` call
+                    // syntax itself -- point at `recv.span` (the list expression), not
+                    // the whole method-call `span` (receiver-through-closing-paren),
+                    // matching the tighter span other call-argument diagnostics already
+                    // use elsewhere in this file (PR-it585).
+                    self.err("K0245", format!("`sum` needs a numeric List (Int/Float/sized int/f32/BigInt/Rational), found List[{elem}]"), recv.span);
                 }
                 Some((vec![], elem))
             }
@@ -2494,7 +2506,8 @@ impl Checker {
                 // and native's k_cmp always supported them) — `.sort()` was needlessly
                 // narrower than what the language could already do.
                 if !(elem.is_numeric() || elem == Ty::Str || matches!(elem, Ty::Var(_))) {
-                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, and other numeric types can be compared"), span);
+                    // Point at the receiver list, not the whole `.sort()` call (PR-it585).
+                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, and other numeric types can be compared"), recv.span);
                 }
                 Some((vec![], Ty::List(t.clone())))
             }
@@ -2513,7 +2526,8 @@ impl Checker {
             (Ty::List(t), "join") => {
                 let elem = self.uni.apply(t);
                 if elem != Ty::Str && !matches!(elem, Ty::Var(_)) {
-                    self.err("K0246", format!("`join` needs a List[Str], found List[{elem}]"), span);
+                    // Point at the receiver list, not the whole `.join(...)` call (PR-it585).
+                    self.err("K0246", format!("`join` needs a List[Str], found List[{elem}]"), recv.span);
                 }
                 Some((vec![Ty::Str], Ty::Str))
             }
@@ -2525,7 +2539,8 @@ impl Checker {
             (Ty::List(t), "product") => {
                 let elem = self.default_numeric(self.uni.apply(t));
                 if !elem.is_numeric() {
-                    self.err("K0245", format!("`product` needs a numeric List (Int/Float/sized int/f32/BigInt/Rational), found List[{elem}]"), span);
+                    // Point at the receiver list, not the whole `.product()` call (PR-it585).
+                    self.err("K0245", format!("`product` needs a numeric List (Int/Float/sized int/f32/BigInt/Rational), found List[{elem}]"), recv.span);
                 }
                 Some((vec![], elem))
             }
@@ -2539,7 +2554,8 @@ impl Checker {
             (Ty::List(t), "min") | (Ty::List(t), "max") => {
                 let elem = self.uni.apply(t);
                 if !(elem.is_numeric() || elem == Ty::Str || matches!(elem, Ty::Var(_))) {
-                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, and other numeric types can be compared"), span);
+                    // Point at the receiver list, not the whole `.min()`/`.max()` call (PR-it585).
+                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, and other numeric types can be compared"), recv.span);
                 }
                 Some((vec![], Ty::Option(t.clone())))
             }
@@ -3589,6 +3605,51 @@ mod generic_tests {
                   component Formal fulfills Greeter {\n    intent \"f\"\n    expose fun greet(name: Str) -> Str { \"hi {name}\" }\n}\n";
         let codes: Vec<_> = errors(ok).into_iter().map(|d| d.code).collect();
         assert!(!codes.iter().any(|c| c.starts_with("K026")), "conforming component must not error: {codes:?}");
+    }
+
+    #[test]
+    fn k0263_span_points_at_the_offending_method_not_the_whole_component() {
+        // A REAL BUG found+fixed (PR-it585): K0263 (a fulfilling component exposes a
+        // method with the WRONG signature) used the whole component's `c.span` --
+        // underlining the `component Foo fulfills Bar {` header line -- instead of the
+        // specific `expose fun` declaration actually at fault, even though that exact
+        // tighter span was computed two lines later in the SAME function and already
+        // used correctly by the sibling K0264 effect-budget check right next to it.
+        let src = "contract Store {\n    intent \"s\"\n    expose fun get(k: Str) -> Int\n}\n\
+                   component Bad fulfills Store {\n    intent \"b\"\n    expose fun get(k: Str) -> Str {\n        \"wrong\"\n    }\n}\n";
+        let d = errors(src);
+        let err = d.iter().find(|d| d.code == "K0263").expect("K0263 must fire");
+        let text = &src[err.span.start as usize..err.span.end as usize];
+        assert!(
+            text.contains("fun get") && !text.contains("component Bad"),
+            "span must cover the offending `get` declaration, not the component header: {text:?}"
+        );
+    }
+
+    #[test]
+    fn list_builtin_type_errors_point_at_the_receiver_not_the_whole_call() {
+        // A REAL BUG found+fixed (PR-it585): `sum`/`product`/`join`/`sort`/`min`/`max`'s
+        // wrong-element-type diagnostics (K0245/K0246/K0234) used the WHOLE method-call
+        // span (receiver through the closing `)`) instead of just the receiver list --
+        // needlessly underlining `.sum()`'s own call syntax alongside the actual culprit,
+        // even though `recv.span` (the receiver expression alone) was already a live,
+        // in-scope parameter of the enclosing function.
+        let span_text = |src: &str, code: &str| {
+            let d = errors(src);
+            let err = d.iter().find(|d| d.code == code).unwrap_or_else(|| panic!("{code} must fire: {d:?}"));
+            src[err.span.start as usize..err.span.end as usize].to_string()
+        };
+        let sum = "fun main() uses io {\n    let xs = [\"alpha\", \"beta\", \"gamma\"].sum()\n}\n";
+        let t = span_text(sum, "K0245");
+        assert!(t.contains("[\"alpha\"") && !t.contains(".sum()"), "sum span: {t:?}");
+
+        let join = "fun main() uses io {\n    let xs = [1, 2, 3].join(\",\")\n}\n";
+        let t = span_text(join, "K0246");
+        assert!(t.contains("[1, 2, 3]") && !t.contains(".join"), "join span: {t:?}");
+
+        let sort = "fun main() uses io {\n    let xs = [true, false].sort()\n}\n";
+        let t = span_text(sort, "K0234");
+        assert!(t.contains("[true, false]") && !t.contains(".sort()"), "sort span: {t:?}");
     }
 
     #[test]
