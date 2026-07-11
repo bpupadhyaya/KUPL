@@ -1172,6 +1172,61 @@ fn item_symbol(text: &str, item: &crate::ast::Item) -> String {
     }
 }
 
+/// Collect every span in `item` an editor could reasonably want a fold
+/// chevron for -- deliberately WIDER than `item_symbol`'s children (which
+/// only surfaces state fields + exposed/private methods for outline
+/// purposes): a component's `on X { ... }` handlers and `example { ... }`
+/// blocks have real, often-long bodies too, and a contract's `law "..." {
+/// ... }` bodies (NOT currently in `item_symbol`'s children at all, since
+/// outline and folding are different concerns -- a law's body doesn't need
+/// its own outline entry to still deserve a fold arrow).
+fn foldable_spans(item: &crate::ast::Item, out: &mut Vec<crate::diag::Span>) {
+    use crate::ast::Item;
+    match item {
+        Item::Fun(f) => out.push(f.span),
+        Item::Type(t) => out.push(t.span),
+        Item::Contract(c) => {
+            out.push(c.span);
+            out.extend(c.laws.iter().map(|l| l.span));
+        }
+        Item::Law(l) => out.push(l.span),
+        Item::Component(c) => {
+            out.push(c.span);
+            out.extend(c.exposes.iter().map(|f| f.span));
+            out.extend(c.funs.iter().map(|f| f.span));
+            out.extend(c.handlers.iter().map(|h| h.span));
+            out.extend(c.examples.iter().map(|e| e.span));
+        }
+    }
+}
+
+/// `textDocument/foldingRange`: one `FoldingRange` per multi-line foldable
+/// span (see `foldable_spans`) -- a single-line span is skipped, since
+/// folding a declaration that's already on one line is meaningless (and some
+/// clients render a same-line start/end fold as a visual glitch).
+fn folding_ranges(text: &str) -> Option<String> {
+    let (program, diags) = crate::parser::parse(text);
+    if diags.iter().any(|d| d.severity == Severity::Error) {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for item in &program.items {
+        foldable_spans(item, &mut spans);
+    }
+    let ranges: Vec<String> = spans
+        .into_iter()
+        .filter_map(|span| {
+            let (l0, _) = line_col(text, span.start);
+            let (l1, _) = line_col(text, span.end);
+            if l0 == l1 {
+                return None;
+            }
+            Some(format!("{{\"startLine\":{},\"endLine\":{}}}", l0 - 1, l1 - 1))
+        })
+        .collect();
+    Some(format!("[{}]", ranges.join(",")))
+}
+
 /// Below this many collected files, `collect_kupl_files` keeps recursing --
 /// a hard ceiling so a huge or symlink-cyclic tree can't hang the server.
 const MAX_WORKSPACE_FILES: usize = 5000;
@@ -1409,7 +1464,7 @@ pub fn serve() -> i32 {
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}},\"signatureHelpProvider\":{{\"triggerCharacters\":[\"(\",\",\"]}},\"codeActionProvider\":{{\"codeActionKinds\":[\"quickfix\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}},\"signatureHelpProvider\":{{\"triggerCharacters\":[\"(\",\",\"]}},\"codeActionProvider\":{{\"codeActionKinds\":[\"quickfix\"]}},\"foldingRangeProvider\":true}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -1695,6 +1750,17 @@ pub fn serve() -> i32 {
                     let uri = p.get("textDocument")?.get("uri")?.str()?;
                     let text = doc_text(uri, &buffers)?;
                     document_symbols(&text)
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/foldingRange" => {
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let uri = p.get("textDocument")?.get("uri")?.str()?;
+                    let text = doc_text(uri, &buffers)?;
+                    folding_ranges(&text)
                 })()
                 .unwrap_or_else(|| "null".into());
                 send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
@@ -2502,6 +2568,43 @@ mod tests {
 
         // unparseable source: nothing safe to outline
         assert_eq!(document_symbols("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
+    }
+
+    #[test]
+    fn folding_ranges_cover_every_multiline_construct_but_skip_one_liners() {
+        // A NEW LSP capability (PR-it590): `textDocument/foldingRange`, the last
+        // confirmed-missing method from a quick spec-vs-implementation inventory
+        // (codeLens/inlayHint/documentLink/pull-mode-diagnostics were all considered
+        // and are either not well-scoped for KUPL yet or lower value; foldingRange is
+        // the one every general-purpose editor expects out of the box). Deliberately
+        // WIDER than `item_symbol`'s outline children: component `on X` handlers and
+        // `example { ... }` blocks, and contract `law "..." { ... }` bodies, are all
+        // real multi-line bodies worth folding even though none of them appear as
+        // documentSymbol children today (outline and folding are different concerns).
+        let src = "component Counter {\n    intent \"c\"\n    in click: Event\n    state n: Int = 0\n    \
+                   on click {\n        n += 1\n    }\n    example {\n        send click\n        expect n == 1\n    }\n}\n\
+                   contract Store {\n    expose fun get(k: Str) -> Int\n    law \"roundtrip\" {\n        expect get(\"x\") == 0\n    }\n}\n";
+        let ranges = folding_ranges(src).expect("parses cleanly, should have folding ranges");
+
+        // component body, its `on click` handler, and its `example` block
+        assert!(ranges.contains("{\"startLine\":0,\"endLine\":11}"), "{ranges}"); // component Counter
+        assert!(ranges.contains("{\"startLine\":4,\"endLine\":6}"), "{ranges}"); // on click
+        assert!(ranges.contains("{\"startLine\":7,\"endLine\":10}"), "{ranges}"); // example
+
+        // contract body and its law -- but NOT the single-line `expose fun get(...)` sig
+        assert!(ranges.contains("{\"startLine\":12,\"endLine\":17}"), "{ranges}"); // contract Store
+        assert!(ranges.contains("{\"startLine\":14,\"endLine\":16}"), "{ranges}"); // law "roundtrip"
+        assert!(!ranges.contains("\"startLine\":13"), "a single-line sig has nothing to fold: {ranges}");
+
+        // exactly those five ranges, nothing else
+        assert_eq!(ranges.matches("\"startLine\"").count(), 5, "{ranges}");
+
+        // single-line top-level items produce no folding range at all
+        let one_liners = "type Shape = Circle(r: Float) | Square(s: Float)\n";
+        assert_eq!(folding_ranges(one_liners), Some("[]".to_string()));
+
+        // unparseable source: nothing safe to fold
+        assert_eq!(folding_ranges("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
     }
 
     #[test]
