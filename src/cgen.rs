@@ -2879,7 +2879,7 @@ static int k_re_match_here(KRegex* re, const unsigned char* t, int tlen, int pos
 /* leftmost match: fills *start,*end; returns 1 if found */
 static int k_re_leftmost(KRegex* re, const unsigned char* t, int tlen, int* start, int* end) {
     int last = re->astart ? 0 : tlen;
-    for (int s = 0; s <= last; s++) {
+    for (int s = 0; s <= last; s += (s < tlen ? k_utf8_len(t[s]) : 1)) {
         int e = k_re_match_here(re, t, tlen, s);
         if (e >= 0) { *start = s; *end = e; return 1; }
         if (re->astart) break;
@@ -2918,10 +2918,10 @@ static KValue k_re_find_all(KValue pat, KValue text) {
         if (e >= 0) {
             if (n == cap) { cap *= 2; items = (KValue*)realloc(items, sizeof(KValue) * cap); }
             items[n++] = k_substr(t, i, e);
-            i = e > i ? e : i + 1;
+            i = e > i ? e : i + (i < tlen ? k_utf8_len(t[i]) : 1);
         }
         else if (re.astart) break;
-        else i++;
+        else i += (i < tlen ? k_utf8_len(t[i]) : 1);
     }
     KValue r = k_list(items, n);
     free(items);
@@ -2935,8 +2935,9 @@ static KValue k_re_replace(KValue pat, KValue text, KValue repl) {
     KBuf b = { 0, 0, 0 }; int i = 0;
     while (i < tlen) {
         int e = k_re_match_here(&re, t, tlen, i);
-        if (e >= 0) { kb_puts(&b, rep); if (e > i) i = e; else { kb_putc(&b, (char)t[i]); i++; } }
-        else { kb_putc(&b, (char)t[i]); i++; }
+        int cl = k_utf8_len(t[i]);
+        if (e >= 0) { kb_puts(&b, rep); if (e > i) i = e; else { for (int k = 0; k < cl; k++) kb_putc(&b, (char)t[i + k]); i += cl; } }
+        else { for (int k = 0; k < cl; k++) kb_putc(&b, (char)t[i + k]); i += cl; }
     }
     if (i == tlen && k_re_match_here(&re, t, tlen, i) == i) kb_puts(&b, rep);
     return k_str(kb_take(&b));
@@ -7744,6 +7745,39 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "regexutf8").trim(),
             "Some(\"ééé\")\n[\"é\"]\ntrue\ntrue\ntrue"
+        );
+    }
+
+    /// A REAL BUG found+fixed (PR-it574): the native regex engine's three top-level scan
+    /// loops (`k_re_leftmost`, `k_re_find_all`, `k_re_replace`) tried every BYTE offset as
+    /// a candidate match position, unlike `regex.rs` (shared by interp/vm), which operates
+    /// over `Vec<char>` and only ever tries CHARACTER boundaries. So native additionally
+    /// attempted to start a match in the middle of a multi-byte UTF-8 sequence, at a
+    /// continuation byte; `kre_utf8_cp`'s truncated-input fallback then decoded that lone
+    /// continuation byte as its own "codepoint" (its raw byte value), so a pattern whose
+    /// codepoint happened to equal that raw byte value produced a SPURIOUS match interp/vm
+    /// never try -- and slicing it out via `k_substr` produced a `Str` containing INVALID
+    /// UTF-8, violating the "Str is always valid UTF-8" invariant other native code relies
+    /// on. Confirmed live: `re_match("©", "é")` (pattern U+00A9, text U+00E9 whose UTF-8 is
+    /// `C3 A9` -- the trailing `A9` byte numerically equals U+00A9) returned `true` on
+    /// native and `false` on interp/vm/.kx. Fixed by advancing each scan loop's position by
+    /// a full UTF-8 character length (`k_utf8_len`) instead of one byte, on every
+    /// non-match/zero-width-match step -- matching `regex.rs`'s per-character stepping
+    /// exactly. Re-verified clean under a fresh ASan+UBSan build of the emitted C.
+    #[test]
+    fn native_regex_scan_positions_are_char_boundaries_not_byte_offsets() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(re_match(\"©\", \"é\"))\n    \
+                   print(re_find(\"©\", \"é\"))\n    \
+                   print(re_find_all(\".\", \"aébc\"))\n    \
+                   print(re_replace(\".\", \"aébcé\", \"X\"))\n    \
+                   print(re_find_all(\"x?\", \"aébc\"))\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "regexutf8scan").trim(),
+            "false\nNone\n[\"a\", \"é\", \"b\", \"c\"]\nXXXXX\n[\"\", \"\", \"\", \"\", \"\"]"
         );
     }
 
