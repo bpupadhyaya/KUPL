@@ -1773,6 +1773,12 @@ static char* kjp_string(KJP* p) {  /* assumes current char is the opening quote 
                         } else { p->pos = save; code = 0xFFFD; }
                     } else { code = 0xFFFD; }
                 }
+                /* KUPL strings are NUL-free (K0008); a decoded NUL is rejected rather
+                   than embedded -- matches json.rs. Without this, kb_putc's own
+                   strlen()-based append would silently DROP the byte (0-length
+                   "string"), producing a corrupted, un-terminated Str rather than
+                   even a truncation (PR-it575). */
+                if (code == 0) { kjp_fail(p, "\\u0000 escape decodes to a NUL byte, not allowed in a KUPL Str (K0008)"); break; }
                 kb_putcp(&b, code);
             } else { kjp_fail(p, "invalid escape"); break; }
         } else kb_putc(&b, (char)c);
@@ -1925,7 +1931,14 @@ static const char* k_url_decode_into(KBuf* b, const char* in) {
             if (i + 2 >= n) return "invalid percent-encoding: truncated escape";
             int hi = k_hexval(p[i + 1]), lo = k_hexval(p[i + 2]);
             if (hi < 0 || lo < 0) return "invalid percent-encoding: bad hex";
-            kb_putc(b, (char)((hi << 4) | lo)); i += 3;
+            unsigned char byte = (unsigned char)((hi << 4) | lo);
+            /* KUPL strings are NUL-free (K0008); mirrors k_url_decode's own guard
+               above -- this sibling helper (used by query_parse) was missing it,
+               so a `%00` inside a query string silently corrupted via kb_putc's
+               strlen()-based append instead of falling back to the raw segment
+               like url.rs's query_parse does on any decode error (PR-it575). */
+            if (byte == 0) return "invalid percent-encoding: decoded NUL byte";
+            kb_putc(b, (char)byte); i += 3;
         } else if (p[i] == '+') { kb_putc(b, ' '); i++; }
         else { kb_putc(b, (char)p[i]); i++; }
     }
@@ -5649,6 +5662,55 @@ fun main() uses io { print("{e("NaN")}|{e("[1,2")}|{e("1.2.3")}|{e("")}|{e("[1,2
 fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD83C\"")}") }
 "#;
         assert_eq!(native_main_stdout(src, "surr").trim(), "🎉:1|café:4|\u{FFFD}:1");
+    }
+
+    /// A REAL BUG found+fixed (PR-it575): a JSON ` ` escape decodes to a NUL byte,
+    /// which KUPL strings must never contain (K0008, enforced everywhere else — the
+    /// lexer, base64/hex decode, url_decode). `json.rs`'s `\u` handling never checked
+    /// for this, so interp/vm happily produced a genuinely NUL-containing `Str` value;
+    /// native's `kjp_string` then routed the decoded NUL through `kb_putc`, whose
+    /// `strlen()`-based append is a silent no-op on a NUL byte (`strlen("\0")==0`), so
+    /// the byte was DROPPED rather than embedded or truncated -- a 3-byte "a\0b" input
+    /// silently became a corrupted 2-byte "ab" on native alone. Fixed at the root: added
+    /// a K0008-style rejection (matching the existing NUL-decode guards in url.rs and
+    /// encoding.rs) to json.rs's shared `\u` handling (fixing interp+vm in one place,
+    /// PLUS the interpreter's own previously-unenforced NUL leniency) AND to native's
+    /// `kjp_string`, so all three engines now consistently reject rather than corrupt.
+    #[test]
+    fn native_json_u0000_escape_is_rejected_not_silently_dropped() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    match json_parse("\"a\\u0000b\"") {
+        Ok(_) => print("accepted")
+        Err(m) => print(m)
+    }
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "jnul").trim(),
+            "\\u0000 escape decodes to a NUL byte, not allowed in a KUPL Str (K0008)"
+        );
+    }
+
+    /// A REAL BUG found+fixed (PR-it575), sibling to the JSON one above: `query_parse`'s
+    /// internal `k_url_decode_into` (used ONLY by `query_parse`, distinct from the public
+    /// `k_url_decode` builtin which already had this guard) was missing the K0008 NUL
+    /// rejection, so a `%00` inside a query string silently corrupted via the same
+    /// `kb_putc` bug instead of falling back to the raw undecoded segment the way
+    /// `url.rs::query_parse` does on ANY decode error.
+    #[test]
+    fn native_query_parse_rejects_a_decoded_nul_falling_back_to_the_raw_segment() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(query_parse(\"a%00b=x&c=1\"))\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "qpnul").trim(),
+            "[[\"a%00b\", \"x\"], [\"c\", \"1\"]]"
+        );
     }
 
     /// Native JSON number stringify is positional (never scientific) — PR-it114 fixed

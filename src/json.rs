@@ -175,6 +175,12 @@ impl Parser<'_> {
                         } else {
                             hi
                         };
+                        // KUPL strings are NUL-free (K0008); a decoded NUL is rejected
+                        // rather than embedded (the native runtime's C-string Str
+                        // representation would silently truncate at it — divergence).
+                        if cp == 0 {
+                            return Err("\\u0000 escape decodes to a NUL byte, not allowed in a KUPL Str (K0008)".into());
+                        }
                         out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                     }
                     _ => return Err("invalid escape".into()),

@@ -1989,6 +1989,25 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
     }
 
     #[test]
+    fn diff_json_u0000_escape_is_rejected() {
+        // A REAL BUG found+fixed (PR-it575): json.rs's `\u` handling never rejected a
+        // decoded NUL byte, unlike EVERY other place KUPL synthesizes bytes from
+        // user-controlled hex (url.rs's %00, encoding.rs's base64/hex decode) -- all of
+        // which enforce K0008 (KUPL strings are NUL-free). `json_parse("\"a\\u0000b\"")`
+        // used to succeed on interp/KVM, producing a genuinely NUL-containing Str (a
+        // cross-engine hazard the native C runtime's kb_putc couldn't represent at all --
+        // it silently DROPPED the byte instead, corrupting the string to "ab"). Now
+        // rejected consistently with a clear Err on every engine.
+        let src = r#"fun probe() -> Str { match json_parse("\"a\\u0000b\"") { Ok(_) => "accepted"
+        Err(m) => m } }
+"#;
+        assert_eq!(
+            differential(src),
+            "\\u0000 escape decodes to a NUL byte, not allowed in a KUPL Str (K0008)"
+        );
+    }
+
+    #[test]
     fn diff_json_number_and_string_fidelity() {
         // PR-it114: JSON numbers format positionally (never scientific), byte-identical
         // on interp/KVM — a large integer-valued float is "100000000000000000000", not
