@@ -642,12 +642,14 @@ fn find_fun_decl_by_span<'a>(
     None
 }
 
-/// Extract the comma-separated effect names from a K0301 message
-/// (`` `name` is public but does not declare its effects — add `uses X, Y` ``)
-/// -- parsing OUR OWN generated string is a common, low-risk quick-fix
-/// pattern (the message format is fixed and covered by effects.rs's own
-/// tests, which would catch drift immediately) rather than re-deriving the
-/// missing-effects set from scratch here.
+/// Extract the effect name(s) quoted after `` `uses `` in a K0301 or K0302
+/// message -- K0301's ("public but does not declare its effects — add
+/// `uses X, Y`") is a comma-separated list; K0302's ("declares `uses X` but
+/// never uses it") is always exactly one name, and this same rfind-based scan
+/// finds it too. Parsing OUR OWN generated string is a common, low-risk
+/// quick-fix pattern (the message format is fixed and covered by effects.rs's
+/// own tests, which would catch drift immediately) rather than re-deriving
+/// the effect set from scratch here.
 fn extract_uses_names(message: &str) -> Option<String> {
     let marker = "`uses ";
     let start = message.rfind(marker)? + marker.len();
@@ -681,20 +683,55 @@ fn insertion_point_after_params(text: &str, fun_span: crate::diag::Span) -> Opti
     }
 }
 
+/// Locate an existing `uses X, Y` clause right after a function's parameter
+/// list (reuses `insertion_point_after_params` for the "where does the clause
+/// start" half rather than re-deriving that paren-depth-tracked search).
+/// Returns `(range_start, range_end, effect_names)` where `range_start` is
+/// right after `)` and `range_end` is right before the `->`/`{` that follows
+/// -- i.e. the exact span that must be replaced to add, remove, or drop the
+/// whole clause. `None` if the function has no `uses` clause at all (effect
+/// names, unlike arbitrary identifiers, never contain `-` or `{`, so scanning
+/// for the first occurrence of either safely finds the clause's end without
+/// needing to parse the return type).
+fn find_uses_clause_range(text: &str, fun_span: crate::diag::Span) -> Option<(usize, usize, Vec<String>)> {
+    let after_params = insertion_point_after_params(text, fun_span)?;
+    let rest = text.get(after_params..)?;
+    let kw_rel = rest.len() - rest.trim_start().len();
+    let trimmed = &rest[kw_rel..];
+    if !trimmed.starts_with("uses") {
+        return None;
+    }
+    let after_kw = &trimmed[4..];
+    if after_kw.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None; // e.g. `usesomething`, not the `uses` keyword
+    }
+    let clause_start = after_params;
+    let inner_start = after_params + kw_rel + 4;
+    let end_rel = after_kw.find(['-', '{'])?;
+    let clause_end = inner_start + end_rel;
+    let effects: Vec<String> =
+        text[inner_start..clause_end].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    Some((clause_start, clause_end, effects))
+}
+
 /// `codeAction`: quick-fixes derivable from the file's OWN current diagnostics
 /// (computed directly, the same recipe `diagnostics_notification` already
 /// uses: `check::check` then `effects::check_effects` if no hard errors --
 /// reused here for consistency rather than a second, independently-written
-/// diagnostics pipeline). v0 scope: ONE fix -- for a K0301 ("public but does
+/// diagnostics pipeline). v0 scope: TWO fixes. (1) K0301 ("public but does
 /// not declare its effects") on a function with NO existing `uses` clause at
-/// all, insert the missing effect list. A function that already declares
+/// all -- insert the missing effect list. A function that already declares
 /// SOME effects but is missing others (widening `uses io` to
-/// `uses io, ai.call`) is intentionally out of scope for this first pass:
-/// safely rewriting an EXISTING clause needs its own span, which K0301's
-/// diagnostic doesn't carry -- adding a fresh clause to a function with none
-/// is the common, unambiguous case. Returns (title, insert-at byte offset,
-/// text to insert).
-pub fn resolve_code_actions(text: &str, start_off: usize, end_off: usize) -> Vec<(String, usize, String)> {
+/// `uses io, ai.call`) is intentionally out of scope for this pass: safely
+/// rewriting an EXISTING clause needs its own span, which K0301's diagnostic
+/// doesn't carry -- adding a fresh clause to a function with none is the
+/// common, unambiguous case. (2) K0302 ("declares `uses X` but never uses
+/// it") -- the symmetric follow-up: drop just that one effect name from the
+/// clause (or the whole clause, if it was the only effect declared). Returns
+/// (title, replace-range start, replace-range end, replacement text) --
+/// K0301's fix is always a zero-width insertion (start == end); K0302's is a
+/// real range replacement.
+pub fn resolve_code_actions(text: &str, start_off: usize, end_off: usize) -> Vec<(String, usize, usize, String)> {
     let (program, mut diags) = crate::parser::parse(text);
     diags.extend(crate::check::check(&program).1);
     if !diags.iter().any(|d| d.severity == Severity::Error) {
@@ -702,19 +739,29 @@ pub fn resolve_code_actions(text: &str, start_off: usize, end_off: usize) -> Vec
     }
     let mut out = Vec::new();
     for d in &diags {
-        if d.code != "K0301" {
-            continue;
-        }
         if (d.span.end as usize) < start_off || (d.span.start as usize) > end_off {
             continue;
         }
-        let Some(f) = find_fun_decl_by_span(&program, d.span) else { continue };
-        if !f.effects.is_empty() {
-            continue;
+        if d.code == "K0301" {
+            let Some(f) = find_fun_decl_by_span(&program, d.span) else { continue };
+            if !f.effects.is_empty() {
+                continue;
+            }
+            let Some(names) = extract_uses_names(&d.message) else { continue };
+            let Some(insert_at) = insertion_point_after_params(text, f.span) else { continue };
+            out.push((format!("Add `uses {names}`"), insert_at, insert_at, format!(" uses {names}")));
+        } else if d.code == "K0302" {
+            let Some(f) = find_fun_decl_by_span(&program, d.span) else { continue };
+            let Some(name) = extract_uses_names(&d.message) else { continue };
+            let Some((clause_start, clause_end, effects)) = find_uses_clause_range(text, f.span) else { continue };
+            if !effects.iter().any(|e| e == &name) {
+                continue;
+            }
+            let remaining: Vec<&str> = effects.iter().map(String::as_str).filter(|e| *e != name).collect();
+            let replacement =
+                if remaining.is_empty() { " ".to_string() } else { format!(" uses {} ", remaining.join(", ")) };
+            out.push((format!("Remove unused `uses {name}`"), clause_start, clause_end, replacement));
         }
-        let Some(names) = extract_uses_names(&d.message) else { continue };
-        let Some(insert_at) = insertion_point_after_params(text, f.span) else { continue };
-        out.push((format!("Add `uses {names}`"), insert_at, format!(" uses {names}")));
     }
     out
 }
@@ -1456,8 +1503,10 @@ pub fn serve() -> i32 {
                 send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
             }
             "textDocument/codeAction" => {
-                // Quick-fix: add a missing `uses <effect>` clause for K0301 (PR-it587),
-                // the other confirmed-missing LSP capability alongside signatureHelp.
+                // Quick-fixes: add a missing `uses <effect>` clause for K0301 (PR-it587),
+                // and remove an unused one for K0302 (PR-it588) -- the other confirmed-
+                // missing LSP capability alongside signatureHelp, now covering both halves
+                // of the effects-declaration lint.
                 let rid = id.map(render_id).unwrap_or_else(|| "null".into());
                 let result = (|| {
                     let p = msg.get("params")?;
@@ -1472,11 +1521,13 @@ pub fn serve() -> i32 {
                     let end_off = offset_at(&text, el, ec);
                     let items: Vec<String> = resolve_code_actions(&text, start_off, end_off)
                         .into_iter()
-                        .map(|(title, insert_at, new_text)| {
-                            let (l, c) = line_col(&text, insert_at as u32);
-                            let pos = format!("{{\"line\":{},\"character\":{}}}", l - 1, c - 1);
+                        .map(|(title, edit_start, edit_end, new_text)| {
+                            let (sl, sc) = line_col(&text, edit_start as u32);
+                            let (el, ec) = line_col(&text, edit_end as u32);
+                            let start_pos = format!("{{\"line\":{},\"character\":{}}}", sl - 1, sc - 1);
+                            let end_pos = format!("{{\"line\":{},\"character\":{}}}", el - 1, ec - 1);
                             format!(
-                                "{{\"title\":\"{}\",\"kind\":\"quickfix\",\"edit\":{{\"changes\":{{\"{}\":[{{\"range\":{{\"start\":{pos},\"end\":{pos}}},\"newText\":\"{}\"}}]}}}}}}",
+                                "{{\"title\":\"{}\",\"kind\":\"quickfix\",\"edit\":{{\"changes\":{{\"{}\":[{{\"range\":{{\"start\":{start_pos},\"end\":{end_pos}}},\"newText\":\"{}\"}}]}}}}}}",
                                 json_escape(&title),
                                 json_escape(uri),
                                 json_escape(&new_text)
@@ -1687,12 +1738,13 @@ mod tests {
         let src = "pub fun outer(x: Int) -> Int {\n    print(to_str(x))\n    x\n}\n";
         let actions = resolve_code_actions(src, 0, src.len());
         assert_eq!(actions.len(), 1, "{actions:?}");
-        let (title, insert_at, new_text) = &actions[0];
+        let (title, start, end, new_text) = &actions[0];
         assert_eq!(title, "Add `uses io`");
         assert_eq!(new_text, " uses io");
+        assert_eq!(start, end, "K0301's fix is a zero-width insertion");
         // applying the edit produces a program with NO K0301 (and no OTHER new errors).
         let mut fixed = src.to_string();
-        fixed.insert_str(*insert_at, new_text);
+        fixed.insert_str(*start, new_text);
         let (program, mut diags) = crate::parser::parse(&fixed);
         diags.extend(crate::check::check(&program).1);
         if !diags.iter().any(|d| d.severity == Severity::Error) {
@@ -1714,6 +1766,53 @@ mod tests {
         assert!(resolve_code_actions(already_declared, 0, already_declared.len()).is_empty());
         let clean = "fun outer(x: Int) -> Int {\n    x\n}\n";
         assert!(resolve_code_actions(clean, 0, clean.len()).is_empty());
+    }
+
+    #[test]
+    fn code_action_removes_the_sole_unused_uses_clause_for_k0302() {
+        // The symmetric follow-up to K0301's fix (PR-it588): K0302 ("declares `uses
+        // X` but never uses it") on a function whose `uses` clause names only ONE
+        // effect -- the fix must drop the WHOLE clause, not leave a dangling `uses`.
+        let src = "pub fun outer(x: Int) uses io -> Int {\n    x\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (title, start, end, new_text) = &actions[0];
+        assert_eq!(title, "Remove unused `uses io`");
+        let mut fixed = src.to_string();
+        fixed.replace_range(*start..*end, new_text);
+        assert_eq!(fixed, "pub fun outer(x: Int) -> Int {\n    x\n}\n");
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(
+            !diags.iter().any(|d| d.code == "K0301" || d.code == "K0302"),
+            "the fix must not leave K0301/K0302 behind: {fixed:?} -> {diags:?}"
+        );
+    }
+
+    #[test]
+    fn code_action_removes_just_one_of_several_unused_effects_for_k0302() {
+        // Multiple declared effects, only one unused -- the fix must drop just that
+        // ONE name and keep the rest of the clause intact.
+        let src = "pub fun outer(x: Int) uses io, ai.call -> Int {\n    print(to_str(x))\n    x\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (title, start, end, new_text) = &actions[0];
+        assert_eq!(title, "Remove unused `uses ai.call`");
+        let mut fixed = src.to_string();
+        fixed.replace_range(*start..*end, new_text);
+        assert_eq!(fixed, "pub fun outer(x: Int) uses io -> Int {\n    print(to_str(x))\n    x\n}\n");
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(
+            !diags.iter().any(|d| d.code == "K0301" || d.code == "K0302"),
+            "the fix must not leave K0301/K0302 behind: {fixed:?} -> {diags:?}"
+        );
     }
 
     #[test]
