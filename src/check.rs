@@ -3013,84 +3013,174 @@ impl Checker {
 
     fn check_exhaustive(&mut self, scrut: &Ty, arms: &[MatchArm], span: Span) {
         // Only UNGUARDED arms contribute to exhaustiveness — a guarded arm may
-        // not run even when its pattern matches. An or-pattern arm covers each
-        // of its alternatives.
-        let mut catch_all = false;
-        let mut covered: HashSet<String> = HashSet::new();
-        let mut bools: HashSet<bool> = HashSet::new();
-        fn collect(p: &Pattern, catch_all: &mut bool, covered: &mut HashSet<String>, bools: &mut HashSet<bool>) {
-            match &p.kind {
-                PatternKind::Wildcard | PatternKind::Bind(_) => *catch_all = true,
-                PatternKind::Ctor { name, .. } => {
-                    covered.insert(name.clone());
-                }
-                PatternKind::Bool(b) => {
-                    bools.insert(*b);
-                }
-                PatternKind::Or(alts) => {
-                    for a in alts {
-                        collect(a, catch_all, covered, bools);
-                    }
-                }
-                // `name @ inner` covers whatever `inner` covers (so `name @ _`
-                // is a catch-all). Ranges never exhaust an unbounded Int.
-                PatternKind::At { inner, .. } => collect(inner, catch_all, covered, bools),
-                _ => {}
-            }
-        }
-        for a in arms.iter().filter(|a| a.guard.is_none()) {
-            collect(&a.pattern, &mut catch_all, &mut covered, &mut bools);
-        }
-        if catch_all {
+        // not run even when its pattern matches.
+        let patterns: Vec<&Pattern> =
+            arms.iter().filter(|a| a.guard.is_none()).map(|a| &a.pattern).collect();
+        if patterns.iter().any(|p| Self::pattern_is_catch_all(p)) {
             return;
         }
-        let covered: HashSet<&str> = covered.iter().map(String::as_str).collect();
-        let missing: Vec<String> = match self.uni.apply(scrut) {
-            Ty::Bool => {
-                let mut m = Vec::new();
-                if !bools.contains(&true) {
-                    m.push("true".into());
+        match self.uni.apply(scrut) {
+            Ty::Bool | Ty::Option(_) | Ty::Result(_, _) | Ty::Named(..) => {
+                let missing = self.exhaustive_missing(scrut, &patterns);
+                if !missing.is_empty() {
+                    self.err(
+                        "K0257",
+                        format!("non-exhaustive `match`: missing {}", missing.join(", ")),
+                        span,
+                    );
                 }
-                if !bools.contains(&false) {
-                    m.push("false".into());
-                }
-                m
             }
-            Ty::Option(_) => ["Some", "None"]
-                .iter()
-                .filter(|v| !covered.contains(**v))
-                .map(|v| v.to_string())
-                .collect(),
-            Ty::Result(_, _) => ["Ok", "Err"]
-                .iter()
-                .filter(|v| !covered.contains(**v))
-                .map(|v| v.to_string())
-                .collect(),
-            Ty::Named(tn, _) => match self.checked.types.get(&tn) {
-                Some(sig) => sig
-                    .variants
-                    .iter()
-                    .filter(|v| !covered.contains(v.name.as_str()))
-                    .map(|v| v.name.clone())
-                    .collect(),
-                None => Vec::new(),
-            },
             _ => {
                 self.err(
                     "K0256",
                     "this `match` needs a catch-all arm (`_ => …`) — the scrutinee type has unbounded values",
                     span,
                 );
-                return;
             }
-        };
-        if !missing.is_empty() {
-            self.err(
-                "K0257",
-                format!("non-exhaustive `match`: missing {}", missing.join(", ")),
-                span,
-            );
         }
+    }
+
+    fn pattern_is_catch_all(p: &Pattern) -> bool {
+        match &p.kind {
+            PatternKind::Wildcard | PatternKind::Bind(_) => true,
+            // `name @ inner` covers whatever `inner` covers (so `name @ _` is
+            // a catch-all). An or-pattern arm is a catch-all the moment ANY
+            // alternative is, since a value failing every other alternative
+            // still matches that one.
+            PatternKind::Or(alts) => alts.iter().any(Self::pattern_is_catch_all),
+            PatternKind::At { inner, .. } => Self::pattern_is_catch_all(inner),
+            _ => false,
+        }
+    }
+
+    /// Recursively collect missing-case descriptions for `ty` given the
+    /// patterns that reach this position from all (unguarded) enclosing
+    /// arms. Bool/Option/Result/Named types are checked recursively into
+    /// each variant's fields — e.g. `Some(Good(_))` alone does NOT cover
+    /// `Some`, since `Some`'s payload (`R`) itself has an uncovered `Bad`
+    /// case; this used to be missed entirely, since the old checker only
+    /// asked "does some arm mention the OUTER constructor name," never
+    /// recursing into `args` (PR-it568). Any other type (Int, Str, Float,
+    /// BigInt, Rational, SizedInt, unresolved type variables, ...) is
+    /// treated as already covered at THIS position — full exhaustiveness
+    /// over an unbounded scalar FIELD (as opposed to the scrutinee itself,
+    /// which the caller already rejects via K0256) is a separate, broader
+    /// concern intentionally left out of this fix's scope.
+    fn exhaustive_missing(&self, ty: &Ty, patterns: &[&Pattern]) -> Vec<String> {
+        if patterns.iter().any(|p| Self::pattern_is_catch_all(p)) {
+            return Vec::new();
+        }
+        match self.uni.apply(ty) {
+            Ty::Bool => {
+                let mut present: HashSet<bool> = HashSet::new();
+                for p in patterns {
+                    Self::collect_bools(p, &mut present);
+                }
+                let mut missing = Vec::new();
+                if !present.contains(&true) {
+                    missing.push("true".to_string());
+                }
+                if !present.contains(&false) {
+                    missing.push("false".to_string());
+                }
+                missing
+            }
+            Ty::Option(inner) => self.exhaustive_missing_variants(
+                &[("Some", vec![*inner]), ("None", vec![])],
+                patterns,
+            ),
+            Ty::Result(ok, err) => self.exhaustive_missing_variants(
+                &[("Ok", vec![*ok]), ("Err", vec![*err])],
+                patterns,
+            ),
+            Ty::Named(tn, targs) => match self.checked.types.get(&tn).cloned() {
+                Some(sig) => {
+                    let m: HashMap<u32, Ty> =
+                        sig.qvars.iter().cloned().zip(targs.iter().cloned()).collect();
+                    let variants: Vec<(&str, Vec<Ty>)> = sig
+                        .variants
+                        .iter()
+                        .map(|v| {
+                            (
+                                v.name.as_str(),
+                                v.fields.iter().map(|(_, fty)| Self::subst_ty(fty, &m)).collect(),
+                            )
+                        })
+                        .collect();
+                    self.exhaustive_missing_variants(&variants, patterns)
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// For each `(variant_name, field_types)`, checks that some arm's
+    /// top-level pattern targets it, and — if so — that the field patterns
+    /// contributed by ALL arms targeting it jointly cover each field
+    /// (recursively). A variant with zero matching arms is simply missing; a
+    /// variant with matching arms whose fields aren't jointly exhaustive is
+    /// reported as `Variant(<what's missing in each under-covered field>)`.
+    fn exhaustive_missing_variants(&self, variants: &[(&str, Vec<Ty>)], patterns: &[&Pattern]) -> Vec<String> {
+        let mut missing = Vec::new();
+        for (vname, field_tys) in variants {
+            let arg_tuples = Self::ctor_args_for(patterns, vname);
+            if arg_tuples.is_empty() {
+                missing.push((*vname).to_string());
+                continue;
+            }
+            let mut field_missing = Vec::new();
+            for (i, fty) in field_tys.iter().enumerate() {
+                let field_pats: Vec<&Pattern> =
+                    arg_tuples.iter().filter_map(|args| args.get(i)).collect();
+                let m = self.exhaustive_missing(fty, &field_pats);
+                if !m.is_empty() {
+                    field_missing.push(m.join(" or "));
+                }
+            }
+            if !field_missing.is_empty() {
+                missing.push(format!("{vname}({})", field_missing.join(", ")));
+            }
+        }
+        missing
+    }
+
+    fn collect_bools(p: &Pattern, out: &mut HashSet<bool>) {
+        match &p.kind {
+            PatternKind::Bool(b) => {
+                out.insert(*b);
+            }
+            PatternKind::Or(alts) => {
+                for a in alts {
+                    Self::collect_bools(a, out);
+                }
+            }
+            PatternKind::At { inner, .. } => Self::collect_bools(inner, out),
+            _ => {}
+        }
+    }
+
+    /// Collect, from `patterns` (expanding `Or` and unwrapping `At` as
+    /// needed), the field-pattern tuple of every `Ctor` arm matching
+    /// `variant_name` — one entry per arm that targets this variant.
+    fn ctor_args_for<'a>(patterns: &[&'a Pattern], variant_name: &str) -> Vec<&'a [Pattern]> {
+        fn walk<'a>(p: &'a Pattern, variant_name: &str, out: &mut Vec<&'a [Pattern]>) {
+            match &p.kind {
+                PatternKind::Ctor { name, args } if name == variant_name => out.push(args.as_slice()),
+                PatternKind::Or(alts) => {
+                    for a in alts {
+                        walk(a, variant_name, out);
+                    }
+                }
+                PatternKind::At { inner, .. } => walk(inner, variant_name, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for p in patterns {
+            walk(p, variant_name, &mut out);
+        }
+        out
     }
 }
 
@@ -3430,6 +3520,49 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    #[test]
+    fn exhaustiveness_checker_recurses_into_nested_ctor_patterns() {
+        // `check_exhaustive` used to collect only the OUTER constructor name
+        // mentioned by each arm (`PatternKind::Ctor { name, .. } =>
+        // covered.insert(name)`) and never looked at `args` at all -- so
+        // `Some(Good(a))` alone was treated as fully covering `Some`,
+        // regardless of what (if anything) the `R` payload's OTHER variant
+        // (`Bad`) needed. `kupl check` reported "ok" and every engine then
+        // panicked "no match arm matched" at runtime on the uncovered case
+        // (PR-it568) -- a genuine soundness gap: valid-looking, "checked"
+        // KUPL crashed in production. Fixed by recursively checking each
+        // matched variant's field types too, not just the top-level tag.
+        let nested = errors(
+            "type R = Good(v: Int) | Bad(msg: Str)\n\
+             fun f(x: Option[R]) -> Int {\n    \
+             match x {\n        Some(Good(a)) => a\n        None => 0\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(
+            nested.iter().any(|d| d.code == "K0257" && d.message.contains("Some(Bad)")),
+            "{nested:?}"
+        );
+        // A genuinely exhaustive nested match (every payload variant covered
+        // too) must NOT be flagged -- no new false rejection of valid code.
+        let ok = errors(
+            "type R = Good(v: Int) | Bad(msg: Str)\n\
+             fun f(x: Option[R]) -> Int {\n    \
+             match x {\n        Some(Good(a)) => a\n        Some(Bad(_)) => 0\n        None => -1\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        // The same nested wildcard (`Some(_)`) still trivially covers `Some`
+        // regardless of the payload's own variants -- a nested wildcard/bind
+        // is a catch-all at that position, same as before this fix.
+        let wildcard_payload = errors(
+            "type R = Good(v: Int) | Bad(msg: Str)\n\
+             fun f(x: Option[R]) -> Int {\n    \
+             match x {\n        Some(_) => 1\n        None => 0\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(wildcard_payload.is_empty(), "{wildcard_payload:?}");
     }
 
     #[test]
