@@ -1767,12 +1767,20 @@ impl Parser {
                 for p in &parts {
                     match p {
                         StrPart::Text(t) => text.push_str(t),
-                        StrPart::Expr(..) => {
+                        StrPart::Expr(src, off) => {
+                            // A REAL bug found+fixed (PR-it602, a parser.rs span-precision
+                            // sweep mirroring check.rs's it585): this used to reuse `span`
+                            // (the WHOLE string-literal token) instead of the interpolation's
+                            // own offset -- `off` is already the file-absolute byte position
+                            // of the `{...}` expression's source text, the SAME mechanism
+                            // `str_parts_expr`/`parse_expr_fragment` use elsewhere in this
+                            // file to build a precise span from an interpolation offset.
+                            let interp_span = Span::new(*off, *off + src.len() as u32);
                             return Err(Diag::error(
                                 "K0112",
                                 "string patterns cannot contain interpolation",
-                                span,
-                            ))
+                                interp_span,
+                            ));
                         }
                     }
                 }
@@ -1983,6 +1991,22 @@ mod tests {
         );
         // A normal, non-overflowing duration still parses cleanly.
         ok("component T {\n    intent \"t\"\n    out tick: Int\n    on every 10ms {\n        emit tick(1)\n    }\n}\n");
+    }
+
+    #[test]
+    fn k0112_span_points_at_the_interpolation_not_the_whole_string_literal() {
+        // A REAL bug found+fixed (PR-it602, a parser.rs span-precision sweep mirroring
+        // check.rs's it585): "string patterns cannot contain interpolation" used to
+        // underline the WHOLE string-literal token, no matter how long, instead of the
+        // `{...}` interpolation that's actually the problem -- even though `StrPart::
+        // Expr`'s own byte offset (the SAME mechanism `str_parts_expr`/
+        // `parse_expr_fragment` already use elsewhere in this file) was sitting right
+        // there, unused.
+        let src = "fun f(s: Str) -> Int {\n    match s {\n        \"prefix-aaaaaaaaaa {x} bbbbbbbbbb-suffix\" => 1\n        _ => 2\n    }\n}\n";
+        let (_, diags) = parse(src);
+        let d = diags.iter().find(|d| d.code == "K0112").expect("K0112 must fire");
+        let text = &src[d.span.start as usize..d.span.end as usize];
+        assert_eq!(text, "x", "span must cover just the interpolated expression, not the whole string literal: {text:?}");
     }
 
     #[test]
