@@ -248,6 +248,50 @@ impl Checker {
         self.unify(expected, actual, span, what);
     }
 
+    /// When two DIFFERENT concrete component types have no textual contract
+    /// annotation anywhere nearby (so `contract_assignable` can't fire in either
+    /// direction — neither side already resolves to `Ty::Contract`), check
+    /// whether they nonetheless share exactly ONE contract both `fulfills`. Two
+    /// or more shared contracts is ambiguous (which one did the author mean?)
+    /// and is left to fail normally rather than silently guessing.
+    fn common_fulfilled_contract(&self, a: &Ty, b: &Ty) -> Option<String> {
+        let (Ty::Component(x), Ty::Component(y)) = (self.uni.resolve(a), self.uni.resolve(b)) else {
+            return None;
+        };
+        if x == y {
+            return None;
+        }
+        let sig_x = self.checked.components.get(&x)?;
+        let sig_y = self.checked.components.get(&y)?;
+        let mut common = sig_x.fulfills.iter().filter(|c| sig_y.fulfills.contains(c));
+        let first = common.next()?;
+        if common.next().is_some() {
+            return None;
+        }
+        Some(first.clone())
+    }
+
+    /// Merge two branch types (`if`/`else`, `match` arms): like `unify`, but
+    /// admits contract assignability SYMMETRICALLY (either branch may already be
+    /// contract-typed) and, when both branches are bare, different concrete
+    /// component types with no annotation, widens to their one shared `fulfills`
+    /// contract if there is exactly one (e.g. `if b { Mem() } else { Prefix() }`
+    /// where both fulfill `Store` — no `unify`-based check, however wrapped,
+    /// can accept this on its own, since NEITHER side is `Ty::Contract` yet).
+    /// Falls through to plain `unify` (reporting the usual K0200) otherwise.
+    fn check_merge(&mut self, a: &Ty, b: &Ty, span: Span, what: &str) -> Ty {
+        if self.contract_assignable(a, b) {
+            return self.uni.apply(a);
+        }
+        if self.contract_assignable(b, a) {
+            return self.uni.apply(b);
+        }
+        if let Some(c) = self.common_fulfilled_contract(a, b) {
+            return Ty::Contract(c);
+        }
+        self.unify(a, b, span, what)
+    }
+
     // ---------------- pass 1: collect ----------------
 
     fn collect(&mut self, program: &Program) {
@@ -1522,8 +1566,7 @@ impl Checker {
                 match else_block {
                     Some(e) => {
                         let et = self.infer_expr(e, ctx);
-                        self.unify(&tt, &et, expr.span, "`if`/`else` branches");
-                        self.uni.apply(&tt)
+                        self.check_merge(&tt, &et, expr.span, "`if`/`else` branches")
                     }
                     None => Ty::Unit,
                 }
@@ -1531,7 +1574,14 @@ impl Checker {
             ExprKind::BlockExpr(b) => self.check_block(b, ctx),
             ExprKind::Match { scrutinee, arms } => {
                 let st = self.infer_expr(scrutinee, ctx);
-                let result = self.uni.fresh();
+                // `result` is threaded as a plain Rust value (not left to the
+                // Unifier's internal type-variable state) once any arm widens to
+                // a shared `fulfills` contract via check_merge, since that
+                // widening doesn't rebind any underlying type variable -- a
+                // later arm must be merged against the WIDENED type, not a
+                // stale variable that still thinks it's bound to the first
+                // arm's bare concrete component type.
+                let mut result: Option<Ty> = None;
                 for arm in arms {
                     ctx.scopes.push();
                     self.check_pattern(&arm.pattern, &st, ctx);
@@ -1540,11 +1590,22 @@ impl Checker {
                         self.unify(&Ty::Bool, &gt, guard.span, "match guard (must be Bool)");
                     }
                     let at = self.infer_expr(&arm.body, ctx);
-                    self.unify(&result, &at, arm.body.span, "match arms (all arms must have the same type)");
+                    result = Some(match result {
+                        None => {
+                            let fresh = self.uni.fresh();
+                            self.check_merge(&fresh, &at, arm.body.span, "match arms (all arms must have the same type)")
+                        }
+                        Some(r) => self.check_merge(&r, &at, arm.body.span, "match arms (all arms must have the same type)"),
+                    });
                     ctx.scopes.pop();
                 }
                 self.check_exhaustive(&st, arms, expr.span);
-                self.uni.apply(&result)
+                match result {
+                    Some(r) => self.uni.apply(&r),
+                    // no arms at all: unreachable in practice (the parser
+                    // requires at least one arm), but Unit is a safe fallback.
+                    None => Ty::Unit,
+                }
             }
             ExprKind::Lambda { params, body } => {
                 ctx.scopes.push();

@@ -17785,6 +17785,54 @@ fun main() {\n    var v: Store = Mem()\n    v = NotAStore()\n}\n";
     }
 
     #[test]
+    fn diff_contract_branch_merge_widens_to_the_one_shared_fulfilled_contract() {
+        // The it565 fix only handled DIRECTIONAL sites (one side already
+        // annotated as a contract type). `if`/`else` and `match` arms are
+        // SYMMETRIC merges: `if b { Mem() } else { Prefix() }` has NEITHER
+        // branch pre-typed as `Ty::Contract` (both are bare, DIFFERENT concrete
+        // component types), so no directional check_assign-style widening could
+        // ever fire -- this needed a genuinely different check: do the two
+        // branch types share exactly ONE `fulfills` contract? If so, that's the
+        // obvious common type; if zero or more than one, fall through to the
+        // normal K0200 (PR-it566, `check_merge`/`common_fulfilled_contract`).
+        // Also covers a 3-arm match, proving the merge threads correctly across
+        // more than 2 arms (a later arm merges against the ALREADY-WIDENED
+        // contract type from earlier arms, not a stale first-arm type).
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get() -> Int\n}\n\
+component Mem fulfills Store {\n    intent \"mem\"\n    expose fun get() -> Int { 1 }\n}\n\
+component Prefix fulfills Store {\n    intent \"prefix\"\n    expose fun get() -> Int { 2 }\n}\n\
+component Cached fulfills Store {\n    intent \"cache\"\n    expose fun get() -> Int { 3 }\n}\n\
+fun mk_if(b: Bool) -> Store {\n    if b { Mem() } else { Prefix() }\n}\n\
+fun mk_match(n: Int) -> Store {\n    match n {\n        0 => Mem()\n        1 => Prefix()\n        _ => Cached()\n    }\n}\n\
+fun probe() -> Str {\n    \"{mk_if(true).get()}|{mk_if(false).get()}|{mk_match(0).get()}|{mk_match(1).get()}|{mk_match(2).get()}\"\n}\n";
+        assert_eq!(differential(src), "1|2|1|2|3");
+    }
+
+    #[test]
+    fn contract_branch_merge_rejects_an_ambiguous_or_absent_shared_contract() {
+        // A component fulfilling TWO contracts merged against another
+        // component fulfilling the SAME two contracts is ambiguous -- which one
+        // did the author mean? -- and must still be a K0200, not a silent
+        // guess. Two components sharing NO contract at all must also still be
+        // rejected exactly as before.
+        let ambiguous = "contract A {\n    intent \"a\"\n    expose fun x() -> Int\n}\n\
+contract B {\n    intent \"b\"\n    expose fun y() -> Int\n}\n\
+component Both1 fulfills A, B {\n    intent \"b1\"\n    expose fun x() -> Int { 1 }\n    expose fun y() -> Int { 1 }\n}\n\
+component Both2 fulfills A, B {\n    intent \"b2\"\n    expose fun x() -> Int { 2 }\n    expose fun y() -> Int { 2 }\n}\n\
+fun main() {\n    let v = if true { Both1() } else { Both2() }\n    let _ = v\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(ambiguous).0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+
+        let no_common = "contract A {\n    intent \"a\"\n    expose fun x() -> Int\n}\n\
+contract B {\n    intent \"b\"\n    expose fun y() -> Int\n}\n\
+component OnlyA fulfills A {\n    intent \"oa\"\n    expose fun x() -> Int { 1 }\n}\n\
+component OnlyB fulfills B {\n    intent \"ob\"\n    expose fun y() -> Int { 1 }\n}\n\
+fun main() {\n    let v = if true { OnlyA() } else { OnlyB() }\n    let _ = v\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(no_common).0);
+        assert!(diags.iter().any(|d| d.code == "K0200"), "{diags:?}");
+    }
+
+    #[test]
     fn forall_property_passes_and_fails_with_shrunk_counterexample() {
         // run a top-level law body on the interpreter and inspect the outcome
         let run_law = |src: &str| -> Result<(), String> {

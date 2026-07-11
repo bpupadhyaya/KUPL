@@ -6172,6 +6172,32 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "contractassign").trim(), "1|2|1|1|1|2");
     }
 
+    /// `if`/`else` and `match` arms are SYMMETRIC merges -- neither branch is
+    /// pre-typed as a contract, so `if b { Mem() } else { Prefix() }` needed a
+    /// different check than it565's directional `check_assign` sites: do the two
+    /// branch types share exactly ONE `fulfills` contract? Exercises native
+    /// codegen for a 3-way `match` merge too, proving the widened contract type
+    /// threads correctly past the first arm (PR-it566, `check_merge`/
+    /// `common_fulfilled_contract` in check.rs).
+    #[test]
+    fn native_contract_branch_merge_widens_to_the_one_shared_fulfilled_contract() {
+        if !cc_available() {
+            return;
+        }
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get() -> Int\n}\n\
+                   component Mem fulfills Store {\n    intent \"mem\"\n    expose fun get() -> Int { 1 }\n}\n\
+                   component Prefix fulfills Store {\n    intent \"prefix\"\n    expose fun get() -> Int { 2 }\n}\n\
+                   component Cached fulfills Store {\n    intent \"cache\"\n    expose fun get() -> Int { 3 }\n}\n\
+                   fun mk_if(b: Bool) -> Store {\n    if b { Mem() } else { Prefix() }\n}\n\
+                   fun mk_match(n: Int) -> Store {\n    match n {\n        0 => Mem()\n        1 => Prefix()\n        _ => Cached()\n    }\n}\n\
+                   fun main() uses io {\n    \
+                   print(\"{mk_if(true).get()}|{mk_if(false).get()}|{mk_match(0).get()}|{mk_match(1).get()}|{mk_match(2).get()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "contractmerge").trim(),
+            "1|2|1|2|3"
+        );
+    }
+
     /// Native if-let (expression + nested pattern) and while-let (termination) match
     /// interp/KVM (PR-it125).
     #[test]
