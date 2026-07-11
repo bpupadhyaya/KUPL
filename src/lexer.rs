@@ -203,6 +203,20 @@ impl<'a> Lexer<'a> {
                 (NumSuffix::Int(w), Ok(v)) => self.emit_sized(v as i128, w, start),
                 (NumSuffix::F32, Ok(v)) => self.push(Tok::F32Lit(v as f32), start),
                 (NumSuffix::None, Ok(v)) => self.push(Tok::Int(v as i64), start),
+                // A REAL bug found+fixed (PR-it604, a lexer.rs sweep mirroring check.rs/
+                // parser.rs's it581-603 findings): this used to fall straight through to
+                // `fit_err` even when an EXPLICIT width suffix (`u8`, `i16`, ...) was
+                // present, silently dropping it -- the message talked about `Int
+                // (64-bit)` and `big(...)`, neither of which addresses what the user
+                // actually wrote. Route a suffixed literal through `emit_sized`'s
+                // existing width-aware "out of range for `W` (its range is X..Y)"
+                // template instead (reused, not reimplemented) whenever the value at
+                // least fits `i128` -- the SAME magnitude-then-cast-then-range-check
+                // shape the `Ok(v)` arm above already uses for values that fit `u64`.
+                (NumSuffix::Int(w), Err(_)) => match i128::from_str_radix(&text, radix) {
+                    Ok(v) => self.emit_sized(v, w, start),
+                    Err(_) => fit_err(self, &text, radix),
+                },
                 (_, Err(_)) => fit_err(self, &text, radix),
             }
             return;
@@ -258,9 +272,22 @@ impl<'a> Lexer<'a> {
                 } else {
                     match text.parse::<i128>() {
                         Ok(v) => self.emit_sized(v, w, start),
+                        // A REAL bug found+fixed (PR-it604, same lexer.rs sweep): unlike
+                        // `emit_sized`'s own "out of range" message (used a few lines up
+                        // for a value that DOES fit `i128`), this bare fallback -- for a
+                        // decimal literal so large it doesn't even fit `i128` -- named
+                        // the width but dropped its range AND the `big(...)` fix,
+                        // even though `w.min()`/`w.max()` are directly available without
+                        // needing the (here, unrepresentable) overflowing value itself.
                         Err(_) => self.diags.push(Diag::error(
                             "K0009",
-                            format!("literal `{text}` out of range for `{}`", w.name()),
+                            format!(
+                                "literal `{text}` out of range for `{}` (its range is {}..{}) — \
+                                 too large for any fixed-width integer; use `big(\"{text}\")` for an arbitrary-precision BigInt",
+                                w.name(),
+                                w.min(),
+                                w.max()
+                            ),
                             self.span_from(start),
                         )),
                     }
@@ -420,10 +447,20 @@ impl<'a> Lexer<'a> {
                     while depth > 0 {
                         match self.bump() {
                             None | Some(b'\n') => {
+                                // A REAL bug found+fixed (PR-it604, same lexer.rs sweep):
+                                // this used to span from `expr_start` (right AFTER the
+                                // opening `{`), excluding the very delimiter the message
+                                // names ("unterminated `{` interpolation") -- unlike its
+                                // sibling unterminated-construct diagnostics (K0002 block
+                                // comment, K0005 string literal), which both anchor at
+                                // their construct's own opening delimiter. `expr_start -
+                                // 1` is the `{`'s own position, already in hand; `
+                                // expr_start` ITSELF must stay unchanged since it's also
+                                // used below for `StrPart::Expr`'s raw-source offset.
                                 self.diags.push(Diag::error(
                                     "K0007",
                                     "unterminated `{` interpolation in string",
-                                    self.span_from(expr_start),
+                                    self.span_from(expr_start.saturating_sub(1)),
                                 ));
                                 depth = 0;
                             }
@@ -438,7 +475,7 @@ impl<'a> Lexer<'a> {
                                         self.diags.push(Diag::error(
                                             "K0007",
                                             "unterminated `{` interpolation in string",
-                                            self.span_from(expr_start),
+                                            self.span_from(expr_start.saturating_sub(1)),
                                         ));
                                         depth = 0;
                                         break;
@@ -714,6 +751,52 @@ mod tests {
         assert!(s.contains("`i16` holds it"), "signed literal suggests i16: {s}");
         // 70000 overflows u16 -> suggest u32.
         assert!(d("70000u16").contains("`u32` holds it"), "u16 overflow suggests u32");
+    }
+
+    #[test]
+    fn suffixed_overflow_never_silently_drops_the_declared_width() {
+        // Two REAL bugs found+fixed (PR-it604, a lexer.rs sweep mirroring check.rs/
+        // parser.rs's it581-603 findings): an explicit width suffix (`u8`) on an
+        // overflowing literal used to be silently dropped from the error message in
+        // two shapes -- a hex/binary literal too big to fit u64 (fell through to the
+        // generic "does not fit in Int (64-bit)" / "big(...)" message, ignoring the
+        // suffix entirely), and a DECIMAL literal too big to fit even i128 (named the
+        // width but dropped its range and the big(...) fix that its sibling,
+        // `emit_sized`'s own message, always includes).
+        let (_, diags) = lex("0x1FFFFFFFFFFFFFFFFu8"); // too big for u64, fits i128
+        let d = diags.iter().find(|d| d.code == "K0009").expect("K0009, not the generic K0004");
+        assert!(
+            d.message.contains("out of range for `u8`") && d.message.contains("0..255"),
+            "must name the declared width and its range, not silently drop the suffix: {}",
+            d.message
+        );
+
+        let (_, diags) = lex("99999999999999999999999999999999999999999999u8"); // too big even for i128
+        let d = diags.iter().find(|d| d.code == "K0009").expect("K0009");
+        assert!(
+            d.message.contains("out of range for `u8`") && d.message.contains("0..255"),
+            "must show u8's own range even when the value overflows i128: {}",
+            d.message
+        );
+        assert!(
+            d.message.contains("big(\"99999999999999999999999999999999999999999999\")"),
+            "must still name the big(...) fix: {}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn unterminated_interpolation_span_covers_its_opening_brace() {
+        // A REAL bug found+fixed (PR-it604, same sweep): "unterminated `{`
+        // interpolation in string" used to underline starting ONE BYTE AFTER the
+        // `{` it names, unlike its sibling unterminated-construct diagnostics
+        // (K0002 block comment, K0005 string literal), which both anchor at their
+        // construct's own opening delimiter.
+        let src = "\"{abc";
+        let (_, diags) = lex(src);
+        let d = diags.iter().find(|d| d.code == "K0007").expect("K0007");
+        let text = &src[d.span.start as usize..d.span.end as usize];
+        assert!(text.starts_with('{'), "span must include the opening `{{`: {text:?}");
     }
 
     /// A decimal literal too large for i64 is a K0004, and the message now NAMES the fix:
