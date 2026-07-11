@@ -507,6 +507,119 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
     None
 }
 
+/// A callable's parameter labels + full signature label, for `signatureHelp`.
+/// Searches the SAME three sources as `item_signature`'s method/UFCS lookup --
+/// top-level funs (covers plain calls AND UFCS, since `x.free_fn()` resolves
+/// to a top-level `Fun` the same way a direct `free_fn(x)` call would),
+/// component methods (`exposes`/`funs`), and contract methods (`sigs`).
+fn signature_help_info(program: &crate::ast::Program, name: &str) -> Option<(String, Vec<String>)> {
+    use crate::ast::Item;
+    use crate::fmt::ty_str;
+    let params_of = |params: &[crate::ast::Param]| -> Vec<String> {
+        params.iter().map(|p| format!("{}: {}", p.name, ty_str(&p.ty))).collect()
+    };
+    for item in &program.items {
+        match item {
+            Item::Fun(f) if f.name == name => return Some((fun_sig_str(f), params_of(&f.params))),
+            Item::Component(c) => {
+                if let Some(f) = c.exposes.iter().chain(&c.funs).find(|f| f.name == name) {
+                    return Some((fun_sig_str(f), params_of(&f.params)));
+                }
+            }
+            Item::Contract(c) => {
+                if let Some(f) = c.sigs.iter().find(|f| f.name == name) {
+                    return Some((contract_sig_str(f), params_of(&f.params)));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// How many arguments (by SPAN) lie fully before `offset` -- the 0-based
+/// index of the parameter currently being typed. A cursor still inside an
+/// argument's own span counts that argument as active (not yet "past" it);
+/// a cursor at/after a trailing comma counts as having moved to the next one.
+fn active_param_index(spans: impl Iterator<Item = crate::diag::Span>, offset: usize) -> usize {
+    spans.filter(|s| (s.end as usize) <= offset).count()
+}
+
+/// Find the INNERMOST `Call`/`MethodCall` expression whose span contains
+/// `offset` (so `f(g(x, |), y)` at `|` resolves to `g`, not `f`), across
+/// every function-shaped body in the program (top-level funs, component
+/// exposes/funs/handlers, contract laws, top-level laws). Reuses
+/// `effects::walk_block` -- the SAME shared expression walker used by effect
+/// inference (including its match-arm-guard coverage, PR-it584) -- rather
+/// than re-implementing a second, independent AST traversal that could drift
+/// out of sync with it, per this campaign's own sibling-consistency lesson.
+/// Returns (callee/method name, active parameter index).
+fn find_enclosing_call(program: &crate::ast::Program, offset: usize) -> Option<(String, usize)> {
+    use crate::ast::{ExprKind, Item};
+    let mut best: Option<(u32, String, usize)> = None; // (span width, name, active index)
+    let mut consider = |e: &crate::ast::Expr| {
+        let sp = e.span;
+        if (sp.start as usize) > offset || offset > (sp.end as usize) {
+            return;
+        }
+        let width = sp.end - sp.start;
+        let found = match &e.kind {
+            ExprKind::Call { callee, args } => match &callee.kind {
+                ExprKind::Ident(n) => {
+                    Some((n.clone(), active_param_index(args.iter().map(|a| a.value.span), offset)))
+                }
+                _ => None,
+            },
+            ExprKind::MethodCall { name, args, .. } => {
+                Some((name.clone(), active_param_index(args.iter().map(|a| a.span), offset)))
+            }
+            _ => None,
+        };
+        if let Some((n, idx)) = found {
+            if best.as_ref().is_none_or(|(w, _, _)| width < *w) {
+                best = Some((width, n, idx));
+            }
+        }
+    };
+    let mut visit_block = |block: &crate::ast::Block| crate::effects::walk_block(block, &mut consider);
+    for item in &program.items {
+        match item {
+            Item::Fun(f) => visit_block(&f.body),
+            Item::Component(c) => {
+                for f in c.exposes.iter().chain(&c.funs) {
+                    visit_block(&f.body);
+                }
+                for h in &c.handlers {
+                    visit_block(&h.body);
+                }
+            }
+            Item::Contract(c) => {
+                for l in &c.laws {
+                    visit_block(&l.body);
+                }
+            }
+            Item::Law(l) => visit_block(&l.body),
+            _ => {}
+        }
+    }
+    best.map(|(_, name, idx)| (name, idx))
+}
+
+/// `signatureHelp` at an LSP position: the enclosing call's signature label,
+/// its parameter labels, and which parameter is active (clamped into range),
+/// or None if the cursor isn't inside a resolvable call's argument list.
+pub fn resolve_signature_help(text: &str, line: usize, character: usize) -> Option<(String, Vec<String>, usize)> {
+    let offset = offset_at(text, line, character);
+    let (program, diags) = crate::parser::parse(text);
+    if diags.iter().any(|d| d.severity == Severity::Error) {
+        return None;
+    }
+    let (name, active) = find_enclosing_call(&program, offset)?;
+    let (label, params) = signature_help_info(&program, &name)?;
+    let active = if params.is_empty() { 0 } else { active.min(params.len() - 1) };
+    Some((label, params, active))
+}
+
 /// The declaration range (l0, c0, l1, c1) of the top-level item named `name`,
 /// as 0-based LSP positions pointing at the NAME token.
 fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Option<(usize, usize, usize, usize)> {
@@ -1133,7 +1246,7 @@ pub fn serve() -> i32 {
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}},\"signatureHelpProvider\":{{\"triggerCharacters\":[\"(\",\",\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -1215,6 +1328,29 @@ pub fn serve() -> i32 {
                     Some(format!(
                         "{{\"contents\":{{\"kind\":\"markdown\",\"value\":\"{}\"}}}}",
                         json_escape(&md)
+                    ))
+                })()
+                .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/signatureHelp" => {
+                // Parameter hints while typing a call's argument list (PR-it586): the
+                // one commonly-expected LSP capability this server never implemented,
+                // confirmed absent by an explicit method-inventory check.
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let (uri, line, ch) = position_of(p)?;
+                    let text = doc_text(uri, &buffers)?;
+                    let (label, params, active) = resolve_signature_help(&text, line, ch)?;
+                    let param_json: Vec<String> = params
+                        .iter()
+                        .map(|p| format!("{{\"label\":\"{}\"}}", json_escape(p)))
+                        .collect();
+                    Some(format!(
+                        "{{\"signatures\":[{{\"label\":\"{}\",\"parameters\":[{}]}}],\"activeSignature\":0,\"activeParameter\":{active}}}",
+                        json_escape(&label),
+                        param_json.join(",")
                     ))
                 })()
                 .unwrap_or_else(|| "null".into());
@@ -1409,6 +1545,69 @@ mod tests {
     const PROG: &str = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
                         type Shape = Circle(r: Float) | Square(s: Float)\n\
                         fun main() uses io {\n    print(add(1, 2))\n}\n";
+
+    #[test]
+    fn signature_help_reports_params_and_active_index() {
+        // A NEW LSP capability added (PR-it586): parameter hints while typing a call's
+        // argument list. This server implemented hover/definition/completion/rename/
+        // symbols but never signatureHelp -- confirmed absent via an explicit method-
+        // inventory check, a genuinely missing, commonly-expected capability rather
+        // than a bug in an existing one.
+        let call_line = PROG.lines().position(|l| l.contains("print(add(")).unwrap();
+        let line = PROG.lines().nth(call_line).unwrap();
+        let open_paren = line.find("add(").unwrap() + "add(".len();
+
+        // cursor right after `add(`, before any argument -> parameter 0 active.
+        let (label, params, active) = resolve_signature_help(PROG, call_line, open_paren)
+            .expect("signature help inside add(...)'s argument list");
+        assert_eq!(label, "fun add(a: Int, b: Int) -> Int");
+        assert_eq!(params, vec!["a: Int".to_string(), "b: Int".to_string()]);
+        assert_eq!(active, 0, "cursor before any argument must be on parameter 0");
+
+        // cursor just after the comma (into the second argument) -> parameter 1 active.
+        let comma = line.find(',').unwrap();
+        let (_, _, active2) =
+            resolve_signature_help(PROG, call_line, comma + 2).expect("signature help on 2nd arg");
+        assert_eq!(active2, 1, "cursor past the comma must be on parameter 1");
+
+        // outside any call entirely (the `type Shape = ...` line) -> None.
+        let type_line = PROG.lines().position(|l| l.contains("type Shape")).unwrap();
+        assert!(
+            resolve_signature_help(PROG, type_line, 5).is_none(),
+            "no active call on a line with no call at all"
+        );
+    }
+
+    #[test]
+    fn signature_help_resolves_the_innermost_nested_call_and_component_methods() {
+        // Nested calls: signature help for `outer(inner(1, |), 3)` at `|` must resolve
+        // to `inner`'s signature (the INNERMOST enclosing call), not `outer`'s --
+        // `find_enclosing_call` picks the SMALLEST containing span for exactly this
+        // reason. Also covers a component's `expose fun` method, both via a direct
+        // `recv.method(...)` call site (PR-it586).
+        let src = "fun inner(x: Int, y: Int) -> Int { x + y }\n\
+                   fun outer(a: Int, b: Int) -> Int { a + b }\n\
+                   component Greeter {\n    intent \"g\"\n    expose fun greet(name: Str, loud: Bool) -> Str { name }\n}\n\
+                   fun main() uses io {\n    \
+                   print(outer(inner(1, 2), 3))\n    \
+                   let g = Greeter()\n    \
+                   print(g.greet(\"x\", true))\n}\n";
+
+        let nested_line = src.lines().position(|l| l.contains("outer(inner(")).unwrap();
+        let line = src.lines().nth(nested_line).unwrap();
+        let inner_open = line.find("inner(").unwrap() + "inner(".len();
+        let (label, ..) =
+            resolve_signature_help(src, nested_line, inner_open).expect("signature help inside inner(...)");
+        assert!(label.starts_with("fun inner("), "must resolve the innermost call: {label}");
+
+        let method_line = src.lines().position(|l| l.contains("g.greet(")).unwrap();
+        let mline = src.lines().nth(method_line).unwrap();
+        let greet_open = mline.find("greet(").unwrap() + "greet(".len();
+        let (label2, params2, _) =
+            resolve_signature_help(src, method_line, greet_open).expect("signature help on a method call");
+        assert!(label2.contains("greet(name: Str, loud: Bool)"), "{label2}");
+        assert_eq!(params2, vec!["name: Str".to_string(), "loud: Bool".to_string()]);
+    }
 
     #[test]
     fn hover_and_definition_work_on_component_methods() {
