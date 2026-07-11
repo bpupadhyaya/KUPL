@@ -410,6 +410,22 @@ fn fun_sig_str(f: &crate::ast::FunDecl) -> String {
     format!("{kw} {}({}){ret}{eff}", f.name, params.join(", "))
 }
 
+/// Render a contract's body-less method signature (`expose fun name(params) ->
+/// ret uses effects`) -- same shape as `fun_sig_str`, but `ast::FunSig` (a
+/// contract method) has no body/`ai` field, unlike `ast::FunDecl`.
+fn contract_sig_str(f: &crate::ast::FunSig) -> String {
+    use crate::fmt::ty_str;
+    let params: Vec<String> =
+        f.params.iter().map(|p| format!("{}: {}", p.name, ty_str(&p.ty))).collect();
+    let ret = f.ret.as_ref().map(|r| format!(" -> {}", ty_str(r))).unwrap_or_default();
+    let eff = if f.effects.is_empty() {
+        String::new()
+    } else {
+        format!(" uses {}", f.effects.join(", "))
+    };
+    format!("expose fun {}({}){ret}{eff}", f.name, params.join(", "))
+}
+
 fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
     use crate::ast::Item;
     use crate::fmt::ty_str;
@@ -476,6 +492,17 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
                 return Some(format!("{}\n// method of component {}", fun_sig_str(f), c.name));
             }
         }
+        // A contract's exposed method signature -- the same gap class as
+        // component methods above, but never mirrored for `ContractDecl.sigs`:
+        // hovering a contract method (its own declaration inside `contract { }`,
+        // or a `recv.method(...)` call site on a contract-typed receiver)
+        // returned no hover at all, since only the contract's OWN name was
+        // ever matched, never its nested `sigs` list (PR-it571).
+        if let Item::Contract(c) = item {
+            if let Some(f) = c.sigs.iter().find(|f| f.name == name) {
+                return Some(format!("{}\n// method of contract {}", contract_sig_str(f), c.name));
+            }
+        }
     }
     None
 }
@@ -494,6 +521,9 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
         // above: "go to definition" on a component method used to find nothing
         // because only TOP-LEVEL items were searched (PR-it513).
         Item::Component(c) => c.exposes.iter().chain(&c.funs).find(|f| f.name == name).map(|f| f.span),
+        // A contract's exposed method signature -- same gap, never mirrored for
+        // `ContractDecl.sigs` (PR-it571).
+        Item::Contract(c) => c.sigs.iter().find(|f| f.name == name).map(|f| f.span),
         _ => None,
     })?;
     // locate the name token within the declaration for a precise range
@@ -736,7 +766,15 @@ fn item_completions(program: &crate::ast::Program) -> Vec<(String, u8, String)> 
                     out.push((s.name.clone(), 6, format!("state {}", s.name))); // 6 = Variable
                 }
             }
-            Item::Contract(c) => out.push((c.name.clone(), 8, format!("contract {}", c.name))), // 8 = Interface
+            Item::Contract(c) => {
+                out.push((c.name.clone(), 8, format!("contract {}", c.name))); // 8 = Interface
+                // Contract method signatures used to be completely invisible to
+                // completion -- only the contract's OWN name was listed, the same
+                // gap class fixed for component methods/state above (PR-it571).
+                for f in &c.sigs {
+                    out.push((f.name.clone(), 3, contract_sig_str(f))); // 3 = Function
+                }
+            }
             _ => {}
         }
     }
@@ -1415,6 +1453,60 @@ mod tests {
         let ch4 = src.lines().nth(comp_line).unwrap().find("Greeter").unwrap() + 1;
         let h_comp = resolve_hover(src, comp_line, ch4).expect("hover on component ctor call");
         assert!(h_comp.contains("component Greeter"), "{h_comp}");
+    }
+
+    #[test]
+    fn hover_and_definition_work_on_contract_methods() {
+        // The exact same gap class as it513's component-method fix (above), just never
+        // mirrored for `ContractDecl.sigs`: hovering on a contract's exposed method --
+        // its own declaration inside `contract { }`, OR a `recv.method(...)` call site
+        // on a contract-typed receiver -- returned NO hover at all, and "go to
+        // definition" found nothing either, since item_signature/item_definition's
+        // component-method fallthrough only ever looked at Item::Component, never
+        // Item::Contract's own `sigs` list. Only hovering on the contract's OWN name
+        // worked (PR-it571). `FunSig` (a contract method) has no body/`ai` field unlike
+        // `FunDecl`, so a small analogous `contract_sig_str` formatter was added rather
+        // than reusing `fun_sig_str` directly.
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n}\nfun use_it(s: Store) -> Int {\n    s.get(\"x\")\n}\n";
+
+        // hover on the method's own declaration inside the contract
+        let decl_line = src.lines().position(|l| l.contains("expose fun get")).unwrap();
+        let ch = src.lines().nth(decl_line).unwrap().find("get").unwrap() + 1;
+        let h_decl = resolve_hover(src, decl_line, ch).expect("hover on contract method decl");
+        assert!(h_decl.contains("expose fun get(k: Str) -> Int"), "{h_decl}");
+        assert!(h_decl.contains("method of contract Store"), "{h_decl}");
+
+        // hover on a `recv.method(...)` CALL SITE on a contract-typed receiver
+        let call_line = src.lines().position(|l| l.contains("s.get")).unwrap();
+        let ch2 = src.lines().nth(call_line).unwrap().find("get").unwrap() + 1;
+        let h_call = resolve_hover(src, call_line, ch2).expect("hover on contract method call site");
+        assert!(h_call.contains("expose fun get(k: Str) -> Int"), "{h_call}");
+
+        // go-to-definition on the call site resolves to the method's OWN declaration line
+        let (l0, c0, _, _) = resolve_definition(src, call_line, ch2).expect("definition of get");
+        assert_eq!(l0, decl_line, "definition should point at the `expose fun get` line");
+        assert_eq!(c0, src.lines().nth(decl_line).unwrap().find("get").unwrap());
+
+        // the contract's own name still hovers as before (no regression)
+        let param_line = src.lines().position(|l| l.contains("s: Store")).unwrap();
+        let ch3 = src.lines().nth(param_line).unwrap().find("Store").unwrap() + 1;
+        let h_contract = resolve_hover(src, param_line, ch3).expect("hover on contract type name");
+        assert!(h_contract.contains("contract Store"), "{h_contract}");
+    }
+
+    #[test]
+    fn completions_include_contract_methods() {
+        // Same gap class as it514's component-method/state completion fix, mirrored for
+        // contracts: a contract's exposed method signatures were completely invisible to
+        // completion -- only the contract's OWN name was listed (PR-it571).
+        let src = "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n}\n";
+        let items = completions(src);
+        let labels: Vec<&str> = items.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert!(labels.contains(&"Store"), "the contract's own name is still listed: {labels:?}");
+        assert!(labels.contains(&"get"), "contract method must be a completion candidate: {labels:?}");
+        let get = items.iter().find(|(l, _, _)| l == "get").unwrap();
+        assert_eq!(get.1, 3, "method completion kind must be Function (3)");
+        assert!(get.2.contains("expose fun get(k: Str) -> Int"), "{get:?}");
     }
 
     #[test]
