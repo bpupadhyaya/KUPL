@@ -4483,7 +4483,16 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "max")) return k_int(recv.as.i > args[0].as.i ? recv.as.i : args[0].as.i);
         if (!strcmp(name, "pow")) {
             int64_t e = args[0].as.i;
-            if (e < 0) k_panic("`pow` needs a non-negative exponent");
+            /* A REAL cross-engine bug (PR-it599, from the SAME sibling-dispatch sweep
+               as it596): interp.rs's exponent is passed to Rust's `checked_pow`, which
+               takes a `u32`, so its guard is `e >= 0 && e <= u32::MAX as i64` -- an
+               exponent ABOVE u32::MAX (not just a negative one) ALSO reports "needs a
+               non-negative exponent" there (and in the VM, which shares that arm) --
+               this loop had no such upper bound at all, so a huge exponent either
+               looped until it overflowed with the WRONG message, or (base 0/1/-1,
+               which never overflow) silently returned a real result instead of
+               panicking like both reference engines do. */
+            if (e < 0 || e > (int64_t)UINT32_MAX) k_panic("`pow` needs a non-negative exponent");
             int64_t r = 1, base = recv.as.i;
             for (int64_t i = 0; i < e; i++)
                 if (__builtin_mul_overflow(r, base, &r)) k_panic("integer overflow in pow");
@@ -9588,6 +9597,34 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         let long = "x".repeat(200);
         let src = format!("fun main() uses io {{\n    print(big(\"{long}\"))\n}}\n");
         assert_panic_wording_matches(&src, "bigtrail");
+    }
+
+    /// A REAL cross-engine bug (PR-it599, found by sweeping cgen.rs's LARGE per-method
+    /// builtin dispatch chain for the SAME "does every sibling type handle this
+    /// consistently" pattern that found it596's Rational-`%` bug): interp.rs's
+    /// `Int.pow()` passes its exponent to Rust's `checked_pow`, which takes a `u32`,
+    /// so the guard is `e >= 0 && e <= u32::MAX as i64` -- an exponent ABOVE
+    /// `u32::MAX` (not just a negative one) ALSO reports "needs a non-negative
+    /// exponent" there and in the VM. Native's C loop had no upper bound at all, so a
+    /// huge exponent either looped until it overflowed with the WRONG panic message,
+    /// or (base 0/1/-1, which never overflow) silently returned a real result where
+    /// both reference engines panic.
+    #[test]
+    fn native_int_pow_huge_exponent_panic_matches_interp_wording() {
+        // base 2: native used to overflow-panic with the WRONG message.
+        assert_panic_wording_matches(
+            "fun main() uses io {\n    print(2.pow(5000000000))\n}\n",
+            "powwrongmsg",
+        );
+        // base 1: native used to SILENTLY SUCCEED (1^anything = 1, never overflows) --
+        // the worse divergence, since it's not even a panic-wording mismatch, it's a
+        // missing panic entirely. assert_panic_wording_matches itself asserts the
+        // interpreter panics, so this line alone catches a native regression back to
+        // "succeeds instead of panicking".
+        assert_panic_wording_matches(
+            "fun main() uses io {\n    print(1.pow(5000000000))\n}\n",
+            "powsilent",
+        );
     }
 
     /// `if let` / `while let` (it58) desugar to match, so they compile to
