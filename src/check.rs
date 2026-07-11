@@ -1823,7 +1823,7 @@ impl Checker {
                         };
                         self.err(
                             "K0238",
-                            format!("`?` requires the enclosing function to return a Result, but it returns {r}{hint}"),
+                            format!("`?` on a Result requires the enclosing function to return a Result, but it returns {r}{hint}"),
                             expr.span,
                         );
                     } else {
@@ -2854,7 +2854,7 @@ impl Checker {
                     None => {
                         // Same courtesy for contract dynamic dispatch: name the closest
                         // contract function instead of a bare "has no function" (PR-it477).
-                        let mut m = format!("contract `{cname}` has no function named `{name}`");
+                        let mut m = format!("contract `{cname}` does not expose a function named `{name}`");
                         if let Some(s) = suggest(name, sig.sigs.keys().map(|k| k.as_str())) {
                             m.push_str(&format!(" — did you mean `{s}`?"));
                         }
@@ -3538,6 +3538,22 @@ mod generic_tests {
             errors(mismatch2).iter().any(|d| d.code == "K0238" && d.message.contains("`.ok()?`")),
             "Result ? in an Option fun must hint .ok: {:?}",
             errors(mismatch2).iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        // A REAL bug found+fixed (PR-it591, message-template-consistency sweep #3 of
+        // check.rs -- did-you-mean coverage it581/582 and span precision it585 were the
+        // first two): the Option branch led with "`?` on an Option requires...", but the
+        // Result branch dropped the mirror-image "on a Result" clause ("`?` requires the
+        // enclosing function to return a Result..."), despite both being the identical
+        // operand-family-vs-return-type mismatch reworded only by which family is which.
+        assert!(
+            errors(mismatch1).iter().any(|d| d.code == "K0238" && d.message.starts_with("`?` on an Option requires")),
+            "{:?}",
+            errors(mismatch1)
+        );
+        assert!(
+            errors(mismatch2).iter().any(|d| d.code == "K0238" && d.message.starts_with("`?` on a Result requires")),
+            "the Result branch must lead with the same \"on a Result\" clause the Option branch uses: {:?}",
+            errors(mismatch2)
         );
     }
 
@@ -4304,6 +4320,25 @@ mod generic_tests {
         );
         // A real exposed function still type-checks.
         assert!(errors("component C {\n    intent \"c\"\n    state n: Int = 0\n    expose fun bump() -> Int { n = n + 1\n        n }\n}\nfun main() { let c = C()\n    let _ = c.bump() }\n").is_empty());
+    }
+
+    #[test]
+    fn k0247_wording_is_consistent_between_component_and_contract_dispatch() {
+        // A REAL bug found+fixed (PR-it591, message-template-consistency sweep #3 of
+        // check.rs): the COMPONENT branch of K0247's unknown-method diagnostic (tested
+        // above) says "does not expose a function named", but the CONTRACT branch
+        // (dynamic dispatch through a contract-typed value) said "has no function named"
+        // instead -- different wording for the identical situation, even though contracts
+        // ALSO declare their signatures with `expose fun`, so the component branch's
+        // wording fits the contract case equally well.
+        let contract = errors(
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n}\n\
+             fun use_it(s: Store) {\n    s.frobnicate()\n}\n",
+        );
+        assert!(
+            contract.iter().any(|d| d.code == "K0247" && d.message.contains("does not expose a function named `frobnicate`")),
+            "{contract:?}"
+        );
     }
 
     #[test]
