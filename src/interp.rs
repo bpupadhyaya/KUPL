@@ -3758,6 +3758,12 @@ pub fn http_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
 /// Parse an HTTP request line (`METHOD PATH HTTP/1.1`) into (method, path).
 pub fn parse_request_line(head: &str) -> (String, String) {
     let line = head.lines().next().unwrap_or("");
+    // A raw socket read can legitimately contain an embedded NUL (e.g. a
+    // deliberately malformed request); strip it before splitting so `method`/
+    // `path` can never violate K0008 (KUPL strings are NUL-free) — mirrors the
+    // native runtime's equivalent buffer sanitizing (PR-it577).
+    let line: std::borrow::Cow<str> =
+        if line.contains('\0') { line.replace('\0', "").into() } else { line.into() };
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("GET").to_string();
     let path = parts.next().unwrap_or("/").to_string();
@@ -3854,7 +3860,17 @@ pub fn exec_builtin(args: &[Value]) -> Result<Value, String> {
             Err(_) => Ok(Value::err(Value::str("command output is not valid UTF-8".to_string()))),
         }
     } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // Same K0008 rule as the stdout success path above: a NUL byte or invalid
+        // UTF-8 in stderr can't become a valid KUPL Str. Rather than truncate at
+        // the NUL (a native-only divergence like the stdout case would have) or
+        // lossily replace invalid bytes (which native can't cheaply mirror byte-
+        // for-byte here), fall back to the SAME generic exit-status message the
+        // "stderr is empty" branch below already uses — the process genuinely
+        // did fail; only the diagnostic TEXT is unrepresentable (PR-it577).
+        let err = match std::str::from_utf8(&out.stderr) {
+            Ok(s) if !s.as_bytes().contains(&0) => s.trim().to_string(),
+            _ => String::new(),
+        };
         let msg = if err.is_empty() {
             format!("exited with status {}", out.status.code().unwrap_or(-1))
         } else {
@@ -3879,14 +3895,31 @@ fn run_curl(mut cmd: std::process::Command, body: Option<String>) -> Result<Stri
     }
     let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // Same fallback-on-unrepresentable-message strategy as exec_builtin's
+        // equivalent error path (PR-it577): a NUL byte or invalid UTF-8 in
+        // curl's stderr can't become a valid KUPL Str (K0008).
+        let err = match std::str::from_utf8(&out.stderr) {
+            Ok(s) if !s.as_bytes().contains(&0) => s.trim().to_string(),
+            _ => String::new(),
+        };
         return Err(if err.is_empty() {
             format!("request failed (curl exit {})", out.status.code().unwrap_or(-1))
         } else {
             err
         });
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    // A KUPL string must be valid UTF-8 and NUL-free (K0008) — reject a binary/
+    // invalid response body rather than pass it through raw (native's C-string
+    // Str representation can't do so safely either); this success path
+    // previously had NO such check at all, unlike exec_builtin's stdout guard
+    // (PR-it577) — a real, non-adversarial gap: any http_get/http_post against
+    // a binary resource (an image, say) used to silently smuggle a K0008-
+    // violating Str into the program instead of a clean Err.
+    match String::from_utf8(out.stdout) {
+        Ok(s) if !s.as_bytes().contains(&0) => Ok(s),
+        Ok(_) => Err("response body contains a NUL byte".to_string()),
+        Err(_) => Err("response body is not valid UTF-8".to_string()),
+    }
 }
 
 /// File I/O builtins — shared by interpreter and KVM. Effect `io.fs`.

@@ -2075,6 +2075,32 @@ static void kb_write(KBuf* b, const char* s, long n) { kb_grow(b, n); memcpy(b->
    the interpreter/KVM's shared `exec_builtin` — avoids this by reading both
    streams on separate threads; poll() gets the same "never block on the wrong
    fd" property without needing real threads in the generated C. */
+static int k_valid_utf8(const unsigned char* b, size_t n); /* defined later; fwd-decl */
+/* Trim a captured-stderr KBuf and return a heap Str, or NULL if -- after
+   trimming -- it's empty, contains an embedded NUL, or isn't valid UTF-8
+   (KUPL strings are NUL-free + valid UTF-8, K0008). Byte-length-based (uses
+   `er->len`, never `strlen`), unlike the OLD trimming code here, which used
+   `strlen(e)` to find the trimmed length -- silently truncating at an
+   embedded NUL rather than detecting it, so a subprocess/curl invocation
+   whose stderr happened to contain a raw NUL byte produced a corrupted,
+   K0008-violating error Str on native with NO indication anything was lost
+   (PR-it577; mirrors interp::exec_builtin's/run_curl's equivalent fallback
+   to a generic exit-status message on the same condition). */
+static char* k_trim_stderr_or_null(KBuf* er) {
+    if (!er->buf) return 0;
+    const char* e = er->buf; long elen = (long)er->len;
+    long start = 0;
+    while (start < elen && (e[start] == ' ' || e[start] == '\t' || e[start] == '\n' || e[start] == '\r')) start++;
+    long end = elen;
+    while (end > start && (e[end-1] == ' ' || e[end-1] == '\t' || e[end-1] == '\n' || e[end-1] == '\r')) end--;
+    long tlen = end - start;
+    if (tlen <= 0) return 0;
+    if (memchr(e + start, 0, (size_t)tlen)) return 0;
+    if (!k_valid_utf8((const unsigned char*)(e + start), (size_t)tlen)) return 0;
+    char* out = (char*)k_alloc((size_t)tlen + 1);
+    memcpy(out, e + start, (size_t)tlen); out[tlen] = 0;
+    return out;
+}
 static void k_drain_two_pipes(int out_fd, int err_fd, KBuf* out, KBuf* er) {
     char buf[4096];
     struct pollfd pfds[2] = { { out_fd, POLLIN, 0 }, { err_fd, POLLIN, 0 } };
@@ -2123,17 +2149,23 @@ static KValue k_run_curl(char* const argv[], const char* body) {
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code == 127) return k_err(k_str("cannot run curl: command not found"));
     if (code != 0) {
-        char* e = er.buf ? er.buf : (char*)"";
-        while (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r') e++;      /* trim start */
-        long len = (long)strlen(e);
-        while (len > 0 && (e[len-1] == ' ' || e[len-1] == '\t' || e[len-1] == '\n' || e[len-1] == '\r')) e[--len] = 0;
-        if (len > 0) return k_err(k_str(e));
+        char* e = k_trim_stderr_or_null(&er);
+        if (e) return k_err(k_str(e));
         char m[64]; snprintf(m, sizeof m, "request failed (curl exit %d)", code);
         return k_err(k_str(m));
     }
+    /* KUPL strings are NUL-free + valid UTF-8 (K0008) -- reject a binary/
+       invalid response body rather than pass it through raw, which native's
+       C-string Str representation cannot do safely and which would diverge
+       from the interpreter's own equivalent stdout guard (PR-it577; this
+       success path previously had NO such check at all, unlike exec's). */
+    if (out.buf) {
+        if (memchr(out.buf, 0, out.len)) return k_err(k_str("response body contains a NUL byte"));
+        if (!k_valid_utf8((const unsigned char*)out.buf, out.len))
+            return k_err(k_str("response body is not valid UTF-8"));
+    }
     return k_ok(k_str(out.buf ? out.buf : (char*)""));
 }
-static int k_valid_utf8(const unsigned char* b, size_t n); /* defined later; fwd-decl */
 /* exec(program, args) — fork/execvp an arbitrary program (no shell), capture
    stdout. Ok(stdout) on exit 0, else Err(trimmed stderr | "exited with status N"
    | "cannot run …"). Mirrors interp::exec_builtin's decision + shape. */
@@ -2179,11 +2211,8 @@ static KValue k_exec(KValue prog, KValue arglist) {
     int status = 0; waitpid(pid, &status, 0);
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code != 0) {
-        char* e = er.buf ? er.buf : (char*)"";
-        while (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r') e++;
-        long len = (long)strlen(e);
-        while (len > 0 && (e[len-1] == ' ' || e[len-1] == '\t' || e[len-1] == '\n' || e[len-1] == '\r')) e[--len] = 0;
-        if (len > 0) return k_err(k_str(k_strdup(e)));
+        char* e = k_trim_stderr_or_null(&er);
+        if (e) return k_err(k_str(e));
         char m[64]; snprintf(m, sizeof m, "exited with status %d", code);
         return k_err(k_str(k_strdup(m)));
     }
@@ -2294,6 +2323,20 @@ static KValue k_remove_dir(KValue path) {
     return k_ok(k_unit());
 }
 
+/* Find `needle` (length `nlen`) within `hay` (length `hlen`); byte-safe over
+   the ACTUAL length, unlike `strstr`, which treats `hay` as a NUL-terminated
+   C string and stops at the first embedded NUL. A raw socket read can
+   legitimately contain a NUL byte anywhere in the request head; `strstr`
+   being blind to anything past it meant `k_http_serve`'s header-terminator
+   search could never "see" a real `\r\n\r\n` that came after one, so the
+   read loop blocked forever waiting for more bytes the client would never
+   send -- a genuine, single-request DoS against the whole (single-threaded,
+   sequential-accept) server (PR-it577). */
+static const char* k_memfind(const char* hay, long hlen, const char* needle, long nlen) {
+    if (nlen == 0 || hlen < nlen) return 0;
+    for (long i = 0; i <= hlen - nlen; i++) if (memcmp(hay + i, needle, (size_t)nlen) == 0) return hay + i;
+    return 0;
+}
 /* http_serve(port, handler): a blocking HTTP server mirroring
    interp::serve_http. Binds 127.0.0.1:port, and for each request calls the KUPL
    handler value with (method, path) to get the response body. Err on bind
@@ -2321,8 +2364,20 @@ static KValue k_http_serve(KValue port, KValue handler) {
         char buf[1024]; ssize_t n;
         while ((n = read(conn, buf, sizeof buf)) > 0) {
             kb_write(&head, buf, n);
-            if (head.len >= 4 && strstr(head.buf, "\r\n\r\n")) break;
+            if (head.len >= 4 && k_memfind(head.buf, (long)head.len, "\r\n\r\n", 4)) break;
             if (head.len > 64 * 1024) break;
+        }
+        /* Strip any embedded NUL from the request head before the strchr/strstr-
+           based parsing below, which -- like the OLD terminator search -- treats
+           the buffer as a NUL-terminated C string and would otherwise silently
+           truncate `method`/`path` at the first one. KUPL strings are NUL-free
+           (K0008); mirrors interp::parse_request_line's equivalent sanitizing
+           (PR-it577). */
+        if (head.buf) {
+            long w = 0;
+            for (long r = 0; r < (long)head.len; r++) if (head.buf[r] != 0) head.buf[w++] = head.buf[r];
+            head.len = (size_t)w;
+            head.buf[head.len] = 0;
         }
         /* parse the request line: METHOD PATH HTTP/1.1 */
         const char* method = "GET";
@@ -5477,6 +5532,59 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         assert_eq!(native_main_stdout(ok, "execok").trim(), "ok:hi");
     }
 
+    /// A REAL BUG found+fixed (PR-it577), the STDERR twin of `native_exec_matches_interp`'s
+    /// already-locked stdout NUL rejection above: `k_exec`'s ERROR path (stderr, on a
+    /// nonzero exit) used `strlen(e)` to find the trimmed message length -- silently
+    /// TRUNCATING at an embedded NUL rather than detecting it (unlike the stdout success
+    /// path, which already correctly rejected one). A subprocess whose stderr happened to
+    /// contain a raw NUL byte produced a corrupted, K0008-violating `Err` Str on native
+    /// with no indication anything was lost, diverging from interp/vm (which now fall
+    /// back to the SAME generic "exited with status N" message the empty-stderr case
+    /// already used, since the diagnostic TEXT itself is unrepresentable as a KUPL Str).
+    #[test]
+    fn native_exec_stderr_with_a_nul_byte_falls_back_to_the_exit_status_message() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   match exec(\"sh\", [\"-c\", \"printf 'a\\\\000b' 1>&2; exit 1\"]) { Ok(s) => print(\"ok:{s}\"), Err(e) => print(\"err:{e}\") }\n}\n";
+        assert_eq!(native_main_stdout(src, "execstderrnul").trim(), "err:exited with status 1");
+    }
+
+    /// A REAL, non-adversarial BUG found+fixed (PR-it577): `k_run_curl`'s SUCCESS path
+    /// (used by `http_get`/`http_post`) had NO K0008 (NUL-free + valid-UTF-8) check on the
+    /// response body AT ALL, unlike `k_exec`'s equivalent stdout guard -- so fetching any
+    /// binary resource (an image, say) over `http_get` would silently smuggle a corrupted
+    /// (native truncates a C string at the first NUL) or outright invalid-UTF-8 `Str`
+    /// value into the running program instead of a clean `Err`, exactly the kind of
+    /// K0008 violation it575/it576 already closed for JSON/query_parse/date-time. Spinning
+    /// up a real HTTP server that returns a NUL byte in its body is exercised live (not
+    /// simulated) here since KUPL itself can never CONSTRUCT a NUL-containing Str to test
+    /// with directly.
+    #[test]
+    fn native_http_get_rejects_a_response_body_containing_a_nul_byte() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        // A minimal raw HTTP/1.0 server (plain std::net, no KUPL involved) that always
+        // answers with a 3-byte body containing an embedded NUL.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\na\x00b");
+            }
+        });
+        let src = format!(
+            "fun main() uses io {{\n    match http_get(\"http://127.0.0.1:{port}/\") {{ Ok(b) => print(\"ok:{{b.len()}}\"), Err(e) => print(\"err:{{e}}\") }}\n}}\n"
+        );
+        assert_eq!(native_main_stdout(&src, "curlnul").trim(), "err:response body contains a NUL byte");
+        let _ = server.join();
+    }
+
     /// Native string interpolation renders mixed value types + literal braces
     /// identically to the interpreter. PR-it50.
     #[test]
@@ -8472,6 +8580,82 @@ fun main() uses io {
             let _ = s2.read_to_string(&mut resp2);
             if !resp2.contains("HTTP/1.1 200 OK") || !resp2.ends_with("ok /ok") {
                 return Err(format!("bad post-panic response: {resp2:?}"));
+            }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
+    /// A REAL, SEVERE BUG found+fixed (PR-it577): native's `k_http_serve` searched for
+    /// the request head's `\r\n\r\n` terminator with `strstr`, a NUL-TERMINATED-string
+    /// function -- a raw socket read can legitimately contain an embedded NUL byte
+    /// ANYWHERE (a malformed/adversarial request line), and `strstr` is blind to
+    /// anything past the first one, so it could never "see" the real terminator that
+    /// followed. The read loop then blocked forever waiting for bytes the client would
+    /// never send. Since `k_http_serve` is a single-threaded, sequential accept-then-
+    /// read loop, ONE connection sending a NUL-laced request and simply holding the
+    /// socket open was a complete, trivially-triggered DENIAL OF SERVICE against the
+    /// WHOLE server -- no other client could ever be served again. interp/vm's
+    /// `serve_http` never had this bug (it searches the raw byte buffer directly,
+    /// `buf.windows(4).any(|w| w == b"\r\n\r\n")`, unaffected by embedded NULs). Fixed by
+    /// replacing the `strstr` terminator search with a byte-length-based `k_memfind`,
+    /// AND stripping any embedded NUL from the request head before the (still
+    /// `strchr`-based) method/path field extraction -- matching a parallel fix in
+    /// `interp::parse_request_line`, which now strips NUL the same way (K0008: KUPL
+    /// strings are NUL-free), so `method`/`path` agree byte-for-byte across engines
+    /// even for a deliberately malformed request.
+    #[test]
+    fn native_http_serve_survives_a_nul_byte_in_the_request_head() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str) -> Str { \"{m.len()} {p.len()}\" }\n\
+                   fun main() uses io { let _ = http_serve(38123, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srvnul-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let connect = || {
+            for _ in 0..300 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38123u16)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        let result = (|| {
+            // request 1: a NUL byte embedded in the path ("/a\0b") -- must get a clean,
+            // PROMPT response (the NUL stripped, path length 3) instead of the connection
+            // (and the WHOLE server) hanging forever waiting for a terminator strstr can't see.
+            let mut s1 = connect().ok_or("server should be listening")?;
+            s1.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s1.write_all(b"GET /a\x00b HTTP/1.1\r\nHost: x\r\n\r\n").map_err(|e| e.to_string())?;
+            let mut resp1 = String::new();
+            let _ = s1.read_to_string(&mut resp1);
+            if !resp1.contains("HTTP/1.1 200 OK") || !resp1.ends_with("3 3") {
+                return Err(format!("bad NUL-request response (or it hung): {resp1:?}"));
+            }
+            // request 2: a FRESH connection -- proves the server is still alive and
+            // serving normally, not wedged by the first (adversarial) connection.
+            let mut s2 = connect().ok_or("server should still be listening after the NUL request")?;
+            s2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s2.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n").map_err(|e| e.to_string())?;
+            let mut resp2 = String::new();
+            let _ = s2.read_to_string(&mut resp2);
+            if !resp2.contains("HTTP/1.1 200 OK") || !resp2.ends_with("3 3") {
+                return Err(format!("bad post-NUL response: {resp2:?}"));
             }
             Ok::<(), String>(())
         })();
