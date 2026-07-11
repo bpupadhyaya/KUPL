@@ -2861,9 +2861,30 @@ static KReAlts kre_alternation(KReP* p) {
 static KRegex k_re_compile(const char* pat) {
     KReP p; p.s = (const unsigned char*)pat; p.pos = 0; p.len = (int)strlen(pat); p.aend = 0; p.err = 0; p.msg = "";
     KRegex re; re.astart = 0; re.aend = 0;
+    /* holds the trailing-metacharacter message below -- must outlive `p.msg`
+       being read by the final snprintf a few lines down, so it's a plain
+       function-scope local (thread-safe, no `static`), not a nested-block one. */
+    char trailing_msg[40];
     if (kre_peek(&p) == '^') { re.astart = 1; p.pos++; }
     re.alts = kre_alternation(&p);
-    if (!p.err && p.pos != p.len) { p.err = 1; p.msg = "unexpected metacharacter in pattern"; }
+    if (!p.err && p.pos != p.len) {
+        /* A REAL cross-engine bug (PR-it595): regex.rs's `compile()` names the
+           actual leftover character ("unexpected `)` in pattern"), but this used
+           to be a static "unexpected metacharacter in pattern" with no character
+           -- confirmed diverging LIVE across all three engines on `re_match("a)",
+           "a)")` (interp/vm said "unexpected `)` in pattern", native said the
+           generic fallback). Decode the one codepoint at `p.pos` (`kre_utf8_cp`,
+           already used throughout this parser for pattern/subject characters) and
+           copy its raw UTF-8 bytes into the message, matching regex.rs exactly. */
+        int clen;
+        kre_utf8_cp(p.s, p.len, p.pos, &clen);
+        char raw[8];
+        memcpy(raw, p.s + p.pos, (size_t)clen);
+        raw[clen] = 0;
+        snprintf(trailing_msg, sizeof trailing_msg, "unexpected `%s` in pattern", raw);
+        p.err = 1;
+        p.msg = trailing_msg;
+    }
     re.aend = p.aend;
     if (p.err) { char b[128]; snprintf(b, sizeof b, "invalid regex: %s", p.msg); k_panic(b); }
     return re;
@@ -9377,6 +9398,53 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         ] {
             assert_eq!(native_main_stdout(src, "re"), expected, "src: {src}");
         }
+    }
+
+    /// A REAL cross-engine bug (PR-it595): `regex.rs`'s `compile()` names the
+    /// actual leftover character in its "unexpected `X` in pattern" panic
+    /// (interp/KVM share this code), but native's C mirror (`k_re_compile`) used
+    /// to emit a static, character-less "unexpected metacharacter in pattern"
+    /// instead -- a wording divergence `sweep2.sh`'s curated corpus never
+    /// exercises (it has no regex examples), so it slipped through undetected.
+    #[test]
+    fn native_regex_trailing_char_panic_matches_interp_wording() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print(re_match(\"a)\", \"a)\"))\n}\n";
+        // the interpreter is the reference semantics -- confirm ITS wording first.
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Err(crate::interp::Flow::Panic { msg, .. }) => {
+                assert!(msg.contains("unexpected `)` in pattern"), "{msg}");
+            }
+            Ok(_) => panic!("a stray `)` must panic, not succeed"),
+            Err(_) => panic!("a stray `)` must panic with Flow::Panic specifically"),
+        }
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-retrail-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let out = std::process::Command::new(&bin).output().unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unexpected `)` in pattern"),
+            "native must name the offending character exactly like the interpreter does: {stderr:?}"
+        );
     }
 
     /// `if let` / `while let` (it58) desugar to match, so they compile to
