@@ -1477,6 +1477,15 @@ static KValue k_rem(KValue a, KValue b) {
     if (a.tag == K_FLOAT && b.tag == K_FLOAT) return k_float(fmod(a.as.f, b.as.f));
     if (a.tag == K_F32 && b.tag == K_F32) return k_f32(fmodf(a.as.f32v, b.as.f32v));
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 4);
+    /* A REAL cross-engine bug (PR-it596): unlike its add/sub/mul/div siblings
+       above, this was MISSING a K_RATIONAL case entirely, so `Rational %
+       Rational` (statically permitted -- check.rs allows `%` on any numeric
+       type) fell all the way through to the generic "invalid operand types"
+       panic below instead of interp.rs's specific "Rational remainder is not
+       supported" (Rem is deliberately unimplemented for Rational, not a type
+       error) -- confirmed diverging LIVE (interp/vm said the specific
+       message, native said the generic one). */
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) k_panic("Rational remainder is not supported");
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("rem", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -9444,6 +9453,53 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         assert!(
             stderr.contains("unexpected `)` in pattern"),
             "native must name the offending character exactly like the interpreter does: {stderr:?}"
+        );
+    }
+
+    /// A REAL cross-engine bug (PR-it596, found via the SAME panic-wording sweep
+    /// that found it595's regex bug): `k_rem`'s add/sub/mul/div siblings all have a
+    /// `K_RATIONAL` case, but `k_rem` used to lack one entirely, so `Rational %
+    /// Rational` (statically permitted -- `%` is allowed on any numeric type) fell
+    /// through to the generic "invalid operand types" panic instead of interp.rs's
+    /// specific "Rational remainder is not supported" (`%` is deliberately
+    /// unimplemented for `Rational`, not a genuine type mismatch).
+    #[test]
+    fn native_rational_remainder_panic_matches_interp_wording() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let a = rat(3, 2)\n    let b = rat(1, 2)\n    print(\"{a % b}\")\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Err(crate::interp::Flow::Panic { msg, .. }) => {
+                assert_eq!(msg, "Rational remainder is not supported");
+            }
+            Ok(_) => panic!("Rational % Rational must panic, not succeed"),
+            Err(_) => panic!("Rational % Rational must panic with Flow::Panic specifically"),
+        }
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-ratrem-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let out = std::process::Command::new(&bin).output().unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Rational remainder is not supported"),
+            "native must match the interpreter's specific message, not the generic \"invalid operand types\": {stderr:?}"
         );
     }
 
