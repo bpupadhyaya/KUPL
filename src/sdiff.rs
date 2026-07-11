@@ -171,6 +171,15 @@ fn interface_of(item: &Item) -> String {
                     s.push_str(&format!("{}:{},", p.name, ty_str(&p.ty)));
                 }
                 s.push_str(&format!(")->{}", sig.ret.as_ref().map(ty_str).unwrap_or_else(|| "Unit".into())));
+                // A contract method's declared effect BUDGET is part of its public
+                // interface, same as a top-level fun's or a component expose's `uses`
+                // clause above -- any fulfilling component must satisfy it (K0264).
+                // Widening it (e.g. adding `uses io`) is a genuine breaking change: an
+                // EXISTING fulfilling component may no longer satisfy the contract.
+                // This was the one sig-interface site missing `uses[...]`, so a
+                // contract-only effect change was misclassified as "implementation
+                // only" instead of "[INTERFACE — breaking]" (PR-it580).
+                s.push_str(&format!(" uses[{}]", sig.effects.join(",")));
             }
             for law in &ct.laws {
                 s.push_str(&format!(" law:{}", law.name));
@@ -266,6 +275,31 @@ mod tests {
         // Adding a variant to a sum type breaks exhaustive matches downstream.
         let (lines, _) = diff_lines("type C = Red | Green\n", "type C = Red | Green | Blue\n");
         assert_eq!(lines, vec!["interface C"]);
+    }
+
+    /// A REAL BUG found+fixed (PR-it580): `interface_of`'s contract-sig branch was the
+    /// ONE sig-interface site missing `uses[...]` -- a top-level `fun`'s effects (tested
+    /// just above) and a component `expose`'s effects both count toward the interface,
+    /// but a contract method's declared effect BUDGET (`FunSig.effects`) was silently
+    /// dropped from its fingerprint entirely. Widening a contract's effect requirement
+    /// (e.g. adding `uses io` to a method with none) is a genuine breaking change -- any
+    /// EXISTING fulfilling component may no longer satisfy the contract (K0264) -- but
+    /// `kupl diff` reported it as "[implementation only]" since the fingerprint before
+    /// and after were byte-identical.
+    #[test]
+    fn contract_method_effect_change_is_interface() {
+        let (lines, _) = diff_lines(
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n}\n",
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) uses io -> Int\n}\n",
+        );
+        assert_eq!(lines, vec!["interface Store"]);
+        // a param-only rename with the SAME effects still correctly reports interface
+        // (unrelated to this fix, but locks the sibling shape doesn't regress).
+        let (lines, _) = diff_lines(
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n}\n",
+            "contract Store {\n    intent \"kv\"\n    expose fun get(key: Str) -> Int\n}\n",
+        );
+        assert_eq!(lines, vec!["interface Store"]);
     }
 
     #[test]
