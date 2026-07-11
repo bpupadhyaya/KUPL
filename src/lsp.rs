@@ -620,6 +620,105 @@ pub fn resolve_signature_help(text: &str, line: usize, character: usize) -> Opti
     Some((label, params, active))
 }
 
+/// Find a `FunDecl` (top-level or a component's `expose`d/private method) by
+/// its exact span -- how a K0301 diagnostic's `info.decl.span` maps back to
+/// the AST node whose signature needs editing.
+fn find_fun_decl_by_span<'a>(
+    program: &'a crate::ast::Program,
+    span: crate::diag::Span,
+) -> Option<&'a crate::ast::FunDecl> {
+    use crate::ast::Item;
+    for item in &program.items {
+        match item {
+            Item::Fun(f) if f.span == span => return Some(f),
+            Item::Component(c) => {
+                if let Some(f) = c.exposes.iter().chain(&c.funs).find(|f| f.span == span) {
+                    return Some(f);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract the comma-separated effect names from a K0301 message
+/// (`` `name` is public but does not declare its effects — add `uses X, Y` ``)
+/// -- parsing OUR OWN generated string is a common, low-risk quick-fix
+/// pattern (the message format is fixed and covered by effects.rs's own
+/// tests, which would catch drift immediately) rather than re-deriving the
+/// missing-effects set from scratch here.
+fn extract_uses_names(message: &str) -> Option<String> {
+    let marker = "`uses ";
+    let start = message.rfind(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
+}
+
+/// The byte offset right after a function's parameter list's closing `)`,
+/// where a fresh `uses X` clause should be inserted (`fun name(params) uses
+/// X -> ret { ... }`). Paren-depth-tracked so a default-value expression
+/// containing its own parens (`x: Int = f(1)`) doesn't confuse the match.
+fn insertion_point_after_params(text: &str, fun_span: crate::diag::Span) -> Option<usize> {
+    let start = fun_span.start as usize;
+    let bytes = text.as_bytes();
+    let open_rel = text.get(start..)?.find('(')?;
+    let mut i = start + open_rel;
+    let mut depth = 0i32;
+    loop {
+        match bytes.get(i)? {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// `codeAction`: quick-fixes derivable from the file's OWN current diagnostics
+/// (computed directly, the same recipe `diagnostics_notification` already
+/// uses: `check::check` then `effects::check_effects` if no hard errors --
+/// reused here for consistency rather than a second, independently-written
+/// diagnostics pipeline). v0 scope: ONE fix -- for a K0301 ("public but does
+/// not declare its effects") on a function with NO existing `uses` clause at
+/// all, insert the missing effect list. A function that already declares
+/// SOME effects but is missing others (widening `uses io` to
+/// `uses io, ai.call`) is intentionally out of scope for this first pass:
+/// safely rewriting an EXISTING clause needs its own span, which K0301's
+/// diagnostic doesn't carry -- adding a fresh clause to a function with none
+/// is the common, unambiguous case. Returns (title, insert-at byte offset,
+/// text to insert).
+pub fn resolve_code_actions(text: &str, start_off: usize, end_off: usize) -> Vec<(String, usize, String)> {
+    let (program, mut diags) = crate::parser::parse(text);
+    diags.extend(crate::check::check(&program).1);
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        diags.extend(crate::effects::check_effects(&program));
+    }
+    let mut out = Vec::new();
+    for d in &diags {
+        if d.code != "K0301" {
+            continue;
+        }
+        if (d.span.end as usize) < start_off || (d.span.start as usize) > end_off {
+            continue;
+        }
+        let Some(f) = find_fun_decl_by_span(&program, d.span) else { continue };
+        if !f.effects.is_empty() {
+            continue;
+        }
+        let Some(names) = extract_uses_names(&d.message) else { continue };
+        let Some(insert_at) = insertion_point_after_params(text, f.span) else { continue };
+        out.push((format!("Add `uses {names}`"), insert_at, format!(" uses {names}")));
+    }
+    out
+}
+
 /// The declaration range (l0, c0, l1, c1) of the top-level item named `name`,
 /// as 0-based LSP positions pointing at the NAME token.
 fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Option<(usize, usize, usize, usize)> {
@@ -1246,7 +1345,7 @@ pub fn serve() -> i32 {
                 send(
                     &mut stdout,
                     &format!(
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}},\"signatureHelpProvider\":{{\"triggerCharacters\":[\"(\",\",\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"completionProvider\":{{\"triggerCharacters\":[\".\"]}},\"signatureHelpProvider\":{{\"triggerCharacters\":[\"(\",\",\"]}},\"codeActionProvider\":{{\"codeActionKinds\":[\"quickfix\"]}}}},\"serverInfo\":{{\"name\":\"kupl-lsp\",\"version\":\"{}\"}}}}}}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -1354,6 +1453,39 @@ pub fn serve() -> i32 {
                     ))
                 })()
                 .unwrap_or_else(|| "null".into());
+                send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
+            }
+            "textDocument/codeAction" => {
+                // Quick-fix: add a missing `uses <effect>` clause for K0301 (PR-it587),
+                // the other confirmed-missing LSP capability alongside signatureHelp.
+                let rid = id.map(render_id).unwrap_or_else(|| "null".into());
+                let result = (|| {
+                    let p = msg.get("params")?;
+                    let uri = p.get("textDocument")?.get("uri")?.str()?;
+                    let range = p.get("range")?;
+                    let s = range.get("start")?;
+                    let e = range.get("end")?;
+                    let (sl, sc) = (s.get("line")?.as_usize()?, s.get("character")?.as_usize()?);
+                    let (el, ec) = (e.get("line")?.as_usize()?, e.get("character")?.as_usize()?);
+                    let text = doc_text(uri, &buffers)?;
+                    let start_off = offset_at(&text, sl, sc);
+                    let end_off = offset_at(&text, el, ec);
+                    let items: Vec<String> = resolve_code_actions(&text, start_off, end_off)
+                        .into_iter()
+                        .map(|(title, insert_at, new_text)| {
+                            let (l, c) = line_col(&text, insert_at as u32);
+                            let pos = format!("{{\"line\":{},\"character\":{}}}", l - 1, c - 1);
+                            format!(
+                                "{{\"title\":\"{}\",\"kind\":\"quickfix\",\"edit\":{{\"changes\":{{\"{}\":[{{\"range\":{{\"start\":{pos},\"end\":{pos}}},\"newText\":\"{}\"}}]}}}}}}",
+                                json_escape(&title),
+                                json_escape(uri),
+                                json_escape(&new_text)
+                            )
+                        })
+                        .collect();
+                    Some(format!("[{}]", items.join(",")))
+                })()
+                .unwrap_or_else(|| "[]".into());
                 send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{rid},\"result\":{result}}}"));
             }
             "textDocument/definition" => {
@@ -1545,6 +1677,44 @@ mod tests {
     const PROG: &str = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
                         type Shape = Circle(r: Float) | Square(s: Float)\n\
                         fun main() uses io {\n    print(add(1, 2))\n}\n";
+
+    #[test]
+    fn code_action_adds_a_missing_uses_clause_for_k0301() {
+        // A NEW LSP capability added (PR-it587): a quick-fix for K0301 ("public but
+        // does not declare its effects") that inserts the missing `uses <effect>`
+        // clause automatically -- the other confirmed-missing capability alongside
+        // signatureHelp (it586), from the same method-inventory check.
+        let src = "pub fun outer(x: Int) -> Int {\n    print(to_str(x))\n    x\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (title, insert_at, new_text) = &actions[0];
+        assert_eq!(title, "Add `uses io`");
+        assert_eq!(new_text, " uses io");
+        // applying the edit produces a program with NO K0301 (and no OTHER new errors).
+        let mut fixed = src.to_string();
+        fixed.insert_str(*insert_at, new_text);
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(
+            !diags.iter().any(|d| d.code == "K0301"),
+            "the fix must actually resolve K0301: {fixed:?} -> {diags:?}"
+        );
+    }
+
+    #[test]
+    fn code_action_stays_empty_when_a_uses_clause_already_exists_or_nothing_is_wrong() {
+        // No false positives: a function that ALREADY declares some effects (widening
+        // an existing clause is intentionally out of scope for v0, see
+        // resolve_code_actions's own doc comment) and a function with no K0301 at all
+        // must both yield zero code actions.
+        let already_declared = "pub fun outer(x: Int) uses io -> Int {\n    print(to_str(x))\n    x\n}\n";
+        assert!(resolve_code_actions(already_declared, 0, already_declared.len()).is_empty());
+        let clean = "fun outer(x: Int) -> Int {\n    x\n}\n";
+        assert!(resolve_code_actions(clean, 0, clean.len()).is_empty());
+    }
 
     #[test]
     fn signature_help_reports_params_and_active_index() {
