@@ -1725,10 +1725,27 @@ static KValue k_json_stringify(KValue v) {
 }
 
 /* --- parse (mirror json.rs Parser); build Json ctors, wrap in Ok/Err --- */
-typedef struct { const unsigned char* s; long pos, len; int failed; int depth; char err[192]; } KJP;
+/* `err` is heap-allocated (not a fixed-size array): a REAL cross-engine bug
+   (PR-it600, closing the LAST deferred finding from the it595/596/597/599
+   panic-wording sweep) -- this used to be a fixed `char err[192]`, which
+   truncated the ONE error message here that echoes UNBOUNDED user input
+   (kjp_number's "invalid number `{s}`", below) for any malformed numeric
+   token over ~180 bytes, where json.rs's `format!("invalid number `{s}`")`
+   never truncates. The other 14 kjp_fail call sites all build small, FIXED-
+   or-bounded text (a single UTF-8 character, a position number, a literal
+   phrase) that already fit comfortably under 192 bytes, so heap-allocating
+   `err` sized to the ACTUAL message doesn't change their behavior at all --
+   only kjp_number's message stops being silently cut short. */
+typedef struct { const unsigned char* s; long pos, len; int failed; int depth; char* err; } KJP;
 /* First error wins (mirrors the interpreter's `?` short-circuit) so the reported
    message matches json.rs byte-for-byte. */
-static void kjp_fail(KJP* p, const char* m) { if (!p->failed) { p->failed = 1; snprintf(p->err, sizeof p->err, "%s", m); } }
+static void kjp_fail(KJP* p, const char* m) {
+    if (!p->failed) {
+        p->failed = 1;
+        p->err = (char*)k_alloc(strlen(m) + 1);
+        strcpy(p->err, m);
+    }
+}
 /* Character (not byte) offset of `pos` — json.rs positions are char indices. */
 static long kjp_cpos(KJP* p, long pos) { long n = 0; for (long i = 0; i < pos && i < p->len; i++) if ((p->s[i] & 0xC0) != 0x80) n++; return n; }
 /* Copy the whole UTF-8 character starting at `pos` into `out`. */
@@ -1809,10 +1826,18 @@ static KValue kjp_number(KJP* p) {
     long start = p->pos;
     if (kjp_peek(p) == '-') p->pos++;
     while (p->pos < p->len) { unsigned char c = p->s[p->pos]; if ((c>='0'&&c<='9')||c=='.'||c=='e'||c=='E'||c=='+'||c=='-') p->pos++; else break; }
-    char buf[64]; long n = p->pos - start; if (n >= (long)sizeof buf) n = sizeof buf - 1;
+    long n = p->pos - start;
+    char* buf = (char*)k_alloc((size_t)n + 1);
     memcpy(buf, p->s + start, n); buf[n] = 0;
     char* end; double d = strtod(buf, &end);
-    if (end == buf || *end != 0) { char m[96]; snprintf(m, sizeof m, "invalid number `%s`", buf); kjp_fail(p, m); return k_unit(); }
+    if (end == buf || *end != 0) {
+        const char* prefix = "invalid number `";
+        size_t need = strlen(prefix) + (size_t)n + 2; /* + closing backtick + NUL */
+        char* m = (char*)k_alloc(need);
+        snprintf(m, need, "%s%s`", prefix, buf);
+        kjp_fail(p, m);
+        return k_unit();
+    }
     KValue f = k_float(d); return k_jc_("JNum", &f, 1);
 }
 static KValue k_jc_(const char* name, KValue* fields, int n) { return k_ctor(k_ctor_by_name(name), fields, n); }
@@ -1900,11 +1925,14 @@ static KValue kjp_value(KJP* p) {
 static KValue k_json_parse(KValue s) {
     if (s.tag != K_STR) { const char* d = k_show(s); (void)d; }
     const char* str = (s.tag == K_STR) ? s.as.s : k_show(s);
-    KJP p; p.s = (const unsigned char*)str; p.pos = 0; p.len = (long)strlen(str); p.failed = 0; p.depth = 0; p.err[0] = 0;
+    KJP p; p.s = (const unsigned char*)str; p.pos = 0; p.len = (long)strlen(str); p.failed = 0; p.depth = 0; p.err = 0;
     kjp_ws(&p);
     KValue v = kjp_value(&p);
     kjp_ws(&p);
-    if (p.failed) { char* e = (char*)k_alloc(strlen(p.err) + 1); strcpy(e, p.err); return k_err(k_str(e)); }
+    /* p.err is ALREADY a fresh, uniquely-owned k_alloc'd buffer (kjp_fail
+       heap-allocates it directly) -- no need to copy it again into a second
+       buffer before wrapping it in a Str. */
+    if (p.failed) { return k_err(k_str(p.err)); }
     if (p.pos != p.len) {
         char m[64]; snprintf(m, sizeof m, "unexpected trailing characters at position %ld", kjp_cpos(&p, p.pos));
         char* e = (char*)k_alloc(strlen(m) + 1); strcpy(e, m); return k_err(k_str(e));
@@ -9597,6 +9625,23 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         let long = "x".repeat(200);
         let src = format!("fun main() uses io {{\n    print(big(\"{long}\"))\n}}\n");
         assert_panic_wording_matches(&src, "bigtrail");
+    }
+
+    /// A REAL cross-engine bug (PR-it600, CLOSING the last deferred finding from the
+    /// it595/596/597/599 panic-wording sweep): native's `kjp_number` used to copy the
+    /// matched (unbounded-length) number token into a fixed `char buf[64]`, AND the
+    /// message itself flowed through `KJP.err`, ALSO a fixed `char[192]` shared by
+    /// every OTHER json_parse error path -- both truncated the echoed text in
+    /// json.rs's `format!("invalid number `{s}`")` for a malformed token over ~180
+    /// bytes, where json.rs never truncates. Fixed by heap-allocating both the
+    /// matched-token buffer AND `KJP.err` itself, sized to the actual content.
+    #[test]
+    fn native_json_parse_long_malformed_number_panic_matches_interp_wording_untruncated() {
+        let dots = ".".repeat(200);
+        let src = format!(
+            "fun main() uses io {{\n    match json_parse(\"1{dots}\") {{\n        Ok(_) => print(\"ok\"),\n        Err(e) => panic(e),\n    }}\n}}\n"
+        );
+        assert_panic_wording_matches(&src, "jsonnumtrail");
     }
 
     /// A REAL cross-engine bug (PR-it599, found by sweeping cgen.rs's LARGE per-method
