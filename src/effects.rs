@@ -255,13 +255,27 @@ fn collect_expr(
 ) {
     // A method-call name may be a UFCS call to a top-level function; a plain
     // call names the function directly. Both attribute that function's effects
-    // (conservatively — over-attribution is sound).
+    // (conservatively — over-attribution is sound). A bare reference to a
+    // known function's NAME (passed as a plain value -- e.g. `xs.map(log)`,
+    // or stored in a local and passed on) is ALSO treated as a potential
+    // call: `funs.contains_key` below only matches genuine function names,
+    // and the callee could invoke it at any time, so conservatively
+    // attributing the referenced function's effects here is sound (and, for
+    // a name that happens to shadow a function with an unrelated local
+    // variable, only over-attributes -- never silently drops a real edge).
+    // This matters for more than the `uses` diagnostic: `pure_funs()` (which
+    // gates the interp/KVM real-thread `par_map`/`par_filter` fast path)
+    // used to misclassify a wrapper like `fun w(x) { [x].map(log)... }` as
+    // PURE whenever it only referenced `log` by name instead of calling it
+    // directly -- letting a genuinely impure function run unsynchronized
+    // across real OS threads, producing observable nondeterminism (PR-it569).
     let call_name = match &expr.kind {
         ExprKind::Call { callee, .. } => match &callee.kind {
             ExprKind::Ident(name) => Some(name.as_str()),
             _ => None,
         },
         ExprKind::MethodCall { name, .. } => Some(name.as_str()),
+        ExprKind::Ident(name) => Some(name.as_str()),
         _ => None,
     };
     if let Some(name) = call_name {
@@ -448,5 +462,50 @@ mod tests {
     fn private_funs_stay_implicit() {
         let d = diags_for("fun helper() {\n    print(\"hi\")\n}\n");
         assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn effect_propagates_through_a_function_passed_by_name_to_a_hof() {
+        // `collect_expr` used to attribute a function's effects only when its
+        // name was the DIRECT callee of a Call/MethodCall node -- a function
+        // referenced as a plain VALUE (e.g. `xs.map(log)`, passing `log` by
+        // name rather than calling it) was invisible to effect inference
+        // entirely, so a `pub fun` that only ever referenced an impure
+        // function this way was never required to declare it (PR-it569).
+        let d = diags_for(
+            "fun log(x: Int) -> Int {\n    print(to_str(x))\n    x\n}\n\
+             pub fun outer(xs: List[Int]) -> List[Int] {\n    xs.map(log)\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K0301"), "{d:?}");
+        // and the corresponding declaration is accepted with no spurious
+        // "declared but unused" K0302 once correctly attributed.
+        let ok = diags_for(
+            "fun log(x: Int) -> Int {\n    print(to_str(x))\n    x\n}\n\
+             pub fun outer(xs: List[Int]) uses io -> List[Int] {\n    xs.map(log)\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn pure_funs_excludes_a_function_only_referenced_by_name() {
+        // The SAME root cause as the test above has a much higher-severity
+        // consequence: `pure_funs()` gates the interp/KVM real-thread
+        // `par_map`/`par_filter` fast path (src/parallel.rs), which assumes a
+        // "pure" function is safe to run unsynchronized across OS threads. A
+        // wrapper that only references an impure function BY NAME (instead
+        // of calling it directly) used to be wrongly classified pure,
+        // letting genuinely impure work (e.g. `print`) run concurrently and
+        // unsynchronized -- observable as run-to-run nondeterministic output
+        // interleaving, a real safety violation, not just a missing
+        // diagnostic (PR-it569).
+        let (p, d) = crate::parser::parse(
+            "fun log(x: Int) -> Int {\n    print(to_str(x))\n    x\n}\n\
+             fun wrapper(x: Int) -> Int {\n    [x].map(log).get(0).unwrap_or(0)\n}\n\
+             fun pure_double(x: Int) -> Int { x * 2 }\n",
+        );
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let pure = super::pure_funs(&p);
+        assert!(!pure.contains("wrapper"), "wrapper must NOT be classified pure: {pure:?}");
+        assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
     }
 }
