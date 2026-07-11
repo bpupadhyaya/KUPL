@@ -101,8 +101,12 @@ fn run_cli() -> ExitCode {
                 }
             },
             Err(e) => {
+                // Sibling-consistency fix (PR-it594): `kupl dis missing.kx` (run.rs's
+                // `disassemble`) already reports the IDENTICAL "missing .kx file"
+                // condition as exit 1 -- this direct `kupl run <file.kx>` path used to
+                // report exit 2 for the same failure on the same file extension.
                 eprintln!("error: cannot read {path}: {e}");
-                2
+                1
             }
         },
         (cmd, _) => match cmd {
@@ -322,15 +326,70 @@ fn with_file(args: &[String], f: impl Fn(&str, &str) -> i32) -> i32 {
     match std::fs::read_to_string(path) {
         Ok(src) => f(&src, path),
         Err(e) => {
-            eprintln!("error: cannot read {path}: {e}");
-            2
+            // A REAL sibling-consistency bug (PR-it594): every OTHER subcommand
+            // (run/check/native/test/build/bundle/dis/manifest/context, all routed
+            // through `load_compile`/`loader::load`) reports an unreadable entry file
+            // as a K0400 LOAD failure (exit 1) -- `kupl fmt`, the one subcommand still
+            // using this standalone helper, used to report the IDENTICAL condition as
+            // exit 2 (grouped with the unrelated "no argument at all" usage error
+            // above), so a script checking `$?` got a different signal for the same
+            // underlying problem depending on which subcommand it ran. Wording unified
+            // to match K0400's "module file" phrasing too.
+            eprintln!("error: cannot read module file {path}: {e}");
+            1
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_module, valid_project_name};
+    use super::{build_module, valid_project_name, with_file};
+
+    #[test]
+    fn with_file_reports_missing_entry_as_a_load_failure_not_a_bare_usage_error() {
+        // A REAL sibling-consistency bug (PR-it594): `kupl fmt` (the one subcommand
+        // still using `with_file`) used to report an unreadable entry file as exit 2,
+        // the SAME code as its own "no argument at all" usage error a few lines above
+        // -- while every other subcommand (run/check/native/test/build/bundle/dis/
+        // manifest/context, routed through `load_compile`/`loader::load`) reports the
+        // identical "can't read this entry file" condition as a K0400 LOAD failure,
+        // exit 1. Fixed by giving `with_file`'s read-error branch its own exit 1.
+        let args = vec!["fmt".to_string(), "/definitely/does/not/exist/kupl-it594.kupl".to_string()];
+        let code = with_file(&args, |_src, _file| 0);
+        assert_eq!(code, 1, "an unreadable entry file must be a load failure (exit 1), not a usage error (exit 2)");
+
+        // the genuinely-missing-ARGUMENT case is a DIFFERENT situation and must stay exit 2.
+        let no_arg = vec!["fmt".to_string()];
+        assert_eq!(with_file(&no_arg, |_src, _file| 0), 2);
+    }
+
+    #[test]
+    fn missing_kx_file_reports_the_same_exit_code_whether_run_or_disassembled() {
+        // A REAL sibling-consistency bug (PR-it594): `kupl dis missing.kx` (routed
+        // through `run::disassemble`'s own `.kx` branch) already reported a missing
+        // `.kx` file as exit 1 -- `kupl run missing.kx` (a SEPARATE direct-decode path
+        // in `main()`, for the same file extension) reported exit 2 for the identical
+        // condition. Fixed by matching `run`'s exit code to `dis`'s.
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet (e.g. a lib-only build) -- nothing to test
+        }
+        let missing = "/definitely/does/not/exist/kupl-it594.kx";
+        let run_code = std::process::Command::new(&bin)
+            .args(["run", missing])
+            .output()
+            .expect("kupl run runs")
+            .status
+            .code();
+        let dis_code = std::process::Command::new(&bin)
+            .args(["dis", missing])
+            .output()
+            .expect("kupl dis runs")
+            .status
+            .code();
+        assert_eq!(run_code, Some(1), "kupl run on a missing .kx file must be exit 1");
+        assert_eq!(run_code, dis_code, "run and dis must agree on a missing .kx file's exit code");
+    }
 
     #[test]
     fn build_resolves_multi_file_use_imports() {
