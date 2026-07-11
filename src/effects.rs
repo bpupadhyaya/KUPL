@@ -374,6 +374,18 @@ fn walk_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         ExprKind::Match { scrutinee, arms } => {
             walk_expr(scrutinee, f);
             for arm in arms {
+                // A match arm's `if COND` guard is an arbitrary expression (parsed via
+                // the full `parse_expr`) and can contain any call, including an impure
+                // one -- but it was never walked here, so an impure call reachable ONLY
+                // through a guard was completely invisible to effect inference, in BOTH
+                // directions (a caller could omit `uses io` with no K0301, and one that
+                // correctly declared it got a spurious K0302 "declared but unused").
+                // Since `pure_funs()` shares this exact walk, an impure guard-only call
+                // was also misclassified PURE for the par_map/par_filter real-OS-thread
+                // fast path -- the same severity class as it569's bug (PR-it584).
+                if let Some(g) = &arm.guard {
+                    walk_expr(g, f);
+                }
                 walk_expr(&arm.body, f);
             }
         }
@@ -501,6 +513,48 @@ mod tests {
         let (p, d) = crate::parser::parse(
             "fun log(x: Int) -> Int {\n    print(to_str(x))\n    x\n}\n\
              fun wrapper(x: Int) -> Int {\n    [x].map(log).get(0).unwrap_or(0)\n}\n\
+             fun pure_double(x: Int) -> Int { x * 2 }\n",
+        );
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let pure = super::pure_funs(&p);
+        assert!(!pure.contains("wrapper"), "wrapper must NOT be classified pure: {pure:?}");
+        assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
+    }
+
+    #[test]
+    fn effect_propagates_through_a_match_arm_guard() {
+        // A REAL BUG found+fixed (PR-it584), the SAME severity class as it569's
+        // by-name-reference bug: `walk_expr`'s `Match` arm walked each arm's `body` but
+        // never its optional `if COND` guard (`MatchArm.guard: Option<Expr>`) -- an
+        // arbitrary expression that can contain any call, including an impure one. An
+        // impure call reachable ONLY through a guard was completely invisible to effect
+        // inference in BOTH directions: a caller could omit `uses io` with no K0301, and
+        // one that correctly declared it got a spurious K0302 "declared but unused".
+        let d = diags_for(
+            "fun noisy(x: Int) -> Bool {\n    print(to_str(x))\n    x > 0\n}\n\
+             pub fun outer(x: Int) -> Str {\n    match x {\n        n if noisy(n) => \"pos\"\n        \
+             _ => \"other\"\n    }\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K0301"), "{d:?}");
+        let ok = diags_for(
+            "fun noisy(x: Int) -> Bool {\n    print(to_str(x))\n    x > 0\n}\n\
+             pub fun outer(x: Int) uses io -> Str {\n    match x {\n        n if noisy(n) => \"pos\"\n        \
+             _ => \"other\"\n    }\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn pure_funs_excludes_a_function_only_referenced_in_a_match_guard() {
+        // The SAME root cause as the test above, with the SAME higher-severity
+        // consequence as it569: `pure_funs()` shares the identical walk, so a wrapper
+        // whose only impure call was hidden inside a match guard used to be wrongly
+        // classified pure -- letting it run unsynchronized on the real-thread
+        // par_map/par_filter fast path (PR-it584).
+        let (p, d) = crate::parser::parse(
+            "fun noisy(x: Int) -> Bool {\n    print(to_str(x))\n    x > 0\n}\n\
+             fun wrapper(x: Int) -> Str {\n    match x {\n        n if noisy(n) => \"pos\"\n        \
+             _ => \"other\"\n    }\n}\n\
              fun pure_double(x: Int) -> Int { x * 2 }\n",
         );
         assert!(d.is_empty(), "parse diags: {d:?}");
