@@ -718,19 +718,23 @@ fn find_uses_clause_range(text: &str, fun_span: crate::diag::Span) -> Option<(us
 /// (computed directly, the same recipe `diagnostics_notification` already
 /// uses: `check::check` then `effects::check_effects` if no hard errors --
 /// reused here for consistency rather than a second, independently-written
-/// diagnostics pipeline). v0 scope: TWO fixes. (1) K0301 ("public but does
-/// not declare its effects") on a function with NO existing `uses` clause at
-/// all -- insert the missing effect list. A function that already declares
-/// SOME effects but is missing others (widening `uses io` to
-/// `uses io, ai.call`) is intentionally out of scope for this pass: safely
-/// rewriting an EXISTING clause needs its own span, which K0301's diagnostic
-/// doesn't carry -- adding a fresh clause to a function with none is the
-/// common, unambiguous case. (2) K0302 ("declares `uses X` but never uses
-/// it") -- the symmetric follow-up: drop just that one effect name from the
-/// clause (or the whole clause, if it was the only effect declared). Returns
-/// (title, replace-range start, replace-range end, replacement text) --
-/// K0301's fix is always a zero-width insertion (start == end); K0302's is a
-/// real range replacement.
+/// diagnostics pipeline). v0 scope: THREE fixes, covering both directions of
+/// the effects-declaration lint plus the case a fresh clause alone couldn't
+/// handle. (1) K0301 on a function with NO existing `uses` clause at all --
+/// insert the missing effect list as a fresh clause (zero-width insertion).
+/// (2) K0301 on a function that ALREADY declares SOME effects but is missing
+/// others (e.g. `uses io` needs to become `uses io, ai.call`) -- this was
+/// PR-it587's deferred v0 gap ("K0301's diagnostic doesn't carry the existing
+/// clause's span"), closed here by locating that span independently via
+/// `find_uses_clause_range` (the same helper PR-it588 built for K0302) and
+/// replacing the WHOLE clause with the union of the existing + missing
+/// effects, rather than needing the diagnostic itself to carry that span.
+/// (3) K0302 ("declares `uses X` but never uses it") -- drop just that one
+/// effect name from the clause (or the whole clause, if it was the only
+/// effect declared). Returns (title, replace-range start, replace-range end,
+/// replacement text) -- a fresh-clause K0301 fix is a zero-width insertion
+/// (start == end); the widening K0301 fix and the K0302 fix are both real
+/// range replacements.
 pub fn resolve_code_actions(text: &str, start_off: usize, end_off: usize) -> Vec<(String, usize, usize, String)> {
     let (program, mut diags) = crate::parser::parse(text);
     diags.extend(crate::check::check(&program).1);
@@ -744,12 +748,25 @@ pub fn resolve_code_actions(text: &str, start_off: usize, end_off: usize) -> Vec
         }
         if d.code == "K0301" {
             let Some(f) = find_fun_decl_by_span(&program, d.span) else { continue };
-            if !f.effects.is_empty() {
-                continue;
-            }
             let Some(names) = extract_uses_names(&d.message) else { continue };
-            let Some(insert_at) = insertion_point_after_params(text, f.span) else { continue };
-            out.push((format!("Add `uses {names}`"), insert_at, insert_at, format!(" uses {names}")));
+            if f.effects.is_empty() {
+                let Some(insert_at) = insertion_point_after_params(text, f.span) else { continue };
+                out.push((format!("Add `uses {names}`"), insert_at, insert_at, format!(" uses {names}")));
+            } else {
+                let Some((clause_start, clause_end, _)) = find_uses_clause_range(text, f.span) else { continue };
+                let mut widened = f.effects.clone();
+                for m in names.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if !widened.iter().any(|e| e == m) {
+                        widened.push(m.to_string());
+                    }
+                }
+                out.push((
+                    format!("Widen `uses` clause to add `{names}`"),
+                    clause_start,
+                    clause_end,
+                    format!(" uses {} ", widened.join(", ")),
+                ));
+            }
         } else if d.code == "K0302" {
             let Some(f) = find_fun_decl_by_span(&program, d.span) else { continue };
             let Some(name) = extract_uses_names(&d.message) else { continue };
@@ -1758,14 +1775,41 @@ mod tests {
 
     #[test]
     fn code_action_stays_empty_when_a_uses_clause_already_exists_or_nothing_is_wrong() {
-        // No false positives: a function that ALREADY declares some effects (widening
-        // an existing clause is intentionally out of scope for v0, see
-        // resolve_code_actions's own doc comment) and a function with no K0301 at all
-        // must both yield zero code actions.
+        // No false positives: a function whose EXISTING `uses` clause already covers
+        // everything it calls (so K0301 never fires -- distinct from the widening
+        // case below, which covers a clause that's PRESENT but INCOMPLETE), and a
+        // function with no K0301 at all, must both yield zero code actions.
         let already_declared = "pub fun outer(x: Int) uses io -> Int {\n    print(to_str(x))\n    x\n}\n";
         assert!(resolve_code_actions(already_declared, 0, already_declared.len()).is_empty());
         let clean = "fun outer(x: Int) -> Int {\n    x\n}\n";
         assert!(resolve_code_actions(clean, 0, clean.len()).is_empty());
+    }
+
+    #[test]
+    fn code_action_widens_an_existing_uses_clause_for_k0301() {
+        // PR-it587's deferred v0 gap, closed here (PR-it589): a function that ALREADY
+        // declares `uses io` but is MISSING another required effect (calling an `ai
+        // fun`, which requires `ai`) must get a fix that WIDENS the existing clause
+        // (`uses io` -> `uses io, ai`) rather than being skipped as out of scope.
+        let src = "ai fun helper() -> Str {\n    intent \"say hi\"\n}\n\
+                   pub fun outer(x: Int) uses io -> Str {\n    print(to_str(x))\n    helper()\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (title, start, end, new_text) = &actions[0];
+        assert_eq!(title, "Widen `uses` clause to add `ai`");
+        assert_ne!(start, end, "widening is a real range replacement, not a zero-width insertion");
+        let mut fixed = src.to_string();
+        fixed.replace_range(*start..*end, new_text);
+        assert!(fixed.contains("uses io, ai"), "{fixed:?}");
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(
+            !diags.iter().any(|d| d.code == "K0301"),
+            "the fix must actually resolve K0301: {fixed:?} -> {diags:?}"
+        );
     }
 
     #[test]
