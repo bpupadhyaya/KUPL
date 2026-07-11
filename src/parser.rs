@@ -1013,8 +1013,25 @@ impl Parser {
             other => Err(Diag::error(
                 "K0107",
                 format!(
-                    "unexpected {} in component body (expected `intent`, ports, `state`, `on`, `fun`, `wire`, `example`, …)",
-                    other.describe()
+                    "unexpected {} in component body (expected `intent`, ports, `state`, `on`, `fun`, `wire`, `example`, …){}",
+                    other.describe(),
+                    // The did-you-mean candidate list this campaign's it603 memory
+                    // entry deferred (K0107 was left out of it603's first pass since
+                    // its valid-construct set spans MANY match arms, not one small
+                    // literal list like K0103/K0116/K0106's did) -- traced directly
+                    // from every arm THIS match actually accepts (not copied from the
+                    // message text above, which is itself abbreviated with "…" and
+                    // would have given an incomplete candidate set): the two
+                    // soft/contextual keywords `out`/`state` (matched by string
+                    // comparison, not `token::keyword`) plus every hard keyword this
+                    // function's own match handles.
+                    keyword_suggestion(
+                        &other,
+                        &[
+                            "intent", "in", "out", "prop", "requires", "state", "let", "wire",
+                            "supervise", "on", "expose", "pub", "fun", "async", "example", "test",
+                        ]
+                    )
                 ),
                 self.span(),
             )),
@@ -2070,6 +2087,38 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.code == "K0103" && !d.message.contains("did you mean")),
             "a non-identifier token must never get a suggestion: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn k0107_component_body_typos_suggest_the_closest_keyword() {
+        // Closes the K0107 gap it603's memory entry deliberately deferred: component
+        // bodies accept 16 constructs across many separate match arms (a mix of hard
+        // keywords like `wire`/`supervise` and two SOFT/contextual keywords, `out`
+        // and `state`, matched by string comparison rather than `token::keyword`) --
+        // the candidate list was traced from every arm this file's own
+        // `parse_component_member` match actually accepts, not copied from the
+        // (abbreviated, "…"-truncated) message text.
+        let (_, diags) = parse("component C {\n    intent \"c\"\n    wier x.a -> y.b\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0107" && d.message.contains("did you mean `wire`?")),
+            "`wier` should suggest `wire`: {diags:?}"
+        );
+        let (_, diags) = parse("component C {\n    intent \"c\"\n    stat n: Int = 0\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0107" && d.message.contains("did you mean `state`?")),
+            "`stat` should suggest the SOFT keyword `state`: {diags:?}"
+        );
+        let (_, diags) = parse("component C {\n    intent \"c\"\n    supervize child restart never\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0107" && d.message.contains("did you mean `supervise`?")),
+            "`supervize` should suggest `supervise`: {diags:?}"
+        );
+        // an unrelated identifier still gets no false-positive suggestion.
+        let (_, diags) = parse("component C {\n    intent \"c\"\n    xyzzyplugh\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0107" && !d.message.contains("did you mean")),
+            "an unrelated identifier must not get a false-positive suggestion: {diags:?}"
         );
     }
 
