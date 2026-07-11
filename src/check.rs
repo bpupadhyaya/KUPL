@@ -779,11 +779,20 @@ impl Checker {
             let comp_sig = self.checked.components.get(&c.name).cloned().unwrap_or_default();
             for (fname, (params, ret, effects)) in &contract.sigs {
                 match comp_sig.exposes.get(fname) {
-                    None => self.err(
-                        "K0262",
-                        format!("`{}` fulfills `{contract_name}` but does not expose `{fname}`", c.name),
-                        c.span,
-                    ),
+                    None => {
+                        // Did-you-mean, matching K0261's courtesy right above (a typo'd
+                        // `fulfills` contract name) -- a typo'd EXPOSED METHOD name landed
+                        // here bare: `expose fun gett(...)` for a contract requiring `get`
+                        // named the missing method but never suggested the close-by typo
+                        // actually exposed, unlike the sibling `.method()` call-site lookup
+                        // (`find_method`) which already does this (PR-it581).
+                        let mut msg =
+                            format!("`{}` fulfills `{contract_name}` but does not expose `{fname}`", c.name);
+                        if let Some(s) = suggest(fname, comp_sig.exposes.keys().map(String::as_str)) {
+                            msg.push_str(&format!(" — did you mean `{s}`?"));
+                        }
+                        self.err("K0262", msg, c.span);
+                    }
                     Some((cp, cr)) => {
                         let want = Ty::Fun(params.clone(), Box::new(ret.clone()));
                         let got = Ty::Fun(cp.clone(), Box::new(cr.clone()));
@@ -3568,6 +3577,44 @@ mod generic_tests {
         assert!(
             none.iter().any(|d| d.code == "K0261" && !d.message.contains("did you mean")),
             "unrelated name should stay bare: {none:?}"
+        );
+    }
+
+    #[test]
+    fn k0262_missing_contract_method_suggests_closest_exposed_name() {
+        // A REAL BUG found+fixed (PR-it581), a sibling to K0261's did-you-mean (right
+        // above): K0261 suggests a close-by CONTRACT name when `fulfills` names an unknown
+        // contract, but K0262 (a component fulfilling a KNOWN contract while missing one
+        // of its required methods) never checked the component's OWN exposed methods for a
+        // close match -- `expose fun gett(...)` for a contract requiring `get` named the
+        // miss ("does not expose `get`") but never pointed at the typo actually present,
+        // unlike the reverse case (`recv.gett()` on a call site, which `find_method`
+        // already suggests correctly).
+        let typo = errors(
+            "contract KeyStore {\n    intent \"kv\"\n    expose fun put(key: Str, value: Str) -> Bool\n    \
+             expose fun get(key: Str) -> Option[Str]\n}\n\
+             component MemoryStore fulfills KeyStore {\n    intent \"m\"\n    state entries: List[Str] = []\n    \
+             expose fun put(key: Str, value: Str) -> Bool { true }\n    \
+             expose fun gett(key: Str) -> Option[Str] { None }\n}\n",
+        );
+        assert!(
+            typo.iter().any(|d| d.code == "K0262"
+                && d.message.contains("does not expose `get`")
+                && d.message.contains("did you mean `gett`?")),
+            "typo'd exposed method should suggest the close match: {typo:?}"
+        );
+        // Nothing close -> no suggestion (no false-positive did-you-mean); this is the
+        // SAME repro `contract_conformance_is_structurally_enforced` already locks for
+        // K0262's bare existence, re-asserted here specifically for the ABSENCE of a
+        // bogus suggestion.
+        let none = errors(
+            "contract KeyStore {\n    intent \"kv\"\n    expose fun get(key: Str) -> Option[Str]\n}\n\
+             component MemoryStore fulfills KeyStore {\n    intent \"m\"\n    state entries: List[Str] = []\n    \
+             expose fun size() -> Int { 0 }\n}\n",
+        );
+        assert!(
+            none.iter().any(|d| d.code == "K0262" && !d.message.contains("did you mean")),
+            "unrelated exposed name should stay bare: {none:?}"
         );
     }
 
