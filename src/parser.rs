@@ -33,6 +33,24 @@ fn str_parts_text(parts: &[StrPart]) -> String {
         .collect()
 }
 
+/// A did-you-mean suggestion suffix (`" — did you mean \`X\`?"`, or empty) for a
+/// mis-parsed keyword-dispatched fallback: when the unrecognized token is an
+/// IDENTIFIER (a typo'd keyword lexes as a plain `Tok::Ident`, not as the
+/// keyword's own token) that's close to one of `candidates`, name the fix --
+/// otherwise (a non-identifier token, or nothing close enough) stays silent,
+/// same calibration as `check::suggest`'s own edit-distance threshold. Reuses
+/// `check::suggest` (PR-it603) rather than a second, independently-written
+/// fuzzy-match implementation -- this file had ZERO did-you-mean coverage
+/// before this, unlike check.rs's ~95 `self.err(...)` sites (it581/582).
+fn keyword_suggestion(tok: &Tok, candidates: &[&str]) -> String {
+    match tok {
+        Tok::Ident(name) => crate::check::suggest(name, candidates.iter().copied())
+            .map(|s| format!(" — did you mean `{s}`?"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Build an interpolated-string `Expr` from lexed string parts (interpolation
 /// sub-expressions are parsed). Used for `ai fun` intents.
 fn str_parts_expr(parts: &[StrPart], span: Span) -> PResult<Expr> {
@@ -314,8 +332,9 @@ impl Parser {
             other => Err(Diag::error(
                 "K0103",
                 format!(
-                    "expected a declaration (`fun`, `type`, `component`, `app`), found {}",
-                    other.describe()
+                    "expected a declaration (`fun`, `type`, `component`, `app`), found {}{}",
+                    other.describe(),
+                    keyword_suggestion(other, &["fun", "type", "component", "app", "contract", "use", "module"])
                 ),
                 self.span(),
             )),
@@ -658,8 +677,9 @@ impl Parser {
                     return Err(Diag::error(
                         "K0116",
                         format!(
-                            "unexpected {} in contract body (expected `intent`, `expose fun`, or `law`)",
-                            other.describe()
+                            "unexpected {} in contract body (expected `intent`, `expose fun`, or `law`){}",
+                            other.describe(),
+                            keyword_suggestion(&other, &["intent", "expose", "law"])
                         ),
                         self.span(),
                     ))
@@ -976,7 +996,11 @@ impl Parser {
                         other => {
                             return Err(Diag::error(
                                 "K0106",
-                                format!("example blocks contain `send`, `expect`, and `advance` steps; found {}", other.describe()),
+                                format!(
+                                    "example blocks contain `send`, `expect`, and `advance` steps; found {}{}",
+                                    other.describe(),
+                                    keyword_suggestion(&other, &["send", "expect", "advance"])
+                                ),
                                 self.span(),
                             ))
                         }
@@ -2007,6 +2031,46 @@ mod tests {
         let d = diags.iter().find(|d| d.code == "K0112").expect("K0112 must fire");
         let text = &src[d.span.start as usize..d.span.end as usize];
         assert_eq!(text, "x", "span must cover just the interpolated expression, not the whole string literal: {text:?}");
+    }
+
+    #[test]
+    fn keyword_typos_suggest_the_closest_valid_keyword() {
+        // A NEW capability (PR-it603, part 2 of the parser.rs sweep this campaign
+        // started with K0112's span fix): parser.rs had ZERO did-you-mean coverage
+        // before this, unlike check.rs's ~95 `self.err(...)` sites (it581/582) -- a
+        // typo'd keyword (which lexes as a plain identifier, not the keyword's own
+        // token) at one of the three smallest, cleanest keyword-dispatched fallback
+        // sites now suggests the closest valid keyword, reusing `check::suggest`
+        // rather than a second fuzzy-match implementation.
+        let (_, diags) = parse("fnu main() {\n    print(\"hi\")\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0103" && d.message.contains("did you mean `fun`?")),
+            "top-level `fnu` should suggest `fun`: {diags:?}"
+        );
+        let (_, diags) = parse("contract Store {\n    intetn \"kv\"\n    expose fun get(k: Str) -> Int\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0116" && d.message.contains("did you mean `intent`?")),
+            "contract-body `intetn` should suggest `intent`: {diags:?}"
+        );
+        let (_, diags) = parse(
+            "component C {\n    intent \"c\"\n    in click: Event\n    state n: Int = 0\n    on click { n = n + 1 }\n    example {\n        sned click\n    }\n}\n",
+        );
+        assert!(
+            diags.iter().any(|d| d.code == "K0106" && d.message.contains("did you mean `send`?")),
+            "example-step `sned` should suggest `send`: {diags:?}"
+        );
+        // no false-positive suggestion when nothing is close enough, or when the
+        // offending token isn't even an identifier (e.g. an integer literal).
+        let (_, diags) = parse("xyzzyplugh main() {\n    print(\"hi\")\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0103" && !d.message.contains("did you mean")),
+            "a genuinely unrelated identifier must not get a false-positive suggestion: {diags:?}"
+        );
+        let (_, diags) = parse("123 main() {\n    print(\"hi\")\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0103" && !d.message.contains("did you mean")),
+            "a non-identifier token must never get a suggestion: {diags:?}"
+        );
     }
 
     #[test]
