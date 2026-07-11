@@ -792,6 +792,23 @@ pub fn run_tests(path: &str) -> i32 {
         }
         if c.props.iter().any(|p| p.default.is_none()) {
             println!("skip  {} laws (component requires props)", c.name);
+            // Matches the sibling `example` skip branch above (`skipped +=
+            // c.examples.len()`): tally how many laws this skip actually
+            // covers -- every law of every contract this component fulfills
+            // -- rather than leaving the final summary silently undercounting
+            // (PR-it583, found via a multi-file/generics investigation that
+            // otherwise confirmed cross-file law-running is fully correct).
+            let n: usize = c
+                .fulfills
+                .iter()
+                .filter_map(|contract_name| {
+                    compiled.program.items.iter().find_map(|i| match i {
+                        Item::Contract(ct) if &ct.name == contract_name => Some(ct.laws.len()),
+                        _ => None,
+                    })
+                })
+                .sum();
+            skipped += n;
             continue;
         }
         for contract_name in &c.fulfills {
@@ -998,6 +1015,45 @@ mod tests {
         // a file with no laws is not an error.
         let none = write("none.kupl", "fun add(a: Int, b: Int) -> Int { a + b }\n");
         assert_eq!(super::run_tests(&none), 0, "no tests is a clean pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_tests_tallies_skipped_contract_laws() {
+        // A REAL BUG found+fixed (PR-it583): the contract-laws loop's "component
+        // requires props, skip its laws" branch printed a "skip ..." line but never
+        // incremented the `skipped` counter (unlike the sibling `example`-skip branch
+        // right above it, which correctly does `skipped += c.examples.len()`) -- the
+        // final "N passed, N failed, N skipped" summary always undercounted by the
+        // number of laws belonging to every prop-requiring fulfilling component,
+        // regardless of exit code (still 0, since only `failed` gates it) -- a silent
+        // wrong-VALUE bug in `kupl test`'s own reporting, not its execution.
+        let dir = std::env::temp_dir().join(format!("kupl-runtests-skiplaw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "contract Counter {\n    intent \"a counter\"\n    expose fun get() -> Int\n    expose fun inc()\n    \
+                   law \"law one\" {\n        expect get() >= 0\n    }\n    \
+                   law \"law two\" {\n        let before = get()\n        inc()\n        expect get() == before + 1\n    }\n}\n\
+                   component B fulfills Counter {\n    intent \"requires a prop\"\n    prop start: Int\n    \
+                   state n: Int = start\n    expose fun get() -> Int { n }\n    expose fun inc() { n = n + 1 }\n}\n\
+                   fun main() { print(\"hi\") }\n";
+        let path = dir.join("skiplaw.kupl");
+        std::fs::write(&path, src).unwrap();
+        // `CARGO_BIN_EXE_kupl` is only set for integration tests/benches, not for
+        // unit tests embedded in the lib crate -- fall back to the standard debug
+        // build path `cargo test` itself just produced.
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet (e.g. a lib-only build) -- nothing to test
+        }
+        let out = std::process::Command::new(&bin)
+            .args(["test", path.to_str().unwrap()])
+            .output()
+            .expect("kupl test runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("0 passed, 0 failed, 2 skipped"),
+            "both of B's contract laws must count as skipped, not zero: {stdout:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
