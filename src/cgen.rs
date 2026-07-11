@@ -3267,7 +3267,12 @@ static int64_t k_floor_div(int64_t a, int64_t b) {
     if ((a % b != 0) && ((a % b < 0) != (b < 0))) q -= 1;
     return q;
 }
-static int64_t k_floor_mod(int64_t a, int64_t b) { return a - k_floor_div(a, b) * b; }
+/* Widen to __int128 for the multiply/subtract -- the final result is always in
+   [0, b) (tiny: 86400, 400, 146097, 7...), but the intermediate product can
+   transiently overflow int64_t when `a` spans the full i64 timestamp range
+   (mirrors time.rs::floor_mod's same fix; confirmed via UBSan on a timestamp
+   near INT64_MIN, PR-it576). */
+static int64_t k_floor_mod(int64_t a, int64_t b) { return (int64_t)((__int128)a - (__int128)k_floor_div(a, b) * b); }
 static void k_civil(int64_t z, int64_t* y, int64_t* m, int64_t* d) {
     z += 719468;
     int64_t era = k_floor_div(z >= 0 ? z : z - 146096, 146097);
@@ -7109,6 +7114,28 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "datetime").trim(),
             "2024-2-29 wd=4|2024-02-29T00:00:00Z|3-1"
+        );
+    }
+
+    /// A REAL BUG found+fixed (PR-it576), the native-only twin of `k_floor_mod`'s overflow:
+    /// `k_floor_mod`'s C mirror had the SAME `a - k_floor_div(a, b) * b` shape, whose
+    /// intermediate `int64_t` multiplication overflows -- undefined behavior in C (not a
+    /// caught panic like Rust's debug build), confirmed via UBSan: "signed integer overflow"
+    /// on a timestamp near INT64_MIN. The plain (non-sanitized) build silently produced a
+    /// value anyway (UB that happened to not visibly misbehave under this compiler/
+    /// optimization level) -- exactly the "looks fine under normal testing, only a
+    /// sanitizer catches it" pattern this campaign's native-runtime-audit vein exists to
+    /// find. Fixed by widening to `__int128`, matching `time.rs`'s fix exactly.
+    #[test]
+    fn native_date_iso_near_i64_extremes_matches_interp_no_ub() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{date_iso(9223372036854775807)}|{date_iso(-9223372036854775807)}|{weekday_of(-9223372036854775807)}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "timeextreme").trim(),
+            "292277026596-12-04T15:30:07Z|-292277022657-01-28T08:29:53Z|0"
         );
     }
 

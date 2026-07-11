@@ -15503,6 +15503,23 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
     }
 
     #[test]
+    fn diff_date_iso_near_i64_extremes_does_not_ice() {
+        // A REAL BUG found+fixed (PR-it576): time.rs's shared `floor_mod(a, b)` computed
+        // `a - floor_div(a, b) * b` -- the FINAL result is always in [0, b) (tiny: 86400,
+        // 400, 146097, 7...), but the INTERMEDIATE product `floor_div(a, b) * b` can
+        // transiently overflow i64 when `a` is a raw Unix timestamp spanning the FULL i64
+        // range (a timestamp near i64::MIN/MAX is a perfectly valid Int, no type-level
+        // restriction prevents it). In a debug build this tripped Rust's overflow panic,
+        // caught by main.rs's generic panic hook and reported as a bogus "internal
+        // compiler error" -- crashing the ENTIRE interpreter/KVM on a normal Int input,
+        // not a KUPL-level panic. Fixed by widening the multiply/subtract to i128.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{date_iso(9223372036854775807)}|{date_iso(-9223372036854775807)}|{weekday_of(-9223372036854775807)}\" }\n"),
+            "292277026596-12-04T15:30:07Z|-292277022657-01-28T08:29:53Z|0"
+        );
+    }
+
+    #[test]
     fn diff_transcendental_math() {
         // sqrt/cbrt/hypot are correctly-rounded (IEEE); sin/cos/tan/exp/log/pow share the
         // platform libm, so interp and KVM (both Rust f64, which delegates to libm) agree

@@ -20,7 +20,14 @@ fn floor_div(a: i64, b: i64) -> i64 {
 }
 
 fn floor_mod(a: i64, b: i64) -> i64 {
-    a - floor_div(a, b) * b
+    // The final result is always in [0, b) (tiny for every real caller here --
+    // 86400, 400, 146097, 7...), but the INTERMEDIATE product `floor_div(a, b) * b`
+    // can transiently exceed i64 range when `a` spans the full i64 timestamp range
+    // (e.g. a timestamp near i64::MIN/MAX) even though `a` itself and the final
+    // subtracted result both fit -- a classic "intermediate overflow, final value in
+    // range" trap. Widen to i128 for the multiply/subtract so this never overflows;
+    // the final cast back to i64 is always in-bounds by construction.
+    (a as i128 - floor_div(a, b) as i128 * b as i128) as i64
 }
 
 /// (year, month 1..=12, day 1..=31) from a count of days since 1970-01-01.
