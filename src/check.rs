@@ -968,11 +968,14 @@ impl Checker {
         }
         for s in &c.supervises {
             if !child_types.contains_key(&s.child) {
-                self.err(
-                    "K0265",
-                    format!("`supervise` references unknown child `{}`", s.child),
-                    s.span,
-                );
+                // Did-you-mean, matching K0213's `wire`-child lookup (the SAME
+                // `child_types` pool) -- a typo'd `supervise` child name named the miss
+                // but never suggested the close declared child (PR-it582).
+                let mut msg = format!("`supervise` references unknown child `{}`", s.child);
+                if let Some(sug) = suggest(&s.child, child_types.keys().map(String::as_str)) {
+                    msg.push_str(&format!(" — did you mean `{sug}`?"));
+                }
+                self.err("K0265", msg, s.span);
             }
         }
 
@@ -1026,10 +1029,17 @@ impl Checker {
                     }
                     match sig.in_ports.get(p) {
                         None => {
+                            // Did-you-mean, matching the same courtesy already given to
+                            // unknown contracts/methods/fields/ctors/child-components
+                            // (K0261/K0262/K0247/K0230/K0254/K0208) -- a typo'd port name
+                            // in `on <port>` named the miss but never suggested the close
+                            // in-scope port name (PR-it582).
                             let hint = if sig.out_ports.contains_key(p) {
-                                " (it is an `out` port — handlers react to `in` ports)"
+                                " (it is an `out` port — handlers react to `in` ports)".to_string()
+                            } else if let Some(s) = suggest(p, sig.in_ports.keys().map(String::as_str)) {
+                                format!(" — did you mean `{s}`?")
                             } else {
-                                ""
+                                String::new()
                             };
                             self.err("K0211", format!("`on {p}`: component `{}` has no `in` port named `{p}`{hint}", c.name), h.span);
                         }
@@ -1088,11 +1098,14 @@ impl Checker {
         match map.get(port) {
             Some(ty) => Some(ty.clone()),
             None => {
-                self.err(
-                    "K0214",
-                    format!("component `{comp_name}` has no `{kind}` port named `{port}`"),
-                    span,
-                );
+                // Did-you-mean, matching the sibling child-name lookup right above
+                // (K0213) -- a typo'd PORT name (once the child itself resolved fine)
+                // named the miss but never suggested the close in-scope port (PR-it582).
+                let mut msg = format!("component `{comp_name}` has no `{kind}` port named `{port}`");
+                if let Some(s) = suggest(port, map.keys().map(String::as_str)) {
+                    msg.push_str(&format!(" — did you mean `{s}`?"));
+                }
+                self.err("K0214", msg, span);
                 None
             }
         }
@@ -1128,14 +1141,21 @@ impl Checker {
                     self.check_assign(&pty, &arg_ty, arg.value.span, &format!("prop `{pname}` of `{comp_name}`"));
                 }
                 None => {
-                    self.err(
-                        "K0215",
-                        match &arg.name {
-                            Some(n) => format!("component `{comp_name}` has no prop named `{n}`"),
-                            None => format!("too many arguments for `{comp_name}` (has {} props)", sig.props.len()),
-                        },
-                        arg.value.span,
-                    );
+                    let msg = match &arg.name {
+                        Some(n) => {
+                            // Did-you-mean, matching the same courtesy given to unknown
+                            // record fields/ctor fields/exposed methods (K0230/K0244/
+                            // K0247) -- a typo'd NAMED prop named the miss but never
+                            // suggested the close prop actually declared (PR-it582).
+                            let mut msg = format!("component `{comp_name}` has no prop named `{n}`");
+                            if let Some(s) = suggest(n, sig.props.iter().map(|(pn, _, _)| pn.as_str())) {
+                                msg.push_str(&format!(" — did you mean `{s}`?"));
+                            }
+                            msg
+                        }
+                        None => format!("too many arguments for `{comp_name}` (has {} props)", sig.props.len()),
+                    };
+                    self.err("K0215", msg, arg.value.span);
                 }
             }
         }
@@ -1154,11 +1174,17 @@ impl Checker {
         for step in &ex.steps {
             match step {
                 ExampleStep::Send { port, arg, span } => match sig.in_ports.get(port) {
-                    None => self.err(
-                        "K0217",
-                        format!("`send {port}`: component `{}` has no `in` port named `{port}`", c.name),
-                        *span,
-                    ),
+                    None => {
+                        // Did-you-mean, matching K0211's sibling `on <port>` lookup --
+                        // a typo'd port name in `send <port>` named the miss but never
+                        // suggested the close in-scope `in` port (PR-it582).
+                        let mut msg =
+                            format!("`send {port}`: component `{}` has no `in` port named `{port}`", c.name);
+                        if let Some(s) = suggest(port, sig.in_ports.keys().map(String::as_str)) {
+                            msg.push_str(&format!(" — did you mean `{s}`?"));
+                        }
+                        self.err("K0217", msg, *span);
+                    }
                     Some(ty) => {
                         let ty = ty.clone();
                         let mut ctx = Ctx {
@@ -1324,10 +1350,15 @@ impl Checker {
                 let sig = self.checked.components.get(&c.name).cloned().unwrap_or_default();
                 match sig.out_ports.get(port) {
                     None => {
+                        // Did-you-mean, matching K0211/K0217's sibling port lookups --
+                        // a typo'd port name in `emit <port>` named the miss but never
+                        // suggested the close in-scope `out` port (PR-it582).
                         let hint = if sig.in_ports.contains_key(port) {
-                            " (it is an `in` port — you can only `emit` on `out` ports)"
+                            " (it is an `in` port — you can only `emit` on `out` ports)".to_string()
+                        } else if let Some(s) = suggest(port, sig.out_ports.keys().map(String::as_str)) {
+                            format!(" — did you mean `{s}`?")
                         } else {
-                            ""
+                            String::new()
                         };
                         self.err("K0226", format!("component `{}` has no `out` port named `{port}`{hint}", c.name), *span);
                     }
@@ -3616,6 +3647,66 @@ mod generic_tests {
             none.iter().any(|d| d.code == "K0262" && !d.message.contains("did you mean")),
             "unrelated exposed name should stay bare: {none:?}"
         );
+    }
+
+    #[test]
+    fn wiring_port_and_supervise_typos_suggest_closest_name() {
+        // A REAL BUG found+fixed (PR-it582), SIX more instances of the same sibling-
+        // consistency gap as K0261/K0262 (it512/it581): a systematic sweep of every
+        // "unknown X"-shaped diagnostic in check.rs found K0211/K0214/K0215/K0217/K0226/
+        // K0265 all had an obvious in-scope candidate pool (in_ports/out_ports/props/
+        // child names) sitting right next to the `self.err(...)` call, but never called
+        // `suggest(...)` -- each named the miss with zero pointer to the close-by typo.
+        let has_suggestion = |src: &str, code: &str, wanted: &str| {
+            errors(src).iter().any(|d| d.code == code && d.message.contains(&format!("did you mean `{wanted}`?")))
+        };
+
+        // K0211: `on <port>` handler trigger.
+        assert!(has_suggestion(
+            "component Widget {\n    intent \"x\"\n    in trigger: Int\n    on triger(n) { }\n}\n",
+            "K0211", "trigger"
+        ));
+        // K0214: `wire a.port -> b.port` (port typo, child name already resolved).
+        assert!(has_suggestion(
+            "component Src {\n    intent \"s\"\n    out value: Int\n}\n\
+             component Consumer {\n    intent \"c\"\n    in value: Int\n    on value(n) { }\n}\n\
+             component Top {\n    intent \"t\"\n    let producer = Src()\n    let consumer = Consumer()\n    \
+             wire producer.valu -> consumer.value\n}\n",
+            "K0214", "value"
+        ));
+        // K0215: a NAMED prop typo in component construction.
+        assert!(has_suggestion(
+            "component Widget {\n    intent \"x\"\n    prop label: Str\n}\n\
+             fun main() uses io {\n    let w = Widget(lable: \"hi\")\n}\n",
+            "K0215", "label"
+        ));
+        // K0217: `example { send <port>(...) }`.
+        assert!(has_suggestion(
+            "component Widget {\n    intent \"x\"\n    in trigger: Int\n    on trigger(n) { }\n    \
+             example {\n        send triger(1)\n    }\n}\n",
+            "K0217", "trigger"
+        ));
+        // K0226: `emit <port>(...)`.
+        assert!(has_suggestion(
+            "component Widget {\n    intent \"x\"\n    out result: Int\n    in go: Int\n    on go(n) {\n        \
+             emit resutl(n)\n    }\n}\n",
+            "K0226", "result"
+        ));
+        // K0265: `supervise <child> restart on_failure`.
+        assert!(has_suggestion(
+            "component Divider {\n    intent \"d\"\n}\n\
+             component Top {\n    intent \"t\"\n    let divider = Divider()\n    supervise dividr restart on_failure\n}\n",
+            "K0265", "divider"
+        ));
+
+        // Nothing close for either -> stays bare, no false-positive did-you-mean.
+        let none1 = errors("component Widget {\n    intent \"x\"\n    in trigger: Int\n    on zzzzzzz(n) { }\n}\n");
+        assert!(none1.iter().any(|d| d.code == "K0211" && !d.message.contains("did you mean")));
+        let none2 = errors(
+            "component Divider {\n    intent \"d\"\n}\n\
+             component Top {\n    intent \"t\"\n    let divider = Divider()\n    supervise zzzzzzz restart on_failure\n}\n",
+        );
+        assert!(none2.iter().any(|d| d.code == "K0265" && !d.message.contains("did you mean")));
     }
 
     #[test]
