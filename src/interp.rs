@@ -3470,7 +3470,17 @@ pub fn random_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
 /// after `--`; with no `--`, there are none. (The native backend reads argv
 /// directly.)
 pub fn program_args() -> Vec<String> {
-    let all: Vec<String> = std::env::args().collect();
+    // `std::env::args()` PANICS on any argument that isn't valid Unicode (a raw,
+    // non-UTF8 argv element is rare but real — e.g. a filename-derived argument
+    // passed through by another tool) — contradicting the "no panics on any
+    // input" goal with a bare Rust panic reported as a bogus "internal compiler
+    // error". `args_os()` never panics; an unrepresentable argument is replaced
+    // WHOLESALE with a placeholder rather than embedded lossily byte-by-byte, so
+    // native (which can't cheaply replicate Rust's per-invalid-run lossy
+    // algorithm) can match this exactly with a single whole-value check (PR-it578).
+    let all: Vec<String> = std::env::args_os()
+        .map(|a| a.to_str().map(str::to_string).unwrap_or_else(|| "\u{FFFD}".to_string()))
+        .collect();
     match all.iter().position(|a| a == "--") {
         Some(i) => all[i + 1..].to_vec(),
         None => Vec::new(),

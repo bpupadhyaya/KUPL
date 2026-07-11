@@ -3071,15 +3071,31 @@ static KValue k_file_exists(KValue path) {
 /* ---- environment & process builtins ---- */
 static int k_argc = 0;
 static char** k_argv = 0;
+/* An OS environment variable's VALUE is arbitrary bytes on POSIX, not
+   guaranteed UTF-8 (unlike a NUL, which can't appear -- env vars are
+   NUL-terminated by construction). interp's `std::env::var` already treats a
+   non-UTF8 value as "not present" (`VarError::NotUnicode` -> `None`); native
+   previously returned it RAW with no check at all, a K0008-adjacent (valid-
+   UTF-8) violation reachable from any oddly-set environment (PR-it578). */
 static KValue k_env_var(KValue name) {
     const char* v = getenv(name.as.s);
-    return v ? k_some(k_str(v)) : k_none();
+    if (!v) return k_none();
+    if (!k_valid_utf8((const unsigned char*)v, strlen(v))) return k_none();
+    return k_some(k_str(v));
 }
 static KValue k_args(void) {
-    /* the program's own args are argv[1..] */
+    /* the program's own args are argv[1..]. A raw, non-UTF8 argv element is
+       rare but real (PR-it578): interp's `program_args` used to PANIC on one
+       (`std::env::args()`'s own documented behavior) -- now it substitutes a
+       U+FFFD placeholder for the WHOLE argument instead, which native mirrors
+       exactly here (a single whole-value validity check, not a per-invalid-
+       byte lossy decode) rather than silently holding an invalid-UTF8 Str. */
     int n = k_argc > 1 ? k_argc - 1 : 0;
     KValue* out = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
-    for (int i = 0; i < n; i++) out[i] = k_str(k_argv[i + 1]);
+    for (int i = 0; i < n; i++) {
+        const char* a = k_argv[i + 1];
+        out[i] = k_valid_utf8((const unsigned char*)a, strlen(a)) ? k_str(a) : k_str("\xEF\xBF\xBD");
+    }
     return k_list(out, n);
 }
 static KValue k_eprint(KValue v) {
@@ -5503,6 +5519,45 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
                    print(\"{env_var(\"KUPL_DEFINITELY_MISSING_XYZ\")}\")\n}\n";
         let out = native_main_stdout_env(src, "envv", &[("KUPL_NATIVE_TEST_VAR", "hello")]);
         assert_eq!(out.trim(), "Some(\"hello\")\nNone");
+    }
+
+    /// A REAL BUG found+fixed (PR-it578): a raw, non-UTF8 command-line argument (rare,
+    /// but real -- e.g. a filename-derived argument forwarded by another tool) used to
+    /// PANIC interp/vm outright (`std::env::args()`'s own documented behavior, reported
+    /// as a bogus "internal compiler error" from BOTH main.rs's own top-level CLI arg
+    /// parsing AND `interp::program_args`), while native silently held the invalid bytes
+    /// in a live `Str` value with NO check at all -- a genuine 3-way divergence (crash vs.
+    /// silent invariant violation). Fixed by switching to `args_os()` on both engines and
+    /// substituting a single U+FFFD placeholder for the WHOLE unrepresentable argument
+    /// (not a per-invalid-byte lossy decode, which would be expensive to replicate
+    /// byte-for-byte in native's C mirror) -- never panics, never holds invalid UTF-8.
+    #[test]
+    fn native_args_with_invalid_utf8_returns_a_placeholder_not_a_crash() {
+        if !cc_available() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let src = "fun main() uses io {\n    print(args())\n}\n";
+            let compiled = crate::run::compile(src).expect("program compiles");
+            let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let c = super::emit_c(&module).expect("emit_c succeeds");
+            let base = std::env::temp_dir().join(format!("kupl-cgen-argsutf8-{}", std::process::id()));
+            let cpath = base.with_extension("c");
+            let bin = base.with_extension("out");
+            std::fs::write(&cpath, &c).unwrap();
+            assert!(std::process::Command::new(cc())
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .status().unwrap().success());
+            let bad_arg = std::ffi::OsString::from_vec(vec![0xFF, 0xFE]);
+            let out = std::process::Command::new(&bin).arg(&bad_arg).output().expect("binary runs");
+            let _ = std::fs::remove_file(&cpath);
+            let _ = std::fs::remove_file(&bin);
+            assert!(out.status.success(), "must not crash: {out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[\"\u{FFFD}\"]");
+        }
     }
 
     /// Native exec matches the interpreter on the nonexistent-command message

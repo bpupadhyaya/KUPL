@@ -70,7 +70,19 @@ fn run_cli() -> ExitCode {
         }
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `std::env::args()` PANICS on any argument that isn't valid Unicode. A raw,
+    // non-UTF8 argv element is rare but real (e.g. a filename-derived argument
+    // forwarded by another tool) — this is the CLI's own top-level arg parsing,
+    // reached before user code ever runs, so a bare Rust panic here previously
+    // crashed the whole `kupl` invocation as a misleading "internal compiler
+    // error" no matter what subcommand was requested. `args_os()` never panics;
+    // an unrepresentable argument becomes a placeholder instead (matches
+    // interp::program_args's identical fix for a user program's OWN `args()`
+    // builtin, PR-it578).
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_str().map(str::to_string).unwrap_or_else(|| "\u{FFFD}".to_string()))
+        .collect();
     let json = args.iter().any(|a| a == "--json");
     let vm = args.iter().any(|a| a == "--vm");
     let kx_path = args
