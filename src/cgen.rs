@@ -4267,8 +4267,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             const char** starts; int* lens;
             int nc = k_str_char_spans(s, &starts, &lens);
             int64_t lo = a < 0 ? 0 : (a > nc ? nc : a);
-            int64_t amax = a < 0 ? 0 : a;
-            int64_t hi = b < amax ? amax : (b > nc ? nc : b);
+            int64_t hi = b < lo ? lo : (b > nc ? nc : b);
             KBuf buf = {0};
             for (int64_t i = lo; i < hi; i++) {
                 char c[5]; memcpy(c, starts[i], (size_t)lens[i]); c[lens[i]] = 0;
@@ -6030,6 +6029,28 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
             native_main_stdout(src, "sliceidx").trim(),
             "é世|世b||Some(5)|None|[1, 2, 3, 4, 5]|[4, 5]|[[1, 2], [3, 4], [5]]"
         );
+    }
+
+    /// Native `Str.slice` with a START index PAST the string's own char count, combined
+    /// with an END index SMALLER than that start (`a > len`, `b < a`), used to read past
+    /// the end of the `k_str_char_spans` char-span array: the old C code computed the
+    /// clamped `hi` bound using an UNCLAMPED `amax = max(a, 0)` as its floor instead of
+    /// the already-`nc`-clamped `lo`, so `hi` could exceed `nc` whenever `b < amax` --
+    /// the subsequent `for (i = lo; i < hi; i++)` loop then indexed uninitialized heap
+    /// memory as a `char*`/length pair and `memcpy`'d from it (confirmed via
+    /// AddressSanitizer: `negative-size-param`, reading malloc's `0xbebebe...` poison
+    /// pattern as a wild pointer) -- undefined behavior, not just a wrong VALUE, on a
+    /// combination `native_slice_and_index_edges` above never exercised (PR-it572).
+    /// interp/KVM share one Rust `shared_method` implementation (already correct, uses
+    /// `lo` as `hi`'s floor) so this was native-only.
+    #[test]
+    fn native_slice_start_past_len_with_end_before_start_is_not_oob() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let s = \"abc\"\n    \
+                   print(\"{s.slice(10, 5)}|{s.slice(1, 3)}|{s.slice(3, 2)}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "sliceoob").trim(), "|bc|");
     }
 
     /// Native emits escape sequences as their actual control bytes (a `\n` prints a real
