@@ -206,6 +206,26 @@ struct Ctx<'a> {
     loop_depth: usize,
 }
 
+/// One "column" of the joint exhaustiveness matrix (`Checker::joint_exhaustive`):
+/// either a real source sub-pattern, or a synthetic wildcard produced when
+/// specializing a row whose pattern at this position was already a
+/// catch-all (a bare `_`/bind covers every value, so it "expands" into one
+/// synthetic wildcard per field of whichever constructor is being checked).
+#[derive(Clone, Copy)]
+enum Slot<'a> {
+    Pat(&'a Pattern),
+    Wild,
+}
+
+impl<'a> Slot<'a> {
+    fn is_catch_all(&self) -> bool {
+        match self {
+            Slot::Wild => true,
+            Slot::Pat(p) => Checker::pattern_is_catch_all(p),
+        }
+    }
+}
+
 impl Checker {
     fn err(&mut self, code: &'static str, msg: impl Into<String>, span: Span) {
         self.diags.push(Diag::error(code, msg, span));
@@ -3028,6 +3048,29 @@ impl Checker {
                         format!("non-exhaustive `match`: missing {}", missing.join(", ")),
                         span,
                     );
+                    return;
+                }
+                // `exhaustive_missing` checks each matched constructor's
+                // fields INDEPENDENTLY, which is a strictly WEAKER guarantee
+                // than true joint coverage for a MULTI-field constructor:
+                // e.g. `P(Circle(_), _) => .., P(Square(_), Circle(_)) => ..`
+                // on `P(a: Shape, b: Shape)` looks fully covered field-by-
+                // field (field 0 sees Circle+Square; field 1 sees a
+                // catch-all) but is actually missing the SPECIFIC combination
+                // `P(Square(_), Square(_))`. Run the full joint/decision-tree
+                // check as a safety net whenever the cheaper per-field check
+                // found nothing (PR-it570; the per-field check still owns the
+                // common, precise single-field-per-constructor message).
+                let rows: Vec<Vec<Slot>> = patterns.iter().map(|p| vec![Slot::Pat(p)]).collect();
+                if !self.joint_exhaustive(&rows, std::slice::from_ref(scrut)) {
+                    self.err(
+                        "K0257",
+                        "non-exhaustive `match`: the arms shown do not jointly cover every \
+                         combination of the matched fields — add a catch-all arm (`_ => …`) \
+                         or handle the missing combination explicitly"
+                            .to_string(),
+                        span,
+                    );
                 }
             }
             _ => {
@@ -3038,6 +3081,168 @@ impl Checker {
                 );
             }
         }
+    }
+
+    /// True joint (multi-column) exhaustiveness: does `rows` (each a
+    /// pattern-tuple for the remaining `tys` positions, contributed by an
+    /// arm still relevant at this point) cover every possible combination
+    /// of values across ALL of `tys` together? This is the proper
+    /// decision-tree/specialization algorithm real exhaustiveness checkers
+    /// use, as opposed to `exhaustive_missing`'s cheaper per-field-
+    /// independent approximation (PR-it570).
+    fn joint_exhaustive(&self, rows: &[Vec<Slot>], tys: &[Ty]) -> bool {
+        // A row where EVERY remaining position is a catch-all trivially
+        // covers ANY combination of values for `tys`, no matter how deep --
+        // this is both a correctness shortcut (a bare `_`/bind genuinely
+        // matches anything) and the TERMINATION guarantee for recursive ADTs
+        // (e.g. `type Tree = Leaf | Node(l: Tree, r: Tree)`): without this
+        // short-circuit, specializing an all-wildcard row by `Node` would
+        // keep expanding into MORE wildcard `Tree` columns forever.
+        if rows.iter().any(|r| r.iter().all(Slot::is_catch_all)) {
+            return true;
+        }
+        let Some((t0, rest)) = tys.split_first() else {
+            // no positions left to decide: covered iff some row reached here
+            return !rows.is_empty();
+        };
+        match self.uni.apply(t0) {
+            Ty::Bool => {
+                for b in [true, false] {
+                    let specialized = Self::specialize_bool(rows, b);
+                    if !self.joint_exhaustive(&specialized, rest) {
+                        return false;
+                    }
+                }
+                true
+            }
+            ty @ (Ty::Option(_) | Ty::Result(_, _) | Ty::Named(..)) => {
+                let variants = self.variant_field_tys(&ty);
+                if variants.is_empty() {
+                    // unknown/unresolved type: don't false-reject
+                    return true;
+                }
+                for (vname, field_tys) in &variants {
+                    let specialized = Self::specialize_ctor(rows, vname, field_tys.len());
+                    let mut sub_tys = field_tys.clone();
+                    sub_tys.extend(rest.iter().cloned());
+                    if !self.joint_exhaustive(&specialized, &sub_tys) {
+                        return false;
+                    }
+                }
+                true
+            }
+            // unbounded scalar column (Int, Str, Float, ...): same leniency
+            // as `exhaustive_missing` -- this position's OWN value-space
+            // isn't required to be fully covered. But that must not
+            // short-circuit the WHOLE check: every row still passes through
+            // unconditionally (we're choosing not to discriminate on this
+            // column, not declaring the remaining columns irrelevant), so
+            // `rest` is still checked for joint coverage using each row's
+            // own leftover positions.
+            _ => {
+                let passthrough: Vec<Vec<Slot>> = rows.iter().map(|r| r[1..].to_vec()).collect();
+                self.joint_exhaustive(&passthrough, rest)
+            }
+        }
+    }
+
+    /// `(variant name, field types)` for every variant of `ty`, with type
+    /// parameters substituted; empty for a type this pass can't resolve.
+    fn variant_field_tys(&self, ty: &Ty) -> Vec<(String, Vec<Ty>)> {
+        match ty {
+            Ty::Option(inner) => vec![("Some".to_string(), vec![(**inner).clone()]), ("None".to_string(), vec![])],
+            Ty::Result(ok, err) => {
+                vec![("Ok".to_string(), vec![(**ok).clone()]), ("Err".to_string(), vec![(**err).clone()])]
+            }
+            Ty::Named(tn, targs) => match self.checked.types.get(tn).cloned() {
+                Some(sig) => {
+                    let m: HashMap<u32, Ty> = sig.qvars.iter().cloned().zip(targs.iter().cloned()).collect();
+                    sig.variants
+                        .iter()
+                        .map(|v| {
+                            (
+                                v.name.clone(),
+                                v.fields.iter().map(|(_, fty)| Self::subst_ty(fty, &m)).collect(),
+                            )
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Flatten every row's position-0 slot (unwrapping `At`, expanding `Or`
+    /// into one row per alternative) before specializing against a
+    /// constructor/literal — matches `pattern_is_catch_all`'s and
+    /// `ctor_args_for`'s existing At/Or handling.
+    fn flatten_rows<'a>(rows: &[Vec<Slot<'a>>]) -> Vec<Vec<Slot<'a>>> {
+        fn expand<'a>(s: Slot<'a>, out: &mut Vec<Slot<'a>>) {
+            match s {
+                Slot::Wild => out.push(Slot::Wild),
+                Slot::Pat(p) => match &p.kind {
+                    PatternKind::At { inner, .. } => expand(Slot::Pat(inner), out),
+                    PatternKind::Or(alts) => {
+                        for a in alts {
+                            expand(Slot::Pat(a), out);
+                        }
+                    }
+                    _ => out.push(Slot::Pat(p)),
+                },
+            }
+        }
+        let mut out = Vec::new();
+        for row in rows {
+            let mut heads = Vec::new();
+            expand(row[0], &mut heads);
+            for h in heads {
+                let mut new_row = vec![h];
+                new_row.extend(row[1..].iter().copied());
+                out.push(new_row);
+            }
+        }
+        out
+    }
+
+    fn specialize_bool<'a>(rows: &[Vec<Slot<'a>>], b: bool) -> Vec<Vec<Slot<'a>>> {
+        let mut out = Vec::new();
+        for row in Self::flatten_rows(rows) {
+            if row[0].is_catch_all() {
+                out.push(row[1..].to_vec());
+                continue;
+            }
+            if let Slot::Pat(p) = row[0] {
+                if let PatternKind::Bool(rb) = &p.kind {
+                    if *rb == b {
+                        out.push(row[1..].to_vec());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn specialize_ctor<'a>(rows: &[Vec<Slot<'a>>], variant_name: &str, arity: usize) -> Vec<Vec<Slot<'a>>> {
+        let mut out = Vec::new();
+        for row in Self::flatten_rows(rows) {
+            if row[0].is_catch_all() {
+                let mut new_row = vec![Slot::Wild; arity];
+                new_row.extend(row[1..].iter().copied());
+                out.push(new_row);
+                continue;
+            }
+            if let Slot::Pat(p) = row[0] {
+                if let PatternKind::Ctor { name, args } = &p.kind {
+                    if name == variant_name {
+                        let mut new_row: Vec<Slot> = args.iter().map(Slot::Pat).collect();
+                        new_row.extend(row[1..].iter().copied());
+                        out.push(new_row);
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn pattern_is_catch_all(p: &Pattern) -> bool {
@@ -3563,6 +3768,70 @@ mod generic_tests {
              fun main() {}\n",
         );
         assert!(wildcard_payload.is_empty(), "{wildcard_payload:?}");
+    }
+
+    #[test]
+    fn exhaustiveness_checker_catches_multi_field_cross_product_gaps() {
+        // it568's fix checks each matched constructor's fields INDEPENDENTLY,
+        // which under-counts a MULTI-field constructor: `P(Circle(_), _) =>
+        // .., P(Square(_), Circle(_)) => ..` on `P(a: Shape, b: Shape)` looks
+        // fully covered field-by-field (field 0 sees Circle+Square; field 1
+        // sees a catch-all) but is actually missing the SPECIFIC combination
+        // `P(Square(_), Square(_))` -- a real, previously-documented,
+        // deliberately-scoped-out gap. Fixed with a proper joint/decision-
+        // tree exhaustiveness check (`joint_exhaustive`) that specializes
+        // POOLED row-tuples by each field's own constructors and recurses,
+        // run as a safety net whenever the cheaper per-field check finds
+        // nothing (PR-it570).
+        let missing = errors(
+            "type Shape = Circle(r: Int) | Square(s: Int)\n\
+             type Pair = P(a: Shape, b: Shape)\n\
+             fun f(x: Pair) -> Int {\n    \
+             match x {\n        P(Circle(r), _) => r\n        P(Square(s), Circle(r2)) => s + r2\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(missing.iter().any(|d| d.code == "K0257"), "{missing:?}");
+        // A genuinely exhaustive multi-field match (every combination
+        // covered) must NOT be flagged -- no new false rejection.
+        let ok = errors(
+            "type Shape = Circle(r: Int) | Square(s: Int)\n\
+             type Pair = P(a: Shape, b: Shape)\n\
+             fun f(x: Pair) -> Int {\n    \
+             match x {\n        \
+             P(Circle(r), Circle(r2)) => r + r2\n        \
+             P(Circle(r), Square(s)) => r + s\n        \
+             P(Square(s), Circle(r2)) => s + r2\n        \
+             P(Square(s), Square(s2)) => s + s2\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn exhaustiveness_checker_terminates_on_recursive_adt_matches() {
+        // The joint/decision-tree check specializes a matched constructor's
+        // OWN field types too, which for a RECURSIVE type (`Tree` has fields
+        // of type `Tree` itself) could recurse forever without a proper
+        // termination rule: a row that's already a bare wildcard at every
+        // remaining position trivially covers ANY value (including further
+        // recursive structure) and must short-circuit WITHOUT expanding into
+        // more wildcard sub-columns (PR-it570). Both a genuinely exhaustive
+        // and a genuinely non-exhaustive recursive match must resolve
+        // promptly (this test itself would hang the whole suite otherwise).
+        let exhaustive = errors(
+            "type Tree = Leaf | Node(l: Tree, r: Tree)\n\
+             fun sum(t: Tree) -> Int {\n    \
+             match t {\n        Leaf => 0\n        Node(l, r) => sum(l) + sum(r)\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(exhaustive.is_empty(), "{exhaustive:?}");
+        let non_exhaustive = errors(
+            "type Tree = Leaf | Node(l: Tree, r: Tree)\n\
+             fun sum(t: Tree) -> Int {\n    \
+             match t {\n        Leaf => 0\n        Node(Leaf, r) => sum(r)\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(non_exhaustive.iter().any(|d| d.code == "K0257"), "{non_exhaustive:?}");
     }
 
     #[test]
