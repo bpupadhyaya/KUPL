@@ -69,7 +69,20 @@ pub fn render(diag: &Diag, src: &str, file: &str) -> String {
         Severity::Warning => "warning",
     };
     let src_line = src.lines().nth(line - 1).unwrap_or("");
-    let caret_len = ((diag.span.end - diag.span.start) as usize).max(1).min(src_line.len().saturating_sub(col - 1).max(1));
+    // Caret length must be measured in CHARACTERS, matching `col` (which
+    // `line_col` computes via `char_indices`) -- `diag.span.end -
+    // diag.span.start` is a BYTE length, which overshoots the character
+    // count for any span covering multi-byte UTF-8 text, extending the
+    // caret underline past the actual erroring source text (confirmed live:
+    // a span over "日本語" -- 3 characters, 9 bytes -- produced 6 EXTRA
+    // carets). `.get(..)` (not direct slicing) so a span that isn't on a
+    // char boundary, or a reversed `end < start` span, degrades to 0 chars
+    // instead of panicking (production-hardening PR-it655).
+    let span_start = (diag.span.start as usize).min(src.len());
+    let span_end = (diag.span.end as usize).min(src.len()).max(span_start);
+    let span_chars = src.get(span_start..span_end).map_or(0, |s| s.chars().count());
+    let line_chars_after_col = src_line.chars().count().saturating_sub(col - 1);
+    let caret_len = span_chars.max(1).min(line_chars_after_col.max(1));
     let mut out = String::new();
     out.push_str(&format!(
         "{sev}[{code}]: {msg}\n  --> {file}:{line}:{col}\n",
@@ -129,4 +142,82 @@ pub fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn carets(rendered: &str) -> usize {
+        rendered.lines().find(|l| l.contains('^')).map_or(0, |l| l.matches('^').count())
+    }
+
+    #[test]
+    fn caret_length_matches_ascii_span_exactly() {
+        let src = "let x: Int = \"hi\"\n";
+        // span covers `"hi"` (4 bytes == 4 chars for pure ASCII)
+        let start = src.find('"').unwrap() as u32;
+        let end = start + "\"hi\"".len() as u32;
+        let d = Diag::error("K0000", "test", Span::new(start, end));
+        let out = render(&d, src, "f");
+        assert_eq!(carets(&out), 4, "{out}");
+    }
+
+    /// A REAL BUG found+fixed (production-hardening PR-it655): `diag.rs` had
+    /// ZERO test coverage of any kind before this iteration, despite being
+    /// the rendering path EVERY diagnostic in the compiler flows through.
+    /// `caret_len` used `diag.span.end - diag.span.start` (a BYTE length)
+    /// directly as the number of `^` characters to print, but `col` (and
+    /// the visual position a caret needs to align with) is a CHARACTER
+    /// column -- for a span covering multi-byte UTF-8 text, the byte length
+    /// exceeds the character length, so the caret UNDERLINE overshot past
+    /// the actual erroring source text. Confirmed live before fixing: a
+    /// span over "日本語" (3 characters, 9 bytes) produced 6 EXTRA carets.
+    #[test]
+    fn caret_length_matches_character_count_not_byte_count_for_utf8() {
+        let src = "let x: Int = \"日本語\" + \"y\"\n";
+        // span covers the string literal `"日本語"` -- 5 characters (the two
+        // quotes + 3 CJK characters), 11 bytes (quotes are 1 byte each, each
+        // CJK character is 3 bytes: 2 + 3*3 = 11).
+        let start = src.find('"').unwrap() as u32;
+        let end = start + "\"日本語\"".len() as u32;
+        let d = Diag::error("K0000", "test", Span::new(start, end));
+        let out = render(&d, src, "f");
+        assert_eq!(carets(&out), 5, "byte-length would wrongly give 11: {out}");
+    }
+
+    #[test]
+    fn caret_length_is_clamped_to_the_remaining_line_not_beyond_it() {
+        // a span that (incorrectly) extends past the end of its own line
+        // must not print more carets than characters actually remain.
+        let src = "let x = 1\nlet y = 2\n";
+        let d = Diag::error("K0000", "test", Span::new(4, 9999));
+        let out = render(&d, src, "f");
+        // "x = 1" is 5 characters; the caret must not run past the line.
+        assert_eq!(carets(&out), 5, "{out}");
+    }
+
+    #[test]
+    fn a_reversed_span_does_not_panic_and_still_renders() {
+        // `end < start` should never happen in practice (spans are built via
+        // `Span::merge`'s min/max), but `Span::new` performs no validation --
+        // rendering must degrade gracefully (a minimum 1-character caret),
+        // never panic on the underflowing subtraction the old code did.
+        let src = "let x = 1\n";
+        let d = Diag::error("K0000", "test", Span::new(8, 2));
+        let out = render(&d, src, "f");
+        assert_eq!(carets(&out), 1, "{out}");
+    }
+
+    #[test]
+    fn to_json_escapes_and_reports_every_diag_field() {
+        let src = "let x = 1\n";
+        let d = Diag::warning("K0100", "a \"quoted\" message", Span::new(4, 5));
+        let out = to_json(&[d], src, "f.kupl");
+        assert!(out.contains("\"severity\":\"warning\""), "{out}");
+        assert!(out.contains("\"code\":\"K0100\""), "{out}");
+        assert!(out.contains("a \\\"quoted\\\" message"), "{out}");
+        assert!(out.contains("\"file\":\"f.kupl\""), "{out}");
+        assert!(out.contains("\"start\":4") && out.contains("\"end\":5"), "{out}");
+    }
 }
