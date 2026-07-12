@@ -132,8 +132,9 @@ fn run_cli() -> ExitCode {
         Some("pkg") => match (args.get(1).map(String::as_str), args.get(2)) {
             (Some("tree"), Some(p)) => run::pkg_tree(p),
             (Some("lock"), Some(p)) => run::pkg_lock(p),
+            (Some("fetch"), Some(p)) => run::pkg_fetch(p),
             _ => {
-                eprintln!("usage: kupl pkg <tree|lock> <file.kupl>");
+                eprintln!("usage: kupl pkg <tree|lock|fetch> <file.kupl>");
                 2
             }
         },

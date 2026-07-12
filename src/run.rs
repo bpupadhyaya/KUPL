@@ -512,6 +512,76 @@ pub fn pkg_lock(path: &str) -> i32 {
     }
 }
 
+/// `kupl pkg fetch <entry>` — resolve and download every registry-only
+/// dependency `<entry>`'s project declares (`{ version = ".." }`, no
+/// `path`), populating the local registry cache (`registry_cache_dir`)
+/// via `registry::fetch_package`. Uses the SAME `registry_only_deps`
+/// (`loader.rs`) that `pkg_tree`/`pkg_lock` already use to REPORT these
+/// dependencies as unresolved (production-hardening PR-it625) — this is
+/// the first subcommand that actually RESOLVES them.
+pub fn pkg_fetch(path: &str) -> i32 {
+    pkg_fetch_with(path, crate::registry::DEFAULT_REGISTRY_URL, &registry_cache_dir(), crate::registry::fetch_package)
+}
+
+/// `pkg_fetch`, but the registry URL, cache directory, and fetch
+/// transport are all injectable — lets a test exercise the real
+/// per-dependency iteration/reporting/exit-code logic against a canned
+/// fetcher, with no live network access, mirroring `registry.rs`'s own
+/// `fetch_package`/`fetch_package_with` split (production-hardening
+/// PR-it632). A single dependency's fetch failure is reported and the
+/// loop CONTINUES to the rest (not aborted early) — every dependency
+/// gets a definitive fetched-or-failed report in one run, matching how a
+/// build tool's dependency-install step should behave; the function's
+/// own exit code still reflects whether ANY dependency failed.
+fn pkg_fetch_with(
+    path: &str,
+    registry_url: &str,
+    cache_dir: &std::path::Path,
+    fetch: impl Fn(&str, &str, &str, &std::path::Path) -> Result<std::path::PathBuf, String>,
+) -> i32 {
+    let registry_only = match crate::loader::registry_only_deps(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    if registry_only.is_empty() {
+        println!("no registry dependencies to fetch");
+        return 0;
+    }
+    let mut ok = true;
+    for (name, version) in &registry_only {
+        match fetch(registry_url, name, version, cache_dir) {
+            Ok(dest) => println!("fetched {name} @ {version} -> {}", dest.display()),
+            Err(e) => {
+                eprintln!("error: {name} @ {version}: {e}");
+                ok = false;
+            }
+        }
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// The local on-disk cache `kupl pkg fetch` materializes registry packages
+/// into: `~/.kupl/registry-cache` (`$HOME`, or `%USERPROFILE%` on Windows
+/// where `HOME` isn't set), falling back to a temp directory if neither is
+/// set — degrades gracefully rather than panicking, matching this
+/// codebase's existing convention (e.g. `csv.rs`/`url.rs`'s malformed-input
+/// handling). A fixed, well-known location so re-running `kupl pkg fetch`
+/// reuses the same cache across invocations instead of re-downloading.
+fn registry_cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    home.join(".kupl").join("registry-cache")
+}
+
 pub fn emit_manifest(path: &str) -> i32 {
     let Ok((compiled, _map)) = load_compile(path) else { return 1 };
     println!("{}", manifest_json(&compiled.program));
@@ -1237,5 +1307,121 @@ mod tests {
         assert!(hashes.is_empty(), "nothing resolvable, so nothing should be locked: {lock_text:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project with NO registry-only dependencies must report that
+    /// plainly (mirroring `pkg_tree`/`pkg_lock`'s existing "no
+    /// dependencies" messaging) and exit 0 — without ever invoking a
+    /// fetch at all, so this exercises the REAL `pkg_fetch` (not the
+    /// injectable `_with` variant) with zero live network access, since
+    /// the fetch closure is provably never called on this path.
+    #[test]
+    fn pkg_fetch_reports_no_registry_dependencies_cleanly() {
+        let dir = std::env::temp_dir().join(format!("kupl-pkgfetch-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "fun main() {}\n").unwrap();
+        assert_eq!(super::pkg_fetch(dir.join("main.kupl").to_str().unwrap()), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing/unreadable entry file is a clean error (matching
+    /// `pkg_tree`/`pkg_lock`'s existing behavior for the same condition),
+    /// not a panic.
+    #[test]
+    fn pkg_fetch_reports_a_missing_entry_as_a_clean_error() {
+        assert_eq!(super::pkg_fetch("/nonexistent/path/does-not-exist/main.kupl"), 1);
+    }
+
+    /// The real work: every registry-only dependency gets fetched via the
+    /// injected transport (no live network access — the SAME
+    /// dependency-injection pattern `registry.rs`'s `fetch_package_with`
+    /// already uses, production-hardening PR-it632), and the printed
+    /// destination + exit code both reflect success.
+    #[test]
+    fn pkg_fetch_with_downloads_every_registry_only_dependency_via_the_injected_fetcher() {
+        let dir = std::env::temp_dir().join(format!("kupl-pkgfetch-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n\
+             [dependencies]\njson2 = { version = \"1.2.0\" }\ncsvlib = { version = \"2.0.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "fun main() {}\n").unwrap();
+        let cache = dir.join("cache");
+        let fetched = std::cell::RefCell::new(Vec::new());
+        let exit = super::pkg_fetch_with(
+            dir.join("main.kupl").to_str().unwrap(),
+            "https://registry.example.com",
+            &cache,
+            |registry_url, name, version, cache_dir| {
+                fetched.borrow_mut().push((registry_url.to_string(), name.to_string(), version.to_string()));
+                Ok(cache_dir.join(name).join(version))
+            },
+        );
+        assert_eq!(exit, 0);
+        let calls = fetched.into_inner();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls.contains(&(
+            "https://registry.example.com".to_string(),
+            "csvlib".to_string(),
+            "2.0.0".to_string()
+        )));
+        assert!(calls.contains(&(
+            "https://registry.example.com".to_string(),
+            "json2".to_string(),
+            "1.2.0".to_string()
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One dependency's fetch failure must not abort the rest — a project
+    /// with several registry dependencies should still attempt (and
+    /// report) EVERY one, not stop at the first failure, while the
+    /// function's own exit code still reflects that something failed.
+    #[test]
+    fn pkg_fetch_with_reports_a_per_package_failure_without_aborting_the_rest() {
+        let dir = std::env::temp_dir().join(format!("kupl-pkgfetch-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n\
+             [dependencies]\njson2 = { version = \"1.2.0\" }\ncsvlib = { version = \"2.0.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "fun main() {}\n").unwrap();
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let exit = super::pkg_fetch_with(
+            dir.join("main.kupl").to_str().unwrap(),
+            "https://registry.example.com",
+            &dir.join("cache"),
+            |_registry_url, name, _version, cache_dir| {
+                attempted.borrow_mut().push(name.to_string());
+                if name == "json2" {
+                    Err("simulated network failure".to_string())
+                } else {
+                    Ok(cache_dir.join(name))
+                }
+            },
+        );
+        assert_eq!(exit, 1, "a failed dependency must make the overall exit code non-zero");
+        assert_eq!(
+            attempted.into_inner().len(),
+            2,
+            "the OTHER dependency must still be attempted, not skipped after the first failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_cache_dir_is_a_fixed_dot_kupl_registry_cache_location() {
+        let dir = super::registry_cache_dir();
+        assert_eq!(dir.file_name().unwrap(), "registry-cache");
+        assert_eq!(dir.parent().unwrap().file_name().unwrap(), ".kupl");
     }
 }

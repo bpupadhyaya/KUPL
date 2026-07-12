@@ -43,6 +43,17 @@ use std::collections::HashMap;
 
 use crate::lsp::{parse_json, Json};
 
+/// The v1 registry URL: a single, hardcoded location, not a `--registry`
+/// flag or environment-variable override. Deliberate, per the design memo's
+/// security bar (production-hardening PR-it630): letting a per-invocation
+/// value substitute an arbitrary registry is a supply-chain risk surface
+/// (a compromised build script or CI variable could silently redirect every
+/// fetch to an attacker-controlled index) — deferred to a v2 that doesn't
+/// exist yet. No live service is deployed at this address yet; `kupl pkg
+/// fetch` against a real registry-only dependency fails with a clean
+/// network error until one is, exactly like any other unreachable host.
+pub const DEFAULT_REGISTRY_URL: &str = "https://registry.kupl-lang.org";
+
 /// One file a registry package version is made of: where to fetch it, and
 /// the hash its downloaded content must match.
 #[derive(Debug, Clone, PartialEq)]
