@@ -8,20 +8,26 @@
 //! module previously said division/modulo/power were "a later iteration,"
 //! but all three are implemented; the doc comment was simply stale, PR-it637).
 //! Because multiplication is schoolbook (O(n²), not Karatsuba/Toom-Cook),
-//! `pow`'s repeated squaring is the one place a caller-supplied magnitude
-//! matters: an uncapped exponent would request a result whose SIZE grows
-//! exponentially, so `pow` rejects a request whose result would be
-//! unreasonably large rather than exhaust memory or pin a CPU core
-//! indefinitely computing it.
+//! any operation whose result SIZE isn't bounded by its inputs' own size is a
+//! potential denial-of-service: `pow`'s repeated squaring can turn a modest
+//! exponent into an exponentially large result, and `from_str` can turn an
+//! arbitrarily long caller-supplied digit string directly into an
+//! arbitrarily large `BigInt` with no intermediate computation at all. Both
+//! reject a request that would exceed `MAX_BIGINT_LIMBS` rather than exhaust
+//! memory or pin a CPU core indefinitely (PR-it637/PR-it638).
 
 use std::cmp::Ordering;
 
 const BASE: u64 = 1_000_000_000;
-/// `pow`'s result-size sanity cap, in limbs (~9 decimal digits per limb) —
-/// generous for any plausible legitimate use (an RSA-2048 key is ~617
-/// decimal digits; this campaign's own tests exercise 400-digit numbers),
-/// but far short of exhausting memory/CPU via schoolbook squaring.
-pub const MAX_POW_RESULT_LIMBS: u64 = 20_000;
+/// A sanity cap on ANY single `BigInt`'s size, in limbs (~9 decimal digits
+/// per limb) — generous for any plausible legitimate use (an RSA-2048 key is
+/// ~617 decimal digits; this campaign's own tests exercise 400-digit
+/// numbers), but far short of exhausting memory/CPU via schoolbook
+/// operations. Enforced at every point a `BigInt` can newly EXCEED its
+/// inputs' own combined size: `pow` (exponential growth from a modest
+/// exponent) and `from_str` (an arbitrarily large caller-supplied string,
+/// with no proportional computation of its own to "pay for" the size).
+pub const MAX_BIGINT_LIMBS: u64 = 20_000;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BigInt {
@@ -52,7 +58,15 @@ impl BigInt {
     }
 
     /// Parse an optional sign followed by decimal digits. Returns `None` on
-    /// empty input or a non-digit character.
+    /// empty input, a non-digit character, or a digit string so long the
+    /// resulting `BigInt` would exceed `MAX_BIGINT_LIMBS` (a REAL bug found+
+    /// fixed, production-hardening PR-it638: unlike `pow`, this construction
+    /// path has no computation of its own to "pay for" the result's size --
+    /// an ordinary KUPL line like `big("9".repeat(50_000_000))` turns a
+    /// modestly-sized string-building call directly into a multi-megabyte
+    /// `BigInt`, in ONE step, with no intermediate cost proportional to the
+    /// danger. Checked BEFORE building any limbs, on the decimal digit COUNT
+    /// alone -- no need to build anything just to reject it).
     pub fn from_str(s: &str) -> Option<Self> {
         let s = s.trim();
         let (neg, digits) = match s.strip_prefix('-') {
@@ -60,6 +74,9 @@ impl BigInt {
             None => (false, s.strip_prefix('+').unwrap_or(s)),
         };
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if digits.len() as u64 > MAX_BIGINT_LIMBS * 9 {
             return None;
         }
         let bytes = digits.as_bytes();
@@ -334,7 +351,7 @@ impl BigInt {
     /// upper bound — squaring roughly doubles a number's DIGIT count per
     /// squaring step, so the true result size stays under this estimate)
     /// BEFORE doing any of the expensive multiplication, and rejects
-    /// anything past `MAX_POW_RESULT_LIMBS` cleanly instead of attempting it.
+    /// anything past `MAX_BIGINT_LIMBS` cleanly instead of attempting it.
     /// `|self|` of 0 or 1 is exempt from the estimate entirely — `0^n` and
     /// `(±1)^n` stay O(1)-sized for ANY exponent, so a huge `exp` alone must
     /// never reject them (the estimate, based on limb COUNT alone, can't
@@ -344,13 +361,13 @@ impl BigInt {
         if !unit_magnitude {
             let base_limbs = self.limbs.len() as u64;
             let too_large = match base_limbs.checked_mul(exp) {
-                Some(estimated) => estimated > MAX_POW_RESULT_LIMBS,
+                Some(estimated) => estimated > MAX_BIGINT_LIMBS,
                 None => true, // the estimate itself overflowed u64 -- certainly too large
             };
             if too_large {
                 return Err(format!(
-                    "BigInt.pow: result would be too large to compute (limit ~{MAX_POW_RESULT_LIMBS} limbs, roughly {} decimal digits)",
-                    MAX_POW_RESULT_LIMBS * 9
+                    "BigInt.pow: result would be too large to compute (limit ~{MAX_BIGINT_LIMBS} limbs, roughly {} decimal digits)",
+                    MAX_BIGINT_LIMBS * 9
                 ));
             }
         }
@@ -420,6 +437,31 @@ mod tests {
         assert_eq!(BigInt::from_str("007").unwrap().to_decimal(), "7");
         assert!(BigInt::from_str("").is_none());
         assert!(BigInt::from_str("12x").is_none());
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it638) -- the SAME
+    /// "check extremes" class as `pow`'s fix (it637), but at the OTHER end:
+    /// `pow` can turn a modest exponent into an exponentially large result;
+    /// `from_str` can turn an arbitrarily long caller-supplied STRING
+    /// directly into an arbitrarily large `BigInt`, with no proportional
+    /// computation of its own to "pay for" the size -- an ordinary KUPL line
+    /// like `big("9".repeat(50_000_000))` used to succeed immediately,
+    /// producing a multi-megabyte `BigInt` in one step from a single call.
+    #[test]
+    fn from_str_rejects_a_digit_string_too_long_to_represent() {
+        // exactly at the cap: still fine.
+        let at_cap = "9".repeat((MAX_BIGINT_LIMBS * 9) as usize);
+        assert!(BigInt::from_str(&at_cap).is_some());
+        // one digit past the cap: rejected -- and MUST return quickly (this
+        // test itself would be slow/wasteful if rejection required building
+        // the limbs first).
+        let over_cap = "9".repeat((MAX_BIGINT_LIMBS * 9 + 1) as usize);
+        assert!(BigInt::from_str(&over_cap).is_none());
+        // a sign prefix doesn't let a caller sneak past the cap by one digit.
+        let neg_over_cap = format!("-{over_cap}");
+        assert!(BigInt::from_str(&neg_over_cap).is_none());
+        // ordinary, legitimate large-but-reasonable strings are unaffected.
+        assert!(BigInt::from_str(&"9".repeat(400)).is_some());
     }
 
     #[test]

@@ -4067,6 +4067,14 @@ pub fn big_builtin(v: &Value) -> Result<Value, String> {
         Value::BigInt(b) => Ok(Value::BigInt(b.clone())),
         Value::Str(s) => match crate::bigint::BigInt::from_str(s) {
             Some(b) => Ok(Value::BigInt(Rc::new(b))),
+            // A string long enough to be rejected by from_str's own size cap
+            // (PR-it638) shouldn't be echoed into the error text -- report the
+            // length instead of dumping a potentially enormous string.
+            None if s.len() as u64 > crate::bigint::MAX_BIGINT_LIMBS * 9 => Err(format!(
+                "invalid BigInt: input is {} characters long, exceeding the {}-digit limit",
+                s.len(),
+                crate::bigint::MAX_BIGINT_LIMBS * 9
+            )),
             None => Err(format!("invalid BigInt: {s}")),
         },
         other => Err(format!("`big` needs an Int or a Str, found {}", other.type_name())),

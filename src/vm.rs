@@ -1413,6 +1413,33 @@ mod tests {
         );
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it638) -- the OTHER
+    /// end of `pow`'s fix (it637): `from_str` can turn an arbitrarily long
+    /// caller-supplied STRING directly into an arbitrarily large `BigInt`,
+    /// with no proportional computation of its own to "pay for" the size.
+    /// `"9".repeat(180001)` is a completely ordinary KUPL string operation
+    /// (not itself dangerous); feeding that into `big(..)` used to succeed
+    /// immediately, producing a genuinely huge `BigInt` in one step.
+    #[test]
+    fn diff_bigint_from_str_rejects_a_digit_string_too_long_to_represent() {
+        assert_eq!(
+            differential("fun probe() -> Str { let s = \"9\".repeat(180001)\n    \"{big(s)}\" }\n"),
+            "panic: invalid BigInt: input is 180001 characters long, exceeding the 180000-digit limit"
+        );
+        // exactly at the cap still works, and doesn't echo the huge string
+        // (only its length matters for a REJECTED string -- accepted ones
+        // never echo anything, they just become the BigInt itself).
+        assert_eq!(
+            differential("fun probe() -> Str { let s = \"9\".repeat(180000)\n    \"{\"{big(s)}\".len()}\" }\n"),
+            "180000"
+        );
+        // an ordinary, legitimate large-but-reasonable string is unaffected.
+        assert_eq!(
+            differential("fun probe() -> Str { let s = \"9\".repeat(400)\n    \"{\"{big(s)}\".len()}\" }\n"),
+            "400"
+        );
+    }
+
     #[test]
     fn diff_int_math_edges() {
         // clamp / gcd / isqrt / sign edge cases are byte-identical on both engines:

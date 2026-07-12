@@ -886,6 +886,13 @@ static KBig* k_big_from_i64(int64_t v) {
     while (m > 0) { tmp[n++] = (uint32_t)(m % KBIG_BASE); m /= KBIG_BASE; }
     return k_big_norm(neg, tmp, n);
 }
+/* A sanity cap on ANY single BigInt's size, in limbs -- matches bigint.rs::
+   MAX_BIGINT_LIMBS exactly. Enforced at every point a BigInt can newly
+   exceed its inputs' own combined size: k_big_pow (exponential growth from a
+   modest exponent, PR-it637) and k_big_from_str, just below (an arbitrarily
+   large caller-supplied string, with no proportional computation of its own
+   to "pay for" the size, PR-it638). */
+#define K_MAX_BIGINT_LIMBS 20000
 static KBig* k_big_from_str(const char* s) {
     /* mirror bigint.rs's from_str, which trims BOTH ends (s.trim()) before
        checking the sign+digits -- this used to only strip leading whitespace,
@@ -899,6 +906,11 @@ static KBig* k_big_from_str(const char* s) {
     while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\n' || s[len-1] == '\r')) len--;
     if (len == 0) return 0;
     for (int i = 0; i < len; i++) if (s[i] < '0' || s[i] > '9') return 0;
+    /* A REAL bug found+fixed (production-hardening PR-it638): mirrors
+       bigint.rs::from_str's fix exactly. Checked on the digit COUNT alone,
+       before allocating anything -- no need to build a limb array just to
+       reject it. */
+    if ((uint64_t)len > (uint64_t)K_MAX_BIGINT_LIMBS * 9) return 0;
     int cap = (len + 8) / 9; if (cap < 1) cap = 1;
     uint32_t* limbs = (uint32_t*)k_alloc(sizeof(uint32_t) * cap);
     int li = 0, i = len;
@@ -1014,9 +1026,6 @@ static KBig* k_big_divmod(KValue av, KValue bv, int want_rem) {
     if (want_rem) return k_big_norm(a->neg, rem, remn);
     return k_big_norm(a->neg != b->neg, quo, an);
 }
-/* pow's result-size sanity cap, in limbs -- matches bigint.rs::
-   MAX_POW_RESULT_LIMBS exactly (PR-it637). */
-#define K_MAX_POW_RESULT_LIMBS 20000
 static KBig* k_big_pow(KValue av, int64_t exp) {
     KBig* b = av.as.big;
     uint64_t e = (uint64_t)exp;
@@ -1032,7 +1041,7 @@ static KBig* k_big_pow(KValue av, int64_t exp) {
        or 1 is exempt -- those stay O(1)-sized for ANY exponent, so a huge
        exp alone must never reject them. */
     int unit_magnitude = (b->n == 0) || (b->n == 1 && b->limbs[0] == 1);
-    if (!unit_magnitude && e != 0 && (uint64_t)b->n > (uint64_t)K_MAX_POW_RESULT_LIMBS / e) {
+    if (!unit_magnitude && e != 0 && (uint64_t)b->n > (uint64_t)K_MAX_BIGINT_LIMBS / e) {
         k_panic("BigInt.pow: result would be too large to compute (limit ~20000 limbs, roughly 180000 decimal digits)");
     }
     KBig* result = k_big_from_i64(1);
@@ -1058,13 +1067,25 @@ static KValue k_big_builtin(KValue v) {
     if (v.tag == K_STR) {
         KBig* b = k_big_from_str(v.as.s);
         if (!b) {
+            size_t slen = strlen(v.as.s);
+            /* A REAL bug found+fixed (production-hardening PR-it638): a string
+               long enough to be rejected by k_big_from_str's own size cap
+               shouldn't be echoed into the error text -- report the length
+               instead of dumping a potentially enormous string, matching
+               interp.rs's SAME fix exactly. */
+            if (slen > (size_t)K_MAX_BIGINT_LIMBS * 9) {
+                char m[128];
+                snprintf(m, sizeof m, "invalid BigInt: input is %zu characters long, exceeding the %d-digit limit",
+                         slen, K_MAX_BIGINT_LIMBS * 9);
+                k_panic(m);
+            }
             /* A REAL cross-engine bug (PR-it597, from the SAME sweep as it595/it596):
                interp.rs's `format!("invalid BigInt: {s}")` echoes the FULL malformed
                string, unbounded -- this used to copy into a fixed `char m[128]`,
                silently truncating any input over ~111 bytes. Heap-allocate the
                message sized to the ACTUAL input instead of guessing a fixed cap. */
             const char* prefix = "invalid BigInt: ";
-            size_t need = strlen(prefix) + strlen(v.as.s) + 1;
+            size_t need = strlen(prefix) + slen + 1;
             char* m = (char*)k_alloc(need);
             snprintf(m, need, "%s%s", prefix, v.as.s);
             k_panic(m);
@@ -10472,6 +10493,22 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         assert_panic_wording_matches(
             "fun main() uses io { print(big(2).pow(1000000000)) }\n",
             "bigpowcap",
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it638) -- the OTHER
+    /// end of `pow`'s fix (it637): `from_str` can turn an arbitrarily long
+    /// caller-supplied string directly into an arbitrarily large `BigInt` in
+    /// ONE step, with no proportional computation of its own to "pay for"
+    /// the size. Fixed on both engines with a length check BEFORE building
+    /// any limbs, panicking with byte-identical text -- including a message
+    /// that reports the LENGTH rather than echoing the (potentially huge)
+    /// rejected string itself.
+    #[test]
+    fn native_bigint_from_str_length_cap_panic_matches_interp_wording() {
+        assert_panic_wording_matches(
+            "fun main() uses io { let s = \"9\".repeat(180001)\n    print(big(s)) }\n",
+            "bigfromstrcap",
         );
     }
 
