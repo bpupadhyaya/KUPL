@@ -831,6 +831,62 @@ mod tests {
         assert_eq!(module.component_names, decoded.component_names);
     }
 
+    /// A coverage-closing test, per PR-it649 (no bug found -- `Module.disassemble()`,
+    /// the equality oracle the test above relies on, only renders `chunks` (name/
+    /// caps/params/regs/consts/code) and `ctors`; it does NOT render `ctor_field_names`,
+    /// `ai_funs`, or a `ComponentMeta`'s richer fields (`props`/`handlers`/`exposes`/
+    /// `out_ports`/`timers`) at all -- so the ONLY existing round-trip test had ZERO
+    /// coverage of those fields ever surviving an encode/decode cycle: an encode or
+    /// decode bug in, say, `timers` or `ai_funs` (both genuinely non-trivial encodings
+    /// -- variable-length `AiShape`/`ToolMeta` nesting, an `Option<u16>` per prop
+    /// default) would have gone completely undetected. Added `#[derive(PartialEq)]`
+    /// to `Op`/`Chunk`/`CtorMeta`/`ComponentMeta`/`Module` (every field type they're
+    /// built from -- `Value`/`TimerMeta`/`Span`/`AiFunMeta`/`ToolMeta`/`AiShape` --
+    /// ALREADY had `PartialEq`, confirmed before adding these) to enable a genuinely
+    /// STRUCTURAL whole-module comparison instead of the narrower text/HashMap
+    /// spot-checks the existing test relies on.
+    #[test]
+    fn kx_roundtrip_preserves_every_module_field_structurally() {
+        // touches every field `disassemble()` skips: a type (ctors +
+        // ctor_field_names), an `ai fun` with a `tools` clause (ai_funs +
+        // ToolMeta), and a component with a defaulted prop, a required prop,
+        // a port handler, a lifecycle handler (`on start`), two timer kinds
+        // (`every`/`after`), and an `expose`d function.
+        let src = "type Item = Item(name: Str)\n\
+                   fun helper(x: Int) -> Int {\n    x + 1\n}\n\
+                   ai fun summarize(text: Str) -> Str tools [helper] {\n    intent \"Summarize the text.\"\n}\n\
+                   component Widget {\n    intent \"w\"\n    prop label: Str\n    prop count: Int = 0\n    \
+                   in trigger: Int\n    out done: Int\n    state total: Int = 0\n    \
+                   on trigger(v) {\n        total = total + v\n        emit done(total)\n    }\n    \
+                   on start { }\n    on every 5s { }\n    on after 2s { }\n    \
+                   expose fun current() -> Int {\n        total\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        // sanity: this source genuinely exercises every field under test, so a
+        // regression can't hide behind an accidentally-empty collection.
+        assert!(!module.ctors.is_empty(), "expected ctors from `type Item`");
+        assert!(!module.ctor_field_names.is_empty(), "expected ctor_field_names from `type Item`");
+        assert!(!module.ai_funs.is_empty(), "expected ai_funs from `ai fun summarize`");
+        assert!(!module.ai_funs[0].tools.is_empty(), "expected a tool from `tools [helper]`");
+        let widget = module.components.iter().find(|c| c.name == "Widget").expect("Widget component");
+        assert_eq!(widget.props.len(), 2, "label (no default) + count (defaulted)");
+        assert!(widget.props.iter().any(|(_, d)| d.is_some()), "count has a default chunk");
+        assert!(widget.props.iter().any(|(_, d)| d.is_none()), "label has no default");
+        assert_eq!(widget.timers.len(), 2, "one `every`, one `after`");
+        assert!(!widget.exposes.is_empty(), "expected `current` in exposes");
+        assert!(widget.handlers.len() >= 2, "port handler + `on start`");
+
+        let bytes = super::encode(&module);
+        let decoded = super::decode(&bytes).expect("decodes");
+        // the FULL structural comparison -- every field of every chunk (including
+        // `spans`, which `disassemble()` never prints), every ctor, every
+        // component's props/handlers/exposes/out_ports/timers, and every ai_fun
+        // (including nested `AiShape`/`ToolMeta` data), not just the narrow
+        // disassembly-text + two-HashMap spot-check the sibling test above does.
+        assert_eq!(module, decoded, "a .kx round-trip must be byte-for-byte structurally identical");
+    }
+
     #[test]
     fn corrupt_kx_is_rejected_not_a_crash() {
         // A tampered/untrusted .kx must decode to a clean Err — never a panic, an

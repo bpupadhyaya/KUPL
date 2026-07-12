@@ -12,7 +12,7 @@ use crate::value::Value;
 
 pub type Reg = u8;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     /// dst <- consts[idx]
     Const(Reg, u16),
@@ -94,7 +94,7 @@ pub enum Op {
     CallAi { dst: Reg, info: u16, intent: Reg },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub name: String,
     /// Number of leading registers holding captures (lambdas only).
@@ -109,7 +109,7 @@ pub struct Chunk {
     pub spans: Vec<Span>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CtorMeta {
     pub type_name: String,
     pub variant: String,
@@ -126,7 +126,7 @@ pub struct TimerMeta {
 }
 
 /// A compiled component: slot layout + chunk indices for its behavior.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ComponentMeta {
     pub name: String,
     pub is_app: bool,
@@ -147,7 +147,7 @@ pub struct ComponentMeta {
 }
 
 /// A compiled program: all function chunks + the constructor table.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Module {
     pub chunks: Vec<Chunk>,
     pub ctors: Vec<CtorMeta>,
