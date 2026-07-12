@@ -414,13 +414,31 @@ fn ident_at(text: &str, offset: usize) -> Option<(String, usize, usize)> {
 }
 
 /// Human-readable signature of a top-level item named `name`, if found.
+/// Render one parameter as `name: Ty` or `name: Ty = default` (PR-it675): a
+/// REAL hover/signatureHelp content-quality bug -- `ast::Param.default` (the
+/// `x: Int = EXPR` syntax) was silently dropped by every LSP signature
+/// renderer below, showing an incomplete/misleading signature for any
+/// function using this documented language feature (e.g. a genuinely
+/// optional `name: Str = "World"` parameter rendered as if it were
+/// required). `fmt.rs`'s canonical formatter (the ONE place this project
+/// treats as the source of truth for how KUPL source re-prints) already
+/// renders defaults correctly; this mirrors that exact ` = {expr}` shape so
+/// hover/signatureHelp stay consistent with `kupl fmt`'s own output.
+fn param_str(p: &crate::ast::Param) -> String {
+    use crate::fmt::{expr_str, ty_str};
+    let mut s = format!("{}: {}", p.name, ty_str(&p.ty));
+    if let Some(d) = &p.default {
+        s.push_str(&format!(" = {}", expr_str(d, 0)));
+    }
+    s
+}
+
 /// Render a function declaration's signature (`fun name(params) -> ret uses effects`),
 /// shared by top-level functions and component methods (exposed or private) so hover
 /// shows the identical format regardless of where the function lives.
 fn fun_sig_str(f: &crate::ast::FunDecl) -> String {
     use crate::fmt::ty_str;
-    let params: Vec<String> =
-        f.params.iter().map(|p| format!("{}: {}", p.name, ty_str(&p.ty))).collect();
+    let params: Vec<String> = f.params.iter().map(param_str).collect();
     let ret = f.ret.as_ref().map(|r| format!(" -> {}", ty_str(r))).unwrap_or_default();
     let eff = if f.effects.is_empty() {
         String::new()
@@ -436,8 +454,7 @@ fn fun_sig_str(f: &crate::ast::FunDecl) -> String {
 /// contract method) has no body/`ai` field, unlike `ast::FunDecl`.
 fn contract_sig_str(f: &crate::ast::FunSig) -> String {
     use crate::fmt::ty_str;
-    let params: Vec<String> =
-        f.params.iter().map(|p| format!("{}: {}", p.name, ty_str(&p.ty))).collect();
+    let params: Vec<String> = f.params.iter().map(param_str).collect();
     let ret = f.ret.as_ref().map(|r| format!(" -> {}", ty_str(r))).unwrap_or_default();
     let eff = if f.effects.is_empty() {
         String::new()
@@ -535,10 +552,7 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
 /// component methods (`exposes`/`funs`), and contract methods (`sigs`).
 fn signature_help_info(program: &crate::ast::Program, name: &str) -> Option<(String, Vec<String>)> {
     use crate::ast::Item;
-    use crate::fmt::ty_str;
-    let params_of = |params: &[crate::ast::Param]| -> Vec<String> {
-        params.iter().map(|p| format!("{}: {}", p.name, ty_str(&p.ty))).collect()
-    };
+    let params_of = |params: &[crate::ast::Param]| -> Vec<String> { params.iter().map(param_str).collect() };
     for item in &program.items {
         match item {
             Item::Fun(f) if f.name == name => return Some((fun_sig_str(f), params_of(&f.params))),
@@ -2667,6 +2681,29 @@ mod tests {
         let tl = PROG.lines().position(|l| l.starts_with("type Shape")).unwrap();
         let h2 = resolve_hover(PROG, tl, 6).expect("hover on Shape");
         assert!(h2.contains("type Shape = Circle(r: Float) | Square(s: Float)"), "{h2}");
+    }
+
+    /// A REAL hover/signatureHelp content-quality bug (PR-it675): `ast::Param.default`
+    /// (`x: Int = EXPR`) was parsed and used at call sites, and `fmt.rs`'s canonical
+    /// formatter already renders it correctly -- but every LSP signature renderer
+    /// (`fun_sig_str`, `contract_sig_str`, `signature_help_info`'s `params_of`) dropped
+    /// it silently, showing a genuinely optional parameter as if it were required.
+    #[test]
+    fn hover_and_signature_help_show_parameter_default_values() {
+        let src = "fun greet(name: Str = \"World\", loud: Bool = false) -> Str {\n    name\n}\n\
+                   fun main() -> Str {\n    greet()\n}\n";
+        let line = src.lines().position(|l| l.starts_with("fun greet")).unwrap();
+        let ch = src.lines().nth(line).unwrap().find("greet").unwrap() + 1;
+        let h = resolve_hover(src, line, ch).expect("hover on greet");
+        assert!(
+            h.contains("fun greet(name: Str = \"World\", loud: Bool = false) -> Str"),
+            "hover must show BOTH default values: {h}"
+        );
+        // signatureHelp's per-parameter labels must also carry the default.
+        let (program, _diags) = crate::parser::parse(src);
+        let (label, params) = signature_help_info(&program, "greet").expect("signature help");
+        assert!(label.contains("= \"World\"") && label.contains("= false"), "label: {label}");
+        assert_eq!(params, vec!["name: Str = \"World\"", "loud: Bool = false"]);
     }
 
     #[test]
