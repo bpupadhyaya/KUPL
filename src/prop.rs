@@ -120,7 +120,30 @@ fn gen_named(name: &str, rng: &mut Rng, types: &TypeDb, depth: usize) -> Result<
     if variants.is_empty() {
         return Err(format!("no generator for type `{name}`"));
     }
-    let (variant, fields) = &variants[rng.below(variants.len() as u64) as usize];
+    // A REAL bug found+fixed (production-hardening PR-it636): `generate`'s own
+    // doc comment claims "`depth` bounds recursion on nested collections/
+    // records so generation always terminates" -- but this function never
+    // checked `depth` at all before this fix, unlike its List/Option siblings
+    // (both cap at `depth >= 4`). A self-referential record/enum (e.g. `type
+    // Tree = Leaf | Node(l: Tree, r: Tree)`) had NO structural termination
+    // guarantee -- only the PROBABILITY that a base-case variant eventually
+    // gets picked, which the RNG's fixed seed either satisfies quickly or
+    // doesn't. Beyond the SAME depth threshold List/Option already use,
+    // strongly prefer a NULLARY variant (a natural base case, no fields to
+    // recurse into) if the type has one -- restoring the doc comment's own
+    // termination guarantee for named types too. If every variant of a type
+    // is recursive (no nullary base case at all -- a type with no way to
+    // construct a finite value), this can't force termination structurally
+    // any more than it could before; that's a property of the TYPE itself,
+    // not a gap this function can close.
+    let nullary: Vec<usize> =
+        variants.iter().enumerate().filter(|(_, (_, f))| f.is_empty()).map(|(i, _)| i).collect();
+    let idx = if depth >= 4 && !nullary.is_empty() {
+        nullary[rng.below(nullary.len() as u64) as usize]
+    } else {
+        rng.below(variants.len() as u64) as usize
+    };
+    let (variant, fields) = &variants[idx];
     let mut vals = Vec::with_capacity(fields.len());
     for (_, fty) in fields {
         vals.push(generate(fty, rng, types, depth + 1)?);
@@ -150,7 +173,16 @@ pub fn shrink(v: &Value) -> Vec<Value> {
         Value::Int(0) => Vec::new(),
         Value::Int(n) => {
             let mut out = vec![Value::Int(0)];
-            if n.abs() > 1 {
+            // `n.abs()` panics for `n == i64::MIN` (its magnitude doesn't fit
+            // in i64) -- `unsigned_abs()` never panics for any i64 value.
+            // Unreachable TODAY (this function's only caller only ever shrinks
+            // a value `generate` produced, and `gen_int` caps magnitude at
+            // 1e6 -- see its own doc comment), but `shrink` is a `pub fn`
+            // with no such restriction documented on ITS OWN signature, and
+            // shrink candidates should never be able to re-introduce a panic
+            // a well-behaved property test couldn't otherwise trigger
+            // (production-hardening PR-it636, found auditing this module).
+            if n.unsigned_abs() > 1 {
                 out.push(Value::Int(n / 2));
             }
             let toward = if *n > 0 { n - 1 } else { n + 1 };
@@ -263,6 +295,17 @@ mod tests {
         assert!(cands.contains(&Value::Int(500)));
     }
 
+    /// `n.abs()` panics for `i64::MIN` (production-hardening PR-it636, found
+    /// auditing this module) -- `shrink` must not panic on ANY `Value::Int`,
+    /// including the one i64 value whose magnitude doesn't fit back in i64.
+    #[test]
+    fn shrink_int_does_not_panic_on_i64_min() {
+        let cands = shrink(&Value::Int(i64::MIN));
+        assert!(cands.contains(&Value::Int(0)));
+        assert!(cands.contains(&Value::Int(i64::MIN / 2)));
+        assert!(cands.contains(&Value::Int(i64::MIN + 1)));
+    }
+
     #[test]
     fn shrink_str_and_list_reduce_size() {
         assert!(shrink(&Value::str("abc")).contains(&Value::str("")));
@@ -277,6 +320,54 @@ mod tests {
         for _ in 0..10_000 {
             let n = gen_int(&mut rng);
             assert!(n.abs() <= 1_000_000, "gen_int out of safe range: {n}");
+        }
+    }
+
+    fn name_ty(n: &str) -> TyExpr {
+        TyExpr { kind: TyExprKind::Name(n.to_string()), span: crate::diag::Span::default() }
+    }
+
+    /// The deepest a `Value::Ctor` chain of self-referential fields (each
+    /// variant's fields recursively checked) goes.
+    fn ctor_chain_depth(v: &Value) -> usize {
+        match v {
+            Value::Ctor { fields, .. } => 1 + fields.iter().map(ctor_chain_depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it636): `generate`'s
+    /// own doc comment claims "`depth` bounds recursion on nested
+    /// collections/records so generation always terminates" -- but
+    /// `gen_named` never checked `depth` at all before this fix, unlike its
+    /// List/Option siblings. Uses a DELIBERATELY recursion-heavy type (3 of 4
+    /// variants recurse, only 1 base case -- a 75% chance of recursing at
+    /// each level, versus a balanced 50/50 type like the `Tree` in
+    /// `examples/properties.kupl`'s own `Point` neighbor) so the fix's
+    /// effect is actually exercised across 100 generated cases, not just
+    /// plausible by chance. `gen_named`'s fix forces a nullary variant once
+    /// `depth >= 4` (matching List/Option's own threshold), so the deepest a
+    /// chain can go is 4 unconstrained levels (0..=3) plus one forced-nullary
+    /// level at depth 4 -- asserts every generated value's ctor-chain depth
+    /// is at most 5, structurally, not just "usually small."
+    #[test]
+    fn gen_named_terminates_for_a_recursion_heavy_self_referential_type() {
+        let mut types: TypeDb = HashMap::new();
+        types.insert(
+            "Chain".to_string(),
+            vec![
+                ("Base".to_string(), vec![]),
+                ("Rec1".to_string(), vec![("child".to_string(), name_ty("Chain"))]),
+                ("Rec2".to_string(), vec![("child".to_string(), name_ty("Chain"))]),
+                ("Rec3".to_string(), vec![("child".to_string(), name_ty("Chain"))]),
+            ],
+        );
+        let ty = name_ty("Chain");
+        let mut rng = Rng::new(SEED);
+        for i in 0..CASES {
+            let v = generate(&ty, &mut rng, &types, 0).expect("generates");
+            let depth = ctor_chain_depth(&v);
+            assert!(depth <= 5, "case {i}: generated a Chain {depth} levels deep -- depth cap not enforced");
         }
     }
 }
