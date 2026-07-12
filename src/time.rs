@@ -286,6 +286,36 @@ mod tests {
         assert_eq!(format_time(feb28_1900 + 86_400), "1900-03-01 00:00:00");
     }
 
+    /// A coverage-closing test, per production-hardening PR-it621's convention
+    /// (a fix/behavior can be REASONED correct without a test exercising that
+    /// exact shape -- close the gap with a cheap permanent test even when no
+    /// bug is found). `leap_year_boundary` above only covers POSITIVE years
+    /// (2000, 1900); no existing test exercised a NEGATIVE (proleptic-
+    /// Gregorian) year's leap-year boundary, despite this module's own header
+    /// comment naming "the full i64 range including negative timestamps" as a
+    /// design goal. Manually verified live before writing this: `is_leap`'s
+    /// `== 0` divisibility checks are sign-invariant under Rust's `%`
+    /// (truncating) convention, so no bug was found -- `parse_iso` already
+    /// correctly rejects/accepts Feb 29 for negative years exactly like it
+    /// does for positive ones. PR-it681.
+    #[test]
+    fn negative_year_leap_year_boundary() {
+        // -400 (400 BCE-equivalent) is a leap year: divisible by 400.
+        assert_eq!(parse_iso("-0400-02-29"), Ok(-74_784_902_400));
+        // -100 is NOT a leap year: divisible by 100 but not by 400.
+        assert!(parse_iso("-0100-02-29").is_err());
+        assert_eq!(parse_iso("-0100-02-28"), Ok(-65_317_968_000));
+        // -4 IS a leap year: divisible by 4, not by 100.
+        assert_eq!(parse_iso("-0004-02-29"), Ok(-62_288_438_400));
+        // -3 is NOT a leap year: not divisible by 4 at all.
+        assert!(parse_iso("-0003-02-29").is_err());
+        // every accepted date round-trips back through `iso`.
+        for s in ["-0400-02-29", "-0004-02-29"] {
+            let t = parse_iso(s).unwrap();
+            assert_eq!(iso(t), format!("{s}T00:00:00Z"));
+        }
+    }
+
     #[test]
     fn negative_epoch() {
         assert_eq!(format_time(-1), "1969-12-31 23:59:59");
