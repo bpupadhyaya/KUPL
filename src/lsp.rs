@@ -2475,6 +2475,108 @@ mod tests {
         assert_eq!(parse_json(&over_limit), Err("JSON nested too deeply".into()));
     }
 
+    /// A narrow adversarial follow-up on PR-it620's own fix (production-
+    /// hardening PR-it621), per that iteration's own guidance: candidate (1)
+    /// was "does the fix correctly handle a NOTIFICATION (no `id` at all)
+    /// whose JSON fails to parse". A NOTIFICATION is only distinguishable
+    /// from a REQUEST by the ABSENCE of an `id` field on an otherwise-valid
+    /// JSON-RPC envelope -- but when the top-level JSON fails to parse (the
+    /// deep-nesting case), the server can never see that far into the
+    /// message to know whether an `id` was present or not. The JSON-RPC 2.0
+    /// spec's own convention (id:null for a parse error) exists precisely
+    /// because of this: the server must always report a parse error, since
+    /// silently guessing "this was probably a notification, drop it" could
+    /// just as easily swallow a REQUEST's reply forever (the exact bug
+    /// PR-it620 already fixed for the well-formed-envelope case). This test
+    /// spawns the REAL `kupl lsp` process (following the it619 REPL
+    /// subprocess-test pattern: background-thread stdin writer, so a large
+    /// adversarial write can't deadlock against the child's own output) and
+    /// sends a message SHAPED like a notification (`textDocument/didChange`,
+    /// no `id` field) whose `params` is nested past `MAX_JSON_DEPTH` -- and
+    /// confirms the server still replies with the spec-mandated id:null /
+    /// -32700 parse-error response (not silence, not a hang, not a crash),
+    /// and remains alive and fully functional for a subsequent normal
+    /// request afterward. No bug found: this is the same unconditional
+    /// parse-error path PR-it620 already wired up, which never branches on
+    /// whether an `id` was present (it can't -- parsing failed before
+    /// reaching that field) -- confirming intended, spec-compliant behavior
+    /// with a live process-level regression test rather than leaving this
+    /// specific shape untested.
+    #[test]
+    fn deeply_nested_notification_shaped_message_gets_a_parse_error_reply_not_silence() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let evil_params = format!("{}{}", "[".repeat(1000), "]".repeat(1000));
+        // note: no "id" field at all -- an otherwise-valid NOTIFICATION shape.
+        let notification = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{evil_params}}}"#
+        );
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let folding = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"file:///nonexistent.kupl"}}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init, &notification, folding] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung reading a deeply-nested notification-shaped message");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        // 3 framed messages went in (init request, evil notification, folding
+        // request); the server must reply to the request (id:1), then to the
+        // evil message it can't distinguish from a request (id:null,
+        // -32700), then to the final request (id:2) -- proving it's still
+        // alive and fully functional afterward, not just not-crashed.
+        let bodies: Vec<&str> = stdout
+            .split("Content-Length:")
+            .filter(|s| !s.trim().is_empty())
+            .map(|chunk| chunk.split("\r\n\r\n").nth(1).unwrap_or("").trim())
+            .collect();
+        assert!(bodies.len() >= 2, "expected at least 2 responses, got {bodies:?}");
+        let parse_error_reply = bodies.iter().find(|b| b.contains("-32700"));
+        assert!(
+            parse_error_reply.is_some(),
+            "expected a -32700 parse-error reply among responses: {bodies:?}"
+        );
+        let reply = parse_error_reply.unwrap();
+        assert!(reply.contains("\"id\":null"), "parse error reply must use id:null: {reply}");
+        let final_reply = bodies.last().unwrap();
+        assert!(
+            final_reply.contains("\"id\":2"),
+            "server must still answer a normal request after the adversarial notification: {final_reply}"
+        );
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+    }
+
+    fn wait_with_timeout_lsp(
+        child: std::process::Child,
+        timeout: std::time::Duration,
+    ) -> Option<std::process::Output> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        rx.recv_timeout(timeout).ok().and_then(Result::ok)
+    }
+
     #[test]
     fn hover_shows_fun_signature() {
         // position on `add` inside main's body (line 4, char ~10)
