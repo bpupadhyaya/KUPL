@@ -134,6 +134,20 @@ fn interface_of(item: &Item) -> String {
             }
         }
         Item::Type(t) => {
+            // A type's OWN type parameter list is part of its interface, exactly
+            // like a `fun`'s `type_params` above -- both its ARITY (how many type
+            // arguments a caller must supply) and its ORDER (which position binds
+            // to which field, e.g. `Pair[A, B]` vs `Pair[B, A]`) are caller-
+            // observable even when no field's rendered type string changes at all:
+            // an UNUSED/phantom type parameter (`Tagged[T] = Tagged(value: Int)`,
+            // legal in KUPL -- `T` never appears in a field) being renamed or
+            // dropped entirely changes the required instantiation arity with NO
+            // visible change to any field's `ty_str`; reordering a USED type
+            // parameter list swaps which concrete type binds to which position
+            // without changing any field's type text either. This was the SAME
+            // sig-interface gap `PR-it580` fixed for contract method effects,
+            // just for `Item::Type` this time (production-hardening PR-it643).
+            s.push_str(&format!("[{}]", t.type_params.join(",")));
             for v in &t.variants {
                 s.push_str(&format!("{}(", v.name));
                 for fld in &v.fields {
@@ -300,6 +314,43 @@ mod tests {
             "contract Store {\n    intent \"kv\"\n    expose fun get(key: Str) -> Int\n}\n",
         );
         assert_eq!(lines, vec!["interface Store"]);
+    }
+
+    /// A REAL BUG found+fixed (production-hardening PR-it643): the SAME sig-
+    /// interface gap `PR-it580` fixed for contract method effects, found in
+    /// `Item::Type`'s branch this time -- `t.type_params` was entirely absent
+    /// from the fingerprint, so a type parameter's arity/order was invisible
+    /// to `kupl diff` whenever no FIELD's rendered type text happened to change.
+    #[test]
+    fn type_parameter_arity_change_is_interface_even_when_unused() {
+        // an UNUSED (phantom) type parameter -- legal in KUPL, `T` never
+        // appears in any field -- being dropped entirely changes the required
+        // instantiation arity (`Tagged[Str]` becomes a type error) with ZERO
+        // change to any field's `ty_str`.
+        let (lines, _) = diff_lines(
+            "type Tagged[T] = Tagged(value: Int)\n",
+            "type Tagged = Tagged(value: Int)\n",
+        );
+        assert_eq!(lines, vec!["interface Tagged"]);
+        // renaming a phantom type parameter is the same shape.
+        let (lines, _) = diff_lines(
+            "type Tagged[T] = Tagged(value: Int)\n",
+            "type Tagged[U] = Tagged(value: Int)\n",
+        );
+        assert_eq!(lines, vec!["interface Tagged"]);
+    }
+
+    #[test]
+    fn type_parameter_reorder_is_interface_even_with_identical_field_text() {
+        // reordering a USED type parameter list swaps which concrete type
+        // binds to which position (`Pair[Int, Str]` means A=Int,B=Str under
+        // the old order but B=Int,A=Str under the new one) without changing
+        // any field's rendered type text at all ("first:A,second:B," either way).
+        let (lines, _) = diff_lines(
+            "type Pair[A, B] = Pair(first: A, second: B)\n",
+            "type Pair[B, A] = Pair(first: A, second: B)\n",
+        );
+        assert_eq!(lines, vec!["interface Pair"]);
     }
 
     #[test]
