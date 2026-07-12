@@ -580,8 +580,9 @@ pub fn emit_manifest(path: &str) -> i32 {
 }
 
 /// Serialize a program's components to the visual-tools manifest JSON (intent,
-/// ports, props, state, exposes, fulfills, children, wires). Every string field
-/// goes through `json_escape`, so the result is always valid, parseable JSON.
+/// ports, props, state, exposes, fulfills, children, wires, supervises,
+/// handlers). Every string field goes through `json_escape`, so the result is
+/// always valid, parseable JSON.
 pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
     use crate::diag::json_escape as esc;
     let mut out = String::from("{\"components\":[");
@@ -667,6 +668,43 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             })
             .collect();
         out.push_str(&format!(",\"wires\":[{}]", wires.join(",")));
+        // `supervises`/`handlers` were missing entirely -- a genuine completeness
+        // gap against this function's own doc comment/design contract ("the
+        // component's members must all be present", per this module's own test
+        // comment): `children`/`wires` (also purely structural connectivity data)
+        // were already included, but a visual tool had NO way to render a
+        // supervision tree or see which triggers a component reacts to, since
+        // both were silently dropped (production-hardening PR-it647).
+        let supervises: Vec<String> = c
+            .supervises
+            .iter()
+            .map(|sv| {
+                format!(
+                    "{{\"child\":\"{}\",\"policy\":\"{}\"}}",
+                    esc(&sv.child),
+                    match sv.policy {
+                        crate::ast::SupervisePolicy::RestartOnFailure => "restart_on_failure",
+                        crate::ast::SupervisePolicy::Never => "never",
+                    }
+                )
+            })
+            .collect();
+        out.push_str(&format!(",\"supervises\":[{}]", supervises.join(",")));
+        let handlers: Vec<String> = c
+            .handlers
+            .iter()
+            .map(|h| {
+                let trigger = match &h.trigger {
+                    crate::ast::Trigger::Port(p) => format!("port:{}", esc(p)),
+                    crate::ast::Trigger::Start => "start".to_string(),
+                    crate::ast::Trigger::Stop => "stop".to_string(),
+                    crate::ast::Trigger::Every(ms) => format!("every:{ms}"),
+                    crate::ast::Trigger::After(ms) => format!("after:{ms}"),
+                };
+                format!("{{\"trigger\":\"{trigger}\"}}")
+            })
+            .collect();
+        out.push_str(&format!(",\"handlers\":[{}]", handlers.join(",")));
         out.push_str(&format!(",\"examples\":{}}}", c.examples.len()));
     }
     out.push_str("]}");
@@ -1044,10 +1082,69 @@ mod tests {
         assert_eq!(arr_len(c.get("props")), Some(1));
         assert_eq!(arr_len(c.get("state")), Some(1));
         assert_eq!(arr_len(c.get("exposes")), Some(1));
+        // `on click(n) { ... }` above is a `handlers` entry -- was silently
+        // dropped entirely before PR-it647 (see `manifest_reports_supervises_
+        // and_handlers` below for the full regression coverage).
+        assert_eq!(arr_len(c.get("handlers")), Some(1));
+        let trigger = c.get("handlers").and_then(|h| h.index(0)).and_then(|h| h.get("trigger")).and_then(|t| t.str());
+        assert_eq!(trigger, Some("port:click"));
         // a program with no components is still valid JSON with an empty array
         let empty = super::manifest_json(&compile("fun main() {}\n").unwrap().program);
         let ev = crate::lsp::parse_json(&empty).expect("empty manifest is valid JSON");
         assert_eq!(arr_len(ev.get("components")), Some(0));
+    }
+
+    /// A REAL BUG found+fixed (production-hardening PR-it647): `manifest_json`'s
+    /// own doc comment (and this module's OTHER manifest test's comment: "the
+    /// component's members must all be present") claims completeness, but
+    /// `supervises`/`handlers` were entirely absent from the emitted JSON --
+    /// `children`/`wires` (also purely structural connectivity data a visual
+    /// tool needs) were already included, making the omission of `supervises`
+    /// (a supervision-tree edge) and `handlers` (which triggers a component
+    /// reacts to) an inconsistent, silent gap rather than a deliberate design
+    /// choice like `state`'s name-only serialization (state's `init` is an
+    /// arbitrary expression, not simple manifest data, unlike `SuperviseDecl`/
+    /// `Trigger` which are both small, fully-serializable structures).
+    #[test]
+    fn manifest_reports_supervises_and_handlers() {
+        let src = "component Child {\n    intent \"c\"\n}\n\
+                   component Parent {\n    intent \"p\"\n    \
+                   let kid = Child()\n    supervise kid restart on_failure\n    \
+                   on start { }\n    on stop { }\n    on every 5s { }\n    on after 2s { }\n}\n";
+        let compiled = compile(src).expect("compiles");
+        let json = super::manifest_json(&compiled.program);
+        let v = crate::lsp::parse_json(&json).expect("manifest must be valid JSON");
+        let arr_len = |j: Option<&crate::lsp::Json>| match j {
+            Some(crate::lsp::Json::Arr(a)) => Some(a.len()),
+            _ => None,
+        };
+        let parent = v
+            .get("components")
+            .and_then(|c| c.index(1))
+            .expect("component 1 (Parent)");
+        assert_eq!(
+            parent.get("name").and_then(|n| n.str()),
+            Some("Parent"),
+            "components are emitted in declaration order"
+        );
+        assert_eq!(arr_len(parent.get("supervises")), Some(1));
+        let sv = parent.get("supervises").and_then(|s| s.index(0)).expect("supervise entry");
+        assert_eq!(sv.get("child").and_then(|c| c.str()), Some("kid"));
+        assert_eq!(sv.get("policy").and_then(|p| p.str()), Some("restart_on_failure"));
+
+        assert_eq!(arr_len(parent.get("handlers")), Some(4));
+        let triggers: Vec<&str> = match parent.get("handlers") {
+            Some(crate::lsp::Json::Arr(hs)) => {
+                hs.iter().filter_map(|h| h.get("trigger")).filter_map(|t| t.str()).collect()
+            }
+            _ => Vec::new(),
+        };
+        assert_eq!(triggers, vec!["start", "stop", "every:5000", "after:2000"]);
+
+        // a component with neither must still emit empty arrays, not omit the keys.
+        let child = v.get("components").and_then(|c| c.index(0)).expect("component 0 (Child)");
+        assert_eq!(arr_len(child.get("supervises")), Some(0));
+        assert_eq!(arr_len(child.get("handlers")), Some(0));
     }
 
     #[test]
