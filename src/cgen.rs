@@ -351,12 +351,41 @@ fn str_const<'a>(chunk: &'a Chunk, idx: u16) -> Result<&'a str, String> {
     }
 }
 
+/// True if `reg` is a genuine chunk-local register — NOT a capture or
+/// parameter, which could be aliased before this chunk ever ran (captures
+/// occupy `[0, ncaps)`, params `[ncaps, ncaps+nparams)`, per compile.rs's
+/// FnCompiler register allocation order). `method_recv_escapes`/
+/// `add_lhs_escapes` only analyze aliasing WITHIN this chunk, so callers
+/// must check this separately before trusting either as sufficient proof a
+/// self-rebind register is safe to mutate in place.
+fn is_chunk_local_reg(chunk: &Chunk, reg: Reg) -> bool {
+    (reg as u16) >= chunk.ncaps as u16 + chunk.nparams as u16
+}
+
 fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize) -> Result<(), String> {
     use Op::*;
     let line = match op {
         Const(d, idx) => format!("regs[{d}] = {};", const_expr(&chunk.consts[*idx as usize], module)?),
         Move(d, s) => format!("regs[{d}] = regs[{s}];"),
-        Add(d, a, b) => format!("regs[{d}] = k_add(regs[{a}], regs[{b}]);"),
+        Add(d, a, b) => {
+            // Self-rebind fast path for `s = s + expr` (string self-append) —
+            // mirrors interp.rs's append_str_in_place / vm.rs's dst==a
+            // Op::Add handling (it611's add_lhs_escapes covers the same
+            // analysis this cgen.rs wiring finally uses). Same preconditions
+            // as Method's self-rebind fast path above: `d == a`, `a` is a
+            // chunk-local register, and add_lhs_escapes proves no other op
+            // in this chunk could alias it. The `tag == K_STR` runtime
+            // guards are load-bearing: `d == a` is purely syntactic and says
+            // nothing about whether this specific Add is a string append or
+            // ordinary numeric arithmetic.
+            if d == a && is_chunk_local_reg(chunk, *a) && !add_lhs_escapes(chunk, pc) {
+                format!(
+                    "regs[{d}] = (regs[{a}].tag == K_STR && regs[{b}].tag == K_STR) ? k_str_append_inplace(regs[{a}], regs[{b}].as.s) : k_add(regs[{a}], regs[{b}]);"
+                )
+            } else {
+                format!("regs[{d}] = k_add(regs[{a}], regs[{b}]);")
+            }
+        }
         Sub(d, a, b) => format!("regs[{d}] = k_sub(regs[{a}], regs[{b}]);"),
         Mul(d, a, b) => format!("regs[{d}] = k_mul(regs[{a}], regs[{b}]);"),
         Div(d, a, b) => format!("regs[{d}] = k_div(regs[{a}], regs[{b}]);"),
@@ -465,8 +494,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             // are purely syntactic and say nothing about the receiver's
             // actual runtime type (e.g. a component exposing its own method
             // literally named "push"/"insert").
-            let is_chunk_local = (*recv as u16) >= chunk.ncaps as u16 + chunk.nparams as u16;
-            let self_rebind = dst == recv && is_chunk_local && !method_recv_escapes(chunk, pc);
+            let self_rebind =
+                dst == recv && is_chunk_local_reg(chunk, *recv) && !method_recv_escapes(chunk, pc);
             if m == "push" && self_rebind {
                 format!(
                     "regs[{dst}] = (regs[{recv}].tag == K_LIST) ? k_list_push_inplace(regs[{recv}], regs[{start}]) : k_method(regs[{recv}], \"push\", &regs[{start}], {argc});"
@@ -742,15 +771,59 @@ static void k_i128_print(char* buf, size_t n, __int128 x) {
 }
 static KValue k_bool(int v)      { KValue x; x.tag = K_BOOL;  x.as.b = !!v; return x; }
 static KValue k_unit(void)       { KValue x; x.tag = K_UNIT;  x.as.i = 0; return x; }
-/* Borrows `s` — does NOT copy. The pointer must outlive the KValue: pass a string
-   literal, a k_strdup/k_alloc'd heap buffer, or a buffer owned by a live structure.
-   NEVER a local stack buffer (dangles after return) or a shared/volatile static like
-   strerror()'s or k_ai_err (a later call clobbers it). Wrap those in k_strdup(). */
-static KValue k_str(const char* s) { KValue x; x.tag = K_STR; x.as.s = s; return x; }
+/* Every K_STR value's `.as.s` points PAST a hidden KStrHdr sitting immediately
+   before it (`((KStrHdr*)s) - 1`), tracking allocated capacity so a self-rebind
+   `s = s + expr` can grow by amortized doubling instead of a fresh alloc + copy
+   on every call (see k_str_append_inplace) — the KList/KMap/KSet `cap` fields'
+   own rationale, applied to strings. k_str() is the SOLE place `.as.s` is ever
+   assigned (verified: no other direct `.as.s =` site exists in this file), so
+   giving every string a header here, unconditionally, means EVERY K_STR value
+   — including literals — is guaranteed to have a valid one; no separate tag or
+   runtime check is needed to tell heap-grown strings apart from borrowed ones,
+   because there is no "borrowed" case left. */
+typedef struct { int64_t len; int64_t cap; } KStrHdr;
+/* Copies `s` (was a raw borrow before this became header-tracked — see the
+   KStrHdr comment above). The extra copy is a one-time, bounded cost paid once
+   per k_str() call; it is NOT paid inside a self-append loop, since after the
+   first `k_str("")` a growing string goes through k_str_append_inplace instead,
+   which never calls k_str() again. `s` itself is never retained. */
+static KValue k_str(const char* s) {
+    size_t n = strlen(s);
+    KStrHdr* h = (KStrHdr*)k_alloc(sizeof(KStrHdr) + n + 1);
+    h->len = (int64_t)n; h->cap = (int64_t)n;
+    char* data = (char*)(h + 1);
+    memcpy(data, s, n); data[n] = 0;
+    KValue x; x.tag = K_STR; x.as.s = data; return x;
+}
 static char* k_strdup(const char* s) { size_t n = strlen(s) + 1; char* c = (char*)k_alloc(n); memcpy(c, s, n); return c; }
+/* In-place append fast path for the self-rebind `s = s + expr` idiom, only
+   ever emitted (see emit_op's Add case) when the codegen has proved `a` is a
+   chunk-local register never aliased elsewhere in this chunk. Grows by
+   amortized doubling (like k_list_push_inplace) so a loop of N such appends
+   is O(N) total, not O(N^2). Every KValue tagged K_STR has a valid KStrHdr
+   (see above), so reading one back from `recv.as.s` is always safe here. */
+static KValue k_str_append_inplace(KValue recv, const char* suffix) {
+    KStrHdr* h = ((KStrHdr*)recv.as.s) - 1;
+    int64_t sn = (int64_t)strlen(suffix);
+    if (h->len + sn > h->cap) {
+        int64_t newcap = h->cap < 1 ? 4 : h->cap * 2;
+        while (newcap < h->len + sn) newcap *= 2;
+        KStrHdr* nh = (KStrHdr*)k_alloc(sizeof(KStrHdr) + (size_t)newcap + 1);
+        nh->len = h->len; nh->cap = newcap;
+        memcpy((char*)(nh + 1), recv.as.s, (size_t)h->len);
+        h = nh;
+        recv.as.s = (const char*)(nh + 1);
+    }
+    char* data = (char*)recv.as.s;
+    memcpy(data + h->len, suffix, (size_t)sn);
+    h->len += sn;
+    data[h->len] = 0;
+    return recv;
+}
 /* An `Err` whose message mirrors Rust's io::Error Display for a raw OS error:
    "<strerror(errno)> (os error <errno>)" — so IO error VALUES are byte-identical to
-   the interpreter. Reads errno first; the message is heap-owned (k_str borrows). */
+   the interpreter. Reads errno first; k_str() copies the message, so it's fine
+   that strerror()'s buffer is a clobber-on-next-call shared static. */
 static KValue k_err(KValue);
 static KValue k_os_error(void) {
     int e = errno;
