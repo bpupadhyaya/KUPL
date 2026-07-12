@@ -96,6 +96,28 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+/// Split `s` on `delim`, but never while inside a quoted string (the SAME
+/// `in_str` toggle-on-`"` technique `strip_comment` above already uses for
+/// `#`) -- so `{ path = "my,dir" }`'s comma-containing path VALUE isn't
+/// mistaken for a second field. PR-it680.
+fn split_outside_quotes(s: &str, delim: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut in_str = false;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_str = !in_str,
+            c if c == delim && !in_str => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
 fn parse_string(v: &str) -> Option<String> {
     let v = v.trim();
     if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
@@ -118,7 +140,17 @@ fn parse_dep(name: &str, value: &str, line: usize) -> Result<Dep, String> {
         .ok_or_else(|| format!("line {line}: expected a string or `{{ … }}` table"))?;
     let mut path = None;
     let mut version = None;
-    for field in inner.split(',') {
+    // A REAL sibling bug to `strip_comment`'s already-fixed `#`-inside-a-
+    // string footgun (PR-it654), found by re-checking this SAME file's other
+    // naive-delimiter-split for the identical shape (PR-it680): a plain
+    // `inner.split(',')` breaks the moment a `path`/`version` VALUE contains
+    // a literal comma (e.g. `{ path = "my,dir" }`), since the comma inside
+    // the quoted string gets treated as a field separator too. Confirmed
+    // live before this fix: `kupl pkg tree` on a manifest with exactly this
+    // shape failed with a confusing "expected a string value" instead of
+    // parsing the path correctly. `split_outside_quotes` mirrors
+    // `strip_comment`'s exact `in_str` toggle-on-`"` technique.
+    for field in split_outside_quotes(inner, ',') {
         let field = field.trim();
         if field.is_empty() {
             continue;
@@ -190,5 +222,31 @@ mod tests {
         assert!(parse("[project]\nname \"x\"\n").is_err()); // no `=`
         assert!(parse("[bogus]\n").is_err()); // unknown section
         assert!(parse("[dependencies]\nfoo = { }\n").is_err()); // no path/version
+    }
+
+    /// A REAL sibling bug to `hash_inside_a_string_value_is_not_treated_as_a_
+    /// comment` above (PR-it680, same file, same "naive delimiter split
+    /// ignores string-literal boundaries" shape it654 already fixed once for
+    /// `#`, just for a DIFFERENT delimiter): `parse_dep`'s inline-table field
+    /// parser used a plain `inner.split(',')`, which breaks the moment a
+    /// `path`/`version` VALUE contains a literal comma -- the comma inside
+    /// the quoted string was mistaken for a field separator, corrupting the
+    /// split into two bogus fields. Confirmed live before this fix: `kupl
+    /// pkg tree` on a manifest with `{ path = "my,dir" }` failed with a
+    /// confusing "expected a string value" instead of parsing the path.
+    #[test]
+    fn comma_inside_a_dependency_string_value_is_not_treated_as_a_field_separator() {
+        let m = parse("[dependencies]\nmath = { path = \"my,dir\" }\n").unwrap();
+        assert_eq!(m.deps, vec![Dep { name: "math".into(), path: Some("my,dir".into()), version: None }]);
+        // BOTH fields present, with the comma-bearing one first, still parses
+        // both correctly (the split must resume normally after the string closes).
+        let m2 = parse(
+            "[dependencies]\nweb = { path = \"a,b\", version = \"1.2.0\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            m2.deps,
+            vec![Dep { name: "web".into(), path: Some("a,b".into()), version: Some("1.2.0".into()) }]
+        );
     }
 }
