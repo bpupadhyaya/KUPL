@@ -81,6 +81,7 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
         comp_props: HashMap::new(),
         diags: Vec::new(),
         fun_names: funs.iter().map(|f| f.name.clone()).collect(),
+        too_many_chunks: false,
     };
 
     // components: register names first (constructions may be mutually recursive)
@@ -105,8 +106,7 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
                 let r = fc.expr(d);
                 fc.emit(Op::Ret(r), p.span);
                 let chunk = fc.finish();
-                shared.module.chunks.push(chunk);
-                (shared.module.chunks.len() - 1) as u16
+                shared.push_chunk(chunk, p.span)
             });
             props.push((p.name.clone(), default));
         }
@@ -190,16 +190,18 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
     // pre-assign chunk indices for ALL component functions (mutual recursion)
     let mut fun_chunks: HashMap<String, u16> = HashMap::new();
     for f in c.funs.iter().chain(c.exposes.iter()) {
-        let idx = shared.module.chunks.len() as u16;
-        shared.module.chunks.push(Chunk {
-            name: format!("{}::{}", c.name, f.name),
-            ncaps: 0,
-            nparams: f.params.len() as u8,
-            nregs: 0,
-            consts: Vec::new(),
-            code: Vec::new(),
-            spans: Vec::new(),
-        });
+        let idx = shared.push_chunk(
+            Chunk {
+                name: format!("{}::{}", c.name, f.name),
+                ncaps: 0,
+                nparams: f.params.len() as u8,
+                nregs: 0,
+                consts: Vec::new(),
+                code: Vec::new(),
+                spans: Vec::new(),
+            },
+            f.span,
+        );
         fun_chunks.insert(f.name.clone(), idx);
     }
     let comp_ctx = CompCtx { slots: slots.clone(), funs: fun_chunks.clone() };
@@ -216,8 +218,7 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         let u = fc.const_reg(Value::Unit, c.span);
         fc.emit(Op::Ret(u), c.span);
         let chunk = fc.finish();
-        shared.module.chunks.push(chunk);
-        (shared.module.chunks.len() - 1) as u16
+        shared.push_chunk(chunk, c.span)
     };
 
     // init chunk: state inits, children, wires (instance is current)
@@ -245,8 +246,7 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         let u = fc.const_reg(Value::Unit, c.span);
         fc.emit(Op::Ret(u), c.span);
         let chunk = fc.finish();
-        shared.module.chunks.push(chunk);
-        (shared.module.chunks.len() - 1) as u16
+        shared.push_chunk(chunk, c.span)
     };
 
     // handlers (ports + lifecycle) and timers
@@ -279,8 +279,7 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         let u = fc.const_reg(Value::Unit, h.span);
         fc.emit(Op::Ret(u), h.span);
         let chunk = fc.finish();
-        shared.module.chunks.push(chunk);
-        let chunk_idx = (shared.module.chunks.len() - 1) as u16;
+        let chunk_idx = shared.push_chunk(chunk, h.span);
         match timer {
             Some((every, interval_ms)) => {
                 timers.push(TimerMeta { chunk: chunk_idx, every, interval_ms });
@@ -345,6 +344,35 @@ struct Shared {
     comp_props: HashMap<String, Vec<(String, Option<u16>)>>,
     diags: Vec<Diag>,
     fun_names: HashSet<String>,
+    too_many_chunks: bool,
+}
+
+impl Shared {
+    /// Push a `Chunk` (a top-level fun, a component method/lifecycle handler, a
+    /// lambda's own chunk, ...) and return its index -- the ONE shared choke point
+    /// for every `module.chunks.push(...)` site, checking the SAME fixed-width-
+    /// bytecode-operand-vs-unbounded-source-count overflow `K0801`/`K0805`/`K0806`
+    /// already guard for registers/state-slots/the constant pool (production-
+    /// hardening PR-it696, closing a sibling gap `K0806`'s own investigation
+    /// flagged but deliberately left for a follow-up): `Op::Call`/`Op::CallComp`'s
+    /// `fun`, `Op::MakeClosure`'s `proto`, and the function-name/component-method
+    /// lookup tables all index `module.chunks` with a `u16`, with nothing checking
+    /// the growing chunk count still fits -- a module with more than 65536
+    /// functions/closures/component-methods would silently alias `Op::Call`/
+    /// `Op::MakeClosure` to the WRONG chunk once the count wraps.
+    fn push_chunk(&mut self, chunk: Chunk, span: Span) -> u16 {
+        let i = self.module.chunks.len();
+        if i > u16::MAX as usize && !self.too_many_chunks {
+            self.too_many_chunks = true;
+            self.diags.push(Diag::error(
+                "K0807",
+                "module has too many functions/closures/component methods for KVM v0 (more than 65536 chunks)",
+                span,
+            ));
+        }
+        self.module.chunks.push(chunk);
+        (i & 0xffff) as u16
+    }
 }
 
 /// Component compilation context: name -> instance slot (props, state, children),
@@ -1099,8 +1127,7 @@ impl<'s> FnCompiler<'s> {
                     let r = last.unwrap_or_else(|| lc.const_reg(Value::Unit, span));
                     lc.emit(Op::Ret(r), span);
                     let chunk = lc.finish();
-                    self.shared.module.chunks.push(chunk);
-                    (self.shared.module.chunks.len() - 1) as u16
+                    self.shared.push_chunk(chunk, span)
                 };
 
                 // copy captured values into consecutive regs
@@ -1598,6 +1625,7 @@ mod tests {
             comp_props: HashMap::new(),
             diags: Vec::new(),
             fun_names: HashSet::new(),
+            too_many_chunks: false,
         }
     }
 
@@ -1653,5 +1681,64 @@ mod tests {
             fc3.const_idx(Value::Int(7), Span::default());
         }
         assert_eq!(fc3.chunk.consts.len(), 1);
+    }
+
+    fn dummy_chunk(name: &str) -> Chunk {
+        Chunk {
+            name: name.to_string(),
+            ncaps: 0,
+            nparams: 0,
+            nregs: 0,
+            consts: Vec::new(),
+            code: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it696), the sibling `K0806`'s
+    /// own investigation flagged but deliberately left for a follow-up: EVERY
+    /// `module.chunks.push(...)` site (top-level fun/closure/component-method/
+    /// timer/handler chunks) computed its returned index as `(module.chunks.len() -
+    /// 1) as u16` (or, at one site, `module.chunks.len() as u16` BEFORE the push)
+    /// with NO overflow check -- `Op::Call`/`Op::CallComp`'s `fun` and
+    /// `Op::MakeClosure`'s `proto` both index `module.chunks` with a `u16`. Past
+    /// 65536 chunks in one module, a NEW chunk's index would silently wrap
+    /// (65536 -> 0), and every `Op::Call`/`Op::MakeClosure` referencing it would
+    /// silently invoke the WRONG function/closure instead. Fixed by routing every
+    /// site through a single shared `Shared::push_chunk` choke point (the "narrower
+    /// shared boundary point" pattern, it638/it639/it691/it692/it695), mirroring
+    /// `const_idx`'s own `K0806` check exactly.
+    ///
+    /// Pre-populates `module.chunks` directly (an O(n) `Vec` build), NOT by driving
+    /// 65537+ real chunks through actual compilation -- same rationale as
+    /// `oversized_constant_pool_is_rejected_not_silently_aliased`'s own rewrite
+    /// (it695): this exercises the EXACT check `push_chunk` performs on every call,
+    /// without the cost of getting there via the public compile-a-huge-program path.
+    #[test]
+    fn oversized_chunk_table_is_rejected_not_silently_aliased() {
+        let mut shared = new_shared();
+        shared.module.chunks = (0..=u16::MAX as usize).map(|i| dummy_chunk(&format!("f{i}"))).collect();
+        assert_eq!(shared.module.chunks.len(), 65536);
+        let idx = shared.push_chunk(dummy_chunk("overflow"), Span::default());
+        assert_eq!(idx, 0, "index truncates to 0 (documented, diagnosed -- not silently trusted)");
+        assert!(shared.too_many_chunks);
+        assert!(
+            shared.diags.iter().any(|d| d.code == "K0807"),
+            "expected K0807, got: {:?}",
+            shared.diags
+        );
+        // the diagnostic fires only ONCE even if more chunks keep getting pushed
+        // past the limit.
+        shared.push_chunk(dummy_chunk("overflow2"), Span::default());
+        assert_eq!(shared.diags.iter().filter(|d| d.code == "K0807").count(), 1);
+
+        // well-under-the-limit is entirely unaffected.
+        let mut shared2 = new_shared();
+        for i in 0..1000 {
+            shared2.push_chunk(dummy_chunk(&format!("f{i}")), Span::default());
+        }
+        assert!(!shared2.too_many_chunks);
+        assert!(shared2.diags.is_empty());
+        assert_eq!(shared2.module.chunks.len(), 1000);
     }
 }
