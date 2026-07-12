@@ -344,9 +344,33 @@ pub fn method_recv_escapes(chunk: &Chunk, method_idx: usize) -> bool {
         Some(Op::Method { recv, .. }) => *recv,
         _ => return true,
     };
-    let (start, end) = match enclosing_loop_range(chunk, method_idx) {
+    reg_escapes(chunk, method_idx, recv)
+}
+
+/// True if the value in register `a` at `Op::Add(d, a, b)` where `d == a`
+/// (the `s = s + expr` string self-append shape compile.rs compiles to a
+/// dst==src Add, mirroring its dst==recv Op::Method compilation for
+/// `xs = xs.push(item)`) could be aliased elsewhere in this chunk. Same
+/// soundness argument and same out-of-scope caveat as
+/// [`method_recv_escapes`] — see its doc comment; this is that same
+/// analysis for a different self-rebind op shape, sharing the underlying
+/// [`reg_escapes`] window logic instead of duplicating it.
+pub fn add_lhs_escapes(chunk: &Chunk, add_idx: usize) -> bool {
+    let a = match chunk.code.get(add_idx) {
+        Some(Op::Add(_, a, _)) => *a,
+        _ => return true,
+    };
+    reg_escapes(chunk, add_idx, a)
+}
+
+/// Shared window-scan behind [`method_recv_escapes`] and [`add_lhs_escapes`]:
+/// true if `reg`'s value at `op_idx` could be aliased by another op in this
+/// chunk. See `method_recv_escapes`'s doc comment for the two-window
+/// soundness argument (loop body vs whole prefix) this implements.
+fn reg_escapes(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool {
+    let (start, end) = match enclosing_loop_range(chunk, op_idx) {
         Some((lo, hi)) => (lo, hi + 1),
-        None => (0, method_idx),
+        None => (0, op_idx),
     };
     chunk
         .code
@@ -354,7 +378,7 @@ pub fn method_recv_escapes(chunk: &Chunk, method_idx: usize) -> bool {
         .enumerate()
         .take(end)
         .skip(start)
-        .any(|(i, op)| i != method_idx && aliasing_regs(op).contains(&recv))
+        .any(|(i, op)| i != op_idx && aliasing_regs(op).contains(&reg))
 }
 
 #[cfg(test)]
@@ -517,5 +541,71 @@ mod escape_tests {
     fn non_method_op_at_the_index_is_conservatively_treated_as_escaping() {
         let c = chunk(vec![Op::Move(0, 1)]);
         assert!(method_recv_escapes(&c, 0));
+    }
+
+    fn self_add(reg: Reg, b: Reg) -> Op {
+        Op::Add(reg, reg, b)
+    }
+
+    #[test]
+    fn straight_line_self_add_with_no_prior_use_is_safe() {
+        let c = chunk(vec![Op::Const(0, 0), Op::Const(1, 1), self_add(0, 1)]);
+        assert!(!add_lhs_escapes(&c, 2));
+    }
+
+    #[test]
+    fn straight_line_move_before_self_add_escapes() {
+        // s = ""; t = s; s = s + x
+        let c = chunk(vec![
+            Op::Const(0, 0),
+            Op::Move(2, 0), // t = s
+            Op::Const(1, 1),
+            self_add(0, 1),
+        ]);
+        assert!(add_lhs_escapes(&c, 3));
+    }
+
+    #[test]
+    fn loop_body_alias_after_the_add_still_escapes_the_next_iteration() {
+        // while i < n { s = s + x; t = s; i = i + 1 }
+        let c = chunk(vec![
+            Op::Lt(2, 1, 3),   // 0: loop head
+            Op::JumpIfFalse(2, 6), // 1
+            self_add(0, 4),    // 2: s = s + x
+            Op::Move(5, 0),    // 3: t = s   <- escape, textually AFTER the add
+            Op::Add(1, 1, 4),  // 4: i = i + 1
+            Op::Jump(0),       // 5: back-edge to loop head
+        ]);
+        assert!(add_lhs_escapes(&c, 2));
+    }
+
+    #[test]
+    fn simple_loop_self_add_with_no_escape_is_safe() {
+        let c = chunk(vec![
+            Op::Const(0, 0),      // 0: s = ""
+            Op::Lt(2, 1, 3),      // 1: loop head
+            Op::JumpIfFalse(2, 5), // 2
+            self_add(0, 4),        // 3: s = s + x
+            Op::Add(1, 1, 4),      // 4: i = i + 1
+            Op::Jump(1),            // 5: back-edge
+        ]);
+        assert!(!add_lhs_escapes(&c, 3));
+    }
+
+    #[test]
+    fn call_argument_before_self_add_escapes() {
+        let c = chunk(vec![
+            Op::Const(0, 0),
+            Op::Call { dst: 1, fun: 0, start: 0, argc: 1 }, // s passed as an arg
+            Op::Const(2, 1),
+            self_add(0, 2),
+        ]);
+        assert!(add_lhs_escapes(&c, 3));
+    }
+
+    #[test]
+    fn non_add_op_at_the_index_is_conservatively_treated_as_escaping() {
+        let c = chunk(vec![Op::Move(0, 1)]);
+        assert!(add_lhs_escapes(&c, 0));
     }
 }
