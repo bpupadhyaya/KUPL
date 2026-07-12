@@ -74,6 +74,25 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
         if info.decl.ai.is_some() {
             eff.insert("ai".to_string());
         }
+        // A REAL bug found+fixed (production-hardening PR-it629), the SAME
+        // missed-traversal-site shape and severity as it569 (a function
+        // referenced by name, not called directly) and it584 (a match arm's
+        // guard expression): a parameter's DEFAULT VALUE (`x: Int = EXPR`,
+        // `Param::default`) is evaluated on every call that omits that
+        // argument -- a REAL, observable execution path -- but was never
+        // walked here, only `decl.body` was. Confirmed via a live repro
+        // BEFORE this fix: `pub fun greet(x: Int = noisy())` (where `noisy`
+        // calls `print`) was accepted with NO `uses io` requirement at all,
+        // and calling `greet()` with the argument omitted genuinely printed
+        // the undeclared side effect at runtime -- a real boundary-
+        // explicitness violation, not just a missing diagnostic.
+        for p in &info.decl.params {
+            if let Some(d) = &p.default {
+                walk_expr(d, &mut |expr| {
+                    collect_expr(expr, info.component, &funs, &mut eff, &mut calls);
+                });
+            }
+        }
         walk_block(&info.decl.body, &mut |expr| {
             collect_expr(expr, info.component, &funs, &mut eff, &mut calls);
         });
@@ -176,6 +195,22 @@ pub fn infer_effects(program: &Program) -> HashMap<String, EffectSet> {
         let mut calls = Vec::new();
         if decl.ai.is_some() {
             eff.insert("ai".to_string());
+        }
+        // See the identical fix + comment in check_effects above
+        // (production-hardening PR-it629): a parameter default value is a
+        // real execution path (evaluated whenever that argument is
+        // omitted), and `pure_funs()` (built on this function) gates the
+        // real-OS-thread par_map/par_filter fast path -- so missing this
+        // here isn't just a missing diagnostic, it's the SAME severity
+        // class as it569/it584: a function whose body is genuinely pure but
+        // whose ONLY impurity lives in a default value used to be wrongly
+        // classified pure, letting it run unsynchronized on that fast path.
+        for p in &decl.params {
+            if let Some(d) = &p.default {
+                walk_expr(d, &mut |expr| {
+                    collect_expr(expr, *component, &funs, &mut eff, &mut calls);
+                });
+            }
         }
         walk_block(&decl.body, &mut |expr| {
             collect_expr(expr, *component, &funs, &mut eff, &mut calls);
@@ -555,6 +590,52 @@ mod tests {
             "fun noisy(x: Int) -> Bool {\n    print(to_str(x))\n    x > 0\n}\n\
              fun wrapper(x: Int) -> Str {\n    match x {\n        n if noisy(n) => \"pos\"\n        \
              _ => \"other\"\n    }\n}\n\
+             fun pure_double(x: Int) -> Int { x * 2 }\n",
+        );
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let pure = super::pure_funs(&p);
+        assert!(!pure.contains("wrapper"), "wrapper must NOT be classified pure: {pure:?}");
+        assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
+    }
+
+    #[test]
+    fn effect_propagates_through_a_parameter_default_value() {
+        // A REAL bug found+fixed (production-hardening PR-it629), the SAME
+        // missed-traversal-site shape as it569 (a function referenced by
+        // name) and it584 (a match arm's guard): a parameter DEFAULT VALUE
+        // (`x: Int = EXPR`) is evaluated on every call that omits that
+        // argument -- a real, observable execution path -- but was never
+        // walked, only the function BODY was. Confirmed via a live repro
+        // BEFORE this fix: `pub fun greet(x: Int = noisy())` (calling
+        // `print`) was accepted with NO `uses io` requirement at all, and
+        // calling `greet()` with the argument omitted genuinely printed the
+        // undeclared side effect at runtime.
+        let d = diags_for(
+            "fun noisy() -> Int {\n    print(\"hi\")\n    42\n}\n\
+             pub fun greet(x: Int = noisy()) -> Int {\n    x\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K0301"), "{d:?}");
+        // and the corresponding declaration is accepted with no spurious
+        // "declared but unused" K0302 once correctly attributed.
+        let ok = diags_for(
+            "fun noisy() -> Int {\n    print(\"hi\")\n    42\n}\n\
+             pub fun greet(x: Int = noisy()) uses io -> Int {\n    x\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn pure_funs_excludes_a_function_whose_only_impurity_is_a_parameter_default() {
+        // The SAME root cause as the test above has the SAME higher-severity
+        // consequence as it569/it584: `pure_funs()` gates the interp/KVM
+        // real-thread `par_map`/`par_filter` fast path (src/parallel.rs). A
+        // function whose BODY is genuinely pure but whose ONLY impurity
+        // lives in a parameter's default value used to be wrongly
+        // classified pure, letting it run unsynchronized on that fast path
+        // -- a real safety violation, not just a missing diagnostic.
+        let (p, d) = crate::parser::parse(
+            "fun noisy() -> Int {\n    print(\"hi\")\n    42\n}\n\
+             fun wrapper(x: Int = noisy()) -> Int {\n    x * 2\n}\n\
              fun pure_double(x: Int) -> Int { x * 2 }\n",
         );
         assert!(d.is_empty(), "parse diags: {d:?}");
