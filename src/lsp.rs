@@ -2327,6 +2327,52 @@ mod tests {
         }
     }
 
+    /// A robustness-audit finding (production-hardening PR-it618): the LSP
+    /// methods added LATER (signatureHelp/codeAction/foldingRange, it586-590)
+    /// were never added to `position_handlers_never_panic_on_edge_input`'s
+    /// fuzz loop above -- that test only calls the four OLDER handlers
+    /// (hover/definition/completions/occurrences). The newer ones take a
+    /// DIFFERENT parameter shape too (`resolve_code_actions` takes raw BYTE
+    /// OFFSETS, not line/character), so even re-running the exact same test
+    /// wouldn't have exercised the right kind of adversarial input for it.
+    /// Extends the same never-panic discipline to all three. No bug found —
+    /// `resolve_signature_help` routes through the already-hardened
+    /// `offset_at` (proven safe by the test above) before touching the AST;
+    /// `resolve_code_actions`'s `start_off`/`end_off` are only ever used in
+    /// numeric `<`/`>` comparisons against diagnostic spans, never as a
+    /// slice index, so they're safe for ANY usize value including
+    /// `usize::MAX`; `folding_ranges` only takes `text`. Locking this in as
+    /// a permanent regression test now that it's been checked, rather than
+    /// leaving the newer methods with weaker coverage than the older ones.
+    #[test]
+    fn newer_lsp_methods_never_panic_on_edge_input() {
+        let big = "fun f(){}\n".repeat(500);
+        let docs = [
+            "",
+            "fun",
+            "fun main() { print(",
+            "let café = 1\nlet 日本 = 2\n",
+            "// 🎉🎉🎉 comment\nfun f() {}\n",
+            "\"unterminated {interp",
+            "fun f(x: Int",                    // truncated mid-signature
+            "fun f(x: Int) uses io { g(",     // truncated mid-call
+            big.as_str(),
+        ];
+        for doc in docs {
+            for line in [0usize, 1, 2, 5, 100, usize::MAX] {
+                for ch in [0usize, 1, 3, 4, 5, 50, 10_000, usize::MAX] {
+                    let _ = resolve_signature_help(doc, line, ch);
+                }
+            }
+            for off in [0usize, 1, 3, doc.len(), doc.len() + 1, 10_000, usize::MAX] {
+                for end_off in [0usize, off, off.saturating_add(1), usize::MAX] {
+                    let _ = resolve_code_actions(doc, off, end_off);
+                }
+            }
+            let _ = folding_ranges(doc);
+        }
+    }
+
     #[test]
     fn parse_json_literal_keywords_are_validated_not_just_sniffed() {
         // A REAL BUG found+fixed (bug-hunt batch 153, PR-it545): the
