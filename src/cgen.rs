@@ -581,7 +581,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             // an unused-var warning when zero.
             format!("(void){argc}; regs[{dst}] = CHUNKS[{fun}](0, &regs[{start}]);")
         }
-        // emit_c rejects modules with ai funs before reaching here
+        // ai funs compile natively (see the module doc comment); a real
+        // provider/tool call defers to `kupl bundle` at runtime (k_ai_call).
         CallAi { dst, info, intent } => {
             // mock/deterministic path; the resolved intent + args are unused (the
             // mock ignores the prompt). Real providers/tools defer in k_ai_call.

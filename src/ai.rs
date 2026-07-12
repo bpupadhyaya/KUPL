@@ -21,8 +21,10 @@
 //!
 //! Transport is the system `curl` (KUPL has zero Rust dependencies).
 //! Both engines (interpreter and KVM) call `ai_call` — one implementation,
-//! byte-identical behavior. The native backend rejects modules with `ai fun`s
-//! for now (a clear error at `kupl native` time).
+//! byte-identical behavior. `kupl native` also compiles `ai fun`s: the
+//! deterministic mock path is fully native, while a real provider call (or
+//! a tool-using `ai fun`) defers to `kupl bundle` at runtime (see
+//! `cgen.rs`'s `k_ai_call`).
 
 use std::collections::HashMap;
 

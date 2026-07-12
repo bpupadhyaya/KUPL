@@ -378,6 +378,33 @@ impl Checker {
         }
         for item in &program.items {
             if let Item::Component(c) = item {
+                // A REAL bug (production-hardening PR-it703, found via a
+                // fifteenth research-subagent dispatch investigating contract
+                // law execution completeness): unlike every sibling top-level
+                // item (types K0201, constructors K0202, functions K0203,
+                // contracts K0260, and even a component's OWN methods K0277),
+                // a component's own name had NO duplicate-name check --
+                // `self.checked.components` is a plain `HashMap<String,
+                // ComponentSig>`, last-write-wins. Two components sharing a
+                // name silently collapsed into ONE entry here, and interp.rs's
+                // `ProgramDb.components` (also a bare-name `HashMap`) collapsed
+                // the same way, so a duplicate `component A` compiled clean
+                // and every reference to `A` -- including `fulfills`
+                // signature-checking and, worse, `kupl test`'s law-execution
+                // loop -- silently resolved to the LAST-declared `A`'s
+                // signature and code, never the first. Live-reproduced: a
+                // component `A` fulfilling `Getter` with a law-violating body
+                // followed by an unrelated `A` fulfilling `Setter` made `kupl
+                // check` accept with zero diagnostics and `kupl test` report
+                // the first `A`'s law as passing -- its buggy code was never
+                // run at all.
+                if self.checked.components.contains_key(&c.name) {
+                    self.err(
+                        "K0278",
+                        format!("component `{}` is defined more than once", crate::resolve::demangle_for_display(&c.name)),
+                        c.span,
+                    );
+                }
                 self.checked.components.insert(c.name.clone(), ComponentSig::default());
             }
             // register contract names early so contract-typed props/params resolve
@@ -4814,6 +4841,39 @@ mod generic_tests {
         assert!(
             fulfills_hole.iter().any(|d| d.code == "K0277" && d.message.contains("method `act`")),
             "{fulfills_hole:?}"
+        );
+    }
+
+    /// A REAL bug (production-hardening PR-it703): unlike every sibling
+    /// top-level item (types K0201, constructors K0202, functions K0203,
+    /// contracts K0260), a component's OWN name had no duplicate-name check
+    /// -- `Checker.checked.components` is a bare-name `HashMap`, last-write-
+    /// wins, and so is `interp.rs`'s `ProgramDb.components`. Found via a
+    /// fifteenth research-subagent dispatch investigating contract law
+    /// execution completeness under `kupl test`: two components both named
+    /// `A`, the first fulfilling a contract with a law-violating body, the
+    /// second fulfilling an unrelated contract with a correct body, compiled
+    /// with ZERO diagnostics and `kupl test` reported the first `A`'s law as
+    /// PASSING -- its buggy code was never instantiated or run at all, since
+    /// every reference to `A` (fulfills-checking AND law-execution) silently
+    /// resolved to the last-declared `A`.
+    #[test]
+    fn duplicate_component_names_are_rejected() {
+        let dup = errors("component A {\n    intent \"one\"\n    expose fun get() -> Int { 1 }\n}\ncomponent A {\n    intent \"two\"\n    expose fun get() -> Int { 2 }\n}\nfun main() {}\n");
+        assert!(dup.iter().any(|d| d.code == "K0278" && d.message.contains("component `A`")), "{dup:?}");
+        // an ordinary program with distinctly-named components is unaffected.
+        assert!(errors("component A {\n    intent \"one\"\n    expose fun get() -> Int { 1 }\n}\ncomponent B {\n    intent \"two\"\n    expose fun get() -> Int { 2 }\n}\nfun main() {}\n").is_empty());
+
+        // The exact live-reproduced scenario: a law-violating `A` shadowed by
+        // an unrelated, correct `A` used to let `kupl check` accept clean and
+        // `kupl test` silently skip exercising the first `A` at all -- it
+        // must now be rejected as a duplicate before any law can run.
+        let shadowed_law = errors(
+            "contract Getter {\n    intent \"get\"\n    expose fun get() -> Int\n    law \"get is nonnegative\" {\n        forall n: Int {\n            let c = A()\n            c.get() >= 0\n        }\n    }\n}\ncontract Setter {\n    intent \"set\"\n    expose fun get() -> Int\n}\ncomponent A fulfills Getter {\n    intent \"bad\"\n    expose fun get() -> Int { -1 }\n}\ncomponent A fulfills Setter {\n    intent \"good\"\n    expose fun get() -> Int { 2 }\n}\nfun main() {}\n",
+        );
+        assert!(
+            shadowed_law.iter().any(|d| d.code == "K0278" && d.message.contains("component `A`")),
+            "{shadowed_law:?}"
         );
     }
 

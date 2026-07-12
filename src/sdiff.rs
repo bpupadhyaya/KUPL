@@ -117,7 +117,10 @@ fn items_by_kind_and_name(items: Vec<Item>) -> BTreeMap<(&'static str, String), 
     map
 }
 
-fn item_name(item: &Item) -> &str {
+/// `pub(crate)`: also used by `repl.rs` to identify which prior top-level
+/// declaration a freshly-typed one should replace (production-hardening
+/// PR-it703) -- reusing this rather than a parallel name-extraction match.
+pub(crate) fn item_name(item: &Item) -> &str {
     match item {
         Item::Fun(f) => &f.name,
         Item::Type(t) => &t.name,
@@ -130,8 +133,9 @@ fn item_name(item: &Item) -> &str {
 /// Unpadded kind discriminant, for the `(kind, name)` map key -- distinct
 /// from `kind()` below, whose fixed-width-padded strings are for aligned
 /// DISPLAY output, not key uniqueness (though either would work as a key;
-/// this one exists so the two concerns stay visibly separate).
-fn kind_tag(item: &Item) -> &'static str {
+/// this one exists so the two concerns stay visibly separate). `pub(crate)`:
+/// also used by `repl.rs` (production-hardening PR-it703).
+pub(crate) fn kind_tag(item: &Item) -> &'static str {
     match item {
         Item::Fun(_) => "fun",
         Item::Type(_) => "type",
