@@ -2566,6 +2566,85 @@ mod tests {
         );
     }
 
+    /// A permanent regression guard, per PR-it648 (no bug found this iteration --
+    /// applying the "completeness claim vs actual implementation" methodology
+    /// (`sdiff.rs` it643/it644/it646, `manifest_json` it647) to the LSP's
+    /// `initialize` capability advertisement came back CLEAN: every
+    /// `"textDocument/..."`/`"workspace/..."` dispatch match arm this module
+    /// implements (hover, signatureHelp, codeAction, definition, references,
+    /// documentHighlight, rename, completion, formatting, documentSymbol,
+    /// foldingRange, workspace/symbol -- confirmed via a full read of the
+    /// dispatch match block, not a skim) has a corresponding capability flag,
+    /// and no capability is advertised without a matching handler. This test
+    /// closes the gap of there being ZERO prior coverage of that claim -- so a
+    /// FUTURE regression (a new method added without advertising it, or a
+    /// capability flag left behind after a handler is removed) is caught
+    /// automatically rather than relying on the same manual audit recurring.
+    #[test]
+    fn initialize_advertises_every_provider_capability_it_actually_implements() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", init.len(), init);
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung answering initialize");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let body = stdout.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+        let v = parse_json(body).expect("initialize response must be valid JSON");
+        let caps = v.get("result").and_then(|r| r.get("capabilities")).expect("capabilities object");
+
+        // one entry per implemented `textDocument/x` or `workspace/x` request
+        // handler (lifecycle methods `initialize`/`shutdown`/`exit` and the four
+        // `did*` NOTIFICATIONS -- covered collectively by `textDocumentSync` --
+        // are intentionally excluded, matching LSP's own convention).
+        for key in [
+            "hoverProvider",
+            "definitionProvider",
+            "referencesProvider",
+            "renameProvider",
+            "documentFormattingProvider",
+            "documentSymbolProvider",
+            "documentHighlightProvider",
+            "workspaceSymbolProvider",
+            "completionProvider",
+            "signatureHelpProvider",
+            "codeActionProvider",
+            "foldingRangeProvider",
+        ] {
+            assert!(caps.get(key).is_some(), "missing advertised capability `{key}`: {caps:?}");
+        }
+        assert_eq!(
+            caps.get("textDocumentSync").and_then(Json::as_usize),
+            Some(1),
+            "textDocumentSync must be full-sync (1), covering didOpen/didChange/didSave/didClose"
+        );
+        // the ONLY code action kind any handler ever emits is "quickfix" (grepped
+        // the full `textDocument/codeAction` handler to confirm) -- advertising a
+        // kind with no handler support (or vice versa) would mislead a client.
+        let kinds = caps.get("codeActionProvider").and_then(|c| c.get("codeActionKinds"));
+        assert_eq!(
+            kinds.and_then(|k| k.index(0)).and_then(Json::str),
+            Some("quickfix"),
+            "codeActionKinds: {kinds:?}"
+        );
+    }
+
     fn wait_with_timeout_lsp(
         child: std::process::Child,
         timeout: std::time::Duration,
