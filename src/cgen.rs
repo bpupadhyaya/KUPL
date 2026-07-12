@@ -4000,7 +4000,11 @@ static int64_t k_floor_div(int64_t a, int64_t b) {
 static int64_t k_floor_mod(int64_t a, int64_t b) { return (int64_t)((__int128)a - (__int128)k_floor_div(a, b) * b); }
 static void k_civil(int64_t z, int64_t* y, int64_t* m, int64_t* d) {
     z += 719468;
-    int64_t era = k_floor_div(z >= 0 ? z : z - 146096, 146097);
+    /* Plain TRUNCATING division, not k_floor_div (PR-it682, mirrors the same
+       fix in time.rs::civil_from_days): the `-146096` offset already
+       compensates for negative z, so wrapping it in k_floor_div too
+       double-corrects, off-by-one-ing era for negative-era dates. */
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
     int64_t doe = z - era * 146097;
     int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     int64_t yy = yoe + era * 400;
@@ -4044,16 +4048,13 @@ static KValue k_weekday_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s
    k_parse_iso) must use k_days_from_civil_checked instead (PR-it635). */
 static int64_t k_days_from_civil(int64_t y, int64_t m, int64_t d) {
     y = m <= 2 ? y - 1 : y;
-    int64_t era = k_floor_div(y >= 0 ? y : y - 399, 400);
+    /* Plain TRUNCATING division, not k_floor_div -- same bug/fix as k_civil
+       above (PR-it682). */
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
     int64_t yoe = y - era * 400;
     int64_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
     int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     return era * 146097 + doe - 719468;
-}
-static __int128 k_floor_div_128(__int128 a, __int128 b) {
-    __int128 q = a / b;
-    if ((a % b != 0) && ((a % b < 0) != (b < 0))) q -= 1;
-    return q;
 }
 /* k_days_from_civil, but widened to __int128 THROUGHOUT -- a REAL bug found+
    fixed (production-hardening PR-it635): y/m are directly, arbitrarily user-
@@ -4069,7 +4070,9 @@ static __int128 k_floor_div_128(__int128 a, __int128 b) {
    count doesn't fit back into int64_t. */
 static int k_days_from_civil_checked(int64_t y, int64_t m, int64_t d, int64_t* out) {
     __int128 yy = (m <= 2) ? (__int128)y - 1 : (__int128)y;
-    __int128 era = k_floor_div_128(yy >= 0 ? yy : yy - 399, 400);
+    /* Plain TRUNCATING division, not k_floor_div_128 -- same bug/fix as
+       k_days_from_civil above (PR-it682). */
+    __int128 era = (yy >= 0 ? yy : yy - 399) / 400;
     __int128 yoe = yy - era * 400;
     __int128 doy = (153 * ((m > 2) ? (__int128)m - 3 : (__int128)m + 9) + 2) / 5 + (__int128)d - 1;
     __int128 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
@@ -8383,6 +8386,14 @@ fun main() uses io {
     /// optimization level) -- exactly the "looks fine under normal testing, only a
     /// sanitizer catches it" pattern this campaign's native-runtime-audit vein exists to
     /// find. Fixed by widening to `__int128`, matching `time.rs`'s fix exactly.
+    ///
+    /// The negative-year golden value below was refreshed by PR-it682: the
+    /// ORIGINAL `-01-28` value was itself computed against a separate, since-
+    /// fixed bug in `k_civil`'s era computation (see `time.rs`'s matching fix
+    /// and its `negative_era_day_count_matches_the_400_year_periodicity_invariant`
+    /// test) that off-by-one'd every negative-era civil date by one day -- this
+    /// deeply-negative timestamp happens to land in a negative era, so its
+    /// correct day is `-01-27`, not `-01-28`.
     #[test]
     fn native_date_iso_near_i64_extremes_matches_interp_no_ub() {
         if !cc_available() {
@@ -8392,7 +8403,7 @@ fun main() uses io {
                    print(\"{date_iso(9223372036854775807)}|{date_iso(-9223372036854775807)}|{weekday_of(-9223372036854775807)}\")\n}\n";
         assert_eq!(
             native_main_stdout(src, "timeextreme").trim(),
-            "292277026596-12-04T15:30:07Z|-292277022657-01-28T08:29:53Z|0"
+            "292277026596-12-04T15:30:07Z|-292277022657-01-27T08:29:53Z|0"
         );
     }
 

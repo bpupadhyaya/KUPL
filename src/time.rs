@@ -39,7 +39,15 @@ fn floor_mod(a: i64, b: i64) -> i64 {
 /// (year, month 1..=12, day 1..=31) from a count of days since 1970-01-01.
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
-    let era = floor_div(if z >= 0 { z } else { z - 146_096 }, 146_097);
+    // Plain TRUNCATING division here, not `floor_div` (PR-it682, a REAL bug):
+    // Hinnant's algorithm already compensates for negative `z` by subtracting
+    // `146_096` (one era-length minus one) BEFORE dividing -- that offset is
+    // specifically designed so truncating division on the offset value equals
+    // floor division on the ORIGINAL value. Wrapping it in `floor_div` (a
+    // genuine floor-division function) applies the negative-number correction
+    // a SECOND time, off-by-one-ing `era` for every negative-era `z` that
+    // isn't an exact multiple of 146_097.
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe + era * 400;
@@ -60,20 +68,15 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// construction) must use `days_from_civil_checked` instead.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
-    let era = floor_div(if y >= 0 { y } else { y - 399 }, 400);
+    // Plain TRUNCATING division, not `floor_div` -- see `civil_from_days`'s
+    // comment on the identical bug (PR-it682): the `-399` offset already
+    // compensates for negative `y`, so wrapping it in `floor_div` too
+    // double-corrects.
+    let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146_097 + doe - 719_468
-}
-
-fn floor_div_128(a: i128, b: i128) -> i128 {
-    let q = a / b;
-    if (a % b != 0) && ((a % b < 0) != (b < 0)) {
-        q - 1
-    } else {
-        q
-    }
 }
 
 /// `days_from_civil`, but widened to i128 THROUGHOUT (not just at the one risky
@@ -94,7 +97,9 @@ fn floor_div_128(a: i128, b: i128) -> i128 {
 fn days_from_civil_checked(y: i64, m: i64, d: i64) -> Option<i64> {
     let (y, m, d) = (y as i128, m as i128, d as i128);
     let y = if m <= 2 { y - 1 } else { y };
-    let era = floor_div_128(if y >= 0 { y } else { y - 399 }, 400);
+    // Plain TRUNCATING division, not `floor_div_128` -- same bug/fix as
+    // `days_from_civil` above (PR-it682).
+    let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
@@ -293,26 +298,69 @@ mod tests {
     /// (2000, 1900); no existing test exercised a NEGATIVE (proleptic-
     /// Gregorian) year's leap-year boundary, despite this module's own header
     /// comment naming "the full i64 range including negative timestamps" as a
-    /// design goal. Manually verified live before writing this: `is_leap`'s
-    /// `== 0` divisibility checks are sign-invariant under Rust's `%`
-    /// (truncating) convention, so no bug was found -- `parse_iso` already
-    /// correctly rejects/accepts Feb 29 for negative years exactly like it
-    /// does for positive ones. PR-it681.
+    /// design goal. `is_leap`'s `== 0` divisibility checks are sign-invariant
+    /// under Rust's `%` (truncating) convention, so that part was never
+    /// buggy -- but the day-count CONVERSION itself was (see
+    /// `negative_era_day_count_matches_the_400_year_periodicity_invariant`
+    /// below, PR-it682): these golden values were originally computed against
+    /// the pre-it682-fix binary and have been refreshed to the CORRECT values
+    /// now that `days_from_civil`/`civil_from_days`'s era computation is
+    /// fixed. PR-it681, values corrected PR-it682.
     #[test]
     fn negative_year_leap_year_boundary() {
         // -400 (400 BCE-equivalent) is a leap year: divisible by 400.
         assert_eq!(parse_iso("-0400-02-29"), Ok(-74_784_902_400));
         // -100 is NOT a leap year: divisible by 100 but not by 400.
         assert!(parse_iso("-0100-02-29").is_err());
-        assert_eq!(parse_iso("-0100-02-28"), Ok(-65_317_968_000));
+        assert_eq!(parse_iso("-0100-02-28"), Ok(-65_317_881_600));
         // -4 IS a leap year: divisible by 4, not by 100.
-        assert_eq!(parse_iso("-0004-02-29"), Ok(-62_288_438_400));
+        assert_eq!(parse_iso("-0004-02-29"), Ok(-62_288_352_000));
         // -3 is NOT a leap year: not divisible by 4 at all.
         assert!(parse_iso("-0003-02-29").is_err());
         // every accepted date round-trips back through `iso`.
         for s in ["-0400-02-29", "-0004-02-29"] {
             let t = parse_iso(s).unwrap();
             assert_eq!(iso(t), format!("{s}T00:00:00Z"));
+        }
+    }
+
+    /// THE BUG (production-hardening PR-it682, MAJOR): `days_from_civil`,
+    /// `days_from_civil_checked`, and `civil_from_days` all computed their
+    /// `era` via `floor_div(offset_y, 400)` (or `/146_097` for the day-based
+    /// inverse) -- but Howard Hinnant's original algorithm's `-399`/`-146_096`
+    /// offset is ITSELF the negative-number correction, specifically designed
+    /// so a plain TRUNCATING division on the offset value equals floor
+    /// division on the un-offset value. Wrapping that already-corrected value
+    /// in a genuine floor-division function applied the correction a SECOND
+    /// time, off-by-one-ing `era` (and therefore the returned day count / civil
+    /// date) for every negative-era year that wasn't an exact multiple of 400
+    /// (where truncating and floor division happen to coincide). Every
+    /// existing test before this fix only ever exercised `era == 0` (the
+    /// `z >= 0`/`y >= 0` branch, where floor vs. truncating division never
+    /// differs) -- negative-era dates (roughly year 0 and earlier) were
+    /// entirely untested. This is a hard mathematical fact independent of any
+    /// specific date algorithm: the Gregorian calendar repeats EXACTLY every
+    /// 400 years (146_097 days, since 146_097 / 7 = 20_871 exactly) -- so
+    /// `days_from_civil(y, m, d)` and `days_from_civil(y + 400, m, d)` must
+    /// differ by EXACTLY 146_097 for ANY `y`, positive or negative. Confirmed
+    /// live before the fix: the pre-fix binary gave 146_098 for `y = -4`,
+    /// `-100`, `-3` (all off by exactly one day) but the CORRECT 146_097 for
+    /// `y = -400` (the one case where the double-correction happened to land
+    /// on an exact multiple, coincidentally masking the bug).
+    #[test]
+    fn negative_era_day_count_matches_the_400_year_periodicity_invariant() {
+        for (y, m, d) in [(-4, 1, 1), (-4, 12, 31), (-100, 2, 28), (-3, 12, 31), (-799, 6, 15)] {
+            let a = days_from_civil(y, m, d);
+            let b = days_from_civil(y + 400, m, d);
+            assert_eq!(b - a, 146_097, "periodicity broke for {y}-{m:02}-{d:02}");
+        }
+        // the same invariant holds through `civil_from_days`'s inverse
+        // direction: converting a day count back to civil components 400
+        // years apart must land on the identical month/day, year+400.
+        for days in [-865_566i64, -755_994, -720_930, -1_200_000] {
+            let (y, m, d) = civil_from_days(days);
+            let (y2, m2, d2) = civil_from_days(days + 146_097);
+            assert_eq!((y + 400, m, d), (y2, m2, d2), "periodicity broke for day {days}");
         }
     }
 

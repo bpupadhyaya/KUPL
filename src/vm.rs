@@ -15641,9 +15641,17 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
         // caught by main.rs's generic panic hook and reported as a bogus "internal
         // compiler error" -- crashing the ENTIRE interpreter/KVM on a normal Int input,
         // not a KUPL-level panic. Fixed by widening the multiply/subtract to i128.
+        //
+        // The negative-year golden value below was refreshed by PR-it682: the
+        // ORIGINAL `-01-28` value was itself computed against a separate, since-
+        // fixed bug in `civil_from_days`'s era computation (see
+        // `time.rs::negative_era_day_count_matches_the_400_year_periodicity_invariant`)
+        // that off-by-one'd every negative-era civil date by one day -- this
+        // deeply-negative timestamp happens to land in a negative era, so its
+        // correct day is `-01-27`, not `-01-28`.
         assert_eq!(
             differential("fun probe() -> Str { \"{date_iso(9223372036854775807)}|{date_iso(-9223372036854775807)}|{weekday_of(-9223372036854775807)}\" }\n"),
-            "292277026596-12-04T15:30:07Z|-292277022657-01-28T08:29:53Z|0"
+            "292277026596-12-04T15:30:07Z|-292277022657-01-27T08:29:53Z|0"
         );
     }
 
