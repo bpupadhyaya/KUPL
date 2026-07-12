@@ -332,7 +332,7 @@ impl Parser {
             other => Err(Diag::error(
                 "K0103",
                 format!(
-                    "expected a declaration (`fun`, `type`, `component`, `app`), found {}{}",
+                    "unexpected {} at the top level (expected `fun`, `type`, `component`, `app`){}",
                     other.describe(),
                     keyword_suggestion(other, &["fun", "type", "component", "app", "contract", "use", "module"])
                 ),
@@ -997,7 +997,7 @@ impl Parser {
                             return Err(Diag::error(
                                 "K0106",
                                 format!(
-                                    "example blocks contain `send`, `expect`, and `advance` steps; found {}{}",
+                                    "unexpected {} in example body (expected `send`, `expect`, or `advance`){}",
                                     other.describe(),
                                     keyword_suggestion(&other, &["send", "expect", "advance"])
                                 ),
@@ -1789,7 +1789,7 @@ impl Parser {
                     Tok::Int(v) => self.maybe_range(-v, span.merge(self.prev_span())),
                     other => Err(Diag::error(
                         "K0111",
-                        format!("expected integer after `-` in pattern, found {}", other.describe()),
+                        format!("expected an integer after `-` in pattern, found {}", other.describe()),
                         self.prev_span(),
                     )),
                 }
@@ -2119,6 +2119,60 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.code == "K0107" && !d.message.contains("did you mean")),
             "an unrelated identifier must not get a false-positive suggestion: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn k0103_k0106_k0107_k0116_body_error_templates_are_consistent() {
+        // A REAL wording inconsistency deferred by it602's memory entry (message-
+        // wording-consistency sweep #2 of parser.rs, finding #2 of 2): the four
+        // "unrecognized construct in a scope" diagnostics (top-level, contract body,
+        // component body, example body) used THREE different sentence shapes for the
+        // identical situation. K0116 (contract) and K0107 (component) already agreed
+        // on "unexpected {found} in <location> (expected LIST)" -- converged K0103
+        // (top-level) and K0106 (example) onto that same template rather than
+        // inventing a fourth shape, since it was already the majority form.
+        let (_, diags) = parse("123\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0103" && d.message.starts_with("unexpected ") && d.message.contains("at the top level (expected")),
+            "K0103 should use the same \"unexpected X in/at LOCATION (expected LIST)\" template as K0106/K0107/K0116: {diags:?}"
+        );
+        let (_, diags) = parse("contract Store {\n    intent \"kv\"\n    123\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0116" && d.message.starts_with("unexpected ") && d.message.contains("in contract body (expected")),
+            "K0116's existing template, unchanged: {diags:?}"
+        );
+        let (_, diags) = parse(
+            "component C {\n    intent \"c\"\n    in click: Event\n    state n: Int = 0\n    on click { n = n + 1 }\n    example {\n        123\n    }\n}\n",
+        );
+        assert!(
+            diags.iter().any(|d| d.code == "K0106" && d.message.starts_with("unexpected ") && d.message.contains("in example body (expected")),
+            "K0106 should use the same template as K0107/K0116, not its old \"blocks contain LIST steps; found X\" shape: {diags:?}"
+        );
+        let (_, diags) = parse("component C {\n    intent \"c\"\n    123\n}\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0107" && d.message.starts_with("unexpected ") && d.message.contains("in component body (expected")),
+            "K0107's existing template, unchanged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn k0111_wording_is_consistent_between_its_two_sites() {
+        // The other half of it602's deferred wording finding: K0111 fires from two
+        // sibling sites (integer after a unary `-` in a pattern, and an integer upper
+        // bound in a range pattern) that disagreed on an indefinite article --
+        // "expected integer after..." vs. "expected an integer...". Added the
+        // missing "an" to the first site rather than removing it from the second,
+        // since "expected an integer" reads more naturally as a full sentence.
+        let (_, diags) = parse("fun f(x: Int) -> Int { match x { -a => 1, _ => 0 } }\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0111" && d.message.starts_with("expected an integer after `-` in pattern")),
+            "expected `expected an integer after ...`, got: {diags:?}"
+        );
+        let (_, diags) = parse("fun f(x: Int) -> Int { match x { 0..a => 1, _ => 0 } }\n");
+        assert!(
+            diags.iter().any(|d| d.code == "K0111" && d.message.starts_with("expected an integer upper bound in range pattern")),
+            "the range-pattern site's existing wording, unchanged: {diags:?}"
         );
     }
 
