@@ -234,6 +234,37 @@ impl Checker {
         self.diags.push(Diag::warning(code, msg, span));
     }
 
+    /// Reject `= EXPR` on every param in `params` (K0275): default-value
+    /// resolution is implemented ONLY for direct calls of top-level `fun`s
+    /// (`callargs.rs`'s own doc comment: "not constructors, methods, or
+    /// UFCS"). `Param` is reused verbatim by FOUR other syntactic positions
+    /// whose parser also happens to call the shared `parse_params` --
+    /// ADT constructor fields (PR-it677), and (PR-it679, this fix) component
+    /// exposed methods, component private methods, and contract method
+    /// signatures. `= EXPR` parses cleanly in all four, but the default is
+    /// 100% dead: confirmed live before this fix that `expose fun greet(name:
+    /// Str = "World")` still required the argument at every call site
+    /// (K0250), and likewise for a private component method (K0242) and a
+    /// contract signature (K0250 again, on the fulfilling component's own
+    /// call sites) -- silently doing nothing, forever, with zero diagnostic.
+    /// `what` names the containing declaration for the error message (e.g.
+    /// `` `Hello`'s fields `` or `` exposed method `greet` ``).
+    fn reject_param_defaults(&mut self, params: &[crate::ast::Param], what: &str) {
+        for p in params {
+            if p.default.is_some() {
+                self.err(
+                    "K0275",
+                    format!(
+                        "parameter `{}` cannot have a default value -- \
+                         defaults only apply to top-level `fun` parameters, not {what}",
+                        p.name
+                    ),
+                    p.span,
+                );
+            }
+        }
+    }
+
     fn unify(&mut self, a: &Ty, b: &Ty, span: Span, what: &str) -> Ty {
         if let Err((x, y)) = self.uni.unify(a, b) {
             let x = self.uni.apply(&x);
@@ -449,9 +480,13 @@ impl Checker {
                         sig.props.push((prop.name.clone(), ty, prop.default.is_some()));
                     }
                     for f in &c.exposes {
+                        self.reject_param_defaults(&f.params, &format!("exposed method `{}`'s parameters", f.name));
                         let params: Vec<Ty> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
                         let ret = f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
                         sig.exposes.insert(f.name.clone(), (params, ret));
+                    }
+                    for f in &c.funs {
+                        self.reject_param_defaults(&f.params, &format!("private method `{}`'s parameters", f.name));
                     }
                     sig.fulfills = c.fulfills.clone();
                     self.checked.components.insert(c.name.clone(), sig);
@@ -466,6 +501,7 @@ impl Checker {
                 Item::Contract(ct) => {
                     let mut sig = ContractSig::default();
                     for s in &ct.sigs {
+                        self.reject_param_defaults(&s.params, &format!("contract `{}`'s method `{}`'s parameters", ct.name, s.name));
                         let params: Vec<Ty> = s.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
                         let ret = s.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
                         sig.sigs.insert(s.name.clone(), (params, ret, s.effects.clone()));
@@ -4192,6 +4228,49 @@ mod generic_tests {
         );
         // A fieldless variant and a variant with no defaults at all are unaffected.
         assert!(errors("type Greeting = Hello(name: Str) | Nothing\nfun main() { let _ = Hello(\"x\")\n    let _ = Nothing }\n").is_empty());
+    }
+
+    /// A REAL silent-footgun bug (PR-it679, THREE MORE sibling instances of
+    /// it677's constructor-field-default class): component exposed methods,
+    /// component private methods, and contract method signatures ALL reuse
+    /// `Param` for their parameter lists too, so `x: Int = EXPR` parses fine
+    /// on any of them -- but `callargs.rs`'s doc comment excludes "methods"
+    /// and "UFCS" from default-value resolution, same as it677's
+    /// constructors. Confirmed live before this fix: `expose fun greet(name:
+    /// Str = "World")` still required the argument at every call site
+    /// (K0250), a PRIVATE component method the same (K0242), and a contract
+    /// signature's default was equally dead -- all silently doing nothing.
+    #[test]
+    fn component_and_contract_method_parameter_defaults_are_rejected_at_check_time() {
+        let comp = "\nfun main() { let _ = 0 }\n";
+        let expose = errors(&format!(
+            "component G {{\n    intent \"g\"\n    expose fun greet(name: Str = \"World\") -> Str {{ name }}\n}}{comp}"
+        ));
+        assert!(
+            expose.iter().any(|d| d.code == "K0275" && d.message.contains("parameter `name`") && d.message.contains("exposed method `greet`")),
+            "{expose:?}"
+        );
+        let private = errors(&format!(
+            "component G {{\n    intent \"g\"\n    fun helper(name: Str = \"World\") -> Str {{ name }}\n    expose fun greet() -> Str {{ helper(\"x\") }}\n}}{comp}"
+        ));
+        assert!(
+            private.iter().any(|d| d.code == "K0275" && d.message.contains("parameter `name`") && d.message.contains("private method `helper`")),
+            "{private:?}"
+        );
+        let contract = errors(&format!(
+            "contract Store {{\n    expose fun get(k: Str = \"x\") -> Int\n}}{comp}"
+        ));
+        assert!(
+            contract.iter().any(|d| d.code == "K0275" && d.message.contains("parameter `k`") && d.message.contains("contract `Store`'s method `get`")),
+            "{contract:?}"
+        );
+        // Component/contract methods with NO defaults at all are unaffected.
+        assert!(
+            errors(&format!(
+                "component G {{\n    intent \"g\"\n    fun helper(name: Str) -> Str {{ name }}\n    expose fun greet(name: Str) -> Str {{ helper(name) }}\n}}{comp}"
+            ))
+            .is_empty()
+        );
     }
 
     #[test]

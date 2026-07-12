@@ -9,8 +9,22 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{Item, Program};
-use crate::fmt::{format_program, ty_str};
+use crate::fmt::{expr_str, format_program, ty_str};
 use crate::parser;
+
+/// A parameter's fingerprint fragment: `name:Ty` or `name:Ty=default` (PR-it679).
+/// A default's PRESENCE and VALUE are both caller-observable interface facts --
+/// removing `= EXPR` turns an optional argument into a required one (an
+/// existing call site that omits it now fails to compile), and CHANGING an
+/// existing default's value changes what a call site that omits the argument
+/// actually receives, even though nothing else about the signature changed.
+/// Mirrors the exact `= {expr}` rendering `fmt.rs`'s canonical formatter uses.
+fn param_fingerprint(p: &crate::ast::Param) -> String {
+    match &p.default {
+        Some(d) => format!("{}:{}={}", p.name, ty_str(&p.ty), expr_str(d, 0)),
+        None => format!("{}:{}", p.name, ty_str(&p.ty)),
+    }
+}
 
 pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
     let (old_items, ok_a) = load_items(old_path);
@@ -123,7 +137,7 @@ fn interface_of(item: &Item) -> String {
                 f.ai.is_some()
             ));
             for p in &f.params {
-                s.push_str(&format!(" {}:{}", p.name, ty_str(&p.ty)));
+                s.push_str(&format!(" {}", param_fingerprint(p)));
             }
             if let Some(r) = &f.ret {
                 s.push_str(&format!(" -> {}", ty_str(r)));
@@ -188,14 +202,20 @@ fn interface_of(item: &Item) -> String {
                 ));
             }
             for p in &c.props {
-                s.push_str(&format!(" prop {}:{} req={}", p.name, ty_str(&p.ty), p.default.is_none()));
+                // A prop's default VALUE (not just its presence) is caller-observable
+                // too, the same reasoning as `param_fingerprint` below (PR-it679) --
+                // this used to render only `req={bool}`, which caught a default being
+                // added/removed but not an EXISTING default's value changing.
+                let default_part =
+                    p.default.as_ref().map(|d| format!("={}", expr_str(d, 0))).unwrap_or_default();
+                s.push_str(&format!(" prop {}:{}{}", p.name, ty_str(&p.ty), default_part));
             }
             let mut exposes: Vec<&crate::ast::FunDecl> = c.exposes.iter().collect();
             exposes.sort_by_key(|f| &f.name);
             for f in exposes {
                 s.push_str(&format!(" expose {}(", f.name));
                 for p in &f.params {
-                    s.push_str(&format!("{}:{},", p.name, ty_str(&p.ty)));
+                    s.push_str(&format!("{},", param_fingerprint(p)));
                 }
                 s.push_str(&format!(")->{}", f.ret.as_ref().map(ty_str).unwrap_or_else(|| "Unit".into())));
                 s.push_str(&format!(" uses[{}]", f.effects.join(",")));
@@ -323,6 +343,44 @@ mod tests {
         // Adding a variant to a sum type breaks exhaustive matches downstream.
         let (lines, _) = diff_lines("type C = Red | Green\n", "type C = Red | Green | Blue\n");
         assert_eq!(lines, vec!["interface C"]);
+    }
+
+    /// A REAL BUG found+fixed (PR-it679): a parameter's default value was
+    /// completely invisible to `interface_of`'s fingerprint for `fun`s,
+    /// component `expose`s, and a component `prop`'s VALUE specifically (its
+    /// mere presence/absence was already caught via `req={bool}`, but not a
+    /// change to an EXISTING default's value) -- so removing a default
+    /// (turning an optional argument into a required one, breaking every
+    /// existing call site that omits it) or changing its value (silently
+    /// changing what an omitting call site receives) both misclassified as
+    /// `[implementation only]`, confirmed live before this fix via `kupl
+    /// diff` on both cases.
+    #[test]
+    fn parameter_default_value_change_is_interface_not_implementation() {
+        // removing a default entirely (optional -> required) is breaking.
+        let (lines, _) = diff_lines(
+            "fun greet(name: Str = \"World\") -> Str {\n    name\n}\n",
+            "fun greet(name: Str) -> Str {\n    name\n}\n",
+        );
+        assert_eq!(lines, vec!["interface greet"]);
+        // changing an EXISTING default's value is also caller-observable.
+        let (lines, _) = diff_lines(
+            "fun greet(name: Str = \"World\") -> Str {\n    name\n}\n",
+            "fun greet(name: Str = \"Kupl\") -> Str {\n    name\n}\n",
+        );
+        assert_eq!(lines, vec!["interface greet"]);
+        // a component prop's default VALUE (not just presence) is the same story.
+        let (lines, _) = diff_lines(
+            "component W {\n    intent \"w\"\n    prop label: Str = \"a\"\n    expose fun get() -> Str {\n        label\n    }\n}\n",
+            "component W {\n    intent \"w\"\n    prop label: Str = \"b\"\n    expose fun get() -> Str {\n        label\n    }\n}\n",
+        );
+        assert_eq!(lines, vec!["interface W"]);
+        // an unchanged default, with only the body changing, is still implementation-only.
+        let (lines, _) = diff_lines(
+            "fun greet(name: Str = \"World\") -> Str {\n    name\n}\n",
+            "fun greet(name: Str = \"World\") -> Str {\n    let n = name\n    n\n}\n",
+        );
+        assert_eq!(lines, vec!["impl greet"]);
     }
 
     /// A REAL BUG found+fixed (PR-it580): `interface_of`'s contract-sig branch was the
