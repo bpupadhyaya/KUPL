@@ -1471,6 +1471,23 @@ mod tests {
         assert_eq!(differential("fun probe() -> Str { \"{big(6) * big(7)}\" }\n"), "42");
     }
 
+    /// `Str.repeat`'s size check (`s.len().saturating_mul(n as usize) >
+    /// 100_000_000`) is already overflow-safe on interp/KVM (`saturating_mul`
+    /// can never wrap) -- this locks that CORRECT, already-shared behavior
+    /// with a permanent test (it had none before), complementing
+    /// `native_str_repeat_overflow_no_longer_heap_corrupts` (cgen.rs) which
+    /// covers the SEVERE bug this exact call shape had on native
+    /// specifically (production-hardening PR-it640).
+    #[test]
+    fn diff_str_repeat_rejects_a_result_too_large_to_represent() {
+        assert_eq!(
+            differential("fun probe() -> Str { \"abcd\".repeat(4611686018427387904) }\n"),
+            "panic: `repeat` result too large"
+        );
+        // an ordinary, legitimate repeat is completely unaffected.
+        assert_eq!(differential("fun probe() -> Str { \"ab\".repeat(3) }\n"), "ababab");
+    }
+
     #[test]
     fn diff_int_math_edges() {
         // clamp / gcd / isqrt / sign edge cases are byte-identical on both engines:

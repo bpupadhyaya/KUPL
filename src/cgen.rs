@@ -4672,11 +4672,38 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             if (args[0].tag != K_INT || args[0].as.i < 0) k_panic("`repeat` needs a non-negative Int");
             int64_t n = args[0].as.i;
             size_t sl = strlen(s);
-            if (sl * (size_t)n > 100000000) k_panic("`repeat` result too large");
-            char* out = k_alloc(sl * (size_t)n + 1);
+            /* A REAL, SEVERE bug found+fixed (production-hardening PR-it640):
+               the size check used to be a PLAIN `sl * (size_t)n`, which can
+               ITSELF overflow size_t for a large enough `n` -- unlike
+               interp.rs's `s.len().saturating_mul(n as usize)` (which can
+               never overflow: it saturates at usize::MAX instead), this
+               overflowed check could wrap around to a SMALL value, silently
+               passing the `> 100000000` gate. `"abcd".repeat(4611686018427387904)`
+               (sl=4, n=2^62) makes `sl*n` wrap to EXACTLY 0, so `k_alloc(0+1)`
+               allocates a 1-byte buffer, and the loop below then writes ~4.6
+               QUINTILLION bytes into it -- a genuine, immediately-triggered
+               HEAP BUFFER OVERFLOW (confirmed live under ASan: a
+               heap-buffer-overflow WRITE one byte past the allocation, at
+               the very first memcpy), not just a hang/panic like every
+               other size-cap bug this campaign has found. `n` is an
+               UNCONSTRAINED user-supplied Int with no relationship to
+               available memory (unlike a string's own byte length, which
+               is bounded by what's already been successfully allocated),
+               so this was trivially reachable with one ordinary line of
+               KUPL, no huge string needed. Fixed with `__builtin_mul_overflow`
+               (the SAME overflow-checked-multiply primitive `k_add`/`k_mul`
+               already use for `Int` arithmetic overflow, GCC/Clang builtin
+               -- correctly detects an overflow REGARDLESS of what it wraps
+               to, unlike a post-hoc range check on the (possibly already
+               corrupted) result). */
+            size_t total;
+            if (__builtin_mul_overflow(sl, (size_t)n, &total) || total > 100000000) {
+                k_panic("`repeat` result too large");
+            }
+            char* out = k_alloc(total + 1);
             out[0] = 0;
             for (int64_t i = 0; i < n; i++) memcpy(out + i * sl, s, sl);
-            out[sl * (size_t)n] = 0;
+            out[total] = 0;
             return k_str(out);
         }
         if (!strcmp(name, "parse_int")) {
@@ -10564,6 +10591,37 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         assert_panic_wording_matches(
             "fun main() uses io { let s = \"9\".repeat(100000)\n    let r = rat(big(s), 3)\n    print(r * r) }\n",
             "ratmulcap",
+        );
+    }
+
+    /// A REAL, SEVERE bug found+fixed (production-hardening PR-it640): unlike
+    /// interp.rs's `s.len().saturating_mul(n as usize)` (which can never
+    /// overflow -- it saturates at `usize::MAX` instead), native's size
+    /// check for `Str.repeat` used a PLAIN `sl * (size_t)n` multiplication,
+    /// which can overflow `size_t` ITSELF for a large enough `n`.
+    /// `"abcd".repeat(4611686018427387904)` (sl=4, n=2^62) makes `sl*n` wrap
+    /// to EXACTLY 0, silently passing the `> 100_000_000` gate -- `k_alloc`
+    /// then allocates a 1-byte buffer, and the copy loop writes ~4.6
+    /// QUINTILLION bytes into it. Confirmed live under
+    /// `clang -fsanitize=address,undefined`: a heap-buffer-overflow WRITE
+    /// one byte past the allocation, at the very first `memcpy` -- a
+    /// genuine, IMMEDIATELY-TRIGGERED memory-safety vulnerability, not just
+    /// a hang/panic like every other size-cap bug this campaign has found
+    /// so far. `n` is an UNCONSTRAINED user-supplied `Int` with no
+    /// relationship to available memory (unlike a string's own byte length,
+    /// which is bounded by what's already been successfully allocated), so
+    /// this was trivially reachable with ONE ordinary line of KUPL. Fixed
+    /// with `__builtin_mul_overflow` (the SAME overflow-checked-multiply
+    /// primitive `k_add`/`k_mul` already use for `Int` arithmetic overflow).
+    /// This test only confirms the panic wording matches interp's (the
+    /// memory-safety fix itself was verified separately, ONE TIME, under a
+    /// fresh ASan/UBSan build before this test was written -- ASan is not
+    /// part of this crate's normal `cargo test` run).
+    #[test]
+    fn native_str_repeat_overflow_no_longer_heap_corrupts() {
+        assert_panic_wording_matches(
+            "fun main() uses io { let r = \"abcd\".repeat(4611686018427387904)\n    print(r) }\n",
+            "strrepeatoverflow",
         );
     }
 
