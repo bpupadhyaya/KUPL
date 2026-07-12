@@ -2242,7 +2242,17 @@ pub fn shared_method(
                     let mut acc: i128 = 1;
                     for item in items.iter() {
                         let Value::SizedInt(b) = item else { unreachable!() };
-                        acc *= b.0;
+                        // A REAL, SIBLING bug to it671's SizedInt-mul fix (PR-it672):
+                        // `acc *= b.0` in plain i128 can itself overflow i128, the same
+                        // way the `*`/wrapping_mul/saturating_mul call sites did --
+                        // reachable trivially with just `[u64::MAX, u64::MAX].product()`
+                        // (confirmed live before this fix: crashed with an actual Rust
+                        // overflow panic, not the intended "integer overflow in product"
+                        // one). `sum`'s plain `+=` just above is NOT at risk the same
+                        // way -- summing i8..u64-range terms would need on the order of
+                        // 2^64 elements to overflow i128, which is not a reachable list
+                        // size, unlike multiplication's much faster growth.
+                        acc = acc.checked_mul(b.0).ok_or_else(|| "integer overflow in product".to_string())?;
                         if !w.check_range(acc) {
                             return Err("integer overflow in product".into());
                         }

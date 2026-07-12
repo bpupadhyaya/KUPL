@@ -17067,6 +17067,31 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         );
     }
 
+    /// A REAL, SIBLING bug to `diff_sized_int_mul_near_u64_i64_extremes_does_not_crash_it671`
+    /// (PR-it672): `List[SizedInt].product()` has its OWN separate accumulation loop
+    /// (`acc *= b.0` in plain i128, distinct from the binary `*`/wrapping_mul/
+    /// saturating_mul call sites it671 fixed) with the identical overflow shape --
+    /// trivially reachable with just `[u64::MAX, u64::MAX].product()`, unlike
+    /// `.sum()`'s `+=` loop just above it, which is NOT practically reachable (would
+    /// need on the order of 2^64 list elements to overflow i128 via pure addition).
+    #[test]
+    fn diff_sized_list_product_near_u64_extreme_does_not_crash_it672() {
+        assert_eq!(
+            differential(
+                "fun probe() -> u64 {\n    \
+                 let xs: List[u64] = [18446744073709551615u64, 18446744073709551615u64]\n    xs.product()\n}\n"
+            ),
+            "panic: integer overflow in product"
+        );
+        // a fitting product still computes correctly.
+        assert_eq!(
+            differential(
+                "fun probe() -> u64 {\n    let xs: List[u64] = [2u64, 3u64, 4u64]\n    xs.product()\n}\n"
+            ),
+            "24"
+        );
+    }
+
     #[test]
     fn diff_f32_it28() {
         assert_eq!(differential("fun probe() -> f32 {\n    1.5f32 + 2.0f32\n}\n"), "3.5");

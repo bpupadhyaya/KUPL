@@ -4648,7 +4648,14 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 int w = l->items[0].as.sized->width;
                 __int128 acc = 1;
                 for (int64_t i = 0; i < l->len; i++) {
-                    acc *= l->items[i].as.sized->v;
+                    /* A REAL, SIBLING bug to it671's SizedInt-mul fix (PR-it672): plain
+                       `acc *= ...` in __int128 is undefined behavior on overflow, the
+                       same as the `*`/wrapping_mul/saturating_mul call sites -- reuses
+                       the SAME overflow-safe helpers built there. */
+                    __int128 rhs = l->items[i].as.sized->v;
+                    int neg;
+                    if (k_i128_mul_overflows(acc, rhs, &neg)) k_panic("integer overflow in product");
+                    acc = k_i128_wrapping_mul(acc, rhs);
                     if (acc < k_iw_min(w) || acc > k_iw_max(w)) k_panic("integer overflow in product");
                 }
                 return k_sized(acc, w);
@@ -8466,6 +8473,38 @@ fun main() uses io {
             )
             .trim(),
             "18446744073709551615"
+        );
+    }
+
+    /// A REAL, SIBLING bug to `native_sized_int_mul_near_u64_i64_extremes_does_not_crash_it671`
+    /// (PR-it672): `List[SizedInt].product()`'s accumulation loop had its OWN plain
+    /// `acc *= ...` in `__int128`, distinct from the `wrapping_mul`/`saturating_mul`/`*`
+    /// call sites it671 fixed — same undefined-behavior-on-overflow shape, now fixed by
+    /// reusing the SAME `k_i128_mul_overflows`/`k_i128_wrapping_mul` helpers.
+    #[test]
+    fn native_sized_list_product_near_u64_extreme_does_not_crash_it672() {
+        if !cc_available() {
+            return;
+        }
+        assert!(
+            native_main_stdout(
+                "fun main() uses io {\n    \
+                 let xs: List[u64] = [18446744073709551615u64, 18446744073709551615u64]\n    \
+                 print(xs.product())\n}\n",
+                "u64prodovf"
+            )
+            .trim()
+            .is_empty(),
+            "expected a clean panic, not a printed (possibly UB-corrupted) value"
+        );
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io {\n    \
+                 let xs: List[u64] = [2u64, 3u64, 4u64]\n    print(xs.product())\n}\n",
+                "u64prodok"
+            )
+            .trim(),
+            "24"
         );
     }
 
