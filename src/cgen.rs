@@ -4733,9 +4733,45 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             out[sl] = 0;
             return k_str(out);
         }
-        if (!strcmp(name, "trim") || !strcmp(name, "trim_start") || !strcmp(name, "trim_end")) {
-            int do_start = strcmp(name, "trim_end") != 0;   /* trim + trim_start */
-            int do_end = strcmp(name, "trim_start") != 0;   /* trim + trim_end */
+        if (!strcmp(name, "trim")) {
+            /* Unicode-whitespace-aware, matching interp.rs's plain `s.trim()`
+               exactly -- a REAL cross-engine bug (production-hardening
+               PR-it663): this used to share the SAME ASCII-only ' \t\n\r'
+               trim as trim_start/trim_end below (which interp.rs
+               DELIBERATELY narrows to ASCII-only -- "the same set as trim,
+               matching the C mirror" per interp.rs's own comment on THOSE
+               two methods specifically) -- but plain `trim()` in interp.rs is
+               Rust's genuinely Unicode-aware `.trim()`, so a string padded
+               with a non-ASCII whitespace character (NBSP, U+2028, U+3000,
+               etc.) was silently left UNTRIMMED on native alone; confirmed
+               live via `" \u{A0}hi\u{A0} ".trim()`. Reuses the SAME UTF-8
+               decode helpers built for BigInt.from_str's identical bug class
+               (PR-it662) -- `trim_start`/`trim_end` correctly stay
+               ASCII-only below, matching interp.rs's own narrowing there. */
+            long slen = (long)strlen(s);
+            long start = 0;
+            while (start < slen) {
+                int clen;
+                long cp = kre_utf8_cp((const unsigned char*)s, (int)slen, (int)start, &clen);
+                if (!k_is_unicode_ws((uint32_t)cp)) break;
+                start += clen;
+            }
+            long send = slen;
+            while (send > start) {
+                long cstart = k_utf8_prev_start((const unsigned char*)s, send);
+                int clen;
+                long cp = kre_utf8_cp((const unsigned char*)s, (int)slen, (int)cstart, &clen);
+                if (!k_is_unicode_ws((uint32_t)cp)) break;
+                send = cstart;
+            }
+            char* out = k_alloc((size_t)(send - start) + 1);
+            memcpy(out, s + start, (size_t)(send - start));
+            out[send - start] = 0;
+            return k_str(out);
+        }
+        if (!strcmp(name, "trim_start") || !strcmp(name, "trim_end")) {
+            int do_start = strcmp(name, "trim_end") != 0;   /* trim_start */
+            int do_end = strcmp(name, "trim_start") != 0;   /* trim_end */
             const char* a = s;
             const char* z = s + strlen(s);
             if (do_start)
@@ -9878,6 +9914,39 @@ fun main() uses io {
                    print(big(\"\u{3000}789\u{3000}\"))\n\
                    }\n";
         assert_eq!(native_main_stdout(src, "bigunicodetrim"), "123\n-456\n789\n");
+    }
+
+    /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
+    /// PR-it663, the SAME bug class as it662's BigInt.from_str finding, this
+    /// time on a far more commonly-used surface): `Str.trim()` used to share
+    /// the SAME ASCII-only ' \t\n\r' trim as `trim_start`/`trim_end` in
+    /// `cgen.rs` -- but interp.rs's plain `trim` uses Rust's genuinely
+    /// Unicode-aware `s.trim()`, while its `trim_start`/`trim_end` are
+    /// DELIBERATELY narrowed to the SAME ASCII-only set as the (then-only)
+    /// native mirror, per interp.rs's own comment on those two methods
+    /// specifically. So `trim()` diverged (native didn't strip NBSP/U+2028/
+    /// U+3000/etc.) while `trim_start`/`trim_end` did NOT (already
+    /// consistently ASCII-only in both interp.rs and native by design) --
+    /// confirmed both halves of this live before fixing only the genuinely
+    /// broken one. Reused the SAME UTF-8 decode helpers built for
+    /// `BigInt.from_str`'s identical bug shape one iteration earlier.
+    #[test]
+    fn native_str_trim_strips_unicode_whitespace_but_trim_start_end_stay_ascii_only() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"[{\"\u{A0}hi\u{A0}\".trim()}]\")\n    \
+                   print(\"[{\"\u{2028}bye\u{2028}\".trim()}]\")\n    \
+                   print(\"[{\"\u{A0}hi\u{A0}\".trim_start()}]\")\n    \
+                   print(\"[{\"\u{A0}hi\u{A0}\".trim_end()}]\")\n\
+                   }\n";
+        // trim() strips the Unicode whitespace; trim_start/trim_end do NOT --
+        // that asymmetry is interp.rs's own documented design, not a bug.
+        assert_eq!(
+            native_main_stdout(src, "unicodetrimasym"),
+            "[hi]\n[bye]\n[\u{A0}hi\u{A0}]\n[\u{A0}hi\u{A0}]\n"
+        );
     }
 
     /// The static-site-generator's markdown transformer (it63) — string-ops
