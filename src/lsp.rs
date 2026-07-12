@@ -53,7 +53,7 @@ impl Json {
 pub fn parse_json(src: &str) -> Result<Json, String> {
     let bytes = src.as_bytes();
     let mut pos = 0usize;
-    let v = parse_value(bytes, &mut pos)?;
+    let v = parse_value(bytes, &mut pos, 0)?;
     Ok(v)
 }
 
@@ -63,13 +63,30 @@ fn skip_ws(b: &[u8], pos: &mut usize) {
     }
 }
 
-fn parse_value(b: &[u8], pos: &mut usize) -> Result<Json, String> {
+/// A robustness-audit finding (production-hardening PR-it620): this
+/// recursive-descent parser had NO nesting-depth guard, unlike json.rs's
+/// `parse` (the `json_parse` builtin's implementation, shared by interp/vm)
+/// and cgen.rs's `kjp_value` (native's mirror) -- both of which already
+/// bound recursion via `json::MAX_JSON_DEPTH`/`K_MAX_JSON_DEPTH` specifically
+/// to prevent a stack overflow on untrusted deeply-nested input. THIS parser
+/// (used for LSP JSON-RPC AND ai.rs's mock-response parsing) was the one gap
+/// -- confirmed by direct reproduction: `parse_json("[".repeat(1000) + "]"
+/// .repeat(1000))` overflowed the stack and aborted the process (SIGABRT),
+/// not a catchable panic. Reuses `json::MAX_JSON_DEPTH` (not a new constant)
+/// so all three parsers agree on the same limit, matching json.rs's own
+/// documented intent ("the native backend enforces the same limit so all
+/// engines agree").
+fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> {
     skip_ws(b, pos);
     if *pos >= b.len() {
         return Err("unexpected end of JSON".into());
     }
     match b[*pos] {
         b'{' => {
+            let depth = depth + 1;
+            if depth > crate::json::MAX_JSON_DEPTH {
+                return Err("JSON nested too deeply".into());
+            }
             *pos += 1;
             let mut pairs = Vec::new();
             skip_ws(b, pos);
@@ -79,7 +96,7 @@ fn parse_value(b: &[u8], pos: &mut usize) -> Result<Json, String> {
             }
             loop {
                 skip_ws(b, pos);
-                let key = match parse_value(b, pos)? {
+                let key = match parse_value(b, pos, depth)? {
                     Json::Str(s) => s,
                     _ => return Err("object key must be a string".into()),
                 };
@@ -88,7 +105,7 @@ fn parse_value(b: &[u8], pos: &mut usize) -> Result<Json, String> {
                     return Err("expected ':'".into());
                 }
                 *pos += 1;
-                let val = parse_value(b, pos)?;
+                let val = parse_value(b, pos, depth)?;
                 pairs.push((key, val));
                 skip_ws(b, pos);
                 match b.get(*pos) {
@@ -104,6 +121,10 @@ fn parse_value(b: &[u8], pos: &mut usize) -> Result<Json, String> {
             }
         }
         b'[' => {
+            let depth = depth + 1;
+            if depth > crate::json::MAX_JSON_DEPTH {
+                return Err("JSON nested too deeply".into());
+            }
             *pos += 1;
             let mut items = Vec::new();
             skip_ws(b, pos);
@@ -112,7 +133,7 @@ fn parse_value(b: &[u8], pos: &mut usize) -> Result<Json, String> {
                 return Ok(Json::Arr(items));
             }
             loop {
-                items.push(parse_value(b, pos)?);
+                items.push(parse_value(b, pos, depth)?);
                 skip_ws(b, pos);
                 match b.get(*pos) {
                     Some(b',') => {
@@ -1443,7 +1464,24 @@ pub fn serve() -> i32 {
     let mut workspace_root: Option<PathBuf> = None;
 
     while let Some(body) = read_message(&mut stdin) {
-        let Ok(msg) = parse_json(&body) else { continue };
+        // A robustness-audit finding (production-hardening PR-it620): a
+        // message whose top-level JSON fails to parse used to be silently
+        // dropped (`continue`) -- fine for a malformed NOTIFICATION (no
+        // response expected anyway), but for a REQUEST (has an `id`), the
+        // client is left waiting forever for a reply that will never come.
+        // This became newly reachable once `parse_json` gained a nesting-
+        // depth guard (same iteration): a deeply-nested `params` value used
+        // to crash the whole process (a stack overflow); after the guard,
+        // it cleanly returns `Err` instead -- which then fell straight into
+        // this SAME silent-drop path, turning a crash into an indefinite
+        // hang instead of actually fixing it. Per the JSON-RPC 2.0 spec's
+        // own convention for a parse error (code -32700): respond with
+        // `id: null`, since a message that failed to parse can't reliably
+        // have its own `id` extracted either.
+        let Ok(msg) = parse_json(&body) else {
+            send(&mut stdout, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}");
+            continue;
+        };
         let method = msg.get("method").and_then(Json::str).unwrap_or("");
         let id = msg.get("id");
 
@@ -2399,6 +2437,42 @@ mod tests {
         assert_eq!(parse_json("tomato"), Err("invalid literal (expected `true`)".into()));
         assert_eq!(parse_json("foobar"), Err("invalid literal (expected `false`)".into()));
         assert_eq!(parse_json("t"), Err("invalid literal (expected `true`)".into()));
+    }
+
+    /// A REAL, SEVERE robustness bug found+fixed (production-hardening
+    /// PR-it620): this parser had NO recursion-depth guard at all, unlike
+    /// json.rs's `parse` (the `json_parse` builtin, shared by interp/vm) and
+    /// cgen.rs's `kjp_value` (native's mirror) -- both of which were ALREADY
+    /// protected. Confirmed via direct reproduction BEFORE this fix: a
+    /// document with 1,000 levels of `[` nesting overflowed the native stack
+    /// and aborted the WHOLE TEST PROCESS (SIGABRT) -- not a catchable Rust
+    /// panic, so `std::panic::set_hook`'s "internal compiler error" safety
+    /// net (main.rs) can't help either; a stack overflow bypasses it
+    /// entirely. This is used for LSP JSON-RPC (a malicious/buggy editor
+    /// could send a deeply-nested `params` value) AND ai.rs's mock-response
+    /// parsing -- a genuine crash-the-process DoS on an externally-facing
+    /// surface, not just a missing test. Fixed by reusing
+    /// `json::MAX_JSON_DEPTH` (matching the OTHER two parsers' limit exactly,
+    /// rather than inventing a new one) and threading a depth counter through
+    /// every recursive `parse_value` call. 100,000 levels of nesting (100x
+    /// the limit) must now fail with a clean `Err`, not crash -- this test
+    /// itself is the proof the fix actually prevents the stack overflow that
+    /// used to happen at this depth.
+    #[test]
+    fn deeply_nested_json_is_rejected_not_a_stack_overflow() {
+        let nested = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
+        assert_eq!(parse_json(&nested), Err("JSON nested too deeply".into()));
+        // well within the limit still parses fine.
+        let shallow = format!("{}1{}", "[".repeat(50), "]".repeat(50));
+        assert!(parse_json(&shallow).is_ok());
+        // exactly at the boundary: MAX_JSON_DEPTH nested arrays is still ok,
+        // one more is rejected -- pins the boundary precisely, not just "very
+        // deep nesting eventually fails somewhere".
+        let at_limit = format!("{}1{}", "[".repeat(crate::json::MAX_JSON_DEPTH), "]".repeat(crate::json::MAX_JSON_DEPTH));
+        assert!(parse_json(&at_limit).is_ok(), "exactly MAX_JSON_DEPTH nested arrays must still parse");
+        let over_limit =
+            format!("{}1{}", "[".repeat(crate::json::MAX_JSON_DEPTH + 1), "]".repeat(crate::json::MAX_JSON_DEPTH + 1));
+        assert_eq!(parse_json(&over_limit), Err("JSON nested too deeply".into()));
     }
 
     #[test]
