@@ -644,6 +644,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it628): a cross-
+    /// package type/constructor's mangled name (`resolve.rs`'s own `pkg$name`
+    /// scheme) used to leak verbatim into user-facing `Display` output AND
+    /// type-checker error messages — `math.origin()`'s `Point` value printed
+    /// as `math$Point(0, 0)` instead of `Point(0, 0)`, and a type mismatch
+    /// reported "expected math$Point" instead of "expected Point". Confirmed
+    /// via a live 3-engine repro (interp/vm/native all agreed on the leak)
+    /// before this fix. Covers BOTH the runtime `Display` leak (via the
+    /// returned `Value`'s `to_string()`, which is exactly what `print()`
+    /// uses internally) and the compile-time error-message leak (via a
+    /// deliberate type mismatch), in one fixture.
+    #[test]
+    fn cross_package_type_names_are_demangled_for_display() {
+        let base = std::env::temp_dir().join(format!("kupl-demangle-test-{}", std::process::id()));
+        let math = base.join("math");
+        let app = base.join("app");
+        std::fs::create_dir_all(&math).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(math.join("kupl.toml"), "[project]\nname = \"math\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            math.join("main.kupl"),
+            "pub type Point = Point(x: Int, y: Int)\npub fun origin() -> Point {\n    Point(x: 0, y: 0)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = { path = \"../math\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use math\n\nfun get_point() {\n    math.origin()\n}\n",
+        )
+        .unwrap();
+
+        // the runtime Display leak: the returned value's `to_string()` (what
+        // `print()` uses internally) must show the ORIGINAL name, not the
+        // internal `math$Point` mangled one.
+        let (program, _map) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its math dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(diags.iter().all(|d| d.severity != crate::diag::Severity::Error), "{diags:?}");
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("get_point".to_string()));
+        let v = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v,
+            Err(_) => panic!("get_point should evaluate"),
+        };
+        assert_eq!(v.to_string(), "Point(0, 0)", "the mangled `math$` prefix must not leak into Display");
+        assert_eq!(v.type_name(), "Point", "the mangled `math$` prefix must not leak into type_name either");
+
+        // the compile-time error-message leak: an intentional type mismatch
+        // involving the cross-package type must name it as `Point`, not
+        // `math$Point`.
+        std::fs::write(
+            app.join("main.kupl"),
+            "use math\n\nfun main() uses io {\n    let p = math.origin()\n    print(p + 1)\n}\n",
+        )
+        .unwrap();
+        let (program2, _map2) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads and parses even though it has a type error");
+        let (_, diags2) = crate::check::check(&program2);
+        let err = diags2
+            .iter()
+            .find(|d| d.severity == crate::diag::Severity::Error)
+            .expect("a type mismatch should be reported");
+        assert!(err.message.contains("Point"), "error should name the type as Point: {}", err.message);
+        assert!(
+            !err.message.contains("math$Point"),
+            "the mangled name must not leak into the error message: {}",
+            err.message
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn two_packages_same_name_dont_collide() {
         // two dependencies BOTH define `helper` — namespace isolation keeps them

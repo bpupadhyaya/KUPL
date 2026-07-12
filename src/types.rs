@@ -186,7 +186,14 @@ impl fmt::Display for Ty {
             Ty::Option(e) => write!(f, "Option[{e}]"),
             Ty::Result(a, b) => write!(f, "Result[{a}, {b}]"),
             Ty::Named(n, args) => {
-                write!(f, "{n}")?;
+                // A REAL bug found+fixed (production-hardening PR-it628): a
+                // cross-package type's mangled name (`pkg$Name`, see
+                // resolve.rs) used to leak verbatim into type-checker error
+                // messages ("expected math$Point, found Int") -- demangled
+                // here for display; `n` itself stays the full mangled name
+                // everywhere else (equality, lookups), only this rendering
+                // is affected.
+                write!(f, "{}", crate::resolve::demangle_for_display(n))?;
                 if !args.is_empty() {
                     write!(f, "[")?;
                     for (i, a) in args.iter().enumerate() {
@@ -197,8 +204,8 @@ impl fmt::Display for Ty {
                 }
                 Ok(())
             }
-            Ty::Component(n) => write!(f, "{n}"),
-            Ty::Contract(n) => write!(f, "{n}"),
+            Ty::Component(n) => write!(f, "{}", crate::resolve::demangle_for_display(n)),
+            Ty::Contract(n) => write!(f, "{}", crate::resolve::demangle_for_display(n)),
             Ty::Fun(ps, r) => {
                 write!(f, "fn(")?;
                 for (i, p) in ps.iter().enumerate() {

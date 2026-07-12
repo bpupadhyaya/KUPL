@@ -21,6 +21,26 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 
+/// Strip a `pkg$name` mangling prefix for USER-FACING display — never for
+/// internal identity/equality, which must keep comparing the full mangled
+/// name (that's the entire point of mangling: two same-named types from
+/// different packages must stay distinguishable). `$` never appears in a
+/// source identifier (this module's own doc comment above), so stripping
+/// everything up to and including the LAST `$` is always safe and never
+/// mistakes real source text for a mangling artifact.
+///
+/// A REAL bug found+fixed (production-hardening PR-it628): this module's own
+/// doc comment documents the mangling scheme precisely, but nothing ever
+/// REVERSED it for display -- so a cross-package type/constructor's mangled
+/// name leaked verbatim into `print()` output AND type-checker error
+/// messages (`math.origin()` printed as `math$Point(0, 0)` instead of
+/// `Point(0, 0)`; a type mismatch reported "expected math$Point" instead of
+/// "expected Point"), across ALL THREE engines. Confirmed via a live 3-way
+/// repro (interp/vm/native all agreed on the leak) before touching any code.
+pub fn demangle_for_display(name: &str) -> &str {
+    name.rsplit('$').next().unwrap_or(name)
+}
+
 /// Rewrite a program's items so cross-package names are globally unique.
 /// `tagged` is `(item, package-prefix)` in load order (prefix "" = root, never
 /// mangled); `pkg_deps` maps a package prefix to the dependency aliases it may
@@ -429,5 +449,28 @@ impl Rewriter<'_> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A REAL bug found+fixed (production-hardening PR-it628): confirms
+    /// `demangle_for_display` correctly reverses this module's OWN mangling
+    /// scheme (documented at the top of this file) for user-facing display,
+    /// without needing to touch the internal (still-mangled) representation
+    /// anywhere else. Also confirms a name with NO mangling prefix (the
+    /// common case — most types live in the root/never-mangled package, or
+    /// are builtins) passes through completely unchanged.
+    #[test]
+    fn demangle_for_display_strips_only_the_mangling_prefix() {
+        assert_eq!(demangle_for_display("math$Point"), "Point");
+        // a name with no `$` at all (the common case) is unchanged
+        assert_eq!(demangle_for_display("Point"), "Point");
+        assert_eq!(demangle_for_display(""), "");
+        // only the LAST `$`-delimited segment is kept, in case some future
+        // extension ever produces more than one level of prefixing
+        assert_eq!(demangle_for_display("outer$inner$Point"), "Point");
     }
 }

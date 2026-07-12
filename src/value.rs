@@ -272,7 +272,8 @@ impl Value {
             Value::Str(_) => "Str".into(),
             Value::Unit => "Unit".into(),
             Value::List(_) => "List".into(),
-            Value::Ctor { ty, .. } => ty.as_str().into(),
+            // demangled for display -- see the Display impl's Ctor arm below.
+            Value::Ctor { ty, .. } => crate::resolve::demangle_for_display(ty).into(),
             Value::Closure(_) => "fn".into(),
             Value::Fun(_) => "fn".into(),
             Value::Component(_) => "component".into(),
@@ -357,7 +358,14 @@ impl fmt::Display for Value {
                 write!(f, "]")
             }
             Value::Ctor { variant, fields, .. } => {
-                write!(f, "{variant}")?;
+                // A REAL bug found+fixed (production-hardening PR-it628): a
+                // cross-package constructor's mangled name (`pkg$Name`, see
+                // resolve.rs) used to leak verbatim into `print()` output --
+                // demangled here for display; `variant` itself stays the
+                // full mangled name for equality/matching (see `PartialEq`
+                // below and interp.rs's pattern matching), only this
+                // rendering is affected.
+                write!(f, "{}", crate::resolve::demangle_for_display(variant))?;
                 if !fields.is_empty() {
                     write!(f, "(")?;
                     for (i, field) in fields.iter().enumerate() {

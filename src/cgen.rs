@@ -1193,6 +1193,22 @@ static KValue k_list_push_inplace(KValue recv, KValue item) {
 
 extern const KCtorMeta CTORS[];
 
+/* Strip a "pkg$name" mangling prefix for USER-FACING display only -- never
+   for internal identity/equality (k_eq's K_CTOR case keeps comparing the
+   full mangled string, which is the entire point of mangling: two
+   same-named types from different packages must stay distinguishable).
+   Mirrors resolve.rs::demangle_for_display exactly (production-hardening
+   PR-it628): a cross-package constructor's mangled name used to leak
+   verbatim into print() output and runtime type-mismatch panic messages
+   ("expected math$Point" instead of "expected Point"), confirmed via a
+   live 3-engine repro before this fix (interp/vm/native all agreed on the
+   leak). `$` never appears in a source identifier, so the LAST occurrence
+   found by strrchr is always a mangling artifact, never real source text. */
+static const char* k_demangle_for_display(const char* name) {
+    const char* dollar = strrchr(name, '$');
+    return dollar ? dollar + 1 : name;
+}
+
 /* mirrors value.rs Value::type_name() exactly, for panic messages that name the operand type. */
 static const char* k_type_name(KValue v) {
     switch (v.tag) {
@@ -1206,7 +1222,7 @@ static const char* k_type_name(KValue v) {
         case K_STR: return "Str";
         case K_UNIT: return "Unit";
         case K_LIST: return "List";
-        case K_CTOR: return CTORS[v.as.ctor->ctor].type_name;
+        case K_CTOR: return k_demangle_for_display(CTORS[v.as.ctor->ctor].type_name);
         case K_CLOSURE: case K_FUN: return "fn";
         case K_COMPONENT: return "component";
         case K_TENSOR: return "Tensor";
@@ -1437,7 +1453,7 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
             break;
         }
         case K_CTOR: {
-            kb_puts(b, CTORS[v.as.ctor->ctor].variant);
+            kb_puts(b, k_demangle_for_display(CTORS[v.as.ctor->ctor].variant));
             if (v.as.ctor->nfields > 0) {
                 kb_puts(b, "(");
                 for (int i = 0; i < v.as.ctor->nfields; i++) {
