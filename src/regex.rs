@@ -274,33 +274,74 @@ impl<'a> Parser<'a> {
                         's' => {
                             ranges.extend([(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')]);
                         }
-                        'n' => ranges.push(('\n', '\n')),
-                        't' => ranges.push(('\t', '\t')),
-                        'r' => ranges.push(('\r', '\r')),
-                        other => ranges.push((other, other)),
+                        // single-char escapes (`\n \t \r` or an escaped literal
+                        // like `\.`) resolve to ONE character, so -- unlike
+                        // `\d`/`\w`/`\s` above -- they're eligible as either
+                        // endpoint of a `lo-hi` range, same as a plain char
+                        // (production-hardening PR-it659; previously this arm
+                        // pushed a single-char range immediately and never
+                        // looked for a following `-`, so `[\t-\r]` silently
+                        // parsed as three separate members -- tab, literal
+                        // `-`, and CR -- instead of the tab-through-CR range
+                        // the syntax visually promises).
+                        'n' => self.finish_class_member('\n', &mut ranges)?,
+                        't' => self.finish_class_member('\t', &mut ranges)?,
+                        'r' => self.finish_class_member('\r', &mut ranges)?,
+                        other => self.finish_class_member(other, &mut ranges)?,
                     }
                 }
                 Some(lo) => {
                     self.pos += 1;
-                    // range `a-z` when a `-` is followed by a non-`]`
-                    if self.peek() == Some('-')
-                        && self.chars.get(self.pos + 1).is_some_and(|&c| c != ']')
-                    {
-                        self.pos += 1; // consume '-'
-                        let hi = self.peek().unwrap();
-                        self.pos += 1;
-                        if lo <= hi {
-                            ranges.push((lo, hi));
-                        } else {
-                            ranges.push((hi, lo));
-                        }
-                    } else {
-                        ranges.push((lo, lo));
-                    }
+                    self.finish_class_member(lo, &mut ranges)?;
                 }
             }
         }
         Ok(Atom::Class { negated, ranges })
+    }
+
+    /// Given one already-consumed class member `lo` (a plain char or a
+    /// resolved single-char escape), check for a `-hi` range continuation
+    /// (a `-` followed by a non-`]`) and push either the resulting range or
+    /// `lo` alone. `hi` may itself be a plain char or a single-char escape
+    /// (`[\t-\r]`, `[a-\n]`); `\d`/`\w`/`\s`/`\D`/`\W`/`\S` are rejected as a
+    /// range endpoint (they don't resolve to one character) rather than
+    /// silently taking the raw `\` byte as the boundary.
+    fn finish_class_member(&mut self, lo: char, ranges: &mut Vec<(char, char)>) -> Result<(), String> {
+        if self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&c| c != ']') {
+            self.pos += 1; // consume '-'
+            let hi = self.range_endpoint()?;
+            if lo <= hi {
+                ranges.push((lo, hi));
+            } else {
+                ranges.push((hi, lo));
+            }
+        } else {
+            ranges.push((lo, lo));
+        }
+        Ok(())
+    }
+
+    /// Read one character-class range endpoint at the current position: a
+    /// plain character, or (after a leading `\`) a single-char escape.
+    fn range_endpoint(&mut self) -> Result<char, String> {
+        if self.peek() == Some('\\') {
+            self.pos += 1;
+            let c = self.peek().ok_or("dangling `\\` in class")?;
+            self.pos += 1;
+            match c {
+                'd' | 'D' | 'w' | 'W' | 's' | 'S' => Err(format!(
+                    "`\\{c}` cannot be used as a character-class range endpoint"
+                )),
+                'n' => Ok('\n'),
+                't' => Ok('\t'),
+                'r' => Ok('\r'),
+                other => Ok(other),
+            }
+        } else {
+            let c = self.peek().ok_or("unclosed character class `[`")?;
+            self.pos += 1;
+            Ok(c)
+        }
     }
 }
 
@@ -623,5 +664,45 @@ mod tests {
         assert!(m("^[\\s]+$", " \t"));
         // combined with other members in the same class still errors.
         assert!(compile("[a\\Dz]").is_err());
+    }
+
+    /// A REAL BUG found+fixed (production-hardening PR-it659): a single-char
+    /// escape (`\n \t \r`, or an escaped literal) used as either endpoint of
+    /// a character-class range used to be taken LITERALLY instead of
+    /// resolved -- `[\t-\r]` parsed as three separate members (tab, literal
+    /// `-`, and CR) instead of the tab-through-CR range the syntax visually
+    /// promises (found while auditing PR-it658's neighboring code). Fixed by
+    /// routing BOTH the `lo` and `hi` sides of a range through a shared
+    /// `range_endpoint` helper that resolves a single-char escape the same
+    /// way a plain char is used; `\d`/`\D`/`\w`/`\W`/`\s`/`\S` (which don't
+    /// resolve to ONE character) are refused as a range endpoint with a
+    /// clean error instead of silently taking the raw `\` byte as the bound
+    /// (the SAME "clean rejection over silent wrong output" philosophy as
+    /// it658, applied to the endpoint side of a range this time).
+    #[test]
+    fn escaped_single_chars_compose_into_a_real_range_not_three_separate_members() {
+        // BEFORE the fix, `[\t-\r]` matched tab, `-`, or CR individually --
+        // never the code points strictly between them (`\n`, 0x0B, 0x0C).
+        assert!(m("^[\\t-\\r]$", "\t"));
+        assert!(m("^[\\t-\\r]$", "\n")); // 0x0A -- strictly between tab and CR
+        assert!(m("^[\\t-\\r]$", "\r"));
+        assert!(!m("^[\\t-\\r]$", "a"));
+        // BEFORE the fix, `-` between tab and CR would ALSO have matched (as
+        // its own literal member) -- now it's consumed as the range
+        // operator, not a member.
+        assert!(!m("^[\\t-\\r]$", "-"));
+        // an escape as the LOW endpoint composes too, and order still
+        // normalizes regardless of which side is numerically smaller.
+        assert!(m("^[\\n-a]$", "T")); // '\n'(0x0A)..'a'(0x61) covers 'T'
+        // a multi-range escape (`\d` etc.) can't be the HI side of a range
+        // (it doesn't resolve to one character). Note `\d`/`\w`/`\s` as the
+        // LO side were never range-eligible in the first place, before or
+        // after this fix -- they push their full expansion immediately and
+        // are never followed up with a `-` lookahead, same as always.
+        assert!(compile("[a-\\d]").is_err());
+        // a trailing escape right before `]` still isn't treated as a range
+        // (nothing follows the `-`... here there's no `-` at all, so this
+        // just confirms the single-escape-as-sole-member case still works).
+        assert!(m("^[\\t]$", "\t"));
     }
 }

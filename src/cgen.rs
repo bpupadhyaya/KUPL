@@ -3147,13 +3147,63 @@ static long kre_utf8_cp(const unsigned char* s, int len, int pos, int* outlen) {
     return cp;
 }
 
+static void kre_repush(KReAtom* a, int* cap, long lo, long hi) {
+    if (a->nranges == *cap) { *cap = *cap ? *cap * 2 : 8; a->ranges = (KReRange*)realloc(a->ranges, sizeof(KReRange) * *cap); }
+    a->ranges[a->nranges].lo = lo; a->ranges[a->nranges].hi = hi; a->nranges++;
+}
+
+/* Read one character-class range endpoint at the current position: a plain
+   (possibly multi-byte) character, or (after a leading `\`) a single-char
+   escape (`\n \t \r` or an escaped literal). `\d`/`\D`/`\w`/`\W`/`\s`/`\S`
+   don't resolve to one character, so they're refused as a range endpoint
+   (sets p->err; caller must check it) rather than silently taking the raw
+   `\` byte as the boundary. Mirrors regex.rs's `range_endpoint` exactly
+   (production-hardening PR-it659). */
+static long kre_range_endpoint(KReP* p) {
+    if (kre_peek(p) == '\\') {
+        p->pos++;
+        int e = kre_peek(p);
+        if (e < 0) { kre_fail(p, "dangling `\\` in class"); return 0; }
+        p->pos++;
+        switch (e) {
+            case 'd': kre_fail(p, "`\\d` cannot be used as a character-class range endpoint"); return 0;
+            case 'D': kre_fail(p, "`\\D` cannot be used as a character-class range endpoint"); return 0;
+            case 'w': kre_fail(p, "`\\w` cannot be used as a character-class range endpoint"); return 0;
+            case 'W': kre_fail(p, "`\\W` cannot be used as a character-class range endpoint"); return 0;
+            case 's': kre_fail(p, "`\\s` cannot be used as a character-class range endpoint"); return 0;
+            case 'S': kre_fail(p, "`\\S` cannot be used as a character-class range endpoint"); return 0;
+            case 'n': return '\n';
+            case 't': return '\t';
+            case 'r': return '\r';
+            default: return (unsigned char)e;
+        }
+    }
+    int clen; long cp = kre_utf8_cp(p->s, p->len, p->pos, &clen); p->pos += clen;
+    return cp;
+}
+
+/* Given one already-consumed class member `lo`, check for a `-hi` range
+   continuation (a `-` followed by a non-`]`) and push either the resulting
+   range or `lo` alone; `hi` may itself be a plain char or a single-char
+   escape. Mirrors regex.rs's `finish_class_member` exactly
+   (production-hardening PR-it659). */
+static void kre_finish_class_member(KReP* p, KReAtom* a, int* cap, long lo) {
+    if (kre_peek(p) == '-' && p->pos + 1 < p->len && p->s[p->pos + 1] != ']') {
+        p->pos++;
+        long hi = kre_range_endpoint(p);
+        if (p->err) return;
+        if (lo <= hi) kre_repush(a, cap, lo, hi); else kre_repush(a, cap, hi, lo);
+    } else {
+        kre_repush(a, cap, lo, lo);
+    }
+}
+
 static void kre_class(KReP* p, KReAtom* a) {
     p->pos++;                 /* '[' */
     a->kind = 2; a->negated = 0; a->ranges = 0; a->nranges = 0;
     int cap = 0;
     if (kre_peek(p) == '^') { a->negated = 1; p->pos++; }
-    #define REPUSH(LO, HI) do { if (a->nranges == cap) { cap = cap ? cap * 2 : 8; a->ranges = (KReRange*)realloc(a->ranges, sizeof(KReRange) * cap); } a->ranges[a->nranges].lo = (LO); a->ranges[a->nranges].hi = (HI); a->nranges++; } while (0)
-    if (kre_peek(p) == ']') { REPUSH(']', ']'); p->pos++; }
+    if (kre_peek(p) == ']') { kre_repush(a, &cap, ']', ']'); p->pos++; }
     for (;;) {
         int c = kre_peek(p);
         if (c < 0) { kre_fail(p, "unclosed character class `[`"); return; }
@@ -3165,33 +3215,28 @@ static void kre_class(KReP* p, KReAtom* a) {
             p->pos++;
             /* `\D`/`\W`/`\S` (negated predefined classes) are refused here,
                matching regex.rs exactly (production-hardening PR-it658) --
-               see the long comment on the Rust side for why. */
+               see the long comment on the Rust side for why. Single-char
+               escapes (`\n \t \r`, or an escaped literal) are eligible as
+               either endpoint of a `lo-hi` range (production-hardening
+               PR-it659), same as a plain char. */
             switch (e) {
                 case 'D': kre_fail(p, "`\\D` is not supported inside a character class `[...]` (only `\\d`, `\\w`, `\\s`, and single-char escapes are)"); return;
                 case 'W': kre_fail(p, "`\\W` is not supported inside a character class `[...]` (only `\\d`, `\\w`, `\\s`, and single-char escapes are)"); return;
                 case 'S': kre_fail(p, "`\\S` is not supported inside a character class `[...]` (only `\\d`, `\\w`, `\\s`, and single-char escapes are)"); return;
-                case 'd': REPUSH('0', '9'); break;
-                case 'w': REPUSH('a', 'z'); REPUSH('A', 'Z'); REPUSH('0', '9'); REPUSH('_', '_'); break;
-                case 's': REPUSH(' ', ' '); REPUSH('\t', '\t'); REPUSH('\n', '\n'); REPUSH('\r', '\r'); break;
-                case 'n': REPUSH('\n', '\n'); break;
-                case 't': REPUSH('\t', '\t'); break;
-                case 'r': REPUSH('\r', '\r'); break;
-                default: REPUSH((unsigned char)e, (unsigned char)e); break;
+                case 'd': kre_repush(a, &cap, '0', '9'); break;
+                case 'w': kre_repush(a, &cap, 'a', 'z'); kre_repush(a, &cap, 'A', 'Z'); kre_repush(a, &cap, '0', '9'); kre_repush(a, &cap, '_', '_'); break;
+                case 's': kre_repush(a, &cap, ' ', ' '); kre_repush(a, &cap, '\t', '\t'); kre_repush(a, &cap, '\n', '\n'); kre_repush(a, &cap, '\r', '\r'); break;
+                case 'n': kre_finish_class_member(p, a, &cap, '\n'); if (p->err) return; break;
+                case 't': kre_finish_class_member(p, a, &cap, '\t'); if (p->err) return; break;
+                case 'r': kre_finish_class_member(p, a, &cap, '\r'); if (p->err) return; break;
+                default: kre_finish_class_member(p, a, &cap, (unsigned char)e); if (p->err) return; break;
             }
         } else {
             int clen; long cp = kre_utf8_cp(p->s, p->len, p->pos, &clen); p->pos += clen;
-            /* range lo-hi when `-` is followed by a non-`]` */
-            if (kre_peek(p) == '-' && p->pos + 1 < p->len && p->s[p->pos + 1] != ']') {
-                p->pos++;
-                int hlen; long hi = kre_utf8_cp(p->s, p->len, p->pos, &hlen); p->pos += hlen;
-                if (cp <= hi) REPUSH(cp, hi);
-                else REPUSH(hi, cp);
-            } else {
-                REPUSH(cp, cp);
-            }
+            kre_finish_class_member(p, a, &cap, cp);
+            if (p->err) return;
         }
     }
-    #undef REPUSH
 }
 
 static KReAtom* kre_atom(KReP* p) {
@@ -10427,6 +10472,63 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
                 "letter {letter}: native must match interp's wording exactly: {stderr:?}"
             );
         }
+    }
+
+    /// A REAL BUG found+fixed (production-hardening PR-it659), verified for
+    /// cross-engine byte-identity here: a single-char escape (`\n \t \r`, or
+    /// an escaped literal) used as a character-class range endpoint used to
+    /// be taken LITERALLY instead of resolved -- `[\t-\r]` matched tab, `-`,
+    /// or CR individually, never the code points strictly between them
+    /// (`\n` chief among them). `cgen.rs`'s `kre_class` shared the identical
+    /// gap. Both engines now resolve an escaped endpoint the same way a
+    /// plain char is used, and both refuse a multi-range escape (`\d` etc.)
+    /// as an endpoint with an identical error.
+    #[test]
+    fn native_regex_escaped_range_endpoints_match_interp() {
+        if !cc_available() {
+            return;
+        }
+        // positive: the composed range now covers `\n`, strictly between the
+        // two escaped endpoints -- BEFORE the fix this printed "false".
+        let src = "fun main() uses io { print(re_match(\"^[\\\\t-\\\\r]$\", \"\\n\")) }";
+        assert_eq!(native_main_stdout(src, "reesc").trim(), "true");
+
+        // negative: a multi-range escape as the range's HI side is now a
+        // clean, byte-identical compile error in both engines.
+        let src2 = "fun main() uses io {\n    print(re_match(\"[a-\\\\d]\", \"x\"))\n}\n";
+        let compiled = crate::run::compile(src2).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let expected = "`\\d` cannot be used as a character-class range endpoint";
+        match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Err(crate::interp::Flow::Panic { msg, .. }) => {
+                assert!(msg.contains(expected), "{msg}");
+            }
+            Ok(_) => panic!("expected a panic, got success"),
+            Err(_) => panic!("expected a panic with Flow::Panic specifically"),
+        }
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-reesc-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let out = std::process::Command::new(&bin).output().unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(expected),
+            "native must match interp's wording exactly: {stderr:?}"
+        );
     }
 
     /// A REAL cross-engine bug (PR-it596, found via the SAME panic-wording sweep
