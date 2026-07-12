@@ -273,8 +273,8 @@ width suffix: `255u8`, `1000i16`, `0xFFu8`, `0b1010u8`. Out-of-range literals
 are a compile error (K0009). Arithmetic is **checked** (overflow panics, like
 `Int`); mixing widths is a type error — convert explicitly. There is also a
 single-precision **`f32`** float (`1.5f32`, `10f32`, `1e3f32`); its arithmetic
-matches `Float` (no overflow panic) and it does not mix with `Float`. Not yet
-on the native backend (`kupl run`/`--vm`/`bundle`).
+matches `Float` (no overflow panic) and it does not mix with `Float`. Both
+sized integers and `f32` run on every engine, including `kupl native`.
 
 | Method | Signature | Notes |
 |---|---|---|
