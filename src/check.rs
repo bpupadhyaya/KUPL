@@ -350,7 +350,17 @@ impl Checker {
         for item in &program.items {
             if let Item::Type(t) = item {
                 if self.checked.types.contains_key(&t.name) {
-                    self.err("K0201", format!("type `{}` is defined more than once", t.name), t.span);
+                    // `crate::resolve::demangle_for_display`, not the raw (possibly
+                    // `pkg$name`-mangled) name -- production-hardening PR-it698,
+                    // a companion fix to the diamond-dependency namespace-isolation
+                    // bug found the same iteration: even a LEGITIMATE cross-package
+                    // collision should name the type the user actually wrote, not
+                    // an internal mangling artifact they never typed.
+                    self.err(
+                        "K0201",
+                        format!("type `{}` is defined more than once", crate::resolve::demangle_for_display(&t.name)),
+                        t.span,
+                    );
                     continue;
                 }
                 // placeholder so recursive types resolve
@@ -423,7 +433,10 @@ impl Checker {
                         if self.checked.ctors.contains_key(&v.name) {
                             self.err(
                                 "K0202",
-                                format!("constructor `{}` is defined more than once", v.name),
+                                format!(
+                                    "constructor `{}` is defined more than once",
+                                    crate::resolve::demangle_for_display(&v.name)
+                                ),
                                 v.span,
                             );
                         }
@@ -459,7 +472,11 @@ impl Checker {
                     let ret = f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
                     self.tyvars.clear();
                     if self.checked.funs.contains_key(&f.name) {
-                        self.err("K0203", format!("function `{}` is defined more than once", f.name), f.span);
+                        self.err(
+                            "K0203",
+                            format!("function `{}` is defined more than once", crate::resolve::demangle_for_display(&f.name)),
+                            f.span,
+                        );
                     }
                     self.checked.funs.insert(f.name.clone(), (params, ret, qvars));
                 }
@@ -510,7 +527,11 @@ impl Checker {
                     // sig means a genuine redefinition
                     match self.checked.contracts.get(&ct.name) {
                         Some(existing) if !existing.sigs.is_empty() => {
-                            self.err("K0260", format!("contract `{}` is defined more than once", ct.name), ct.span);
+                            self.err(
+                                "K0260",
+                                format!("contract `{}` is defined more than once", crate::resolve::demangle_for_display(&ct.name)),
+                                ct.span,
+                            );
                         }
                         _ => {
                             self.checked.contracts.insert(ct.name.clone(), sig);

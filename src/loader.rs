@@ -380,10 +380,11 @@ pub fn load_with(
     }
     let mut ctx_cache: HashMap<PathBuf, Rc<PkgCtx>> = HashMap::new();
     let mut queue: Vec<(PathBuf, Rc<PkgCtx>, Option<Span>)> = vec![(entry_path, root_ctx, None)];
-    // items tagged with their owning package's mangling prefix, plus the deps
-    // each package may reference — fed to the namespace-isolation pass.
+    // items tagged with their owning package's mangling prefix, plus each
+    // package's own alias table (alias name -> that dependency's resolved
+    // prefix) — fed to the namespace-isolation pass.
     let mut tagged: Vec<(crate::ast::Item, String)> = Vec::new();
-    let mut pkg_deps: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut pkg_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     while let Some((path, ctx, use_span)) = queue.pop() {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -415,10 +416,6 @@ pub fn load_with(
             base,
         });
         diags.extend(file_diags);
-        pkg_deps
-            .entry(ctx.prefix.clone())
-            .or_default()
-            .extend(ctx.deps.keys().cloned());
         for (use_path, span) in &file_program.uses {
             let first = use_path.split('.').next().unwrap_or(use_path);
             if let Some((dep_dir, req_version)) = ctx.deps.get(first) {
@@ -439,11 +436,38 @@ pub fn load_with(
                     }
                 }
                 // cross-package `use <dep>` (or `<dep>.sub`) — the dependency's
-                // package is mangled with its import alias as the prefix
+                // package is mangled with a prefix unique to ITS OWN position
+                // in the dependency graph (this package's own prefix, chained
+                // with the alias), NOT the bare alias text. A REAL namespace-
+                // isolation-bypass bug found+fixed (production-hardening
+                // PR-it698): two UNRELATED dependencies can each independently
+                // alias a DIFFERENT sub-dependency as the SAME name (e.g. both
+                // `depA` and `depB` `use shared`, pointing at two entirely
+                // different physical packages) — mangling both under the bare
+                // alias `shared` made their definitions collide (or, worse,
+                // with no name collision at all, silently invoke whichever
+                // definition happened to load last, since `try_qualified` in
+                // resolve.rs used to build the qualified reference from the
+                // same bare alias text too). `ctx_cache` still dedupes by
+                // PHYSICAL directory, so a genuinely SHARED dependency (the
+                // exact same path reached via two different alias chains)
+                // still gets ONE mangled namespace, as intended — only the
+                // prefix CHOSEN for a not-yet-cached directory changes.
                 let dep_ctx = ctx_cache
                     .entry(dep_dir.clone())
-                    .or_insert_with(|| pkg_ctx(dep_dir, false, first))
+                    .or_insert_with(|| {
+                        let dep_prefix = if ctx.prefix.is_empty() {
+                            first.to_string()
+                        } else {
+                            format!("{}.{first}", ctx.prefix)
+                        };
+                        pkg_ctx(dep_dir, false, &dep_prefix)
+                    })
                     .clone();
+                pkg_deps
+                    .entry(ctx.prefix.clone())
+                    .or_default()
+                    .insert(first.to_string(), dep_ctx.prefix.clone());
                 let target = if let Some(tail) =
                     use_path.strip_prefix(first).and_then(|t| t.strip_prefix('.'))
                 {
@@ -888,6 +912,169 @@ mod tests {
             Ok(v) => assert_eq!(v.to_string(), "1121"),
             Err(_) => panic!("probe should evaluate"),
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL, previously-silent namespace-isolation BYPASS (production-hardening
+    /// PR-it698): `depA` and `depB` are UNRELATED packages that each independently
+    /// alias a DIFFERENT sub-dependency as `shared` (their own local choice, no
+    /// coordination possible between them). Before this fix, both got mangled under
+    /// the bare alias text `shared` (not a unique-per-dependency-graph-edge prefix),
+    /// AND cross-package references (`shared.addA(...)`) were rewritten using that
+    /// SAME bare alias text too -- so `depB.calcB`'s call to `shared.addA` (which
+    /// `utilB`, `depB`'s OWN `shared`, does NOT define) silently resolved to
+    /// `utilA`'s `addA` instead of failing, purely because `depA` (an unrelated
+    /// sibling) happened to alias ITS OWN unrelated dependency `shared` too.
+    /// Confirmed live before this fix: `kupl check`/`kupl run` on this EXACT
+    /// scenario reported clean/`7 7` instead of an unknown-name error. Fixed by
+    /// mangling each dependency under a prefix chained from its OWN position in the
+    /// dependency graph (`{parent_prefix}.{alias}`) and threading each package's
+    /// alias->resolved-prefix table through to reference-rewriting too (not just
+    /// definition-mangling) -- so `depA`'s `shared` and `depB`'s `shared` are two
+    /// entirely distinct namespaces, byte-identical on interp/KVM/native.
+    /// Scaffolds the diamond-alias fixture used by both regression tests below:
+    /// `depA`/`depB` are UNRELATED packages that each independently alias a
+    /// DIFFERENT sub-dependency as `shared` (their own local choice, no
+    /// coordination possible between them). `util_b_addr` controls whether
+    /// `utilB` (depB's OWN `shared`) also defines an `addA` -- the two tests
+    /// exercise the "both sides otherwise valid" and "depB's shared genuinely
+    /// lacks addA" scenarios respectively (`check()` validates the WHOLE merged
+    /// program regardless of what `probe()` itself calls, so these must be
+    /// separate fixtures, not two phases of one program).
+    fn diamond_alias_fixture(tag: &str, util_b_body: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("kupl-diamond-alias-{tag}-{}", std::process::id()));
+        let util_a = base.join("utilA");
+        let util_b = base.join("utilB");
+        let dep_a = base.join("depA");
+        let dep_b = base.join("depB");
+        let app = base.join("app");
+        for d in [&util_a, &util_b, &dep_a, &dep_b, &app] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(util_a.join("kupl.toml"), "[project]\nname = \"utilA\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(util_a.join("main.kupl"), "pub fun addA(a: Int, b: Int) -> Int {\n    a + b\n}\n").unwrap();
+        std::fs::write(util_b.join("kupl.toml"), "[project]\nname = \"utilB\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(util_b.join("main.kupl"), util_b_body).unwrap();
+        std::fs::write(
+            dep_a.join("kupl.toml"),
+            "[project]\nname = \"depA\"\nentry = \"main.kupl\"\n\n[dependencies]\nshared = { path = \"../utilA\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dep_a.join("main.kupl"), "use shared\npub fun calcA(x: Int, y: Int) -> Int {\n    shared.addA(x, y)\n}\n").unwrap();
+        std::fs::write(
+            dep_b.join("kupl.toml"),
+            "[project]\nname = \"depB\"\nentry = \"main.kupl\"\n\n[dependencies]\nshared = { path = \"../utilB\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dep_b.join("main.kupl"), "use shared\npub fun calcB(x: Int, y: Int) -> Int {\n    shared.addA(x, y)\n}\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndepA = { path = \"../depA\" }\ndepB = { path = \"../depB\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use depA\nuse depB\nfun probe() -> Int {\n    depA.calcA(3, 4) + depB.calcB(3, 4)\n}\n",
+        )
+        .unwrap();
+        app.join("main.kupl")
+    }
+
+    /// A REAL, previously-silent namespace-isolation BYPASS (production-hardening
+    /// PR-it698). Before this fix, `depA`'s and `depB`'s (unrelated, independently-
+    /// chosen) `shared` aliases were BOTH mangled under the bare alias text
+    /// `shared` (not a prefix unique to each's OWN position in the dependency
+    /// graph), AND cross-package references (`shared.addA(...)`) were rewritten
+    /// using that SAME bare alias text too -- so even when BOTH `utilA` and
+    /// `utilB` legitimately define their OWN `addA`, `depB.calcB`'s call could
+    /// silently resolve to `utilA`'s `addA` instead of `utilB`'s, purely because
+    /// `depA` happened to alias its own unrelated dependency `shared` too.
+    /// Confirmed live before this fix: both calls returned utilA's `7`, never
+    /// reaching utilB's `12`. Fixed by mangling each dependency under a prefix
+    /// chained from its OWN position in the dependency graph
+    /// (`{parent_prefix}.{alias}`) and threading each package's own
+    /// alias->resolved-prefix table through reference-rewriting too (not just
+    /// definition-mangling) -- so `depA`'s `shared` and `depB`'s `shared` are two
+    /// entirely distinct namespaces, byte-identical on interp/KVM/native.
+    #[test]
+    fn diamond_dependency_with_same_alias_resolves_each_package_to_its_own_util() {
+        let entry = diamond_alias_fixture(
+            "ok",
+            "pub fun addA(a: Int, b: Int) -> Int {\n    a * b\n}\n",
+        );
+        let (program, _) = super::load(entry.to_str().unwrap()).map_err(|(d, _)| format!("{d:?}")).expect("loads");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(diags.iter().all(|d| d.severity != crate::diag::Severity::Error), "{diags:?}");
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("probe".to_string()));
+        match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            // depA.calcA = utilA.addA(3,4) = 7; depB.calcB = utilB.addA(3,4) = 12
+            Ok(v) => assert_eq!(v.to_string(), "19", "each dep must resolve `shared` to its OWN util, not cross-contaminate"),
+            Err(_) => panic!("probe should evaluate"),
+        }
+        let _ = std::fs::remove_dir_all(entry.parent().unwrap().parent().unwrap());
+    }
+
+    /// Sibling to the test above: `utilB` (depB's OWN `shared`) genuinely does
+    /// NOT define `addA` at all. Before this fix, `depB.calcB`'s `shared.addA`
+    /// call silently resolved against `utilA`'s `addA` (a package `depB` never
+    /// declared as a dependency) instead of failing -- confirmed live: `kupl
+    /// check` reported `ok`. This must be a clean, hard unknown-name error.
+    #[test]
+    fn diamond_dependency_where_one_side_genuinely_lacks_the_function_is_a_clean_error() {
+        let entry = diamond_alias_fixture(
+            "bad",
+            "pub fun subB(a: Int, b: Int) -> Int {\n    a - b\n}\n",
+        );
+        let (program, _) = super::load(entry.to_str().unwrap()).map_err(|(d, _)| format!("{d:?}")).expect("loads");
+        let (_, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().any(|d| d.severity == crate::diag::Severity::Error
+                && d.message.contains("unknown name")
+                && d.message.contains("addA")),
+            "depB's `shared.addA` (utilB has no addA) must be an unknown-name error, \
+             not silently resolved against utilA's addA: {diags:?}"
+        );
+        let _ = std::fs::remove_dir_all(entry.parent().unwrap().parent().unwrap());
+    }
+
+    /// A companion fix (production-hardening PR-it698): a GENUINE cross-package
+    /// name collision (two files inside the SAME mangled dependency package both
+    /// defining `helper`) used to report `K0203: function \`dep$helper\` is
+    /// defined more than once` -- leaking the internal `pkg$name` mangling
+    /// artifact into a user-facing diagnostic (the user never wrote `dep$helper`
+    /// anywhere). `demangle_for_display` was already used for print()/type-
+    /// mismatch messages (PR-it628) but never wired into this specific
+    /// duplicate-definition diagnostic (nor its K0201/K0202/K0260 siblings for
+    /// types/constructors/contracts).
+    #[test]
+    fn cross_package_duplicate_definition_message_is_demangled() {
+        let base = std::env::temp_dir().join(format!("kupl-dup-demangle-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"a.kupl\"\n").unwrap();
+        std::fs::write(dep.join("a.kupl"), "use b\npub fun helper() -> Int {\n    1\n}\n").unwrap();
+        std::fs::write(dep.join("b.kupl"), "pub fun helper() -> Int {\n    2\n}\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use dep\nfun probe() -> Int {\n    dep.helper()\n}\n").unwrap();
+
+        let (program, _) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("loads");
+        let (_, diags) = crate::check::check(&program);
+        let dup = diags
+            .iter()
+            .find(|d| d.code == "K0203")
+            .unwrap_or_else(|| panic!("expected a K0203 duplicate-function diagnostic: {diags:?}"));
+        assert!(dup.message.contains("`helper`"), "message must name the bare, user-written identifier: {}", dup.message);
+        assert!(!dup.message.contains('$'), "message must NOT leak the internal `pkg$name` mangling artifact: {}", dup.message);
         let _ = std::fs::remove_dir_all(&base);
     }
 

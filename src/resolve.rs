@@ -43,11 +43,14 @@ pub fn demangle_for_display(name: &str) -> &str {
 
 /// Rewrite a program's items so cross-package names are globally unique.
 /// `tagged` is `(item, package-prefix)` in load order (prefix "" = root, never
-/// mangled); `pkg_deps` maps a package prefix to the dependency aliases it may
-/// reference with `alias.name`.
+/// mangled); `pkg_deps` maps a package prefix to the ALIASES it may reference
+/// with `alias.name`, each pointing to that dependency's OWN resolved
+/// mangling prefix -- NOT necessarily the bare alias text itself (production-
+/// hardening PR-it698, see `try_qualified` below for why this distinction is
+/// load-bearing).
 pub fn isolate(
     tagged: Vec<(Item, String)>,
-    pkg_deps: &HashMap<String, HashSet<String>>,
+    pkg_deps: &HashMap<String, HashMap<String, String>>,
 ) -> Vec<Item> {
     // per-package: bare defined name -> mangled name
     let mut renames: HashMap<String, HashMap<String, String>> = HashMap::new();
@@ -61,7 +64,7 @@ pub fn isolate(
         }
     }
 
-    let empty = HashSet::new();
+    let empty = HashMap::new();
     tagged
         .into_iter()
         .map(|(mut item, prefix)| {
@@ -91,7 +94,9 @@ fn defined_names(item: &Item) -> Vec<String> {
 
 struct Rewriter<'a> {
     rename: &'a HashMap<String, String>,
-    deps: &'a HashSet<String>,
+    /// alias name (as written in THIS package's own `use`) -> that
+    /// dependency's OWN resolved mangling prefix.
+    deps: &'a HashMap<String, String>,
     scope: Vec<HashSet<String>>,
 }
 
@@ -439,25 +444,41 @@ impl Rewriter<'_> {
     }
 
     /// If `e` is a package-qualified access `alias.name` (`alias` a dependency,
-    /// not shadowed by a local), rewrite it to a bare `alias$name` reference.
+    /// not shadowed by a local), rewrite it to a bare `resolved$name`
+    /// reference -- `resolved` is `alias`'s DEPENDENCY's own resolved
+    /// mangling prefix, NOT the bare `alias` text itself. This distinction is
+    /// load-bearing (production-hardening PR-it698, a REAL namespace-
+    /// isolation-bypass bug found+fixed): two UNRELATED nested dependencies
+    /// can each independently choose the SAME local alias for their own
+    /// (different) sub-dependency (e.g. both `depA` and `depB` `use shared`,
+    /// pointing at two entirely different physical packages) -- using the
+    /// bare alias text here, as this used to, would mangle both packages'
+    /// references to the SAME `shared$name` regardless of prefix uniqueness
+    /// upstream, silently invoking whichever definition happened to load
+    /// last. `self.deps` maps THIS package's own alias table to each
+    /// dependency's actual (now-unique) resolved prefix, so the reference
+    /// always lands on the SAME definition the DEFINING side was mangled
+    /// under.
     fn try_qualified(&self, e: &Expr) -> Option<ExprKind> {
-        let is_dep = |recv: &Expr| matches!(&recv.kind, ExprKind::Ident(a) if self.deps.contains(a) && !self.is_local(a));
+        let is_dep = |recv: &Expr| matches!(&recv.kind, ExprKind::Ident(a) if self.deps.contains_key(a) && !self.is_local(a));
         match &e.kind {
-            // `alias.method(args)` -> `alias$method(args)`
+            // `alias.method(args)` -> `resolved$method(args)`
             ExprKind::MethodCall { recv, name, args } if is_dep(recv) => {
                 let ExprKind::Ident(a) = &recv.kind else { return None };
+                let resolved = self.deps.get(a).map(String::as_str).unwrap_or(a);
                 Some(ExprKind::Call {
                     callee: Box::new(Expr {
-                        kind: ExprKind::Ident(format!("{a}${name}")),
+                        kind: ExprKind::Ident(format!("{resolved}${name}")),
                         span: recv.span,
                     }),
                     args: args.iter().cloned().map(|value| Arg { name: None, value }).collect(),
                 })
             }
-            // `alias.name` used as a value / callee -> `alias$name`
+            // `alias.name` used as a value / callee -> `resolved$name`
             ExprKind::Field { recv, name } if is_dep(recv) => {
                 let ExprKind::Ident(a) = &recv.kind else { return None };
-                Some(ExprKind::Ident(format!("{a}${name}")))
+                let resolved = self.deps.get(a).map(String::as_str).unwrap_or(a);
+                Some(ExprKind::Ident(format!("{resolved}${name}")))
             }
             _ => None,
         }
