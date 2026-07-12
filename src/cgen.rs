@@ -4087,10 +4087,22 @@ static KValue k_parse_iso(KValue sv) {
        with two-or-more trailing `Z`s (e.g. "...T01:46:40ZZ") parsed
        successfully (Ok) on interp/vm -- both go through the SAME shared
        `time.rs::parse_iso` -- yet failed (Err) here on native alone, a
-       genuine DIVERGENCE (not just a shared wrong answer) confirmed live. */
-    while (*raw == ' ' || *raw == '\t' || *raw == '\n' || *raw == '\r') raw++;
-    long n = (long)strlen(raw);
-    while (n > 0 && (raw[n-1] == ' ' || raw[n-1] == '\t' || raw[n-1] == '\n' || raw[n-1] == '\r')) n--;
+       genuine DIVERGENCE (not just a shared wrong answer) confirmed live.
+       A SECOND, SIBLING divergence in the SAME `s.trim()` call, found+fixed
+       one iteration later (production-hardening PR-it666, the same bug
+       class as it662-665): `s.trim()` itself is Rust's Unicode-aware trim,
+       but the `while (*raw==' '||...)` walk just below only ever recognized
+       ASCII space/tab/CR/LF -- it660's fix touched ONLY the trailing-`Z`
+       loop, not this ASCII-only leading/trailing walk it sits right next
+       to, so a timestamp padded with a non-ASCII whitespace character
+       (NBSP here) still parsed on interp/vm but failed on native alone;
+       confirmed live via `parse_iso("\u{A0}2001-09-09T01:46:40Z\u{A0}")`
+       BEFORE fixing. Now uses the shared `k_utf8_trim_range` (built for
+       BigInt.from_str, it662) instead of the ASCII-only walk. */
+    long tstart, tend;
+    k_utf8_trim_range(raw, &tstart, &tend);
+    raw += tstart;
+    long n = tend - tstart;
     while (n > 0 && raw[n-1] == 'Z') n--;
     /* A REAL cross-engine bug (PR-it597, from the SAME sweep as it595/it596):
        interp.rs's `format!("invalid ISO-8601 timestamp: {s}")` echoes the FULL
@@ -7128,6 +7140,27 @@ fun main() uses io {
             native_main_stdout(src, "isozz").trim(),
             "true|true|true|1000000000"
         );
+    }
+
+    /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
+    /// PR-it666, the SAME bug class as it662-665, and a SIBLING gap in the
+    /// exact function it660 already fixed once): `time.rs::parse_iso`'s
+    /// `s.trim()` is Rust's Unicode-aware trim, but `k_parse_iso`'s
+    /// leading/trailing whitespace walk (separate from the trailing-`Z`
+    /// loop it660 fixed) recognized ASCII space/tab/CR/LF only -- so a
+    /// timestamp padded with a non-ASCII whitespace character (NBSP here)
+    /// parsed successfully on interp/vm but failed on native alone;
+    /// confirmed live via `parse_iso("\u{A0}2001-09-09T01:46:40Z\u{A0}")`
+    /// BEFORE fixing (native returned `Err`, interp/vm returned `Ok`).
+    #[test]
+    fn native_parse_iso_trims_unicode_whitespace() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{parse_iso(\"\u{A0}2001-09-09T01:46:40Z\u{A0}\").is_ok()}|\
+                   {parse_iso(\"2001-09-09T01:46:40Z\").is_ok()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "isounicodetrim").trim(), "true|true");
     }
 
     /// Native's mock tool-calling loop matches interp/KVM: a multi-step loop reaches
