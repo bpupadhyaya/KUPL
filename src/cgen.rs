@@ -360,17 +360,6 @@ fn str_const<'a>(chunk: &'a Chunk, idx: u16) -> Result<&'a str, String> {
     }
 }
 
-/// True if `reg` is a genuine chunk-local register — NOT a capture or
-/// parameter, which could be aliased before this chunk ever ran (captures
-/// occupy `[0, ncaps)`, params `[ncaps, ncaps+nparams)`, per compile.rs's
-/// FnCompiler register allocation order). `method_recv_escapes`/
-/// `add_lhs_escapes` only analyze aliasing WITHIN this chunk, so callers
-/// must check this separately before trusting either as sufficient proof a
-/// self-rebind register is safe to mutate in place.
-fn is_chunk_local_reg(chunk: &Chunk, reg: Reg) -> bool {
-    (reg as u16) >= chunk.ncaps as u16 + chunk.nparams as u16
-}
-
 fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize) -> Result<(), String> {
     use Op::*;
     let line = match op {
@@ -381,13 +370,18 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             // mirrors interp.rs's append_str_in_place / vm.rs's dst==a
             // Op::Add handling (it611's add_lhs_escapes covers the same
             // analysis this cgen.rs wiring finally uses). Same preconditions
-            // as Method's self-rebind fast path above: `d == a`, `a` is a
-            // chunk-local register, and add_lhs_escapes proves no other op
-            // in this chunk could alias it. The `tag == K_STR` runtime
-            // guards are load-bearing: `d == a` is purely syntactic and says
-            // nothing about whether this specific Add is a string append or
+            // as Method's self-rebind fast path above: `d == a`, `a`'s value
+            // doesn't trace back to a capture/parameter (see
+            // reg_traces_to_a_parameter's doc comment — a PR-it615 fix:
+            // is_chunk_local_reg's register-NUMBER check alone missed the
+            // `fun f(xs){ var s = xs; s = s + y }` shape, where `s` gets a
+            // fresh register but its VALUE is a Move'd alias of the
+            // parameter), and add_lhs_escapes proves no other op in this
+            // chunk could alias it. The `tag == K_STR` runtime guards are
+            // load-bearing: `d == a` is purely syntactic and says nothing
+            // about whether this specific Add is a string append or
             // ordinary numeric arithmetic.
-            if d == a && is_chunk_local_reg(chunk, *a) && !add_lhs_escapes(chunk, pc) {
+            if d == a && !reg_traces_to_a_parameter(chunk, pc, *a) && !add_lhs_escapes(chunk, pc) {
                 format!(
                     "regs[{d}] = (regs[{a}].tag == K_STR && regs[{b}].tag == K_STR) ? k_str_append_inplace(regs[{a}], regs[{b}].as.s) : k_add(regs[{a}], regs[{b}]);"
                 )
@@ -492,19 +486,25 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             // Self-rebind fast path for `xs = xs.push(item)` (List),
             // `xs = xs.insert(k, v)` (Map) and `xs = xs.insert(item)` (Set) —
             // mirrors interp.rs's push_list_in_place / vm.rs's dst==recv
-            // Op::Method handling. Only safe when `recv` is a genuine
-            // chunk-local register (not a capture/param, which could be
-            // aliased before this chunk ever ran — captures occupy
-            // [0, ncaps), params [ncaps, ncaps+nparams), per compile.rs's
-            // FnCompiler register allocation order) AND method_recv_escapes
-            // proves no OTHER op in this chunk could alias it. The
-            // `regs[recv].tag == ...` runtime guards are load-bearing, not
-            // defensive dressing: `dst == recv` and a matching method name
-            // are purely syntactic and say nothing about the receiver's
-            // actual runtime type (e.g. a component exposing its own method
-            // literally named "push"/"insert").
-            let self_rebind =
-                dst == recv && is_chunk_local_reg(chunk, *recv) && !method_recv_escapes(chunk, pc);
+            // Op::Method handling. Only safe when `recv`'s value doesn't
+            // trace back to a capture/parameter register — NOT just when
+            // `recv`'s own register NUMBER happens to be chunk-local (a
+            // PR-it615 fix: a live cross-engine stress test found that
+            // `fun f(xs){ var ys = xs; ys = ys.push(item) }` was WRONGLY
+            // taking this fast path — `ys` gets a fresh, chunk-local
+            // register, but its VALUE is a Move'd alias of the parameter
+            // `xs`, so mutating it in place corrupted the CALLER's own
+            // reference; see reg_traces_to_a_parameter's doc comment for the
+            // full analysis) AND method_recv_escapes proves no OTHER op in
+            // this chunk could alias it. The `regs[recv].tag == ...` runtime
+            // guards are load-bearing, not defensive dressing: `dst == recv`
+            // and a matching method name are purely syntactic and say
+            // nothing about the receiver's actual runtime type (e.g. a
+            // component exposing its own method literally named
+            // "push"/"insert").
+            let self_rebind = dst == recv
+                && !reg_traces_to_a_parameter(chunk, pc, *recv)
+                && !method_recv_escapes(chunk, pc);
             if m == "push" && self_rebind {
                 format!(
                     "regs[{dst}] = (regs[{recv}].tag == K_LIST) ? k_list_push_inplace(regs[{recv}], regs[{start}]) : k_method(regs[{recv}], \"push\", &regs[{start}], {argc});"
@@ -5524,6 +5524,63 @@ mod tests {
             let _ = std::fs::remove_file(&cpath);
             let _ = std::fs::remove_file(&bin);
         }
+    }
+
+    /// A REAL cross-engine correctness bug (production-hardening PR-it615),
+    /// found by a live stress test deliberately built to exercise the
+    /// self-rebind fast paths (it608-612) beyond each individual iteration's
+    /// one or two aliasing repros: `fun f(xs: List[Int]) { var ys = xs; ys =
+    /// ys.push(item) }` -- rebinding a PARAMETER through an intermediate
+    /// local before self-pushing -- was WRONGLY taking native's in-place
+    /// fast path, silently CORRUPTING the caller's own list. `ys` gets a
+    /// fresh, chunk-local register (the `Op::Method` self-rebind's own
+    /// `dst == recv` check and the old `is_chunk_local_reg`'s register-
+    /// NUMBER check both said "safe"), but `var ys = xs` compiles to
+    /// `Move(ys_reg, xs_reg)` -- `ys`'s VALUE is still an alias of the
+    /// parameter `xs`, which the CALLER retains its own reference to.
+    /// interp.rs and vm.rs never had this bug (their own `Rc::get_mut`/
+    /// register-uniqueness checks are RUNTIME facts, not just a register-
+    /// number heuristic) -- this was native-specific, closed by
+    /// `reg_traces_to_a_parameter` (bytecode.rs), which follows the `Move`
+    /// chain transitively instead of only checking `recv`'s own register
+    /// number.
+    #[test]
+    fn native_self_rebind_through_a_parameter_alias_does_not_corrupt_the_callers_list() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun grow_outside(xs: List[Int]) -> List[Int] {\n    \
+                   var ys = xs\n    ys = ys.push(999)\n    ys\n}\n\
+                   fun main() uses io {\n    \
+                   var c: List[Int] = []\n    c = c.push(100)\n    \
+                   var snapshot = grow_outside(c)\n    c = c.push(200)\n    \
+                   print(\"{c}|{snapshot}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_param_alias");
+        assert_eq!(
+            out.trim(),
+            "[100, 200]|[100, 999]",
+            "native must NOT corrupt the caller's `c` via grow_outside's internal self-push \
+             (matches interp/KVM, verified by hand: both always printed this and never had \
+             the bug -- this pins native specifically)"
+        );
+    }
+
+    /// The Str-append analogue of the List bug above, same root cause and
+    /// same fix: `fun f(s: Str) { var t = s; t = t + suffix }` must not
+    /// corrupt the caller's string either.
+    #[test]
+    fn native_self_rebind_str_append_through_a_parameter_alias_does_not_corrupt_the_callers_string() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun grow_str_outside(s: Str) -> Str {\n    \
+                   var t = s\n    t = t + \"!\"\n    t\n}\n\
+                   fun main() uses io {\n    \
+                   var a = \"ab\"\n    a = a + \"c\"\n    \
+                   var snapshot = grow_str_outside(a)\n    a = a + \"d\"\n    \
+                   print(\"{a}|{snapshot}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_str_param_alias");
+        assert_eq!(out.trim(), "abcd|abc!", "native must not corrupt the caller's `a` via grow_str_outside's internal self-append");
     }
 
     /// `ai fun` compiles and RUNS on native, agreeing byte-for-byte with the

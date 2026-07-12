@@ -311,6 +311,67 @@ fn enclosing_loop_range(chunk: &Chunk, idx: usize) -> Option<(usize, usize)> {
     result
 }
 
+/// True if `reg` is a genuine chunk-local register — not a capture or
+/// parameter, which the CALLER of this chunk could hold an independent
+/// reference to (captures occupy `[0, ncaps)`, params `[ncaps,
+/// ncaps+nparams)`, per compile.rs's FnCompiler register allocation order).
+///
+/// This alone is NOT sufficient to prove a self-rebind register is safe to
+/// mutate in place — see [`reg_traces_to_a_parameter`], which additionally
+/// accounts for a register whose CURRENT VALUE was copied (via `Move`) from
+/// a parameter/capture even though the register's own NUMBER is chunk-local.
+pub fn is_chunk_local_reg(chunk: &Chunk, reg: Reg) -> bool {
+    (reg as u16) >= chunk.ncaps as u16 + chunk.nparams as u16
+}
+
+/// True if the value in register `reg`, as observed at `op_idx`, could have
+/// originated — directly, or through a chain of `Move`s — from a capture or
+/// parameter register.
+///
+/// This closes a real gap `is_chunk_local_reg` alone misses: the common
+/// `fun f(xs: List[Int]) { var ys = xs; ys = ys.push(item) }` shape compiles
+/// `var ys = xs` to `Move(ys_reg, xs_reg)` — `ys_reg` gets a FRESH,
+/// chunk-local register number (so `is_chunk_local_reg` alone says "safe"),
+/// but its value is a Move'd ALIAS of the parameter `xs`, exactly as unsafe
+/// to mutate in place as `xs` itself: the CALLER's own reference to the list
+/// it passed as `xs` would observe the mutation too.
+///
+/// Recursive: follows every `Move` writing into `reg` within the same
+/// loop-body-or-whole-prefix window [`reg_escapes`] scans (same soundness
+/// argument — see `method_recv_escapes`'s doc comment), and treats ANY path
+/// that reaches a parameter/capture as tainting the whole thing —
+/// conservative, since a register conditionally assigned from either a safe
+/// or unsafe source on different branches must be treated as unsafe on the
+/// union of both. Depth-bounded by `nregs` as a cycle guard (a well-formed
+/// chunk's Move chain can't legitimately need more hops than it has
+/// registers); hitting the bound is conservatively treated as unsafe.
+pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool {
+    fn go(chunk: &Chunk, op_idx: usize, reg: Reg, depth: u16) -> bool {
+        if !is_chunk_local_reg(chunk, reg) {
+            return true;
+        }
+        if depth as usize > chunk.nregs as usize {
+            return true;
+        }
+        let (start, end) = match enclosing_loop_range(chunk, op_idx) {
+            Some((lo, hi)) => (lo, hi + 1),
+            None => (0, op_idx),
+        };
+        for (i, op) in chunk.code.iter().enumerate().take(end).skip(start) {
+            if i == op_idx {
+                continue;
+            }
+            if let Op::Move(dst, src) = op {
+                if *dst == reg && go(chunk, op_idx, *src, depth + 1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    go(chunk, op_idx, reg, 0)
+}
+
 /// True if the value in register `recv` at the self-rebind `Op::Method` site
 /// `chunk.code[method_idx]` (`dst == recv`, i.e. `xs = xs.push(item)`-shaped
 /// code) could be aliased by another live reference, making an in-place
@@ -386,11 +447,15 @@ mod escape_tests {
     use super::*;
 
     fn chunk(code: Vec<Op>) -> Chunk {
+        chunk_with_params(0, code)
+    }
+
+    fn chunk_with_params(nparams: u8, code: Vec<Op>) -> Chunk {
         let spans = vec![Span::default(); code.len()];
         Chunk {
             name: "test".into(),
             ncaps: 0,
-            nparams: 0,
+            nparams,
             nregs: 8,
             consts: vec![],
             code,
@@ -607,5 +672,53 @@ mod escape_tests {
     fn non_add_op_at_the_index_is_conservatively_treated_as_escaping() {
         let c = chunk(vec![Op::Move(0, 1)]);
         assert!(add_lhs_escapes(&c, 0));
+    }
+
+    #[test]
+    fn a_parameter_register_itself_traces_to_a_parameter() {
+        // register 0 is the sole parameter (nparams=1): using it directly
+        // (no Move at all) must already be unsafe.
+        let c = chunk_with_params(1, vec![self_push(0)]);
+        assert!(reg_traces_to_a_parameter(&c, 0, 0));
+    }
+
+    #[test]
+    fn a_chunk_local_alias_of_a_parameter_traces_to_it_through_one_move() {
+        // fun f(xs: List[Int]) { var ys = xs; ys = ys.push(item) }
+        // ys (register 1) is chunk-local by NUMBER (nparams=1, so only
+        // register 0 is a parameter), but its value is a Move'd alias of
+        // the parameter xs (register 0) -- this is the real bug PR-it614's
+        // stress test found: is_chunk_local_reg alone said "safe" here,
+        // wrongly, because it never looked at ys's value's PROVENANCE.
+        let c = chunk_with_params(1, vec![Op::Move(1, 0), self_push(1)]);
+        assert!(reg_traces_to_a_parameter(&c, 1, 1));
+    }
+
+    #[test]
+    fn a_two_hop_move_chain_from_a_parameter_is_still_caught() {
+        // var tmp = xs; var ys = tmp; ys = ys.push(item) -- tmp and ys are
+        // BOTH chunk-local by register number, but the value still
+        // originates from the parameter two hops back.
+        let c = chunk_with_params(1, vec![Op::Move(1, 0), Op::Move(2, 1), self_push(2)]);
+        assert!(reg_traces_to_a_parameter(&c, 2, 2));
+    }
+
+    #[test]
+    fn a_fresh_chunk_local_value_moved_into_its_bound_register_does_not_trace_to_a_parameter() {
+        // var xs: List[Int] = [] -- compiles to MakeList into a temp
+        // register, then Move into xs's own bound register. This is the
+        // ORIGINAL, most common self-rebind shape (it609) and must NOT be
+        // disqualified by this check: register 1 (the temp) was never
+        // itself Move'd from anywhere, so the chain terminates safely.
+        let c = chunk_with_params(0, vec![Op::MakeList { dst: 1, start: 1, len: 0 }, Op::Move(0, 1), self_push(0)]);
+        assert!(!reg_traces_to_a_parameter(&c, 2, 0));
+    }
+
+    #[test]
+    fn a_capture_register_traces_to_a_parameter_the_same_way_a_param_does() {
+        // ncaps=1: register 0 is a closure capture, not chunk-local either.
+        let mut c = chunk(vec![Op::Move(1, 0), self_push(1)]);
+        c.ncaps = 1;
+        assert!(reg_traces_to_a_parameter(&c, 1, 1));
     }
 }
