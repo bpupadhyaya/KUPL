@@ -3687,7 +3687,11 @@ pub fn time_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            Value::Int(tm::make(n(0), n(1), n(2), n(3), n(4), n(5)))
+            // `date_make` is declared `(Int, Int, Int, Int, Int, Int) -> Int` (no
+            // `Result` in its own type signature — check.rs), so an unrepresentable
+            // component (PR-it635) surfaces as a panic here, the same way
+            // `json_stringify`'s non-finite-number rejection does (PR-it634).
+            return tm::make(n(0), n(1), n(2), n(3), n(4), n(5)).map(Value::Int);
         }
         _ => return Err(format!("unknown time builtin `{name}`")),
     })

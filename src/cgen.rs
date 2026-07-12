@@ -3721,7 +3721,11 @@ static KValue k_hour_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); 
 static KValue k_minute_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int((s % 3600) / 60); }
 static KValue k_second_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int(s % 60); }
 static KValue k_weekday_of(KValue tv) { int64_t dy, s; k_tsplit(tv.as.i, &dy, &s); return k_int(k_floor_mod(dy + 4, 7)); }
-/* inverse of k_civil: days-since-epoch from a civil (y, m, d) */
+/* inverse of k_civil: days-since-epoch from a civil (y, m, d). UNCHECKED
+   int64_t arithmetic -- safe ONLY when `y` is itself already bounded (e.g.
+   derived from k_civil of a real epoch_secs, as k_yearday_of below does).
+   A caller receiving y/m/d directly from UNTRUSTED input (k_date_make/
+   k_parse_iso) must use k_days_from_civil_checked instead (PR-it635). */
 static int64_t k_days_from_civil(int64_t y, int64_t m, int64_t d) {
     y = m <= 2 ? y - 1 : y;
     int64_t era = k_floor_div(y >= 0 ? y : y - 399, 400);
@@ -3730,11 +3734,58 @@ static int64_t k_days_from_civil(int64_t y, int64_t m, int64_t d) {
     int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     return era * 146097 + doe - 719468;
 }
+static __int128 k_floor_div_128(__int128 a, __int128 b) {
+    __int128 q = a / b;
+    if ((a % b != 0) && ((a % b < 0) != (b < 0))) q -= 1;
+    return q;
+}
+/* k_days_from_civil, but widened to __int128 THROUGHOUT -- a REAL bug found+
+   fixed (production-hardening PR-it635): y/m are directly, arbitrarily user-
+   controlled via date_make/parse_iso (unlike k_civil's `z`, always derived
+   from an already-int64-bounded epoch_secs), so an extreme value drove
+   `153 * (m - 3)`-style terms past int64_t's range -- signed integer overflow,
+   UNDEFINED BEHAVIOR in C (confirmed live: silently produced a WRONG
+   timestamp with plain optimized codegen, matching interp.rs's release-mode
+   silent-wraparound twin of this same bug). Every intermediate term here is
+   bounded by a small constant multiple of an int64_t-range value, so
+   __int128 (unlike int64_t) has enough headroom that NO possible y/m/d input
+   can overflow it -- returns 0 (leaving *out unset) only if the FINAL day
+   count doesn't fit back into int64_t. */
+static int k_days_from_civil_checked(int64_t y, int64_t m, int64_t d, int64_t* out) {
+    __int128 yy = (m <= 2) ? (__int128)y - 1 : (__int128)y;
+    __int128 era = k_floor_div_128(yy >= 0 ? yy : yy - 399, 400);
+    __int128 yoe = yy - era * 400;
+    __int128 doy = (153 * ((m > 2) ? (__int128)m - 3 : (__int128)m + 9) + 2) / 5 + (__int128)d - 1;
+    __int128 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    __int128 days = era * 146097 + doe - 719468;
+    if (days > (__int128)INT64_MAX || days < (__int128)INT64_MIN) return 0;
+    *out = (int64_t)days;
+    return 1;
+}
 static int64_t k_make(int64_t y, int64_t m, int64_t d, int64_t hh, int64_t mm, int64_t ss) {
     return k_days_from_civil(y, m, d) * 86400 + hh * 3600 + mm * 60 + ss;
 }
+/* Checked twin of k_make (PR-it635): __int128 throughout, returns 0 (leaving
+   *out unset) on overflow of EITHER the day count or the final second count
+   -- mirrors time.rs::make exactly. */
+static int k_make_checked(int64_t y, int64_t m, int64_t d, int64_t hh, int64_t mm, int64_t ss, int64_t* out) {
+    int64_t days;
+    if (!k_days_from_civil_checked(y, m, d, &days)) return 0;
+    __int128 total = (__int128)days * 86400 + (__int128)hh * 3600 + (__int128)mm * 60 + (__int128)ss;
+    if (total > (__int128)INT64_MAX || total < (__int128)INT64_MIN) return 0;
+    *out = (int64_t)total;
+    return 1;
+}
 static KValue k_date_make(KValue y, KValue m, KValue d, KValue hh, KValue mm, KValue ss) {
-    return k_int(k_make(y.as.i, m.as.i, d.as.i, hh.as.i, mm.as.i, ss.as.i));
+    /* date_make is declared (Int,Int,Int,Int,Int,Int) -> Int (no Result), so
+       an unrepresentable component panics -- same message text as
+       interp.rs's Err-turned-panic, so this is indistinguishable across
+       engines (PR-it635, following PR-it634's same cross-engine-wording
+       discipline). */
+    int64_t out;
+    if (!k_make_checked(y.as.i, m.as.i, d.as.i, hh.as.i, mm.as.i, ss.as.i, &out))
+        k_panic("date component out of representable range");
+    return k_int(out);
 }
 static KValue k_yearday_of(KValue tv) {
     int64_t dy, s, y, m, d; k_tsplit(tv.as.i, &dy, &s); k_civil(dy, &y, &m, &d);
@@ -3820,7 +3871,15 @@ static KValue k_parse_iso(KValue sv) {
         ss = k_strtol_checked(sstr, &end, &ok);  if (!ok || *end || sstr[0] == 0) return k_err(k_str(errbuf));
         if (hh < 0 || hh > 23 || mi < 0 || mi > 59 || ss < 0 || ss > 60) return k_err(k_str(errbuf));
     }
-    return k_ok(k_int(k_make(y, mo, d, hh, mi, ss)));
+    /* A syntactically fine but astronomically large year parses to a valid
+       long `y` above, but k_make can still fail to represent the resulting
+       timestamp (PR-it635) -- collapses into the SAME errbuf every other
+       validation failure here already returns, matching time.rs::parse_iso. */
+    {
+        int64_t out;
+        if (!k_make_checked(y, mo, d, hh, mi, ss, &out)) return k_err(k_str(errbuf));
+        return k_ok(k_int(out));
+    }
 }
 static KValue k_now(void) { return k_int((int64_t)time(0)); }
 /* read one line from stdin (newline stripped); None at EOF */
@@ -8050,7 +8109,9 @@ fun main() uses io {
                    fun chain(n: Int) -> Result[Int, Str] { let a = half(n)?\n    Ok(a) }\n\
                    fun main() uses io {\n    let s: Option[Int] = Some(2)\n    let n: Option[Int] = None\n    \
                    print(\"{s.map(fn x { x + 1 })}|{n.unwrap_or(0)}|{s.ok_or(\"e\")}|{chain(8)}|{chain(3)}|{Some(Some(7))}\")\n}\n";
-        assert_eq!(native_main_stdout(src, "optres").trim(), "Some(3)|0|Ok(2)|Ok(4)|Err(\"odd\")|Some(Some(7))");
+        // Renamed from the colliding "optres" tag (production-hardening
+        // PR-it635 — see native_datetime's comment for the full explanation).
+        assert_eq!(native_main_stdout(src, "optrestry").trim(), "Some(3)|0|Ok(2)|Ok(4)|Err(\"odd\")|Some(Some(7))");
     }
 
     /// Native `?` on Option (Some unwraps, None short-circuits the enclosing
@@ -8709,8 +8770,10 @@ fun main() uses io {
                    let m = Map().insert(\"b\", 1).insert(\"a\", 2).insert(\"c\", 3)\n    \
                    print(m.keys())\n    print(m.remove(\"a\").keys())\n    \
                    print(Set([5, 1, 3, 9, 2, 7, 1, 5]).to_list())\n}\n";
+        // Renamed from the colliding "mapord" tag (production-hardening
+        // PR-it635 — see native_datetime's comment for the full explanation).
         assert_eq!(
-            native_main_stdout(src, "mapord").trim(),
+            native_main_stdout(src, "mapsetord").trim(),
             "[\"b\", \"a\", \"c\"]\n[\"b\", \"c\"]\n[5, 1, 3, 9, 2, 7]"
         );
     }
@@ -9552,8 +9615,11 @@ fun main() uses io {
                    match list_dir(d) {\n        Ok(n) => print(\"{n}\")\n        Err(_) => print(\"err\")\n    }\n    \
                    let _ = remove_dir(d)\n}\n";
         if cc_available() {
+            // Renamed from the colliding "paths" tag (production-hardening
+            // PR-it635 — see native_datetime's comment for the full
+            // explanation of this class of test-infrastructure flake).
             assert_eq!(
-                native_main_stdout(src, "paths"),
+                native_main_stdout(src, "pathsfileio"),
                 "a/b/c.txt c.txt a/b .txt\n[\"a.txt\", \"b.txt\"]\n"
             );
         }
@@ -10350,6 +10416,29 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         );
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it635) -- the SAME class
+    /// of bug as `native_json_stringify_non_finite_panic_matches_interp_wording`
+    /// just above, in a completely different module: `date_make` with an
+    /// extreme component (e.g. `i64::MAX` as the year) used to drive
+    /// `k_days_from_civil`'s raw int64_t arithmetic into signed overflow --
+    /// undefined behavior in C, silently producing a WRONG timestamp with
+    /// ordinary optimized codegen, rather than a clean panic. Fixed with
+    /// `k_days_from_civil_checked`/`k_make_checked` (`__int128` throughout,
+    /// mirroring `time.rs::days_from_civil_checked`), panicking with the SAME
+    /// message text `time::make`'s `Err` becomes once the interpreter turns it
+    /// into a panic.
+    #[test]
+    fn native_date_make_extreme_component_panic_matches_interp_wording() {
+        assert_panic_wording_matches(
+            "fun main() uses io { print(date_make(9223372036854775807, 1, 1, 0, 0, 0)) }\n",
+            "datemakeyear",
+        );
+        assert_panic_wording_matches(
+            "fun main() uses io { print(date_make(2024, 9223372036854775807, 1, 0, 0, 0)) }\n",
+            "datemakemonth",
+        );
+    }
+
     /// A REAL cross-engine bug (PR-it599, found by sweeping cgen.rs's LARGE per-method
     /// builtin dispatch chain for the SAME "does every sibling type handle this
     /// consistently" pattern that found it596's Rational-`%` bug): interp.rs's
@@ -10388,7 +10477,9 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
                    if let Some(n) = step(0) { print(n) } else { print(-1) }\n    \
                    var i = 3\n    while let Some(v) = step(i) {\n        print(v)\n        i = i - 1\n    }\n}\n";
         if cc_available() {
-            assert_eq!(native_main_stdout(src, "iflet"), "7\n-1\n3\n2\n1\n");
+            // Renamed from the colliding "iflet" tag (production-hardening
+            // PR-it635 — see native_datetime's comment for the full explanation).
+            assert_eq!(native_main_stdout(src, "ifwhilelet"), "7\n-1\n3\n2\n1\n");
         }
     }
 
@@ -10461,8 +10552,20 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
                    print(\"{year_of(e)} {weekday_of(e)} {yearday_of(e)}\")\n    \
                    match parse_iso(date_iso(e)) {\n        Ok(t) => print(\"{t}\")\n        Err(m) => print(m)\n    }\n}\n";
         if cc_available() {
+            // A REAL test-infrastructure bug found+fixed (production-hardening
+            // PR-it635, discovered while verifying an UNRELATED fix in this same
+            // file): this test's tag used to be the literal string "datetime",
+            // IDENTICAL to `native_date_time_arithmetic_and_components`'s tag --
+            // `native_main_stdout`'s temp path is `{tag}-{process::id()}`, and
+            // `cargo test` runs both in parallel on the SAME process, so the two
+            // tests raced on the SAME `.c`/`.out` files, occasionally running
+            // one test's compiled binary under the OTHER test's assertion.
+            // Renamed to a unique tag; a full grep for every OTHER
+            // `native_main_stdout`/`native_main_stdout_env` tag in this file
+            // found FOUR more genuine duplicates ("paths", "optres", "mapord",
+            // "iflet") — all fixed the same way in this same commit.
             assert_eq!(
-                native_main_stdout(src, "datetime"),
+                native_main_stdout(src, "datetimeroundtrip"),
                 "2001-09-09T01:46:40Z\n2001 0 252\n1000000000\n"
             );
         }

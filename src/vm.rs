@@ -15548,6 +15548,36 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
         );
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it635) — the REVERSE
+    /// direction of PR-it576's `diff_date_iso_near_i64_extremes_does_not_ice`
+    /// above: that fix guarded `civil_from_days`'s `z` (always derived from an
+    /// already-i64-bounded epoch_secs); this one guards `days_from_civil`'s
+    /// `y`/`m`/`d`, which `date_make` receives DIRECTLY from arbitrary caller
+    /// input with no natural bound at all. `date_make(i64::MAX, ...)` used to
+    /// overflow raw i64 arithmetic — a debug-build Rust panic (crashing the
+    /// whole process with a bogus "internal compiler error", confirmed live)
+    /// or a release-build silent wraparound to a meaningless timestamp — for
+    /// entirely ordinary, type-correct KUPL code, not a checker-preventable
+    /// case. Now a clean KUPL-level panic (`differential()`'s own
+    /// `"panic: {msg}"` convention), byte-identical on interp/KVM.
+    #[test]
+    fn diff_date_make_extreme_components_does_not_ice() {
+        assert_eq!(
+            differential("fun probe() -> Str { \"{date_make(9223372036854775807, 1, 1, 0, 0, 0)}\" }\n"),
+            "panic: date component out of representable range"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{date_make(2024, 9223372036854775807, 1, 0, 0, 0)}\" }\n"),
+            "panic: date component out of representable range"
+        );
+        // an ordinary, moderate "rollover" out-of-range value is UNAFFECTED --
+        // month 13 still normalizes into the next year, exactly as documented.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{date_make(2024, 13, 1, 0, 0, 0) == date_make(2025, 1, 1, 0, 0, 0)}\" }\n"),
+            "true"
+        );
+    }
+
     #[test]
     fn diff_transcendental_math() {
         // sqrt/cbrt/hypot are correctly-rounded (IEEE); sin/cos/tan/exp/log/pow share the

@@ -7,6 +7,12 @@
 //! which is correct for the full i64 range including negative (pre-1970)
 //! timestamps. Because it is pure integer math, `cgen.rs` mirrors it exactly,
 //! so `format_time` and the extractors are byte-identical on every engine.
+//!
+//! `make`/`date_make`/`parse_iso` accept civil components (year, month, day, …)
+//! directly from arbitrary caller input, unlike the day↔civil conversion the
+//! other direction uses (always fed a `days` count already bounded by a real
+//! i64 epoch_secs) — so `make` validates that its result actually fits in i64
+//! and returns `Err` rather than overflowing (PR-it635).
 
 /// Floor-divide (round toward negative infinity), so pre-1970 timestamps split
 /// into days/seconds correctly.
@@ -46,6 +52,12 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 /// Count of days since 1970-01-01 for a civil (year, month 1..=12, day 1..=31).
 /// The inverse of `civil_from_days` — Howard Hinnant's well-known algorithm.
+/// UNCHECKED i64 arithmetic — safe ONLY when `y` is itself already bounded
+/// (e.g. derived from `civil_from_days` of a real epoch_secs, as `yearday_of`
+/// below does; such a `y` can never approach the overflow threshold below).
+/// A caller that receives `y`/`m`/`d` directly from arbitrary, UNTRUSTED input
+/// (a user-supplied `date_make`/`parse_iso` argument, unbounded by
+/// construction) must use `days_from_civil_checked` instead.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = floor_div(if y >= 0 { y } else { y - 399 }, 400);
@@ -55,11 +67,50 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+fn floor_div_128(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if (a % b != 0) && ((a % b < 0) != (b < 0)) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// `days_from_civil`, but widened to i128 THROUGHOUT (not just at the one risky
+/// step, unlike `floor_mod` above) — a REAL bug found+fixed (production-
+/// hardening PR-it635): `days_from_civil`'s `y`/`m` are directly, arbitrarily
+/// user-controlled via `date_make`/`parse_iso` (unlike `civil_from_days`'s `z`,
+/// always derived from an already-i64-bounded epoch_secs), so an extreme value
+/// (e.g. `date_make(9223372036854775807, ...)`, or `parse_iso` on a
+/// syntactically-fine-but-astronomically-large year like
+/// "99999999999999-01-01") drove `153 * (m - 3)`-style terms past i64's range
+/// — a raw Rust arithmetic overflow, which PANICS (crashing the whole process
+/// with an "internal compiler error", confirmed live) in a debug build, or
+/// silently wraps to a meaningless, WRONG timestamp in a release build.
+/// Because every intermediate term here is bounded by a small constant
+/// multiple of an i64-range value, i128 (unlike i64) has enough headroom that
+/// NO possible y/m/d input can overflow it — `None` only if the FINAL day
+/// count itself doesn't fit back into i64.
+fn days_from_civil_checked(y: i64, m: i64, d: i64) -> Option<i64> {
+    let (y, m, d) = (y as i128, m as i128, d as i128);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = floor_div_128(if y >= 0 { y } else { y - 399 }, 400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::try_from(era * 146_097 + doe - 719_468).ok()
+}
+
 /// Compose a UTC timestamp from civil components (seconds since 1970-01-01).
 /// Components are not range-checked; out-of-range values normalize (e.g. a
-/// `month` of 13 rolls into the next year), matching civil arithmetic.
-pub fn make(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
-    days_from_civil(y, m, d) * 86_400 + hh * 3600 + mm * 60 + ss
+/// `month` of 13 rolls into the next year), matching civil arithmetic — but
+/// `Err` (never a panic/overflow) if the components are so extreme the result
+/// genuinely cannot be represented as an i64 second count (PR-it635).
+pub fn make(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> Result<i64, String> {
+    let overflow = || "date component out of representable range".to_string();
+    let days = days_from_civil_checked(y, m, d).ok_or_else(overflow)?;
+    let total = (days as i128) * 86_400 + (hh as i128) * 3600 + (mm as i128) * 60 + (ss as i128);
+    i64::try_from(total).map_err(|_| overflow())
 }
 
 /// Day of the year, 1 = Jan 1 … 365/366 = Dec 31.
@@ -137,7 +188,12 @@ pub fn parse_iso(s: &str) -> Result<i64, String> {
             return Err(bad());
         }
     }
-    Ok(make(y, mo, d, hh, mi, ss))
+    // A syntactically fine but astronomically large year (e.g. "99999999999999")
+    // parses to a valid i64 `y`, but `make` can still fail to represent the
+    // resulting timestamp (PR-it635) -- collapsed into the SAME "invalid
+    // ISO-8601 timestamp" wording as every other validation failure here,
+    // rather than leaking `make`'s own internal message.
+    make(y, mo, d, hh, mi, ss).map_err(|_| bad())
 }
 
 /// Split a timestamp into (days-since-epoch, second-of-day 0..86399).
@@ -240,9 +296,9 @@ mod tests {
 
     #[test]
     fn make_and_roundtrip() {
-        assert_eq!(make(1970, 1, 1, 0, 0, 0), 0);
-        assert_eq!(make(2001, 9, 9, 1, 46, 40), 1_000_000_000);
-        assert_eq!(make(2000, 2, 29, 0, 0, 0), 951_782_400);
+        assert_eq!(make(1970, 1, 1, 0, 0, 0), Ok(0));
+        assert_eq!(make(2001, 9, 9, 1, 46, 40), Ok(1_000_000_000));
+        assert_eq!(make(2000, 2, 29, 0, 0, 0), Ok(951_782_400));
         // round-trip a spread of timestamps through iso <-> parse_iso
         for &t in &[0i64, 1_000_000_000, 1_783_123_200, 951_782_400, -1, -62_135_596_800] {
             assert_eq!(parse_iso(&iso(t)), Ok(t), "roundtrip {t}");
@@ -268,9 +324,46 @@ mod tests {
     #[test]
     fn yeardays() {
         assert_eq!(yearday_of(0), 1); // Jan 1
-        assert_eq!(yearday_of(make(2000, 12, 31, 0, 0, 0)), 366); // leap year
-        assert_eq!(yearday_of(make(2001, 12, 31, 0, 0, 0)), 365);
-        assert_eq!(yearday_of(make(2023, 3, 1, 0, 0, 0)), 60); // 31+28+1
+        assert_eq!(yearday_of(make(2000, 12, 31, 0, 0, 0).unwrap()), 366); // leap year
+        assert_eq!(yearday_of(make(2001, 12, 31, 0, 0, 0).unwrap()), 365);
+        assert_eq!(yearday_of(make(2023, 3, 1, 0, 0, 0).unwrap()), 60); // 31+28+1
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it635): `date_make`
+    /// with an extreme component (e.g. `i64::MAX` as the year OR the month)
+    /// used to overflow `days_from_civil`'s raw i64 arithmetic -- a Rust-level
+    /// panic (crashing the WHOLE process with an "internal compiler error" in
+    /// a debug build, confirmed live) rather than a clean `Err`. `make` itself
+    /// has no natural upper bound on inputs the way an epoch-derived civil
+    /// date does, so this is reachable through entirely ordinary, type-correct
+    /// KUPL code (`date_make(9223372036854775807, ...)`), not just internal
+    /// misuse. Now a clean `Err`, never a crash -- and an ordinary "reasonable
+    /// rollover" (month 13) still normalizes exactly as before, unaffected.
+    #[test]
+    fn make_rejects_components_too_extreme_to_represent_instead_of_overflowing() {
+        assert!(make(i64::MAX, 1, 1, 0, 0, 0).is_err());
+        assert!(make(i64::MIN, 1, 1, 0, 0, 0).is_err());
+        assert!(make(2024, i64::MAX, 1, 0, 0, 0).is_err());
+        assert!(make(2024, 1, i64::MAX, 0, 0, 0).is_err());
+        assert!(make(2024, 1, 1, i64::MAX, 0, 0).is_err());
+        // an ordinary, moderate "rollover" out-of-range value is UNAFFECTED --
+        // month 13 still normalizes into the next year, exactly as documented.
+        assert_eq!(make(2024, 13, 1, 0, 0, 0), make(2025, 1, 1, 0, 0, 0));
+    }
+
+    /// The SAME overflow, reached via `parse_iso` on a year string that's
+    /// perfectly valid i64-parseable text (so it's NOT rejected by the
+    /// existing `i64::parse()`-failure path -- that's a DIFFERENT, already-
+    /// fixed gap, PR-it560's `strtol` clamping fix, for years with too many
+    /// DIGITS to even parse) but still astronomically too large for the
+    /// resulting timestamp to fit in i64. Collapses into the SAME "invalid
+    /// ISO-8601 timestamp" error every other malformed input already gets,
+    /// not a distinct internal message.
+    #[test]
+    fn parse_iso_rejects_a_syntactically_valid_but_unrepresentable_year() {
+        let err = parse_iso("99999999999999-01-01").unwrap_err();
+        assert!(err.contains("invalid ISO-8601 timestamp"), "{err}");
+        assert!(err.contains("99999999999999"), "{err}");
     }
 
     #[test]
