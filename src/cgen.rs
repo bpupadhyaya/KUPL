@@ -947,6 +947,30 @@ static long k_token_end(const unsigned char* s, long len, long pos) {
     }
     return pos;
 }
+/* Compute the Unicode-whitespace-trimmed [*start, *end) byte range of the
+   NUL-terminated `s` -- matches Rust's `s.trim()` exactly (the shared
+   trim-both-ends primitive behind k_big_from_str/Str.trim/k_ai_strip's
+   identical bug shape, it662-it665; extracted here since a 4th copy-pasted
+   inline version would be one too many). */
+static void k_utf8_trim_range(const char* s, long* start, long* end) {
+    long slen = (long)strlen(s);
+    long a = 0;
+    while (a < slen) {
+        int clen;
+        long cp = kre_utf8_cp((const unsigned char*)s, (int)slen, (int)a, &clen);
+        if (!k_is_unicode_ws((uint32_t)cp)) break;
+        a += clen;
+    }
+    long z = slen;
+    while (z > a) {
+        long cstart = k_utf8_prev_start((const unsigned char*)s, z);
+        int clen;
+        long cp = kre_utf8_cp((const unsigned char*)s, (int)slen, (int)cstart, &clen);
+        if (!k_is_unicode_ws((uint32_t)cp)) break;
+        z = cstart;
+    }
+    *start = a; *end = z;
+}
 static KBig* k_big_from_str(const char* s) {
     /* mirror bigint.rs's from_str, which trims BOTH ends (s.trim(), ALL
        Unicode whitespace -- see k_is_unicode_ws above) before checking the
@@ -3007,34 +3031,43 @@ static KValue k_ai_from_json(const KAiShape* s, KValue j) {
     k_ai_ok = 0; return k_unit();
 }
 
-/* strip a leading ```json fence (mirrors ai.rs::strip_fences); returns a copy */
+/* strip a leading ```json fence (mirrors ai.rs::strip_fences); returns a copy.
+   A REAL cross-engine DIVERGENCE found+fixed (production-hardening PR-it665,
+   the SAME bug class as it662-664): ai.rs's `strip_fences`/`convert` trim
+   with Rust's Unicode-aware `s.trim()` on both the raw model-response text
+   AND (for a `-> Str` ai fun) the final converted value -- this used to
+   trim ASCII whitespace only, so a mock/model response padded with a
+   non-ASCII whitespace character (NBSP, etc.) parsed correctly on interp/vm
+   but left the padding in place on native alone; confirmed live via
+   `KUPL_AI_MOCK="\u{A0}hi\u{A0}"` on an `ai fun () -> Str`. Now uses the
+   shared `k_utf8_trim_range` (see above) at every trim point, matching
+   `strip_fences` exactly -- the ASCII-only `\r`/`\n` fence-newline strip
+   right after `json` is UNCHANGED (mirrors `trim_start_matches(['\r','\n'])`
+   exactly, which really is ASCII-only in ai.rs too, not a gap). */
 static const char* k_ai_strip(const char* text) {
-    const char* t = text;
-    while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
-    long n = (long)strlen(t);
-    while (n > 0 && (t[n-1] == ' ' || t[n-1] == '\t' || t[n-1] == '\n' || t[n-1] == '\r')) n--;
-    char* s = (char*)k_alloc(n + 1); memcpy(s, t, n); s[n] = 0;
+    long a, z;
+    k_utf8_trim_range(text, &a, &z);
+    long n = z - a;
+    char* s = (char*)k_alloc(n + 1); memcpy(s, text + a, n); s[n] = 0;
     if (strncmp(s, "```", 3) != 0) return s;
     char* p = s + 3;
     if (strncmp(p, "json", 4) == 0) p += 4;
     while (*p == '\r' || *p == '\n') p++;
     long pn = (long)strlen(p);
     if (pn >= 3 && strcmp(p + pn - 3, "```") == 0) p[pn - 3] = 0;
-    /* trim */
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    pn = (long)strlen(p);
-    while (pn > 0 && (p[pn-1] == ' ' || p[pn-1] == '\t' || p[pn-1] == '\n' || p[pn-1] == '\r')) p[--pn] = 0;
-    return p;
+    long pa, pz;
+    k_utf8_trim_range(p, &pa, &pz);
+    p[pz] = 0;
+    return p + pa;
 }
 
 static KValue k_ai_convert(const KAiShape* shape, const char* text) {
     k_ai_ok = 1;
     if (shape->kind == 0) {   /* -> Str: return the trimmed text */
-        const char* t = text;
-        while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
-        long n = (long)strlen(t);
-        while (n > 0 && (t[n-1] == ' ' || t[n-1] == '\t' || t[n-1] == '\n' || t[n-1] == '\r')) n--;
-        char* c = (char*)k_alloc(n + 1); memcpy(c, t, n); c[n] = 0; return k_str(c);
+        long a, z;
+        k_utf8_trim_range(text, &a, &z);
+        long n = z - a;
+        char* c = (char*)k_alloc(n + 1); memcpy(c, text + a, n); c[n] = 0; return k_str(c);
     }
     const char* payload = k_ai_strip(text);
     KValue parsed = k_json_parse(k_str(payload));
@@ -11302,6 +11335,70 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
             String::from_utf8_lossy(&out.stdout),
             "cherry blossoms\npositive 0.9\n[\"alpha\", \"beta\"]\n"
         );
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
+    /// PR-it665, the SAME bug class as it662-664): `ai.rs::convert`'s
+    /// `-> Str` shortcut trims with Rust's Unicode-aware `s.trim()`, but
+    /// `k_ai_convert`'s C mirror used to trim ASCII whitespace only -- so a
+    /// mock/model response padded with a non-ASCII whitespace character
+    /// (NBSP here) left the padding in place on native alone; confirmed
+    /// live via `KUPL_AI_MOCK="\u{A0}hi\u{A0}"` on a `-> Str` ai fun BEFORE
+    /// fixing (native printed `"[\u{A0}hi\u{A0}]"` instead of `"[hi]"`).
+    #[test]
+    fn native_ai_convert_str_shape_trims_unicode_whitespace() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun greet() -> Str { intent \"x\" }\n\
+                   fun main() uses io {\n    print(\"[{greet()}]\")\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("ai funs compile to C via the mock path");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aitrim-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK", "\u{A0}hi\u{A0}")
+            .output()
+            .expect("runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "[hi]\n");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// The SAME divergence as `native_ai_convert_str_shape_trims_unicode_
+    /// whitespace` above, but for `k_ai_strip`'s (`ai.rs::strip_fences`'s
+    /// mirror) INDEPENDENT fix -- exercised only by a NON-`Str` shape, since
+    /// `convert`'s `-> Str` shortcut bypasses `strip_fences` entirely and
+    /// never reaches this code path. Pads BOTH the outer response text and
+    /// the payload inside the fence with NBSP.
+    #[test]
+    fn native_ai_strip_fences_trims_unicode_whitespace() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun classify() -> Int { intent \"x\" }\n\
+                   fun main() uses io {\n    print(classify())\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("ai funs compile to C via the mock path");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aistripfence-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK", "\u{A0}```json\n{\"value\": 42}\n```\u{A0}")
+            .output()
+            .expect("runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
         let _ = std::fs::remove_file(&cp);
         let _ = std::fs::remove_file(&bin);
     }
