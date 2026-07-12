@@ -389,9 +389,7 @@ type Json = JNull | JBool(b: Bool) | JNum(n: Float) | JStr(s: Str)
   so `json_stringify(json_parse(s))` is stable.
 - Numbers parse to `JNum(Float)`. Objects are `JObj(Map[Str, Json])` (insertion
   order kept, last key wins).
-- Runs on the interpreter, KVM, `.kx`, and bundles. The **native** backend
-  (`kupl native`) does not yet support the JSON builtins and reports a clear
-  error — use `kupl run`/`--vm`/`bundle` for JSON programs.
+- Runs on every engine, including `kupl native` — byte-identical output.
 
 ### Tensor
 
