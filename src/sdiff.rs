@@ -38,8 +38,9 @@ pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
         println!("{line}");
     };
 
-    for (name, old) in &old_items {
-        match new_items.get(name) {
+    for (key, old) in &old_items {
+        let name = &key.1;
+        match new_items.get(key) {
             None => {
                 changes += 1;
                 report(format!("removed    {} {name}", kind(old)));
@@ -59,10 +60,10 @@ pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
             }
         }
     }
-    for (name, new) in &new_items {
-        if !old_items.contains_key(name) {
+    for (key, new) in &new_items {
+        if !old_items.contains_key(key) {
             changes += 1;
-            report(format!("added      {} {name}", kind(new)));
+            report(format!("added      {} {}", kind(new), key.1));
         }
     }
 
@@ -75,7 +76,7 @@ pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
     }
 }
 
-fn load_items(path: &str) -> (BTreeMap<String, Item>, bool) {
+fn load_items(path: &str) -> (BTreeMap<(&'static str, String), Item>, bool) {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -91,11 +92,29 @@ fn load_items(path: &str) -> (BTreeMap<String, Item>, bool) {
         eprintln!("error: {path} does not parse; fix it before diffing");
         return (BTreeMap::new(), false);
     }
+    (items_by_kind_and_name(program.items), true)
+}
+
+/// Key a program's items by `(kind, name)`, NOT bare name alone -- a REAL,
+/// silent, CI-gate-defeating bug found+fixed (production-hardening PR-it699):
+/// KUPL allows a `fun` and a `type` (or any two DIFFERENT item kinds) to share
+/// the same name with no diagnostic anywhere (`check.rs`'s `collect` pass
+/// keeps `funs`/`types`/`components`/`contracts` in entirely separate maps,
+/// with no cross-kind duplicate-name check) -- an ordinary, non-adversarial
+/// pattern (e.g. a `Config` type alongside a `Config(...)` smart-constructor
+/// function). Keying this map by bare name alone let the later-loaded item
+/// silently CLOBBER the earlier one, so `semantic_diff` only ever compared
+/// ONE of the two colliding items -- confirmed live before this fix: `kupl
+/// diff` reported `semantically identical` (exit 0) for a file pair where a
+/// colliding type's shape had genuinely changed (a real, breaking interface
+/// change), purely because a same-named function loaded after it in the same
+/// file silently overwrote its map entry.
+fn items_by_kind_and_name(items: Vec<Item>) -> BTreeMap<(&'static str, String), Item> {
     let mut map = BTreeMap::new();
-    for item in program.items {
-        map.insert(item_name(&item).to_string(), item);
+    for item in items {
+        map.insert((kind_tag(&item), item_name(&item).to_string()), item);
     }
-    (map, true)
+    map
 }
 
 fn item_name(item: &Item) -> &str {
@@ -105,6 +124,20 @@ fn item_name(item: &Item) -> &str {
         Item::Component(c) => &c.name,
         Item::Contract(ct) => &ct.name,
         Item::Law(l) => &l.name,
+    }
+}
+
+/// Unpadded kind discriminant, for the `(kind, name)` map key -- distinct
+/// from `kind()` below, whose fixed-width-padded strings are for aligned
+/// DISPLAY output, not key uniqueness (though either would work as a key;
+/// this one exists so the two concerns stay visibly separate).
+fn kind_tag(item: &Item) -> &'static str {
+    match item {
+        Item::Fun(_) => "fun",
+        Item::Type(_) => "type",
+        Item::Component(_) => "component",
+        Item::Contract(_) => "contract",
+        Item::Law(_) => "law",
     }
 }
 
@@ -262,22 +295,21 @@ fn interface_of(item: &Item) -> String {
 #[cfg(test)]
 mod tests {
     fn diff_lines(old: &str, new: &str) -> (Vec<String>, bool) {
-        // in-memory variant of semantic_diff for tests
+        // in-memory variant of semantic_diff for tests -- shares the SAME
+        // `(kind, name)`-keyed map-building as the real path (production-
+        // hardening PR-it699: this used to independently reimplement the
+        // bare-name-keyed map, so it wouldn't have caught the cross-kind
+        // collision bug at all).
         let (pa, da) = crate::parser::parse(old);
         let (pb, db) = crate::parser::parse(new);
         assert!(da.is_empty() && db.is_empty());
-        let items = |p: crate::ast::Program| {
-            let mut m = std::collections::BTreeMap::new();
-            for item in p.items {
-                m.insert(super::item_name(&item).to_string(), item);
-            }
-            m
-        };
-        let (a, b) = (items(pa), items(pb));
+        let a = super::items_by_kind_and_name(pa.items);
+        let b = super::items_by_kind_and_name(pb.items);
         let mut lines = Vec::new();
         let mut changed = false;
-        for (name, old) in &a {
-            match b.get(name) {
+        for (key, old) in &a {
+            let name = &key.1;
+            match b.get(key) {
                 None => {
                     changed = true;
                     lines.push(format!("removed {name}"));
@@ -295,10 +327,10 @@ mod tests {
                 }
             }
         }
-        for name in b.keys() {
-            if !a.contains_key(name) {
+        for key in b.keys() {
+            if !a.contains_key(key) {
                 changed = true;
-                lines.push(format!("added {name}"));
+                lines.push(format!("added {}", key.1));
             }
         }
         (lines, changed)
@@ -311,6 +343,36 @@ mod tests {
             "// a comment\nfun add(a:Int,b:Int)->Int{ a + b }\n",
         );
         assert!(!changed, "{lines:?}");
+    }
+
+    /// A REAL, silent, CI-gate-defeating bug (production-hardening PR-it699): KUPL
+    /// allows a `fun` and a `type` (or any two DIFFERENT item kinds) to share the
+    /// same name with no diagnostic anywhere -- an ordinary pattern, e.g. a `Point`
+    /// type alongside a `Point(...)` smart-constructor function. Keying the diff's
+    /// item map by bare name alone let the later-loaded item silently CLOBBER the
+    /// earlier one, so a real, breaking change to the type's shape was silently
+    /// invisible to `kupl diff` whenever a same-named function also existed --
+    /// confirmed live before this fix: `semantically identical` (exit 0) for a
+    /// file pair where the colliding type's fields had genuinely changed.
+    #[test]
+    fn cross_kind_name_collision_does_not_hide_a_real_change() {
+        let old = "type Point = Rec(x: Int, y: Int)\nfun Point(n: Int) -> Int {\n    n + 1\n}\n";
+        // the TYPE's shape changed (a real, breaking interface change) while the
+        // same-named FUNCTION is untouched.
+        let new = "type Point = Rec(x: Int, y: Int, z: Int)\nfun Point(n: Int) -> Int {\n    n + 1\n}\n";
+        let (lines, changed) = diff_lines(old, new);
+        assert!(changed, "the type's shape genuinely changed: {lines:?}");
+        assert_eq!(lines, vec!["interface Point"], "must report the TYPE's change, not silently drop it: {lines:?}");
+
+        // conversely, only the FUNCTION's body changes -- the type is untouched.
+        let new2 = "type Point = Rec(x: Int, y: Int)\nfun Point(n: Int) -> Int {\n    n + 2\n}\n";
+        let (lines2, changed2) = diff_lines(old, new2);
+        assert!(changed2, "{lines2:?}");
+        assert_eq!(lines2, vec!["impl Point"], "must report the FUNCTION's change, not the type: {lines2:?}");
+
+        // BOTH kinds present, BOTH unchanged -- no collision-induced false positive.
+        let (lines3, changed3) = diff_lines(old, old);
+        assert!(!changed3, "{lines3:?}");
     }
 
     #[test]
