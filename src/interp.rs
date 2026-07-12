@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::check::Checked;
 use crate::diag::Span;
-use crate::value::{Closure, Env, IntW, Value};
+use crate::value::{value_key_eq, Closure, Env, IntW, Value};
 
 /// Non-local control flow during evaluation.
 pub enum Flow {
@@ -2404,7 +2404,7 @@ pub fn shared_method(
             let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
             for item in items.iter() {
                 let key = call(f.clone(), vec![item.clone()])?;
-                match groups.iter_mut().find(|(k, _)| *k == key) {
+                match groups.iter_mut().find(|(k, _)| value_key_eq(k, &key)) {
                     Some((_, list)) => list.push(item.clone()),
                     None => groups.push((key, vec![item.clone()])),
                 }
@@ -3075,7 +3075,7 @@ pub fn shared_method(
                 it.next().ok_or("`insert` needs a value")?,
             );
             let mut out = pairs.as_ref().clone();
-            match out.iter_mut().find(|(pk, _)| *pk == k) {
+            match out.iter_mut().find(|(pk, _)| value_key_eq(pk, &k)) {
                 Some(pair) => pair.1 = v,
                 None => out.push((k, v)),
             }
@@ -3085,19 +3085,19 @@ pub fn shared_method(
             let k = args.into_iter().next().ok_or("`get` needs a key")?;
             Ok(pairs
                 .iter()
-                .find(|(pk, _)| *pk == k)
+                .find(|(pk, _)| value_key_eq(pk, &k))
                 .map(|(_, v)| Value::some(v.clone()))
                 .unwrap_or_else(Value::none))
         }
         (Value::Map(pairs), "remove") => {
             let k = args.into_iter().next().ok_or("`remove` needs a key")?;
             Ok(Value::Map(Rc::new(
-                pairs.iter().filter(|(pk, _)| *pk != k).cloned().collect(),
+                pairs.iter().filter(|(pk, _)| !value_key_eq(pk, &k)).cloned().collect(),
             )))
         }
         (Value::Map(pairs), "contains_key") => {
             let k = args.into_iter().next().ok_or("`contains_key` needs a key")?;
-            Ok(Value::Bool(pairs.iter().any(|(pk, _)| *pk == k)))
+            Ok(Value::Bool(pairs.iter().any(|(pk, _)| value_key_eq(pk, &k))))
         }
         (Value::Map(pairs), "keys") => Ok(Value::List(Rc::new(
             pairs.iter().map(|(k, _)| k.clone()).collect(),
@@ -3113,7 +3113,7 @@ pub fn shared_method(
             let default = it.next().ok_or("`get_or` needs a default")?;
             Ok(pairs
                 .iter()
-                .find(|(pk, _)| *pk == k)
+                .find(|(pk, _)| value_key_eq(pk, &k))
                 .map(|(_, v)| v.clone())
                 .unwrap_or(default))
         }
@@ -3121,7 +3121,7 @@ pub fn shared_method(
             Some(Value::Map(other)) => {
                 let mut out = pairs.as_ref().clone();
                 for (k, v) in other.iter() {
-                    match out.iter_mut().find(|(pk, _)| pk == k) {
+                    match out.iter_mut().find(|(pk, _)| value_key_eq(pk, k)) {
                         Some(pair) => pair.1 = v.clone(),
                         None => out.push((k.clone(), v.clone())),
                     }
@@ -3159,7 +3159,7 @@ pub fn shared_method(
         }
         (Value::Set(items), "insert") => {
             let v = args.into_iter().next().ok_or("`insert` needs a value")?;
-            if items.iter().any(|x| *x == v) {
+            if items.iter().any(|x| value_key_eq(x, &v)) {
                 Ok(Value::Set(items.clone()))
             } else {
                 let mut out = items.as_ref().clone();
@@ -3170,19 +3170,19 @@ pub fn shared_method(
         (Value::Set(items), "remove") => {
             let v = args.into_iter().next().ok_or("`remove` needs a value")?;
             Ok(Value::Set(Rc::new(
-                items.iter().filter(|x| **x != v).cloned().collect(),
+                items.iter().filter(|x| !value_key_eq(x, &v)).cloned().collect(),
             )))
         }
         (Value::Set(items), "contains") => {
             let v = args.into_iter().next().ok_or("`contains` needs a value")?;
-            Ok(Value::Bool(items.iter().any(|x| *x == v)))
+            Ok(Value::Bool(items.iter().any(|x| value_key_eq(x, &v))))
         }
         (Value::Set(items), "len") => Ok(Value::Int(items.len() as i64)),
         (Value::Set(items), "union") => match args.into_iter().next() {
             Some(Value::Set(other)) => {
                 let mut out = items.as_ref().clone();
                 for x in other.iter() {
-                    if !out.iter().any(|y| y == x) {
+                    if !out.iter().any(|y| value_key_eq(y, x)) {
                         out.push(x.clone());
                     }
                 }
@@ -3192,13 +3192,13 @@ pub fn shared_method(
         },
         (Value::Set(items), "intersect") => match args.into_iter().next() {
             Some(Value::Set(other)) => Ok(Value::Set(Rc::new(
-                items.iter().filter(|x| other.iter().any(|y| y == *x)).cloned().collect(),
+                items.iter().filter(|x| other.iter().any(|y| value_key_eq(y, x))).cloned().collect(),
             ))),
             _ => Err("`intersect` needs a Set".into()),
         },
         (Value::Set(items), "difference") => match args.into_iter().next() {
             Some(Value::Set(other)) => Ok(Value::Set(Rc::new(
-                items.iter().filter(|x| !other.iter().any(|y| y == *x)).cloned().collect(),
+                items.iter().filter(|x| !other.iter().any(|y| value_key_eq(y, x))).cloned().collect(),
             ))),
             _ => Err("`difference` needs a Set".into()),
         },
@@ -3206,9 +3206,9 @@ pub fn shared_method(
             Some(Value::Set(other)) => {
                 // (in self, not other) then (in other, not self) — deterministic order
                 let mut out: Vec<Value> =
-                    items.iter().filter(|x| !other.iter().any(|y| y == *x)).cloned().collect();
+                    items.iter().filter(|x| !other.iter().any(|y| value_key_eq(y, x))).cloned().collect();
                 for x in other.iter() {
-                    if !items.iter().any(|y| y == x) {
+                    if !items.iter().any(|y| value_key_eq(y, x)) {
                         out.push(x.clone());
                     }
                 }
@@ -3220,14 +3220,14 @@ pub fn shared_method(
         (Value::Set(items), "is_empty") => Ok(Value::Bool(items.is_empty())),
         (Value::Set(items), "is_subset") => match args.into_iter().next() {
             Some(Value::Set(other)) => {
-                Ok(Value::Bool(items.iter().all(|x| other.iter().any(|y| y == x))))
+                Ok(Value::Bool(items.iter().all(|x| other.iter().any(|y| value_key_eq(y, x)))))
             }
             _ => Err("`is_subset` needs a Set".into()),
         },
         (Value::Set(items), "is_superset") => match args.into_iter().next() {
             // The mirror of is_subset: every element of `other` is contained in the receiver.
             Some(Value::Set(other)) => {
-                Ok(Value::Bool(other.iter().all(|x| items.iter().any(|y| y == x))))
+                Ok(Value::Bool(other.iter().all(|x| items.iter().any(|y| value_key_eq(y, x)))))
             }
             _ => Err("`is_superset` needs a Set".into()),
         },
@@ -3434,7 +3434,7 @@ pub fn set_from_list(v: &Value) -> Result<Value, String> {
         Value::List(items) => {
             let mut out: Vec<Value> = Vec::new();
             for it in items.iter() {
-                if !out.iter().any(|x| x == it) {
+                if !out.iter().any(|x| value_key_eq(x, it)) {
                     out.push(it.clone());
                 }
             }

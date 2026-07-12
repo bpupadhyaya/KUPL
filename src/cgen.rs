@@ -1440,6 +1440,7 @@ static KValue k_tensor_new(double* data, int64_t n) {
 }
 
 static int k_eq(KValue a, KValue b);
+static int k_key_eq(KValue a, KValue b);
 static int k_op_overload(const char* name, KValue a, KValue b, KValue* out);
 
 static KValue k_map_new(void) {
@@ -1467,7 +1468,7 @@ static KValue k_map_make(KValue* keys, KValue* vals, int64_t n) {
 static KValue k_map_insert_inplace(KValue recv, KValue key, KValue val) {
     KMap* m = recv.as.map;
     for (int64_t i = 0; i < m->len; i++) {
-        if (k_eq(m->keys[i], key)) { m->vals[i] = val; return recv; }
+        if (k_key_eq(m->keys[i], key)) { m->vals[i] = val; return recv; }
     }
     if (m->len >= m->cap) {
         int64_t newcap = m->cap < 1 ? 4 : m->cap * 2;
@@ -1501,7 +1502,7 @@ static KValue k_set_make(KValue* items, int64_t n) {
 static KValue k_set_insert_inplace(KValue recv, KValue item) {
     KSet* s = recv.as.set;
     for (int64_t i = 0; i < s->len; i++) {
-        if (k_eq(s->items[i], item)) return recv;
+        if (k_key_eq(s->items[i], item)) return recv;
     }
     if (s->len >= s->cap) {
         int64_t newcap = s->cap < 1 ? 4 : s->cap * 2;
@@ -1520,7 +1521,7 @@ static KValue k_set_from(KValue v) {
     for (int64_t i = 0; i < l->len; i++) {
         int dup = 0;
         for (int64_t j = 0; j < n; j++)
-            if (k_eq(out[j], l->items[i])) { dup = 1; break; }
+            if (k_key_eq(out[j], l->items[i])) { dup = 1; break; }
         if (!dup) out[n++] = l->items[i];
     }
     return k_set_make(out, n);
@@ -1781,12 +1782,16 @@ static int k_eq(KValue a, KValue b) {
                 if (a.as.ten->data[i] != b.as.ten->data[i]) return 0;
             return 1;
         case K_MAP: {
+            /* Key/value identity here uses k_key_eq, not k_eq (PR-it691) --
+               mirrors value.rs's PartialEq for Value::Map, which does the
+               same, so a `NaN` key compares consistently between `map1 ==
+               map2` and `map1.get(nan)`/`map1.contains_key(nan)`. */
             if (a.as.map->len != b.as.map->len) return 0;
             for (int64_t i = 0; i < a.as.map->len; i++) {
                 int found = 0;
                 for (int64_t j = 0; j < b.as.map->len; j++)
-                    if (k_eq(a.as.map->keys[i], b.as.map->keys[j])
-                        && k_eq(a.as.map->vals[i], b.as.map->vals[j])) { found = 1; break; }
+                    if (k_key_eq(a.as.map->keys[i], b.as.map->keys[j])
+                        && k_key_eq(a.as.map->vals[i], b.as.map->vals[j])) { found = 1; break; }
                 if (!found) return 0;
             }
             return 1;
@@ -1796,12 +1801,78 @@ static int k_eq(KValue a, KValue b) {
             for (int64_t i = 0; i < a.as.set->len; i++) {
                 int found = 0;
                 for (int64_t j = 0; j < b.as.set->len; j++)
-                    if (k_eq(a.as.set->items[i], b.as.set->items[j])) { found = 1; break; }
+                    if (k_key_eq(a.as.set->items[i], b.as.set->items[j])) { found = 1; break; }
                 if (!found) return 0;
             }
             return 1;
         }
         default: return 0;
+    }
+}
+
+/* Key/element identity for Map/Set (insert/get/contains_key/remove/get_or/
+   merge/the in-place insert fast paths/group_by's grouping key/contains/
+   union/intersect/difference/symmetric_difference/is_subset/is_superset,
+   and k_eq's own K_MAP/K_SET case above) -- DISTINCT from k_eq, which
+   correctly keeps IEEE-754 (`NaN != NaN`) for the `==` OPERATOR and
+   value-sequence helpers like List.contains/index_of/unique/dedup, left
+   unchanged. Mirrors value.rs's `value_key_eq` exactly (production-hardening
+   PR-it691): every native Map/Set builtin used k_eq for key/element
+   identity, so `0.0 / 0.0` (an ordinary, reachable NaN -- KUPL float
+   division has no zero-guard) broke Map's documented "updates in place
+   positionally" contract on native, exactly as it did on interp/KVM before
+   their sibling fix. Recurses through composite types so a NaN buried
+   inside a List/Ctor/Map/Set/Range/Tensor used AS a key is also handled
+   correctly, not just a bare NaN key. */
+static int k_key_eq(KValue a, KValue b) {
+    if (a.tag != b.tag) return 0;
+    switch (a.tag) {
+        case K_FLOAT: return a.as.f == b.as.f || (isnan(a.as.f) && isnan(b.as.f));
+        case K_F32: return a.as.f32v == b.as.f32v || (isnan(a.as.f32v) && isnan(b.as.f32v));
+        case K_LIST:
+            if (a.as.list->len != b.as.list->len) return 0;
+            for (int64_t i = 0; i < a.as.list->len; i++)
+                if (!k_key_eq(a.as.list->items[i], b.as.list->items[i])) return 0;
+            return 1;
+        case K_CTOR: {
+            if (strcmp(CTORS[a.as.ctor->ctor].variant, CTORS[b.as.ctor->ctor].variant)) return 0;
+            if (a.as.ctor->nfields != b.as.ctor->nfields) return 0;
+            for (int i = 0; i < a.as.ctor->nfields; i++)
+                if (!k_key_eq(a.as.ctor->fields[i], b.as.ctor->fields[i])) return 0;
+            return 1;
+        }
+        case K_RANGE:
+            return a.as.range.lo == b.as.range.lo && a.as.range.hi == b.as.range.hi
+                && a.as.range.incl == b.as.range.incl;
+        case K_TENSOR:
+            if (a.as.ten->len != b.as.ten->len) return 0;
+            for (int64_t i = 0; i < a.as.ten->len; i++) {
+                double x = a.as.ten->data[i], y = b.as.ten->data[i];
+                if (!(x == y || (isnan(x) && isnan(y)))) return 0;
+            }
+            return 1;
+        case K_MAP: {
+            if (a.as.map->len != b.as.map->len) return 0;
+            for (int64_t i = 0; i < a.as.map->len; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < b.as.map->len; j++)
+                    if (k_key_eq(a.as.map->keys[i], b.as.map->keys[j])
+                        && k_key_eq(a.as.map->vals[i], b.as.map->vals[j])) { found = 1; break; }
+                if (!found) return 0;
+            }
+            return 1;
+        }
+        case K_SET: {
+            if (a.as.set->len != b.as.set->len) return 0;
+            for (int64_t i = 0; i < a.as.set->len; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < b.as.set->len; j++)
+                    if (k_key_eq(a.as.set->items[i], b.as.set->items[j])) { found = 1; break; }
+                if (!found) return 0;
+            }
+            return 1;
+        }
+        default: return k_eq(a, b);
     }
 }
 
@@ -4810,7 +4881,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             for (int64_t i = 0; i < n; i++) {
                 KValue key = k_call(args[0], &l->items[i], 1);
                 int64_t g = -1;
-                for (int64_t j = 0; j < ng; j++) if (k_eq(keys[j], key)) { g = j; break; }
+                for (int64_t j = 0; j < ng; j++) if (k_key_eq(keys[j], key)) { g = j; break; }
                 if (g < 0) {
                     g = ng;
                     keys[ng] = key;
@@ -5445,12 +5516,12 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "len")) return k_int(m->len);
         if (!strcmp(name, "get")) {
             for (int64_t i = 0; i < m->len; i++)
-                if (k_eq(m->keys[i], args[0])) return k_some(m->vals[i]);
+                if (k_key_eq(m->keys[i], args[0])) return k_some(m->vals[i]);
             return k_none();
         }
         if (!strcmp(name, "contains_key")) {
             for (int64_t i = 0; i < m->len; i++)
-                if (k_eq(m->keys[i], args[0])) return k_bool(1);
+                if (k_key_eq(m->keys[i], args[0])) return k_bool(1);
             return k_bool(0);
         }
         if (!strcmp(name, "insert")) {
@@ -5459,7 +5530,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             memcpy(ks, m->keys, sizeof(KValue) * m->len);
             memcpy(vs, m->vals, sizeof(KValue) * m->len);
             for (int64_t i = 0; i < m->len; i++)
-                if (k_eq(ks[i], args[0])) { vs[i] = args[1]; return k_map_make(ks, vs, m->len); }
+                if (k_key_eq(ks[i], args[0])) { vs[i] = args[1]; return k_map_make(ks, vs, m->len); }
             ks[m->len] = args[0]; vs[m->len] = args[1];
             return k_map_make(ks, vs, m->len + 1);
         }
@@ -5468,14 +5539,14 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             KValue* vs = k_alloc(sizeof(KValue) * (m->len < 1 ? 1 : m->len));
             int64_t n = 0;
             for (int64_t i = 0; i < m->len; i++)
-                if (!k_eq(m->keys[i], args[0])) { ks[n] = m->keys[i]; vs[n] = m->vals[i]; n++; }
+                if (!k_key_eq(m->keys[i], args[0])) { ks[n] = m->keys[i]; vs[n] = m->vals[i]; n++; }
             return k_map_make(ks, vs, n);
         }
         if (!strcmp(name, "keys")) return k_list(m->keys, (int)m->len);
         if (!strcmp(name, "values")) return k_list(m->vals, (int)m->len);
         if (!strcmp(name, "is_empty")) return k_bool(m->len == 0);
         if (!strcmp(name, "get_or")) {
-            for (int64_t i = 0; i < m->len; i++) if (k_eq(m->keys[i], args[0])) return m->vals[i];
+            for (int64_t i = 0; i < m->len; i++) if (k_key_eq(m->keys[i], args[0])) return m->vals[i];
             return args[1];
         }
         if (!strcmp(name, "map_values")) {
@@ -5512,7 +5583,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             int64_t n = m->len;
             for (int64_t i = 0; i < o->len; i++) {
                 int found = 0;
-                for (int64_t j = 0; j < n; j++) if (k_eq(ks[j], o->keys[i])) { vs[j] = o->vals[i]; found = 1; break; }
+                for (int64_t j = 0; j < n; j++) if (k_key_eq(ks[j], o->keys[i])) { vs[j] = o->vals[i]; found = 1; break; }
                 if (!found) { ks[n] = o->keys[i]; vs[n] = o->vals[i]; n++; }
             }
             return k_map_make(ks, vs, n);
@@ -5523,12 +5594,12 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "len")) return k_int(st->len);
         if (!strcmp(name, "contains")) {
             for (int64_t i = 0; i < st->len; i++)
-                if (k_eq(st->items[i], args[0])) return k_bool(1);
+                if (k_key_eq(st->items[i], args[0])) return k_bool(1);
             return k_bool(0);
         }
         if (!strcmp(name, "insert")) {
             for (int64_t i = 0; i < st->len; i++)
-                if (k_eq(st->items[i], args[0])) return recv;
+                if (k_key_eq(st->items[i], args[0])) return recv;
             KValue* out = k_alloc(sizeof(KValue) * (st->len + 1));
             memcpy(out, st->items, sizeof(KValue) * st->len);
             out[st->len] = args[0];
@@ -5538,7 +5609,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             KValue* out = k_alloc(sizeof(KValue) * (st->len < 1 ? 1 : st->len));
             int64_t n = 0;
             for (int64_t i = 0; i < st->len; i++)
-                if (!k_eq(st->items[i], args[0])) out[n++] = st->items[i];
+                if (!k_key_eq(st->items[i], args[0])) out[n++] = st->items[i];
             return k_set_make(out, n);
         }
         if (!strcmp(name, "union")) {
@@ -5549,7 +5620,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             for (int64_t i = 0; i < o->len; i++) {
                 int dup = 0;
                 for (int64_t j = 0; j < n; j++)
-                    if (k_eq(out[j], o->items[i])) { dup = 1; break; }
+                    if (k_key_eq(out[j], o->items[i])) { dup = 1; break; }
                 if (!dup) out[n++] = o->items[i];
             }
             return k_set_make(out, n);
@@ -5562,7 +5633,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             for (int64_t i = 0; i < st->len; i++) {
                 int found = 0;
                 for (int64_t j = 0; j < o->len; j++)
-                    if (k_eq(st->items[i], o->items[j])) { found = 1; break; }
+                    if (k_key_eq(st->items[i], o->items[j])) { found = 1; break; }
                 if (found == want) out[n++] = st->items[i];
             }
             return k_set_make(out, n);
@@ -5573,12 +5644,12 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             int64_t n = 0;
             for (int64_t i = 0; i < st->len; i++) {
                 int found = 0;
-                for (int64_t j = 0; j < o->len; j++) if (k_eq(st->items[i], o->items[j])) { found = 1; break; }
+                for (int64_t j = 0; j < o->len; j++) if (k_key_eq(st->items[i], o->items[j])) { found = 1; break; }
                 if (!found) out[n++] = st->items[i];
             }
             for (int64_t i = 0; i < o->len; i++) {
                 int found = 0;
-                for (int64_t j = 0; j < st->len; j++) if (k_eq(o->items[i], st->items[j])) { found = 1; break; }
+                for (int64_t j = 0; j < st->len; j++) if (k_key_eq(o->items[i], st->items[j])) { found = 1; break; }
                 if (!found) out[n++] = o->items[i];
             }
             return k_set_make(out, n);
@@ -5589,7 +5660,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             KSet* o = args[0].as.set;
             for (int64_t i = 0; i < st->len; i++) {
                 int found = 0;
-                for (int64_t j = 0; j < o->len; j++) if (k_eq(st->items[i], o->items[j])) { found = 1; break; }
+                for (int64_t j = 0; j < o->len; j++) if (k_key_eq(st->items[i], o->items[j])) { found = 1; break; }
                 if (!found) return k_bool(0);
             }
             return k_bool(1);
@@ -5599,7 +5670,7 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             KSet* o = args[0].as.set;
             for (int64_t i = 0; i < o->len; i++) {
                 int found = 0;
-                for (int64_t j = 0; j < st->len; j++) if (k_eq(o->items[i], st->items[j])) { found = 1; break; }
+                for (int64_t j = 0; j < st->len; j++) if (k_key_eq(o->items[i], st->items[j])) { found = 1; break; }
                 if (!found) return k_bool(0);
             }
             return k_bool(1);
@@ -7104,8 +7175,10 @@ fun main() uses io {
     }
 
     /// Native NaN-in-collection behavior matches interp/KVM: sort is deterministic (the
-    /// PR-it148 k_cmp fix flows into the sort comparator), min/max skip NaN, and Set keeps
-    /// duplicate NaNs since nan != nan (PR-it149).
+    /// PR-it148 k_cmp fix flows into the sort comparator), min/max skip NaN, `List.unique`
+    /// keeps duplicate NaNs since the `==` operator stays IEEE (`nan != nan`), but Set
+    /// ELEMENT identity is NaN-aware (`k_key_eq`, PR-it691) and dedupes a repeated NaN like
+    /// any other repeated value.
     #[test]
     fn native_nan_in_collections() {
         if !cc_available() {
@@ -7115,7 +7188,7 @@ fun main() uses io {
                    print(\"{xs.sort()}|{xs.min()}|{xs.max()}|{[nan, nan, 1.0].unique()}|{Set([nan, nan, 1.0]).len()}\")\n}\n";
         assert_eq!(
             native_main_stdout(src, "nancoll").trim(),
-            "[3.0, NaN, 1.0, 2.0]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|3"
+            "[3.0, NaN, 1.0, 2.0]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|2"
         );
     }
 

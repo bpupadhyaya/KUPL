@@ -379,18 +379,79 @@ impl PartialEq for Value {
             (Value::Component(a), Value::Component(b)) => a == b,
             (Value::Range(a, b, i), Value::Range(c, d, j)) => a == c && b == d && i == j,
             (Value::Tensor(a), Value::Tensor(b)) => a == b,
-            // Map/Set equality is order-insensitive (Python dict/set semantics)
+            // Map/Set equality is order-insensitive (Python dict/set semantics).
+            // Keys/elements compare via `value_key_eq` (PR-it691), not plain
+            // `==`, so a `NaN` key/element compares consistently with what
+            // `.get`/`.contains_key`/`.contains` would actually find --
+            // otherwise `Map` `A` and `Map` `B` could each independently
+            // report `.contains_key(nan)` as true while `A == B` disagreed
+            // with that, an inconsistency worse than either alone.
             (Value::Map(a), Value::Map(b)) => {
                 a.len() == b.len()
                     && a.iter().all(|(k, v)| {
-                        b.iter().any(|(k2, v2)| k == k2 && v == v2)
+                        b.iter().any(|(k2, v2)| value_key_eq(k, k2) && value_key_eq(v, v2))
                     })
             }
             (Value::Set(a), Value::Set(b)) => {
-                a.len() == b.len() && a.iter().all(|x| b.iter().any(|y| x == y))
+                a.len() == b.len() && a.iter().all(|x| b.iter().any(|y| value_key_eq(x, y)))
             }
             _ => false,
         }
+    }
+}
+
+/// Key/element identity for `Map`/`Set` (insert/get/contains_key/remove/
+/// contains/merge/union/intersect/difference, and Map/Set's own `==`) —
+/// DISTINCT from `PartialEq`/`==`, which correctly follows IEEE-754 (`NaN !=
+/// NaN`, the mathematically standard and expected behavior for the `==`
+/// OPERATOR and for value-sequence helpers like `List.contains`). A REAL bug
+/// found+fixed (production-hardening PR-it691): every Map/Set method used
+/// plain `==`/`PartialEq` for key/element identity, so `0.0 / 0.0` (an
+/// ordinary, reachable NaN — KUPL float division has no zero-guard) broke
+/// `docs/reference/STDLIB.md`'s own documented Map contract ("updates in
+/// place positionally"): confirmed live, identically on interp AND the KVM,
+/// that `m.insert(nan, 1)` then `m.get(nan)` returned `None` (not `Some(1)`),
+/// and a SECOND `m.insert(nan, 2)` grew `m.len()` to 2 instead of updating
+/// the existing entry — Set's `insert`/`contains` showed the identical
+/// duplication. Most languages special-case NaN for CONTAINER-key identity
+/// specifically (JS `Map`/`Set` use SameValueZero; Python's `dict`/`set`
+/// short-circuit on identity before `==`) precisely to avoid this trap,
+/// while leaving ordinary `==` IEEE-754-correct — this function is that
+/// special case for KUPL. Recurses through every composite variant (not just
+/// a top-level `Float`/`F32`) so a NaN buried inside a List/Ctor/Map/Set/
+/// Range/Tensor used AS a Map key or Set element is ALSO handled correctly,
+/// not just a bare NaN key.
+pub fn value_key_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::F32(x), Value::F32(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| value_key_eq(xi, yi))
+        }
+        (
+            Value::Ctor { ty: t1, variant: v1, fields: f1 },
+            Value::Ctor { ty: t2, variant: v2, fields: f2 },
+        ) => {
+            t1 == t2
+                && v1 == v2
+                && f1.len() == f2.len()
+                && f1.iter().zip(f2.iter()).all(|(x, y)| value_key_eq(x, y))
+        }
+        (Value::Range(a1, b1, i1), Value::Range(a2, b2, i2)) => a1 == a2 && b1 == b2 && i1 == i2,
+        (Value::Tensor(x), Value::Tensor(y)) => {
+            x.len() == y.len()
+                && x.iter().zip(y.iter()).all(|(xi, yi)| xi == yi || (xi.is_nan() && yi.is_nan()))
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, v)| {
+                    y.iter().any(|(k2, v2)| value_key_eq(k, k2) && value_key_eq(v, v2))
+                })
+        }
+        (Value::Set(x), Value::Set(y)) => {
+            x.len() == y.len() && x.iter().all(|xi| y.iter().any(|yi| value_key_eq(xi, yi)))
+        }
+        _ => a == b,
     }
 }
 

@@ -14429,6 +14429,37 @@ fun probe() -> Str {
     }
 
     #[test]
+    fn diff_map_set_nan_key_identity() {
+        // A NaN key/element is a REAL, reachable value (KUPL float division has no zero-guard, so
+        // `0.0 / 0.0` is ordinary user-reachable code), and every Map/Set method used plain `==`
+        // for key/element identity, which is IEEE-754 `NaN != NaN` -- so `m.insert(nan, 1)` then
+        // `m.get(nan)` returned `None` instead of `Some(1)`, and a SECOND `insert(nan, 2)` grew
+        // `len()` to 2 instead of updating in place, breaking STDLIB.md's own documented Map
+        // contract ("updates in place positionally"). Set showed identical duplication. Fixed via
+        // `value_key_eq` (PR-it691), a narrow helper used ONLY for Map/Set key/element identity --
+        // the `==` OPERATOR and `List.contains` correctly keep IEEE-754 `NaN != NaN` semantics,
+        // unchanged by this fix. Byte-identical on interp/KVM.
+        let m = r#"fun probe() -> Str {
+    let nan = 0.0 / 0.0
+    let m = Map().insert(nan, 1)
+    let before = "{m.get(nan)}|{m.len()}"
+    let m2 = m.insert(nan, 2)
+    "{before}|{m2.get(nan)}|{m2.len()}|{m2.contains_key(nan)}"
+}
+"#;
+        assert_eq!(differential(m), "Some(1)|1|Some(2)|1|true");
+        let s = r#"fun probe() -> Str {
+    let nan = 0.0 / 0.0
+    let s = Set([nan])
+    let before = "{s.contains(nan)}|{s.len()}"
+    let s2 = s.insert(nan)
+    "{before}|{s2.len()}"
+}
+"#;
+        assert_eq!(differential(s), "true|1|1");
+    }
+
+    #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose
         // guard holds; a guard that fails falls through to later arms. This is byte-identical on
@@ -14568,9 +14599,11 @@ fun probe() -> Str {
     #[test]
     fn diff_numeric_collection_edges() {
         // Subtle numeric/collection edges surfaced by a bug-hunt sweep, all byte-identical on
-        // interp/KVM (PR-it192): a NaN can be STORED in a Set (len grows) but contains(nan) is
-        // false since NaN != NaN (IEEE); a rational normalizes the sign onto the numerator and
-        // reduces; and the classic i64::MIN / -1 and x / 0 cases panic rather than wrap.
+        // interp/KVM (PR-it192): a NaN can be STORED in a Set (len grows), and — as of
+        // `value_key_eq`/`k_key_eq` (PR-it691) — `contains(nan)` correctly finds it, since Set
+        // element identity is NaN-aware even though the `==` operator stays IEEE (`NaN != NaN`);
+        // a rational normalizes the sign onto the numerator and reduces; and the classic
+        // i64::MIN / -1 and x / 0 cases panic rather than wrap.
         let src = r#"fun probe() -> Str {
     let nan = 0.0 / 0.0
     let s = Set([1.0, 2.0, nan])
@@ -14579,7 +14612,7 @@ fun probe() -> Str {
     "{setnan}#{rats}"
 }
 "#;
-        assert_eq!(differential(src), "3|false|true#-1/2|1/2|-1/2");
+        assert_eq!(differential(src), "3|true|true#-1/2|1/2|-1/2");
         // Division edges are clean panics (not wrapped values), identical across engines.
         assert_eq!(differential("fun probe() -> Str { \"{10 / 0}\" }\n"), "panic: division by zero");
         assert_eq!(
@@ -15962,11 +15995,12 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
                    let dup = [nan, nan, 1.0, 1.0]\n    \
                    \"{xs.sort()}|{xs.min()}|{xs.max()}|{dup.unique()}|{dup.contains(nan)}|{[1.0, 2.0].contains(2.0)}\" }\n";
         assert_eq!(differential(src), "[3.0, NaN, 1.0, 2.0]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|false|true");
-        // Set and Map are equality-keyed, and nan != nan, so duplicate NaN elements/keys are
-        // all kept and a NaN key can never be looked up.
+        // Set/Map KEY/ELEMENT identity is NaN-aware (`value_key_eq`/`k_key_eq`, PR-it691),
+        // unlike the `==` operator and List helpers above: a duplicate NaN element/key
+        // dedupes/updates-in-place exactly like any other repeated value would.
         let sm = "fun probe() -> Str { let nan = 0.0 / 0.0\n    let s = Set([nan, nan, 1.0])\n    \
                   let m = Map().insert(nan, 1).insert(nan, 2)\n    \"{s.len()}|{m.len()}|{m.get_or(nan, 0 - 1)}\" }\n";
-        assert_eq!(differential(sm), "3|2|-1");
+        assert_eq!(differential(sm), "2|1|2");
     }
 
     #[test]
