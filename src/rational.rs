@@ -41,6 +41,15 @@ impl Rational {
         Rational::new(BigInt::from_i64(n), BigInt::from_i64(d))
     }
 
+    /// Whether either component exceeds `bigint::MAX_BIGINT_LIMBS` (PR-it639)
+    /// — `add`/`sub`/`mul` each cross-multiply numerator/denominator BigInts
+    /// internally, so a `Rational`'s components can grow the SAME way a bare
+    /// `BigInt`'s can via repeated arithmetic; exposed for the SAME
+    /// KUPL-operator-boundary check `raw_binary_op` applies to `BigInt`.
+    pub fn exceeds_max_size(&self) -> bool {
+        self.num.exceeds_max_size() || self.den.exceeds_max_size()
+    }
+
     pub fn add(&self, o: &Rational) -> Rational {
         // a/b + c/d = (a*d + c*b) / (b*d)
         let n = self.num.mul(&o.den).add(&o.num.mul(&self.den));

@@ -106,6 +106,25 @@ impl BigInt {
         self.limbs.is_empty()
     }
 
+    /// Whether this `BigInt`'s size exceeds `MAX_BIGINT_LIMBS`. `pow` and
+    /// `from_str` already reject a request that would newly EXCEED the cap
+    /// in one step (PR-it637/PR-it638) — but repeated ordinary arithmetic
+    /// (`a * b` doubling roughly every multiplication, in a loop, e.g. a
+    /// hand-written squaring loop) can still walk an already-in-range
+    /// `BigInt` past the cap one legitimate-looking operation at a time,
+    /// bypassing `pow`'s guard entirely without ever calling `pow` at all.
+    /// Exposed so a CALLER (specifically `raw_binary_op`, the shared
+    /// operator-dispatch boundary reached from ordinary KUPL `+`/`-`/`*`
+    /// syntax) can check a RESULT after computing it and reject further
+    /// growth, rather than this module capping every individual `add`/
+    /// `sub`/`mul` call itself — those remain uncapped internal building
+    /// blocks (used throughout this crate on values already known to be
+    /// safely bounded), and only the KUPL-visible boundary needs the check
+    /// (PR-it639).
+    pub fn exceeds_max_size(&self) -> bool {
+        self.limbs.len() as u64 > MAX_BIGINT_LIMBS
+    }
+
     pub fn is_negative(&self) -> bool {
         self.neg
     }
@@ -462,6 +481,26 @@ mod tests {
         assert!(BigInt::from_str(&neg_over_cap).is_none());
         // ordinary, legitimate large-but-reasonable strings are unaffected.
         assert!(BigInt::from_str(&"9".repeat(400)).is_some());
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it639): `pow` (it637)
+    /// and `from_str` (it638) already reject a request that would newly
+    /// exceed `MAX_BIGINT_LIMBS` in ONE step -- but ordinary REPEATED
+    /// multiplication (a hand-written squaring loop, `r = r * r` many times
+    /// over) can walk an already-in-range `BigInt` past the cap one
+    /// legitimate-looking `mul` call at a time, bypassing `pow`'s guard
+    /// entirely without ever calling `pow`. `exceeds_max_size` is the
+    /// primitive `raw_binary_op` (the shared KUPL-operator-dispatch
+    /// boundary) uses to close that gap.
+    #[test]
+    fn exceeds_max_size_detects_growth_past_the_cap() {
+        let at_cap = BigInt::from_str(&"9".repeat((MAX_BIGINT_LIMBS * 9) as usize)).unwrap();
+        assert!(!at_cap.exceeds_max_size());
+        let over_cap = at_cap.mul(&BigInt::from_i64(10));
+        assert!(over_cap.exceeds_max_size());
+        // small, ordinary values are never mistakenly flagged.
+        assert!(!b("12345").exceeds_max_size());
+        assert!(!BigInt::zero().exceeds_max_size());
     }
 
     #[test]

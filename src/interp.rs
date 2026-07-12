@@ -1606,39 +1606,70 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     match (l, r) {
         (Value::BigInt(a), Value::BigInt(b)) => {
             use std::cmp::Ordering;
-            Ok(match op {
-                Add => Value::BigInt(Rc::new(a.add(b))),
-                Sub => Value::BigInt(Rc::new(a.sub(b))),
-                Mul => Value::BigInt(Rc::new(a.mul(b))),
-                Lt => Value::Bool(a.cmp(b) == Ordering::Less),
-                Le => Value::Bool(a.cmp(b) != Ordering::Greater),
-                Gt => Value::Bool(a.cmp(b) == Ordering::Greater),
-                Ge => Value::Bool(a.cmp(b) != Ordering::Less),
+            let result = match op {
+                Add => a.add(b),
+                Sub => a.sub(b),
+                Mul => a.mul(b),
+                Lt => return Ok(Value::Bool(a.cmp(b) == Ordering::Less)),
+                Le => return Ok(Value::Bool(a.cmp(b) != Ordering::Greater)),
+                Gt => return Ok(Value::Bool(a.cmp(b) == Ordering::Greater)),
+                Ge => return Ok(Value::Bool(a.cmp(b) != Ordering::Less)),
                 Div => match a.divmod(b) {
-                    Some((q, _)) => Value::BigInt(Rc::new(q)),
+                    Some((q, _)) => q,
                     None => return Err("division by zero".into()),
                 },
                 Rem => match a.divmod(b) {
-                    Some((_, r)) => Value::BigInt(Rc::new(r)),
+                    Some((_, r)) => r,
                     None => return Err("remainder by zero".into()),
                 },
                 _ => unreachable!(),
-            })
+            };
+            // A REAL bug found+fixed (production-hardening PR-it639): pow
+            // (it637) and from_str (it638) already reject a request that
+            // would newly exceed MAX_BIGINT_LIMBS in ONE step -- but ordinary
+            // repeated multiplication (a hand-written squaring loop, `r =
+            // r.mul(&r)` many times over) can walk an already-in-range
+            // BigInt past the cap one legitimate-looking `*` at a time,
+            // bypassing pow's guard entirely without ever calling pow.
+            // Checked HERE, the shared KUPL-operator-dispatch boundary
+            // (reached from ordinary `+`/`-`/`*`/`/` syntax on BOTH engines),
+            // rather than inside BigInt::add/sub/mul themselves, which stay
+            // uncapped internal building blocks used throughout this crate
+            // on values already known to be safely bounded.
+            if result.exceeds_max_size() {
+                return Err(format!(
+                    "BigInt arithmetic result would be too large to compute (limit ~{} limbs, roughly {} decimal digits)",
+                    crate::bigint::MAX_BIGINT_LIMBS,
+                    crate::bigint::MAX_BIGINT_LIMBS * 9
+                ));
+            }
+            Ok(Value::BigInt(Rc::new(result)))
         }
         (Value::Rational(a), Value::Rational(b)) => {
             use std::cmp::Ordering;
-            Ok(match op {
-                Add => Value::Rational(Rc::new(a.add(b))),
-                Sub => Value::Rational(Rc::new(a.sub(b))),
-                Mul => Value::Rational(Rc::new(a.mul(b))),
-                Div => Value::Rational(Rc::new(a.div(b)?)),
-                Lt => Value::Bool(a.cmp(b) == Ordering::Less),
-                Le => Value::Bool(a.cmp(b) != Ordering::Greater),
-                Gt => Value::Bool(a.cmp(b) == Ordering::Greater),
-                Ge => Value::Bool(a.cmp(b) != Ordering::Less),
+            let result = match op {
+                Add => a.add(b),
+                Sub => a.sub(b),
+                Mul => a.mul(b),
+                Div => a.div(b)?,
+                Lt => return Ok(Value::Bool(a.cmp(b) == Ordering::Less)),
+                Le => return Ok(Value::Bool(a.cmp(b) != Ordering::Greater)),
+                Gt => return Ok(Value::Bool(a.cmp(b) == Ordering::Greater)),
+                Ge => return Ok(Value::Bool(a.cmp(b) != Ordering::Less)),
                 Rem => return Err("Rational remainder is not supported".into()),
                 _ => unreachable!(),
-            })
+            };
+            // Same size-cap check as BigInt above (PR-it639) -- Rational's
+            // OWN add/sub/mul each cross-multiply numerator/denominator
+            // BigInts internally, so its components can grow the SAME way.
+            if result.exceeds_max_size() {
+                return Err(format!(
+                    "Rational arithmetic result would be too large to compute (limit ~{} limbs, roughly {} decimal digits)",
+                    crate::bigint::MAX_BIGINT_LIMBS,
+                    crate::bigint::MAX_BIGINT_LIMBS * 9
+                ));
+            }
+            Ok(Value::Rational(Rc::new(result)))
         }
         (Value::Int(a), Value::Int(b)) => {
             let (a, b) = (*a, *b);

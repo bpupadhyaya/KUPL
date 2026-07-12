@@ -1675,6 +1675,36 @@ static KValue k_tensor_binop(KValue a, KValue b, int op) { /* 0:+ 1:- 2:* 3:/ */
     return k_tensor_new(d, x->len);
 }
 
+/* Same size-cap check as bigint.rs::exceeds_max_size / MAX_BIGINT_LIMBS
+   (PR-it637/it638), applied at the SAME KUPL-operator-dispatch boundary
+   raw_binary_op checks on the Rust side (PR-it639): pow and from_str
+   already reject a request that would newly exceed the cap in ONE step,
+   but ordinary repeated multiplication (a hand-written squaring loop, `r =
+   r * r` many times over) can walk an already-in-range BigInt/Rational
+   past the cap one legitimate-looking operator at a time, bypassing pow's
+   guard entirely without ever calling pow. k_big_add/sub/mul/k_rat_add/
+   sub/mul themselves stay uncapped internal building blocks (used
+   throughout this file on values already known to be safely bounded) --
+   only this KUPL-visible boundary needs the check. */
+static void k_big_check_size(KBig* b, const char* opname) {
+    if (b->n > K_MAX_BIGINT_LIMBS) {
+        char m[160];
+        snprintf(m, sizeof m,
+                 "%s arithmetic result would be too large to compute (limit ~%d limbs, roughly %d decimal digits)",
+                 opname, K_MAX_BIGINT_LIMBS, K_MAX_BIGINT_LIMBS * 9);
+        k_panic(m);
+    }
+}
+static void k_rat_check_size(KRat* r) {
+    if (r->num->n > K_MAX_BIGINT_LIMBS || r->den->n > K_MAX_BIGINT_LIMBS) {
+        char m[160];
+        snprintf(m, sizeof m,
+                 "Rational arithmetic result would be too large to compute (limit ~%d limbs, roughly %d decimal digits)",
+                 K_MAX_BIGINT_LIMBS, K_MAX_BIGINT_LIMBS * 9);
+        k_panic(m);
+    }
+}
+
 static KValue k_add(KValue a, KValue b) {
     if (a.tag == K_INT && b.tag == K_INT) {
         int64_t r;
@@ -1686,8 +1716,8 @@ static KValue k_add(KValue a, KValue b) {
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 0);
     if (a.tag == K_STR && b.tag == K_STR) return k_concat(a, b);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 0);
-    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_add(a, b));
-    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_add(a, b));
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_add(a, b); k_big_check_size(r, "BigInt"); return k_big_v(r); }
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { KRat* r = k_rat_add(a, b); k_rat_check_size(r); return k_rat_v(r); }
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("add", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -1701,8 +1731,8 @@ static KValue k_sub(KValue a, KValue b) {
     if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v - b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 1);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 1);
-    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_sub(a, b));
-    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_sub(a, b));
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_sub(a, b); k_big_check_size(r, "BigInt"); return k_big_v(r); }
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { KRat* r = k_rat_sub(a, b); k_rat_check_size(r); return k_rat_v(r); }
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("sub", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -1716,8 +1746,8 @@ static KValue k_mul(KValue a, KValue b) {
     if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v * b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 2);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 2);
-    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_mul(a, b));
-    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_mul(a, b));
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_mul(a, b); k_big_check_size(r, "BigInt"); return k_big_v(r); }
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { KRat* r = k_rat_mul(a, b); k_rat_check_size(r); return k_rat_v(r); }
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("mul", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -1731,13 +1761,18 @@ static KValue k_div(KValue a, KValue b) {
     if (a.tag == K_F32 && b.tag == K_F32) return k_f32(a.as.f32v / b.as.f32v);
     if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) return k_sized_arith(a, b, 3);
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 3);
-    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_divmod(a, b, 0));
-    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) return k_rat_v(k_rat_div(a, b));
+    /* Division/remainder can never grow a BigInt result past its dividend's
+       own size, so this check is a no-op in practice -- included anyway to
+       match raw_binary_op's uniform coverage exactly (PR-it639), rather than
+       leaving Div/Rem as a special, unchecked case for no principled reason. */
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_divmod(a, b, 0); k_big_check_size(r, "BigInt"); return k_big_v(r); }
+    if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { KRat* r = k_rat_div(a, b); k_rat_check_size(r); return k_rat_v(r); }
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("div", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
 static KValue k_rem(KValue a, KValue b) {
-    if (a.tag == K_BIGINT && b.tag == K_BIGINT) return k_big_v(k_big_divmod(a, b, 1));
+    /* Same no-op-in-practice consistency note as k_div above. */
+    if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_divmod(a, b, 1); k_big_check_size(r, "BigInt"); return k_big_v(r); }
     if (a.tag == K_INT && b.tag == K_INT) {
         if (b.as.i == 0) k_panic("remainder by zero");
         /* INT64_MIN % -1 overflows (like the division) — C would be UB; panic to
@@ -10509,6 +10544,26 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         assert_panic_wording_matches(
             "fun main() uses io { let s = \"9\".repeat(180001)\n    print(big(s)) }\n",
             "bigfromstrcap",
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it639): `pow` (it637)
+    /// and `from_str` (it638) already reject a request that would newly
+    /// exceed the size cap in ONE step -- but ordinary repeated
+    /// multiplication (a hand-written squaring loop) can walk an already-
+    /// in-range `BigInt`/`Rational` past the cap one legitimate-looking `*`
+    /// at a time, bypassing `pow`'s guard entirely. Fixed on both engines at
+    /// the SHARED KUPL-operator-dispatch boundary (`raw_binary_op` /
+    /// `k_add`/`k_sub`/`k_mul`), panicking with byte-identical text.
+    #[test]
+    fn native_bigint_and_rational_mul_size_cap_panic_matches_interp_wording() {
+        assert_panic_wording_matches(
+            "fun main() uses io { let s = \"9\".repeat(100000)\n    let r = big(s)\n    print(r * r) }\n",
+            "bigmulcap",
+        );
+        assert_panic_wording_matches(
+            "fun main() uses io { let s = \"9\".repeat(100000)\n    let r = rat(big(s), 3)\n    print(r * r) }\n",
+            "ratmulcap",
         );
     }
 

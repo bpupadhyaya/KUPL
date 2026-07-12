@@ -1440,6 +1440,37 @@ mod tests {
         );
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it639): `pow` (it637)
+    /// and `from_str` (it638) already reject a request that would newly
+    /// exceed the size cap in ONE step -- but ordinary REPEATED
+    /// multiplication (a hand-written squaring loop, `r = r * r` many times
+    /// over) can walk an already-in-range `BigInt`/`Rational` past the cap
+    /// one legitimate-looking `*` at a time, bypassing `pow`'s guard
+    /// entirely without ever calling `pow`. A single squaring of an
+    /// already-near-cap `BigInt` exercises the SAME code path a repeated
+    /// LOOP would, without needing many slow iterations in the test itself
+    /// (100,000 digits squared -> 200,000 digits, well past the 180,000-
+    /// digit cap in ONE multiplication).
+    #[test]
+    fn diff_bigint_and_rational_mul_rejects_growth_past_the_cap_via_repeated_multiplication() {
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let s = \"9\".repeat(100000)\n    let r = big(s)\n    \"{r * r}\" }\n"
+            ),
+            "panic: BigInt arithmetic result would be too large to compute (limit ~20000 limbs, roughly 180000 decimal digits)"
+        );
+        // Rational's own add/sub/mul cross-multiply numerator/denominator
+        // BigInts internally, so it grows the SAME way.
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let s = \"9\".repeat(100000)\n    let r = rat(big(s), 3)\n    \"{r * r}\" }\n"
+            ),
+            "panic: Rational arithmetic result would be too large to compute (limit ~20000 limbs, roughly 180000 decimal digits)"
+        );
+        // an ordinary, legitimate multiplication is completely unaffected.
+        assert_eq!(differential("fun probe() -> Str { \"{big(6) * big(7)}\" }\n"), "42");
+    }
+
     #[test]
     fn diff_int_math_edges() {
         // clamp / gcd / isqrt / sign edge cases are byte-identical on both engines:
