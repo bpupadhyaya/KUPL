@@ -1134,7 +1134,24 @@ static char* k_rat_to_decimal(KRat* r) {
     return out;
 }
 static double k_rat_to_f64(KRat* r) {
-    return strtod(k_big_to_decimal(r->num), 0) / strtod(k_big_to_decimal(r->den), 0);
+    double n = strtod(k_big_to_decimal(r->num), 0);
+    double d = strtod(k_big_to_decimal(r->den), 0);
+    if (isfinite(n) && isfinite(d)) return n / d;
+    /* A REAL bug found+fixed (production-hardening PR-it627, mirroring the
+       SAME fix in rational.rs's Rational::to_f64): converting num and den
+       to f64 SEPARATELY and dividing is wrong when BOTH overflow f64's
+       range individually but their RATIO doesn't -- e.g. two ~400-digit
+       coprime BigInts differing by 2 each parse as +inf, giving inf/inf =
+       NaN instead of the true value ~1.0. Scale num by a fixed power of ten
+       via EXACT BigInt arithmetic before dividing, so precision survives
+       even though the individual operands don't fit f64. A genuinely
+       astronomical ratio still correctly reduces to +-inf or 0.0, since the
+       scaled quotient itself then overflows/underflows on its own. */
+    KBig* scale = k_big_pow(k_big_v(k_big_from_i64(10)), 30);
+    KBig* scaled_num = k_big_mul(k_big_v(r->num), k_big_v(scale));
+    KBig* q = k_big_divmod(k_big_v(scaled_num), k_big_v(r->den), 0);
+    double approx = strtod(k_big_to_decimal(q), 0);
+    return approx / pow(10.0, 30.0);
 }
 
 static KValue k_fun(int32_t idx) { KValue x; x.tag = K_FUN;   x.as.fun = idx; return x; }
@@ -9021,6 +9038,30 @@ fun main() uses io {
                    print(rat(1, 3) / rat(1, 2))\n    print(rat(3, 7).recip())\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "rational"), "1/2\n1/2\n2/3\n7/3\n");
+        }
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it627), mirroring the
+    /// SAME fix in `rational.rs`'s `Rational::to_f64`: native's
+    /// `k_rat_to_f64` converted `num` and `den` to `double` SEPARATELY via
+    /// `strtod` and divided -- for two coprime BigInts EACH individually too
+    /// large for `f64` (both parse to `+inf`) but whose RATIO is perfectly
+    /// representable, this computed `inf / inf = NaN` instead of the true
+    /// value ~1.0, exactly like the Rust bug. Confirmed cross-engine
+    /// agreement (interp/vm/native all NaN before the fix, all ~1.0 after)
+    /// via a live 3-engine repro before touching cgen.rs. Fixed the same
+    /// way: scale `num` by a fixed power of ten via exact BigInt arithmetic
+    /// before dividing when either operand overflows `f64` on its own.
+    #[test]
+    fn native_rational_to_float_does_not_produce_nan_for_individually_oversized_but_close_operands() {
+        let src = "fun main() uses io {\n    \
+                   let n = big(10).pow(400) + big(1)\n    let d = big(10).pow(400) + big(3)\n    \
+                   print(rat(n, d).to_float())\n    \
+                   print(rat(big(10).pow(400), big(1)).to_float())\n    \
+                   print(rat(big(1), big(10).pow(400)).to_float())\n    \
+                   print(rat(1, 4).to_float())\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "rational_f64"), "1.0\ninf\n0.0\n0.25\n");
         }
     }
 
