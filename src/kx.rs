@@ -925,6 +925,90 @@ mod tests {
         }
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it687): the sibling
+    /// `flip a byte` fuzz loop above (`corrupt_kx_is_rejected_not_a_crash`)
+    /// only calls `decode()` and never RUNS the resulting module -- so it
+    /// never caught this: `decode()` never cross-validates a chunk's `nregs`
+    /// (or a component's `nslots`) against the register/slot indices its OWN
+    /// decoded instructions reference. A `.kx` file where those disagree
+    /// (impossible from `compile.rs`'s own allocator, which always sizes
+    /// `nregs` to cover every register it emits -- but trivially producible
+    /// by hand-editing or corrupting a `.kx` file, which `kupl run
+    /// <file.kx>`/`kupl dis` accept from an arbitrary path) decodes
+    /// successfully, then used to crash the VM with a raw Rust
+    /// index-out-of-bounds panic (a bogus "internal compiler error")
+    /// partway through EXECUTION, not decoding. Confirmed live before this
+    /// fix by hand-patching a real compiled `.kx` file's `nregs` field down
+    /// from 6 to 1/3 and running it.
+    ///
+    /// Constructs the corruption directly on a `Module` (skipping
+    /// encode/decode entirely, since the bug is in EXECUTION, not decoding)
+    /// -- `compile_module`'s own allocator always produces a consistent
+    /// `nregs`, so this simulates exactly what a hand-crafted/corrupted
+    /// `.kx` file's `decode()` would hand the VM.
+    #[test]
+    fn a_kx_module_with_nregs_smaller_than_its_own_bytecode_needs_is_a_clean_error_not_a_panic() {
+        let src = "fun add(a: Int, b: Int) -> Int {\n    let x = a + b\n    let y = x * 2\n    y + 1\n}\n\
+                   fun main() uses io {\n    print(add(3, 4))\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let add_idx = module.funs["add"];
+        let original_nregs = module.chunks[add_idx as usize].nregs;
+        assert!(original_nregs > 2, "the test needs `add` to genuinely use more than 2 registers");
+
+        // a legitimate module still runs correctly (sanity check).
+        let mut vm = crate::vm::Vm::new(&module);
+        assert_eq!(vm.call_named("main", vec![]).is_ok(), true);
+
+        // corrupt just this one chunk's `nregs` -- exactly what a
+        // hand-edited/corrupted `.kx` file's decode() would hand the VM,
+        // since decode() never cross-checks this field.
+        module.chunks[add_idx as usize].nregs = 2;
+        let mut vm = crate::vm::Vm::new(&module);
+        let err = vm.call_named("add", vec![crate::value::Value::Int(3), crate::value::Value::Int(4)]).expect_err(
+            "an nregs/bytecode mismatch must be a clean VmError, not a panic",
+        );
+        assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
+    }
+
+    /// The state-slot twin of the test above (production-hardening
+    /// PR-it687): `ComponentMeta::nslots` has the exact same "never cross-
+    /// validated by `decode()`" gap as a chunk's `nregs` -- `Op::StateGet`/
+    /// `Op::StateSet` decode their own independent `slot: u8` operand that
+    /// `decode()` never checks against `nslots`. A component whose `nslots`
+    /// disagrees with the slot indices its own handlers/exposes reference
+    /// used to crash with a raw index-out-of-bounds panic on
+    /// `self.instances[id].slots[slot as usize]`.
+    #[test]
+    fn a_kx_component_with_nslots_smaller_than_its_own_state_accesses_is_a_clean_error_not_a_panic() {
+        let src = "component Widget {\n    intent \"w\"\n    state total: Int = 0\n    \
+                   expose fun bump() -> Int {\n        total += 1\n        total\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let widget = module.components.iter_mut().find(|c| c.name == "Widget").expect("Widget component");
+        assert!(widget.nslots >= 1, "the test needs Widget to genuinely have a state slot");
+
+        // a legitimate module still runs correctly (sanity check).
+        let mut vm = crate::vm::Vm::new(&module);
+        let id = vm.instantiate_named("Widget", vec![]).expect("instantiates");
+        assert!(vm.call_expose(id, "bump", vec![]).is_ok());
+
+        // corrupt nslots to 0 -- exactly what a hand-edited/corrupted `.kx`
+        // file's decode() would hand the VM, since decode() never
+        // cross-checks this field against `Op::StateGet`/`StateSet`. The
+        // mismatch surfaces immediately: `instantiate` sizes `slots` off
+        // `nslots` BEFORE running the init chunk, which itself sets `total`
+        // via `Op::StateSet(0, ...)`.
+        module.components.iter_mut().find(|c| c.name == "Widget").unwrap().nslots = 0;
+        let mut vm = crate::vm::Vm::new(&module);
+        let err = vm
+            .instantiate_named("Widget", vec![])
+            .expect_err("an nslots/state-access mismatch must be a clean VmError, not a panic");
+        assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
+    }
+
     #[test]
     fn version_mismatch_is_distinguished() {
         let src = "fun main() {\n    print(1)\n}\n";

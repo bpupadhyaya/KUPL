@@ -335,8 +335,15 @@ impl<'m> Vm<'m> {
         }
     }
 
-    fn chunk(&self, idx: u16) -> &'m Chunk {
-        &self.module.chunks[idx as usize]
+    /// `Err` (a clean `VmError`, never a panic) on an out-of-range `idx` --
+    /// legitimate `compile.rs`-produced bytecode never emits one, but a
+    /// hand-crafted or corrupted `.kx` file's `Call`/`MakeClosure`/etc. `fun`/
+    /// `proto` operand could (production-hardening PR-it687).
+    fn chunk(&self, idx: u16) -> Result<&'m Chunk, VmError> {
+        self.module.chunks.get(idx as usize).ok_or_else(|| VmError {
+            msg: "corrupt .kx module: chunk index out of range".into(),
+            span: Span::default(),
+        })
     }
 
     fn push_frame(
@@ -346,7 +353,7 @@ impl<'m> Vm<'m> {
         dst: Reg,
         inst: Option<usize>,
     ) -> Result<(), VmError> {
-        let chunk = self.chunk(chunk_idx);
+        let chunk = self.chunk(chunk_idx)?;
         let expected = chunk.nparams as usize;
         if args.len() != expected {
             return Err(VmError {
@@ -356,8 +363,21 @@ impl<'m> Vm<'m> {
         }
         let base = self.stack.len();
         self.stack.resize(base + chunk.nregs as usize, Value::Unit);
+        // `ncaps`/`nparams` are independent `.kx` fields too -- placing an
+        // argument/capture past `nregs` (only reachable via a corrupt file;
+        // `compile.rs` always allocates enough registers for its own
+        // captures+params) must be a clean error, not a panic (PR-it687).
         for (i, a) in args.iter().enumerate() {
-            self.stack[base + chunk.ncaps as usize + i] = a.clone();
+            let idx = base + chunk.ncaps as usize + i;
+            match self.stack.get_mut(idx) {
+                Some(slot) => *slot = a.clone(),
+                None => {
+                    return Err(VmError {
+                        msg: "corrupt .kx module: parameter register out of range".into(),
+                        span: Span::default(),
+                    })
+                }
+            }
         }
         if self.frames.len() >= 10_000 {
             return Err(VmError { msg: "stack overflow (10000 frames)".into(), span: Span::default() });
@@ -377,7 +397,17 @@ impl<'m> Vm<'m> {
         self.push_frame(proto, args, dst, inst)?;
         let base = self.frames.last().unwrap().base;
         for (i, c) in captures.iter().enumerate() {
-            self.stack[base + i] = c.clone();
+            // same corrupt-.kx-file concern as push_frame's own parameter
+            // placement above (PR-it687).
+            match self.stack.get_mut(base + i) {
+                Some(slot) => *slot = c.clone(),
+                None => {
+                    return Err(VmError {
+                        msg: "corrupt .kx module: capture register out of range".into(),
+                        span: Span::default(),
+                    })
+                }
+            }
         }
         Ok(())
     }
@@ -413,19 +443,46 @@ impl<'m> Vm<'m> {
                 let f = frame!();
                 (f.chunk, f.ip, f.base, f.inst)
             };
-            let chunk = self.chunk(chunk_idx);
+            let chunk = self.chunk(chunk_idx)?;
             let op = chunk.code[ip].clone();
             let span = chunk.spans[ip];
             frame!().ip += 1;
 
+            // A REAL bug found+fixed (production-hardening PR-it687): `reg!`/
+            // `set!` used to index `self.stack` directly with no bounds check.
+            // In a module `compile.rs` produced, every register operand IS
+            // guaranteed `< chunk.nregs` (its own register allocator's own
+            // invariant) -- but `kx.rs::decode()` never cross-validates a
+            // `.kx` file's `nregs` field against the actual register operands
+            // its bytecode instructions reference, so a hand-crafted or
+            // corrupted `.kx` file can freely violate that invariant.
+            // Confirmed live before this fix: patching a compiled `.kx`
+            // file's `nregs` field down to 1 (leaving its `Add`/etc.
+            // instructions, which reference higher registers, untouched)
+            // crashed `kupl run` with a raw Rust index-out-of-bounds panic
+            // (a bogus "internal compiler error"), not a clean error --
+            // `kupl run <file.kx>`/`kupl dis` accept an arbitrary path, and
+            // `.kx` is documented as a distributable compiled-module format,
+            // so this is genuinely untrusted input, not just "can't happen
+            // to a well-formed file we produced ourselves."
             macro_rules! reg {
                 ($r:expr) => {
-                    self.stack[base + $r as usize].clone()
+                    match self.stack.get(base + $r as usize) {
+                        Some(v) => v.clone(),
+                        None => {
+                            return Err(VmError { msg: "corrupt .kx module: register index out of range".into(), span })
+                        }
+                    }
                 };
             }
             macro_rules! set {
                 ($r:expr, $v:expr) => {
-                    self.stack[base + $r as usize] = $v
+                    match self.stack.get_mut(base + $r as usize) {
+                        Some(slot) => *slot = $v,
+                        None => {
+                            return Err(VmError { msg: "corrupt .kx module: register index out of range".into(), span })
+                        }
+                    }
                 };
             }
             macro_rules! bin {
@@ -527,7 +584,7 @@ impl<'m> Vm<'m> {
                 },
                 Op::Call { dst, fun, start, argc } => {
                     let args: Vec<Value> =
-                        (0..argc).map(|i| reg!(start + i)).collect();
+                        (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     self.push_frame(fun, &args, dst, None).map_err(|mut e| {
                         e.span = span;
                         e
@@ -535,7 +592,7 @@ impl<'m> Vm<'m> {
                 }
                 Op::CallComp { dst, fun, start, argc } => {
                     let args: Vec<Value> =
-                        (0..argc).map(|i| reg!(start + i)).collect();
+                        (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     self.push_frame(fun, &args, dst, cur_inst).map_err(|mut e| {
                         e.span = span;
                         e
@@ -550,14 +607,14 @@ impl<'m> Vm<'m> {
                     };
                     let intent_str = reg!(intent).to_string();
                     let args: Vec<Value> =
-                        (0..chunk.nparams).map(|i| reg!(chunk.ncaps + i)).collect();
+                        (0..chunk.nparams).map(|i| Ok(reg!(chunk.ncaps + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     match crate::ai::ai_call(meta, &intent_str, &args, self) {
                         Ok(v) => set!(dst, v),
                         Err(msg) => return Err(VmError { msg, span }),
                     }
                 }
                 Op::CallBuiltin { dst, which, start, argc } => {
-                    let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     match which {
                         BUILTIN_PRINT => {
                             println!("{}", args[0]);
@@ -774,7 +831,7 @@ impl<'m> Vm<'m> {
                 }
                 Op::CallValue { dst, f, start, argc } => {
                     let callee = reg!(f);
-                    let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     match callee {
                         Value::Fun(name) => {
                             let Some(&idx) = self.module.funs.get(name.as_str()) else {
@@ -874,7 +931,7 @@ impl<'m> Vm<'m> {
                         continue;
                     }
                     let r = reg!(recv);
-                    let args: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     // expose call on a component instance
                     if let Value::Component(id) = r {
                         let meta = &self.module.components[self.instances[id].comp as usize];
@@ -948,12 +1005,12 @@ impl<'m> Vm<'m> {
                     self.stack[slot] = value;
                 }
                 Op::MakeList { dst, start, len } => {
-                    let items: Vec<Value> = (0..len).map(|i| reg!(start + i)).collect();
+                    let items: Vec<Value> = (0..len).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     set!(dst, Value::List(Rc::new(items)));
                 }
                 Op::MakeCtor { dst, ctor, start, len } => {
                     let meta = &self.module.ctors[ctor as usize];
-                    let fields: Vec<Value> = (0..len).map(|i| reg!(start + i)).collect();
+                    let fields: Vec<Value> = (0..len).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     set!(
                         dst,
                         Value::Ctor {
@@ -1045,7 +1102,7 @@ impl<'m> Vm<'m> {
                     set!(dst, Value::Bool(is));
                 }
                 Op::MakeClosure { dst, proto, start, ncaps } => {
-                    let caps: Vec<Value> = (0..ncaps).map(|i| reg!(start + i)).collect();
+                    let caps: Vec<Value> = (0..ncaps).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     set!(dst, Value::VmClosure(proto, Rc::new(caps), cur_inst));
                 }
                 Op::MakeRange { dst, lo, hi, inclusive } => {
@@ -1098,7 +1155,12 @@ impl<'m> Vm<'m> {
                     let Some(id) = cur_inst else {
                         return Err(VmError { msg: "state access outside a component".into(), span });
                     };
-                    let v = self.instances[id].slots[slot as usize].clone();
+                    // `slot` is an independent `.kx`-decoded operand, never
+                    // cross-checked against `nslots` at load time -- same
+                    // corrupt-file concern as register indices (PR-it687).
+                    let Some(v) = self.instances[id].slots.get(slot as usize).cloned() else {
+                        return Err(VmError { msg: "corrupt .kx module: state slot out of range".into(), span });
+                    };
                     set!(dst, v);
                 }
                 Op::StateSet(slot, src) => {
@@ -1106,10 +1168,15 @@ impl<'m> Vm<'m> {
                         return Err(VmError { msg: "state access outside a component".into(), span });
                     };
                     let v = reg!(src);
-                    self.instances[id].slots[slot as usize] = v;
+                    match self.instances[id].slots.get_mut(slot as usize) {
+                        Some(s) => *s = v,
+                        None => {
+                            return Err(VmError { msg: "corrupt .kx module: state slot out of range".into(), span })
+                        }
+                    }
                 }
                 Op::MakeInstance { dst, comp, start, argc, policy } => {
-                    let props: Vec<Value> = (0..argc).map(|i| reg!(start + i)).collect();
+                    let props: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     let id = self.instantiate(comp, props).map_err(|mut e| {
                         if e.span == Span::default() {
                             e.span = span;
