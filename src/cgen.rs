@@ -299,7 +299,7 @@ fn emit_chunk(out: &mut String, module: &Module, idx: usize, chunk: &Chunk) -> R
 
     for (pc, op) in chunk.code.iter().enumerate() {
         let _ = write!(out, "L{pc}: ");
-        emit_op(out, module, chunk, op)?;
+        emit_op(out, module, chunk, op, pc)?;
     }
     // safety net: falling off the end returns unit
     let _ = writeln!(out, "L{}: return k_unit();", chunk.code.len());
@@ -351,7 +351,7 @@ fn str_const<'a>(chunk: &'a Chunk, idx: u16) -> Result<&'a str, String> {
     }
 }
 
-fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<(), String> {
+fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize) -> Result<(), String> {
     use Op::*;
     let line = match op {
         Const(d, idx) => format!("regs[{d}] = {};", const_expr(&chunk.consts[*idx as usize], module)?),
@@ -451,10 +451,29 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op) -> Result<
         }
         Method { dst, recv, name, start, argc } => {
             let m = str_const(chunk, *name)?;
-            format!(
-                "regs[{dst}] = k_method(regs[{recv}], \"{}\", &regs[{start}], {argc});",
-                c_escape(m)
-            )
+            // Self-rebind `xs = xs.push(item)` fast path (mirrors interp.rs's
+            // push_list_in_place / vm.rs's dst==recv Op::Method handling):
+            // only safe when `recv` is a genuine chunk-local register (not a
+            // capture/param, which could be aliased before this chunk ever
+            // ran — captures occupy [0, ncaps), params [ncaps, ncaps+nparams),
+            // per compile.rs's FnCompiler register allocation order) AND
+            // method_recv_escapes proves no OTHER op in this chunk could
+            // alias it. The `regs[recv].tag == K_LIST` runtime guard is load-
+            // bearing, not defensive dressing: `dst == recv` and a matching
+            // method name are purely syntactic and say nothing about the
+            // receiver's actual runtime type (e.g. a component exposing its
+            // own method literally named "push").
+            let is_chunk_local = (*recv as u16) >= chunk.ncaps as u16 + chunk.nparams as u16;
+            if m == "push" && dst == recv && is_chunk_local && !method_recv_escapes(chunk, pc) {
+                format!(
+                    "regs[{dst}] = (regs[{recv}].tag == K_LIST) ? k_list_push_inplace(regs[{recv}], regs[{start}]) : k_method(regs[{recv}], \"push\", &regs[{start}], {argc});"
+                )
+            } else {
+                format!(
+                    "regs[{dst}] = k_method(regs[{recv}], \"{}\", &regs[{start}], {argc});",
+                    c_escape(m)
+                )
+            }
         }
         Ret(r) => format!("return regs[{r}];"),
         MakeList { dst, start, len } => format!("regs[{dst}] = k_list(&regs[{start}], {len});"),
@@ -577,7 +596,12 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <poll.h>
 
 typedef struct KValue KValue;
-typedef struct { int64_t len; KValue* items; } KList;
+/* `cap` tracks allocated (not just used) slots in `items`, so a self-rebind
+   `xs = xs.push(item)` can grow via amortized-doubling reallocation instead
+   of a fresh k_alloc + memcpy on every call (see k_list_push_inplace). Every
+   OTHER constructor of a KList (k_list itself) sets cap == len — spare
+   capacity only exists after at least one in-place push. */
+typedef struct { int64_t len; int64_t cap; KValue* items; } KList;
 typedef struct { int32_t ctor; KValue* fields; int32_t nfields; } KCtor;
 /* origin_inst: the component instance that was "current" when this closure
    was made (-1 outside any component). A call to a component-local function
@@ -1026,9 +1050,30 @@ static KValue k_range(KValue lo, KValue hi, int incl) {
 static KValue k_list(KValue* items, int n) {
     KList* l = k_alloc(sizeof(KList));
     l->len = n;
+    l->cap = n;
     l->items = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
     memcpy(l->items, items, sizeof(KValue) * n);
     KValue x; x.tag = K_LIST; x.as.list = l; return x;
+}
+
+/* In-place push fast path for the self-rebind `xs = xs.push(item)` idiom.
+   Only ever emitted (see emit_op's Method case) when the codegen has
+   proved `recv` is a chunk-local register never aliased elsewhere in this
+   chunk — safe to mutate the SAME KList this call's receiver already
+   points to, rather than the generic k_method "push" handler's always-copy
+   path. Grows `items` by amortized doubling (like Vec's own growth
+   strategy) so a loop of N such pushes is O(N) total, not O(N^2). */
+static KValue k_list_push_inplace(KValue recv, KValue item) {
+    KList* l = recv.as.list;
+    if (l->len >= l->cap) {
+        int64_t newcap = l->cap < 1 ? 4 : l->cap * 2;
+        KValue* grown = k_alloc(sizeof(KValue) * newcap);
+        memcpy(grown, l->items, sizeof(KValue) * l->len);
+        l->items = grown;
+        l->cap = newcap;
+    }
+    l->items[l->len++] = item;
+    return recv;
 }
 
 extern const KCtorMeta CTORS[];
