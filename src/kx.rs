@@ -1009,6 +1009,73 @@ mod tests {
         assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
     }
 
+    /// The constant-pool twin of the two tests above (production-hardening
+    /// PR-it688): `Op::Const`'s own index operand (and several other ops that
+    /// store a field/method/port NAME as a string constant) is never
+    /// cross-validated by `decode()` against `chunk.consts.len()` either.
+    #[test]
+    fn a_kx_chunk_with_a_const_index_past_its_own_pool_is_a_clean_error_not_a_panic() {
+        let src = "fun greet() -> Str {\n    \"hello\"\n}\nfun main() uses io {\n    print(greet())\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let greet_idx = module.funs["greet"];
+        assert!(
+            !module.chunks[greet_idx as usize].consts.is_empty(),
+            "the test needs `greet` to genuinely reference a constant"
+        );
+
+        // a legitimate module still runs correctly (sanity check).
+        let mut vm = crate::vm::Vm::new(&module);
+        assert!(vm.call_named("main", vec![]).is_ok());
+
+        // drop the const pool to empty -- exactly what a hand-edited/
+        // corrupted `.kx` file's decode() would hand the VM, since decode()
+        // never cross-checks a chunk's `consts` length against the const
+        // indices its OWN `code` still references.
+        module.chunks[greet_idx as usize].consts.clear();
+        let mut vm = crate::vm::Vm::new(&module);
+        let err = vm
+            .call_named("greet", vec![])
+            .expect_err("a consts/bytecode mismatch must be a clean VmError, not a panic");
+        assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
+    }
+
+    /// The instruction-pointer twin of the tests above (production-hardening
+    /// PR-it688): `ip` starts at 0 and only ever changes via a plain
+    /// increment or a `Jump`/`JumpIfFalse`/`JumpIfTrue` target -- neither
+    /// `decode()` nor the VM's own increment ever checked it stays `<
+    /// chunk.code.len()`. A truncated `.kx` file's `code` array (shorter than
+    /// what its OWN spans array or a jump target still implies) used to crash
+    /// with a raw index-out-of-bounds panic reading the NEXT instruction.
+    #[test]
+    fn a_kx_chunk_whose_code_ends_before_ip_reaches_it_is_a_clean_error_not_a_panic() {
+        let src = "fun three() -> Int {\n    let a = 1\n    let b = 2\n    a + b\n}\n\
+                   fun main() uses io {\n    print(three())\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let three_idx = module.funs["three"];
+        let original_len = module.chunks[three_idx as usize].code.len();
+        assert!(original_len > 1, "the test needs `three` to genuinely have more than one instruction");
+
+        // a legitimate module still runs correctly (sanity check).
+        let mut vm = crate::vm::Vm::new(&module);
+        assert!(vm.call_named("main", vec![]).is_ok());
+
+        // truncate `code` (and `spans`, kept in sync the same way decode()
+        // itself always keeps them) to just its FIRST instruction -- `ip`
+        // walks off the end on the second loop iteration, exactly what a
+        // `.kx` file truncated (or lying about `ncode`) would produce.
+        module.chunks[three_idx as usize].code.truncate(1);
+        module.chunks[three_idx as usize].spans.truncate(1);
+        let mut vm = crate::vm::Vm::new(&module);
+        let err = vm
+            .call_named("three", vec![])
+            .expect_err("running off the end of `code` must be a clean VmError, not a panic");
+        assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
+    }
+
     #[test]
     fn version_mismatch_is_distinguished() {
         let src = "fun main() {\n    print(1)\n}\n";

@@ -444,8 +444,21 @@ impl<'m> Vm<'m> {
                 (f.chunk, f.ip, f.base, f.inst)
             };
             let chunk = self.chunk(chunk_idx)?;
-            let op = chunk.code[ip].clone();
-            let span = chunk.spans[ip];
+            // `ip` starts at 0 and only ever changes via `frame!().ip += 1`
+            // below or a `Jump`/`JumpIfFalse`/`JumpIfTrue` target -- for
+            // `compile.rs`-produced bytecode it always stays in range (every
+            // function body ends in `Op::Ret`; every jump target is one of
+            // its OWN chunk's instruction indices). A hand-crafted/corrupted
+            // `.kx` file's jump target (or a code/spans array truncated
+            // relative to what other bytecode still references it) is under
+            // no such guarantee -- same corrupt-file concern as register/
+            // chunk/slot indices above (PR-it687/it688).
+            let (Some(op), Some(span)) = (chunk.code.get(ip).cloned(), chunk.spans.get(ip).copied()) else {
+                return Err(VmError {
+                    msg: "corrupt .kx module: instruction pointer out of range".into(),
+                    span: Span::default(),
+                });
+            };
             frame!().ip += 1;
 
             // A REAL bug found+fixed (production-hardening PR-it687): `reg!`/
@@ -485,6 +498,21 @@ impl<'m> Vm<'m> {
                     }
                 };
             }
+            // Same corrupt-`.kx`-file concern as `reg!`/`set!` above, for a
+            // chunk's `consts` pool (`Op::Const`'s own const index, and
+            // several ops that store a field/method/port NAME as a string
+            // constant) -- `decode()` never cross-validates a const index
+            // operand against `consts.len()` either (PR-it688).
+            macro_rules! konst {
+                ($idx:expr) => {
+                    match chunk.consts.get($idx as usize) {
+                        Some(v) => v,
+                        None => {
+                            return Err(VmError { msg: "corrupt .kx module: constant index out of range".into(), span })
+                        }
+                    }
+                };
+            }
             macro_rules! bin {
                 ($dst:expr, $a:expr, $b:expr, $op:expr) => {{
                     let l = reg!($a);
@@ -515,7 +543,7 @@ impl<'m> Vm<'m> {
 
             use crate::ast::BinOp as B;
             match op {
-                Op::Const(dst, idx) => set!(dst, chunk.consts[idx as usize].clone()),
+                Op::Const(dst, idx) => set!(dst, konst!(idx).clone()),
                 Op::Move(dst, src) => {
                     let v = reg!(src);
                     set!(dst, v);
@@ -858,7 +886,7 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::Method { dst, recv, name, start, argc } => {
-                    let method = match &chunk.consts[name as usize] {
+                    let method = match konst!(name) {
                         Value::Str(s) => s.as_str().to_string(),
                         _ => return Err(VmError { msg: "bad method name".into(), span }),
                     };
@@ -1033,7 +1061,7 @@ impl<'m> Vm<'m> {
                     }
                 },
                 Op::GetFieldNamed { dst, obj, name } => {
-                    let field = match &chunk.consts[name as usize] {
+                    let field = match konst!(name) {
                         Value::Str(s) => s.as_str().to_string(),
                         _ => return Err(VmError { msg: "bad field name".into(), span }),
                     };
@@ -1063,7 +1091,7 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::WithField { dst, obj, name, value } => {
-                    let field = match &chunk.consts[name as usize] {
+                    let field = match konst!(name) {
                         Value::Str(s) => s.as_str().to_string(),
                         _ => return Err(VmError { msg: "bad field name".into(), span }),
                     };
@@ -1191,8 +1219,8 @@ impl<'m> Vm<'m> {
                     else {
                         return Err(VmError { msg: "wire endpoints must be components".into(), span });
                     };
-                    let out_name = chunk.consts[out_port as usize].to_string();
-                    let in_name = chunk.consts[in_port as usize].to_string();
+                    let out_name = konst!(out_port).to_string();
+                    let in_name = konst!(in_port).to_string();
                     self.instances[src]
                         .wires
                         .entry(out_name)
@@ -1207,7 +1235,7 @@ impl<'m> Vm<'m> {
                         Some(r) => reg!(r),
                         None => Value::Unit,
                     };
-                    let port_name = chunk.consts[port as usize].to_string();
+                    let port_name = konst!(port).to_string();
                     let targets = self.instances[id].wires.get(&port_name).cloned().unwrap_or_default();
                     if targets.is_empty() {
                         if self.print_unwired {
@@ -1221,7 +1249,7 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::Panic(idx) => {
-                    let msg = chunk.consts[idx as usize].to_string();
+                    let msg = konst!(idx).to_string();
                     return Err(VmError { msg, span });
                 }
             }
