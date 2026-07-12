@@ -1,7 +1,6 @@
 //! Abstract syntax tree for KUPL v0.1.
 
 use crate::diag::Span;
-use crate::token::StrPart;
 
 #[derive(Debug, Clone, Default)]
 pub struct Program {
@@ -451,13 +450,4 @@ pub enum TyExprKind {
     Generic(String, Vec<TyExpr>),
     /// `fn(Int, Str) -> Bool`
     Fun(Vec<TyExpr>, Box<TyExpr>),
-}
-
-impl std::convert::From<&StrPart> for StrPiece {
-    fn from(part: &StrPart) -> Self {
-        match part {
-            StrPart::Text(t) => StrPiece::Text(t.clone()),
-            StrPart::Expr(src, _) => StrPiece::Text(format!("{{{src}}}")),
-        }
-    }
 }

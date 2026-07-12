@@ -2342,6 +2342,34 @@ app Main {
         assert_eq!(p.items.len(), 1);
     }
 
+    /// A REAL dead/wrong-code finding fixed (production-hardening PR-it657):
+    /// `ast.rs` used to ALSO declare `impl From<&StrPart> for StrPiece`, but a
+    /// full-codebase grep found nothing that ever called it -- genuinely dead
+    /// code, and worse, semantically WRONG relative to this file's own
+    /// `str_parts_expr`: it turned an `{expr}` interpolation into the LITERAL
+    /// text `"{expr}"` (`StrPiece::Text`) instead of actually parsing it into
+    /// a sub-expression (`StrPiece::Expr`) -- a landmine for a future
+    /// refactor that reached for `.into()` instead of this function. This
+    /// test locks in the DESIGN that impl would have broken: an interpolated
+    /// `{expr}` must parse into a real `StrPiece::Expr` sub-expression (here,
+    /// a `Binary` for `name + "!"`), never survive as literal brace text.
+    #[test]
+    fn string_interpolation_parses_into_a_real_expression_not_literal_brace_text() {
+        let p = ok("fun f() -> Str {\n    \"hi {1 + 2}!\"\n}\n");
+        let Item::Fun(f) = &p.items[0] else { panic!("expected fun") };
+        let Stmt::Expr(e) = &f.body.stmts[0] else { panic!("expected expr stmt") };
+        let ExprKind::Str(pieces) = &e.kind else { panic!("expected a string literal") };
+        assert_eq!(pieces.len(), 3, "{pieces:?}");
+        assert!(matches!(&pieces[0], StrPiece::Text(t) if t == "hi "));
+        match &pieces[1] {
+            StrPiece::Expr(inner) => {
+                assert!(matches!(&inner.kind, ExprKind::Binary { .. }), "{inner:?}");
+            }
+            other => panic!("interpolation must parse to StrPiece::Expr, not {other:?}"),
+        }
+        assert!(matches!(&pieces[2], StrPiece::Text(t) if t == "!"));
+    }
+
     #[test]
     fn parse_lambda_and_methods() {
         let p = ok("fun f(xs: List[Int]) -> List[Int] {\n    xs.filter(fn x { x > 1 }).map(fn x { x * 2 })\n}\n");
