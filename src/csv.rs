@@ -130,6 +130,29 @@ mod tests {
         assert_eq!(p("a\n\nb"), vec![vec!["a"], vec![""], vec!["b"]]);
     }
 
+    /// A coverage-closing verification (production-hardening PR-it667; no
+    /// bug found -- checked here AND in `cgen.rs`'s native mirror after a
+    /// direct line-by-line read of both implementations found no
+    /// divergence). An UNTERMINATED quoted field (a `"` opened but never
+    /// closed before the input ends) had ZERO test coverage: the quote-
+    /// consuming inner loop's `if i >= n { break; }` just stops at EOF with
+    /// whatever was accumulated -- no panic, no error, matching RFC 4180's
+    /// lack of any error-recovery grammar for a genuinely malformed CSV
+    /// document (this parser has no error channel at all, so "read to EOF"
+    /// is the only sane behavior). Also locks in a related, easy-to-miss
+    /// edge case: a LONE quoted field with no trailing comma/newline
+    /// delimiter at all is silently DROPPED entirely (the flush check at
+    /// the end of `parse` only fires when `field` or `row` is non-empty,
+    /// but a fully-consumed `""` leaves BOTH empty) -- surprising, but
+    /// consistent between engines, so not a bug for cross-engine purposes.
+    #[test]
+    fn unterminated_quoted_field_reads_to_end_of_input() {
+        assert_eq!(p("a,\"unterminated"), vec![vec!["a", "unterminated"]]);
+        // a lone quoted-then-closed field with NO delimiter at all never
+        // reaches the end-of-parse flush (nothing was ever pushed to `row`).
+        assert_eq!(p("\"\""), Vec::<Vec<String>>::new());
+    }
+
     #[test]
     fn stringify_quotes_when_needed() {
         assert_eq!(stringify(&[vec!["a".into(), "b".into()]]), "a,b");

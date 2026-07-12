@@ -8980,6 +8980,23 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "csv").trim(), "a,\"b,c\"\nd,e\n\"a\"\"b\",c\nx,y");
     }
 
+    /// A coverage-closing verification (production-hardening PR-it667; no
+    /// bug found, matching a new test added to `csv.rs` itself this same
+    /// iteration -- `unterminated_quoted_field_reads_to_end_of_input`). An
+    /// unterminated quoted field (EOF mid-quote) and a lone quoted field
+    /// with no trailing delimiter (silently dropped, since the end-of-parse
+    /// flush never fires) had ZERO native cross-engine coverage before this.
+    #[test]
+    fn native_csv_unterminated_quote_and_lone_field_match_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(csv_parse(\"a,\\\"unterminated\"))\n    \
+                   print(csv_parse(\"\\\"\\\"\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "csvunterm").trim(), "[[\"a\", \"unterminated\"]]\n[]");
+    }
+
     /// Native regex matches the interpreter, incl. `.` over multi-byte characters
     /// (was one byte -> invalid-UTF-8 fragments; PR-it42). ASCII unchanged.
     #[test]
