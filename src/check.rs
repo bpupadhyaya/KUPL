@@ -496,6 +496,43 @@ impl Checker {
                         let ty = self.resolve_ty(&prop.ty);
                         sig.props.push((prop.name.clone(), ty, prop.default.is_some()));
                     }
+                    // A REAL cross-engine-divergence bug (production-hardening
+                    // PR-it701): unlike every sibling collection in this same
+                    // function (ports K0204, children K0207, `on` handlers K0209,
+                    // props K0215, top-level funs K0203), a component's PRIVATE
+                    // and EXPOSED methods had no duplicate-name check at all --
+                    // `c.funs`/`c.exposes` are both plain `Vec<FunDecl>`, and
+                    // nothing rejected two same-named methods (private+private,
+                    // exposed+exposed, OR private+exposed, since interp.rs's
+                    // dispatch chains BOTH lists together either order). Confirmed
+                    // live before this fix that the FOUR ENGINES DISAGREE on a
+                    // duplicate: interp.rs's `.find()` over the chained lists
+                    // picks the FIRST declaration; compile.rs's `fun_chunks`
+                    // `HashMap::insert` (feeding the KVM AND native, which share
+                    // the same compiled `Module`) picks the LAST -- a direct
+                    // violation of the "four engines byte-identical" invariant,
+                    // reachable from source `kupl check` accepted with ZERO
+                    // diagnostics. This ALSO closed a `check_fulfills` soundness
+                    // hole: it validated a contract's effect budget (K0264)
+                    // against the FIRST matching declaration's effects while the
+                    // type signature check used the type-checker's own LAST-
+                    // registered signature -- two different physical
+                    // declarations could be silently cross-validated against
+                    // each other, so a genuinely contract-violating duplicate
+                    // (declaring a narrower-effects `act` first, a wider-effects
+                    // one second) passed `kupl check` clean even though the
+                    // declaration that actually WINS at runtime (KVM/native)
+                    // exceeds the contract's declared budget.
+                    let mut method_names: HashSet<&str> = HashSet::new();
+                    for f in c.funs.iter().chain(c.exposes.iter()) {
+                        if !method_names.insert(f.name.as_str()) {
+                            self.err(
+                                "K0277",
+                                format!("method `{}` is defined more than once in component `{}`", f.name, c.name),
+                                f.span,
+                            );
+                        }
+                    }
                     for f in &c.exposes {
                         self.reject_param_defaults(&f.params, &format!("exposed method `{}`'s parameters", f.name));
                         let params: Vec<Ty> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
@@ -4729,6 +4766,53 @@ mod generic_tests {
         assert!(
             nonempty.iter().any(|d| d.code == "K0264" && d.message.contains("uses `exec`") && d.message.contains("allows only [io]")),
             "{nonempty:?}"
+        );
+    }
+
+    /// A REAL cross-engine-divergence bug (production-hardening PR-it701): unlike
+    /// every sibling collection in the component signature-collection pass (ports
+    /// K0204, children K0207, `on` handlers K0209, props K0215, top-level funs
+    /// K0203), a component's private/exposed methods had NO duplicate-name check
+    /// at all. Confirmed live before this fix that the interpreter and the KVM/
+    /// native DISAGREE on which same-named declaration wins (interp: first;
+    /// compile.rs's `HashMap::insert`-built chunk table, shared by KVM and
+    /// native: last) -- reachable from source `kupl check` accepted with ZERO
+    /// diagnostics, a direct violation of the four-engines-byte-identical
+    /// invariant.
+    #[test]
+    fn duplicate_component_method_names_are_rejected() {
+        // exposed + exposed.
+        let ee = errors("component Dup {\n    intent \"dup\"\n    expose fun act() -> Int { 1 }\n    expose fun act() -> Int { 2 }\n}\nfun main() {}\n");
+        assert!(
+            ee.iter().any(|d| d.code == "K0277" && d.message.contains("method `act`") && d.message.contains("component `Dup`")),
+            "{ee:?}"
+        );
+        // private + private.
+        let pp = errors("component Dup {\n    intent \"dup\"\n    fun helper() -> Int { 1 }\n    fun helper() -> Int { 2 }\n    expose fun act() -> Int { helper() }\n}\nfun main() {}\n");
+        assert!(pp.iter().any(|d| d.code == "K0277" && d.message.contains("method `helper`")), "{pp:?}");
+        // private + exposed (interp.rs's dispatch chains BOTH lists together,
+        // so this collides in dispatch exactly like same-list duplicates do).
+        let pe = errors("component Dup {\n    intent \"dup\"\n    fun act() -> Int { 1 }\n    expose fun act() -> Int { 2 }\n}\nfun main() {}\n");
+        assert!(pe.iter().any(|d| d.code == "K0277" && d.message.contains("method `act`")), "{pe:?}");
+        // an ordinary component with distinctly-named private+exposed methods is unaffected.
+        assert!(errors("component Ok {\n    intent \"ok\"\n    fun helper() -> Int { 1 }\n    expose fun act() -> Int { helper() }\n}\nfun main() {}\n").is_empty());
+
+        // The duplicate check ALSO closes a `check_fulfills` soundness hole: it
+        // used to validate a contract's effect budget (K0264) against the FIRST
+        // matching declaration while the type-checker's signature lookup used the
+        // LAST-registered one -- two DIFFERENT physical declarations silently
+        // cross-validated against each other. A genuinely contract-violating
+        // duplicate (a narrower-effects `act` first, a wider-effects one second,
+        // where the SECOND is the one that actually wins at runtime on KVM/
+        // native) used to pass `kupl check` clean; it must now be REJECTED (as a
+        // duplicate, before K0264 is even reached) rather than silently
+        // validated against the wrong declaration.
+        let fulfills_hole = errors(
+            "contract L {\n    intent \"log\"\n    expose fun act() uses io\n}\ncomponent C fulfills L {\n    intent \"io+exec\"\n    expose fun act() uses io {}\n    expose fun act() uses exec {}\n}\nfun main() {}\n",
+        );
+        assert!(
+            fulfills_hole.iter().any(|d| d.code == "K0277" && d.message.contains("method `act`")),
+            "{fulfills_hole:?}"
         );
     }
 
