@@ -2906,6 +2906,19 @@ mod tests {
 
         // unparseable source: nothing safe to fold
         assert_eq!(folding_ranges("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
+
+        // A REAL coverage gap found+closed (production-hardening PR-it653):
+        // `foldable_spans`' match is exhaustive over ALL 5 `Item` variants
+        // (`Fun`/`Type`/`Component`/`Contract`/`Law`), so a top-level `fun` and
+        // a multi-line `type` genuinely DO fold in the implementation -- but
+        // this test's own name claims "every multiline construct" while only
+        // ever exercising `Component`/`Contract`/`Law`, never `Fun` or `Type`.
+        let top_level = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+                          type Row = {\n    name: Str,\n    age: Int\n}\n";
+        let top_ranges = folding_ranges(top_level).expect("parses cleanly");
+        assert!(top_ranges.contains("{\"startLine\":0,\"endLine\":2}"), "fun add: {top_ranges}");
+        assert!(top_ranges.contains("{\"startLine\":3,\"endLine\":6}"), "multi-line type Row: {top_ranges}");
+        assert_eq!(top_ranges.matches("\"startLine\"").count(), 2, "{top_ranges}");
     }
 
     #[test]
