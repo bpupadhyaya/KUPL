@@ -240,14 +240,52 @@ pub fn materialize(
         }
         verify_hash(content, &version.files[path].hash)?;
     }
-    std::fs::create_dir_all(cache_dir).map_err(|e| format!("cannot create {}: {e}", cache_dir.display()))?;
+    // Stage into a sibling temp directory and only atomically rename it into
+    // place once EVERY file has been written successfully (production-
+    // hardening PR-it700). `loader.rs::pkg_ctx`'s "already fetched" check
+    // relies on `cache_dir` being reliable: it treats a cache directory as
+    // fully fetched purely because `kupl.toml` exists in it, with no
+    // verification that every OTHER declared file was actually written. An
+    // interrupted `kupl pkg fetch` (process killed mid-write) used to leave
+    // a PARTIAL `cache_dir` (`kupl.toml` present, entry file missing) that a
+    // LATER `kupl run`/`pkg tree` would then trust as "already fetched" and
+    // skip re-fetching entirely -- failing deep in module loading with a
+    // generic "cannot read module file ... No such file or directory" error,
+    // no hint the CACHE itself was corrupted. Confirmed live before this
+    // fix. Writing to a staging directory first means a mid-write
+    // interruption leaves the ORIGINAL `cache_dir` (if any) untouched and
+    // the staging directory an orphaned `.tmp-*` sibling `pkg_ctx` never
+    // looks at -- never a half-written `cache_dir` for its existence check
+    // to be fooled by.
+    let staging = cache_dir.with_file_name(format!(
+        "{}.tmp-{}",
+        cache_dir.file_name().and_then(|n| n.to_str()).unwrap_or("pkg"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&staging); // a stale leftover from a prior crash, if any
+    std::fs::create_dir_all(&staging).map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
     for (path, content) in contents {
-        let dest = cache_dir.join(path);
+        let dest = staging.join(path);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(format!("cannot create {}: {e}", parent.display()));
+            }
         }
-        std::fs::write(&dest, content).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+        if let Err(e) = std::fs::write(&dest, content) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!("cannot write {}: {e}", dest.display()));
+        }
     }
+    // Every file landed in staging -- now atomically replace `cache_dir`
+    // (a re-fetch's prior contents, if any, are simply superseded; v1
+    // deliberately never cache-skips a re-fetch, per this module's own
+    // established design).
+    let _ = std::fs::remove_dir_all(cache_dir);
+    std::fs::rename(&staging, cache_dir).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        format!("cannot finalize {}: {e}", cache_dir.display())
+    })?;
     Ok(())
 }
 
@@ -563,6 +601,78 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(std::fs::read_to_string(dir.join("main.kupl")).unwrap(), "pub fun f() -> Int { 1 }\n");
         assert_eq!(std::fs::read_to_string(dir.join("kupl.toml")).unwrap(), "[project]\nname = \"x\"\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it700): `materialize` used
+    /// to write files one at a time directly into `cache_dir`, with no staging or
+    /// atomic finalization. `loader.rs::pkg_ctx`'s "already fetched" check treats a
+    /// cache directory as fully materialized purely because `kupl.toml` exists in
+    /// it -- so an interrupted `kupl pkg fetch` (process killed mid-write) could
+    /// leave a PARTIAL cache directory (`kupl.toml` present, entry file missing)
+    /// that a LATER `kupl run`/`pkg tree` would trust as complete and skip
+    /// re-fetching, failing deep in module loading with a generic, uninformative
+    /// "cannot read module file" error. This test simulates exactly that partial/
+    /// corrupt state (a `kupl.toml` with garbage content, a stale leftover file, NO
+    /// entry file), confirms `materialize` atomically REPLACES the whole directory
+    /// (the stale content does not survive, does not get merged with the new
+    /// content), and confirms no orphaned staging directory litters the parent.
+    #[test]
+    fn materialize_atomically_replaces_stale_or_partial_cache_content_and_leaves_no_staging_litter() {
+        let version = RegistryVersion {
+            entry: "main.kupl".to_string(),
+            files: HashMap::from([
+                (
+                    "main.kupl".to_string(),
+                    RegistryFile {
+                        url: "https://example.com/main.kupl".to_string(),
+                        hash: crate::encoding::hex_encode(&format!(
+                            "{}",
+                            crate::encoding::hash_fnv("pub fun f() -> Int { 2 }\n")
+                        )),
+                    },
+                ),
+                (
+                    "kupl.toml".to_string(),
+                    RegistryFile {
+                        url: "https://example.com/kupl.toml".to_string(),
+                        hash: crate::encoding::hex_encode(&format!(
+                            "{}",
+                            crate::encoding::hash_fnv("[project]\nname = \"x\"\n")
+                        )),
+                    },
+                ),
+            ]),
+        };
+        let contents = HashMap::from([
+            ("main.kupl".to_string(), "pub fun f() -> Int { 2 }\n".to_string()),
+            ("kupl.toml".to_string(), "[project]\nname = \"x\"\n".to_string()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("kupl-registry-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Simulate a partial/corrupt cache directory left behind by an
+        // interrupted fetch: `kupl.toml` present (what `pkg_ctx`'s "already
+        // fetched" check looks for) but with GARBAGE content, the entry file
+        // genuinely MISSING, plus a stale leftover a real fetch never wrote.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kupl.toml"), "GARBAGE, not even the right content").unwrap();
+        std::fs::write(dir.join("stale_leftover.kupl"), "should not survive").unwrap();
+        assert!(!dir.join("main.kupl").is_file(), "sanity: entry file genuinely missing, simulating a partial fetch");
+
+        let result = materialize(&version, &contents, &dir);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("main.kupl")).unwrap(), "pub fun f() -> Int { 2 }\n");
+        assert_eq!(std::fs::read_to_string(dir.join("kupl.toml")).unwrap(), "[project]\nname = \"x\"\n");
+        assert!(!dir.join("stale_leftover.kupl").exists(), "old/partial cache content must not survive a re-fetch");
+
+        // No orphaned staging directory litters the parent.
+        let parent = dir.parent().unwrap();
+        let leftover_staging = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(!leftover_staging, "materialize must not leave an orphaned staging directory behind on success");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
