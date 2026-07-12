@@ -1195,6 +1195,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL quality bug in `prop::shrink` (PR-it694): the generic `Value::Ctor` arm
+    /// only shrunk fields IN PLACE, never trying a smaller SIBLING variant of the same
+    /// recursive type -- so shrinking a self-referential ADT (a `Tree`, a linked-list-
+    /// as-ADT, an expression AST, ...) could get permanently stuck at whatever depth the
+    /// first failing generated case happened to land on, reporting a needlessly deep,
+    /// non-minimal counterexample instead of the genuinely minimal one. Confirmed live
+    /// before this fix: `type Chain = Base | Rec1(child: Chain) | Rec2(child: Chain) |
+    /// Rec3(child: Chain)` with `forall c: Chain { expect false }` (unconditionally
+    /// false, so the true minimal counterexample is simply `Base`) reported
+    /// `Rec2(Rec3(Base))` instead. `forall`/`shrink` is interp-only (`kupl test` always
+    /// runs laws via `Interp`, never the KVM or native) -- sweeps not applicable, stated
+    /// explicitly.
+    #[test]
+    fn forall_shrinks_a_recursive_adt_counterexample_to_its_minimal_sibling_variant() {
+        use crate::ast::Item;
+        use crate::interp::{Flow, Interp, ProgramDb};
+
+        let law_panic_msg = |src: &str| -> String {
+            let compiled = super::compile(src).expect("compiles");
+            let Item::Law(law) = compiled
+                .program
+                .items
+                .iter()
+                .find(|i| matches!(i, Item::Law(_)))
+                .expect("has a law")
+            else {
+                unreachable!()
+            };
+            let db = ProgramDb::build(&compiled.program, &compiled.checked);
+            let mut interp = Interp::new(db);
+            let env = interp.globals.child();
+            match interp.exec_block(&law.body, &env) {
+                Err(Flow::Panic { msg, .. }) => msg,
+                Ok(_) => panic!("expected the law to fail, but it passed"),
+                Err(_) => panic!("expected a panic, got other unexpected control flow"),
+            }
+        };
+        // A single-recursive-field enum: the minimal counterexample is the nullary
+        // variant `Base`, reachable only by promoting a same-typed field up a level.
+        let chain = "type Chain = Base | Rec1(child: Chain) | Rec2(child: Chain) | Rec3(child: Chain)\n\
+                     law \"x\" { forall c: Chain { expect false } }\n";
+        assert_eq!(law_panic_msg(chain), "property failed for c = Base");
+        // A two-recursive-field (binary tree) shape shrinks to its own nullary variant
+        // too -- promotion must work regardless of WHICH field position holds the
+        // same-typed value, and regardless of how many recursive fields a variant has.
+        let tree = "type Tree = Leaf | Node(l: Tree, r: Tree)\n\
+                    law \"x\" { forall t: Tree { expect false } }\n";
+        assert_eq!(law_panic_msg(tree), "property failed for t = Leaf");
+    }
+
     #[test]
     fn run_tests_tallies_skipped_contract_laws() {
         // A REAL BUG found+fixed (PR-it583): the contract-laws loop's "component

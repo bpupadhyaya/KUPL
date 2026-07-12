@@ -266,9 +266,32 @@ pub fn shrink(v: &Value) -> Vec<Value> {
             }
             out
         }
-        // record / enum: shrink one field at a time
+        // record / enum: promote a same-typed field to replace the whole value,
+        // THEN shrink one field at a time. The promotion is a generalization of
+        // the `Option::Some -> None` case above to any user-defined recursive
+        // ADT: a field whose OWN value is a `Ctor` of the SAME `ty` (e.g.
+        // `Rec2(child: Chain)`'s `child`, itself a `Chain`) is structurally
+        // guaranteed to be a valid, smaller sibling of the whole value --
+        // `generate` could only ever have produced a same-typed value there.
+        // Without this, shrinking a recursive type (a tree, a linked-list-as-
+        // ADT, an expression AST, ...) could get permanently stuck mutating
+        // fields IN PLACE at whatever depth the first failing case happened to
+        // generate, converging on a needlessly deep, non-minimal counterexample
+        // instead of a genuinely minimal one -- confirmed live before this fix
+        // (production-hardening PR-it694): `type Chain = Base | Rec1(child:
+        // Chain) | Rec2(child: Chain) | Rec3(child: Chain)` with `forall c:
+        // Chain { expect false }` (unconditionally false, so `Base` is the
+        // true minimal counterexample) reported `Rec2(Rec3(Base))` instead.
+        // Promotions are tried FIRST (greedy shrinking keeps the first
+        // still-failing candidate) since dropping a whole level converges
+        // faster than a single field-level mutation.
         Value::Ctor { ty, variant, fields } if !fields.is_empty() => {
             let mut out = Vec::new();
+            for f in fields.iter() {
+                if matches!(f, Value::Ctor { ty: fty, .. } if fty == ty) {
+                    out.push(f.clone());
+                }
+            }
             for i in 0..fields.len() {
                 for c in shrink(&fields[i]) {
                     let mut nf = fields.as_ref().clone();
