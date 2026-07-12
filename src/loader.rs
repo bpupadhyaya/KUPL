@@ -30,6 +30,17 @@ struct PkgCtx {
     /// forgetting to write the file, even though the manifest correctly
     /// declared the dependency (production-hardening PR-it625).
     registry_only: HashMap<String, String>,
+    /// name -> version for EVERY version-only dependency the manifest
+    /// declares, regardless of whether it has already been fetched into the
+    /// registry cache (unlike `registry_only`, which only holds the
+    /// still-unresolved ones once a dependency's cache directory exists —
+    /// production-hardening PR-it641). `kupl pkg fetch` iterates this one:
+    /// `registry.rs`'s `fetch_package` doc comment is explicit that v1
+    /// deliberately never cache-skips a re-fetch, and that design decision
+    /// must keep holding even though `registry_only`/`deps` now do
+    /// distinguish fetched from unfetched for every OTHER purpose (`use`
+    /// resolution, `pkg tree`/`pkg lock`, ordinary loading).
+    all_registry: HashMap<String, String>,
     prefix: String,
     /// Set when a `kupl.toml` was found but failed to parse — surfaced as a hard
     /// error rather than silently ignored (which would make the deps vanish).
@@ -69,20 +80,40 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
                 Ok(m) => {
                     let mut deps = HashMap::new();
                     let mut registry_only = HashMap::new();
+                    let mut all_registry = HashMap::new();
                     for dep in &m.deps {
                         if let Some(p) = &dep.path {
                             deps.insert(dep.name.clone(), (normalize(&cur.join(p)), dep.version.clone()));
                         } else if let Some(v) = &dep.version {
-                            // version-only deps resolve via a registry — a later slice.
-                            // Tracked (not dropped) so a `use` of this name gets a clear
-                            // error instead of a misleading "file not found".
-                            registry_only.insert(dep.name.clone(), v.clone());
+                            // version-only deps resolve via the registry cache `kupl pkg
+                            // fetch` populates (`registry::cache_dir()/name/version`,
+                            // exactly where `registry::fetch_package` materializes them
+                            // — a plain local directory, matching `registry.rs`'s own
+                            // central design claim that a materialized package is
+                            // indistinguishable downstream from a hand-written `{ path =
+                            // ".." }` dependency). If that directory already exists,
+                            // treat this dependency exactly like a local one from here
+                            // on — `use`, `resolve_deps`, `pkg tree`/`pkg lock`, and
+                            // ordinary loading all pick it up transparently, with no
+                            // separate "run kupl pkg fetch first, then re-run" step
+                            // once the fetch has actually happened. Only still-
+                            // unfetched dependencies fall into `registry_only` below
+                            // (production-hardening PR-it641 — unifies the
+                            // resolve_deps/registry_only_deps split PR-it633 deferred).
+                            all_registry.insert(dep.name.clone(), v.clone());
+                            let cached = crate::registry::cache_dir().join(&dep.name).join(v);
+                            if cached.join("kupl.toml").is_file() {
+                                deps.insert(dep.name.clone(), (cached, Some(v.clone())));
+                            } else {
+                                registry_only.insert(dep.name.clone(), v.clone());
+                            }
                         }
                     }
                     return Rc::new(PkgCtx {
                         root: cur.to_path_buf(),
                         deps,
                         registry_only,
+                        all_registry,
                         prefix: prefix.to_string(),
                         err: None,
                     });
@@ -94,6 +125,7 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
                         root: cur.to_path_buf(),
                         deps: HashMap::new(),
                         registry_only: HashMap::new(),
+                        all_registry: HashMap::new(),
                         prefix: prefix.to_string(),
                         err: Some(format!("invalid manifest {}: {e}", toml.display())),
                     });
@@ -106,6 +138,7 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
         root: dir.to_path_buf(),
         deps: HashMap::new(),
         registry_only: HashMap::new(),
+        all_registry: HashMap::new(),
         prefix: prefix.to_string(),
         err: None,
     })
@@ -273,6 +306,29 @@ pub fn registry_only_deps(entry: &str) -> Result<Vec<(String, String)>, String> 
         return Err(e.clone());
     }
     let mut out: Vec<(String, String)> = ctx.registry_only.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+    out.sort();
+    Ok(out)
+}
+
+/// EVERY version-only (`{ version = ".." }`, no `path`) direct dependency the
+/// project owning `entry` declares — including ones already fetched into the
+/// registry cache, unlike `registry_only_deps` above (which drops those once
+/// resolved). `kupl pkg fetch` uses this one, not `registry_only_deps`, so
+/// that re-running it still re-fetches and re-verifies every registry
+/// dependency fresh even after a prior successful fetch — `registry.rs`'s
+/// `fetch_package` doc comment is explicit that v1 deliberately never
+/// cache-skips (production-hardening PR-it641).
+pub fn all_registry_deps(entry: &str) -> Result<Vec<(String, String)>, String> {
+    let entry_path = PathBuf::from(entry);
+    if let Err(e) = std::fs::read_to_string(&entry_path) {
+        return Err(format!("entry {}: {e}", entry_path.display()));
+    }
+    let dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let ctx = pkg_ctx(&dir, true, "");
+    if let Some(e) = &ctx.err {
+        return Err(e.clone());
+    }
+    let mut out: Vec<(String, String)> = ctx.all_registry.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
     out.sort();
     Ok(out)
 }
@@ -946,5 +1002,75 @@ mod tests {
         assert_eq!(registry_only, vec![("json2".to_string(), "1.2.0".to_string())]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL usability gap found+fixed (production-hardening PR-it641): once
+    /// `kupl pkg fetch` has actually populated a registry dependency's cache
+    /// directory (`registry::cache_dir()/name/version`), a `use` of that
+    /// name still hit the SAME "registry dependencies aren't supported yet"
+    /// K0401 error `version_only_dependency_reports_a_clear_registry_error...`
+    /// above proves for the unfetched case -- `resolve_deps`/`registry_only`
+    /// checked only whether the manifest declared a `path`, never whether the
+    /// dependency had ALREADY been resolved into the cache, even though
+    /// `registry.rs`'s own design (proven by
+    /// `a_materialized_package_loads_and_runs_exactly_like_a_local_dependency`)
+    /// is that a materialized package is an ordinary local directory. Fixed
+    /// by having `pkg_ctx` check for the cache directory and, if present,
+    /// resolve the dependency exactly like a `{ path = ".." }` one from then
+    /// on -- `use`, `resolve_deps` (`kupl pkg tree`/`kupl pkg lock`), and
+    /// ordinary program loading all pick it up transparently now, with no
+    /// separate "already fetched, re-run to pick it up" step.
+    #[test]
+    fn a_registry_dependency_already_fetched_into_the_cache_resolves_like_a_local_one() {
+        let name = "kuplforgeit641testdep";
+        let version = "9.9.9";
+        let cache_pkg = crate::registry::cache_dir().join(name).join(version);
+        std::fs::create_dir_all(&cache_pkg).unwrap();
+        std::fs::write(
+            cache_pkg.join("kupl.toml"),
+            format!("[project]\nname = \"{name}\"\nentry = \"main.kupl\"\nversion = \"{version}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            cache_pkg.join("main.kupl"),
+            "pub fun double(x: Int) -> Int {\n    x * 2\n}\n",
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("kupl-registry-dep-fetched-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kupl.toml"),
+            format!(
+                "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\n{name} = {{ version = \"{version}\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.kupl"),
+            format!("use {name}\nfun main() {{\n    let _ = {name}.double(3)\n}}\n"),
+        )
+        .unwrap();
+
+        assert!(
+            super::load(dir.join("main.kupl").to_str().unwrap()).is_ok(),
+            "an already-fetched registry dependency must load like a local one"
+        );
+
+        let deps = super::resolve_deps(dir.join("main.kupl").to_str().unwrap()).expect("resolves the fetched dep");
+        assert_eq!(deps.len(), 1, "{:?}", deps.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert_eq!(deps[0].name, name);
+
+        // no longer reported as unresolved...
+        let registry_only =
+            super::registry_only_deps(dir.join("main.kupl").to_str().unwrap()).expect("registry_only_deps works");
+        assert!(registry_only.is_empty(), "{registry_only:?}");
+        // ...but `kupl pkg fetch` must still see it, so re-running it
+        // re-fetches/re-verifies rather than silently skipping.
+        let all = super::all_registry_deps(dir.join("main.kupl").to_str().unwrap()).expect("all_registry_deps works");
+        assert_eq!(all, vec![(name.to_string(), version.to_string())]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::registry::cache_dir().join(name));
     }
 }

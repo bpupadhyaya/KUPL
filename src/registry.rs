@@ -274,6 +274,24 @@ fn curl_get(url: &str) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|_| format!("response from {url} is not valid UTF-8"))
 }
 
+/// The local on-disk cache `kupl pkg fetch` materializes registry packages
+/// into: `~/.kupl/registry-cache` (`$HOME`, or `%USERPROFILE%` on Windows
+/// where `HOME` isn't set), falling back to a temp directory if neither is
+/// set — degrades gracefully rather than panicking, matching this
+/// codebase's existing convention (e.g. `csv.rs`/`url.rs`'s malformed-input
+/// handling). A fixed, well-known location so re-running `kupl pkg fetch`
+/// reuses the same cache across invocations instead of re-downloading, and
+/// so `loader.rs`'s `pkg_ctx` can independently compute the SAME path a
+/// registry-only dependency would materialize to, to detect whether it has
+/// already been fetched (production-hardening PR-it641).
+pub fn cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    home.join(".kupl").join("registry-cache")
+}
+
 /// Fetch and materialize one package version from a registry: the index at
 /// `{registry_url}/{name}.json`, then every file the resolved version
 /// lists, verifying every hash before anything is written to disk (via
@@ -341,6 +359,13 @@ fn fetch_package_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_dir_is_a_fixed_dot_kupl_registry_cache_location() {
+        let dir = super::cache_dir();
+        assert_eq!(dir.file_name().unwrap(), "registry-cache");
+        assert_eq!(dir.parent().unwrap().file_name().unwrap(), ".kupl");
+    }
 
     fn sample_index() -> &'static str {
         r#"{

@@ -520,7 +520,7 @@ pub fn pkg_lock(path: &str) -> i32 {
 /// dependencies as unresolved (production-hardening PR-it625) — this is
 /// the first subcommand that actually RESOLVES them.
 pub fn pkg_fetch(path: &str) -> i32 {
-    pkg_fetch_with(path, crate::registry::DEFAULT_REGISTRY_URL, &registry_cache_dir(), crate::registry::fetch_package)
+    pkg_fetch_with(path, crate::registry::DEFAULT_REGISTRY_URL, &crate::registry::cache_dir(), crate::registry::fetch_package)
 }
 
 /// `pkg_fetch`, but the registry URL, cache directory, and fetch
@@ -539,7 +539,13 @@ fn pkg_fetch_with(
     cache_dir: &std::path::Path,
     fetch: impl Fn(&str, &str, &str, &std::path::Path) -> Result<std::path::PathBuf, String>,
 ) -> i32 {
-    let registry_only = match crate::loader::registry_only_deps(path) {
+    // Uses `all_registry_deps`, NOT `registry_only_deps` -- the latter drops
+    // a dependency once it's already been fetched (so `use`/`pkg
+    // tree`/`pkg lock` can treat it as resolved), but `kupl pkg fetch`
+    // itself must keep re-fetching and re-verifying every registry
+    // dependency on every run, matching `fetch_package`'s own documented
+    // no-cache-skip design (production-hardening PR-it641).
+    let registry_only = match crate::loader::all_registry_deps(path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error: {e}");
@@ -565,21 +571,6 @@ fn pkg_fetch_with(
     } else {
         1
     }
-}
-
-/// The local on-disk cache `kupl pkg fetch` materializes registry packages
-/// into: `~/.kupl/registry-cache` (`$HOME`, or `%USERPROFILE%` on Windows
-/// where `HOME` isn't set), falling back to a temp directory if neither is
-/// set — degrades gracefully rather than panicking, matching this
-/// codebase's existing convention (e.g. `csv.rs`/`url.rs`'s malformed-input
-/// handling). A fixed, well-known location so re-running `kupl pkg fetch`
-/// reuses the same cache across invocations instead of re-downloading.
-fn registry_cache_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    home.join(".kupl").join("registry-cache")
 }
 
 pub fn emit_manifest(path: &str) -> i32 {
@@ -1418,10 +1409,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn registry_cache_dir_is_a_fixed_dot_kupl_registry_cache_location() {
-        let dir = super::registry_cache_dir();
-        assert_eq!(dir.file_name().unwrap(), "registry-cache");
-        assert_eq!(dir.parent().unwrap().file_name().unwrap(), ".kupl");
-    }
 }
