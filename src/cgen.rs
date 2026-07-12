@@ -1888,9 +1888,17 @@ static void kb_putcp(KBuf* b, unsigned int cp) {   /* UTF-8 encode a code point 
 
 /* --- serialize (mirror json.rs write_value/format_num/write_string) --- */
 static void k_json_num(KBuf* b, double n) {
-    /* Non-finite: match json.rs::format_num's Rust `f64::to_string()` spelling. */
-    if (isnan(n)) { kb_puts(b, "NaN"); return; }
-    if (isinf(n)) { kb_puts(b, n < 0 ? "-inf" : "inf"); return; }
+    /* RFC 8259 section 6: JSON's number grammar has no representation for
+       NaN/Infinity. A REAL bug found+fixed (production-hardening PR-it634,
+       json.rs::format_num): this used to silently emit "NaN"/"inf"/"-inf" as
+       bare, unquoted text -- not valid JSON syntax at all -- reachable via
+       an ordinary overflowing number literal like `1e400` (syntactically
+       valid JSON, but overflows to Infinity), not just programmer error.
+       Now panics with the SAME message json.rs's Err becomes when the
+       interpreter/KVM turn it into a panic, so this is indistinguishable
+       across all three engines rather than silently diverging into
+       "native emits corrupt text, interp/KVM don't." */
+    if (!isfinite(n)) k_panic("cannot serialize a non-finite number (NaN/Infinity) to JSON");
     if (n == floor(n) && fabs(n) < 1e15) {
         char t[32]; snprintf(t, sizeof t, "%lld", (long long)n); kb_puts(b, t);
     } else {
@@ -10312,6 +10320,34 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
             "fun main() uses io {{\n    match json_parse(\"1{dots}\") {{\n        Ok(_) => print(\"ok\"),\n        Err(e) => panic(e),\n    }}\n}}\n"
         );
         assert_panic_wording_matches(&src, "jsonnumtrail");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it634): `json_stringify`
+    /// on a `JNum` holding a non-finite float used to silently emit the bare,
+    /// unquoted text `inf`/`-inf`/`NaN` on ALL three engines identically -- not
+    /// valid JSON syntax at all (RFC 8259 permits only finite numbers), reachable
+    /// via an ordinary overflowing JSON number literal (`1e400`), not just
+    /// programmer error. Fixed on both interp/KVM (`json.rs::format_num`) and
+    /// native (`k_json_num`) to panic instead, with BYTE-IDENTICAL wording --
+    /// this locks that native's `k_panic` call uses the exact same message text
+    /// json.rs's `Err` becomes once the interpreter turns it into a panic
+    /// (`assert_panic_wording_matches`), covering Infinity, negative Infinity,
+    /// and NaN, all reached through ordinary `1.0 / 0.0`-style float division
+    /// (no special native-only code path).
+    #[test]
+    fn native_json_stringify_non_finite_panic_matches_interp_wording() {
+        assert_panic_wording_matches(
+            "fun main() uses io { print(json_stringify(JNum(1.0 / 0.0))) }\n",
+            "jsoninf",
+        );
+        assert_panic_wording_matches(
+            "fun main() uses io { print(json_stringify(JNum(0.0 - 1.0 / 0.0))) }\n",
+            "jsonneginf",
+        );
+        assert_panic_wording_matches(
+            "fun main() uses io { print(json_stringify(JNum(0.0 / 0.0))) }\n",
+            "jsonnan",
+        );
     }
 
     /// A REAL cross-engine bug (PR-it599, found by sweeping cgen.rs's LARGE per-method

@@ -2028,6 +2028,35 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
         );
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it634): `json_stringify`
+    /// on a `JNum` holding a non-finite float used to silently emit the bare,
+    /// unquoted text `inf`/`-inf`/`NaN` -- not valid JSON syntax at all (RFC
+    /// 8259 permits only finite numbers). Now a clean panic instead, on both
+    /// engines, with byte-identical wording (interp's `Err` becomes a panic
+    /// via `Self::panic_flow`; native's `k_json_num` calls `k_panic` with the
+    /// SAME message text directly) -- `differential()` itself asserts
+    /// interp/KVM agree; this locks that the shared `json.rs` panic path
+    /// (used by BOTH engines) fires for Infinity (via ordinary `1.0 / 0.0`,
+    /// no special syntax needed) and NaN (`0.0 / 0.0`) alike, and that an
+    /// ordinary finite value alongside is completely unaffected.
+    #[test]
+    fn diff_json_stringify_rejects_non_finite_numbers() {
+        assert_eq!(
+            differential("fun probe() -> Str { json_stringify(JNum(1.0 / 0.0)) }\n"),
+            "panic: cannot serialize a non-finite number (NaN/Infinity) to JSON"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { json_stringify(JNum(0.0 - 1.0 / 0.0)) }\n"),
+            "panic: cannot serialize a non-finite number (NaN/Infinity) to JSON"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { json_stringify(JNum(0.0 / 0.0)) }\n"),
+            "panic: cannot serialize a non-finite number (NaN/Infinity) to JSON"
+        );
+        // an ordinary finite value is unaffected by the new check.
+        assert_eq!(differential("fun probe() -> Str { json_stringify(JNum(42.5)) }\n"), "42.5");
+    }
+
     #[test]
     fn diff_list_higher_order_ordering() {
         // sort_by is STABLE: elements with equal keys keep their original relative order.

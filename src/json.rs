@@ -247,7 +247,10 @@ impl Parser<'_> {
 }
 
 /// Serialize a `Json` value to compact text. A non-`Json` value is an error
-/// (the checker prevents this, so it only guards internal misuse).
+/// (the checker prevents this, so it only guards internal misuse) — as is a
+/// `JNum` holding a non-finite float (NaN/Infinity have no JSON text form;
+/// reachable via `json_parse` on an overflowing number literal, or a
+/// directly-constructed `JNum`, not just internal misuse — PR-it634).
 pub fn stringify(v: &Value) -> Result<String, String> {
     let mut out = String::new();
     write_value(v, &mut out)?;
@@ -265,7 +268,7 @@ fn write_value(v: &Value, out: &mut String) -> Result<(), String> {
             _ => return Err("malformed JBool".into()),
         },
         "JNum" => match fields.first() {
-            Some(Value::Float(n)) => out.push_str(&format_num(*n)),
+            Some(Value::Float(n)) => out.push_str(&format_num(*n)?),
             _ => return Err("malformed JNum".into()),
         },
         "JStr" => match fields.first() {
@@ -310,11 +313,32 @@ fn write_value(v: &Value, out: &mut String) -> Result<(), String> {
 
 /// Whole floats render without a decimal point (`1`, not `1.0`) so parsed
 /// integers round-trip; everything else uses the shortest round-trip form.
-fn format_num(n: f64) -> String {
-    if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{}", n as i64)
+/// `Err` for a non-finite value (NaN/Infinity) — a REAL bug found+fixed
+/// (production-hardening PR-it634): RFC 8259 §6 permits only finite numbers
+/// in JSON's number grammar, but this function used to fall through to
+/// Rust's `f64::to_string()` for ANY non-finite input, silently emitting
+/// `"inf"`/`"-inf"`/`"NaN"` as bare, UNQUOTED text — not valid JSON syntax
+/// at all (no JSON parser, strict or lenient, accepts those tokens; even
+/// languages that tolerate a NON-standard `Infinity`/`NaN` spelling, like
+/// Python's `json` module, don't use Rust's `inf` spelling). Reachable
+/// through entirely ordinary input, not just programmer error: a JSON
+/// number literal like `1e400` is syntactically valid and parses via
+/// `parse` into `JNum(Value::Float(f64::INFINITY))` (confirmed live —
+/// `json_parse("1e400")` succeeds), so `json_stringify` on parsed,
+/// attacker-or-just-large-input-controlled data could silently corrupt
+/// its own output. Fails the SAME way `write_value`'s other internal-
+/// invariant checks already do (a panic, not a catchable `Result` — matches
+/// `json_stringify`'s own declared `(Json) -> Str` signature, which has no
+/// error channel to surface a `Result` through) rather than the prior
+/// silent-corruption behavior.
+fn format_num(n: f64) -> Result<String, String> {
+    if !n.is_finite() {
+        return Err("cannot serialize a non-finite number (NaN/Infinity) to JSON".into());
+    }
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        Ok(format!("{}", n as i64))
     } else {
-        n.to_string()
+        Ok(n.to_string())
     }
 }
 
@@ -371,6 +395,41 @@ mod tests {
     #[test]
     fn integral_floats_have_no_decimal() {
         assert_eq!(roundtrip("[1, 2.0, 2.5]"), "[1,2,2.5]");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it634): `1e400` is a
+    /// syntactically valid JSON number literal (the JSON grammar places no
+    /// bound on the exponent), so `parse` correctly accepts it -- but it
+    /// overflows `f64` to `Infinity`, and `stringify` used to silently emit
+    /// the bare, unquoted text `inf` for it -- not valid JSON syntax at
+    /// all. Now a clean `Err`, not silently-corrupted output.
+    #[test]
+    fn stringify_rejects_a_non_finite_number_reached_via_an_overflowing_literal() {
+        let huge = parse("1e400").expect("1e400 is syntactically valid JSON");
+        assert!(stringify(&huge).is_err(), "must not silently emit non-JSON `inf` text");
+
+        let neg_huge = parse("-1e400").expect("-1e400 is syntactically valid JSON");
+        assert!(stringify(&neg_huge).is_err());
+    }
+
+    /// The same rejection applies to a `JNum` built directly (not via
+    /// `parse` at all) -- e.g. from a KUPL-level `1.0 / 0.0` or `0.0 / 0.0`
+    /// -- since `stringify` has no way to know how its `Value` argument was
+    /// constructed.
+    #[test]
+    fn stringify_rejects_a_directly_constructed_non_finite_jnum() {
+        assert!(stringify(&ctor("JNum", vec![Value::Float(f64::INFINITY)])).is_err());
+        assert!(stringify(&ctor("JNum", vec![Value::Float(f64::NEG_INFINITY)])).is_err());
+        assert!(stringify(&ctor("JNum", vec![Value::Float(f64::NAN)])).is_err());
+        // nested inside an array/object -- the rejection must propagate up
+        // through the recursive write_value, not just at the top level.
+        let nested = ctor(
+            "JArr",
+            vec![Value::List(Rc::new(vec![ctor("JNum", vec![Value::Float(f64::NAN)])]))],
+        );
+        assert!(stringify(&nested).is_err());
+        // an ordinary finite float alongside is unaffected.
+        assert!(stringify(&ctor("JNum", vec![Value::Float(42.5)])).is_ok());
     }
 
     #[test]
