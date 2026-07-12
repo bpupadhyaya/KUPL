@@ -451,22 +451,29 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
         }
         Method { dst, recv, name, start, argc } => {
             let m = str_const(chunk, *name)?;
-            // Self-rebind `xs = xs.push(item)` fast path (mirrors interp.rs's
-            // push_list_in_place / vm.rs's dst==recv Op::Method handling):
-            // only safe when `recv` is a genuine chunk-local register (not a
-            // capture/param, which could be aliased before this chunk ever
-            // ran — captures occupy [0, ncaps), params [ncaps, ncaps+nparams),
-            // per compile.rs's FnCompiler register allocation order) AND
-            // method_recv_escapes proves no OTHER op in this chunk could
-            // alias it. The `regs[recv].tag == K_LIST` runtime guard is load-
-            // bearing, not defensive dressing: `dst == recv` and a matching
-            // method name are purely syntactic and say nothing about the
-            // receiver's actual runtime type (e.g. a component exposing its
-            // own method literally named "push").
+            // Self-rebind fast path for `xs = xs.push(item)` (List),
+            // `xs = xs.insert(k, v)` (Map) and `xs = xs.insert(item)` (Set) —
+            // mirrors interp.rs's push_list_in_place / vm.rs's dst==recv
+            // Op::Method handling. Only safe when `recv` is a genuine
+            // chunk-local register (not a capture/param, which could be
+            // aliased before this chunk ever ran — captures occupy
+            // [0, ncaps), params [ncaps, ncaps+nparams), per compile.rs's
+            // FnCompiler register allocation order) AND method_recv_escapes
+            // proves no OTHER op in this chunk could alias it. The
+            // `regs[recv].tag == ...` runtime guards are load-bearing, not
+            // defensive dressing: `dst == recv` and a matching method name
+            // are purely syntactic and say nothing about the receiver's
+            // actual runtime type (e.g. a component exposing its own method
+            // literally named "push"/"insert").
             let is_chunk_local = (*recv as u16) >= chunk.ncaps as u16 + chunk.nparams as u16;
-            if m == "push" && dst == recv && is_chunk_local && !method_recv_escapes(chunk, pc) {
+            let self_rebind = dst == recv && is_chunk_local && !method_recv_escapes(chunk, pc);
+            if m == "push" && self_rebind {
                 format!(
                     "regs[{dst}] = (regs[{recv}].tag == K_LIST) ? k_list_push_inplace(regs[{recv}], regs[{start}]) : k_method(regs[{recv}], \"push\", &regs[{start}], {argc});"
+                )
+            } else if m == "insert" && self_rebind {
+                format!(
+                    "regs[{dst}] = (regs[{recv}].tag == K_MAP) ? k_map_insert_inplace(regs[{recv}], regs[{start}], regs[{start}+1]) : (regs[{recv}].tag == K_SET) ? k_set_insert_inplace(regs[{recv}], regs[{start}]) : k_method(regs[{recv}], \"insert\", &regs[{start}], {argc});"
                 )
             } else {
                 format!(
@@ -610,8 +617,16 @@ typedef struct { int32_t ctor; KValue* fields; int32_t nfields; } KCtor;
    a closure is bound to its creator, not to its caller. */
 typedef struct { int32_t proto; int32_t ncaps; KValue* caps; int origin_inst; } KClosure;
 typedef struct { int64_t len; double* data; } KTensor;
-typedef struct { int64_t len; KValue* keys; KValue* vals; } KMap;
-typedef struct { int64_t len; KValue* items; } KSet;
+/* `cap` mirrors KList's (see its own comment): tracks allocated slots so a
+   self-rebind `xs = xs.insert(k, v)` can grow by amortized doubling rather
+   than a fresh alloc + memcpy on every call. Every constructor of a KMap
+   sets cap == len (four sites: k_map_new, k_map_make, and json_parse's two
+   inline KMap builds in kjp_object) -- unlike KList, this is NOT a single
+   choke point, so each site needs its own explicit cap assignment. */
+typedef struct { int64_t len; int64_t cap; KValue* keys; KValue* vals; } KMap;
+/* Same idea, same "every constructor sets cap == len" rule; KSet has two
+   constructors (k_set_new, k_set_make). */
+typedef struct { int64_t len; int64_t cap; KValue* items; } KSet;
 typedef struct { const char* type_name; const char* variant; int arity; const char** fields; } KCtorMeta;
 /* a fixed-width integer: the value is boxed (like the interpreter's i128 box) so
    KValue stays small; width is the IntW tag 0..7 (i8,i16,i32,i64,u8,u16,u32,u64) */
@@ -1134,29 +1149,73 @@ static int k_op_overload(const char* name, KValue a, KValue b, KValue* out);
 
 static KValue k_map_new(void) {
     KMap* m = k_alloc(sizeof(KMap));
-    m->len = 0; m->keys = 0; m->vals = 0;
+    m->len = 0; m->cap = 0; m->keys = 0; m->vals = 0;
     KValue x; x.tag = K_MAP; x.as.map = m; return x;
 }
 static KValue k_map_make(KValue* keys, KValue* vals, int64_t n) {
     KMap* m = k_alloc(sizeof(KMap));
     m->len = n;
+    m->cap = n;
     m->keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
     m->vals = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
     memcpy(m->keys, keys, sizeof(KValue) * n);
     memcpy(m->vals, vals, sizeof(KValue) * n);
     KValue x; x.tag = K_MAP; x.as.map = m; return x;
 }
+
+/* In-place insert fast path for the self-rebind `xs = xs.insert(k, v)`
+   idiom on a Map, mirroring k_list_push_inplace's growth strategy and
+   safety preconditions (only emitted by emit_op's Method case when it's
+   proven `recv` is a chunk-local register never aliased elsewhere in this
+   chunk). A matching key updates its value in place with no growth; a new
+   key grows `keys`/`vals` by amortized doubling. */
+static KValue k_map_insert_inplace(KValue recv, KValue key, KValue val) {
+    KMap* m = recv.as.map;
+    for (int64_t i = 0; i < m->len; i++) {
+        if (k_eq(m->keys[i], key)) { m->vals[i] = val; return recv; }
+    }
+    if (m->len >= m->cap) {
+        int64_t newcap = m->cap < 1 ? 4 : m->cap * 2;
+        KValue* nk = k_alloc(sizeof(KValue) * newcap);
+        KValue* nv = k_alloc(sizeof(KValue) * newcap);
+        memcpy(nk, m->keys, sizeof(KValue) * m->len);
+        memcpy(nv, m->vals, sizeof(KValue) * m->len);
+        m->keys = nk; m->vals = nv; m->cap = newcap;
+    }
+    m->keys[m->len] = key; m->vals[m->len] = val; m->len++;
+    return recv;
+}
+
 static KValue k_set_new(void) {
     KSet* s = k_alloc(sizeof(KSet));
-    s->len = 0; s->items = 0;
+    s->len = 0; s->cap = 0; s->items = 0;
     KValue x; x.tag = K_SET; x.as.set = s; return x;
 }
 static KValue k_set_make(KValue* items, int64_t n) {
     KSet* s = k_alloc(sizeof(KSet));
     s->len = n;
+    s->cap = n;
     s->items = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
     memcpy(s->items, items, sizeof(KValue) * n);
     KValue x; x.tag = K_SET; x.as.set = s; return x;
+}
+
+/* Same idea as k_map_insert_inplace, for the `xs = xs.insert(item)` Set
+   idiom: an already-present item is a no-op; a new item grows `items` by
+   amortized doubling. */
+static KValue k_set_insert_inplace(KValue recv, KValue item) {
+    KSet* s = recv.as.set;
+    for (int64_t i = 0; i < s->len; i++) {
+        if (k_eq(s->items[i], item)) return recv;
+    }
+    if (s->len >= s->cap) {
+        int64_t newcap = s->cap < 1 ? 4 : s->cap * 2;
+        KValue* ni = k_alloc(sizeof(KValue) * newcap);
+        memcpy(ni, s->items, sizeof(KValue) * s->len);
+        s->items = ni; s->cap = newcap;
+    }
+    s->items[s->len++] = item;
+    return recv;
 }
 static KValue k_set_from(KValue v) {
     if (v.tag != K_LIST) k_panic("Set(...) needs a List");
@@ -1914,7 +1973,7 @@ static KValue kjp_object(KJP* p) {
     KValue* keys = k_alloc(sizeof(KValue) * cap);
     KValue* vals = k_alloc(sizeof(KValue) * cap);
     kjp_ws(p);
-    if (kjp_peek(p) == '}') { p->pos++; KMap* m = k_alloc(sizeof(KMap)); m->len = 0; m->keys = k_alloc(1); m->vals = k_alloc(1); KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1); }
+    if (kjp_peek(p) == '}') { p->pos++; KMap* m = k_alloc(sizeof(KMap)); m->len = 0; m->cap = 0; m->keys = k_alloc(1); m->vals = k_alloc(1); KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1); }
     for (;;) {
         kjp_ws(p);
         if (kjp_peek(p) != '"') { kjp_fail(p, "expected string key in object"); break; }
@@ -1944,7 +2003,7 @@ static KValue kjp_object(KJP* p) {
         kjp_fail(p, "expected `,` or `}` in object"); break;
     }
     KMap* m = k_alloc(sizeof(KMap));
-    m->len = n; m->keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n)); m->vals = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+    m->len = n; m->cap = n; m->keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n)); m->vals = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
     memcpy(m->keys, keys, sizeof(KValue) * n); memcpy(m->vals, vals, sizeof(KValue) * n);
     KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1);
 }
