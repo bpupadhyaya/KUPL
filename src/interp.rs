@@ -3797,6 +3797,20 @@ pub fn serve_http(
     port: i64,
     handler: &mut dyn FnMut(String, String) -> Result<String, String>,
 ) -> Result<(), String> {
+    serve_http_with_read_timeout(port, handler, Some(std::time::Duration::from_secs(30)))
+}
+
+/// `serve_http`, but the per-connection read timeout is injectable — lets a
+/// test exercise the timeout mechanism itself without waiting out the real
+/// 30s production value (`serve_http` above always uses 30s; only tests call
+/// this directly). `None` disables the timeout entirely (the pre-fix,
+/// blocks-forever behavior), kept only so a test could pin that shape too if
+/// ever needed.
+fn serve_http_with_read_timeout(
+    port: i64,
+    handler: &mut dyn FnMut(String, String) -> Result<String, String>,
+    read_timeout: Option<std::time::Duration>,
+) -> Result<(), String> {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind(("127.0.0.1", port as u16))
         .map_err(|e| format!("cannot bind 127.0.0.1:{port}: {e}"))?;
@@ -3805,6 +3819,27 @@ pub fn serve_http(
             Ok(s) => s,
             Err(_) => continue,
         };
+        // A REAL, SEVERE availability bug found+fixed (production-hardening
+        // PR-it623): no read timeout was ever set on the accepted connection.
+        // This is a single-threaded, sequential accept-then-read loop -- the
+        // SAME class of bug as PR-it559 (a panicking handler took down the
+        // whole server) and PR-it577 (a NUL byte broke the terminator search
+        // and hung the read loop forever), both on this exact function. A
+        // client that opens a connection and simply never finishes sending
+        // its request head (a classic "slowloris" attack, or just a stalled/
+        // dead network peer) blocked `stream.read()` INDEFINITELY -- and
+        // since the loop can't reach its next `accept()` until the CURRENT
+        // connection's read/handle/write cycle finishes, one stalled
+        // connection wedged the ENTIRE server, refusing every other client
+        // forever. Fixed by bounding the read with a timeout matching this
+        // codebase's existing `curl --max-time 30` convention for outbound
+        // calls (interp.rs's own http_get, line ~3749). A timed-out read is
+        // just another `Err` to the loop below (`Err(_) => break`), so the
+        // server falls through to respond to whatever partial/empty head it
+        // received (`parse_request_line` already defensively defaults an
+        // incomplete line to `GET /`) and moves on to the next connection,
+        // rather than hanging forever.
+        let _ = stream.set_read_timeout(read_timeout);
         // read the request head (until the blank line ending the headers)
         let mut buf: Vec<u8> = Vec::new();
         let mut tmp = [0u8; 1024];
@@ -4137,7 +4172,9 @@ fn builtin_method(
 
 #[cfg(test)]
 mod server_tests {
-    use super::{http_response, parse_request_line, serve_http, Flow, Interp, ProgramDb, Value};
+    use super::{
+        http_response, parse_request_line, serve_http, serve_http_with_read_timeout, Flow, Interp, ProgramDb, Value,
+    };
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -4228,6 +4265,73 @@ fun main() uses io { let _ = http_serve(38131, handle) }
         let _ = stream.read_to_string(&mut resp);
         assert!(resp.contains("HTTP/1.1 200 OK"), "resp: {resp}");
         assert!(resp.ends_with("GET /world"), "resp: {resp}");
+    }
+
+    /// A REAL, SEVERE availability bug found+fixed (production-hardening
+    /// PR-it623): confirms `serve_http` no longer hangs forever on a stalled
+    /// connection, the same class of single-connection-wedges-the-whole-
+    /// server bug as PR-it559 (panic) and PR-it577 (NUL byte), both on this
+    /// exact function -- but previously unaddressed for a client that simply
+    /// never finishes sending its request head at all (a slowloris attack).
+    /// Opens a connection, sends a PARTIAL request line with no terminating
+    /// blank line, and deliberately never sends more or closes it. Uses
+    /// `serve_http_with_read_timeout` directly with a SHORT injected timeout
+    /// (not the real 30s production value `serve_http` uses) so this test
+    /// stays fast while still proving the exact mechanism end to end: the
+    /// timeout unblocks the read, and -- critically -- the server remains
+    /// alive and promptly serves a SECOND, well-formed request on a fresh
+    /// connection right after, proving the whole server wasn't wedged by the
+    /// one stalled connection (before the fix, this second request would
+    /// never have been reached at all).
+    #[test]
+    fn serve_http_recovers_from_a_stalled_slow_client() {
+        let port: u16 = 38113;
+        std::thread::spawn(move || {
+            let mut h = |m: String, p: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
+            let _ = serve_http_with_read_timeout(
+                port as i64,
+                &mut h,
+                Some(std::time::Duration::from_millis(200)),
+            );
+        });
+        let connect = || {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        // connection 1: a partial request line, no terminator -- held open,
+        // never closed, never completed. Before the fix, `serve_http` would
+        // block on this forever and connection 2 below would never even be
+        // accepted, let alone answered.
+        let mut stalled = connect().expect("server should be listening");
+        stalled.write_all(b"GET /stalled HTTP/1.1\r\nHost: x").unwrap();
+        // connection 2: retried for up to 2s (well past the 200ms injected
+        // timeout) -- proves the server recovers and serves a fresh request
+        // rather than staying wedged on connection 1.
+        let mut recovered = None;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                if s.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\n\r\n").is_err() {
+                    continue;
+                }
+                let mut resp = String::new();
+                let _ = s.read_to_string(&mut resp);
+                if resp.contains("HTTP/1.1 200 OK") {
+                    recovered = Some(resp);
+                    break;
+                }
+            }
+        }
+        let resp = recovered
+            .expect("server should recover and serve a fresh request after the stalled one times out");
+        assert!(resp.ends_with("GET /world"), "resp: {resp}");
+        drop(stalled);
     }
 }
 

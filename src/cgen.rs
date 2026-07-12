@@ -636,6 +636,7 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <sys/stat.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
@@ -2593,6 +2594,29 @@ static KValue k_http_serve(KValue port, KValue handler) {
     for (;;) {
         int conn = accept(fd, 0, 0);
         if (conn < 0) continue;
+        /* A REAL, SEVERE availability bug found+fixed (production-hardening
+           PR-it623): no read timeout was ever set on the accepted connection.
+           This is a single-threaded, sequential accept-then-read loop -- the
+           SAME class of bug as PR-it559 (a panicking handler took down the
+           whole server) and PR-it577 (a NUL byte broke the terminator search
+           and hung the read loop forever), both on this exact function. A
+           client that opens a connection and simply never finishes sending
+           its request head (a classic "slowloris" attack, or just a stalled/
+           dead network peer) blocked the `read()` below INDEFINITELY -- and
+           since the loop can't reach its next `accept()` until the CURRENT
+           connection's read/handle/write cycle finishes, one stalled
+           connection wedged the ENTIRE server, refusing every other client
+           forever -- mirroring interp::serve_http's identical, separately-
+           fixed gap. Fixed with SO_RCVTIMEO, matching interp.rs's 30s value
+           (this codebase's existing `curl --max-time 30` convention for
+           outbound calls). A timed-out read returns -1/EAGAIN, which the
+           `while ((n = read(...)) > 0)` loop below already treats like any
+           other non-positive read (falls through to parse whatever partial/
+           empty head was received -- the method/path extraction below
+           already defensively defaults to "GET"/"/" when the line is
+           incomplete) rather than hanging forever. */
+        struct timeval rcvtimeo = { 30, 0 };
+        setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &rcvtimeo, sizeof rcvtimeo);
         /* read the request head until the blank line (or a 64KB cap) */
         KBuf head = { 0, 0, 0 };
         char buf[1024]; ssize_t n;
@@ -9170,6 +9194,95 @@ fun main() uses io {
             if !resp2.contains("HTTP/1.1 200 OK") || !resp2.ends_with("3 3") {
                 return Err(format!("bad post-NUL response: {resp2:?}"));
             }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
+    /// A REAL, SEVERE availability bug found+fixed (production-hardening
+    /// PR-it623): confirms native's `k_http_serve` no longer hangs forever on
+    /// a stalled connection -- the SAME class of single-connection-wedges-
+    /// the-whole-server bug as `native_http_serve_survives_a_panicking_handler`
+    /// (PR-it559) and `native_http_serve_survives_a_nul_byte_in_the_request_head`
+    /// (PR-it577), both on this exact function, but previously unaddressed
+    /// for a client that simply never finishes sending its request head at
+    /// all (a slowloris attack) -- `interp::serve_http` had the identical gap,
+    /// fixed separately in the SAME iteration (interp.rs's own
+    /// `serve_http_recovers_from_a_stalled_slow_client`). Opens a connection,
+    /// sends a PARTIAL request line with no terminating blank line, and
+    /// deliberately never sends more or closes it, then confirms a SECOND,
+    /// fresh connection still gets served -- proving the server recovers
+    /// rather than staying wedged forever. Unlike interp.rs's equivalent test
+    /// (which injects a short timeout via a private test-only parameter),
+    /// native's timeout is a fixed 30s C constant with no injection point, so
+    /// this test genuinely waits out that real production value (retried for
+    /// up to ~35s) rather than a shortened one -- a deliberate, one-time cost
+    /// for the most direct possible proof that the actual shipped C code
+    /// recovers, not just that the underlying SO_RCVTIMEO mechanism can.
+    #[test]
+    fn native_http_serve_recovers_from_a_stalled_slow_client() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str) -> Str { \"{m} {p}\" }\n\
+                   fun main() uses io { let _ = http_serve(38124, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        assert!(c.contains("SO_RCVTIMEO"), "the fix must emit a read-timeout setsockopt call");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srvslow-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let connect = || {
+            for _ in 0..300 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38124u16)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        let result = (|| {
+            // connection 1: a partial request line, no terminator -- held
+            // open, never closed, never completed. Before the fix, the
+            // native server would block on this forever and connection 2
+            // below would never even be accepted, let alone answered.
+            let mut stalled = connect().ok_or("server should be listening")?;
+            stalled.write_all(b"GET /stalled HTTP/1.1\r\nHost: x").map_err(|e| e.to_string())?;
+            // connection 2: retried for up to ~35s (past the real 30s
+            // SO_RCVTIMEO production value) -- proves the server recovers
+            // and serves a fresh request rather than staying wedged.
+            let mut recovered = None;
+            for _ in 0..875 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", 38124u16)) {
+                    s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                    if s.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\n\r\n").is_err() {
+                        continue;
+                    }
+                    let mut resp = String::new();
+                    let _ = s.read_to_string(&mut resp);
+                    if resp.contains("HTTP/1.1 200 OK") {
+                        recovered = Some(resp);
+                        break;
+                    }
+                }
+            }
+            let resp = recovered
+                .ok_or("server should recover and serve a fresh request after the stalled one times out")?;
+            if !resp.ends_with("GET /world") {
+                return Err(format!("bad recovered response: {resp}"));
+            }
+            drop(stalled);
             Ok::<(), String>(())
         })();
         let _ = child.kill();
