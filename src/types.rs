@@ -48,6 +48,29 @@ impl Ty {
     pub fn is_numeric(&self) -> bool {
         matches!(self, Ty::Int | Ty::Float | Ty::IntW(_) | Ty::F32 | Ty::BigInt | Ty::Rational)
     }
+
+    /// Replace inference-var ids in `self` per `m` -- used to instantiate a
+    /// generic scheme or a generic ADT's field types with concrete type
+    /// arguments. The SAME substitution `check.rs`'s own generic-instance
+    /// resolution (`instantiate_ctor`/`instantiate_scheme`) uses, moved here
+    /// (production-hardening PR-it702) so `ai.rs`'s structured-output schema
+    /// builder can reuse it too, instead of a NEW parallel implementation --
+    /// or, as it stood before this fix, no substitution at all (a generic
+    /// record's field types leaked their raw, unsubstituted `Ty::Var` ids
+    /// straight into a user-facing diagnostic).
+    pub fn subst(&self, m: &HashMap<u32, Ty>) -> Ty {
+        match self {
+            Ty::Var(id) => m.get(id).cloned().unwrap_or(Ty::Var(*id)),
+            Ty::List(e) => Ty::List(Box::new(e.subst(m))),
+            Ty::Set(e) => Ty::Set(Box::new(e.subst(m))),
+            Ty::Map(k, v) => Ty::Map(Box::new(k.subst(m)), Box::new(v.subst(m))),
+            Ty::Option(e) => Ty::Option(Box::new(e.subst(m))),
+            Ty::Result(a, b) => Ty::Result(Box::new(a.subst(m)), Box::new(b.subst(m))),
+            Ty::Fun(ps, r) => Ty::Fun(ps.iter().map(|p| p.subst(m)).collect(), Box::new(r.subst(m))),
+            Ty::Named(n, args) => Ty::Named(n.clone(), args.iter().map(|a| a.subst(m)).collect()),
+            other => other.clone(),
+        }
+    }
 }
 
 #[derive(Default)]

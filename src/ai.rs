@@ -91,11 +91,21 @@ impl ToolHost for NullToolHost {
 }
 
 /// Build an [`AiShape`] from a resolved return type. `records` maps a type
-/// name to its single variant (name, fields) — multi-variant types are not
-/// representable as structured output in v1.
+/// name to its single variant (name, fields, and the type's own `qvars` --
+/// the fresh inference-var ids bound to its `type_params` at declaration
+/// time) — multi-variant types are not representable as structured output in
+/// v1. A generic record's field types are stored UNINSTANTIATED (still
+/// referencing the type's own `qvars`), so a `Ty::Named(name, args)` carrying
+/// CONCRETE type arguments (e.g. `Box[Int]`) must substitute `qvars -> args`
+/// into each field type before recursing -- a REAL bug found+fixed
+/// (production-hardening PR-it702): without this substitution, a generic
+/// record's fields recursed as raw, unbound `Ty::Var` ids, which the
+/// catch-all error arm below then formatted straight into the diagnostic as
+/// a meaningless `?0`, rejecting every generic record as ai structured
+/// output with no clear explanation.
 pub fn build_shape(
     ty: &Ty,
-    records: &HashMap<String, (String, Vec<(String, Ty)>)>,
+    records: &HashMap<String, (String, Vec<(String, Ty)>, Vec<u32>)>,
     visiting: &mut Vec<String>,
 ) -> Result<AiShape, String> {
     match ty {
@@ -105,19 +115,32 @@ pub fn build_shape(
         Ty::Bool => Ok(AiShape::Bool),
         Ty::List(t) => Ok(AiShape::List(Box::new(build_shape(t, records, visiting)?))),
         Ty::Option(t) => Ok(AiShape::Option(Box::new(build_shape(t, records, visiting)?))),
-        Ty::Named(name, _) => {
+        Ty::Named(name, args) => {
             if visiting.iter().any(|v| v == name) {
                 return Err(format!("recursive type `{name}` is not supported"));
             }
-            let Some((variant, fields)) = records.get(name) else {
+            let Some((variant, fields, qvars)) = records.get(name) else {
                 return Err(format!(
                     "type `{name}` has multiple variants — structured output needs a record"
                 ));
             };
+            if qvars.len() != args.len() {
+                // Structurally shouldn't happen (the checker always resolves a
+                // `Named` type with exactly as many args as the type declares
+                // params for) -- guarded rather than indexed into blindly, since
+                // this function parses caller-supplied `Ty`s, not just checker-
+                // internal ones.
+                return Err(format!(
+                    "type `{name}` expects {} type argument(s), got {}",
+                    qvars.len(),
+                    args.len()
+                ));
+            }
+            let subst: HashMap<u32, Ty> = qvars.iter().copied().zip(args.iter().cloned()).collect();
             visiting.push(name.clone());
             let mut fs = Vec::with_capacity(fields.len());
             for (fname, fty) in fields {
-                fs.push((fname.clone(), build_shape(fty, records, visiting)?));
+                fs.push((fname.clone(), build_shape(&fty.subst(&subst), records, visiting)?));
             }
             visiting.pop();
             Ok(AiShape::Record { ty: name.clone(), variant: variant.clone(), fields: fs })
@@ -1004,6 +1027,86 @@ mod tests {
         );
         let v = run(&meta("t_rec", shape, false), &[Value::str("great")]).unwrap();
         assert_eq!(v.to_string(), "Sentiment(\"positive\", 0.9)");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it702): `records`' field
+    /// types are stored UNSUBSTITUTED (still referencing the type's own
+    /// `qvars`, the fresh inference-var ids bound to its `type_params` at
+    /// declaration time), so a `Ty::Named(name, args)` instantiation carrying
+    /// CONCRETE type arguments (e.g. `Box[Int]`) used to recurse into `value:
+    /// T`'s raw, unbound `Ty::Var` id instead of substituting it with `Int` --
+    /// the catch-all error arm then formatted that unbound var straight into
+    /// the diagnostic as a meaningless `?0`, rejecting EVERY generic record as
+    /// ai structured output. Confirmed live before this fix via `kupl check`
+    /// on `type Box[T] = Box(value: T)` used as `ai fun get_box() -> Box[Int]`.
+    #[test]
+    fn build_shape_substitutes_generic_type_arguments() {
+        // type Box[T] = Box(value: T) -- `T` is inference-var id 0.
+        let mut records = HashMap::new();
+        records.insert(
+            "Box".to_string(),
+            ("Box".to_string(), vec![("value".to_string(), Ty::Var(0))], vec![0u32]),
+        );
+        let ty = Ty::Named("Box".to_string(), vec![Ty::Int]);
+        let shape = super::build_shape(&ty, &records, &mut Vec::new()).expect("Box[Int] must build a shape");
+        assert_eq!(
+            shape,
+            AiShape::Record {
+                ty: "Box".to_string(),
+                variant: "Box".to_string(),
+                fields: vec![("value".to_string(), AiShape::Int)],
+            }
+        );
+
+        // multi-param: type Pair[A, B] = Pair(first: A, second: B).
+        let mut records2 = HashMap::new();
+        records2.insert(
+            "Pair".to_string(),
+            (
+                "Pair".to_string(),
+                vec![("first".to_string(), Ty::Var(0)), ("second".to_string(), Ty::Var(1))],
+                vec![0u32, 1u32],
+            ),
+        );
+        let ty2 = Ty::Named("Pair".to_string(), vec![Ty::Str, Ty::Int]);
+        let shape2 = super::build_shape(&ty2, &records2, &mut Vec::new()).expect("Pair[Str, Int] must build a shape");
+        assert_eq!(
+            shape2,
+            AiShape::Record {
+                ty: "Pair".to_string(),
+                variant: "Pair".to_string(),
+                fields: vec![("first".to_string(), AiShape::Str), ("second".to_string(), AiShape::Int)],
+            }
+        );
+
+        // nested: `List[Box[Int]]` -- substitution must apply through List too.
+        let list_ty = Ty::List(Box::new(Ty::Named("Box".to_string(), vec![Ty::Int])));
+        let list_shape = super::build_shape(&list_ty, &records, &mut Vec::new()).expect("List[Box[Int]] must build a shape");
+        assert_eq!(
+            list_shape,
+            AiShape::List(Box::new(AiShape::Record {
+                ty: "Box".to_string(),
+                variant: "Box".to_string(),
+                fields: vec![("value".to_string(), AiShape::Int)],
+            }))
+        );
+
+        // a monomorphic record (no qvars, no args) is entirely unaffected.
+        let mut records3 = HashMap::new();
+        records3.insert(
+            "Point".to_string(),
+            ("Point".to_string(), vec![("x".to_string(), Ty::Int), ("y".to_string(), Ty::Int)], Vec::new()),
+        );
+        let ty3 = Ty::Named("Point".to_string(), Vec::new());
+        let shape3 = super::build_shape(&ty3, &records3, &mut Vec::new()).expect("monomorphic Point must build a shape");
+        assert_eq!(
+            shape3,
+            AiShape::Record {
+                ty: "Point".to_string(),
+                variant: "Point".to_string(),
+                fields: vec![("x".to_string(), AiShape::Int), ("y".to_string(), AiShape::Int)],
+            }
+        );
     }
 
     #[test]

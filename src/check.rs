@@ -584,13 +584,25 @@ impl Checker {
     /// Third pass: `ai fun` signatures. Runs after every type is resolved so
     /// return shapes can reference records declared anywhere in the program.
     fn collect_ai_funs(&mut self, program: &Program) {
-        let records: std::collections::HashMap<String, (String, Vec<(String, Ty)>)> = self
+        // `qvars` (the fresh inference-var ids bound to this type's own
+        // `type_params` at declaration time, see `TypeSig`) travels alongside
+        // each record's fields so `ai.rs::build_shape` can substitute a
+        // generic record's field types with the CONCRETE type arguments a
+        // `Ty::Named(name, args)` instantiation actually carries -- a REAL
+        // bug found+fixed (production-hardening PR-it702): without this, a
+        // generic record used as `ai fun`/tool structured output (e.g. `type
+        // Box[T] = Box(value: T)` returned as `-> Box[Int]`) recursed into
+        // its field types UNSUBSTITUTED, leaking a raw internal inference-
+        // variable id (`?0`) into a user-facing K0271/K0272 diagnostic,
+        // rejecting every generic record as ai structured output even though
+        // no such restriction is documented anywhere in `ai.rs`.
+        let records: std::collections::HashMap<String, (String, Vec<(String, Ty)>, Vec<u32>)> = self
             .checked
             .types
             .values()
             .filter(|t| t.variants.len() == 1)
             .map(|t| {
-                (t.name.clone(), (t.variants[0].name.clone(), t.variants[0].fields.clone()))
+                (t.name.clone(), (t.variants[0].name.clone(), t.variants[0].fields.clone(), t.qvars.clone()))
             })
             .collect();
         for item in &program.items {
@@ -644,7 +656,7 @@ impl Checker {
         owner: &FunDecl,
         ai: &AiDecl,
         program: &Program,
-        records: &std::collections::HashMap<String, (String, Vec<(String, Ty)>)>,
+        records: &std::collections::HashMap<String, (String, Vec<(String, Ty)>, Vec<u32>)>,
     ) -> Vec<crate::ai::ToolMeta> {
         let mut out = Vec::new();
         for tool_name in &ai.tools {
@@ -2003,24 +2015,13 @@ impl Checker {
     }
 
     /// Replace inference-var ids in `ty` per `m` (used to instantiate a generic
-    /// scheme or a generic ADT's field types). Recurses into every constructor.
+    /// scheme or a generic ADT's field types). A thin wrapper over `Ty::subst`
+    /// (moved to types.rs, production-hardening PR-it702, so `ai.rs`'s
+    /// structured-output schema builder can reuse it too) -- kept as a method
+    /// here so every existing `Self::subst_ty(...)` call site in this file is
+    /// unaffected.
     fn subst_ty(ty: &Ty, m: &HashMap<u32, Ty>) -> Ty {
-        match ty {
-            Ty::Var(id) => m.get(id).cloned().unwrap_or(Ty::Var(*id)),
-            Ty::List(e) => Ty::List(Box::new(Self::subst_ty(e, m))),
-            Ty::Set(e) => Ty::Set(Box::new(Self::subst_ty(e, m))),
-            Ty::Map(k, v) => Ty::Map(Box::new(Self::subst_ty(k, m)), Box::new(Self::subst_ty(v, m))),
-            Ty::Option(e) => Ty::Option(Box::new(Self::subst_ty(e, m))),
-            Ty::Result(a, b) => Ty::Result(Box::new(Self::subst_ty(a, m)), Box::new(Self::subst_ty(b, m))),
-            Ty::Fun(ps, r) => Ty::Fun(
-                ps.iter().map(|p| Self::subst_ty(p, m)).collect(),
-                Box::new(Self::subst_ty(r, m)),
-            ),
-            Ty::Named(n, args) => {
-                Ty::Named(n.clone(), args.iter().map(|a| Self::subst_ty(a, m)).collect())
-            }
-            other => other.clone(),
-        }
+        ty.subst(m)
     }
 
     /// Instantiate a constructor's field types with fresh type args, returning
@@ -4814,6 +4815,50 @@ mod generic_tests {
             fulfills_hole.iter().any(|d| d.code == "K0277" && d.message.contains("method `act`")),
             "{fulfills_hole:?}"
         );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it702): a generic
+    /// record used as `ai fun`/tool structured output (e.g. `type Box[T] =
+    /// Box(value: T)` returned as `-> Box[Int]`) recursed into its field
+    /// types UNSUBSTITUTED, since `collect_ai_funs`'s `records` map (fed to
+    /// `ai::build_shape`) never carried the type's own `qvars` -- leaking a
+    /// raw internal inference-variable id (`?0`) into the K0271/K0272
+    /// diagnostic and rejecting every generic record, with no such
+    /// restriction documented anywhere in `ai.rs`. Confirmed live before
+    /// this fix on all four call shapes covered here.
+    #[test]
+    fn generic_record_types_are_supported_as_ai_structured_output() {
+        // ai fun return type, single type param.
+        assert!(errors(
+            "type Box[T] = Box(value: T)\nai fun get_box() -> Box[Int] {\n    intent \"box\"\n}\nfun main() {}\n"
+        )
+        .is_empty());
+        // ai fun return type, multi param.
+        assert!(errors(
+            "type Pair[A, B] = Pair(first: A, second: B)\nai fun get_pair() -> Pair[Str, Int] {\n    intent \"pair\"\n}\nfun main() {}\n"
+        )
+        .is_empty());
+        // nested inside List.
+        assert!(errors(
+            "type Box[T] = Box(value: T)\nai fun get_boxes() -> List[Box[Int]] {\n    intent \"boxes\"\n}\nfun main() {}\n"
+        )
+        .is_empty());
+        // tool parameter/return type.
+        assert!(errors(
+            "type Box[T] = Box(value: T)\nfun make_box(n: Int) -> Box[Int] {\n    Box(value: n)\n}\nai fun summarize(text: Str) -> Str tools [make_box] {\n    intent \"summarize\"\n}\nfun main() {}\n"
+        )
+        .is_empty());
+        // a genuinely UNSUPPORTED generic shape (multi-variant, or single-
+        // variant but recursive) must still be rejected -- this fix only
+        // adds substitution, it does not loosen either existing restriction.
+        let multivariant = errors(
+            "type Shape[T] = Circle(r: T) | Square(s: T)\nai fun get_shape() -> Shape[Int] {\n    intent \"x\"\n}\nfun main() {}\n",
+        );
+        assert!(multivariant.iter().any(|d| d.code == "K0271" && d.message.contains("multiple variants")), "{multivariant:?}");
+        let recursive = errors(
+            "type Wrap[T] = Wrap(value: T, next: Wrap[T])\nai fun get_wrap() -> Wrap[Int] {\n    intent \"x\"\n}\nfun main() {}\n",
+        );
+        assert!(recursive.iter().any(|d| d.code == "K0271" && d.message.contains("recursive type")), "{recursive:?}");
     }
 
     #[test]
