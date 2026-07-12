@@ -5583,6 +5583,64 @@ mod tests {
         assert_eq!(out.trim(), "abcd|abc!", "native must not corrupt the caller's `a` via grow_str_outside's internal self-append");
     }
 
+    /// A wider adversarial stress pass following it615's severe finding (per
+    /// its own memory-entry guidance -- do NOT declare the thread closed
+    /// after one fix): the CLOSURE-CAPTURE analogue of the parameter-alias
+    /// bug. A lambda that captures a list, locally rebinds it (`var ys =
+    /// captured`), then self-pushes `ys`, must not corrupt the OUTER
+    /// captured list -- captures occupy `[0, ncaps)`, the SAME register
+    /// range `reg_traces_to_a_parameter`'s base case already treats as
+    /// unsafe (it doesn't distinguish captures from params), so this was
+    /// expected to already be covered by it615's fix; confirmed live
+    /// (byte-identical across interp/vm/native) AND by inspecting the
+    /// emitted C directly (the lambda's chunk uses the generic
+    /// `k_method(..., "push", ...)` fallback, not `k_list_push_inplace`).
+    #[test]
+    fn native_self_rebind_through_a_closure_capture_alias_does_not_corrupt_the_outer_list() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   var captured: List[Int] = [1, 2, 3]\n    \
+                   var build = fn {\n        var ys = captured\n        ys = ys.push(999)\n        ys\n    }\n    \
+                   var result = build()\n    \
+                   print(\"{captured}|{result}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_capture_alias");
+        assert_eq!(
+            out.trim(),
+            "[1, 2, 3]|[1, 2, 3, 999]",
+            "native must not corrupt the outer `captured` via the lambda's internal self-push"
+        );
+    }
+
+    /// The Map/Set analogues of the List/Str parameter-alias bug above --
+    /// same root cause (`var m2 = m; m2 = m2.insert(...)` where `m` is a
+    /// parameter), same fix (`reg_traces_to_a_parameter`), covering the two
+    /// container types the original two regression tests (List, Str)
+    /// didn't. Both in one test since they're structurally identical.
+    #[test]
+    fn native_self_rebind_map_and_set_insert_through_a_parameter_alias_does_not_corrupt_the_callers_container() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun grow_map(m: Map[Int, Int]) -> Map[Int, Int] {\n    \
+                   var m2 = m\n    m2 = m2.insert(999, 999)\n    m2\n}\n\
+                   fun grow_set(s: Set[Int]) -> Set[Int] {\n    \
+                   var s2 = s\n    s2 = s2.insert(999)\n    s2\n}\n\
+                   fun main() uses io {\n    \
+                   var m: Map[Int, Int] = Map()\n    m = m.insert(1, 10)\n    \
+                   var msnap = grow_map(m)\n    \
+                   var s: Set[Int] = Set()\n    s = s.insert(1)\n    \
+                   var ssnap = grow_set(s)\n    \
+                   print(\"{m.len()}|{msnap.len()}|{s.len()}|{ssnap.len()}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_mapset_param_alias");
+        assert_eq!(
+            out.trim(),
+            "1|2|1|2",
+            "native must not corrupt the caller's `m`/`s` via grow_map/grow_set's internal self-insert"
+        );
+    }
+
     /// `ai fun` compiles and RUNS on native, agreeing byte-for-byte with the
     /// interpreter/KVM. Bug-hunt batch 145 (PR-it537): LANGUAGE-REFERENCE.md's
     /// own execution-modes table marked "ai fun **[design]**" for native --
