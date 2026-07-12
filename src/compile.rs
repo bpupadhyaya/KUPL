@@ -134,23 +134,58 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
     }
 }
 
+/// Assign the next component-instance slot for a prop/state field/child,
+/// erroring (once per component) instead of silently wrapping if the
+/// combined count exceeds 256. A REAL bug found+fixed (production-hardening
+/// PR-it685): `ComponentMeta::nslots` and every `Op::StateGet`/`StateSet`
+/// slot index are `u8` (`bytecode.rs`), so the ORIGINAL code tracked the
+/// running counter as a bare `u8` too — a component with 257+ combined
+/// props/state fields/children drove `slot += 1` past `u8::MAX`, an
+/// unchecked Rust arithmetic overflow: a debug-build panic (crashing the
+/// whole process with a bogus "internal compiler error", confirmed live)
+/// or, in a release build, a SILENT wraparound that aliases two unrelated
+/// fields onto the identical slot index — reading one field's state would
+/// silently return the OTHER's value. Fixed by tracking the counter as a
+/// wider `u16` (mirroring `FnCompiler::alloc`'s identical `next: u16` vs.
+/// `Reg = u8` split for KVM register allocation, and its own `K0801`
+/// "too large" diagnostic pattern exactly), so the overflow is detected
+/// and reported BEFORE the truncating cast into the `u8`-keyed slot map,
+/// instead of after.
+fn alloc_slot(
+    shared: &mut Shared,
+    slots: &mut HashMap<String, u8>,
+    slot: &mut u16,
+    too_many: &mut bool,
+    name: &str,
+    span: Span,
+) {
+    if *slot > 255 && !*too_many {
+        *too_many = true;
+        shared.diags.push(Diag::error(
+            "K0805",
+            "component has too many props + state fields + children for KVM v0 (more than 256 total)",
+            span,
+        ));
+    }
+    slots.insert(name.to_string(), (*slot & 0xff) as u8);
+    *slot += 1;
+}
+
 /// Compile a component: slot layout (props, state, children), default chunks,
 /// init chunk (state inits + children + wires), handler chunks, expose chunks.
 fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
     // slot layout
     let mut slots: HashMap<String, u8> = HashMap::new();
-    let mut slot = 0u8;
+    let mut slot: u16 = 0;
+    let mut too_many_slots = false;
     for p in &c.props {
-        slots.insert(p.name.clone(), slot);
-        slot += 1;
+        alloc_slot(shared, &mut slots, &mut slot, &mut too_many_slots, &p.name, p.span);
     }
     for s in &c.state {
-        slots.insert(s.name.clone(), slot);
-        slot += 1;
+        alloc_slot(shared, &mut slots, &mut slot, &mut too_many_slots, &s.name, s.span);
     }
     for child in &c.children {
-        slots.insert(child.name.clone(), slot);
-        slot += 1;
+        alloc_slot(shared, &mut slots, &mut slot, &mut too_many_slots, &child.name, child.span);
     }
     // pre-assign chunk indices for ALL component functions (mutual recursion)
     let mut fun_chunks: HashMap<String, u16> = HashMap::new();
@@ -283,7 +318,11 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         name: c.name.clone(),
         is_app: c.is_app,
         props,
-        nslots: slot,
+        // truncate defensively (matches `alloc_slot`'s own masking): if
+        // `too_many_slots` fired, a K0805 error is already queued and this
+        // `ComponentMeta` will never be used (`compile_module` returns
+        // `Err` once `shared.diags` is non-empty).
+        nslots: (slot & 0xff) as u8,
         init_chunk,
         restart_chunk,
         handlers,

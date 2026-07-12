@@ -16302,6 +16302,53 @@ component Store {
         assert_eq!(v_log[5], "2 entries, 1 loads"); // alpha + k (v2 overwrote v1)
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it685): `compile.rs`'s
+    /// `compile_component` tracked its running props/state/children slot
+    /// counter as a bare `u8` (matching `ComponentMeta::nslots`'s own storage
+    /// type) -- but a component with 257+ combined slots drove `slot += 1`
+    /// past `u8::MAX`, an unchecked overflow: a debug-build panic (a bogus
+    /// "internal compiler error", confirmed live BEFORE this fix) or, in a
+    /// release build, a silent wraparound aliasing two unrelated fields onto
+    /// the same slot index. Fixed by tracking the counter as a wider `u16`
+    /// (mirroring `FnCompiler::alloc`'s identical split for KVM register
+    /// allocation) and reporting a clean `K0805` diagnostic once the true
+    /// count exceeds 256, before any truncating cast happens.
+    #[test]
+    fn component_with_more_than_256_state_fields_is_a_clean_diagnostic_not_an_ice() {
+        let mut src = String::from("component Big {\n    intent \"many state fields\"\n");
+        for i in 0..300 {
+            src.push_str(&format!("    state f{i}: Int = {i}\n"));
+        }
+        src.push_str("    expose fun first() -> Int { f0 }\n}\n");
+        src.push_str("fun main() uses io {\n    let b = Big()\n    print(\"{b.first()}\")\n}\n");
+
+        // the checker itself has no such limit (only the KVM backend does) --
+        // this must compile past `check.rs` cleanly.
+        let compiled = crate::run::compile(&src).expect("checker accepts 300 state fields");
+
+        // the interpreter has no slot-index concept at all and is unaffected.
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let f = Value::Fun(std::rc::Rc::new("main".to_string()));
+        assert!(interp.call_value(f, vec![], crate::diag::Span::default()).is_ok());
+
+        // the KVM backend must reject cleanly with K0805, never panic.
+        let err = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect_err("300 slots must be rejected, not silently truncated");
+        assert!(
+            err.iter().any(|d| d.code == "K0805"),
+            "expected a K0805 diagnostic, got: {err:?}"
+        );
+
+        // an ordinary, well-under-the-limit component is entirely unaffected.
+        let small = crate::run::compile(
+            "component Small {\n    intent \"few fields\"\n    state x: Int = 0\n    \
+             expose fun get() -> Int { x }\n}\nfun main() uses io {\n    print(\"{Small().get()}\")\n}\n",
+        )
+        .expect("compiles");
+        assert!(crate::compile::compile_module(&small.program, &small.checked).is_ok());
+    }
+
     #[test]
     fn diff_component_isolation_and_panic() {
         // Two instances of the same component keep SEPARATE private state, and a
