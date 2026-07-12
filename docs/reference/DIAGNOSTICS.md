@@ -116,6 +116,7 @@ Severity: **E** = error, **W** = warning.
 | K0273 | E | no parameter of that name |
 | K0274 | E | missing argument for a required parameter |
 | K0275 | E | a parameter cannot have a default value here — only top-level `fun` parameters support defaults, not constructor fields, methods, or contract signatures |
+| K0276 | E | `forall` binder's type has no property-test generator (supported: `Int`, `Bool`, `Float`, `Str`, `List[T]`, `Option[T]`, and user-defined record/enum types) |
 | K0260 | E | contract defined more than once |
 | K0261 | E | `fulfills` names an unknown contract |
 | K0262 | E | fulfilling component does not expose a required function |

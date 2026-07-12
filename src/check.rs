@@ -1465,6 +1465,26 @@ impl Checker {
             Stmt::Forall { vars, body, .. } => {
                 ctx.scopes.push();
                 for (name, ty) in vars {
+                    // A `forall` binder's type must actually be something the
+                    // property-test generator (`prop::generate`) can produce a
+                    // value for — Map[K,V]/Set[T]/Tensor/Range/function types
+                    // silently pass THIS check (no unify/resolve failure) and
+                    // then unconditionally FAIL every `kupl test` run at
+                    // runtime, even for a tautologically true body like
+                    // `expect true` (production-hardening PR-it693).
+                    let ok = crate::prop::is_generatable(ty, &|n| {
+                        self.checked.types.get(n).is_some_and(|sig| !sig.variants.is_empty())
+                    });
+                    if !ok {
+                        self.err(
+                            "K0276",
+                            format!(
+                                "forall variable `{name}` has type `{}`, which has no property-test generator (supported: Int, Bool, Float, Str, List[T], Option[T], and user-defined record/enum types)",
+                                crate::prop::tyname(ty)
+                            ),
+                            ty.span,
+                        );
+                    }
                     let t = self.resolve_ty(ty);
                     ctx.scopes.insert(name, t, false);
                 }
@@ -4270,6 +4290,59 @@ mod generic_tests {
                 "component G {{\n    intent \"g\"\n    fun helper(name: Str) -> Str {{ name }}\n    expose fun greet(name: Str) -> Str {{ helper(name) }}\n}}{comp}"
             ))
             .is_empty()
+        );
+    }
+
+    /// A REAL silent-footgun bug (PR-it693): `Stmt::Forall`'s checker arm resolved a
+    /// `forall` binder's type and type-checked the body, but never validated that
+    /// `prop::generate` can actually PRODUCE a value of that type. So `forall m:
+    /// Map[Str, Int] { expect true }` compiled clean (`kupl check` exit 0, zero
+    /// diagnostics) and then unconditionally FAILED every single `kupl test` run at
+    /// runtime -- even for a tautologically true body -- with the raw generator error
+    /// ("no generator for type `Map[Str, Int]`") standing in for what should have been
+    /// a check-time diagnostic. This undermined contract-law verification soundness:
+    /// a law using such a type could NEVER be validated, regardless of whether the
+    /// contract was genuinely honored. Confirmed live before this fix.
+    #[test]
+    fn forall_binder_type_with_no_property_test_generator_is_rejected_at_check_time() {
+        let map_err = errors("law \"x\" { forall m: Map[Str, Int] { expect true } }\n");
+        assert!(
+            map_err.iter().any(|d| d.code == "K0276"
+                && d.message.contains("forall variable `m`")
+                && d.message.contains("Map[Str, Int]")),
+            "{map_err:?}"
+        );
+        // Set/Tensor/Range and a nested-inside-List/Option unsupported type are all the
+        // SAME shape -- `is_generatable` recurses into List[T]/Option[T]'s own `T`, so
+        // burying the unsupported type one level deep must still be caught.
+        let set_err = errors("law \"x\" { forall s: Set[Int] { expect true } }\n");
+        assert!(set_err.iter().any(|d| d.code == "K0276" && d.message.contains("Set[Int]")), "{set_err:?}");
+        let nested_err = errors("law \"x\" { forall xs: List[Set[Int]] { expect true } }\n");
+        assert!(nested_err.iter().any(|d| d.code == "K0276" && d.message.contains("List[Set[Int]]")), "{nested_err:?}");
+        // A function-typed binder is also rejected (`generate` explicitly refuses it).
+        let fn_err = errors("law \"x\" { forall f: fn(Int) -> Int { expect true } }\n");
+        assert!(fn_err.iter().any(|d| d.code == "K0276"), "{fn_err:?}");
+        // Every type prop::generate DOES support -- the primitives, List[T]/Option[T]
+        // (including nested), and a user-defined enum/record -- stays completely clean.
+        assert!(errors(
+            "law \"x\" { forall n: Int, b: Bool, f: Float, s: Str, xs: List[Int], o: Option[Str], oo: Option[List[Int]] { expect true } }\n"
+        )
+        .is_empty());
+        assert!(errors(
+            "type Color = Red | Green | Blue\nlaw \"x\" { forall c: Color { expect true } }\n"
+        )
+        .is_empty());
+        assert!(errors(
+            "type P = { x: Int, y: Int }\nlaw \"x\" { forall p: P { expect true } }\n"
+        )
+        .is_empty());
+        // The SAME check applies inside a contract's law, not just a top-level one.
+        let contract_err = errors(
+            "contract Store {\n    law \"x\" { forall m: Map[Str, Int] { expect true } }\n}\n",
+        );
+        assert!(
+            contract_err.iter().any(|d| d.code == "K0276" && d.message.contains("Map[Str, Int]")),
+            "{contract_err:?}"
         );
     }
 

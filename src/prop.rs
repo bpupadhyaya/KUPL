@@ -155,7 +155,7 @@ fn gen_named(name: &str, rng: &mut Rng, types: &TypeDb, depth: usize) -> Result<
     })
 }
 
-fn tyname(ty: &TyExpr) -> String {
+pub fn tyname(ty: &TyExpr) -> String {
     match &ty.kind {
         TyExprKind::Name(n) => n.clone(),
         TyExprKind::Generic(n, args) => {
@@ -163,6 +163,29 @@ fn tyname(ty: &TyExpr) -> String {
             format!("{n}[{}]", inner.join(", "))
         }
         TyExprKind::Fun(..) => "fn".into(),
+    }
+}
+
+/// Whether `generate` can actually produce a value for `ty`, WITHOUT running
+/// it — mirrors `generate`'s own match arms exactly, so this predicate and
+/// `generate`'s actual behavior can never silently drift apart (production-
+/// hardening PR-it693). `known_type` should report whether a NAMED type has a
+/// registered, non-empty variant list (what `gen_named` itself requires) —
+/// for the interp/vm's own `TypeDb`, that's
+/// `|n| types.get(n).is_some_and(|v| !v.is_empty())`. Used by `check.rs`'s
+/// `Stmt::Forall` handling to catch an unsupported `forall` binder type (e.g.
+/// `Map[K, V]`, `Set[T]`, `Tensor`, a function type) at CHECK time instead of
+/// letting it silently pass `kupl check` and then unconditionally fail every
+/// single `kupl test` run — even for a tautologically true body — with no way
+/// to have caught it ahead of time.
+pub fn is_generatable(ty: &TyExpr, known_type: &impl Fn(&str) -> bool) -> bool {
+    match &ty.kind {
+        TyExprKind::Name(n) => matches!(n.as_str(), "Int" | "Bool" | "Float" | "Str") || known_type(n),
+        TyExprKind::Generic(n, args) => match (n.as_str(), args.len()) {
+            ("List", 1) | ("Option", 1) => is_generatable(&args[0], known_type),
+            _ => false,
+        },
+        TyExprKind::Fun(..) => false,
     }
 }
 
