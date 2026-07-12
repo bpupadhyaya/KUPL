@@ -13,6 +13,9 @@ Usage:
   kupl dis <file.kupl>              Disassemble the compiled KVM bytecode
   kupl diff <old.kupl> <new.kupl>   Semantic diff (interface vs implementation)
   kupl new <name>                   Scaffold a new KUPL project
+  kupl pkg tree <file.kupl>         Print the resolved dependency tree
+  kupl pkg lock <file.kupl>         Write a lockfile pinning resolved dependency versions
+  kupl pkg fetch <file.kupl>        Download registry dependencies into the local cache
   kupl test <file.kupl>             Run `example` blocks + contract laws as tests
   kupl check <file.kupl> [--json]   Parse, type-check, and effect-check
   kupl fmt <file.kupl> [--write]    Print (or rewrite to) canonical form
@@ -344,7 +347,30 @@ fn with_file(args: &[String], f: impl Fn(&str, &str) -> i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_module, valid_project_name, with_file};
+    use super::{build_module, valid_project_name, with_file, USAGE};
+
+    /// A REAL discoverability gap (PR-it669): `kupl pkg tree|lock|fetch
+    /// <file.kupl>` is a fully implemented, tested subcommand (dispatched in
+    /// `run_cli`'s match, with its own usage error and `run.rs` tests), but it
+    /// was entirely absent from the top-level `USAGE` string -- so `kupl` with
+    /// no args, an unknown subcommand, or `--help`-style confusion never told
+    /// the user `pkg` exists at all. Every OTHER dispatched top-level
+    /// subcommand is one line in `USAGE`; this locks in that `pkg` (and any
+    /// future addition) can't silently drop out of the help text again. This
+    /// is a manual list, not derived from the match arms -- so a newly added
+    /// dispatched subcommand must be added HERE too, not just to `run_cli`.
+    #[test]
+    fn usage_text_mentions_every_dispatched_top_level_subcommand() {
+        for cmd in [
+            "run", "build", "bundle", "native", "dis", "diff", "new", "pkg", "test", "check", "fmt", "context",
+            "manifest", "repl", "lsp", "version",
+        ] {
+            assert!(
+                USAGE.contains(&format!("kupl {cmd}")),
+                "USAGE is missing a line for the `{cmd}` subcommand, which run_cli actually dispatches"
+            );
+        }
+    }
 
     #[test]
     fn with_file_reports_missing_entry_as_a_load_failure_not_a_bare_usage_error() {
