@@ -5,11 +5,16 @@
 //! ranges, matching `loader.rs`'s existing "ranges are a future addition"
 //! scope for local path dependencies.
 //!
-//! This module implements the PARSING/RESOLUTION/VERIFICATION core; actually
-//! fetching a package over HTTP and caching it on disk are deliberately
-//! separate, later slices. Everything here is pure and deterministic — no
-//! network or filesystem access of its own — so it is fully unit-testable
-//! without a live registry.
+//! This module implements the parse/resolve/verify/materialize core, plus a
+//! `fetch_package` orchestration layer on top of it (`curl`-based, matching
+//! `interp.rs`'s HTTP builtins and `ai.rs`'s provider calls — the same zero-
+//! dependency transport approach used everywhere else in this codebase).
+//! The core (`parse_index`/`resolve_version`/`verify_hash`/`materialize`) is
+//! pure and deterministic — no network or filesystem access of its own — so
+//! it is fully unit-testable without a live registry; `fetch_package`'s own
+//! tests inject a canned, in-memory fetcher (`fetch_package_with`) rather
+//! than depending on live network access. Wiring this into a CLI subcommand
+//! (`kupl pkg fetch`) is a deliberately separate, later slice.
 //!
 //! Index shape (one JSON document per package name):
 //!
@@ -233,6 +238,93 @@ pub fn materialize(
         std::fs::write(&dest, content).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
     }
     Ok(())
+}
+
+/// Fetch `url` via `curl` — the same zero-dependency, subprocess-based
+/// transport `interp.rs`'s `http_get`/`http_post` builtins and `ai.rs`'s
+/// provider calls already use (`-sS --fail` so a non-2xx status becomes an
+/// `Err`, `--max-time 30` so a stalled/unreachable host can't hang the CLI
+/// forever). `Err` on a non-2xx status, an unreachable host, curl being
+/// missing, or a response that isn't valid UTF-8.
+fn curl_get(url: &str) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sS", "--fail", "--max-time", "30", url]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let out = cmd.output().map_err(|e| format!("cannot run curl: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("request to {url} failed (curl exit {})", out.status.code().unwrap_or(-1))
+        } else {
+            format!("request to {url} failed: {err}")
+        });
+    }
+    String::from_utf8(out.stdout).map_err(|_| format!("response from {url} is not valid UTF-8"))
+}
+
+/// Fetch and materialize one package version from a registry: the index at
+/// `{registry_url}/{name}.json`, then every file the resolved version
+/// lists, verifying every hash before anything is written to disk (via
+/// `materialize`, which re-checks regardless of what this function already
+/// trusts). Returns the directory the package was materialized into — an
+/// ordinary local directory `loader.rs`'s existing local-path-dependency
+/// machinery can consume unchanged, exactly like a hand-written `{ path =
+/// ".." }` dependency, matching this module's own central design claim
+/// (verified end to end by this module's tests).
+///
+/// v1 deliberately does not cache-skip a re-fetch of an already-materialized
+/// version — always fetches and re-verifies fresh. Caching is a
+/// deliberately separate, later concern (out of scope here, same as the
+/// module doc comment's network/caching split for `materialize` itself).
+pub fn fetch_package(
+    registry_url: &str,
+    name: &str,
+    version: &str,
+    cache_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    fetch_package_with(curl_get, registry_url, name, version, cache_dir)
+}
+
+/// `fetch_package`, but the transport is injectable — lets a test exercise
+/// the full fetch-index/resolve-version/fetch-files/materialize pipeline
+/// with a canned, in-memory fetcher instead of live curl/network access
+/// (only `fetch_package` above uses real curl; tests call this directly),
+/// mirroring `interp.rs`'s `serve_http`/`serve_http_with_read_timeout` test-
+/// injection pattern (production-hardening PR-it623).
+fn fetch_package_with(
+    fetch: impl Fn(&str) -> Result<String, String>,
+    registry_url: &str,
+    name: &str,
+    version: &str,
+    cache_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let index_url = format!("{}/{name}.json", registry_url.trim_end_matches('/'));
+    let index_text =
+        fetch(&index_url).map_err(|e| format!("cannot fetch registry index for `{name}`: {e}"))?;
+    let index = parse_index(&index_text)?;
+    // The index at this URL is untrusted, network-supplied data (the SAME
+    // class of concern `is_safe_relative_path` already guards against for
+    // file paths) -- without this check, a misconfigured or compromised
+    // registry could serve one package's index content at another
+    // package's URL, silently installing the wrong code under the name the
+    // caller asked for.
+    if index.name != name {
+        return Err(format!(
+            "registry index at {index_url} is for package `{}`, not `{name}` -- refusing a mismatched index",
+            index.name
+        ));
+    }
+    let resolved = resolve_version(&index, version)?;
+    let mut contents = HashMap::new();
+    for (path, file) in &resolved.files {
+        let content = fetch(&file.url)
+            .map_err(|e| format!("cannot fetch `{name}` {version} file `{path}`: {e}"))?;
+        contents.insert(path.clone(), content);
+    }
+    let dest = cache_dir.join(name).join(version);
+    materialize(resolved, &contents, &dest)?;
+    Ok(dest)
 }
 
 #[cfg(test)]
@@ -534,6 +626,205 @@ mod tests {
         match interp.call_value(f, vec![], crate::diag::Span::default()) {
             Ok(_) => {}
             Err(_) => panic!("main() should run cleanly against the materialized dependency"),
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A canned, in-memory fetcher for `fetch_package_with` tests: a URL ->
+    /// content map, `Err` for anything not listed. Lets these tests exercise
+    /// the real fetch/resolve/materialize pipeline deterministically, with
+    /// no live network access.
+    fn mock_fetcher(urls: HashMap<String, String>) -> impl Fn(&str) -> Result<String, String> {
+        move |url: &str| {
+            urls.get(url).cloned().ok_or_else(|| format!("mock: no canned response for {url}"))
+        }
+    }
+
+    fn mock_index_and_files(name: &str, version: &str, main_content: &str) -> (String, HashMap<String, String>) {
+        let main_hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(main_content)));
+        let index_url = format!("https://registry.example.com/{name}.json");
+        let main_url = format!("https://cdn.example.com/{name}/{version}/main.kupl");
+        let index_json = format!(
+            r#"{{"name": "{name}", "versions": {{"{version}": {{"entry": "main.kupl", "files": {{"main.kupl": {{"url": "{main_url}", "hash": "{main_hash}"}}}}}}}}}}"#
+        );
+        let urls = HashMap::from([(index_url, index_json), (main_url, main_content.to_string())]);
+        (main_hash, urls)
+    }
+
+    #[test]
+    fn fetch_package_with_materializes_a_resolved_version_from_canned_responses() {
+        let (_hash, urls) = mock_index_and_files("json2", "1.2.0", "pub fun id(x: Int) -> Int { x }\n");
+        let dir = std::env::temp_dir().join(format!("kupl-registry-fetch-happy-{}", std::process::id()));
+        let result = fetch_package_with(
+            mock_fetcher(urls),
+            "https://registry.example.com",
+            "json2",
+            "1.2.0",
+            &dir,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let dest = result.unwrap();
+        assert_eq!(dest, dir.join("json2").join("1.2.0"));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("main.kupl")).unwrap(),
+            "pub fun id(x: Int) -> Int { x }\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The trailing-slash form of a registry URL must resolve to the SAME
+    /// index URL as the non-trailing-slash form -- a config typo (a stray
+    /// `/`) shouldn't silently produce a different (404ing) request.
+    #[test]
+    fn fetch_package_with_tolerates_a_trailing_slash_on_the_registry_url() {
+        let (_hash, urls) = mock_index_and_files("json2", "1.0.0", "pub fun f() -> Int { 1 }\n");
+        let dir = std::env::temp_dir().join(format!("kupl-registry-fetch-slash-{}", std::process::id()));
+        let result = fetch_package_with(
+            mock_fetcher(urls),
+            "https://registry.example.com/",
+            "json2",
+            "1.0.0",
+            &dir,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_package_with_reports_a_missing_version_cleanly() {
+        let (_hash, urls) = mock_index_and_files("json2", "1.2.0", "pub fun f() -> Int { 1 }\n");
+        let dir = std::env::temp_dir().join(format!("kupl-registry-fetch-missing-version-{}", std::process::id()));
+        let err = fetch_package_with(mock_fetcher(urls), "https://registry.example.com", "json2", "9.9.9", &dir)
+            .unwrap_err();
+        assert!(err.contains("9.9.9") && err.contains("1.2.0"), "{err}");
+        assert!(!dir.exists(), "nothing should be written on a resolve failure");
+    }
+
+    #[test]
+    fn fetch_package_with_reports_an_unreachable_index_cleanly() {
+        // no canned response for the index URL at all -- simulates a 404 or
+        // network failure fetching the index itself.
+        let err = fetch_package_with(
+            mock_fetcher(HashMap::new()),
+            "https://registry.example.com",
+            "json2",
+            "1.0.0",
+            &std::env::temp_dir().join("kupl-registry-fetch-unreachable-does-not-matter"),
+        )
+        .unwrap_err();
+        assert!(err.contains("json2"), "{err}");
+    }
+
+    #[test]
+    fn fetch_package_with_reports_an_unreachable_file_cleanly() {
+        // the index resolves fine, but the file's own URL has no canned
+        // response -- simulates the index being reachable while its CDN
+        // (a genuinely separate host, in a real deployment) is not.
+        let (_hash, mut urls) = mock_index_and_files("json2", "1.0.0", "pub fun f() -> Int { 1 }\n");
+        urls.retain(|k, _| k.contains(".json"));
+        let dir = std::env::temp_dir().join(format!("kupl-registry-fetch-unreachable-file-{}", std::process::id()));
+        let err =
+            fetch_package_with(mock_fetcher(urls), "https://registry.example.com", "json2", "1.0.0", &dir)
+                .unwrap_err();
+        assert!(err.contains("main.kupl"), "{err}");
+        assert!(!dir.exists());
+    }
+
+    /// A malicious/compromised registry serving package `evil`'s content
+    /// under `honest`'s index URL must be rejected, not silently installed
+    /// under the name the caller actually asked for.
+    #[test]
+    fn fetch_package_with_rejects_an_index_whose_name_does_not_match_the_request() {
+        let index_url = "https://registry.example.com/honest.json".to_string();
+        let index_json = r#"{"name": "evil", "versions": {"1.0.0": {"entry": "main.kupl", "files": {"main.kupl": {"url": "https://cdn.example.com/x", "hash": "aa"}}}}}"#.to_string();
+        let urls = HashMap::from([(index_url, index_json)]);
+        let err = fetch_package_with(
+            mock_fetcher(urls),
+            "https://registry.example.com",
+            "honest",
+            "1.0.0",
+            &std::env::temp_dir().join("kupl-registry-fetch-name-mismatch-does-not-matter"),
+        )
+        .unwrap_err();
+        assert!(err.contains("evil") && err.contains("honest"), "{err}");
+    }
+
+    #[test]
+    fn fetch_package_with_refuses_a_file_whose_fetched_content_fails_the_hash_check() {
+        let main_url = "https://cdn.example.com/json2/1.0.0/main.kupl".to_string();
+        let index_json = format!(
+            r#"{{"name": "json2", "versions": {{"1.0.0": {{"entry": "main.kupl", "files": {{"main.kupl": {{"url": "{main_url}", "hash": "deadbeef"}}}}}}}}}}"#
+        );
+        let urls = HashMap::from([
+            ("https://registry.example.com/json2.json".to_string(), index_json),
+            (main_url, "tampered in transit".to_string()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("kupl-registry-fetch-tampered-{}", std::process::id()));
+        let err = fetch_package_with(mock_fetcher(urls), "https://registry.example.com", "json2", "1.0.0", &dir)
+            .unwrap_err();
+        assert!(err.contains("hash mismatch"), "{err}");
+        assert!(!dir.exists(), "a hash-mismatched fetch must never be written to disk");
+    }
+
+    /// Proves the fetch layer's own central claim end to end: a package
+    /// fetched (from canned, in-memory responses standing in for a real
+    /// registry) through `fetch_package_with` produces a directory that
+    /// `loader.rs`'s EXISTING local-path-dependency machinery loads and
+    /// runs completely unchanged -- extending PR-it631's equivalent proof
+    /// for `materialize` alone to cover the fetch orchestration around it.
+    #[test]
+    fn a_fetched_package_loads_and_runs_exactly_like_a_local_dependency() {
+        let toml_content = "[project]\nname = \"math\"\nentry = \"main.kupl\"\n";
+        let main_content = "pub fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n";
+        let toml_hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(toml_content)));
+        let main_hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(main_content)));
+        let toml_url = "https://cdn.example.com/math/1.0.0/kupl.toml".to_string();
+        let main_url = "https://cdn.example.com/math/1.0.0/main.kupl".to_string();
+        let index_json = format!(
+            r#"{{"name": "math", "versions": {{"1.0.0": {{"entry": "main.kupl", "files": {{
+                "kupl.toml": {{"url": "{toml_url}", "hash": "{toml_hash}"}},
+                "main.kupl": {{"url": "{main_url}", "hash": "{main_hash}"}}
+            }}}}}}}}"#
+        );
+        let urls = HashMap::from([
+            ("https://registry.example.com/math.json".to_string(), index_json),
+            (toml_url, toml_content.to_string()),
+            (main_url, main_content.to_string()),
+        ]);
+
+        let base = std::env::temp_dir().join(format!("kupl-registry-fetch-e2e-{}", std::process::id()));
+        let math_cache =
+            fetch_package_with(mock_fetcher(urls), "https://registry.example.com", "math", "1.0.0", &base)
+                .expect("fetches and materializes cleanly");
+
+        let app = base.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            format!(
+                "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = {{ path = \"{}\" }}\n",
+                math_cache.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use math\n\nfun main() uses io {\n    print(math.add(2, 3))\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = crate::loader::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its fetched math dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(diags.iter().all(|d| d.severity != crate::diag::Severity::Error), "{diags:?}");
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(_) => {}
+            Err(_) => panic!("main() should run cleanly against the fetched dependency"),
         }
 
         let _ = std::fs::remove_dir_all(&base);
