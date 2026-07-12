@@ -157,8 +157,29 @@ fn interface_of(item: &Item) -> String {
             }
         }
         Item::Component(c) => {
-            s.push_str(&format!("app={} fulfills[{}]", c.is_app, c.fulfills.join(",")));
-            for p in &c.ports {
+            // `fulfills`/`ports`/`exposes` are all looked up BY NAME everywhere
+            // they're consumed -- `fulfills` via set membership (`check.rs`'s
+            // `.contains`/`.any`), `ports` via named wiring (`WireDecl`'s
+            // `(component, port)` string tuples, never a position), `exposes`
+            // via `sig.exposes.insert(f.name.clone(), ...)` (a HashMap keyed by
+            // name). Declaration ORDER therefore carries no interface-observable
+            // meaning for any of the three -- confirmed live: reordering each one
+            // alone (with no other change) previously flagged `[INTERFACE —
+            // breaking]` on a component with no actual caller-visible change, a
+            // FALSE POSITIVE (the opposite failure mode from `PR-it580`/`PR-it643`,
+            // which were false NEGATIVES) -- so each is sorted before joining, to
+            // capture the SET (additions/removals still correctly flagged) without
+            // being sensitive to source order. `props`, by contrast, genuinely IS
+            // order-sensitive (`interp.rs`'s `instantiate`: "props: by name or
+            // POSITION, else default" -- an unnamed positional call argument binds
+            // by declaration index) and is deliberately left in declaration order
+            // (production-hardening PR-it646).
+            let mut fulfills = c.fulfills.clone();
+            fulfills.sort();
+            s.push_str(&format!("app={} fulfills[{}]", c.is_app, fulfills.join(",")));
+            let mut ports: Vec<&crate::ast::Port> = c.ports.iter().collect();
+            ports.sort_by_key(|p| &p.name);
+            for p in ports {
                 s.push_str(&format!(
                     " {}:{}:{}",
                     if p.dir == crate::ast::PortDir::In { "in" } else { "out" },
@@ -169,7 +190,9 @@ fn interface_of(item: &Item) -> String {
             for p in &c.props {
                 s.push_str(&format!(" prop {}:{} req={}", p.name, ty_str(&p.ty), p.default.is_none()));
             }
-            for f in &c.exposes {
+            let mut exposes: Vec<&crate::ast::FunDecl> = c.exposes.iter().collect();
+            exposes.sort_by_key(|f| &f.name);
+            for f in exposes {
                 s.push_str(&format!(" expose {}(", f.name));
                 for p in &f.params {
                     s.push_str(&format!("{}:{},", p.name, ty_str(&p.ty)));
@@ -179,7 +202,16 @@ fn interface_of(item: &Item) -> String {
             }
         }
         Item::Contract(ct) => {
-            for sig in &ct.sigs {
+            // Same order-insensitivity as `Item::Component` above -- fulfilling
+            // components satisfy contract `sigs`/`laws` by NAME (`check.rs` line
+            // ~780: `for (fname, (params, ret, effects)) in &contract.sigs`, a
+            // name-keyed lookup once checked), never by declaration position, so
+            // reordering either list is not a real interface change (confirmed
+            // live: reordering two `expose fun`s, or two `law`s, with no other
+            // change, previously flagged `[INTERFACE — breaking]` incorrectly).
+            let mut sigs: Vec<&crate::ast::FunSig> = ct.sigs.iter().collect();
+            sigs.sort_by_key(|sig| &sig.name);
+            for sig in sigs {
                 s.push_str(&format!(" {}(", sig.name));
                 for p in &sig.params {
                     s.push_str(&format!("{}:{},", p.name, ty_str(&p.ty)));
@@ -195,7 +227,9 @@ fn interface_of(item: &Item) -> String {
                 // only" instead of "[INTERFACE — breaking]" (PR-it580).
                 s.push_str(&format!(" uses[{}]", sig.effects.join(",")));
             }
-            for law in &ct.laws {
+            let mut laws: Vec<&crate::ast::Law> = ct.laws.iter().collect();
+            laws.sort_by_key(|law| &law.name);
+            for law in laws {
                 s.push_str(&format!(" law:{}", law.name));
             }
         }
@@ -371,6 +405,73 @@ mod tests {
         let iface_change = "component C {\n intent \"x\"\n in a: Str\n state n: Int = 0\n on a(v) { n += 1 }\n}\n";
         assert_eq!(diff_lines(old, impl_change).0, vec!["impl C"]);
         assert_eq!(diff_lines(old, iface_change).0, vec!["interface C"]);
+    }
+
+    /// A REAL BUG found+fixed (production-hardening PR-it646) — the OPPOSITE
+    /// failure mode from `PR-it580`/`PR-it643` (which were false NEGATIVES,
+    /// silently missing a genuine interface change): `fulfills`/`ports`/`exposes`
+    /// were all captured in DECLARATION order, but none of the three is actually
+    /// order-sensitive anywhere they're consumed (`fulfills` via set membership,
+    /// `ports` via named wiring, `exposes` via a name-keyed lookup once checked)
+    /// -- so a pure reorder with NO other change was a FALSE POSITIVE, incorrectly
+    /// flagged `[INTERFACE — breaking]`.
+    #[test]
+    fn component_fulfills_ports_exposes_reorder_is_not_interface() {
+        // NOTE: `canonical()` (the formatter) preserves DECLARATION order in its
+        // printed text, so a pure reorder still registers as SOME change (the
+        // formatted text literally differs) -- the fix under test is specifically
+        // about the INTERFACE vs implementation CLASSIFICATION of that change,
+        // not about whether it's flagged as a change at all. So the correct
+        // expectation is `impl`, not "no change".
+        let contracts = "contract A {\n    intent \"a\"\n    expose fun f() -> Int\n}\n\
+                          contract B {\n    intent \"b\"\n    expose fun g() -> Int\n}\n";
+        let (lines, _) = diff_lines(
+            &format!("{contracts}component C fulfills A, B {{\n    expose fun f() -> Int {{ 1 }}\n    expose fun g() -> Int {{ 2 }}\n}}\n"),
+            &format!("{contracts}component C fulfills B, A {{\n    expose fun f() -> Int {{ 1 }}\n    expose fun g() -> Int {{ 2 }}\n}}\n"),
+        );
+        assert_eq!(lines, vec!["impl C"], "reordering `fulfills` must be implementation-only");
+
+        let (lines, _) = diff_lines(
+            "component C {\n    in a: Int\n    in b: Str\n}\n",
+            "component C {\n    in b: Str\n    in a: Int\n}\n",
+        );
+        assert_eq!(lines, vec!["impl C"], "reordering `ports` must be implementation-only");
+
+        let (lines, _) = diff_lines(
+            "component C {\n    expose fun a() -> Int { 1 }\n    expose fun b() -> Int { 2 }\n}\n",
+            "component C {\n    expose fun b() -> Int { 2 }\n    expose fun a() -> Int { 1 }\n}\n",
+        );
+        assert_eq!(lines, vec!["impl C"], "reordering `exposes` must be implementation-only");
+
+        // sanity: an ACTUAL fulfills change (not just reordered) still reports.
+        let (lines, _) = diff_lines(
+            &format!("{contracts}component C fulfills A {{\n    expose fun f() -> Int {{ 1 }}\n}}\n"),
+            &format!("{contracts}component C fulfills A, B {{\n    expose fun f() -> Int {{ 1 }}\n    expose fun g() -> Int {{ 2 }}\n}}\n"),
+        );
+        assert_eq!(lines, vec!["interface C"]);
+    }
+
+    /// Same false-positive shape as the component test above, for `Item::Contract`'s
+    /// `sigs`/`laws` (production-hardening PR-it646) — a fulfilling component
+    /// satisfies a contract's methods BY NAME (`check.rs`'s `for (fname, ...) in
+    /// &contract.sigs`, name-keyed once checked), so declaration order is not
+    /// interface-observable.
+    #[test]
+    fn contract_sigs_and_laws_reorder_is_not_interface() {
+        // Same NOTE as the component test above: `canonical()` preserves source
+        // order, so reordering still registers as SOME change -- the fix is about
+        // the interface/impl CLASSIFICATION, so the expectation is `impl`.
+        let (lines, _) = diff_lines(
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n    expose fun put(k: Str, v: Int) -> Int\n}\n",
+            "contract Store {\n    intent \"kv\"\n    expose fun put(k: Str, v: Int) -> Int\n    expose fun get(k: Str) -> Int\n}\n",
+        );
+        assert_eq!(lines, vec!["impl Store"], "reordering contract `sigs` must be implementation-only");
+
+        let (lines, _) = diff_lines(
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n    law \"one\" { assert(true) }\n    law \"two\" { assert(true) }\n}\n",
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n    law \"two\" { assert(true) }\n    law \"one\" { assert(true) }\n}\n",
+        );
+        assert_eq!(lines, vec!["impl Store"], "reordering `laws` must be implementation-only");
     }
 
     #[test]
