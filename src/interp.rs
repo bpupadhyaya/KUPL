@@ -2931,7 +2931,7 @@ pub fn shared_method(
             _ => Err("`max` needs a Float".into()),
         },
         (Value::BigInt(b), "pow") => match args.into_iter().next() {
-            Some(Value::Int(e)) if e >= 0 => Ok(Value::BigInt(Rc::new(b.pow(e as u64)))),
+            Some(Value::Int(e)) if e >= 0 => b.pow(e as u64).map(|r| Value::BigInt(Rc::new(r))),
             Some(Value::Int(_)) => Err("`pow` exponent must be non-negative".into()),
             _ => Err("`pow` needs an Int exponent".into()),
         },

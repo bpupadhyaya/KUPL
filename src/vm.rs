@@ -1389,6 +1389,30 @@ mod tests {
         assert_eq!(differential("fun probe() -> Str {\n    \"{rat(1, 0)}\"\n}\n"), "panic: division by zero");
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it637): unlike
+    /// `Int.pow` (bounded, fails fast on overflow), `BigInt.pow` had NO
+    /// limit at all -- an ordinary KUPL line like `big(2).pow(1000000000)`
+    /// requests a result with roughly a BILLION bits, either exhausting
+    /// memory or pinning a CPU core indefinitely with no diagnostic at all.
+    /// `differential()` itself would hang/OOM here if the cap were not
+    /// enforced BEFORE attempting the computation on EITHER engine.
+    #[test]
+    fn diff_bigint_pow_rejects_a_result_that_would_be_unreasonably_large() {
+        assert_eq!(
+            differential("fun probe() -> Str { \"{big(2).pow(1000000000)}\" }\n"),
+            "panic: BigInt.pow: result would be too large to compute (limit ~20000 limbs, roughly 180000 decimal digits)"
+        );
+        // 0 and 1 to a huge power stay trivially tiny -- must NOT be rejected
+        // just because the exponent alone is large.
+        assert_eq!(differential("fun probe() -> Str { \"{big(1).pow(9223372036854775807)}\" }\n"), "1");
+        assert_eq!(differential("fun probe() -> Str { \"{big(0).pow(9223372036854775807)}\" }\n"), "0");
+        // an ordinary, legitimate large-but-reasonable pow is unaffected.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{big(10).pow(400)}\" }\n").len(),
+            401
+        );
+    }
+
     #[test]
     fn diff_int_math_edges() {
         // clamp / gcd / isqrt / sign edge cases are byte-identical on both engines:

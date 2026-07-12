@@ -4,12 +4,24 @@
 //! chosen so `to_string` is trivial and identical to a C port (native), which
 //! matters for byte-identity across engines.
 //!
-//! Schoolbook add/sub/mul (a standard, well-known approach). Division, modulo,
-//! and power are a later iteration.
+//! Schoolbook add/sub/mul/div/mod (a standard, well-known approach — this
+//! module previously said division/modulo/power were "a later iteration,"
+//! but all three are implemented; the doc comment was simply stale, PR-it637).
+//! Because multiplication is schoolbook (O(n²), not Karatsuba/Toom-Cook),
+//! `pow`'s repeated squaring is the one place a caller-supplied magnitude
+//! matters: an uncapped exponent would request a result whose SIZE grows
+//! exponentially, so `pow` rejects a request whose result would be
+//! unreasonably large rather than exhaust memory or pin a CPU core
+//! indefinitely computing it.
 
 use std::cmp::Ordering;
 
 const BASE: u64 = 1_000_000_000;
+/// `pow`'s result-size sanity cap, in limbs (~9 decimal digits per limb) —
+/// generous for any plausible legitimate use (an RSA-2048 key is ~617
+/// decimal digits; this campaign's own tests exercise 400-digit numbers),
+/// but far short of exhausting memory/CPU via schoolbook squaring.
+pub const MAX_POW_RESULT_LIMBS: u64 = 20_000;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BigInt {
@@ -307,8 +319,41 @@ impl BigInt {
         a
     }
 
-    /// `self ^ exp` for a non-negative exponent, by repeated squaring.
-    pub fn pow(&self, exp: u64) -> BigInt {
+    /// `self ^ exp` for a non-negative exponent, by repeated squaring. `Err`
+    /// if the RESULT would be unreasonably large — a REAL bug found+fixed
+    /// (production-hardening PR-it637): unlike `Int.pow` (which caps its
+    /// exponent at `u32::MAX` AND uses `checked_pow`, failing fast the
+    /// instant the i64 result would overflow), this function had NO limit at
+    /// all before this fix — an ordinary, syntactically unremarkable KUPL
+    /// line like `big(2).pow(1_000_000_000)` requests a result with roughly
+    /// a BILLION bits, which this module's schoolbook (O(n²)) squaring either
+    /// exhausts all available memory building, or pins a CPU core computing
+    /// for an effectively unbounded time — with NO diagnostic, no clean
+    /// panic, nothing a caller could catch or a user could debug. Estimates
+    /// the result's limb count (`self`'s own limb count × `exp`, a safe
+    /// upper bound — squaring roughly doubles a number's DIGIT count per
+    /// squaring step, so the true result size stays under this estimate)
+    /// BEFORE doing any of the expensive multiplication, and rejects
+    /// anything past `MAX_POW_RESULT_LIMBS` cleanly instead of attempting it.
+    /// `|self|` of 0 or 1 is exempt from the estimate entirely — `0^n` and
+    /// `(±1)^n` stay O(1)-sized for ANY exponent, so a huge `exp` alone must
+    /// never reject them (the estimate, based on limb COUNT alone, can't
+    /// see that a magnitude-1 base never actually grows when multiplied).
+    pub fn pow(&self, exp: u64) -> Result<BigInt, String> {
+        let unit_magnitude = self.limbs.is_empty() || (self.limbs.len() == 1 && self.limbs[0] == 1);
+        if !unit_magnitude {
+            let base_limbs = self.limbs.len() as u64;
+            let too_large = match base_limbs.checked_mul(exp) {
+                Some(estimated) => estimated > MAX_POW_RESULT_LIMBS,
+                None => true, // the estimate itself overflowed u64 -- certainly too large
+            };
+            if too_large {
+                return Err(format!(
+                    "BigInt.pow: result would be too large to compute (limit ~{MAX_POW_RESULT_LIMBS} limbs, roughly {} decimal digits)",
+                    MAX_POW_RESULT_LIMBS * 9
+                ));
+            }
+        }
         let mut result = BigInt::from_i64(1);
         let mut base = self.clone();
         let mut e = exp;
@@ -321,7 +366,7 @@ impl BigInt {
                 base = base.mul(&base);
             }
         }
-        result
+        Ok(result)
     }
 
     pub fn cmp(&self, o: &BigInt) -> Ordering {
@@ -411,10 +456,39 @@ mod tests {
         assert_eq!(b("1000000000000000000000000000000").divmod(&b("1000000000000000")).unwrap().0.to_decimal(),
                    "1000000000000000");
         // powers
-        assert_eq!(b("2").pow(10).to_decimal(), "1024");
-        assert_eq!(b("2").pow(128).to_decimal(), "340282366920938463463374607431768211456");
-        assert_eq!(b("10").pow(0).to_decimal(), "1");
-        assert_eq!(b("-3").pow(3).to_decimal(), "-27");
+        assert_eq!(b("2").pow(10).unwrap().to_decimal(), "1024");
+        assert_eq!(b("2").pow(128).unwrap().to_decimal(), "340282366920938463463374607431768211456");
+        assert_eq!(b("10").pow(0).unwrap().to_decimal(), "1");
+        assert_eq!(b("-3").pow(3).unwrap().to_decimal(), "-27");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it637): unlike
+    /// `Int.pow` (capped at exponent `u32::MAX`, and `checked_pow` fails fast
+    /// on overflow), `BigInt.pow` had NO limit — `big(2).pow(1_000_000_000)`
+    /// (an entirely ordinary, syntactically unremarkable KUPL line) requests
+    /// a result with roughly a BILLION bits, which this module's schoolbook
+    /// (O(n²)) squaring either exhausts memory building or pins a CPU core
+    /// computing for an unbounded time.
+    #[test]
+    fn pow_rejects_a_result_that_would_be_unreasonably_large() {
+        // a genuinely huge exponent on a non-trivial base is rejected --
+        // MUST return quickly (this test itself would hang/OOM if the cap
+        // were not enforced BEFORE attempting the computation).
+        assert!(b("2").pow(1_000_000_000).is_err());
+        assert!(b("999999999").pow(u64::MAX).is_err());
+        // a base whose limb count times a large exponent overflows u64
+        // ITSELF must also be rejected, not silently wrap into "small enough".
+        assert!(b("1000000000000000000").pow(u64::MAX).is_err());
+
+        // ordinary, legitimate large-but-reasonable results are unaffected --
+        // matches this campaign's own 400-digit test fixtures elsewhere.
+        assert!(b("10").pow(400).is_ok());
+        assert!(b("2").pow(1000).is_ok());
+        // 0 and 1 to any power (even a huge one) are trivially tiny and must
+        // never be rejected just because the EXPONENT is large.
+        assert_eq!(b("0").pow(1_000_000_000).unwrap().to_decimal(), "0");
+        assert_eq!(b("1").pow(u64::MAX).unwrap().to_decimal(), "1");
+        assert_eq!(b("0").pow(0).unwrap().to_decimal(), "1"); // 0^0 == 1, by convention
     }
 
     #[test]
@@ -426,7 +500,7 @@ mod tests {
         assert_eq!(b("100").gcd(&b("0")).to_decimal(), "100");
         assert_eq!(b("0").gcd(&b("0")).to_decimal(), "0");
         // large: gcd(2^100, 2^60) == 2^60
-        assert_eq!(b("2").pow(100).gcd(&b("2").pow(60)), b("2").pow(60));
+        assert_eq!(b("2").pow(100).unwrap().gcd(&b("2").pow(60).unwrap()), b("2").pow(60).unwrap());
     }
 
     #[test]

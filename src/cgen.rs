@@ -1014,10 +1014,29 @@ static KBig* k_big_divmod(KValue av, KValue bv, int want_rem) {
     if (want_rem) return k_big_norm(a->neg, rem, remn);
     return k_big_norm(a->neg != b->neg, quo, an);
 }
+/* pow's result-size sanity cap, in limbs -- matches bigint.rs::
+   MAX_POW_RESULT_LIMBS exactly (PR-it637). */
+#define K_MAX_POW_RESULT_LIMBS 20000
 static KBig* k_big_pow(KValue av, int64_t exp) {
+    KBig* b = av.as.big;
+    uint64_t e = (uint64_t)exp;
+    /* A REAL bug found+fixed (production-hardening PR-it637): mirrors
+       bigint.rs::pow's fix exactly. Unlike native's Int.pow (bounded, fails
+       fast the instant the int64_t result would overflow), this had NO
+       limit at all before this fix -- an ordinary KUPL line like
+       big(2).pow(1000000000) requests a result with roughly a BILLION bits,
+       which this module's schoolbook (O(n^2)) squaring either exhausts
+       memory building or pins a CPU core computing indefinitely. Estimates
+       the result's limb count (b's own limb count * exp, a safe upper
+       bound) BEFORE doing any of the expensive multiplication. |self| of 0
+       or 1 is exempt -- those stay O(1)-sized for ANY exponent, so a huge
+       exp alone must never reject them. */
+    int unit_magnitude = (b->n == 0) || (b->n == 1 && b->limbs[0] == 1);
+    if (!unit_magnitude && e != 0 && (uint64_t)b->n > (uint64_t)K_MAX_POW_RESULT_LIMBS / e) {
+        k_panic("BigInt.pow: result would be too large to compute (limit ~20000 limbs, roughly 180000 decimal digits)");
+    }
     KBig* result = k_big_from_i64(1);
     KValue base = av;
-    uint64_t e = (uint64_t)exp;
     while (e > 0) {
         if (e & 1) result = k_big_mul(k_big_v(result), base);
         e >>= 1;
@@ -10436,6 +10455,23 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         assert_panic_wording_matches(
             "fun main() uses io { print(date_make(2024, 9223372036854775807, 1, 0, 0, 0)) }\n",
             "datemakemonth",
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it637): unlike
+    /// `Int.pow` (bounded, `checked_pow` fails fast on overflow),
+    /// `BigInt.pow` had NO limit at all -- an ordinary KUPL line like
+    /// `big(2).pow(1000000000)` requests a result with roughly a BILLION
+    /// bits, which this module's schoolbook (O(n^2)) squaring either
+    /// exhausts memory building or pins a CPU core computing indefinitely,
+    /// with NO diagnostic. Fixed with a result-size estimate (mirrors
+    /// `bigint.rs::pow`'s fix exactly) BEFORE attempting the computation on
+    /// both engines, panicking with byte-identical text.
+    #[test]
+    fn native_bigint_pow_size_cap_panic_matches_interp_wording() {
+        assert_panic_wording_matches(
+            "fun main() uses io { print(big(2).pow(1000000000)) }\n",
+            "bigpowcap",
         );
     }
 

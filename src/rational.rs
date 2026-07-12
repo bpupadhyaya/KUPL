@@ -107,7 +107,9 @@ impl Rational {
             }
         }
         const SCALE_DIGITS: u32 = 30;
-        let scale = BigInt::from_i64(10).pow(SCALE_DIGITS as u64);
+        // 10^30 is 4 limbs -- nowhere near BigInt::pow's MAX_POW_RESULT_LIMBS
+        // sanity cap (a constant, never caller-controlled).
+        let scale = BigInt::from_i64(10).pow(SCALE_DIGITS as u64).expect("10^30 is far under the pow size cap");
         let scaled_num = self.num.mul(&scale);
         let (q, _) = scaled_num.divmod(&self.den).unwrap();
         let approx = q.to_decimal().parse::<f64>().unwrap_or(f64::INFINITY);
@@ -177,7 +179,7 @@ mod tests {
         // (10^400 + 1) / (10^400 + 3) -- coprime (differ by 2, and neither
         // is a multiple of the other), each individually WAY beyond f64's
         // ~1.8e308 range, but the ratio itself is extremely close to 1.
-        let ten_400 = BigInt::from_i64(10).pow(400);
+        let ten_400 = BigInt::from_i64(10).pow(400).unwrap();
         let n = ten_400.add(&BigInt::from_i64(1));
         let d = ten_400.add(&BigInt::from_i64(3));
         let ratio = Rational::new(n, d).unwrap();
@@ -189,9 +191,9 @@ mod tests {
         // must still correctly reduce to +inf / 0.0, matching the doc
         // comment's own documented "may be ±inf for values beyond range" —
         // the fix must not accidentally turn THESE cases finite.
-        let huge_over_one = Rational::new(BigInt::from_i64(10).pow(400), BigInt::from_i64(1)).unwrap();
+        let huge_over_one = Rational::new(BigInt::from_i64(10).pow(400).unwrap(), BigInt::from_i64(1)).unwrap();
         assert_eq!(huge_over_one.to_f64(), f64::INFINITY);
-        let one_over_huge = Rational::new(BigInt::from_i64(1), BigInt::from_i64(10).pow(400)).unwrap();
+        let one_over_huge = Rational::new(BigInt::from_i64(1), BigInt::from_i64(10).pow(400).unwrap()).unwrap();
         assert_eq!(one_over_huge.to_f64(), 0.0);
 
         // the ordinary, small-number fast path is unaffected by the fix.
