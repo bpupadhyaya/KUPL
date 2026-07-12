@@ -1171,38 +1171,77 @@ fn lsp_range(text: &str, span: crate::diag::Span) -> String {
 /// `DocumentSymbol` JSON. `range`/`selectionRange` are the same span here (no
 /// separate name-only span is tracked on these AST nodes) -- valid per spec
 /// (selectionRange must be contained in range; equal satisfies that trivially).
-fn symbol_json(name: &str, kind: u8, range: &str, children: &[String]) -> String {
+/// `detail` is LSP's own "more detail for this symbol, e.g. the signature of
+/// a function" field (PR-it675 follow-up, PR-it676): hover/completion/
+/// signatureHelp all show a callable's full signature (params, return type,
+/// effects, and -- since it675 -- default values), but the outline/breadcrumb
+/// view (`documentSymbol`) used to show ONLY bare names for every symbol,
+/// even though the very field the LSP spec exists FOR was sitting right there
+/// unused. Empty string omits the field entirely (an empty `"detail":""`
+/// would be technically valid but visually noisy in most editors' outline
+/// views for symbols with no natural signature, like a bare `type`/`state`).
+fn symbol_json(name: &str, kind: u8, range: &str, detail: &str, children: &[String]) -> String {
     let children_part =
         if children.is_empty() { String::new() } else { format!(",\"children\":[{}]", children.join(",")) };
+    let detail_part = if detail.is_empty() { String::new() } else { format!(",\"detail\":\"{}\"", json_escape(detail)) };
     format!(
-        "{{\"name\":\"{}\",\"kind\":{kind},\"range\":{range},\"selectionRange\":{range}{children_part}}}",
+        "{{\"name\":\"{}\",\"kind\":{kind},\"range\":{range},\"selectionRange\":{range}{detail_part}{children_part}}}",
         json_escape(name)
     )
+}
+
+/// A constructor's field-list signature, e.g. `Circle(r: Float)` -- empty for
+/// a fieldless variant (`Nothing`), since that would just repeat the `name`
+/// field verbatim, which `symbol_json` correctly treats as "nothing to add"
+/// the same way it does for a `type`/`component`/`contract`'s own entry.
+fn variant_detail(v: &crate::ast::Variant) -> String {
+    if v.fields.is_empty() {
+        String::new()
+    } else {
+        format!("{}({})", v.name, v.fields.iter().map(param_str).collect::<Vec<_>>().join(", "))
+    }
 }
 
 /// LSP `SymbolKind` numeric codes used here: Method=6, Function=12, Field=8,
 /// EnumMember=22, Enum=10, Class=5, Interface=11.
 fn item_symbol(text: &str, item: &crate::ast::Item) -> String {
     use crate::ast::Item;
+    use crate::fmt::ty_str;
     match item {
-        Item::Fun(f) => symbol_json(&f.name, 12, &lsp_range(text, f.span), &[]),
+        Item::Fun(f) => symbol_json(&f.name, 12, &lsp_range(text, f.span), &fun_sig_str(f), &[]),
         Item::Type(t) => {
-            let children: Vec<String> =
-                t.variants.iter().map(|v| symbol_json(&v.name, 22, &lsp_range(text, v.span), &[])).collect();
-            symbol_json(&t.name, 10, &lsp_range(text, t.span), &children)
+            let children: Vec<String> = t
+                .variants
+                .iter()
+                .map(|v| symbol_json(&v.name, 22, &lsp_range(text, v.span), &variant_detail(v), &[]))
+                .collect();
+            symbol_json(&t.name, 10, &lsp_range(text, t.span), "", &children)
         }
         Item::Contract(c) => {
-            let children: Vec<String> =
-                c.sigs.iter().map(|s| symbol_json(&s.name, 6, &lsp_range(text, s.span), &[])).collect();
-            symbol_json(&c.name, 11, &lsp_range(text, c.span), &children)
+            let children: Vec<String> = c
+                .sigs
+                .iter()
+                .map(|s| symbol_json(&s.name, 6, &lsp_range(text, s.span), &contract_sig_str(s), &[]))
+                .collect();
+            symbol_json(&c.name, 11, &lsp_range(text, c.span), "", &children)
         }
-        Item::Law(l) => symbol_json(&l.name, 12, &lsp_range(text, l.span), &[]),
+        Item::Law(l) => symbol_json(&l.name, 12, &lsp_range(text, l.span), "", &[]),
         Item::Component(c) => {
-            let mut children: Vec<String> =
-                c.state.iter().map(|s| symbol_json(&s.name, 8, &lsp_range(text, s.span), &[])).collect();
-            children.extend(c.exposes.iter().map(|f| symbol_json(&f.name, 6, &lsp_range(text, f.span), &[])));
-            children.extend(c.funs.iter().map(|f| symbol_json(&f.name, 6, &lsp_range(text, f.span), &[])));
-            symbol_json(&c.name, 5, &lsp_range(text, c.span), &children)
+            let mut children: Vec<String> = c
+                .state
+                .iter()
+                .map(|s| {
+                    let detail = s.ty.as_ref().map(ty_str).unwrap_or_default();
+                    symbol_json(&s.name, 8, &lsp_range(text, s.span), &detail, &[])
+                })
+                .collect();
+            children.extend(
+                c.exposes.iter().map(|f| symbol_json(&f.name, 6, &lsp_range(text, f.span), &fun_sig_str(f), &[])),
+            );
+            children.extend(
+                c.funs.iter().map(|f| symbol_json(&f.name, 6, &lsp_range(text, f.span), &fun_sig_str(f), &[])),
+            );
+            symbol_json(&c.name, 5, &lsp_range(text, c.span), "", &children)
         }
     }
 }
@@ -2906,6 +2945,36 @@ mod tests {
 
         // unparseable source: nothing safe to outline
         assert_eq!(document_symbols("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
+    }
+
+    /// A REAL outline content-quality gap (PR-it676, follow-up to it675):
+    /// hover/completion/signatureHelp all show a callable's full signature,
+    /// but `documentSymbol`'s outline/breadcrumb entries showed ONLY bare
+    /// names -- never populating LSP's own `detail` field, whose spec
+    /// wording is literally "more detail for this symbol, e.g. the signature
+    /// of a function". Fixed by threading each item's already-correct
+    /// signature string (or declared type, for state fields) through.
+    #[test]
+    fn document_symbols_populate_the_detail_field_with_signatures() {
+        let src = "fun add(a: Int, b: Int = 1) -> Int {\n    a + b\n}\ntype Shape = Circle(r: Float) | Nothing\ncomponent Greeter {\n    intent \"g\"\n    state n: Int = 0\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n}\ncontract Store {\n    expose fun get(k: Str) -> Int\n}\n";
+        let syms = document_symbols(src).expect("parses cleanly, should outline");
+
+        // top-level function: full signature, including the default value.
+        assert!(syms.contains("\"detail\":\"fun add(a: Int, b: Int = 1) -> Int\""), "{syms}");
+        // ADT variant: constructor field list.
+        assert!(syms.contains("\"detail\":\"Circle(r: Float)\""), "{syms}");
+        // component method: full signature, same as hover would show.
+        assert!(syms.contains("\"detail\":\"fun greet(name: Str) -> Str\""), "{syms}");
+        // component state field: its declared type.
+        assert!(syms.contains("\"name\":\"n\",\"kind\":8"), "{syms}");
+        assert!(syms.contains("\"detail\":\"Int\""), "{syms}");
+        // contract method: full signature.
+        assert!(syms.contains("\"detail\":\"expose fun get(k: Str) -> Int\""), "{syms}");
+        // Exactly 5 symbols have a natural signature/type here (add, Circle,
+        // greet, n, get) -- a fieldless variant (`Nothing`) and every item
+        // with no natural signature (Shape/Greeter/Store's OWN entries) must
+        // NOT carry a spurious `"detail"` key at all, not even an empty one.
+        assert_eq!(syms.matches("\"detail\"").count(), 5, "{syms}");
     }
 
     #[test]
