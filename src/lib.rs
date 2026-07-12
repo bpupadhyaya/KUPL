@@ -33,6 +33,7 @@ pub mod resolve;
 pub mod lsp;
 pub mod parser;
 pub mod prop;
+pub mod registry;
 pub mod repl;
 pub mod run;
 pub mod sdiff;

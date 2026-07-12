@@ -1,0 +1,541 @@
+//! Package registry index parsing (v1 design — see the production-hardening
+//! campaign's design memo for the full scope: index format, cache layout,
+//! security bar). A v1 registry is a static per-package JSON index at
+//! `{registry_url}/{name}.json`, resolved by EXACT version match only — no
+//! ranges, matching `loader.rs`'s existing "ranges are a future addition"
+//! scope for local path dependencies.
+//!
+//! This module implements the PARSING/RESOLUTION/VERIFICATION core; actually
+//! fetching a package over HTTP and caching it on disk are deliberately
+//! separate, later slices. Everything here is pure and deterministic — no
+//! network or filesystem access of its own — so it is fully unit-testable
+//! without a live registry.
+//!
+//! Index shape (one JSON document per package name):
+//!
+//! ```json
+//! {
+//!   "name": "json2",
+//!   "versions": {
+//!     "1.2.0": {
+//!       "entry": "main.kupl",
+//!       "files": {
+//!         "kupl.toml": {"url": "https://example.com/json2/1.2.0/kupl.toml", "hash": "a1b2c3"},
+//!         "main.kupl": {"url": "https://example.com/json2/1.2.0/main.kupl", "hash": "d4e5f6"}
+//!       }
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! Every listed file carries an FNV-1a hex `hash` — the SAME primitive
+//! `loader::ResolvedDep` already uses for local-dependency drift detection
+//! (`encoding::hash_fnv`/`hex_encode`) — which a fetched file's bytes MUST
+//! match before the package is ever used. Hash verification is mandatory,
+//! never optional or silently skipped: a mismatch is always a hard error.
+
+use std::collections::HashMap;
+
+use crate::lsp::{parse_json, Json};
+
+/// One file a registry package version is made of: where to fetch it, and
+/// the hash its downloaded content must match.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegistryFile {
+    pub url: String,
+    pub hash: String,
+}
+
+/// One resolved version of a registry package.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegistryVersion {
+    /// The package's entry file path (e.g. `"main.kupl"`), a key into `files`.
+    pub entry: String,
+    /// Relative file path (e.g. `"kupl.toml"`, `"main.kupl"`) -> where to
+    /// fetch it and what its content must hash to.
+    pub files: HashMap<String, RegistryFile>,
+}
+
+/// A parsed registry index for one package name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegistryIndex {
+    pub name: String,
+    pub versions: HashMap<String, RegistryVersion>,
+}
+
+/// Parse a registry index JSON document. `Err` on malformed JSON or a
+/// missing/wrong-shaped required field — never panics, since this parses
+/// untrusted data fetched over the network. Reuses `lsp::parse_json`
+/// (already hardened with a recursion-depth guard, production-hardening
+/// PR-it620) rather than writing a parallel JSON parser.
+pub fn parse_index(text: &str) -> Result<RegistryIndex, String> {
+    let json = parse_json(text).map_err(|e| format!("invalid registry index JSON: {e}"))?;
+    let name = json
+        .get("name")
+        .and_then(Json::str)
+        .ok_or("registry index missing `name`")?
+        .to_string();
+    let versions_json = json.get("versions").ok_or("registry index missing `versions`")?;
+    let Json::Obj(version_pairs) = versions_json else {
+        return Err("registry index `versions` must be an object".into());
+    };
+    let mut versions = HashMap::new();
+    for (version, entry_json) in version_pairs {
+        let entry = entry_json
+            .get("entry")
+            .and_then(Json::str)
+            .ok_or_else(|| format!("registry index version `{version}` missing `entry`"))?
+            .to_string();
+        let files_json = entry_json
+            .get("files")
+            .ok_or_else(|| format!("registry index version `{version}` missing `files`"))?;
+        let Json::Obj(file_pairs) = files_json else {
+            return Err(format!("registry index version `{version}`'s `files` must be an object"));
+        };
+        let mut files = HashMap::new();
+        for (path, file_json) in file_pairs {
+            // A registry index is untrusted, network-supplied data. A file
+            // path is later joined onto a local cache directory
+            // (`materialize`, below) and written to disk — without this
+            // check, a malicious or compromised registry could supply a
+            // path like `"../../../.ssh/authorized_keys"` (path traversal)
+            // or `"/etc/passwd"` (absolute path) to write OUTSIDE the
+            // intended cache directory entirely. Rejected here, at parse
+            // time, the single earliest enforcement point, so every
+            // downstream consumer of a successfully parsed `RegistryIndex`
+            // can trust every file path is safe without re-checking.
+            if !is_safe_relative_path(path) {
+                return Err(format!(
+                    "registry index version `{version}` has an unsafe file path `{path}` \
+                     (must be a relative path with no `..` component)"
+                ));
+            }
+            let url = file_json
+                .get("url")
+                .and_then(Json::str)
+                .ok_or_else(|| format!("registry index version `{version}` file `{path}` missing `url`"))?
+                .to_string();
+            let hash = file_json
+                .get("hash")
+                .and_then(Json::str)
+                .ok_or_else(|| format!("registry index version `{version}` file `{path}` missing `hash`"))?
+                .to_string();
+            files.insert(path.clone(), RegistryFile { url, hash });
+        }
+        if files.is_empty() {
+            return Err(format!("registry index version `{version}` has no files"));
+        }
+        if !files.contains_key(&entry) {
+            return Err(format!(
+                "registry index version `{version}`'s entry `{entry}` is not listed in `files`"
+            ));
+        }
+        versions.insert(version.clone(), RegistryVersion { entry, files });
+    }
+    Ok(RegistryIndex { name, versions })
+}
+
+/// Resolve an EXACT version from a parsed index. `Err` (naming every
+/// available version, sorted) if the requested version isn't listed —
+/// matches `loader.rs`'s existing "exact match in v1; ranges are a future
+/// addition" scope for local path dependency version pins.
+pub fn resolve_version<'a>(index: &'a RegistryIndex, version: &str) -> Result<&'a RegistryVersion, String> {
+    index.versions.get(version).ok_or_else(|| {
+        let mut available: Vec<&str> = index.versions.keys().map(String::as_str).collect();
+        available.sort();
+        format!(
+            "registry package `{}` has no version `{version}` (available: {})",
+            index.name,
+            if available.is_empty() { "none".to_string() } else { available.join(", ") }
+        )
+    })
+}
+
+/// Verify a fetched file's content matches its expected hash. `Err` on
+/// mismatch — a hard, mandatory check per the v1 design's security bar,
+/// never optional or silent. Uses the SAME FNV-1a-hex-of-decimal-string
+/// encoding `loader::resolve_deps` already computes for local dependencies
+/// (`encoding::hex_encode(&format!("{}", encoding::hash_fnv(content)))`),
+/// so a hash computed either way for the same bytes always matches.
+pub fn verify_hash(content: &str, expected_hash: &str) -> Result<(), String> {
+    let actual = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(content)));
+    if actual == expected_hash {
+        Ok(())
+    } else {
+        Err(format!(
+            "hash mismatch: expected {expected_hash}, got {actual} — refusing to use unverified content"
+        ))
+    }
+}
+
+/// Whether `path` is safe to join onto a local directory and write to: not
+/// absolute (`/etc/passwd`), and no `..` component that could climb out of
+/// it (`../../.ssh/authorized_keys`). Deliberately conservative — a `.`
+/// component or a Windows-style drive prefix are also rejected, since a
+/// registry index has no legitimate reason to need either.
+fn is_safe_relative_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return false;
+    }
+    p.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Write a registry package version's ALREADY-FETCHED, ALREADY-VERIFIED file
+/// contents into `cache_dir` (created if needed), producing an ordinary
+/// local directory that `loader.rs`'s EXISTING local-path-dependency
+/// machinery (`pkg_ctx`, `load_with`) can consume completely unchanged —
+/// the registry layer's only job is "produce a directory containing the
+/// package's files"; everything downstream already works. `contents` maps
+/// each file's relative path (matching `RegistryVersion::files`'s keys) to
+/// its fetched text — fetching those bytes over HTTP is a deliberately
+/// separate, later slice; this function has no network dependency of its
+/// own, so it's fully unit-testable without one. Re-verifies EVERY file's
+/// hash again here (not just trusting a caller already did), and rejects
+/// a `contents` map that doesn't exactly match what the index declared
+/// (missing or extra entries) — either would silently diverge from what
+/// the index promised.
+pub fn materialize(
+    version: &RegistryVersion,
+    contents: &HashMap<String, String>,
+    cache_dir: &std::path::Path,
+) -> Result<(), String> {
+    for path in version.files.keys() {
+        if !contents.contains_key(path) {
+            return Err(format!("missing fetched content for `{path}`"));
+        }
+    }
+    for path in contents.keys() {
+        if !version.files.contains_key(path) {
+            return Err(format!("fetched content for `{path}`, which the index did not declare"));
+        }
+    }
+    for (path, content) in contents {
+        // `parse_index` already rejects an unsafe path before a
+        // `RegistryVersion` can exist at all, but re-checking here means
+        // this function is safe to call with a hand-built `RegistryVersion`
+        // too (e.g. from a test, or a future caller that doesn't route
+        // through `parse_index`), not just ones that came from it.
+        if !is_safe_relative_path(path) {
+            return Err(format!("unsafe file path `{path}`"));
+        }
+        verify_hash(content, &version.files[path].hash)?;
+    }
+    std::fs::create_dir_all(cache_dir).map_err(|e| format!("cannot create {}: {e}", cache_dir.display()))?;
+    for (path, content) in contents {
+        let dest = cache_dir.join(path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&dest, content).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_index() -> &'static str {
+        r#"{
+            "name": "json2",
+            "versions": {
+                "1.2.0": {
+                    "entry": "main.kupl",
+                    "files": {
+                        "kupl.toml": {"url": "https://example.com/json2/1.2.0/kupl.toml", "hash": "aa"},
+                        "main.kupl": {"url": "https://example.com/json2/1.2.0/main.kupl", "hash": "bb"}
+                    }
+                },
+                "1.1.0": {
+                    "entry": "main.kupl",
+                    "files": {
+                        "main.kupl": {"url": "https://example.com/json2/1.1.0/main.kupl", "hash": "cc"}
+                    }
+                }
+            }
+        }"#
+    }
+
+    #[test]
+    fn parses_a_well_formed_index() {
+        let idx = parse_index(sample_index()).expect("parses");
+        assert_eq!(idx.name, "json2");
+        assert_eq!(idx.versions.len(), 2);
+        let v = &idx.versions["1.2.0"];
+        assert_eq!(v.entry, "main.kupl");
+        assert_eq!(v.files.len(), 2);
+        assert_eq!(
+            v.files["kupl.toml"],
+            RegistryFile { url: "https://example.com/json2/1.2.0/kupl.toml".into(), hash: "aa".into() }
+        );
+    }
+
+    #[test]
+    fn resolve_version_finds_an_exact_match() {
+        let idx = parse_index(sample_index()).unwrap();
+        let v = resolve_version(&idx, "1.1.0").expect("1.1.0 exists");
+        assert_eq!(v.entry, "main.kupl");
+        assert_eq!(v.files.len(), 1);
+    }
+
+    #[test]
+    fn resolve_version_rejects_a_missing_version_and_lists_available_ones() {
+        let idx = parse_index(sample_index()).unwrap();
+        let err = resolve_version(&idx, "9.9.9").unwrap_err();
+        assert!(err.contains("9.9.9"), "{err}");
+        assert!(err.contains("1.1.0") && err.contains("1.2.0"), "should list available versions: {err}");
+    }
+
+    /// v1 is explicitly exact-match only (no ranges) — a range-shaped
+    /// request must be rejected the SAME clean way an unknown version is,
+    /// not silently interpreted as "any compatible version."
+    #[test]
+    fn resolve_version_does_not_interpret_ranges() {
+        let idx = parse_index(sample_index()).unwrap();
+        assert!(resolve_version(&idx, "^1.0.0").is_err());
+        assert!(resolve_version(&idx, ">=1.0.0").is_err());
+        assert!(resolve_version(&idx, "1").is_err());
+    }
+
+    #[test]
+    fn verify_hash_accepts_a_matching_hash_and_rejects_a_mismatch() {
+        let content = "pub fun add(a: Int, b: Int) -> Int { a + b }\n";
+        let real_hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(content)));
+        assert!(verify_hash(content, &real_hash).is_ok());
+        assert!(verify_hash(content, "0000000000000000").is_err());
+        // even a single-byte difference must be rejected, not "close enough"
+        let tampered = "pub fun add(a: Int, b: Int) -> Int { a - b }\n";
+        assert!(verify_hash(tampered, &real_hash).is_err());
+    }
+
+    #[test]
+    fn malformed_json_is_a_clean_error_not_a_panic() {
+        assert!(parse_index("").is_err());
+        assert!(parse_index("not json at all {{{").is_err());
+        assert!(parse_index("{}").is_err());
+        assert!(parse_index(r#"{"name": "x"}"#).is_err());
+        assert!(parse_index(r#"{"name": "x", "versions": "not an object"}"#).is_err());
+        assert!(parse_index(r#"{"name": "x", "versions": {"1.0.0": {}}}"#).is_err());
+        assert!(parse_index(r#"{"name": "x", "versions": {"1.0.0": {"entry": "main.kupl"}}}"#).is_err());
+        // a deeply nested (adversarial) document must not crash the parser,
+        // matching `lsp::parse_json`'s existing depth guard (PR-it620) --
+        // confirms this module correctly inherits that protection by reuse
+        // rather than needing its own.
+        let deeply_nested = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
+        assert!(parse_index(&deeply_nested).is_err());
+    }
+
+    #[test]
+    fn an_entry_not_listed_in_files_is_rejected() {
+        // the `entry` field must name a file that's actually IN `files` --
+        // otherwise a package would resolve successfully but have no way to
+        // ever locate its own entry point.
+        let bad = r#"{
+            "name": "x",
+            "versions": {
+                "1.0.0": {
+                    "entry": "main.kupl",
+                    "files": {"other.kupl": {"url": "https://x/other.kupl", "hash": "aa"}}
+                }
+            }
+        }"#;
+        let err = parse_index(bad).unwrap_err();
+        assert!(err.contains("entry") && err.contains("main.kupl"), "{err}");
+    }
+
+    #[test]
+    fn a_version_with_no_files_is_rejected() {
+        let bad = r#"{"name": "x", "versions": {"1.0.0": {"entry": "main.kupl", "files": {}}}}"#;
+        assert!(parse_index(bad).is_err());
+    }
+
+    /// A REAL security concern this module's `materialize` step introduces
+    /// (production-hardening PR-it631): a registry index's file paths are
+    /// UNTRUSTED, network-supplied data, and get joined onto a local cache
+    /// directory and written to disk — without validation, a malicious or
+    /// compromised registry could supply a path traversal (`"../../.ssh/
+    /// authorized_keys"`) or an absolute path (`"/etc/passwd"`) to write
+    /// OUTSIDE the intended cache directory entirely. Confirmed the check
+    /// catches every shape at PARSE time (the single earliest enforcement
+    /// point), before a `RegistryVersion` can even be constructed.
+    #[test]
+    fn unsafe_file_paths_are_rejected_at_parse_time() {
+        for bad_path in ["../evil.kupl", "../../.ssh/authorized_keys", "/etc/passwd", "a/../../b", "./x.kupl", ""] {
+            let idx = format!(
+                r#"{{"name": "x", "versions": {{"1.0.0": {{"entry": "{bad_path}", "files": {{"{bad_path}": {{"url": "https://x/y", "hash": "aa"}}}}}}}}}}"#
+            );
+            let err = parse_index(&idx);
+            assert!(err.is_err(), "path {bad_path:?} should have been rejected, got {err:?}");
+        }
+        // an ordinary nested-but-safe relative path (a subdirectory) is fine
+        let ok = r#"{"name": "x", "versions": {"1.0.0": {"entry": "src/main.kupl", "files": {"src/main.kupl": {"url": "https://x/y", "hash": "aa"}}}}}"#;
+        assert!(parse_index(ok).is_ok());
+    }
+
+    #[test]
+    fn materialize_writes_verified_content_to_the_cache_directory() {
+        let version = RegistryVersion {
+            entry: "main.kupl".to_string(),
+            files: HashMap::from([
+                (
+                    "main.kupl".to_string(),
+                    RegistryFile {
+                        url: "https://example.com/main.kupl".to_string(),
+                        hash: crate::encoding::hex_encode(&format!(
+                            "{}",
+                            crate::encoding::hash_fnv("pub fun f() -> Int { 1 }\n")
+                        )),
+                    },
+                ),
+                (
+                    "kupl.toml".to_string(),
+                    RegistryFile {
+                        url: "https://example.com/kupl.toml".to_string(),
+                        hash: crate::encoding::hex_encode(&format!(
+                            "{}",
+                            crate::encoding::hash_fnv("[project]\nname = \"x\"\n")
+                        )),
+                    },
+                ),
+            ]),
+        };
+        let contents = HashMap::from([
+            ("main.kupl".to_string(), "pub fun f() -> Int { 1 }\n".to_string()),
+            ("kupl.toml".to_string(), "[project]\nname = \"x\"\n".to_string()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("kupl-registry-materialize-{}", std::process::id()));
+        let result = materialize(&version, &contents, &dir);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("main.kupl")).unwrap(), "pub fun f() -> Int { 1 }\n");
+        assert_eq!(std::fs::read_to_string(dir.join("kupl.toml")).unwrap(), "[project]\nname = \"x\"\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_refuses_content_with_a_wrong_hash() {
+        // A tampered-with or corrupted download must never be written to
+        // disk, even if the caller otherwise supplies exactly the right set
+        // of file paths -- hash verification is re-checked here, not just
+        // trusted from an earlier step.
+        let version = RegistryVersion {
+            entry: "main.kupl".to_string(),
+            files: HashMap::from([(
+                "main.kupl".to_string(),
+                RegistryFile { url: "https://example.com/main.kupl".to_string(), hash: "deadbeef".to_string() },
+            )]),
+        };
+        let contents = HashMap::from([("main.kupl".to_string(), "tampered content".to_string())]);
+        let dir = std::env::temp_dir().join(format!("kupl-registry-tamper-{}", std::process::id()));
+        let result = materialize(&version, &contents, &dir);
+        assert!(result.is_err(), "{result:?}");
+        assert!(!dir.join("main.kupl").exists(), "a hash-mismatched file must never be written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_refuses_a_contents_map_that_does_not_match_the_index() {
+        let version = RegistryVersion {
+            entry: "main.kupl".to_string(),
+            files: HashMap::from([(
+                "main.kupl".to_string(),
+                RegistryFile {
+                    url: "https://example.com/main.kupl".to_string(),
+                    hash: crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv("x"))),
+                },
+            )]),
+        };
+        let dir = std::env::temp_dir().join(format!("kupl-registry-mismatch-{}", std::process::id()));
+        // missing a file the index declared
+        assert!(materialize(&version, &HashMap::new(), &dir).is_err());
+        // an extra file the index never declared
+        let extra = HashMap::from([
+            ("main.kupl".to_string(), "x".to_string()),
+            ("sneaky.kupl".to_string(), "y".to_string()),
+        ]);
+        assert!(materialize(&version, &extra, &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Proves the v1 design's own central claim: a `materialize`d registry
+    /// package produces an ORDINARY local directory that `loader.rs`'s
+    /// EXISTING local-path-dependency machinery consumes completely
+    /// unchanged — no registry-specific code needed anywhere downstream of
+    /// `materialize`. Builds a fake registry index for a tiny `math`
+    /// package end to end (parse index -> resolve version -> materialize
+    /// fetched content to a cache dir), then loads a SEPARATE `app` package
+    /// that depends on it via an ordinary `{ path = ".." }` local
+    /// dependency pointing AT the materialized cache directory (standing in
+    /// for what a later "fetch" slice would wire up automatically via
+    /// `kupl.toml`'s registry `{ version = ".." }` syntax) — and confirms
+    /// the WHOLE pipeline (loader, checker, interpreter) runs it correctly.
+    #[test]
+    fn a_materialized_package_loads_and_runs_exactly_like_a_local_dependency() {
+        let index_json = r#"{
+            "name": "math",
+            "versions": {
+                "1.0.0": {
+                    "entry": "main.kupl",
+                    "files": {
+                        "kupl.toml": {"url": "https://example.com/math/1.0.0/kupl.toml", "hash": "REPLACED_TOML"},
+                        "main.kupl": {"url": "https://example.com/math/1.0.0/main.kupl", "hash": "REPLACED_MAIN"}
+                    }
+                }
+            }
+        }"#;
+        let toml_content = "[project]\nname = \"math\"\nentry = \"main.kupl\"\n";
+        let main_content = "pub fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n";
+        let toml_hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(toml_content)));
+        let main_hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(main_content)));
+        let index_json = index_json.replace("REPLACED_TOML", &toml_hash).replace("REPLACED_MAIN", &main_hash);
+
+        let index = parse_index(&index_json).expect("index parses");
+        let version = resolve_version(&index, "1.0.0").expect("1.0.0 resolves");
+
+        let base = std::env::temp_dir().join(format!("kupl-registry-e2e-{}", std::process::id()));
+        let math_cache = base.join("math-1.0.0");
+        let contents = HashMap::from([
+            ("kupl.toml".to_string(), toml_content.to_string()),
+            ("main.kupl".to_string(), main_content.to_string()),
+        ]);
+        materialize(version, &contents, &math_cache).expect("materializes cleanly");
+
+        // an ordinary app package depending on the materialized cache dir
+        // via a plain LOCAL path -- exactly what loader.rs already supports
+        // today, proving the registry layer adds nothing downstream needs
+        // to special-case.
+        let app = base.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            format!(
+                "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = {{ path = \"{}\" }}\n",
+                math_cache.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use math\n\nfun main() uses io {\n    print(math.add(2, 3))\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = crate::loader::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its materialized math dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(diags.iter().all(|d| d.severity != crate::diag::Severity::Error), "{diags:?}");
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(_) => {}
+            Err(_) => panic!("main() should run cleanly against the materialized dependency"),
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
