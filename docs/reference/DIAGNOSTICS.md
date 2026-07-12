@@ -151,6 +151,7 @@ Severity: **E** = error, **W** = warning.
 | K0803 | E | cannot assign to a lambda-captured variable on the KVM |
 | K0804 | E | `forall` runs only under `kupl test` (interpreter); not compiled to the KVM |
 | K0805 | E | component has too many props + state fields + children for KVM v0 (more than 256 total) |
+| K0806 | E | chunk has too many distinct constants for KVM v0 (more than 65536) |
 
 ## K09xx — Runtime
 

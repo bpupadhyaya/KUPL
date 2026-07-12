@@ -238,8 +238,8 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
         for w in &c.wires {
             let from = fc.slot_reg(&w.from.0, w.span);
             let to = fc.slot_reg(&w.to.0, w.span);
-            let out_port = fc.const_idx(Value::str(w.from.1.clone()));
-            let in_port = fc.const_idx(Value::str(w.to.1.clone()));
+            let out_port = fc.const_idx(Value::str(w.from.1.clone()), w.span);
+            let in_port = fc.const_idx(Value::str(w.to.1.clone()), w.span);
             fc.emit(Op::WireOp { from, out_port, to, in_port }, w.span);
         }
         let u = fc.const_reg(Value::Unit, c.span);
@@ -411,6 +411,7 @@ struct FnCompiler<'s> {
     loops: Vec<(usize, Vec<usize>)>,
     pending_continues: Vec<usize>,
     too_large: bool,
+    too_many_consts: bool,
 }
 
 impl<'s> FnCompiler<'s> {
@@ -433,6 +434,7 @@ impl<'s> FnCompiler<'s> {
             loops: Vec::new(),
             pending_continues: Vec::new(),
             too_large: false,
+            too_many_consts: false,
         }
     }
 
@@ -562,19 +564,41 @@ impl<'s> FnCompiler<'s> {
         }
     }
 
-    fn const_idx(&mut self, v: Value) -> u16 {
+    fn const_idx(&mut self, v: Value, span: Span) -> u16 {
         // interning: reuse identical constants
         for (i, c) in self.chunk.consts.iter().enumerate() {
             if *c == v {
                 return i as u16;
             }
         }
+        let i = self.chunk.consts.len();
+        // `Op::Const`/`GetFieldNamed`/`Method`/etc. all index this pool with a
+        // `u16`, exactly the same fixed-width-operand-vs-unbounded-source-count
+        // shape `K0801` (registers) and `K0805` (state slots) already guard --
+        // missed here (production-hardening PR-it695). Unlike registers, a
+        // constant is never register-resident once loaded, so `block()`'s
+        // per-statement register-reclaiming reset (which indirectly keeps
+        // `K0801` a safety net for register-derived `as u8` casts elsewhere)
+        // does NOT bound this: a long run of bare expression-statements each
+        // referencing one distinct literal grows `consts` unboundedly while
+        // `next` stays low. Past 65536 distinct constants in one chunk, the
+        // cast below would silently truncate/alias to the WRONG constant
+        // (index 65536 wraps to 0) with no diagnostic -- confirmed reachable
+        // via a synthetic 70,000-distinct-literal function before this fix.
+        if i > u16::MAX as usize && !self.too_many_consts {
+            self.too_many_consts = true;
+            self.err(
+                "K0806",
+                "chunk has too many distinct constants for KVM v0 (more than 65536)",
+                span,
+            );
+        }
         self.chunk.consts.push(v);
-        (self.chunk.consts.len() - 1) as u16
+        (i & 0xffff) as u16
     }
 
     fn const_reg(&mut self, v: Value, span: Span) -> Reg {
-        let idx = self.const_idx(v);
+        let idx = self.const_idx(v, span);
         let dst = self.alloc(span);
         self.emit(Op::Const(dst, idx), span);
         dst
@@ -644,7 +668,7 @@ impl<'s> FnCompiler<'s> {
                                 {
                                     let exprs: Vec<Expr> = args.clone();
                                     let start = self.consecutive(&exprs, *span);
-                                    let name_idx = self.const_idx(Value::str(m.to_string()));
+                                    let name_idx = self.const_idx(Value::str(m.to_string()), *span);
                                     self.emit(
                                         Op::Method { dst: local, recv: local, name: name_idx, start, argc: args.len() as u8 },
                                         *span,
@@ -764,7 +788,7 @@ impl<'s> FnCompiler<'s> {
                 // Name the failing expression (rendered from source) — the same text
                 // the interpreter produces, so KVM and native match byte-for-byte.
                 let text = format!("expectation failed: {}", crate::fmt::expr_str(e, 0));
-                let msg = self.const_idx(Value::str(text));
+                let msg = self.const_idx(Value::str(text), *span);
                 self.emit(Op::Panic(msg), *span);
                 self.patch_jump(ok);
                 None
@@ -802,7 +826,7 @@ impl<'s> FnCompiler<'s> {
                     return None;
                 }
                 let payload = arg.as_ref().map(|e| self.expr(e));
-                let port_idx = self.const_idx(Value::str(port.clone()));
+                let port_idx = self.const_idx(Value::str(port.clone()), *span);
                 self.emit(Op::EmitOp { port: port_idx, payload }, *span);
                 None
             }
@@ -908,7 +932,7 @@ impl<'s> FnCompiler<'s> {
                 let r = self.expr(recv);
                 let exprs: Vec<Expr> = args.clone();
                 let start = self.consecutive(&exprs, span);
-                let name_idx = self.const_idx(Value::str(name.clone()));
+                let name_idx = self.const_idx(Value::str(name.clone()), span);
                 let dst = self.alloc(span);
                 self.emit(
                     Op::Method { dst, recv: r, name: name_idx, start, argc: args.len() as u8 },
@@ -918,7 +942,7 @@ impl<'s> FnCompiler<'s> {
             }
             ExprKind::Field { recv, name } => {
                 let r = self.expr(recv);
-                let name_idx = self.const_idx(Value::str(name.clone()));
+                let name_idx = self.const_idx(Value::str(name.clone()), span);
                 let dst = self.alloc(span);
                 self.emit(Op::GetFieldNamed { dst, obj: r, name: name_idx }, span);
                 dst
@@ -1017,7 +1041,7 @@ impl<'s> FnCompiler<'s> {
                     }
                     self.scopes.pop();
                 }
-                let msg = self.const_idx(Value::str("no match arm matched"));
+                let msg = self.const_idx(Value::str("no match arm matched"), span);
                 self.emit(Op::Panic(msg), span);
                 for j in end_jumps {
                     self.patch_jump(j);
@@ -1096,7 +1120,7 @@ impl<'s> FnCompiler<'s> {
                 let mut cur = self.expr(recv);
                 for (field, value) in updates {
                     let v = self.expr(value);
-                    let name_idx = self.const_idx(Value::str(field.clone()));
+                    let name_idx = self.const_idx(Value::str(field.clone()), span);
                     let dst = self.alloc(span);
                     self.emit(Op::WithField { dst, obj: cur, name: name_idx, value: v }, span);
                     cur = dst;
@@ -1559,5 +1583,75 @@ fn bind_pattern_names(p: &Pattern, bound: &mut HashSet<String>) {
             bind_pattern_names(inner, bound);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_shared() -> Shared {
+        Shared {
+            module: Module::default(),
+            ctor_idx: HashMap::new(),
+            ctor_fields: HashMap::new(),
+            comp_props: HashMap::new(),
+            diags: Vec::new(),
+            fun_names: HashSet::new(),
+        }
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it695), sibling to `K0801`
+    /// (registers) and `K0805` (state slots): `const_idx` cast a chunk's
+    /// constant-pool index to `u16` with NO overflow check, unlike those two. Unlike
+    /// a register, a constant is never register-resident once loaded, so `block()`'s
+    /// per-statement register-reclaiming reset (which keeps `K0801` an effective
+    /// safety net for `Op::MakeCtor`/`Op::MakeList`'s own `u8`-truncation cases,
+    /// PR-it686) does NOT bound the constant pool: a long run of bare expression-
+    /// statements, each referencing one distinct literal, grows `chunk.consts`
+    /// unboundedly while the live register count stays low. Past 65536 distinct
+    /// constants in one chunk, `Op::Const`'s index would silently wrap (65536 -> 0),
+    /// aliasing the WRONG constant with no diagnostic at all.
+    ///
+    /// Pre-populates `consts` directly (an O(n) `Vec` build) rather than driving
+    /// 65537+ real calls through `const_idx`'s own O(pool size)-per-call linear
+    /// interning scan (which would make this single test O(n^2) -- confirmed
+    /// prohibitively slow, ~20s, in an earlier draft of this test) -- this exercises
+    /// the EXACT SAME check `const_idx` performs on every call, just without paying
+    /// for 65536 redundant interning comparisons to get there.
+    #[test]
+    fn oversized_constant_pool_is_rejected_not_silently_aliased() {
+        let mut shared = new_shared();
+        let mut fc = FnCompiler::new(&mut shared, "probe", 0, 0);
+        fc.chunk.consts = (0..=u16::MAX as i64).map(Value::Int).collect();
+        assert_eq!(fc.chunk.consts.len(), 65536);
+        let idx = fc.const_idx(Value::Int(-1), Span::default());
+        // the SLOT is still allocated (compilation continues, doesn't abort
+        // mid-function) -- what must NOT happen is a SILENT wraparound to an
+        // existing, wrong index.
+        assert_eq!(idx, 0, "index truncates to 0 (documented, diagnosed -- not silently trusted)");
+        assert!(fc.too_many_consts);
+        assert!(
+            shared.diags.iter().any(|d| d.code == "K0806"),
+            "expected K0806, got: {:?}",
+            shared.diags
+        );
+
+        // well-under-the-limit is entirely unaffected.
+        let mut shared2 = new_shared();
+        let mut fc2 = FnCompiler::new(&mut shared2, "probe2", 0, 0);
+        for i in 0..1000 {
+            fc2.const_idx(Value::Int(i), Span::default());
+        }
+        assert!(!fc2.too_many_consts);
+        assert!(shared2.diags.is_empty());
+        // interning still works: 1000 repeated references to the SAME constant is
+        // ONE pool entry, not 1000.
+        let mut shared3 = new_shared();
+        let mut fc3 = FnCompiler::new(&mut shared3, "probe3", 0, 0);
+        for _ in 0..1000 {
+            fc3.const_idx(Value::Int(7), Span::default());
+        }
+        assert_eq!(fc3.chunk.consts.len(), 1);
     }
 }
