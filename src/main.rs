@@ -516,6 +516,82 @@ mod tests {
         }
     }
 
+    /// A coverage-closing test, per production-hardening PR-it651 (no bug
+    /// found -- `repl.rs`'s own core state-management claim, "Keep live
+    /// values/instances; swap in the new definitions" (its redefinition-
+    /// handling code comment), had ZERO test coverage of whether that claim
+    /// is actually TRUE: the sibling fuzz test above only asserts the REPL
+    /// never panics/hangs on adversarial input, never that a variable's
+    /// VALUE or a component instance's live STATE is genuinely preserved
+    /// across an interleaved, unrelated redefinition. Verified live via the
+    /// real binary before writing this test (not assumed): a plain `let`
+    /// binding survives an unrelated `fun` redefinition; a live component
+    /// instance's mutated state survives too, continuing to accumulate
+    /// correctly; and -- the trickiest case -- redefining a component
+    /// ADDING a new field/method leaves an ALREADY-INSTANTIATED old instance
+    /// correctly frozen to its ORIGINAL shape (a clean "does not expose"
+    /// panic on the new method, not silent corruption or a crash), while a
+    /// FRESH instantiation after the redefinition correctly uses the new
+    /// shape -- confirming `Instance.comp` is genuinely a frozen snapshot
+    /// per instance, not a live reference to mutable component metadata.
+    #[test]
+    fn repl_preserves_live_variable_and_component_state_across_redefinition() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "let x = 42\n\
+                      fun unrelated1() -> Int { 1 }\n\
+                      x\n\
+                      component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
+                      expose fun bump(v: Int) -> Int {\n        n = n + v\n        n\n    }\n}\n\
+                      let c = Counter()\n\
+                      c.bump(5)\n\
+                      fun unrelated2() -> Int { 2 }\n\
+                      c.bump(3)\n\
+                      component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
+                      expose fun bump(v: Int) -> Int {\n        n = n + v\n        n\n    }\n    \
+                      expose fun readNew() -> Str {\n        \"new-shape\"\n    }\n}\n\
+                      c.readNew()\n\
+                      let c2 = Counter()\n\
+                      c2.readNew()\n\
+                      :quit\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = format!("{stdout}{stderr}");
+        assert!(!combined.contains("panicked at"), "kupl repl panicked: {combined}");
+        // the plain `let x = 42` value survives an unrelated `fun` redefinition
+        assert!(stdout.contains("42"), "x's value must survive redefinition: {stdout}");
+        // the live component instance's state accumulates correctly (5, then 8)
+        // across an unrelated redefinition sitting in between
+        assert!(stdout.contains("\n5\n") || stdout.contains(" 5\n"), "c.bump(5): {stdout}");
+        assert!(stdout.contains("\n8\n") || stdout.contains(" 8\n"), "c.bump(3) -> 8: {stdout}");
+        // the OLD instance `c` stays frozen to its original shape -- a clean
+        // panic naming the missing method, not a crash or silent misbehavior
+        assert!(
+            stderr.contains("does not expose") && stderr.contains("readNew"),
+            "the pre-existing instance must not gain the new component's method: {stderr}"
+        );
+        // a FRESH instance created after the redefinition uses the new shape
+        assert!(stdout.contains("new-shape"), "a new instance must see the new method: {stdout}");
+    }
+
     /// Waits for `child` to exit, but gives up after `timeout` rather than
     /// blocking forever -- `std::process::Child::wait_with_output` has no
     /// built-in deadline (and this repo's own convention is that macOS has
