@@ -13,31 +13,95 @@
 
 use crate::ast::*;
 
-/// Whether `src` contains a `//` line comment or `/* … */` block comment outside
-/// of a string literal. Used to warn that `kupl fmt` would drop comments — the
-/// lexer skips them, so the formatter cannot round-trip them.
+/// Whether `src` contains a `//` line comment or `/* … */` block comment
+/// anywhere it would actually be lexed as one. Used to warn that `kupl fmt`
+/// would drop comments — the lexer skips them, so the formatter cannot
+/// round-trip them.
+///
+/// A REAL bug found+fixed (production-hardening PR-it626): a naive scanner
+/// that just toggles "in a string" on `"` (as this function used to do)
+/// treats a string's ENTIRE span — including any `{...}` interpolation
+/// inside it — as inert text. But `lexer.rs`'s `lex_string` only captures an
+/// interpolation's raw source; `parser::parse_expr_fragment` then RE-LEXES
+/// that raw text as genuine code (`lexer::lex`), so a `//`/`/* */` written
+/// INSIDE an interpolation (`"{x /* really a comment */ + 1}"`) is stripped
+/// by the compiler exactly like an ordinary comment — confirmed via a live
+/// repro: `run` evaluates `x /* comment */ + 1` as `x + 1`, but the OLD
+/// scanner here never detected it, so `kupl fmt --write` silently deleted it
+/// with NO warning at all (worse than the documented "comments aren't
+/// preserved" limitation, which is at least accompanied by one). Fixed by
+/// mirroring `lex_string`'s own recursive structure: `scan_code_for_comments`
+/// (comments are real) recurses into `scan_string_for_comments` on a `"`,
+/// which recurses BACK into `scan_code_for_comments` on a bare `{`
+/// (interpolation) — correctly handling ARBITRARY nesting (a comment inside
+/// a nested string inside a nested interpolation inside an outer string).
 pub fn source_has_comments(src: &str) -> bool {
     let b = src.as_bytes();
     let mut i = 0;
-    let mut in_str = false;
-    while i < b.len() {
-        let c = b[i];
-        if in_str {
-            match c {
-                b'\\' => i += 2, // skip an escaped char (e.g. \" or \\)
-                b'"' => {
-                    in_str = false;
-                    i += 1;
+    scan_code_for_comments(b, &mut i, false)
+}
+
+/// Scan bytes as CODE (comments here are real) starting at `*i`, advancing
+/// it as it goes. When `in_interpolation` is true, this is scanning a
+/// string's `{...}` interpolation content — it tracks `{`/`}` depth (ANY
+/// nested braces, e.g. from an `if`/`match`/closure body inside the
+/// interpolation, not just further interpolations) and stops at the `}`
+/// that closes the CURRENT level, returning control to the calling
+/// `scan_string_for_comments`. When false (ordinary top-level code), it
+/// scans to the end of `b` and braces are not tracked at all — matching this
+/// function's pre-fix behavior for code outside any string.
+fn scan_code_for_comments(b: &[u8], i: &mut usize, in_interpolation: bool) -> bool {
+    let mut depth = 0usize;
+    while *i < b.len() {
+        match b[*i] {
+            b'/' if *i + 1 < b.len() && (b[*i + 1] == b'/' || b[*i + 1] == b'*') => return true,
+            b'"' => {
+                *i += 1;
+                if scan_string_for_comments(b, i) {
+                    return true;
                 }
-                _ => i += 1,
             }
-        } else if c == b'"' {
-            in_str = true;
-            i += 1;
-        } else if c == b'/' && i + 1 < b.len() && (b[i + 1] == b'/' || b[i + 1] == b'*') {
-            return true;
-        } else {
-            i += 1;
+            b'{' if in_interpolation => {
+                depth += 1;
+                *i += 1;
+            }
+            b'}' if in_interpolation && depth == 0 => {
+                *i += 1; // consume the interpolation's closing brace
+                return false;
+            }
+            b'}' if in_interpolation => {
+                depth -= 1;
+                *i += 1;
+            }
+            _ => *i += 1,
+        }
+    }
+    false
+}
+
+/// Scan a string literal's body (comments here are NOT real — literal text)
+/// starting at `*i` (just after the opening `"`), advancing it past the
+/// closing `"`. A `\` escapes the next byte (covers `\"`, `\\`, `\{`, `\}`,
+/// etc. — none of them can open interpolation or end the string early). A
+/// doubled `{{` is `lex_string`'s literal-brace escape and stays in string
+/// mode; a bare `{` opens interpolation — genuine code, recursed into via
+/// `scan_code_for_comments`.
+fn scan_string_for_comments(b: &[u8], i: &mut usize) -> bool {
+    while *i < b.len() {
+        match b[*i] {
+            b'\\' => *i += 2,
+            b'"' => {
+                *i += 1;
+                return false;
+            }
+            b'{' if b.get(*i + 1) == Some(&b'{') => *i += 2,
+            b'{' => {
+                *i += 1;
+                if scan_code_for_comments(b, i, true) {
+                    return true;
+                }
+            }
+            _ => *i += 1,
         }
     }
     false
@@ -795,6 +859,65 @@ mod tests {
         assert!(!super::source_has_comments("fun main() { let x = 1 }\n"));
         // an escaped quote must not end the string early and expose a following //
         assert!(!super::source_has_comments("fun main() uses io { print(\"a\\\" // b\") }\n"));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it626): a comment
+    /// written INSIDE a string's `{...}` interpolation IS a real comment —
+    /// `lexer::lex_string` only captures the interpolation's raw source;
+    /// `parser::parse_expr_fragment` re-lexes it as genuine code (confirmed
+    /// via a live `run`: `print("{x /* comment */ + 1}")` evaluates the
+    /// comment away, printing `x + 1`) — but the OLD `source_has_comments`
+    /// treated a string's ENTIRE span (interpolation included) as inert
+    /// text, so `kupl fmt --write` silently deleted such a comment with NO
+    /// warning at all. Covers the exact repro, `//` (not just `/* */`)
+    /// inside an interpolation, `{{`/`}}` literal-brace escaping (which must
+    /// NOT be misread as opening/closing an interpolation), a `}` closing
+    /// the interpolation immediately after the comment (boundary), and a
+    /// comment nested two levels deep (a comment inside a string that's
+    /// itself inside an interpolation that's itself inside an outer
+    /// string) — the case that specifically exercises the recursive
+    /// (not just one-level) structure of the fix.
+    #[test]
+    fn source_has_comments_detects_a_comment_inside_string_interpolation() {
+        // the exact original repro
+        assert!(super::source_has_comments(
+            "fun main() uses io { print(\"{x /* a real comment */ + 1}\") }\n"
+        ));
+        // `//` (not just block comments) inside an interpolation
+        assert!(super::source_has_comments(
+            "fun main() uses io { print(\"{x // trailing line comment\n + 1}\") }\n"
+        ));
+        // the comment sits immediately before the interpolation's closing `}`
+        assert!(super::source_has_comments(
+            "fun main() uses io { print(\"{x /* c */}\") }\n"
+        ));
+        // `{{`/`}}` (literal escaped braces) must NOT be misread as opening
+        // or closing an interpolation -- no real interpolation here at all,
+        // so a comment-looking `//` INSIDE the doubled braces is genuinely
+        // just string text, not code.
+        assert!(!super::source_has_comments(
+            "fun main() uses io { print(\"{{ not // interpolation /* at all */ }}\") }\n"
+        ));
+        // a comment nested two levels deep: an interpolation containing a
+        // nested string literal that ITSELF has an interpolation with a
+        // comment -- exercises the recursive (not just one-level) structure.
+        assert!(super::source_has_comments(
+            "fun main() uses io { print(\"{xs.map(fn x { \"{x /* nested */ }\" }).join(\",\")}\") }\n"
+        ));
+        // a plain interpolation with NO comment must still be clean (no
+        // false positive from the new brace-depth tracking itself)
+        assert!(!super::source_has_comments(
+            "fun main() uses io { print(\"{x + 1}\") }\n"
+        ));
+        // an interpolation containing braces from real code structure (an
+        // `if` expression), not just interpolation delimiters -- the brace
+        // depth tracking must follow those too, not stop early
+        assert!(!super::source_has_comments(
+            "fun main() uses io { print(\"{if x { 1 } else { 2 }}\") }\n"
+        ));
+        assert!(super::source_has_comments(
+            "fun main() uses io { print(\"{if x { 1 /* c */ } else { 2 }}\") }\n"
+        ));
     }
 
     #[test]
