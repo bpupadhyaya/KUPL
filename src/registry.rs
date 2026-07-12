@@ -328,6 +328,29 @@ fn fetch_package_with(
     version: &str,
     cache_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf, String> {
+    // `name`/`version` are NOT registry-supplied like a `RegistryVersion`'s
+    // file paths (already guarded by `is_safe_relative_path` in
+    // `parse_index`) -- they come from the CALLER, ultimately traced back to
+    // the local `kupl.toml`'s dependency table key and version-pin string
+    // (`manifest.rs::parse_dep`, which places no restriction on either). A
+    // malicious or untrusted project's manifest (e.g. one you `git clone`
+    // and build, or a transitively-pulled-in dependency's own manifest) can
+    // declare a dependency name or version containing `..`/an absolute path
+    // -- without this check, `dest = cache_dir.join(name).join(version)`
+    // below builds a path `PathBuf::join` does NOT collapse (confirmed
+    // live: joining `../../../../tmp/evil` onto a cache dir yields a path
+    // string containing that literal `..` sequence), which `materialize`'s
+    // `std::fs::write` WOULD then resolve at the OS level -- an arbitrary
+    // file write anywhere the current user can write, entirely outside the
+    // intended cache directory. Reuses the SAME `is_safe_relative_path`
+    // helper `parse_index`/`materialize` already use for the analogous
+    // registry-file-path threat (production-hardening PR-it683).
+    if !is_safe_relative_path(name) {
+        return Err(format!("unsafe package name `{name}`"));
+    }
+    if !is_safe_relative_path(version) {
+        return Err(format!("unsafe package version `{version}`"));
+    }
     let index_url = format!("{}/{name}.json", registry_url.trim_end_matches('/'));
     let index_text =
         fetch(&index_url).map_err(|e| format!("cannot fetch registry index for `{name}`: {e}"))?;
@@ -784,6 +807,67 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("evil") && err.contains("honest"), "{err}");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it683): unlike a
+    /// `RegistryVersion`'s own file paths (registry-supplied, already
+    /// guarded by `is_safe_relative_path`), `name`/`version` come from the
+    /// CALLER -- ultimately a local `kupl.toml`'s dependency table key and
+    /// version-pin string, which `manifest.rs` places no restriction on.
+    /// Before this fix, a `..`-laden name/version reached
+    /// `cache_dir.join(name).join(version)` unchecked, and `PathBuf::join`
+    /// does NOT collapse `..` components -- `materialize`'s `std::fs::write`
+    /// would resolve that path at the OS level, writing OUTSIDE the intended
+    /// cache directory entirely (an arbitrary file write anywhere the
+    /// current user can write, exploitable via a malicious/untrusted
+    /// project's `kupl.toml`, e.g. one pulled in transitively). Now rejected
+    /// cleanly before any network fetch or filesystem write happens.
+    #[test]
+    fn fetch_package_with_rejects_a_path_traversal_name_or_version() {
+        let dir = std::env::temp_dir().join(format!("kupl-registry-fetch-traversal-{}", std::process::id()));
+        let escape_target = std::env::temp_dir().join("kupl-registry-fetch-traversal-escaped-file");
+        let _ = std::fs::remove_file(&escape_target);
+
+        // a `..`-laden name: without the fix, `dest` would climb OUT of `dir`
+        // entirely (confirmed live: `PathBuf::join` leaves `..` literal).
+        let err = fetch_package_with(
+            mock_fetcher(HashMap::new()),
+            "https://registry.example.com",
+            "../../../../tmp/kupl-registry-fetch-traversal-escaped-file",
+            "1.0.0",
+            &dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("unsafe package name"), "{err}");
+
+        // a `..`-laden version, with an otherwise well-formed name/index --
+        // proves the SAME check applies to `version`, not just `name`.
+        let (_hash, urls) = mock_index_and_files("json2", "1.0.0", "pub fun f() -> Int { 1 }\n");
+        let err = fetch_package_with(
+            mock_fetcher(urls),
+            "https://registry.example.com",
+            "json2",
+            "../../../../tmp/kupl-registry-fetch-traversal-escaped-file",
+            &dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("unsafe package version"), "{err}");
+
+        // an absolute-path name/version is rejected the same way.
+        assert!(fetch_package_with(
+            mock_fetcher(HashMap::new()),
+            "https://registry.example.com",
+            "/etc/passwd",
+            "1.0.0",
+            &dir,
+        )
+        .unwrap_err()
+        .contains("unsafe package name"));
+
+        // nothing was ever written, inside `dir` OR at the attempted escape target.
+        assert!(!dir.exists());
+        assert!(!escape_target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
