@@ -168,6 +168,23 @@ mod tests {
         assert!(m.deps.is_empty());
     }
 
+    /// A coverage-closing test, per production-hardening PR-it654 (no bug
+    /// found -- reasoned through `strip_comment`'s character walk before
+    /// writing this: it toggles `in_str` on every `"`, so a `#` encountered
+    /// while `in_str` is true is correctly left alone rather than truncating
+    /// the line early). This exact edge case -- a literal `#` inside a
+    /// quoted string value, as opposed to an actual trailing comment -- is a
+    /// classic footgun for a naive "everything after `#` is a comment"
+    /// implementation, and had zero prior test coverage despite the
+    /// existing `defaults_and_comments` test already covering an ORDINARY
+    /// trailing comment.
+    #[test]
+    fn hash_inside_a_string_value_is_not_treated_as_a_comment() {
+        let m = parse("[project]\nname = \"a#b\"\nentry = \"main.kupl\"  # trailing comment\n").unwrap();
+        assert_eq!(m.name, "a#b");
+        assert_eq!(m.entry, "main.kupl");
+    }
+
     #[test]
     fn malformed_is_error() {
         assert!(parse("[project]\nname \"x\"\n").is_err()); // no `=`
