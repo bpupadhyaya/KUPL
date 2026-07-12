@@ -1699,9 +1699,17 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             })
         }
         // Sized ints: same-width only (mixed widths fall through to the type
-        // error below — the checker already forbids them). Arithmetic is done in
-        // i128 (which cannot overflow for any i8..u64 operands) then range-checked
-        // against the width, panicking with the same messages as `Int`.
+        // error below — the checker already forbids them). Add/Sub are done in
+        // plain i128, which cannot overflow for any i8..u64 operands (max
+        // magnitude ~2^65, well under i128's ~2^127) then range-checked against
+        // the width, panicking with the same messages as `Int`. Mul is NOT safe
+        // in plain i128 (PR-it671, confirmed live: `u64::MAX * u64::MAX` is
+        // ~2^128, past i128::MAX's ~2^127 -- this used to be a genuine
+        // `internal compiler error` crash, not the intended "integer overflow
+        // in multiplication" panic) -- `checked_mul` catches the i128-level
+        // overflow itself, which is a stronger condition than the width's own
+        // (much narrower) range, so treating an i128 overflow as a
+        // width-overflow is exactly correct, not just crash-avoidance.
         (Value::SizedInt(x), Value::SizedInt(y)) if x.1 == y.1 => {
             let (a, b, w) = (x.0, y.0, x.1);
             let checked = |r: i128, what: &str| -> Result<Value, String> {
@@ -1714,7 +1722,10 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             match op {
                 Add => checked(a + b, "addition"),
                 Sub => checked(a - b, "subtraction"),
-                Mul => checked(a * b, "multiplication"),
+                Mul => match a.checked_mul(b) {
+                    Some(r) => checked(r, "multiplication"),
+                    None => Err(overflow("multiplication")),
+                },
                 Div => {
                     if b == 0 {
                         return Err("division by zero".into());
@@ -2706,10 +2717,13 @@ pub fn shared_method(
             let r = match m {
                 "wrapping_add" => w.wrap(a + rhs),
                 "wrapping_sub" => w.wrap(a - rhs),
-                "wrapping_mul" => w.wrap(a * rhs),
+                // `a * rhs` in plain i128 can itself overflow for U64/I64 operands
+                // near their extremes (PR-it671) -- route mul through the
+                // overflow-safe helpers instead of the raw `*` operator.
+                "wrapping_mul" => w.wrapping_mul(a, rhs),
                 "saturating_add" => w.saturate(a + rhs),
                 "saturating_sub" => w.saturate(a - rhs),
-                "saturating_mul" => w.saturate(a * rhs),
+                "saturating_mul" => w.saturating_mul(a, rhs),
                 "band" => w.wrap((a & mask) & (rhs & mask)),
                 "bor" => w.wrap((a & mask) | (rhs & mask)),
                 "bxor" => w.wrap((a & mask) ^ (rhs & mask)),

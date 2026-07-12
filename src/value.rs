@@ -86,6 +86,33 @@ impl IntW {
     pub fn saturate(self, v: i128) -> i128 {
         v.clamp(self.min(), self.max())
     }
+    /// `a.wrapping_mul(b)` for a fixed width, reduced with `wrap` (PR-it671).
+    /// `a * b` for two `U64`/`I64`-range operands can itself overflow `i128`
+    /// (`u64::MAX * u64::MAX` is roughly `2^128`, past `i128::MAX`'s `2^127`),
+    /// which panics under `cargo test`'s default overflow-checks -- confirmed
+    /// as a live crash (`kupl: internal compiler error`). `i128::wrapping_mul`
+    /// never panics, and since `2^128` is a multiple of `2^64`, its low 64
+    /// bits agree with the mathematically-true product's, so `wrap`'s
+    /// subsequent `rem_euclid` on the wrapped-mod-2^128 value still yields the
+    /// mathematically-correct wrapped result at this width.
+    pub fn wrapping_mul(self, a: i128, b: i128) -> i128 {
+        self.wrap(a.wrapping_mul(b))
+    }
+    /// `a.saturating_mul(b)` for a fixed width (PR-it671). Unlike `wrap`'s
+    /// case, `saturate` needs the TRUE product's magnitude/sign to clamp
+    /// correctly -- naively reducing an overflowed product mod `2^128` first
+    /// (as `wrapping_mul` above does) can flip its sign, so clamping THAT
+    /// value gives the WRONG answer (`u64::MAX.saturating_mul(u64::MAX)`
+    /// would wrongly saturate to `0`, not `u64::MAX` -- confirmed by direct
+    /// computation before this fix). `checked_mul` detects the overflow
+    /// directly; when it overflows, the two width-bounded operands' signs
+    /// alone determine which extreme the true product saturates to.
+    pub fn saturating_mul(self, a: i128, b: i128) -> i128 {
+        match a.checked_mul(b) {
+            Some(v) => self.saturate(v),
+            None => if (a >= 0) == (b >= 0) { self.max() } else { self.min() },
+        }
+    }
     pub fn name(self) -> &'static str {
         match self {
             IntW::I8 => "i8",
@@ -162,6 +189,50 @@ mod intw_tests {
         assert_eq!(IntW::I8.saturate(200), 127);
         assert_eq!(IntW::I8.saturate(-200), -128);
         assert_eq!(IntW::I8.saturate(42), 42);
+    }
+
+    /// A REAL, severe bug (PR-it671): the plain `a * b` (both `i128`) this
+    /// used to route through can itself overflow `i128` for `U64`/`I64`-range
+    /// operands (`u64::MAX * u64::MAX` is ~2^128, past `i128::MAX`'s ~2^127),
+    /// which panicked (`cargo test`'s default overflow-checks) instead of
+    /// wrapping to the correct answer -- a genuine `kupl: internal compiler
+    /// error` crash on valid, in-range KUPL source, confirmed live before this
+    /// fix. `wrapping_mul` must still give the mathematically-correct
+    /// modular-wraparound answer despite the i128-level overflow along the way.
+    #[test]
+    fn wrapping_mul_does_not_panic_and_stays_correct_when_the_raw_i128_product_overflows() {
+        let max = u64::MAX as i128;
+        // u64::MAX ≡ -1 (mod 2^64), so (-1)*(-1) = 1 is the correct wraparound.
+        assert_eq!(IntW::U64.wrapping_mul(max, max), 1);
+        // i64::MIN * -1 doesn't overflow i128 at all, but exercises the same
+        // call path with a signed width for good measure.
+        let i64_min = i64::MIN as i128;
+        assert_eq!(IntW::I64.wrapping_mul(i64_min, -1), i64_min);
+    }
+
+    /// A REAL correctness bug, not just a crash (PR-it671): naively reducing
+    /// an i128-overflowed product mod 2^128 BEFORE clamping (i.e. reusing
+    /// `wrapping_mul`'s result for `saturate`) flips its sign for a large
+    /// enough overflow, so a positive-times-positive product that should
+    /// saturate UP to the width's max instead wrongly clamps DOWN to the
+    /// width's min (confirmed by direct computation before this fix: it gave
+    /// 0, not `u64::MAX`). `saturating_mul` must detect the true overflow
+    /// (not the wrapped-then-clamped one) to pick the correct extreme.
+    #[test]
+    fn saturating_mul_clamps_toward_the_mathematically_correct_extreme_not_the_wrapped_ones_sign() {
+        let max = u64::MAX as i128;
+        assert_eq!(IntW::U64.saturating_mul(max, max), max, "positive overflow must clamp UP to max, not down to 0");
+        let i64_min = i64::MIN as i128;
+        // (i64::MIN) * 2: true product is very negative -> must clamp to i64::MIN.
+        assert_eq!(IntW::I64.saturating_mul(i64_min, 2), i64_min);
+        // i64::MAX * i64::MAX: true product is huge and positive -> clamp to i64::MAX.
+        let i64_max = i64::MAX as i128;
+        assert_eq!(IntW::I64.saturating_mul(i64_max, i64_max), i64_max);
+        // (i64::MIN) * (-2): true product is huge and positive (both negative) -> clamp to i64::MAX.
+        assert_eq!(IntW::I64.saturating_mul(i64_min, -2), i64_max);
+        // no overflow at all: behaves exactly like plain saturate(a*b).
+        assert_eq!(IntW::U8.saturating_mul(100, 3), 255);
+        assert_eq!(IntW::U8.saturating_mul(10, 3), 30);
     }
 }
 

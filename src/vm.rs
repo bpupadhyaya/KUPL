@@ -17016,6 +17016,57 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         );
     }
 
+    /// A REAL, severe bug (PR-it671): `diff_sized_methods_it29` above only
+    /// ever multiplies small `u8`/`i8` values, whose products never come
+    /// close to overflowing the `i128` these ops are computed in. Two
+    /// `U64`/`I64`-range operands near their extremes make `a * b` overflow
+    /// `i128` itself (`u64::MAX * u64::MAX` is ~2^128, past `i128::MAX`'s
+    /// ~2^127) -- this used to be a genuine `kupl: internal compiler error`
+    /// crash on all THREE engines (interp, VM -- which shares interp's
+    /// `raw_binary_op`/`shared_method` directly -- and native), not the
+    /// intended "integer overflow in multiplication" panic.
+    #[test]
+    fn diff_sized_int_mul_near_u64_i64_extremes_does_not_crash_it671() {
+        // plain `*` must cleanly panic (overflows even i128, so certainly
+        // overflows u64/i64) rather than crash the whole process.
+        assert_eq!(
+            differential("fun probe() -> u64 {\n    (18446744073709551615u64) * (18446744073709551615u64)\n}\n"),
+            "panic: integer overflow in multiplication"
+        );
+        assert_eq!(
+            differential("fun probe() -> i64 {\n    (9223372036854775807i64) * (9223372036854775807i64)\n}\n"),
+            "panic: integer overflow in multiplication"
+        );
+        // wrapping_mul must still give the mathematically-correct wraparound
+        // despite the i128-level overflow along the way: u64::MAX ≡ -1 (mod
+        // 2^64), so (-1)*(-1) = 1.
+        assert_eq!(
+            differential(
+                "fun probe() -> u64 {\n    (18446744073709551615u64).wrapping_mul(18446744073709551615u64)\n}\n"
+            ),
+            "1"
+        );
+        // saturating_mul must clamp UP to the max, not silently flip sign and
+        // clamp down to 0 (the exact wrong answer a naive i128-overflow-then-
+        // clamp implementation gives, confirmed by direct computation).
+        assert_eq!(
+            differential(
+                "fun probe() -> u64 {\n    (18446744073709551615u64).saturating_mul(18446744073709551615u64)\n}\n"
+            ),
+            "18446744073709551615"
+        );
+        // signed extreme: i64::MIN * -2 is hugely positive in true math ->
+        // must clamp UP to i64::MAX, not stay negative. (i64::MIN is built via
+        // subtraction -- the literal `-9223372036854775808i64` itself would
+        // overflow i64's positive range before the unary minus ever applies.)
+        assert_eq!(
+            differential(
+                "fun probe() -> i64 {\n    let min = (0i64 - 9223372036854775807i64) - 1i64\n    min.saturating_mul(-2i64)\n}\n"
+            ),
+            "9223372036854775807"
+        );
+    }
+
     #[test]
     fn diff_f32_it28() {
         assert_eq!(differential("fun probe() -> f32 {\n    1.5f32 + 2.0f32\n}\n"), "3.5");

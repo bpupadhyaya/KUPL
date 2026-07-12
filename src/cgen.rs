@@ -745,6 +745,44 @@ static __int128 k_iw_sat(int w, __int128 v) {
     __int128 lo = k_iw_min(w), hi = k_iw_max(w);
     return v < lo ? lo : (v > hi ? hi : v);
 }
+/* PR-it671: `x * y` in plain (signed) __int128 can itself overflow for
+   U64/I64-range operands (`u64::MAX * u64::MAX` is ~2^128, past __int128's
+   signed range of ~2^127) -- unlike Rust's checked_mul-avoidable panic, a raw
+   signed-__int128 multiply overflowing is UNDEFINED BEHAVIOR in C (UBSan
+   would flag it; in practice it can also silently produce a wrong result
+   depending on codegen). `a`/`b` are always within i8..u64 range here (a
+   SizedInt's own component), so their magnitudes are < 2^64 and an unsigned
+   __int128 product of them is < 2^128 -- exact, no wraparound, no UB.
+   Reinterpreting that unsigned bit pattern as signed (well-defined,
+   implementation-defined-not-undefined per C99, and matches two's-complement
+   on every compiler this project targets) gives exactly the same low-order
+   bits as an unbounded-precision signed product mod 2^128 would, which is
+   all `k_iw_wrap`'s further narrowing needs. */
+static __int128 k_i128_wrapping_mul(__int128 a, __int128 b) {
+    unsigned __int128 ua = (unsigned __int128)a, ub = (unsigned __int128)b;
+    return (__int128)(ua * ub);
+}
+/* Whether `a * b` (both within i8..u64 range) overflows signed __int128's
+   representable range, and if so which sign the TRUE unbounded product has --
+   needed so `saturating_mul` clamps toward the correct extreme. Naively
+   reducing an overflowed product mod 2^128 first (as `k_i128_wrapping_mul`
+   above does, by design) can flip its apparent sign, which would silently
+   saturate toward the WRONG extreme (confirmed by direct computation on the
+   Rust side before this fix: `u64::MAX.saturating_mul(u64::MAX)` would wrongly
+   give 0, not u64::MAX) -- mirrors value.rs's IntW::saturating_mul exactly. */
+static int k_i128_mul_overflows(__int128 a, __int128 b, int* neg_out) {
+    unsigned __int128 ua = a < 0 ? (unsigned __int128)(-a) : (unsigned __int128)a;
+    unsigned __int128 ub = b < 0 ? (unsigned __int128)(-b) : (unsigned __int128)b;
+    int neg = (a < 0) != (b < 0);
+    *neg_out = neg;
+    unsigned __int128 limit = neg ? ((unsigned __int128)1 << 127) : (((unsigned __int128)1 << 127) - 1);
+    return (ua * ub) > limit;
+}
+static __int128 k_iw_saturating_mul(int w, __int128 a, __int128 b) {
+    int neg;
+    if (k_i128_mul_overflows(a, b, &neg)) return neg ? k_iw_min(w) : k_iw_max(w);
+    return k_iw_sat(w, k_i128_wrapping_mul(a, b));
+}
 static KValue k_sized(__int128 v, int w) {
     KValue x; x.tag = K_SIZEDINT;
     x.as.sized = (KSized*)k_alloc(sizeof(KSized));
@@ -759,7 +797,17 @@ static KValue k_sized_arith(KValue a, KValue b, int op) {
     switch (op) {
         case 0: r = x + y; what = "addition"; break;
         case 1: r = x - y; what = "subtraction"; break;
-        case 2: r = x * y; what = "multiplication"; break;
+        case 2: {
+            int neg;
+            /* mirrors interp.rs's `checked_mul` — an i128-level overflow here
+               certainly also overflows the (much narrower) width, so panic
+               immediately with the SAME message the range check below would
+               give, rather than risk feeding it a corrupted wrapped value. */
+            if (k_i128_mul_overflows(x, y, &neg)) k_panic("integer overflow in multiplication");
+            r = k_i128_wrapping_mul(x, y);
+            what = "multiplication";
+            break;
+        }
         case 3: if (y == 0) k_panic("division by zero"); r = x / y; what = "division"; break;
         default: if (y == 0) k_panic("remainder by zero"); r = x % y; what = "remainder"; break;
     }
@@ -4313,10 +4361,12 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             __int128 rhs = args[0].as.sized->v, mask = ((__int128)1 << k_iw_bits(w)) - 1, r;
             if (!strcmp(name,"wrapping_add")) r = k_iw_wrap(w, a + rhs);
             else if (!strcmp(name,"wrapping_sub")) r = k_iw_wrap(w, a - rhs);
-            else if (!strcmp(name,"wrapping_mul")) r = k_iw_wrap(w, a * rhs);
+            /* `a * rhs` in plain __int128 can itself overflow (PR-it671) -- route
+               mul through the overflow-safe helpers instead of raw `*`. */
+            else if (!strcmp(name,"wrapping_mul")) r = k_iw_wrap(w, k_i128_wrapping_mul(a, rhs));
             else if (!strcmp(name,"saturating_add")) r = k_iw_sat(w, a + rhs);
             else if (!strcmp(name,"saturating_sub")) r = k_iw_sat(w, a - rhs);
-            else if (!strcmp(name,"saturating_mul")) r = k_iw_sat(w, a * rhs);
+            else if (!strcmp(name,"saturating_mul")) r = k_iw_saturating_mul(w, a, rhs);
             else if (!strcmp(name,"band")) r = k_iw_wrap(w, (a & mask) & (rhs & mask));
             else if (!strcmp(name,"bor")) r = k_iw_wrap(w, (a & mask) | (rhs & mask));
             else r = k_iw_wrap(w, (a & mask) ^ (rhs & mask));
@@ -8366,6 +8416,57 @@ fun main() uses io {
         ] {
             assert!(native_main_stdout(src, tag).trim().is_empty(), "{tag}: expected a panic");
         }
+    }
+
+    /// A REAL, severe bug (PR-it671, confirmed under UBSan before this fix):
+    /// `native_sized_int_arithmetic_overflow_panics` above only multiplies
+    /// small u8 values, whose products never come close to overflowing the
+    /// signed `__int128` these ops are computed in. Two `u64`/`i64`-range
+    /// operands near their extremes make `a * b` overflow `__int128` itself
+    /// (`u64::MAX * u64::MAX` is ~2^128, past `__int128`'s signed range of
+    /// ~2^127) -- signed overflow is UNDEFINED BEHAVIOR in C (a fresh
+    /// `clang -fsanitize=undefined` build of the pre-fix C flagged this exact
+    /// line with "runtime error: signed integer overflow ... cannot be
+    /// represented in type '__int128'"), unlike Rust's checked_mul-avoidable
+    /// panic on interp/KVM. `wrapping_mul`/`saturating_mul` must ALSO stay
+    /// correct (not just crash-free) despite the overflow along the way.
+    #[test]
+    fn native_sized_int_mul_near_u64_i64_extremes_does_not_crash_it671() {
+        if !cc_available() {
+            return;
+        }
+        // plain `*` cleanly panics (matches interp/KVM's "integer overflow in
+        // multiplication"), rather than hitting undefined behavior.
+        assert!(
+            native_main_stdout(
+                "fun main() uses io {\n    print((18446744073709551615u64) * (18446744073709551615u64))\n}\n",
+                "u64mulovf"
+            )
+            .trim()
+            .is_empty(),
+            "expected a clean panic, not a printed (possibly UB-corrupted) value"
+        );
+        // wrapping_mul stays mathematically correct: u64::MAX ≡ -1 (mod 2^64), so (-1)*(-1) = 1.
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io {\n    \
+                 print((18446744073709551615u64).wrapping_mul(18446744073709551615u64))\n}\n",
+                "u64wrapmul"
+            )
+            .trim(),
+            "1"
+        );
+        // saturating_mul clamps UP to the max, not down to 0 (the wrong answer a naive
+        // overflow-then-clamp implementation gives — confirmed by direct computation).
+        assert_eq!(
+            native_main_stdout(
+                "fun main() uses io {\n    \
+                 print((18446744073709551615u64).saturating_mul(18446744073709551615u64))\n}\n",
+                "u64satmul"
+            )
+            .trim(),
+            "18446744073709551615"
+        );
     }
 
     /// Native sized-int bitwise ops mask results to the operand WIDTH, matching interp/KVM —
