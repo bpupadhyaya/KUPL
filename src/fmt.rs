@@ -941,6 +941,33 @@ mod tests {
         roundtrip("type Box[T] = { item: T }\n");
     }
 
+    /// A cheap coverage-closing test (no bug found, per PR-it645) for a shape
+    /// discovered while auditing `sdiff.rs`'s interface fingerprint (PR-it643):
+    /// KUPL legally allows an UNUSED (phantom) type parameter -- `T` never
+    /// appearing in any field. `fmt_type`'s two shorthand rewrites (`new T` for
+    /// a single-variant, single-`value`-field "newtype"; `{ f: T, ... }` for a
+    /// single-variant multi-field "record") both interact with `type_params`
+    /// through a SEPARATE code path from the general `Ctor(f: T, ...)` case
+    /// `fmt_preserves_generic_type_params` above already covers -- neither
+    /// shorthand path had ANY test coverage for a phantom type parameter
+    /// specifically before this test (confirmed via manual live round-trip
+    /// checks through a built binary: reparse, reformat-idempotence, AND
+    /// actual program execution all held, but nothing pinned it permanently).
+    #[test]
+    fn fmt_roundtrips_a_phantom_type_parameter_through_newtype_and_record_sugar() {
+        // "newtype" sugar (`type X = new T`): a single-variant type whose sole
+        // field is named `value` -- the phantom parameter appears ONLY in `[T]`,
+        // never in the field type itself.
+        roundtrip("type Tagged[T] = Tagged(value: Int)\n");
+        // record-brace sugar (`type X = { f: T, ... }`) with a phantom THIRD
+        // parameter alongside two genuinely-used ones.
+        roundtrip("type Pair[A, B, C] = Pair(first: A, second: B)\n");
+        // the zero-field record-brace edge case (`type X = {  }`) with a
+        // phantom parameter -- the "newtype" branch's `fields.len() == 1` guard
+        // correctly falls through to the record-brace branch here.
+        roundtrip("type Marker[T] = Marker()\n");
+    }
+
     #[test]
     fn fmt_roundtrips_every_example() {
         // Every shipped example: format -> the output must reparse cleanly and
