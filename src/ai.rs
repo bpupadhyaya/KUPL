@@ -250,6 +250,32 @@ fn dump_json(j: &Json) -> String {
 /// Convert parsed JSON to a KUPL value guided by the shape.
 pub fn value_from_json(shape: &AiShape, json: &Json) -> Result<Value, String> {
     match (shape, json) {
+        // A REAL bug found+fixed (production-hardening PR-it690): unlike
+        // `json.rs`'s OWN parser (which rejects a ` ` escape at parse
+        // time -- "not allowed in a KUPL Str, K0008") and ~15 other input
+        // boundaries across this codebase, this module parses a model's JSON
+        // response with `lsp::parse_json`, which decodes ` ` to a
+        // literal NUL character with NO such guard -- so a model response
+        // (or a misbehaving/malicious provider) could construct a
+        // `Value::Str` violating KUPL's own "Str is NUL-free UTF-8 text"
+        // invariant, structurally unreachable from any KUPL-source literal.
+        // Confirmed live before this fix (calling `value_from_json`/
+        // `convert` directly, bypassing env-var mocking -- `std::env::
+        // set_var` itself rejects a NUL in the value, so this couldn't be
+        // demonstrated via the existing `KUPL_AI_MOCK*` test harness) that a
+        // NUL genuinely reaches a `Value::Str` untouched. Traced the
+        // downstream consequence: `cgen.rs`'s SOLE native string
+        // constructor, `k_str()`, derives its length via C's `strlen()`,
+        // which stops at the first NUL byte -- so on native this wouldn't
+        // just be an invariant violation, it would SILENTLY TRUNCATE the
+        // string at the embedded NUL while interp/vm's Rust `String` (which
+        // tracks length explicitly) keeps everything after it: a genuine
+        // cross-engine BYTE-IDENTITY divergence, not just a broken
+        // invariant. Rejected here, matching every other K0008 boundary's
+        // wording, mirrored in `cgen.rs`'s `k_ai_from_json` (case 0).
+        (AiShape::Str, Json::Str(s)) if s.contains('\0') => Err(
+            "model response contains a NUL byte, not allowed in a KUPL Str (K0008)".to_string(),
+        ),
         (AiShape::Str, Json::Str(s)) => Ok(Value::str(s.clone())),
         (AiShape::Int, Json::Num(n)) => {
             if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
@@ -482,6 +508,16 @@ fn strip_fences(text: &str) -> &str {
 
 fn convert(meta: &AiFunMeta, text: &str) -> Result<Value, String> {
     if meta.shape == AiShape::Str {
+        // Same "Str is NUL-free" concern as `value_from_json`'s `AiShape::
+        // Str` arm above (PR-it690), for the RAW-TEXT fast path (no JSON
+        // parsing at all here, so no ` `-escape angle -- a literal NUL
+        // byte anywhere in the model's raw response text reaches this point
+        // completely unchecked).
+        if text.contains('\0') {
+            return Err(
+                "model response contains a NUL byte, not allowed in a KUPL Str (K0008)".to_string(),
+            );
+        }
         return Ok(Value::str(text.trim().to_string()));
     }
     let payload = strip_fences(text);
@@ -914,6 +950,44 @@ mod tests {
     fn mock_str_roundtrip() {
         std::env::set_var("KUPL_AI_MOCK_T_STR", "  hello  ");
         let v = run(&meta("t_str", AiShape::Str, false), &[Value::Int(1)]).unwrap();
+        assert_eq!(v, Value::str("hello"));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it690): unlike
+    /// `json.rs`'s own parser and ~15 other input boundaries, neither
+    /// `convert`'s raw-text fast path (`-> Str` ai funs) nor
+    /// `value_from_json`'s `AiShape::Str` arm (used for a JSON ` `
+    /// escape, decoded by `lsp::parse_json` with no NUL guard) rejected a
+    /// NUL byte reaching a `Value::Str` -- violating KUPL's "Str is
+    /// NUL-free" invariant via a path structurally unreachable from any
+    /// KUPL-source literal. Confirmed live before this fix by calling
+    /// `convert`/`value_from_json` directly (bypassing env-var mocking,
+    /// since `std::env::set_var` itself rejects a NUL in the value) that a
+    /// `Value::Str` genuinely ended up containing a raw `\0`. Traced the
+    /// consequence: `cgen.rs`'s sole native string constructor, `k_str()`,
+    /// derives its length via C's `strlen()` (stops at the first NUL) --
+    /// so this wasn't just a broken invariant, it was a genuine
+    /// cross-engine BYTE-IDENTITY divergence waiting to happen (interp/vm's
+    /// Rust `String` keeps everything after the NUL; native would silently
+    /// truncate there).
+    #[test]
+    fn ai_response_containing_a_nul_byte_is_a_clean_error_not_a_smuggled_value() {
+        // raw-text fast path (`-> Str` ai funs, `convert`'s first branch).
+        let m = meta("t_nul_raw", AiShape::Str, false);
+        let err = super::convert(&m, "hi\u{0}there").unwrap_err();
+        assert!(err.contains("NUL"), "{err}");
+
+        // JSON-shape path (`value_from_json`'s `AiShape::Str` arm), reached
+        // via a ` ` escape that `lsp::parse_json` decodes to a literal
+        // NUL with no guard of its own.
+        let json = crate::lsp::parse_json("{\"value\": \"hi\\u0000there\"}").unwrap();
+        let inner = json.get("value").unwrap();
+        let err2 = super::value_from_json(&AiShape::Str, inner).unwrap_err();
+        assert!(err2.contains("NUL"), "{err2}");
+
+        // an ordinary, NUL-free response is entirely unaffected.
+        let m2 = meta("t_ok", AiShape::Str, false);
+        let v = super::convert(&m2, "  hello  ").unwrap();
         assert_eq!(v, Value::str("hello"));
     }
 

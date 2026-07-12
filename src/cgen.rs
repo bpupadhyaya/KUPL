@@ -3124,6 +3124,24 @@ static KValue k_ai_convert(const KAiShape* shape, const char* text) {
         long a, z;
         k_utf8_trim_range(text, &a, &z);
         long n = z - a;
+        /* A REAL cross-engine gap found+fixed (production-hardening
+           PR-it690): this raw-text path (no JSON parsing at all, so it
+           never goes through kjp_string's own   guard, PR-it575)
+           reaches k_str() below unchecked -- and k_str()'s sole length
+           source is C's strlen(), which stops at the first NUL byte. A
+           model response containing an embedded NUL wouldn't just violate
+           KUPL's "Str is NUL-free" invariant, it would be SILENTLY
+           TRUNCATED here while interp/vm's Rust String (explicit length,
+           mirrors ai.rs::convert's matching fix) keeps everything after
+           it -- a genuine byte-identity divergence. Checked via memchr
+           (finds a NUL anywhere in the range; unlike strchr/strlen it does
+           NOT stop there itself), matching this file's own established
+           NUL-byte-rejection pattern (k_url_decode, HTTP response bodies,
+           command output, file reads). */
+        if (memchr(text + a, 0, (size_t)n)) {
+            snprintf(k_ai_err, sizeof k_ai_err, "model response contains a NUL byte, not allowed in a KUPL Str (K0008)");
+            k_ai_ok = 0; return k_unit();
+        }
         char* c = (char*)k_alloc(n + 1); memcpy(c, text + a, n); c[n] = 0; return k_str(c);
     }
     const char* payload = k_ai_strip(text);
