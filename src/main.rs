@@ -435,4 +435,109 @@ mod tests {
         // over-long names are rejected (keeps paths + manifests sane)
         assert!(!valid_project_name(&"a".repeat(65)));
     }
+
+    /// A robustness-audit finding (production-hardening PR-it619): `repl.rs`
+    /// had never had a process-level fuzz test at all -- only two pure-
+    /// function unit tests for `braces_balanced`/`is_item` in isolation,
+    /// unlike the CLI's own top-level dispatch (it578/it594's non-UTF8-argv
+    /// and exit-code fixes) and `.kx` deserialization (`corrupt_kx_is_rejected_not_a_crash`'s
+    /// exhaustive truncation + single-byte-flip fuzzing), both already
+    /// thoroughly hardened. Pipes a battery of adversarial multi-line inputs
+    /// through the REAL `kupl repl` process's stdin -- unterminated strings,
+    /// deeply unbalanced braces, a 1-million-character line, multibyte
+    /// UTF-8, empty/unknown REPL commands, and a mid-signature EOF with no
+    /// trailing newline at all -- and asserts the process never panics
+    /// (no "internal compiler error"/"panicked at" in its output) and never
+    /// hangs. No bug found -- `braces_balanced`/`is_item` only ever iterate
+    /// `chars()` (never byte-index or slice), so they're panic-safe by
+    /// construction; `read_line`'s `Err` case already returns cleanly.
+    /// Locking this in as a permanent regression test rather than leaving
+    /// the REPL as the one interactive surface with no fuzz coverage at all.
+    #[test]
+    fn repl_survives_adversarial_piped_input_without_panicking_or_hanging() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let inputs: Vec<String> = vec![
+            "".to_string(),
+            "\n".to_string(),
+            ":quit\n".to_string(),
+            ":unknown-command\n".to_string(),
+            "fun f() -> Int {\n".repeat(50) + "1\n" + &"}\n".repeat(50),
+            "print(\"unterminated\n".to_string(),
+            "print(\"a { b\n".to_string(),
+            "fun f() { (((((((((((\n".to_string(),
+            "}}}}}}}}}}}}}}}}\n".to_string(),
+            "2 + 3\n".repeat(1000),
+            "x".repeat(1_000_000) + "\n",
+            "print(\"日本語 🎉🎉🎉\")\n".to_string(),
+            "fun f(".to_string(), // truncated mid-signature, no trailing newline, then EOF
+            ":defs\n:help\n:quit\n".to_string(),
+            "let café = \"日本\"\ncafé\n:quit\n".to_string(),
+        ];
+        for input in inputs {
+            let mut child = std::process::Command::new(&bin)
+                .arg("repl")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("kupl repl spawns");
+            // Write stdin on a background thread rather than blocking here: if
+            // the child fills its stdout/stderr pipe buffer before finishing a
+            // large write (the 1-million-character-line case), a synchronous
+            // write_all on the main thread could deadlock against the child's
+            // own blocked write -- the classic pipe-deadlock shape `subprocess`
+            // avoids internally via `communicate()`. Writing concurrently with
+            // the wait/read below sidesteps it regardless of buffer sizes.
+            let mut stdin = child.stdin.take().unwrap();
+            let input_bytes = input.clone().into_bytes();
+            let writer = std::thread::spawn(move || {
+                use std::io::Write as _;
+                let _ = stdin.write_all(&input_bytes);
+                // drop(stdin) here closes the pipe -> EOF, so the REPL's
+                // `read_line` sees Ok(0) and exits cleanly once caught up.
+            });
+            let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+            let _ = writer.join();
+            let preview: String = input.chars().take(60).collect();
+            let out = out.unwrap_or_else(|| panic!("kupl repl hung on input starting {preview:?}"));
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !combined.contains("internal compiler error") && !combined.contains("panicked at"),
+                "kupl repl panicked on input starting {preview:?}: {combined}"
+            );
+        }
+    }
+
+    /// Waits for `child` to exit, but gives up after `timeout` rather than
+    /// blocking forever -- `std::process::Child::wait_with_output` has no
+    /// built-in deadline (and this repo's own convention is that macOS has
+    /// no `timeout` command to shell out to). `wait_with_output` itself is
+    /// used here, not a hand-rolled `try_wait` polling loop: a large adversarial
+    /// input can make the child echo well over the OS pipe buffer size (64KB)
+    /// into stderr (e.g. a malformed-token error message quoting a
+    /// million-character identifier verbatim) -- a polling loop that only
+    /// calls `try_wait` without draining stdout/stderr concurrently would
+    /// deadlock the CHILD (blocked writing to a full, unread pipe) against
+    /// the TEST (blocked waiting for an exit that can't happen). Running
+    /// `wait_with_output` (which drains both pipes concurrently via its own
+    /// internal threads) on a background thread and racing it against the
+    /// timeout via a channel gets both properties: no deadlock, AND a bound
+    /// on genuine hangs.
+    fn wait_with_timeout(
+        child: std::process::Child,
+        timeout: std::time::Duration,
+    ) -> Option<std::process::Output> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        rx.recv_timeout(timeout).ok().and_then(Result::ok)
+    }
 }
