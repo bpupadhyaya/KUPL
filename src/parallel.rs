@@ -292,10 +292,22 @@ mod tests {
 
     #[test]
     fn round_trip_every_plain_variant() {
+        // A REAL coverage gap found+closed (production-hardening PR-it652): this
+        // test's own NAME claims "every plain variant", but `Value::BigInt`/
+        // `Value::Rational` -- the two `Rc`-wrapped, heap-allocated numeric
+        // types this module's `PortableValue` mirror exists specifically to
+        // move safely across a thread boundary -- were never actually
+        // included. Verified live first (not assumed): a real `par_map` over
+        // 300+ `BigInt` elements produces byte-identical output to `--vm`,
+        // so this closes a coverage gap, not a functional bug.
+        let big = crate::bigint::BigInt::from_i64(123_456_789_012_345);
+        let rat = crate::rational::Rational::from_ints(22, 7).expect("22/7 is a valid rational");
         let samples = vec![
             Value::Int(-7),
             Value::SizedInt(Box::new((200, IntW::U8))),
             Value::F32(1.5),
+            Value::BigInt(Rc::new(big)),
+            Value::Rational(Rc::new(rat)),
             Value::Float(3.25),
             Value::Bool(true),
             Value::Str(Rc::new("héllo".to_string())),
