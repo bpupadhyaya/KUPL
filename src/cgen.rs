@@ -3957,11 +3957,19 @@ static long k_strtol_checked(const char* s, char** end, int* ok) {
 /* parse "YYYY-MM-DD[(T| )HH:MM:SS][Z]" -> Ok(epoch) | Err(msg); mirrors time::parse_iso */
 static KValue k_parse_iso(KValue sv) {
     const char* raw = sv.as.s;
-    /* trim leading/trailing spaces + a trailing Z */
+    /* trim leading/trailing spaces, then EVERY trailing `Z` -- a REAL
+       cross-engine bug (production-hardening PR-it660): time.rs's
+       `s.trim().trim_end_matches('Z')` strips trailing `Z`s REPEATEDLY
+       (Rust's `trim_end_matches` loops until the pattern no longer matches),
+       but this used to strip only ONE via a plain `if`, so a malformed input
+       with two-or-more trailing `Z`s (e.g. "...T01:46:40ZZ") parsed
+       successfully (Ok) on interp/vm -- both go through the SAME shared
+       `time.rs::parse_iso` -- yet failed (Err) here on native alone, a
+       genuine DIVERGENCE (not just a shared wrong answer) confirmed live. */
     while (*raw == ' ' || *raw == '\t' || *raw == '\n' || *raw == '\r') raw++;
     long n = (long)strlen(raw);
     while (n > 0 && (raw[n-1] == ' ' || raw[n-1] == '\t' || raw[n-1] == '\n' || raw[n-1] == '\r')) n--;
-    if (n > 0 && raw[n-1] == 'Z') n--;
+    while (n > 0 && raw[n-1] == 'Z') n--;
     /* A REAL cross-engine bug (PR-it597, from the SAME sweep as it595/it596):
        interp.rs's `format!("invalid ISO-8601 timestamp: {s}")` echoes the FULL
        trimmed input, unbounded -- this used to copy into a fixed `char s[128]`,
@@ -6896,6 +6904,37 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(
             native_main_stdout(src, "isooverflow").trim(),
             "false|false|false|false|false|false|true|true"
+        );
+    }
+
+    /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
+    /// PR-it660, found while auditing shared modules for it658's "byte-
+    /// identical wrong answer" blind spot -- this turned out to be a
+    /// genuine DIVERGENCE instead, an even higher-severity find since it
+    /// violates cross-engine byte-identity directly): `time.rs::parse_iso`
+    /// does `s.trim().trim_end_matches('Z')`, which strips trailing `Z`
+    /// characters REPEATEDLY (Rust's `trim_end_matches` loops until the
+    /// pattern no longer matches) -- interp.rs and vm.rs both call this SAME
+    /// shared function, so they necessarily agree. `k_parse_iso`'s C mirror
+    /// used to strip only ONE trailing `Z` via a plain `if`, so an input
+    /// with two-or-more trailing `Z`s parsed successfully (`Ok`) on
+    /// interp/vm but failed (`Err`) on native alone -- confirmed live via
+    /// `kupl run` vs `kupl native` on the same source before fixing.
+    #[test]
+    fn native_parse_iso_strips_every_trailing_z_not_just_one() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let zz = match parse_iso(\"2001-09-09T01:46:40ZZ\") { Ok(t) => \"{t}\", Err(m) => m }\n    \
+                   print(\"{parse_iso(\"2001-09-09T01:46:40Z\").is_ok()}|\
+                   {parse_iso(\"2001-09-09T01:46:40ZZ\").is_ok()}|\
+                   {parse_iso(\"2001-09-09T01:46:40ZZZ\").is_ok()}|{zz}\")\n}\n";
+        // BEFORE the fix, native printed "true|false|false|..." (only a
+        // single Z stripped) while interp/vm printed "true|true|true|...".
+        assert_eq!(
+            native_main_stdout(src, "isozz").trim(),
+            "true|true|true|1000000000"
         );
     }
 
