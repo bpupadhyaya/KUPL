@@ -16349,6 +16349,81 @@ component Store {
         assert!(crate::compile::compile_module(&small.program, &small.checked).is_ok());
     }
 
+    /// A coverage-closing test, per production-hardening PR-it621's convention
+    /// (no bug found, but a genuine untested shape closed with a permanent
+    /// test). PR-it686 investigated whether the SAME "narrow u8 count field"
+    /// bug shape found+fixed in `compile_component`'s slot counter (it685)
+    /// recurs elsewhere in `compile.rs`: `Op::MakeCtor`'s `len:
+    /// ordered.len() as u8` (constructor field count) and `Op::MakeList`'s
+    /// `len: items.len() as u8` / `len: branches.len() as u8` (list literals
+    /// AND `par { }` fork-join branches, which share the same op) are ALL
+    /// similarly unguarded in isolation. Unlike `compile_component`'s slot
+    /// counter (which had a genuine escape hatch -- `prop` slots don't
+    /// consume any register in `compile_component`'s own chunk, only in the
+    /// CALLER's instantiation-site chunk), these three constructs have NO
+    /// such escape hatch: `consecutive()` allocates one FRESH register per
+    /// element/field/branch with no reuse ("correctness first, allocation
+    /// later" per this file's own header comment), so >255 of any of them
+    /// ALWAYS also exceeds the ALREADY-GUARDED 256-register-per-chunk limit
+    /// (`K0801`, `FnCompiler::alloc`) first -- confirmed live via two
+    /// independent repros (a 256-field constructor call, a 300-element list
+    /// literal) before writing this test: both hit `K0801` cleanly, with no
+    /// path to observe the `u8` truncation actually firing. Function
+    /// parameter counts (`nparams: f.params.len() as u8`) share the exact
+    /// same coupling: `compile_fun` binds every parameter via
+    /// `bind_local`->`alloc`, so a 256-param function's OWN declaration
+    /// already hits `K0801` while compiling its body, before the truncated
+    /// `nparams` metadata could ever matter. This test locks in that
+    /// reassurance as a permanent regression guard -- if a future
+    /// optimization ever lets `consecutive()`/`bind_local` reuse registers
+    /// (breaking the "one fresh register per element" coupling this
+    /// safety net currently depends on), one of these assertions would
+    /// start failing (a raw panic or corrupted output instead of the clean
+    /// `K0801`), signaling that `Op::MakeCtor`/`Op::MakeList`'s own `u8`
+    /// count fields would need their own dedicated guard at that point.
+    #[test]
+    fn oversized_ctor_and_list_and_par_are_masked_by_the_existing_register_limit_not_silently_corrupted() {
+        // a constructor call with 256 fields: hits K0801 (register limit)
+        // before Op::MakeCtor's own `len: u8` truncation could ever fire.
+        let mut fields = String::new();
+        let mut args = String::new();
+        for i in 0..256 {
+            if i > 0 {
+                fields.push_str(", ");
+                args.push_str(", ");
+            }
+            fields.push_str(&format!("f{i}: Int"));
+            args.push_str(&format!("f{i}: {i}"));
+        }
+        let src = format!(
+            "type Big = Big({fields})\nfun main() uses io {{\n    let b = Big({args})\n    print(\"{{b.f0}}\")\n}}\n"
+        );
+        let compiled = crate::run::compile(&src).expect("checker accepts a 256-field constructor");
+        let err = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect_err("256 ctor fields must be rejected, not silently truncated to 0");
+        assert!(err.iter().any(|d| d.code == "K0801"), "expected K0801, got: {err:?}");
+
+        // a 300-element list literal: same masking, via Op::MakeList.
+        let items: Vec<String> = (0..300).map(|i| i.to_string()).collect();
+        let src = format!(
+            "fun main() uses io {{\n    let xs = [{}]\n    print(\"{{xs.len()}}\")\n}}\n",
+            items.join(", ")
+        );
+        let compiled = crate::run::compile(&src).expect("checker accepts a 300-element list literal");
+        let err = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect_err("300 list items must be rejected, not silently truncated");
+        assert!(err.iter().any(|d| d.code == "K0801"), "expected K0801, got: {err:?}");
+
+        // an ordinary, well-under-the-limit constructor call and list
+        // literal are entirely unaffected.
+        let small = crate::run::compile(
+            "type Pair = Pair(a: Int, b: Int)\nfun main() uses io {\n    \
+             let p = Pair(a: 1, b: 2)\n    let xs = [1, 2, 3]\n    print(\"{p.a}|{xs.len()}\")\n}\n",
+        )
+        .expect("compiles");
+        assert!(crate::compile::compile_module(&small.program, &small.checked).is_ok());
+    }
+
     #[test]
     fn diff_component_isolation_and_panic() {
         // Two instances of the same component keep SEPARATE private state, and a
