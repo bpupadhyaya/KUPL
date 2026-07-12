@@ -922,6 +922,31 @@ static int k_is_unicode_ws(uint32_t cp) {
             return cp >= 0x2000 && cp <= 0x200A;
     }
 }
+/* Skip forward over a run of Unicode whitespace starting at `pos`; returns
+   the position of the first non-whitespace character (or `len`). Shared
+   tokenizing primitive -- see k_token_end below and k_http_serve's request-
+   line parser (PR-it664), which together mirror Rust's `split_whitespace()`. */
+static long k_skip_unicode_ws(const unsigned char* s, long len, long pos) {
+    while (pos < len) {
+        int clen;
+        long cp = kre_utf8_cp(s, (int)len, (int)pos, &clen);
+        if (!k_is_unicode_ws((uint32_t)cp)) break;
+        pos += clen;
+    }
+    return pos;
+}
+/* Find the end of the token (run of NON-whitespace) starting at `pos`
+   (`pos` itself must not be whitespace); returns the position right after
+   the token (or `len`). */
+static long k_token_end(const unsigned char* s, long len, long pos) {
+    while (pos < len) {
+        int clen;
+        long cp = kre_utf8_cp(s, (int)len, (int)pos, &clen);
+        if (k_is_unicode_ws((uint32_t)cp)) break;
+        pos += clen;
+    }
+    return pos;
+}
 static KBig* k_big_from_str(const char* s) {
     /* mirror bigint.rs's from_str, which trims BOTH ends (s.trim(), ALL
        Unicode whitespace -- see k_is_unicode_ws above) before checking the
@@ -2824,20 +2849,42 @@ static KValue k_http_serve(KValue port, KValue handler) {
             head.len = (size_t)w;
             head.buf[head.len] = 0;
         }
-        /* parse the request line: METHOD PATH HTTP/1.1 */
+        /* parse the request line: METHOD PATH HTTP/1.1. A REAL cross-engine
+           DIVERGENCE found+fixed (production-hardening PR-it664, the SAME
+           bug class as it662/it663): interp::parse_request_line tokenizes
+           with Rust's `line.split_whitespace()`, which splits on ANY Unicode
+           whitespace run (tab included, not just a literal space) -- this
+           used to split on a literal ' ' (0x20) ONLY via `strchr`, so a
+           request line using a tab (or any other whitespace) as a separator
+           parsed correctly on interp/vm but fell back to the "GET"/"/"
+           defaults on native alone; confirmed live via a raw socket sending
+           "GET\t/world\tHTTP/1.1\r\n\r\n". Reuses the SAME UTF-8 decode/
+           classify helpers built for BigInt.from_str and Str.trim's
+           identical bug shape (PR-it662/it663). */
         const char* method = "GET";
         const char* path = "/";
         if (head.buf) {
             char* line = head.buf;
             char* eol = strstr(line, "\r\n");
             if (eol) *eol = 0;
-            char* sp1 = strchr(line, ' ');
-            if (sp1) {
-                *sp1 = 0; method = k_strdup(line);
-                char* p = sp1 + 1;
-                char* sp2 = strchr(p, ' ');
-                if (sp2) *sp2 = 0;
-                path = k_strdup(p);
+            long llen = (long)strlen(line);
+            long p = k_skip_unicode_ws((const unsigned char*)line, llen, 0);
+            long mstart = p;
+            long mend = k_token_end((const unsigned char*)line, llen, p);
+            if (mend > mstart) {
+                char* mbuf = (char*)k_alloc((size_t)(mend - mstart) + 1);
+                memcpy(mbuf, line + mstart, (size_t)(mend - mstart));
+                mbuf[mend - mstart] = 0;
+                method = mbuf;
+                long q = k_skip_unicode_ws((const unsigned char*)line, llen, mend);
+                long pstart = q;
+                long pend = k_token_end((const unsigned char*)line, llen, q);
+                if (pend > pstart) {
+                    char* pbuf = (char*)k_alloc((size_t)(pend - pstart) + 1);
+                    memcpy(pbuf, line + pstart, (size_t)(pend - pstart));
+                    pbuf[pend - pstart] = 0;
+                    path = pbuf;
+                }
             }
         }
         KValue hargs[2] = { k_str(method), k_str(path) };
@@ -9654,6 +9701,70 @@ fun main() uses io {
             let _ = s2.read_to_string(&mut resp2);
             if !resp2.contains("HTTP/1.1 200 OK") || !resp2.ends_with("3 3") {
                 return Err(format!("bad post-NUL response: {resp2:?}"));
+            }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
+    /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
+    /// PR-it664, the SAME bug class as it662/it663's Unicode-whitespace
+    /// findings): `interp::parse_request_line` tokenizes the request line
+    /// with Rust's `line.split_whitespace()`, which splits on ANY Unicode
+    /// whitespace run (a tab included, not just a literal space, and
+    /// collapsing repeated separators) -- `k_http_serve`'s C mirror used to
+    /// split on a literal `' '` (0x20) ONLY via `strchr`, so a request line
+    /// using a tab as its separator fell back to the "GET"/"/" defaults on
+    /// native alone instead of correctly extracting the method/path;
+    /// confirmed live via a raw socket sending
+    /// `"GET\t/world\tHTTP/1.1\r\n\r\n"` BEFORE fixing (native returned the
+    /// wrong path, `/`, instead of `/world`).
+    #[test]
+    fn native_http_serve_request_line_uses_unicode_whitespace_like_interp() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str) -> Str { \"{m}|{p}\" }\n\
+                   fun main() uses io { let _ = http_serve(38126, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srvtab-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let connect = || {
+            for _ in 0..300 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38126u16)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        let result = (|| {
+            for (req, want) in [
+                (&b"GET\t/world\tHTTP/1.1\r\nHost: x\r\n\r\n"[..], "GET|/world"),
+                (&b"GET  /multi-space  HTTP/1.1\r\nHost: x\r\n\r\n"[..], "GET|/multi-space"),
+                (&b"POST /only\r\n\r\n"[..], "POST|/only"),
+                (&b"\r\n\r\n"[..], "GET|/"),
+            ] {
+                let mut s = connect().ok_or("server should be listening")?;
+                s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                s.write_all(req).map_err(|e| e.to_string())?;
+                let mut resp = String::new();
+                let _ = s.read_to_string(&mut resp);
+                if !resp.ends_with(want) {
+                    return Err(format!("req {req:?}: expected response ending {want:?}, got {resp:?}"));
+                }
             }
             Ok::<(), String>(())
         })();
