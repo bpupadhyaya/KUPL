@@ -983,4 +983,121 @@ mod tests {
             "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"integer\"}},\"required\":[\"value\"],\"additionalProperties\":false}"
         );
     }
+
+    /// A fresh axis (production-hardening PR-it622), per it621's own guidance:
+    /// the AI mock-provider infrastructure's genuine JSON-parser crash was
+    /// already found and fixed (it620, in the SHARED `lsp::parse_json`), but
+    /// this file's OWN response-handling code (`convert`, `value_from_json`,
+    /// `strip_fences`) had never been given a dedicated adversarial pass of
+    /// its own -- `KUPL_AI_MOCK_*` env vars are effectively untrusted,
+    /// model-controlled text (a real provider's response is no more trusted
+    /// than this), so a malformed/adversarial mock string should behave
+    /// exactly like a malformed/adversarial real provider response would.
+    /// Feeds a battery of adversarial mock texts (empty, truncated JSON,
+    /// mismatched code fences, a NUL byte, multibyte UTF-8, a huge string,
+    /// JSON nested past `MAX_JSON_DEPTH`, an overflowing number, a bare
+    /// non-object payload) through the REAL `ai_call` entry point for a
+    /// structured (Record) shape and asserts it never panics -- always
+    /// returns a clean `Result`, in this case always `Err` since none of
+    /// these adversarial payloads are valid `Sentiment` records. Each case
+    /// uses a distinct fun name (matching this file's existing
+    /// `KUPL_AI_MOCK_T_*` convention) since Rust runs tests in the same
+    /// process concurrently and env vars are global state.
+    #[test]
+    fn mock_response_fuzz_never_panics_across_adversarial_text() {
+        let shape = AiShape::Record {
+            ty: "Sentiment".into(),
+            variant: "Sentiment".into(),
+            fields: vec![("label".into(), AiShape::Str), ("score".into(), AiShape::Float)],
+        };
+        let deep_nesting = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
+        let huge = "x".repeat(500_000);
+        let cases: Vec<(&str, String)> = vec![
+            ("it622_empty", String::new()),
+            ("it622_whitespace", "   \n\t  ".into()),
+            ("it622_not_json", "not json at all".into()),
+            ("it622_unterminated_obj", "{".into()),
+            ("it622_unterminated_str", "{\"value\": \"unterminated".into()),
+            ("it622_lone_close", "}".into()),
+            ("it622_deep_nesting", deep_nesting),
+            ("it622_huge", huge),
+            ("it622_multibyte", "日本語 🎉🎉🎉 テスト".into()),
+            // Note: a genuine NUL byte in the mock text is NOT testable via
+            // this mechanism -- `std::env::set_var` itself panics on a NUL in
+            // the VALUE (env vars are OS-level C strings, a platform
+            // constraint entirely independent of KUPL's own code -- a real
+            // provider response could still contain one, but exercising that
+            // would need a fake HTTP layer, not the env-var mock path).
+            ("it622_bad_fence_unclosed", "```json\n{\"value\": 1".into()),
+            ("it622_bad_fence_extra_backtick", "```\n{\"value\": 1}\n````".into()),
+            ("it622_overflow_number", "{\"value\": 1e400}".into()),
+            ("it622_bare_non_object", "42".into()),
+            ("it622_bare_array", "[1, 2, 3]".into()),
+            ("it622_trailing_garbage", "{\"value\": 1} aardvark".into()),
+            ("it622_nested_value_wrapper", "{\"value\": {\"value\": {\"value\": 1}}}".into()),
+            ("it622_control_chars", "\u{1}\u{7f}{\"value\":1}".into()),
+        ];
+        for (name, text) in cases {
+            std::env::set_var(format!("KUPL_AI_MOCK_{}", name.to_uppercase()), &text);
+            let result = std::panic::catch_unwind(|| run(&meta(name, shape.clone(), false), &[Value::str("x")]));
+            assert!(
+                result.is_ok(),
+                "ai_call panicked on adversarial mock text for case {name:?}: {text:?}"
+            );
+            std::env::remove_var(format!("KUPL_AI_MOCK_{}", name.to_uppercase()));
+        }
+    }
+
+    /// The SAME adversarial-text battery, but through the OTHER, structurally
+    /// distinct mock path: `tool_response`/`MockProvider`/`run_tool_loop`
+    /// (used whenever an `ai fun` declares `tools [...]`) -- a scripted-round
+    /// mock has its OWN parsing shape (`{"tool":...}`/`{"tools":[...]}`/
+    /// `{"final":...}` per round, gated on `crate::json::parse`'s strictness
+    /// check to decide interp/native agreement) entirely separate from the
+    /// no-tools `convert()` path above, so it needs its own adversarial pass
+    /// rather than assuming the first test's coverage carries over. Also
+    /// includes a case specific to this path: a `"tools"` round with a huge
+    /// number of entries, exercising `Vec::with_capacity` and the loop that
+    /// builds one `ToolReq` per entry.
+    #[test]
+    fn tool_calling_mock_fuzz_never_panics_across_adversarial_scripts() {
+        let tool = ToolMeta {
+            name: "lookup".into(),
+            description: "look something up".into(),
+            params: vec![("q".into(), AiShape::Str)],
+            ret: AiShape::Str,
+        };
+        let many_tool_calls = format!(
+            "[{{\"tools\": [{}]}}]",
+            (0..2000).map(|i| format!("{{\"tool\":\"lookup\",\"input\":{{\"q\":\"{i}\"}}}}")).collect::<Vec<_>>().join(",")
+        );
+        let cases: Vec<(&str, String)> = vec![
+            ("it622_tool_empty", String::new()),
+            ("it622_tool_not_json", "not json".into()),
+            ("it622_tool_unterminated", "[{\"tool\": \"lookup\"".into()),
+            ("it622_tool_wrong_type_name", "[{\"tool\": 42}]".into()),
+            ("it622_tool_missing_tool_and_final", "[{}]".into()),
+            ("it622_tool_unknown_tool_name", "[{\"tool\": \"does_not_exist\"}]".into()),
+            ("it622_tool_deep_nesting", format!("[{{\"final\": {}{}}}]", "[".repeat(100_000), "]".repeat(100_000))),
+            ("it622_tool_many_entries", many_tool_calls),
+            ("it622_tool_empty_tools_array", "[{\"tools\": []}]".into()),
+            ("it622_tool_malformed_tools_entry", "[{\"tools\": [{\"no_tool_key\": 1}]}]".into()),
+            ("it622_tool_multibyte_final", "[{\"final\": \"日本語 🎉\"}]".into()),
+            ("it622_tool_zero_rounds_scripted", "[]".into()),
+        ];
+        for (name, text) in cases {
+            std::env::set_var(format!("KUPL_AI_MOCK_{}", name.to_uppercase()), &text);
+            let mut m = meta(name, AiShape::Str, false);
+            m.tools = vec![tool.clone()];
+            let intent = m.intent.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ai_call(&m, &intent, &[Value::str("x")], &mut NullToolHost)
+            }));
+            assert!(
+                result.is_ok(),
+                "ai_call (tool path) panicked on adversarial scripted-round text for case {name:?}: {text:?}"
+            );
+            std::env::remove_var(format!("KUPL_AI_MOCK_{}", name.to_uppercase()));
+        }
+    }
 }
