@@ -14,6 +14,16 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut field = String::new();
+    // Whether the CURRENT field was opened with `"..."`, even if its content is
+    // empty (PR-it678, real silent-data-loss bug: the final flush below used to
+    // check only `!field.is_empty() || !row.is_empty()`, which can't tell "we
+    // never saw any field content" (input ended right after a newline -- the
+    // genuinely-desired skip) apart from "we saw a real, deliberately-empty
+    // quoted field (`""`) that happens to be its row's ONLY field" -- BOTH leave
+    // `field`/`row` empty. This silently dropped the entire last row of ANY
+    // multi-row CSV whenever that row was a lone `""`, not just a
+    // whole-document-is-just-`""` edge case as first characterized in it667.
+    let mut field_was_quoted = false;
     let mut i = 0;
     let n = chars.len();
 
@@ -33,6 +43,7 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
                         i += 2;
                     } else {
                         i += 1; // closing quote
+                        field_was_quoted = true;
                         break;
                     }
                 } else {
@@ -42,6 +53,7 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
             }
         } else if c == ',' {
             row.push(std::mem::take(&mut field));
+            field_was_quoted = false;
             i += 1;
         } else if c == '\n' || c == '\r' {
             // end of record (handle CRLF as one terminator)
@@ -50,6 +62,7 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
             }
             row.push(std::mem::take(&mut field));
             rows.push(std::mem::take(&mut row));
+            field_was_quoted = false;
             i += 1;
         } else {
             field.push(c);
@@ -57,8 +70,9 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
         }
     }
     // flush the final field/record unless the input ended exactly on a newline
-    // (in which case `field`/`row` are empty and we skip the phantom record)
-    if !field.is_empty() || !row.is_empty() {
+    // (in which case `field`/`row` are empty and we skip the phantom record) --
+    // a CLOSED quoted field counts as real content even when empty (see above).
+    if !field.is_empty() || !row.is_empty() || field_was_quoted {
         row.push(field);
         rows.push(row);
     }
@@ -139,18 +153,37 @@ mod tests {
     /// whatever was accumulated -- no panic, no error, matching RFC 4180's
     /// lack of any error-recovery grammar for a genuinely malformed CSV
     /// document (this parser has no error channel at all, so "read to EOF"
-    /// is the only sane behavior). Also locks in a related, easy-to-miss
-    /// edge case: a LONE quoted field with no trailing comma/newline
-    /// delimiter at all is silently DROPPED entirely (the flush check at
-    /// the end of `parse` only fires when `field` or `row` is non-empty,
-    /// but a fully-consumed `""` leaves BOTH empty) -- surprising, but
-    /// consistent between engines, so not a bug for cross-engine purposes.
+    /// is the only sane behavior).
     #[test]
     fn unterminated_quoted_field_reads_to_end_of_input() {
         assert_eq!(p("a,\"unterminated"), vec![vec!["a", "unterminated"]]);
-        // a lone quoted-then-closed field with NO delimiter at all never
-        // reaches the end-of-parse flush (nothing was ever pushed to `row`).
-        assert_eq!(p("\"\""), Vec::<Vec<String>>::new());
+    }
+
+    /// A REAL silent-data-loss bug (PR-it678, resolving the DESIGN question
+    /// it667 flagged but left open): a lone, PROPERLY-CLOSED quoted-empty
+    /// field (`""`) with no trailing comma/newline delimiter used to be
+    /// silently DROPPED entirely -- the end-of-parse flush condition
+    /// (`!field.is_empty() || !row.is_empty()`) can't distinguish "no field
+    /// content at all" (input ended right after a newline, the genuinely-
+    /// desired skip) from "a real, deliberately-empty quoted field that's
+    /// its row's only field" -- both leave `field`/`row` empty. This wasn't
+    /// just a whole-document-is-`""` curiosity: it dropped the ENTIRE LAST
+    /// ROW of any multi-row CSV whenever that row was a lone `""`, a
+    /// realistic shape (a trailing blank-but-quoted last column value with
+    /// no final newline). Fixed by tracking whether the current field was
+    /// closed via `"..."` (even if empty) and treating that as real content
+    /// for flush purposes, in both `csv.rs` and `cgen.rs`'s `k_csv_parse`.
+    #[test]
+    fn lone_closed_empty_quoted_field_is_not_silently_dropped() {
+        // the exact case it667 characterized as "not a bug" -- now fixed.
+        assert_eq!(p("\"\""), vec![vec![""]]);
+        // the SAME bug, but as the last row of a multi-row document -- the
+        // shape that makes this a real, reachable data-loss bug, not just a
+        // whole-document curiosity.
+        assert_eq!(p("a\n\"\""), vec![vec!["a"], vec![""]]);
+        // a non-empty quoted lone field was NEVER affected (field.is_empty()
+        // was already false) -- confirm it still round-trips correctly.
+        assert_eq!(p("\"x\""), vec![vec!["x"]]);
     }
 
     #[test]

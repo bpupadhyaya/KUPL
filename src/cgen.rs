@@ -2504,6 +2504,14 @@ static KValue k_csv_parse(KValue s) {
     int rows_cap = 16; KValue* rows = (KValue*)k_alloc(sizeof(KValue) * rows_cap); int nrows = 0;
     int row_cap = 16; KValue* row = (KValue*)k_alloc(sizeof(KValue) * row_cap); int ncols = 0;
     KBuf field = { 0, 0, 0 };
+    /* Whether the CURRENT field was opened with "..." even if empty (PR-it678,
+       mirrors csv.rs's Rust fix exactly): the flush condition below used to be
+       `field.len > 0 || ncols > 0`, which can't tell "no field content at all"
+       (input ended right after a newline) apart from "a real, deliberately-
+       empty quoted field ("") that's its row's only field" -- both leave
+       field/ncols at zero, silently dropping the CSV's last row whenever that
+       row was a lone "". */
+    int field_was_quoted = 0;
     while (i < n) {
         char c = in[i];
         if (c == '"') {
@@ -2513,13 +2521,13 @@ static KValue k_csv_parse(KValue s) {
                 char q = in[i];
                 if (q == '"') {
                     if (i + 1 < n && in[i + 1] == '"') { kb_putc(&field, '"'); i += 2; }
-                    else { i++; break; }
+                    else { i++; field_was_quoted = 1; break; }
                 } else { kb_putc(&field, q); i++; }
             }
         } else if (c == ',') {
             if (ncols == row_cap) { row_cap *= 2; row = (KValue*)realloc(row, sizeof(KValue) * row_cap); }
             row[ncols++] = k_str(kb_take(&field));
-            field = (KBuf){ 0, 0, 0 }; i++;
+            field = (KBuf){ 0, 0, 0 }; field_was_quoted = 0; i++;
         } else if (c == '\n' || c == '\r') {
             if (c == '\r' && i + 1 < n && in[i + 1] == '\n') i++;
             if (ncols == row_cap) { row_cap *= 2; row = (KValue*)realloc(row, sizeof(KValue) * row_cap); }
@@ -2527,11 +2535,12 @@ static KValue k_csv_parse(KValue s) {
             field = (KBuf){ 0, 0, 0 };
             if (nrows == rows_cap) { rows_cap *= 2; rows = (KValue*)realloc(rows, sizeof(KValue) * rows_cap); }
             rows[nrows++] = k_list(row, ncols);
-            ncols = 0; i++;
+            ncols = 0; field_was_quoted = 0; i++;
         } else { kb_putc(&field, c); i++; }
     }
-    // flush the final field/record unless input ended exactly on a newline
-    if (field.len > 0 || ncols > 0) {
+    // flush the final field/record unless input ended exactly on a newline --
+    // a CLOSED quoted field counts as real content even when empty (see above).
+    if (field.len > 0 || ncols > 0 || field_was_quoted) {
         if (ncols == row_cap) { row_cap *= 2; row = (KValue*)realloc(row, sizeof(KValue) * row_cap); }
         row[ncols++] = k_str(kb_take(&field));
         if (nrows == rows_cap) { rows_cap *= 2; rows = (KValue*)realloc(rows, sizeof(KValue) * rows_cap); }
@@ -9123,18 +9132,34 @@ fun main() uses io {
     /// A coverage-closing verification (production-hardening PR-it667; no
     /// bug found, matching a new test added to `csv.rs` itself this same
     /// iteration -- `unterminated_quoted_field_reads_to_end_of_input`). An
-    /// unterminated quoted field (EOF mid-quote) and a lone quoted field
-    /// with no trailing delimiter (silently dropped, since the end-of-parse
-    /// flush never fires) had ZERO native cross-engine coverage before this.
+    /// unterminated quoted field (EOF mid-quote) had ZERO native
+    /// cross-engine coverage before this.
     #[test]
-    fn native_csv_unterminated_quote_and_lone_field_match_interp() {
+    fn native_csv_unterminated_quote_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print(csv_parse(\"a,\\\"unterminated\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "csvunterm").trim(), "[[\"a\", \"unterminated\"]]");
+    }
+
+    /// A REAL silent-data-loss bug (PR-it678, matching the fix + updated test
+    /// in `csv.rs` this same iteration): a lone, properly-CLOSED quoted-empty
+    /// field (`""`) with no trailing delimiter used to be silently DROPPED --
+    /// `k_csv_parse`'s end-of-parse flush condition (`field.len > 0 || ncols >
+    /// 0`) couldn't distinguish "no field content at all" from "a real,
+    /// deliberately-empty quoted field that's its row's only field". This
+    /// dropped the ENTIRE LAST ROW of any multi-row CSV whenever that row was
+    /// a lone `""`, not just a whole-document curiosity.
+    #[test]
+    fn native_csv_lone_closed_empty_quoted_field_is_not_silently_dropped() {
         if !cc_available() {
             return;
         }
         let src = "fun main() uses io {\n    \
-                   print(csv_parse(\"a,\\\"unterminated\"))\n    \
-                   print(csv_parse(\"\\\"\\\"\"))\n}\n";
-        assert_eq!(native_main_stdout(src, "csvunterm").trim(), "[[\"a\", \"unterminated\"]]\n[]");
+                   print(csv_parse(\"\\\"\\\"\"))\n    \
+                   print(csv_parse(\"a\\n\\\"\\\"\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "csvlonefield").trim(), "[[\"\"]]\n[[\"a\"], [\"\"]]");
     }
 
     /// Native regex matches the interpreter, incl. `.` over multi-byte characters
