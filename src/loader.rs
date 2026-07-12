@@ -779,6 +779,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it684): `resolve.rs`'s
+    /// `Rewriter::component` visited a component's `props`/`state` field
+    /// DECLARATIONS (types, default/init expressions) but never bound their
+    /// NAMES into its own scope tracking -- so a bare reference to a state or
+    /// prop field inside a handler/exposed-method body was treated as an
+    /// ordinary global reference, not a component-local one. If the SAME
+    /// dependency package also happened to define a top-level `fun` with the
+    /// identical bare name (legal: different namespaces), the mangling pass
+    /// incorrectly rewrote the state/prop reference to the package's mangled
+    /// TOP-LEVEL name. Confirmed live before this fix: `state counter: Int`
+    /// alongside a top-level `fun counter()` in the same package made
+    /// `counter += 1` inside a handler fail with `K0220: unknown variable
+    /// dep$counter` (mangled, no longer matching the un-mangled state
+    /// field) -- and a bare `counter` READ elsewhere didn't even fail
+    /// cleanly, it silently resolved to the mangled TOP-LEVEL FUN instead, a
+    /// genuine wrong-value substitution surfaced only as a confusing
+    /// downstream type mismatch ("expected Int, found fn() -> Int").
+    #[test]
+    fn component_state_field_name_colliding_with_a_top_level_fun_is_not_mangled() {
+        let base = std::env::temp_dir().join(format!("kupl-state-collision-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "pub fun counter() -> Int {\n    42\n}\n\n\
+             pub component Widget {\n    \
+             intent \"collides with a top-level fun by name\"\n    \
+             state counter: Int = 0\n    \
+             expose fun bump() {\n        counter += 1\n    }\n    \
+             expose fun value() -> Int {\n        counter\n    }\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun main() uses io {\n    \
+             let w = dep.Widget()\n    w.bump()\n    print(w.value())\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its dep dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "state field reference must not be mistaken for the same-named top-level fun: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        assert!(
+            interp.call_value(f, vec![], crate::diag::Span::default()).is_ok(),
+            "main() should run cleanly"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn two_packages_same_name_dont_collide() {
         // two dependencies BOTH define `helper` — namespace isolation keeps them

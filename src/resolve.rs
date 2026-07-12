@@ -196,6 +196,32 @@ impl Rewriter<'_> {
             }
             self.expr(&mut s.init);
         }
+        // A prop/state field is referenced by BARE name inside handler
+        // bodies, exposed/private-method bodies, child-instantiation args,
+        // and example blocks below -- but until this fix (PR-it684) those
+        // names were never bound into `self.scope`, so `is_local` never saw
+        // them. If this SAME package also happens to define a top-level
+        // `fun`/`type`/`component`/`contract` with the identical bare name
+        // (legal: different namespaces), `self.name(n)` fell through to the
+        // rename map and incorrectly mangled the reference. Confirmed live:
+        // a component `state counter: Int` alongside a top-level
+        // `fun counter()` in the same package made `counter += 1` inside a
+        // handler fail with "unknown variable `pkg$counter`" (mangled, no
+        // longer matching the un-mangled state field), and a bare `counter`
+        // read elsewhere silently resolved to the mangled TOP-LEVEL FUN
+        // instead -- a genuine wrong-value substitution, not just a clean
+        // "unknown name," surfaced downstream as a confusing type mismatch.
+        // Prop DEFAULTS and state INIT expressions above are evaluated
+        // BEFORE this scope opens (a default/init can't reference the
+        // component's own not-yet-constructed state), matching how a
+        // constructor's own field defaults can't reference sibling fields.
+        self.push();
+        for p in &c.props {
+            self.bind(&p.name);
+        }
+        for s in &c.state {
+            self.bind(&s.name);
+        }
         for ch in &mut c.children {
             if let Some(m) = self.name(&ch.component) {
                 ch.component = m;
@@ -228,6 +254,7 @@ impl Rewriter<'_> {
             }
             self.pop();
         }
+        self.pop();
     }
 
     fn contract(&mut self, c: &mut ContractDecl) {
