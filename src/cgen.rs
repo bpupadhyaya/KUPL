@@ -40,7 +40,13 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
 
     // forward declarations — the depth-guarding wrapper `fun_i` and its body `fun_i_impl`
     for (i, c) in module.chunks.iter().enumerate() {
-        let _ = writeln!(out, "static KValue fun_{i}(KValue* caps, KValue* args); /* {} */", c.name);
+        // `//` not `/* */`: chunk names are built only from lexically-restricted
+        // KUPL identifiers today (the "*/" C block-comment terminator is not a
+        // valid identifier character), so this is not reachable now, but a `//`
+        // line comment costs nothing and is safe unconditionally -- it can never
+        // be prematurely closed by anything short of a literal newline, which no
+        // chunk name can contain either.
+        let _ = writeln!(out, "static KValue fun_{i}(KValue* caps, KValue* args); // {}", c.name);
         let _ = writeln!(out, "static KValue fun_{i}_impl(KValue* caps, KValue* args);");
     }
     let _ = writeln!(out, "\nKValue (*CHUNKS[])(KValue*, KValue*) = {{");
@@ -271,7 +277,10 @@ fn emit_ai_shape(out: &mut String, shape: &crate::ai::AiShape, ctr: &mut usize) 
 }
 
 fn emit_chunk(out: &mut String, module: &Module, idx: usize, chunk: &Chunk) -> Result<(), String> {
-    let _ = writeln!(out, "/* {} */", chunk.name);
+    // `//`, not `/* */` -- see the matching comment on the forward-declaration
+    // site in emit_c for why (chunk names can't contain "*/" today, but a line
+    // comment is safe unconditionally rather than safe-by-a-lexical-invariant).
+    let _ = writeln!(out, "// {}", chunk.name);
     // Depth-guard wrapper: matches the interpreter/KVM 10 000-frame recursion cap
     // so deep recursion panics cleanly rather than overflowing the C stack. cc -O2
     // inlines the one-line body call, so the overhead is a single inc/dec per call.
@@ -5443,6 +5452,78 @@ mod tests {
 
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A security-audit finding (production-hardening sweep, PR-it614): `emit_c`
+    /// interpolates each chunk's name into a `/* ... */` C block comment (a
+    /// forward-declaration line and a per-chunk header line) WITHOUT escaping.
+    /// Chunk names can't actually contain `*/` via normal `.kupl` compilation
+    /// today -- they're built only from lexically-restricted identifiers plus
+    /// fixed separators like `"::"` (see compile.rs's `Chunk{name: ...}`
+    /// construction sites), so the C block-comment terminator is never
+    /// reachable in practice -- but that safety depended entirely on a
+    /// lexical invariant holding forever, not on `emit_c` itself being safe
+    /// regardless of its input. Switched both sites to `//` line comments,
+    /// which are unconditionally safe (a chunk name can't contain a literal
+    /// newline either, so nothing can prematurely end a `//` comment).
+    /// Constructs a `Module` DIRECTLY (bypassing the parser entirely) with an
+    /// adversarial chunk name containing `*/` followed by injected C code, to
+    /// prove the fix structurally rather than relying on the parser
+    /// continuing to forbid this forever.
+    #[test]
+    fn native_chunk_names_containing_c_comment_terminators_cannot_break_out_of_the_comment() {
+        let evil_name = "evil*/int injected(void){return 1;}/*".to_string();
+        let mut module = crate::bytecode::Module {
+            chunks: vec![
+                crate::bytecode::Chunk {
+                    name: evil_name,
+                    ncaps: 0,
+                    nparams: 0,
+                    nregs: 1,
+                    consts: vec![],
+                    code: vec![crate::bytecode::Op::Ret(0)],
+                    spans: vec![crate::diag::Span::default()],
+                },
+                crate::bytecode::Chunk {
+                    name: "main".into(),
+                    ncaps: 0,
+                    nparams: 0,
+                    nregs: 1,
+                    consts: vec![],
+                    code: vec![crate::bytecode::Op::Ret(0)],
+                    spans: vec![crate::diag::Span::default()],
+                },
+            ],
+            ..Default::default()
+        };
+        module.funs.insert("main".to_string(), 1);
+        let c = super::emit_c(&module).expect("emit_c must still succeed with an adversarial chunk name");
+        // Wherever the injected text appears, it must be preceded by `//` on
+        // the SAME line -- proving it's inert inside a line comment, not a
+        // real C declaration the compiler would ever see.
+        for line in c.lines() {
+            if let Some(idx) = line.find("injected") {
+                assert!(
+                    line[..idx].contains("//"),
+                    "adversarial chunk name content must only ever appear after a `//` marker on its line: {line:?}"
+                );
+            }
+        }
+        if cc_available() {
+            let base = std::env::temp_dir().join(format!("kupl-cgen-comment-{}", std::process::id()));
+            let cpath = base.with_extension("c");
+            let bin = base.with_extension("out");
+            std::fs::write(&cpath, &c).unwrap();
+            let status = std::process::Command::new(cc())
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .status()
+                .expect("cc runs");
+            assert!(status.success(), "generated C (with the adversarial chunk name) must still compile cleanly");
+            let out = std::process::Command::new(&bin).output().expect("binary runs");
+            assert_eq!(out.status.code(), Some(0), "must run cleanly, no injected code interfering");
+            let _ = std::fs::remove_file(&cpath);
+            let _ = std::fs::remove_file(&bin);
+        }
     }
 
     /// `ai fun` compiles and RUNS on native, agreeing byte-for-byte with the
