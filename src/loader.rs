@@ -19,6 +19,17 @@ struct PkgCtx {
     root: PathBuf,
     /// name -> (directory, required version if the manifest pinned one)
     deps: HashMap<String, (PathBuf, Option<String>)>,
+    /// name -> version, for a dependency declared with ONLY `{ version = ".." }`
+    /// (no `path`) -- the manifest's own doc comment documents this as valid
+    /// syntax ("registry (resolved later)"), but no registry exists yet. Kept
+    /// separate from `deps` (rather than silently dropped, which it was
+    /// before) so a `use` of one of these names can report a clear,
+    /// accurate "registry dependencies aren't supported yet" error instead
+    /// of the confusing "cannot read module file <name>.kupl" a silently-
+    /// dropped dependency used to produce -- indistinguishable from simply
+    /// forgetting to write the file, even though the manifest correctly
+    /// declared the dependency (production-hardening PR-it625).
+    registry_only: HashMap<String, String>,
     prefix: String,
     /// Set when a `kupl.toml` was found but failed to parse — surfaced as a hard
     /// error rather than silently ignored (which would make the deps vanish).
@@ -57,13 +68,24 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
             match crate::manifest::read(&toml) {
                 Ok(m) => {
                     let mut deps = HashMap::new();
+                    let mut registry_only = HashMap::new();
                     for dep in &m.deps {
                         if let Some(p) = &dep.path {
                             deps.insert(dep.name.clone(), (normalize(&cur.join(p)), dep.version.clone()));
+                        } else if let Some(v) = &dep.version {
+                            // version-only deps resolve via a registry — a later slice.
+                            // Tracked (not dropped) so a `use` of this name gets a clear
+                            // error instead of a misleading "file not found".
+                            registry_only.insert(dep.name.clone(), v.clone());
                         }
-                        // version-only deps resolve via a registry — a later slice
                     }
-                    return Rc::new(PkgCtx { root: cur.to_path_buf(), deps, prefix: prefix.to_string(), err: None });
+                    return Rc::new(PkgCtx {
+                        root: cur.to_path_buf(),
+                        deps,
+                        registry_only,
+                        prefix: prefix.to_string(),
+                        err: None,
+                    });
                 }
                 // The manifest exists but is malformed — stop and report it, rather
                 // than walking past it (which would silently drop the project's deps).
@@ -71,6 +93,7 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
                     return Rc::new(PkgCtx {
                         root: cur.to_path_buf(),
                         deps: HashMap::new(),
+                        registry_only: HashMap::new(),
                         prefix: prefix.to_string(),
                         err: Some(format!("invalid manifest {}: {e}", toml.display())),
                     });
@@ -79,7 +102,13 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
         }
         d = if walk { cur.parent() } else { None };
     }
-    Rc::new(PkgCtx { root: dir.to_path_buf(), deps: HashMap::new(), prefix: prefix.to_string(), err: None })
+    Rc::new(PkgCtx {
+        root: dir.to_path_buf(),
+        deps: HashMap::new(),
+        registry_only: HashMap::new(),
+        prefix: prefix.to_string(),
+        err: None,
+    })
 }
 
 pub struct SourceFile {
@@ -224,6 +253,30 @@ pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
     Ok(out)
 }
 
+/// The direct dependencies declared with ONLY a `version` (no `path`) in the
+/// project owning `entry` — registry dependencies, which cannot resolve until
+/// a registry exists. Returns (name, version) pairs, sorted by name. Kept
+/// separate from `resolve_deps` (rather than folded into `ResolvedDep`, which
+/// always carries a `path`/`hash` these can never have) so `kupl pkg
+/// tree`/`kupl pkg lock` can report them explicitly instead of the project
+/// simply looking like it has fewer dependencies than its manifest actually
+/// declares (production-hardening PR-it625 — the same silent-drop this
+/// module's `use`-resolution path was ALSO fixed to report clearly).
+pub fn registry_only_deps(entry: &str) -> Result<Vec<(String, String)>, String> {
+    let entry_path = PathBuf::from(entry);
+    if let Err(e) = std::fs::read_to_string(&entry_path) {
+        return Err(format!("entry {}: {e}", entry_path.display()));
+    }
+    let dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let ctx = pkg_ctx(&dir, true, "");
+    if let Some(e) = &ctx.err {
+        return Err(e.clone());
+    }
+    let mut out: Vec<(String, String)> = ctx.registry_only.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+    out.sort();
+    Ok(out)
+}
+
 /// Serialize resolved deps to the `kupl.lock` line format:
 /// `name<TAB>path<TAB>version<TAB>hash` (one per line, name-sorted).
 pub fn lock_text(deps: &[ResolvedDep]) -> String {
@@ -348,6 +401,23 @@ pub fn load_with(
                     dep_ctx.root.join(entry)
                 };
                 queue.push((target, dep_ctx, Some(*span)));
+            } else if let Some(version) = ctx.registry_only.get(first) {
+                // A registry-only dependency (declared `{ version = ".." }` with no
+                // `path`) — no registry exists yet, so this can never resolve. Report
+                // that PLAINLY rather than falling through to the local-file lookup
+                // below, which would otherwise report "cannot read module file
+                // <name>.kupl" — indistinguishable from simply forgetting to write
+                // the file, even though the manifest correctly declared the
+                // dependency (production-hardening PR-it625).
+                diags.push(Diag::error(
+                    "K0401",
+                    format!(
+                        "dependency `{first}` (version {version}) has no `path` — registry \
+                         dependencies are not supported yet; declare a local `{{ path = \"...\" }}` \
+                         dependency instead"
+                    ),
+                    *span,
+                ));
             } else {
                 let rel: PathBuf = use_path.split('.').collect();
                 let mut fs_path = ctx.root.join(rel);
@@ -714,5 +784,88 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "math");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL usability bug found+fixed (production-hardening PR-it625):
+    /// `kupl.toml`'s own doc comment (top of this file) documents
+    /// `foo = { version = "1.2.0" }` (no `path`) as valid syntax for a
+    /// "registry (resolved later)" dependency -- but `pkg_ctx` silently
+    /// DROPPED any dependency with no `path`, so a `use` of that name fell
+    /// through to the SAME local-file lookup as an undeclared name, giving
+    /// "cannot read module file foo.kupl: No such file or directory" --
+    /// indistinguishable from simply forgetting to write the file, even
+    /// though the manifest correctly declared the dependency and a registry
+    /// simply doesn't exist yet. Fixed by tracking registry-only deps
+    /// separately (`PkgCtx::registry_only`) and reporting them with a clear,
+    /// specific K0401 naming the actual cause (no registry support yet)
+    /// instead of falling through to the generic file-not-found path.
+    #[test]
+    fn version_only_dependency_reports_a_clear_registry_error_not_a_confusing_file_not_found() {
+        let dir = std::env::temp_dir().join(format!("kupl-registry-dep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\njson2 = { version = \"1.2.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "use json2\nfun main() {}\n").unwrap();
+        let (diags, _) = match super::load(dir.join("main.kupl").to_str().unwrap()) {
+            Ok(_) => panic!("a use of an unresolvable registry dependency must be an error"),
+            Err(e) => e,
+        };
+        let err = diags
+            .iter()
+            .find(|d| d.severity == crate::diag::Severity::Error)
+            .unwrap_or_else(|| panic!("expected an error, got {diags:?}"));
+        assert_eq!(err.code, "K0401", "{diags:?}");
+        assert!(err.message.contains("json2"), "should name the dependency: {}", err.message);
+        assert!(
+            err.message.contains("registry") && err.message.contains("not supported"),
+            "should explain the ACTUAL cause (no registry support), not a generic file-not-found: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("No such file or directory"),
+            "must not fall through to the misleading local-file error: {}",
+            err.message
+        );
+
+        // a project that ALSO has a real path dependency alongside the
+        // registry-only one still resolves the path one correctly -- the fix
+        // doesn't regress the mixed case.
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n\
+             [dependencies]\njson2 = { version = \"1.2.0\" }\nmath = { path = \"./mathlib\" }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("mathlib")).unwrap();
+        std::fs::write(
+            dir.join("mathlib/kupl.toml"),
+            "[project]\nname = \"math\"\nentry = \"main.kupl\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("mathlib/main.kupl"),
+            "pub fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "use math\nfun main() {\n    let _ = math.add(1, 2)\n}\n").unwrap();
+        assert!(
+            super::load(dir.join("main.kupl").to_str().unwrap()).is_ok(),
+            "a real path dependency still resolves when a registry-only one is ALSO declared"
+        );
+
+        // `resolve_deps` (kupl pkg tree/lock) omits the registry-only dep
+        // from its resolved list (nothing to resolve), but `registry_only_deps`
+        // surfaces it explicitly rather than the project looking dep-free.
+        let deps = super::resolve_deps(dir.join("main.kupl").to_str().unwrap()).expect("resolves the path dep");
+        assert_eq!(deps.len(), 1, "{:?}", deps.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert_eq!(deps[0].name, "math");
+        let registry_only =
+            super::registry_only_deps(dir.join("main.kupl").to_str().unwrap()).expect("registry_only_deps works");
+        assert_eq!(registry_only, vec![("json2".to_string(), "1.2.0".to_string())]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

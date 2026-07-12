@@ -442,7 +442,12 @@ pub fn pkg_tree(path: &str) -> i32 {
             return 1;
         }
     };
-    if deps.is_empty() {
+    // Registry-only dependencies (`{ version = ".." }`, no `path`) can never
+    // resolve without a registry — reported explicitly rather than making
+    // the project look like it simply has fewer dependencies than its
+    // manifest declares (production-hardening PR-it625).
+    let registry_only = crate::loader::registry_only_deps(path).unwrap_or_default();
+    if deps.is_empty() && registry_only.is_empty() {
         println!("no dependencies");
         return 0;
     }
@@ -465,6 +470,9 @@ pub fn pkg_tree(path: &str) -> i32 {
         };
         println!("{} @ {}  ({}){}", d.name, ver, d.path, drift);
     }
+    for (name, version) in &registry_only {
+        println!("{name} @ {version}  (registry — not yet supported, unresolved)");
+    }
     0
 }
 
@@ -477,6 +485,8 @@ pub fn pkg_lock(path: &str) -> i32 {
             return 1;
         }
     };
+    // See pkg_tree above: reported, not silently dropped from the count.
+    let registry_only = crate::loader::registry_only_deps(path).unwrap_or_default();
     let lock_path = std::path::Path::new(path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -484,6 +494,15 @@ pub fn pkg_lock(path: &str) -> i32 {
     match std::fs::write(&lock_path, crate::loader::lock_text(&deps)) {
         Ok(()) => {
             println!("wrote {} ({} dependencies)", lock_path.display(), deps.len());
+            if !registry_only.is_empty() {
+                let names: Vec<&str> = registry_only.iter().map(|(n, _)| n.as_str()).collect();
+                println!(
+                    "note: {} registry dependenc{} not written to the lockfile (not yet supported): {}",
+                    registry_only.len(),
+                    if registry_only.len() == 1 { "y" } else { "ies" },
+                    names.join(", ")
+                );
+            }
             0
         }
         Err(e) => {
@@ -1180,5 +1199,43 @@ mod tests {
             let keys: Vec<(u32, &str)> = v.iter().map(|d| (d.span.start, d.code)).collect();
             assert_eq!(keys, vec![(0, "K0302"), (5, "K0100"), (5, "K0101"), (20, "K0302")]);
         }
+    }
+
+    /// A follow-up to the loader.rs fix (production-hardening PR-it625): a
+    /// project whose ONLY declared dependency is registry-only (`{ version =
+    /// ".." }`, no `path`) used to make `kupl pkg tree`/`kupl pkg lock` look
+    /// completely dependency-free ("no dependencies" / a 0-dependency
+    /// lockfile), even though the manifest DOES declare one -- silently
+    /// indistinguishable from a project with no `[dependencies]` section at
+    /// all. `pkg_tree`/`pkg_lock` don't panic on this (never did), but their
+    /// EXIT CODE and LOCKFILE CONTENT are the only things a test can assert
+    /// on without capturing stdout — confirms both still succeed cleanly
+    /// (exit 0) and the lockfile correctly has 0 RESOLVED entries (nothing
+    /// to lock for an unresolvable registry dep), while the loader.rs test
+    /// (`version_only_dependency_reports_a_clear_registry_error_not_a_confusing_file_not_found`)
+    /// covers the actual user-facing improvement: `registry_only_deps`
+    /// surfacing the name/version so the CLI's printed note (verified
+    /// manually, not capturable here) can report it instead of staying
+    /// silent.
+    #[test]
+    fn pkg_tree_and_lock_do_not_crash_on_a_registry_only_dependency() {
+        let dir = std::env::temp_dir().join(format!("kupl-pkgcli-registry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\njson2 = { version = \"1.2.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "fun main() {}\n").unwrap();
+        let entry = dir.join("main.kupl");
+        let entry_str = entry.to_str().unwrap();
+
+        assert_eq!(super::pkg_tree(entry_str), 0, "pkg tree must not error on an unresolvable registry dep");
+        assert_eq!(super::pkg_lock(entry_str), 0, "pkg lock must not error on an unresolvable registry dep");
+        let lock_text = std::fs::read_to_string(dir.join("kupl.lock")).expect("lockfile written");
+        let hashes = crate::loader::lock_hashes(&lock_text);
+        assert!(hashes.is_empty(), "nothing resolvable, so nothing should be locked: {lock_text:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
