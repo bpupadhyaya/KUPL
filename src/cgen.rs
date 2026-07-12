@@ -3163,7 +3163,13 @@ static void kre_class(KReP* p, KReAtom* a) {
             int e = kre_peek(p);
             if (e < 0) { kre_fail(p, "dangling `\\` in class"); return; }
             p->pos++;
+            /* `\D`/`\W`/`\S` (negated predefined classes) are refused here,
+               matching regex.rs exactly (production-hardening PR-it658) --
+               see the long comment on the Rust side for why. */
             switch (e) {
+                case 'D': kre_fail(p, "`\\D` is not supported inside a character class `[...]` (only `\\d`, `\\w`, `\\s`, and single-char escapes are)"); return;
+                case 'W': kre_fail(p, "`\\W` is not supported inside a character class `[...]` (only `\\d`, `\\w`, `\\s`, and single-char escapes are)"); return;
+                case 'S': kre_fail(p, "`\\S` is not supported inside a character class `[...]` (only `\\d`, `\\w`, `\\s`, and single-char escapes are)"); return;
                 case 'd': REPUSH('0', '9'); break;
                 case 'w': REPUSH('a', 'z'); REPUSH('A', 'Z'); REPUSH('0', '9'); REPUSH('_', '_'); break;
                 case 's': REPUSH(' ', ' '); REPUSH('\t', '\t'); REPUSH('\n', '\n'); REPUSH('\r', '\r'); break;
@@ -10366,6 +10372,61 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
             stderr.contains("unexpected `)` in pattern"),
             "native must name the offending character exactly like the interpreter does: {stderr:?}"
         );
+    }
+
+    /// A REAL BUG found+fixed (production-hardening PR-it658), verified for
+    /// cross-engine byte-identity here: `\D`/`\W`/`\S` inside a character
+    /// class (`[\D]`) used to silently compile and match only the LITERAL
+    /// letter `D` (both `regex.rs` and its native mirror `kre_class` shared
+    /// the SAME "falls through to the literal-char default arm" gap). Both
+    /// engines now refuse it with an identical, character-naming error
+    /// instead. Confirms native's C mirror produces the exact same wording
+    /// as the interpreter for `S`/`W`/`D` specifically (not just the `D` case
+    /// covered by it595's earlier, unrelated panic-wording test above).
+    #[test]
+    fn native_regex_negated_class_inside_brackets_matches_interp_wording() {
+        if !cc_available() {
+            return;
+        }
+        for (letter, pattern) in [('D', "[\\\\D]"), ('W', "[\\\\W]"), ('S', "[\\\\S]")] {
+            let src = format!(
+                "fun main() uses io {{\n    print(re_match(\"{pattern}\", \"x\"))\n}}\n"
+            );
+            let compiled = crate::run::compile(&src).expect("program compiles");
+            let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+            let mut interp = crate::interp::Interp::new(db);
+            let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+            let expected = format!("`\\{letter}` is not supported inside a character class");
+            match interp.call_value(f, vec![], crate::diag::Span::default()) {
+                Err(crate::interp::Flow::Panic { msg, .. }) => {
+                    assert!(msg.contains(&expected), "letter {letter}: {msg}");
+                }
+                Ok(_) => panic!("letter {letter}: expected a panic, got success"),
+                Err(_) => panic!("letter {letter}: expected a panic with Flow::Panic specifically"),
+            }
+
+            let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let c = super::emit_c(&module).expect("emit_c succeeds");
+            let base = std::env::temp_dir()
+                .join(format!("kupl-cgen-reclass-{letter}-{}", std::process::id()));
+            let cpath = base.with_extension("c");
+            let bin = base.with_extension("out");
+            std::fs::write(&cpath, &c).unwrap();
+            assert!(std::process::Command::new(cc())
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success());
+            let out = std::process::Command::new(&bin).output().unwrap();
+            let _ = std::fs::remove_file(&cpath);
+            let _ = std::fs::remove_file(&bin);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(&expected),
+                "letter {letter}: native must match interp's wording exactly: {stderr:?}"
+            );
+        }
     }
 
     /// A REAL cross-engine bug (PR-it596, found via the SAME panic-wording sweep

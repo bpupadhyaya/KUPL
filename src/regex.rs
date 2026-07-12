@@ -246,8 +246,27 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     let c = self.peek().ok_or("dangling `\\` in class")?;
                     self.pos += 1;
-                    // predefined classes expand into ranges inside `[...]`
+                    // predefined classes expand into ranges inside `[...]`. The
+                    // NEGATED predefined classes (`\D` `\W` `\S`) are refused
+                    // here rather than silently falling through to the `other`
+                    // arm below (which would treat them as the literal letters
+                    // `D`/`W`/`S` -- a real, easy-to-hit footgun: `[\D]` looks
+                    // exactly like "any non-digit" to anyone used to
+                    // PCRE/JS-style regex, but would have silently matched only
+                    // the literal character `D`). A negated class can't be
+                    // expressed as a small set of INCLUSIVE ranges the way
+                    // `\d`/`\w`/`\s` can without either a per-element negation
+                    // flag (this engine's `Atom::Class` has a single flag for
+                    // the whole class) or hand-enumerating the complement's
+                    // ranges -- a clean compile error is far safer than
+                    // shipping a second, subtly-wrong implementation of that
+                    // math (production-hardening PR-it658).
                     match c {
+                        'D' | 'W' | 'S' => {
+                            return Err(format!(
+                                "`\\{c}` is not supported inside a character class `[...]` (only `\\d`, `\\w`, `\\s`, and single-char escapes are)"
+                            ));
+                        }
                         'd' => ranges.push(('0', '9')),
                         'w' => {
                             ranges.extend([('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')]);
@@ -576,5 +595,33 @@ mod tests {
         assert!(compile("(abc").is_err());
         assert!(compile("[a-z").is_err());
         assert!(compile("*abc").is_err());
+    }
+
+    /// A REAL BUG found+fixed (production-hardening PR-it658): `\D`/`\W`/`\S`
+    /// (the negated predefined classes) work fine OUTSIDE a character class
+    /// (`escape()` handles them), but char_class()'s own inline escape match
+    /// had NO arm for the uppercase letters -- they silently fell through to
+    /// the `other => ranges.push((other, other))` catch-all, so `[\D]`
+    /// matched only the LITERAL character `D`, not "any non-digit" as anyone
+    /// used to PCRE/JS-style regex would expect from syntax that looks
+    /// identical to the well-supported `[\d]`. Rather than attempt to make
+    /// `\D`/`\W`/`\S` actually WORK inside `[...]` (their complement can't be
+    /// expressed as a small set of inclusive ranges without either a
+    /// per-element negation flag this engine's `Atom::Class` doesn't have, or
+    /// hand-enumerating the complement's ranges -- real feature work with
+    /// real risk of a NEW, subtler bug), a clean compile error is far safer
+    /// than silently matching the wrong thing.
+    #[test]
+    fn negated_predefined_class_inside_a_character_class_is_a_clean_error_not_a_silent_wrong_match() {
+        // BEFORE the fix, this compiled successfully and matched only "D".
+        assert!(compile("[\\D]").is_err());
+        assert!(compile("[\\W]").is_err());
+        assert!(compile("[\\S]").is_err());
+        // the lowercase (non-negated) forms are unaffected.
+        assert!(m("^[\\d]+$", "123"));
+        assert!(m("^[\\w]+$", "a_1"));
+        assert!(m("^[\\s]+$", " \t"));
+        // combined with other members in the same class still errors.
+        assert!(compile("[a\\Dz]").is_err());
     }
 }
