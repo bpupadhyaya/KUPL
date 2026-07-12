@@ -893,19 +893,61 @@ static KBig* k_big_from_i64(int64_t v) {
    large caller-supplied string, with no proportional computation of its own
    to "pay for" the size, PR-it638). */
 #define K_MAX_BIGINT_LIMBS 20000
+static long kre_utf8_cp(const unsigned char* s, int len, int pos, int* outlen); /* defined later in the runtime */
+/* Start offset of the UTF-8 character immediately before byte offset `end`
+   (end > 0): scans backward past continuation bytes (10xxxxxx). */
+static long k_utf8_prev_start(const unsigned char* s, long end) {
+    long i = end - 1;
+    while (i > 0 && (s[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+/* Whether codepoint `cp` is Unicode whitespace -- matches Rust's
+   `char::is_whitespace()` (the Unicode White_Space property) exactly, used
+   by `k_big_from_str` below since `bigint.rs::from_str` trims with `s.trim()`.
+   A REAL cross-engine bug (production-hardening PR-it662): the OLD trim here
+   only stripped ASCII space/tab/CR/LF, so a string padded with a non-ASCII
+   whitespace character Rust's `.trim()` ALSO recognizes (NBSP U+00A0, the
+   U+2000..200A family, U+2028/2029 line/paragraph separators, U+3000
+   ideographic space, etc.) parsed successfully on interp/vm (which share
+   bigint.rs) but panicked on native alone -- confirmed live via
+   `big(" \u{2028}123\u{2028} ")` (a genuine divergence, not just a shared
+   wrong answer, matching it660's parse_iso finding). */
+static int k_is_unicode_ws(uint32_t cp) {
+    switch (cp) {
+        case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x20:
+        case 0x85: case 0xA0: case 0x1680: case 0x2028: case 0x2029:
+        case 0x202F: case 0x205F: case 0x3000:
+            return 1;
+        default:
+            return cp >= 0x2000 && cp <= 0x200A;
+    }
+}
 static KBig* k_big_from_str(const char* s) {
-    /* mirror bigint.rs's from_str, which trims BOTH ends (s.trim()) before
-       checking the sign+digits -- this used to only strip leading whitespace,
-       so a trailing space (e.g. big("123 ")) panicked here while interp/vm
-       (sharing bigint.rs) accepted it. */
-    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    /* mirror bigint.rs's from_str, which trims BOTH ends (s.trim(), ALL
+       Unicode whitespace -- see k_is_unicode_ws above) before checking the
+       sign+digits. */
+    long slen = (long)strlen(s);
+    long start = 0;
+    while (start < slen) {
+        int clen;
+        long cp = kre_utf8_cp((const unsigned char*)s, (int)slen, (int)start, &clen);
+        if (!k_is_unicode_ws((uint32_t)cp)) break;
+        start += clen;
+    }
+    long send = slen;
+    while (send > start) {
+        long cstart = k_utf8_prev_start((const unsigned char*)s, send);
+        int clen;
+        long cp = kre_utf8_cp((const unsigned char*)s, (int)slen, (int)cstart, &clen);
+        if (!k_is_unicode_ws((uint32_t)cp)) break;
+        send = cstart;
+    }
     int neg = 0;
-    if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
-    if (!*s) return 0;
-    int len = (int)strlen(s);
-    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\n' || s[len-1] == '\r')) len--;
-    if (len == 0) return 0;
-    for (int i = 0; i < len; i++) if (s[i] < '0' || s[i] > '9') return 0;
+    if (start < send && s[start] == '-') { neg = 1; start++; }
+    else if (start < send && s[start] == '+') { start++; }
+    if (start >= send) return 0;
+    int len = (int)(send - start);
+    for (int i = 0; i < len; i++) if (s[start + i] < '0' || s[start + i] > '9') return 0;
     /* A REAL bug found+fixed (production-hardening PR-it638): mirrors
        bigint.rs::from_str's fix exactly. Checked on the digit COUNT alone,
        before allocating anything -- no need to build a limb array just to
@@ -917,7 +959,7 @@ static KBig* k_big_from_str(const char* s) {
     while (i > 0) {
         int st = i - 9; if (st < 0) st = 0;
         uint32_t v = 0;
-        for (int j = st; j < i; j++) v = v * 10 + (uint32_t)(s[j] - '0');
+        for (int j = st; j < i; j++) v = v * 10 + (uint32_t)(s[start + j] - '0');
         limbs[li++] = v;
         i = st;
     }
@@ -9811,6 +9853,31 @@ fun main() uses io {
         }
         let src = "fun main() uses io {\n    print(big(\"123 \"))\n    print(big(\"  -45\\t\"))\n}\n";
         assert_eq!(native_main_stdout(src, "bigtrim"), "123\n-45\n");
+    }
+
+    /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
+    /// PR-it662, found via the "scan shared/mirrored modules" technique that
+    /// found it660's parse_iso divergence): `bigint.rs::from_str` trims with
+    /// `s.trim()`, which strips EVERY Unicode-whitespace character (the
+    /// White_Space property: NBSP U+00A0, U+2000..200A, U+2028/2029
+    /// line/paragraph separators, U+3000 ideographic space, etc.), not just
+    /// ASCII space/tab/CR/LF -- `k_big_from_str`'s C mirror (fixed for
+    /// ASCII-only trimming in PR-it563) still only recognized ASCII
+    /// whitespace, so a BigInt string literal padded with a non-ASCII
+    /// whitespace character parsed successfully on interp/vm (which share
+    /// bigint.rs) but panicked on native alone -- confirmed live via
+    /// `big("\u{2028}123\u{2028}")` before fixing.
+    #[test]
+    fn native_bigint_from_str_trims_unicode_whitespace() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(big(\"\u{2028}123\u{2028}\"))\n    \
+                   print(big(\"\u{A0}-456\u{A0}\"))\n    \
+                   print(big(\"\u{3000}789\u{3000}\"))\n\
+                   }\n";
+        assert_eq!(native_main_stdout(src, "bigunicodetrim"), "123\n-456\n789\n");
     }
 
     /// The static-site-generator's markdown transformer (it63) — string-ops
