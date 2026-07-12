@@ -591,8 +591,13 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some(b'&') {
                     two(self, Tok::AndAnd)
                 } else {
+                    // A distinct code from K0008's NUL-in-string errors (PR-it670): both
+                    // used to share K0008, silently violating DIAGNOSTICS.md's own stated
+                    // invariant that "codes are never reused with a different meaning" --
+                    // which matters for `kupl check --json`/LSP consumers that key
+                    // remediation logic off the code, not just the message text.
                     self.diags.push(Diag::error(
-                        "K0008",
+                        "K0010",
                         "single `&` is not an operator (did you mean `&&`?)",
                         self.span_from(start),
                     ));
@@ -964,6 +969,21 @@ mod tests {
         assert!(diags.iter().any(|d| d.code == "K0008"), "escape: {diags:?}");
         let (_t2, diags2) = lex("\"a\0b\"");
         assert!(diags2.iter().any(|d| d.code == "K0008"), "raw byte: {diags2:?}");
+    }
+
+    /// A REAL code-collision bug (PR-it670): a single `&` (not `&&`) used to be
+    /// reported under the SAME code as `nul_in_string_is_rejected`'s K0008 --
+    /// two entirely unrelated diagnostics (a bad-token lexer error vs. a
+    /// string-content rule) sharing one code, directly violating
+    /// `docs/reference/DIAGNOSTICS.md`'s own stated invariant that codes are
+    /// "never reused with a different meaning". Now K0010, its own code.
+    #[test]
+    fn single_ampersand_is_rejected_with_its_own_code_not_the_nul_in_string_one() {
+        let (_t, diags) = lex("a & b");
+        let d = diags.iter().find(|d| d.code == "K0010").expect("K0010");
+        assert!(d.message.contains("did you mean `&&`?"), "{}", d.message);
+        // must NOT collide with the unrelated NUL-in-string diagnostic's code.
+        assert!(!diags.iter().any(|d| d.code == "K0008"), "must not reuse K0008: {diags:?}");
     }
 
     #[test]

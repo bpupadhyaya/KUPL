@@ -18,8 +18,8 @@ Severity: **E** = error, **W** = warning.
 | K0006 | E | unknown escape sequence |
 | K0007 | E | unterminated `{` interpolation in string |
 | K0008 | E | NUL (`\0` or a raw NUL byte) in a string literal — `Str` is NUL-free UTF-8 text |
-| K0008 | E | single `&` is not an operator (did you mean `&&`?) |
 | K0009 | E | integer literal out of range for its width suffix (`256u8`) |
+| K0010 | E | single `&` is not an operator (did you mean `&&`?) |
 
 ## K01xx — Parser
 
