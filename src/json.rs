@@ -392,6 +392,60 @@ mod tests {
         assert_eq!(roundtrip("\"\\u0041\""), "\"A\"");
     }
 
+    /// Decode a JSON string literal into its raw Rust `String` content (not
+    /// re-stringified JSON text), or the parse error.
+    fn decoded_str(s: &str) -> Result<String, String> {
+        match parse(s)? {
+            Value::Ctor { variant, fields, .. } if variant.as_str() == "JStr" => match &fields[0] {
+                Value::Str(s) => Ok(s.to_string()),
+                _ => panic!("JStr with a non-Str field"),
+            },
+            other => panic!("expected a JStr, got {other:?}"),
+        }
+    }
+
+    /// A coverage-closing verification (production-hardening PR-it661; no bug
+    /// found in `json.rs` itself -- this locks in the reference behavior the
+    /// surrogate-pairing logic ABOVE had ZERO direct test coverage of before
+    /// this, only an indirect native-side spot-check in `cgen.rs`'s
+    /// `native_json_surrogate_pair_parsing`). Found while auditing `json.rs`
+    /// vs its native mirror `kjp_string` for a divergence in the SAME
+    /// technique that found it660's `parse_iso` bug: `kjp_string`'s
+    /// "not a low surrogate" fallback (an unpaired high surrogate -> U+FFFD,
+    /// re-parsing the following `\u` independently) uses the SAME
+    /// save/restore mechanism for BOTH "successfully parsed 4 hex digits
+    /// that aren't DC00..DFFF" AND "failed to even parse 4 hex digits
+    /// (truncated/invalid)" -- unlike `json.rs`'s `hex4()?`, which propagates
+    /// a truncated/invalid `\u` as an immediate `Err`, never reaching the
+    /// range check at all. Traced by hand that this difference is NOT
+    /// user-visible: `kjp_string`'s restore-then-retry re-scans the EXACT
+    /// SAME subsequent bytes from the EXACT SAME position, so it
+    /// deterministically re-derives the identical truncated/invalid failure
+    /// `json.rs`'s single-pass `?` would have reported directly -- but this
+    /// was reasoned, not empirically locked down anywhere, so a future
+    /// "simplification" of either side could silently break the equivalence
+    /// without any test catching it.
+    #[test]
+    fn unpaired_high_surrogate_cases_are_fully_covered() {
+        // valid astral pair -> one 4-byte-UTF-8 character
+        assert_eq!(decoded_str("\"\\uD83C\\uDF89\"").unwrap(), "\u{1F389}");
+        // lone high surrogate at the very end of the string -> U+FFFD
+        assert_eq!(decoded_str("\"\\uD83C\"").unwrap(), "\u{FFFD}");
+        // high surrogate followed by a VALID \u escape that's simply not in
+        // the low-surrogate range -> U+FFFD, then the second \u re-parsed as
+        // its own independent character.
+        assert_eq!(decoded_str("\"\\uD800\\u0041\"").unwrap(), "\u{FFFD}A");
+        // high surrogate followed by a \u with an INVALID hex digit -> a
+        // clean Err (not a silently-swallowed U+FFFD).
+        let err = decoded_str("\"\\uD800\\uZZZZ\"").unwrap_err();
+        assert!(err.contains("invalid \\u escape"), "{err}");
+        // high surrogate followed by a \u that's TRUNCATED (the INPUT itself
+        // ends mid-escape, no closing quote at all) -> a clean Err naming
+        // the truncation specifically, distinct from "invalid" above.
+        let err2 = decoded_str("\"\\uD800\\u12").unwrap_err();
+        assert!(err2.contains("truncated \\u escape"), "{err2}");
+    }
+
     #[test]
     fn integral_floats_have_no_decimal() {
         assert_eq!(roundtrip("[1, 2.0, 2.5]"), "[1,2,2.5]");

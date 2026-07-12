@@ -6604,6 +6604,40 @@ fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("
         assert_eq!(native_main_stdout(src, "surr").trim(), "🎉:1|café:4|\u{FFFD}:1");
     }
 
+    /// A coverage-closing verification (production-hardening PR-it661; no
+    /// divergence found -- confirmed via careful hand-tracing AND this live
+    /// test both). `kjp_string`'s C mirror handles an unpaired high
+    /// surrogate's "is the following `\u` a valid low surrogate?" check
+    /// DIFFERENTLY internally than `json.rs`'s `hex4()?` -- C merges "the
+    /// following `\u`'s 4 hex digits failed to even parse (truncated or
+    /// invalid)" into the SAME save/restore-then-retry bucket as "parsed
+    /// fine but isn't in the low-surrogate range", where Rust's `?`
+    /// propagates a hex4() parse failure as an IMMEDIATE `Err`, never
+    /// reaching the range check. Traced by hand that C's restore-then-retry
+    /// re-scans the EXACT SAME subsequent bytes from the EXACT SAME
+    /// position, so it deterministically re-derives the identical
+    /// truncated/invalid failure Rust's single-pass check would report
+    /// directly -- this test locks that equivalence in empirically, matching
+    /// the new `unpaired_high_surrogate_cases_are_fully_covered` test added
+    /// to `json.rs` itself this same iteration (which had ZERO direct
+    /// surrogate-pairing coverage before now, only this file's indirect
+    /// native-side spot-check above).
+    #[test]
+    fn native_json_unpaired_surrogate_followed_by_broken_escape_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun d(j: Str) -> Str { match json_parse(j) { Ok(JStr(s)) => s
+        Ok(_) => "ERR:not-a-string"
+        Err(m) => "ERR:{m}" } }
+fun main() uses io {
+    print("{d("\"\\uD800\\u0041\"")}|{d("\"\\uD800\\uZZZZ\"")}")
+}
+"#;
+        let out = native_main_stdout(src, "surrbroken");
+        assert!(out.starts_with("\u{FFFD}A|ERR:invalid \\u escape"), "{out:?}");
+    }
+
     /// A REAL BUG found+fixed (PR-it575): a JSON ` ` escape decodes to a NUL byte,
     /// which KUPL strings must never contain (K0008, enforced everywhere else — the
     /// lexer, base64/hex decode, url_decode). `json.rs`'s `\u` handling never checked
