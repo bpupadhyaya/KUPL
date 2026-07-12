@@ -854,6 +854,47 @@ pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String
     Some(format!("```kupl\n{sig}\n```"))
 }
 
+/// Whether `name` is bound as a parameter (or handler payload binder) of the
+/// function/method/handler whose body CONTAINS `offset` -- production-
+/// hardening PR-it704: `resolve_definition_cross_file`/`occurrences_cross_file`
+/// only ever check whether `name` is a TOP-LEVEL item in the current file
+/// (`item_definition` never looks at local bindings at all); when it isn't --
+/// e.g. the cursor is on a plain function PARAMETER reference like `mean` in
+/// `fun greet(mean: Str) { "hi {mean}" }` -- they used to fall through and
+/// search every `use`d file for an UNRELATED top-level item sharing that same
+/// bare name, silently jumping goto-definition to it or, far worse, including
+/// it in a rename's `WorkspaceEdit` and corrupting a completely unrelated
+/// declaration in another file. This check is deliberately narrow (top-level
+/// fun/method parameters and handler binders only, matching what
+/// `item_definition` itself already covers structurally) -- a `let`/`var`
+/// local, a `match` binding, or a lambda parameter sharing a used file's
+/// top-level name is a real but narrower residual gap, left for future work
+/// (the same kind of explicitly-scoped limitation `occurrences`'s own doc
+/// comment already accepts for same-file shadowing).
+fn locally_bound(program: &crate::ast::Program, offset: usize, name: &str) -> bool {
+    use crate::ast::Item;
+    let in_span = |span: crate::diag::Span| (span.start as usize) <= offset && offset <= (span.end as usize);
+    for item in &program.items {
+        match item {
+            Item::Fun(f) if in_span(f.span) => return f.params.iter().any(|p| p.name == name),
+            Item::Component(c) => {
+                for f in c.exposes.iter().chain(&c.funs) {
+                    if in_span(f.span) {
+                        return f.params.iter().any(|p| p.name == name);
+                    }
+                }
+                for h in &c.handlers {
+                    if in_span(h.span) {
+                        return h.param.as_deref() == Some(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Resolve every `use` target in `program` to a local sibling-file path
 /// relative to `dir` (the document's own directory). Shared by every
 /// cross-file LSP fallback (hover/definition/completion) -- the same simple,
@@ -934,12 +975,21 @@ pub fn occurrences(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> 
 /// module) or reach callers when renaming FROM the declaration site itself;
 /// either would require a project-wide reverse-dependency scan (enumerating
 /// every `.kupl` file in the workspace), which is a genuinely bigger
-/// feature and out of scope here. This is strictly additive over the prior
-/// (100% single-file) behavior -- it never turns a correct rename into an
-/// incorrect one, only finds MORE of the correct occurrences.
+/// feature and out of scope here.
+///
+/// CORRECTNESS (production-hardening PR-it704, correcting a claim this
+/// comment used to make): this is NOT unconditionally "strictly additive...
+/// never turns a correct rename into an incorrect one." A plain function
+/// PARAMETER reference (never a top-level item, so invisible to this file's
+/// own `occurrences`-based scoping) used to still trigger the cross-file
+/// search, silently including and renaming an UNRELATED same-named
+/// top-level item in a `use`d file. `offset` (the cursor's byte position in
+/// `text`) is used to skip the cross-file search when `name` is a local
+/// parameter/handler-binder in scope there -- see `locally_bound`.
 pub fn occurrences_cross_file(
     text: &str,
     name: &str,
+    offset: usize,
     dir: &std::path::Path,
     buffers: &HashMap<PathBuf, String>,
 ) -> Vec<(String, usize, usize, usize, usize)> {
@@ -948,6 +998,9 @@ pub fn occurrences_cross_file(
         .map(|(l0, c0, l1, c1)| (String::new(), l0, c0, l1, c1))
         .collect();
     let (program, _diags) = crate::parser::parse(text);
+    if locally_bound(&program, offset, name) {
+        return out;
+    }
     for fs_path in used_file_paths(&program, dir) {
         let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
         let uri = path_to_uri(&fs_path);
@@ -1034,6 +1087,9 @@ pub fn resolve_definition_cross_file(
     let off = offset_at(text, line, character);
     let (name, _, _) = ident_at(text, off)?;
     let (program, _diags) = crate::parser::parse(text);
+    if locally_bound(&program, off, &name) {
+        return None;
+    }
     for fs_path in used_file_paths(&program, dir) {
         let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
         let (other_program, _diags) = crate::parser::parse(&other_text);
@@ -1733,7 +1789,8 @@ pub fn serve() -> i32 {
                     // completion, plus a correctness angle -- see occurrences_cross_file's
                     // doc comment for why this matters for rename specifically.
                     let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
-                    let locs: Vec<String> = occurrences_cross_file(&text, &name, &dir, &buffers)
+                    let off = offset_at(&text, line, ch);
+                    let locs: Vec<String> = occurrences_cross_file(&text, &name, off, &dir, &buffers)
                         .into_iter()
                         .map(|(target_uri, l0, c0, l1, c1)| {
                             let u = if target_uri.is_empty() { uri.to_string() } else { target_uri };
@@ -1773,8 +1830,9 @@ pub fn serve() -> i32 {
                     // `use`d file) untouched and the program broken. Group edits by target
                     // file into a proper multi-file WorkspaceEdit.
                     let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+                    let off = offset_at(&text, line, ch);
                     let mut by_file: Vec<(String, Vec<String>)> = Vec::new();
-                    for (target_uri, l0, c0, l1, c1) in occurrences_cross_file(&text, &name, &dir, &buffers) {
+                    for (target_uri, l0, c0, l1, c1) in occurrences_cross_file(&text, &name, off, &dir, &buffers) {
                         let u = if target_uri.is_empty() { uri.to_string() } else { target_uri };
                         let edit = format!(
                             "{{\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}},\"newText\":\"{}\"}}",
@@ -2287,7 +2345,8 @@ mod tests {
         let local_only = occurrences(&text, "mean");
         assert_eq!(local_only.len(), 1, "plain occurrences must NOT see the cross-file declaration: {local_only:?}");
 
-        let locs = occurrences_cross_file(&text, "mean", dir, &empty_buffers);
+        let mean_off = text.find("mean(xs)").unwrap();
+        let locs = occurrences_cross_file(&text, "mean", mean_off, dir, &empty_buffers);
         assert_eq!(locs.len(), 2, "call site (this file) + declaration (lib/stats.kupl): {locs:?}");
         let local = locs.iter().filter(|(u, ..)| u.is_empty()).count();
         let cross = locs.iter().filter(|(u, ..)| !u.is_empty()).count();
@@ -2299,9 +2358,61 @@ mod tests {
 
         // A same-file-only symbol (no `use` involvement) is completely unaffected.
         let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() {\n    print(add(1, 2))\n}\n";
-        let same_file = occurrences_cross_file(src, "add", dir, &empty_buffers);
+        let add_off = src.find("add(1, 2)").unwrap();
+        let same_file = occurrences_cross_file(src, "add", add_off, dir, &empty_buffers);
         assert_eq!(same_file.len(), 2, "decl + call, both same-file: {same_file:?}");
         assert!(same_file.iter().all(|(u, ..)| u.is_empty()), "{same_file:?}");
+    }
+
+    /// A REAL bug (production-hardening PR-it704): `resolve_definition_cross_file`/
+    /// `occurrences_cross_file` only ever checked whether `name` is a TOP-LEVEL
+    /// item in the current file before falling back cross-file -- never whether
+    /// it's a plain local PARAMETER, since `item_definition`/`occurrences` never
+    /// model local scope at all. A parameter reference sharing text with an
+    /// unrelated top-level item in a `use`d file used to silently jump
+    /// goto-definition to that unrelated declaration and, far worse, a rename
+    /// would include and rename it too, corrupting a completely unrelated file
+    /// with no warning -- directly contradicting `occurrences_cross_file`'s own
+    /// (now-corrected) doc comment claim that cross-file expansion "never turns
+    /// a correct rename into an incorrect one." Found via a sixteenth
+    /// research-subagent dispatch, live-reproduced before this fix.
+    #[test]
+    fn locally_bound_parameter_suppresses_cross_file_goto_definition_and_rename() {
+        let dir = std::path::Path::new("/fake/lsp-it704");
+        let main_text = "use stats\nfun greet(mean: Str) -> Str {\n    \"hi {mean}\"\n}\nfun main() { greet(\"x\") }\n";
+        let stats_text = "fun mean(xs: List[Int]) -> Float {\n    xs.sum().to_float() / xs.len().to_float()\n}\n";
+        let mut buffers: HashMap<PathBuf, String> = HashMap::new();
+        buffers.insert(dir.join("stats.kupl"), stats_text.to_string());
+
+        // The cursor is on `mean` INSIDE the interpolation `"hi {mean}"` -- a
+        // reference to the PARAMETER, never a call to the imported `fun mean`.
+        let off = main_text.find("{mean}").unwrap() + 1;
+        let line = main_text[..off].matches('\n').count();
+        let line_start = main_text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let ch = off - line_start;
+
+        // goto-definition must NOT jump into stats.kupl.
+        assert!(
+            resolve_definition_cross_file(main_text, line, ch, dir, &buffers).is_none(),
+            "a local parameter reference must not resolve to an unrelated cross-file declaration"
+        );
+
+        // rename must ONLY touch the current file's occurrences of the parameter.
+        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers);
+        assert!(locs.iter().all(|(u, ..)| u.is_empty()), "must not reach into stats.kupl: {locs:?}");
+        assert_eq!(locs.len(), 2, "the parameter declaration + its one interpolation use: {locs:?}");
+
+        // Sanity: a GENUINE cross-file reference (a real call to the imported
+        // function, never a local of any kind) still resolves correctly -- this
+        // fix must not be a blanket "never cross a file boundary" regression.
+        let caller_text = "use stats\nfun report(xs: List[Int]) -> Float {\n    mean(xs)\n}\n";
+        let off2 = caller_text.find("mean(xs)").unwrap();
+        let call_line = caller_text[..off2].matches('\n').count();
+        let call_line_start = caller_text[..off2].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let call_ch = off2 - call_line_start;
+        let (target_uri, ..) = resolve_definition_cross_file(caller_text, call_line, call_ch, dir, &buffers)
+            .expect("a genuine cross-file call must still resolve");
+        assert!(target_uri.ends_with("stats.kupl"), "{target_uri}");
     }
 
     #[test]
