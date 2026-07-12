@@ -15,7 +15,18 @@ pub enum Tok {
     Str(Vec<StrPart>),
     Ident(String),
 
-    // Keywords (reserved)
+    // Keywords (reserved everywhere, matched by `keyword()` below). `out`,
+    // `state`, `start`, and `stop` are deliberately NOT here (and NOT in
+    // `keyword()`) -- they're CONTEXTUAL/soft keywords, recognized only in
+    // specific syntactic positions via `Tok::Ident(s) if s == "out"`-style
+    // matching directly in `parser.rs` (see `at_port_direction`/the `state`/
+    // `on start`/`on stop` handling there), so a variable or function named
+    // `state`/`start`/etc. stays legal everywhere else. This file used to
+    // ALSO declare `KwOut`/`KwState`/`KwStart`/`KwStop` variants for these --
+    // dead code, since `keyword()` never produced them and nothing else in
+    // the codebase ever constructed or matched on them (confirmed via a
+    // full-codebase grep before removing them, production-hardening
+    // PR-it656).
     KwComponent,
     KwApp,
     KwContract,
@@ -28,8 +39,6 @@ pub enum Tok {
     KwRequires,
     KwProp,
     KwIn,
-    KwOut,
-    KwState,
     KwOn,
     KwExpose,
     KwEmit,
@@ -57,8 +66,6 @@ pub enum Tok {
     KwNew,
     KwUse,
     KwModule,
-    KwStart,
-    KwStop,
 
     // Operators & punctuation
     Plus,
@@ -226,8 +233,6 @@ impl Tok {
             Tok::KwRequires => "requires",
             Tok::KwProp => "prop",
             Tok::KwIn => "in",
-            Tok::KwOut => "out",
-            Tok::KwState => "state",
             Tok::KwOn => "on",
             Tok::KwExpose => "expose",
             Tok::KwEmit => "emit",
@@ -255,8 +260,6 @@ impl Tok {
             Tok::KwNew => "new",
             Tok::KwUse => "use",
             Tok::KwModule => "module",
-            Tok::KwStart => "start",
-            Tok::KwStop => "stop",
             Tok::Plus => "+",
             Tok::Minus => "-",
             Tok::Star => "*",
@@ -295,5 +298,61 @@ impl Tok {
             Tok::RBrace => "}",
             _ => "?",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyword_recognizes_reserved_words() {
+        assert_eq!(keyword("fun"), Some(Tok::KwFun));
+        assert_eq!(keyword("component"), Some(Tok::KwComponent));
+        assert_eq!(keyword("match"), Some(Tok::KwMatch));
+        assert_eq!(keyword("uses"), Some(Tok::KwUses));
+        assert_eq!(keyword("notakeyword"), None);
+    }
+
+    /// A REAL dead-code finding fixed (production-hardening PR-it656): `Tok`
+    /// used to ALSO declare `KwOut`/`KwState`/`KwStart`/`KwStop` variants,
+    /// but `keyword()` never produced them and a full-codebase grep found
+    /// nothing else that ever constructed or matched on them -- genuinely
+    /// dead code, since `out`/`state`/`start`/`stop` are all CONTEXTUAL/soft
+    /// keywords, recognized only in specific syntactic positions via
+    /// `Tok::Ident(s) if s == "out"`-style matching directly in `parser.rs`
+    /// (so a variable or function named `state`/`start`/etc. stays legal
+    /// everywhere else in the language) -- removed the 4 dead variants.
+    /// This test locks in the DESIGN this depends on: `keyword()` must never
+    /// start treating these words as hard/reserved, or the contextual
+    /// pattern (and every plain identifier that happens to be named one of
+    /// these words) would silently break.
+    #[test]
+    fn keyword_does_not_reserve_the_contextual_soft_keywords() {
+        for w in ["out", "state", "start", "stop"] {
+            assert_eq!(keyword(w), None, "`{w}` must stay usable as a plain identifier");
+        }
+    }
+
+    #[test]
+    fn describe_renders_literals_and_symbols_distinctly() {
+        assert_eq!(Tok::Int(5).describe(), "integer `5`");
+        assert_eq!(Tok::Ident("x".into()).describe(), "identifier `x`");
+        assert_eq!(Tok::Newline.describe(), "end of line");
+        assert_eq!(Tok::Eof.describe(), "end of file");
+        assert_eq!(Tok::Arrow.describe(), "`->`");
+        assert_eq!(Tok::KwFun.describe(), "`fun`");
+    }
+
+    #[test]
+    fn suppresses_newline_covers_binary_operators_and_open_delimiters() {
+        assert!(Tok::Plus.suppresses_newline());
+        assert!(Tok::Comma.suppresses_newline());
+        assert!(Tok::LParen.suppresses_newline());
+        assert!(Tok::Newline.suppresses_newline());
+        // a closing delimiter or a literal does NOT suppress -- a newline
+        // right after `)` or `5` really does end the statement.
+        assert!(!Tok::RParen.suppresses_newline());
+        assert!(!Tok::Int(5).suppresses_newline());
     }
 }
