@@ -93,6 +93,33 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                 });
             }
         }
+        // A REAL bug found+fixed (production-hardening PR-it689), the SAME
+        // missed-traversal-site shape as it569/it584/it629 in this same
+        // file: an `ai fun`'s `tools [f, g]` clause names top-level
+        // functions the MODEL may genuinely invoke mid-conversation (a real
+        // execution path -- `ai.rs`'s tool loop actually calls them) -- but
+        // was never walked here, only `decl.body` was (and an `ai fun`'s
+        // body can ONLY ever be `intent "..."` / `model "..."`, per K0119's
+        // grammar restriction, so `tools` is the ONLY way an `ai fun` can
+        // indirectly perform an effect beyond `ai` itself). Confirmed via a
+        // live repro BEFORE this fix: `pub ai fun summarize(text: Str) -> Str
+        // tools [do_write]` (where `do_write` calls `print`, `uses io`)
+        // compiled with NO `uses io` requirement on `summarize` at all --
+        // the general mechanism DOES correctly require it for an ordinary
+        // function that calls `do_write` directly, confirming this was
+        // specifically the `tools` traversal that was missing, not the
+        // enforcement mechanism itself. Tool names are always TOP-LEVEL
+        // functions (`check.rs::resolve_ai_tools`'s own scope), so this
+        // looks up `fun_key(None, tool)` directly rather than trying the
+        // component-local lookup `collect_expr` does for an ordinary call.
+        if let Some(ai) = &info.decl.ai {
+            for tool in &ai.tools {
+                let top_level = fun_key(None, tool);
+                if funs.contains_key(&top_level) {
+                    calls.push(top_level);
+                }
+            }
+        }
         walk_block(&info.decl.body, &mut |expr| {
             collect_expr(expr, info.component, &funs, &mut eff, &mut calls);
         });
@@ -642,5 +669,47 @@ mod tests {
         let pure = super::pure_funs(&p);
         assert!(!pure.contains("wrapper"), "wrapper must NOT be classified pure: {pure:?}");
         assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
+    }
+
+    #[test]
+    fn effect_propagates_through_an_ai_funs_tools_list() {
+        // A REAL bug found+fixed (production-hardening PR-it689), the SAME
+        // missed-traversal-site shape as it569/it584/it629 above: an
+        // `ai fun`'s `tools [f, g]` clause names top-level functions the
+        // MODEL may genuinely invoke mid-conversation -- a real execution
+        // path (`ai.rs`'s tool loop actually calls them) -- but was never
+        // walked, only `decl.body` was (and an `ai fun`'s body can ONLY
+        // ever be `intent "..."` / `model "..."`, so `tools` is the ONLY
+        // way an `ai fun` can indirectly perform an effect beyond `ai`
+        // itself). Confirmed via a live repro BEFORE this fix: `pub ai fun
+        // summarize(text: Str) -> Str tools [do_write]` (where `do_write`
+        // calls `print`, `uses io`) was accepted with NO `uses io`
+        // requirement on `summarize` at all.
+        let d = diags_for(
+            "fun do_write(msg: Str) uses io -> Str {\n    print(msg)\n    \"done\"\n}\n\
+             pub ai fun summarize(text: Str) -> Str tools [do_write] {\n    \
+             intent \"Summarize: {text}\"\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K0301"), "{d:?}");
+        // and the corresponding declaration is accepted with no spurious
+        // "declared but unused" K0302 once correctly attributed.
+        let ok = diags_for(
+            "fun do_write(msg: Str) uses io -> Str {\n    print(msg)\n    \"done\"\n}\n\
+             pub ai fun summarize(text: Str) uses io -> Str tools [do_write] {\n    \
+             intent \"Summarize: {text}\"\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        // an `ai fun` with a genuinely PURE tool (or no tools at all) stays
+        // unaffected -- this isn't a blanket "ai funs must declare uses"
+        // rule, only a correct ATTRIBUTION of what the tool itself does.
+        let pure_tool = diags_for(
+            "fun square(x: Int) -> Int {\n    x * x\n}\n\
+             pub ai fun mathy(text: Str) -> Str tools [square] {\n    intent \"Math: {text}\"\n}\n",
+        );
+        assert!(pure_tool.is_empty(), "{pure_tool:?}");
+        let no_tools = diags_for(
+            "pub ai fun classify(text: Str) -> Str {\n    intent \"Classify: {text}\"\n}\n",
+        );
+        assert!(no_tools.is_empty(), "{no_tools:?}");
     }
 }
