@@ -314,18 +314,61 @@ fn scaffold_project(name: &str) -> i32 {
     0
 }
 
+/// Find the `<file.kupl>` positional argument among `args[1..]`, skipping
+/// long-form flags (`--foo`, e.g. `--keep-c`) and the `-o <value>` flag
+/// (`build`/`bundle`/`native` accept it, and — unlike `--foo` flags — it's a
+/// TWO-token pair, so it must be skipped as a unit wherever it appears, not
+/// just when it trails the path). Two REAL, previously-silent bugs fixed
+/// together here (production-hardening PR-it697), since fixing either alone
+/// would make the other WORSE: (1) `-o` appearing BEFORE the path (a
+/// perfectly natural flag ordering, e.g. `kupl build -o out.kx foo.kupl`)
+/// was itself misidentified AS the path (`-o` doesn't start with `--`),
+/// producing a confusing "cannot read module file -o" error instead of
+/// compiling `foo.kupl` to `out.kx` — confirmed live before this fix. (2) a
+/// SECOND, genuinely unexpected positional argument (a typo, a leftover
+/// argument from a copy-pasted command, e.g. `kupl run foo.kupl bar.kupl`)
+/// was silently DROPPED with no diagnostic at all — confirmed live running
+/// `foo.kupl` and exiting 0, `bar.kupl` never even read. Returns the path,
+/// or a usage-error message (missing path / an unexpected extra argument).
+fn find_path_arg(args: &[String]) -> Result<&str, String> {
+    let mut path: Option<&str> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "-o" {
+            i += 2; // the flag AND its value, as a unit
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        match path {
+            None => path = Some(a),
+            Some(_) => return Err(format!("unexpected extra argument `{a}`")),
+        }
+        i += 1;
+    }
+    path.ok_or_else(|| "missing <file.kupl> argument".to_string())
+}
+
 fn with_path(args: &[String], f: impl Fn(&str) -> i32) -> i32 {
-    let Some(path) = args.iter().skip(1).find(|a| !a.starts_with("--")) else {
-        eprintln!("error: missing <file.kupl> argument");
-        return 2;
-    };
-    f(path)
+    match find_path_arg(args) {
+        Ok(path) => f(path),
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            2
+        }
+    }
 }
 
 fn with_file(args: &[String], f: impl Fn(&str, &str) -> i32) -> i32 {
-    let Some(path) = args.iter().skip(1).find(|a| !a.starts_with("--")) else {
-        eprintln!("error: missing <file.kupl> argument");
-        return 2;
+    let path = match find_path_arg(args) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return 2;
+        }
     };
     match std::fs::read_to_string(path) {
         Ok(src) => f(&src, path),
@@ -347,7 +390,7 @@ fn with_file(args: &[String], f: impl Fn(&str, &str) -> i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_module, valid_project_name, with_file, USAGE};
+    use super::{build_module, find_path_arg, valid_project_name, with_file, USAGE};
 
     /// A REAL discoverability gap (PR-it669): `kupl pkg tree|lock|fetch
     /// <file.kupl>` is a fully implemented, tested subcommand (dispatched in
@@ -388,6 +431,44 @@ mod tests {
         // the genuinely-missing-ARGUMENT case is a DIFFERENT situation and must stay exit 2.
         let no_arg = vec!["fmt".to_string()];
         assert_eq!(with_file(&no_arg, |_src, _file| 0), 2);
+    }
+
+    /// TWO REAL, previously-silent bugs in `with_path`/`with_file`'s shared path-
+    /// finding logic, fixed together (production-hardening PR-it697), across the 9
+    /// subcommands routed through it (run/dis/native/manifest/build/bundle/test/
+    /// check/fmt): (1) `-o` (a TWO-token flag `build`/`bundle`/`native` accept)
+    /// appearing BEFORE the path -- a natural flag ordering -- was itself
+    /// misidentified AS the path, since it doesn't start with `--`. (2) a genuinely
+    /// unexpected SECOND positional argument (a typo, a leftover argument from a
+    /// copy-pasted command) was silently DROPPED with zero diagnostic, running the
+    /// FIRST file and silently ignoring the rest.
+    #[test]
+    fn find_path_arg_skips_the_o_flag_pair_and_rejects_a_genuine_extra_argument() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // `-o` BEFORE the path is correctly skipped as a flag+value PAIR, not
+        // mistaken for the path itself.
+        assert_eq!(find_path_arg(&s(&["build", "-o", "out.kx", "foo.kupl"])), Ok("foo.kupl"));
+        // ...and still works in its more common position, AFTER the path.
+        assert_eq!(find_path_arg(&s(&["build", "foo.kupl", "-o", "out.kx"])), Ok("foo.kupl"));
+        // a `--`-prefixed boolean flag (no value) in either position is unaffected.
+        assert_eq!(find_path_arg(&s(&["native", "--keep-c", "foo.kupl"])), Ok("foo.kupl"));
+        assert_eq!(find_path_arg(&s(&["native", "--keep-c", "-o", "out", "foo.kupl"])), Ok("foo.kupl"));
+
+        // a genuinely unexpected SECOND positional argument is a clean error, not
+        // silently dropped -- whether it's a plausible typo or a second real path.
+        assert_eq!(
+            find_path_arg(&s(&["run", "foo.kupl", "extra_typo"])),
+            Err("unexpected extra argument `extra_typo`".to_string())
+        );
+        assert_eq!(
+            find_path_arg(&s(&["run", "foo.kupl", "bar.kupl"])),
+            Err("unexpected extra argument `bar.kupl`".to_string())
+        );
+        // an ordinary single path is, of course, entirely unaffected.
+        assert_eq!(find_path_arg(&s(&["run", "foo.kupl"])), Ok("foo.kupl"));
+        // no path at all is the pre-existing missing-argument error, unchanged.
+        assert_eq!(find_path_arg(&s(&["run"])), Err("missing <file.kupl> argument".to_string()));
     }
 
     #[test]
