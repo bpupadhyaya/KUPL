@@ -2617,10 +2617,28 @@ static KValue k_http_serve(KValue port, KValue handler) {
            incomplete) rather than hanging forever. */
         struct timeval rcvtimeo = { 30, 0 };
         setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &rcvtimeo, sizeof rcvtimeo);
+        /* A second, narrower availability gap found+fixed in the SAME
+           iteration (production-hardening PR-it624), per it623's own lesson
+           ("the same vulnerability class can have MULTIPLE independent
+           trigger mechanisms -- always ask if there's a third"): SO_RCVTIMEO
+           resets on EVERY successful read, so it only bounds how long the
+           server waits for the NEXT byte, not the connection's TOTAL
+           duration. A "trickle" client sending one byte every ~29 seconds
+           (just under the 30s per-read window) never trips SO_RCVTIMEO at
+           all, since each individual read succeeds -- and could hold the
+           connection (and thus the whole single-threaded server) open for as
+           long as it likes, up to the ~19 days it would take to accumulate
+           the 64KB cap one byte at a time. Fixed with a total elapsed-time
+           deadline (the SAME 30s value, checked once per loop iteration)
+           independent of SO_RCVTIMEO -- closing the trickle variant while
+           leaving the "sends nothing at all" case (the one PR-it623 fixed)
+           covered exactly as before. Mirrors interp::serve_http's identical,
+           separately-fixed gap (its own `deadline` check). */
+        time_t deadline = time(0) + 30;
         /* read the request head until the blank line (or a 64KB cap) */
         KBuf head = { 0, 0, 0 };
         char buf[1024]; ssize_t n;
-        while ((n = read(conn, buf, sizeof buf)) > 0) {
+        while (time(0) < deadline && (n = read(conn, buf, sizeof buf)) > 0) {
             kb_write(&head, buf, n);
             if (head.len >= 4 && k_memfind(head.buf, (long)head.len, "\r\n\r\n", 4)) break;
             if (head.len > 64 * 1024) break;
@@ -9283,6 +9301,115 @@ fun main() uses io {
                 return Err(format!("bad recovered response: {resp}"));
             }
             drop(stalled);
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
+    /// A second, narrower availability gap found+fixed in the SAME iteration
+    /// (production-hardening PR-it624), applying it623's own lesson ("the
+    /// same vulnerability class can have MULTIPLE independent trigger
+    /// mechanisms — always ask if there's a third"): `SO_RCVTIMEO` (the
+    /// PR-it623 fix, verified above) resets on every successful read, so it
+    /// only bounds the wait for the NEXT byte, not the connection's TOTAL
+    /// duration. A "trickle" client that keeps sending a byte every so
+    /// often — always comfortably within the 30s per-read window — never
+    /// trips `SO_RCVTIMEO` at all, and could hold the connection (and the
+    /// single-threaded native server) open indefinitely, exactly like
+    /// `interp::serve_http`'s identical, separately-fixed gap (its own
+    /// `serve_http_closes_a_trickle_connection_that_never_finishes` test).
+    /// Trickles one byte every 500ms (comfortably under the 30s per-read
+    /// window, so `SO_RCVTIMEO` alone would never fire) for 70 rounds (35s
+    /// total, past the real 30s TOTAL deadline), and confirms a fresh
+    /// connection still gets served afterward. Like PR-it623's stalled-
+    /// client test, native has no injection point for a shorter timeout (a
+    /// fixed C constant, deliberately not parameterized), so this test
+    /// genuinely waits out the real 30s production deadline.
+    #[test]
+    fn native_http_serve_closes_a_trickle_connection_that_never_finishes() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str) -> Str { \"{m} {p}\" }\n\
+                   fun main() uses io { let _ = http_serve(38125, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srvtrickle-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let connect = || {
+            for _ in 0..300 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38125u16)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        let result = (|| {
+            // connection 1: connected synchronously first (so it's
+            // guaranteed to be accept()ed before connection 2 below ever
+            // tries), then trickled from a background thread -- one byte
+            // every 500ms for 100 rounds (50s total -- deliberately LONGER
+            // than connection 2's own observation budget below, so the
+            // trickle thread is STILL actively running, and the socket
+            // still open, throughout that entire window. A trickle that
+            // finished WITHIN the observation window would drop its
+            // `TcpStream` when the thread ends, sending the server an EOF
+            // that resolves the read loop on its own -- an unintended
+            // shortcut that doesn't actually exercise the deadline fix at
+            // all. Confirmed this exact failure mode: an EARLIER version of
+            // this test used only 70 rounds (35s) with a 34s budget, and
+            // WRONGLY PASSED even with the deadline check disabled, because
+            // the trickle thread finished and dropped the stream just
+            // before the 34s budget ran out, resolving the connection via
+            // EOF rather than via either timeout mechanism). Never sends a
+            // terminator, never closes on its own within the window.
+            let mut trickle = connect().ok_or("server should be listening")?;
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let _ = trickle.write_all(b"x");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            });
+            // connection 2: retried for up to ~34s total (40ms sleep + up to
+            // 200ms read per attempt, 140 attempts) -- comfortably past the
+            // real 30s TOTAL deadline, but short of the trickle's 50s
+            // natural end (30 + 500ms-per-round margin) -- proves the server
+            // recovers via the deadline rather than staying wedged for the
+            // trickle's full duration.
+            let mut recovered = None;
+            for _ in 0..140 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", 38125u16)) {
+                    s.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+                    if s.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\n\r\n").is_err() {
+                        continue;
+                    }
+                    let mut resp = String::new();
+                    let _ = s.read_to_string(&mut resp);
+                    if resp.contains("HTTP/1.1 200 OK") {
+                        recovered = Some(resp);
+                        break;
+                    }
+                }
+            }
+            let resp = recovered.ok_or(
+                "server should recover after the trickle connection's total deadline expires",
+            )?;
+            if !resp.ends_with("GET /world") {
+                return Err(format!("bad recovered response: {resp}"));
+            }
             Ok::<(), String>(())
         })();
         let _ = child.kill();

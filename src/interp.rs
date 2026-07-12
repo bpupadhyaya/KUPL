@@ -3840,10 +3840,30 @@ fn serve_http_with_read_timeout(
         // incomplete line to `GET /`) and moves on to the next connection,
         // rather than hanging forever.
         let _ = stream.set_read_timeout(read_timeout);
+        // A second, narrower availability gap found+fixed in the SAME
+        // iteration (production-hardening PR-it624), per it623's own lesson
+        // ("the same vulnerability class can have MULTIPLE independent
+        // trigger mechanisms — always ask if there's a third"): the read
+        // timeout above resets on EVERY successful read, so it only bounds
+        // how long the server waits for the NEXT byte, not the connection's
+        // TOTAL duration. A "trickle" client sending one byte every ~29
+        // seconds (just under the 30s per-read window) never trips that
+        // timeout at all, since each individual read succeeds -- and could
+        // hold the connection (and thus the whole single-threaded server)
+        // open for as long as it likes, up to the ~19 days it would take to
+        // accumulate the 64KB cap one byte at a time. Fixed with a total
+        // elapsed-time deadline (the SAME `read_timeout` duration, checked
+        // once per loop iteration) independent of the per-read timeout --
+        // closing the trickle variant while leaving the "sends nothing at
+        // all" case (the one PR-it623 fixed) covered exactly as before.
+        let deadline = read_timeout.map(|d| std::time::Instant::now() + d);
         // read the request head (until the blank line ending the headers)
         let mut buf: Vec<u8> = Vec::new();
         let mut tmp = [0u8; 1024];
         loop {
+            if deadline.is_some_and(|dl| std::time::Instant::now() >= dl) {
+                break;
+            }
             match stream.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -4332,6 +4352,115 @@ fun main() uses io { let _ = http_serve(38131, handle) }
             .expect("server should recover and serve a fresh request after the stalled one times out");
         assert!(resp.ends_with("GET /world"), "resp: {resp}");
         drop(stalled);
+    }
+
+    /// A second, narrower availability gap found+fixed in the SAME iteration
+    /// (production-hardening PR-it624), applying it623's own lesson ("the
+    /// same vulnerability class can have MULTIPLE independent trigger
+    /// mechanisms — always ask if there's a third"): PR-it623's per-read
+    /// timeout resets on every successful read, so it bounds the wait for
+    /// the NEXT byte, not the connection's TOTAL duration. A "trickle" client
+    /// that sends a byte every so often -- always comfortably within a
+    /// single read's timeout window -- never trips that timeout at all, and
+    /// could hold the connection (and thus the single-threaded server) open
+    /// indefinitely. Trickles one byte every 60ms (well under the 300ms
+    /// per-read timeout injected here, so the per-read mechanism alone would
+    /// never fire) for long enough that the CUMULATIVE elapsed time exceeds
+    /// the 300ms total deadline, and confirms the server gives up and serves
+    /// a fresh connection promptly afterward — proving the fix is the total-
+    /// duration deadline, not a lucky per-read timeout.
+    #[test]
+    fn serve_http_closes_a_trickle_connection_that_never_finishes() {
+        let port: u16 = 38114;
+        std::thread::spawn(move || {
+            let mut h = |m: String, p: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
+            let _ = serve_http_with_read_timeout(
+                port as i64,
+                &mut h,
+                Some(std::time::Duration::from_millis(1000)),
+            );
+        });
+        fn connect(port: u16) -> Option<TcpStream> {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        // connection 1: connected SYNCHRONOUSLY first (so it's guaranteed to
+        // be accept()ed by the server before connection 2 below ever tries
+        // -- otherwise a scheduling race could let connection 2 reach the
+        // server FIRST and get served immediately, making the test pass
+        // without ever exercising the trickle scenario at all). Once
+        // connected, trickles one byte every 150ms for 200 rounds (30s
+        // total -- LONG past the 1s deadline, and deliberately longer than
+        // connection 2's own observation budget below, so the trickle
+        // thread is STILL actively holding the socket open throughout that
+        // entire window; a trickle that finished WITHIN the window would
+        // drop its `TcpStream` when the thread ends, sending the server an
+        // EOF that resolves the read loop on its own -- an unintended
+        // shortcut that doesn't actually exercise the deadline fix at all
+        // (confirmed: this exact failure mode hit the analogous native C
+        // test in the SAME iteration, fixed there the same way). Each
+        // individual gap (150ms) is comfortably inside the 1s per-read
+        // timeout, so that mechanism ALONE would never fire while the
+        // trickle is ongoing. This is what isolates the deadline check from
+        // the per-read timeout: a trickle that stops early would ALSO
+        // eventually be closed via the ordinary per-read timeout once the
+        // client goes idle, without ever exercising the deadline path at all
+        // (confirmed earlier, with a since-widened set of margins: an
+        // 8-byte trickle that stopped well before its own per-read timeout
+        // window elapsed still passed even with the deadline check
+        // disabled). Never sends a terminator, never closes on its own
+        // within the window; write errors after the server eventually
+        // closes its end are ignored, harmless.
+        let mut trickle = connect(port).expect("server should be listening");
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                let _ = trickle.write_all(b"x");
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        });
+        // connection 2: retried for up to ~24s total -- comfortably past the
+        // fixed case's recovery (typically well under 1.5s, but given
+        // generous headroom here since this test runs alongside SEVERAL
+        // other HTTP tests -- including two ~30s native ones -- spawning
+        // their own servers/threads/processes in parallel; observed CI
+        // scheduling jitter under that FULL combined load occasionally
+        // pushed recovery past earlier, tighter budgets that worked fine in
+        // isolation), but well short of the 30s trickle's natural end. Each
+        // ATTEMPT's own read is bounded to a SHORT 200ms (not a generous
+        // multi-second one) -- while the server is still busy with
+        // connection 1, a fresh probe connection here gets queued in the OS
+        // backlog but never actually served, so its read would otherwise
+        // block for whatever timeout IT was given; a short per-attempt
+        // bound is what keeps the outer loop's total budget properly
+        // bounded rather than able to balloon to Nx a multi-second
+        // per-attempt wait. If the deadline fix is missing, this loop
+        // exhausts and `recovered` stays `None` (confirmed via temporarily
+        // disabling the deadline check and re-running this exact test: it
+        // failed cleanly, not hanging, well within this budget).
+        let mut recovered = None;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+                if s.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\n\r\n").is_err() {
+                    continue;
+                }
+                let mut resp = String::new();
+                let _ = s.read_to_string(&mut resp);
+                if resp.contains("HTTP/1.1 200 OK") {
+                    recovered = Some(resp);
+                    break;
+                }
+            }
+        }
+        let resp = recovered
+            .expect("server should recover after the trickle connection's total deadline expires");
+        assert!(resp.ends_with("GET /world"), "resp: {resp}");
     }
 }
 
