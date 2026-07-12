@@ -254,3 +254,268 @@ impl Module {
         out
     }
 }
+
+/// Registers `op` could hand an existing value's pointer through to another
+/// live reference (aliasing it), as opposed to registers `op` merely
+/// overwrites or reads a scalar from. Used by [`method_recv_escapes`] to
+/// decide whether a self-rebind `Op::Method` (`xs = xs.push(item)`-shaped
+/// code, compiled with `dst == recv`) is safe for a backend to mutate in
+/// place instead of copying.
+///
+/// Deliberately narrow: only the op kinds that can actually smuggle a
+/// List/Map/Set/record pointer to somewhere else are listed. An `Op::Method`
+/// call that merely reads `recv` as its receiver (e.g. `.len()`) is NOT
+/// treated as an escape here — most builtin methods read rather than store
+/// their receiver. This should be re-examined per-method before any backend
+/// relies on this analysis for a method whose semantics could stash the
+/// receiver elsewhere.
+fn aliasing_regs(op: &Op) -> Vec<Reg> {
+    match op {
+        Op::Move(_dst, src) => vec![*src],
+        Op::Call { start, argc, .. }
+        | Op::CallComp { start, argc, .. }
+        | Op::CallBuiltin { start, argc, .. }
+        | Op::CallValue { start, argc, .. } => (*start..start.saturating_add(*argc)).collect(),
+        Op::MakeList { start, len, .. } | Op::MakeCtor { start, len, .. } => {
+            (*start..start.saturating_add(*len)).collect()
+        }
+        Op::MakeClosure { start, ncaps, .. } => (*start..start.saturating_add(*ncaps)).collect(),
+        Op::WithField { value, .. } => vec![*value],
+        Op::StateSet(_slot, src) => vec![*src],
+        Op::EmitOp { payload: Some(r), .. } => vec![*r],
+        _ => vec![],
+    }
+}
+
+/// The smallest `[lo, hi]` instruction-index range enclosing `idx` that some
+/// backward jump (`Jump`/`JumpIfFalse`/`JumpIfTrue` whose target is `<=` its
+/// own index) loops over, or `None` if `idx` isn't inside such a range.
+/// Nested/overlapping enclosing loops are merged into one conservative range.
+fn enclosing_loop_range(chunk: &Chunk, idx: usize) -> Option<(usize, usize)> {
+    let mut result: Option<(usize, usize)> = None;
+    for (i, op) in chunk.code.iter().enumerate() {
+        let target = match op {
+            Op::Jump(t) => Some(*t),
+            Op::JumpIfFalse(_, t) => Some(*t),
+            Op::JumpIfTrue(_, t) => Some(*t),
+            _ => None,
+        };
+        let Some(t) = target else { continue };
+        if t <= i && t <= idx && idx <= i {
+            result = Some(match result {
+                None => (t, i),
+                Some((lo, hi)) => (lo.min(t), hi.max(i)),
+            });
+        }
+    }
+    result
+}
+
+/// True if the value in register `recv` at the self-rebind `Op::Method` site
+/// `chunk.code[method_idx]` (`dst == recv`, i.e. `xs = xs.push(item)`-shaped
+/// code) could be aliased by another live reference, making an in-place
+/// mutation there unsafe.
+///
+/// Conservative by construction: this only returns `false` (safe) when it
+/// can prove no alias-creating op touches `recv` in the relevant window;
+/// anything this analysis doesn't recognize, or is ambiguous about, is
+/// decided in favor of `true` (unsafe) — worst case a missed fast path,
+/// never a wrongly-taken one.
+///
+/// Two windows, chosen to stay sound across both straight-line code and
+/// loops:
+/// - If `method_idx` is inside a loop (per [`enclosing_loop_range`]), the
+///   WHOLE loop body is scanned — including ops textually AFTER
+///   `method_idx` within that body. This matters because an alias created
+///   late in one iteration (e.g. `xs = xs.push(i); ys = xs`) is live BEFORE
+///   the `Method` op on the next iteration; a scan bounded only by
+///   `method_idx`'s textual position would miss it.
+/// - Otherwise, the whole prefix `[0, method_idx)` is scanned (not just
+///   "since `recv`'s last write"), since a branch can make the nearest
+///   textual write to `recv` reachable only on some paths, leaving an
+///   earlier alias on another path still live at `method_idx`.
+///
+/// Out of scope: this is a single-chunk (intraprocedural) analysis. A
+/// register holding a function PARAMETER can always be aliased by the
+/// caller before the call, which this analysis cannot see — callers of this
+/// function must treat parameter registers as always-escaped separately.
+pub fn method_recv_escapes(chunk: &Chunk, method_idx: usize) -> bool {
+    let recv = match chunk.code.get(method_idx) {
+        Some(Op::Method { recv, .. }) => *recv,
+        _ => return true,
+    };
+    let (start, end) = match enclosing_loop_range(chunk, method_idx) {
+        Some((lo, hi)) => (lo, hi + 1),
+        None => (0, method_idx),
+    };
+    chunk
+        .code
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+        .any(|(i, op)| i != method_idx && aliasing_regs(op).contains(&recv))
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    fn chunk(code: Vec<Op>) -> Chunk {
+        let spans = vec![Span::default(); code.len()];
+        Chunk {
+            name: "test".into(),
+            ncaps: 0,
+            nparams: 0,
+            nregs: 8,
+            consts: vec![],
+            code,
+            spans,
+        }
+    }
+
+    const PUSH: u16 = 0;
+
+    fn self_push(reg: Reg) -> Op {
+        Op::Method { dst: reg, recv: reg, name: PUSH, start: reg, argc: 1 }
+    }
+
+    #[test]
+    fn straight_line_self_push_with_no_prior_use_is_safe() {
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            self_push(0),
+        ]);
+        assert!(!method_recv_escapes(&c, 1));
+    }
+
+    #[test]
+    fn straight_line_move_before_push_escapes() {
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::Move(1, 0), // ys = xs
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn straight_line_escape_on_a_branch_not_reached_by_the_nearest_write_is_still_flagged() {
+        // xs = []; ys = xs; if cond { xs = other }; xs = xs.push(1)
+        // the nearest textual write to xs before the push is inside the
+        // conditional; the true escape (ys = xs) predates it and must still
+        // be caught by scanning the whole prefix, not just since that write.
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 }, // 0: xs = []
+            Op::Move(1, 0),                            // 1: ys = xs   <- escape
+            Op::JumpIfFalse(2, 4),                     // 2: if !cond -> 4
+            Op::Move(0, 3),                            // 3: xs = other
+            self_push(0),                              // 4: xs = xs.push(1)
+        ]);
+        assert!(method_recv_escapes(&c, 4));
+    }
+
+    #[test]
+    fn call_argument_before_push_escapes() {
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::Call { dst: 1, fun: 0, start: 0, argc: 1 }, // xs passed as an arg
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn closure_capture_before_push_escapes() {
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::MakeClosure { dst: 1, proto: 0, start: 0, ncaps: 1 },
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn embedding_in_a_new_list_before_push_escapes() {
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::MakeList { dst: 1, start: 0, len: 1 }, // [xs] embeds it
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn with_field_value_before_push_escapes() {
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::WithField { dst: 1, obj: 2, name: 0, value: 0 },
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn state_set_before_push_escapes() {
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::StateSet(0, 0),
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn emit_payload_before_push_escapes_but_a_portless_emit_does_not() {
+        let escapes = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::EmitOp { port: 0, payload: Some(0) },
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&escapes, 2));
+
+        let safe = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::EmitOp { port: 0, payload: None },
+            self_push(0),
+        ]);
+        assert!(!method_recv_escapes(&safe, 2));
+    }
+
+    #[test]
+    fn simple_loop_with_no_escape_is_safe() {
+        // xs = []; while i < n { xs = xs.push(i); i = i + 1 }
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 }, // 0
+            Op::Lt(2, 1, 3),                           // 1: loop head, i < n
+            Op::JumpIfFalse(2, 5),                     // 2
+            self_push(0),                              // 3: xs = xs.push(i)
+            Op::Add(1, 1, 4),                           // 4: i = i + 1 (falls through to jump)
+            Op::Jump(1),                                // 5: back-edge to the loop head
+        ]);
+        // method op is at index 3; the back-edge Jump(1) is at index 5.
+        assert!(!method_recv_escapes(&c, 3));
+    }
+
+    #[test]
+    fn loop_body_alias_after_the_push_still_escapes_the_next_iteration() {
+        // while i < n { xs = xs.push(i); ys = xs; i = i + 1 }
+        // the alias (ys = xs) happens AFTER the push textually, but is live
+        // BEFORE the push on the next iteration — must still be flagged.
+        let c = chunk(vec![
+            Op::Lt(2, 1, 3),        // 0: loop head
+            Op::JumpIfFalse(2, 6),  // 1
+            self_push(0),           // 2: xs = xs.push(i)
+            Op::Move(5, 0),         // 3: ys = xs   <- escape, textually AFTER the push
+            Op::Add(1, 1, 4),       // 4: i = i + 1
+            Op::Jump(0),            // 5: back-edge to loop head
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn non_method_op_at_the_index_is_conservatively_treated_as_escaping() {
+        let c = chunk(vec![Op::Move(0, 1)]);
+        assert!(method_recv_escapes(&c, 0));
+    }
+}
