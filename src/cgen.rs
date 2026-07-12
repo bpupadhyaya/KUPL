@@ -7192,6 +7192,30 @@ fun main() uses io {
         );
     }
 
+    /// The `m = m.insert(k, v)`/`s = s.insert(v)` self-rebind in-place fast paths
+    /// (`k_map_insert_inplace`/`k_set_insert_inplace`) are a SEPARATE code path from
+    /// the general `.insert` method dispatch, and were fixed to use `k_key_eq`
+    /// alongside it in PR-it691 -- unlike interp/KVM, where the equivalent fast
+    /// paths (`Env::insert_map_in_place`/`insert_set_in_place` in value.rs, and
+    /// vm.rs's own inline copy) were MISSED by it691 and only fixed in the
+    /// follow-up PR-it692. This test locks native's (already-correct) behavior
+    /// permanently, matching the interp/KVM regression test added alongside it692's
+    /// fix (`diff_map_set_self_insert_in_place_nan_key_identity`).
+    #[test]
+    fn native_map_set_self_insert_in_place_nan_key_identity() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let nan = 0.0 / 0.0\n    \
+                   var m = Map()\n    m = m.insert(nan, 1)\n    m = m.insert(nan, 2)\n    \
+                   var s = Set()\n    s = s.insert(nan)\n    s = s.insert(nan)\n    \
+                   print(\"{m.get(nan)}|{m.len()}|{s.len()}|{s.contains(nan)}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "naninplace").trim(),
+            "Some(2)|1|1|true"
+        );
+    }
+
     /// Native float comparison is IEEE-correct for NaN (`<=`/`>=` against NaN are false, not
     /// true) — a regression guard for PR-it148: k_cmp used to collapse NaN's unordered
     /// result into a 3-way 0 (looks equal), making `nan <= nan` wrongly true. Now floats

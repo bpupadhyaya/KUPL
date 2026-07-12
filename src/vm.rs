@@ -929,7 +929,10 @@ impl<'m> Vm<'m> {
                                     Rc::get_mut(rc).unwrap()
                                 }
                             };
-                            match pairs.iter_mut().find(|(pk, _)| *pk == key) {
+                            // value_key_eq, not plain `==` (PR-it692, a direct follow-up
+                            // gap in PR-it691's NaN-key-identity fix): this fast path must
+                            // apply the same key identity as the general `.insert` method.
+                            match pairs.iter_mut().find(|(pk, _)| crate::value::value_key_eq(pk, &key)) {
                                 Some(pair) => pair.1 = val,
                                 None => pairs.push((key, val)),
                             }
@@ -952,7 +955,8 @@ impl<'m> Vm<'m> {
                                     Rc::get_mut(rc).unwrap()
                                 }
                             };
-                            if !items.iter().any(|x| *x == v) {
+                            // value_key_eq, not plain `==` -- see the Map fast path above (PR-it692).
+                            if !items.iter().any(|x| crate::value::value_key_eq(x, &v)) {
                                 items.push(v);
                             }
                         }
@@ -16108,6 +16112,40 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
         let loop_src = "fun probe() -> Str {\n    var s: Set[Int] = Set()\n    \
                         for i in 0..6 { s = s.insert(i % 3) }\n    \"{s.to_list()}\"\n}\n";
         assert_eq!(differential(loop_src), "[0, 1, 2]");
+    }
+
+    #[test]
+    fn diff_map_set_self_insert_in_place_nan_key_identity() {
+        // A direct follow-up gap in PR-it691's NaN-key-identity fix (`value_key_eq`):
+        // the `m = m.insert(k, v)`/`s = s.insert(v)` in-place fast paths
+        // (`Env::insert_map_in_place`/`insert_set_in_place` in value.rs, and vm.rs's
+        // OWN inline copy of the same fast path for the KVM) each independently
+        // re-implement `.insert` and had their own plain `==` comparison, missed
+        // when it691 fixed the general `.insert`/`.get`/etc. methods. So
+        // `m = m.insert(nan, 1); m = m.insert(nan, 2)` (which hits this fast path,
+        // unlike `m = m.insert(nan, 1).insert(nan, 2)` chained in one statement,
+        // which does not) still duplicated a NaN key instead of updating in place —
+        // confirmed live as an ACTUAL interp/KVM-vs-native divergence (native's
+        // `k_map_insert_inplace`/`k_set_insert_inplace` were already fixed in it691)
+        // before this fix. Byte-identical on interp/KVM now.
+        let m = r#"fun probe() -> Str {
+    let nan = 0.0 / 0.0
+    var m = Map()
+    m = m.insert(nan, 1)
+    m = m.insert(nan, 2)
+    "{m.get(nan)}|{m.len()}"
+}
+"#;
+        assert_eq!(differential(m), "Some(2)|1");
+        let s = r#"fun probe() -> Str {
+    let nan = 0.0 / 0.0
+    var s = Set()
+    s = s.insert(nan)
+    s = s.insert(nan)
+    "{s.len()}|{s.contains(nan)}"
+}
+"#;
+        assert_eq!(differential(s), "1|true");
     }
 
     #[test]

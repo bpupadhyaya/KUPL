@@ -678,7 +678,13 @@ impl Env {
         if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
             if let Value::Map(rc) = &mut slot.1 {
                 if let Some(pairs) = Rc::get_mut(rc) {
-                    match pairs.iter_mut().find(|(pk, _)| *pk == key) {
+                    // `value_key_eq`, not plain `==` (PR-it692, a direct follow-up gap
+                    // in PR-it691's NaN-key-identity fix): this fast path is a
+                    // behavior-preserving shortcut for the general `.insert` method
+                    // (which IS value_key_eq-based), so it must apply the SAME key
+                    // identity or `m = m.insert(nan, 1); m = m.insert(nan, 2)` would
+                    // silently diverge from `m = m.insert(nan,1).insert(nan,2)`.
+                    match pairs.iter_mut().find(|(pk, _)| value_key_eq(pk, &key)) {
                         Some(pair) => pair.1 = val,
                         None => pairs.push((key, val)),
                     }
@@ -704,7 +710,8 @@ impl Env {
         if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
             if let Value::Set(rc) = &mut slot.1 {
                 if let Some(items) = Rc::get_mut(rc) {
-                    if !items.iter().any(|x| *x == v) {
+                    // value_key_eq, not plain `==` -- see insert_map_in_place above (PR-it692).
+                    if !items.iter().any(|x| value_key_eq(x, &v)) {
                         items.push(v);
                     }
                     return None;
