@@ -364,6 +364,28 @@ impl Checker {
                     for v in &t.variants {
                         let mut fields = Vec::new();
                         for f in &v.fields {
+                            // A REAL silent-footgun bug (PR-it677, follow-up to it675's LSP
+                            // investigation): `Variant.fields` reuses `Param` (the SAME struct
+                            // function params use, since the parser's `parse_params` is shared),
+                            // so `x: Int = EXPR` parses fine on a constructor field -- but
+                            // `callargs.rs`'s own doc comment says default-value resolution
+                            // "applies only to direct calls of top-level `fun`s (not
+                            // constructors...)" by design. Before this fix, `type T = Ctor(x:
+                            // Int = 5)` compiled clean and `Ctor()` still required the argument
+                            // (K0243) -- the `= 5` silently did nothing, forever, with zero
+                            // diagnostic anywhere. Reject it explicitly instead of accepting
+                            // dead syntax that looks like it works.
+                            if f.default.is_some() {
+                                self.err(
+                                    "K0275",
+                                    format!(
+                                        "constructor field `{}` cannot have a default value -- \
+                                         defaults only apply to `fun` parameters, not `{}`'s fields",
+                                        f.name, v.name
+                                    ),
+                                    f.span,
+                                );
+                            }
                             let ty = self.resolve_ty(&f.ty);
                             fields.push((f.name.clone(), ty));
                         }
@@ -4135,6 +4157,41 @@ mod generic_tests {
         // A POSITIONAL too-few call keeps the bare count (no reliable field->slot naming).
         let pf = errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(1) }\n");
         assert!(pf.iter().any(|d| d.code == "K0243" && d.message.contains("2 fields, 1 argument given") && !d.message.contains("missing")), "positional keeps bare count: {pf:?}");
+    }
+
+    /// A REAL silent-footgun bug (PR-it677, follow-up to it675's LSP investigation):
+    /// `Variant.fields` reuses `Param` (the SAME struct function params use, since
+    /// the parser's `parse_params` is shared), so `x: Int = EXPR` parses fine on a
+    /// constructor field -- but `callargs.rs`'s own doc comment says default-value
+    /// resolution "applies only to direct calls of top-level `fun`s (not
+    /// constructors...)" by design. Before this fix, `type T = Ctor(x: Int = 5)`
+    /// compiled clean and `Ctor()` still required the argument (K0243) -- the
+    /// `= 5` silently did nothing, forever, with zero diagnostic anywhere.
+    #[test]
+    fn constructor_field_default_value_is_rejected_at_check_time() {
+        let e = errors("type Greeting = Hello(name: Str = \"World\")\nfun main() { let _ = Hello(\"x\") }\n");
+        assert!(
+            e.iter().any(|d| d.code == "K0275" && d.message.contains("constructor field `name`") && d.message.contains("Hello")),
+            "{e:?}"
+        );
+        // Record-shaped type syntax (`type P = { x: Int, y: Int }`) is parsed by a
+        // SEPARATE, dedicated field parser that hardcodes `default: None` and never
+        // even attempts to parse `=` -- a genuinely different code path from the
+        // parenthesized-variant one above, so `= EXPR` there is already a hard parse
+        // error (K0100), not a silently-accepted-then-ignored default. No bug there.
+        let er = errors("type P = { x: Int = 1 }\n");
+        assert!(er.iter().any(|d| d.code == "K0100"), "{er:?}");
+        // Ordinary function parameter defaults are, of course, still completely fine --
+        // via the REAL pipeline (`crate::run::compile`, which runs
+        // `callargs::resolve_call_args` before the checker, same as k0241's test just
+        // above): the bare `errors()` harness skips that pass entirely and would
+        // misleadingly report a missing-argument error even for this valid call.
+        assert!(
+            crate::run::compile("fun greet(name: Str = \"World\") -> Str { name }\nfun main() { print(greet()) }\n").is_ok(),
+            "a direct call relying on a function parameter default must compile cleanly"
+        );
+        // A fieldless variant and a variant with no defaults at all are unaffected.
+        assert!(errors("type Greeting = Hello(name: Str) | Nothing\nfun main() { let _ = Hello(\"x\")\n    let _ = Nothing }\n").is_empty());
     }
 
     #[test]

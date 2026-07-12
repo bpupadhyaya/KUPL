@@ -115,6 +115,7 @@ Severity: **E** = error, **W** = warning.
 | K0269 | E | argument given more than once |
 | K0273 | E | no parameter of that name |
 | K0274 | E | missing argument for a required parameter |
+| K0275 | E | constructor field cannot have a default value |
 | K0260 | E | contract defined more than once |
 | K0261 | E | `fulfills` names an unknown contract |
 | K0262 | E | fulfilling component does not expose a required function |
