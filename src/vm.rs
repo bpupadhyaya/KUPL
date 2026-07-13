@@ -14699,6 +14699,24 @@ fun probe() -> Str {
         assert_eq!(differential(src), "3.0|-3.0|3.0#-3.0|-inf|3.0");
     }
 
+    /// interp/KVM lock (production-hardening PR-it710, native fixed
+    /// alongside this test): `Float.min`/`.max` fold with Rust's SYMMETRIC
+    /// `f64::min`/`f64::max`, ignoring a NaN operand regardless of which
+    /// argument position it's in -- native's independent C reimplementation
+    /// used an asymmetric raw `<`/`>` ternary that only ignored NaN in the
+    /// RECEIVER position, silently returning NaN when the ARGUMENT was NaN
+    /// (see `native_float_min_max_ignore_nan_regardless_of_argument_position`
+    /// in cgen.rs's own test module for the native-side fix + full repro).
+    #[test]
+    fn diff_float_min_max_ignore_nan_regardless_of_argument_position() {
+        let src = r#"fun probe() -> Str {
+    let nan = 0.0 / 0.0
+    "{(5.0).min(nan)}|{(5.0).max(nan)}|{nan.min(5.0)}|{nan.max(5.0)}"
+}
+"#;
+        assert_eq!(differential(src), "5.0|5.0|5.0|5.0");
+    }
+
     #[test]
     fn diff_float_trunc_fract() {
         // The NEW trunc/fract complete the floor/ceil/round rounding family, byte-identical on

@@ -5472,8 +5472,23 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "trunc")) return k_float(trunc(recv.as.f));
         /* fract = x - trunc(x), matching Rust f64::fract (fract of +/-inf is NaN). */
         if (!strcmp(name, "fract")) return k_float(recv.as.f - trunc(recv.as.f));
-        if (!strcmp(name, "min")) return k_float(recv.as.f < args[0].as.f ? recv.as.f : args[0].as.f);
-        if (!strcmp(name, "max")) return k_float(recv.as.f > args[0].as.f ? recv.as.f : args[0].as.f);
+        // A REAL cross-engine divergence bug (production-hardening PR-it710,
+        // the SAME root cause as Tensor.max()/.min()'s leading-NaN bug fixed
+        // one iteration earlier): a raw C `<`/`>` ternary is asymmetric under
+        // NaN -- `recv < NaN` and `recv > NaN` are BOTH false, so the ternary
+        // always picks the SECOND operand (`args[0]`) whenever `recv` itself
+        // isn't NaN, silently returning NaN instead of the real value when
+        // the ARGUMENT (not the receiver) is NaN. The interpreter/KVM fold
+        // with Rust's `f64::min`/`f64::max`, which return the OTHER operand
+        // whenever EITHER side is NaN (symmetric) -- confirmed live before
+        // this fix: `5.0.min(0.0/0.0)` returned `5.0` on `kupl run`/`kupl
+        // run --vm` but `NaN` on `kupl native` (the reverse order,
+        // `(0.0/0.0).min(5.0)`, already agreed by coincidence of the
+        // ternary's structure, matching Tensor's fix precedent that only ONE
+        // NaN position was actually broken). `fmax`/`fmin` (<math.h>, PR-it709)
+        // have exactly this symmetric NaN-avoiding IEEE 754-2008 semantics.
+        if (!strcmp(name, "min")) return k_float(fmin(recv.as.f, args[0].as.f));
+        if (!strcmp(name, "max")) return k_float(fmax(recv.as.f, args[0].as.f));
         if (!strcmp(name, "pow")) return k_float(pow(recv.as.f, args[0].as.f));
         if (!strcmp(name, "log")) return k_float(log(recv.as.f));
         if (!strcmp(name, "log10")) return k_float(log10(recv.as.f));
@@ -7886,6 +7901,31 @@ fun main() uses io {
 }
 "#;
         assert_eq!(native_main_stdout(src, "fcopysign").trim(), "-3.0|3.0|-3.0|-inf");
+    }
+
+    /// A REAL cross-engine divergence bug (production-hardening PR-it710, the
+    /// SAME root cause as Tensor.max()/.min()'s leading-NaN bug fixed one
+    /// iteration earlier, it709): native's `Float.min(other)`/`.max(other)`
+    /// used a raw C `<`/`>` ternary, ASYMMETRIC under NaN -- `recv < NaN` and
+    /// `recv > NaN` are both false, so the ternary always picked the SECOND
+    /// operand whenever `recv` itself wasn't NaN, silently returning NaN
+    /// instead of the real value when the ARGUMENT (not the receiver) was
+    /// NaN. `5.0.min(NaN)`/`5.0.max(NaN)` returned `NaN` on `kupl native` but
+    /// `5.0` on `kupl run`/`kupl run --vm` (which fold with Rust's symmetric
+    /// `f64::min`/`f64::max`); the reverse order, `NaN.min(5.0)`, already
+    /// agreed by coincidence of the ternary's structure -- confirming, as
+    /// with Tensor, that only ONE NaN position was actually broken.
+    #[test]
+    fn native_float_min_max_ignore_nan_regardless_of_argument_position() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let nan = 0.0 / 0.0
+    print("{(5.0).min(nan)}|{(5.0).max(nan)}|{nan.min(5.0)}|{nan.max(5.0)}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "fminmaxnan").trim(), "5.0|5.0|5.0|5.0");
     }
 
     /// Native trunc/fract match interp/KVM: round-toward-zero and signed fractional part,
