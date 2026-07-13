@@ -2084,12 +2084,15 @@ pub fn shared_method(
             Ok(Value::Bool(true))
         }
         (Value::List(items), "sort") => {
-            // Delegates to `list_order` (also used by min/max/min_by/max_by) so every
-            // orderable element type -- Int/Float/Str plus SizedInt/F32/BigInt/Rational as
-            // of PR-it549 -- stays in sync across all four methods from one place.
+            // Delegates to `sort_order`, not `list_order` (production-hardening
+            // PR-it711: see `sort_order`'s own doc comment for why `.sort()` needs a
+            // GENUINE total order under NaN -- Rust's `sort_by` crashes without one --
+            // while min/max/min_by/max_by keep `list_order`'s original NaN-inert fold
+            // unchanged). Every orderable element type -- Int/Float/Str plus SizedInt/
+            // F32/BigInt/Rational as of PR-it549 -- stays supported either way.
             let mut out = items.as_ref().clone();
             let mut err = None;
-            out.sort_by(|a, b| match list_order(a, b) {
+            out.sort_by(|a, b| match sort_order(a, b) {
                 Ok(ord) => ord,
                 Err(e) => {
                     err = Some(e);
@@ -3407,7 +3410,12 @@ fn int_isqrt(v: i64) -> i64 {
     x as i64
 }
 
-/// Ordering for `List.min`/`max` — Int, Float, or Str elements only.
+/// Ordering for `List.min`/`max`/`min_by`/`max_by` — Int, Float, or Str
+/// elements only. Float/F32 NaN comparisons are "Equal" (never wins against
+/// a real value, matching native's `k_cmp`-based fold, PR-it148/it150 --
+/// deliberately UNCHANGED by PR-it711 below, which gives `.sort()` its own,
+/// stricter comparator instead of touching this one, to avoid breaking this
+/// established min/max/min_by/max_by behavior).
 fn list_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
     use std::cmp::Ordering;
     match (a, b) {
@@ -3425,6 +3433,41 @@ fn list_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
         (Value::BigInt(x), Value::BigInt(y)) => Ok(x.cmp(y)),
         (Value::Rational(x), Value::Rational(y)) => Ok(x.cmp(y)),
         _ => Err("`min`/`max` need Int, Float, Str, or another orderable type".into()),
+    }
+}
+
+/// A total, TRANSITIVE order used ONLY by `List.sort()` (never by
+/// `min`/`max`/`min_by`/`max_by`, which keep `list_order`'s established
+/// "NaN never wins" fold behavior above, PR-it148/it150, UNCHANGED): real
+/// values compare normally, NaN sorts as the greatest value (NaN == NaN,
+/// NaN > everything else). Production-hardening PR-it711: `list_order`'s
+/// `partial_cmp().unwrap_or(Ordering::Equal)` treats EVERY NaN comparison as
+/// "equal" -- not just to other NaNs, but to every real value too, which is
+/// NOT transitive (`NaN == 5.0` and `NaN == 3.0` would imply `5.0 == 3.0`,
+/// false). A single linear fold (`min`/`max`/`min_by`/`max_by`) never
+/// noticed, but `.sort()` -- built on Rust's `slice::sort_by`, which relies
+/// on its comparator being a genuine total order to run its optimized
+/// algorithm -- hit an internal Rust standard-library panic ("internal
+/// compiler error [.../smallsort.rs:...]") on a NaN-containing list of
+/// non-trivial size, crashing the WHOLE interpreter process on ordinary user
+/// code (sorting a float list that happens to contain NaN, e.g. from missing/
+/// invalid data) -- confirmed live with an 81-element NaN-containing list
+/// before this fix. `sort_order` is otherwise IDENTICAL to `list_order`
+/// (same type coverage), differing only in the Float/F32 arms.
+fn sort_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
+    use std::cmp::Ordering;
+    fn float_order(x: f64, y: f64) -> Ordering {
+        match (x.is_nan(), y.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => x.partial_cmp(&y).expect("neither operand is NaN"),
+        }
+    }
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => Ok(float_order(*x, *y)),
+        (Value::F32(x), Value::F32(y)) => Ok(float_order(*x as f64, *y as f64)),
+        _ => list_order(a, b),
     }
 }
 

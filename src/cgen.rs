@@ -2054,6 +2054,47 @@ static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
         default: return k_bool(c >= 0);
     }
 }
+/* A REAL, LIVE-CRASHING bug fixed alongside interp.rs's `sort_order`/
+   `float_order` (production-hardening PR-it711): `List.sort()` delegated
+   straight to `k_cmp`'s raw IEEE `<`/`>` -- correct for the user-facing
+   `<`/`<=`/`>`/`>=` operators (NaN comparisons must ALL be false there),
+   but NOT a valid total order: `k_cmp(NaN, x, '<')` and `k_cmp(NaN, x,
+   '>')` are both false, so nothing ever "beats" a NaN pivot and nothing
+   ever displaces one, the exact shape of bug it709/it710 already fixed
+   for min/max/pairwise methods -- but here it also fed Rust's
+   `slice::sort_by` (used by the INTERPRETER's own `.sort()`, sharing this
+   same ordering relation before this fix) a non-transitive comparator,
+   crashing the interpreter itself with an internal Rust panic on a
+   NaN-containing list of non-trivial size -- confirmed live with an
+   81-element list before this fix. This dedicated comparator (mirroring
+   interp.rs's `sort_order`/`float_order` exactly: NaN sorts as the
+   GREATEST value, NaN==NaN) is used ONLY by `.sort()` below --
+   `min`/`max`/`min_by`/`max_by` deliberately keep using `k_cmp` directly,
+   preserving their OWN established "NaN never wins" behavior (PR-it148/
+   it150) unchanged; `k_cmp` itself, and the `<`/`<=`/`>`/`>=` operators
+   built on it, are also UNCHANGED. Returns -1/0/1, matching Rust's
+   `Ordering`. */
+static int k_list_order(KValue a, KValue b) {
+    if (a.tag == K_FLOAT && b.tag == K_FLOAT) {
+        int an = isnan(a.as.f), bn = isnan(b.as.f);
+        if (an && bn) return 0;
+        if (an) return 1;
+        if (bn) return -1;
+        return a.as.f < b.as.f ? -1 : (a.as.f > b.as.f ? 1 : 0);
+    }
+    if (a.tag == K_F32 && b.tag == K_F32) {
+        int an = isnan(a.as.f32v), bn = isnan(b.as.f32v);
+        if (an && bn) return 0;
+        if (an) return 1;
+        if (bn) return -1;
+        return a.as.f32v < b.as.f32v ? -1 : (a.as.f32v > b.as.f32v ? 1 : 0);
+    }
+    KValue lt = k_cmp(a, b, 0);
+    if (lt.tag == K_BOOL && lt.as.b) return -1;
+    KValue gt = k_cmp(a, b, 2);
+    if (gt.tag == K_BOOL && gt.as.b) return 1;
+    return 0;
+}
 static KValue k_neg(KValue a) {
     if (a.tag == K_INT) {
         if (a.as.i == INT64_MIN) k_panic("integer overflow in negation");
@@ -4634,17 +4675,22 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
             memcpy(out, l->items, sizeof(KValue) * l->len);
             /* insertion sort: stable, no globals needed for the comparator. Delegates to
-               k_cmp (PR-it549) -- the same comparator `<`/`<=`/etc and min_by/max_by already
-               use, and which already supports SizedInt/f32/BigInt/Rational alongside
-               Int/Float/Str -- instead of a narrower duplicated Int/Float/Str-only check, so
-               `.sort()` no longer rejects types the checker (and every other comparison)
-               already accepts. */
+               k_list_order (PR-it549 originally routed this through k_cmp directly;
+               PR-it711 introduced this DEDICATED comparator, used ONLY by `.sort()`, not
+               by min/max/min_by/max_by above, which keep k_cmp unchanged) -- supports
+               SizedInt/f32/BigInt/Rational alongside Int/Float/Str, same as k_cmp, but
+               ALSO defines a genuine total order over NaN-containing float lists: k_cmp's
+               raw `<`/`>` is correct for the user-facing comparison operators (NaN must
+               never beat anything there) but is NOT a valid total order for a SORT
+               algorithm, which used to make the INTERPRETER's own `.sort()` (built on
+               Rust's `slice::sort_by`, which shared this same non-transitive ordering
+               relation before PR-it711) crash the whole process with an internal Rust
+               panic on a NaN-containing list of non-trivial size. */
             for (int64_t i = 1; i < l->len; i++) {
                 KValue key = out[i];
                 int64_t j = i - 1;
                 while (j >= 0) {
-                    KValue c = k_cmp(out[j], key, 2); /* out[j] > key */
-                    if (c.tag != K_BOOL || !c.as.b) break;
+                    if (k_list_order(out[j], key) <= 0) break; /* out[j] > key */
                     out[j + 1] = out[j];
                     j--;
                 }
@@ -4796,10 +4842,14 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 /* Seed with the first element and replace only on a STRICT it<best (min)
                    or it>best (max), matching the interpreter's fold. Using strict `>`
                    rather than `!(it<best)` keeps NaN inert (both comparisons are false),
-                   so NaN never displaces the running best and never cascades — a `!<` form
+                   so NaN never displaces the running best and never cascades -- a `!<` form
                    would treat NaN's unordered result as "greater" and poison the result.
-                   Delegates to k_cmp (PR-it549), same as min_by/max_by below and `.sort()`
-                   above, so SizedInt/f32/BigInt/Rational elements are supported too. */
+                   Delegates to k_cmp (PR-it549), same as min_by/max_by below, so SizedInt/
+                   f32/BigInt/Rational elements are supported too. Deliberately NOT
+                   `k_list_order` (production-hardening PR-it711, used only by `.sort()`
+                   below) -- min/max/min_by/max_by's "NaN never wins" behavior is an
+                   established contract (PR-it148/it150), unrelated to the crash `.sort()`
+                   needed its own comparator to avoid. */
                 KValue c = k_cmp(it, best, wmin ? 0 : 2);
                 if (c.tag == K_BOOL && c.as.b) best = it;
             }
@@ -7204,11 +7254,13 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "nanby").trim(), "1|1|NaN");
     }
 
-    /// Native NaN-in-collection behavior matches interp/KVM: sort is deterministic (the
-    /// PR-it148 k_cmp fix flows into the sort comparator), min/max skip NaN, `List.unique`
-    /// keeps duplicate NaNs since the `==` operator stays IEEE (`nan != nan`), but Set
-    /// ELEMENT identity is NaN-aware (`k_key_eq`, PR-it691) and dedupes a repeated NaN like
-    /// any other repeated value.
+    /// Native NaN-in-collection behavior matches interp/KVM: min/max skip NaN
+    /// (PR-it148/it150, unaffected by PR-it711), `List.unique` keeps duplicate NaNs since
+    /// the `==` operator stays IEEE (`nan != nan`), Set ELEMENT identity is NaN-aware
+    /// (`k_key_eq`, PR-it691) and dedupes a repeated NaN like any other repeated value, and
+    /// `.sort()` is now GENUINELY, fully sorted with NaN last (production-hardening
+    /// PR-it711, via the new `k_list_order` comparator -- was `[3.0, NaN, 1.0, 2.0]`,
+    /// "deterministic" but not actually sorted).
     #[test]
     fn native_nan_in_collections() {
         if !cc_available() {
@@ -7218,7 +7270,7 @@ fun main() uses io {
                    print(\"{xs.sort()}|{xs.min()}|{xs.max()}|{[nan, nan, 1.0].unique()}|{Set([nan, nan, 1.0]).len()}\")\n}\n";
         assert_eq!(
             native_main_stdout(src, "nancoll").trim(),
-            "[3.0, NaN, 1.0, 2.0]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|2"
+            "[1.0, 2.0, 3.0, NaN]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|2"
         );
     }
 
@@ -7926,6 +7978,56 @@ fun main() uses io {
 }
 "#;
         assert_eq!(native_main_stdout(src, "fminmaxnan").trim(), "5.0|5.0|5.0|5.0");
+    }
+
+    /// A REAL, LIVE-CRASHING bug on interp/KVM, fixed alongside native's OWN
+    /// matching comparator (production-hardening PR-it711): `List.sort()`'s
+    /// old comparator (`k_cmp`'s raw `<`/`>`) was never a valid total order
+    /// under NaN, which crashed the INTERPRETER (Rust's `slice::sort_by`
+    /// requires a genuine total order) on a NaN-containing float list of
+    /// non-trivial size -- see `diff_sort_treats_nan_as_the_greatest_value_
+    /// and_does_not_crash_min_max_unaffected` in vm.rs's own test module for
+    /// the interp/KVM-side fix + full repro. Native's own `.sort()` never
+    /// crashed (a hand-rolled insertion sort has no such internal
+    /// consistency requirement), but used to silently produce a DIFFERENT
+    /// (also wrong -- barely touched, NaN acting as an immovable barrier)
+    /// partial ordering than the interpreter's now-fixed, well-defined "NaN
+    /// sorts as the greatest value" total order. This locks in that native's
+    /// `.sort()` now matches exactly, via the new `k_list_order` comparator
+    /// -- `.min()`/`.max()`/`.min_by()`/`.max_by()` are DELIBERATELY
+    /// unaffected (still `k_cmp`-based, preserving their established "NaN
+    /// never wins" behavior, PR-it148/it150).
+    #[test]
+    fn native_sort_treats_nan_as_the_greatest_value_min_max_unaffected() {
+        if !cc_available() {
+            return;
+        }
+        // Same two-run shape as vm.rs's differential test (see its comment): a native
+        // insertion sort has no comparator-consistency requirement, so this input shape
+        // isn't load-bearing for native's OWN correctness, but keeping it identical makes
+        // the two tests directly comparable.
+        let src = r#"fun main() uses io {
+    let nan = 0.0 / 0.0
+    var xs: List[Float] = []
+    var i = 0
+    while i < 40 {
+        xs = xs.push((39 - i).to_float())
+        i = i + 1
+    }
+    xs = xs.push(nan)
+    i = 0
+    while i < 40 {
+        xs = xs.push(i.to_float() + 0.5)
+        i = i + 1
+    }
+    let sorted = xs.sort()
+    print("{sorted.len()}|{sorted.get(0)}|{sorted.get(79)}|{sorted.get(80)}|{xs.max()}|{xs.min()}|{xs.max_by(fn x { x })}|{xs.min_by(fn x { x })}")
+}
+"#;
+        assert_eq!(
+            native_main_stdout(src, "sortnan").trim(),
+            "81|Some(0.0)|Some(39.5)|Some(NaN)|Some(39.5)|Some(0.0)|Some(39.5)|Some(0.0)"
+        );
     }
 
     /// Native trunc/fract match interp/KVM: round-toward-zero and signed fractional part,

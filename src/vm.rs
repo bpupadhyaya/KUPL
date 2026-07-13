@@ -15457,6 +15457,59 @@ fun probe() -> Str {
         assert!(crate::run::compile("type P = P(x: Int)\nfun main() { let _ = [P(1), P(2)].sort() }\n").is_err());
     }
 
+    /// A REAL, LIVE-CRASHING bug (production-hardening PR-it711): `List.sort()`
+    /// delegated to `list_order`, whose Float/F32 arms treat EVERY comparison
+    /// involving NaN as `Ordering::Equal` -- not just NaN-to-NaN, but
+    /// NaN-to-ANY-real-value too, which is NOT transitive (`NaN == 5.0` and
+    /// `NaN == 3.0` would imply `5.0 == 3.0`, false). `min`/`max`/`min_by`/
+    /// `max_by` (each a single linear fold) never noticed and their
+    /// established "NaN never wins" behavior (PR-it148/it150) is
+    /// DELIBERATELY left completely unchanged by this fix -- but `.sort()` is
+    /// built on Rust's `slice::sort_by`, which relies on its comparator being
+    /// a genuine total order for its optimized algorithm, and feeding it this
+    /// inconsistency crashed the WHOLE INTERPRETER PROCESS with an internal
+    /// Rust standard-library panic ("internal compiler error [.../smallsort.
+    /// rs:...]") on an ordinary NaN-containing float list of non-trivial size
+    /// (51 elements here; a small list happened to stay within Rust's
+    /// insertion-sort fallback and merely produced a weird but non-crashing
+    /// partial order instead) -- reachable from completely ordinary user code
+    /// (sorting float data that happens to contain a NaN, e.g. from a
+    /// missing/invalid value), confirmed live before this fix.
+    /// Fixed by giving `.sort()` its OWN, dedicated, TRANSITIVE total order
+    /// (`sort_order`/`float_order` in interp.rs, `k_list_order` in cgen.rs)
+    /// used ONLY by `.sort()` -- NOT by `list_order`/`k_cmp` (used by
+    /// min/max/min_by/max_by, and by the IEEE-correct `<`/`<=`/`>`/`>=`
+    /// operators, all of which are UNTOUCHED): NaN sorts as the GREATEST
+    /// value (NaN == NaN, NaN > every real value) -- a fresh, deliberate,
+    /// well-defined, cross-engine-consistent design decision for `.sort()`
+    /// specifically, not a behavior-preserving bugfix, since `.sort()`'s
+    /// prior NaN behavior was itself already an accidental, undocumented
+    /// side effect of the crash-causing bug, not a protected contract.
+    #[test]
+    fn diff_sort_treats_nan_as_the_greatest_value_and_does_not_crash_min_max_unaffected() {
+        // The list is deliberately TWO runs (a descending 39..0, then NaN, then a SEPARATE
+        // ascending 0.5..39.5), matching the exact shape that reliably crashed the
+        // interpreter before this fix -- a SINGLE monotonic run with a NaN merely appended
+        // (e.g. `[49, 48, ..., 0, NaN]`) does NOT reliably reach the crashing code path,
+        // since Rust's sort implementation special-cases already-(reverse-)sorted runs.
+        let src = "fun probe() -> Str {\n    let nan = 0.0 / 0.0\n    \
+                   var xs: List[Float] = []\n    var i = 0\n    \
+                   while i < 40 {\n        xs = xs.push((39 - i).to_float())\n        i = i + 1\n    }\n    \
+                   xs = xs.push(nan)\n    i = 0\n    \
+                   while i < 40 {\n        xs = xs.push(i.to_float() + 0.5)\n        i = i + 1\n    }\n    \
+                   let sorted = xs.sort()\n    \
+                   \"{sorted.len()}|{sorted.get(0)}|{sorted.get(79)}|{sorted.get(80)}|\
+                   {xs.max()}|{xs.min()}|{xs.max_by(fn x { x })}|{xs.min_by(fn x { x })}\"\n}\n";
+        assert_eq!(
+            differential(src),
+            // sort() is now FULLY, correctly sorted (all 80 real values interleaved
+            // ascending) with NaN last; min/max/min_by/max_by keep their established "NaN
+            // never wins" behavior (max/max_by = 39.5, the genuine maximum among the real
+            // values; min/min_by = 0.0, the genuine minimum) -- completely unaffected.
+            "81|Some(0.0)|Some(39.5)|Some(NaN)|Some(39.5)|Some(0.0)|Some(39.5)|Some(0.0)"
+        );
+    }
+
     #[test]
     fn diff_while_loop_and_break_continue() {
         // while runs while its condition holds (false-initial => zero iterations); break exits
@@ -16033,13 +16086,17 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
 
     #[test]
     fn diff_nan_in_collections() {
-        // NaN in collections follows from `nan != nan` and its unordered comparisons — sort
-        // is deterministic and identical across engines (the PR-it148 k_cmp fix propagated),
-        // min/max SKIP NaN, and equality-based ops keep duplicate NaNs (PR-it149).
+        // NaN in collections follows from `nan != nan` and its unordered comparisons —
+        // min/max SKIP NaN (PR-it148/it150, unaffected by PR-it711), and equality-based ops
+        // keep duplicate NaNs (PR-it149). `.sort()` is now GENUINELY, fully sorted with NaN
+        // last (production-hardening PR-it711 -- was `[3.0, NaN, 1.0, 2.0]`, "deterministic"
+        // but not actually sorted; that comparator crashed the interpreter outright on a
+        // larger NaN-containing list, see `diff_sort_treats_nan_as_the_greatest_value_and_
+        // does_not_crash_min_max_unaffected`).
         let src = "fun probe() -> Str { let nan = 0.0 / 0.0\n    let xs = [3.0, nan, 1.0, 2.0]\n    \
                    let dup = [nan, nan, 1.0, 1.0]\n    \
                    \"{xs.sort()}|{xs.min()}|{xs.max()}|{dup.unique()}|{dup.contains(nan)}|{[1.0, 2.0].contains(2.0)}\" }\n";
-        assert_eq!(differential(src), "[3.0, NaN, 1.0, 2.0]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|false|true");
+        assert_eq!(differential(src), "[1.0, 2.0, 3.0, NaN]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|false|true");
         // Set/Map KEY/ELEMENT identity is NaN-aware (`value_key_eq`/`k_key_eq`, PR-it691),
         // unlike the `==` operator and List helpers above: a duplicate NaN element/key
         // dedupes/updates-in-place exactly like any other repeated value would.
