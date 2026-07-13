@@ -1284,6 +1284,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A coverage-closing test (production-hardening PR-it705, no bug found --
+    /// a seventeenth research-subagent dispatch investigated `example`-block
+    /// execution semantics end-to-end (`Send`/`Expect`/`Advance`) and
+    /// confirmed every mechanism routes through the SAME shared interp.rs
+    /// primitives a real running program uses -- `interp.send`, `interp.
+    /// advance`, `interp.eval` -- never a parallel reimplementation. But
+    /// `run_example`, one of run.rs's core user-facing mechanisms, had ZERO
+    /// test coverage in this file's own `mod tests` before this (confirmed:
+    /// zero "example" hits in any `#[test]` fn name here). Worse, NOTHING in
+    /// the whole test suite actually RUNS `examples/timers.kupl`'s own
+    /// `example` blocks through `kupl test` -- `fmt.rs` sweeps `examples/*.
+    /// kupl` for formatting idempotence only, never execution -- so the
+    /// canonical, human-reviewed `Ticker`/`Delayed` fixtures documenting
+    /// multi-fire `advance` semantics were unverified by CI. This test
+    /// reuses `Ticker` verbatim from `examples/timers.kupl` and locks in the
+    /// single most fragile property confirmed live: `advance` correctly
+    /// fires a REPEATING timer MULTIPLE times within one `advance` step
+    /// (5s and 10s within `advance 12s`), not just once.
+    #[test]
+    fn example_advance_fires_a_repeating_timer_multiple_times_in_one_step() {
+        let dir = std::env::temp_dir().join(format!("kupl-example-advance-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "component Ticker {\n    intent \"Emits a rising tick count on a recurring timer.\"\n\n    out tick: Int\n    state n: Int = 0\n\n    on every 5s {\n        n += 1\n        emit tick(n)\n    }\n\n    example {\n        advance 12s\n        expect tick == 2\n        advance 3s\n        expect tick == 3\n    }\n}\nfun main() {}\n";
+        let path = dir.join("advance.kupl");
+        std::fs::write(&path, src).unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let out = std::process::Command::new(&bin)
+            .args(["test", path.to_str().unwrap()])
+            .output()
+            .expect("kupl test runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("1 passed, 0 failed, 0 skipped"),
+            "advance 12s must fire `on every 5s` exactly twice (at 5s, 10s), then advance 3s once more \
+             (at 15s), satisfying both `expect tick == 2` and `expect tick == 3`: {stdout:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn emit_context_resolves_item_and_errors_on_missing() {
         // `kupl context <file> <item>` emits the item + its direct-dependency closure
