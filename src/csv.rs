@@ -29,7 +29,18 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
 
     while i < n {
         let c = chars[i];
-        if c == '"' {
+        // A `"` only opens a quoted field when it's the FIRST character of a
+        // not-yet-started field (`field.is_empty()`) -- matching how RFC 4180
+        // readers in the wild (e.g. Python's `csv` module) actually behave on
+        // real, imperfectly-RFC-compliant input. Without the `field.is_empty()`
+        // guard, a `"` appearing later in an otherwise-unquoted field (e.g. a
+        // brand name like `ab"cd` exported without escaping) would wrongly
+        // switch into quoted-field parsing, silently swallowing every comma
+        // and newline up to the next `"` -- merging what should be several
+        // fields/rows into one. A `"` after any content (literal chars, or
+        // trailing text after an already-closed quoted section) is instead
+        // just literal field content, handled by the final `else` arm below.
+        if c == '"' && field.is_empty() {
             // quoted field: consume until the closing quote (with "" escapes)
             i += 1;
             loop {
@@ -184,6 +195,35 @@ mod tests {
         // a non-empty quoted lone field was NEVER affected (field.is_empty()
         // was already false) -- confirm it still round-trips correctly.
         assert_eq!(p("\"x\""), vec![vec!["x"]]);
+    }
+
+    /// A REAL silent-data-corruption bug (PR-it712): a `"` appearing anywhere
+    /// in a field -- not just as the field's very first character -- used to
+    /// switch parsing into "quoted field" mode, swallowing every comma and
+    /// newline up to the next `"` as if they were quoted content. Real-world,
+    /// imperfectly-RFC-compliant CSV (e.g. an unescaped brand name like
+    /// `ab"cd`) hit this constantly, silently merging unrelated fields and
+    /// even whole rows into one. Fixed by only opening quoted-field mode when
+    /// the `"` is the first character of a not-yet-started field, matching
+    /// how real-world RFC 4180 readers (e.g. Python's `csv` module) treat a
+    /// stray `"` later in an unquoted field: as ordinary literal content.
+    #[test]
+    fn a_quote_that_is_not_the_first_character_of_a_field_is_literal() {
+        // the bug's reproducer: a mid-field quote used to swallow the
+        // following comma AND newline, merging 2 rows/3 fields into 1 field.
+        assert_eq!(
+            p("ab\"cd,ef\nx,y"),
+            vec![vec!["ab\"cd", "ef"], vec!["x", "y"]]
+        );
+        // a quote appearing after a properly closed quoted section, with more
+        // literal text trailing before the delimiter, was already fine (the
+        // outer loop's `else` arm handles it) -- confirm still correct, and
+        // that a SECOND embedded quote in that trailing text is now also
+        // literal rather than re-opening quoted mode.
+        assert_eq!(p("\"a\"b\"c,d"), vec![vec!["ab\"c", "d"]]);
+        // a genuine leading quote (field.is_empty() at the time it's seen)
+        // still opens quoted-field parsing as normal.
+        assert_eq!(p("\"a,b\",c"), vec![vec!["a,b", "c"]]);
     }
 
     #[test]
