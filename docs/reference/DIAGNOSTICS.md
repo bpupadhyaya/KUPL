@@ -129,6 +129,7 @@ Severity: **E** = error, **W** = warning.
 | K0272 | E | `ai fun` tool is not a monomorphic top-level function with representable parameter/return types |
 | K0277 | E | method (private or exposed) is defined more than once in a component |
 | K0278 | E | component is defined more than once |
+| K0279 | W | a fulfilling method calls a value of function type — its effects cannot be verified against the contract's effect budget |
 
 ## K03xx — Effects & style
 

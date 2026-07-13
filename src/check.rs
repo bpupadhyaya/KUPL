@@ -990,6 +990,72 @@ impl Checker {
                                     );
                                 }
                             }
+                            // A REAL, LIVE-CONFIRMED soundness gap (production-hardening
+                            // PR-it706, found via an eighteenth research-subagent dispatch
+                            // instructed to adversarially try to break the "K0301 forces
+                            // full effect declaration, so K0264 can't be evaded" reasoning):
+                            // `effects.rs`'s effect inference only ever attributes effects
+                            // through a call whose callee is a resolvable NAMED function
+                            // (`collect_expr`) -- a call through a `state`/prop field of
+                            // function type (`state cb: fn() -> Int = fn() { print("io!")
+                            // 42 }` ... `expose fun act() -> Int { cb() }`) is silently
+                            // invisible to it, an already-documented v0.2 limitation
+                            // (effects.rs's own module doc: "effects of calls through
+                            // closures/variables are not tracked... needs effect types in
+                            // fn(...), planned with KIR"). But that documented limitation
+                            // undersells its OWN severity here: it doesn't just mean
+                            // `uses` declarations can be incomplete for convenience
+                            // purposes -- it means a contract's effect BUDGET (K0264,
+                            // right above this check, including a budget of `[]`, i.e. "no
+                            // effects allowed") can be silently violated at RUNTIME with
+                            // ZERO diagnostics anywhere. Confirmed live before this fix:
+                            // a contract with an empty budget, fulfilled by exactly the
+                            // `cb()` shape above, passed `kupl check`/`kupl build` clean
+                            // and `kupl run` genuinely printed the "leaked" effect. A full
+                            // fix needs real effect-typed `fn(...)` signatures (the KIR
+                            // work the doc comment already points at) -- out of scope for
+                            // one iteration -- but leaving this COMPLETELY silent, instead
+                            // of at least warning at the exact point the budget guarantee
+                            // is most load-bearing (a method a caller is trusting BECAUSE
+                            // it fulfills a contract), was avoidable. Scoped deliberately
+                            // narrow: only the exposing method's OWN body is walked (not
+                            // transitively through private helpers it calls), and only
+                            // state/prop fields of syntactically-evident function type are
+                            // detected -- a documented residual gap, not a claim of
+                            // completeness.
+                            let closures = closure_typed_field_names(c);
+                            if !closures.is_empty() {
+                                let mut called: Vec<String> = Vec::new();
+                                crate::effects::walk_block(&decl.body, &mut |e| {
+                                    let name = match &e.kind {
+                                        ExprKind::Call { callee, .. } => match &callee.kind {
+                                            ExprKind::Ident(n) => Some(n.as_str()),
+                                            _ => None,
+                                        },
+                                        ExprKind::MethodCall { name, .. } => Some(name.as_str()),
+                                        _ => None,
+                                    };
+                                    if let Some(n) = name {
+                                        if closures.contains(n) && !called.iter().any(|c| c == n) {
+                                            called.push(n.to_string());
+                                        }
+                                    }
+                                });
+                                if !called.is_empty() {
+                                    called.sort_unstable();
+                                    self.warn(
+                                        "K0279",
+                                        format!(
+                                            "`{}`.`{fname}` calls `{}` (a value of function type) -- \
+                                             its effects cannot be verified against contract `{contract_name}`'s \
+                                             effect budget",
+                                            c.name,
+                                            called.join("`, `")
+                                        ),
+                                        decl.span,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -3624,6 +3690,30 @@ fn covers_effect(budget: &str, used: &str) -> bool {
     used == budget || used.starts_with(&format!("{budget}."))
 }
 
+/// Names of `c`'s state fields and props whose type is a function (`fn(...)
+/// -> ...`), detected syntactically -- an explicit `fn(...)` annotation, or
+/// (for a state field with an elided type) an `Expr::Lambda` initializer.
+/// Used by `check_fulfills`'s K0279 check (production-hardening PR-it706).
+fn closure_typed_field_names(c: &ComponentDecl) -> HashSet<&str> {
+    let is_fun_ty = |ty: &TyExpr| matches!(ty.kind, TyExprKind::Fun(..));
+    let mut names = HashSet::new();
+    for s in &c.state {
+        let is_closure = match &s.ty {
+            Some(ty) => is_fun_ty(ty),
+            None => matches!(s.init.kind, ExprKind::Lambda { .. }),
+        };
+        if is_closure {
+            names.insert(s.name.as_str());
+        }
+    }
+    for p in &c.props {
+        if is_fun_ty(&p.ty) {
+            names.insert(p.name.as_str());
+        }
+    }
+    names
+}
+
 fn op_sym(op: AssignOp) -> &'static str {
     match op {
         AssignOp::Set => "",
@@ -4795,6 +4885,52 @@ mod generic_tests {
             nonempty.iter().any(|d| d.code == "K0264" && d.message.contains("uses `exec`") && d.message.contains("allows only [io]")),
             "{nonempty:?}"
         );
+    }
+
+    fn all_diags(src: &str) -> Vec<crate::diag::Diag> {
+        let (mut program, mut diags) = crate::parser::parse(src);
+        crate::run::inject_prelude(&mut program);
+        let (_checked, cdiags) = super::check(&program);
+        diags.extend(cdiags);
+        diags
+    }
+
+    /// A REAL, LIVE-CONFIRMED soundness gap (production-hardening PR-it706):
+    /// a contract's effect budget (K0264, including an EMPTY budget -- "no
+    /// effects allowed") could be silently violated at runtime with ZERO
+    /// diagnostics, whenever the fulfilling method's undeclared effect comes
+    /// from a call through a `state`/prop field of function type rather than
+    /// a directly-named function -- `effects.rs`'s inference (which K0264's
+    /// soundness otherwise depends on, since K0301 forces DECLARED effects to
+    /// be complete for named-function calls) simply never sees such a call at
+    /// all, an already-documented v0.2 limitation whose K0264-defeating
+    /// severity wasn't previously surfaced anywhere. Confirmed live before
+    /// this fix: `kupl check`/`kupl build` accepted the exact repro below
+    /// clean, and `kupl run` genuinely printed the "leaked" effect.
+    #[test]
+    fn calling_a_closure_typed_field_warns_that_its_effects_cannot_be_verified() {
+        let src = "contract Pure {\n    intent \"none\"\n    expose fun act() -> Int\n}\ncomponent C fulfills Pure {\n    intent \"closure laundering\"\n    state cb: fn() -> Int = fn() {\n        42\n    }\n    expose fun act() -> Int { cb() }\n}\nfun main() {}\n";
+        let diags = all_diags(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == "K0279" && d.message.contains("cb") && d.message.contains("act") && d.message.contains("Pure")),
+            "{diags:?}"
+        );
+        // it's a WARNING, not an error -- doesn't newly reject an otherwise-clean program
+        // (the underlying inference gap is a documented limitation, not fully fixable here).
+        assert!(!diags.iter().any(|d| d.code == "K0279" && d.severity == crate::diag::Severity::Error), "{diags:?}");
+        assert!(!diags.iter().any(|d| d.severity == crate::diag::Severity::Error), "{diags:?}");
+
+        // A closure-typed field that's declared but never CALLED inside the
+        // exposing method must not warn -- only an actual call site is a risk.
+        let unused = "contract Pure {\n    intent \"none\"\n    expose fun act() -> Int\n}\ncomponent C fulfills Pure {\n    intent \"unused callback\"\n    state cb: fn() -> Int = fn() {\n        42\n    }\n    expose fun act() -> Int { 1 }\n}\nfun main() {}\n";
+        assert!(!all_diags(unused).iter().any(|d| d.code == "K0279"), "{:?}", all_diags(unused));
+
+        // An ordinary component with no function-typed fields at all is completely
+        // unaffected (the common case -- no new false positives).
+        let ordinary = "contract Pure {\n    intent \"none\"\n    expose fun act() -> Int\n}\ncomponent C fulfills Pure {\n    intent \"ordinary\"\n    state n: Int = 0\n    expose fun act() -> Int { n }\n}\nfun main() {}\n";
+        assert!(!all_diags(ordinary).iter().any(|d| d.code == "K0279"), "{:?}", all_diags(ordinary));
     }
 
     /// A REAL cross-engine-divergence bug (production-hardening PR-it701): unlike
