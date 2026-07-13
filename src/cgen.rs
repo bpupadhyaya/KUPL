@@ -5700,9 +5700,23 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "max") || !strcmp(name, "min")) {
             // per-op message to match the interpreter ("max of …" / "min of …").
             if (t->len == 0) k_panic(name[1] == 'a' ? "max of an empty tensor" : "min of an empty tensor");
+            // A REAL cross-engine divergence bug (production-hardening PR-it709):
+            // a raw C `>`/`<` comparison is ALWAYS false against NaN, so seeding
+            // the accumulator with `t->data[0]` and only ever REPLACING it on a
+            // true comparison means a leading NaN element is never displaced by a
+            // later real value -- the result stays NaN. The interpreter instead
+            // folds with Rust's `f64::max`/`f64::min`, which return the OTHER
+            // operand whenever exactly one side is NaN (only NaN if BOTH are),
+            // matching C99's `fmax`/`fmin` from <math.h> exactly -- so a leading
+            // NaN element used to be silently "healed away" by every engine
+            // except native. Confirmed live before this fix: `tensor([0.0/0.0,
+            // 5.0, 3.0]).max()` returned `5.0` on `kupl run`/`kupl run --vm` but
+            // `NaN` on `kupl native`; a NaN NOT in the leading position already
+            // agreed everywhere, pinpointing the bug to accumulator-seeding
+            // order specifically, not general NaN handling.
             double m = t->data[0];
             for (int64_t i = 1; i < t->len; i++) {
-                if (name[1] == 'a' ? t->data[i] > m : t->data[i] < m) m = t->data[i];
+                m = name[1] == 'a' ? fmax(m, t->data[i]) : fmin(m, t->data[i]);
             }
             return k_float(m);
         }
@@ -8917,6 +8931,31 @@ fun main() uses io {
             native_main_stdout(src, "tensor").trim(),
             "10.0|2.5|17.0|[0.5, 1.0, 1.5, 2.0]|3.0|0.0|[0.0, 1.0, 2.0, 3.0]"
         );
+    }
+
+    /// A REAL cross-engine divergence bug (production-hardening PR-it709):
+    /// native's `.max()`/`.min()` seeded a C accumulator with `t->data[0]`
+    /// and only ever REPLACED it via a raw `>`/`<` comparison -- always false
+    /// against NaN -- so a leading NaN element was never displaced by a later
+    /// real value, and the result stayed NaN. The interpreter/KVM (sharing
+    /// ONE `shared_method` implementation, so byte-identical to each other by
+    /// construction) instead fold with Rust's `f64::max`/`f64::min`, which
+    /// return the OTHER operand whenever exactly one side is NaN (NaN only
+    /// if BOTH are) -- so `tensor([NaN, 5.0, 3.0]).max()` returned `5.0` on
+    /// `kupl run`/`kupl run --vm` but `NaN` on `kupl native`. A NaN NOT in
+    /// the leading position already agreed everywhere (confirmed below too),
+    /// pinpointing the bug to accumulator-seeding order specifically. Fixed
+    /// by folding with C99's `fmax`/`fmin` (`<math.h>`, already included),
+    /// which have exactly this NaN-avoiding IEEE 754-2008 maxNum semantics.
+    #[test]
+    fn native_tensor_max_min_ignore_a_leading_nan_matching_the_interpreter() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let a = tensor([0.0 / 0.0, 5.0, 3.0])\n    \
+                   let b = tensor([5.0, 0.0 / 0.0, 3.0])\n    \
+                   print(\"{a.max()}|{a.min()}|{b.max()}|{b.min()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "tensornan").trim(), "5.0|3.0|5.0|3.0");
     }
 
     /// Native evaluates call arguments strictly left-to-right and short-circuits

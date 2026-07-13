@@ -2145,6 +2145,29 @@ fun probe() -> Int {
         );
     }
 
+    /// A REAL cross-engine divergence bug, native-only, fixed alongside this
+    /// interp/KVM-locking test (production-hardening PR-it709): `.max()`/
+    /// `.min()` fold with Rust's `f64::max`/`f64::min`, which ignore a
+    /// leading NaN element (return the other operand whenever exactly one
+    /// side is NaN) -- native's independent C reimplementation used a raw
+    /// `>`/`<` comparison loop that never displaces a NaN-seeded accumulator,
+    /// since any comparison against NaN is false in C. interp and KVM were
+    /// never divergent from EACH OTHER (both call the SAME `shared_method`),
+    /// but this locks in the CORRECT NaN-ignoring behavior `cgen.rs` was
+    /// fixed to match (see `native_tensor_max_min_ignore_a_leading_nan_
+    /// matching_the_interpreter` in cgen.rs's own test module).
+    #[test]
+    fn diff_tensor_max_min_ignore_a_leading_nan() {
+        assert_eq!(
+            differential("fun probe() -> Str { \"{tensor([0.0 / 0.0, 5.0, 3.0]).max()}|{tensor([0.0 / 0.0, 5.0, 3.0]).min()}\" }\n"),
+            "5.0|3.0"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str { \"{tensor([5.0, 0.0 / 0.0, 3.0]).max()}|{tensor([5.0, 0.0 / 0.0, 3.0]).min()}\" }\n"),
+            "5.0|3.0"
+        );
+    }
+
     #[test]
     fn diff_codec_decode_error_messages() {
         // PR-it117: the codec decoders (hex/base64/url) already give specific, matching
