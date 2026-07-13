@@ -13,7 +13,7 @@
 //! Limitation (documented): effects of calls through closures/variables are not
 //! tracked in v0.2 — that needs effect types in `fn(...)`, planned with KIR.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diag::Diag;
@@ -26,6 +26,24 @@ fn fun_key(component: Option<&str>, name: &str) -> String {
         Some(c) => format!("{c}.{name}"),
         None => name.to_string(),
     }
+}
+
+/// Every component method name (exposed or private) declared ANYWHERE in the
+/// program, unqualified -- used by `collect_expr` to tell a genuine (if
+/// unresolvable without type info) component-instance method call apart from
+/// an ordinary builtin VALUE method (`.len()`, `.push()`, `.map()`, ...),
+/// which is never itself a component method name in any realistic program.
+/// See `collect_expr`'s doc comment (production-hardening PR-it707).
+fn component_method_names(program: &Program) -> HashSet<&str> {
+    let mut names = HashSet::new();
+    for item in &program.items {
+        if let Item::Component(c) = item {
+            for f in c.exposes.iter().chain(&c.funs) {
+                names.insert(f.name.as_str());
+            }
+        }
+    }
+    names
 }
 
 pub fn check_effects(program: &Program) -> Vec<Diag> {
@@ -64,12 +82,17 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
         }
     }
 
+    let method_names = component_method_names(program);
+
     // ---- direct effects + call edges per function ----
     let mut direct: HashMap<String, EffectSet> = HashMap::new();
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
     for (key, info) in &funs {
         let mut eff = EffectSet::new();
         let mut calls = Vec::new();
+        // K0301/K0302 deliberately don't act on "unresolved call" (see
+        // `collect_expr`'s doc comment) -- discarded, not accumulated.
+        let mut unresolved = false;
         // `ai fun` performs the `ai` effect; the keyword itself declares it.
         if info.decl.ai.is_some() {
             eff.insert("ai".to_string());
@@ -89,7 +112,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
         for p in &info.decl.params {
             if let Some(d) = &p.default {
                 walk_expr(d, &mut |expr| {
-                    collect_expr(expr, info.component, &funs, &mut eff, &mut calls);
+                    collect_expr(expr, info.component, &funs, &method_names, &mut eff, &mut calls, &mut unresolved);
                 });
             }
         }
@@ -121,8 +144,9 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
             }
         }
         walk_block(&info.decl.body, &mut |expr| {
-            collect_expr(expr, info.component, &funs, &mut eff, &mut calls);
+            collect_expr(expr, info.component, &funs, &method_names, &mut eff, &mut calls, &mut unresolved);
         });
+        let _ = unresolved; // deliberately unused here -- see comment above
         direct.insert(key.clone(), eff);
         edges.insert(key.clone(), calls);
     }
@@ -193,9 +217,12 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
 }
 
 /// Infer the transitive effect set of every function (keyed as in
-/// `check_effects`: top-level name, or `Component.fun`). Exposed so other passes
-/// (e.g. the parallel scheduler) can ask which functions are pure.
-pub fn infer_effects(program: &Program) -> HashMap<String, EffectSet> {
+/// `check_effects`: top-level name, or `Component.fun`), paired with whether
+/// its call graph reaches a call this module couldn't resolve to a builtin,
+/// component-local method, or top-level function (see `collect_expr`'s doc
+/// comment). Exposed so other passes (e.g. the parallel scheduler) can ask
+/// which functions are pure.
+pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
     // key -> (decl body, owning component)
     let mut funs: HashMap<String, (&FunDecl, Option<&str>)> = HashMap::new();
     for item in &program.items {
@@ -215,11 +242,15 @@ pub fn infer_effects(program: &Program) -> HashMap<String, EffectSet> {
         }
     }
 
+    let method_names = component_method_names(program);
+
     let mut direct: HashMap<String, EffectSet> = HashMap::new();
+    let mut direct_unresolved: HashMap<String, bool> = HashMap::new();
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
     for (key, (decl, component)) in &funs {
         let mut eff = EffectSet::new();
         let mut calls = Vec::new();
+        let mut unresolved = false;
         if decl.ai.is_some() {
             eff.insert("ai".to_string());
         }
@@ -235,47 +266,77 @@ pub fn infer_effects(program: &Program) -> HashMap<String, EffectSet> {
         for p in &decl.params {
             if let Some(d) = &p.default {
                 walk_expr(d, &mut |expr| {
-                    collect_expr(expr, *component, &funs, &mut eff, &mut calls);
+                    collect_expr(expr, *component, &funs, &method_names, &mut eff, &mut calls, &mut unresolved);
                 });
             }
         }
         walk_block(&decl.body, &mut |expr| {
-            collect_expr(expr, *component, &funs, &mut eff, &mut calls);
+            collect_expr(expr, *component, &funs, &method_names, &mut eff, &mut calls, &mut unresolved);
         });
         direct.insert(key.clone(), eff);
+        direct_unresolved.insert(key.clone(), unresolved);
         edges.insert(key.clone(), calls);
     }
 
     let mut inferred = direct;
+    let mut inferred_unresolved = direct_unresolved;
     loop {
         let mut changed = false;
         for (key, callees) in &edges {
             let mut acc = inferred.get(key).cloned().unwrap_or_default();
             let before = acc.len();
+            let mut unresolved = inferred_unresolved.get(key).copied().unwrap_or(false);
+            let unresolved_before = unresolved;
             for callee in callees {
                 if let Some(ce) = inferred.get(callee) {
                     acc.extend(ce.iter().cloned());
                 }
+                if inferred_unresolved.get(callee).copied().unwrap_or(false) {
+                    unresolved = true;
+                }
             }
-            if acc.len() != before {
+            if acc.len() != before || unresolved != unresolved_before {
                 changed = true;
             }
             inferred.insert(key.clone(), acc);
+            inferred_unresolved.insert(key.clone(), unresolved);
         }
         if !changed {
             break;
         }
     }
     inferred
+        .into_iter()
+        .map(|(k, eff)| {
+            let unresolved = inferred_unresolved.remove(&k).unwrap_or(false);
+            (k, (eff, unresolved))
+        })
+        .collect()
 }
 
-/// Top-level functions with NO inferred effects — referentially transparent, so
-/// safe to evaluate on a worker thread. Component methods are excluded (they can
-/// touch instance state); only bare `fun` names are returned.
+/// Top-level functions with NO inferred effects AND no call this module
+/// couldn't resolve (see `collect_expr`'s doc comment) — referentially
+/// transparent, so safe to evaluate on a worker thread. Component methods
+/// are excluded (they can touch instance state); only bare `fun` names are
+/// returned.
+///
+/// A REAL, LIVE-CRASHING bug (production-hardening PR-it707): before the
+/// `unresolved` flag existed, this filtered on `eff.is_empty()` alone -- so a
+/// bare `fun` that constructs a component and calls an effectful exposed
+/// method on it (`let s = SomeComponent()  s.method()`, entirely invisible to
+/// `collect_expr`'s call-graph traversal, which has no type information for
+/// `s`) was wrongly classified PURE. Dispatched to `parallel.rs`'s real-OS-
+/// thread fast path for `xs.par_map(wrapper)`/`xs.par_filter(wrapper)`, where
+/// `ProgramImage::worker_db()` deliberately builds each worker with an EMPTY
+/// `components` map ("workers stay sequential, no nested threads") -- so the
+/// exact same correct program panicked with `unknown name 'X'` the instant
+/// the list crossed `THRESHOLD` (256) elements, while succeeding identically
+/// via `.map()` or a shorter list. Confirmed live on both `kupl run` and
+/// `kupl run --vm` before this fix.
 pub fn pure_funs(program: &Program) -> std::collections::HashSet<String> {
     infer_effects(program)
         .into_iter()
-        .filter(|(key, eff)| eff.is_empty() && !key.contains('.'))
+        .filter(|(key, (eff, unresolved))| eff.is_empty() && !unresolved && !key.contains('.'))
         .map(|(key, _)| key)
         .collect()
 }
@@ -312,8 +373,10 @@ fn collect_expr(
     expr: &Expr,
     component: Option<&str>,
     funs: &HashMap<String, impl Sized>,
+    component_method_names: &HashSet<&str>,
     eff: &mut EffectSet,
     calls: &mut Vec<String>,
+    unresolved: &mut bool,
 ) {
     // A method-call name may be a UFCS call to a top-level function; a plain
     // call names the function directly. Both attribute that function's effects
@@ -331,31 +394,75 @@ fn collect_expr(
     // PURE whenever it only referenced `log` by name instead of calling it
     // directly -- letting a genuinely impure function run unsynchronized
     // across real OS threads, producing observable nondeterminism (PR-it569).
-    let call_name = match &expr.kind {
+    let (call_name, is_plain_call, is_method_call) = match &expr.kind {
         ExprKind::Call { callee, .. } => match &callee.kind {
-            ExprKind::Ident(name) => Some(name.as_str()),
-            _ => None,
+            ExprKind::Ident(name) => (Some(name.as_str()), true, false),
+            _ => (None, false, false),
         },
-        ExprKind::MethodCall { name, .. } => Some(name.as_str()),
-        ExprKind::Ident(name) => Some(name.as_str()),
-        _ => None,
+        ExprKind::MethodCall { name, .. } => (Some(name.as_str()), false, true),
+        // A bare name reference is NEVER itself flagged `unresolved` below --
+        // see the comment above: it's a deliberately loose, ALWAYS-harmless
+        // over-attribution heuristic (an ordinary local/parameter reference,
+        // like `x` in `x * 2`, matches here too, and marking every such
+        // reference "unresolved" would make `pure_funs()` reject nearly
+        // everything).
+        ExprKind::Ident(name) => (Some(name.as_str()), false, false),
+        _ => (None, false, false),
     };
-    if let Some(name) = call_name {
-        if let Some(e) = builtin_effects(name) {
-            eff.insert(e.to_string());
+    let Some(name) = call_name else { return };
+    let builtin = builtin_effects(name);
+    let mut resolved = builtin.is_some();
+    if let Some(e) = builtin {
+        eff.insert(e.to_string());
+    }
+    // component-local fun first, then top-level
+    if let Some(c) = component {
+        let local = fun_key(Some(c), name);
+        if funs.contains_key(&local) {
+            calls.push(local);
+            return;
         }
-        // component-local fun first, then top-level
-        if let Some(c) = component {
-            let local = fun_key(Some(c), name);
-            if funs.contains_key(&local) {
-                calls.push(local);
-                return;
-            }
-        }
-        let global = fun_key(None, name);
-        if funs.contains_key(&global) {
-            calls.push(global);
-        }
+    }
+    let global = fun_key(None, name);
+    if funs.contains_key(&global) {
+        calls.push(global);
+        resolved = true;
+    }
+    if resolved {
+        return;
+    }
+    // A REAL, LIVE-CRASHING bug (production-hardening PR-it707): a call this
+    // module genuinely cannot resolve to a builtin, a component-local
+    // method, or a top-level function used to be silently dropped here with
+    // NO signal at all -- the exact same root cause as K0279's closure-field
+    // gap (it706), generalized to a THIRD vector K0279 didn't cover:
+    // constructing a component and calling an effectful exposed method on it
+    // from a bare `fun` (`let s = SomeComponent()  s.method()`), entirely
+    // invisible to this module since it has no type information for `s`.
+    // `check_effects` (K0301/K0302) intentionally IGNORES this flag (see its
+    // call site) -- injecting it into the shared `EffectSet` would make
+    // every ordinary function that legitimately constructs a component (an
+    // extremely common pattern) newly fail K0301, trading one crash for a
+    // much bigger diagnostic-noise regression. `pure_funs()` (see its own
+    // doc comment) is the one consumer that needs the STRICT "provably safe"
+    // bar this flag provides -- a wrongly-pure classification there doesn't
+    // just miss a diagnostic, it panics a live program purely because a list
+    // crossed a size threshold (confirmed live, both interp and KVM).
+    //
+    // A PLAIN call (`f()`) always counts -- there is no ambiguity: a plain
+    // call unresolved at this point is either a call through a function-
+    // typed local/parameter value (a real, if narrower, laundering risk of
+    // its own) or a genuinely undefined name the type checker would have
+    // already rejected (so it can't reach `pure_funs()` at all). A METHOD
+    // call only counts when its name is ALSO a real component method
+    // somewhere in the program -- otherwise it's almost certainly an
+    // ordinary builtin VALUE method (`.len()`, `.push()`, `.map()`, ...),
+    // which is never itself a component method name in any realistic
+    // program; flagging every builtin value-method call too would make
+    // `pure_funs()` reject nearly every function that touches a list/string/
+    // map at all.
+    if is_plain_call || (is_method_call && component_method_names.contains(name)) {
+        *unresolved = true;
     }
 }
 
@@ -663,6 +770,37 @@ mod tests {
         let (p, d) = crate::parser::parse(
             "fun noisy() -> Int {\n    print(\"hi\")\n    42\n}\n\
              fun wrapper(x: Int = noisy()) -> Int {\n    x * 2\n}\n\
+             fun pure_double(x: Int) -> Int { x * 2 }\n",
+        );
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let pure = super::pure_funs(&p);
+        assert!(!pure.contains("wrapper"), "wrapper must NOT be classified pure: {pure:?}");
+        assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
+    }
+
+    /// A REAL, LIVE-CRASHING bug (production-hardening PR-it707): a bare
+    /// `fun` that constructs a component and calls an effectful exposed
+    /// method on it is entirely invisible to `collect_expr`'s call-graph
+    /// traversal (no type information for the constructed value), so
+    /// `pure_funs()` used to wrongly classify it PURE -- letting it be
+    /// dispatched to `parallel.rs`'s real-OS-thread `par_map`/`par_filter`
+    /// fast path, where `ProgramImage::worker_db()` deliberately builds each
+    /// worker with an EMPTY `components` map. Confirmed live before this fix:
+    /// the exact same correct program panicked with `unknown name 'Sink'`
+    /// the instant a list crossed THRESHOLD (256) elements, while succeeding
+    /// identically via `.map()` or a shorter list -- found via a nineteenth
+    /// research-subagent dispatch instructed to adversarially try to
+    /// disprove the orchestrator's own reasoning that this specific vector
+    /// was unreachable (the closure-laundering vectors K0279 (it706)
+    /// targeted ARE correctly unreachable here, since `pure_funs()` excludes
+    /// component methods entirely and a portable-list-of-closures can never
+    /// reach the fast path -- but this THIRD, distinct vector was missed).
+    #[test]
+    fn pure_funs_excludes_a_function_that_constructs_a_component_and_calls_an_effectful_method() {
+        let (p, d) = crate::parser::parse(
+            "component Sink {\n    intent \"an effectful exposed method\"\n    \
+             expose fun boom(x: Int) uses io -> Int {\n        print(\"side effect {x}\")\n        x\n    }\n}\n\
+             fun wrapper(x: Int) -> Int {\n    let s = Sink()\n    s.boom(x)\n    x * 2\n}\n\
              fun pure_double(x: Int) -> Int { x * 2 }\n",
         );
         assert!(d.is_empty(), "parse diags: {d:?}");
