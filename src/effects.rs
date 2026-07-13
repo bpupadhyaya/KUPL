@@ -809,6 +809,33 @@ mod tests {
         assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
     }
 
+    /// A coverage-closing test (production-hardening PR-it708, no bug found).
+    /// it707's fix was designed to ALSO close a THIRD closure-laundering
+    /// vector alongside the two it actually live-reproduced (K0279's
+    /// closure-field vector, it707's own component-construction vector): a
+    /// function-typed PARAMETER invoked directly (`fun apply(f: fn() -> Int)
+    /// -> Int { f() }`). That vector was only ever verified "by design" --
+    /// the `is_plain_call` branch in `collect_expr`'s `unresolved` logic
+    /// unconditionally marks ANY unresolved plain call, which structurally
+    /// covers this case too -- but it707's own memory entry explicitly
+    /// flagged it as not yet given its own dedicated live test. This closes
+    /// that gap. (Note: this vector was ALREADY unreachable via `par_map`/
+    /// `par_filter`'s specific calling convention even before it707 -- a
+    /// function-typed list element always fails `to_portable`'s portability
+    /// check -- so `pure_funs()` being conservative here costs nothing; this
+    /// test locks in the classification itself, not a live crash fix.)
+    #[test]
+    fn pure_funs_excludes_a_function_that_invokes_its_own_function_typed_parameter() {
+        let (p, d) = crate::parser::parse(
+            "fun apply(f: fn() -> Int) -> Int {\n    f()\n}\n\
+             fun pure_double(x: Int) -> Int { x * 2 }\n",
+        );
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let pure = super::pure_funs(&p);
+        assert!(!pure.contains("apply"), "apply must NOT be classified pure: {pure:?}");
+        assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
+    }
+
     #[test]
     fn effect_propagates_through_an_ai_funs_tools_list() {
         // A REAL bug found+fixed (production-hardening PR-it689), the SAME
