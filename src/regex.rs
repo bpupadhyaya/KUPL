@@ -366,13 +366,31 @@ impl Regex {
         reset_budget();
         let chars: Vec<char> = text.chars().collect();
         let mut out = Vec::new();
+        if self.anchored_start {
+            // A REAL bug found+fixed (production-hardening PR-it724): the OLD
+            // loop below only stopped early when `match_here` FAILED at the
+            // current position (`else if self.anchored_start { break }`) --
+            // it never actually restricted itself to trying position 0 only.
+            // If the pattern's shape happened to ALSO fit starting at a
+            // LATER position (e.g. `^abc` against "abcabc": the second
+            // "abc" happens to match too), `match_here` doesn't know or
+            // care that it's being asked about a non-zero position, so it
+            // matched again there -- confirmed live:
+            // `re_find_all("^abc", "abcabc")` wrongly gave `["abc", "abc"]`
+            // where a `^`-anchored pattern (no multi-line mode in this
+            // engine) can only EVER match once, at the very start of the
+            // string. Fixed by trying position 0 ONLY, mirroring
+            // `leftmost`'s already-correct `starts = vec![0]` restriction.
+            if let Some(end) = self.match_here(&chars, 0) {
+                out.push(chars[0..end].iter().collect());
+            }
+            return out;
+        }
         let mut i = 0;
         while i <= chars.len() {
             if let Some(end) = self.match_here(&chars, i) {
                 out.push(chars[i..end].iter().collect());
                 i = if end > i { end } else { i + 1 };
-            } else if self.anchored_start {
-                break; // ^ can only match at the current search origin
             } else {
                 i += 1;
             }
@@ -384,6 +402,31 @@ impl Regex {
     pub fn replace_all(&self, text: &str, replacement: &str) -> String {
         reset_budget();
         let chars: Vec<char> = text.chars().collect();
+        if self.anchored_start {
+            // A REAL bug found+fixed (production-hardening PR-it724): the OLD
+            // loop below tried `match_here` at EVERY position with no check
+            // of `anchored_start` at all -- so `^abc` wrongly matched (and
+            // replaced) "abc" wherever it occurred in the text, not just at
+            // position 0 (confirmed live: `re_replace("^abc", "xyzabc",
+            // "#")` wrongly gave "xyz#" instead of leaving the text
+            // untouched, since "xyzabc" doesn't start with "abc"). `^` in
+            // this engine's no-multi-line-mode model can only EVER match
+            // once, at the very start of the string -- never at any later
+            // position, mirroring `leftmost`'s already-correct
+            // `starts = vec![0]` restriction. So an anchored pattern is
+            // tried at position 0 ONLY: on a match, the replacement plus the
+            // untouched remainder; on no match, the text completely
+            // unchanged (this ALSO correctly handles an empty `text`, where
+            // the loop below never runs at all).
+            return match self.match_here(&chars, 0) {
+                Some(end) => {
+                    let mut out = String::from(replacement);
+                    out.extend(&chars[end..]);
+                    out
+                }
+                None => text.to_string(),
+            };
+        }
         let mut out = String::new();
         let mut i = 0;
         while i < chars.len() {
@@ -552,6 +595,44 @@ mod tests {
         assert!(!m("abc$", "abcx"));
         assert!(m("^abc$", "abc"));
         assert!(!m("^abc$", "abcd"));
+    }
+
+    /// TWO REAL bugs found+fixed (production-hardening PR-it724, found via a
+    /// scoped Explore survey): `^` in this engine (no multi-line mode) can
+    /// only ever match ONCE, at the very start of the string -- `is_match`/
+    /// `find` already got this right via `leftmost`'s `starts = vec![0]`
+    /// restriction, but the two MULTI-match functions did not. (1)
+    /// `find_all`'s old loop only stopped early when a match FAILED at the
+    /// current position -- it never restricted itself to trying position 0
+    /// ONLY, so a pattern shape that happened to also fit at a LATER
+    /// position (`^abc` against "abcabc": a second "abc" happens to occur)
+    /// spuriously matched again there. (2) `replace_all`'s old loop tried
+    /// EVERY position with no `anchored_start` check at all, so `^abc`
+    /// wrongly matched (and replaced) "abc" wherever it occurred, not just
+    /// at position 0. Every case here is independently cross-checked
+    /// against Python's `re.findall`/`re.sub` (which model the SAME
+    /// no-multi-line `^`/`$` semantics) as a reference oracle.
+    #[test]
+    fn anchored_start_only_ever_matches_once_in_find_all_and_replace_all() {
+        let fa = |p: &str, t: &str| compile(p).unwrap().find_all(t);
+        let ra = |p: &str, t: &str, r: &str| compile(p).unwrap().replace_all(t, r);
+        // find_all: a `^`-anchored pattern matches AT MOST once, even when
+        // its shape recurs later in the text.
+        assert_eq!(fa("^abc", "abcabc"), vec!["abc"]);
+        assert_eq!(fa("^abc", "xyzabc"), Vec::<String>::new());
+        assert_eq!(fa("abc", "abcabc"), vec!["abc", "abc"]); // unanchored: unaffected
+        assert_eq!(fa("abc$", "abcabcabc"), vec!["abc"]); // $ was already correct
+        assert_eq!(fa("^$", ""), vec![""]);
+        assert_eq!(fa("^", "abc"), vec![""]);
+        // replace_all: a `^`-anchored pattern replaces AT MOST once, at
+        // position 0; a failed anchored match leaves the text untouched.
+        assert_eq!(ra("^abc", "xyzabc", "#"), "xyzabc");
+        assert_eq!(ra("^abc", "abcabc", "#"), "#abc");
+        assert_eq!(ra("abc", "abcabc", "#"), "##"); // unanchored: unaffected
+        assert_eq!(ra("abc$", "abcabcabc", "#"), "abcabc#"); // $ was already correct
+        assert_eq!(ra("^$", "", "X"), "X"); // empty text: the loop-based old code never ran at all
+        assert_eq!(ra("^a*", "aaa", "#"), "#");
+        assert_eq!(ra("^a*", "bbb", "#"), "#bbb");
     }
 
     #[test]

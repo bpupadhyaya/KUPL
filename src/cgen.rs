@@ -3943,7 +3943,22 @@ static KValue k_re_find_all(KValue pat, KValue text) {
        stack array used to silently TRUNCATE past that many matches -- a zero-width
        pattern like `x?` over a >8192-char string returned only the first 8192
        matches on native instead of the correct count). */
-    int cap = 16; KValue* items = (KValue*)k_alloc(sizeof(KValue) * cap); int n = 0; int i = 0;
+    int cap = 16; KValue* items = (KValue*)k_alloc(sizeof(KValue) * cap); int n = 0;
+    if (re.astart) {
+        /* A REAL bug found+fixed (production-hardening PR-it724, mirroring
+           regex.rs's identical fix): `^` in this engine (no multi-line mode)
+           can only ever match ONCE, at the very start of the text -- the OLD
+           loop below only stopped early when a match FAILED at the current
+           position (`else if (re.astart) break;`), so a pattern shape that
+           happened to ALSO fit at a LATER position (`^abc` against "abcabc":
+           a second "abc" happens to occur) spuriously matched again there. */
+        int e = k_re_match_here(&re, t, tlen, 0);
+        if (e >= 0) items[n++] = k_substr(t, 0, e);
+        KValue r = k_list(items, n);
+        free(items);
+        return r;
+    }
+    int i = 0;
     while (i <= tlen) {
         int e = k_re_match_here(&re, t, tlen, i);
         if (e >= 0) {
@@ -3951,7 +3966,6 @@ static KValue k_re_find_all(KValue pat, KValue text) {
             items[n++] = k_substr(t, i, e);
             i = e > i ? e : i + (i < tlen ? k_utf8_len(t[i]) : 1);
         }
-        else if (re.astart) break;
         else i += (i < tlen ? k_utf8_len(t[i]) : 1);
     }
     KValue r = k_list(items, n);
@@ -3963,6 +3977,23 @@ static KValue k_re_replace(KValue pat, KValue text, KValue repl) {
     kre_steps = 10000000;
     const unsigned char* t = (const unsigned char*)k_as_str(text); int tlen = (int)strlen((const char*)t);
     const char* rep = k_as_str(repl);
+    if (re.astart) {
+        /* A REAL bug found+fixed (production-hardening PR-it724, mirroring
+           regex.rs's identical fix): the OLD loop below tried EVERY position
+           with no `astart` check at all, so `^abc` wrongly matched (and
+           replaced) "abc" wherever it occurred in the text, not just at
+           position 0. `^` can only ever match once, at the very start of
+           the string, so an anchored pattern is tried at position 0 ONLY. */
+        int e = k_re_match_here(&re, t, tlen, 0);
+        KBuf b = { 0, 0, 0 };
+        if (e >= 0) {
+            kb_puts(&b, rep);
+            kb_write(&b, (const char*)t + e, tlen - e);
+        } else {
+            kb_puts(&b, (const char*)t);
+        }
+        return k_str(kb_take(&b));
+    }
     KBuf b = { 0, 0, 0 }; int i = 0;
     while (i < tlen) {
         int e = k_re_match_here(&re, t, tlen, i);
@@ -9775,6 +9806,40 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "regex").trim(),
             "[\"1\", \"22\", \"333\"]\na#b#c\nSome(\"日\")\nSome(\"a日本z\")"
+        );
+    }
+
+    /// TWO REAL bugs found+fixed (production-hardening PR-it724, the native
+    /// mirror of regex.rs's identical fix): `^` in this engine (no
+    /// multi-line mode) can only ever match ONCE, at the very start of the
+    /// text -- `k_re_leftmost` (backing `re_match`/`re_find`) already got
+    /// this right via its `last = re->astart ? 0 : tlen` restriction, but
+    /// the two MULTI-match functions did not. (1) `k_re_find_all`'s old loop
+    /// only stopped early when a match FAILED at the current position
+    /// (`else if (re.astart) break;`) -- it never restricted itself to
+    /// trying position 0 ONLY, so a pattern shape that happened to also fit
+    /// at a LATER position (`^abc` against "abcabc": a second "abc" occurs)
+    /// spuriously matched again there. (2) `k_re_replace`'s old loop tried
+    /// EVERY position with no `astart` check at all, so `^abc` wrongly
+    /// matched (and replaced) "abc" wherever it occurred, not just at
+    /// position 0. Expected values are HARDCODED (not compared against
+    /// interp) since they were independently cross-checked against Python's
+    /// `re.findall`/`re.sub` (which model the identical no-multi-line `^`/`$`
+    /// semantics) before this native mirror was written, and native's
+    /// `k_re_find_all`/`k_re_replace` are fully independent C
+    /// reimplementations of the same bug-affected Rust functions.
+    #[test]
+    fn native_regex_anchored_start_only_ever_matches_once_in_find_all_and_replace() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{re_find_all(\"^abc\", \"abcabc\")}|{re_find_all(\"^abc\", \"xyzabc\")}|{re_find_all(\"abc\", \"abcabc\")}|{re_find_all(\"abc$\", \"abcabcabc\")}\")\n    \
+                   print(\"{re_replace(\"^abc\", \"xyzabc\", \"#\")}|{re_replace(\"^abc\", \"abcabc\", \"#\")}|{re_replace(\"abc\", \"abcabc\", \"#\")}|{re_replace(\"abc$\", \"abcabcabc\", \"#\")}\")\n    \
+                   print(\"{re_replace(\"^$\", \"\", \"X\")}|{re_replace(\"^a*\", \"aaa\", \"#\")}|{re_replace(\"^a*\", \"bbb\", \"#\")}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "regexanchor").trim(),
+            "[\"abc\"]|[]|[\"abc\", \"abc\"]|[\"abc\"]\nxyzabc|#abc|##|abcabc#\nX|#|#bbb"
         );
     }
 
