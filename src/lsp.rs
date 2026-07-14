@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use crate::diag::{json_escape, line_col, Severity};
+use crate::diag::{json_escape, line_col, line_col_utf16, Severity};
 
 // ---------------- tiny JSON ----------------
 
@@ -336,8 +336,8 @@ fn diagnostics_notification(path: &PathBuf, uri: &str, buffers: &HashMap<PathBuf
         }
         let local_start = d.span.start - file.base;
         let local_end = d.span.end.max(d.span.start + 1) - file.base;
-        let (l1, c1) = line_col(&file.src, local_start);
-        let (l2, c2) = line_col(&file.src, local_end);
+        let (l1, c1) = line_col_utf16(&file.src, local_start);
+        let (l2, c2) = line_col_utf16(&file.src, local_end);
         let severity = match d.severity {
             Severity::Error => 1,
             Severity::Warning => 2,
@@ -376,15 +376,14 @@ fn diagnostics_notification(path: &PathBuf, uri: &str, buffers: &HashMap<PathBuf
 /// UTF-16 unit count to the matching byte offset (`char::len_utf16` vs.
 /// `char::len_utf8`); a run past the end of the line's UTF-16 length still
 /// clamps to the line's full byte length, same defensive behavior as
-/// before. (The output side -- `diag::line_col`, used to build the
-/// positions this server SENDS back -- already returns a raw char count,
-/// which happens to equal the UTF-16 unit count for every character KUPL's
-/// `is_ident` allows in an identifier (alphanumeric BMP characters), so
-/// responses were already correctly aligned with real clients for the
-/// common case; only 4-byte/astral-plane characters like emoji, which can
-/// only ever appear in a comment or string literal, not an identifier,
-/// would still under-count there -- a narrower, lower-severity residual gap
-/// left for a future iteration, not fixed here.)
+/// before. (The output side was ALSO fixed, production-hardening PR-it764:
+/// `diag::line_col`'s raw char count happens to equal the UTF-16 unit count
+/// for every character KUPL's `is_ident` allows in an identifier
+/// (alphanumeric BMP characters), so responses were already correctly
+/// aligned with real clients for the common case -- but 4-byte/astral-plane
+/// characters like emoji, which can only ever appear in a comment or string
+/// literal, still under-counted every position on the SAME line. See
+/// `diag::line_col_utf16`'s own doc comment for the fix and live repro.)
 fn offset_at(text: &str, line: usize, character: usize) -> usize {
     let mut off = 0usize;
     for (n, l) in text.split_inclusive('\n').enumerate() {
@@ -871,8 +870,8 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
     // locate the name token within the declaration for a precise range
     let decl_start = span.start as usize;
     let name_off = text.get(decl_start..).and_then(|s| s.find(name)).map(|i| decl_start + i)?;
-    let (l0, c0) = crate::diag::line_col(text, name_off as u32);
-    let (l1, c1) = crate::diag::line_col(text, (name_off + name.len()) as u32);
+    let (l0, c0) = crate::diag::line_col_utf16(text, name_off as u32);
+    let (l1, c1) = crate::diag::line_col_utf16(text, (name_off + name.len()) as u32);
     Some((l0 - 1, c0 - 1, l1 - 1, c1 - 1))
 }
 
@@ -1292,8 +1291,8 @@ fn collect_occurrences(
     for t in &tokens {
         match &t.tok {
             crate::token::Tok::Ident(s) if s == name => {
-                let (l0, c0) = crate::diag::line_col(full, base + t.span.start);
-                let (l1, c1) = crate::diag::line_col(full, base + t.span.end);
+                let (l0, c0) = crate::diag::line_col_utf16(full, base + t.span.start);
+                let (l1, c1) = crate::diag::line_col_utf16(full, base + t.span.end);
                 out.push((l0 - 1, c0 - 1, l1 - 1, c1 - 1));
             }
             // `"…{x}…"` — the interpolated expression is captured raw inside the
@@ -1491,8 +1490,8 @@ fn document_symbols(text: &str) -> Option<String> {
 
 /// LSP `Range` for a span, rendered inline as a JSON object literal.
 fn lsp_range(text: &str, span: crate::diag::Span) -> String {
-    let (l0, c0) = line_col(text, span.start);
-    let (l1, c1) = line_col(text, span.end);
+    let (l0, c0) = line_col_utf16(text, span.start);
+    let (l1, c1) = line_col_utf16(text, span.end);
     format!(
         "{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}",
         l0 - 1,
@@ -1844,7 +1843,7 @@ fn resolve_formatting(text: &str) -> Option<String> {
     if formatted == text {
         return Some("[]".to_string());
     }
-    let (end_line, end_col) = line_col(text, text.len() as u32);
+    let (end_line, end_col) = line_col_utf16(text, text.len() as u32);
     Some(format!(
         "[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":{},\"character\":{}}}}},\"newText\":\"{}\"}}]",
         end_line - 1,
@@ -2113,8 +2112,8 @@ pub fn serve() -> i32 {
                     let items: Vec<String> = resolve_code_actions(&text, start_off, end_off)
                         .into_iter()
                         .map(|(title, edit_start, edit_end, new_text)| {
-                            let (sl, sc) = line_col(&text, edit_start as u32);
-                            let (el, ec) = line_col(&text, edit_end as u32);
+                            let (sl, sc) = line_col_utf16(&text, edit_start as u32);
+                            let (el, ec) = line_col_utf16(&text, edit_end as u32);
                             let start_pos = format!("{{\"line\":{},\"character\":{}}}", sl - 1, sc - 1);
                             let end_pos = format!("{{\"line\":{},\"character\":{}}}", el - 1, ec - 1);
                             format!(
@@ -3668,6 +3667,48 @@ mod tests {
         // since everything up to that point is single-byte ASCII.
         assert_eq!(offset_at(text, 0, 4), 4);
         assert_eq!(ident_under(text, 0, 4).as_deref(), Some("café"));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it764, the exact
+    /// residual gap PR-it740's own doc comment above left open): the ENCODE
+    /// side (`diag::line_col`, used to build every LSP position this server
+    /// SENDS back) computed its column as a raw Unicode-scalar CHAR count,
+    /// which happens to equal the UTF-16 unit count for every BMP character
+    /// (café's é, 日本's CJK characters -- all exactly 1 UTF-16 unit each,
+    /// covering PR-it740's own fix) -- but UNDER-counts by 1 for every
+    /// ASTRAL-PLANE character (anything above U+FFFF, e.g. an emoji, encoded
+    /// as a UTF-16 SURROGATE PAIR = 2 units) preceding the target position on
+    /// the same line. `is_ident` categorically excludes such characters from
+    /// ever being part of an identifier, so this couldn't misdirect a
+    /// hover/rename/definition request the way PR-it740's decode-side bug
+    /// did -- but it silently shifted every published diagnostic position on
+    /// any line containing an astral character, for every real client. Live-
+    /// confirmed BEFORE this fix (via a raw-UTF-8 JSON-RPC message, matching
+    /// what a real client actually sends over the wire): `fun main() { let s
+    /// = "🎉"; bogus_undefined_name }` published its `K0240` diagnostic at
+    /// `character: 26`, one short of the correct UTF-16 offset `27`.
+    #[test]
+    fn published_diagnostic_positions_count_an_astral_plane_character_as_two_utf16_units() {
+        let dir = std::env::temp_dir().join(format!("kupl-lsp-astral-it764-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("astral.kupl");
+        // "🎉" (U+1F389) is ONE Rust char / Unicode scalar value, but TWO
+        // UTF-16 code units (a surrogate pair) -- the diagnostic for
+        // `bogus_undefined_name`, on the SAME line, must count it as such.
+        let src = "fun main() { let s = \"\u{1F389}\"; bogus_undefined_name }\n";
+        std::fs::write(&file, src).unwrap();
+        let uri = format!("file://{}", file.display());
+        let note = diagnostics_notification(&file, &uri, &HashMap::new());
+        assert!(note.contains("K0240"), "{note}");
+        assert!(
+            note.contains("\"character\":27"),
+            "the astral-plane emoji must count as 2 UTF-16 units, putting the diagnostic at character 27, not 26: {note}"
+        );
+        assert!(
+            !note.contains("\"character\":26"),
+            "must not under-count by treating the emoji as a single UTF-16 unit: {note}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

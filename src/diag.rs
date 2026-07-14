@@ -62,6 +62,47 @@ pub fn line_col(src: &str, offset: u32) -> (usize, usize) {
     (line, col)
 }
 
+/// Resolve a byte offset to 1-based (line, UTF-16 CODE UNIT column) -- for
+/// building LSP protocol positions, which the spec (and every real client)
+/// encodes `character` as UTF-16 code units, not Unicode scalar values (see
+/// `lsp.rs::offset_at`'s own doc comment for the matching DECODE-side fix,
+/// production-hardening PR-it740). A REAL bug found+fixed (production-
+/// hardening PR-it764, the residual gap PR-it740 explicitly left open):
+/// `line_col`'s plain char count is correct for CLI caret-length purposes
+/// (matches per-character terminal columns, see `render()`'s own comment)
+/// and happens to ALSO be correct for the ENCODE side wherever every
+/// preceding character on the line is in the Basic Multilingual Plane (1
+/// UTF-16 unit each) -- but UNDER-counts by 1 for every ASTRAL-PLANE
+/// character (any codepoint above U+FFFF -- emoji, mathematical alphanumeric
+/// symbols, etc., encoded as a UTF-16 SURROGATE PAIR = 2 units) preceding the
+/// target offset on the same line. `is_ident` categorically excludes such
+/// characters from ever being part of an identifier, so this couldn't affect
+/// WHICH identifier a position resolves to -- but it silently shifts every
+/// LSP position (diagnostics, hover/definition ranges, occurrences/rename,
+/// document symbols, formatting edits, code actions) on any line containing
+/// an astral character, for every real client. Live-confirmed before this
+/// fix: `fun main() { let s = "🎉"; bogus_undefined_name }` published a
+/// `K0240` diagnostic at `character: 26`, but the correct UTF-16 offset
+/// (verified against a real client's encoding of the same text) is `27` --
+/// one short, exactly the astral character's own surrogate-pair "debt".
+pub fn line_col_utf16(src: &str, offset: u32) -> (usize, usize) {
+    let offset = (offset as usize).min(src.len());
+    let mut line = 1;
+    let mut col = 1;
+    for (i, ch) in src.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += ch.len_utf16();
+        }
+    }
+    (line, col)
+}
+
 pub fn render(diag: &Diag, src: &str, file: &str) -> String {
     let (line, col) = line_col(src, diag.span.start);
     let sev = match diag.severity {
