@@ -2296,6 +2296,50 @@ static void k_json_num(KBuf* b, double n) {
     if (!isfinite(n)) k_panic("cannot serialize a non-finite number (NaN/Infinity) to JSON");
     if (n == floor(n) && fabs(n) < 1e15) {
         char t[32]; snprintf(t, sizeof t, "%lld", (long long)n); kb_puts(b, t);
+    } else if (n == floor(n)) {
+        /* A REAL, FUZZ-CONFIRMED cross-engine byte divergence found+fixed
+           (production-hardening PR-it722): for a whole number >= 1e15 (past
+           the exact-int64 fast path above), the OLD code below searched
+           %.*f precision starting at p=0 -- but %.0f on a whole number
+           ALWAYS round-trips trivially (it's the EXACT decimal expansion of
+           the double's binary value), so the loop exited immediately at
+           p=0 and emitted that FULL exact expansion -- which for a value
+           this large has 50-300+ digits that are really just binary-to-
+           decimal noise beyond the ~17 significant digits an f64 actually
+           carries -- NOT the shortest round-tripping decimal Rust's
+           `f64::to_string()` produces (json.rs::format_num). Confirmed
+           live: json_stringify(2.2243541059934106e209) gave interp/vm
+           "22243541059934106" + 193 zeros (210 digits total, matching
+           Rust's to_string()) but native gave a DIFFERENT 210-digit string
+           sharing only the same length and leading few digits. Fixed by
+           searching SIGNIFICANT-digit count via %.*e (scientific notation,
+           mirroring the fractional branch below's search over decimal-place
+           count) to find the shortest round-tripping MANTISSA, then
+           expanding it back into positional form with trailing zeros --
+           exactly Rust's algorithm. The pre-existing "nice" cases (e.g.
+           1e20, a single significant digit) still degenerate to the same
+           output as before, since the shortest mantissa for a round number
+           IS just that one digit either way. */
+        char sci[64];
+        int prec = 0;
+        for (; prec <= 17; prec++) {
+            snprintf(sci, sizeof sci, "%.*e", prec, n);
+            if (strtod(sci, 0) == n) break;
+        }
+        int neg = sci[0] == '-';
+        const char* p = sci + (neg ? 1 : 0);
+        char digits[24]; int ndig = 0;
+        digits[ndig++] = *p++;
+        if (*p == '.') {
+            p++;
+            while (*p != 'e' && *p != 'E') digits[ndig++] = *p++;
+        }
+        while (*p != 'e' && *p != 'E') p++;
+        int exp = atoi(p + 1);
+        digits[ndig] = 0;
+        if (neg) kb_putc(b, '-');
+        kb_puts(b, digits);
+        for (int i = 0; i < exp - (ndig - 1); i++) kb_putc(b, '0');
     } else {
         /* Shortest POSITIONAL (never scientific) representation that round-trips —
            matches Rust's `f64::to_string()` used by json.rs::format_num. `%g` diverged
@@ -7242,6 +7286,49 @@ fun main() uses io {
             native_main_stdout(src, "jnum").trim(),
             "100000000000000000000|0.30000000000000004|42|0.00001"
         );
+    }
+
+    /// A REAL, FUZZ-CONFIRMED cross-engine byte divergence found+fixed
+    /// (production-hardening PR-it722, found via a scoped Explore survey):
+    /// `native_json_number_positional` above only exercises "nice" whole
+    /// numbers (1e20 — a single significant digit), which happen to
+    /// degenerate to the SAME output under the old buggy algorithm and the
+    /// new correct one. A GENUINE whole-number double with many significant
+    /// digits (not a round power of ten) exposed the real bug: `k_json_num`'s
+    /// old precision-search loop used `%.*f` starting at p=0, which trivially
+    /// round-trips for ANY whole number (it's the number's EXACT decimal
+    /// expansion) — so the loop always stopped at p=0 and emitted that full
+    /// exact expansion (hundreds of digits of binary-to-decimal noise past
+    /// the ~17 significant digits an f64 actually carries), not the SHORTEST
+    /// round-tripping decimal Rust's `f64::to_string()` produces (used by
+    /// json.rs::format_num, and thus by interp/KVM). Confirmed live before
+    /// the fix: interp gave "22243541059934106" + 193 zeros (210 digits) for
+    /// `2.2243541059934106e209`; native gave a 210-digit string that only
+    /// shared the same length and leading few digits. Fixed by searching
+    /// SIGNIFICANT-digit count via `%.*e` (mirroring the fractional branch's
+    /// existing `%.*f`-precision search) to find the shortest round-tripping
+    /// mantissa, then expanding it back to positional form with trailing
+    /// zeros — exactly Rust's algorithm. Values are HARDCODED here (not
+    /// compared against interp) since interp is independently confirmed
+    /// correct (it matches Rust's own `to_string()`, verified directly via
+    /// `rustc`), and the bug lives ONLY in native's fully independent C
+    /// reimplementation.
+    #[test]
+    fn native_json_number_large_whole_value_matches_rust_shortest_round_trip() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{json_stringify(JNum(2.2243541059934106e209))}|{json_stringify(JNum(-2.2243541059934106e209))}|{json_stringify(JNum(1e300))}|{json_stringify(JNum(1e15))}\")\n}\n";
+        let expected_209 = format!(
+            "22243541059934106{}",
+            "0".repeat(193)
+        );
+        let expected = format!(
+            "{expected_209}|-{expected_209}|1{}|1000000000000000",
+            "0".repeat(300)
+        );
+        assert_eq!(native_main_stdout(src, "jnumbig").trim(), expected);
     }
 
     /// Native list higher-order methods preserve order/stability like interp/KVM:
