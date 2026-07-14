@@ -159,6 +159,73 @@ fn common_method_alias(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether `e` references ANY bare identifier in `names`, anywhere in its
+/// expression tree -- used by `check_default_params_dont_reference_sibling_params`
+/// (PR-it720, see its doc comment). Deliberately does NOT track shadowing
+/// (a lambda param or match binding that happens to reuse one of `names`
+/// still counts as a "hit") -- this check only ever REJECTS a pattern, so
+/// erring toward over-matching is safe (worst case: a rare, genuinely-safe
+/// shadowed usage gets rejected too, not a correctness risk) and far
+/// simpler than tracking scopes correctly through every expression form.
+fn expr_references_name(e: &Expr, names: &HashSet<&str>) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => names.contains(n.as_str()),
+        ExprKind::Str(pieces) => pieces.iter().any(|p| match p {
+            StrPiece::Expr(e) => expr_references_name(e, names),
+            StrPiece::Text(_) => false,
+        }),
+        ExprKind::List(items) | ExprKind::Par(items) => items.iter().any(|i| expr_references_name(i, names)),
+        ExprKind::Call { callee, args } => {
+            expr_references_name(callee, names) || args.iter().any(|a| expr_references_name(&a.value, names))
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            expr_references_name(recv, names) || args.iter().any(|a| expr_references_name(a, names))
+        }
+        ExprKind::Field { recv, .. } => expr_references_name(recv, names),
+        ExprKind::Binary { lhs, rhs, .. } => expr_references_name(lhs, names) || expr_references_name(rhs, names),
+        ExprKind::Unary { operand, .. } => expr_references_name(operand, names),
+        ExprKind::If { cond, then_block, else_block } => {
+            expr_references_name(cond, names)
+                || block_references_name(then_block, names)
+                || else_block.as_ref().is_some_and(|e| expr_references_name(e, names))
+        }
+        ExprKind::BlockExpr(b) => block_references_name(b, names),
+        ExprKind::Match { scrutinee, arms } => {
+            expr_references_name(scrutinee, names)
+                || arms.iter().any(|arm| {
+                    arm.guard.as_ref().is_some_and(|g| expr_references_name(g, names))
+                        || expr_references_name(&arm.body, names)
+                })
+        }
+        ExprKind::Lambda { body, .. } => block_references_name(body, names),
+        ExprKind::Range { lo, hi, .. } => expr_references_name(lo, names) || expr_references_name(hi, names),
+        ExprKind::With { recv, updates } => {
+            expr_references_name(recv, names) || updates.iter().any(|(_, v)| expr_references_name(v, names))
+        }
+        ExprKind::Try(e) | ExprKind::Await(e) => expr_references_name(e, names),
+        _ => false,
+    }
+}
+
+fn block_references_name(b: &Block, names: &HashSet<&str>) -> bool {
+    b.stmts.iter().any(|s| stmt_references_name(s, names))
+}
+
+fn stmt_references_name(s: &Stmt, names: &HashSet<&str>) -> bool {
+    match s {
+        Stmt::Let { init, .. } => expr_references_name(init, names),
+        Stmt::Assign { target, value, .. } => expr_references_name(target, names) || expr_references_name(value, names),
+        Stmt::Expr(e) => expr_references_name(e, names),
+        Stmt::Return(Some(e), _) => expr_references_name(e, names),
+        Stmt::While { cond, body, .. } => expr_references_name(cond, names) || block_references_name(body, names),
+        Stmt::For { iter, body, .. } => expr_references_name(iter, names) || block_references_name(body, names),
+        Stmt::Emit { arg: Some(e), .. } => expr_references_name(e, names),
+        Stmt::Expect(e, _) => expr_references_name(e, names),
+        Stmt::Forall { body, .. } => block_references_name(body, names),
+        _ => false,
+    }
+}
+
 /// Every built-in method name across all receiver types, for "did you mean"
 /// suggestions on an unknown method (K0249). Suggestion-only and best-effort —
 /// if a newly added method is missing here the only effect is a missed hint, so
@@ -1063,7 +1130,53 @@ impl Checker {
         }
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it720):
+    /// `callargs.rs`'s `resolve_one` splices a missing argument's default
+    /// (`p.default.clone()`) DIRECTLY into whichever CALL SITE is missing it
+    /// -- so a default expression referencing ANOTHER parameter of the same
+    /// function (`fun f(a: Int, b: Int = a + 1)`, a common, useful pattern in
+    /// Swift/Kotlin/C#) resolves that name in the CALLER's scope instead of
+    /// the callee's parameter scope. Confirmed live: `f(5)` called with NO
+    /// caller-scope `a` in sight failed with a confusing "unknown name `a`
+    /// (did you mean `f`?)" pointing at the FUNCTION'S OWN declaration line;
+    /// with a coincidentally-matching caller-scope `let a = 100`, it
+    /// compiled and SILENTLY returned the WRONG value (106, using the
+    /// caller's `a`) instead of the correct one (11, using the argument
+    /// `5`) -- a genuinely dangerous silent-wrong-value bug, not just a
+    /// confusing error. Rather than attempt full per-call hygiene (would
+    /// need to rewrite/rebind every name the default references, including
+    /// through nested calls -- a bigger, riskier feature), this closes the
+    /// SEVERITY gap by rejecting the pattern cleanly and deterministically
+    /// AT THE DECLARATION SITE, matching the K0275 precedent (it677/it679)
+    /// of turning a silently-broken default-parameter shape into a clean
+    /// compile error instead. Only checked for TOP-LEVEL `fun` params
+    /// (`component.is_none()`) -- component/contract/ctor param defaults are
+    /// ALREADY rejected entirely by `reject_param_defaults` (K0275) before
+    /// this would ever matter.
+    fn check_default_params_dont_reference_sibling_params(&mut self, f: &FunDecl) {
+        let names: HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        for p in &f.params {
+            if let Some(d) = &p.default {
+                if expr_references_name(d, &names) {
+                    self.err(
+                        "K0280",
+                        format!(
+                            "parameter `{}`'s default value cannot reference another parameter of \
+                             `{}` -- it is evaluated at the CALL SITE, not in `{}`'s own scope, so it \
+                             would silently use whatever name is in scope there instead",
+                            p.name, f.name, f.name
+                        ),
+                        d.span,
+                    );
+                }
+            }
+        }
+    }
+
     fn check_fun(&mut self, f: &FunDecl, component: Option<&ComponentDecl>) {
+        if component.is_none() {
+            self.check_default_params_dont_reference_sibling_params(f);
+        }
         self.tyvars.clear();
         for tp in &f.type_params {
             let v = self.uni.fresh();
@@ -4424,6 +4537,45 @@ mod generic_tests {
         );
         // A fieldless variant and a variant with no defaults at all are unaffected.
         assert!(errors("type Greeting = Hello(name: Str) | Nothing\nfun main() { let _ = Hello(\"x\")\n    let _ = Nothing }\n").is_empty());
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug (PR-it720): `callargs.rs`'s
+    /// `resolve_one` splices a missing argument's default directly into the
+    /// CALL SITE, so `fun f(a: Int, b: Int = a + 1)` resolves `a` in the
+    /// CALLER's scope, not `f`'s own parameter scope. Confirmed live via the
+    /// real pipeline (`crate::run::compile`, not the bare `errors()` harness,
+    /// since the divergence only manifests once `resolve_call_args` actually
+    /// splices the default): `f(5)` with NO caller-scope `a` failed with a
+    /// confusing "unknown name `a`" pointing at `f`'s OWN declaration; with a
+    /// coincidentally-matching `let a = 100` in the caller, it compiled and
+    /// SILENTLY returned 106 (using the caller's `a`) instead of the correct
+    /// 11 (using the argument `5`).
+    #[test]
+    fn default_value_referencing_a_sibling_parameter_is_rejected_at_check_time() {
+        let e = errors("fun f(a: Int, b: Int = a + 1) -> Int { a + b }\nfun main() { print(f(5)) }\n");
+        assert!(
+            e.iter().any(|d| d.code == "K0280" && d.message.contains("parameter `b`'s default value cannot reference another parameter") && d.message.contains("`f`")),
+            "{e:?}"
+        );
+        // Referencing a LATER (still-required) sibling, or even ITSELF, is
+        // equally rejected -- the check doesn't special-case "earlier" vs.
+        // "later" (K0267 already requires defaults to be trailing, so only
+        // ordering K0267 wouldn't otherwise catch matters here).
+        let self_ref = errors("fun f(a: Int = a) -> Int { a }\nfun main() { print(f()) }\n");
+        assert!(self_ref.iter().any(|d| d.code == "K0280"), "{self_ref:?}");
+        // A default referencing a GLOBAL function or a plain constant (no
+        // sibling-parameter name involved at all) is completely unaffected --
+        // proven via the REAL pipeline, confirming it both check-passes AND
+        // produces the CORRECT runtime value (not just "doesn't error").
+        assert!(
+            crate::run::compile(
+                "fun helper() -> Int { 42 }\n\
+                 fun g(a: Int, b: Int = 10, c: Int = helper()) -> Int { a + b + c }\n\
+                 fun main() { print(g(1)) }\n"
+            )
+            .is_ok(),
+            "a default referencing only globals/constants must compile cleanly"
+        );
     }
 
     /// A REAL silent-footgun bug (PR-it679, THREE MORE sibling instances of
