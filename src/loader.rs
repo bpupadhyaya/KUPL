@@ -361,12 +361,79 @@ pub fn all_registry_deps(entry: &str) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
+/// Escape a `kupl.lock` field so it can never be mistaken for the `\t`
+/// column delimiter or a `\n` line break -- production-hardening PR-it762:
+/// a REAL bug found+fixed where a dependency NAME containing a literal tab
+/// byte (`manifest.rs` places NO identifier-syntax restriction on a
+/// `[dependencies]` key -- it's just `key.trim()` from a raw
+/// `split_once('=')`) produced a lock line with 5 tab-separated columns
+/// instead of 4, silently dropped by `lock_hashes`'s exact `cols.len() ==
+/// 4` check -- with no error, no warning, and no indication in `kupl pkg
+/// tree`'s output that drift detection had gone dark for that ONE
+/// dependency (confirmed live: a genuine source change to the affected
+/// dependency produced NO `[drift]` marker, while a sibling dependency in
+/// the SAME lockfile continued to correctly show `[drift]`). The identical
+/// corruption is reachable through a dependency's `version` string too
+/// (`manifest.rs`'s `parse_string` does no escape processing on quoted
+/// string content), so the fix lives in the lock format's OWN
+/// serialization rather than trying to reject every field independently at
+/// every point data enters it.
+fn escape_lock_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Reverse `escape_lock_field`.
+fn unescape_lock_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                // an unrecognized escape (or a dangling trailing backslash) is
+                // preserved verbatim rather than silently eaten -- this can
+                // only arise from hand-editing a lockfile against its own
+                // "do not edit by hand" header, so surfacing the raw text
+                // (which then simply won't match any real hash) is safer
+                // than guessing.
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Serialize resolved deps to the `kupl.lock` line format:
-/// `name<TAB>path<TAB>version<TAB>hash` (one per line, name-sorted).
+/// `name<TAB>path<TAB>version<TAB>hash` (one per line, name-sorted). Each
+/// field is escaped (`escape_lock_field`) so an embedded `\t`/`\n`/`\\` in
+/// any field can never be mistaken for the column/line delimiters.
 pub fn lock_text(deps: &[ResolvedDep]) -> String {
     let mut s = String::from("# kupl.lock — resolved dependencies (do not edit by hand)\n");
     for d in deps {
-        s.push_str(&format!("{}\t{}\t{}\t{}\n", d.name, d.path, d.version, d.hash));
+        s.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            escape_lock_field(&d.name),
+            escape_lock_field(&d.path),
+            escape_lock_field(&d.version),
+            escape_lock_field(&d.hash)
+        ));
     }
     s
 }
@@ -380,7 +447,7 @@ pub fn lock_hashes(text: &str) -> HashMap<String, String> {
         }
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() == 4 {
-            m.insert(cols[0].to_string(), cols[3].to_string());
+            m.insert(unescape_lock_field(cols[0]), unescape_lock_field(cols[3]));
         }
     }
     m
@@ -1566,5 +1633,59 @@ mod tests {
         assert!(interp.call_value(f, vec![], crate::diag::Span::default()).is_ok(), "main() must run to completion (1001 printed twice)");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it762, from a fresh
+    /// Explore survey of loader.rs's `lock_hashes`/lockfile-drift-detection
+    /// mechanism): a dependency NAME (or `path`/`version`) containing a
+    /// literal tab byte -- `manifest.rs` places NO identifier-syntax
+    /// restriction on a `[dependencies]` key, it's just `key.trim()` -- got
+    /// serialized into a `kupl.lock` line with 5 tab-separated columns
+    /// instead of the expected 4, silently DROPPED by `lock_hashes`'s exact
+    /// `cols.len() == 4` check, with no error and no indication anything
+    /// was wrong. Live-confirmed before this fix: `kupl pkg tree` on a
+    /// project with a tab-containing dependency name showed NO `[drift]`
+    /// marker even after the dependency's real source content changed,
+    /// while a sibling dependency with a normal name in the SAME lockfile
+    /// correctly showed `[drift]` -- drift detection silently went dark for
+    /// exactly one dependency with zero warning. This test exercises the
+    /// pure `lock_text`/`lock_hashes` round-trip directly (deterministic,
+    /// no filesystem/process needed) rather than the full `kupl pkg
+    /// tree`/`pkg lock` CLI path, since the bug is entirely in this
+    /// serialization pair.
+    #[test]
+    fn a_lockfile_field_containing_a_tab_or_newline_round_trips_instead_of_corrupting_the_column_count() {
+        let deps = vec![
+            super::ResolvedDep {
+                name: "foo\tbar".to_string(),
+                path: "/some/path".to_string(),
+                version: "1.0.0".to_string(),
+                hash: "deadbeef".to_string(),
+            },
+            super::ResolvedDep {
+                name: "normal".to_string(),
+                path: "/other/path".to_string(),
+                version: "2.0.0\nwith-newline".to_string(),
+                hash: "cafef00d".to_string(),
+            },
+        ];
+        let text = super::lock_text(&deps);
+        // exactly 2 real dependency lines (plus the leading comment) -- an
+        // embedded `\n` in the version field must NOT be mistaken for a
+        // line break, and an embedded `\t` in the name field must NOT be
+        // mistaken for an extra column.
+        assert_eq!(
+            text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).count(),
+            2,
+            "an embedded tab/newline must not fragment one dependency into multiple lock lines: {text:?}"
+        );
+        let hashes = super::lock_hashes(&text);
+        assert_eq!(
+            hashes.get("foo\tbar"),
+            Some(&"deadbeef".to_string()),
+            "a tab-containing dependency name must still round-trip to its own hash, not be silently dropped: {hashes:?}"
+        );
+        assert_eq!(hashes.get("normal"), Some(&"cafef00d".to_string()), "{hashes:?}");
+        assert_eq!(hashes.len(), 2, "no dependency should be silently dropped from drift tracking: {hashes:?}");
     }
 }
