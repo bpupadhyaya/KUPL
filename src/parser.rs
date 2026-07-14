@@ -23,6 +23,48 @@ pub struct Parser {
 /// parser (~11 precedence frames per level) stays well within a small thread stack.
 const MAX_EXPR_DEPTH: usize = 128;
 
+/// A duration literal (`on every`/`on after`, and an `example` block's
+/// `advance` step) is capped at 100 years in milliseconds.
+///
+/// A REAL, uncatchable/UB-inducing bug found+fixed (production-hardening
+/// PR-it728, found via a scoped Explore survey): `parse_duration` already
+/// guarded the UNIT-CONVERSION multiplication (`n.checked_mul(per)`, below)
+/// against overflow, but placed NO cap on the resulting millisecond value
+/// itself — so `9223372036854775807ms` (using the `ms` unit directly, where
+/// `per == 1` and the multiplication trivially never overflows) sailed
+/// straight through as a legal duration. This value then reached THREE
+/// independent unchecked-arithmetic sites, none of which cross-validated it:
+/// `interp.rs`/`vm.rs`'s `next_fire: now + interval` (timer arming) and
+/// `next_fire += interval` (timer rescheduling), and `interp.rs`/`vm.rs`'s
+/// `advance()`'s own `self.now + dur` (used by BOTH automatic timer
+/// advancing AND an `example` block's explicit `advance <duration>` step,
+/// confirmed as a SEPARATE, independently-reachable crash site — an
+/// `advance` step needs no timer at all). Confirmed LIVE on all three
+/// mechanisms: `on every 9223372036854775807ms { ... }` crashed BOTH
+/// `kupl run` (a raw "attempt to add with overflow" Rust panic reported as
+/// a bogus "internal compiler error", interp.rs:363) and `kupl run --vm`
+/// (the identical ICE, vm.rs:254) — and, worse, did NOT crash on
+/// `kupl native` at all: C signed-integer overflow is UNDEFINED BEHAVIOR,
+/// which in practice wraps `next_fire` to a hugely NEGATIVE value, so the
+/// timer re-fires FOREVER inside a single `k_run_timers` call (observed
+/// multiple GB of output before being killed) — a genuine three-way engine
+/// DIVERGENCE (two clean-ish ICEs vs. one silent resource-exhaustion hang),
+/// on a trivial, single-line, checker-accepted program. `advance
+/// 9223372036854775807ms` in an example block crashed at interp.rs:320
+/// (`self.now + dur`) with NO timer involved at all — `check.rs`'s
+/// `ExampleStep::Advance` arm does no validation whatsoever. Rather than add
+/// checked-arithmetic to every one of these runtime sites, independently,
+/// in three separately-maintained engines, this rejects the PATHOLOGICAL
+/// duration LITERAL once, here, in the single parser all three engines
+/// share (matching the EXISTING `checked_mul` overflow guard's own
+/// check-time, not runtime-checked-arithmetic, philosophy) — closing all
+/// three crash sites and the cross-engine divergence in one place. 100
+/// years is generous for any legitimate `on every`/`on after`/`advance`
+/// duration while leaving enormous headroom against the worst case:
+/// `run_timers`'s own bounded 100-fire loop repeatedly rescheduling a timer
+/// at the cap totals only ~100 * 100 years, over 29,000x below `i64::MAX`.
+const MAX_DURATION_MS: i64 = 100 * 365 * 24 * 60 * 60 * 1000;
+
 fn str_parts_text(parts: &[StrPart]) -> String {
     parts
         .iter()
@@ -503,13 +545,23 @@ impl Parser {
                 ))
             }
         };
-        n.checked_mul(per).ok_or_else(|| {
+        let ms = n.checked_mul(per).ok_or_else(|| {
             Diag::error(
                 "K0120",
                 format!("`{n}{unit}` is too large — durations are stored as milliseconds in a 64-bit integer, and this overflows it"),
                 span.merge(self.prev_span()),
             )
-        })
+        })?;
+        if ms > MAX_DURATION_MS {
+            return Err(Diag::error(
+                "K0120",
+                format!(
+                    "`{n}{unit}` is too large — durations are capped at 100 years, since an `on every`/`on after` timer that reschedules (or an `advance` step) could otherwise overflow the virtual clock's 64-bit millisecond counter"
+                ),
+                span.merge(self.prev_span()),
+            ));
+        }
+        Ok(ms)
     }
 
     fn parse_params(&mut self) -> PResult<Vec<Param>> {
@@ -2383,6 +2435,61 @@ mod tests {
         );
         // A normal, non-overflowing duration still parses cleanly.
         ok("component T {\n    intent \"t\"\n    out tick: Int\n    on every 10ms {\n        emit tick(1)\n    }\n}\n");
+    }
+
+    /// A REAL, uncatchable/UB-inducing bug found+fixed (production-hardening
+    /// PR-it728, found via a scoped Explore survey): `parse_duration`'s
+    /// existing overflow guard (`checked_mul`, tested above) only protects
+    /// the UNIT-CONVERSION multiplication -- a duration expressed directly
+    /// in `ms` (where the multiplier is 1, so the multiplication trivially
+    /// never overflows) sailed through with NO cap on the resulting
+    /// millisecond value at all. Confirmed live: `on every
+    /// 9223372036854775807ms` crashed BOTH `kupl run` (interp.rs:363, timer
+    /// rescheduling's `next_fire += interval`) and `kupl run --vm`
+    /// (vm.rs:254, identical) with a raw "attempt to add with overflow"
+    /// panic -- and did NOT crash `kupl native` at all: C signed-overflow is
+    /// UB, which in practice silently WRAPS `next_fire`, so the timer
+    /// re-fires FOREVER inside one `k_run_timers` call (a genuine
+    /// three-way DIVERGENCE, not just a shared crash). A SEPARATE,
+    /// independently-reachable crash site needs no timer at all: an
+    /// `example` block's `advance` step feeds the SAME unchecked
+    /// `self.now + dur` arithmetic (interp.rs:320) with ZERO validation
+    /// (`check.rs`'s `ExampleStep::Advance` arm does nothing at all).
+    /// `MAX_DURATION_MS` (100 years) closes all of this in the ONE place
+    /// every engine's duration literals pass through.
+    #[test]
+    fn k0120_a_duration_that_would_overflow_the_virtual_clock_on_reschedule_is_capped() {
+        let (_, diags) = parse(
+            "component T {\n    intent \"t\"\n    out tick: Int\n    on every 9223372036854775807ms {\n        emit tick(1)\n    }\n}\n",
+        );
+        assert!(
+            diags.iter().any(|d| d.code == "K0120"
+                && d.message.contains("9223372036854775807ms")
+                && d.message.contains("100 years")),
+            "{diags:?}"
+        );
+        // the SAME cap applies to `on after`.
+        let (_, after_diags) = parse(
+            "component T {\n    intent \"t\"\n    out tick: Int\n    on after 9223372036854775807ms {\n        emit tick(1)\n    }\n}\n",
+        );
+        assert!(after_diags.iter().any(|d| d.code == "K0120" && d.message.contains("100 years")), "{after_diags:?}");
+        // an `example` block's `advance` step is the SEPARATE, independently
+        // reachable crash site (no timer involved at all) -- same cap applies.
+        let (_, advance_diags) = parse(
+            "app A {\n    intent \"a\"\n    example {\n        advance 9223372036854775807ms\n    }\n}\n",
+        );
+        assert!(
+            advance_diags.iter().any(|d| d.code == "K0120" && d.message.contains("100 years")),
+            "{advance_diags:?}"
+        );
+        // exactly at the cap: fine. one millisecond over: rejected.
+        ok("component T {\n    intent \"t\"\n    out tick: Int\n    on every 3153600000000ms {\n        emit tick(1)\n    }\n}\n");
+        let (_, over_diags) = parse(
+            "component T {\n    intent \"t\"\n    out tick: Int\n    on every 3153600000001ms {\n        emit tick(1)\n    }\n}\n",
+        );
+        assert!(over_diags.iter().any(|d| d.code == "K0120" && d.message.contains("100 years")), "{over_diags:?}");
+        // an ordinary, realistic duration is completely unaffected.
+        ok("component T {\n    intent \"t\"\n    out tick: Int\n    on every 500ms {\n        emit tick(1)\n    }\n}\n");
     }
 
     #[test]
