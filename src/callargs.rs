@@ -71,6 +71,41 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
                 for s in &mut c.state {
                     walk_expr(&mut s.init, &mut visit);
                 }
+                // A REAL bug found+fixed (production-hardening PR-it769): this
+                // arm never walked `c.examples` -- the `example { send ...;
+                // expect ... }` blocks `kupl test` runs directly -- so a call
+                // relying on a default parameter value or named arguments
+                // inside an `expect`/`send` expression was silently rejected
+                // by the type checker (a misleading K0242/K0241 arity/named-
+                // arg error) even though the IDENTICAL call compiles cleanly
+                // everywhere else (top-level, ordinary functions, handlers).
+                // Live-confirmed before this fix: `expect result == add(10)`
+                // against `fun add(a: Int, b: Int = 5) -> Int`.
+                for ex in &mut c.examples {
+                    for step in &mut ex.steps {
+                        match step {
+                            ExampleStep::Send { arg: Some(e), .. } => walk_expr(e, &mut visit),
+                            ExampleStep::Expect { expr, .. } => walk_expr(expr, &mut visit),
+                            ExampleStep::Send { arg: None, .. } | ExampleStep::Advance { .. } => {}
+                        }
+                    }
+                }
+            }
+            // A REAL bug found+fixed (production-hardening PR-it769): this
+            // whole item kind fell into the `_ => {}` catch-all, so a
+            // `contract`'s `law "..." { ... }` bodies (executable properties
+            // `kupl test` runs against every component that fulfills the
+            // contract) were NEVER visited by this pass -- the exact same
+            // silent default-parameter/named-argument rejection as the
+            // `examples` gap above, reachable through the SAME root cause
+            // (an item kind simply missing from this match) but a genuinely
+            // DIFFERENT AST node (`ContractDecl.laws`, not `Component.
+            // examples`). Live-confirmed before this fix: `expect add(10) ==
+            // 15` inside `contract Adder { law "..." { ... } }`.
+            Item::Contract(ct) => {
+                for law in &mut ct.laws {
+                    walk_block(&mut law.body, &mut visit);
+                }
             }
             _ => {}
         }
@@ -342,5 +377,51 @@ mod tests {
         // A correct named call still type-checks cleanly.
         let ok_src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() uses io {\n    print(\"{add(a: 1, b: 2)}\")\n}\n";
         assert!(errors(ok_src).is_empty());
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it769): `resolve_call_args`'s
+    /// item walker (the loop right above this test module) never visited a
+    /// `contract`'s `law` bodies (fell into the `_ => {}` catch-all -- `Item::
+    /// Contract` was simply missing from the match) OR a component's `example`
+    /// blocks (the `Item::Component` arm walked handlers/funs/exposes/state
+    /// but never `c.examples`) -- so a call relying on a default parameter
+    /// value or named arguments, inside either construct, was silently
+    /// rejected by the type checker with a misleading K0242 (wrong arity)
+    /// error, even though the IDENTICAL call compiles cleanly everywhere else
+    /// (top-level, an ordinary function, a handler). Live-confirmed BEFORE
+    /// this fix via `kupl test`: `expect add(10) == 15` inside a contract law,
+    /// and `expect result == add(10)` inside an example block, both failed
+    /// with "this function takes 2 arguments, 1 given" against `fun add(a:
+    /// Int, b: Int = 5) -> Int`.
+    #[test]
+    fn default_params_and_named_args_resolve_inside_contract_laws_and_component_examples() {
+        // default parameter, inside a contract law
+        let contract_default = "fun add(a: Int, b: Int = 5) -> Int {\n    a + b\n}\n\
+                                 contract Adder {\n    law \"with default\" { expect add(10) == 15 }\n}\n";
+        assert!(
+            errors(contract_default).is_empty(),
+            "a default-param call inside a contract law must resolve like it does everywhere else: {:?}",
+            errors(contract_default)
+        );
+
+        // default parameter, inside a component example block
+        let example_default = "fun add(a: Int, b: Int = 5) -> Int {\n    a + b\n}\n\
+                                component Adder {\n    intent \"adds\"\n    \
+                                in go: Int\n    out result: Int\n    on go(n) { emit result(add(n)) }\n    \
+                                example {\n        send go(10)\n        expect result == add(10)\n    }\n}\n";
+        assert!(
+            errors(example_default).is_empty(),
+            "a default-param call inside an example block must resolve like it does everywhere else: {:?}",
+            errors(example_default)
+        );
+
+        // named arguments, inside a contract law
+        let contract_named = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+                               contract Adder {\n    law \"named\" { expect add(b: 2, a: 10) == 12 }\n}\n";
+        assert!(
+            errors(contract_named).is_empty(),
+            "a named-argument call inside a contract law must resolve like it does everywhere else: {:?}",
+            errors(contract_named)
+        );
     }
 }
