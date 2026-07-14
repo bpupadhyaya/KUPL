@@ -1488,6 +1488,51 @@ mod tests {
         assert_eq!(differential("fun probe() -> Str {\n    \"{rat(1, 0)}\"\n}\n"), "panic: division by zero");
     }
 
+    /// A coverage-closing verification (production-hardening PR-it717; no bug
+    /// found). `diff_bigint_rational_edges` above only ever exercised
+    /// SINGLE-limb (small-magnitude) BigInt division (`-7 / 2`) -- `bigint.rs`'s
+    /// `divmod_mag` (interp/KVM, shared) and `cgen.rs`'s independent C
+    /// reimplementation `k_big_divmod` (native) are BOTH a non-trivial
+    /// binary-search-based long-division algorithm, and per PR-it709's lesson
+    /// ("the independent reimplementation is the highest-risk site for
+    /// language-semantics-porting bugs") this genuinely untested MULTI-LIMB
+    /// path deserved direct verification rather than being assumed correct
+    /// from the single-limb case. Confirmed clean via a 51-case sweep (hand-
+    /// picked edge cases: dividend<divisor, equal magnitude, every sign
+    /// combination, limb-boundary values, PLUS 30 random multi-limb pairs)
+    /// cross-checked against Python's arbitrary-precision arithmetic (adjusted
+    /// from floor to KUPL's truncated-toward-zero convention) as an
+    /// independent ground truth, byte-identical across interp, KVM, AND
+    /// native -- zero divergence found. This test locks in a representative
+    /// subset permanently: two genuinely multi-limb operands (not just one
+    /// large operand against a small one), every sign combination, the
+    /// dividend-smaller-than-divisor case, equal-magnitude operands, and a
+    /// value straddling exactly one internal limb boundary (`BASE = 10^9`).
+    #[test]
+    fn diff_bigint_divmod_multi_limb_and_dividend_smaller_than_divisor() {
+        let src = r#"fun probe() -> Str {
+    let a = big("123456789012345678901234567890")
+    let b = big("987654321098765432109876543")
+    let c = big("-123456789012345678901234567890")
+    let d = big("42")
+    let e = big("123456789012345678901234567890")
+    let f = big("999999999999999999999999999999999999999")
+    let g = big("1000000000000000000")
+    let h = big("999999999")
+    "{a / b}|{a % b}|{c / b}|{c % b}|{a / (-b)}|{a % (-b)}|{d / e}|{d % e}|{f / f}|{f % f}|{g / h}|{g % h}"
+}
+"#;
+        assert_eq!(
+            differential(src),
+            "124|987653196098765319609876558|\
+             -124|-987653196098765319609876558|\
+             -124|987653196098765319609876558|\
+             0|42|\
+             1|0|\
+             1000000001|1"
+        );
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it637): unlike
     /// `Int.pow` (bounded, fails fast on overflow), `BigInt.pow` had NO
     /// limit at all -- an ordinary KUPL line like `big(2).pow(1000000000)`

@@ -9017,6 +9017,41 @@ fun main() uses io {
         );
     }
 
+    /// The native mirror of `diff_bigint_divmod_multi_limb_and_dividend_smaller_than_divisor`
+    /// (vm.rs, PR-it717): `native_bigint_and_rational_match` above only ever
+    /// exercises SINGLE-limb BigInt division (`17 / 5`); `k_big_divmod`'s
+    /// binary-search-based long-division algorithm (the independent C
+    /// reimplementation of `bigint.rs`'s `divmod_mag`, PR-it709's highest-
+    /// risk-site lesson) had no genuine MULTI-limb coverage on the native
+    /// side either. Same cases as the interp/KVM differential test, cross-
+    /// checked against Python's arbitrary-precision arithmetic as ground
+    /// truth before this test was written -- confirmed clean, locked in here.
+    #[test]
+    fn native_bigint_divmod_multi_limb_and_dividend_smaller_than_divisor() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let a = big(\"123456789012345678901234567890\")\n    \
+                   let b = big(\"987654321098765432109876543\")\n    \
+                   let c = big(\"-123456789012345678901234567890\")\n    \
+                   let d = big(\"42\")\n    \
+                   let e = big(\"123456789012345678901234567890\")\n    \
+                   let f = big(\"999999999999999999999999999999999999999\")\n    \
+                   let g = big(\"1000000000000000000\")\n    \
+                   let h = big(\"999999999\")\n    \
+                   print(\"{a / b}|{a % b}|{c / b}|{c % b}|{a / (-b)}|{a % (-b)}|{d / e}|{d % e}|{f / f}|{f % f}|{g / h}|{g % h}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "bigdivmod").trim(),
+            "124|987653196098765319609876558|\
+             -124|-987653196098765319609876558|\
+             -124|987653196098765319609876558|\
+             0|42|\
+             1|0|\
+             1000000001|1"
+        );
+    }
+
     /// Rational ACCUMULATION with running GCD-reduction (it231): a harmonic-series loop adds 1/i each
     /// turn; H(10)=7381/2520 requires the native reduction to keep numerator/denominator exact at
     /// every step. Complements native_bigint_fibonacci (integer accumulation).
