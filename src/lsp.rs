@@ -909,29 +909,88 @@ pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String
 /// it only needs to answer "is this name EVER locally bound here," not
 /// "which exact declaration does this specific use resolve to."
 fn locally_bound(program: &crate::ast::Program, offset: usize, name: &str) -> bool {
+    local_binding_scope(program, offset, name).is_some()
+}
+
+/// Like `locally_bound`, but on a match also returns the byte SPAN of the
+/// enclosing function/method/handler body -- production-hardening PR-it741:
+/// `occurrences_cross_file` used to call `locally_bound` only to decide
+/// whether to ALSO search cross-file, but its SAME-FILE base list (plain
+/// `occurrences(text, name)`) was computed unconditionally, with no scope
+/// filtering at all. That meant a LOCAL variable sharing a name with an
+/// unrelated TOP-LEVEL declaration IN THE SAME FILE (no `use` involved at
+/// all -- the single most common case) still had its rename/references
+/// request silently include and corrupt that unrelated top-level
+/// declaration and all ITS OWN call sites -- the exact same severity bug
+/// class PR-it704/PR-it739 fixed for the cross-file case, just one file
+/// shorter. Returning the enclosing scope lets `occurrences_cross_file`
+/// restrict the same-file occurrence list to the local's own scope instead
+/// of the whole file.
+fn local_binding_scope(program: &crate::ast::Program, offset: usize, name: &str) -> Option<crate::diag::Span> {
     use crate::ast::Item;
     let in_span = |span: crate::diag::Span| (span.start as usize) <= offset && offset <= (span.end as usize);
     for item in &program.items {
         match item {
             Item::Fun(f) if in_span(f.span) => {
-                return f.params.iter().any(|p| p.name == name) || block_binds_name(&f.body, name);
+                let bound = f.params.iter().any(|p| p.name == name) || block_binds_name(&f.body, name);
+                return bound.then_some(f.span);
             }
             Item::Component(c) => {
                 for f in c.exposes.iter().chain(&c.funs) {
                     if in_span(f.span) {
-                        return f.params.iter().any(|p| p.name == name) || block_binds_name(&f.body, name);
+                        let bound = f.params.iter().any(|p| p.name == name) || block_binds_name(&f.body, name);
+                        return bound.then_some(f.span);
                     }
                 }
                 for h in &c.handlers {
                     if in_span(h.span) {
-                        return h.param.as_deref() == Some(name) || block_binds_name(&h.body, name);
+                        let bound = h.param.as_deref() == Some(name) || block_binds_name(&h.body, name);
+                        return bound.then_some(h.span);
                     }
                 }
             }
             _ => {}
         }
     }
-    false
+    None
+}
+
+/// Every function/method/handler span in `program` where `name` is locally
+/// bound (a "shadow zone") -- the complement of `local_binding_scope`: that
+/// function answers "is THIS specific offset inside a local binding of
+/// `name`," this one answers "which regions of the file would SHADOW `name`
+/// if some OTHER reference (e.g. a top-level declaration) were renamed."
+/// Used by `occurrences_cross_file` to make the PR-it741 same-file scoping
+/// fix symmetric: renaming a local must not reach an unrelated top-level
+/// declaration (via `local_binding_scope`), and conversely renaming a
+/// top-level declaration must not reach into a DIFFERENT function's
+/// unrelated local of the same bare name (via this).
+fn shadow_zones(program: &crate::ast::Program, name: &str) -> Vec<crate::diag::Span> {
+    use crate::ast::Item;
+    let mut zones = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Fun(f) => {
+                if f.params.iter().any(|p| p.name == name) || block_binds_name(&f.body, name) {
+                    zones.push(f.span);
+                }
+            }
+            Item::Component(c) => {
+                for f in c.exposes.iter().chain(&c.funs) {
+                    if f.params.iter().any(|p| p.name == name) || block_binds_name(&f.body, name) {
+                        zones.push(f.span);
+                    }
+                }
+                for h in &c.handlers {
+                    if h.param.as_deref() == Some(name) || block_binds_name(&h.body, name) {
+                        zones.push(h.span);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    zones
 }
 
 /// Whether `name` is bound anywhere inside `block` by a `let`/`var`, a `for`
@@ -1115,6 +1174,26 @@ pub fn occurrences(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> 
 /// top-level item in a `use`d file. `offset` (the cursor's byte position in
 /// `text`) is used to skip the cross-file search when `name` is a local
 /// parameter/handler-binder in scope there -- see `locally_bound`.
+///
+/// CORRECTNESS, part 2 (production-hardening PR-it741): the SAME-FILE base
+/// list used to be plain, unconditional `occurrences(text, name)` -- which
+/// is deliberately token-based/not-scope-aware (see that function's own doc
+/// comment) and so ALSO includes any unrelated TOP-LEVEL declaration
+/// sharing the local's bare name, in the SAME file, no `use` required at
+/// all. That's a plain function `mean` and an unrelated `let mean` local in
+/// the SAME file getting merged into one rename -- the identical severity
+/// bug class as PR-it704/PR-it739, just without a file boundary. Fixed
+/// symmetrically: when `local_binding_scope` finds `name` locally bound at
+/// `offset`, the same-file list is restricted to lines within that
+/// enclosing function/method/handler's own span; otherwise (renaming a
+/// top-level declaration, or a reference that ISN'T itself a local binding)
+/// any occurrence falling inside a DIFFERENT function's `shadow_zones` --
+/// i.e. a region where `name` is locally rebound to something else -- is
+/// excluded, since that occurrence refers to the unrelated local, not the
+/// top-level symbol being renamed. Both directions are coarse (line-range,
+/// not exact-scope), matching this file's established imprecision
+/// elsewhere, but enough to stop a rename from reaching a declaration in a
+/// STRUCTURALLY UNRELATED part of the file.
 pub fn occurrences_cross_file(
     text: &str,
     name: &str,
@@ -1122,12 +1201,25 @@ pub fn occurrences_cross_file(
     dir: &std::path::Path,
     buffers: &HashMap<PathBuf, String>,
 ) -> Vec<(String, usize, usize, usize, usize)> {
-    let mut out: Vec<(String, usize, usize, usize, usize)> = occurrences(text, name)
-        .into_iter()
-        .map(|(l0, c0, l1, c1)| (String::new(), l0, c0, l1, c1))
-        .collect();
     let (program, _diags) = crate::parser::parse(text);
-    if locally_bound(&program, offset, name) {
+    let local_scope = local_binding_scope(&program, offset, name);
+    let line_range = |span: crate::diag::Span| {
+        let (start_line, _) = crate::diag::line_col(text, span.start);
+        let (end_line, _) = crate::diag::line_col(text, span.end);
+        (start_line - 1)..=(end_line - 1)
+    };
+    let other_shadow_zones: Vec<crate::diag::Span> = if local_scope.is_none() {
+        shadow_zones(&program, name)
+    } else {
+        Vec::new()
+    };
+    let same_file_occ = occurrences(text, name).into_iter().filter(|(l0, ..)| match local_scope {
+        Some(span) => line_range(span).contains(l0),
+        None => !other_shadow_zones.iter().any(|z| line_range(*z).contains(l0)),
+    });
+    let mut out: Vec<(String, usize, usize, usize, usize)> =
+        same_file_occ.map(|(l0, c0, l1, c1)| (String::new(), l0, c0, l1, c1)).collect();
+    if local_scope.is_some() {
         return out;
     }
     for fs_path in used_file_paths(&program, dir) {
@@ -2619,6 +2711,56 @@ mod tests {
         let (target_uri, ..) = resolve_definition_cross_file(caller_text, call_line, call_ch, dir, &buffers)
             .expect("a genuine cross-file call must still resolve");
         assert!(target_uri.ends_with("stats.kupl"), "{target_uri}");
+    }
+
+    /// A REAL bug (production-hardening PR-it741): the SAME-FILE analog of PR-it739
+    /// -- no `use`/cross-file boundary needed at all. `occurrences_cross_file`'s base
+    /// same-file list used to be plain, unconditional `occurrences(text, name)`, which
+    /// is purely token-based (matches every identifier token with the given text,
+    /// regardless of what it actually refers to). A local `let mean = 5.0` inside one
+    /// function sharing a bare name with an UNRELATED top-level `fun mean` elsewhere in
+    /// the SAME file got merged into ONE rename: renaming the local also silently
+    /// renamed the unrelated function's declaration AND its own call site (in a
+    /// DIFFERENT function), corrupting a completely different part of the program the
+    /// user never touched. The fix is symmetric (see `shadow_zones`): renaming the
+    /// top-level `fun mean` itself must also skip an unrelated local of the same name
+    /// shadowed in a different function. Live-verified before this fix: plain
+    /// `occurrences(src, "mean")` returned all 4 locations merged into one group,
+    /// regardless of which one the rename was invoked from.
+    ///
+    /// NOTE on precision: the fix is line-range-based, not exact-scope (matching this
+    /// file's established coarse-imprecision elsewhere -- see `block_binds_name`'s doc
+    /// comment) -- it protects against a DIFFERENT function/scope entirely, which is
+    /// the common, realistic case exercised here (the unrelated top-level call site
+    /// lives in `helper()`, a separate function from the local's own `main()`). It does
+    /// NOT precisely separate "before" vs. "after" a shadowing point WITHIN the SAME
+    /// function (an intentionally out-of-scope, rarer edge case).
+    #[test]
+    fn local_binding_scope_suppresses_same_file_rename_into_an_unrelated_top_level_declaration() {
+        let src = "fun mean(xs: List[Int]) -> Float {\n    xs.sum().to_float() / xs.len().to_float()\n}\nfun helper() {\n    print(mean([1, 2, 3]))\n}\nfun main() {\n    let mean = 5.0\n    print(mean)\n}\n";
+
+        // Plain (scope-blind) occurrences confirms the hazard still exists at that
+        // primitive layer (by design -- see `occurrences`'s own doc comment): all 4
+        // are merged with no scope awareness.
+        let all = occurrences(src, "mean");
+        assert_eq!(all.len(), 4, "unrelated fun decl + its call + local decl + local use: {all:?}");
+
+        // The cursor is on the LOCAL `let mean` declaration inside `main()`.
+        let off = src.find("mean = 5.0").unwrap();
+        let dir = std::path::Path::new("/fake/lsp-it741");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+        let locs = occurrences_cross_file(src, "mean", off, dir, &empty_buffers);
+        assert_eq!(locs.len(), 2, "only the local's own decl + use, NOT the unrelated fun: {locs:?}");
+        // Neither location may fall on line 0 (the unrelated `fun mean` declaration)
+        // or line 4 (its call site inside `helper()`'s `print(mean([1, 2, 3]))`).
+        assert!(locs.iter().all(|(_, l0, ..)| *l0 != 0 && *l0 != 4), "must not touch the unrelated fun: {locs:?}");
+
+        // Renaming the TOP-LEVEL `fun mean` itself is symmetrically protected: still
+        // finds only its own declaration + call site, not the unrelated local in main().
+        let fun_off = src.find("fun mean").unwrap() + 4;
+        let fun_locs = occurrences_cross_file(src, "mean", fun_off, dir, &empty_buffers);
+        assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
+        assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 4), "{fun_locs:?}");
     }
 
     #[test]
