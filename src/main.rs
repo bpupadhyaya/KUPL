@@ -187,6 +187,20 @@ fn run_cli() -> ExitCode {
             println!("kupl {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        // PRODUCTION-HARDENING (PR-it772): an EXPLICITLY requested help screen is a
+        // successful invocation, not a usage error -- the universal CLI convention
+        // (git, cargo, curl, npm, docker, ...) is exit 0 for `--help`/`-h`/`help`.
+        // This used to fall into the catch-all `_` arm below and share exit code 2
+        // with a genuinely invalid invocation, indistinguishable to a script that
+        // checks `kupl --help; echo $?` to confirm the binary is sane. Deliberately
+        // NARROW in scope: only these three EXPLICIT forms get 0 -- a bare `kupl`
+        // (no subcommand at all) and any unrecognized subcommand are still more
+        // defensibly "the user probably made a mistake," so they keep exit 2 below,
+        // unchanged.
+        Some("--help") | Some("-h") | Some("help") => {
+            print!("{USAGE}");
+            0
+        }
         _ => {
             print!("{USAGE}");
             2
@@ -413,6 +427,35 @@ mod tests {
                 "USAGE is missing a line for the `{cmd}` subcommand, which run_cli actually dispatches"
             );
         }
+    }
+
+    /// A REAL CLI-scripting correctness gap (PR-it772, found by an Explore
+    /// survey, agentId aca5b82689fe978bd, and independently live-verified via
+    /// `kupl --help; echo $?` before implementing): `kupl --help`/`-h`/`help`
+    /// used to fall into the SAME catch-all `_` arm as a genuinely invalid
+    /// invocation, sharing exit code 2 -- indistinguishable to a script that
+    /// checks the exit code to confirm the binary is sane, and contrary to the
+    /// universal CLI convention (git, cargo, curl, npm, docker, ...) that an
+    /// EXPLICITLY requested help screen is a successful invocation (exit 0).
+    /// Deliberately narrow in scope: a bare `kupl` (no subcommand at all) and
+    /// a genuinely unrecognized subcommand are more defensibly "the user
+    /// probably made a mistake," so BOTH still correctly return exit 2,
+    /// unchanged -- locked in here alongside the fix so a future change can't
+    /// silently widen the scope to bare/bogus invocations without noticing.
+    #[test]
+    fn explicit_help_exits_zero_but_a_bare_or_unrecognized_invocation_still_exits_two() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet (e.g. a lib-only build) -- nothing to test
+        }
+        let code = |args: &[&str]| -> Option<i32> {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs").status.code()
+        };
+        for flag in ["--help", "-h", "help"] {
+            assert_eq!(code(&[flag]), Some(0), "kupl {flag} must exit 0 (explicit help request)");
+        }
+        assert_eq!(code(&[]), Some(2), "bare `kupl` with no subcommand must still exit 2");
+        assert_eq!(code(&["definitely-not-a-real-subcommand"]), Some(2), "an unrecognized subcommand must still exit 2");
     }
 
     #[test]
