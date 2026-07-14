@@ -1961,16 +1961,38 @@ pub fn serve() -> i32 {
                     .and_then(|p| p.get("textDocument"))
                     .and_then(|d| d.get("uri"))
                     .and_then(Json::str);
-                let text = params
-                    .and_then(|p| p.get("contentChanges"))
-                    .and_then(|c| c.index(0))
-                    .and_then(|c| c.get("text"))
-                    .and_then(Json::str);
+                let change = params.and_then(|p| p.get("contentChanges")).and_then(|c| c.index(0));
+                let text = change.and_then(|c| c.get("text")).and_then(Json::str);
+                // A REAL, live-confirmed document-state-corruption bug
+                // found+fixed (production-hardening PR-it754): this server
+                // declares `textDocumentSync: 1` (full sync) at
+                // `initialize`, which per the LSP spec obligates a
+                // compliant client to send `contentChanges[0].text` as the
+                // ENTIRE new document with NO `range` field -- but this
+                // handler never verified that contract, unconditionally
+                // treating whatever text arrived as the full buffer. A
+                // client (or client bug) that sends an INCREMENTAL-style
+                // edit instead (a `range` + a tiny replacement fragment --
+                // exactly what `textDocumentSync: 2` clients send, and what
+                // this server never asked for) silently overwrote the
+                // ENTIRE document down to just that tiny fragment, with
+                // zero error reported back to the client. Live-confirmed
+                // BEFORE this fix: `didOpen` with a real multi-line
+                // program, then a single incremental-style `didChange`
+                // (`range` + `text: "9"`) left the server's buffer
+                // containing only `"9"` -- the whole document silently
+                // gone. A `range`-bearing entry is now rejected as a
+                // protocol violation (buffer left untouched, matching this
+                // handler's existing no-op behavior for any other
+                // malformed/missing field) instead of corrupting state.
+                let is_full_replacement = change.is_some_and(|c| c.get("range").is_none());
                 if let (Some(uri), Some(text)) = (uri, text) {
-                    if let Some(path) = uri_to_path(uri) {
-                        buffers.insert(path.clone(), text.to_string());
-                        let note = diagnostics_notification(&path, uri, &buffers);
-                        send(&mut stdout, &note);
+                    if is_full_replacement {
+                        if let Some(path) = uri_to_path(uri) {
+                            buffers.insert(path.clone(), text.to_string());
+                            let note = diagnostics_notification(&path, uri, &buffers);
+                            send(&mut stdout, &note);
+                        }
                     }
                 }
             }
@@ -3200,6 +3222,85 @@ mod tests {
         assert!(
             !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
             "kupl lsp panicked: {stdout}"
+        );
+    }
+
+    /// A REAL, live-confirmed document-state-corruption bug found+fixed
+    /// (production-hardening PR-it754): this server declares
+    /// `textDocumentSync: 1` (full sync) at `initialize`, which per the LSP
+    /// spec obligates a compliant client to send `contentChanges[0].text`
+    /// as the ENTIRE new document with NO `range` field on every
+    /// `didChange` -- but the handler never verified that contract,
+    /// unconditionally treating whatever text arrived as the full buffer.
+    /// A client that sends an INCREMENTAL-style edit instead (a `range` +
+    /// a tiny replacement fragment -- what `textDocumentSync: 2` clients
+    /// send, never requested here) silently overwrote the ENTIRE document
+    /// down to just that fragment, with zero error reported to the client.
+    /// Spawns the REAL `kupl lsp` process (following this file's own
+    /// established subprocess-test pattern): opens a real multi-line
+    /// program, sends a single incremental-style `didChange` (a `range` +
+    /// `text: "9"`), then requests `textDocument/documentSymbol` for the
+    /// SAME uri -- if the buffer were corrupted to just `"9"` (a bare
+    /// top-level integer, a parse error), `document_symbols` returns `None`
+    /// (`"result":null`); if the buffer survived intact, the original
+    /// function's name is still in the returned symbol list. Also confirms
+    /// the server stays alive and answers a normal request afterward.
+    #[test]
+    fn an_incremental_style_didchange_does_not_corrupt_the_full_sync_document_buffer() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let full_src = "fun example_function_marker_it754() -> Int {\n    42\n}\n";
+        let did_open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///corruption_test_it754.kupl","text":{full_src:?}}}}}}}"#
+        );
+        // an INCREMENTAL-style edit: carries a `range`, and `text` is a tiny
+        // replacement fragment, not the full document -- exactly what a
+        // textDocumentSync:2 client would send, never requested by this
+        // server's own declared textDocumentSync:1 capability.
+        let incremental_change = r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///corruption_test_it754.kupl","version":2},"contentChanges":[{"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":6}},"rangeLength":2,"text":"9"}]}}"#;
+        let symbol_req = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///corruption_test_it754.kupl"}}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init.to_string(), did_open, incremental_change.to_string(), symbol_req.to_string()] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung after an incremental-style didChange");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+
+        let bodies: Vec<&str> = stdout
+            .split("Content-Length:")
+            .filter(|s| !s.trim().is_empty())
+            .map(|chunk| chunk.split("\r\n\r\n").nth(1).unwrap_or("").trim())
+            .collect();
+        let symbol_reply = bodies
+            .iter()
+            .find(|b| b.contains("\"id\":2"))
+            .expect("server must still answer the documentSymbol request after the incremental-style didChange");
+        assert!(
+            symbol_reply.contains("example_function_marker_it754"),
+            "the original document must survive an incremental-style didChange intact -- \
+             the buffer was corrupted down to just the malformed edit's fragment: {symbol_reply}"
         );
     }
 
