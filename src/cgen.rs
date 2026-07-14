@@ -3323,16 +3323,39 @@ static KValue k_http_serve(KValue port, KValue handler) {
            the WHOLE server process (k_panic's no-pad path: exit 101) instead
            of surviving like interp/vm -- a real availability divergence, not
            just a message-wording one. Same setjmp/k_pad pattern as
-           k_ai_call_one_tool's tool-call pad and k_dispatch's supervision pad. */
+           k_ai_call_one_tool's tool-call pad and k_dispatch's supervision pad.
+           A REAL, SEVERE bug found+fixed (production-hardening PR-it737,
+           the SAME class as PR-it736's k_dispatch fix, applied here since
+           it736 only checked k_dispatch's own pad): a longjmp-driven panic
+           recovery here skipped k_depth's per-frame decrements just like
+           k_dispatch's did, but WORSE -- confirmed LIVE that after ~190
+           requests to a panicking route, the bogus "stack overflow (10000
+           frames)" body appears instead of the real panic message, AND
+           every OTHER route (even a completely unrelated, non-panicking
+           one, already confirmed 200 OK before the panic storm) starts
+           returning the SAME bogus 500 for ALL SUBSEQUENT traffic -- a
+           self-inflicted, PERMANENT, total-server DoS triggered by
+           ordinary 500-worthy requests, the EXACT scenario this landing
+           pad exists to tolerate gracefully. Also snapshots/restores
+           k_cur_inst (which this pad never touched at all, unlike
+           k_dispatch's own pad) as defensive hardening: k_call's closure
+           branch (cgen.rs's k_call) hand-rolls the same save/mutate/restore
+           pattern for k_cur_inst around invoking a captured closure, and
+           THAT restore is equally skippable by a longjmp originating
+           inside the closure body -- if a handler ever invokes a
+           component-captured closure that panics, k_cur_inst could leak
+           to a stale instance id past this pad. */
         const char* status; const char* body;
         jmp_buf handler_pad; jmp_buf* prev_pad = k_pad; k_pad = &handler_pad;
+        int saved_cur_inst = k_cur_inst;
+        int64_t saved_depth = k_depth;
         if (setjmp(handler_pad) == 0) {
             KValue rv = k_call(handler, hargs, 3);
             k_pad = prev_pad;
             status = "200 OK";
             body = rv.tag == K_STR ? rv.as.s : "";
         } else {
-            k_pad = prev_pad;
+            k_pad = prev_pad; k_cur_inst = saved_cur_inst; k_depth = saved_depth;
             status = "500 Internal Server Error";
             body = k_panic_buf;
         }
@@ -3557,13 +3580,30 @@ static int k_ai_call_one_tool(const KAiFun* f, KMap* m) {
        -- mirrors interp.rs/vm.rs's ToolHost::call_tool, which explicitly
        catches a tool's panic and turns it into Err(msg) rather than letting
        it propagate raw past k_ai_call's own "ai `name`: " wrapping (same
-       setjmp/k_pad pattern as k_dispatch's supervision landing pad). */
+       setjmp/k_pad pattern as k_dispatch's supervision landing pad).
+       A REAL bug found+fixed (production-hardening PR-it737, the SAME class
+       as PR-it736's k_dispatch fix, applied here since it736 only checked
+       k_dispatch's own pad): a longjmp-driven panic recovery here also
+       skipped k_depth's per-frame decrements, leaking depth by the full
+       call-chain depth active at panic time on every caught tool panic.
+       Confirmed LIVE: a tool recursing 51-deep before panicking, called
+       repeatedly in a loop, correctly errors on interp/vm forever but
+       trips a bogus "stack overflow (10000 frames)" panic on native after
+       ~193-200 calls -- matching the leak arithmetic (10000 / ~52
+       leaked-per-call) exactly, confirming this is the depth-leak class,
+       not a real depth issue. Also snapshots/restores k_cur_inst as
+       defensive hardening, matching the identical fix at k_http_serve's
+       handler_pad -- see that pad's own comment for the k_cur_inst
+       rationale (a panicking closure invoked from inside a tool body could
+       otherwise leak k_cur_inst to a stale instance id). */
     jmp_buf tool_pad; jmp_buf* prev_pad = k_pad; k_pad = &tool_pad;
+    int saved_cur_inst = k_cur_inst;
+    int64_t saved_depth = k_depth;
     if (setjmp(tool_pad) == 0) {
         k_call(k_fun(t->fnid), targs, t->nparams);   /* side effects; result discarded (mock) */
         k_pad = prev_pad;
     } else {
-        k_pad = prev_pad;
+        k_pad = prev_pad; k_cur_inst = saved_cur_inst; k_depth = saved_depth;
         snprintf(k_ai_err, sizeof k_ai_err, "%s", k_panic_buf);
         k_ai_ok = 0;
         return 0;
