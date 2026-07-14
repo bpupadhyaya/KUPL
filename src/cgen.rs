@@ -2782,7 +2782,20 @@ static KValue k_csv_parse(KValue s) {
     int field_was_quoted = 0;
     while (i < n) {
         char c = in[i];
-        if (c == '"') {
+        /* A REAL, cross-engine-DIVERGING bug found+fixed (production-hardening
+           PR-it738): a `"` only opens a quoted field when it's the FIRST
+           character of a not-yet-started field (`field.len == 0`) -- csv.rs's
+           own PR-it712 fix, which this C reimplementation was missing
+           entirely. Without the `field.len == 0` guard, a `"` appearing LATER
+           in an otherwise-unquoted field (e.g. a brand name like `ab"cd`
+           exported without escaping) wrongly switched into quoted-field
+           parsing, silently swallowing every comma and newline up to the
+           next `"` -- merging what should be several fields/rows into ONE,
+           on native ONLY. Confirmed LIVE: `csv_parse("ab\"cd,ef\nx,y")`
+           produced `[["ab"cd", "ef"], ["x", "y"]]` on interp/vm but
+           `[["abcd,ef\nx,y"]]` on native -- 2 rows/3 fields silently merged
+           into 1, and the literal `"` itself dropped from the output. */
+        if (c == '"' && field.len == 0) {
             i++;
             for (;;) {
                 if (i >= n) break;
@@ -9970,6 +9983,34 @@ fun main() uses io {
                    print(csv_parse(\"\\\"\\\"\"))\n    \
                    print(csv_parse(\"a\\n\\\"\\\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "csvlonefield").trim(), "[[\"\"]]\n[[\"a\"], [\"\"]]");
+    }
+
+    /// A REAL, cross-engine-DIVERGING bug found+fixed (production-hardening
+    /// PR-it738): `k_csv_parse` was missing the `field.len == 0` guard
+    /// `csv.rs`'s own PR-it712 fix already established -- a `"` only opens a
+    /// quoted field when it's the FIRST character of a not-yet-started
+    /// field; without that guard, a `"` appearing LATER in an otherwise-
+    /// unquoted field (e.g. a brand name like `ab"cd` exported without
+    /// escaping) wrongly switched into quoted-field parsing, silently
+    /// swallowing every comma and newline up to the next `"` -- merging
+    /// what should be several fields/rows into ONE. This fix was ported to
+    /// `csv.rs` itself but never to this independent C reimplementation, and
+    /// no prior native CSV test exercised a mid-field quote at all (only
+    /// doubled quotes, unterminated quotes, and empty-quoted-field
+    /// flushing). Confirmed LIVE before this fix: `csv_parse("ab\"cd,ef\nx,y")`
+    /// produced `[["ab\"cd", "ef"], ["x", "y"]]` on interp/vm but
+    /// `[["abcd,ef\nx,y"]]` on native -- 2 rows/3 fields silently merged into
+    /// 1, and the literal `"` itself dropped from the output.
+    #[test]
+    fn native_csv_mid_field_quote_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(csv_parse(\"ab\\\"cd,ef\\nx,y\"))\n    \
+                   print(csv_parse(\"\\\"a\\\"b\\\"c,d\"))\n}\n";
+        let expected = "[[\"ab\"cd\", \"ef\"], [\"x\", \"y\"]]\n[[\"ab\"c\", \"d\"]]";
+        assert_eq!(native_main_stdout(src, "csvmidquote").trim(), expected);
     }
 
     /// Native regex matches the interpreter, incl. `.` over multi-byte characters
