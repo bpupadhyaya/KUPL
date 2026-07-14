@@ -767,6 +767,101 @@ mod tests {
         assert!(out.status.success(), "the REPL process itself must exit cleanly via :quit, not abort: {out:?}");
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it763, the second
+    /// finding from the same survey that produced PR-it762's lockfile
+    /// field-escaping fix): `kupl pkg tree`'s drift check only ever asked
+    /// "does THIS dependency's hash differ from what the lockfile
+    /// recorded" for each dependency in the CURRENT manifest -- it never
+    /// checked whether the lockfile itself contained an ORPHANED entry (a
+    /// dependency removed from `[dependencies]` without re-running `kupl
+    /// pkg lock`), and a brand-new never-locked dependency was
+    /// indistinguishable from an already-locked, unchanged one (both fell
+    /// through to the same "no marker" branch). Live-confirmed before this
+    /// fix: removing a dependency silently made it vanish from `pkg tree`'s
+    /// output with zero indication the lockfile was now stale; adding one
+    /// produced no signal it had never been locked either. Fixed by (a)
+    /// splitting `locked.get(name) == None` out from "locked and unchanged"
+    /// with its own `[new, not yet locked]` marker, and (b) diffing
+    /// `locked`'s OWN names against the current dependency set to report
+    /// orphaned lock entries explicitly.
+    #[test]
+    fn pkg_tree_flags_both_a_brand_new_unlocked_dependency_and_an_orphaned_lock_entry() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("kupl-pkgtree-lockstate-it763-{}", std::process::id()));
+        let proj = base.join("proj");
+        let dep_a = base.join("depA");
+        let dep_b = base.join("depB");
+        for d in [&proj, &dep_a, &dep_b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dep_a.join("kupl.toml"), "[project]\nname = \"depA\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(dep_a.join("main.kupl"), "pub fun a() -> Int {\n    1\n}\n").unwrap();
+        std::fs::write(dep_b.join("kupl.toml"), "[project]\nname = \"depB\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(dep_b.join("main.kupl"), "pub fun b() -> Int {\n    2\n}\n").unwrap();
+
+        let main_kupl = proj.join("main.kupl");
+        let main_str = main_kupl.to_str().unwrap();
+
+        // lock a project depending on ONLY depA -- depB has NEVER been locked.
+        std::fs::write(
+            proj.join("kupl.toml"),
+            "[project]\nname = \"proj\"\nentry = \"main.kupl\"\n\n[dependencies]\ndepA = { path = \"../depA\" }\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("main.kupl"), "use depA\nfun main() {}\n").unwrap();
+        assert!(
+            std::process::Command::new(&bin).args(["pkg", "lock", main_str]).status().unwrap().success(),
+            "pkg lock must succeed"
+        );
+
+        // add depB (never locked) alongside the still-locked depA.
+        std::fs::write(
+            proj.join("kupl.toml"),
+            "[project]\nname = \"proj\"\nentry = \"main.kupl\"\n\n\
+             [dependencies]\ndepA = { path = \"../depA\" }\ndepB = { path = \"../depB\" }\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("main.kupl"), "use depA\nuse depB\nfun main() {}\n").unwrap();
+        let out = std::process::Command::new(&bin).args(["pkg", "tree", main_str]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("depB") && stdout.contains("[new, not yet locked]"),
+            "a brand-new, never-locked dependency must be flagged as such, not silently treated as unchanged: {stdout}"
+        );
+        assert!(
+            stdout.lines().any(|l| l.starts_with("depA ") && !l.contains("[drift]") && !l.contains("[new,")),
+            "the already-locked, unchanged depA must show no marker at all: {stdout}"
+        );
+
+        // now lock BOTH, then remove depB from the manifest WITHOUT
+        // re-locking -> depB's kupl.lock entry is now orphaned.
+        assert!(
+            std::process::Command::new(&bin).args(["pkg", "lock", main_str]).status().unwrap().success(),
+            "pkg lock (both deps) must succeed"
+        );
+        std::fs::write(
+            proj.join("kupl.toml"),
+            "[project]\nname = \"proj\"\nentry = \"main.kupl\"\n\n[dependencies]\ndepA = { path = \"../depA\" }\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("main.kupl"), "use depA\nfun main() {}\n").unwrap();
+        let out2 = std::process::Command::new(&bin).args(["pkg", "tree", main_str]).output().unwrap();
+        let stdout2 = String::from_utf8_lossy(&out2.stdout);
+        assert!(
+            stdout2.contains("depB") && stdout2.contains("no longer in kupl.toml"),
+            "a dependency removed from the manifest but still present in kupl.lock must be flagged as an orphan: {stdout2}"
+        );
+        assert!(
+            !stdout2.lines().any(|l| l.contains("depB") && l.contains("[drift]")),
+            "an orphan must not ALSO be misreported as ordinary drift: {stdout2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Waits for `child` to exit, but gives up after `timeout` rather than
     /// blocking forever -- `std::process::Child::wait_with_output` has no
     /// built-in deadline (and this repo's own convention is that macOS has

@@ -461,17 +461,65 @@ pub fn pkg_tree(path: &str) -> i32 {
         .map(|t| crate::loader::lock_hashes(&t));
     for d in &deps {
         let ver = if d.version.is_empty() { "?".to_string() } else { d.version.clone() };
-        let drift = match &locked {
+        // A REAL bug found+fixed (production-hardening PR-it763, the second
+        // finding from the SAME survey that produced PR-it762's lockfile
+        // field-escaping fix): the drift check below only ever asked "is
+        // THIS dependency's hash different from what the lockfile
+        // recorded" -- `h.get(&d.name)` returning `None` (this dependency
+        // was never locked at all) and `Some(hash) if hash == &d.hash`
+        // (locked AND unchanged) both fell through to the SAME "" (no
+        // marker) branch, so a BRAND-NEW dependency just added to
+        // `kupl.toml` looked indistinguishable from one that's already
+        // locked and unchanged. Live-confirmed before this fix: adding a
+        // never-locked dependency produced no `[new]`/any marker at all in
+        // `kupl pkg tree`'s output. Fixed by splitting the `None` case out
+        // from the "unchanged" case with its own `[new, not yet locked]`
+        // marker.
+        // A REAL bug found+fixed (production-hardening PR-it763, the second
+        // finding from the SAME survey that produced PR-it762's lockfile
+        // field-escaping fix): the drift check below only ever asked "is
+        // THIS dependency's hash different from what the lockfile
+        // recorded" -- `h.get(&d.name)` returning `None` (this dependency
+        // was never locked at all) and `Some(hash) if hash == &d.hash`
+        // (locked AND unchanged) both fell through to the SAME "" (no
+        // marker) branch, so a BRAND-NEW dependency just added to
+        // `kupl.toml` looked indistinguishable from one that's already
+        // locked and unchanged. Live-confirmed before this fix: adding a
+        // never-locked dependency produced no `[new]`/any marker at all in
+        // `kupl pkg tree`'s output. Fixed by splitting the `None` case out
+        // from the "unchanged" case with its own `[new, not yet locked]`
+        // marker.
+        let marker = match &locked {
             Some(h) => match h.get(&d.name) {
                 Some(old) if old != &d.hash => "  [drift]",
-                _ => "",
+                Some(_) => "",
+                None => "  [new, not yet locked]",
             },
             None => "",
         };
-        println!("{} @ {}  ({}){}", d.name, ver, d.path, drift);
+        println!("{} @ {}  ({}){}", d.name, ver, d.path, marker);
     }
     for (name, version) in &registry_only {
         println!("{name} @ {version}  (registry — not yet supported, unresolved)");
+    }
+    // A SECOND, independently-real half of the SAME bug (PR-it763): the loop
+    // above only ever iterates the CURRENT manifest's dependencies, looking
+    // each one up in the old lock map -- it never iterates the LOCK FILE'S
+    // own names to find entries that no longer exist in the current
+    // manifest at all. Removing a dependency from `[dependencies]` without
+    // re-running `kupl pkg lock` made it silently VANISH from this
+    // command's output with no indication the lockfile itself was now
+    // stale for that entry -- live-confirmed before this fix. `kupl.lock`
+    // only ever locks path-resolvable dependencies (never `registry_only`
+    // ones, which can't resolve without a registry), so orphans are found
+    // by diffing `locked`'s names against `deps`'s names alone.
+    if let Some(h) = &locked {
+        let current: std::collections::HashSet<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        let mut orphaned: Vec<&String> = h.keys().filter(|name| !current.contains(name.as_str())).collect();
+        orphaned.sort();
+        for name in orphaned {
+            println!("{name}  [in kupl.lock but no longer in kupl.toml — stale, re-run `kupl pkg lock`]");
+        }
     }
     0
 }
