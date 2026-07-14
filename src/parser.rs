@@ -154,7 +154,18 @@ pub fn parse_expr_fragment(src: &str, offset: u32) -> Result<Expr, Diag> {
     for t in &mut toks {
         t.span = Span::new(t.span.start + offset, t.span.end + offset);
     }
-    if let Some(d) = diags.into_iter().next() {
+    // A REAL bug found+fixed (production-hardening PR-it753): the fragment's
+    // TOKEN spans are shifted by `offset` (above) so they read as absolute
+    // file coordinates once merged back into the enclosing program, but its
+    // own lexer DIAGNOSTICS were returned raw, still relative to this tiny
+    // fragment's own 0-based coordinates. A lexer error inside a string-
+    // interpolation sub-expression (most naturally: an unterminated nested
+    // string literal) was reported pointing at an essentially arbitrary,
+    // unrelated location elsewhere in the real file. Live-confirmed BEFORE
+    // this fix: an unterminated string nested inside `"...${"..."..."` at
+    // line 6 of a file reported its K0005 error at line 1:1 instead.
+    if let Some(mut d) = diags.into_iter().next() {
+        d.span = Span::new(d.span.start + offset, d.span.end + offset);
         return Err(d);
     }
     let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new(), depth: 0 };
@@ -2670,6 +2681,50 @@ mod tests {
             let has_err = pdiags.iter().chain(cdiags.iter()).any(|d| d.severity == crate::diag::Severity::Error);
             let trivially_empty = matches!(src, "" | "   \n\t\n  " | "// just a comment\n");
             assert!(has_err || trivially_empty, "expected a diagnostic for {src:?}");
+        }
+    }
+
+    #[test]
+    fn a_lexer_error_inside_a_string_interpolation_fragment_points_at_its_real_file_location() {
+        // A REAL bug found+fixed (production-hardening PR-it753): `parse_expr_
+        // fragment` re-lexes a string-interpolation sub-expression (`"...${
+        // EXPR }..."`) independently, then shifts its TOKEN spans by `offset`
+        // so they read as absolute file coordinates once merged back into the
+        // enclosing program -- but its own lexer DIAGNOSTICS were returned
+        // raw, still relative to the fragment's own 0-based coordinates. A
+        // lexer error inside the interpolation (most naturally: an
+        // unterminated nested string literal) was reported pointing at an
+        // essentially arbitrary, unrelated location elsewhere in the real
+        // file. Live-confirmed BEFORE this fix: this exact program's
+        // unterminated-string error (genuinely on line 6) was reported at
+        // line 1, column 1 -- a location with no quote character at all.
+        //
+        // Line 1 is a syntactically PERFECT function declaration with no
+        // error of any kind, so the strongest, unambiguous invariant is
+        // "no diagnostic from this parse ever points at line 1" -- rather
+        // than picking out one specific diagnostic by code, which is
+        // fragile here: the OUTER string (`"start ${...`) is itself also
+        // unterminated (since its interpolation never closes), producing a
+        // SECOND, always-correctly-positioned `K0005` at line 6 regardless
+        // of this fix. An earlier version of this test used
+        // `diags.iter().find(|d| d.code == "K0005")`, which nondeterministically
+        // picked up that unrelated, already-correct K0005 instead of the
+        // buggy fragment-relexed one -- passing identically whether the fix
+        // was present or absent, exactly the "zero regression value" trap
+        // this campaign's own established lesson warns against. Caught via
+        // this iteration's own mandatory revert-and-verify step.
+        let src = "fun padding_marker_XXXXXXXXXXXXXXXXXXXX() -> Int {\n  1\n}\n\n\
+                   fun main() -> Str {\n  \"start ${\"nested unterminated string right here\n}\n";
+        let (_, diags) = parse(src);
+        assert!(!diags.is_empty(), "expected at least one diagnostic: {diags:?}");
+        for d in &diags {
+            let (line, _) = crate::diag::line_col(src, d.span.start);
+            assert_ne!(
+                line, 1,
+                "no diagnostic may point at line 1 -- it is syntactically valid code; \
+                 a diagnostic here means a fragment's lexer error was reported at the \
+                 fragment's own 0-based coordinates instead of the real file location: {diags:?}"
+            );
         }
     }
 
