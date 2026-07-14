@@ -1041,6 +1041,149 @@ mod tests {
         assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
     }
 
+    /// Five REAL bugs found+fixed (production-hardening PR-it726): the SAME
+    /// corrupt-`.kx` bounds-check gap as `nregs`/`nslots`/`consts` above
+    /// (PR-it687/it688), but in FIVE self-mutating fast paths added AFTER
+    /// that fix and never covered by it -- `Op::Add`'s string self-append
+    /// (`s = s + x`), `Op::Method`'s List/Map/Set self-push/self-insert
+    /// (`xs = xs.push(x)`, `m = m.insert(k, v)`, `s = s.insert(v)`), and
+    /// `Op::Ret`'s write into the CALLER's own destination register. All
+    /// five used to index `self.stack` DIRECTLY, bypassing `reg!`/`set!`'s
+    /// bounds check entirely. Rather than shrinking `nregs` (the technique
+    /// the tests above use), these corrupt the SPECIFIC instruction's own
+    /// register operand directly to an out-of-range value -- shrinking
+    /// `nregs` doesn't cleanly isolate these fast paths, since the
+    /// registers they read are typically THE SAME ones earlier instructions
+    /// in the same tiny function already used (there's no way to shrink
+    /// `nregs` such that an EARLIER access stays in-bounds while the fast
+    /// path's own access goes out of bounds, when they reference the exact
+    /// same register index) -- so this test corrupts each opcode's operand
+    /// directly instead, precisely targeting only the one instruction under
+    /// test while leaving everything else (including `nregs`) untouched and
+    /// internally consistent.
+    #[test]
+    fn a_kx_module_with_a_self_mutating_fast_path_register_out_of_range_is_a_clean_error_not_a_panic() {
+        // Op::Add's string self-append fast path (`s = s + x`).
+        {
+            let src = "fun main() uses io {\n    var s = \"a\"\n    s = s + \"b\"\n    print(s)\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let main_idx = module.funs["main"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            let code = &mut module.chunks[main_idx as usize].code;
+            let pos = code.iter().position(|op| matches!(op, crate::bytecode::Op::Add(..))).expect("main uses Add");
+            if let crate::bytecode::Op::Add(_, _, b) = &mut code[pos] {
+                *b = 200;
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("main", vec![])
+                .expect_err("an out-of-range Add operand must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "Add: {}", err.msg);
+        }
+        // Op::Method's List.push self-mutate fast path (`xs = xs.push(x)`).
+        {
+            let src = "fun main() uses io {\n    var xs = [1]\n    xs = xs.push(2)\n    print(xs)\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let main_idx = module.funs["main"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            let code = &mut module.chunks[main_idx as usize].code;
+            let pos = code.iter().position(|op| matches!(op, crate::bytecode::Op::Method { .. })).expect("main uses Method");
+            if let crate::bytecode::Op::Method { dst, recv, .. } = &mut code[pos] {
+                // corrupt BOTH -- the fast path requires `dst == recv`, so
+                // corrupting `recv` alone would make that equality FALSE and
+                // skip the fast path's vulnerable check entirely, silently
+                // masking the bug instead of exercising it.
+                *dst = 200;
+                *recv = 200;
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("main", vec![])
+                .expect_err("an out-of-range Method recv must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "List.push: {}", err.msg);
+        }
+        // Op::Method's Map.insert self-mutate fast path (`m = m.insert(k, v)`).
+        {
+            let src =
+                "fun main() uses io {\n    var m = Map()\n    m = m.insert(\"a\", 1)\n    print(m)\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let main_idx = module.funs["main"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            let code = &mut module.chunks[main_idx as usize].code;
+            let pos = code.iter().position(|op| matches!(op, crate::bytecode::Op::Method { .. })).expect("main uses Method");
+            if let crate::bytecode::Op::Method { dst, recv, .. } = &mut code[pos] {
+                // corrupt BOTH -- the fast path requires `dst == recv`, so
+                // corrupting `recv` alone would make that equality FALSE and
+                // skip the fast path's vulnerable check entirely, silently
+                // masking the bug instead of exercising it.
+                *dst = 200;
+                *recv = 200;
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("main", vec![])
+                .expect_err("an out-of-range Method recv must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "Map.insert: {}", err.msg);
+        }
+        // Op::Method's Set.insert self-mutate fast path (`s = s.insert(v)`).
+        {
+            let src = "fun main() uses io {\n    var s = Set()\n    s = s.insert(1)\n    print(s)\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let main_idx = module.funs["main"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            let code = &mut module.chunks[main_idx as usize].code;
+            let pos = code.iter().position(|op| matches!(op, crate::bytecode::Op::Method { .. })).expect("main uses Method");
+            if let crate::bytecode::Op::Method { dst, recv, .. } = &mut code[pos] {
+                // corrupt BOTH -- the fast path requires `dst == recv`, so
+                // corrupting `recv` alone would make that equality FALSE and
+                // skip the fast path's vulnerable check entirely, silently
+                // masking the bug instead of exercising it.
+                *dst = 200;
+                *recv = 200;
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("main", vec![])
+                .expect_err("an out-of-range Method recv must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "Set.insert: {}", err.msg);
+        }
+        // Op::Ret's write into the CALLER's own destination register.
+        {
+            let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() uses io {\n    print(add(1, 2))\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let main_idx = module.funs["main"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            // corrupt `main`'s OWN Call instruction's `dst` operand -- this
+            // becomes `f.dst` on the callee's frame, later applied by
+            // `Op::Ret` against the CALLER's (main's) register space.
+            let code = &mut module.chunks[main_idx as usize].code;
+            let pos = code.iter().position(|op| matches!(op, crate::bytecode::Op::Call { .. })).expect("main calls add");
+            if let crate::bytecode::Op::Call { dst, .. } = &mut code[pos] {
+                *dst = 200;
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("main", vec![])
+                .expect_err("an out-of-range Call dst must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "Ret: {}", err.msg);
+        }
+    }
+
     /// The instruction-pointer twin of the tests above (production-hardening
     /// PR-it688): `ip` starts at 0 and only ever changes via a plain
     /// increment or a `Jump`/`JumpIfFalse`/`JumpIfTrue` target -- neither

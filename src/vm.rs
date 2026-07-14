@@ -553,18 +553,32 @@ impl<'m> Vm<'m> {
                     // append x's rendering to the uniquely-owned Str in place instead
                     // of reallocating — O(n^2) -> O(n). A shared string rebuilds, so
                     // value semantics hold. All non-(Str+Str) cases use the shared op.
-                    let both_str = matches!(&self.stack[base + a as usize], Value::Str(_))
-                        && matches!(&self.stack[base + b as usize], Value::Str(_));
+                    //
+                    // A REAL bug found+fixed (production-hardening PR-it726, the SAME
+                    // corrupt-`.kx` bounds-check gap as PR-it687/it688, but in a fast
+                    // path added AFTER that fix and never covered by it): this used to
+                    // index `self.stack` DIRECTLY (`self.stack[base + a as usize]`),
+                    // bypassing the `reg!`/`set!` macros' bounds check entirely. A
+                    // hand-crafted/corrupted `.kx` file whose `nregs` is smaller than
+                    // what its own `Add` instruction references crashed the VM with a
+                    // raw Rust index-out-of-bounds panic instead of a clean error.
+                    // Fixed with `.get()`/`.get_mut()`; an out-of-bounds register
+                    // simply fails the fast-path CHECK (never even attempted a Str
+                    // match), falling through to the already-safe `bin!`/`reg!` path
+                    // below, which reports the clean "corrupt .kx module" error.
+                    let both_str = self.stack.get(base + a as usize).is_some_and(|v| matches!(v, Value::Str(_)))
+                        && self.stack.get(base + b as usize).is_some_and(|v| matches!(v, Value::Str(_)));
                     if d == a && both_str {
                         let r = reg!(b);
-                        let slot = &mut self.stack[base + a as usize];
-                        if let Value::Str(rc) = slot {
-                            if Rc::get_mut(rc).is_some() {
-                                use std::fmt::Write as _;
-                                let _ = write!(Rc::get_mut(rc).unwrap(), "{r}");
-                            } else {
-                                let l = rc.clone();
-                                *slot = Value::str(format!("{l}{r}"));
+                        if let Some(slot) = self.stack.get_mut(base + a as usize) {
+                            if let Value::Str(rc) = slot {
+                                if Rc::get_mut(rc).is_some() {
+                                    use std::fmt::Write as _;
+                                    let _ = write!(Rc::get_mut(rc).unwrap(), "{r}");
+                                } else {
+                                    let l = rc.clone();
+                                    *slot = Value::str(format!("{l}{r}"));
+                                }
                             }
                         }
                     } else {
@@ -897,13 +911,19 @@ impl<'m> Vm<'m> {
                     // the receiver register; push in place when the List is uniquely
                     // owned (O(n^2) -> O(n)). A shared list rebuilds a new one, so
                     // value semantics hold (an aliased list is never mutated).
+                    //
+                    // A REAL bug found+fixed (production-hardening PR-it726, the SAME
+                    // gap as `Op::Add`'s self-append fast path above -- see its comment
+                    // for the full rationale): this and the two fast paths below used
+                    // to index `self.stack` DIRECTLY, bypassing `reg!`/`set!`'s bounds
+                    // check. Fixed with `.get()`/`.get_mut()`, matching that same fix.
                     if method == "push"
                         && argc == 1
                         && dst == recv
-                        && matches!(&self.stack[base + recv as usize], Value::List(_))
+                        && self.stack.get(base + recv as usize).is_some_and(|v| matches!(v, Value::List(_)))
                     {
                         let item = reg!(start);
-                        if let Value::List(rc) = &mut self.stack[base + recv as usize] {
+                        if let Some(Value::List(rc)) = self.stack.get_mut(base + recv as usize) {
                             match Rc::get_mut(rc) {
                                 Some(v) => v.push(item),
                                 None => {
@@ -920,11 +940,11 @@ impl<'m> Vm<'m> {
                     if method == "insert"
                         && argc == 2
                         && dst == recv
-                        && matches!(&self.stack[base + recv as usize], Value::Map(_))
+                        && self.stack.get(base + recv as usize).is_some_and(|v| matches!(v, Value::Map(_)))
                     {
                         let key = reg!(start);
                         let val = reg!(start + 1);
-                        if let Value::Map(rc) = &mut self.stack[base + recv as usize] {
+                        if let Some(Value::Map(rc)) = self.stack.get_mut(base + recv as usize) {
                             let pairs = match Rc::get_mut(rc) {
                                 Some(p) => p,
                                 None => {
@@ -947,10 +967,10 @@ impl<'m> Vm<'m> {
                     if method == "insert"
                         && argc == 1
                         && dst == recv
-                        && matches!(&self.stack[base + recv as usize], Value::Set(_))
+                        && self.stack.get(base + recv as usize).is_some_and(|v| matches!(v, Value::Set(_)))
                     {
                         let v = reg!(start);
-                        if let Value::Set(rc) = &mut self.stack[base + recv as usize] {
+                        if let Some(Value::Set(rc)) = self.stack.get_mut(base + recv as usize) {
                             let items = match Rc::get_mut(rc) {
                                 Some(it) => it,
                                 None => {
@@ -1037,7 +1057,24 @@ impl<'m> Vm<'m> {
                     }
                     let caller = self.frames.last().unwrap();
                     let slot = caller.base + f.dst as usize;
-                    self.stack[slot] = value;
+                    // A REAL bug found+fixed (production-hardening PR-it726, the SAME
+                    // corrupt-`.kx` bounds-check gap as `Op::Add`'s self-append fast
+                    // path above): `f.dst` is the CALLER's own destination register,
+                    // captured from `Op::Call`'s `dst` operand when the frame was
+                    // pushed -- a corrupted `.kx` file can make it exceed the caller
+                    // chunk's real `nregs` the exact same way any other register
+                    // operand can. This write happens on the CALLER's frame, outside
+                    // the CURRENT chunk's own `reg!`/`set!` macro scope, so it was
+                    // never covered by PR-it687 either. Fixed with `.get_mut()`.
+                    match self.stack.get_mut(slot) {
+                        Some(s) => *s = value,
+                        None => {
+                            return Err(VmError {
+                                msg: "corrupt .kx module: register index out of range".into(),
+                                span,
+                            })
+                        }
+                    }
                 }
                 Op::MakeList { dst, start, len } => {
                     let items: Vec<Value> = (0..len).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
