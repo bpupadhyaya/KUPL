@@ -11165,6 +11165,33 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Compile `src` to native, run it, return stderr -- for asserting an
+    /// EXPECTED (hardcoded) panic message directly, unlike
+    /// `assert_panic_wording_matches` (which only checks native agrees with
+    /// interp -- insufficient when the bug under test lives in a shared,
+    /// upstream-of-every-engine AST rewrite, since interp would be wrong in
+    /// the exact SAME way; PR-it719 caught this exact gap during its own
+    /// revert-and-verify).
+    fn native_stderr(src: &str, tag: &str) -> String {
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-{tag}-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
     /// Sized integers compile to native and match the interpreter — arithmetic,
     /// conversions, wrapping/saturating/bitwise/shift methods, and u64 values
     /// above i64::MAX (computed via __int128).
@@ -11733,6 +11760,46 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
             "fun main() uses io { print(big(2).pow(1000000000)) }\n",
             "bigpowcap",
         );
+    }
+
+    /// The native mirror of `diff_named_argument_calls_evaluate_side_effects_in_source_written_order`
+    /// (vm.rs, PR-it719): `callargs.rs`'s named-argument evaluation-order fix
+    /// is a SINGLE AST-rewrite pass that runs upstream of ALL FOUR engines
+    /// (the checker, interp, KVM, AND native all consume the SAME rewritten
+    /// program). Deliberately does NOT use `assert_panic_wording_matches`
+    /// (which only checks native agrees with interp) -- during this test's
+    /// OWN revert-and-verify, that comparison kept PASSING with the bug
+    /// still present, because interp was wrong in the exact SAME way (the
+    /// bug lives upstream of both). Checks native's stderr against a
+    /// HARDCODED expected message instead, exactly like the vm.rs
+    /// differential test checks a hardcoded string rather than "matches
+    /// whatever interp currently does". `panic(msg)` as a purely-functional
+    /// order probe: whichever argument's expression is evaluated FIRST is
+    /// the one whose panic message surfaces.
+    #[test]
+    fn native_named_argument_calls_evaluate_side_effects_in_source_written_order() {
+        if !cc_available() {
+            return;
+        }
+        // reordered named args: written b-then-a -> B's panic must fire.
+        let src1 = "fun f(a: Int, b: Int) -> Int { a + b }\n\
+                    fun main() uses io { print(f(b: panic(\"B\"), a: panic(\"A\"))) }\n";
+        assert!(
+            native_stderr(src1, "namedargorder1").contains("panic: B"),
+            "reordered named args must evaluate B (written first) before A"
+        );
+        // nested named call: outer written a-then-b, inner written b-then-a
+        // -> the nested B is the very first side effect reached overall.
+        let src2 = "fun f(a: Int, b: Int) -> Int { a + b }\n\
+                    fun main() uses io { print(f(a: f(b: panic(\"NESTED_B\"), a: panic(\"NESTED_A\")), b: panic(\"OUTER_B\"))) }\n";
+        assert!(
+            native_stderr(src2, "namedargorder2").contains("panic: NESTED_B"),
+            "a nested named call's own reordering must still surface as the first side effect overall"
+        );
+        // a trailing default evaluates correctly and after every explicit arg.
+        let ok = "fun g(a: Int, b: Int, c: Int = 100) -> Int { a + b + c }\n\
+                  fun main() uses io { print(g(b: 20, a: 10)) }\n";
+        assert_eq!(native_main_stdout(ok, "namedargdefault").trim(), "130");
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it638) -- the OTHER

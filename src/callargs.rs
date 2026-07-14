@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
-use crate::diag::{Diag, Span};
+use crate::diag::Diag;
 
 /// Rewrite every call to a top-level function into positional form, filling
 /// defaults and reordering named arguments. Returns any structural diagnostics.
@@ -42,14 +42,18 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
         }
     }
 
+    let mut temp_counter = 0usize;
     let mut visit = |e: &mut Expr| {
-        let span = e.span;
-        if let ExprKind::Call { callee, args } = &mut e.kind {
-            if let ExprKind::Ident(name) = &callee.kind {
-                if let Some(params) = funs.get(name) {
-                    resolve_one(name, params, args, span, &mut diags);
-                }
-            }
+        let callee_name = match &e.kind {
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Ident(name) if funs.contains_key(name) => Some(name.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(name) = callee_name {
+            let params = funs.get(&name).unwrap().clone();
+            resolve_one(&name, &params, e, &mut diags, &mut temp_counter);
         }
     };
 
@@ -74,28 +78,77 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
     diags
 }
 
-/// Resolve one call's args against `params`, in place. Only runs when there are
-/// named args or missing trailing args; leaves well-formed positional calls and
-/// over-full calls (arity errors) to the checker.
-fn resolve_one(fun_name: &str, params: &[Param], args: &mut Vec<Arg>, span: Span, diags: &mut Vec<Diag>) {
+/// Resolve one call's args against `params`, rewriting `e` (a `Call` node) in
+/// place. Only runs when there are named args or missing trailing args;
+/// leaves well-formed positional calls and over-full calls (arity errors) to
+/// the checker.
+///
+/// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it719):
+/// reordering named arguments into parameter-declaration order used to move
+/// the ARGUMENT EXPRESSIONS THEMSELVES (not just their final call-site slot)
+/// -- so `f(b: sideEffectB(), a: sideEffectA())` silently evaluated
+/// `sideEffectA()` BEFORE `sideEffectB()`, the REVERSE of how the call reads,
+/// identically (and identically WRONG) on all four engines, since this
+/// rewrite runs ONCE upstream of interp/KVM/native/`.kx`. Confirmed live:
+/// printing inside each side effect showed "A" then "B" for a call written
+/// `f(b: sideB(), a: sideA())`. Every mainstream language with named/keyword
+/// arguments (Swift, Kotlin, Python, C#, Ruby -- this campaign's own
+/// standing "Swift+Kotlin in comparisons" directive) evaluates call
+/// arguments in SOURCE-WRITTEN order regardless of parameter declaration
+/// order; this was an unconsidered divergence, not a documented design
+/// choice. Fixed by evaluating every consumed argument (positional OR
+/// named) into a synthetic `let __namedargN = ARGEXPR` IN SOURCE-WRITTEN
+/// ORDER, then building the final positional call from `Ident` references
+/// to those temporaries in PARAMETER order -- preserving both observable
+/// evaluation order (the `let`s run source-first) and the callee's ordinary
+/// positional-argument contract (every downstream engine still just sees a
+/// plain `Call`, wrapped in a `Block`). Trailing DEFAULT values (no
+/// source-written position at all) are left unwrapped, evaluated directly at
+/// their PARAMETER-ORDER position in the final call -- after every
+/// explicitly-given (now temp-bound) argument, since K0267 already requires
+/// defaults to be trailing.
+fn resolve_one(fun_name: &str, params: &[Param], e: &mut Expr, diags: &mut Vec<Diag>, temp_counter: &mut usize) {
+    let span = e.span;
+    let (callee, mut args) = match std::mem::replace(&mut e.kind, ExprKind::Unit) {
+        ExprKind::Call { callee, args } => (callee, args),
+        other => unreachable!("resolve_one called on a non-Call node: {other:?}"),
+    };
     let has_named = args.iter().any(|a| a.name.is_some());
     if !has_named && args.len() == params.len() {
+        e.kind = ExprKind::Call { callee, args };
         return;
     }
     if args.len() > params.len() {
-        return; // too many — let the arity check report it
+        e.kind = ExprKind::Call { callee, args }; // too many — let the arity check report it
+        return;
     }
     let mut slots: Vec<Option<Expr>> = (0..params.len()).map(|_| None).collect();
     let mut seen_named = false;
     let mut pos = 0usize;
-    for a in std::mem::take(args) {
+    // Every consumed argument's expression, wrapped in a fresh `let` IN
+    // SOURCE-WRITTEN ORDER (only when the call actually mixes/uses named
+    // args -- a purely positional or already-in-order call needs no
+    // rewriting, matching the ORIGINAL behavior exactly, since no reordering
+    // ever happens for it).
+    let mut prelude: Vec<Stmt> = Vec::new();
+    let mut bind = |value: Expr| -> Expr {
+        if !has_named {
+            return value;
+        }
+        let tmp = format!("__namedarg{temp_counter}");
+        *temp_counter += 1;
+        let vspan = value.span;
+        prelude.push(Stmt::Let { name: tmp.clone(), ty: None, init: value, mutable: false, span: vspan });
+        Expr { kind: ExprKind::Ident(tmp), span: vspan }
+    };
+    for a in args.drain(..) {
         match a.name {
             None => {
                 if seen_named {
                     diags.push(Diag::error("K0268", "positional argument after a named argument", span));
                 }
                 if pos < slots.len() {
-                    slots[pos] = Some(a.value);
+                    slots[pos] = Some(bind(a.value));
                 }
                 pos += 1;
             }
@@ -106,7 +159,7 @@ fn resolve_one(fun_name: &str, params: &[Param], args: &mut Vec<Arg>, span: Span
                         if slots[i].is_some() {
                             diags.push(Diag::error("K0269", format!("argument `{n}` given more than once"), span));
                         } else {
-                            slots[i] = Some(a.value);
+                            slots[i] = Some(bind(a.value));
                         }
                     }
                     None => {
@@ -127,7 +180,7 @@ fn resolve_one(fun_name: &str, params: &[Param], args: &mut Vec<Arg>, span: Span
     let mut out = Vec::with_capacity(params.len());
     for (i, p) in params.iter().enumerate() {
         match slots[i].take() {
-            Some(e) => out.push(Arg { name: None, value: e }),
+            Some(v) => out.push(Arg { name: None, value: v }),
             None => match &p.default {
                 Some(d) => out.push(Arg { name: None, value: d.clone() }),
                 None => {
@@ -142,7 +195,13 @@ fn resolve_one(fun_name: &str, params: &[Param], args: &mut Vec<Arg>, span: Span
             },
         }
     }
-    *args = out;
+    let call = Expr { kind: ExprKind::Call { callee, args: out }, span };
+    if prelude.is_empty() {
+        *e = call;
+    } else {
+        prelude.push(Stmt::Expr(call));
+        e.kind = ExprKind::BlockExpr(Block { stmts: prelude, span });
+    }
 }
 
 // ---- mutable AST walkers (mirror the immutable ones in effects.rs) ----

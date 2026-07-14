@@ -14639,6 +14639,81 @@ fun probe() -> Str {
         assert_eq!(differential(s), "[NaN, 3.0]");
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it719):
+    /// `callargs.rs`'s named-argument resolution (a pre-check pass that runs
+    /// ONCE upstream of every engine, rewriting `f(b: X, a: Y)` into ordinary
+    /// positional form) used to move each argument EXPRESSION directly into
+    /// its final PARAMETER-declaration-order slot -- so `f(b: sideEffectB(),
+    /// a: sideEffectA())` silently evaluated `sideEffectA()` BEFORE
+    /// `sideEffectB()`, the REVERSE of how the call reads, identically (and
+    /// identically WRONG) across interp/KVM/native, since all three consume
+    /// the SAME rewritten AST. Every mainstream language with named/keyword
+    /// arguments (Swift, Kotlin, Python, C#, Ruby) evaluates call arguments
+    /// in SOURCE-WRITTEN order regardless of parameter declaration order --
+    /// confirmed this was an unconsidered divergence (no test or doc
+    /// asserted any evaluation order for named-arg calls) via a live repro
+    /// (printing inside each side effect) before writing any fix. Fixed by
+    /// evaluating every consumed argument into a synthetic `let` IN SOURCE-
+    /// WRITTEN ORDER, then building the final positional call from `Ident`
+    /// references to those temporaries in parameter order -- see
+    /// `callargs.rs::resolve_one`'s doc comment for the full mechanism.
+    ///
+    /// Uses `panic(msg)` as a purely-functional order probe: whichever
+    /// argument's expression is evaluated FIRST is the one whose panic
+    /// message surfaces (evaluation stops there, so only the first-reached
+    /// side effect is ever observable) -- no mutable/closure state needed.
+    #[test]
+    fn diff_named_argument_calls_evaluate_side_effects_in_source_written_order() {
+        // reordered named args: written b-then-a -> B's panic must fire, not A's
+        // (A's panic firing would mean the OLD parameter-declaration-order bug).
+        assert_eq!(
+            differential(
+                "fun f(a: Int, b: Int) -> Int { a + b }\n\
+                 fun probe() -> Str { \"{f(b: panic(\"B\"), a: panic(\"A\"))}\" }\n"
+            ),
+            "panic: B"
+        );
+        // mixed positional-then-named: written a-then-b -> A's panic fires first.
+        assert_eq!(
+            differential(
+                "fun f(a: Int, b: Int) -> Int { a + b }\n\
+                 fun probe() -> Str { \"{f(panic(\"A\"), b: panic(\"B\"))}\" }\n"
+            ),
+            "panic: A"
+        );
+        // named args already in declaration order: no observable change either
+        // way, but confirms the rewrite doesn't accidentally reverse THIS case.
+        assert_eq!(
+            differential(
+                "fun f(a: Int, b: Int) -> Int { a + b }\n\
+                 fun probe() -> Str { \"{f(a: panic(\"A\"), b: panic(\"B\"))}\" }\n"
+            ),
+            "panic: A"
+        );
+        // nested named call as an argument: outer written a-then-b, so the
+        // OUTER a: (the whole nested call) must be entered before the outer
+        // b: is ever evaluated -- the nested call's OWN b-then-a reordering
+        // means the very first side effect reached overall is the nested B.
+        assert_eq!(
+            differential(
+                "fun f(a: Int, b: Int) -> Int { a + b }\n\
+                 fun probe() -> Str { \"{f(a: f(b: panic(\"NESTED_B\"), a: panic(\"NESTED_A\")), b: panic(\"OUTER_B\"))}\" }\n"
+            ),
+            "panic: NESTED_B"
+        );
+        // a trailing DEFAULT must still evaluate correctly (default value
+        // untouched by the temp-binding rewrite) and AFTER every explicitly-
+        // given argument -- confirmed via the correct arithmetic RESULT
+        // (10 + 20 + 100 = 130), not just that it doesn't crash.
+        assert_eq!(
+            differential(
+                "fun g(a: Int, b: Int, c: Int = 100) -> Int { a + b + c }\n\
+                 fun probe() -> Str { \"{g(b: 20, a: 10)}\" }\n"
+            ),
+            "130"
+        );
+    }
+
     #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose
