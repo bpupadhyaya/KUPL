@@ -318,15 +318,31 @@ pub fn materialize(
     Ok(())
 }
 
+/// A response larger than this is rejected (curl exit 63, `--max-filesize`)
+/// rather than fully buffered into memory -- a REAL, live-confirmed
+/// resource-exhaustion gap found+fixed (production-hardening PR-it751): a
+/// malicious or merely misbehaving registry/mirror could return an
+/// arbitrarily large body for an ordinary `kupl pkg fetch`, which
+/// `cmd.output()` below buffers ENTIRELY into memory before this function
+/// gets a chance to look at it. A HIGHER-severity trust boundary than
+/// `interp.rs`'s equivalent gap (fixed in the SAME iteration): here the
+/// registry itself (untrusted, per this module's own established threat
+/// model -- see `is_safe_registry_url`/`is_safe_relative_path`) controls
+/// both the URL AND the response for a routine dependency-fetch operation,
+/// not something the KUPL program author opted into per-call. Mirrors
+/// `interp.rs`'s own `MAX_HTTP_RESPONSE_SIZE` (10MB) for consistency.
+const MAX_REGISTRY_RESPONSE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Fetch `url` via `curl` — the same zero-dependency, subprocess-based
 /// transport `interp.rs`'s `http_get`/`http_post` builtins and `ai.rs`'s
 /// provider calls already use (`-sS --fail` so a non-2xx status becomes an
 /// `Err`, `--max-time 30` so a stalled/unreachable host can't hang the CLI
-/// forever). `Err` on a non-2xx status, an unreachable host, curl being
-/// missing, or a response that isn't valid UTF-8.
+/// forever, `--max-filesize` so an oversized response can't exhaust
+/// memory). `Err` on a non-2xx status, an unreachable host, curl being
+/// missing, a response that isn't valid UTF-8, or a response exceeding
+/// `MAX_REGISTRY_RESPONSE_SIZE`.
 fn curl_get(url: &str) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-sS", "--fail", "--max-time", "30", url]);
+    let mut cmd = build_curl_get_cmd(url);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     let out = cmd.output().map_err(|e| format!("cannot run curl: {e}"))?;
@@ -339,6 +355,23 @@ fn curl_get(url: &str) -> Result<String, String> {
         });
     }
     String::from_utf8(out.stdout).map_err(|_| format!("response from {url} is not valid UTF-8"))
+}
+
+/// Build (but don't spawn) `curl_get`'s command, split out purely so a unit
+/// test can introspect the exact args via `Command::get_args()` without
+/// spawning a real `curl` subprocess -- this codebase's registry.rs tests
+/// deliberately never invoke real `curl` (every `fetch_package_with` test
+/// injects a canned/mock fetcher instead), so a network-dependent test here
+/// would be the first of its kind and break that established, deliberate
+/// portability convention. Testing the args a real invocation WOULD use
+/// still catches the actual regression this fix guards against (the
+/// `--max-filesize` flag being silently dropped in a future edit).
+fn build_curl_get_cmd(url: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sS", "--fail", "--max-time", "30"]);
+    cmd.args(["--max-filesize", &MAX_REGISTRY_RESPONSE_SIZE.to_string()]);
+    cmd.arg(url);
+    cmd
 }
 
 /// The local on-disk cache `kupl pkg fetch` materializes registry packages
@@ -624,6 +657,43 @@ mod tests {
             );
             assert!(parse_index(&idx).is_ok(), "url {good_url:?} should have parsed cleanly");
         }
+    }
+
+    #[test]
+    fn curl_get_caps_the_response_size_it_will_buffer_into_memory() {
+        // A REAL, live-confirmed resource-exhaustion gap found+fixed
+        // (production-hardening PR-it751): `curl_get` had no response-size
+        // limit at all -- `cmd.output()` buffers the ENTIRE response body
+        // into memory before this module gets a chance to look at it, so a
+        // malicious or merely misbehaving registry/mirror could return an
+        // arbitrarily large body for an ordinary `kupl pkg fetch`.
+        // Live-confirmed BEFORE this fix, outside this test (a local test
+        // HTTP server serving a 10MB file, run via a real `curl` subprocess
+        // with and without `--max-filesize`): without the flag, curl
+        // downloaded the full 10MB; with `--max-filesize 1000000` (1MB) set
+        // against the SAME 10MB file, curl aborted with exit 63 ("Maximum
+        // file size exceeded") and downloaded nothing.
+        //
+        // This test does NOT spawn a real `curl` subprocess (unlike a
+        // network-dependent integration test would) -- every existing test
+        // in this module's `fetch_package_with` family deliberately injects
+        // a canned/mock fetcher instead of touching real `curl`, and a
+        // network-dependent test here would be the first of its kind,
+        // breaking that established portability convention. Instead it
+        // introspects the ACTUAL `Command` `curl_get` would spawn (via
+        // `build_curl_get_cmd`, the same function `curl_get` itself calls)
+        // using `Command::get_args()` -- this still catches the real
+        // regression the fix guards against (the `--max-filesize` flag
+        // being silently dropped in a future edit), without any network
+        // dependency or flakiness.
+        let cmd = build_curl_get_cmd("https://registry.example.com/x.json");
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let flag_pos = args.iter().position(|a| a == "--max-filesize");
+        assert!(flag_pos.is_some(), "curl_get must pass --max-filesize: {args:?}");
+        let limit: u64 = args[flag_pos.unwrap() + 1].parse().expect("--max-filesize value must be numeric");
+        assert_eq!(limit, MAX_REGISTRY_RESPONSE_SIZE, "{args:?}");
+        assert!(limit > 0, "a zero cap would reject every legitimate response too: {args:?}");
     }
 
     #[test]

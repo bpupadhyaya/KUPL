@@ -3909,21 +3909,56 @@ pub fn regex_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     Ok(result)
 }
 
+/// A REAL, live-confirmed resource-exhaustion gap found+fixed (production-
+/// hardening PR-it751): `http_builtin`'s `curl` invocation had no response-
+/// size limit at all -- `run_curl`'s `child.wait_with_output()` buffers the
+/// ENTIRE response body into memory before this module gets a chance to
+/// look at it, so `http_get`/`http_post` against a URL that happens to
+/// return an enormous body (an attacker-controlled or simply misbehaving
+/// server -- the KUPL program author writes the URL, but not what the
+/// remote host chooses to send back) could exhaust the process's memory.
+/// Confirmed live BEFORE this fix: a local test server serving a 10MB file
+/// downloaded in full with the pre-fix flag set (no cap at all); mirrors
+/// this same file's own existing `MAX_BODY_SIZE` precedent (10MB, chosen
+/// for the SERVER-side inbound request body cap, just above) for the
+/// OUTBOUND response side.
+const MAX_HTTP_RESPONSE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Build (but don't spawn) the `curl` invocation's shared base flags, split
+/// out purely so a unit test can introspect the exact args via
+/// `Command::get_args()` without spawning a real `curl` subprocess -- this
+/// codebase's http-builtin tests deliberately never invoke real `curl`
+/// (unlike `serve_http`'s tests, which exercise the SERVER side via raw
+/// `TcpStream`s and need no external process at all), so a network-
+/// dependent test here would be the first of its kind. Testing the args a
+/// real invocation WOULD use still catches the actual regression this fix
+/// guards against (the `--max-filesize` flag being silently dropped in a
+/// future edit). `--fail` makes curl return a non-zero status (and thus an
+/// `Err`) on HTTP 4xx/5xx; `-sS` silences the progress meter but keeps
+/// error messages; `--max-filesize` aborts an oversized transfer (curl
+/// exit 63, handled by the SAME existing non-2xx `Err` branch in
+/// `run_curl` -- no new panic surface) rather than buffering an unbounded
+/// response into memory (production-hardening PR-it751).
+fn base_curl_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sS", "--fail", "--max-time", "30"]);
+    cmd.args(["--max-filesize", &MAX_HTTP_RESPONSE_SIZE.to_string()]);
+    cmd
+}
+
 /// HTTP builtins — shared by interpreter and KVM. Effect `io.net`. Transport is
 /// the system `curl` (the same zero-dependency approach the AI runtime uses).
 /// Returns a `Result` value: `Ok(body)` on a successful request, `Err(message)`
-/// otherwise (unreachable host, non-2xx, curl missing, …). The `Err` text is a
-/// human-readable description and may vary by platform — match `Ok`/`Err`.
+/// otherwise (unreachable host, non-2xx, curl missing, response too large, …).
+/// The `Err` text is a human-readable description and may vary by platform —
+/// match `Ok`/`Err`.
 pub fn http_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     let as_str = |v: &Value| match v {
         Value::Str(s) => s.as_str().to_string(),
         other => other.to_string(),
     };
     let url = as_str(&args[0]);
-    // `--fail` makes curl return a non-zero status (and thus an Err) on HTTP
-    // 4xx/5xx; `-sS` silences the progress meter but keeps error messages.
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-sS", "--fail", "--max-time", "30"]);
+    let mut cmd = base_curl_cmd();
     let result = match name {
         "http_get" => {
             cmd.arg(&url);
@@ -4764,6 +4799,50 @@ fun main() uses io { let _ = http_serve(38131, handle) }
         let resp = recovered
             .expect("server should recover after the trickle connection's total deadline expires");
         assert!(resp.ends_with("GET /world"), "resp: {resp}");
+    }
+}
+
+#[cfg(test)]
+mod http_client_tests {
+    use super::{base_curl_cmd, MAX_HTTP_RESPONSE_SIZE};
+
+    #[test]
+    fn base_curl_cmd_caps_the_response_size_it_will_buffer_into_memory() {
+        // A REAL, live-confirmed resource-exhaustion gap found+fixed
+        // (production-hardening PR-it751): `http_builtin`'s `curl`
+        // invocation had no response-size limit at all --
+        // `run_curl`'s `child.wait_with_output()` buffers the ENTIRE
+        // response body into memory before this module gets a chance to
+        // look at it, so `http_get`/`http_post` against a URL that happens
+        // to return an enormous body (the KUPL program author writes the
+        // URL, but not what the remote host chooses to send back) could
+        // exhaust the process's memory. Live-confirmed BEFORE this fix,
+        // outside this test (a local test HTTP server serving a 10MB file,
+        // run via a real `curl` subprocess with and without
+        // `--max-filesize`): without the flag, curl downloaded the full
+        // 10MB; with `--max-filesize 1000000` (1MB) set against the SAME
+        // 10MB file, curl aborted with exit 63 ("Maximum file size
+        // exceeded") and downloaded nothing.
+        //
+        // This test does NOT spawn a real `curl` subprocess -- no existing
+        // test in this module invokes real `curl` for the CLIENT side
+        // (`serve_http`'s tests exercise only the SERVER side, via raw
+        // `TcpStream`s, needing no external process), and a network-
+        // dependent test here would be the first of its kind. Instead it
+        // introspects the ACTUAL `Command` `http_builtin` would spawn (via
+        // `base_curl_cmd`, the same function `http_builtin` itself calls)
+        // using `Command::get_args()` -- this still catches the real
+        // regression the fix guards against (the `--max-filesize` flag
+        // being silently dropped in a future edit), without any network
+        // dependency or flakiness.
+        let cmd = base_curl_cmd();
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let flag_pos = args.iter().position(|a| a == "--max-filesize");
+        assert!(flag_pos.is_some(), "http_builtin must pass --max-filesize: {args:?}");
+        let limit: u64 = args[flag_pos.unwrap() + 1].parse().expect("--max-filesize value must be numeric");
+        assert_eq!(limit, MAX_HTTP_RESPONSE_SIZE, "{args:?}");
+        assert!(limit > 0, "a zero cap would reject every legitimate response too: {args:?}");
     }
 }
 
