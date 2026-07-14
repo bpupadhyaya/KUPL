@@ -6326,10 +6326,20 @@ static void k_restart(int id, const char* msg) {
     k_arm_timers(id);
 }
 
+/* Bound on timer fires within a single k_advance call — mirrors interp.rs's
+   MAX_ADVANCE_FIRES (production-hardening PR-it734): the RATIO between an
+   advance step's duration and a timer's interval is unbounded even though
+   each is individually capped at 100 years, so an ordinary `on every 1ms`
+   soak-tested with a large `advance` requires days of wall-clock time with
+   no progress output. See interp::MAX_ADVANCE_FIRES's own doc comment for
+   the full live reproduction. */
+#define K_MAX_ADVANCE_FIRES 10000000
+
 /* advance the virtual clock to now+dur, firing due timers in (time, instance,
    decl) order, draining between fires — verbatim from vm.rs::advance */
 static void k_advance(long long dur) {
     long long target = k_vnow + dur;
+    long long fires = 0;
     for (;;) {
         long long bt = 0; int bi = -1, btk = -1;
         for (int iid = 0; iid < k_ninsts; iid++) {
@@ -6344,6 +6354,9 @@ static void k_advance(long long dur) {
             }
         }
         if (bi < 0) break;
+        if (++fires > K_MAX_ADVANCE_FIRES) {
+            k_panic("`advance` would fire more than 10000000 timer events; use a smaller duration or a longer timer interval");
+        }
         k_vnow = bt;
         k_dispatch(bi, k_insts[bi].timers[btk].chunk, 0);
         k_drain();

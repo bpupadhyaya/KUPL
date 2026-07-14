@@ -150,6 +150,20 @@ pub const MAX_TENSOR_LEN: u64 = 100_000_000;
 /// the interpreter, KVM (`vm.rs`), and native runtime (`cgen.rs`).
 pub const MAX_COMPONENT_MESSAGES: u64 = 1_000_000;
 
+/// Bound on timer fires processed within a single `advance()` call (an
+/// `example` block's `advance <duration>` step). A duration literal's
+/// MAGNITUDE is already capped at 100 years (`parser.rs::MAX_DURATION_MS`,
+/// PR-it728), but the RATIO between an `advance` step's duration and a
+/// timer's interval was never bounded -- both can independently sit at that
+/// cap, so an entirely ordinary `on every 1ms { ... }` soak-tested with
+/// `advance 100y` requires ~3.156e12 loop iterations (days of wall-clock
+/// time, confirmed empirically at ~8.7M fires/sec on this hardware), with
+/// no progress output and no way to bound it short of killing the process.
+/// 10M mirrors `regex.rs::MATCH_BUDGET`'s "generous for real use, but caps
+/// runaway growth" sizing; identical on the interpreter, KVM (`vm.rs`), and
+/// native runtime (`cgen.rs`).
+pub const MAX_ADVANCE_FIRES: usize = 10_000_000;
+
 impl Interp {
     pub fn new(db: ProgramDb) -> Interp {
         let image = Some(crate::parallel::ProgramImage::from_db(&db));
@@ -313,11 +327,33 @@ impl Interp {
     /// Advance the virtual clock by `dur` ms, firing every due timer in time
     /// order (ties broken by instance then declaration order — deterministic).
     /// Recurring timers reschedule; one-shots deactivate.
+    ///
+    /// A REAL, non-adversarial DoS bug found+fixed (production-hardening
+    /// PR-it734): this loop fires one timer event per iteration with NO
+    /// bound on the iteration count, which is `dur / timer_interval` --
+    /// unbounded, since PR-it728 only capped each duration LITERAL's
+    /// magnitude (100 years), never the RATIO between an `advance` step's
+    /// duration and a timer's interval, both of which can independently sit
+    /// at that cap. An entirely ordinary-looking `example` block -- `on
+    /// every 1ms { ... }` soak-tested with `advance 100000000ms` (100M ms,
+    /// ~27.8 virtual hours -- not an extreme value) -- confirmed LIVE to
+    /// take 11.5s wall-clock for 100M fires; extrapolating to the parser's
+    /// own legal maximum (`advance` of 100 years against a 1ms timer) is
+    /// ~4.2 DAYS of pegged CPU, with no progress output and no timeout
+    /// anywhere in the CLI to bound it -- a two-line test file silently
+    /// wedging a CI runner for days, not a crash. Same threat class as this
+    /// file's own PR-it559 (panicking handler wedges the server) and
+    /// PR-it577 (a NUL byte hangs forever): an entirely ordinary input with
+    /// no error, just unbounded wall-clock time. Fixed with the SAME
+    /// safety-valve shape `run_timers` already uses one function below --
+    /// `MAX_ADVANCE_FIRES` bounds fires within a single `advance` call,
+    /// reporting a clean panic instead of grinding indefinitely.
     pub fn advance(&mut self, dur: i64) -> Result<(), Flow> {
         if dur < 0 {
             return Err(Self::panic_flow("cannot advance the clock by a negative duration", Span::default()));
         }
         let target = self.now + dur;
+        let mut fires = 0usize;
         loop {
             // earliest active timer with next_fire <= target
             let mut best: Option<(i64, usize, usize)> = None;
@@ -332,6 +368,13 @@ impl Interp {
                 }
             }
             let Some((fire_time, iid, ti)) = best else { break };
+            fires += 1;
+            if fires > MAX_ADVANCE_FIRES {
+                return Err(Self::panic_flow(
+                    format!("`advance` would fire more than {MAX_ADVANCE_FIRES} timer events; use a smaller duration or a longer timer interval"),
+                    Span::default(),
+                ));
+            }
             self.now = fire_time;
             let handler_idx = self.instances[iid].timers[ti].handler_idx;
             let comp = self.instances[iid].comp.clone();

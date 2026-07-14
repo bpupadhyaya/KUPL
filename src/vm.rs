@@ -213,11 +213,20 @@ impl<'m> Vm<'m> {
 
     /// Advance the virtual clock, firing due timers in time order (ties broken
     /// by instance then declaration order) — identical semantics to the interp.
+    ///
+    /// Mirrors interp.rs's identical PR-it734 fix: bounds fires within a
+    /// single call at `MAX_ADVANCE_FIRES`, since the RATIO between an
+    /// `advance` step's duration and a timer's interval is otherwise
+    /// unbounded (each individually capped at 100 years by
+    /// `parser.rs::MAX_DURATION_MS`, but never their ratio) -- see
+    /// `interp::MAX_ADVANCE_FIRES`'s own doc comment for the full live
+    /// reproduction and severity rationale.
     pub fn advance(&mut self, dur: i64) -> Result<(), VmError> {
         if dur < 0 {
             return Err(VmError { msg: "cannot advance the clock by a negative duration".into(), span: Span::default() });
         }
         let target = self.now + dur;
+        let mut fires = 0usize;
         loop {
             let mut best: Option<(i64, usize, usize)> = None;
             for (iid, inst) in self.instances.iter().enumerate() {
@@ -231,6 +240,16 @@ impl<'m> Vm<'m> {
                 }
             }
             let Some((fire_time, iid, ti)) = best else { break };
+            fires += 1;
+            if fires > crate::interp::MAX_ADVANCE_FIRES {
+                return Err(VmError {
+                    msg: format!(
+                        "`advance` would fire more than {} timer events; use a smaller duration or a longer timer interval",
+                        crate::interp::MAX_ADVANCE_FIRES
+                    ),
+                    span: Span::default(),
+                });
+            }
             self.now = fire_time;
             let chunk = self.instances[iid].timers[ti].chunk;
             // SOUNDNESS FIX (PR-it509): mirrors the interp fix -- `restart` already
@@ -18342,6 +18361,50 @@ fun probe() -> Str {\n    par { par_label(\"a\")  par_label(\"b\") }.join(\",\")
         assert_eq!(i_ticks, "2"); // every 5s fired at 5s and 10s within 12s
         assert_eq!(i_ready, "1");
         assert_eq!(i_tick, "2");
+    }
+
+    /// A REAL, non-adversarial DoS bug found+fixed (production-hardening
+    /// PR-it734): `advance()`'s timer-fire loop had NO bound on iteration
+    /// count, which is `dur / timer_interval` -- unbounded, since PR-it728
+    /// only capped each duration LITERAL's magnitude (100 years), never the
+    /// RATIO between an `advance` step's duration and a timer's interval.
+    /// An entirely ordinary-looking `example` block (`on every 1ms`
+    /// soak-tested with a large `advance`) confirmed LIVE to take DAYS of
+    /// wall-clock time with no progress output -- a two-line test file
+    /// silently wedging a CI runner. Fixed with a `MAX_ADVANCE_FIRES` cap
+    /// (10M), reporting a clean panic instead. This test drives a 1ms timer
+    /// with a duration requiring exactly ONE more fire than the cap allows,
+    /// confirming BOTH engines cleanly reject it with the identical message
+    /// (not a hang) -- proving real teeth by using the cap's own EXACT
+    /// boundary (cap+1 fires), not just "some huge value".
+    #[test]
+    fn diff_advance_beyond_the_fire_cap_is_a_clean_error_not_a_hang() {
+        let src = "component T {\n    intent \"fire cap\"\n    state n: Int = 0\n\
+    on every 1ms {\n        n += 1\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        // one fire beyond the cap: MAX_ADVANCE_FIRES + 1 fires at a 1ms interval.
+        let dur = crate::interp::MAX_ADVANCE_FIRES as i64 + 1;
+
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        assert!(it.instantiate("T", &[], crate::diag::Span::default()).is_ok(), "inst");
+        it.start_all().ok();
+        let i_err = match it.advance(dur) {
+            Err(crate::interp::Flow::Panic { msg, .. }) => msg,
+            Ok(()) => panic!("interp must cleanly panic, got Ok"),
+            Err(_) => panic!("interp must panic with Flow::Panic specifically"),
+        };
+        assert!(i_err.contains("would fire more than 10000000 timer events"), "{i_err}");
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let _vid = vm.instantiate_named("T", vec![]).expect("inst");
+        let v_err = match vm.advance(dur) {
+            Err(e) => e.msg,
+            other => panic!("KVM must cleanly error, got {other:?}"),
+        };
+        assert_eq!(i_err, v_err, "interpreter and KVM must report the identical fire-cap message");
     }
 
     #[test]
