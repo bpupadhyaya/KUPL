@@ -6,7 +6,7 @@
 //!   - implementation: only bodies/state/wiring changed (non-breaking)
 //! Exit code 0 = semantically identical, 1 = changes found.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{Item, Program};
 use crate::fmt::{expr_str, format_program, ty_str};
@@ -26,9 +26,19 @@ fn param_fingerprint(p: &crate::ast::Param) -> String {
     }
 }
 
+/// A program's imported module paths, as a SET -- `use` declaration ORDER has
+/// no semantic meaning in KUPL, mirroring how items are compared by
+/// `(kind, name)` identity rather than list position. Shared between the real
+/// diff path and the test module's `diff_lines` helper (mirroring how
+/// `items_by_kind_and_name` is ALSO shared, PR-it699/757's own precedent) so a
+/// regression here is caught by either.
+fn use_paths(program: &Program) -> BTreeSet<String> {
+    program.uses.iter().map(|(p, _)| p.clone()).collect()
+}
+
 pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
-    let (old_items, ok_a) = load_items(old_path);
-    let (new_items, ok_b) = load_items(new_path);
+    let (old_items, old_uses, ok_a) = load_items(old_path);
+    let (new_items, new_uses, ok_b) = load_items(new_path);
     if !ok_a || !ok_b {
         return 2;
     }
@@ -37,6 +47,28 @@ pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
     let report = |line: String| {
         println!("{line}");
     };
+
+    // A REAL bug found+fixed (production-hardening PR-it776, an Explore
+    // survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
+    // live before implementing): `use` declarations (`Program.uses`) were
+    // never compared at all -- only `program.items` fed `load_items`. Two
+    // files with textually-identical item bodies but a REMOVED `use` line
+    // reported `semantically identical` (exit 0) even when the removal makes
+    // the new file fail to even compile (`error[K0240]: unknown name`).
+    // Confirmed live: an entry file calling `mathlib.value()` with `use
+    // mathlib` present checks cleanly; the identical file with that ONE line
+    // deleted fails K0240 -- yet `kupl diff` reported no change at all. A
+    // `use` change has no interface/implementation distinction (unlike an
+    // item, it has no signature to compare) -- reported the same simple way
+    // as an added/removed item.
+    for path in old_uses.difference(&new_uses) {
+        changes += 1;
+        report(format!("removed    use {path}"));
+    }
+    for path in new_uses.difference(&old_uses) {
+        changes += 1;
+        report(format!("added      use {path}"));
+    }
 
     for (key, old) in &old_items {
         let name = &key.1;
@@ -76,12 +108,12 @@ pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
     }
 }
 
-fn load_items(path: &str) -> (BTreeMap<(&'static str, String), Item>, bool) {
+fn load_items(path: &str) -> (BTreeMap<(&'static str, String), Item>, BTreeSet<String>, bool) {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: cannot read {path}: {e}");
-            return (BTreeMap::new(), false);
+            return (BTreeMap::new(), BTreeSet::new(), false);
         }
     };
     let (program, diags) = parser::parse(&src);
@@ -90,13 +122,14 @@ fn load_items(path: &str) -> (BTreeMap<(&'static str, String), Item>, bool) {
         .any(|d| d.severity == crate::diag::Severity::Error)
     {
         eprintln!("error: {path} does not parse; fix it before diffing");
-        return (BTreeMap::new(), false);
+        return (BTreeMap::new(), BTreeSet::new(), false);
     }
+    let uses = use_paths(&program);
     match items_by_kind_and_name(program.items) {
-        Ok(map) => (map, true),
+        Ok(map) => (map, uses, true),
         Err((kind, name)) => {
             eprintln!("error: {path} declares {kind} `{name}` more than once; fix it before diffing");
-            (BTreeMap::new(), false)
+            (BTreeMap::new(), BTreeSet::new(), false)
         }
     }
 }
@@ -335,10 +368,22 @@ mod tests {
         let (pa, da) = crate::parser::parse(old);
         let (pb, db) = crate::parser::parse(new);
         assert!(da.is_empty() && db.is_empty());
+        // Compared as a SET, matching the real path (PR-it776) -- `use`
+        // declaration order is not semantically meaningful.
+        let uses_a = super::use_paths(&pa);
+        let uses_b = super::use_paths(&pb);
         let a = super::items_by_kind_and_name(pa.items).expect("old has no duplicate (kind, name)");
         let b = super::items_by_kind_and_name(pb.items).expect("new has no duplicate (kind, name)");
         let mut lines = Vec::new();
         let mut changed = false;
+        for path in uses_a.difference(&uses_b) {
+            changed = true;
+            lines.push(format!("removed use {path}"));
+        }
+        for path in uses_b.difference(&uses_a) {
+            changed = true;
+            lines.push(format!("added use {path}"));
+        }
         for (key, old) in &a {
             let name = &key.1;
             match b.get(key) {
@@ -375,6 +420,72 @@ mod tests {
             "// a comment\nfun add(a:Int,b:Int)->Int{ a + b }\n",
         );
         assert!(!changed, "{lines:?}");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it776, an Explore
+    /// survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
+    /// live before implementing): `use` declarations (`Program.uses`) were
+    /// never compared at all -- `load_items` only ever extracted
+    /// `program.items`. Two files with textually-identical item bodies but a
+    /// REMOVED `use` line reported `semantically identical` (exit 0), even
+    /// though the removal can make the new file fail to even compile.
+    /// Confirmed live via a real two-package structure before this fix: an
+    /// entry file calling `mathlib.value()` checks cleanly with `use
+    /// mathlib` present, fails with K0240 (unknown name) with that ONE line
+    /// deleted -- yet `kupl diff` reported no change at all either way.
+    #[test]
+    fn a_removed_or_added_use_declaration_is_a_reported_change() {
+        let old = "use mathlib\n\nfun run() -> Int {\n    1\n}\n";
+        let new = "fun run() -> Int {\n    1\n}\n";
+        let (lines, changed) = diff_lines(old, new);
+        assert!(changed, "removing a `use` must register as a change: {lines:?}");
+        assert_eq!(lines, vec!["removed use mathlib"], "{lines:?}");
+
+        // symmetric: the SAME pair, reversed, reports it as ADDED.
+        let (lines2, changed2) = diff_lines(new, old);
+        assert!(changed2, "{lines2:?}");
+        assert_eq!(lines2, vec!["added use mathlib"], "{lines2:?}");
+    }
+
+    #[test]
+    fn reordering_use_declarations_is_not_a_change() {
+        // `use` declaration ORDER has no semantic meaning in KUPL -- a diff
+        // tool must compare the SET of imports, not textual position,
+        // mirroring how items are already compared by (kind, name) identity
+        // rather than list position.
+        let (lines, changed) = diff_lines(
+            "use alpha\nuse beta\n\nfun run() -> Int {\n    1\n}\n",
+            "use beta\nuse alpha\n\nfun run() -> Int {\n    1\n}\n",
+        );
+        assert!(!changed, "{lines:?}");
+    }
+
+    /// `diff_lines` (above) is an IN-MEMORY reimplementation of the
+    /// comparison ALGORITHM (sharing `use_paths`/`items_by_kind_and_name`
+    /// with the real path, but not `load_items`/`semantic_diff`
+    /// themselves) -- it cannot catch a WIRING bug where `semantic_diff`
+    /// simply never CALLS `use_paths` at all (the exact shape of the
+    /// original PR-it776 bug). This test calls the REAL, public
+    /// `semantic_diff` with REAL temp files end-to-end, closing that gap:
+    /// confirms the actual exit code a `kupl diff` invocation would produce,
+    /// not just the algorithm in isolation.
+    #[test]
+    fn semantic_diff_end_to_end_detects_a_removed_use_via_real_files() {
+        let dir = std::env::temp_dir().join(format!("kupl-sdiff-uses-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_path = dir.join("old.kupl");
+        let new_path = dir.join("new.kupl");
+        std::fs::write(&old_path, "use mathlib\n\nfun run() -> Int {\n    1\n}\n").unwrap();
+        std::fs::write(&new_path, "fun run() -> Int {\n    1\n}\n").unwrap();
+
+        let code = super::semantic_diff(old_path.to_str().unwrap(), new_path.to_str().unwrap());
+        assert_eq!(code, 1, "a removed `use` must be reported as a change, not exit 0 (semantically identical)");
+
+        // the SAME file against itself must still report no change.
+        let code_self = super::semantic_diff(old_path.to_str().unwrap(), old_path.to_str().unwrap());
+        assert_eq!(code_self, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A REAL, silent, CI-gate-defeating bug (production-hardening PR-it699): KUPL
