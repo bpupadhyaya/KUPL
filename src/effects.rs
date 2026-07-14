@@ -46,6 +46,38 @@ fn component_method_names(program: &Program) -> HashSet<&str> {
     names
 }
 
+/// The names of `decl`'s parameters whose declared type is a function type
+/// (`fn(...) -> ...`) -- used by `collect_expr` to scope the K0303 "call
+/// through an unverifiable function value" warning EXACTLY to a call through
+/// one of the enclosing function's own function-typed parameters, rather
+/// than to every plain call this pass cannot otherwise resolve
+/// (production-hardening PR-it750 v2). An earlier version of this fix
+/// instead EXCLUDED known component names from a much broader "any
+/// unresolved plain call" gate (to avoid false-positiving on `Counter()`
+/// component-constructor calls, which parse identically to an ordinary
+/// plain function call) -- live-confirmed via `cargo test --lib effects::`
+/// to STILL false-positive on any PURE builtin called as a plain call this
+/// module doesn't separately special-case (e.g. `to_str(x)`): a bare
+/// builtin name is not a user function, not a component name, and not
+/// resolved by `builtin_effects` either (which lists only EFFECTFUL
+/// builtins), so it fell through as "unresolved" just like a genuine
+/// function-typed parameter would. Matching ONLY the enclosing function's
+/// OWN declared function-typed parameters is both narrower AND simpler: it
+/// needs no builtin/component allow-list at all, and it exactly targets the
+/// "laundering risk" this warning exists for -- a value of function type
+/// invoked without knowing what it points to. A call through a LOCAL
+/// variable of function type (`let f = some_fn; f()`) is still not covered
+/// -- consistent with this file's own top-of-file "Limitation (documented)"
+/// note that closures/variables need real effect types to track safely,
+/// not something inferable from syntax alone.
+fn fn_typed_param_names(decl: &FunDecl) -> HashSet<&str> {
+    decl.params
+        .iter()
+        .filter(|p| matches!(p.ty.kind, TyExprKind::Fun(..)))
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
 pub fn check_effects(program: &Program) -> Vec<Diag> {
     let mut diags = Vec::new();
 
@@ -87,12 +119,23 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
     // ---- direct effects + call edges per function ----
     let mut direct: HashMap<String, EffectSet> = HashMap::new();
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    // Which functions make a PLAIN call through a value this pass cannot
+    // resolve to a builtin/component-local/top-level function -- i.e. a call
+    // through a function-typed parameter or local (production-hardening
+    // PR-it750, closing a real soundness gap: see `collect_expr`'s doc
+    // comment for why this is tracked SEPARATELY from the broader
+    // `unresolved` flag `pure_funs()` uses, rather than reusing it here).
+    let mut plain_call_unresolved: HashMap<String, bool> = HashMap::new();
     for (key, info) in &funs {
         let mut eff = EffectSet::new();
         let mut calls = Vec::new();
-        // K0301/K0302 deliberately don't act on "unresolved call" (see
-        // `collect_expr`'s doc comment) -- discarded, not accumulated.
+        // K0301/K0302 deliberately don't act on the BROADER "unresolved
+        // call" flag (see `collect_expr`'s doc comment) -- discarded, not
+        // accumulated. The NARROWER `plain_call` flag below is tracked and
+        // DOES feed K0303/K0302 (see the enforcement loop).
         let mut unresolved = false;
+        let mut plain_call = false;
+        let fn_params = fn_typed_param_names(info.decl);
         // `ai fun` performs the `ai` effect; the keyword itself declares it.
         if info.decl.ai.is_some() {
             eff.insert("ai".to_string());
@@ -112,7 +155,17 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
         for p in &info.decl.params {
             if let Some(d) = &p.default {
                 walk_expr(d, &mut |expr| {
-                    collect_expr(expr, info.component, &funs, &method_names, &mut eff, &mut calls, &mut unresolved);
+                    collect_expr(
+                        expr,
+                        info.component,
+                        &funs,
+                        &method_names,
+                        &fn_params,
+                        &mut eff,
+                        &mut calls,
+                        &mut unresolved,
+                        &mut plain_call,
+                    );
                 });
             }
         }
@@ -144,9 +197,20 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
             }
         }
         walk_block(&info.decl.body, &mut |expr| {
-            collect_expr(expr, info.component, &funs, &method_names, &mut eff, &mut calls, &mut unresolved);
+            collect_expr(
+                expr,
+                info.component,
+                &funs,
+                &method_names,
+                &fn_params,
+                &mut eff,
+                &mut calls,
+                &mut unresolved,
+                &mut plain_call,
+            );
         });
         let _ = unresolved; // deliberately unused here -- see comment above
+        plain_call_unresolved.insert(key.clone(), plain_call);
         direct.insert(key.clone(), eff);
         edges.insert(key.clone(), calls);
     }
@@ -201,14 +265,68 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                 ));
             }
         }
+        // Gated by `must_declare`, EXACTLY like K0301 above -- this
+        // module's own top-of-file doc comment is explicit that "Private
+        // functions and handlers may stay implicit", i.e. a private
+        // function is under NO obligation to declare its effects at all,
+        // so a warning telling it to `declare uses` for an unverifiable
+        // call makes no sense there. Confirmed as a REAL regression in an
+        // early version of this very fix via the mandatory examples/*.kupl
+        // sweep (production-hardening PR-it750): `examples/collections.kupl`
+        // (`bst_insert`/`bst_contains`, private, taking a `cmp: fn(T, T) ->
+        // Int` comparator) and `examples/generics.kupl` (`swap_apply`,
+        // private, taking `f: fn(T) -> U`) both newly warned K0303 despite
+        // being ordinary, idiomatic private higher-order helpers with no
+        // boundary-explicitness obligation whatsoever.
+        let has_unresolved_plain_call =
+            info.must_declare && plain_call_unresolved.get(key).copied().unwrap_or(false);
+        // A REAL, live-confirmed HIGH-severity soundness gap found+fixed
+        // (production-hardening PR-it750): a PUBLIC/EXPOSED function that
+        // plain-calls a value this pass cannot resolve to any known
+        // function -- i.e. a call through a FUNCTION-TYPED PARAMETER, the
+        // same "laundering risk" `collect_expr`'s own doc comment already
+        // named but declined to act on for K0301/K0302 (to avoid also
+        // flagging the much more common, unrelated "construct a component,
+        // call an exposed method" pattern -- see that comment). Confirmed
+        // live BEFORE this fix: `pub fun outer(f: fn() -> Int) -> Int {
+        // f() }` compiled with ZERO diagnostics even though `outer(noisy)`
+        // (where `noisy` calls `print`) genuinely executed the undeclared
+        // `io` effect on `kupl run`/`kupl run --vm`/a compiled `.kx`
+        // module -- and, worse, a caller who responsibly wrote `uses io`
+        // up front to cover the callback was PUNISHED with a spurious
+        // K0302 "declared but unused" warning. This does NOT attempt full
+        // HOF effect soundness (that needs effect-typed `fn(...)`
+        // signatures, a genuinely bigger language feature -- see this
+        // file's own top-of-file "Limitation (documented)" note) --
+        // instead, mirroring the EXACT precedent `check.rs`'s K0279 already
+        // established for the narrower "closure stored in a component
+        // state field" case: a WARNING (not a hard K0301 error, to avoid
+        // turning every legitimate, already-widely-used callback-accepting
+        // function into a fresh compile error), scoped to ONLY the
+        // boundary (`must_declare`) functions K0301/K0302 already cover,
+        // plus suppressing K0302 for its own declared effects (a
+        // declaration this pass cannot prove is truly unused).
+        if has_unresolved_plain_call {
+            diags.push(Diag::warning(
+                "K0303",
+                format!(
+                    "`{}` calls a value of function type -- its effects cannot be verified; \
+                     declare `uses` for any effect it may perform",
+                    info.decl.name
+                ),
+                info.decl.span,
+            ));
+        }
         // declared-but-unused (any fun that declares)
-        for d in &declared {
-            if !used.iter().any(|u| covers(d, u)) {
-                diags.push(Diag::warning(
-                    "K0302",
-                    format!("`{}` declares `uses {d}` but never uses it", info.decl.name),
-                    info.decl.span,
-                ));
+        if !has_unresolved_plain_call {
+            for d in &declared {
+                if !used.iter().any(|u| covers(d, u)) {
+                    diags.push(Diag::warning(
+                        "K0302",
+                        format!("`{}` declares `uses {d}` but never uses it", info.decl.name),
+                        info.decl.span,
+                    ));
+                }
             }
         }
     }
@@ -251,6 +369,11 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
         let mut eff = EffectSet::new();
         let mut calls = Vec::new();
         let mut unresolved = false;
+        // `pure_funs()` only needs the broader `unresolved` flag (already
+        // tracked above); this local sink is discarded, matching
+        // `check_effects`'s OWN pre-PR-it750 treatment of `unresolved`.
+        let mut plain_call_unresolved = false;
+        let fn_params = fn_typed_param_names(decl);
         if decl.ai.is_some() {
             eff.insert("ai".to_string());
         }
@@ -266,12 +389,32 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
         for p in &decl.params {
             if let Some(d) = &p.default {
                 walk_expr(d, &mut |expr| {
-                    collect_expr(expr, *component, &funs, &method_names, &mut eff, &mut calls, &mut unresolved);
+                    collect_expr(
+                        expr,
+                        *component,
+                        &funs,
+                        &method_names,
+                        &fn_params,
+                        &mut eff,
+                        &mut calls,
+                        &mut unresolved,
+                        &mut plain_call_unresolved,
+                    );
                 });
             }
         }
         walk_block(&decl.body, &mut |expr| {
-            collect_expr(expr, *component, &funs, &method_names, &mut eff, &mut calls, &mut unresolved);
+            collect_expr(
+                expr,
+                *component,
+                &funs,
+                &method_names,
+                &fn_params,
+                &mut eff,
+                &mut calls,
+                &mut unresolved,
+                &mut plain_call_unresolved,
+            );
         });
         direct.insert(key.clone(), eff);
         direct_unresolved.insert(key.clone(), unresolved);
@@ -374,9 +517,11 @@ fn collect_expr(
     component: Option<&str>,
     funs: &HashMap<String, impl Sized>,
     component_method_names: &HashSet<&str>,
+    fn_typed_params: &HashSet<&str>,
     eff: &mut EffectSet,
     calls: &mut Vec<String>,
     unresolved: &mut bool,
+    plain_call_unresolved: &mut bool,
 ) {
     // A method-call name may be a UFCS call to a top-level function; a plain
     // call names the function directly. Both attribute that function's effects
@@ -463,6 +608,36 @@ fn collect_expr(
     // map at all.
     if is_plain_call || (is_method_call && component_method_names.contains(name)) {
         *unresolved = true;
+        // `plain_call_unresolved` is DELIBERATELY narrower than `unresolved`
+        // above -- set ONLY for a plain call whose name is one of the
+        // ENCLOSING function's own declared function-typed parameters
+        // (`fun outer(f: fn() -> Int) { f() }`), NEVER for the method-call/
+        // component-instance case, and NEVER for an unresolved plain call to
+        // anything else (production-hardening PR-it750 v2). This is exactly
+        // the distinction `check_effects`'s own K0301/K0302 pass needs:
+        // feeding the BROADER `unresolved` flag straight into K0301/K0302
+        // would reintroduce the diagnostic-noise regression PR-it707
+        // explicitly avoided for the "construct a component, call an exposed
+        // method" pattern (`Counter()` parses identically to an ordinary
+        // plain function call). An earlier version of this fix instead
+        // excluded known component names from the broader "any unresolved
+        // plain call" gate -- live-confirmed via `cargo test --lib effects::`
+        // to still false-positive on any PURE builtin called as a plain call
+        // (e.g. `to_str(x)`: not a user function, not a component name, and
+        // not in `builtin_effects`'s EFFECTFUL-only table either, so it fell
+        // through as "unresolved" too). Matching only `fn_typed_params`
+        // sidesteps both false positives at once with no allow-list to
+        // maintain: neither a component constructor nor any builtin name
+        // (pure or effectful) can ever collide with a parameter name the
+        // enclosing function itself declared as `fn(...)`-typed.
+        // `pure_funs()` deliberately keeps NO such narrowing for the
+        // BROADER `unresolved` flag it still consumes unchanged (it wants
+        // the strictest possible bar for the real-OS-thread fast path it
+        // gates, per its own doc comment) -- this narrowing applies ONLY to
+        // the new, K0301/K0302-facing `plain_call_unresolved` flag.
+        if is_plain_call && fn_typed_params.contains(name) {
+            *plain_call_unresolved = true;
+        }
     }
 }
 
@@ -876,5 +1051,85 @@ mod tests {
             "pub ai fun classify(text: Str) -> Str {\n    intent \"Classify: {text}\"\n}\n",
         );
         assert!(no_tools.is_empty(), "{no_tools:?}");
+    }
+
+    #[test]
+    fn a_call_through_a_function_typed_parameter_warns_k0303_and_is_not_silently_pure() {
+        // A REAL, live-confirmed HIGH-severity soundness bypass found+fixed
+        // (production-hardening PR-it750): a `pub fun` that plain-calls a
+        // FUNCTION-TYPED PARAMETER could perform arbitrary effects (I/O,
+        // network, ...) with zero required `uses` and zero diagnostic --
+        // and a caller who responsibly declared `uses io` up front to cover
+        // the callback was actively PUNISHED with a spurious K0302
+        // "declared but unused" warning. Confirmed live BEFORE this fix:
+        // `pub fun outer(f: fn() -> Int) -> Int { f() }` compiled with ZERO
+        // diagnostics even though `outer(noisy)` (where `noisy` performs
+        // `print`) genuinely executed the undeclared `io` effect at runtime.
+        let bypass = diags_for("pub fun outer(f: fn() -> Int) -> Int {\n    f()\n}\n");
+        assert!(
+            bypass.iter().any(|d| d.code == "K0303"),
+            "a call through a function-typed parameter must warn K0303: {bypass:?}"
+        );
+        assert!(
+            !bypass.iter().any(|d| d.code == "K0301"),
+            "K0303 is a warning, not a hard K0301 error: {bypass:?}"
+        );
+
+        // Declaring `uses io` to cover the callback must NOT also draw a
+        // spurious K0302 "declared but unused" warning -- this pass cannot
+        // prove the declaration unused, since it cannot see what `f` does.
+        let declared = diags_for("pub fun outer(f: fn() -> Int) uses io -> Int {\n    f()\n}\n");
+        assert!(declared.iter().any(|d| d.code == "K0303"), "{declared:?}");
+        assert!(
+            !declared.iter().any(|d| d.code == "K0302"),
+            "a declared effect covering an unverifiable call must not warn K0302: {declared:?}"
+        );
+
+        // A component CONSTRUCTOR call (`Counter()`, parsed identically to
+        // an ordinary plain function call) must NOT trigger K0303 -- the
+        // exact diagnostic-noise regression PR-it707 already avoided for
+        // the broader `unresolved` flag, reintroduced here if not excluded.
+        let component_ctor = diags_for(
+            "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
+             expose fun bump() -> Int { n }\n}\n\
+             pub fun make_and_bump() -> Int {\n    let c = Counter()\n    c.bump()\n}\n",
+        );
+        assert!(
+            !component_ctor.iter().any(|d| d.code == "K0303"),
+            "constructing a component must not warn K0303: {component_ctor:?}"
+        );
+
+        // A PURE builtin called as a plain call (e.g. `to_str`) must also
+        // stay clean -- confirmed as a real regression introduced by an
+        // earlier, broader version of this fix (a component-name-only
+        // exclusion), which still misclassified any plain call this module
+        // doesn't otherwise resolve, including ordinary pure builtins.
+        let pure_builtin = diags_for(
+            "pub fun describe(x: Int) -> Str {\n    to_str(x)\n}\n",
+        );
+        assert!(
+            !pure_builtin.iter().any(|d| d.code == "K0303"),
+            "a plain call to a pure builtin must not warn K0303: {pure_builtin:?}"
+        );
+
+        // A PRIVATE function calling its own function-typed parameter must
+        // also stay clean -- this module's own top-of-file doc comment is
+        // explicit that "Private functions and handlers may stay implicit",
+        // i.e. a private function has no boundary-explicitness obligation
+        // at all, so K0303 telling it to `declare uses` makes no sense.
+        // Confirmed as a REAL regression in an early version of this fix
+        // via the mandatory examples/*.kupl sweep (production-hardening
+        // PR-it750): `examples/collections.kupl`'s private `bst_insert`/
+        // `bst_contains` (taking a `cmp: fn(T, T) -> Int` comparator) and
+        // `examples/generics.kupl`'s private `swap_apply` (taking `f:
+        // fn(T) -> U`) both newly warned K0303 despite being ordinary,
+        // idiomatic private higher-order helpers.
+        let private_hof = diags_for(
+            "fun apply_cmp[T](a: T, b: T, cmp: fn(T, T) -> Int) -> Int {\n    cmp(a, b)\n}\n",
+        );
+        assert!(
+            !private_hof.iter().any(|d| d.code == "K0303"),
+            "a private function calling its own function-typed parameter must not warn K0303: {private_hof:?}"
+        );
     }
 }
