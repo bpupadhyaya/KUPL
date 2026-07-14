@@ -642,7 +642,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         for _ in 0..nparams {
             params.push(r.s()?);
         }
-        let shape = decode_shape(&mut r)?;
+        let shape = decode_shape(&mut r, 0)?;
         let wraps_result = r.u8()? != 0;
         let ntools = r.u32()?;
         let mut tools = Vec::with_capacity(r.cap(ntools as usize));
@@ -653,9 +653,9 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
             let mut tparams = Vec::with_capacity(r.cap(nparams as usize));
             for _ in 0..nparams {
                 let pname = r.s()?;
-                tparams.push((pname, decode_shape(&mut r)?));
+                tparams.push((pname, decode_shape(&mut r, 0)?));
             }
-            let ret = decode_shape(&mut r)?;
+            let ret = decode_shape(&mut r, 0)?;
             tools.push(crate::ai::ToolMeta { name: tname, description, params: tparams, ret });
         }
         m.ai_funs.push(crate::ai::AiFunMeta {
@@ -672,15 +672,41 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
     Ok(m)
 }
 
-fn decode_shape(r: &mut R) -> DecodeResult<crate::ai::AiShape> {
+/// A REAL, uncatchable-crash bug found+fixed (production-hardening PR-it730,
+/// found via a scoped Explore survey): unlike every OTHER recursive decoder
+/// in this codebase (`json.rs`'s own parser, and `lsp.rs`'s JSON parser,
+/// fixed in PR-it620 to reuse the SAME `MAX_JSON_DEPTH` constant), this
+/// function had NO depth tracking or cap at all -- `List`/`Option` (tags 4/5)
+/// each consume exactly ONE byte and recurse unconditionally. A `.kx` file's
+/// `ai_fun` shape field is fully attacker-controlled (`kupl dis`/`kupl run
+/// <file.kx>` accept an arbitrary path, and `.kx` is a documented
+/// distributable format -- genuinely untrusted input, matching this
+/// campaign's established `.kx`-hardening precedent, PR-it687/it688/it726).
+/// Confirmed LIVE: a ~20MB `.kx` file whose shape field is ~20 million
+/// consecutive `List` tag bytes crashed BOTH `kupl dis` and `kupl run` with
+/// an UNCATCHABLE `thread '<unknown>' has overflowed its stack` / `fatal
+/// runtime error: stack overflow, aborting` (SIGABRT) -- even though
+/// `main.rs` already gives the main thread a 2GiB stack (the SAME hardening
+/// PR-it729 relied on for `par_map`'s workers), since each `decode_shape`
+/// frame costs only ~100+ bytes, so a cheap, small, single-digit-MB file is
+/// still enough to exhaust even a 2GiB reservation. Fixed by threading a
+/// `depth: usize` parameter through and rejecting once it exceeds
+/// `json::MAX_JSON_DEPTH` with a clean "corrupt .kx module" error --
+/// reusing the SAME constant (not a new one) and the SAME
+/// check-before-recurse shape `lsp.rs`'s own fix already established for
+/// this exact vulnerability class.
+fn decode_shape(r: &mut R, depth: usize) -> DecodeResult<crate::ai::AiShape> {
     use crate::ai::AiShape::*;
+    if depth > crate::json::MAX_JSON_DEPTH {
+        return Err("corrupt .kx module: ai shape nested too deeply".into());
+    }
     Ok(match r.u8()? {
         0 => Str,
         1 => Int,
         2 => Float,
         3 => Bool,
-        4 => List(Box::new(decode_shape(r)?)),
-        5 => Option(Box::new(decode_shape(r)?)),
+        4 => List(Box::new(decode_shape(r, depth + 1)?)),
+        5 => Option(Box::new(decode_shape(r, depth + 1)?)),
         6 => {
             let ty = r.s()?;
             let variant = r.s()?;
@@ -688,7 +714,7 @@ fn decode_shape(r: &mut R) -> DecodeResult<crate::ai::AiShape> {
             let mut fields = Vec::with_capacity(r.cap(n as usize));
             for _ in 0..n {
                 let name = r.s()?;
-                fields.push((name, decode_shape(r)?));
+                fields.push((name, decode_shape(r, depth + 1)?));
             }
             Record { ty, variant, fields }
         }
@@ -815,6 +841,47 @@ pub fn read_bundle(exe: &[u8]) -> Option<DecodeResult<Module>> {
 
 #[cfg(test)]
 mod tests {
+    /// A REAL, uncatchable-crash bug found+fixed (production-hardening
+    /// PR-it730): `decode_shape` (an `ai fun`'s structured-output type,
+    /// decoded from an untrusted `.kx` byte buffer) had NO depth tracking
+    /// or cap at all -- `List`/`Option` tags each consume exactly ONE byte
+    /// and recurse unconditionally. Confirmed live before this fix: a small
+    /// (single-digit-MB) `.kx` file whose `ai_fun` shape field is millions
+    /// of consecutive `List` tag bytes crashed BOTH `kupl dis` and `kupl
+    /// run` with an uncatchable native stack overflow (SIGABRT), even
+    /// though `main.rs` already gives the main thread a 2GiB stack (the
+    /// SAME hardening PR-it729 relied on for `par_map`'s workers) -- each
+    /// `decode_shape` frame costs only ~100+ bytes, so a cheap file still
+    /// exhausts even a 2GiB reservation. Calls `decode_shape` DIRECTLY on a
+    /// crafted byte buffer (skipping a full `.kx` file's encode/decode
+    /// entirely, mirroring PR-it687/it688's own `Module`-field-corruption
+    /// tests) -- a run of `0x04` ("List" tag) bytes one past
+    /// `json::MAX_JSON_DEPTH` must be a clean error, not a panic; well
+    /// within the cap must still decode correctly.
+    #[test]
+    fn decode_shape_deeply_nested_list_tags_is_a_clean_error_not_a_stack_overflow() {
+        // one byte too many: must be a clean "corrupt .kx module" error.
+        let too_deep = vec![4u8; crate::json::MAX_JSON_DEPTH + 2];
+        let mut r = super::R { buf: &too_deep, pos: 0 };
+        let err = super::decode_shape(&mut r, 0).expect_err("must be a clean error, not a panic");
+        assert!(err.contains("corrupt .kx module"), "{err}");
+
+        // well within the cap, followed by a real leaf tag (`0` = Str): decodes fine.
+        let mut ok_buf = vec![4u8; 10];
+        ok_buf.push(0);
+        let mut r = super::R { buf: &ok_buf, pos: 0 };
+        let shape = super::decode_shape(&mut r, 0).expect("a shallow shape must decode cleanly");
+        // 10 levels of List wrapping a Str leaf.
+        let mut cur = &shape;
+        for _ in 0..10 {
+            match cur {
+                crate::ai::AiShape::List(inner) => cur = inner,
+                other => panic!("expected List, got {other:?}"),
+            }
+        }
+        assert!(matches!(cur, crate::ai::AiShape::Str));
+    }
+
     #[test]
     fn kx_roundtrip_preserves_disassembly() {
         let src = std::fs::read_to_string(
