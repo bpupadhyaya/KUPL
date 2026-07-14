@@ -243,11 +243,21 @@ pub fn shrink(v: &Value) -> Vec<Value> {
                 smaller.remove(i);
                 out.push(Value::List(Rc::new(smaller)));
             }
-            // shrink the first element
-            if let Some(cands) = items.first().map(shrink) {
-                for c in cands {
+            // shrink EVERY element, not just the first -- a REAL quality bug
+            // found+fixed (production-hardening PR-it749): this used to only
+            // ever offer candidates shrinking `items[0]`, so a property whose
+            // failure depends on a NON-first element's magnitude/value could
+            // never have that element minimized. Confirmed live before this
+            // fix: `forall xs: List[Int] { expect xs.get(3).map(|v| v <= 100)
+            // .unwrap_or(true) }` reported a counterexample with an unshrunk,
+            // near-cap value at index 3 (e.g. `719630`) while the identical
+            // property checked at index 0 correctly shrank to `[101]`. Same
+            // class of gap PR-it694 already fixed for `Ctor` fields (`for i
+            // in 0..fields.len()`, below) but never extended to `List`.
+            for i in 0..items.len() {
+                for c in shrink(&items[i]) {
                     let mut v2 = items.as_ref().clone();
-                    v2[0] = c;
+                    v2[i] = c;
                     out.push(Value::List(Rc::new(v2)));
                 }
             }
@@ -358,6 +368,37 @@ mod tests {
         let list = Value::List(Rc::new(vec![Value::Int(1), Value::Int(2)]));
         let cands = shrink(&list);
         assert!(cands.contains(&Value::List(Rc::new(Vec::new()))));
+    }
+
+    /// A REAL quality bug found+fixed (production-hardening PR-it749): `shrink`'s
+    /// `List` arm used to only ever offer candidates shrinking `items[0]` -- an
+    /// element at any OTHER position could never be individually minimized, since
+    /// there was no equivalent of the `Ctor` arm's `for i in 0..fields.len()` loop
+    /// (the sibling recursive-record case, fixed for the analogous gap under
+    /// PR-it694). Confirmed live via `kupl test` before this fix: a property
+    /// depending on `xs.get(3)`'s magnitude reported an unshrunk near-cap value at
+    /// index 3 while the identical property on index 0 shrank correctly.
+    #[test]
+    fn shrink_list_offers_candidates_shrinking_every_element_not_just_the_first() {
+        let list = Value::List(Rc::new(vec![Value::Int(5), Value::Int(5), Value::Int(42)]));
+        let cands = shrink(&list);
+        // a candidate shrinking element[0] toward 0 must exist (the pre-fix
+        // behavior already covered this).
+        assert!(
+            cands.contains(&Value::List(Rc::new(vec![Value::Int(0), Value::Int(5), Value::Int(42)]))),
+            "must still offer a shrunk-index-0 candidate: {cands:?}"
+        );
+        // a candidate shrinking element[1] (a NON-first position) toward 0 must
+        // ALSO exist -- this is exactly what was missing before the fix.
+        assert!(
+            cands.contains(&Value::List(Rc::new(vec![Value::Int(5), Value::Int(0), Value::Int(42)]))),
+            "must offer a shrunk-index-1 candidate: {cands:?}"
+        );
+        // and element[2] (the LAST position) too.
+        assert!(
+            cands.contains(&Value::List(Rc::new(vec![Value::Int(5), Value::Int(5), Value::Int(0)]))),
+            "must offer a shrunk-index-2 candidate: {cands:?}"
+        );
     }
 
     #[test]
