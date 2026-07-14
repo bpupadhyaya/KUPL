@@ -18,6 +18,86 @@ pub struct VmError {
     pub span: Span,
 }
 
+/// The exact argument count `compile.rs::call` requires to select each
+/// `BUILTIN_*` id in the first place -- mirrors that function's own
+/// `(name, args.len())` match verbatim (production-hardening PR-it744).
+/// Used by `Op::CallBuiltin`'s handler to reject a corrupted `.kx` file's
+/// mismatched `argc` with a clean error instead of a panicking `args[N]`
+/// index inside one of the ~40 builtin-dispatch arms. `None` for an
+/// unrecognized `which` -- that case is already handled by the dispatch
+/// match's own `_ => Err(...)` fallback arm.
+fn builtin_argc(which: u8) -> Option<u8> {
+    Some(match which {
+        BUILTIN_PRINT => 1,
+        BUILTIN_TO_STR => 1,
+        BUILTIN_PANIC => 1,
+        BUILTIN_TENSOR => 1,
+        BUILTIN_ZEROS => 1,
+        BUILTIN_ARANGE => 1,
+        BUILTIN_MAP_NEW => 0,
+        BUILTIN_SET_NEW => 0,
+        BUILTIN_SET_FROM => 1,
+        BUILTIN_READ_FILE => 1,
+        BUILTIN_WRITE_FILE => 2,
+        BUILTIN_APPEND_FILE => 2,
+        BUILTIN_DELETE_FILE => 1,
+        BUILTIN_FILE_EXISTS => 1,
+        BUILTIN_JSON_PARSE => 1,
+        BUILTIN_JSON_STRINGIFY => 1,
+        BUILTIN_ENV_VAR => 1,
+        BUILTIN_ARGS => 0,
+        BUILTIN_EPRINT => 1,
+        BUILTIN_EXIT => 1,
+        BUILTIN_RANDOM_INTS => 2,
+        BUILTIN_RANDOM_FLOATS => 2,
+        BUILTIN_SHUFFLE => 2,
+        BUILTIN_HTTP_GET => 1,
+        BUILTIN_HTTP_POST => 2,
+        BUILTIN_RE_MATCH => 2,
+        BUILTIN_RE_FIND => 2,
+        BUILTIN_RE_FIND_ALL => 2,
+        BUILTIN_RE_REPLACE => 3,
+        BUILTIN_FORMAT_TIME => 1,
+        BUILTIN_YEAR_OF => 1,
+        BUILTIN_MONTH_OF => 1,
+        BUILTIN_DAY_OF => 1,
+        BUILTIN_HOUR_OF => 1,
+        BUILTIN_MINUTE_OF => 1,
+        BUILTIN_SECOND_OF => 1,
+        BUILTIN_WEEKDAY_OF => 1,
+        BUILTIN_NOW => 0,
+        BUILTIN_BASE64_ENCODE => 1,
+        BUILTIN_BASE64_DECODE => 1,
+        BUILTIN_HEX_ENCODE => 1,
+        BUILTIN_HEX_DECODE => 1,
+        BUILTIN_HASH_FNV => 1,
+        BUILTIN_CSV_PARSE => 1,
+        BUILTIN_CSV_STRINGIFY => 1,
+        BUILTIN_URL_ENCODE => 1,
+        BUILTIN_URL_DECODE => 1,
+        BUILTIN_QUERY_PARSE => 1,
+        BUILTIN_QUERY_BUILD => 1,
+        BUILTIN_DATE_MAKE => 6,
+        BUILTIN_PARSE_ISO => 1,
+        BUILTIN_DATE_ISO => 1,
+        BUILTIN_YEARDAY_OF => 1,
+        BUILTIN_READ_LINE => 0,
+        BUILTIN_READ_ALL => 0,
+        BUILTIN_EXEC => 2,
+        BUILTIN_PATH_JOIN => 2,
+        BUILTIN_PATH_BASE => 1,
+        BUILTIN_PATH_DIR => 1,
+        BUILTIN_PATH_EXT => 1,
+        BUILTIN_LIST_DIR => 1,
+        BUILTIN_MAKE_DIR => 1,
+        BUILTIN_REMOVE_DIR => 1,
+        BUILTIN_BIG => 1,
+        BUILTIN_HTTP_SERVE => 2,
+        BUILTIN_RAT => 2,
+        _ => return None,
+    })
+}
+
 struct Frame {
     chunk: u16,
     ip: usize,
@@ -177,7 +257,16 @@ impl<'m> Vm<'m> {
     /// Create an instance: fill props (running default chunks for gaps is the
     /// compiler's job — args arrive complete), zero the state, run the init chunk.
     fn instantiate(&mut self, comp_idx: u16, props: Vec<Value>) -> Result<usize, VmError> {
-        let meta = &self.module.components[comp_idx as usize];
+        // `comp_idx` is a hand-crafted-`.kx`-reachable field on `Op::MakeInstance` --
+        // legitimate `compile.rs` output never emits an out-of-range one, but a
+        // corrupted file could (production-hardening PR-it744, closing a live-
+        // confirmed panic; the two OTHER callers of `instantiate` -- `run_app`/
+        // `instantiate_named` -- always derive `comp_idx` from a `component_names`
+        // lookup, so this is the ONE call site that needs the guard).
+        let meta = self.module.components.get(comp_idx as usize).ok_or_else(|| VmError {
+            msg: "corrupt .kx module: component index out of range".into(),
+            span: Span::default(),
+        })?;
         let init = meta.init_chunk;
         let mut slots = props;
         slots.resize(meta.nslots as usize, Value::Unit);
@@ -675,6 +764,25 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::CallBuiltin { dst, which, start, argc } => {
+                    // `argc` is a hand-crafted-`.kx`-reachable field -- legitimate
+                    // `compile.rs` output always matches the exact arity below (the
+                    // SAME table `compile.rs::call`'s own `(name, args.len())` match
+                    // uses to pick `which` in the first place), but a corrupted file
+                    // could set `argc` to anything (production-hardening PR-it744,
+                    // closing a live-confirmed panic: nearly every builtin arm below
+                    // indexes `args[0]`/`args[1]` directly with no length check, so a
+                    // too-short `args` panicked instead of erroring cleanly). An
+                    // unrecognized `which` is already handled safely by the `_ =>`
+                    // arm at the end of this match, so this only needs to cover
+                    // KNOWN builtin ids.
+                    if let Some(expected) = builtin_argc(which) {
+                        if argc != expected {
+                            return Err(VmError {
+                                msg: "corrupt .kx module: builtin argument count mismatch".into(),
+                                span,
+                            });
+                        }
+                    }
                     let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     match which {
                         BUILTIN_PRINT => {
@@ -1100,7 +1208,14 @@ impl<'m> Vm<'m> {
                     set!(dst, Value::List(Rc::new(items)));
                 }
                 Op::MakeCtor { dst, ctor, start, len } => {
-                    let meta = &self.module.ctors[ctor as usize];
+                    // `ctor` is a hand-crafted-`.kx`-reachable field -- legitimate
+                    // `compile.rs` output never emits an out-of-range one, but a
+                    // corrupted file could (production-hardening PR-it744, closing a
+                    // live-confirmed panic).
+                    let meta = self.module.ctors.get(ctor as usize).ok_or_else(|| VmError {
+                        msg: "corrupt .kx module: ctor index out of range".into(),
+                        span,
+                    })?;
                     let fields: Vec<Value> = (0..len).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     set!(
                         dst,
@@ -1188,7 +1303,12 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::TagIs { dst, obj, ctor } => {
-                    let meta = &self.module.ctors[ctor as usize];
+                    // Same PR-it744 fix as Op::MakeCtor above -- `ctor` is a hand-
+                    // crafted-`.kx`-reachable field, unguarded before this fix.
+                    let meta = self.module.ctors.get(ctor as usize).ok_or_else(|| VmError {
+                        msg: "corrupt .kx module: ctor index out of range".into(),
+                        span,
+                    })?;
                     let is = matches!(reg!(obj), Value::Ctor { variant, .. } if *variant == meta.variant);
                     set!(dst, Value::Bool(is));
                 }

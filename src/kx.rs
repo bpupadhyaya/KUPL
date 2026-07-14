@@ -1251,6 +1251,116 @@ mod tests {
         }
     }
 
+    /// Four REAL bugs found+fixed (production-hardening PR-it744): the SAME
+    /// corrupt-`.kx` bounds-check gap as `nregs`/`nslots`/`consts`/`ip` above
+    /// (PR-it687/it688), but in four MORE operand fields that were never
+    /// covered by that sweep: `Op::MakeCtor`/`Op::TagIs`'s `ctor` operand
+    /// (indexes `module.ctors` directly), `Op::MakeInstance`'s `comp`
+    /// operand (via `instantiate`, indexes `module.components` directly),
+    /// and `Op::CallBuiltin`'s `argc` operand (never cross-checked against
+    /// the exact arity `compile.rs::call`'s own `(name, args.len())` match
+    /// used to pick `which` in the first place, so nearly every one of the
+    /// ~40 builtin-dispatch arms indexed `args[0]`/`args[1]` directly with
+    /// no length check). All four found by a research subagent, which
+    /// live-reproduced each one by hand-flipping the exact byte in a real
+    /// compiled `.kx` file and running it through the actual `kupl` CLI
+    /// binary (each crashed with `internal compiler error [src/vm.rs:N]`,
+    /// exit 101) before this fix existed.
+    #[test]
+    fn a_kx_module_with_an_out_of_range_ctor_component_or_builtin_argc_operand_is_a_clean_error_not_a_panic() {
+        // Op::MakeCtor's `ctor` operand.
+        {
+            let src = "type Pt = Pt(x: Int, y: Int)\nfun main() uses io {\n    let p = Pt(1, 2)\n    print(p.x)\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let main_idx = module.funs["main"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            let code = &mut module.chunks[main_idx as usize].code;
+            let pos = code.iter().position(|op| matches!(op, crate::bytecode::Op::MakeCtor { .. })).expect("main uses MakeCtor");
+            if let crate::bytecode::Op::MakeCtor { ctor, .. } = &mut code[pos] {
+                *ctor = 5000;
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("main", vec![])
+                .expect_err("an out-of-range MakeCtor ctor must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "MakeCtor: {}", err.msg);
+        }
+        // Op::TagIs's `ctor` operand.
+        {
+            let src = "type Shape = Circle(r: Int) | Square(s: Int)\n\
+                       fun describe(sh: Shape) -> Str {\n    \
+                       match sh {\n        Circle(r) => \"circle\"\n        Square(s) => \"square\"\n    }\n}\n\
+                       fun main() uses io {\n    print(describe(Circle(1)))\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let describe_idx = module.funs["describe"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            let code = &mut module.chunks[describe_idx as usize].code;
+            let pos = code.iter().position(|op| matches!(op, crate::bytecode::Op::TagIs { .. })).expect("describe uses TagIs");
+            if let crate::bytecode::Op::TagIs { ctor, .. } = &mut code[pos] {
+                *ctor = 5000;
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("describe", vec![crate::value::Value::Ctor {
+                    ty: std::rc::Rc::new("Shape".into()),
+                    variant: std::rc::Rc::new("Circle".into()),
+                    fields: std::rc::Rc::new(vec![crate::value::Value::Int(1)]),
+                }])
+                .expect_err("an out-of-range TagIs ctor must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "TagIs: {}", err.msg);
+        }
+        // Op::MakeInstance's `comp` operand (via `instantiate`).
+        {
+            let src = "component Widget {\n    intent \"w\"\n    state total: Int = 0\n    \
+                       expose fun bump() -> Int {\n        total += 1\n        total\n    }\n}\n\
+                       fun main() uses io {\n    let w = Widget()\n    print(w.bump())\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let main_idx = module.funs["main"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            let code = &mut module.chunks[main_idx as usize].code;
+            let pos =
+                code.iter().position(|op| matches!(op, crate::bytecode::Op::MakeInstance { .. })).expect("main uses MakeInstance");
+            if let crate::bytecode::Op::MakeInstance { comp, .. } = &mut code[pos] {
+                *comp = 4242;
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("main", vec![])
+                .expect_err("an out-of-range MakeInstance comp must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "MakeInstance: {}", err.msg);
+        }
+        // Op::CallBuiltin's `argc` operand (mismatched against `which`'s real arity).
+        {
+            let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+            let compiled = crate::run::compile(src).expect("compiles");
+            let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+                .expect("module compiles");
+            let main_idx = module.funs["main"];
+            let mut vm = crate::vm::Vm::new(&module);
+            assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+            let code = &mut module.chunks[main_idx as usize].code;
+            let pos =
+                code.iter().position(|op| matches!(op, crate::bytecode::Op::CallBuiltin { .. })).expect("main calls print");
+            if let crate::bytecode::Op::CallBuiltin { argc, .. } = &mut code[pos] {
+                *argc = 0; // print needs exactly 1
+            }
+            let mut vm = crate::vm::Vm::new(&module);
+            let err = vm
+                .call_named("main", vec![])
+                .expect_err("a CallBuiltin argc/arity mismatch must be a clean VmError, not a panic");
+            assert!(err.msg.contains("corrupt .kx module"), "CallBuiltin: {}", err.msg);
+        }
+    }
+
     /// The instruction-pointer twin of the tests above (production-hardening
     /// PR-it688): `ip` starts at 0 and only ever changes via a plain
     /// increment or a `Jump`/`JumpIfFalse`/`JumpIfTrue` target -- neither
