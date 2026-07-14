@@ -6281,7 +6281,22 @@ static void k_emit(const char* port, KValue value) {
 
 /* Dispatch a chunk on an instance. If the instance is supervised, catch a panic
    via a setjmp pad and restart it (mirrors the VM's restart-on-failure branch);
-   otherwise a panic propagates (k_pad unchanged → exit 101 at top level). */
+   otherwise a panic propagates (k_pad unchanged → exit 101 at top level).
+   A REAL latent bug found+fixed (production-hardening PR-it736, surfaced by
+   the SAME investigation as k_run_lifecycle's fix above): every generated
+   function increments `k_depth` on entry and decrements it on a NORMAL
+   return (emit_chunk's depth-guard wrapper) -- but `longjmp` unwinds
+   straight past every frame between the panic site and this setjmp,
+   skipping their decrements entirely, so `k_depth` LEAKS by the full call
+   depth active at panic time on every caught-and-restarted panic. Over
+   enough legitimate supervised restarts (protected drain/advance paths,
+   matching the reference engines' own restart semantics -- not the
+   now-removed unsupervised @start path above), the leaked depth
+   accumulates until it trips a bogus "stack overflow (10000 frames)" panic
+   with nothing to do with actual call depth. Fixed by snapshotting
+   `k_depth` before the dispatch attempt and restoring it in the
+   panic-caught branch, undoing exactly the increments the skipped
+   decrements would otherwise have undone. */
 static void k_dispatch(int id, int chunk, KValue* arg) {
     if (!k_insts[id].restart_on_failure) {
         int saved = k_cur_inst; k_cur_inst = id;
@@ -6291,12 +6306,13 @@ static void k_dispatch(int id, int chunk, KValue* arg) {
     }
     jmp_buf pad; jmp_buf* prev = k_pad; k_pad = &pad;
     int saved = k_cur_inst; k_cur_inst = id;
+    int64_t saved_depth = k_depth;
     if (setjmp(pad) == 0) {
         CHUNKS[chunk](0, arg);
         k_cur_inst = saved; k_pad = prev;
     } else {
         /* panic caught: restore, then restart this instance */
-        k_cur_inst = saved; k_pad = prev;
+        k_cur_inst = saved; k_pad = prev; k_depth = saved_depth;
         k_restart(id, k_panic_buf);
     }
 }
@@ -6322,12 +6338,37 @@ static void k_drain(void) {
     }
 }
 
-/* run a named lifecycle handler (@start/@stop) on an instance, if present */
+/* run a named lifecycle handler (@start/@stop) on an instance, if present.
+   A REAL, cross-engine-DIVERGING bug found+fixed (production-hardening
+   PR-it736): this used to call the handler via k_dispatch, which
+   UNCONDITIONALLY applies supervision -- but interp.rs's start_all
+   (interp.rs:296-303) and restart (interp.rs:497-500) both call
+   run_handler directly with a plain `?` (no restart_on_failure check) for
+   BOTH the initial @start delivery and restart()'s own re-run of @start;
+   vm.rs::run_app/restart do the same. Supervision on the reference engines
+   protects ONLY later message dispatch (drain) and timer firing (advance)
+   -- never the two @start delivery paths this function serves. Confirmed
+   LIVE: a supervised component whose `on start` handler ALWAYS panics
+   (`supervise b restart on_failure` wrapping `on start { panic("boom") }`)
+   cleanly panicked ONCE on interp/vm (`panic: boom`, exit 101), but on
+   native was CAUGHT AND RESTARTED FOREVER (via the SAME k_dispatch
+   supervision path this function used to route through both at initial
+   launch AND inside k_restart's own re-run below) -- an infinite loop on
+   entirely ORDINARY, non-adversarial source (a component reading required
+   config in `on start`, supervised for graceful degrade -- a completely
+   plausible real pattern), only terminating by an unrelated accident (see
+   PR-it736's k_dispatch fix for the k_depth-leak-on-longjmp secondary bug
+   this exposed) after 10000 restarts with a misleading "stack overflow"
+   panic instead of the correct, immediate `panic: boom`. Fixed by calling
+   the chunk directly -- bypassing k_dispatch's supervision wrapper
+   entirely -- mirroring interp.rs/vm.rs exactly. */
 static void k_run_lifecycle(int id, const char* key) {
     const KCompMeta* cm = &COMPS[k_insts[id].comp];
     for (int i = 0; i < cm->nhandlers; i++) {
         if (!strcmp(cm->handlers[i].port, key)) {
-            k_dispatch(id, cm->handlers[i].chunk, 0);
+            int saved = k_cur_inst; k_cur_inst = id;
+            CHUNKS[cm->handlers[i].chunk](0, 0);
+            k_cur_inst = saved;
             return;
         }
     }
@@ -11521,6 +11562,54 @@ component Spawner {\n    intent \"spawns a child during its own on-start\"\n    
     on start { let c = Child()\n        print(\"spawner started\") }\n}\n\
 app Main {\n    intent \"dynamic instantiation during on-start\"\n    let sp = Spawner()\n}\n";
         assert_eq!(native_stdout(src, "dynspawn").trim(), "spawner started");
+    }
+
+    /// A REAL, cross-engine-DIVERGING bug found+fixed (production-hardening
+    /// PR-it736): `k_run_lifecycle` (used for BOTH the initial `@start`
+    /// delivery at app launch AND `k_restart`'s own re-run of `@start`)
+    /// dispatched through `k_dispatch`, which UNCONDITIONALLY applies
+    /// supervision -- but interp.rs's `start_all`/`restart` and vm.rs's
+    /// `run_app`/`restart` all call the handler directly with NO
+    /// `restart_on_failure` check for either `@start` delivery path;
+    /// supervision on the reference engines protects ONLY later message
+    /// dispatch (`drain`) and timer firing (`advance`). Confirmed LIVE
+    /// BEFORE this fix: a supervised component whose `on start` ALWAYS
+    /// panics cleanly panicked ONCE on interp/vm ("panic: boom", exit 101),
+    /// but was CAUGHT AND RESTARTED FOREVER on native -- an infinite loop
+    /// on entirely ORDINARY source (a component reading required config in
+    /// `on start`, supervised for graceful degrade), only terminating via
+    /// an unrelated `k_depth`-leak-on-longjmp accident (also fixed in this
+    /// same iteration, see `k_dispatch`'s own comment) after 10000 restarts
+    /// with a misleading "stack overflow" panic instead of the correct,
+    /// immediate `panic: boom`.
+    #[test]
+    fn native_a_component_whose_on_start_always_panics_is_not_supervised() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Bad {\n    intent \"always panics on start\"\n    on start { panic(\"boom\") }\n}\n\
+app Root {\n    intent \"supervises a component that always fails\"\n    let b = Bad()\n    supervise b restart on_failure\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-badstart-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must NOT exit successfully -- an always-panicking on start must terminate the process: {stderr:?}");
+        assert!(stderr.contains("panic: boom"), "must report the ORIGINAL panic message, matching interp/vm: {stderr:?}");
+        assert!(!stderr.contains("[supervise]"), "an on-start panic must NOT be caught/restarted -- supervision only protects later message/timer dispatch: {stderr:?}");
+        assert!(!stderr.contains("stack overflow"), "must not exhibit the k_depth-leak-driven bogus stack-overflow panic: {stderr:?}");
     }
 
     #[test]
