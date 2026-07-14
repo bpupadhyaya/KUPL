@@ -1227,21 +1227,39 @@ impl Parser {
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
-            return Err(Diag::error(
-                "K0121",
-                format!(
-                    "expression nesting too deep (limit is {MAX_EXPR_DEPTH}) — break it into intermediate `let` bindings"
-                ),
-                self.span(),
-            ));
+            return Err(self.expr_too_deep());
         }
         let r = self.parse_pipeline();
         self.depth -= 1;
         r
     }
 
+    /// Shared K0121 diagnostic for `MAX_EXPR_DEPTH` overflow, used both by
+    /// `parse_expr`'s own recursive-descent counter (`self.depth`, genuine
+    /// bracketed/parenthesized nesting) and by every LEFT-ASSOCIATIVE chain
+    /// loop below (`parse_pipeline`/`parse_or`/.../`parse_postfix`, PR-it713).
+    /// Those loops build their `lhs` via straight-line iteration, never
+    /// re-entering `parse_expr`, so a long flat chain of the SAME operator
+    /// (e.g. `1 + 1 + 1 + ... ` a few hundred thousand times) used to bypass
+    /// `self.depth` entirely and build an AST just as deep as an equivalent
+    /// pile of nested parens would -- deep enough to STACK-OVERFLOW every
+    /// downstream recursive consumer of that tree (fmt, check, interp, and
+    /// the bytecode compiler all recurse over it) with an uncatchable
+    /// process abort, not a diagnostic. Each such loop now tracks its OWN
+    /// local chain length against the same `MAX_EXPR_DEPTH` limit.
+    fn expr_too_deep(&self) -> Diag {
+        Diag::error(
+            "K0121",
+            format!(
+                "expression nesting too deep (limit is {MAX_EXPR_DEPTH}) — break it into intermediate `let` bindings"
+            ),
+            self.span(),
+        )
+    }
+
     fn parse_pipeline(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_or()?;
+        let mut chain = 0usize;
         while self.at(&Tok::PipeGt) {
             self.bump();
             let rhs = self.parse_or()?;
@@ -1260,34 +1278,49 @@ impl Parser {
                     span,
                 },
             };
+            chain += 1;
+            if chain > MAX_EXPR_DEPTH {
+                return Err(self.expr_too_deep());
+            }
         }
         Ok(lhs)
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_and()?;
+        let mut chain = 0usize;
         while self.at(&Tok::OrOr) {
             self.bump();
             let rhs = self.parse_and()?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr { kind: ExprKind::Binary { op: BinOp::Or, lhs: Box::new(lhs), rhs: Box::new(rhs) }, span };
+            chain += 1;
+            if chain > MAX_EXPR_DEPTH {
+                return Err(self.expr_too_deep());
+            }
         }
         Ok(lhs)
     }
 
     fn parse_and(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_equality()?;
+        let mut chain = 0usize;
         while self.at(&Tok::AndAnd) {
             self.bump();
             let rhs = self.parse_equality()?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr { kind: ExprKind::Binary { op: BinOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs) }, span };
+            chain += 1;
+            if chain > MAX_EXPR_DEPTH {
+                return Err(self.expr_too_deep());
+            }
         }
         Ok(lhs)
     }
 
     fn parse_equality(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_comparison()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Tok::EqEq => BinOp::Eq,
@@ -1298,12 +1331,17 @@ impl Parser {
             let rhs = self.parse_comparison()?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr { kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }, span };
+            chain += 1;
+            if chain > MAX_EXPR_DEPTH {
+                return Err(self.expr_too_deep());
+            }
         }
         Ok(lhs)
     }
 
     fn parse_comparison(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_with()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Tok::Lt => BinOp::Lt,
@@ -1316,6 +1354,10 @@ impl Parser {
             let rhs = self.parse_with()?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr { kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }, span };
+            chain += 1;
+            if chain > MAX_EXPR_DEPTH {
+                return Err(self.expr_too_deep());
+            }
         }
         Ok(lhs)
     }
@@ -1325,6 +1367,7 @@ impl Parser {
     /// x: 1, other)` parses `other` as the next call argument).
     fn parse_with(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_range()?;
+        let mut chain = 0usize;
         while matches!(self.peek(), Tok::Ident(n) if n == "with") {
             self.bump();
             // A record update lists fields directly: `p with x: 1, y: 2` — there are no braces.
@@ -1353,6 +1396,10 @@ impl Parser {
             }
             let span = lhs.span.merge(self.prev_span());
             lhs = Expr { kind: ExprKind::With { recv: Box::new(lhs), updates }, span };
+            chain += 1;
+            if chain > MAX_EXPR_DEPTH {
+                return Err(self.expr_too_deep());
+            }
         }
         Ok(lhs)
     }
@@ -1372,6 +1419,7 @@ impl Parser {
 
     fn parse_additive(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_multiplicative()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Tok::Plus => BinOp::Add,
@@ -1382,12 +1430,17 @@ impl Parser {
             let rhs = self.parse_multiplicative()?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr { kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }, span };
+            chain += 1;
+            if chain > MAX_EXPR_DEPTH {
+                return Err(self.expr_too_deep());
+            }
         }
         Ok(lhs)
     }
 
     fn parse_multiplicative(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_unary()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Tok::Star => BinOp::Mul,
@@ -1399,30 +1452,65 @@ impl Parser {
             let rhs = self.parse_unary()?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr { kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }, span };
+            chain += 1;
+            if chain > MAX_EXPR_DEPTH {
+                return Err(self.expr_too_deep());
+            }
         }
         Ok(lhs)
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        // Unlike the chain loops above, a prefix-operator run (`------x`,
+        // `!!!!!!!!x`) recurses directly into `parse_unary` itself rather
+        // than looping -- so it shares `parse_expr`'s own `self.depth`
+        // counter (genuine call/return-symmetric recursion) instead of a
+        // local chain counter. The recursive call's result is captured
+        // (not `?`-propagated immediately) so `self.depth` is decremented
+        // on EVERY exit path, including an error bubbling up from deeper in
+        // the chain -- otherwise a rejected pathologically-deep chain would
+        // leave `self.depth` permanently inflated, false-positive-failing
+        // unrelated, ordinarily-shallow expressions later in the same file.
         match self.peek() {
             Tok::Minus => {
+                self.depth += 1;
+                if self.depth > MAX_EXPR_DEPTH {
+                    self.depth -= 1;
+                    return Err(self.expr_too_deep());
+                }
                 let span = self.span();
                 self.bump();
-                let operand = self.parse_unary()?;
+                let operand = self.parse_unary();
+                self.depth -= 1;
+                let operand = operand?;
                 let span = span.merge(operand.span);
                 Ok(Expr { kind: ExprKind::Unary { op: UnOp::Neg, operand: Box::new(operand) }, span })
             }
             Tok::Bang => {
+                self.depth += 1;
+                if self.depth > MAX_EXPR_DEPTH {
+                    self.depth -= 1;
+                    return Err(self.expr_too_deep());
+                }
                 let span = self.span();
                 self.bump();
-                let operand = self.parse_unary()?;
+                let operand = self.parse_unary();
+                self.depth -= 1;
+                let operand = operand?;
                 let span = span.merge(operand.span);
                 Ok(Expr { kind: ExprKind::Unary { op: UnOp::Not, operand: Box::new(operand) }, span })
             }
             Tok::KwAwait => {
+                self.depth += 1;
+                if self.depth > MAX_EXPR_DEPTH {
+                    self.depth -= 1;
+                    return Err(self.expr_too_deep());
+                }
                 let span = self.span();
                 self.bump();
-                let operand = self.parse_unary()?;
+                let operand = self.parse_unary();
+                self.depth -= 1;
+                let operand = operand?;
                 let span = span.merge(operand.span);
                 Ok(Expr { kind: ExprKind::Await(Box::new(operand)), span })
             }
@@ -1432,6 +1520,7 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_primary()?;
+        let mut chain = 0usize;
         loop {
             match self.peek() {
                 Tok::LParen => {
@@ -1440,6 +1529,10 @@ impl Parser {
                     let end = self.expect(Tok::RParen)?;
                     let span = expr.span.merge(end);
                     expr = Expr { kind: ExprKind::Call { callee: Box::new(expr), args }, span };
+                    chain += 1;
+                    if chain > MAX_EXPR_DEPTH {
+                        return Err(self.expr_too_deep());
+                    }
                 }
                 Tok::Dot => {
                     self.bump();
@@ -1458,12 +1551,20 @@ impl Parser {
                         let span = expr.span.merge(nspan);
                         expr = Expr { kind: ExprKind::Field { recv: Box::new(expr), name }, span };
                     }
+                    chain += 1;
+                    if chain > MAX_EXPR_DEPTH {
+                        return Err(self.expr_too_deep());
+                    }
                 }
                 Tok::Question => {
                     let end = self.span();
                     self.bump();
                     let span = expr.span.merge(end);
                     expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
+                    chain += 1;
+                    if chain > MAX_EXPR_DEPTH {
+                        return Err(self.expr_too_deep());
+                    }
                 }
                 // a method chain may continue on the next line when that line
                 // starts with `.` (a leading `.` can't begin a statement, so this
@@ -2010,6 +2111,72 @@ mod tests {
                     diags.iter().any(|d| d.code == "K0121" && d.message.contains("limit is 128") && d.message.contains("`type` alias")),
                     "type nesting K0121 must name the limit and the type-alias fix: {diags:?}"
                 );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A REAL, LIVE-CRASHING bug (PR-it713): `MAX_EXPR_DEPTH` only guarded
+    /// genuine RECURSIVE nesting (`parse_expr` re-entering itself, e.g. via
+    /// parens/brackets) via `self.depth`. Every LEFT-ASSOCIATIVE chain loop
+    /// (`parse_pipeline`, `parse_or`, `parse_and`, `parse_equality`,
+    /// `parse_comparison`, `parse_additive`, `parse_multiplicative`,
+    /// `parse_postfix`, `parse_with`) builds its `lhs` via straight-line
+    /// iteration, calling `self.parse_expr()` exactly ZERO times per chain
+    /// link -- so a long flat chain of the SAME operator (e.g. `1 + 1 + 1 +
+    /// ... ` a few hundred thousand times, entirely realistic for generated
+    /// or templated source) bypassed `self.depth` completely and built an
+    /// AST just as deep as an equivalent pile of nested parens, deep enough
+    /// to STACK-OVERFLOW every downstream recursive consumer (`kupl fmt`,
+    /// `kupl check`, `kupl run`, `kupl run --vm` all confirmed to crash with
+    /// a fatal, uncatchable "stack overflow, aborting" process abort on a
+    /// live repro before this fix -- not a graceful diagnostic). A prefix
+    /// chain (`------x`) had the same gap via `parse_unary`'s own direct
+    /// self-recursion, never touching `self.depth` either. Fixed by giving
+    /// every chain loop a local counter (or, for `parse_unary`'s genuine
+    /// recursion, symmetric `self.depth` push/pop) checked against the SAME
+    /// `MAX_EXPR_DEPTH` limit, turning the crash into the same clean K0121
+    /// the recursive-nesting case already produced.
+    #[test]
+    fn a_long_flat_operator_chain_is_a_clean_k0121_not_a_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                // `n` TERMS join into `n - 1` operators for the binary-chain
+                // cases, so `MAX_EXPR_DEPTH + 2` terms gives one operator over
+                // the limit for every vulnerable chain-loop kind -- each used
+                // to build unbounded AST depth with ZERO diagnostic before.
+                let n = MAX_EXPR_DEPTH + 2;
+                let cases: Vec<(&str, String)> = vec![
+                    ("additive (`+`) chain", format!("fun main() -> Int {{ let x = {}\n    return x\n}}\n", (0..n).map(|_| "1").collect::<Vec<_>>().join(" + "))),
+                    ("multiplicative (`*`) chain", format!("fun main() -> Int {{ let x = {}\n    return x\n}}\n", (0..n).map(|_| "1").collect::<Vec<_>>().join(" * "))),
+                    ("or (`||`) chain", format!("fun main() -> Bool {{ let x = {}\n    return x\n}}\n", (0..n).map(|_| "true").collect::<Vec<_>>().join(" || "))),
+                    ("and (`&&`) chain", format!("fun main() -> Bool {{ let x = {}\n    return x\n}}\n", (0..n).map(|_| "true").collect::<Vec<_>>().join(" && "))),
+                    ("equality (`==`) chain", format!("fun main() -> Bool {{ let x = {}\n    return x\n}}\n", (0..n).map(|_| "1").collect::<Vec<_>>().join(" == "))),
+                    ("comparison (`<`) chain", format!("fun main() -> Bool {{ let x = {}\n    return x\n}}\n", (0..n).map(|_| "1").collect::<Vec<_>>().join(" < "))),
+                    ("pipeline (`|>`) chain", format!("fun id(x: Int) -> Int {{ x }}\nfun main() -> Int {{ let x = 1{}\n    return x\n}}\n", " |> id".repeat(n))),
+                    ("postfix try (`?`) chain", format!("fun main() -> Int {{ let x = 1{}\n    return x\n}}\n", "?".repeat(n))),
+                    ("unary prefix (`-`) chain", format!("fun main() -> Int {{ let x = {}1\n    return x\n}}\n", "-".repeat(n))),
+                ];
+                for (label, src) in &cases {
+                    let (_, diags) = parse(src);
+                    assert!(
+                        diags.iter().any(|d| d.code == "K0121"),
+                        "{label} of length {n} must hit K0121, not silently build an unbounded AST: {diags:?}\nsrc (truncated): {:.200}",
+                        src
+                    );
+                }
+                // The SAME chain kinds at an ordinary, well-under-the-limit length
+                // must NOT false-positive -- confirms the new counters don't
+                // regress normal code (a realistic long-ish `+` chain, a short
+                // `.method()` chain, a couple of `|>` pipeline stages).
+                let ok_add = format!("fun main() -> Int {{ let x = {}\n    return x\n}}\n", (0..20).map(|_| "1").collect::<Vec<_>>().join(" + "));
+                let (_, diags) = parse(&ok_add);
+                assert!(diags.is_empty(), "a 20-term `+` chain must parse cleanly: {diags:?}");
+                let ok_pipe = "fun id(x: Int) -> Int { x }\nfun main() -> Int { let x = 1 |> id |> id |> id\n    return x\n}\n";
+                let (_, diags) = parse(ok_pipe);
+                assert!(diags.is_empty(), "a 3-stage pipeline must parse cleanly: {diags:?}");
             })
             .unwrap()
             .join()
