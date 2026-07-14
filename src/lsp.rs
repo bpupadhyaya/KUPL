@@ -864,28 +864,36 @@ pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String
 /// search every `use`d file for an UNRELATED top-level item sharing that same
 /// bare name, silently jumping goto-definition to it or, far worse, including
 /// it in a rename's `WorkspaceEdit` and corrupting a completely unrelated
-/// declaration in another file. This check is deliberately narrow (top-level
-/// fun/method parameters and handler binders only, matching what
-/// `item_definition` itself already covers structurally) -- a `let`/`var`
-/// local, a `match` binding, or a lambda parameter sharing a used file's
-/// top-level name is a real but narrower residual gap, left for future work
-/// (the same kind of explicitly-scoped limitation `occurrences`'s own doc
-/// comment already accepts for same-file shadowing).
+/// declaration in another file. Beyond parameters/handler binders, this also
+/// checks the whole function/method/handler BODY for a `let`/`var` local, a
+/// `for` loop variable, a `match`/`@`-pattern binding, or a lambda parameter
+/// sharing the searched name (production-hardening PR-it739, closing the gap
+/// this comment used to leave as future work: a local `let mean = ...` inside
+/// `fun report() { ... }` was still falling through to the cross-file search
+/// and silently reaching an unrelated top-level `fun mean` in a `use`d
+/// sibling file, both for goto-definition and for rename's `WorkspaceEdit`).
+/// This is deliberately coarse (matches anywhere in the whole body, not
+/// precise per-scope shadowing) -- the same explicitly-accepted imprecision
+/// `occurrences`'s own doc comment already documents for same-file shadowing;
+/// it only needs to answer "is this name EVER locally bound here," not
+/// "which exact declaration does this specific use resolve to."
 fn locally_bound(program: &crate::ast::Program, offset: usize, name: &str) -> bool {
     use crate::ast::Item;
     let in_span = |span: crate::diag::Span| (span.start as usize) <= offset && offset <= (span.end as usize);
     for item in &program.items {
         match item {
-            Item::Fun(f) if in_span(f.span) => return f.params.iter().any(|p| p.name == name),
+            Item::Fun(f) if in_span(f.span) => {
+                return f.params.iter().any(|p| p.name == name) || block_binds_name(&f.body, name);
+            }
             Item::Component(c) => {
                 for f in c.exposes.iter().chain(&c.funs) {
                     if in_span(f.span) {
-                        return f.params.iter().any(|p| p.name == name);
+                        return f.params.iter().any(|p| p.name == name) || block_binds_name(&f.body, name);
                     }
                 }
                 for h in &c.handlers {
                     if in_span(h.span) {
-                        return h.param.as_deref() == Some(name);
+                        return h.param.as_deref() == Some(name) || block_binds_name(&h.body, name);
                     }
                 }
             }
@@ -893,6 +901,96 @@ fn locally_bound(program: &crate::ast::Program, offset: usize, name: &str) -> bo
         }
     }
     false
+}
+
+/// Whether `name` is bound anywhere inside `block` by a `let`/`var`, a `for`
+/// loop variable, a `forall` property variable, a lambda parameter, or a
+/// `match` pattern binding (`x`, `x @ pat`, or a `Ctor(x)` sub-pattern) --
+/// the local-binding forms `locally_bound` didn't check before PR-it739.
+/// Deliberately walks the WHOLE block regardless of `offset`, matching this
+/// file's existing token-based, not-precisely-scope-aware approach.
+fn block_binds_name(block: &crate::ast::Block, name: &str) -> bool {
+    block.stmts.iter().any(|s| stmt_binds_name(s, name))
+}
+
+fn stmt_binds_name(stmt: &crate::ast::Stmt, name: &str) -> bool {
+    use crate::ast::Stmt;
+    match stmt {
+        Stmt::Let { name: n, init, .. } => n == name || expr_binds_name(init, name),
+        Stmt::Assign { target, value, .. } => expr_binds_name(target, name) || expr_binds_name(value, name),
+        Stmt::Expr(e) => expr_binds_name(e, name),
+        Stmt::Return(e, _) => e.as_ref().is_some_and(|e| expr_binds_name(e, name)),
+        Stmt::While { cond, body, .. } => expr_binds_name(cond, name) || block_binds_name(body, name),
+        Stmt::For { var, iter, body, .. } => {
+            var == name || expr_binds_name(iter, name) || block_binds_name(body, name)
+        }
+        Stmt::Emit { arg, .. } => arg.as_ref().is_some_and(|e| expr_binds_name(e, name)),
+        Stmt::Expect(e, _) => expr_binds_name(e, name),
+        Stmt::Forall { vars, body, .. } => {
+            vars.iter().any(|(v, _)| v == name) || block_binds_name(body, name)
+        }
+        Stmt::Break(_) | Stmt::Continue(_) => false,
+    }
+}
+
+fn expr_binds_name(expr: &crate::ast::Expr, name: &str) -> bool {
+    use crate::ast::{ExprKind, StrPiece};
+    match &expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Ident(_)
+        | ExprKind::SizedInt(_, _)
+        | ExprKind::F32(_) => false,
+        ExprKind::Str(pieces) => pieces.iter().any(|p| match p {
+            StrPiece::Text(_) => false,
+            StrPiece::Expr(e) => expr_binds_name(e, name),
+        }),
+        ExprKind::List(items) | ExprKind::Par(items) => items.iter().any(|e| expr_binds_name(e, name)),
+        ExprKind::Call { callee, args } => {
+            expr_binds_name(callee, name) || args.iter().any(|a| expr_binds_name(&a.value, name))
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            expr_binds_name(recv, name) || args.iter().any(|e| expr_binds_name(e, name))
+        }
+        ExprKind::Field { recv, .. } => expr_binds_name(recv, name),
+        ExprKind::Binary { lhs, rhs, .. } => expr_binds_name(lhs, name) || expr_binds_name(rhs, name),
+        ExprKind::Unary { operand, .. } => expr_binds_name(operand, name),
+        ExprKind::If { cond, then_block, else_block } => {
+            expr_binds_name(cond, name)
+                || block_binds_name(then_block, name)
+                || else_block.as_ref().is_some_and(|e| expr_binds_name(e, name))
+        }
+        ExprKind::BlockExpr(b) => block_binds_name(b, name),
+        ExprKind::Match { scrutinee, arms } => {
+            expr_binds_name(scrutinee, name)
+                || arms.iter().any(|arm| {
+                    pattern_binds_name(&arm.pattern, name)
+                        || arm.guard.as_ref().is_some_and(|g| expr_binds_name(g, name))
+                        || expr_binds_name(&arm.body, name)
+                })
+        }
+        ExprKind::Lambda { params, body } => {
+            params.iter().any(|p| p.name == name) || block_binds_name(body, name)
+        }
+        ExprKind::Range { lo, hi, .. } => expr_binds_name(lo, name) || expr_binds_name(hi, name),
+        ExprKind::With { recv, updates } => {
+            expr_binds_name(recv, name) || updates.iter().any(|(_, e)| expr_binds_name(e, name))
+        }
+        ExprKind::Try(e) | ExprKind::Await(e) => expr_binds_name(e, name),
+    }
+}
+
+fn pattern_binds_name(pattern: &crate::ast::Pattern, name: &str) -> bool {
+    use crate::ast::PatternKind;
+    match &pattern.kind {
+        PatternKind::Wildcard | PatternKind::Int(_) | PatternKind::Bool(_) | PatternKind::Str(_) | PatternKind::Range { .. } => false,
+        PatternKind::Bind(n) => n == name,
+        PatternKind::Ctor { args, .. } => args.iter().any(|p| pattern_binds_name(p, name)),
+        PatternKind::Or(alts) => alts.iter().any(|p| pattern_binds_name(p, name)),
+        PatternKind::At { name: n, inner } => n == name || pattern_binds_name(inner, name),
+    }
 }
 
 /// Resolve every `use` target in `program` to a local sibling-file path
@@ -2435,6 +2533,54 @@ mod tests {
         // function, never a local of any kind) still resolves correctly -- this
         // fix must not be a blanket "never cross a file boundary" regression.
         let caller_text = "use stats\nfun report(xs: List[Int]) -> Float {\n    mean(xs)\n}\n";
+        let off2 = caller_text.find("mean(xs)").unwrap();
+        let call_line = caller_text[..off2].matches('\n').count();
+        let call_line_start = caller_text[..off2].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let call_ch = off2 - call_line_start;
+        let (target_uri, ..) = resolve_definition_cross_file(caller_text, call_line, call_ch, dir, &buffers)
+            .expect("a genuine cross-file call must still resolve");
+        assert!(target_uri.ends_with("stats.kupl"), "{target_uri}");
+    }
+
+    /// A REAL bug (production-hardening PR-it739): PR-it704's `locally_bound` fix only
+    /// ever checked function/method PARAMETERS and handler payload binders -- its own
+    /// doc comment explicitly flagged `let`/`var` locals, `match` bindings, and lambda
+    /// parameters as an unfixed residual gap. A `let mean = 5.0` local inside
+    /// `fun report()` shares its bare name with an unrelated top-level `fun mean` in a
+    /// `use`d sibling file; renaming/goto-definition on the LOCAL used to still fall
+    /// through to the cross-file search (since `occurrences`/`item_definition` have no
+    /// notion of local scope), silently jumping goto-definition into the wrong file and,
+    /// far worse, including that unrelated declaration in a rename's `WorkspaceEdit` --
+    /// corrupting `stats.kupl` when the user only meant to rename a local variable.
+    /// Live-reproduced by a research subagent before this fix (compiled `libkupl.rlib`,
+    /// called `occurrences_cross_file` directly, observed the cross-file hit).
+    #[test]
+    fn locally_bound_let_local_suppresses_cross_file_goto_definition_and_rename() {
+        let dir = std::path::Path::new("/fake/lsp-it739");
+        let main_text = "use stats\nfun report() -> Float {\n    let mean = 5.0\n    print(mean)\n    mean\n}\n";
+        let stats_text = "fun mean(xs: List[Int]) -> Float {\n    xs.sum().to_float() / xs.len().to_float()\n}\n";
+        let mut buffers: HashMap<PathBuf, String> = HashMap::new();
+        buffers.insert(dir.join("stats.kupl"), stats_text.to_string());
+
+        // The cursor is on the `let mean` declaration itself.
+        let off = main_text.find("mean = 5.0").unwrap();
+        let line = main_text[..off].matches('\n').count();
+        let line_start = main_text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let ch = off - line_start;
+
+        // goto-definition must NOT jump into stats.kupl.
+        assert!(
+            resolve_definition_cross_file(main_text, line, ch, dir, &buffers).is_none(),
+            "a local `let` reference must not resolve to an unrelated cross-file declaration"
+        );
+
+        // rename must ONLY touch the current file's occurrences of the local (decl + 2 uses).
+        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers);
+        assert!(locs.iter().all(|(u, ..)| u.is_empty()), "must not reach into stats.kupl: {locs:?}");
+        assert_eq!(locs.len(), 3, "declaration + print(mean) + trailing mean, all same-file: {locs:?}");
+
+        // Sanity: a genuine cross-file call to the imported `mean` function is unaffected.
+        let caller_text = "use stats\nfun report2(xs: List[Int]) -> Float {\n    mean(xs)\n}\n";
         let off2 = caller_text.find("mean(xs)").unwrap();
         let call_line = caller_text[..off2].matches('\n').count();
         let call_line_start = caller_text[..off2].rfind('\n').map(|i| i + 1).unwrap_or(0);
