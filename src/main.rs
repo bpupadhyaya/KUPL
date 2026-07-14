@@ -19,6 +19,7 @@ Usage:
   kupl test <file.kupl>             Run `example` blocks + contract laws as tests
   kupl check <file.kupl> [--json]   Parse, type-check, and effect-check
   kupl fmt <file.kupl> [--write]    Print (or rewrite to) canonical form
+  kupl fmt <file.kupl> --check      Exit nonzero if the file isn't already canonical (CI gate)
   kupl context <file.kupl> <name>   Emit an item + its direct deps (LLM context)
   kupl manifest <file.kupl>         Emit component manifests as JSON (visual tools)
   kupl repl                         Start an interactive session
@@ -163,7 +164,43 @@ fn run_cli() -> ExitCode {
                     "note: `kupl fmt` does not yet preserve comments — they are dropped from the formatted output"
                 );
             }
-            if args.iter().any(|a| a == "--write") {
+            let write = args.iter().any(|a| a == "--write");
+            let check = args.iter().any(|a| a == "--check");
+            // PRODUCTION-HARDENING (PR-it774): `kupl fmt --check` was entirely
+            // missing -- a survey-flagged gap (agentId aca5b82689fe978bd),
+            // reframed as a MISSING FEATURE, not a regression (`--check` was
+            // never documented or implemented; USAGE only ever listed
+            // `[--write]`). Any other flag, including `--check`, was silently
+            // ignored and fell through to the default print-and-exit-0 path
+            // regardless of whether the file was already canonical -- a CI
+            // pipeline wired to gate on `kupl fmt --check` (the `rustfmt
+            // --check`/`prettier --check` convention) would never fail.
+            // `--write` and `--check` together is a genuinely ambiguous
+            // combination (write the file, or only report on it?) -- rejected
+            // as a usage error rather than silently picking one, matching
+            // this file's own convention of an explicit `eprintln!` +
+            // exit 2 for a malformed invocation.
+            if write && check {
+                eprintln!("usage: kupl fmt <file.kupl> [--write | --check] — pass at most one");
+                return 2;
+            }
+            if check {
+                // Reuses exit code 1 for "not clean" -- the SAME code `kupl
+                // check`'s own `has_errors` branch already uses (run.rs's
+                // `check_cmd`), so `--check` finding a diff and a genuine
+                // parse/load failure (the `errors` branch above, also exit 1)
+                // both signal "this file isn't in a fully clean state" with
+                // ONE consistent code, matching this project's own existing
+                // convention as well as `rustfmt --check`'s exit 1. Never
+                // writes to the file.
+                if formatted == src {
+                    println!("ok: {file}");
+                    return 0;
+                }
+                eprintln!("would reformat: {file}");
+                return 1;
+            }
+            if write {
                 if let Err(e) = std::fs::write(file, &formatted) {
                     eprintln!("error: cannot write {file}: {e}");
                     return 1;
@@ -456,6 +493,59 @@ mod tests {
         }
         assert_eq!(code(&[]), Some(2), "bare `kupl` with no subcommand must still exit 2");
         assert_eq!(code(&["definitely-not-a-real-subcommand"]), Some(2), "an unrecognized subcommand must still exit 2");
+    }
+
+    /// A REAL missing-feature gap found+closed (production-hardening PR-it774,
+    /// an Explore survey finding, agentId aca5b82689fe978bd, reframed from the
+    /// survey's own "broken CI gate" framing to "a missing feature" -- `--check`
+    /// was never documented or implemented in the first place, USAGE only ever
+    /// listed `[--write]`): `kupl fmt <file.kupl> --check` fell through to the
+    /// SAME default print-and-exit-0 path as no flag at all, so a CI pipeline
+    /// wired to gate on it (the `rustfmt --check`/`prettier --check` convention)
+    /// would NEVER fail, regardless of whether the file was canonically
+    /// formatted. Added a real `--check` mode: exits 0 (printing `ok: {file}`)
+    /// when the file's current content already matches the formatter's own
+    /// canonical output, exits 1 (printing `would reformat: {file}`, matching
+    /// this project's OWN existing convention -- `run.rs::check_cmd`'s
+    /// `has_errors` branch ALSO uses exit 1, so "needs reformatting" and "has a
+    /// parse/load error" both consistently signal "not clean") when it doesn't
+    /// -- and NEVER writes to the file either way. `--write` and `--check`
+    /// together is genuinely ambiguous (write, or only report?) -- rejected as
+    /// a usage error (exit 2) rather than silently picking one.
+    #[test]
+    fn fmt_check_exits_zero_when_canonical_one_when_not_and_never_writes_the_file() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let tmp = std::env::temp_dir().join(format!("kupl_it774_fmt_check_{}.kupl", std::process::id()));
+
+        // a file already in the formatter's own canonical form: exit 0, `ok: ...`.
+        let adventure = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/adventure.kupl");
+        let canon = run(&["fmt", adventure.to_str().unwrap()]).stdout; // the formatter's own output IS canonical by definition
+        std::fs::write(&tmp, &canon).unwrap();
+        let ok = run(&["fmt", tmp.to_str().unwrap(), "--check"]);
+        assert_eq!(ok.status.code(), Some(0), "{ok:?}");
+        assert!(String::from_utf8_lossy(&ok.stdout).contains("ok: "), "{ok:?}");
+        assert_eq!(std::fs::read(&tmp).unwrap(), canon, "--check must never modify the file");
+
+        // a genuinely non-canonical file: exit 1, `would reformat: ...`, unchanged on disk.
+        let dirty = b"fun   main( )  {\nprint(\"hi\")\n}\n".to_vec();
+        std::fs::write(&tmp, &dirty).unwrap();
+        let bad = run(&["fmt", tmp.to_str().unwrap(), "--check"]);
+        assert_eq!(bad.status.code(), Some(1), "{bad:?}");
+        assert!(String::from_utf8_lossy(&bad.stderr).contains("would reformat: "), "{bad:?}");
+        assert_eq!(std::fs::read(&tmp).unwrap(), dirty, "--check must never modify the file, even when it disagrees");
+
+        // --check and --write together: rejected as a usage error, file still untouched.
+        let both = run(&["fmt", tmp.to_str().unwrap(), "--check", "--write"]);
+        assert_eq!(both.status.code(), Some(2), "{both:?}");
+        assert_eq!(std::fs::read(&tmp).unwrap(), dirty, "a rejected combination must not write either");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
