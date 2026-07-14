@@ -946,6 +946,32 @@ pub fn ai_call(
         Ok(v) if meta.wraps_result => Ok(Value::ok(v)),
         Ok(v) => Ok(v),
         Err(msg) if meta.wraps_result => Ok(Value::err(Value::str(msg))),
+        // A REAL diagnostics-quality bug found+fixed (production-hardening
+        // PR-it756): a self-referential/mutually-recursive `ai fun` <-> tool
+        // call chain (an `ai fun` with `tools [t]` where `t` eventually
+        // calls back into an `ai fun`, directly or through a longer cycle)
+        // is safely bounded by the shared `MAX_CALL_DEPTH` recursion guard
+        // (`interp.rs`/`vm.rs`, same mechanism ordinary KUPL recursion
+        // uses) -- it does NOT hang or crash the process. But every one of
+        // the thousands of nested `ai_call` frames on the way back up the
+        // unwind re-wraps the SAME error with another `"ai \`name\`: "`
+        // prefix (this exact line), so the final panic message balloons to
+        // tens of KB before the actually-useful "stack overflow" text at
+        // the very end -- a genuine diagnostics-quality defect, not a
+        // correctness bug. Confirmed live BEFORE this fix: a mutually-
+        // recursive `ai fun`/tool pair driven by a mock provider that
+        // always calls the SAME tool back produced a panic message
+        // measured in tens of KB. Since this format string is the ONLY
+        // site in this file that ever produces a message starting with
+        // `"ai \`"`, checking for that prefix unambiguously identifies "this
+        // message was already wrapped by a deeper `ai_call` frame" -- skip
+        // re-wrapping in that case, so the FINAL message attributes to the
+        // ai fun where the failure actually originated (the deepest frame,
+        // wrapped exactly once) instead of accumulating one prefix per
+        // recursion level. An ordinary, non-recursive failure's message
+        // never starts with this prefix, so it is still wrapped exactly
+        // once, unchanged from before.
+        Err(msg) if msg.starts_with("ai `") => Err(msg),
         Err(msg) => Err(format!("ai `{}`: {msg}", meta.name)),
     }
 }
@@ -1278,5 +1304,89 @@ mod tests {
             );
             std::env::remove_var(format!("KUPL_AI_MOCK_{}", name.to_uppercase()));
         }
+    }
+
+    /// A REAL diagnostics-quality bug found+fixed (production-hardening
+    /// PR-it756): a self-referential/mutually-recursive `ai fun` <-> tool
+    /// call chain is safely bounded by the shared `MAX_CALL_DEPTH`
+    /// recursion guard (`interp.rs`/`vm.rs`) -- it does NOT hang or crash
+    /// the process (confirmed separately via a live `kupl run` repro,
+    /// `KUPL_AI_MOCK_CALL_A='[{"tool":"helper_a","input":{"x":1}}]'` on a
+    /// program where `ai fun call_a(x) tools [helper_a]` and `fun
+    /// helper_a(x) { call_a(x) }` mutually recurse -- pre-fix, the panic
+    /// message was 65,201 BYTES; post-fix, 214 bytes). But every one of the
+    /// thousands of nested `ai_call` frames on the way back up the unwind
+    /// used to re-wrap the SAME error with another `"ai \`name\`: "`
+    /// prefix, so the message ballooned linearly with recursion depth.
+    /// This test isolates the wrapping logic itself (`ai_call`'s own
+    /// `Err(msg) => Err(format!("ai \`{}\`: {msg}", meta.name))` arm) with
+    /// a custom, deterministic `ToolHost` that recurses `ai_call` a fixed
+    /// number of times (bypassing the real interpreter's `MAX_CALL_DEPTH`
+    /// entirely, so this stays fast and doesn't need a 2GB-stacked thread)
+    /// -- proving the fix scales to depth WITHOUT needing to actually hit
+    /// the real 10,000-frame guard.
+    #[test]
+    fn a_self_referential_ai_fun_tool_recursion_does_not_balloon_its_panic_message() {
+        struct RecursingHost {
+            remaining: std::cell::Cell<u32>,
+        }
+        impl ToolHost for RecursingHost {
+            fn call_tool(&mut self, _name: &str, _args: Vec<Value>) -> Result<Value, String> {
+                let n = self.remaining.get();
+                if n == 0 {
+                    return Err("bottomed out".to_string());
+                }
+                self.remaining.set(n - 1);
+                ai_call(&recursing_meta(), "loop", &[], self)
+            }
+        }
+        fn recursing_meta() -> AiFunMeta {
+            AiFunMeta {
+                name: "it756_rec".into(),
+                intent: "loop".into(),
+                model: None,
+                params: vec![],
+                shape: AiShape::Int,
+                wraps_result: false,
+                tools: vec![ToolMeta {
+                    name: "rec_tool".into(),
+                    description: "recurse".into(),
+                    params: vec![],
+                    ret: AiShape::Int,
+                }],
+            }
+        }
+
+        // Run on a production-sized (8 MiB) stack -- the default 2 MiB test-
+        // thread stack is smaller than the real CLI main thread's (2 GiB,
+        // `main.rs`), and 500 levels of genuine Rust-level recursion through
+        // `ai_call`/`tool_response`/`run_tool_loop`/`execute_tool` (several
+        // stack frames per logical recursion level) needs more headroom than
+        // the default test-thread stack provides -- matches this codebase's
+        // own established pattern for deliberately-deep-recursion tests
+        // (e.g. `check.rs::deep_nesting_is_a_clean_error_not_a_hang`).
+        std::env::set_var("KUPL_AI_MOCK_IT756_REC", r#"[{"tool":"rec_tool","input":{}}]"#);
+        let err = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut host = RecursingHost { remaining: std::cell::Cell::new(500) };
+                ai_call(&recursing_meta(), "loop", &[], &mut host).unwrap_err()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        std::env::remove_var("KUPL_AI_MOCK_IT756_REC");
+
+        assert!(err.contains("bottomed out"), "the root cause must still be present: {err}");
+        assert_eq!(
+            err.matches("ai `it756_rec`:").count(),
+            1,
+            "the prefix must be added EXACTLY ONCE regardless of recursion depth, not once per level: {err}"
+        );
+        assert!(
+            err.len() < 200,
+            "a 500-level-deep recursive failure must not balloon the message size: {} bytes: {err}",
+            err.len()
+        );
     }
 }

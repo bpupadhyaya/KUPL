@@ -3696,6 +3696,26 @@ static KValue k_ai_call(int info) {
     KValue v = f->has_tools ? k_ai_tool_call(f, text) : k_ai_convert(f->shape, text);
     if (k_ai_ok) return f->wraps_result ? k_ok(v) : v;
     if (f->wraps_result) return k_err(k_str(k_strdup(k_ai_err)));
+    /* A REAL cross-engine divergence found+fixed (production-hardening
+       PR-it756, the SAME wrapping site interp/vm already had -- see the
+       identical fix + comment at ai.rs::ai_call): a self-referential/
+       mutually-recursive ai-fun<->tool call chain re-enters k_ai_call at
+       every nested level on the way back up the unwind (each level's own
+       k_panic(b) triggers the CALLER's tool_pad setjmp handler, which
+       stores the raw panic text into k_ai_err unwrapped, then THAT level's
+       OWN k_ai_call wraps it again with ITS name) -- so the message
+       accumulated one "ai `name`: " prefix per recursion level here too,
+       just bounded (truncated, not unbounded) by k_ai_err/b's fixed
+       buffer sizes rather than growing to interp/vm's pre-fix ~65KB.
+       Confirmed live: interp/vm (post-fix) report the single-wrapped
+       "ai `call_a`: stack overflow (10000 frames)", but native reported a
+       276-byte message of ~20 repeated "ai `call_a`: " prefixes before
+       truncating -- a real cross-engine byte-identity divergence this fix
+       closes. Mirrors ai.rs's fix exactly: `k_ai_err` is the ONLY place
+       this runtime ever produces a message starting with "ai `", so that
+       prefix unambiguously means "already wrapped by a deeper k_ai_call
+       frame" -- skip re-wrapping in that case. */
+    if (!strncmp(k_ai_err, "ai `", 4)) { k_panic(k_ai_err); return k_unit(); }
     char b[320]; snprintf(b, sizeof b, "ai `%s`: %s", f->name, k_ai_err); k_panic(b); return k_unit();
 }
 
@@ -6838,6 +6858,59 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             "native must wrap the tool's panic with the SAME \"ai `name`: \" prefix as interp/KVM: {stderr:?}"
         );
         assert!(out.status.success(), "supervision must catch the tool panic, not exit non-zero: {out:?}");
+    }
+
+    /// A REAL cross-engine divergence found+fixed (production-hardening
+    /// PR-it756, the SAME wrapping site as the test above, a different
+    /// trigger): a self-referential/mutually-recursive `ai fun` <-> tool
+    /// call chain re-enters `k_ai_call` at every nested level on the way
+    /// back up the unwind, and (before this fix) each level's OWN
+    /// `k_ai_call` re-wrapped the SAME error with another `"ai \`name\`: "`
+    /// prefix -- bounded/truncated by `k_ai_err`/`b`'s fixed buffer sizes
+    /// (unlike interp/vm's unbounded Rust `String`, which grew to ~65KB
+    /// before the SAME sibling bug was fixed there), but still a genuine
+    /// cross-engine byte-identity divergence: interp/vm (post-fix) report
+    /// the single-wrapped `"ai \`call_a\`: stack overflow (10000 frames)"`,
+    /// but native (pre-fix) reported a ~276-byte message of roughly 20
+    /// repeated `"ai \`call_a\`: "` prefixes before truncating. Confirmed
+    /// live via a real compile+run BEFORE this fix, then fixed by mirroring
+    /// `ai.rs::ai_call`'s exact fix: skip re-wrapping when `k_ai_err`
+    /// already starts with `"ai \`"` (the only place this runtime ever
+    /// produces that prefix, so it unambiguously means "already wrapped by
+    /// a deeper `k_ai_call` frame").
+    #[test]
+    fn native_self_referential_ai_fun_tool_recursion_matches_interp_message() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun call_a7(x: Int) -> Int tools [helper_a7] {\n    intent \"loop\"\n}\n\
+                   fun helper_a7(x: Int) -> Int {\n    call_a7(x)\n}\n\
+                   fun main() uses io {\n    print(call_a7(1))\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-airec-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_CALL_A7", "[{\"tool\":\"helper_a7\",\"input\":{\"x\":1}}]")
+            .output()
+            .expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.trim(),
+            "panic: ai `call_a7`: stack overflow (10000 frames)",
+            "native must match interp/vm's SINGLE-wrapped message, not one prefix per recursion level: {stderr:?}"
+        );
     }
 
     /// A multi-component app (children + wires + emit) compiles to native and
