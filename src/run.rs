@@ -233,6 +233,63 @@ fn collect_expr_names(e: &crate::ast::Expr, f: &mut impl FnMut(&str)) {
                 f(n);
             }
         }
+        // A REAL bug found+fixed (production-hardening PR-it777, an Explore
+        // survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
+        // live before implementing): `effects::walk_block`/`walk_expr` (which
+        // drives this function's own invocation for every reachable Expr)
+        // visits a `Match`'s `scrutinee` and each arm's `guard`/`body`, but
+        // NEVER an arm's `pattern` -- so a function that discriminates a type
+        // ONLY via `match ... { Circle(_) => ..., Square(_) => ... }`, with
+        // that type never appearing in its own signature, had the type
+        // SILENTLY OMITTED from `kupl context`'s emitted dependency list.
+        // Confirmed live: `fun classify() -> Str { let s = make_shape(); match
+        // s { Circle(_) => "circle", Square(_) => "square" } }` -- `kupl
+        // context file.kupl classify` included `fun make_shape` (an ordinary
+        // call) but completely omitted `type Shape`, even though the type IS
+        // the only thing the match structurally depends on. `walk_expr` DOES
+        // still call back with the `Match` EXPR itself (its callback fires
+        // for every node before recursing on `.kind`), so this arm is reached
+        // -- the fix stays entirely within `collect_expr_names`, no change
+        // needed to the SHARED `effects.rs` walker (which has no need for
+        // pattern-derived names -- patterns can't call functions, so they're
+        // irrelevant to ITS purpose, effect-purity inference; extending its
+        // shared `FnMut(&Expr)` callback signature to also report patterns
+        // would be unnecessary scope creep there). Emitted constructor names
+        // reuse the EXACT SAME `note` closure/`compiled.checked.ctors`
+        // resolution already used for an ordinary constructor CALL (e.g.
+        // `Circle(r: 5)` parses as `ExprKind::Call{callee: Ident("Circle"),
+        // ..}`, already handled above) -- no new resolution logic needed.
+        ExprKind::Match { arms, .. } => {
+            for arm in arms {
+                collect_pattern_names(&arm.pattern, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A pattern's constructor names, resolved to their owning types via the SAME
+/// `note` closure every other name in this module goes through. Recurses into
+/// `Ctor`'s nested args and `Or`/`At`'s sub-patterns -- mirroring the EXACT
+/// same Or/At recursion gap `resolve.rs`'s `Rewriter::pattern` had (PR-it775,
+/// a different bug, same missing-case shape) so this doesn't reintroduce it
+/// here. `Wildcard`/`Bind`/`Int`/`Bool`/`Str`/`Range` are leaf patterns with
+/// no name to report.
+fn collect_pattern_names(p: &crate::ast::Pattern, f: &mut impl FnMut(&str)) {
+    use crate::ast::PatternKind;
+    match &p.kind {
+        PatternKind::Ctor { name, args } => {
+            f(name);
+            for a in args {
+                collect_pattern_names(a, f);
+            }
+        }
+        PatternKind::Or(alts) => {
+            for a in alts {
+                collect_pattern_names(a, f);
+            }
+        }
+        PatternKind::At { inner, .. } => collect_pattern_names(inner, f),
         _ => {}
     }
 }
@@ -1392,6 +1449,59 @@ mod tests {
         let p = file.to_str().unwrap();
         assert_eq!(super::emit_context(p, "target"), 0, "a present item resolves");
         assert_eq!(super::emit_context(p, "does_not_exist"), 1, "a missing item is a clean error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it777, an Explore
+    /// survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
+    /// live before implementing): `collect_expr_names` (this file) is driven
+    /// by `effects::walk_block`/`walk_expr`, which visits a `Match`'s
+    /// `scrutinee` and each arm's `guard`/`body` but NEVER an arm's
+    /// `pattern` -- so a function that discriminates a type ONLY via
+    /// `match ... { Circle(_) => ..., Square(_) => ... }`, with that type
+    /// never appearing in its own signature, had the type SILENTLY OMITTED
+    /// from `kupl context`'s emitted dependency closure. Confirmed live
+    /// before fixing: `kupl context file.kupl classify` included
+    /// `fun make_shape` (an ordinary call) but completely omitted
+    /// `type Shape`, even though the type is the only thing the match
+    /// structurally depends on. `emit_context` prints directly to stdout
+    /// (no return value to inspect in-process) -- this is a real subprocess
+    /// test, spawning `target/debug/kupl context` end-to-end, matching this
+    /// file's OWN established pattern and its sibling test's own comment
+    /// ("closure correctness ... is exercised end-to-end via the CLI").
+    #[test]
+    fn emit_context_includes_a_type_referenced_only_via_a_match_pattern() {
+        let dir = std::env::temp_dir().join(format!("kupl-ctx-pattern-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("p.kupl");
+        std::fs::write(
+            &file,
+            "type Shape = Circle(r: Int) | Square(s: Int)\n\n\
+             fun make_shape() -> Shape {\n    Circle(r: 5)\n}\n\n\
+             fun classify() -> Str {\n    \
+             let s = make_shape()\n    \
+             match s {\n        \
+             Circle(_) => \"circle\"\n        \
+             Square(_) => \"square\"\n    \
+             }\n\
+             }\n",
+        )
+        .unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no debug binary built yet -- nothing to test
+        }
+        let out = std::process::Command::new(&bin)
+            .args(["context", file.to_str().unwrap(), "classify"])
+            .output()
+            .expect("kupl context runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("type Shape"),
+            "a type referenced ONLY via a match pattern (not the function's own signature) must still \
+             appear in the dependency closure: {stdout:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
