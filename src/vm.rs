@@ -1283,7 +1283,26 @@ impl<'m> Vm<'m> {
                             match position {
                                 Some(i) => {
                                     let mut new_fields = fields.as_ref().clone();
-                                    new_fields[i] = reg!(value);
+                                    // `i` comes from `ctor_field_names` (independent
+                                    // .kx metadata), not from `new_fields.len()` --
+                                    // legitimate compile.rs output always keeps
+                                    // Op::MakeCtor's `len` in sync with the ctor's
+                                    // declared field count, but a corrupted .kx file
+                                    // could set `len` shorter, producing a Value::Ctor
+                                    // whose `fields` is too short for `i` (production-
+                                    // hardening PR-it745, closing a live-confirmed
+                                    // panic -- the sole raw-index outlier among
+                                    // GetField/GetFieldNamed/WithField, which already
+                                    // use bounds-checked `.get()`).
+                                    match new_fields.get_mut(i) {
+                                        Some(slot) => *slot = reg!(value),
+                                        None => {
+                                            return Err(VmError {
+                                                msg: "corrupt .kx module: field index out of range".into(),
+                                                span,
+                                            })
+                                        }
+                                    }
                                     set!(dst, Value::Ctor { ty, variant, fields: Rc::new(new_fields) });
                                 }
                                 None => {

@@ -1361,6 +1361,52 @@ mod tests {
         }
     }
 
+    /// A REAL bug (production-hardening PR-it745), found by a follow-up survey
+    /// re-auditing vm.rs for OTHER instances of the exact bug class PR-it744 fixed
+    /// (a decoded `.kx` field used as a raw array index, bypassing bounds checks):
+    /// `Op::WithField`'s field-update fast path (`x with field: value`) computes
+    /// `i` (the field's position) from `module.ctor_field_names` -- metadata decoded
+    /// INDEPENDENTLY from the runtime `Value::Ctor`'s own `fields` vec, whose length
+    /// is controlled entirely by `Op::MakeCtor`'s `len` operand. Legitimate
+    /// `compile.rs` output always keeps these in sync, but a corrupted `.kx` file's
+    /// `MakeCtor.len` can be set shorter than what `ctor_field_names` expects,
+    /// producing a `Value::Ctor` whose `fields` is too short for `i` --
+    /// `new_fields[i] = ...` then panicked with a raw index-out-of-bounds instead of
+    /// the clean error `GetField`/`GetFieldNamed` (the two sibling read paths,
+    /// already `.get()`-based) would give. Live-reproduced by the survey before this
+    /// fix: hand-flipped `MakeCtor`'s `len` byte in a real compiled `.kx` file
+    /// (`type Pt = Pt(x: Int, y: Int)` + `p with y: 99`) from 2 to 0/1 and ran it
+    /// through the actual `kupl run` CLI, observing `internal compiler error
+    /// [src/vm.rs:1286]`, exit 101.
+    #[test]
+    fn a_kx_module_with_a_with_field_update_past_a_shrunk_ctor_is_a_clean_error_not_a_panic() {
+        let src = "type Pt = Pt(x: Int, y: Int)\n\
+                   fun main() uses io {\n    \
+                   let p = Pt(1, 2)\n    let q = p with y: 99\n    print(q.y)\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let main_idx = module.funs["main"];
+
+        // a legitimate module still runs correctly (sanity check).
+        let mut vm = crate::vm::Vm::new(&module);
+        assert!(vm.call_named("main", vec![]).is_ok(), "legitimate module must run correctly");
+
+        // corrupt MakeCtor's `len` operand -- exactly what a hand-edited/corrupted
+        // `.kx` file's decode() would hand the VM, since decode() never cross-checks
+        // this field against `ctor_field_names`.
+        let code = &mut module.chunks[main_idx as usize].code;
+        let pos = code.iter().position(|op| matches!(op, crate::bytecode::Op::MakeCtor { .. })).expect("main uses MakeCtor");
+        if let crate::bytecode::Op::MakeCtor { len, .. } = &mut code[pos] {
+            *len = 1; // Pt has 2 fields (x, y); shrink to 1 so `y`'s position (1) is out of range
+        }
+        let mut vm = crate::vm::Vm::new(&module);
+        let err = vm
+            .call_named("main", vec![])
+            .expect_err("a WithField update past a shrunk ctor must be a clean VmError, not a panic");
+        assert!(err.msg.contains("corrupt .kx module"), "WithField: {}", err.msg);
+    }
+
     /// The instruction-pointer twin of the tests above (production-hardening
     /// PR-it688): `ip` starts at 0 and only ever changes via a plain
     /// increment or a `Jump`/`JumpIfFalse`/`JumpIfTrue` target -- neither
