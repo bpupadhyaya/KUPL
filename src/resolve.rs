@@ -509,6 +509,44 @@ impl Rewriter<'_> {
                     self.pattern(a);
                 }
             }
+            // A REAL bug found+fixed (production-hardening PR-it775, an
+            // Explore survey finding, agentId ad3c3f6ee2f0cd891, independently
+            // re-verified live before implementing): `Or`/`At` fell into the
+            // catch-all `_ => {}` below, so a `Ctor` pattern NESTED inside
+            // either -- `A | B` (each alternative), or `name @ SUBPATTERN`
+            // (the inner pattern) -- never got its constructor name mangled,
+            // unlike an identical `Ctor` pattern one level up. Since
+            // `isolate()` (loader.rs, called before check/compile/interp)
+            // mangles a non-root package's OWN constructor definitions to
+            // `pkg$Name`, a dependency package matching its OWN type via `A |
+            // B` or `name @ pat` kept the BARE pattern name while the
+            // constructor itself got mangled -- a guaranteed mismatch.
+            // Confirmed live: `type Shape = Circle | Square; fun classify(s:
+            // Shape) -> Str { match s { Circle | Square => "known" } }`
+            // compiled and ran fine (`known`) as a plain single-file program,
+            // but failed with K0257 (non-exhaustive match: missing
+            // `shapes$Circle`, `shapes$Square`) and TWO K0254 (unknown
+            // constructor) errors when the IDENTICAL source was loaded as a
+            // dependency package -- a real language feature broken
+            // specifically by the package-isolation pass, not a silent
+            // divergence (matching this module's own stated invariant, "a
+            // missed rewrite surfaces as a loud unresolved-name error"), but
+            // still a genuine correctness bug: legitimate code using `|`/`@`
+            // patterns against a package's own types cannot compile as a
+            // dependency at all. `At`'s `name` is a binding exactly like
+            // `PatternKind::Bind` above (`name @ SUBPATTERN` binds `name` to
+            // the whole matched value) and was ALSO never registered via
+            // `self.bind()` -- a second, adjacent gap sharing the same
+            // root cause, fixed in the same arm.
+            PatternKind::Or(alts) => {
+                for a in alts {
+                    self.pattern(a);
+                }
+            }
+            PatternKind::At { name, inner } => {
+                self.bind(name);
+                self.pattern(inner);
+            }
             _ => {}
         }
     }

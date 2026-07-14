@@ -1172,6 +1172,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it775, an Explore
+    /// survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
+    /// live before implementing): `resolve.rs`'s `Rewriter::pattern` only
+    /// recursed into `PatternKind::Bind`/`Ctor` -- `Or(alts)` (`A | B`) and
+    /// `At { name, inner }` (`name @ SUBPATTERN`) fell into the catch-all `_
+    /// => {}` and were never recursed into. Since `isolate()` mangles a
+    /// dependency package's OWN constructor definitions to `pkg$Name`, a
+    /// package matching its OWN type via `A | B` or `name @ pat` kept the
+    /// BARE constructor name in the pattern while the constructor itself got
+    /// mangled -- a guaranteed mismatch. Confirmed live before this fix: the
+    /// identical `match s { Circle | Square => "known" }` logic compiled and
+    /// ran fine as a plain single-file program, but failed with K0257
+    /// (non-exhaustive match) and two K0254 (unknown constructor) errors when
+    /// loaded as a dependency package -- a real language feature broken
+    /// specifically by the package-isolation pass. `At`'s own `name` binding
+    /// was ALSO never registered via `self.bind()`, a second, adjacent gap
+    /// fixed in the same arm.
+    #[test]
+    fn or_and_at_patterns_against_a_dependencys_own_types_resolve_correctly() {
+        let base = std::env::temp_dir().join(format!("kupl-orat-pattern-test-{}", std::process::id()));
+        let dep = base.join("shapes");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"shapes\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "pub type Shape = Circle | Square\n\n\
+             pub fun classify(s: Shape) -> Str {\n    \
+             match s {\n        \
+             Circle | Square => \"known\"\n    \
+             }\n\
+             }\n\n\
+             pub fun describe(s: Shape) -> Str {\n    \
+             match s {\n        \
+             whole @ Circle => \"circle: {whole}\"\n        \
+             whole @ Square => \"square: {whole}\"\n    \
+             }\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nshapes = { path = \"../shapes\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use shapes\n\nfun main() uses io {\n    \
+             print(shapes.classify(shapes.Circle))\n    \
+             print(shapes.describe(shapes.Square))\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its shapes dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "Or/At patterns against the dependency's OWN type must not produce unknown-constructor/non-exhaustive errors: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        assert!(
+            interp.call_value(f, vec![], crate::diag::Span::default()).is_ok(),
+            "main() should run cleanly"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn two_packages_same_name_dont_collide() {
         // two dependencies BOTH define `helper` — namespace isolation keeps them
