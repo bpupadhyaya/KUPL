@@ -877,10 +877,24 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
 }
 
 /// Hover markdown for the symbol at an LSP position, or None.
+///
+/// A REAL bug found+fixed (production-hardening PR-it742): unlike
+/// `resolve_definition_cross_file`/`occurrences_cross_file` (fixed by
+/// PR-it704/PR-it739/PR-it741), this single-file entry point never checked
+/// `locally_bound` at all -- hovering a LOCAL variable/parameter that shares
+/// a bare name with an unrelated TOP-LEVEL declaration in the SAME file
+/// showed that unrelated declaration's signature instead of no hover (or,
+/// worse, a misleading one). Suppressing the lookup (returning `None`
+/// rather than attempting to resolve to the local's own declaration site --
+/// a bigger feature) matches the existing established behavior for the
+/// cross-file case when no same-file match exists.
 pub fn resolve_hover(text: &str, line: usize, character: usize) -> Option<String> {
     let off = offset_at(text, line, character);
     let (name, _, _) = ident_at(text, off)?;
     let (program, _diags) = crate::parser::parse(text);
+    if locally_bound(&program, off, &name) {
+        return None;
+    }
     let sig = item_signature(&program, &name)?;
     Some(format!("```kupl\n{sig}\n```"))
 }
@@ -1107,6 +1121,16 @@ fn used_file_paths(program: &crate::ast::Program, dir: &std::path::Path) -> Vec<
 /// Cross-file hover: try the current file first (identical to `resolve_hover`),
 /// then fall back to the same locally-`use`d sibling files that
 /// `resolve_definition_cross_file` searches (see its doc comment for scope).
+///
+/// A REAL, previously-unfixed sibling gap (production-hardening PR-it742):
+/// unlike `resolve_definition_cross_file` (fixed by PR-it704), this cross-file
+/// fallback loop never checked `locally_bound` at all -- even after
+/// `resolve_hover` itself gained the check above, a local reference that
+/// ISN'T shadowed by a SAME-FILE top-level item (so `resolve_hover` returns
+/// `None`) would still fall through here and show an UNRELATED top-level
+/// item's signature from a `use`d file, the exact PR-it704 hazard class,
+/// just for hover instead of goto-definition/rename -- apparently missed
+/// when PR-it704 patched the other two cross-file entry points.
 pub fn resolve_hover_cross_file(
     text: &str,
     line: usize,
@@ -1120,6 +1144,9 @@ pub fn resolve_hover_cross_file(
     let off = offset_at(text, line, character);
     let (name, _, _) = ident_at(text, off)?;
     let (program, _diags) = crate::parser::parse(text);
+    if locally_bound(&program, off, &name) {
+        return None;
+    }
     for fs_path in used_file_paths(&program, dir) {
         let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
         let (other_program, _diags) = crate::parser::parse(&other_text);
@@ -1274,10 +1301,23 @@ fn ident_under(text: &str, line: usize, character: usize) -> Option<String> {
 }
 
 /// Definition location (0-based range) for the symbol at an LSP position.
+///
+/// Same PR-it742 fix as `resolve_hover` above: a local reference sharing a
+/// bare name with an unrelated top-level declaration in the SAME file must
+/// not navigate goto-definition to that unrelated declaration. This ALSO
+/// fixes the corresponding gap in `resolve_definition_cross_file`, which
+/// calls this function FIRST and only checks `locally_bound` itself in the
+/// fallback branch reached when this returns `None` -- previously, when a
+/// same-file top-level match existed, this function returned `Some(..)`
+/// unconditionally and `resolve_definition_cross_file`'s own `locally_bound`
+/// guard was never even reached.
 pub fn resolve_definition(text: &str, line: usize, character: usize) -> Option<(usize, usize, usize, usize)> {
     let off = offset_at(text, line, character);
     let (name, _, _) = ident_at(text, off)?;
     let (program, _diags) = crate::parser::parse(text);
+    if locally_bound(&program, off, &name) {
+        return None;
+    }
     item_definition(text, &program, &name)
 }
 
@@ -2761,6 +2801,60 @@ mod tests {
         let fun_locs = occurrences_cross_file(src, "mean", fun_off, dir, &empty_buffers);
         assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
         assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 4), "{fun_locs:?}");
+    }
+
+    /// A REAL bug (production-hardening PR-it742): unlike the cross-file rename/
+    /// goto-definition entry points (PR-it704/PR-it739), the SINGLE-FILE `resolve_hover`/
+    /// `resolve_definition` never checked `locally_bound` at all -- hovering or
+    /// goto-definition on a LOCAL variable sharing a bare name with an unrelated
+    /// TOP-LEVEL declaration in the SAME file showed/navigated to that unrelated
+    /// declaration instead of nothing. Also fixes a previously-unfixed SIBLING gap:
+    /// `resolve_hover_cross_file`'s cross-file fallback loop never checked
+    /// `locally_bound` either (unlike `resolve_definition_cross_file`, which PR-it704
+    /// DID patch) -- a local not shadowed by any SAME-file top-level item could still
+    /// reach an unrelated top-level item's signature in a `use`d file.
+    #[test]
+    fn locally_bound_suppresses_same_file_hover_and_definition_into_an_unrelated_top_level_declaration() {
+        let src = "fun mean(xs: List[Int]) -> Float {\n    xs.sum().to_float() / xs.len().to_float()\n}\nfun main() {\n    let mean = 5.0\n    print(mean)\n}\n";
+        let off = src.find("mean = 5.0").unwrap();
+        let line = src[..off].matches('\n').count();
+        let line_start = src[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let ch = off - line_start;
+
+        // Hovering the local must NOT show the unrelated `fun mean`'s signature.
+        assert!(
+            resolve_hover(src, line, ch).is_none(),
+            "hovering a local must not show an unrelated same-file top-level declaration"
+        );
+        // Goto-definition on the local must NOT navigate to the unrelated `fun mean`.
+        assert!(
+            resolve_definition(src, line, ch).is_none(),
+            "goto-definition on a local must not navigate to an unrelated same-file top-level declaration"
+        );
+
+        // Sanity: hovering/goto-def on the TOP-LEVEL `fun mean` itself is unaffected.
+        let fun_off = src.find("fun mean").unwrap() + 4;
+        let fun_line = src[..fun_off].matches('\n').count();
+        let fun_line_start = src[..fun_off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let fun_ch = fun_off - fun_line_start;
+        assert!(resolve_hover(src, fun_line, fun_ch).is_some(), "the real top-level fn must still hover");
+        assert!(resolve_definition(src, fun_line, fun_ch).is_some(), "the real top-level fn must still goto-def");
+
+        // Cross-file hover sibling gap: a local NOT shadowed by any same-file top-level
+        // item must not reach into a `use`d file's unrelated top-level item either.
+        let dir = std::path::Path::new("/fake/lsp-it742");
+        let main_text = "use stats\nfun report() -> Float {\n    let mean = 5.0\n    print(mean)\n    mean\n}\n";
+        let stats_text = "fun mean(xs: List[Int]) -> Float {\n    xs.sum().to_float() / xs.len().to_float()\n}\n";
+        let mut buffers: HashMap<PathBuf, String> = HashMap::new();
+        buffers.insert(dir.join("stats.kupl"), stats_text.to_string());
+        let off2 = main_text.find("mean = 5.0").unwrap();
+        let line2 = main_text[..off2].matches('\n').count();
+        let line2_start = main_text[..off2].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let ch2 = off2 - line2_start;
+        assert!(
+            resolve_hover_cross_file(main_text, line2, ch2, dir, &buffers).is_none(),
+            "a local not shadowed same-file must not reach an unrelated cross-file declaration via hover"
+        );
     }
 
     #[test]
