@@ -1217,8 +1217,12 @@ impl Interp {
                         }
                     };
                     let handler = self.eval(&args[1].value, env)?;
-                    let mut call = |m: String, p: String| -> Result<String, String> {
-                        match self.call_value(handler.clone(), vec![Value::str(m), Value::str(p)], span) {
+                    let mut call = |m: String, p: String, b: String| -> Result<String, String> {
+                        match self.call_value(
+                            handler.clone(),
+                            vec![Value::str(m), Value::str(p), Value::str(b)],
+                            span,
+                        ) {
                             Ok(v) => Ok(v.to_string()),
                             Err(Flow::Panic { msg, .. }) => Err(msg),
                             Err(_) => Err("http_serve handler used non-local control flow".into()),
@@ -3918,14 +3922,34 @@ pub fn http_response(status: &str, body: &str) -> String {
     )
 }
 
+/// A request body larger than this is truncated rather than fully buffered —
+/// mirrors the existing 64KB request-head cap's DoS-prevention rationale, just
+/// sized for bodies (JSON payloads, form posts) rather than header lines.
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Find a `Content-Length` header in a raw request head and return its value,
+/// capped at `MAX_BODY_SIZE`. Missing/unparsable/negative -> 0 (no body).
+fn parse_content_length(head: &str) -> usize {
+    for line in head.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                if let Ok(n) = value.trim().parse::<usize>() {
+                    return n.min(MAX_BODY_SIZE);
+                }
+            }
+        }
+    }
+    0
+}
+
 /// A minimal blocking HTTP server: bind `127.0.0.1:port`, and for each request
-/// call `handler(method, path)` to produce the response body. The socket + HTTP
-/// wire code is shared by both engines (they differ only in how they invoke the
-/// handler value), so behavior is identical. `Err` on bind failure; otherwise
-/// this never returns (it serves forever).
+/// call `handler(method, path, body)` to produce the response body. The
+/// socket + HTTP wire code is shared by both engines (they differ only in how
+/// they invoke the handler value), so behavior is identical. `Err` on bind
+/// failure; otherwise this never returns (it serves forever).
 pub fn serve_http(
     port: i64,
-    handler: &mut dyn FnMut(String, String) -> Result<String, String>,
+    handler: &mut dyn FnMut(String, String, String) -> Result<String, String>,
 ) -> Result<(), String> {
     serve_http_with_read_timeout(port, handler, Some(std::time::Duration::from_secs(30)))
 }
@@ -3938,7 +3962,7 @@ pub fn serve_http(
 /// ever needed.
 fn serve_http_with_read_timeout(
     port: i64,
-    handler: &mut dyn FnMut(String, String) -> Result<String, String>,
+    handler: &mut dyn FnMut(String, String, String) -> Result<String, String>,
     read_timeout: Option<std::time::Duration>,
 ) -> Result<(), String> {
     use std::io::{Read, Write};
@@ -3990,6 +4014,7 @@ fn serve_http_with_read_timeout(
         // read the request head (until the blank line ending the headers)
         let mut buf: Vec<u8> = Vec::new();
         let mut tmp = [0u8; 1024];
+        let mut head_end = None;
         loop {
             if deadline.is_some_and(|dl| std::time::Instant::now() >= dl) {
                 break;
@@ -3998,16 +4023,54 @@ fn serve_http_with_read_timeout(
                 Ok(0) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 64 * 1024 {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        head_end = Some(pos + 4);
+                        break;
+                    }
+                    if buf.len() > 64 * 1024 {
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-        let head = String::from_utf8_lossy(&buf);
+        let head_end = head_end.unwrap_or(buf.len());
+        let head = String::from_utf8_lossy(&buf[..head_end]);
         let (method, path) = parse_request_line(&head);
-        let resp = match handler(method, path) {
+        let content_length = parse_content_length(&head);
+        // A `read()` past the head/body terminator can already have pulled in
+        // some (or all) of the body in the SAME chunk; only read MORE if the
+        // terminator-adjacent bytes don't already satisfy Content-Length.
+        let mut body: Vec<u8> = buf[head_end..].to_vec();
+        if body.len() > content_length {
+            body.truncate(content_length);
+        } else {
+            while body.len() < content_length {
+                if deadline.is_some_and(|dl| std::time::Instant::now() >= dl) {
+                    break;
+                }
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let take = n.min(content_length - body.len());
+                        body.extend_from_slice(&tmp[..take]);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // Strip any embedded NUL from the body, matching parse_request_line's
+        // identical sanitizing of the method/path line (PR-it577) and the
+        // K0008 invariant ("Str is NUL-free UTF-8 text") that governs every
+        // KUPL string, not just source literals -- otherwise native's `k_str`
+        // (a strlen-based C constructor) would silently TRUNCATE the body at
+        // the first embedded NUL where this Rust String preserves it in
+        // full, a fresh cross-engine divergence in a brand-new feature.
+        let mut body = String::from_utf8_lossy(&body).into_owned();
+        if body.contains('\0') {
+            body = body.replace('\0', "");
+        }
+        let resp = match handler(method, path, body) {
             Ok(body) => http_response("200 OK", &body),
             Err(msg) => http_response("500 Internal Server Error", &msg),
         };
@@ -4361,7 +4424,7 @@ mod server_tests {
     #[test]
     fn json_api_routes() {
         let src = r#"
-fun handle(method: Str, path: Str) -> Str {
+fun handle(method: Str, path: Str, body: Str) -> Str {
     let parts = path.split("/")
     if path == "/health" {
         json_stringify(JObj(Map().insert("status", JStr("ok"))))
@@ -4405,7 +4468,7 @@ fun main() uses io { let _ = http_serve(38131, handle) }
     fn serves_a_request() {
         let port: u16 = 38111;
         std::thread::spawn(move || {
-            let mut h = |m: String, p: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
+            let mut h = |m: String, p: String, _b: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
             let _ = serve_http(port as i64, &mut h);
         });
         let mut stream = None;
@@ -4423,6 +4486,65 @@ fun main() uses io { let _ = http_serve(38131, handle) }
         let _ = stream.read_to_string(&mut resp);
         assert!(resp.contains("HTTP/1.1 200 OK"), "resp: {resp}");
         assert!(resp.ends_with("GET /world"), "resp: {resp}");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it721): `http_serve`'s
+    /// handler was only ever given `(method, path)` -- the request BODY was
+    /// read off the wire (to find the head/body terminator) and then simply
+    /// discarded, making it impossible to implement a real POST/PUT JSON API
+    /// endpoint (the flagship `examples/demos/api.kupl` worked around this by
+    /// encoding all data in the URL path instead of a real request body).
+    /// Confirms the handler now receives the body as its 3rd argument, in
+    /// TWO shapes that previously required different code paths internally:
+    /// (1) the whole body arrives in the SAME `read()` as the head/terminator
+    /// (the common case for a short body), and (2) the body arrives in a
+    /// LATER, separate `write_all` (proving the follow-up read loop -- not
+    /// just the terminator-adjacent bytes -- is exercised too).
+    #[test]
+    fn serve_http_exposes_the_request_body_via_content_length() {
+        let port: u16 = 38112;
+        std::thread::spawn(move || {
+            let mut h = |m: String, p: String, b: String| -> Result<String, String> {
+                Ok(format!("{m} {p} [{b}]"))
+            };
+            let _ = serve_http(port as i64, &mut h);
+        });
+        let connect = || {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        // shape 1: head + full body land in a single write (and thus, very
+        // likely, a single `read()` on the server side).
+        let mut s1 = connect().expect("server should be listening");
+        s1.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        s1.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world")
+            .unwrap();
+        let mut resp1 = String::new();
+        let _ = s1.read_to_string(&mut resp1);
+        assert!(resp1.ends_with("POST /echo [hello world]"), "resp1: {resp1}");
+        // shape 2: the head arrives first, then the body trickles in via a
+        // SEPARATE write shortly after -- proves the post-terminator read
+        // loop (not just bytes already sitting in the head's own read) works.
+        let mut s2 = connect().expect("server should be listening");
+        s2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        s2.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        s2.write_all(b"later").unwrap();
+        let mut resp2 = String::new();
+        let _ = s2.read_to_string(&mut resp2);
+        assert!(resp2.ends_with("POST /echo [later]"), "resp2: {resp2}");
+        // no Content-Length -> empty body, unchanged from the pre-fix shape.
+        let mut s3 = connect().expect("server should be listening");
+        s3.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        s3.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut resp3 = String::new();
+        let _ = s3.read_to_string(&mut resp3);
+        assert!(resp3.ends_with("GET /world []"), "resp3: {resp3}");
     }
 
     /// A REAL, SEVERE availability bug found+fixed (production-hardening
@@ -4445,7 +4567,7 @@ fun main() uses io { let _ = http_serve(38131, handle) }
     fn serve_http_recovers_from_a_stalled_slow_client() {
         let port: u16 = 38113;
         std::thread::spawn(move || {
-            let mut h = |m: String, p: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
+            let mut h = |m: String, p: String, _b: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
             let _ = serve_http_with_read_timeout(
                 port as i64,
                 &mut h,
@@ -4511,7 +4633,7 @@ fun main() uses io { let _ = http_serve(38131, handle) }
     fn serve_http_closes_a_trickle_connection_that_never_finishes() {
         let port: u16 = 38114;
         std::thread::spawn(move || {
-            let mut h = |m: String, p: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
+            let mut h = |m: String, p: String, _b: String| -> Result<String, String> { Ok(format!("{m} {p}")) };
             let _ = serve_http_with_read_timeout(
                 port as i64,
                 &mut h,

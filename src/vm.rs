@@ -745,9 +745,12 @@ impl<'m> Vm<'m> {
                                 _ => return Err(VmError { msg: "http_serve port must be an Int".into(), span }),
                             };
                             let handler = args[1].clone();
-                            let mut call = |m: String, p: String| -> Result<String, String> {
-                                self.call_value_nested(handler.clone(), vec![Value::str(m), Value::str(p)])
-                                    .map(|v| v.to_string())
+                            let mut call = |m: String, p: String, b: String| -> Result<String, String> {
+                                self.call_value_nested(
+                                    handler.clone(),
+                                    vec![Value::str(m), Value::str(p), Value::str(b)],
+                                )
+                                .map(|v| v.to_string())
                             };
                             let v = match crate::interp::serve_http(port, &mut call) {
                                 Ok(()) => Value::ok(Value::Unit),

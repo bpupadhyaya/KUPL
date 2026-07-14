@@ -31,6 +31,7 @@ runaway program fails cleanly instead of taking down the host. Each is enforced 
 | Regex backtracking | `10_000_000` steps | shared matcher (`regex.rs` `MATCH_BUDGET`) + native (`cgen.rs` `kre_steps`) — a catastrophic-backtracking (ReDoS) pattern errors cleanly instead of hanging |
 | `.kx` / bundle module length | validated ≤ remaining bytes | loader (`kx.rs`) — a tampered/corrupt count or trailer length is rejected, never over-allocated or sliced out of bounds (no OOM / panic) |
 | LSP message size | `64 MiB` | language server frame reader (`lsp.rs` `MAX_MESSAGE_LEN`) — refuses an oversized `Content-Length` before allocating |
+| `http_serve` request head / body | `64 KiB` head, `10 MiB` body | interpreter (`interp.rs` — head-read loop, `MAX_BODY_SIZE`), native (`cgen.rs` — the same 64KB head cap, `K_MAX_HTTP_BODY`) — a request head or `Content-Length` body larger than the cap is truncated rather than fully buffered |
 | String contents | no NUL bytes | lexer rejects `\0` and raw NUL (diagnostic `K0008`) — keeps strings safe across the native C runtime, which is NUL-terminated |
 
 ### Crash safety

@@ -3017,10 +3017,46 @@ static const char* k_memfind(const char* hay, long hlen, const char* needle, lon
     for (long i = 0; i <= hlen - nlen; i++) if (memcmp(hay + i, needle, (size_t)nlen) == 0) return hay + i;
     return 0;
 }
+/* A request body larger than this is truncated rather than fully buffered --
+   mirrors interp::MAX_BODY_SIZE (production-hardening PR-it721), sized for
+   bodies (JSON payloads, form posts) the same way the pre-existing 64KB
+   request-head cap is sized for header lines. */
+#define K_MAX_HTTP_BODY (10 * 1024 * 1024)
+static int k_ieq_ascii(char a, char b) {
+    if (a >= 'A' && a <= 'Z') a += 32;
+    if (b >= 'A' && b <= 'Z') b += 32;
+    return a == b;
+}
+/* Find a `Content-Length` header in a raw request head (case-insensitive
+   name, must start a line) and return its value, capped at K_MAX_HTTP_BODY.
+   Missing/unparsable -> 0 (no body). Mirrors interp::parse_content_length. */
+static long k_content_length(const char* head, long head_len) {
+    static const char* NEEDLE = "content-length:";
+    const long nlen = 15;
+    for (long i = 0; i < head_len; i++) {
+        if (i != 0 && head[i - 1] != '\n') continue;
+        if (i + nlen > head_len) continue;
+        int match = 1;
+        for (long k = 0; k < nlen; k++) if (!k_ieq_ascii(head[i + k], NEEDLE[k])) { match = 0; break; }
+        if (!match) continue;
+        long j = i + nlen;
+        while (j < head_len && (head[j] == ' ' || head[j] == '\t')) j++;
+        long start = j;
+        while (j < head_len && head[j] >= '0' && head[j] <= '9') j++;
+        if (j == start) return 0;
+        long v = 0;
+        for (long k = start; k < j; k++) {
+            if (v > K_MAX_HTTP_BODY) { v = K_MAX_HTTP_BODY; continue; }
+            v = v * 10 + (head[k] - '0');
+        }
+        return v > K_MAX_HTTP_BODY ? K_MAX_HTTP_BODY : v;
+    }
+    return 0;
+}
 /* http_serve(port, handler): a blocking HTTP server mirroring
    interp::serve_http. Binds 127.0.0.1:port, and for each request calls the KUPL
-   handler value with (method, path) to get the response body. Err on bind
-   failure; otherwise never returns. */
+   handler value with (method, path, body) to get the response body. Err on
+   bind failure; otherwise never returns. */
 static KValue k_http_serve(KValue port, KValue handler) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { char m[64]; snprintf(m, sizeof m, "cannot bind 127.0.0.1:%lld: socket", (long long)port.as.i); return k_err(k_str(k_strdup(m))); }
@@ -3083,22 +3119,63 @@ static KValue k_http_serve(KValue port, KValue handler) {
         /* read the request head until the blank line (or a 64KB cap) */
         KBuf head = { 0, 0, 0 };
         char buf[1024]; ssize_t n;
+        long head_end = -1;
         while (time(0) < deadline && (n = read(conn, buf, sizeof buf)) > 0) {
             kb_write(&head, buf, n);
-            if (head.len >= 4 && k_memfind(head.buf, (long)head.len, "\r\n\r\n", 4)) break;
+            if (head.len >= 4) {
+                const char* term = k_memfind(head.buf, (long)head.len, "\r\n\r\n", 4);
+                if (term) { head_end = (long)(term - head.buf) + 4; break; }
+            }
             if (head.len > 64 * 1024) break;
         }
-        /* Strip any embedded NUL from the request head before the strchr/strstr-
-           based parsing below, which -- like the OLD terminator search -- treats
-           the buffer as a NUL-terminated C string and would otherwise silently
-           truncate `method`/`path` at the first one. KUPL strings are NUL-free
-           (K0008); mirrors interp::parse_request_line's equivalent sanitizing
-           (PR-it577). */
+        if (head_end < 0) head_end = (long)head.len;
+        /* Copy off any req_body bytes the SAME read already pulled in past the
+           head terminator (production-hardening PR-it721) BEFORE the NUL-
+           stripping below reshuffles the buffer -- mirrors interp.rs's
+           identical split (`buf[head_end..]`). */
+        long body_have = (long)head.len - head_end;
+        if (body_have < 0) body_have = 0;
+        KBuf req_body = { 0, 0, 0 };
+        if (body_have > 0) kb_write(&req_body, head.buf + head_end, body_have);
+        /* Strip any embedded NUL from the request head (head_end bytes only)
+           before the strchr/strstr-based parsing below, which -- like the OLD
+           terminator search -- treats the buffer as a NUL-terminated C string
+           and would otherwise silently truncate `method`/`path` at the first
+           one. KUPL strings are NUL-free (K0008); mirrors
+           interp::parse_request_line's equivalent sanitizing (PR-it577). */
         if (head.buf) {
             long w = 0;
-            for (long r = 0; r < (long)head.len; r++) if (head.buf[r] != 0) head.buf[w++] = head.buf[r];
-            head.len = (size_t)w;
-            head.buf[head.len] = 0;
+            for (long r = 0; r < head_end; r++) if (head.buf[r] != 0) head.buf[w++] = head.buf[r];
+            head_end = w;
+            head.buf[head_end] = 0;
+        }
+        /* Content-Length: read the rest of the req_body if it didn't already
+           fully arrive in the head's own read (production-hardening
+           PR-it721), bounded by the SAME connection deadline used for the
+           head above -- mirrors interp.rs's identical follow-up read loop. */
+        long content_length = k_content_length(head.buf, head_end);
+        if ((long)req_body.len > content_length) {
+            req_body.len = (size_t)content_length;
+            if (req_body.buf) req_body.buf[req_body.len] = 0;
+        } else {
+            while ((long)req_body.len < content_length && time(0) < deadline) {
+                ssize_t bn = read(conn, buf, sizeof buf);
+                if (bn <= 0) break;
+                long need = content_length - (long)req_body.len;
+                kb_write(&req_body, buf, bn < need ? bn : need);
+            }
+        }
+        /* Strip any embedded NUL from the req_body too, matching the same K0008
+           invariant as the head above and interp.rs's identical req_body
+           stripping (production-hardening PR-it721) -- otherwise the
+           strlen-based k_str() call below would silently TRUNCATE the req_body
+           at the first embedded NUL, a fresh cross-engine divergence in a
+           brand-new feature. */
+        if (req_body.buf) {
+            long w = 0;
+            for (long r = 0; r < (long)req_body.len; r++) if (req_body.buf[r] != 0) req_body.buf[w++] = req_body.buf[r];
+            req_body.len = (size_t)w;
+            req_body.buf[req_body.len] = 0;
         }
         /* parse the request line: METHOD PATH HTTP/1.1. A REAL cross-engine
            DIVERGENCE found+fixed (production-hardening PR-it664, the SAME
@@ -3138,7 +3215,7 @@ static KValue k_http_serve(KValue port, KValue handler) {
                 }
             }
         }
-        KValue hargs[2] = { k_str(method), k_str(path) };
+        KValue hargs[3] = { k_str(method), k_str(path), k_str(req_body.buf ? req_body.buf : "") };
         /* Catch a REAL panic from the handler and convert it to a 500 response
            (PR-it559 fix): mirrors interp.rs's serve_http caller
            (interp.rs:1219-1225), which explicitly catches the handler's panic
@@ -3152,7 +3229,7 @@ static KValue k_http_serve(KValue port, KValue handler) {
         const char* status; const char* body;
         jmp_buf handler_pad; jmp_buf* prev_pad = k_pad; k_pad = &handler_pad;
         if (setjmp(handler_pad) == 0) {
-            KValue rv = k_call(handler, hargs, 2);
+            KValue rv = k_call(handler, hargs, 3);
             k_pad = prev_pad;
             status = "200 OK";
             body = rv.tag == K_STR ? rv.as.s : "";
@@ -10205,7 +10282,7 @@ fun main() uses io {
             return;
         }
         use std::io::{Read, Write};
-        let src = "fun h(m: Str, p: Str) -> Str { \"{m} {p}\" }\n\
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str { \"{m} {p}\" }\n\
                    fun main() uses io { let _ = http_serve(38121, h) }\n";
         let compiled = crate::run::compile(src).expect("compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
@@ -10246,6 +10323,71 @@ fun main() uses io {
         result.unwrap();
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it721, the native mirror
+    /// of interp.rs's `serve_http_exposes_the_request_body_via_content_length`):
+    /// `k_http_serve`'s handler was only ever given `(method, path)` -- the
+    /// request BODY was read off the wire (to find the head/body terminator)
+    /// and then simply discarded. Confirms the handler now receives the body
+    /// as its 3rd argument, in the same two shapes as the interp.rs test: the
+    /// whole body landing in the SAME read as the head terminator, and the
+    /// body arriving via a separate, later write.
+    #[test]
+    fn native_http_serve_exposes_the_request_body_via_content_length() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str { \"{m} {p} [{b}]\" }\n\
+                   fun main() uses io { let _ = http_serve(38129, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srv-body-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let mut stream = None;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38129u16)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let result = (|| {
+            // shape 1: head + full body in a single write.
+            let mut s1 = stream.ok_or("server should be listening")?;
+            s1.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s1.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world")
+                .map_err(|e| e.to_string())?;
+            let mut resp1 = String::new();
+            let _ = s1.read_to_string(&mut resp1);
+            if !resp1.ends_with("POST /echo [hello world]") {
+                return Err(format!("bad resp1: {resp1}"));
+            }
+            // shape 2: the body trickles in via a separate write shortly after.
+            let mut s2 = std::net::TcpStream::connect(("127.0.0.1", 38129u16)).map_err(|e| e.to_string())?;
+            s2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s2.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n").map_err(|e| e.to_string())?;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            s2.write_all(b"later").map_err(|e| e.to_string())?;
+            let mut resp2 = String::new();
+            let _ = s2.read_to_string(&mut resp2);
+            if !resp2.ends_with("POST /echo [later]") {
+                return Err(format!("bad resp2: {resp2}"));
+            }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
     /// A REAL BUG found+fixed (bug-hunt batch 167, PR-it559, found via an Explore-agent
     /// survey of tensors [exhausted, clean] vs HTTP [this]): native's `k_http_serve` had
     /// NO panic-catching landing pad around the handler call, unlike interp.rs's
@@ -10267,7 +10409,7 @@ fun main() uses io {
             return;
         }
         use std::io::{Read, Write};
-        let src = "fun h(m: Str, p: Str) -> Str {\n    \
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str {\n    \
                    if p == \"/boom\" {\n        let x = 1 / 0\n        \"unreached {x}\"\n    } else {\n        \"ok {p}\"\n    }\n}\n\
                    fun main() uses io { let _ = http_serve(38122, h) }\n";
         let compiled = crate::run::compile(src).expect("compiles");
@@ -10342,7 +10484,7 @@ fun main() uses io {
             return;
         }
         use std::io::{Read, Write};
-        let src = "fun h(m: Str, p: Str) -> Str { \"{m.len()} {p.len()}\" }\n\
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str { \"{m.len()} {p.len()}\" }\n\
                    fun main() uses io { let _ = http_serve(38123, h) }\n";
         let compiled = crate::run::compile(src).expect("compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
@@ -10412,7 +10554,7 @@ fun main() uses io {
             return;
         }
         use std::io::{Read, Write};
-        let src = "fun h(m: Str, p: Str) -> Str { \"{m}|{p}\" }\n\
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str { \"{m}|{p}\" }\n\
                    fun main() uses io { let _ = http_serve(38126, h) }\n";
         let compiled = crate::run::compile(src).expect("compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
@@ -10484,7 +10626,7 @@ fun main() uses io {
             return;
         }
         use std::io::{Read, Write};
-        let src = "fun h(m: Str, p: Str) -> Str { \"{m} {p}\" }\n\
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str { \"{m} {p}\" }\n\
                    fun main() uses io { let _ = http_serve(38124, h) }\n";
         let compiled = crate::run::compile(src).expect("compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
@@ -10572,7 +10714,7 @@ fun main() uses io {
             return;
         }
         use std::io::{Read, Write};
-        let src = "fun h(m: Str, p: Str) -> Str { \"{m} {p}\" }\n\
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str { \"{m} {p}\" }\n\
                    fun main() uses io { let _ = http_serve(38125, h) }\n";
         let compiled = crate::run::compile(src).expect("compiles");
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();

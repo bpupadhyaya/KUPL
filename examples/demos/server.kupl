@@ -4,16 +4,18 @@
 //   kupl run examples/demos/server.kupl        # then: curl http://127.0.0.1:8080/hello
 //
 //   http_serve(port, handler) -> Result[Unit, Str]
-//     binds 127.0.0.1:port and calls handler(method, path) -> response body for
-//     each request (200 text/plain). Returns Err only if the port can't be bound;
-//     otherwise it never returns. Carries the io.net effect. (Native: use `kupl
-//     run`/`--vm`/`bundle` — native sockets are a follow-up.)
+//     binds 127.0.0.1:port and calls handler(method, path, body) -> response
+//     body for each request (200 text/plain); `body` is read via the
+//     request's Content-Length header (capped at 10MB, empty if none).
+//     Returns Err only if the port can't be bound; otherwise it never
+//     returns. Carries the io.net effect. Works identically on `kupl
+//     run`/`--vm`/`bundle`/`native`.
 
-fun route(method: Str, path: Str) -> Str {
+fun route(method: Str, path: Str, body: Str) -> Str {
     match path {
         "/" => "Welcome to KUPL's HTTP server!\n"
         "/health" => "ok\n"
-        _ => "You sent {method} {path}\n"
+        _ => "You sent {method} {path} (body: {body})\n"
     }
 }
 

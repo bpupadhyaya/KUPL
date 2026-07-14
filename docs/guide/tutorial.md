@@ -888,11 +888,14 @@ $ ./app
 ## 18a. A web server
 
 KUPL can serve HTTP. `http_serve(port, handler)` binds a port and calls your
-`handler(method, path) -> Str` for each request (it blocks and serves forever):
+`handler(method, path, body) -> Str` for each request (it blocks and serves
+forever). `body` is read according to the request's `Content-Length` header
+(capped at 10MB; empty for a request with none) — request headers themselves
+aren't exposed yet:
 
 ```kupl
-fun route(method: Str, path: Str) -> Str {
-    if path == "/health" { "ok" } else { "you sent {method} {path}" }
+fun route(method: Str, path: Str, body: Str) -> Str {
+    if path == "/health" { "ok" } else { "you sent {method} {path}: {body}" }
 }
 
 fun main() uses io {

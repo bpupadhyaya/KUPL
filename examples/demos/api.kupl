@@ -8,6 +8,9 @@
 //   curl http://127.0.0.1:8080/add/2/3      # {"sum":5}
 //   curl http://127.0.0.1:8080/echo/hello   # {"you_said":"hello"}
 //   curl http://127.0.0.1:8080/time/0       # {"epoch":0,"iso":"1970-01-01T00:00:00Z"}
+//   curl -d hi http://127.0.0.1:8080/echo_body   # {"you_said":"hi"} -- a real
+//                                                 # POST-with-body endpoint (not
+//                                                 # data smuggled through the URL)
 //
 // It stitches together http_serve + json_stringify + routing + the stdlib. The
 // same request produces the same JSON on every engine (interpreter, KVM, native)
@@ -49,12 +52,15 @@ fun route_time(epoch: Str) -> Str {
     }
 }
 
-// The router: method + path -> JSON response body.
-fun handle(method: Str, path: Str) -> Str {
+// The router: method + path + body -> JSON response body.
+fun handle(method: Str, path: Str, body: Str) -> Str {
     let parts = path.split("/")
     match path {
         "/" => json_stringify(JObj(Map().insert("service", JStr("kupl-api")).insert("version", JNum(1.0))))
         "/health" => ok_status()
+        // A real POST-with-body endpoint: `body` comes straight from the
+        // request's Content-Length-delimited body, not the URL path.
+        "/echo_body" => json_stringify(JObj(Map().insert("you_said", JStr(body))))
         _ => {
             if parts.len() == 4 && parts.get(1) == Some("add") {
                 route_add(parts.get(2).unwrap_or(""), parts.get(3).unwrap_or(""))
