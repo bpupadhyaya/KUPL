@@ -1358,13 +1358,41 @@ fn folding_ranges(text: &str) -> Option<String> {
 }
 
 /// Below this many collected files, `collect_kupl_files` keeps recursing --
-/// a hard ceiling so a huge or symlink-cyclic tree can't hang the server.
+/// a hard ceiling so a huge tree can't hang the server.
 const MAX_WORKSPACE_FILES: usize = 5000;
 
 /// Recursively collect every `.kupl` file under `root`, skipping hidden
 /// directories (`.git`, editor dirs) and `target` -- this repo's OWN build
 /// output is enormous; scanning it would make `workspace/symbol` pathologically
 /// slow on a real KUPL checkout, for files that were never source anyway.
+///
+/// A REAL bug found+fixed (production-hardening PR-it732): this used
+/// `path.is_dir()`, which FOLLOWS symlinks (it calls `fs::metadata`, not
+/// `symlink_metadata`) -- so a symlinked directory was walked exactly like
+/// an ordinary one, including a directory symlinked back to itself or an
+/// ancestor. A live revert-and-verify test (constructing exactly that
+/// cycle) DISPROVED the initially-suspected stack-overflow crash, though:
+/// this function builds its `root` argument by repeated `entry.path()`
+/// string concatenation, so the constructed path grows by at least one
+/// path component on EVERY recursive call regardless of what the
+/// underlying symlinks resolve to at the OS level -- a cyclic symlink
+/// therefore hits the OS's path-length limit (`ENAMETOOLONG`, already
+/// handled cleanly by the `let Ok(entries) = ... else { return }` above)
+/// after a few hundred to a couple thousand recursions, FAR below what's
+/// needed to exhaust even a modest thread stack. So this is NOT the
+/// uncatchable-crash class of bug that `json::MAX_JSON_DEPTH`/
+/// `kx.rs::decode_shape`/`regex.rs`'s group-nesting cap fixed. It's still
+/// worth fixing on its own, lower-severity terms: following a symlinked
+/// directory means a workspace scan can silently re-visit and duplicate
+/// content already reachable another way (confusing `workspace/symbol`
+/// results with the same symbol reported twice under different paths), and
+/// a self-referencing cycle still wastes hundreds of pointless syscalls
+/// before erroring out. Standard directory-walking tools (ripgrep, fd,
+/// most language servers) deliberately do NOT follow symlinks during a
+/// workspace scan for exactly these reasons. Fixed by switching to
+/// `entry.file_type()` (backed by `symlink_metadata`, which does NOT
+/// follow symlinks) instead of `path.is_dir()` -- a symlinked directory now
+/// reports `is_dir() == false` and is simply never recursed into.
 fn collect_kupl_files(root: &std::path::Path, out: &mut Vec<PathBuf>) {
     if out.len() >= MAX_WORKSPACE_FILES {
         return;
@@ -1377,7 +1405,8 @@ fn collect_kupl_files(root: &std::path::Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if file_type.is_dir() {
             if name.starts_with('.') || name == "target" {
                 continue;
             }
@@ -3194,6 +3223,68 @@ mod tests {
 
         // a query matching nothing returns an empty (not null/error) result
         assert_eq!(workspace_symbols(&dir, "zzz_nonexistent", &HashMap::new()), "[]");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it732): `collect_kupl_files`
+    /// used `path.is_dir()`, which FOLLOWS symlinks -- so a symlinked directory
+    /// was scanned exactly like an ordinary one, letting the same content be
+    /// silently re-visited (and reported twice, under two different paths) via
+    /// whatever symlink happened to reach it. `sibling/marked.kupl` lives OUTSIDE
+    /// `dir` (the workspace root) and is reachable ONLY through `dir/link`, a
+    /// symlink to `sibling` -- with the fix, `link` reports `is_dir() == false`
+    /// (via `entry.file_type()`, which does NOT follow symlinks) and is simply
+    /// never recursed into, so `marked` is correctly NOT found. (An initial
+    /// draft of this fix was suspected to also close an uncatchable stack-overflow
+    /// crash via a self-referencing symlink cycle -- a live revert-and-verify
+    /// DISPROVED that: `collect_kupl_files` builds its `root` argument by
+    /// repeated path-string concatenation, so a cyclic symlink hits the OS's
+    /// path-length limit `ENAMETOOLONG` -- already handled cleanly -- after a
+    /// few hundred/thousand recursions, far below what's needed to overflow a
+    /// thread stack. See the long comment on `collect_kupl_files` itself.)
+    #[test]
+    fn workspace_symbol_search_does_not_follow_a_symlinked_directory() {
+        let dir = std::env::temp_dir().join(format!("kupl-lsp-symlink-test-{}", std::process::id()));
+        let sibling = std::env::temp_dir().join(format!("kupl-lsp-symlink-sibling-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(dir.join("real.kupl"), "fun real(a: Int) -> Int {\n    a\n}\n").unwrap();
+        std::fs::write(sibling.join("hidden.kupl"), "fun marked(a: Int) -> Int {\n    a\n}\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sibling, dir.join("link")).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&sibling, dir.join("link"));
+
+        let matches = workspace_symbols(&dir, "real", &HashMap::new());
+        assert!(matches.contains("\"name\":\"real\""), "{matches}");
+        // the symlinked directory is never entered, so its content is invisible
+        assert_eq!(workspace_symbols(&dir, "marked", &HashMap::new()), "[]");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    /// A directory symlinked back to itself (or an ancestor) must not hang or
+    /// crash the scan -- see the long comment on `collect_kupl_files` for why
+    /// this was never actually an unbounded-recursion crash risk in the first
+    /// place (the function's own path-growing recursion structure is
+    /// self-bounding via the OS's path-length limit), but it's still worth a
+    /// permanent regression test confirming the pathological case terminates
+    /// cleanly and doesn't affect finding real content elsewhere in the tree.
+    #[test]
+    fn workspace_symbol_search_survives_a_self_referencing_symlink_cycle() {
+        let dir = std::env::temp_dir().join(format!("kupl-lsp-symlink-cycle-test-{}", std::process::id()));
+        let cyclic = dir.join("cyclic");
+        std::fs::create_dir_all(&cyclic).unwrap();
+        std::fs::write(dir.join("real.kupl"), "fun real(a: Int) -> Int {\n    a\n}\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cyclic, cyclic.join("loop")).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&cyclic, cyclic.join("loop"));
+
+        let matches = workspace_symbols(&dir, "real", &HashMap::new());
+        assert!(matches.contains("\"name\":\"real\""), "{matches}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
