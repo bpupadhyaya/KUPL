@@ -14486,6 +14486,52 @@ fun probe() -> Str {
         assert_eq!(differential(s), "true|1|1");
     }
 
+    /// A coverage-closing verification (production-hardening PR-it716; no bug
+    /// found -- deferred four times across it712-it715 as a "genuinely fresh
+    /// angle," finally dug into directly per those iterations' own lesson
+    /// about not deferring a repeatedly-flagged candidate). PR-it691's
+    /// `diff_map_set_nan_key_identity` only ever tested a Map/Set containing
+    /// a NaN key/element IN ISOLATION (checking `.len()`/`.get()`/
+    /// `.contains_key()`); it never checked the interaction between NaN's
+    /// special-cased identity (`value_key_eq`) and `Map`/`Set`'s documented
+    /// "updates in place positionally" INSERTION-ORDER contract when a NaN
+    /// key/element coexists with ORDINARY real keys -- i.e. does re-
+    /// inserting a NaN key that sits in the MIDDLE of an otherwise-ordinary
+    /// Map/Set correctly update in place at its ORIGINAL position (matching
+    /// `diff_map_set_self_insert_in_place_positionally`'s non-NaN contract),
+    /// or could it duplicate/move/otherwise corrupt iteration order the way
+    /// the PRE-it691 bug corrupted `len()`/`get()`? Confirmed live across
+    /// interp, KVM, AND native (`kupl native`) BEFORE writing this test:
+    /// already correct -- `Value::Map`/`Value::Set` are `Vec`-backed
+    /// insertion-ordered containers where `insert` does a linear
+    /// `value_key_eq`-based find-and-replace-in-place (or push if absent),
+    /// so NaN's special-cased identity composes correctly with positional
+    /// ordering by construction, with no separate "order" logic that could
+    /// diverge from the key-identity logic it691 already fixed. This test
+    /// closes the coverage gap so a FUTURE regression in either mechanism
+    /// (the `value_key_eq` NaN special-case, OR the positional-update
+    /// `insert` logic) is caught, byte-identical on interp/KVM.
+    #[test]
+    fn diff_map_set_nan_key_element_preserves_insertion_order_among_real_keys() {
+        let m = r#"fun probe() -> Str {
+    let nan = 0.0 / 0.0
+    let m = Map().insert(1.0, "a").insert(nan, "b").insert(3.0, "c").insert(nan, "b2").remove(1.0)
+    "{m.keys()}|{m.values()}|{m}"
+}
+"#;
+        assert_eq!(
+            differential(m),
+            r#"[NaN, 3.0]|["b2", "c"]|Map{NaN: "b2", 3.0: "c"}"#
+        );
+        let s = r#"fun probe() -> Str {
+    let nan = 0.0 / 0.0
+    let s = Set([1.0, nan, 3.0]).insert(nan).remove(1.0)
+    "{s.to_list()}"
+}
+"#;
+        assert_eq!(differential(s), "[NaN, 3.0]");
+    }
+
     #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose
