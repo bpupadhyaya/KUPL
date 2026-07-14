@@ -1912,6 +1912,35 @@ pub fn serve() -> i32 {
             send(&mut stdout, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}");
             continue;
         };
+        // A REAL, live-confirmed silent-hang-the-client bug found+fixed
+        // (production-hardening PR-it755), the SAME root cause and severity
+        // class as PR-it620's own parse-error fix above, just a DIFFERENT
+        // malformed message SHAPE that fix didn't cover: valid JSON whose
+        // TOP-LEVEL value is an array (a base JSON-RPC 2.0 "batch") rather
+        // than an object. `Json::get`/`msg.get("method")`/`msg.get("id")`
+        // only ever match `Json::Obj` (see `Json::get` above), so a
+        // top-level `Json::Arr` makes BOTH return `None` -- `method`
+        // silently defaults to `""`, which falls into the dispatch match's
+        // catch-all `_` arm, and since `id` is ALSO `None` there, that
+        // arm's own `if let Some(id) = id { ...respond... }` never fires
+        // either: NO response is ever sent for the whole message, so any
+        // request nested inside the batch (each with its OWN legitimate
+        // `id`) is left waiting forever for a reply that will never come.
+        // The LSP specification explicitly states batching is NOT
+        // supported (unlike the base JSON-RPC 2.0 protocol it otherwise
+        // follows), so a spec-compliant client should never send one --
+        // but this server had no defensive check at all, silently
+        // swallowing the message instead of reporting the violation.
+        // Mirrors PR-it620's OWN precedent exactly: report a clean
+        // JSON-RPC error (`id: null`, since a batch envelope has no single
+        // `id` of its own to report) rather than staying silent.
+        if matches!(msg, Json::Arr(_)) {
+            send(
+                &mut stdout,
+                "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request: batch requests are not supported\"}}",
+            );
+            continue;
+        }
         let method = msg.get("method").and_then(Json::str).unwrap_or("");
         let id = msg.get("id");
 
@@ -3301,6 +3330,89 @@ mod tests {
             symbol_reply.contains("example_function_marker_it754"),
             "the original document must survive an incremental-style didChange intact -- \
              the buffer was corrupted down to just the malformed edit's fragment: {symbol_reply}"
+        );
+    }
+
+    /// A REAL, live-confirmed silent-hang-the-client bug found+fixed
+    /// (production-hardening PR-it755) -- the SAME root cause and severity
+    /// class as PR-it620's own parse-error fix (a message this server can't
+    /// process used to be silently dropped instead of cleanly erroring),
+    /// just a DIFFERENT malformed message SHAPE: valid JSON whose TOP-LEVEL
+    /// value is an ARRAY (a base JSON-RPC 2.0 "batch") rather than an
+    /// object. `Json::get` only ever matches `Json::Obj`, so a top-level
+    /// `Json::Arr` made both `method` and `id` extraction return `None` --
+    /// `method` defaulted to `""` (falling into the dispatch match's
+    /// catch-all arm), and since `id` was ALSO `None` there, that arm's own
+    /// `if let Some(id) = id { ...respond... }` never fired: NO response
+    /// was ever sent for the whole batch, so a request nested inside it
+    /// (with its OWN legitimate `id`) waited forever for a reply that would
+    /// never come. The LSP specification explicitly states batching is NOT
+    /// supported (unlike the base JSON-RPC 2.0 protocol it otherwise
+    /// follows), so a compliant client should never send one -- but this
+    /// server had no defensive check at all. Spawns the REAL `kupl lsp`
+    /// process (this file's own established subprocess-test pattern):
+    /// sends `initialize`, then a top-level ARRAY containing one
+    /// well-formed request, then a normal request -- confirms the batch
+    /// gets a clean `-32600`/`id:null` error reply (not silence), and the
+    /// server stays alive and answers the normal request afterward.
+    #[test]
+    fn a_top_level_json_rpc_batch_array_gets_a_clean_error_reply_not_silence() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        // a top-level ARRAY (a JSON-RPC batch) containing one well-formed
+        // request with its OWN id (100) -- the LSP spec forbids this shape.
+        let batch = r#"[{"jsonrpc":"2.0","id":100,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"file:///nonexistent.kupl"}}}]"#;
+        let folding = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"file:///nonexistent.kupl"}}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init, batch, folding] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung reading a top-level JSON-RPC batch array");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+
+        let bodies: Vec<&str> = stdout
+            .split("Content-Length:")
+            .filter(|s| !s.trim().is_empty())
+            .map(|chunk| chunk.split("\r\n\r\n").nth(1).unwrap_or("").trim())
+            .collect();
+        assert!(bodies.len() >= 2, "expected at least 2 responses (init + batch error), got {bodies:?}");
+        let batch_reply = bodies.iter().find(|b| b.contains("-32600"));
+        assert!(
+            batch_reply.is_some(),
+            "expected a -32600 Invalid Request reply for the batch array, got no such reply -- \
+             the batch (and any request nested inside it, id:100) was silently dropped: {bodies:?}"
+        );
+        assert!(
+            batch_reply.unwrap().contains("\"id\":null"),
+            "batch rejection reply must use id:null (no single id belongs to the whole batch): {}",
+            batch_reply.unwrap()
+        );
+        let final_reply = bodies.last().unwrap();
+        assert!(
+            final_reply.contains("\"id\":2"),
+            "server must still answer a normal request after the batch array: {final_reply}"
         );
     }
 
