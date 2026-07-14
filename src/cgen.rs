@@ -3611,7 +3611,9 @@ struct KReAtom {
     KReAlts group;
 };
 typedef struct { KReAlts alts; int astart, aend; } KRegex;
-typedef struct { const unsigned char* s; int pos, len, aend, err; const char* msg; } KReP;
+/* `depth` tracks `(...)` group nesting -- see kre_atom's `(` arm and the
+   production-hardening PR-it731 comment there for why it's needed. */
+typedef struct { const unsigned char* s; int pos, len, aend, err, depth; const char* msg; } KReP;
 
 static KReAlts kre_alternation(KReP* p);
 static void kre_fail(KReP* p, const char* m) { if (!p->err) { p->err = 1; p->msg = m; } }
@@ -3732,7 +3734,21 @@ static KReAtom* kre_atom(KReP* p) {
     memset(a, 0, sizeof(KReAtom));
     int c = kre_peek(p);
     if (c == '(') {
-        p->pos++; a->kind = 3; a->group = kre_alternation(p);
+        p->pos++;
+        /* A REAL cross-engine bug (production-hardening PR-it731, mirroring
+           regex.rs's identical fix -- see the long comment on `Parser::depth`
+           there for the full rationale): kre_atom -> kre_alternation ->
+           kre_sequence -> kre_atom is direct mutual recursion on the native C
+           stack with NO depth limit, unlike every other recursive-descent
+           parser in this runtime (K_MAX_JSON_DEPTH's own JSON parser). A
+           regex pattern is ordinary runtime string data, not a literal baked
+           into the generated C, so a program that builds/receives a pattern
+           at runtime can pass one with millions of nested `(` and crash the
+           whole process with a native stack overflow. Bounded at the same
+           K_MAX_JSON_DEPTH every other fix in this class reuses. */
+        if (++p->depth > K_MAX_JSON_DEPTH) { kre_fail(p, "regex pattern nested too deeply"); return a; }
+        a->kind = 3; a->group = kre_alternation(p);
+        p->depth--;
         if (kre_peek(p) == ')') p->pos++; else kre_fail(p, "unclosed group `(`");
     } else if (c == '[') {
         kre_class(p, a);
@@ -3801,7 +3817,7 @@ static KReAlts kre_alternation(KReP* p) {
 
 /* compile; on error, k_panic("invalid regex: <msg>") like regex_builtin */
 static KRegex k_re_compile(const char* pat) {
-    KReP p; p.s = (const unsigned char*)pat; p.pos = 0; p.len = (int)strlen(pat); p.aend = 0; p.err = 0; p.msg = "";
+    KReP p; p.s = (const unsigned char*)pat; p.pos = 0; p.len = (int)strlen(pat); p.aend = 0; p.err = 0; p.depth = 0; p.msg = "";
     KRegex re; re.astart = 0; re.aend = 0;
     /* holds the trailing-metacharacter message below -- must outlive `p.msg`
        being read by the final snprintf a few lines down, so it's a plain
@@ -9878,6 +9894,25 @@ fun main() uses io {
             "fun main() uses io {\n    print(re_match(\"cat|dog$\", \"cat and mouse\"))\n}\n",
             "reanchoralt",
         );
+    }
+
+    /// A REAL cross-engine bug (production-hardening PR-it731, the native mirror
+    /// of regex.rs's identical fix): `kre_atom`'s `(` arm recursed into
+    /// `kre_alternation` -> `kre_sequence` -> `kre_atom` with no depth limit, so a
+    /// pattern with enough nested `(` overflowed the native C stack with an
+    /// uncatchable abort instead of a clean panic -- confirmed live via a crafted
+    /// KUPL source file with millions of nested `(` before this fix. Bounded at
+    /// K_MAX_JSON_DEPTH, matching regex.rs's identical cap; `assert_panic_wording_matches`
+    /// confirms the clean rejection message is IDENTICAL to interp's own (a
+    /// legitimate cross-engine check since `k_re_compile` is a fully independent
+    /// reimplementation, not a shared upstream pass).
+    #[test]
+    fn native_regex_deeply_nested_groups_matches_interp_wording() {
+        let too_deep = "(".repeat(crate::json::MAX_JSON_DEPTH + 1);
+        let src = format!(
+            "fun main() uses io {{\n    print(re_match(\"{too_deep}\", \"x\"))\n}}\n"
+        );
+        assert_panic_wording_matches(&src, "regexdeepgroup");
     }
 
     /// A REAL BUG found+fixed (bug-hunt batch 163, PR-it555): native's regex engine

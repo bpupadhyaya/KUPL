@@ -128,11 +128,30 @@ struct Parser<'a> {
     chars: &'a [char],
     pos: usize,
     anchored_end: bool,
+    /// Current `(...)` group nesting depth, bounded below by `atom`'s `(` arm.
+    /// A REAL bug found+fixed (production-hardening PR-it731): `atom` -> `alternation`
+    /// -> `sequence` -> `atom` is direct mutual recursion on Rust's native call stack
+    /// with NO depth limit, unlike every other recursive-descent parser in this
+    /// codebase (`json.rs`'s own `MAX_JSON_DEPTH`, and `lsp.rs`/`kx.rs::decode_shape`,
+    /// which reuse that same constant for the same reason -- PR-it620/PR-it730). A
+    /// regex pattern is ordinary runtime `Str` data (`re_match`/`re_find`/
+    /// `re_find_all`/`re_replace` all take it as `args[0]`), not a compile-time
+    /// literal, so a program that builds or receives a pattern at runtime (a config
+    /// file, a network body, user input) can pass one with millions of nested `(`
+    /// and crash the whole process. Confirmed live: `re_match(<4.5M+ nested "(">,
+    /// "hello")` overflows the native stack with an UNCATCHABLE `fatal runtime
+    /// error: stack overflow, aborting` (SIGABRT) even on `main.rs`'s already-large
+    /// 2GiB CLI-thread stack -- each parser frame is cheap enough that a few
+    /// megabytes of pattern text is enough to exhaust even that reservation. Fixed
+    /// by bounding group nesting at the same `json::MAX_JSON_DEPTH` every other
+    /// fix in this class reuses, mirroring `json.rs`'s own increment-check-decrement
+    /// shape around its recursive `value()` call.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(chars: &'a [char]) -> Self {
-        Parser { chars, pos: 0, anchored_end: false }
+        Parser { chars, pos: 0, anchored_end: false, depth: 0 }
     }
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
@@ -199,7 +218,12 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some('(') => {
                 self.pos += 1;
+                self.depth += 1;
+                if self.depth > crate::json::MAX_JSON_DEPTH {
+                    return Err("regex pattern nested too deeply".into());
+                }
                 let alts = self.alternation()?;
+                self.depth -= 1;
                 if !self.eat(')') {
                     return Err("unclosed group `(`".into());
                 }
@@ -754,6 +778,24 @@ mod tests {
         assert!(compile("^cat").is_ok());
         assert!(compile("cat$").is_ok());
         assert!(compile("cat|dog").is_ok());
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it731): `atom`'s `(`
+    /// arm recursed into `alternation` -> `sequence` -> `atom` with no depth
+    /// limit, so a pattern with enough nested `(` overflowed the native stack
+    /// with an uncatchable abort instead of a clean `Err`. A pattern well
+    /// within the cap still compiles and matches correctly; one past it is a
+    /// clean error, never a crash.
+    #[test]
+    fn deeply_nested_groups_are_a_clean_error_not_a_stack_overflow() {
+        let too_deep = "(".repeat(crate::json::MAX_JSON_DEPTH + 1);
+        let err = compile(&too_deep).expect_err("must be a clean error, not a panic/crash");
+        assert!(err.contains("nested too deeply"), "{err}");
+
+        // well within the cap: still compiles and matches normally.
+        let shallow = "(".repeat(10) + "a" + &")".repeat(10);
+        assert!(compile(&shallow).is_ok());
+        assert!(m(&shallow, "a"));
     }
 
     #[test]
