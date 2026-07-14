@@ -19249,6 +19249,61 @@ fun main() {\n    let xs = [OnlyA(), OnlyB()]\n    let _ = xs\n}\n";
     }
 
     #[test]
+    fn forall_failure_names_which_expect_condition_actually_failed() {
+        // PRODUCTION-HARDENING (PR-it771): a real bug found by an Explore survey
+        // (agentId aca5b82689fe978bd) and independently live-verified before fixing
+        // (a real `kupl test` CLI run on both a `forall` and a byte-for-byte-identical
+        // non-`forall` law): `run_forall`'s reported failure used to be JUST the shrunk
+        // binding ("property failed for n = -26"), discarding the specific `expect`
+        // condition that failed -- even though that text (`"expectation failed:
+        // {cond}"`) was already computed. The non-`forall` law path for the SAME logic
+        // shows `` `expect doubled >= -50` was not satisfied ``, so a `forall` body
+        // with more than one `expect` (a common pattern) gave the user zero way to
+        // tell which condition failed, or why.
+        let run_law = |src: &str| -> Result<(), String> {
+            let compiled = crate::run::compile(src).expect("compiles");
+            let law = compiled
+                .program
+                .items
+                .iter()
+                .find_map(|i| match i {
+                    crate::ast::Item::Law(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .expect("has a law");
+            let db = ProgramDb::build(&compiled.program, &compiled.checked);
+            let mut it = Interp::new(db);
+            let env = it.globals.child();
+            match it.exec_block(&law.body, &env) {
+                Ok(_) => Ok(()),
+                Err(Flow::Panic { msg, .. }) => Err(msg),
+                Err(_) => Err("flow".into()),
+            }
+        };
+
+        // a body with TWO `expect`s: the failure must name the SPECIFIC one that
+        // failed, not just the shrunk binding -- guards against reintroducing the
+        // "which of several conditions failed?" ambiguity the fix closes.
+        let err = run_law(
+            "law \"bounded\" {\n    forall n: Int {\n        let doubled = n * 2\n        \
+             expect doubled >= -50\n        expect doubled <= 100\n    }\n}\n",
+        )
+        .expect_err("must fail for a sufficiently negative n");
+        assert!(err.contains("n = -26"), "expected shrunk counterexample, got: {err}");
+        assert!(
+            err.contains("`doubled >= -50` was not satisfied"),
+            "expected the specific failing condition to be named, got: {err}"
+        );
+
+        // a genuine panic (not an `expect`) inside the body must still show its own
+        // message via the pre-existing `(panic: {msg})` fallback -- unchanged by
+        // this fix, locked in so the two branches don't get confused.
+        let panic_err = run_law("law \"div\" {\n    forall n: Int { let _ = 10 / n }\n}\n")
+            .expect_err("division by zero must fail");
+        assert!(panic_err.contains("(panic: division by zero)"), "got: {panic_err}");
+    }
+
+    #[test]
     fn forall_is_rejected_by_the_kvm_compiler() {
         // forall is interpreter-only (kupl test); compiling it to the KVM errors
         let src = "fun probe() -> Int {\n    forall n: Int { expect n >= 0 }\n    0\n}\n";

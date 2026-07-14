@@ -1284,13 +1284,17 @@ mod tests {
         // variant `Base`, reachable only by promoting a same-typed field up a level.
         let chain = "type Chain = Base | Rec1(child: Chain) | Rec2(child: Chain) | Rec3(child: Chain)\n\
                      law \"x\" { forall c: Chain { expect false } }\n";
-        assert_eq!(law_panic_msg(chain), "property failed for c = Base");
+        // PRODUCTION-HARDENING (PR-it771): the trailing "(`false` was not
+        // satisfied)" detail is new -- run_forall used to discard the specific
+        // failing `expect` condition entirely for this message shape; see that
+        // fix's own comment for why.
+        assert_eq!(law_panic_msg(chain), "property failed for c = Base (`false` was not satisfied)");
         // A two-recursive-field (binary tree) shape shrinks to its own nullary variant
         // too -- promotion must work regardless of WHICH field position holds the
         // same-typed value, and regardless of how many recursive fields a variant has.
         let tree = "type Tree = Leaf | Node(l: Tree, r: Tree)\n\
                     law \"x\" { forall t: Tree { expect false } }\n";
-        assert_eq!(law_panic_msg(tree), "property failed for t = Leaf");
+        assert_eq!(law_panic_msg(tree), "property failed for t = Leaf (`false` was not satisfied)");
     }
 
     #[test]

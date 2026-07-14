@@ -863,7 +863,19 @@ impl Interp {
                     .zip(&vals)
                     .map(|((n, _), v)| format!("{n} = {}", crate::prop::render(v)))
                     .collect();
-                let detail = if msg.starts_with("expectation failed") || msg.is_empty() {
+                // PRODUCTION-HARDENING (PR-it771): `msg` for the common case (an
+                // `expect` inside the property body) is `"expectation failed:
+                // {rendered cond}"` (Stmt::Expect above) -- it already names the
+                // SPECIFIC condition that failed. The old `starts_with(...)` check
+                // threw that text away entirely, leaving just "property failed for
+                // n = -26" with zero indication of which `expect` failed or why --
+                // unlike the byte-for-byte-identical logic as a plain (non-forall)
+                // law, which shows `` `expect doubled >= -50` was not satisfied ``
+                // (run.rs's own snippet-based rendering). Reuse the already-computed
+                // condition text instead of discarding it, matching that wording.
+                let detail = if let Some(cond) = msg.strip_prefix("expectation failed: ") {
+                    format!(" (`{cond}` was not satisfied)")
+                } else if msg.is_empty() {
                     String::new()
                 } else {
                     format!(" (panic: {msg})")
