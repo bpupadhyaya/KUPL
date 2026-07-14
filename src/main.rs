@@ -699,6 +699,74 @@ mod tests {
         assert!(stdout.contains("new-shape"), "a new instance must see the new method: {stdout}");
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it758): the test
+    /// immediately above proves a redefined COMPONENT's own decl is safely
+    /// frozen per-instance -- but a plain top-level value whose declared
+    /// `type` gets redefined was never protected the same way, because bare
+    /// `let`/`var` statements aren't tracked in `defs_items` and so never
+    /// get swept into the re-`compile()` pass that catches the component
+    /// case. `interp.rs`'s `ExprKind::Field`/`ExprKind::With` both looked up
+    /// a field's POSITION in the CURRENT `self.db.ctors` table, then indexed
+    /// directly into the OLD value's `fields` Vec at that position -- if a
+    /// redefinition grew the field list, that index landed past the stale
+    /// value's actual length, a raw Rust `Vec` index panic. Because `main.rs`
+    /// runs the whole CLI (including the REPL) on a single worker thread,
+    /// this ABORTED THE ENTIRE `kupl repl` PROCESS (exit 101, "internal
+    /// compiler error") -- not just the one offending statement, losing the
+    /// user's whole interactive session. Confirmed live BEFORE this fix,
+    /// both for a field READ (`v.y`) and a field UPDATE (`v with y: 5`).
+    /// Fixed by bounds-checking both indexing sites (`fields.get(i)`/
+    /// `new_fields.get_mut(i)`) and reporting a clean, catchable panic
+    /// instead -- the REPL's own `Err(Flow::Panic{msg,..}) => eprintln!(...)`
+    /// handler already turns that into a normal per-statement error, so the
+    /// session survives and keeps working afterward (verified below).
+    #[test]
+    fn redefining_a_type_under_a_live_value_is_a_clean_panic_not_a_process_abort() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "type T = A(x: Int)\n\
+                      let v = A(1)\n\
+                      type T = A(x: Int, y: Int)\n\
+                      v.y\n\
+                      v with y: 5\n\
+                      print(\"still alive\")\n\
+                      :quit\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            !combined.contains("internal compiler error") && !combined.contains("panicked at"),
+            "a redefined type under a live value must never abort the whole REPL process: {combined}"
+        );
+        assert!(
+            stderr.matches("value's shape no longer matches its current definition").count() == 2,
+            "both the field READ and the field UPDATE must report the same clean panic: {stderr}"
+        );
+        assert!(
+            stdout.contains("still alive"),
+            "the REPL session must survive the panic and keep evaluating later statements: {stdout}"
+        );
+        assert!(out.status.success(), "the REPL process itself must exit cleanly via :quit, not abort: {out:?}");
+    }
+
     /// Waits for `child` to exit, but gives up after `timeout` rather than
     /// blocking forever -- `std::process::Child::wait_with_output` has no
     /// built-in deadline (and this repo's own convention is that macOS has

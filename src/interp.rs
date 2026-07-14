@@ -973,8 +973,38 @@ impl Interp {
                             .get(variant.as_str())
                             .map(|(_, names)| names.clone())
                             .unwrap_or_default();
+                        // A REAL bug found+fixed (production-hardening PR-it758):
+                        // `field_names` comes from `self.db.ctors` -- the CURRENT
+                        // program db -- but `fields` may belong to a value built
+                        // under a PRIOR db, if the REPL redefined this ctor's own
+                        // `type` after the value was constructed (`repl.rs`
+                        // deliberately carries `interp.instances`/`globals`
+                        // forward across a redefinition, with no shape-
+                        // compatibility check at all). `field_names.len()`
+                        // growing past `fields.len()` (e.g. a redefined type
+                        // gaining a field) made `fields[i]` a raw Rust `Vec`
+                        // index panic -- an uncatchable process abort that killed
+                        // the WHOLE REPL session, not just this one statement.
+                        // Live-confirmed BEFORE this fix: `type T = A(x: Int)`,
+                        // `let v = A(1)`, `type T = A(x: Int, y: Int)`, `v.y`
+                        // aborted the entire `kupl repl` process (exit 101,
+                        // "internal compiler error"). `.get(i)` reports a clean,
+                        // catchable panic instead -- matching this module's own
+                        // established "a value this pass cannot resolve gets a
+                        // clean Err, not an OOB index" convention used
+                        // throughout the codebase's `.kx`-corruption fixes.
                         match field_names.iter().position(|f| f == name) {
-                            Some(i) => Ok(fields[i].clone()),
+                            Some(i) => match fields.get(i) {
+                                Some(v) => Ok(v.clone()),
+                                None => Err(Self::panic_flow(
+                                    format!(
+                                        "`{ty}` value's shape no longer matches its current \
+                                         definition (was it redefined at the REPL after this \
+                                         value was created?) -- cannot read field `{name}`"
+                                    ),
+                                    expr.span,
+                                )),
+                            },
                             None => Err(Self::panic_flow(
                                 format!("`{ty}` value has no field `{name}`"),
                                 expr.span,
@@ -1082,8 +1112,31 @@ impl Interp {
                 let mut new_fields = fields.as_ref().clone();
                 for (field, value) in updates {
                     let v = self.eval(value, env)?;
+                    // A REAL sibling bug to `ExprKind::Field`'s identical fix,
+                    // same root cause (production-hardening PR-it758): `names`
+                    // comes from the CURRENT `self.db.ctors`, but `new_fields`
+                    // is cloned from a value that may have been built under a
+                    // PRIOR db if the REPL redefined this ctor's `type` after
+                    // the value was constructed. `new_fields[i] = v` was a raw
+                    // Rust `Vec` index-assignment panic when `i` (a position
+                    // in the CURRENT, possibly-grown field list) exceeded the
+                    // stale value's actual field count -- live-confirmed BEFORE
+                    // this fix to abort the whole `kupl repl` process the same
+                    // way the `ExprKind::Field` read path did.
                     match names.iter().position(|f| f == field) {
-                        Some(i) => new_fields[i] = v,
+                        Some(i) => match new_fields.get_mut(i) {
+                            Some(slot) => *slot = v,
+                            None => {
+                                return Err(Self::panic_flow(
+                                    format!(
+                                        "`{ty}` value's shape no longer matches its current \
+                                         definition (was it redefined at the REPL after this \
+                                         value was created?) -- cannot update field `{field}`"
+                                    ),
+                                    expr.span,
+                                ))
+                            }
+                        },
                         None => {
                             return Err(Self::panic_flow(
                                 format!("`{ty}` has no field `{field}`"),
