@@ -47,6 +47,34 @@ struct PkgCtx {
     err: Option<String>,
 }
 
+/// Filesystem-identity key for `ctx_cache`, matching what `seen` (the
+/// file-content dedup loop, below) already uses -- production-hardening
+/// PR-it761: a REAL bug found+fixed where `ctx_cache` used to be keyed
+/// directly by a dependency's `normalize()`d path (LEXICAL-only, no
+/// filesystem access), while `seen`'s file-content dedup used TRUE
+/// canonical (symlink-resolved) identity. A dependency directory reached
+/// via two lexically-DIFFERENT paths that are the SAME real directory (most
+/// realistically: two aliases where one goes through a symlinked
+/// dependency directory and one doesn't) got TWO different `PkgCtx`s / two
+/// different mangling prefixes here, but the file itself was only ever
+/// parsed ONCE under `seen`'s stricter identity -- whichever alias's queue
+/// entry happened to be popped SECOND (an accident of the loader's LIFO
+/// traversal order) ended up with a mangling prefix that had ZERO items
+/// registered under it, so any reference through it failed with a
+/// spurious `K0240: unknown name`, for a perfectly valid, unambiguous
+/// dependency graph. Live-confirmed before this fix: `b` and `c` both
+/// depending on the same physical directory `d` (one directly, one via a
+/// symlinked alias) made `kupl run`/`kupl check`/`kupl native` all reject
+/// `d.greet(n)` inside `b` with `unknown name \`b.d$greet\` (did you mean
+/// \`c.d$greet\`?)`, even though both dependency declarations are
+/// individually correct. Falls back to `normalize()` when the directory
+/// doesn't exist yet (`canonicalize()` requires the path to actually
+/// exist), so a still-missing dependency continues to surface as today's
+/// clean K0400, not a panic or a behavior change.
+fn dep_identity(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| normalize(p))
+}
+
 /// Lexically resolve `.` and `..` in a path without touching the filesystem
 /// (so a non-existent dependency path still normalizes correctly).
 fn normalize(p: &Path) -> PathBuf {
@@ -392,7 +420,7 @@ pub fn load_with(
     // from inside such a cycle then failed to resolve -- e.g. `dep.root$compute`
     // (an internal mangling artifact leaking into a user-facing "unknown name"
     // diagnostic) for a perfectly legitimate, public root function.
-    ctx_cache.insert(normalize(&root_dir), root_ctx.clone());
+    ctx_cache.insert(dep_identity(&root_dir), root_ctx.clone());
     let mut queue: Vec<(PathBuf, Rc<PkgCtx>, Option<Span>)> = vec![(entry_path, root_ctx, None)];
     // items tagged with their owning package's mangling prefix, plus each
     // package's own alias table (alias name -> that dependency's resolved
@@ -462,13 +490,16 @@ pub fn load_with(
                 // with no name collision at all, silently invoke whichever
                 // definition happened to load last, since `try_qualified` in
                 // resolve.rs used to build the qualified reference from the
-                // same bare alias text too). `ctx_cache` still dedupes by
-                // PHYSICAL directory, so a genuinely SHARED dependency (the
-                // exact same path reached via two different alias chains)
-                // still gets ONE mangled namespace, as intended — only the
-                // prefix CHOSEN for a not-yet-cached directory changes.
+                // same bare alias text too). `ctx_cache` dedupes by PHYSICAL
+                // directory (`dep_identity`, PR-it761 -- see its own doc
+                // comment: this used to be keyed by lexical `normalize()`
+                // alone, which could still assign TWO prefixes to one real
+                // directory), so a genuinely SHARED dependency (the exact
+                // same path reached via two different alias chains) still
+                // gets ONE mangled namespace, as intended — only the prefix
+                // CHOSEN for a not-yet-cached directory changes.
                 let dep_ctx = ctx_cache
-                    .entry(dep_dir.clone())
+                    .entry(dep_identity(dep_dir))
                     .or_insert_with(|| {
                         let dep_prefix = if ctx.prefix.is_empty() {
                             first.to_string()
@@ -1457,5 +1488,83 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(crate::registry::cache_dir().join(name));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it761, from a fresh
+    /// Explore survey of resolve.rs/loader.rs's module-resolution edge
+    /// cases): a genuine DIAMOND dependency -- two sibling packages `b` and
+    /// `c` that both depend on the SAME physical directory `d`, reached
+    /// through two lexically-DIFFERENT paths (here: directly, and through a
+    /// symlinked alias `d2 -> d`) -- got assigned TWO different mangling
+    /// prefixes, even though the file itself was only ever parsed and
+    /// tagged ONCE (the file-content dedup loop already used TRUE
+    /// canonical/symlink-resolved identity; `ctx_cache`'s prefix-assignment
+    /// dedup only used lexical `normalize()`, which can't see through a
+    /// symlink). Whichever alias's queue entry was popped SECOND ended up
+    /// with a mangling prefix that had zero items registered under it, so
+    /// its own reference to the shared dependency failed with a spurious
+    /// `K0240: unknown name`, for a perfectly valid, unambiguous dependency
+    /// graph -- directly contradicting this exact code's own doc comment,
+    /// which claimed `ctx_cache` "still dedupes by PHYSICAL directory."
+    /// Fixed by keying `ctx_cache` with `dep_identity()` (canonicalize,
+    /// falling back to `normalize()` for a not-yet-existing path), matching
+    /// the identity notion the file-content `seen` dedup already used.
+    #[test]
+    fn a_diamond_dependency_reached_through_a_symlinked_alias_resolves_to_one_shared_package() {
+        let base = std::env::temp_dir().join(format!("kupl-pkg-diamond-symlink-test-{}", std::process::id()));
+        let root = base.join("root");
+        let b = root.join("b");
+        let c = root.join("c");
+        let d = root.join("d");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            root.join("kupl.toml"),
+            "[project]\nname = \"root\"\nentry = \"main.kupl\"\n\n[dependencies]\nb = { path = \"b\" }\nc = { path = \"c\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.kupl"),
+            "use b\nuse c\n\nfun main() uses io {\n    print(b.from_b(1))\n    print(c.from_c(1))\n}\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("kupl.toml"), "[project]\nname = \"d\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(d.join("main.kupl"), "pub fun greet(n: Int) -> Int {\n    n + 1000\n}\n").unwrap();
+        std::fs::write(
+            b.join("kupl.toml"),
+            "[project]\nname = \"b\"\nentry = \"main.kupl\"\n\n[dependencies]\nd = { path = \"../d\" }\n",
+        )
+        .unwrap();
+        std::fs::write(b.join("main.kupl"), "use d\n\npub fun from_b(n: Int) -> Int {\n    d.greet(n)\n}\n").unwrap();
+        // c reaches the SAME physical directory `d` through a symlinked alias
+        // `d2`, a lexically different path that `normalize()` alone cannot
+        // see is the identical real directory `canonicalize()` resolves it
+        // (and `seen`'s file-content dedup) to.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&d, root.join("d2")).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&d, root.join("d2"));
+        std::fs::write(
+            c.join("kupl.toml"),
+            "[project]\nname = \"c\"\nentry = \"main.kupl\"\n\n[dependencies]\nd = { path = \"../d2\" }\n",
+        )
+        .unwrap();
+        std::fs::write(c.join("main.kupl"), "use d\n\npub fun from_c(n: Int) -> Int {\n    d.greet(n)\n}\n").unwrap();
+
+        let (program, _map) = super::load(root.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("a diamond dependency reached via a symlinked alias must resolve, not error");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "both b.from_b and c.from_c must resolve cleanly to the ONE shared `d` package: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        assert!(interp.call_value(f, vec![], crate::diag::Span::default()).is_ok(), "main() must run to completion (1001 printed twice)");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
