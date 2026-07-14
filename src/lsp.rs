@@ -63,6 +63,18 @@ fn skip_ws(b: &[u8], pos: &mut usize) {
     }
 }
 
+/// Read exactly 4 hex digits starting at byte index `start` (the body of a
+/// `\uXXXX` escape) into a code unit. Bounds-checked (`.get()`, not direct
+/// slicing) so a truncated escape at the end of input is a clean parse
+/// error instead of an out-of-bounds panic -- production-hardening PR-it765.
+fn hex4(b: &[u8], start: usize) -> Result<u32, String> {
+    let hex = b
+        .get(start..start + 4)
+        .and_then(|s| std::str::from_utf8(s).ok())
+        .ok_or("bad \\u escape")?;
+    u32::from_str_radix(hex, 16).map_err(|_| "bad \\u escape".to_string())
+}
+
 /// A robustness-audit finding (production-hardening PR-it620): this
 /// recursive-descent parser had NO nesting-depth guard, unlike json.rs's
 /// `parse` (the `json_parse` builtin's implementation, shared by interp/vm)
@@ -168,12 +180,54 @@ fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> 
                             Some(b'b') => out.push('\u{8}'),
                             Some(b'f') => out.push('\u{c}'),
                             Some(b'u') => {
-                                let hex = std::str::from_utf8(&b[*pos + 1..*pos + 5])
-                                    .map_err(|_| "bad \\u escape")?;
-                                let cp =
-                                    u32::from_str_radix(hex, 16).map_err(|_| "bad \\u escape")?;
-                                out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+                                // TWO real bugs found+fixed in this one arm (production-
+                                // hardening PR-it765): (1) a genuine PROCESS-ABORTING PANIC
+                                // on a truncated `\u` escape at the end of input -- the
+                                // original direct `&b[*pos+1..*pos+5]` slice indexing panics
+                                // ("range end index ... out of range") instead of returning
+                                // a clean parse error, confirmed live via `parse_json("\"\\u12\"")`.
+                                // Every OTHER literal-matching arm in this same function was
+                                // already hardened against truncated/malformed input
+                                // (PR-it545's `starts_with` bounds-safety comment above), but
+                                // this ONE site was missed. (2) each `\uXXXX` escape was
+                                // decoded INDEPENDENTLY with no surrogate-PAIR combination --
+                                // unlike `json.rs`'s own, already-tested surrogate-pairing
+                                // logic (this parser is a genuinely SEPARATE, independently-
+                                // reimplemented JSON parser, used for LSP JSON-RPC AND ai.rs's
+                                // mock-response parsing, per PR-it620's own doc comment above)
+                                // -- a high surrogate (D800..=DBFF) followed by its low half
+                                // (DC00..=DFFF) is required to form ONE astral code point
+                                // (e.g. an emoji); decoding each half separately instead
+                                // produced TWO U+FFFD replacement characters, confirmed live:
+                                // `parse_json("\"\\uD83C\\uDF89\"")` (the emoji's own true
+                                // surrogate pair) decoded to `"\u{FFFD}\u{FFFD}"` instead of
+                                // the single correct emoji codepoint.
+                                let hi = hex4(b, *pos + 1)?;
                                 *pos += 4;
+                                // A truncated/malformed LOW-surrogate escape (`\u` with fewer
+                                // than 4 hex digits following) is a genuine parse error here
+                                // too -- propagated via `?`, mirroring json.rs's own identical
+                                // convention -- distinct from a VALID-but-out-of-range low
+                                // half (any ordinary `\uXXXX` that isn't DC00..=DFFF), which
+                                // falls back to U+FFFD for the unpaired high surrogate while
+                                // leaving the candidate for the NEXT loop iteration to parse
+                                // on its own.
+                                let cp = if (0xD800..=0xDBFF).contains(&hi) {
+                                    if b.get(*pos + 1) == Some(&b'\\') && b.get(*pos + 2) == Some(&b'u') {
+                                        let lo = hex4(b, *pos + 3)?;
+                                        if (0xDC00..=0xDFFF).contains(&lo) {
+                                            *pos += 6;
+                                            0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                                        } else {
+                                            0xFFFD
+                                        }
+                                    } else {
+                                        0xFFFD
+                                    }
+                                } else {
+                                    hi
+                                };
+                                out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
                             }
                             _ => return Err("bad escape".into()),
                         }
@@ -3719,6 +3773,60 @@ mod tests {
             v.get("a").and_then(|a| a.index(2)).and_then(Json::str),
             Some("x\ny")
         );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it765): this parser's
+    /// `\u` escape handling decoded each `\uXXXX` INDEPENDENTLY, with no
+    /// surrogate-PAIR combination logic -- unlike `json.rs`'s own, already-
+    /// tested surrogate-pairing logic (this is a genuinely SEPARATE,
+    /// independently-reimplemented JSON parser, used for LSP JSON-RPC AND
+    /// ai.rs's mock-response parsing, per PR-it620's own doc comment on
+    /// `parse_value`). A high surrogate (D800..=DBFF) followed by its low
+    /// half (DC00..=DFFF) is required to form ONE astral code point (e.g.
+    /// an emoji); decoding each half separately instead produced TWO
+    /// U+FFFD replacement characters. Live-confirmed BEFORE this fix:
+    /// `parse_json("\"\\uD83C\\uDF89\"")` (the emoji's own true surrogate
+    /// pair) decoded to `"\u{FFFD}\u{FFFD}"` instead of the single correct
+    /// emoji codepoint -- this is EXACTLY what made PR-it764's own first
+    /// test attempt misleadingly appear to pass (a real client that
+    /// `\u`-escapes an astral character in outgoing JSON would have hit
+    /// this bug too, masking the `diag::line_col` astral under-counting
+    /// bug PR-it764 actually fixed, by an unrelated coincidence of two
+    /// replacement characters summing to the same UTF-16 unit count as one
+    /// real emoji).
+    #[test]
+    fn u_escape_surrogate_pairs_combine_into_one_astral_code_point() {
+        let v = parse_json("\"\\uD83C\\uDF89\"").unwrap();
+        assert_eq!(v, Json::Str("🎉".to_string()), "a real UTF-16 surrogate pair must decode to the ONE emoji codepoint it encodes");
+
+        // an UNPAIRED high surrogate (no following low surrogate) still
+        // decodes to U+FFFD, same as before this fix -- not a regression.
+        let v2 = parse_json("\"\\uD83Cx\"").unwrap();
+        assert_eq!(v2, Json::Str("\u{FFFD}x".to_string()));
+    }
+
+    /// A REAL, genuinely process-ABORTING bug found+fixed (production-
+    /// hardening PR-it765, the SAME `\u` escape arm as the test above): a
+    /// truncated `\u` escape at the end of input -- e.g. a message cut off
+    /// mid-escape, or a client bug -- panicked via direct `&b[*pos+1..
+    /// *pos+5]` slice indexing ("range end index ... out of range for
+    /// slice") instead of returning a clean parse error, confirmed live
+    /// BEFORE this fix via `parse_json("\"\\u12\"")`. Every OTHER literal-
+    /// matching arm in this same function was already hardened against
+    /// malformed/truncated input (see PR-it545's `starts_with` bounds-
+    /// safety comment on the `true`/`false`/`null` arms above) -- this ONE
+    /// `\u` escape site was the gap. Since this parser backs `kupl lsp`'s
+    /// entire incoming JSON-RPC message decode path, an adversarial or
+    /// simply buggy client sending a truncated `\u` escape would crash the
+    /// WHOLE server process (`main.rs` runs the whole CLI single-threaded,
+    /// so an uncaught Rust panic here is a genuine process abort, not a
+    /// catchable per-request error), losing every other open document's
+    /// unsaved state too.
+    #[test]
+    fn a_truncated_u_escape_is_a_clean_parse_error_not_a_panic() {
+        assert!(parse_json("\"\\u12\"").is_err(), "a truncated \\u escape must be a clean error, not panic");
+        assert!(parse_json("\"\\u\"").is_err(), "a completely empty \\u escape must also be a clean error");
+        assert!(parse_json("\"\\uD83C\\u\"").is_err(), "a truncated LOW surrogate half must also be a clean error, not panic");
     }
 
     #[test]
