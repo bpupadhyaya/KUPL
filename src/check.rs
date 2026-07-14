@@ -145,6 +145,80 @@ pub(crate) fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>)
 /// edits from the KUPL name), mapped to the KUPL method an AI most likely meant. Suggestion-only
 /// and best-effort like `suggest` -- only consulted as a K0249 fallback, never changes resolution
 /// (PR-it318). `length`/`size` (Java/JS/C#/Swift) -> `len` is the canonical case.
+/// Which named types have at least one FINITELY constructible variant --
+/// computed via a FIXED POINT over every registered named type. A naive
+/// per-type recursive check (walk each variant's fields, recursing into any
+/// `Named` type it references) would itself infinite-loop on exactly the
+/// shape this closes: a type where every variant recurses into itself with
+/// no base case (e.g. `type Stream = Cons(head: Int, tail: Stream)`).
+///
+/// A REAL, uncatchable-crash bug found+fixed (production-hardening PR-it727,
+/// found via a scoped Explore survey): `is_generatable` (used by
+/// `Stmt::Forall`'s checker arm, see below) only verified a named type was
+/// REGISTERED with a non-empty variant list, never that it was actually
+/// INHABITED in finite generation depth -- a `forall` binder over a type
+/// like `Stream` above passed `kupl check` cleanly, then `kupl test`'s
+/// `prop::gen_named` recursed until the Rust call stack overflowed.
+/// Confirmed live: `thread '<unknown>' has overflowed its stack` / `fatal
+/// runtime error: stack overflow, aborting`, exit code 134 (SIGABRT) -- an
+/// uncatchable PROCESS ABORT, not a diagnostic or a catchable `Err`.
+///
+/// `List[T]`/`Option[T]` fields recurse into `T`'s OWN finiteness rather
+/// than being treated as unconditionally safe -- an early draft of this fix
+/// assumed `generate`'s depth cap (forcing an empty list / `None` once
+/// `depth >= 4`) made `List[T]`/`Option[T]` safe for ANY `T`, since the cap
+/// is reached without ever needing to construct a `T`. That reasoning is
+/// WRONG: at any depth below the cap, `List`'s length draw (`rng.below(6)`)
+/// can and does come back non-zero, which DOES attempt to construct a `T`
+/// element -- and if `T` is itself unconditionally recursive (no nullary
+/// variant, `gen_named`'s own depth check never applies since it only
+/// special-cases "depth >= 4 AND a nullary variant exists"), that ONE
+/// element's construction recurses forever regardless of how deep the
+/// OUTER structure already is. Confirmed live with a DETERMINISTIC repro
+/// (fixed seed, so this isn't "sometimes crashes" -- it crashes on every
+/// run): `type Foo = Bar(xs: List[Stream])` (Stream as defined above) still
+/// stack-overflowed even though this draft's check had marked `Foo` as
+/// finitely inhabited. Fixed by recursing `field_is_finite` through
+/// `List`/`Option` into their own element type.
+///
+/// Any type `generate()` doesn't support at all (Map/Set/Fn/Tensor/
+/// Result/...) is treated as not a source of infinite recursion, since
+/// attempting to generate one already fails with a clean `Err`, never a
+/// crash -- this check is deliberately narrow, scoped to the SPECIFIC
+/// uncatchable-crash mechanism, not a general re-audit of every
+/// `generate()` failure mode (a separate, pre-existing, much
+/// lower-severity gap -- K0276 only checks the forall binder's OWN
+/// top-level type, not types nested inside a variant's fields -- is left
+/// unchanged by this fix).
+fn inhabited_named_types(types: &HashMap<String, TypeSig>) -> HashSet<String> {
+    fn field_is_finite(ty: &Ty, inhabited: &HashSet<String>) -> bool {
+        match ty {
+            Ty::Named(n, _) => inhabited.contains(n),
+            Ty::List(inner) | Ty::Option(inner) => field_is_finite(inner, inhabited),
+            _ => true,
+        }
+    }
+    let mut inhabited: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, sig) in types {
+            if inhabited.contains(name) {
+                continue;
+            }
+            let has_finite_variant =
+                sig.variants.iter().any(|v| v.fields.iter().all(|(_, fty)| field_is_finite(fty, &inhabited)));
+            if has_finite_variant {
+                inhabited.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    inhabited
+}
+
 fn common_method_alias(name: &str) -> Option<&'static str> {
     match name {
         "length" | "size" | "count_elements" => Some("len"),
@@ -1740,6 +1814,11 @@ impl Checker {
             }
             Stmt::Forall { vars, body, .. } => {
                 ctx.scopes.push();
+                // Which named types can actually be constructed in FINITE
+                // generation depth (production-hardening PR-it727) -- see
+                // `inhabited_named_types`'s own doc comment for the full
+                // uncatchable-stack-overflow bug this closes.
+                let inhabited = inhabited_named_types(&self.checked.types);
                 for (name, ty) in vars {
                     // A `forall` binder's type must actually be something the
                     // property-test generator (`prop::generate`) can produce a
@@ -1748,14 +1827,23 @@ impl Checker {
                     // then unconditionally FAIL every `kupl test` run at
                     // runtime, even for a tautologically true body like
                     // `expect true` (production-hardening PR-it693).
-                    let ok = crate::prop::is_generatable(ty, &|n| {
+                    let structurally_ok = crate::prop::is_generatable(ty, &|n| {
                         self.checked.types.get(n).is_some_and(|sig| !sig.variants.is_empty())
                     });
-                    if !ok {
+                    if !structurally_ok {
                         self.err(
                             "K0276",
                             format!(
                                 "forall variable `{name}` has type `{}`, which has no property-test generator (supported: Int, Bool, Float, Str, List[T], Option[T], and user-defined record/enum types)",
+                                crate::prop::tyname(ty)
+                            ),
+                            ty.span,
+                        );
+                    } else if !crate::prop::is_generatable(ty, &|n| inhabited.contains(n)) {
+                        self.err(
+                            "K0276",
+                            format!(
+                                "forall variable `{name}` has type `{}`, which has no FINITE property-test generator — every variant of this type recurses into itself with no base case, so no value could ever be constructed (add a non-recursive variant, e.g. a nullary case)",
                                 crate::prop::tyname(ty)
                             ),
                             ty.span,
@@ -4672,6 +4760,74 @@ mod generic_tests {
             contract_err.iter().any(|d| d.code == "K0276" && d.message.contains("Map[Str, Int]")),
             "{contract_err:?}"
         );
+    }
+
+    /// A REAL, uncatchable-crash bug found+fixed (production-hardening
+    /// PR-it727, found via a scoped Explore survey): a `forall` binder over
+    /// a type where EVERY variant recurses into itself with no base case
+    /// (e.g. `type Stream = Cons(head: Int, tail: Stream)`) passed
+    /// `is_generatable`'s OLD check cleanly (it only verified the type was
+    /// REGISTERED with a non-empty variant list, never that it was actually
+    /// INHABITED in finite depth) -- then `kupl test`'s `prop::gen_named`
+    /// recursed until the Rust call stack overflowed. Confirmed live before
+    /// this fix: `kupl check` said "ok", `kupl test` aborted the WHOLE
+    /// PROCESS (`thread '<unknown>' has overflowed its stack`, exit code
+    /// 134/SIGABRT) -- not a diagnostic, not a catchable `Err`. Also covers
+    /// mutual recursion between two named types (with and without a
+    /// base case), and the `List[T]` case where `T` is itself
+    /// unconditionally recursive -- an early draft of this fix wrongly
+    /// assumed `List[T]`/`Option[T]` were ALWAYS safe regardless of `T`
+    /// (reasoning: the depth cap eventually forces an empty list without
+    /// touching `T`), but a LIVE test of `type Foo = Bar(xs: List[Stream])`
+    /// disproved that: `List`'s length draw can (and, for this fixed seed,
+    /// does) come back non-zero before the cap, attempting to construct a
+    /// `Stream` element and recursing forever regardless of the outer
+    /// depth -- caught this BEFORE trusting the fix, not after.
+    #[test]
+    fn forall_binder_over_a_type_with_no_finite_base_case_is_rejected_at_check_time() {
+        let stream_err = errors(
+            "type Stream = Cons(head: Int, tail: Stream)\nlaw \"x\" { forall s: Stream { expect true } }\n",
+        );
+        assert!(
+            stream_err.iter().any(|d| d.code == "K0276"
+                && d.message.contains("forall variable `s`")
+                && d.message.contains("no FINITE property-test generator")),
+            "{stream_err:?}"
+        );
+        // mutual recursion between two named types, no base case anywhere.
+        let mutual_err =
+            errors("type A = MkA(b: B)\ntype B = MkB(a: A)\nlaw \"x\" { forall b: B { expect true } }\n");
+        assert!(
+            mutual_err.iter().any(|d| d.code == "K0276" && d.message.contains("no FINITE property-test generator")),
+            "{mutual_err:?}"
+        );
+        // the SAME mutual pair, but WITH a base case on one side -- must NOT be rejected.
+        assert!(errors(
+            "type A = MkA(b: B) | ADone\ntype B = MkB(a: A)\nlaw \"x\" { forall b: B { expect true } }\n"
+        )
+        .is_empty());
+        // List[T] where T is itself unconditionally recursive is STILL a crash risk
+        // (the list's length draw can be non-zero before the depth cap kicks in) --
+        // must be rejected, not silently treated as safe just because a List CAN
+        // be empty.
+        let list_err = errors(
+            "type Stream = Cons(head: Int, tail: Stream)\ntype Foo = Bar(xs: List[Stream])\nlaw \"x\" { forall f: Foo { expect true } }\n",
+        );
+        assert!(
+            list_err.iter().any(|d| d.code == "K0276" && d.message.contains("no FINITE property-test generator")),
+            "{list_err:?}"
+        );
+        // a genuinely self-referential type WITH a nullary base case (Leaf) stays
+        // completely clean -- this is the established, working `forall` idiom.
+        assert!(errors(
+            "type Tree = Leaf | Node(l: Tree, r: Tree)\nlaw \"x\" { forall t: Tree { expect true } }\n"
+        )
+        .is_empty());
+        // List[T] where T is finitely inhabited (via Tree's own base case) is fine.
+        assert!(errors(
+            "type Tree = Leaf | Node(l: Tree, r: Tree)\ntype Forest = Bar(xs: List[Tree])\nlaw \"x\" { forall f: Forest { expect true } }\n"
+        )
+        .is_empty());
     }
 
     #[test]
