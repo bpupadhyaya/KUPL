@@ -461,24 +461,38 @@ impl Rewriter<'_> {
     /// under.
     fn try_qualified(&self, e: &Expr) -> Option<ExprKind> {
         let is_dep = |recv: &Expr| matches!(&recv.kind, ExprKind::Ident(a) if self.deps.contains_key(a) && !self.is_local(a));
+        // A REAL bug found+fixed (production-hardening PR-it746): `resolved`
+        // is EMPTY exactly when `alias` refers back to the ROOT package (a
+        // dependency cycle looping through root, now resolvable at all since
+        // the loader's own PR-it746 companion fix) -- `isolate()` above never
+        // mangles root's own items (`if prefix.is_empty() { continue; }`), so
+        // they keep bare, unmangled names. Unconditionally formatting
+        // `"{resolved}${name}"` produced `"$name"` (a literal leading `$`
+        // with an EMPTY prefix) in that case, which matches NO defined item
+        // anywhere -- root's own `compute` is registered as `"compute"`, not
+        // `"$compute"`. Mirror `isolate()`'s own empty-prefix special case.
+        let qualify = |resolved: &str, name: &str| {
+            if resolved.is_empty() { name.to_string() } else { format!("{resolved}${name}") }
+        };
         match &e.kind {
-            // `alias.method(args)` -> `resolved$method(args)`
+            // `alias.method(args)` -> `resolved$method(args)` (or bare `method(args)`
+            // when `resolved` is root's empty prefix).
             ExprKind::MethodCall { recv, name, args } if is_dep(recv) => {
                 let ExprKind::Ident(a) = &recv.kind else { return None };
                 let resolved = self.deps.get(a).map(String::as_str).unwrap_or(a);
                 Some(ExprKind::Call {
                     callee: Box::new(Expr {
-                        kind: ExprKind::Ident(format!("{resolved}${name}")),
+                        kind: ExprKind::Ident(qualify(resolved, name)),
                         span: recv.span,
                     }),
                     args: args.iter().cloned().map(|value| Arg { name: None, value }).collect(),
                 })
             }
-            // `alias.name` used as a value / callee -> `resolved$name`
+            // `alias.name` used as a value / callee -> `resolved$name` (or bare `name`).
             ExprKind::Field { recv, name } if is_dep(recv) => {
                 let ExprKind::Ident(a) = &recv.kind else { return None };
                 let resolved = self.deps.get(a).map(String::as_str).unwrap_or(a);
-                Some(ExprKind::Ident(format!("{resolved}${name}")))
+                Some(ExprKind::Ident(qualify(resolved, name)))
             }
             _ => None,
         }

@@ -379,6 +379,20 @@ pub fn load_with(
         return Err((diags, map));
     }
     let mut ctx_cache: HashMap<PathBuf, Rc<PkgCtx>> = HashMap::new();
+    // Seed the cache with the ROOT package itself, keyed under the same
+    // `normalize()`d form every dependency's own `path` entry is stored under
+    // (see `pkg_ctx` above) -- production-hardening PR-it746, closing a real
+    // bug: without this, a dependency (however many hops away) that declares
+    // a `path` dependency BACK to the root project's own directory (a
+    // circular or self-dependency through the root) missed this cache
+    // entirely and fabricated a BOGUS second `PkgCtx` for root with a
+    // synthesized non-empty mangling prefix, even though root's own items
+    // were already tagged with the real, empty prefix (`resolve.rs` never
+    // mangles the root package). Any cross-package reference back into root
+    // from inside such a cycle then failed to resolve -- e.g. `dep.root$compute`
+    // (an internal mangling artifact leaking into a user-facing "unknown name"
+    // diagnostic) for a perfectly legitimate, public root function.
+    ctx_cache.insert(normalize(&root_dir), root_ctx.clone());
     let mut queue: Vec<(PathBuf, Rc<PkgCtx>, Option<Span>)> = vec![(entry_path, root_ctx, None)];
     // items tagged with their owning package's mangling prefix, plus each
     // package's own alias table (alias name -> that dependency's resolved
@@ -513,7 +527,24 @@ pub fn load_with(
     // Isolate package namespaces (mangle dependency names). When there are no
     // dependency packages, keep items verbatim so ordinary programs are
     // byte-identical to before.
-    program.items = if tagged.iter().any(|(_, p)| !p.is_empty()) {
+    //
+    // A REAL bug found+fixed (production-hardening PR-it746): the original
+    // `tagged.iter().any(|(_, p)| !p.is_empty())` check assumed "no item has
+    // a non-empty prefix" means "isolate() has nothing to do" -- true for an
+    // ordinary single-package program, but FALSE for a project with a SELF
+    // dependency (`kupl.toml` declaring `me = { path = "." }`): every item
+    // still has the root's empty prefix (root is never mangled), yet
+    // `pkg_deps[""]` can still hold a real `alias -> resolved-prefix`
+    // mapping (`"me" -> ""`) that `try_qualified` needs to rewrite a
+    // `me.compute()` REFERENCE into a bare `compute()` call. Skipping
+    // `isolate()` entirely left such references as unrewritten
+    // `MethodCall{recv: Ident("me"), ..}` nodes, which the checker then
+    // reported as `unknown name \`me\`` -- `me` was never meant to exist as
+    // a real identifier, only as a package alias. `pkg_deps` is only ever
+    // populated when a genuine cross-package `use` was resolved (regardless
+    // of whether that resolves back to root or to a distinct package), so
+    // checking it directly covers both cases.
+    program.items = if tagged.iter().any(|(_, p)| !p.is_empty()) || !pkg_deps.is_empty() {
         crate::resolve::isolate(tagged, &pkg_deps)
     } else {
         tagged.into_iter().map(|(i, _)| i).collect()
@@ -720,6 +751,106 @@ mod tests {
             Err((diags, _)) => assert!(diags.iter().any(|d| d.code == "K0400"), "{diags:?}"),
             Ok(_) => panic!("missing dependency should fail to load"),
         }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it746): this module's
+    /// own doc comment claims "cycles are fine" -- true for a cycle among
+    /// non-root packages (unaffected by this fix, still verified below), but
+    /// FALSE for a cycle that loops back through the ROOT project's own
+    /// directory. `ctx_cache` (keyed by normalized directory) never contained
+    /// an entry for root itself, so a dependency declaring a `path` back to
+    /// root's directory missed the cache and fabricated a BOGUS second
+    /// `PkgCtx` for root with a synthesized non-empty mangling prefix (e.g.
+    /// `dep2.root`), even though root's real items were tagged with the
+    /// correct, empty prefix. A legitimate, public root function referenced
+    /// from inside the cycle (`dep2.root.compute()`) then failed to resolve,
+    /// reporting `unknown name \`dep2.root$compute\`` -- an internal `$`
+    /// mangling artifact leaking verbatim into a user-facing diagnostic.
+    #[test]
+    fn a_dependency_cycle_that_loops_back_through_the_root_package_resolves_cleanly() {
+        let base = std::env::temp_dir().join(format!("kupl-pkg-cycle-test-{}", std::process::id()));
+        let root = base.join("root");
+        let dep2 = base.join("dep2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&dep2).unwrap();
+        std::fs::write(
+            root.join("kupl.toml"),
+            "[project]\nname = \"root\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep2 = { path = \"../dep2\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.kupl"),
+            "use dep2\n\npub fun compute() -> Int {\n    41\n}\n\nfun main() uses io {\n    print(dep2.helper())\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dep2.join("kupl.toml"),
+            "[project]\nname = \"dep2\"\nentry = \"main.kupl\"\n\n[dependencies]\nroot = { path = \"../root\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dep2.join("main.kupl"),
+            "use root\n\npub fun helper() -> Int {\n    root.compute() + 1\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(root.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("a root-involving dependency cycle must resolve, not error");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "root.compute() must resolve cleanly from inside the cycle, no mangled-name leak: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        assert!(interp.call_value(f, vec![], crate::diag::Span::default()).is_ok(), "dep2.helper() -> root.compute() + 1 = 42");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A SECOND, independently-real bug found+fixed in the SAME investigation as
+    /// the test above (production-hardening PR-it746): a project declaring a
+    /// SELF dependency (`kupl.toml`'s `[dependencies]` pointing `path = "."` back
+    /// at itself) hit a DIFFERENT failure than the two-package cycle case --
+    /// `program.items`'s own `isolate()`-skip fast path assumed "no item has a
+    /// non-empty prefix" means "nothing to isolate," but a self dependency keeps
+    /// every item at root's own empty prefix (root is never mangled) while STILL
+    /// needing `pkg_deps[""]`'s `"me" -> ""` alias entry rewritten via
+    /// `try_qualified` -- skipping `isolate()` entirely left `me.compute()`
+    /// completely unrewritten, reported as `unknown name \`me\`` (worse than the
+    /// cycle case's leaked mangling artifact: here `me` isn't recognized as a
+    /// dependency reference AT ALL).
+    #[test]
+    fn a_self_dependency_on_the_root_package_resolves_cleanly() {
+        let base = std::env::temp_dir().join(format!("kupl-pkg-selfdep-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nme = { path = \".\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("main.kupl"),
+            "use me\n\npub fun compute() -> Int {\n    41\n}\n\nfun main() uses io {\n    print(me.compute() + 1)\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(base.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("a self-dependency on root must resolve, not error");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "`me` must resolve as the self-dependency alias it is, not an unknown name: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        assert!(interp.call_value(f, vec![], crate::diag::Span::default()).is_ok(), "me.compute() + 1 = 42");
 
         let _ = std::fs::remove_dir_all(&base);
     }
