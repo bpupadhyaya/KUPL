@@ -250,10 +250,37 @@ fn par_eval(
             let end = ((w + 1) * chunk).min(n);
             let slice = &portable[start..end];
             let image = image;
-            handles.push(scope.spawn(move || {
-                let mut interp = crate::interp::Interp::new_bare(image.worker_db());
-                slice.iter().map(|p| eval_one(&mut interp, fname, p)).collect::<Vec<_>>()
-            }));
+            // A REAL, uncatchable-crash bug found+fixed (production-hardening
+            // PR-it729, found via a scoped Explore survey): `scope.spawn`
+            // gives a worker thread Rust's DEFAULT stack size, unlike
+            // main.rs's OWN main thread, which is deliberately spawned with a
+            // 2GiB stack SPECIFICALLY so the interpreter's recursion can
+            // reach `MAX_CALL_DEPTH` (10 000) and hit that guard's CLEAN
+            // "stack overflow" panic before exhausting the native stack. A
+            // pure function recursing to depth 9500 -- legitimately within
+            // the documented limit, and confirmed to succeed cleanly when
+            // called SEQUENTIALLY (the main thread's own large stack) --
+            // crashed the WHOLE PROCESS when routed through `par_map`
+            // instead: `thread '<unknown>' has overflowed its stack`,
+            // `fatal runtime error: stack overflow, aborting`, exit code 134
+            // (SIGABRT) -- a genuine, uncatchable process abort, not the
+            // clean `MAX_CALL_DEPTH` panic every OTHER recursion path
+            // produces. `std::thread::Builder::spawn_scoped` (stable since
+            // Rust 1.63) lets a worker use the SAME `Builder` configuration
+            // (including `stack_size`) as a plain scoped `spawn`, so this
+            // gives every worker the IDENTICAL 2GiB reservation main.rs's
+            // own comment already justifies as cheap (the reservation is
+            // virtual; only touched pages commit) -- closing the gap with
+            // the SAME technique already trusted elsewhere in this codebase,
+            // not a new one.
+            let handle = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    let mut interp = crate::interp::Interp::new_bare(image.worker_db());
+                    slice.iter().map(|p| eval_one(&mut interp, fname, p)).collect::<Vec<_>>()
+                })
+                .expect("spawn par_map/par_filter worker thread");
+            handles.push(handle);
         }
         let mut all = Vec::with_capacity(n);
         for h in handles {

@@ -17645,6 +17645,45 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         assert_eq!(differential(&boom_filter), "panic: division by zero");
     }
 
+    /// A REAL, uncatchable-crash bug found+fixed (production-hardening
+    /// PR-it729, found via a scoped Explore survey): `par_map`/`par_filter`'s
+    /// real-thread worker path (`parallel.rs::par_eval`) spawned OS threads
+    /// with Rust's DEFAULT stack size, unlike `main.rs`'s own main thread,
+    /// which is deliberately spawned with a 2GiB stack SPECIFICALLY so a
+    /// KUPL call recursing to `MAX_CALL_DEPTH` (10 000) hits that guard's
+    /// CLEAN "stack overflow" panic before exhausting the native stack. A
+    /// pure function recursing to depth 9500 -- legitimately within the
+    /// documented limit, confirmed live to succeed cleanly when called
+    /// SEQUENTIALLY -- crashed the WHOLE PROCESS with an uncatchable native
+    /// stack overflow (`thread '<unknown>' has overflowed its stack`, exit
+    /// 134/SIGABRT) when routed through `par_map` instead. Fixed by giving
+    /// every worker thread the SAME 2GiB stack via `std::thread::Builder::
+    /// spawn_scoped`. A live process abort can't be asserted on directly (it
+    /// would take the whole `cargo test` run down with it), so this
+    /// confirms the FIX's OBSERVABLE behavior instead: a depth safely under
+    /// the cap now succeeds via the real-thread `par_map` path (previously:
+    /// crashed the process), and a depth genuinely EXCEEDING the cap gives
+    /// the IDENTICAL clean panic message via both the sequential interpreter
+    /// path and the real-thread parallel path (the KVM side of
+    /// `differential()` stays sequential per its own established
+    /// convention, so this also confirms the KVM's heap-frame-stack
+    /// depth guard -- unaffected by native stack size at all -- agrees).
+    #[test]
+    fn diff_par_map_pure_fn_deep_recursion_does_not_crash_the_process() {
+        let deep = "fun deep(n: Int) -> Int {\n    if n <= 0 { 0 } else { 1 + deep(n - 1) }\n}\n";
+        let ok_src = format!(
+            "{MK}{deep}fun run_deep(x: Int) -> Int {{ deep(9500) }}\n\
+             fun probe() -> Int {{\n    mk(300).par_map(run_deep).len()\n}}\n"
+        );
+        assert_eq!(differential(&ok_src), "300");
+
+        let too_deep = format!(
+            "{MK}{deep}fun run_deep(x: Int) -> Int {{ deep(20000) }}\n\
+             fun probe() -> Int {{\n    mk(300).par_map(run_deep).len()\n}}\n"
+        );
+        assert_eq!(differential(&too_deep), "panic: stack overflow (10000 frames)");
+    }
+
     #[test]
     fn diff_sized_methods_it29() {
         // wrapping
