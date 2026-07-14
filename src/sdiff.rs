@@ -92,7 +92,13 @@ fn load_items(path: &str) -> (BTreeMap<(&'static str, String), Item>, bool) {
         eprintln!("error: {path} does not parse; fix it before diffing");
         return (BTreeMap::new(), false);
     }
-    (items_by_kind_and_name(program.items), true)
+    match items_by_kind_and_name(program.items) {
+        Ok(map) => (map, true),
+        Err((kind, name)) => {
+            eprintln!("error: {path} declares {kind} `{name}` more than once; fix it before diffing");
+            (BTreeMap::new(), false)
+        }
+    }
 }
 
 /// Key a program's items by `(kind, name)`, NOT bare name alone -- a REAL,
@@ -109,12 +115,34 @@ fn load_items(path: &str) -> (BTreeMap<(&'static str, String), Item>, bool) {
 /// colliding type's shape had genuinely changed (a real, breaking interface
 /// change), purely because a same-named function loaded after it in the same
 /// file silently overwrote its map entry.
-fn items_by_kind_and_name(items: Vec<Item>) -> BTreeMap<(&'static str, String), Item> {
+///
+/// A SECOND, sibling REAL bug found+fixed (production-hardening PR-it757):
+/// keying by `(kind, name)` closes the CROSS-kind collision (above) but does
+/// NOTHING for the SAME-kind case -- two `fun add`s (or two `type Config`s)
+/// collide on the IDENTICAL key and the plain `map.insert` below still let
+/// the second silently clobber the first, with zero diagnostic (this file
+/// never runs `check.rs`'s own K0203 "function defined more than once"
+/// check -- `load_items` only gates on PARSER errors, above). Confirmed live
+/// before this fix: `old.kupl` with two `fun add`s (`a+b` then `a-b`),
+/// `new.kupl` changing the FIRST's body to `a*100` but leaving the second
+/// `a-b` unchanged -- `kupl diff old.kupl new.kupl` reported `semantically
+/// identical` (exit 0), silently hiding the first `add`'s genuinely changed
+/// body. Rather than silently keeping either declaration (which would just
+/// swap WHICH real change gets hidden depending on iteration order), a
+/// same-kind duplicate now makes the WHOLE file un-diffable -- returned as
+/// an `Err`, reported by `load_items` exactly like an unparseable file
+/// (exit 2, "fix it before diffing") -- since a file with two declarations
+/// sharing a key isn't a case this tool can meaningfully compare at all.
+fn items_by_kind_and_name(items: Vec<Item>) -> Result<BTreeMap<(&'static str, String), Item>, (&'static str, String)> {
     let mut map = BTreeMap::new();
     for item in items {
-        map.insert((kind_tag(&item), item_name(&item).to_string()), item);
+        let key = (kind_tag(&item), item_name(&item).to_string());
+        if map.contains_key(&key) {
+            return Err(key);
+        }
+        map.insert(key, item);
     }
-    map
+    Ok(map)
 }
 
 /// `pub(crate)`: also used by `repl.rs` to identify which prior top-level
@@ -307,8 +335,8 @@ mod tests {
         let (pa, da) = crate::parser::parse(old);
         let (pb, db) = crate::parser::parse(new);
         assert!(da.is_empty() && db.is_empty());
-        let a = super::items_by_kind_and_name(pa.items);
-        let b = super::items_by_kind_and_name(pb.items);
+        let a = super::items_by_kind_and_name(pa.items).expect("old has no duplicate (kind, name)");
+        let b = super::items_by_kind_and_name(pb.items).expect("new has no duplicate (kind, name)");
         let mut lines = Vec::new();
         let mut changed = false;
         for (key, old) in &a {
@@ -377,6 +405,71 @@ mod tests {
         // BOTH kinds present, BOTH unchanged -- no collision-induced false positive.
         let (lines3, changed3) = diff_lines(old, old);
         assert!(!changed3, "{lines3:?}");
+    }
+
+    /// A SECOND, sibling REAL bug (production-hardening PR-it757): PR-it699's
+    /// own `(kind, name)`-keyed map (immediately above) closes the CROSS-kind
+    /// collision but does nothing for the SAME-kind case -- two `fun add`s (or
+    /// two `type Config`s) collide on the IDENTICAL key, so the plain
+    /// `map.insert` still let the second silently clobber the first, with zero
+    /// diagnostic (`load_items` only gates on PARSER errors, never running
+    /// `check.rs`'s own K0203 "function defined more than once" check).
+    /// Confirmed live before this fix: a file pair where the FIRST of two
+    /// same-named `fun add`s had its body genuinely changed (the second
+    /// left untouched) still reported `semantically identical` (exit 0),
+    /// silently hiding the change purely because of iteration/insertion
+    /// order. Rather than silently keeping whichever declaration happens to
+    /// win (which would just swap WHICH real change gets hidden), a same-kind
+    /// duplicate now makes the WHOLE file un-diffable.
+    #[test]
+    fn same_kind_duplicate_name_makes_the_file_undiffable_not_silently_wrong() {
+        // items_by_kind_and_name directly: a same-kind duplicate returns an
+        // Err identifying the exact (kind, name) collision, not a silently
+        // clobbered map.
+        let (p, d) = crate::parser::parse(
+            "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
+             fun add(a: Int, b: Int) -> Int {\n    a - b\n}\n",
+        );
+        assert!(d.is_empty(), "{d:?}");
+        let err = super::items_by_kind_and_name(p.items).unwrap_err();
+        assert_eq!(err, ("fun", "add".to_string()), "{err:?}");
+
+        // the SAME collision for a TYPE (the more consequential case: an
+        // interface-breaking field-shape change, not just an implementation
+        // body).
+        let (pt, dt) = crate::parser::parse(
+            "type Config = Config(name: Str)\ntype Config = Config(name: Str, port: Int)\n",
+        );
+        assert!(dt.is_empty(), "{dt:?}");
+        let errt = super::items_by_kind_and_name(pt.items).unwrap_err();
+        assert_eq!(errt, ("type", "Config".to_string()), "{errt:?}");
+
+        // end to end via `semantic_diff` (the REAL CLI entry point): a
+        // same-kind duplicate must make the WHOLE FILE un-diffable (exit 2,
+        // the SAME code an unparseable file already returns), not silently
+        // report "semantically identical" while a real change to one of the
+        // colliding declarations goes completely unreported.
+        let dir = std::env::temp_dir().join(format!("kupl-sdiff-dup-it757-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_path = dir.join("old.kupl");
+        let new_path = dir.join("new.kupl");
+        std::fs::write(
+            &old_path,
+            "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun add(a: Int, b: Int) -> Int {\n    a - b\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &new_path,
+            // the FIRST add's body genuinely changed; the second is untouched.
+            "fun add(a: Int, b: Int) -> Int {\n    a * 100\n}\nfun add(a: Int, b: Int) -> Int {\n    a - b\n}\n",
+        )
+        .unwrap();
+        let code = super::semantic_diff(old_path.to_str().unwrap(), new_path.to_str().unwrap());
+        assert_eq!(
+            code, 2,
+            "a same-kind duplicate must make the file un-diffable (exit 2), not silently report success"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
