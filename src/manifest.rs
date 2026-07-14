@@ -83,9 +83,10 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                 // parse time, before the ambiguity can reach the loader at
                 // all. (A narrower, lower-priority residual gap -- a
                 // duplicate KEY within a single inline table, e.g.
-                // `{ path = "a", path = "b" }` -- is a separate,
-                // deliberately out-of-scope issue inside `parse_dep`'s own
-                // field parsing, not covered by this check.)
+                // `{ path = "a", path = "b" }` -- was a separate issue
+                // inside `parse_dep`'s own field parsing, NOT covered by
+                // this check; fixed separately in `parse_dep` itself,
+                // production-hardening PR-it752.)
                 if deps.iter().any(|d: &Dep| d.name == dep.name) {
                     return Err(format!(
                         "line {}: duplicate dependency `{}` (already declared earlier in [dependencies])",
@@ -185,9 +186,33 @@ fn parse_dep(name: &str, value: &str, line: usize) -> Result<Dep, String> {
             .split_once('=')
             .ok_or_else(|| format!("line {line}: expected `key = value` in table"))?;
         let val = parse_string(v).ok_or_else(|| format!("line {line}: expected a string value"))?;
+        // A REAL bug found+fixed (production-hardening PR-it752): a
+        // duplicate KEY within a single inline table (`{ path = "a", path =
+        // "b" }`) used to silently resolve "last one wins" -- the SAME
+        // shape of gap PR-it747 already fixed for a duplicate dependency
+        // NAME across separate `[dependencies]` lines, one level deeper
+        // inside a single inline table's own fields (flagged as a
+        // deliberately out-of-scope residual gap in that fix's own doc
+        // comment above, `deps.iter().any(...)`). Live-confirmed BEFORE
+        // this fix: `math = { path = "a", path = "b" }` parsed cleanly to
+        // `Dep { name: "math", path: Some("b"), .. }` with ZERO diagnostic.
         match k.trim() {
-            "path" => path = Some(val),
-            "version" => version = Some(val),
+            "path" => {
+                if path.is_some() {
+                    return Err(format!(
+                        "line {line}: duplicate key `path` in dependency `{name}`'s inline table"
+                    ));
+                }
+                path = Some(val);
+            }
+            "version" => {
+                if version.is_some() {
+                    return Err(format!(
+                        "line {line}: duplicate key `version` in dependency `{name}`'s inline table"
+                    ));
+                }
+                version = Some(val);
+            }
             other => return Err(format!("line {line}: unknown dependency key `{other}`")),
         }
     }
@@ -275,6 +300,33 @@ mod tests {
         let m = parse("[dependencies]\nmath = { path = \"../math\" }\nutil = { path = \"../util\" }\n")
             .expect("distinct dependency names must still parse cleanly");
         assert_eq!(m.deps.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_key_inside_an_inline_table_is_a_clean_error_not_silently_last_wins() {
+        // A REAL bug found+fixed (production-hardening PR-it752): a
+        // duplicate KEY within a SINGLE inline table (`{ path = "a", path =
+        // "b" }`) used to silently resolve "last one wins" -- the SAME
+        // shape of gap PR-it747 fixed for a duplicate dependency NAME
+        // across separate `[dependencies]` lines, one level deeper inside
+        // a single inline table's own field parsing. Live-confirmed BEFORE
+        // this fix: this exact manifest parsed cleanly to
+        // `Dep { name: "math", path: Some("b"), .. }` with ZERO diagnostic.
+        let err = parse("[dependencies]\nmath = { path = \"a\", path = \"b\" }\n")
+            .expect_err("a duplicate `path` key must be a clean error, not silently last-wins");
+        assert!(err.contains("duplicate") && err.contains("path") && err.contains("math"), "{err}");
+
+        // the SAME gap for the OTHER inline-table key, `version`.
+        let err2 = parse("[dependencies]\njson2 = { version = \"1.0.0\", version = \"2.0.0\" }\n")
+            .expect_err("a duplicate `version` key must be a clean error, not silently last-wins");
+        assert!(err2.contains("duplicate") && err2.contains("version") && err2.contains("json2"), "{err2}");
+
+        // sanity: a table with one of EACH distinct key still parses fine
+        // (not an overly-broad check that rejects a legitimate 2-key table).
+        let m = parse("[dependencies]\nweb = { path = \"../web\", version = \"1.0.0\" }\n")
+            .expect("one path key + one version key must still parse cleanly");
+        assert_eq!(m.deps[0].path, Some("../web".to_string()));
+        assert_eq!(m.deps[0].version, Some("1.0.0".to_string()));
     }
 
     /// A REAL sibling bug to `hash_inside_a_string_value_is_not_treated_as_a_
