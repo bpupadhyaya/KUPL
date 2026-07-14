@@ -1877,7 +1877,41 @@ impl Parser {
         Ok(Pattern { kind: PatternKind::Or(alts), span: span.merge(end) })
     }
 
+    /// PR-it714: `parse_pattern_primary` recurses into itself TWICE without
+    /// going through any other depth-guarded entry point -- once indirectly
+    /// via `parse_pattern()` (a constructor pattern's args, `Some(Some(...))`)
+    /// and once DIRECTLY via its own `@`-binding arm (`x @ y @ z @ ...`).
+    /// Structurally the exact same gap it713 just closed for expressions: a
+    /// recursive-descent call chain that never touches `self.depth`, so a
+    /// deep nested-constructor or `@`-chain pattern used to bypass K0121
+    /// entirely and stack-overflow the parser/checker/interpreter with an
+    /// uncatchable crash (confirmed live: `Some(` * 500_000 `+ "1" + `)` *
+    /// 500_000` aborted with "fatal runtime error: stack overflow"). Guarded
+    /// the same way `parse_expr` guards itself: push/pop `self.depth` around
+    /// the entire body, symmetric on every exit path (the body always
+    /// returns through `r`, never via an internal early `?` past the pop).
     fn parse_pattern_primary(&mut self) -> PResult<Pattern> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(self.pattern_too_deep());
+        }
+        let r = self.parse_pattern_primary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn pattern_too_deep(&self) -> Diag {
+        Diag::error(
+            "K0121",
+            format!(
+                "pattern nesting too deep (limit is {MAX_EXPR_DEPTH}) — break it into a helper `fun` or intermediate `match` arms"
+            ),
+            self.span(),
+        )
+    }
+
+    fn parse_pattern_primary_inner(&mut self) -> PResult<Pattern> {
         let span = self.span();
         match self.peek().clone() {
             Tok::Int(v) => {
@@ -2177,6 +2211,58 @@ mod tests {
                 let ok_pipe = "fun id(x: Int) -> Int { x }\nfun main() -> Int { let x = 1 |> id |> id |> id\n    return x\n}\n";
                 let (_, diags) = parse(ok_pipe);
                 assert!(diags.is_empty(), "a 3-stage pipeline must parse cleanly: {diags:?}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A REAL, LIVE-CRASHING bug (PR-it714), the direct follow-up it713
+    /// flagged: `parse_pattern_primary` recurses into itself TWICE without
+    /// ever touching `self.depth` -- indirectly via `parse_pattern()` for a
+    /// nested constructor pattern's args (`Some(Some(Some(...)))`), and
+    /// directly via its own `@`-binding arm (`a @ b @ c @ ...`). Confirmed
+    /// live BEFORE this fix: a 500,000-level-deep `Some(Some(...1...))`
+    /// pattern crashed `kupl fmt`/`kupl check`/`kupl run`/`kupl run --vm`/
+    /// `kupl native` ALL FIVE with the same uncatchable "fatal runtime
+    /// error: stack overflow, aborting" abort it713 fixed for expressions --
+    /// this is the pattern-grammar sibling of that exact gap. Fixed by
+    /// guarding `parse_pattern_primary` itself the same way `parse_expr`
+    /// guards itself (symmetric `self.depth` push/pop around the whole
+    /// body, decrement captured via `let r = ...; self.depth -= 1; r` so it
+    /// fires on every exit path, not just success).
+    #[test]
+    fn a_deeply_nested_constructor_or_at_binding_pattern_is_a_clean_k0121_not_a_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let n = MAX_EXPR_DEPTH + 2;
+                let nested_ctor = format!(
+                    "fun main() -> Int {{ let x = match 1 {{ {}1{} => 1\n        _ => 0 }}\n    return x\n}}\n",
+                    "Some(".repeat(n),
+                    ")".repeat(n)
+                );
+                let (_, diags) = parse(&nested_ctor);
+                assert!(
+                    diags.iter().any(|d| d.code == "K0121"),
+                    "a {n}-deep nested constructor pattern must hit K0121, not silently build an unbounded AST: {diags:?}"
+                );
+                let at_chain = format!(
+                    "fun main() -> Int {{ let x = match 1 {{ {} 1 => 1\n        _ => 0 }}\n    return x\n}}\n",
+                    (0..n).map(|i| format!("a{i} @")).collect::<Vec<_>>().join(" ")
+                );
+                let (_, diags) = parse(&at_chain);
+                assert!(
+                    diags.iter().any(|d| d.code == "K0121"),
+                    "a {n}-deep `@`-binding chain pattern must hit K0121, not silently build an unbounded AST: {diags:?}"
+                );
+                // An ordinary, well-under-the-limit nested constructor pattern
+                // (Option<Option<Option<Option<Option<Int>>>>>-shaped) must NOT
+                // false-positive -- confirms the new guard doesn't regress
+                // normal pattern matching.
+                let ok = "fun main() -> Int {\n    let x = match 1 {\n        Some(Some(Some(Some(Some(v))))) => v\n        _ => 0\n    }\n    return x\n}\n";
+                let (_, diags) = parse(ok);
+                assert!(diags.is_empty(), "a 5-level nested constructor pattern must parse cleanly: {diags:?}");
             })
             .unwrap()
             .join()
