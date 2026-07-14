@@ -13105,6 +13105,82 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// A REAL cross-engine byte-identity divergence found+fixed (production-
+    /// hardening PR-it773): `ai.rs::value_from_json`'s `AiShape::Int` arm used
+    /// `<= i64::MAX as f64` (which is exactly 2^63, one more than the actual
+    /// i64::MAX) as its upper bound, letting a model-returned integer of
+    /// EXACTLY 2^63 through, then SATURATE to i64::MAX on cast -- silently
+    /// corrupting an out-of-range tool argument into a valid-looking one on
+    /// interp/vm. Native's OWN independently-reimplemented `k_ai_from_json`
+    /// (this file, above) ALREADY used the correct strict `< 9223372036854775808.0`
+    /// bound -- its own comment even claimed "matching the interpreter," which
+    /// this bug meant was false. Confirmed live BEFORE fixing (a real 3-engine
+    /// CLI probe, not just this test): interp/vm silently accepted the
+    /// out-of-range value and delivered the corrupted i64::MAX to the tool,
+    /// completing the program normally, while native correctly panicked and
+    /// never called the tool at all -- crash-vs-silent-corruption, a genuine
+    /// behavioral divergence, not just a message-text difference. A SECOND,
+    /// separate, pre-existing divergence found in the same investigation:
+    /// Rust's `{n}` Display for a large whole-number float used to print the
+    /// SHORTEST round-tripping decimal ("...9223372036854776000") rather than
+    /// the exact value native's `%.0f` always prints
+    /// ("...9223372036854775808") -- fixed by using `{n:.0}` on the Rust side
+    /// to match. A THIRD: a genuinely fractional value used to echo its exact
+    /// value on interp/vm ("...returned 3.14") while native has always used a
+    /// generic "...returned a fraction" -- fixed by matching native's
+    /// existing wording. `cgen.rs` itself needed NO changes for any of the
+    /// three (it was already correct); this test locks in that interp/vm now
+    /// match it exactly, so a future regression on EITHER side is caught.
+    #[test]
+    fn native_ai_int_boundary_and_fraction_messages_match_interp_and_vm() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun echo_int773(n: Int) -> Str { \"got {n}\" }\n\
+                   ai fun assist773(q: Str) -> Str tools [echo_int773] { intent \"h\" }\n\
+                   fun main() uses io { print(assist773(\"x\")) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("ai fun compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aiintb-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        // a whole number exactly one past i64::MAX (2^63): must panic, not
+        // silently succeed with a corrupted argument.
+        let past_max = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_ASSIST773", "[{\"tool\":\"echo_int773\",\"input\":{\"n\":9223372036854775808}},{\"final\":\"done\"}]")
+            .output()
+            .expect("runs");
+        assert!(!past_max.status.success(), "a value one past i64::MAX must panic, not silently succeed");
+        assert!(
+            String::from_utf8_lossy(&past_max.stderr)
+                .contains("ai `assist773`: expected an integer, model returned 9223372036854775808"),
+            "{past_max:?}"
+        );
+        // a genuinely fractional value: the generic, value-less message.
+        let frac = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_ASSIST773", "[{\"tool\":\"echo_int773\",\"input\":{\"n\":3.14}},{\"final\":\"done\"}]")
+            .output()
+            .expect("runs");
+        assert!(!frac.status.success());
+        assert!(
+            String::from_utf8_lossy(&frac.stderr).contains("ai `assist773`: expected an integer, model returned a fraction"),
+            "{frac:?}"
+        );
+        // an ordinary in-range integer is entirely unaffected.
+        let ok = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_ASSIST773", "[{\"tool\":\"echo_int773\",\"input\":{\"n\":42}},{\"final\":\"done\"}]")
+            .output()
+            .expect("runs");
+        assert!(ok.status.success(), "{ok:?}");
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), "done\n");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
     /// Native ai-fun `Option[T]` return shapes and compound-shaped tool parameters
     /// (bug-hunt batch 160, PR-it552, companion to the vm.rs differential test): confirmed
     /// via a real 3-engine CLI probe FIRST that `Option[Int]`/`List[Option[Int]]`/

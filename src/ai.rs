@@ -251,7 +251,28 @@ fn dump_json(j: &Json) -> String {
         Json::Null => "null".into(),
         Json::Bool(b) => b.to_string(),
         Json::Num(n) => {
-            if n.fract() == 0.0 && n.is_finite() {
+            // PRODUCTION-HARDENING (PR-it773): `as i64` on a float outside i64's
+            // range doesn't error or wrap -- it SATURATES to exactly i64::MAX/MIN
+            // (Rust's documented float-to-int cast behavior since the 2018
+            // edition). `dump_json` is used to echo a model's OWN tool-call
+            // content back into conversation history for the next round
+            // (AnthropicProvider::round/OpenAiProvider::round below) -- so a
+            // large integer tool argument (a Snowflake-style ID, a large hash)
+            // that happens to exceed i64's range would silently become the
+            // FIXED sentinel 9223372036854775807/-9223372036854775808 in what
+            // the model believes is its own prior message, with no error
+            // anywhere. `i64::MAX as f64` is exactly 2^63 (i64::MAX itself,
+            // 2^63-1, isn't representable in f64) -- a STRICT `<` upper bound
+            // is required, since `n == i64::MAX as f64` itself still saturates
+            // on cast (confirmed empirically: `(i64::MAX as f64) as i64 ==
+            // i64::MAX`, NOT the actual value 2^63 that f64 held). `i64::MIN as
+            // f64` IS exact (a negative power of two), so `>=` is safe there.
+            // Outside this range, fall back to the SAME float-formatted string
+            // already used for genuinely fractional numbers below -- lossy at
+            // f64 precision like any large JSON number, but round-trips to
+            // SOME value derived from what was actually sent, not a sentinel
+            // that discards the input's magnitude entirely.
+            if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n < i64::MAX as f64 {
                 format!("{}", *n as i64)
             } else {
                 format!("{n}")
@@ -303,10 +324,48 @@ pub fn value_from_json(shape: &AiShape, json: &Json) -> Result<Value, String> {
         ),
         (AiShape::Str, Json::Str(s)) => Ok(Value::str(s.clone())),
         (AiShape::Int, Json::Num(n)) => {
-            if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+            // A REAL cross-engine byte-identity divergence found+fixed
+            // (production-hardening PR-it773): this used `<= i64::MAX as f64`
+            // -- but `i64::MAX as f64` is exactly 2^63 (i64::MAX itself, 2^63-1,
+            // isn't representable in f64), so a model-returned value of EXACTLY
+            // 2^63 (9223372036854775808, one more than i64::MAX) passed this
+            // check and then `*n as i64` SATURATED it to i64::MAX
+            // (9223372036854775807) -- silently corrupting a genuinely
+            // out-of-range tool argument into a valid-looking one, instead of
+            // rejecting it. `cgen.rs`'s independently-reimplemented native
+            // mirror, `k_ai_from_json`, ALREADY used the correct strict `<
+            // 9223372036854775808.0` bound (its own comment even claimed
+            // "matching the interpreter" -- which this bug meant was false).
+            // Confirmed live before fixing: a tool call with an Int argument
+            // of exactly 2^63 silently succeeded on interp/vm (the tool
+            // received the corrupted `9223372036854775807`, program completed
+            // normally), while native correctly panicked with "expected an
+            // integer, model returned 9223372036854775808" and never called
+            // the tool at all -- a genuine crash-vs-silent-corruption
+            // cross-engine divergence, not just a message-text difference.
+            // Fixed by matching native's already-correct strict upper bound;
+            // `i64::MIN as f64` IS exact (a negative power of two), so `>=`
+            // was already correct there and is unchanged.
+            if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n < i64::MAX as f64 {
                 Ok(Value::Int(*n as i64))
+            } else if n.fract() == 0.0 && n.is_finite() {
+                // A SECOND, SEPARATE cross-engine message-text divergence found while
+                // fixing the boundary above (production-hardening PR-it773): Rust's
+                // default `{n}` Display for a large whole-number f64 prints the
+                // SHORTEST round-tripping decimal, not the exact value (e.g. 2^63
+                // prints as "9223372036854776000", not "9223372036854775808") --
+                // while `cgen.rs`'s native mirror builds this SAME message via C's
+                // `"%.0f"`, which always prints the exact decimal value. Confirmed
+                // live: rejecting an out-of-range whole number produced DIFFERENT
+                // digit strings on interp/vm ("...9223372036854776000") vs. native
+                // ("...9223372036854775808") for the IDENTICAL underlying value --
+                // full diagnostic-message byte-identity is this project's own
+                // standing invariant. `{n:.0}` (fixed-point, 0 decimals) matches
+                // `%.0f` exactly: always the full decimal expansion, never
+                // scientific notation, for any finite f64 magnitude.
+                Err(format!("expected an integer, model returned {n:.0}"))
             } else {
-                Err(format!("expected an integer, model returned {n}"))
+                Err("expected an integer, model returned a fraction".to_string())
             }
         }
         (AiShape::Float, Json::Num(n)) => Ok(Value::Float(*n)),
@@ -1072,6 +1131,121 @@ mod tests {
         let m2 = meta("t_ok", AiShape::Str, false);
         let v = super::convert(&m2, "  hello  ").unwrap();
         assert_eq!(v, Value::str("hello"));
+    }
+
+    #[test]
+    fn value_from_json_rejects_a_whole_number_exactly_one_past_i64_max_instead_of_saturating() {
+        // A REAL cross-engine byte-identity divergence found+fixed (production-
+        // hardening PR-it773, an Explore survey finding, agentId
+        // aca5b82689fe978bd, independently re-verified before implementing):
+        // `i64::MAX as f64` is exactly 2^63 (i64::MAX itself, 2^63-1, isn't
+        // representable in f64) -- the old `<= i64::MAX as f64` bound let a
+        // model-returned value of EXACTLY 2^63 (9223372036854775808, one more
+        // than i64::MAX) through, and `*n as i64` then SATURATED it to
+        // i64::MAX, silently corrupting an out-of-range argument into a
+        // valid-looking one. Live-confirmed via a real `kupl run`/`--vm`/
+        // `native` tool-call round-trip before this fix: interp/vm silently
+        // accepted it and delivered the corrupted i64::MAX to the tool, while
+        // native (whose independently-reimplemented `k_ai_from_json` already
+        // used the correct strict `<` bound) correctly panicked and never
+        // called the tool at all -- crash-vs-silent-corruption, not just a
+        // message-text difference.
+        let two_pow_63 = Json::Num(9223372036854775808.0_f64);
+        let err = value_from_json(&AiShape::Int, &two_pow_63).expect_err("2^63 must be rejected");
+        assert_eq!(err, "expected an integer, model returned 9223372036854775808");
+
+        // the actual boundary, i64::MAX itself, is representable -- must NOT
+        // regress into being rejected. (i64::MAX as a literal isn't exactly
+        // representable in f64 either, so this uses the nearest safely-below
+        // value instead, matching what a real provider round-trip could
+        // actually deliver without ALSO hitting f64's own separate, inherent
+        // JSON-number precision limit above 2^53.)
+        let safely_below = Json::Num(9223372036854773760.0_f64); // i64::MAX as f64, minus one f64 ulp
+        assert_eq!(value_from_json(&AiShape::Int, &safely_below), Ok(Value::Int(9223372036854773760)));
+
+        // an ordinary in-range integer is completely unaffected.
+        assert_eq!(value_from_json(&AiShape::Int, &Json::Num(42.0)), Ok(Value::Int(42)));
+
+        // i64::MIN's own boundary is unaffected (it WAS already exact, `>=` is unchanged).
+        let two_pow_63_neg = Json::Num(-9223372036854775808.0_f64);
+        assert_eq!(value_from_json(&AiShape::Int, &two_pow_63_neg), Ok(Value::Int(i64::MIN)));
+    }
+
+    #[test]
+    fn value_from_json_fractional_rejection_message_matches_natives_generic_wording() {
+        // A SECOND, SEPARATE, PRE-EXISTING cross-engine message-text divergence
+        // found while fixing the boundary bug above (same investigation, same
+        // match arm): Rust's default `{n}` Display for a genuinely fractional
+        // value used to echo the actual number ("...returned 3.14"), while
+        // `cgen.rs`'s native mirror has ALWAYS used a generic, value-less
+        // "...returned a fraction" message for this case. Live-confirmed
+        // before fixing: `kupl run` (a fractional tool argument) printed
+        // "expected an integer, model returned 3.14" while the native build of
+        // the IDENTICAL program printed "expected an integer, model returned a
+        // fraction" for the SAME input. Fixed by matching native's existing
+        // wording (the simpler, lower-risk direction -- native's C code would
+        // need real added complexity to also print the exact fractional value,
+        // while Rust matching native's existing generic text is a one-line
+        // change).
+        let err = value_from_json(&AiShape::Int, &Json::Num(3.14)).expect_err("a fraction must be rejected");
+        assert_eq!(err, "expected an integer, model returned a fraction");
+
+        // NaN/Infinity also fall into the same generic-message branch (both
+        // fail `n.fract() == 0.0`/`is_finite()` in some combination), matching
+        // native's `isfinite(n) && n == floor(n)` guard exactly.
+        assert_eq!(
+            value_from_json(&AiShape::Int, &Json::Num(f64::NAN)),
+            Err("expected an integer, model returned a fraction".to_string())
+        );
+        assert_eq!(
+            value_from_json(&AiShape::Int, &Json::Num(f64::INFINITY)),
+            Err("expected an integer, model returned a fraction".to_string())
+        );
+    }
+
+    #[test]
+    fn dump_json_does_not_silently_saturate_a_large_integer_when_echoing_tool_call_content() {
+        // A REAL bug found+fixed (production-hardening PR-it773, the ORIGINAL
+        // Explore survey finding this iteration targeted, agentId
+        // aca5b82689fe978bd): `dump_json` is used to echo a model's OWN
+        // `tool_use`/tool-call content back into conversation history for the
+        // next round (`AnthropicProvider::round`/`OpenAiProvider::round`).
+        // Its `Json::Num` arm used the SAME buggy `n as i64` saturating cast
+        // as `value_from_json`'s old bound (fixed above) -- so ANY integer
+        // beyond i64's range in a model's tool-call input, once echoed back,
+        // silently became the FIXED sentinel i64::MAX/MIN in what the model
+        // believes is its own prior message, no error anywhere. Fixed with
+        // the SAME strict-bound check; out-of-range values now fall back to
+        // the ALREADY-EXISTING float-formatted string (Rust's `{n}` Display,
+        // the shortest decimal that round-trips to the exact same f64 bit
+        // pattern -- the same convention JSON serializers universally use for
+        // floats, e.g. "9223372036854776000" rather than the input's own
+        // "9223372036854775808" spelling -- still lossy at f64 precision like
+        // any large JSON number, but crucially DERIVED FROM the actual input
+        // magnitude, not a fixed sentinel that discards it entirely).
+        assert_eq!(dump_json(&Json::Num(9223372036854775808.0)), "9223372036854776000");
+        assert_ne!(
+            dump_json(&Json::Num(9223372036854775808.0)),
+            "9223372036854775807",
+            "must not silently saturate to i64::MAX"
+        );
+        // (a literal one past i64::MIN itself, e.g. `-9223372036854775809.0`,
+        // rounds AT COMPILE TIME to the nearest f64, which is exactly
+        // `i64::MIN as f64` -- landing back INSIDE the safe range and testing
+        // nothing; `-1e20` is unambiguously, comfortably out of range.)
+        assert_eq!(dump_json(&Json::Num(-1e20)), "-100000000000000000000");
+        assert_ne!(
+            dump_json(&Json::Num(-1e20)),
+            format!("{}", i64::MIN),
+            "must not silently saturate to i64::MIN"
+        );
+        // two DIFFERENT out-of-range magnitudes must no longer collapse to
+        // the SAME output -- the actual observable consequence of the bug
+        // (both used to become the identical sentinel "9223372036854775807").
+        assert_ne!(dump_json(&Json::Num(1e20)), dump_json(&Json::Num(2e20)));
+        // ordinary in-range/fractional numbers are completely unaffected.
+        assert_eq!(dump_json(&Json::Num(42.0)), "42");
+        assert_eq!(dump_json(&Json::Num(3.14)), "3.14");
     }
 
     #[test]
