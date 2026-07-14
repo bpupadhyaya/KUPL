@@ -1040,7 +1040,46 @@ impl Parser {
 
     // ---- blocks & statements --------------------------------------------
 
+    /// PR-it715: found during the systematic sweep it714 called for. `while`/
+    /// `for`/`forall` bodies recurse into `parse_block` (-> `parse_stmt` ->
+    /// the SAME statement kind's body -> `parse_block` -> ...) WITHOUT ever
+    /// going through `parse_expr`'s guarded entry point -- `if`/lambda/match-
+    /// arm bodies happen to be safe only because `if`/lambda/match are
+    /// EXPRESSIONS reached via `parse_expr`, not because `parse_block` itself
+    /// is guarded. A deeply nested `while true { while true { ... } }` (or
+    /// `for`/`forall`) chain confirmed live to crash the parser with the same
+    /// uncatchable "fatal runtime error: stack overflow" it713/it714 already
+    /// fixed for expressions and patterns. Guarded here, at `parse_block`
+    /// itself -- the ONE shared function every block body funnels through
+    /// (`if`/lambda/match arms/fun bodies/component members all included) --
+    /// rather than at each of `while`/`for`/`forall`'s call sites individually
+    /// (narrower shared boundary point, matching PR-it638/it639/it692's
+    /// pattern). `if`/lambda/match bodies now get counted TWICE (once by
+    /// `parse_expr`'s own guard, once here) -- harmless: it only makes the
+    /// limit marginally more conservative, never less safe, and real code
+    /// nests far below 128 either way.
     fn parse_block(&mut self) -> PResult<Block> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(self.block_too_deep());
+        }
+        let r = self.parse_block_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn block_too_deep(&self) -> Diag {
+        Diag::error(
+            "K0121",
+            format!(
+                "block nesting too deep (limit is {MAX_EXPR_DEPTH}) — break it into a helper `fun`"
+            ),
+            self.span(),
+        )
+    }
+
+    fn parse_block_inner(&mut self) -> PResult<Block> {
         let start = self.expect(Tok::LBrace)?;
         let mut stmts = Vec::new();
         loop {
@@ -2263,6 +2302,65 @@ mod tests {
                 let ok = "fun main() -> Int {\n    let x = match 1 {\n        Some(Some(Some(Some(Some(v))))) => v\n        _ => 0\n    }\n    return x\n}\n";
                 let (_, diags) = parse(ok);
                 assert!(diags.is_empty(), "a 5-level nested constructor pattern must parse cleanly: {diags:?}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A REAL, LIVE-CRASHING bug (PR-it715), found by the systematic sweep
+    /// it714 called for after TWO consecutive iterations turned up crashes in
+    /// the same vein: `while`/`for`/`forall` statement bodies recurse into
+    /// `parse_block` (-> `parse_stmt` -> the SAME statement kind's body ->
+    /// `parse_block` -> ...) without EVER going through `parse_expr`'s
+    /// guarded entry point. `if`/lambda/match-arm bodies happened to be safe
+    /// only because `if`/lambda/match are EXPRESSIONS reached via
+    /// `parse_expr`, not because `parse_block` itself was guarded -- a purely
+    /// STATEMENT-level nesting chain (`while true { while true { ... } }`,
+    /// same for `for`/`forall`) bypassed K0121 entirely. Confirmed live
+    /// BEFORE this fix: a 500,000-deep `while true { ... }` chain crashed
+    /// `kupl fmt`/`kupl check`/`kupl run`/`kupl run --vm`/`kupl native` ALL
+    /// FIVE with the identical uncatchable "fatal runtime error: stack
+    /// overflow, aborting" abort it713/it714 already fixed for expressions
+    /// and patterns -- the STATEMENT-grammar sibling of that same gap. Fixed
+    /// by guarding `parse_block` itself (renamed body to `parse_block_inner`)
+    /// -- the ONE shared function every block body funnels through (`if`/
+    /// lambda/match arms/fun bodies/component members all included), rather
+    /// than each of `while`/`for`/`forall`'s call sites individually (the
+    /// narrower-shared-boundary-point pattern, PR-it638/it639/it692).
+    #[test]
+    fn deeply_nested_while_for_forall_bodies_are_a_clean_k0121_not_a_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let n = MAX_EXPR_DEPTH + 2;
+                let cases: Vec<(&str, String)> = vec![
+                    (
+                        "while",
+                        format!("fun main() {{\n{}break\n{}}}\n", "while true {\n".repeat(n), "}\n".repeat(n)),
+                    ),
+                    (
+                        "for",
+                        format!("fun main() {{\n{}break\n{}}}\n", "for i in 0..1 {\n".repeat(n), "}\n".repeat(n)),
+                    ),
+                    (
+                        "forall",
+                        format!("fun main() {{\n{}break\n{}}}\n", "forall a: Int {\n".repeat(n), "}\n".repeat(n)),
+                    ),
+                ];
+                for (label, src) in &cases {
+                    let (_, diags) = parse(src);
+                    assert!(
+                        diags.iter().any(|d| d.code == "K0121"),
+                        "a {n}-deep nested `{label}` body must hit K0121, not silently build an unbounded AST: {diags:?}"
+                    );
+                }
+                // An ordinary, well-under-the-limit nested `while` (5 levels)
+                // must NOT false-positive -- confirms the new guard doesn't
+                // regress normal loop nesting.
+                let ok = "fun main() {\n    while true {\n        while true {\n            while true {\n                while true {\n                    while true {\n                        break\n                    }\n                    break\n                }\n                break\n            }\n            break\n        }\n        break\n    }\n}\n";
+                let (_, diags) = parse(ok);
+                assert!(diags.is_empty(), "a 5-level nested `while` must parse cleanly: {diags:?}");
             })
             .unwrap()
             .join()
