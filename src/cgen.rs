@@ -1251,8 +1251,28 @@ static KBig* k_big_gcd(KBig* a, KBig* b) {
     return x;
 }
 static int k_big_is_one(KBig* a) { return a->n == 1 && a->limbs[0] == 1 && !a->neg; }
+/* PR-it718, the C mirror of rational.rs's MAX_GCD_INPUT_LIMBS / Rational::new
+   -- k_big_gcd's Euclidean algorithm is an uncapped internal building block;
+   for two "generic" large operands its cost is empirically much worse than
+   add/sub/mul (measured directly, Rust side: 400 digits ~130ms, 800 digits
+   ~900ms, 1200 digits ~3s). rat(big("<~180,000-digit string>"),
+   big("<~180,000-digit string>")) -- each operand individually legal -- was
+   confirmed LIVE to hang the native binary for OVER TWO MINUTES before this
+   fix. Requires BOTH operands to exceed the cap, not either: one huge
+   operand paired with a small one (e.g. rat(big("<100k digits>"), 3), the
+   pre-existing repeated-multiplication cap test) is cheap regardless of the
+   huge side's size. */
+#define K_MAX_GCD_INPUT_LIMBS 100
 static KRat* k_rat_norm(KBig* num, KBig* den) {
     if (den->n == 0) k_panic("division by zero");
+    if (num->n > K_MAX_GCD_INPUT_LIMBS && den->n > K_MAX_GCD_INPUT_LIMBS) {
+        char m[160];
+        snprintf(m, sizeof m,
+                 "Rational construction would require a GCD reduction too large to compute "
+                 "(limit ~%d limbs, roughly %d decimal digits, when BOTH operands exceed it)",
+                 K_MAX_GCD_INPUT_LIMBS, K_MAX_GCD_INPUT_LIMBS * 9);
+        k_panic(m);
+    }
     if (den->neg) { num = k_big_negate(num); den = k_big_negate(den); }
     KRat* r = (KRat*)k_alloc(sizeof(KRat));
     KBig* g = k_big_gcd(num, den);
@@ -1299,8 +1319,31 @@ static KRat* k_rat_div(KValue av, KValue bv) {
     return k_rat_norm(k_big_mul(k_big_v(a->num), k_big_v(b->den)),
                       k_big_mul(k_big_v(a->den), k_big_v(b->num)));
 }
+/* PR-it718, the C mirror of rational.rs's Rational::cmp_would_be_too_expensive
+   -- k_rat_cmp's cross-multiplication is an uncapped internal building block
+   just like add/sub/mul, but unlike those (checked AFTER computing, via
+   k_rat_check_size) a comparison never stores a result, so checking after
+   the fact means already paying the cost. A Rational can legitimately have
+   ONE huge component paired with a tiny one (k_rat_norm's own cap requires
+   BOTH to be large before rejecting construction) -- e.g. rat(big("<180k
+   digits>"), 3) and rat(3, big("<180k digits>")) each construct instantly,
+   but comparing THOSE TWO cross-multiplies huge*huge on both sides. Without
+   this guard native would SILENTLY compute a correct-but-slow answer while
+   interp/KVM panic on the identical program -- a real cross-engine
+   divergence, not just a perf gap. */
+static int k_rat_cmp_would_be_too_expensive(KRat* a, KRat* b) {
+    return (a->num->n + b->den->n > K_MAX_BIGINT_LIMBS) || (b->num->n + a->den->n > K_MAX_BIGINT_LIMBS);
+}
 static int k_rat_cmp(KValue av, KValue bv) {
     KRat* a = av.as.rat; KRat* b = bv.as.rat;
+    if (k_rat_cmp_would_be_too_expensive(a, b)) {
+        char m[160];
+        snprintf(m, sizeof m,
+                 "Rational comparison would require a BigInt multiplication too large to compute "
+                 "(limit ~%d limbs, roughly %d decimal digits)",
+                 K_MAX_BIGINT_LIMBS, K_MAX_BIGINT_LIMBS * 9);
+        k_panic(m);
+    }
     return k_big_cmp(k_big_v(k_big_mul(k_big_v(a->num), k_big_v(b->den))),
                      k_big_v(k_big_mul(k_big_v(b->num), k_big_v(a->den))));
 }
@@ -1761,7 +1804,21 @@ static int k_eq(KValue a, KValue b) {
         case K_SIZEDINT: return a.as.sized->width == b.as.sized->width && a.as.sized->v == b.as.sized->v;
         case K_F32: return a.as.f32v == b.as.f32v;
         case K_BIGINT: return k_big_cmp(a, b) == 0;
-        case K_RATIONAL: return k_rat_cmp(a, b) == 0;
+        /* PR-it718: structural equality (num/den each compared directly via
+           the cheap k_big_cmp, no multiplication), matching interp.rs's
+           `#[derive(PartialEq)]` on Rational exactly -- a Rational is ALWAYS
+           stored reduced (k_rat_norm), so structural equality of the reduced
+           num/den IS correct mathematical equality, with no need for the
+           cross-multiplication k_rat_cmp uses for genuine ORDERING. Using
+           k_rat_cmp here (as this line originally did) would route `==`
+           through the SAME expensive-multiplication guard `<`/`<=`/`>`/`>=`
+           now correctly need (see k_rat_cmp above) -- but Rust's `==` never
+           pays that cost at all, so reusing k_rat_cmp here would make native
+           panic on an asymmetric huge/tiny Rational pair where interp/KVM's
+           cheap structural `==` succeeds instantly: a cross-engine
+           divergence this fix must NOT introduce. */
+        case K_RATIONAL: return k_big_cmp(k_big_v(a.as.rat->num), k_big_v(b.as.rat->num)) == 0
+                             && k_big_cmp(k_big_v(a.as.rat->den), k_big_v(b.as.rat->den)) == 0;
         case K_LIST:
             if (a.as.list->len != b.as.list->len) return 0;
             for (int64_t i = 0; i < a.as.list->len; i++)
@@ -9050,6 +9107,41 @@ fun main() uses io {
              1|0|\
              1000000001|1"
         );
+    }
+
+    /// The native mirror of `diff_rational_construction_and_comparison_reject_a_gcd_or_multiply_too_large_to_compute`
+    /// (vm.rs, PR-it718): `k_rat_norm`'s `k_big_gcd` call and `k_rat_cmp`'s
+    /// cross-multiplication are BOTH independent C reimplementations of the
+    /// SAME uncapped-building-block pattern `rational.rs`'s `Rational::new`/
+    /// `cmp` have -- confirmed live BEFORE this fix that native hung
+    /// identically to interp/KVM on both the huge/huge construction case AND
+    /// the asymmetric-comparison case (and, distinctly, that native's `k_eq`
+    /// used to route `==` through the SAME expensive `k_rat_cmp` where
+    /// interp.rs's cheap structural `PartialEq` never pays that cost at all
+    /// -- a genuine cross-engine behavioral gap fixed alongside the DoS,
+    /// not just a performance one).
+    #[test]
+    fn native_rational_gcd_and_comparison_reject_a_computation_too_large_to_attempt() {
+        assert_panic_wording_matches(
+            "fun main() uses io {\n    let s = \"9\".repeat(1000)\n    print(\"{rat(big(s), big(s))}\")\n}\n",
+            "ratctorcap",
+        );
+        assert_panic_wording_matches(
+            "fun main() uses io {\n    let s = \"9\".repeat(180000)\n    \
+             let r1 = rat(big(s), 3)\n    let r2 = rat(3, big(s))\n    print(\"{r1 < r2}\")\n}\n",
+            "ratcmpcap",
+        );
+        if !cc_available() {
+            return;
+        }
+        // ONE huge operand paired with a small one constructs/compares fine.
+        let ok = "fun main() uses io {\n    let s = \"9\".repeat(1000)\n    print(\"{rat(big(s), 3) > rat(1, 1)}\")\n}\n";
+        assert_eq!(native_main_stdout(ok, "ratctorok").trim(), "true");
+        // == uses cheap structural comparison, NOT k_rat_cmp -- must stay
+        // fast and correct even for the same asymmetric huge/tiny shape.
+        let eq_check = "fun main() uses io {\n    let s = \"9\".repeat(1000)\n    \
+                        print(\"{rat(big(s), 3) == rat(big(s), 3)}\")\n}\n";
+        assert_eq!(native_main_stdout(eq_check, "rateq").trim(), "true");
     }
 
     /// Rational ACCUMULATION with running GCD-reduction (it231): a harmonic-series loop adds 1/i each

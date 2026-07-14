@@ -1647,6 +1647,21 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
         }
         (Value::Rational(a), Value::Rational(b)) => {
             use std::cmp::Ordering;
+            // A REAL, LIVE-CONFIRMED bug (PR-it718): Rational::cmp's cross-
+            // multiplication is an uncapped internal building block just like
+            // add/sub/mul -- but unlike those (checked AFTER computing, below),
+            // a comparison never stores a result, so checking after the fact
+            // means already paying the cost. Confirmed live: two Rationals
+            // each built from an ordinary near-cap `big("...")` string ran a
+            // single `<` for OVER TWO MINUTES without completing before this
+            // check. See `Rational::cmp_would_be_too_expensive`'s doc comment.
+            if matches!(op, Lt | Le | Gt | Ge) && a.cmp_would_be_too_expensive(b) {
+                return Err(format!(
+                    "Rational comparison would require a BigInt multiplication too large to compute (limit ~{} limbs, roughly {} decimal digits)",
+                    crate::bigint::MAX_BIGINT_LIMBS,
+                    crate::bigint::MAX_BIGINT_LIMBS * 9
+                ));
+            }
             let result = match op {
                 Add => a.add(b),
                 Sub => a.sub(b),
@@ -3431,7 +3446,20 @@ fn list_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
         (Value::SizedInt(x), Value::SizedInt(y)) if x.1 == y.1 => Ok(x.0.cmp(&y.0)),
         (Value::F32(x), Value::F32(y)) => Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal)),
         (Value::BigInt(x), Value::BigInt(y)) => Ok(x.cmp(y)),
-        (Value::Rational(x), Value::Rational(y)) => Ok(x.cmp(y)),
+        (Value::Rational(x), Value::Rational(y)) => {
+            // Same PR-it718 pre-check as raw_binary_op's Lt/Le/Gt/Ge arms --
+            // this function backs `.min()`/`.max()`/`.min_by()`/`.max_by()`
+            // (and, via sort_order's fallthrough, `.sort()`), an entirely
+            // separate reachable path to the SAME uncapped Rational::cmp.
+            if x.cmp_would_be_too_expensive(y) {
+                return Err(format!(
+                    "Rational comparison would require a BigInt multiplication too large to compute (limit ~{} limbs, roughly {} decimal digits)",
+                    crate::bigint::MAX_BIGINT_LIMBS,
+                    crate::bigint::MAX_BIGINT_LIMBS * 9
+                ));
+            }
+            Ok(x.cmp(y))
+        }
         _ => Err("`min`/`max` need Int, Float, Str, or another orderable type".into()),
     }
 }

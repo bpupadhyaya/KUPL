@@ -125,6 +125,19 @@ impl BigInt {
         self.limbs.len() as u64 > MAX_BIGINT_LIMBS
     }
 
+    /// This `BigInt`'s limb count — a cheap O(1) size probe (PR-it718), used
+    /// by `Rational::cmp_would_be_too_expensive` to ESTIMATE the cost of a
+    /// cross-multiplication BEFORE performing it, the same way `pow`
+    /// estimates its result size before the expensive squaring (PR-it637) —
+    /// checking a multiplication's actual RESULT size (like `exceeds_max_size`
+    /// above, used by `raw_binary_op` for `+`/`-`/`*`) is the wrong shape here
+    /// because a comparison never stores its product; by the time the result
+    /// existed to check, the (potentially minutes-long) cost would already be
+    /// paid.
+    pub fn limb_count(&self) -> usize {
+        self.limbs.len()
+    }
+
     pub fn is_negative(&self) -> bool {
         self.neg
     }

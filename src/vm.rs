@@ -1615,6 +1615,68 @@ mod tests {
         assert_eq!(differential("fun probe() -> Str { \"{big(6) * big(7)}\" }\n"), "42");
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it718):
+    /// `Rational::new`'s `gcd`-based reduction, and `Rational::cmp`'s cross-
+    /// multiplication, are BOTH uncapped internal building blocks -- but
+    /// unlike `add`/`sub`/`mul` (checked against `MAX_BIGINT_LIMBS` AFTER
+    /// computing, via `diff_bigint_and_rational_mul_rejects_growth...`
+    /// above), NEITHER a `gcd` call nor a `cmp` call stores a result to check
+    /// afterward, so a size cap must apply BEFORE the expensive work.
+    /// Confirmed LIVE before this fix: two Rationals each built from an
+    /// ordinary `big("<~180,000-digit string>")` (individually well within
+    /// `BigInt::from_str`'s OWN cap) ran for OVER TWO MINUTES without
+    /// completing on a single `rat(...)` construction alone (dominated by
+    /// `gcd`'s empirically much-worse-than-quadratic cost for "generic"
+    /// large operands) -- and, separately, a single `<` comparing an
+    /// asymmetric pair (one huge numerator/tiny denominator vs. one tiny
+    /// numerator/huge denominator, each individually CHEAP to construct)
+    /// also ran unbounded, since `cmp`'s cross-multiplication needs BOTH
+    /// cross terms small, not just each operand's own num/den. Byte-
+    /// identical on interp/KVM; see `native_rational_gcd_and_comparison_...`
+    /// (cgen.rs) for native's independent mirror.
+    #[test]
+    fn diff_rational_construction_and_comparison_reject_a_gcd_or_multiply_too_large_to_compute() {
+        // both operands over the gcd-input cap -> construction itself is
+        // rejected before ever attempting the expensive gcd.
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let s = \"9\".repeat(1000)\n    \"{rat(big(s), big(s))}\" }\n"
+            ),
+            "panic: Rational construction would require a GCD reduction too large to compute \
+             (limit ~100 limbs, roughly 900 decimal digits, when BOTH operands exceed it)"
+        );
+        // ONE huge operand paired with a small one constructs (and compares
+        // against an ordinary Rational) just fine -- confirms the `&&` (not
+        // `||`) condition doesn't over-reject this legitimate, cheap-gcd
+        // asymmetric shape (a real pre-existing pattern, matching
+        // `diff_bigint_and_rational_mul_rejects_growth...`'s own
+        // `rat(big(s), 3)` above).
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let s = \"9\".repeat(1000)\n    \"{rat(big(s), 3) > rat(1, 1)}\" }\n"
+            ),
+            "true"
+        );
+        // comparing TWO such asymmetric Rationals (huge-num/tiny-den vs.
+        // tiny-num/huge-den) cross-multiplies huge*huge on BOTH sides, even
+        // though each individually constructed cheaply -- rejected cleanly.
+        // (needs ~180,000 digits, not just the ~900-digit construction-cap
+        // threshold above, since `cmp`'s own guard reuses `MAX_BIGINT_LIMBS`
+        // -- generated via `.repeat()` at KUPL runtime, not embedded as a
+        // literal, to keep this test's OWN source short.)
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let s = \"9\".repeat(180000)\n    let r1 = rat(big(s), 3)\n    \
+                 let r2 = rat(3, big(s))\n    \"{r1 < r2}\" }\n"
+            ),
+            "panic: Rational comparison would require a BigInt multiplication too large to compute \
+             (limit ~20000 limbs, roughly 180000 decimal digits)"
+        );
+        // ordinary, legitimate Rational construction/comparison is
+        // completely unaffected.
+        assert_eq!(differential("fun probe() -> Str { \"{rat(1, 3) < rat(1, 2)}\" }\n"), "true");
+    }
+
     /// `Str.repeat`'s size check (`s.len().saturating_mul(n as usize) >
     /// 100_000_000`) is already overflow-safe on interp/KVM (`saturating_mul`
     /// can never wrap) -- this locks that CORRECT, already-shared behavior
