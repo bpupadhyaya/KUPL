@@ -361,14 +361,45 @@ fn diagnostics_notification(path: &PathBuf, uri: &str, buffers: &HashMap<PathBuf
 
 // ---- language features: hover, definition, completion (read-only) ----
 
-/// Byte offset of an LSP (line, character) position — both 0-based. Character
-/// columns are treated as byte columns (correct for ASCII; a documented
-/// approximation for multi-byte lines).
+/// Byte offset of an LSP (line, character) position — both 0-based. Per the
+/// LSP spec, `character` is a UTF-16 CODE UNIT offset -- every real client
+/// (VS Code, etc.) sends positions this way. A REAL bug found+fixed
+/// (production-hardening PR-it740): this used to treat `character` as a raw
+/// BYTE offset instead, which is only correct for pure-ASCII lines. KUPL
+/// explicitly supports non-ASCII identifiers (e.g. `café`, `日本` -- see the
+/// fuzz tests below), so any line with a multi-byte UTF-8 character BEFORE
+/// the target column made every position-based request (hover, goto-
+/// definition, rename, completion, references) resolve to the WRONG
+/// identifier -- silently, no panic, no error, just a wrong result -- once a
+/// real editor's UTF-16-based `character` value was misread as a byte
+/// count. Now correctly walks the target line by CHAR, converting the
+/// UTF-16 unit count to the matching byte offset (`char::len_utf16` vs.
+/// `char::len_utf8`); a run past the end of the line's UTF-16 length still
+/// clamps to the line's full byte length, same defensive behavior as
+/// before. (The output side -- `diag::line_col`, used to build the
+/// positions this server SENDS back -- already returns a raw char count,
+/// which happens to equal the UTF-16 unit count for every character KUPL's
+/// `is_ident` allows in an identifier (alphanumeric BMP characters), so
+/// responses were already correctly aligned with real clients for the
+/// common case; only 4-byte/astral-plane characters like emoji, which can
+/// only ever appear in a comment or string literal, not an identifier,
+/// would still under-count there -- a narrower, lower-severity residual gap
+/// left for a future iteration, not fixed here.)
 fn offset_at(text: &str, line: usize, character: usize) -> usize {
     let mut off = 0usize;
     for (n, l) in text.split_inclusive('\n').enumerate() {
         if n == line {
-            return off + character.min(l.trim_end_matches('\n').len());
+            let line_text = l.trim_end_matches('\n');
+            let mut units = 0usize;
+            let mut byte_off = 0usize;
+            for ch in line_text.chars() {
+                if units >= character {
+                    break;
+                }
+                units += ch.len_utf16();
+                byte_off += ch.len_utf8();
+            }
+            return off + byte_off;
         }
         off += l.len();
     }
@@ -3127,6 +3158,36 @@ mod tests {
         assert_eq!(offset_at("ab\ncd", 1, 1), 4); // 'd'
         let (n, _, _) = ident_at("let foo = 1", 5).unwrap();
         assert_eq!(n, "foo");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it740): `offset_at` used
+    /// to treat the LSP `character` field as a raw BYTE offset, but the LSP spec
+    /// (and every real client -- VS Code, etc.) sends it as a UTF-16 CODE UNIT
+    /// offset. On any line with a multi-byte UTF-8 character BEFORE the target
+    /// column, the two counts diverge, so a real client's request landed on the
+    /// WRONG identifier -- silently, no panic, just a wrong result.
+    #[test]
+    fn offset_at_treats_character_as_utf16_units_not_bytes() {
+        let text = "let café = mean\n";
+        // "let café = " is 11 UTF-16 units (l,e,t,sp,c,a,f,é,sp,=,sp -- é is ONE
+        // unit) but 12 BYTES (é is TWO UTF-8 bytes), so "mean" starts at UTF-16
+        // unit 11 / byte 12. A real client's cursor-at-start-of-"mean" request
+        // sends character=11; the OLD byte-based code read that as byte offset
+        // 11, landing on the space one byte short of "mean" (bytes: ...café" is
+        // c=4,a=5,f=6,é=7-8, sp=9, '='=10, sp=11, 'm'=12), so `ident_at` found
+        // no identifier there at all (a space has no adjacent ident chars).
+        assert_eq!(offset_at(text, 0, 11), 12, "'mean' starts at byte 12 but UTF-16 unit 11");
+        assert_eq!(
+            ident_under(text, 0, 11).as_deref(),
+            Some("mean"),
+            "a real client's UTF-16 character=11 must resolve to 'mean', not land on the space before it"
+        );
+
+        // Sanity: the identifier BEFORE the multi-byte char is unaffected --
+        // character=4 (UTF-16 unit, right before 'c') is also byte offset 4,
+        // since everything up to that point is single-byte ASCII.
+        assert_eq!(offset_at(text, 0, 4), 4);
+        assert_eq!(ident_under(text, 0, 4).as_deref(), Some("café"));
     }
 
     #[test]
