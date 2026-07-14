@@ -6390,6 +6390,47 @@ static void k_dispatch(int id, int chunk, KValue* arg) {
     }
 }
 
+/* cheap approximate byte-size of a value's own data -- mirrors
+   Value::approx_byte_size (value.rs) exactly: leaf scalars cost a flat 8
+   bytes, containers sum their children. Used by k_drain to bound unbounded
+   PAYLOAD growth in a `wire` cycle (production-hardening PR-it760) the same
+   way the 1000000 message-COUNT bound above already bounds message count --
+   an ordinary self-wire handler like `emit grown(s + s)` doubles its payload
+   every hop with no error, reaching 512MB in just 30 messages (0.003% of the
+   message-count cap), confirmed live to climb unbounded toward the OS OOM
+   killer rather than ever hitting a clean panic. BigInt/Rational are
+   deliberately left at the flat 8-byte leaf cost -- both already
+   independently cap their own limb count (bigint.rs::MAX_BIGINT_LIMBS), so
+   neither can grow large enough on its own to matter here. */
+static uint64_t k_value_approx_size(KValue v) {
+    switch (v.tag) {
+        case K_STR: return (uint64_t)strlen(v.as.s);
+        case K_LIST: {
+            uint64_t sz = 0;
+            for (int64_t i = 0; i < v.as.list->len; i++) sz += k_value_approx_size(v.as.list->items[i]);
+            return sz;
+        }
+        case K_SET: {
+            uint64_t sz = 0;
+            for (int64_t i = 0; i < v.as.set->len; i++) sz += k_value_approx_size(v.as.set->items[i]);
+            return sz;
+        }
+        case K_CTOR: {
+            uint64_t sz = 0;
+            for (int i = 0; i < v.as.ctor->nfields; i++) sz += k_value_approx_size(v.as.ctor->fields[i]);
+            return sz;
+        }
+        case K_MAP: {
+            uint64_t sz = 0;
+            for (int64_t i = 0; i < v.as.map->len; i++)
+                sz += k_value_approx_size(v.as.map->keys[i]) + k_value_approx_size(v.as.map->vals[i]);
+            return sz;
+        }
+        case K_TENSOR: return (uint64_t)v.as.ten->len * 8;
+        default: return 8;
+    }
+}
+
 /* drain the queue to quiescence: pop front, dispatch by first-match handler */
 static void k_drain(void) {
     long processed = 0;
@@ -6399,6 +6440,8 @@ static void k_drain(void) {
         if (++processed > 1000000L)
             k_panic("component message limit exceeded (1000000) — a `wire` cycle?");
         KMsg m = k_queue[k_qhead++];
+        if (k_value_approx_size(m.value) > 10000000ULL)
+            k_panic("component message payload too large (limit 10000000 bytes) — unbounded growth in a `wire` cycle?");
         KInstance* inst = &k_insts[m.id];
         const KCompMeta* cm = &COMPS[inst->comp];
         for (int i = 0; i < cm->nhandlers; i++) {
@@ -7363,6 +7406,53 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         // the cycle panics on hitting the limit -> no normal output (empty stdout);
         // crucially it TERMINATES (the test would hang otherwise).
         assert!(native_stdout(src, "wirecycle").trim().is_empty(), "expected a bounded panic");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it760, sibling of
+    /// `diff_growing_self_wire_payload_is_bounded_not_an_oom` in vm.rs): the
+    /// test above shows `MAX_COMPONENT_MESSAGES` bounds a `wire` cycle's
+    /// message COUNT, but a self-wire handler that grows its payload each
+    /// hop (`emit grown(s + s)`) doubles its string every message with no
+    /// error -- unbounded toward the OS OOM killer, not a hang, since the
+    /// message-count cap is 1,000,000 messages away. Fixed by adding
+    /// `k_value_approx_size` right next to the existing message-count check
+    /// in `k_drain`, mirroring `Value::approx_byte_size` (value.rs) exactly
+    /// so native matches interp/vm's panic message byte-for-byte.
+    #[test]
+    fn native_growing_self_wire_payload_is_bounded() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Grower {\n    intent \"doubling self-wire cycle\"\n    \
+                   in trigger: Str\n    out grown: Str\n    \
+                   on start { emit grown(\"x\") }\n    \
+                   on trigger(s) { emit grown(s + s) }\n\
+                   }\n\
+                   app Main {\n    intent \"self-wire payload growth\"\n    \
+                   let g = Grower()\n    wire g.grown -> g.trigger\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-growpayload-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.trim(),
+            "panic: component message payload too large (limit 10000000 bytes) — unbounded growth in a `wire` cycle?",
+            "native must match interp/vm's payload-cap panic message: {stderr:?}"
+        );
+        assert!(out.stdout.is_empty(), "expected a bounded panic, no normal output");
     }
 
     /// Native Map/Set methods match the interpreter/KVM, including INSERTION-order

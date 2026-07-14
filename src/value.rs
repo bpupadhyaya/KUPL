@@ -300,6 +300,38 @@ pub struct Closure {
 }
 
 impl Value {
+    /// Cheap approximate byte-size of a value's own data (leaf scalars count
+    /// as a fixed 8 bytes; containers sum their children). Used to bound
+    /// unbounded PAYLOAD growth in a `wire` cycle (production-hardening
+    /// PR-it760) the same way `MAX_COMPONENT_MESSAGES` already bounds message
+    /// COUNT: an ordinary self-wire handler like `emit grown(s + s)` doubles
+    /// its payload every hop with no error, reaching 512MB in just 30
+    /// messages -- 0.003% of the message-count cap -- confirmed live to climb
+    /// unbounded toward the OS OOM killer rather than ever hitting a clean
+    /// panic. `BigInt`/`Rational` are deliberately left at the flat 8-byte
+    /// leaf cost: both already independently cap their own limb count
+    /// (`bigint::MAX_BIGINT_LIMBS`), so neither can grow large enough on its
+    /// own to matter here. This is a pure length/count computation (byte
+    /// length, list length, ...), so it is naturally identical across
+    /// interp.rs, vm.rs (reuses this), and cgen.rs's C mirror
+    /// (`k_value_approx_size`) for any equivalent value -- all three engines
+    /// cross the cap at the exact same message.
+    pub fn approx_byte_size(&self) -> u64 {
+        match self {
+            Value::Str(s) => s.len() as u64,
+            Value::List(xs) | Value::Set(xs) => {
+                xs.iter().map(Value::approx_byte_size).sum()
+            }
+            Value::Ctor { fields, .. } => fields.iter().map(Value::approx_byte_size).sum(),
+            Value::Map(entries) => entries
+                .iter()
+                .map(|(k, v)| k.approx_byte_size() + v.approx_byte_size())
+                .sum(),
+            Value::Tensor(xs) => xs.len() as u64 * 8,
+            _ => 8,
+        }
+    }
+
     pub fn str(s: impl Into<String>) -> Value {
         Value::Str(Rc::new(s.into()))
     }

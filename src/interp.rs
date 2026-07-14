@@ -150,6 +150,17 @@ pub const MAX_TENSOR_LEN: u64 = 100_000_000;
 /// the interpreter, KVM (`vm.rs`), and native runtime (`cgen.rs`).
 pub const MAX_COMPONENT_MESSAGES: u64 = 1_000_000;
 
+/// Sanity bound on a SINGLE message's payload size (`Value::approx_byte_size`),
+/// so a wiring cycle whose handler grows its payload each hop (e.g. `emit
+/// grown(s + s)` on a self-wire) fails with a clean panic instead of climbing
+/// toward the OS OOM killer -- `MAX_COMPONENT_MESSAGES` alone doesn't catch
+/// this, since exponential growth blows past any reasonable memory budget in
+/// a tiny fraction of the message-count cap (confirmed live: 512MB after just
+/// 30 messages, 0.003% of 1,000,000). 10MB mirrors `registry.rs`/`interp.rs`'s
+/// own `MAX_HTTP_RESPONSE_SIZE` sizing (PR-it751); identical on the
+/// interpreter, KVM (`vm.rs`), and native runtime (`cgen.rs`).
+pub const MAX_COMPONENT_MESSAGE_BYTES: u64 = 10_000_000;
+
 /// Bound on timer fires processed within a single `advance()` call (an
 /// `example` block's `advance <duration>` step). A duration literal's
 /// MAGNITUDE is already capped at 100 years (`parser.rs::MAX_DURATION_MS`,
@@ -464,6 +475,14 @@ impl Interp {
                 return Err(Self::panic_flow(
                     format!(
                         "component message limit exceeded ({MAX_COMPONENT_MESSAGES}) — a `wire` cycle?"
+                    ),
+                    crate::diag::Span::default(),
+                ));
+            }
+            if value.approx_byte_size() > MAX_COMPONENT_MESSAGE_BYTES {
+                return Err(Self::panic_flow(
+                    format!(
+                        "component message payload too large (limit {MAX_COMPONENT_MESSAGE_BYTES} bytes) — unbounded growth in a `wire` cycle?"
                     ),
                     crate::diag::Span::default(),
                 ));

@@ -222,6 +222,15 @@ impl<'m> Vm<'m> {
                     span: Span::default(),
                 });
             }
+            if value.approx_byte_size() > crate::interp::MAX_COMPONENT_MESSAGE_BYTES {
+                return Err(VmError {
+                    msg: format!(
+                        "component message payload too large (limit {} bytes) — unbounded growth in a `wire` cycle?",
+                        crate::interp::MAX_COMPONENT_MESSAGE_BYTES
+                    ),
+                    span: Span::default(),
+                });
+            }
             let meta = &self.module.components[self.instances[id].comp as usize];
             let handler = meta
                 .handlers
@@ -2387,6 +2396,67 @@ fun probe() -> Int {
                    Circle(5) => \"five-circle\"\n        Square(_) => \"square\"\n    }\n}\n\
                    fun probe() -> Str {\n    classify(Circle(7))\n}\n";
         assert_eq!(differential(src), "panic: no match arm matched");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it760, from a fresh
+    /// Explore survey of json.rs/supervise/wiring): `MAX_COMPONENT_MESSAGES`
+    /// bounds a `wire` cycle's message COUNT, but nothing bounded a single
+    /// message's PAYLOAD size -- an ordinary self-wire handler that grows its
+    /// payload each hop (`emit grown(s + s)`) doubles its string every
+    /// message with no error, reaching hundreds of megabytes in barely two
+    /// dozen messages (0.002% of the 1,000,000-message cap), confirmed live
+    /// (by the survey and independently here) to climb toward the OS OOM
+    /// killer rather than ever hitting a clean panic. Fixed by adding a
+    /// second, independent cap on `Value::approx_byte_size()` right next to
+    /// the existing message-count cap in `drain()`/`k_drain`, so this now
+    /// panics almost immediately instead of ballooning. Confirms
+    /// interp.rs/vm.rs land on the byte-identical panic message; the native
+    /// mirror (`k_value_approx_size` in cgen.rs) is covered separately by
+    /// `native_growing_self_wire_payload_is_bounded`.
+    #[test]
+    fn diff_growing_self_wire_payload_is_bounded_not_an_oom() {
+        let src = "component Grower {\n    intent \"doubling self-wire cycle\"\n    \
+                   in trigger: Str\n    out grown: Str\n    \
+                   on start { emit grown(\"x\") }\n    \
+                   on trigger(s) { emit grown(s + s) }\n\
+                   }\n\
+                   app Main {\n    intent \"self-wire payload growth\"\n    \
+                   let g = Grower()\n    wire g.grown -> g.trigger\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        match it.instantiate("Main", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(_)) => {}
+            _ => panic!("interp instantiate failed"),
+        }
+        let i_msg = match it.start_all() {
+            Ok(()) => panic!("expected a bounded panic, got unbounded growth"),
+            Err(Flow::Panic { msg, .. }) => msg,
+            Err(_) => panic!("expected a Panic, got some other control-flow error"),
+        };
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let idx = *module.component_names.get("Main").expect("Main in module");
+        vm.instantiate(idx, Vec::new()).expect("kvm instantiate");
+        for id in 0..vm.instances.len() {
+            vm.run_lifecycle(id, "@start").expect("kvm lifecycle");
+            vm.arm_timers(id);
+        }
+        let v_msg = match vm.drain() {
+            Ok(()) => panic!("expected a bounded panic, got unbounded growth"),
+            Err(e) => e.msg,
+        };
+
+        assert_eq!(i_msg, v_msg, "interpreter and KVM disagree on the payload-cap panic message");
+        assert_eq!(
+            i_msg,
+            "component message payload too large (limit 10000000 bytes) — unbounded growth in a `wire` cycle?"
+        );
     }
 
     #[test]
