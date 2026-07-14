@@ -91,6 +91,36 @@ pub fn compile(pattern: &str) -> Result<Regex, String> {
         return Err(format!("unexpected `{}` in pattern", p.chars[p.pos]));
     }
     let anchored_end = p.anchored_end;
+    // A REAL bug found+fixed (production-hardening PR-it725): `^`/`$` are
+    // parsed ONCE, applying as a SINGLE flag to every top-level `|` branch
+    // collectively (`^cat|dog` also anchors "dog"; `cat|dog$` also anchors
+    // "cat") -- unlike every mainstream regex engine (Python, JS, PCRE,
+    // POSIX, the Rust `regex` crate), where `|` is the LOWEST-precedence
+    // operator, so a bare `^`/`$` binds ONLY to the branch it's written in
+    // (`^cat|dog` means `(^cat)|dog`, NOT `^(cat|dog)`). Confirmed live:
+    // `re_match("cat|dog$", "cat and mouse")` wrongly returned `false` (the
+    // shared `anchored_end` forced "cat" to ALSO only match at the string's
+    // end). Properly supporting PER-BRANCH anchoring would require
+    // restructuring `Regex`'s `alts` to carry an independent (start, end)
+    // pair per branch and threading that through every consumer
+    // (`match_here`/`leftmost`/`find_all`/`replace_all`) in BOTH this
+    // engine and its independent native C mirror -- too large a change for
+    // one iteration to land safely, so this ambiguous combination is
+    // instead REJECTED at compile time with a clear message pointing at the
+    // fix (explicit grouping), matching this campaign's established
+    // K0275/K0280 precedent of cleanly rejecting a dangerous/ambiguous
+    // pattern rather than silently doing something surprising. Anchors
+    // nested INSIDE a group (`(^a|b)`) are UNAFFECTED by this check --
+    // `^`/`$` are only ever recognized at the top level in the first place
+    // (this engine has never supported anchors inside groups at all), so
+    // `alts.len() > 1` here can only ever reflect a TOP-LEVEL `|`.
+    if alts.len() > 1 && (anchored_start || anchored_end) {
+        return Err(format!(
+            "a top-level `^`/`$` combined with a top-level `|` is ambiguous in this engine -- \
+             wrap the alternation in parentheses to make the intended scope explicit, \
+             e.g. `^(cat|dog)` or `(cat|dog)$`, not `^cat|dog` or `cat|dog$`"
+        ));
+    }
     Ok(Regex { alts, anchored_start, anchored_end })
 }
 
@@ -687,6 +717,43 @@ mod tests {
         assert!(m("^(ab)+$", "ababab"));
         assert!(!m("^(ab)+$", "aba"));
         assert!(m("^a(b|c)*d$", "abcbcd"));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it725, found via a
+    /// scoped Explore survey): a top-level `^`/`$` used to apply as a SINGLE
+    /// GLOBAL flag to every top-level `|` branch collectively, unlike every
+    /// mainstream regex engine (`|` is lowest-precedence, so a bare `^`/`$`
+    /// binds only to the branch it's written in). Confirmed live:
+    /// `re_match("cat|dog$", "cat and mouse")` wrongly returned `false`
+    /// (the shared `anchored_end` forced "cat" to ALSO only match at the
+    /// string's end). Properly supporting per-branch anchoring was judged
+    /// too large a change for one iteration (would require restructuring
+    /// `Regex`'s data model and re-mirroring it in the independent native C
+    /// engine); instead the ambiguous combination is REJECTED cleanly at
+    /// compile time. Anchors nested inside a group (`(cat|dog)$`,
+    /// `^(cat|dog)`) are UNAFFECTED, since `^`/`$` are only ever recognized
+    /// at the top level in the first place -- confirmed these continue to
+    /// work exactly as before.
+    #[test]
+    fn top_level_anchor_combined_with_top_level_alternation_is_cleanly_rejected() {
+        assert!(compile("^cat|dog").is_err());
+        assert!(compile("cat|dog$").is_err());
+        assert!(compile("^cat|dog$").is_err());
+        // `^` is only ever recognized as an anchor at position 0 of the
+        // WHOLE pattern -- mid-pattern (not right after a `|`), it's just a
+        // literal caret character, so this is unambiguous and NOT rejected.
+        assert!(compile("a|b|^c").is_ok());
+        assert!(m("a|b|^c", "^c"));
+        // grouped alternation is unambiguous and unaffected
+        assert!(compile("(cat|dog)$").is_ok());
+        assert!(compile("^(cat|dog)").is_ok());
+        assert!(compile("^(cat|dog)$").is_ok());
+        assert!(m("(cat|dog)$", "big cat"));
+        assert!(!m("(cat|dog)$", "big fish"));
+        // no top-level `|` at all: anchors work as always
+        assert!(compile("^cat").is_ok());
+        assert!(compile("cat$").is_ok());
+        assert!(compile("cat|dog").is_ok());
     }
 
     #[test]

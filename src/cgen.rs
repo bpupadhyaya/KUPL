@@ -3828,7 +3828,23 @@ static KRegex k_re_compile(const char* pat) {
         p.msg = trailing_msg;
     }
     re.aend = p.aend;
-    if (p.err) { char b[128]; snprintf(b, sizeof b, "invalid regex: %s", p.msg); k_panic(b); }
+    if (!p.err && re.alts.n > 1 && (re.astart || re.aend)) {
+        /* A REAL bug found+fixed (production-hardening PR-it725, mirroring
+           regex.rs's identical fix -- see compile()'s own comment there for
+           the full rationale): `^`/`$` here apply as a SINGLE flag to every
+           top-level `|` branch collectively (`^cat|dog` also anchors "dog";
+           `cat|dog$` also anchors "cat"), unlike every mainstream regex
+           engine, where `|` is LOWEST-precedence and a bare `^`/`$` binds
+           only to the branch it's written in. Properly supporting
+           PER-BRANCH anchoring would require a bigger, riskier rewrite of
+           this parser/matcher's data model -- rejected cleanly at compile
+           time instead, matching this campaign's K0275/K0280 precedent. */
+        p.err = 1;
+        p.msg = "a top-level `^`/`$` combined with a top-level `|` is ambiguous in this engine -- "
+                "wrap the alternation in parentheses to make the intended scope explicit, "
+                "e.g. `^(cat|dog)` or `(cat|dog)$`, not `^cat|dog` or `cat|dog$`";
+    }
+    if (p.err) { char b[320]; snprintf(b, sizeof b, "invalid regex: %s", p.msg); k_panic(b); }
     return re;
 }
 
@@ -9840,6 +9856,27 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "regexanchor").trim(),
             "[\"abc\"]|[]|[\"abc\", \"abc\"]|[\"abc\"]\nxyzabc|#abc|##|abcabc#\nX|#|#bbb"
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it725, the native
+    /// mirror of regex.rs::compile's identical fix): a top-level `^`/`$`
+    /// used to apply as a SINGLE GLOBAL flag to every top-level `|` branch
+    /// collectively (unlike every mainstream regex engine, where `|` is
+    /// lowest-precedence and a bare `^`/`$` binds only to its own branch).
+    /// Since properly supporting per-branch anchoring would require a
+    /// bigger, riskier rewrite of this engine's data model (independently
+    /// in BOTH regex.rs AND this native C mirror), the ambiguous
+    /// combination is instead cleanly REJECTED at compile time with a
+    /// matching message on both engines -- confirmed here via
+    /// `assert_panic_wording_matches` (a legitimate cross-engine check
+    /// since `k_re_compile` is a fully independent reimplementation of the
+    /// same rejection logic, not a shared upstream pass).
+    #[test]
+    fn native_regex_top_level_anchor_combined_with_top_level_alternation_matches_interp_wording() {
+        assert_panic_wording_matches(
+            "fun main() uses io {\n    print(re_match(\"cat|dog$\", \"cat and mouse\"))\n}\n",
+            "reanchoralt",
         );
     }
 
