@@ -211,12 +211,45 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             // instantiate the app (which creates children in creation order),
             // run @start for every instance (parents before children), then
             // drain the message queue to quiescence — mirrors vm.rs::run_app.
+            //
+            // A REAL, cross-engine-DIVERGING bug found+fixed (production-hardening
+            // PR-it735): this loop used the LIVE global `k_ninsts` as its bound
+            // (`id < k_ninsts`), re-read fresh on every iteration -- but
+            // `k_run_lifecycle`'s `@start` handler can itself construct MORE
+            // instances (`Component()` is an ordinary call expression, allowed
+            // anywhere including inside a handler; not restricted to a
+            // component's static `children:` list -- see check.rs/interp.rs's
+            // own construction-site handling), which bumps `k_ninsts` via
+            // `k_instantiate`. interp.rs's `start_all`/vm.rs's `run_app` both
+            // use `0..self.instances.len()` -- a Rust `Range`, whose bound is
+            // evaluated ONCE at loop entry, NOT re-read each iteration -- so a
+            // dynamically-spawned instance (constructed by a PARENT's `@start`)
+            // never gets its own `@start`/timer-arming on interp/vm, but DID
+            // on native, since native's loop bound kept growing in lockstep.
+            // Confirmed LIVE: `component Spawner { on start { let c = Child() }
+            // }` printed "child started" on native ONLY, never on interp/vm;
+            // a recursive `Chain(n)` spawning `Chain(n-1)` in its own `on
+            // start` printed the FULL countdown on native but only the root's
+            // output on interp/vm -- a genuine byte-identity break on
+            // ORDINARY source (a plausible supervisor/factory pattern), not
+            // corrupted/adversarial input. Also a LATENT unbounded-resource
+            // vector unique to native: a base-case-less recursive spawner
+            // would loop until OOM on native while interp/vm cleanly no-op
+            // after one level, since `id < k_ninsts` never goes false when
+            // both increment together. Fixed by snapshotting the bound into a
+            // local BEFORE the loop, matching interp.rs/vm.rs's one-time
+            // `Range` semantics exactly -- the established reference
+            // behavior, even though whether dynamically-spawned instances
+            // SHOULD get their own lifecycle is a separate, larger design
+            // question left for a future iteration; today all three engines
+            // must simply agree, and now they do.
             let _ = writeln!(
                 out,
                 "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    \
                  k_print_unwired = 1;\n    \
                  k_instantiate({app_idx}, 0, 0);\n    \
-                 for (int id = 0; id < k_ninsts; id++) {{ k_run_lifecycle(id, \"@start\"); k_arm_timers(id); }}\n    \
+                 int k_n0 = k_ninsts;\n    \
+                 for (int id = 0; id < k_n0; id++) {{ k_run_lifecycle(id, \"@start\"); k_arm_timers(id); }}\n    \
                  k_drain();\n    \
                  k_run_timers(100);\n    \
                  return 0;\n}}"
@@ -11461,6 +11494,35 @@ fun main() uses io {
     /// timer involved) and `native_timers_run` (plain timer, no supervision).
     /// The it509 fix lives in vm.rs's `advance`/`restart`; cgen.rs mirrors
     /// that logic in C, so this had never been exercised on native before.
+    /// A REAL, cross-engine-DIVERGING bug found+fixed (production-hardening
+    /// PR-it735): the generated `main()`'s "run @start for every instance"
+    /// loop used the LIVE global `k_ninsts` as its bound (re-read fresh every
+    /// iteration), but a component's `on start` handler can itself construct
+    /// MORE instances (`Component()` is an ordinary call expression, allowed
+    /// anywhere, not restricted to a component's static declaration-time
+    /// children) -- bumping `k_ninsts` mid-loop, so a dynamically-spawned
+    /// instance's OWN `@start` ran on native. interp.rs's `start_all`/vm.rs's
+    /// `run_app` both use `0..self.instances.len()` -- a Rust `Range`,
+    /// evaluated ONCE at loop entry -- so a dynamically-spawned instance
+    /// NEVER got its own `@start` on interp/vm. Confirmed LIVE before the
+    /// fix: this exact source printed "spawner started\nchild started" on
+    /// native but only "spawner started" on interp AND vm -- a genuine
+    /// byte-identity break on entirely ORDINARY source (a supervisor/factory
+    /// pattern), not corrupted/adversarial input. Fixed by snapshotting the
+    /// bound into a local BEFORE the loop, matching interp.rs/vm.rs's
+    /// one-time `Range` semantics exactly.
+    #[test]
+    fn native_does_not_run_start_for_a_dynamically_spawned_instance() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Child {\n    intent \"child\"\n    on start { print(\"child started\") }\n}\n\
+component Spawner {\n    intent \"spawns a child during its own on-start\"\n    \
+    on start { let c = Child()\n        print(\"spawner started\") }\n}\n\
+app Main {\n    intent \"dynamic instantiation during on-start\"\n    let sp = Spawner()\n}\n";
+        assert_eq!(native_stdout(src, "dynspawn").trim(), "spawner started");
+    }
+
     #[test]
     fn native_supervised_restart_does_not_double_delay_timers() {
         if !cc_available() {
