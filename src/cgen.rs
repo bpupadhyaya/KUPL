@@ -902,7 +902,28 @@ static KValue k_format_float(double x, int64_t decimals) {
     int d = decimals < 0 ? 0 : (decimals > 18 ? 18 : (int)decimals);
     uint64_t scale = 1;
     for (int i = 0; i < d; i++) scale *= 10;
-    uint64_t scaled = (uint64_t)floor(fabs(x) * (double)scale + 0.5);
+    /* A REAL bug found+fixed (production-hardening PR-it733, the sibling of
+       PR-it640's `Str.repeat` overflow fix -- same root cause class: manually
+       reimplemented arithmetic in C diverges from Rust's checked/saturating
+       semantics): a `double -> uint64_t` cast that overflows the target type
+       is UNDEFINED BEHAVIOR in C (genuinely unspecified, not merely "wraps"),
+       unlike Rust's `as u64`, which has been GUARANTEED saturating since Rust
+       1.45 -- `interp::format_float` (and vm.rs, which shares that exact
+       function) therefore correctly saturates to `u64::MAX` for any `x` whose
+       magnitude exceeds ~1.8e19, while this line's plain `(uint64_t)floor(...)`
+       invoked UB instead. Confirmed live via `-fsanitize=undefined`: `1.0e300
+       .fmt(2)` reported "1e+302 is outside the range of representable values
+       of type 'unsigned long long'" and native printed a completely different,
+       silently WRONG value (`6460508112.8232737832`) instead of interp/vm's
+       correct saturated result (`184467440737095516.15`) -- a genuine
+       cross-engine byte-identity break, not just a crash. Fixed by clamping
+       BEFORE the cast: any pre-cast value >= `(double)UINT64_MAX` (the
+       nearest representable double to 2^64, matching Rust's own saturation
+       threshold exactly, since floats at this magnitude have no fractional
+       part left to floor away) saturates to `UINT64_MAX` directly, without
+       ever casting a value the target type can't represent. */
+    double pre = fabs(x) * (double)scale + 0.5;
+    uint64_t scaled = pre >= (double)UINT64_MAX ? UINT64_MAX : (uint64_t)floor(pre);
     const char* sign = (x < 0 && scaled != 0) ? "-" : "";
     if (d == 0) {
         snprintf(buf, sizeof buf, "%s%llu", sign, (unsigned long long)scaled);
@@ -12232,6 +12253,65 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         assert_panic_wording_matches(
             "fun main() uses io { let r = \"abcd\".repeat(4611686018427387904)\n    print(r) }\n",
             "strrepeatoverflow",
+        );
+    }
+
+    /// A REAL, cross-engine-DIVERGING bug found+fixed (production-hardening
+    /// PR-it733, the sibling of PR-it640's `Str.repeat` overflow fix -- same
+    /// root cause class: manually reimplemented arithmetic in C diverges from
+    /// Rust's checked/saturating semantics): `k_format_float`'s
+    /// `(uint64_t)floor(fabs(x) * scale + 0.5)` cast is UNDEFINED BEHAVIOR in
+    /// C when the pre-cast value exceeds `UINT64_MAX`, unlike Rust's `as u64`
+    /// (guaranteed saturating since Rust 1.45). `interp::format_float`
+    /// (shared by interp.rs AND vm.rs) correctly saturates to `u64::MAX` for
+    /// any `Float` whose magnitude exceeds ~1.8e19; native's cast instead
+    /// invoked UB and printed a completely different, silently WRONG value on
+    /// this platform/compiler -- confirmed the UB itself via
+    /// `-fsanitize=undefined`, separately, ONE TIME under a fresh build
+    /// before this test was written (UBSan is not part of this crate's
+    /// normal `cargo test` run).
+    ///
+    /// IMPORTANT test-construction note: a first-draft version of this test
+    /// bundled all four `fmt()` calls into ONE `fun main()`, and its
+    /// revert-and-verify UNEXPECTEDLY PASSED even with the original buggy
+    /// cast restored -- a mandatory red flag per this campaign's own
+    /// discipline. Root-caused: at `-O2`, `k_format_float` is small enough to
+    /// be a strong INLINING candidate, but only when it has a SINGLE call
+    /// site; bundling four calls into one function gave the compiler four
+    /// call sites, which suppressed inlining, and the resulting genuine
+    /// FUNCTION CALL through the actual `FCVTZU` machine instruction happens
+    /// to saturate on this arm64 host (architectural behavior of that
+    /// instruction, NOT a C-level guarantee). With exactly ONE call site
+    /// (confirmed via `--keep-c` + a fresh isolated single-print program),
+    /// the compiler instead constant-folds the literal argument AT COMPILE
+    /// TIME using a DIFFERENT (non-saturating) conversion path, which is
+    /// where the wrong value actually manifests -- textbook UB: the visible
+    /// symptom depends on incidental optimizer decisions, not just the
+    /// input. Each case below is therefore compiled+run as its OWN separate
+    /// single-print program (own `native_main_stdout` call), matching the
+    /// exact shape that reproducibly manifests the bug; confirmed each
+    /// individually FAILS against the pre-fix code before restoring the fix.
+    #[test]
+    fn native_format_float_saturates_like_interp_instead_of_invoking_ub() {
+        if !cc_available() {
+            return;
+        }
+        assert_eq!(
+            native_main_stdout("fun main() uses io { print(1.0e300.fmt(2)) }\n", "fmtfloatsat1").trim(),
+            "184467440737095516.15"
+        );
+        assert_eq!(
+            native_main_stdout("fun main() uses io { print(1.0e20.fmt(2)) }\n", "fmtfloatsat2").trim(),
+            "184467440737095516.15"
+        );
+        assert_eq!(
+            native_main_stdout("fun main() uses io { print((-1.0e300).fmt(0)) }\n", "fmtfloatsat3").trim(),
+            "-18446744073709551615"
+        );
+        // well within range: unaffected, ordinary formatting still correct
+        assert_eq!(
+            native_main_stdout("fun main() uses io { print(123.456.fmt(2)) }\n", "fmtfloatsat4").trim(),
+            "123.46"
         );
     }
 
