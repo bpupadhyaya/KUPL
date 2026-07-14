@@ -1229,23 +1229,9 @@ pub fn occurrences_cross_file(
     buffers: &HashMap<PathBuf, String>,
 ) -> Vec<(String, usize, usize, usize, usize)> {
     let (program, _diags) = crate::parser::parse(text);
-    let local_scope = local_binding_scope(&program, offset, name);
-    let line_range = |span: crate::diag::Span| {
-        let (start_line, _) = crate::diag::line_col(text, span.start);
-        let (end_line, _) = crate::diag::line_col(text, span.end);
-        (start_line - 1)..=(end_line - 1)
-    };
-    let other_shadow_zones: Vec<crate::diag::Span> = if local_scope.is_none() {
-        shadow_zones(&program, name)
-    } else {
-        Vec::new()
-    };
-    let same_file_occ = occurrences(text, name).into_iter().filter(|(l0, ..)| match local_scope {
-        Some(span) => line_range(span).contains(l0),
-        None => !other_shadow_zones.iter().any(|z| line_range(*z).contains(l0)),
-    });
+    let (same_file_occ, local_scope) = scoped_occurrences(text, &program, name, offset);
     let mut out: Vec<(String, usize, usize, usize, usize)> =
-        same_file_occ.map(|(l0, c0, l1, c1)| (String::new(), l0, c0, l1, c1)).collect();
+        same_file_occ.into_iter().map(|(l0, c0, l1, c1)| (String::new(), l0, c0, l1, c1)).collect();
     if local_scope.is_some() {
         return out;
     }
@@ -1259,6 +1245,37 @@ pub fn occurrences_cross_file(
         );
     }
     out
+}
+
+/// Same-file occurrences of `name`, scoped by `local_binding_scope`/`shadow_zones`
+/// exactly like `occurrences_cross_file`'s own same-file half -- factored out
+/// (production-hardening PR-it743) so `resolve_document_highlight` shares the
+/// IDENTICAL local-vs-top-level-collision protection instead of reimplementing
+/// (or omitting) it. Also returns the resolved `local_binding_scope` result so
+/// callers that need to know whether to ALSO search cross-file (like
+/// `occurrences_cross_file`) don't have to recompute it.
+fn scoped_occurrences(
+    text: &str,
+    program: &crate::ast::Program,
+    name: &str,
+    offset: usize,
+) -> (Vec<(usize, usize, usize, usize)>, Option<crate::diag::Span>) {
+    let local_scope = local_binding_scope(program, offset, name);
+    let line_range = |span: crate::diag::Span| {
+        let (start_line, _) = crate::diag::line_col(text, span.start);
+        let (end_line, _) = crate::diag::line_col(text, span.end);
+        (start_line - 1)..=(end_line - 1)
+    };
+    let other_shadow_zones: Vec<crate::diag::Span> =
+        if local_scope.is_none() { shadow_zones(program, name) } else { Vec::new() };
+    let occ = occurrences(text, name)
+        .into_iter()
+        .filter(|(l0, ..)| match local_scope {
+            Some(span) => line_range(span).contains(l0),
+            None => !other_shadow_zones.iter().any(|z| line_range(*z).contains(l0)),
+        })
+        .collect();
+    (occ, local_scope)
 }
 
 /// Scan `text` (a full document, or the raw source of a string-interpolation
@@ -1768,9 +1785,23 @@ fn collect_workspace_symbol_matches(
 /// defines `documentHighlight` as highlighting occurrences in the current
 /// document, so `occurrences` (not `occurrences_cross_file`) is the
 /// spec-correct choice here, not a scope cut.
+///
+/// A REAL bug found+fixed (production-hardening PR-it743, closing out the
+/// `locally_bound`/local-vs-top-level-collision family -- see PR-it704/it739/
+/// it741/it742): this used to call plain `occurrences(text, &name)`
+/// unconditionally, with zero scope filtering, so highlighting a LOCAL
+/// variable sharing a bare name with an unrelated TOP-LEVEL declaration in
+/// the SAME file also highlighted that unrelated declaration and its own
+/// call sites. Cosmetic severity (a visual highlight only, never
+/// destructive/navigational, unlike rename/goto-definition), but the same
+/// root cause -- now shares `scoped_occurrences` with `occurrences_cross_file`
+/// so this bug family's fix is applied uniformly across every call site.
 fn resolve_document_highlight(text: &str, line: usize, character: usize) -> Option<String> {
+    let off = offset_at(text, line, character);
     let name = ident_under(text, line, character)?;
-    let locs: Vec<String> = occurrences(text, &name)
+    let (program, _diags) = crate::parser::parse(text);
+    let (occ, _local_scope) = scoped_occurrences(text, &program, &name, off);
+    let locs: Vec<String> = occ
         .into_iter()
         .map(|(l0, c0, l1, c1)| {
             format!("{{\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}}}}")
@@ -3636,6 +3667,38 @@ mod tests {
         // LEXED token stream for `Tok::Ident` -- "fun" always lexes as `Tok::KwFun`,
         // never an identifier, so this correctly returns zero highlights, not a crash.
         assert_eq!(resolve_document_highlight(src, 0, 0), Some("[]".to_string()));
+    }
+
+    /// A REAL bug (production-hardening PR-it743), closing out the `locally_bound`/
+    /// local-vs-top-level-collision family (PR-it704/it739/it741/it742): documentHighlight
+    /// was the one remaining call site still using plain, unscoped `occurrences`.
+    /// Highlighting a LOCAL variable used to also highlight an unrelated TOP-LEVEL
+    /// declaration sharing its bare name (and vice versa) elsewhere in the SAME file.
+    /// Cosmetic severity (a visual highlight, not a destructive rename), but the same
+    /// root cause -- now fixed via the shared `scoped_occurrences` helper.
+    #[test]
+    fn document_highlight_does_not_merge_a_local_with_an_unrelated_top_level_declaration() {
+        let src = "fun mean(xs: List[Int]) -> Float {\n    xs.sum().to_float() / xs.len().to_float()\n}\nfun helper() {\n    print(mean([1, 2, 3]))\n}\nfun main() {\n    let mean = 5.0\n    print(mean)\n}\n";
+
+        // Highlighting the LOCAL `mean` must show only its own decl + use (2), not the
+        // unrelated `fun mean`'s decl + call site.
+        let off = src.find("mean = 5.0").unwrap();
+        let line = src[..off].matches('\n').count();
+        let line_start = src[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let ch = off - line_start;
+        let local_highlights =
+            resolve_document_highlight(src, line, ch).expect("cursor is on an identifier");
+        assert_eq!(local_highlights.matches("\"range\":").count(), 2, "{local_highlights}");
+
+        // Highlighting the TOP-LEVEL `fun mean` must show only its own decl + call site
+        // (2), not the unrelated local's decl + use in main().
+        let fun_off = src.find("fun mean").unwrap() + 4;
+        let fun_line = src[..fun_off].matches('\n').count();
+        let fun_line_start = src[..fun_off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let fun_ch = fun_off - fun_line_start;
+        let fun_highlights =
+            resolve_document_highlight(src, fun_line, fun_ch).expect("cursor is on an identifier");
+        assert_eq!(fun_highlights.matches("\"range\":").count(), 2, "{fun_highlights}");
     }
 
     #[test]
