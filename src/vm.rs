@@ -2356,6 +2356,39 @@ fun probe() -> Int {
         assert_eq!(differential(src), "24.0");
     }
 
+    /// A REAL cross-engine byte-identity divergence found+fixed (production-
+    /// hardening PR-it759): interp.rs's "no match arm matched" panic used to
+    /// include the actual runtime VALUE that failed to match
+    /// (`"no match arm matched value \`Circle(7)\`"`), but `compile.rs`'s own
+    /// shared `Op::Panic` emission for this SAME fallback (the compile-time
+    /// constant `"no match arm matched"`, no value -- the value can't be
+    /// embedded there at COMPILE time the way the tree-walking interpreter
+    /// embeds it at RUNTIME) is what vm.rs/cgen.rs/kx.rs all render instead.
+    /// Reachable through ordinary, valid KUPL syntax: a genuinely NON-
+    /// exhaustive `match` on a scalar-typed ADT field position (`check.rs`'s
+    /// exhaustiveness checker treats ANY arm targeting a variant as fully
+    /// covering it, regardless of whether the arm's own LITERAL pattern
+    /// actually covers the value space -- a separate, already-accepted
+    /// scope limitation, unrelated to this fix) compiles cleanly yet panics
+    /// at runtime on an uncovered value. Live-confirmed BEFORE this fix:
+    /// `kupl run` printed the value-bearing message while `kupl run --vm`/
+    /// `kupl native`/a compiled `.kx` module all printed the plain one for
+    /// the IDENTICAL program and input -- interp.rs was the sole
+    /// odd-engine-out among the four "byte-identical" execution engines.
+    /// Fixed by dropping the value from interp.rs's message to match the
+    /// other three (rather than threading a new dynamic-value-formatting
+    /// mechanism through vm.rs/cgen.rs/kx.rs's shared `Op::Panic`, a much
+    /// larger change) -- three independently-derived engines already agreed
+    /// on this exact wording.
+    #[test]
+    fn diff_non_exhaustive_scalar_field_match_panics_identically() {
+        let src = "type Shape = Circle(r: Int) | Square(s: Int)\n\
+                   fun classify(sh: Shape) -> Str {\n    match sh {\n        \
+                   Circle(5) => \"five-circle\"\n        Square(_) => \"square\"\n    }\n}\n\
+                   fun probe() -> Str {\n    classify(Circle(7))\n}\n";
+        assert_eq!(differential(src), "panic: no match arm matched");
+    }
+
     #[test]
     fn diff_lists_lambdas() {
         let src = "fun probe() -> Int {\n    let xs = [1, 2, 3, 4, 5, 6]\n    xs.filter(fn n { n % 2 == 0 }).map(fn n { n * 10 }).sum()\n}\n";

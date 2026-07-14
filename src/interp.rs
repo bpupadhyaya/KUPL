@@ -1071,10 +1071,36 @@ impl Interp {
                         return self.eval(&arm.body, &scope);
                     }
                 }
-                Err(Self::panic_flow(
-                    format!("no match arm matched value `{v}`"),
-                    expr.span,
-                ))
+                // A REAL cross-engine byte-identity divergence found+fixed
+                // (production-hardening PR-it759): this message used to
+                // include the actual runtime VALUE that failed to match
+                // (`format!("no match arm matched value \`{v}\`")`), but
+                // `compile.rs`'s own shared `Op::Panic` emission for this
+                // SAME fallback (line ~1072, `"no match arm matched"`, no
+                // value) is what vm.rs/cgen.rs/kx.rs all render -- the
+                // value can't be embedded there at COMPILE time (unlike
+                // this tree-walking interpreter, which evaluates `v`
+                // directly), so those three engines never had it to begin
+                // with. This made interp.rs the sole odd-engine-out among
+                // the four "byte-identical" execution engines on a path
+                // reachable through ordinary, valid KUPL syntax (a
+                // genuinely non-exhaustive `match` on a scalar-typed ADT
+                // field position, e.g. `Circle(5) => .., Square(_) => ..`
+                // on `Circle(r: Int) | Square(s: Int)`, compiles cleanly --
+                // `check.rs`'s exhaustiveness checker's own scalar-field
+                // limitation is a separate, already-accepted scope
+                // decision, unrelated to this fix). Live-confirmed BEFORE
+                // this fix: `kupl run` printed `"no match arm matched
+                // value \`Circle(7)\`"` while `kupl run --vm`/`kupl
+                // native`/a compiled `.kx` module all printed the plain
+                // `"no match arm matched"` for the IDENTICAL program and
+                // input. Dropping the value here (rather than threading a
+                // NEW dynamic-value-formatting mechanism through all three
+                // OTHER engines' shared `Op::Panic`, a much larger change)
+                // restores byte-identical text across all four engines --
+                // three independently-derived engines already agreed on
+                // this exact wording.
+                Err(Self::panic_flow("no match arm matched".to_string(), expr.span))
             }
             ExprKind::Lambda { params, body } => {
                 // Capture free LOCALS by value (snapshot), like the KVM/native
