@@ -68,7 +68,33 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                     _ => {} // forward-compatible: ignore unknown project keys
                 }
             }
-            "dependencies" => deps.push(parse_dep(key, value, i + 1)?),
+            "dependencies" => {
+                let dep = parse_dep(key, value, i + 1)?;
+                // A REAL bug found+fixed (production-hardening PR-it747): a
+                // duplicate dependency NAME (two separate `mth = { .. }`
+                // lines under `[dependencies]`) used to silently resolve
+                // "last one wins" -- `deps` is a plain `Vec`, and
+                // `loader.rs`'s own `pkg_ctx` builds a `HashMap` from it via
+                // a bare `.insert()`, discarding the earlier declaration
+                // with zero diagnostic. A plausible copy-paste manifest
+                // mistake (e.g. renaming one dependency but forgetting to
+                // remove the old line) previously failed silently rather
+                // than with a clean, actionable error -- now caught at
+                // parse time, before the ambiguity can reach the loader at
+                // all. (A narrower, lower-priority residual gap -- a
+                // duplicate KEY within a single inline table, e.g.
+                // `{ path = "a", path = "b" }` -- is a separate,
+                // deliberately out-of-scope issue inside `parse_dep`'s own
+                // field parsing, not covered by this check.)
+                if deps.iter().any(|d: &Dep| d.name == dep.name) {
+                    return Err(format!(
+                        "line {}: duplicate dependency `{}` (already declared earlier in [dependencies])",
+                        i + 1,
+                        dep.name
+                    ));
+                }
+                deps.push(dep);
+            }
             "" => return Err(format!("line {}: key `{key}` before any `[section]`", i + 1)),
             _ => {}
         }
@@ -222,6 +248,33 @@ mod tests {
         assert!(parse("[project]\nname \"x\"\n").is_err()); // no `=`
         assert!(parse("[bogus]\n").is_err()); // unknown section
         assert!(parse("[dependencies]\nfoo = { }\n").is_err()); // no path/version
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it747): a duplicate
+    /// dependency NAME under `[dependencies]` used to silently resolve "last
+    /// one wins" -- `deps` was a plain `Vec` with no duplicate-name check, and
+    /// `loader.rs`'s `pkg_ctx` builds a `HashMap` from it via a bare
+    /// `.insert()`, silently discarding the earlier declaration. A plausible
+    /// copy-paste mistake (e.g. re-declaring a dependency with a different
+    /// path but forgetting to remove the stale line) previously gave zero
+    /// signal that anything was wrong.
+    #[test]
+    fn duplicate_dependency_name_is_a_clean_error_not_silently_last_wins() {
+        // two separate inline-table entries for the same name
+        let err = parse("[dependencies]\nmth = { path = \"../m1\" }\nmth = { path = \"../m2\" }\n")
+            .expect_err("a duplicate dependency name must be a clean error, not silently accepted");
+        assert!(err.contains("duplicate") && err.contains("mth"), "{err}");
+
+        // a bare-string shorthand entry followed by an inline-table entry, same name
+        let err2 = parse("[dependencies]\nutil = \"vendor/util\"\nutil = { path = \"../util2\" }\n")
+            .expect_err("a duplicate name must be caught regardless of which dependency SYNTAX form is used");
+        assert!(err2.contains("duplicate") && err2.contains("util"), "{err2}");
+
+        // sanity: two DIFFERENT dependency names still parse fine (not an
+        // overly-broad check that rejects every multi-dependency manifest).
+        let m = parse("[dependencies]\nmath = { path = \"../math\" }\nutil = { path = \"../util\" }\n")
+            .expect("distinct dependency names must still parse cleanly");
+        assert_eq!(m.deps.len(), 2);
     }
 
     /// A REAL sibling bug to `hash_inside_a_string_value_is_not_treated_as_a_
