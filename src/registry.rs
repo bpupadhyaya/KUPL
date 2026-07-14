@@ -131,6 +131,12 @@ pub fn parse_index(text: &str) -> Result<RegistryIndex, String> {
                 .and_then(Json::str)
                 .ok_or_else(|| format!("registry index version `{version}` file `{path}` missing `url`"))?
                 .to_string();
+            if !is_safe_registry_url(&url) {
+                return Err(format!(
+                    "registry index version `{version}` file `{path}` has an unsafe url `{url}` \
+                     (must be an http:// or https:// url)"
+                ));
+            }
             let hash = file_json
                 .get("hash")
                 .and_then(Json::str)
@@ -198,6 +204,29 @@ fn is_safe_relative_path(path: &str) -> bool {
         return false;
     }
     p.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Whether `url` is safe to hand to `curl_get`: an `http://` or `https://`
+/// URL, and nothing else. A registry index is untrusted, network-supplied
+/// data -- a file's `url` is later passed DIRECTLY to `curl` (`curl_get`,
+/// below) with no scheme restriction of its own. Without this check, a
+/// malicious or compromised registry could supply `"file:///etc/passwd"`
+/// (local-file-disclosure: `curl` reads and returns the file's content as
+/// if it were a fetched package file) or point at an internal-only host
+/// (SSRF, e.g. a cloud metadata endpoint) via an ordinary `http://` URL to
+/// a non-public address -- `curl`'s own default scheme support has no
+/// allow-list. Rejected here, at parse time, the SAME "single earliest
+/// enforcement point" pattern `is_safe_relative_path` above already uses
+/// for `path` (production-hardening PR-it748, closing a real gap: every
+/// OTHER untrusted field in this module -- `path`, content hashes, the
+/// index's own name -- already has a dedicated check; `url` was the one
+/// exception). Deliberately does NOT attempt to block SSRF against
+/// internal/link-local HOSTS (that would need a live DNS/IP-range check
+/// this parse-time function can't safely perform), only the FAR simpler
+/// and more clearly wrong-in-EVERY-case "not http(s) at all" scheme class
+/// -- `file://` and any other non-network scheme.
+fn is_safe_registry_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 /// Write a registry package version's ALREADY-FETCHED, ALREADY-VERIFIED file
@@ -563,6 +592,38 @@ mod tests {
         // an ordinary nested-but-safe relative path (a subdirectory) is fine
         let ok = r#"{"name": "x", "versions": {"1.0.0": {"entry": "src/main.kupl", "files": {"src/main.kupl": {"url": "https://x/y", "hash": "aa"}}}}}"#;
         assert!(parse_index(ok).is_ok());
+    }
+
+    /// A REAL security bug found+fixed (production-hardening PR-it748): every
+    /// OTHER untrusted field in a registry index (`path`, content hashes, the
+    /// index's own `name`) already has a dedicated safety check -- `url` was
+    /// the one exception, handed DIRECTLY to `curl` (`curl_get`) with no
+    /// scheme restriction at all. A malicious or compromised registry could
+    /// supply `"file:///etc/passwd"` (local-file-disclosure -- `curl` reads
+    /// and returns the file's content as if it were a fetched package file)
+    /// or an SSRF-relevant internal host via a plain `http://` URL to a
+    /// non-public address. Live-confirmed the underlying transport primitive
+    /// before this fix: `curl -sS --fail --max-time 30 file:///etc/hosts`
+    /// (the EXACT invocation shape `curl_get` uses) successfully printed
+    /// `/etc/hosts`'s content with exit code 0 -- `curl`'s own scheme support
+    /// has no allow-list by default.
+    #[test]
+    fn unsafe_file_urls_are_rejected_at_parse_time() {
+        for bad_url in ["file:///etc/passwd", "file://localhost/etc/hosts", "ftp://x/y", "", "not-a-url"] {
+            let idx = format!(
+                r#"{{"name": "x", "versions": {{"1.0.0": {{"entry": "main.kupl", "files": {{"main.kupl": {{"url": "{bad_url}", "hash": "aa"}}}}}}}}}}"#
+            );
+            let err = parse_index(&idx);
+            assert!(err.is_err(), "url {bad_url:?} should have been rejected, got {err:?}");
+        }
+        // ordinary http:// and https:// urls are still fine (not an overly
+        // broad check that rejects every legitimate registry index).
+        for good_url in ["https://x/y", "http://x/y"] {
+            let idx = format!(
+                r#"{{"name": "x", "versions": {{"1.0.0": {{"entry": "main.kupl", "files": {{"main.kupl": {{"url": "{good_url}", "hash": "aa"}}}}}}}}}}"#
+            );
+            assert!(parse_index(&idx).is_ok(), "url {good_url:?} should have parsed cleanly");
+        }
     }
 
     #[test]
