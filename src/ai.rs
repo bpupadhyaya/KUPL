@@ -617,7 +617,39 @@ fn run_tool_loop(
                 }
                 let mut results = Vec::with_capacity(reqs.len());
                 for req in reqs {
-                    let out = execute_tool(host, meta, &req)?;
+                    let out = match execute_tool(host, meta, &req) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            // PRODUCTION-HARDENING (PR-it770): a `{"tools": [...]}` round
+                            // can request SEVERAL tool calls at once, run one at a time
+                            // above. If a LATER call in the round fails, the loop aborts
+                            // here via this `Err` -- but any EARLIER call in the SAME
+                            // round already ran, with a REAL side effect (e.g. a
+                            // `uses io.fs` tool writing a file), before the caller ever
+                            // learns anything went wrong. `ai fun ... -> Result[T, Str]`
+                            // exists specifically so a caller can catch this failure and
+                            // retry -- but a fresh retry starts a brand-new conversation
+                            // with no memory of the partial round, so the already-run
+                            // tool(s) execute AGAIN. Confirmed live: a two-tool round
+                            // (a real `append_file` tool, then an unknown tool) writes
+                            // its marker TWICE across two `Result::Err`-triggered calls,
+                            // even though the caller only ever sees "unknown tool"
+                            // failures, with zero indication the first tool already ran
+                            // both times. Name the already-completed tools in the error
+                            // so a caller (or a human reading a panic) knows not to
+                            // blindly retry, instead of silently discarding that fact.
+                            if results.is_empty() {
+                                return Err(e);
+                            }
+                            let ran: Vec<&str> =
+                                results.iter().map(|(r, _): &(ToolReq, String)| r.name.as_str()).collect();
+                            return Err(format!(
+                                "{e} (this tool failed after {} other tool call(s) in the same round already ran: {})",
+                                ran.len(),
+                                ran.join(", ")
+                            ));
+                        }
+                    };
                     results.push((req, out));
                 }
                 provider.push_results(results);

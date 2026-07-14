@@ -17427,7 +17427,63 @@ fun probe() -> Str {\n    m_assist5(\"x\")\n}\n";
 {\"tool\":\"m_greet5\",\"input\":{}}]},\
 {\"final\":\"done\"}]",
         );
-        assert_eq!(differential(src), "panic: ai `m_assist5`: tool `m_greet5` is missing argument `who`");
+        // PRODUCTION-HARDENING (PR-it770): the message now also names which
+        // tool(s) earlier in the SAME round already ran before this one
+        // failed -- see run_tool_loop's own comment for why (a caller
+        // catching this via `Result[T, Str]` and retrying has no way to
+        // know `m_add5` already executed, otherwise).
+        assert_eq!(
+            differential(src),
+            "panic: ai `m_assist5`: tool `m_greet5` is missing argument `who` \
+(this tool failed after 1 other tool call(s) in the same round already ran: m_add5)"
+        );
+    }
+
+    #[test]
+    fn diff_ai_fun_partial_round_failure_re_runs_the_earlier_tools_side_effect_on_retry() {
+        // PRODUCTION-HARDENING (PR-it770): a REAL bug found by an Explore survey
+        // (agentId ac3bf5c852f158a1a) and independently live-verified before fixing --
+        // `-> Result[T, Str]` exists SPECIFICALLY so a caller can catch an `ai fun`
+        // failure and retry (see `diff_ai_fun_result_wrapping_swallows_tool_panics`
+        // above), but a `{"tools": [...]}` round's failure discards ALL memory of any
+        // tool call that already ran earlier in that SAME round -- so a natural,
+        // fully-supported retry pattern re-runs a tool that already had a real side
+        // effect. This test proves the CONCRETE consequence (not just the message):
+        // a `uses io.fs` tool that appends to a file runs TWICE across two separate
+        // `Result::Err`-triggered calls to the SAME ai fun, even though the caller
+        // only ever sees "unknown tool" failures both times. The fix (this same
+        // commit) does not make retries side-effect-safe -- doing so needs the model
+        // to be told which tools already ran, a materially bigger wire-protocol
+        // change deliberately deferred -- but it DOES surface the fact in the error
+        // text (`diff_ai_fun_multi_tool_round` above), so a caller can choose not to
+        // blindly retry; this test locks in that the surfaced fact is accurate on
+        // BOTH engines.
+        let path = "/tmp/kupl_difftest_it770_marker.txt";
+        let _ = std::fs::remove_file(path);
+        std::env::set_var(
+            "KUPL_AI_MOCK_ASSIST770",
+            "[{\"tools\":[{\"tool\":\"append_marker770\",\"input\":{\"msg\":\"X\"}},\
+{\"tool\":\"nope770\",\"input\":{}}]}]",
+        );
+        let src = "fun append_marker770(msg: Str) -> Str {\n    \
+            let _ = append_file(\"/tmp/kupl_difftest_it770_marker.txt\", msg)\n    \"wrote\"\n}\n\
+ai fun assist770(q: Str) -> Result[Str, Str] tools [append_marker770] {\n    intent \"Assist.\"\n}\n\
+fun probe() -> Str {\n    \
+    let _ = delete_file(\"/tmp/kupl_difftest_it770_marker.txt\")\n    \
+    let r1 = match assist770(\"go\") {\n        Ok(_) => \"ok\"\n        Err(e) => e\n    }\n    \
+    let r2 = match assist770(\"go\") {\n        Ok(_) => \"ok\"\n        Err(e) => e\n    }\n    \
+    let content = match read_file(\"/tmp/kupl_difftest_it770_marker.txt\") {\n        \
+        Ok(c) => c\n        Err(_) => \"MISSING\"\n    }\n    \
+    \"r1={r1} r2={r2} content={content}\"\n}\n";
+        assert_eq!(
+            differential(src),
+            "r1=model called unknown tool `nope770` \
+(this tool failed after 1 other tool call(s) in the same round already ran: append_marker770) \
+r2=model called unknown tool `nope770` \
+(this tool failed after 1 other tool call(s) in the same round already ran: append_marker770) \
+content=XX"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -3570,6 +3570,19 @@ static int k_map_field(KMap* m, const char* key, KValue* out) {
    inside a `"tools": [...]` array). Returns 1 on success (k_ai_ok stays 1),
    0 on failure (k_ai_err/k_ai_ok already set by this function -- caller must
    `return k_unit()` immediately without touching them further). */
+/* Re-extracts a mock round entry's `"tool"` name, mirroring the same field
+   read `k_ai_call_one_tool` does below. Used only to name ALREADY-COMPLETED
+   tool calls earlier in a `"tools": [...]` round after a LATER one fails --
+   see that use site's own comment (PR-it770) for why. Every caller only
+   passes an entry that already succeeded through `k_ai_call_one_tool`
+   (so its own "tool" field is guaranteed a valid JStr); "?" is a purely
+   defensive fallback, never actually hit. */
+static const char* k_ai_tool_name_of(KMap* m) {
+    KValue tn;
+    if (!k_map_field(m, "tool", &tn) || strcmp(k_json_var(tn), "JStr")) return "?";
+    return tn.as.ctor->fields[0].as.s;
+}
+
 static int k_ai_call_one_tool(const KAiFun* f, KMap* m) {
     KValue tn;
     if (!k_map_field(m, "tool", &tn) || strcmp(k_json_var(tn), "JStr")) {
@@ -3665,7 +3678,33 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                             snprintf(k_ai_err, sizeof k_ai_err, "mock round: each entry in `tools` must have a `tool` name");
                             k_ai_ok = 0; return k_unit();
                         }
-                        if (!k_ai_call_one_tool(f, k_json_field0(item).as.map)) return k_unit();
+                        if (!k_ai_call_one_tool(f, k_json_field0(item).as.map)) {
+                            if (ti > 0) {
+                                /* PRODUCTION-HARDENING (PR-it770): mirrors ai.rs::run_tool_loop's
+                                   identical fix. A `"tools": [...]` round can request SEVERAL
+                                   tool calls at once, run one at a time above -- if a LATER
+                                   call fails, any EARLIER call in the SAME round already ran,
+                                   with a real side effect, before the caller (an `ai fun
+                                   ... -> Result[T, Str]`'s catcher) ever learns anything went
+                                   wrong. Since a retry starts a brand-new mock conversation
+                                   with no memory of the partial round, the already-run tool(s)
+                                   would silently execute again. Name them in the error so a
+                                   caller knows not to blindly retry, instead of discarding
+                                   that fact -- mirrors ai.rs's Rust-side message exactly. */
+                                char names[192] = {0};
+                                size_t off = 0;
+                                for (long pj = 0; pj < ti && off < sizeof names; pj++) {
+                                    const char* pname = k_ai_tool_name_of(k_json_field0(items->items[pj]).as.map);
+                                    int n = snprintf(names + off, sizeof(names) - off, "%s%s", pj ? ", " : "", pname);
+                                    if (n > 0) off += (size_t)n;
+                                }
+                                char orig[256]; snprintf(orig, sizeof orig, "%s", k_ai_err);
+                                snprintf(k_ai_err, sizeof k_ai_err,
+                                         "%s (this tool failed after %ld other tool call(s) in the same round already ran: %s)",
+                                         orig, ti, names);
+                            }
+                            return k_unit();
+                        }
                     }
                 } else {
                     if (!k_ai_call_one_tool(f, m)) return k_unit();
@@ -13052,8 +13091,14 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
             .output()
             .expect("runs");
         assert!(!bad.status.success());
+        // PRODUCTION-HARDENING (PR-it770): also names the earlier tool(s) in the
+        // SAME round that already ran before this one failed -- mirrors ai.rs's
+        // identical Rust-side fix (see k_ai_tool_call's own comment for why).
         assert!(
-            String::from_utf8_lossy(&bad.stderr).contains("ai `helper5`: tool `m_greet5` is missing argument `name`"),
+            String::from_utf8_lossy(&bad.stderr).contains(
+                "ai `helper5`: tool `m_greet5` is missing argument `name` \
+(this tool failed after 1 other tool call(s) in the same round already ran: m_add5)"
+            ),
             "{bad:?}"
         );
         let _ = std::fs::remove_file(&cp);
