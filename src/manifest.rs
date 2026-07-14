@@ -64,7 +64,45 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                 match key {
                     "name" => name = s,
                     "version" => version = s,
-                    "entry" => entry = s,
+                    "entry" => {
+                        // A REAL, live-confirmed bug found+fixed (production-hardening
+                        // PR-it766): `entry` was accepted VERBATIM with zero path
+                        // validation, then resolved as `dep_dir.join(&m.entry)`
+                        // (`loader.rs::resolve_deps`) / `dep_ctx.root.join(entry)`
+                        // (`loader.rs`'s `use`-resolution path) -- but `PathBuf::join`
+                        // silently DISCARDS its left-hand base entirely when the
+                        // argument is itself absolute (a well-known Rust footgun), and
+                        // a leading `..` component walks straight out of the
+                        // dependency's own directory. A dependency's OWN `kupl.toml`
+                        // could therefore point `entry` at ANY file the process can
+                        // read anywhere on disk, and that file -- not anything inside
+                        // the dependency's own directory -- silently became the
+                        // dependency's compiled module content, with no diagnostic.
+                        // Live-confirmed BEFORE this fix: a dependency `dep` whose
+                        // `entry` pointed at an absolute path to a file OUTSIDE `dep`'s
+                        // own directory entirely was compiled in place of `dep/
+                        // main.kupl` -- `kupl run`/`kupl pkg tree` both silently used
+                        // the out-of-tree file. `kupl new`'s own `valid_project_name`
+                        // already rejects this exact class of path-traversal/absolute-
+                        // path input for PROJECT NAMES (its own doc comment: "rejects
+                        // path traversal (`../evil`, `/abs`, `a/b`)... the `.`/`..`
+                        // specials") -- `entry` was the one manifest field the project
+                        // hadn't applied that same discipline to.
+                        let p = std::path::Path::new(&s);
+                        if p.is_absolute() {
+                            return Err(format!(
+                                "line {}: `entry` must be a path relative to the project directory, not absolute (`{s}`)",
+                                i + 1
+                            ));
+                        }
+                        if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                            return Err(format!(
+                                "line {}: `entry` must not contain `..` (would escape the project directory): `{s}`",
+                                i + 1
+                            ));
+                        }
+                        entry = s;
+                    }
                     _ => {} // forward-compatible: ignore unknown project keys
                 }
             }
@@ -249,6 +287,33 @@ mod tests {
         assert_eq!(m.name, "x");
         assert_eq!(m.entry, "main.kupl"); // default
         assert!(m.deps.is_empty());
+    }
+
+    /// A REAL, live-confirmed bug found+fixed (production-hardening PR-it766):
+    /// `entry` was accepted VERBATIM with zero path validation, then resolved
+    /// as `dep_dir.join(&m.entry)` -- but `PathBuf::join` silently DISCARDS
+    /// its left-hand base entirely when the argument is itself absolute, and
+    /// a leading `..` component walks straight out of the intended directory.
+    /// A dependency's OWN `kupl.toml` could point `entry` at ANY file the
+    /// process can read anywhere on disk, and that file -- not anything
+    /// inside the dependency's own directory -- silently became the
+    /// dependency's compiled module content. Live-confirmed BEFORE this fix
+    /// via a real multi-package `kupl run`: a dependency whose `entry`
+    /// pointed at an absolute path OUTSIDE its own directory was compiled in
+    /// place of its real `main.kupl`, with no error at all.
+    #[test]
+    fn an_absolute_or_parent_escaping_entry_is_a_clean_parse_error() {
+        let err = parse("[project]\nname = \"x\"\nentry = \"/etc/passwd\"\n")
+            .expect_err("an absolute entry path must be rejected");
+        assert!(err.contains("absolute"), "{err}");
+
+        let err2 = parse("[project]\nname = \"x\"\nentry = \"../outside/evil.kupl\"\n")
+            .expect_err("an entry path containing `..` must be rejected");
+        assert!(err2.contains(".."), "{err2}");
+
+        // an ordinary relative entry, including one nested in a subdirectory,
+        // still parses cleanly -- this is a real, legitimate use of `entry`.
+        assert_eq!(parse("[project]\nname = \"x\"\nentry = \"src/main.kupl\"\n").unwrap().entry, "src/main.kupl");
     }
 
     /// A coverage-closing test, per production-hardening PR-it654 (no bug

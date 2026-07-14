@@ -576,6 +576,30 @@ pub fn load_with(
                         pkg_ctx(dep_dir, false, &dep_prefix)
                     })
                     .clone();
+                // A REAL, live-confirmed bug found+fixed (production-hardening
+                // PR-it766, discovered while fixing the `entry`-field path-escape
+                // bug right below): unlike `root_ctx.err` (checked once, right at
+                // the very start of this function), `dep_ctx.err` -- set by
+                // `pkg_ctx` above when a DEPENDENCY's OWN `kupl.toml` fails to
+                // parse for ANY reason (missing `[project]`, an unknown section, a
+                // malformed line, or -- as of this same iteration -- an unsafe
+                // `entry` value) -- was NEVER checked anywhere in this `use`-
+                // resolution loop. The redundant manifest re-read two lines below
+                // (`crate::manifest::read(...).map(|m| m.entry).unwrap_or_else(|_|
+                // "main.kupl".to_string())`) silently swallowed that SAME error and
+                // fell back to trying "main.kupl" directly -- so a dependency with
+                // a genuinely broken manifest either compiled successfully with the
+                // WRONG entry file (if a "main.kupl" happened to also exist) or
+                // failed later with a confusing, unrelated "cannot read module
+                // file" error that never mentions the actual broken manifest.
+                // `kupl pkg tree`/`kupl pkg lock` (a separate code path,
+                // `resolve_deps`, which propagates manifest errors via `?`) already
+                // reported this correctly -- only the primary `run`/`check`/
+                // `build`/`native`/`test` compile path had this gap.
+                if let Some(e) = &dep_ctx.err {
+                    diags.push(Diag::error("K0401", e.clone(), *span));
+                    continue;
+                }
                 pkg_deps
                     .entry(ctx.prefix.clone())
                     .or_default()
@@ -774,6 +798,55 @@ mod tests {
         std::fs::write(dir.join("kupl.toml"), "").unwrap();
         assert!(super::load(dir.join("main.kupl").to_str().unwrap()).is_ok(), "empty manifest loads");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, live-confirmed bug found+fixed (production-hardening PR-it766,
+    /// discovered while fixing the `entry`-field path-escape bug in the SAME
+    /// iteration): unlike `root_ctx.err` (checked once, right at the start of
+    /// `load_with`, by `malformed_manifest_is_a_clean_error_not_silently_ignored`
+    /// above), `dep_ctx.err` -- set by `pkg_ctx` when a DEPENDENCY's OWN
+    /// `kupl.toml` fails to parse for ANY reason -- was NEVER checked anywhere
+    /// in the `use`-resolution loop. A redundant manifest re-read on the very
+    /// next line silently swallowed that SAME error via
+    /// `.unwrap_or_else(|_| "main.kupl".to_string())` and fell back to trying
+    /// "main.kupl" directly -- so a dependency with a genuinely broken
+    /// manifest either compiled with the WRONG entry file (if a "main.kupl"
+    /// happened to also exist, as it usually does) or failed later with a
+    /// confusing, unrelated error that never mentions the actual broken
+    /// manifest. `kupl pkg tree`/`kupl pkg lock` (`resolve_deps`, a separate
+    /// code path that propagates manifest errors via `?`) already reported
+    /// this correctly -- only the primary `run`/`check`/`build` compile path
+    /// had this gap.
+    #[test]
+    fn a_dependencys_own_malformed_manifest_is_a_clean_error_not_silently_ignored() {
+        let base = std::env::temp_dir().join(format!("kupl-dep-badtoml-it766-{}", std::process::id()));
+        let app = base.join("app");
+        let dep = base.join("dep");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use dep\nfun main() {}\n").unwrap();
+        // dep's OWN manifest is malformed -- a genuinely broken kupl.toml, not
+        // just an unsafe entry value (that narrower case is covered live in
+        // manifest.rs's own `an_absolute_or_parent_escaping_entry_is_a_clean_parse_error`).
+        std::fs::write(dep.join("kupl.toml"), "this is not toml at all {{{\n").unwrap();
+        std::fs::write(dep.join("main.kupl"), "pub fun helper() -> Int {\n    1\n}\n").unwrap();
+
+        let (diags, _) = match super::load(app.join("main.kupl").to_str().unwrap()) {
+            Ok(_) => panic!("a dependency with a malformed manifest must be a load error, not silently ignored"),
+            Err(e) => e,
+        };
+        assert!(
+            diags.iter().any(|d| d.severity == crate::diag::Severity::Error
+                && d.message.contains("invalid manifest")),
+            "should report the dependency's actual invalid manifest, not a generic downstream error: {diags:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
