@@ -463,6 +463,28 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Whether `s` is syntactically valid as a KUPL identifier -- non-empty,
+/// every character passes `is_ident`, and the FIRST character additionally
+/// isn't a digit (matching `lexer.rs::lex_ident`'s own dispatch condition,
+/// `b'A'..=b'Z' | b'a'..=b'z' | b'_' | byte >= 0x80` -- a leading digit
+/// routes to `lex_number` instead). A REAL bug found+fixed (production-
+/// hardening PR-it767): `textDocument/rename`'s `newName` was accepted
+/// VERBATIM with ZERO validation before being embedded into an outgoing
+/// `WorkspaceEdit` -- every mainstream LSP client applies a rename edit
+/// immediately and unconditionally, so an invalid `newName` silently
+/// corrupted previously-working source with no error surfaced anywhere.
+/// Live-confirmed BEFORE this fix via a raw LSP session: renaming to
+/// `"123 bad-name!"` (not an identifier at all) and to `""` (empty) both
+/// returned well-formed, "successful"-looking `WorkspaceEdit`s that would
+/// produce invalid syntax (or delete the identifier entirely) if applied.
+fn is_valid_new_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if is_ident(c) && !c.is_ascii_digit() => chars.all(is_ident),
+        _ => false,
+    }
+}
+
 /// The identifier token covering `offset`, as (name, start, end) byte offsets.
 fn ident_at(text: &str, offset: usize) -> Option<(String, usize, usize)> {
     if offset > text.len() {
@@ -2247,6 +2269,9 @@ pub fn serve() -> i32 {
                     let p = msg.get("params")?;
                     let (uri, line, ch) = position_of(p)?;
                     let new_name = p.get("newName")?.str()?;
+                    if !is_valid_new_identifier(new_name) {
+                        return None;
+                    }
                     let text = doc_text(uri, &buffers)?;
                     let name = ident_under(&text, line, ch)?;
                     // Cross-file fallback (PR-it518): a real correctness hazard, not just a
@@ -3669,6 +3694,88 @@ mod tests {
         // rename would produce one edit per occurrence (same count) -- unaffected by which
         // component the method lives in.
         assert_eq!(occurrences(src, "greet").len(), occ.len());
+    }
+
+    #[test]
+    fn is_valid_new_identifier_rejects_syntactically_invalid_names() {
+        // rejected: empty, contains a space/punctuation, starts with a digit
+        for bad in ["", "123 bad-name!", "9lives", "bad-name", "has space", "!", "a.b"] {
+            assert!(!is_valid_new_identifier(bad), "must reject {bad:?} as a new identifier");
+        }
+        // accepted: ordinary ASCII, underscore-led, non-ASCII (café/日本 -- KUPL
+        // explicitly supports these as real identifiers, matching `lexer.rs::
+        // lex_ident`'s own `byte >= 0x80` dispatch condition)
+        for good in ["foo", "_valid", "café_helper", "日本語", "a1", "CamelCase"] {
+            assert!(is_valid_new_identifier(good), "must accept {good:?} as a new identifier");
+        }
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it767, from a fresh
+    /// Explore survey): `textDocument/rename`'s `newName` was accepted
+    /// VERBATIM with zero validation before being embedded into an outgoing
+    /// `WorkspaceEdit` -- every mainstream LSP client applies a rename edit
+    /// immediately and unconditionally once the server returns one, so an
+    /// invalid `newName` silently produced a "successful"-looking response
+    /// that would corrupt previously-working source if applied, with no
+    /// error surfaced anywhere. Live-confirmed BEFORE this fix via a raw LSP
+    /// stdio session: renaming `foo` to `"123 bad-name!"` (not an identifier
+    /// at all) and to `""` (empty) both returned well-formed `WorkspaceEdit`s
+    /// (2 edits each, covering the declaration and the call site) instead of
+    /// an error/`null`. Spawns the REAL `kupl lsp` process (this file's own
+    /// established subprocess-test pattern) to exercise the actual wire-level
+    /// handler, not just the underlying pure `is_valid_new_identifier` check
+    /// (covered in isolation by the test above).
+    #[test]
+    fn rename_with_an_invalid_new_name_returns_null_not_a_corrupting_edit() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let src = "fun foo(x: Int) -> Int {\n    x + 1\n}\n\nfun main() {\n    print(\"{foo(1)}\")\n}\n";
+        let did_open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///rename_invalid_it767.kupl","text":{src:?}}}}}}}"#
+        );
+        let rename_bad = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_invalid_it767.kupl"},"position":{"line":0,"character":4},"newName":"123 bad-name!"}}"#;
+        let rename_empty = r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_invalid_it767.kupl"},"position":{"line":0,"character":4},"newName":""}}"#;
+        let rename_ok = r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_invalid_it767.kupl"},"position":{"line":0,"character":4},"newName":"bar"}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init.to_string(), did_open, rename_bad.to_string(), rename_empty.to_string(), rename_ok.to_string()] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung on a rename request");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":2,"result":null"#),
+            "renaming to a syntactically invalid name must return null, not a corrupting edit: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":3,"result":null"#),
+            "renaming to an empty name must return null, not a corrupting edit: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":4,"result":{"changes""#),
+            "a genuinely valid rename must still work: {stdout}"
+        );
     }
 
     #[test]
