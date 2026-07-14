@@ -502,12 +502,16 @@ fn fmt_stmt(out: &mut String, stmt: &Stmt, level: usize) {
         }
         Stmt::While { cond, body, .. } => {
             out.push_str(&format!("while {} ", expr_str(cond, 0)));
-            fmt_block(out, body, level);
+            let mut blk = String::new();
+            fmt_block(&mut blk, body, level);
+            out.push_str(&reindent_inline(&blk));
             out.push('\n');
         }
         Stmt::For { var, iter, body, .. } => {
             out.push_str(&format!("for {var} in {} ", expr_str(iter, 0)));
-            fmt_block(out, body, level);
+            let mut blk = String::new();
+            fmt_block(&mut blk, body, level);
+            out.push_str(&reindent_inline(&blk));
             out.push('\n');
         }
         Stmt::Emit { port, arg, .. } => {
@@ -525,7 +529,9 @@ fn fmt_stmt(out: &mut String, stmt: &Stmt, level: usize) {
         Stmt::Forall { vars, body, .. } => {
             let bs: Vec<String> = vars.iter().map(|(n, t)| format!("{n}: {}", ty_str(t))).collect();
             out.push_str(&format!("forall {} ", bs.join(", ")));
-            fmt_block(out, body, level);
+            let mut blk = String::new();
+            fmt_block(&mut blk, body, level);
+            out.push_str(&reindent_inline(&blk));
             out.push('\n');
         }
         Stmt::Break(_) => out.push_str("break\n"),
@@ -1029,6 +1035,38 @@ mod tests {
     fn fmt_idempotent_forall_and_toplevel_law() {
         roundtrip(
             "fun id(xs: List[Int]) -> List[Int] {\n    xs\n}\nlaw \"reverse\" {\n    forall xs: List[Int], n: Int {\n        expect id(xs) == xs\n    }\n}\n",
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it723, found via a
+    /// scoped Explore survey): `while`/`for`/`forall` statement bodies were
+    /// ALWAYS rendered multi-line (`fmt_stmt`'s `Stmt::While`/`Stmt::For`/
+    /// `Stmt::Forall` called `fmt_block` directly, with no attempt to
+    /// collapse a simple body onto one line) -- unlike `if`/`match`/`lambda`
+    /// bodies used as EXPRESSIONS, which already self-inline via
+    /// `reindent_inline` when every inner line has balanced braces. A loop
+    /// nested inside a string's `{...}` interpolation (reachable since a
+    /// `Block` used as an expression, e.g. an `if`'s `then_block`, can
+    /// contain ANY `Stmt` including `While`/`For`/`Forall`) inherited that
+    /// unbalanced, ALWAYS-multi-line rendering, so `StrPiece::Expr`'s
+    /// formatter spliced a raw, literal newline into the middle of a STRING
+    /// LITERAL -- confirmed live to turn a valid, type-checking program into
+    /// completely unparseable output (K0005 unterminated string literal,
+    /// K0007 unterminated interpolation, and a cascade of further parse
+    /// errors). Fixed by applying the SAME `reindent_inline` treatment
+    /// `while`/`for`/`forall` bodies already lacked, matching the EXISTING,
+    /// pre-established style for `if`/`match`/`lambda` (confirmed via a live
+    /// check: a 3-statement `if`-as-expression body ALREADY collapses onto
+    /// one line today) -- this is closing a genuine INCONSISTENCY between
+    /// statement-level and expression-level block rendering, not
+    /// introducing a new style choice.
+    #[test]
+    fn fmt_idempotent_loop_nested_inside_string_interpolation() {
+        roundtrip(
+            "fun main() uses io {\n    var n = 0\n    print(\"val={if n < 1 { while n < 1 { n += 1 } } else { }}\")\n}\n",
+        );
+        roundtrip(
+            "fun main() uses io {\n    var n = 0\n    print(\"val={if n < 1 { for x in 0..3 { n += x } } else { }}\")\n}\n",
         );
     }
 
