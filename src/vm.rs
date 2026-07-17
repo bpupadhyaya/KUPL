@@ -1540,6 +1540,53 @@ mod tests {
         }
     }
 
+    /// A small deterministic xorshift64* PRNG (production-hardening
+    /// PR-it788), mirroring `prop.rs`'s own algorithm SHAPE for this
+    /// codebase's established convention -- kept as a small LOCAL copy in
+    /// this test module rather than widening `prop::Rng`'s module-private
+    /// `next`/`below` methods, since that would extend shared infra's
+    /// encapsulation just to serve this file's own fuzz tests. Originally a
+    /// fn-local struct inside a single fuzz test (PR-it788); hoisted to
+    /// module scope at PR-it789 once a SECOND fuzz test needed the exact
+    /// same generator, per the "share once there are two real callers, not
+    /// before" judgment call.
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn new(seed: u64) -> Self {
+            FuzzRng(if seed == 0 { 1 } else { seed })
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                0
+            } else {
+                self.next() % n
+            }
+        }
+    }
+
+    /// A random, arbitrarily-nested `Int` arithmetic expression (production-
+    /// hardening PR-it788) -- covers `+ - * / %`, including zero-divisor/
+    /// overflow panic paths at random nesting depths.
+    fn fuzz_gen_int_expr(rng: &mut FuzzRng, depth: u32) -> String {
+        if depth == 0 || rng.below(3) == 0 {
+            let n = (rng.below(21) as i64) - 10; // a small literal, -10..=10
+            return format!("({n})");
+        }
+        let ops = ["+", "-", "*", "/", "%"];
+        let op = ops[rng.below(ops.len() as u64) as usize];
+        let l = fuzz_gen_int_expr(rng, depth - 1);
+        let r = fuzz_gen_int_expr(rng, depth - 1);
+        format!("({l} {op} {r})")
+    }
+
     /// A targeted FUZZ-style extension to this file's OWN differential
     /// harness (production-hardening PR-it788) -- a qualitatively different
     /// discovery mechanism from every prior iteration's hand-picked
@@ -1547,59 +1594,22 @@ mod tests {
     /// (six of the latter, all fully mined by it787, with the standing
     /// low-priority list now empty). Rather than hand-constructing specific
     /// arithmetic expressions to test, generates hundreds of small, random,
-    /// arbitrarily-nested `Int` expressions (deterministically, via a local
-    /// xorshift64* PRNG mirroring `prop.rs`'s own algorithm SHAPE for this
-    /// codebase's established convention -- kept as a small local copy
-    /// rather than widening `prop::Rng`'s module-private `next`/`below` to
-    /// serve this one caller) and runs EACH through `differential_checked`,
-    /// covering every arithmetic operator (`+ - * / %`) including the
-    /// zero-divisor/overflow panic paths a hand-picked test suite might not
-    /// think to combine at arbitrary nesting depths. Deterministic (fixed
-    /// seed range `1..=500`, not real randomness) so a failure is always
-    /// reproducible and this test itself is never flaky. Found ZERO
-    /// disagreements across all 500 generated cases -- a genuinely NEW,
-    /// broader coverage mechanism now locked in permanently, not a bug fix.
+    /// arbitrarily-nested `Int` expressions and runs EACH through
+    /// `differential_checked`, covering every arithmetic operator
+    /// (`+ - * / %`) including the zero-divisor/overflow panic paths a
+    /// hand-picked test suite might not think to combine at arbitrary
+    /// nesting depths. Deterministic (fixed seed range `1..=500`, not real
+    /// randomness) so a failure is always reproducible and this test itself
+    /// is never flaky. Found ZERO disagreements across all 500 generated
+    /// cases -- a genuinely NEW, broader coverage mechanism now locked in
+    /// permanently, not a bug fix.
     #[test]
     fn fuzz_random_integer_expressions_agree_between_interp_and_vm() {
-        struct Rng(u64);
-        impl Rng {
-            fn new(seed: u64) -> Self {
-                Rng(if seed == 0 { 1 } else { seed })
-            }
-            fn next(&mut self) -> u64 {
-                let mut x = self.0;
-                x ^= x >> 12;
-                x ^= x << 25;
-                x ^= x >> 27;
-                self.0 = x;
-                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-            }
-            fn below(&mut self, n: u64) -> u64 {
-                if n == 0 {
-                    0
-                } else {
-                    self.next() % n
-                }
-            }
-        }
-
-        fn gen_expr(rng: &mut Rng, depth: u32) -> String {
-            if depth == 0 || rng.below(3) == 0 {
-                let n = (rng.below(21) as i64) - 10; // a small literal, -10..=10
-                return format!("({n})");
-            }
-            let ops = ["+", "-", "*", "/", "%"];
-            let op = ops[rng.below(ops.len() as u64) as usize];
-            let l = gen_expr(rng, depth - 1);
-            let r = gen_expr(rng, depth - 1);
-            format!("({l} {op} {r})")
-        }
-
         let mut mismatches = Vec::new();
         let mut compile_failures = 0usize;
         for seed in 1..=500u64 {
-            let mut rng = Rng::new(seed);
-            let expr = gen_expr(&mut rng, 4);
+            let mut rng = FuzzRng::new(seed);
+            let expr = fuzz_gen_int_expr(&mut rng, 4);
             let src = format!("fun probe() -> Int {{\n    {expr}\n}}\n");
             match differential_checked(&src) {
                 Ok(_) => {}
@@ -1618,6 +1628,74 @@ mod tests {
         // Sanity: the generator must actually be EXERCISING real arithmetic
         // (incl. zero-divisor panics), not silently failing to compile every
         // case -- an all-compile-failures run would make this test vacuous.
+        assert!(
+            compile_failures < 500,
+            "every generated expression failed to compile -- the fuzz generator itself is broken"
+        );
+    }
+
+    /// A random `Bool` expression built from comparisons of `fuzz_gen_int_expr`
+    /// operands (production-hardening PR-it789, extending it788's fuzz
+    /// harness to a genuinely NEW construct category -- comparisons and
+    /// logical operators -- rather than pure arithmetic): either a single
+    /// comparison (`== != < <= > >=`), or two sub-expressions combined with
+    /// `&&`/`||`, or a negated sub-expression.
+    fn fuzz_gen_bool_expr(rng: &mut FuzzRng, depth: u32) -> String {
+        if depth == 0 || rng.below(2) == 0 {
+            let cmp_ops = ["==", "!=", "<", "<=", ">", ">="];
+            let op = cmp_ops[rng.below(cmp_ops.len() as u64) as usize];
+            let l = fuzz_gen_int_expr(rng, 2);
+            let r = fuzz_gen_int_expr(rng, 2);
+            return format!("({l} {op} {r})");
+        }
+        match rng.below(3) {
+            0 => format!("!{}", fuzz_gen_bool_expr(rng, depth - 1)),
+            1 => format!("({} && {})", fuzz_gen_bool_expr(rng, depth - 1), fuzz_gen_bool_expr(rng, depth - 1)),
+            _ => format!("({} || {})", fuzz_gen_bool_expr(rng, depth - 1), fuzz_gen_bool_expr(rng, depth - 1)),
+        }
+    }
+
+    /// A targeted FUZZ-style extension of it788's harness to a genuinely NEW
+    /// construct category (production-hardening PR-it789): random `Bool`
+    /// expressions (comparisons + `&& || !`) driving an `if`/`else`
+    /// EXPRESSION (KUPL's `if` returns a value, like Rust's) whose two
+    /// branches are themselves random `Int` expressions -- exercising
+    /// short-circuit evaluation, comparison operators, and control-flow
+    /// value-selection together, none of which it788's pure-arithmetic
+    /// generator ever touched. Deliberately stays within `Int`/`Bool`
+    /// (avoiding `Float`, whose cross-engine formatting has KNOWN,
+    /// ALREADY-CONFIRMED-INTENTIONAL quirks this campaign has separately
+    /// investigated and accepted -- a fuzzer naively treating those as
+    /// findings would misreport accepted behavior as new bugs) and stays
+    /// within single-function `if`/comparisons (not lists/maps/match,
+    /// deliberately left as a LATER possible extension, not attempted here).
+    /// Found ZERO disagreements across all 500 generated cases.
+    #[test]
+    fn fuzz_random_boolean_and_if_expressions_agree_between_interp_and_vm() {
+        let mut mismatches = Vec::new();
+        let mut compile_failures = 0usize;
+        for seed in 1..=500u64 {
+            let mut rng = FuzzRng::new(seed);
+            let cond = fuzz_gen_bool_expr(&mut rng, 3);
+            let then_branch = fuzz_gen_int_expr(&mut rng, 3);
+            let else_branch = fuzz_gen_int_expr(&mut rng, 3);
+            let src = format!(
+                "fun probe() -> Int {{\n    if {cond} {{\n        {then_branch}\n    }} else {{\n        {else_branch}\n    }}\n}}\n"
+            );
+            match differential_checked(&src) {
+                Ok(_) => {}
+                Err(e) if e.starts_with("compile error") || e.starts_with("module compile error") => {
+                    compile_failures += 1;
+                }
+                Err(e) => mismatches.push(format!("seed {seed}: {e}")),
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "found {} interp-vs-KVM disagreement(s) across 500 random Bool/if expressions:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
         assert!(
             compile_failures < 500,
             "every generated expression failed to compile -- the fuzz generator itself is broken"
