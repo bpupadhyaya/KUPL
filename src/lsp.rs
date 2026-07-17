@@ -54,7 +54,31 @@ pub fn parse_json(src: &str) -> Result<Json, String> {
     let bytes = src.as_bytes();
     let mut pos = 0usize;
     let v = parse_value(bytes, &mut pos, 0)?;
+    skip_ws(bytes, &mut pos);
+    // Trailing non-whitespace after the top-level value is an error, mirroring
+    // json.rs's `parse` exactly (production-hardening PR-it792): this parser
+    // used to silently accept and ignore trailing content -- confirmed live,
+    // a mock ai-fun response of `"123abc"` for an `Int` shape SUCCEEDED (value
+    // 123, "abc" silently dropped) on interp/KVM (both call THIS parser, per
+    // ai.rs::convert), while native's `k_json_parse` (which mirrors json.rs's
+    // OWN trailing-content check) correctly rejected it -- a genuine
+    // crash-vs-succeed-shaped divergence (well, succeed-vs-reject), not just
+    // message wording, and reachable via ordinary ai-fun mock testing.
+    if pos != bytes.len() {
+        return Err(format!("unexpected trailing characters at position {}", byte_to_char_pos(bytes, pos)));
+    }
     Ok(v)
+}
+
+/// Number of UTF-8 characters in `b[..byte_pos]` -- this parser tracks BYTE
+/// offsets internally (unlike json.rs's `Parser`, which is `Vec<char>`-
+/// indexed), but json.rs's own position-bearing error messages (mirrored
+/// exactly by native's `k_json_parse`/`kjp_cpos`, see cgen.rs) report CHAR
+/// positions -- a raw byte position here would silently diverge from both on
+/// any non-ASCII input (production-hardening PR-it792, spotted while fixing
+/// the trailing-content/unexpected-character message gaps below).
+fn byte_to_char_pos(b: &[u8], byte_pos: usize) -> usize {
+    std::str::from_utf8(&b[..byte_pos.min(b.len())]).map(|s| s.chars().count()).unwrap_or(byte_pos)
 }
 
 fn skip_ws(b: &[u8], pos: &mut usize) {
@@ -91,7 +115,11 @@ fn hex4(b: &[u8], start: usize) -> Result<u32, String> {
 fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> {
     skip_ws(b, pos);
     if *pos >= b.len() {
-        return Err("unexpected end of JSON".into());
+        // "...of input", not "...of JSON" -- matches json.rs's own wording
+        // exactly (production-hardening PR-it792); this parser's OTHER
+        // messages already do (see the literal-validation fix above), this
+        // one site was missed.
+        return Err("unexpected end of input".into());
     }
     match b[*pos] {
         b'{' => {
@@ -287,18 +315,36 @@ fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> 
                 Err("invalid literal (expected `null`)".into())
             }
         }
-        _ => {
+        // Only ATTEMPT a number parse when the leading byte could plausibly
+        // start one -- matches json.rs's own `value()` dispatch exactly
+        // (production-hardening PR-it792): the OLD code here fell through to
+        // a number-scan for ANY unrecognized byte, and an empty scan (e.g.
+        // the very first byte is `X`, not digit/`-`) produced a bare
+        // "invalid number" -- json.rs (and native's `k_json_parse`, which
+        // mirrors it byte-for-byte) instead report "unexpected character
+        // `X` at position N" for exactly this input, confirmed as a genuine
+        // ai-fun-mock-response cross-engine wording divergence via live
+        // repro (`KUPL_AI_MOCK_CLASSIFY=X`).
+        _ if matches!(b[*pos], b'0'..=b'9' | b'-') => {
             let start = *pos;
             while *pos < b.len()
                 && matches!(b[*pos], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
             {
                 *pos += 1;
             }
-            std::str::from_utf8(&b[start..*pos])
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(Json::Num)
-                .ok_or_else(|| "invalid number".into())
+            let s = std::str::from_utf8(&b[start..*pos]).unwrap_or("");
+            // The embedded scanned text (`invalid number `{s}`` , not a bare
+            // "invalid number") also mirrors json.rs exactly -- confirmed
+            // via live repro (`KUPL_AI_MOCK_CLASSIFY=12.3.4`).
+            s.parse::<f64>().map(Json::Num).map_err(|_| format!("invalid number `{s}`"))
+        }
+        _ => {
+            let c = std::str::from_utf8(&b[*pos..]).ok().and_then(|s| s.chars().next());
+            let cp = byte_to_char_pos(b, *pos);
+            match c {
+                Some(c) => Err(format!("unexpected character `{c}` at position {cp}")),
+                None => Err(format!("unexpected character at position {cp}")),
+            }
         }
     }
 }
@@ -3253,6 +3299,46 @@ mod tests {
         assert_eq!(parse_json("tomato"), Err("invalid literal (expected `true`)".into()));
         assert_eq!(parse_json("foobar"), Err("invalid literal (expected `false`)".into()));
         assert_eq!(parse_json("t"), Err("invalid literal (expected `true`)".into()));
+    }
+
+    /// A REAL cross-engine wording+behavior gap found+fixed (production-
+    /// hardening PR-it792), the SAME root cause as the literal-validation
+    /// fix just above (this parser is a genuinely separate, independently
+    /// reimplemented JSON parser from `json.rs`, used for LSP JSON-RPC AND
+    /// `ai.rs`'s mock-response parsing) but THREE more previously-missed
+    /// divergences from `json.rs`'s reference behavior, all confirmed live
+    /// via `KUPL_AI_MOCK_<NAME>` against interp vs native's `k_json_parse`
+    /// (which DOES mirror `json.rs` byte-for-byte): (1) trailing content
+    /// after a valid top-level value used to be silently ACCEPTED here
+    /// (`"123abc"` parsed as `123`, dropping `"abc"`) while native correctly
+    /// REJECTED it -- a genuine succeed-vs-error divergence, not just
+    /// wording; (2) an unrecognized leading byte (e.g. `X`) fell through to
+    /// an always-attempted number scan, producing a bare `"invalid number"`
+    /// instead of json.rs's `"unexpected character `X` at position N"`; (3)
+    /// a numeric-shaped but unparseable token (`"12.3.4"`) produced a bare
+    /// `"invalid number"` instead of json.rs's `"invalid number `12.3.4`"`
+    /// (the scanned text embedded). Also fixes a smaller, independently-
+    /// spotted wording slip: `"unexpected end of JSON"` -> `"unexpected end
+    /// of input"`, matching json.rs exactly.
+    #[test]
+    fn parse_json_matches_json_rs_on_trailing_content_and_unexpected_characters() {
+        assert_eq!(
+            parse_json("123abc"),
+            Err("unexpected trailing characters at position 3".into())
+        );
+        assert_eq!(parse_json("X"), Err("unexpected character `X` at position 0".into()));
+        assert_eq!(parse_json("12.3.4"), Err("invalid number `12.3.4`".into()));
+        assert_eq!(parse_json(""), Err("unexpected end of input".into()));
+        // a non-ASCII unrecognized character reports a CHAR position, not a
+        // byte position -- "é" is two bytes but the FIRST character.
+        assert_eq!(parse_json("é"), Err("unexpected character `é` at position 0".into()));
+        // trailing content after whitespace is still trailing content.
+        assert_eq!(
+            parse_json("true  garbage"),
+            Err("unexpected trailing characters at position 6".into())
+        );
+        // genuinely well-formed input is completely unaffected.
+        assert_eq!(parse_json("  42  "), Ok(Json::Num(42.0)));
     }
 
     /// A REAL, SEVERE robustness bug found+fixed (production-hardening
