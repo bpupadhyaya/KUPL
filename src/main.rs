@@ -133,10 +133,33 @@ fn run_cli() -> ExitCode {
             }
         },
         Some("manifest") => with_path(&args, run::emit_manifest),
-        Some("pkg") => match (args.get(1).map(String::as_str), args.get(2)) {
-            (Some("tree"), Some(p)) => run::pkg_tree(p),
-            (Some("lock"), Some(p)) => run::pkg_lock(p),
-            (Some("fetch"), Some(p)) => run::pkg_fetch(p),
+        // A REAL usability bug found+fixed (production-hardening PR-it782, an
+        // Explore survey finding, independently re-verified live before
+        // implementing): `pkg`'s path argument was a raw `args.get(2)`, unlike
+        // EVERY other file-taking subcommand (via `with_path`/`find_path_arg`),
+        // which all skip `--flag`s and an `-o <value>` pair wherever they
+        // appear. A flag placed before the path (a perfectly natural ordering,
+        // matching every sibling subcommand's own accepted ordering) was
+        // misread AS the path itself. Confirmed live before this fix: `kupl
+        // pkg tree --json simple.kupl` reported `error: entry --json: No such
+        // file or directory`, never even looking at `simple.kupl`. Fixed by
+        // routing through the SAME `find_path_arg` every other subcommand
+        // uses -- sliced to `&args[1..]` so `find_path_arg`'s own internal
+        // `args[0]`-is-the-command-word skip lands on `tree`/`lock`/`fetch`
+        // (the pkg SUB-subcommand), not `pkg` itself.
+        Some("pkg") => match args.get(1).map(String::as_str) {
+            Some(sub @ ("tree" | "lock" | "fetch")) => match find_path_arg(&args[1..]) {
+                Ok(p) => match sub {
+                    "tree" => run::pkg_tree(p),
+                    "lock" => run::pkg_lock(p),
+                    "fetch" => run::pkg_fetch(p),
+                    _ => unreachable!(),
+                },
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    2
+                }
+            },
             _ => {
                 eprintln!("usage: kupl pkg <tree|lock|fetch> <file.kupl>");
                 2
@@ -257,6 +280,17 @@ fn run_cli() -> ExitCode {
 /// even compile to a `.kx` module or bundled executable ("unknown name"
 /// errors for every cross-module function).
 fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
+    // See `run::native`'s identical guard (production-hardening PR-it782)
+    // for the full rationale: `.kx` fed here used to walk the lexer over
+    // raw bytecode byte-by-byte instead of a clean error.
+    if file.ends_with(".kx") {
+        let cmd = if bundle { "bundle" } else { "build" };
+        eprintln!(
+            "error: {file} is already compiled bytecode (.kx) -- `kupl {cmd}` needs `.kupl` \
+             source, not an existing module"
+        );
+        return 1;
+    }
     let (compiled, map) = match run::load_compile(file) {
         Ok(ok) => ok,
         Err(code) => return code,
@@ -712,6 +746,95 @@ mod tests {
         let code2 = build_module(&args, &p2, false);
         assert_eq!(code2, 1, "an explicit -o matching the source must also be refused");
         assert_eq!(std::fs::read_to_string(&named).unwrap(), src, "source must be untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL usability bug found+fixed (production-hardening PR-it782, an
+    /// Explore survey finding, independently re-verified live before
+    /// implementing): `build`/`bundle`/`native` all tried to parse a `.kx`
+    /// file as `.kupl` SOURCE, unlike `run`/`dis` which already special-case
+    /// it -- the lexer walked the raw bytecode byte-by-byte, emitting one
+    /// `K0001` per non-token byte. Confirmed live before this fix: `kupl
+    /// native qux.kx` (a genuine compiled module) printed 1455 lines of
+    /// garbage instead of one clean, actionable error. Subprocess test
+    /// (matching this file's own `fmt_check_exits_zero_...` convention)
+    /// since the crux of the bug is the OUTPUT VOLUME, not just the exit
+    /// code -- asserts the error is a SINGLE line, not thousands.
+    #[test]
+    fn build_bundle_native_reject_a_kx_file_with_one_clean_line_not_thousands_of_lexer_errors() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-kx-input-guard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("qux.kupl");
+        std::fs::write(&src, "fun main() uses io {\n    print(\"hi\")\n}\n").unwrap();
+        let kx = dir.join("qux.kx");
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let built = run(&["build", src.to_str().unwrap(), "-o", kx.to_str().unwrap()]);
+        assert_eq!(built.status.code(), Some(0), "{built:?}");
+
+        for cmd in ["native", "build", "bundle"] {
+            let out = run(&[cmd, kx.to_str().unwrap()]);
+            assert_eq!(out.status.code(), Some(1), "`{cmd}` on a .kx file: {out:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.lines().count(),
+                1,
+                "`{cmd}` on a .kx file must report ONE clean line, not a lexer-error dump: {stderr:?}"
+            );
+            assert!(stderr.contains("already compiled bytecode"), "`{cmd}`: {stderr:?}");
+        }
+
+        // `run`/`dis` must remain unaffected -- they already handle `.kx` input directly.
+        let ran = run(&["run", kx.to_str().unwrap()]);
+        assert_eq!(ran.status.code(), Some(0), "{ran:?}");
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "hi");
+        let dis = run(&["dis", kx.to_str().unwrap()]);
+        assert_eq!(dis.status.code(), Some(0), "{dis:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL usability bug found+fixed (production-hardening PR-it782, an
+    /// Explore survey finding, independently re-verified live before
+    /// implementing): `kupl pkg tree|lock|fetch` read their path argument via
+    /// raw `args.get(2)`, unlike every OTHER file-taking subcommand (which
+    /// all route through `find_path_arg`, skipping `--flag`s and an `-o
+    /// <value>` pair wherever they appear) -- so a flag placed BEFORE the
+    /// path was misread as the path itself. Confirmed live before this fix:
+    /// `kupl pkg tree --json qux.kupl` reported `error: entry --json: No
+    /// such file or directory`, never even looking at `qux.kupl`.
+    #[test]
+    fn pkg_tree_accepts_a_flag_before_the_path_like_every_sibling_subcommand() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-pkg-flag-order-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("qux.kupl");
+        std::fs::write(&src, "fun main() uses io {\n    print(\"hi\")\n}\n").unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+
+        // flag BEFORE the path -- must resolve the path correctly, not misread the flag as it.
+        let before = run(&["pkg", "tree", "--bogus-flag", src.to_str().unwrap()]);
+        assert_eq!(before.status.code(), Some(0), "{before:?}");
+        assert!(String::from_utf8_lossy(&before.stdout).contains("no dependencies"), "{before:?}");
+
+        // flag AFTER the path -- the pre-existing ordering must keep working too.
+        let after = run(&["pkg", "tree", src.to_str().unwrap(), "--bogus-flag"]);
+        assert_eq!(after.status.code(), Some(0), "{after:?}");
+
+        // no path at all -- a clean usage error, not a panic.
+        let missing = run(&["pkg", "tree"]);
+        assert_eq!(missing.status.code(), Some(2), "{missing:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

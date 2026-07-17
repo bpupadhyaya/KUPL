@@ -937,6 +937,25 @@ pub fn output_would_overwrite_source(out: &str, source: &str) -> bool {
 
 /// `kupl native`: emit C from the bytecode and compile with the system cc.
 pub fn native(path: &str, args: &[String]) -> i32 {
+    // A REAL usability bug found+fixed (production-hardening PR-it782, an
+    // Explore survey finding, independently re-verified live before
+    // implementing): `native`/`build`/`bundle` all try to PARSE their input
+    // as `.kupl` source with no `.kx`-extension check, unlike `run`/`dis`,
+    // which already special-case a compiled `.kx` module (`disassemble`'s
+    // own `path.ends_with(".kx")` guard right above, mirrored here exactly,
+    // and `main.rs`'s `run` dispatch arm, PR-it594's original precedent).
+    // Feeding a `.kx` file to any of these instead walked the lexer over
+    // raw bytecode BYTE-BY-BYTE, emitting one `K0001: unexpected character`
+    // diagnostic per non-token byte -- confirmed live before this fix:
+    // `kupl native qux.kx` printed 1455 lines of garbage instead of one
+    // clear, actionable error.
+    if path.ends_with(".kx") {
+        eprintln!(
+            "error: {path} is already compiled bytecode (.kx) -- `kupl native` compiles `.kupl` \
+             source, not an existing module"
+        );
+        return 1;
+    }
     let Ok((compiled, map)) = load_compile(path) else { return 1 };
     let module = match crate::compile::compile_module(&compiled.program, &compiled.checked) {
         Ok(m) => m,
