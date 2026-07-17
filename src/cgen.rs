@@ -200,11 +200,34 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
         emit_chunk(&mut out, module, i, chunk)?;
     }
 
+    // `signal(SIGPIPE, SIG_IGN)` first thing in `main` (production-hardening
+    // PR-it791): a REAL, SEVERE availability bug found+fixed, the same class
+    // as PR-it737's k_pad panic-recovery fix but via a totally different
+    // mechanism. `http_serve`'s response-write loop (`write(conn, ...)`, see
+    // the HTTP section of RUNTIME above) and `k_run_curl`'s request-body
+    // pipe-write loop both already handle a short/failed `write()` cleanly
+    // (`if (w <= 0) break;`) -- but that code assumes `write()` on a
+    // peer-closed socket/pipe RETURNS an error, which is only true once
+    // SIGPIPE's default disposition (terminate the whole process) is
+    // disabled. Neither the interpreter nor the KVM has this gap: Rust's
+    // runtime ignores SIGPIPE globally at process startup, so a write to a
+    // broken pipe there always surfaces as an `io::Error`, never a signal.
+    // Confirmed LIVE: a raw client that connects to a native `http_serve`
+    // handler returning a multi-MB body, sends a request, then force-resets
+    // the connection (`SO_LINGER` with `l_onoff=1, l_linger=0`) BEFORE
+    // reading the response, reliably killed the ENTIRE native server process
+    // (exit via SIGPIPE, code 141) on 10/10 attempts -- taking down every
+    // OTHER in-flight/future connection too, not just the aborted one; the
+    // identical test against interp's `http_serve` left the server running.
+    // This is process-wide by design (matches Rust's own approach): ignoring
+    // SIGPIPE is safe for every native program, not just servers, since it
+    // only changes a broken-pipe write from "kill the process" to "return -1
+    // with errno=EPIPE", which every write loop in RUNTIME already handles.
     match entry {
         Entry::Main(main_idx) => {
             let _ = writeln!(
                 out,
-                "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    fun_{main_idx}(0, 0);\n    return 0;\n}}"
+                "\nint main(int argc, char** argv) {{\n    signal(SIGPIPE, SIG_IGN);\n    k_argc = argc; k_argv = argv;\n    fun_{main_idx}(0, 0);\n    return 0;\n}}"
             );
         }
         Entry::App(app_idx) => {
@@ -245,7 +268,7 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             // must simply agree, and now they do.
             let _ = writeln!(
                 out,
-                "\nint main(int argc, char** argv) {{\n    k_argc = argc; k_argv = argv;\n    \
+                "\nint main(int argc, char** argv) {{\n    signal(SIGPIPE, SIG_IGN);\n    k_argc = argc; k_argv = argv;\n    \
                  k_print_unwired = 1;\n    \
                  k_instantiate({app_idx}, 0, 0);\n    \
                  int k_n0 = k_ninsts;\n    \
@@ -674,6 +697,7 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <signal.h>
 
 typedef struct KValue KValue;
 /* `cap` tracks allocated (not just used) slots in `items`, so a self-rebind
@@ -11454,6 +11478,99 @@ fun main() uses io {
             )?;
             if !resp.ends_with("GET /world") {
                 return Err(format!("bad recovered response: {resp}"));
+            }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
+    /// A REAL, SEVERE availability bug found+fixed (production-hardening
+    /// PR-it791, the SAME class as PR-it737's k_pad panic-recovery fix but
+    /// via a totally different mechanism): a close read of `emit_op`'s
+    /// `http_serve` response-write loop (`write(conn, resp.buf + off, ...)`,
+    /// `if (w <= 0) break;`) noticed that loop's correctness silently
+    /// depends on `write()` to a peer-closed socket RETURNING an error --
+    /// which is only true once `SIGPIPE`'s default disposition (terminate
+    /// the whole process) is disabled. `RUNTIME` never called
+    /// `signal(SIGPIPE, SIG_IGN)` anywhere. Confirmed LIVE before the fix: a
+    /// client that connects, sends a request, then drops the connection
+    /// WITHOUT reading the (multi-MB) response reliably killed the ENTIRE
+    /// native server process (SIGPIPE, exit 141) on every attempt, taking
+    /// down every other in-flight/future connection too -- not just failing
+    /// the aborted request. interp's `http_serve` (Rust ignores SIGPIPE
+    /// globally at process startup) survives the identical scenario. Fixed
+    /// by adding `signal(SIGPIPE, SIG_IGN)` as the first statement in BOTH
+    /// `main()` shapes `emit_c` generates (`Entry::Main` and `Entry::App`) --
+    /// process-wide by design, matching Rust's own approach, since it only
+    /// changes a broken-pipe write from "kill the process" to "return -1
+    /// with errno=EPIPE", which every write loop in `RUNTIME` (this one,
+    /// and `k_run_curl`'s request-body pipe-write loop) already handles.
+    /// This test deliberately does NOT need any special socket option (no
+    /// `SO_LINGER`/`set_linger` -- unstable in this toolchain, and this
+    /// codebase is zero-dependency) -- a plain `TcpStream` dropped with
+    /// unread response bytes still pending naturally triggers an RST on
+    /// close, which is exactly what live-confirmed the crash originally.
+    #[test]
+    fn native_http_serve_survives_a_client_that_disconnects_before_reading_a_large_response() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun grow(s: Str) -> Str {\n    \
+                   var out: Str = s\n    var i = 0\n    \
+                   while i < 22 {\n        out = out + out\n        i = i + 1\n    }\n    \
+                   out\n}\n\
+                   fun h(m: Str, p: Str, b: Str) -> Str { grow(\"y\") }\n\
+                   fun main() uses io { let _ = http_serve(38127, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        assert!(
+            c.contains("signal(SIGPIPE, SIG_IGN)"),
+            "the fix must ignore SIGPIPE before any write() to a client socket can occur"
+        );
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srvsigpipe-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let connect = || {
+            for _ in 0..300 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38127u16)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        let result = (|| {
+            // several connections, each sending a request then dropping the
+            // stream WITHOUT reading the ~4MB response -- reliably triggers
+            // the crash before the fix (10/10 in manual live testing).
+            for _ in 0..10 {
+                let mut s = connect().ok_or("server should be listening")?;
+                s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").map_err(|e| e.to_string())?;
+                drop(s);
+            }
+            // a FRESH connection that actually reads the full response --
+            // the server must still be alive and answering correctly.
+            let mut s2 = connect().ok_or("server should still be listening after the disconnects")?;
+            s2.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            s2.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n").map_err(|e| e.to_string())?;
+            let mut resp = Vec::new();
+            s2.read_to_end(&mut resp).map_err(|e| e.to_string())?;
+            let resp = String::from_utf8_lossy(&resp);
+            if !resp.starts_with("HTTP/1.1 200 OK") {
+                return Err(format!("bad post-disconnects response head: {:?}", &resp[..resp.len().min(80)]));
+            }
+            if resp.len() < 4_000_000 {
+                return Err(format!("response body looks truncated: only {} bytes", resp.len()));
             }
             Ok::<(), String>(())
         })();
