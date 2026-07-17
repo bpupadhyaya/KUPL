@@ -1171,6 +1171,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL structural test-coverage gap found+closed (production-hardening
+    /// PR-it785, an Explore survey finding into the differential-testing
+    /// harness's OWN meta-level coverage, independently re-verified live
+    /// before adding this test): `vm.rs`'s own `differential()` helper (the
+    /// mechanism behind the vast majority of this project's interp-vs-KVM
+    /// byte-identity tests) only ever compares a `probe()` function's
+    /// RETURN VALUE -- it never captures or diffs actual printed STDOUT,
+    /// since `print()` writes straight to the real process stdout in both
+    /// engines with no injectable sink. `run_program_vm` (the function
+    /// behind `kupl run --vm`) had, before this test, EXACTLY ONE caller in
+    /// the entire codebase -- `main.rs`'s own CLI dispatch -- and was never
+    /// invoked by any test at all. So an entire category of observable
+    /// program behavior (printed output, its ORDER and COMPLETENESS
+    /// relative to panics/`par_map` scheduling/loops) had ZERO differential
+    /// coverage anywhere in the suite. INDEPENDENTLY VERIFIED clean before
+    /// adding this test (no bug found -- this is a coverage gap being
+    /// closed, not a divergence being fixed, per this campaign's own
+    /// standing rule for coverage-gap findings): ran `kupl run` vs `kupl
+    /// run --vm` on a print+loop+panic program and a `par_map`+print
+    /// program (3x, since `par_map`'s real-thread scheduling is the
+    /// specific risk case) and found byte-identical stdout+exit code every
+    /// time. This test locks that verified-clean state in permanently.
+    #[test]
+    fn stdout_is_byte_identical_between_the_interpreter_and_the_vm() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-vm-stdout-parity-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_both = |file: &std::path::Path| -> (std::process::Output, std::process::Output) {
+            let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+            (interp, vm)
+        };
+
+        // prints interleaved with a loop, then a genuine runtime panic mid-program.
+        let prints = dir.join("prints.kupl");
+        std::fs::write(
+            &prints,
+            "fun main() uses io {\n    print(\"first\")\n    let xs = [1, 2, 3]\n    \
+             for x in xs {\n        print(x)\n    }\n    print(\"before panic\")\n    \
+             let bad = 1 / 0\n    print(\"never\")\n}\n",
+        )
+        .unwrap();
+        let (i1, v1) = run_both(&prints);
+        assert_eq!(i1.stdout, v1.stdout, "stdout must match up to the panic point");
+        assert_eq!(i1.status.code(), v1.status.code(), "the panic exit code must also match");
+        assert!(String::from_utf8_lossy(&i1.stdout).contains("before panic"), "sanity: prints before the panic ran");
+        assert!(!String::from_utf8_lossy(&i1.stdout).contains("never"), "sanity: the print AFTER the panic must not run");
+
+        // `par_map`'s real-OS-thread scheduling is the specific risk case for
+        // print ORDER divergence -- repeat several times, not just once.
+        let parmap = dir.join("parmap.kupl");
+        std::fs::write(
+            &parmap,
+            "fun main() uses io {\n    let xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n    \
+             let ys = xs.par_map(fn x { x * 2 })\n    for y in ys {\n        print(y)\n    }\n}\n",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let (i2, v2) = run_both(&parmap);
+            assert_eq!(i2.stdout, v2.stdout, "par_map's output order must match between engines");
+            assert_eq!(i2.status.code(), Some(0), "{i2:?}");
+            assert_eq!(v2.status.code(), Some(0), "{v2:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Waits for `child` to exit, but gives up after `timeout` rather than
     /// blocking forever -- `std::process::Child::wait_with_output` has no
     /// built-in deadline (and this repo's own convention is that macOS has
