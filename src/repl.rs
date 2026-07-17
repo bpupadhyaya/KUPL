@@ -175,14 +175,44 @@ fn braces_balanced(src: &str) -> bool {
     // matching how an open `{`/`(`/`[` already does, rather than prematurely
     // submitting a truncated comment as if it were a complete top-level form.
     let mut comment_depth: u32 = 0;
-    let mut prev = '\0';
     let mut chars = src.chars().peekable();
     while let Some(ch) = chars.next() {
         if in_str {
-            if ch == '"' && prev != '\\' {
-                in_str = false;
+            // A REAL bug found+fixed (production-hardening PR-it779, a
+            // long-abandoned survey's finding, agentId aaed1d00a40c9e7b6,
+            // dispatched at it764, delivered 14 iterations late; independently
+            // re-verified live before implementing since this SAME survey's
+            // own top finding just turned out to be stale): the OLD escape
+            // check, `ch == '"' && prev != '\\'`, only looked at the SINGLE
+            // immediately-preceding character -- for a string ending in an
+            // escaped backslash, e.g. `"\\"` (source chars: `"`, `\`, `\`,
+            // `"` -- ONE escaped backslash, which `lexer.rs` correctly closes),
+            // the closing `"` is itself preceded by a `\` (the SECOND half of
+            // the `\\` pair), so the old check wrongly treated the close as
+            // escaped and never left `in_str` -- permanently wedging the REPL
+            // (every subsequent line, including `:quit`, got silently
+            // appended to the same never-balanced buffer, since `:`-command
+            // dispatch only fires when the buffer is empty). Confirmed live
+            // before fixing: `printf 'print("\\\\")\n:quit\nprint(1)\n" |
+            // kupl repl` produced FOUR stacked `..>` continuation prompts,
+            // never executing `print("\\")`, never processing `:quit`.
+            // Fixed by mirroring `lexer.rs::lex_string`'s OWN "consume in
+            // pairs" approach exactly (`Some(b'\\') => match self.bump() {
+            // ... }`, which unconditionally consumes the character AFTER a
+            // backslash as part of the SAME escape unit) instead of a
+            // trailing-parity lookback: a `\` while inside a string
+            // immediately consumes the NEXT character too, so THAT character
+            // (whatever it is -- a quote, another backslash, anything) can
+            // never be misread as closing the string on this same pass. This
+            // removes the need for `prev` entirely (its only reader was this
+            // exact check), so it's dropped rather than left as dead state.
+            match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_str = false,
+                _ => {}
             }
-            prev = ch;
             continue;
         }
         if ch == '/' && chars.peek() == Some(&'/') {
@@ -192,7 +222,6 @@ fn braces_balanced(src: &str) -> bool {
                     break;
                 }
             }
-            prev = '\0';
             continue;
         }
         if ch == '/' && chars.peek() == Some(&'*') {
@@ -215,7 +244,6 @@ fn braces_balanced(src: &str) -> bool {
                     _ => {}
                 }
             }
-            prev = '\0';
             continue;
         }
         match ch {
@@ -224,7 +252,6 @@ fn braces_balanced(src: &str) -> bool {
             '}' | ')' | ']' => depth -= 1,
             _ => {}
         }
-        prev = ch;
     }
     depth <= 0 && comment_depth == 0
 }
@@ -281,6 +308,32 @@ mod tests {
         assert!(!braces_balanced("foo(1, 2"));
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it779, a long-abandoned
+    /// survey's finding, agentId aaed1d00a40c9e7b6, dispatched at it764,
+    /// delivered 14 iterations late; independently re-verified live before
+    /// implementing since this SAME survey's own top finding just turned out
+    /// to be stale): the OLD escape check, `ch == '"' && prev != '\\'`, only
+    /// looked at the SINGLE immediately-preceding character -- a string
+    /// ending in an escaped backslash, `"\\"` (ONE escaped backslash char,
+    /// which `lexer.rs` correctly treats as closed), has its closing `"`
+    /// itself preceded by a `\` (the second half of the `\\` pair), so the
+    /// old check wrongly treated the close as escaped and never left
+    /// `in_str` -- permanently wedging the REPL (see the subprocess test
+    /// below for the full end-to-end repro).
+    #[test]
+    fn braces_balanced_handles_a_string_ending_in_an_escaped_backslash() {
+        // one escaped backslash, correctly closed -- the exact PR-it779 repro.
+        assert!(braces_balanced("print(\"\\\\\")"));
+        // two escaped backslashes in a row, still correctly closed.
+        assert!(braces_balanced("print(\"\\\\\\\\\")"));
+        // an escaped quote followed by more text and a real close still works
+        // (guards against over-correcting into "a backslash always closes").
+        assert!(braces_balanced("print(\"a\\\"b\")"));
+        // a GENUINELY unterminated string (odd trailing backslash with no
+        // closing quote at all) must still correctly signal "keep reading".
+        assert!(!braces_balanced("print(\"a\\"));
+    }
+
     #[test]
     fn is_item_classifies_declarations_vs_expressions() {
         assert!(is_item("fun f() -> Int { 1 }"));
@@ -332,6 +385,56 @@ mod tests {
         assert!(
             stdout.contains("hi"),
             "print(\"hi\") must actually run -- the comment must not wedge the REPL: {stdout}"
+        );
+        assert!(
+            !stdout.contains("should not run"),
+            ":quit must genuinely terminate the session, not get silently appended to a dead buffer: {stdout}"
+        );
+        assert!(out.status.success(), ":quit must exit cleanly: {out:?}");
+    }
+
+    /// End-to-end companion to
+    /// `braces_balanced_handles_a_string_ending_in_an_escaped_backslash`
+    /// above: spawns the REAL `kupl repl` process to confirm the full wedge
+    /// is fixed, not just the underlying pure function. Live-confirmed
+    /// BEFORE this fix: `print("\\")` (a string containing one escaped
+    /// backslash) permanently wedged the session -- neither it nor any
+    /// later line, including `:quit`, ever ran; the process only exited via
+    /// silent EOF with the input never fully consumed.
+    #[test]
+    fn a_string_ending_in_an_escaped_backslash_does_not_wedge_the_session() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "print(\"\\\\\")\nprint(\"done-marker\")\n:quit\nprint(\"should not run\")\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out
+            .expect("kupl repl hung on a string ending in an escaped backslash")
+            .expect("wait_with_output succeeds");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("done-marker"),
+            "print(\"done-marker\") must actually run -- the escaped-backslash string must not wedge the REPL: {stdout}"
         );
         assert!(
             !stdout.contains("should not run"),
