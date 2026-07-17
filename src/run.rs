@@ -908,6 +908,33 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
     out
 }
 
+/// A CRITICAL data-loss bug found+fixed (production-hardening PR-it781, an
+/// Explore survey finding, independently re-verified live before
+/// implementing): `kupl bundle`/`kupl native`'s default output path is the
+/// input path with a trailing `.kupl` trimmed off -- a no-op if the source
+/// file doesn't literally end in `.kupl` (KUPL never requires that
+/// extension), so the computed output SILENTLY COLLIDED WITH THE SOURCE
+/// FILE and overwrote it with a compiled binary -- no warning, no
+/// confirmation, permanently (for `native`, the intermediate `.c` is also
+/// deleted on success unless `--keep-c`, leaving nothing recoverable at
+/// all). An explicit `-o <source-path>` hits the identical collision
+/// regardless of naming. Confirmed live before this fix: `kupl bundle foo`
+/// (source file literally named `foo`, no `.kupl` suffix) destroyed `foo`,
+/// replacing it with a Mach-O executable, exit code 0, a "success" message
+/// giving no indication anything unusual happened. Canonicalizes both sides
+/// (falling back to `loader::normalize`'s lexical `.`/`..` resolution when
+/// the output doesn't exist yet, since `canonicalize()` requires the path
+/// to already exist -- mirrors `loader.rs`'s own `dep_identity` convention
+/// exactly, see that function's doc comment) so `./foo` vs `foo` and a
+/// symlinked path still compare correctly, not just a literal string match.
+pub fn output_would_overwrite_source(out: &str, source: &str) -> bool {
+    let identity = |p: &str| -> std::path::PathBuf {
+        let p = std::path::Path::new(p);
+        p.canonicalize().unwrap_or_else(|_| crate::loader::normalize(p))
+    };
+    identity(out) == identity(source)
+}
+
 /// `kupl native`: emit C from the bytecode and compile with the system cc.
 pub fn native(path: &str, args: &[String]) -> i32 {
     let Ok((compiled, map)) = load_compile(path) else { return 1 };
@@ -931,6 +958,13 @@ pub fn native(path: &str, args: &[String]) -> i32 {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_else(|| path.trim_end_matches(".kupl").to_string());
+    if output_would_overwrite_source(&out, path) {
+        eprintln!(
+            "error: refusing to overwrite the source file {path} -- the output path resolves to the \
+             same file (use -o to choose a different output path)"
+        );
+        return 1;
+    }
     let c_path = format!("{out}.c");
     if let Err(e) = std::fs::write(&c_path, &c_src) {
         eprintln!("error: cannot write {c_path}: {e}");
@@ -1251,6 +1285,66 @@ fn snippet(src: &str, span: Span) -> String {
 mod tests {
     use super::{compile, sort_diags};
     use crate::diag::{Diag, Span};
+
+    #[test]
+    fn output_would_overwrite_source_handles_identical_different_and_not_yet_existing_paths() {
+        let dir = std::env::temp_dir().join(format!("kupl-owos-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("foo.kupl");
+        std::fs::write(&source, "fun main() {}\n").unwrap();
+        let s = source.to_str().unwrap();
+
+        assert!(super::output_would_overwrite_source(s, s), "the exact same path is a collision");
+        // a differently-SPELLED but identical path (`./` prefix vs bare) must
+        // still be detected -- a literal string comparison alone would miss this.
+        let dotted = format!("{}/./foo.kupl", dir.to_str().unwrap());
+        assert!(
+            super::output_would_overwrite_source(&dotted, s),
+            "a lexically different but identical real path must still collide"
+        );
+
+        let other = dir.join("bar.kx");
+        assert!(
+            !super::output_would_overwrite_source(other.to_str().unwrap(), s),
+            "a genuinely different path is not a collision"
+        );
+
+        // the output path doesn't exist YET (the normal case, before writing) --
+        // `canonicalize()` fails for it, so this must fall back to lexical
+        // normalization rather than panicking or false-positiving.
+        let not_yet = dir.join("does_not_exist_yet.kx");
+        assert!(
+            !super::output_would_overwrite_source(not_yet.to_str().unwrap(), s),
+            "a not-yet-existing distinct output path is not a collision"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CRITICAL data-loss bug found+fixed (production-hardening PR-it781, an
+    /// Explore survey finding, independently re-verified live before
+    /// implementing): `native`'s default output path (`path` with `.kupl`
+    /// trimmed off) is a no-op when the source doesn't literally end in
+    /// `.kupl`, so it silently collided with and overwrote the source file.
+    /// Confirmed live before this fix: `kupl native bar` (source `bar`, no
+    /// extension) destroyed `bar`, replacing it with a Mach-O executable --
+    /// with NOTHING recoverable afterward, since the intermediate `.c` file
+    /// is also deleted on success unless `--keep-c` is passed.
+    #[test]
+    fn native_refuses_to_overwrite_an_extensionless_source_file() {
+        let dir = std::env::temp_dir().join(format!("kupl-native-owos-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+        let bare = dir.join("bar");
+        std::fs::write(&bare, src).unwrap();
+        let p = bare.to_str().unwrap().to_string();
+        let code = super::native(&p, &[]);
+        assert_eq!(code, 1, "must refuse rather than overwrite the source");
+        let after = std::fs::read_to_string(&bare).unwrap();
+        assert_eq!(after, src, "the source file's content must be completely untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn manifest_json_is_valid_and_escaped() {

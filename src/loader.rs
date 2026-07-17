@@ -76,8 +76,11 @@ fn dep_identity(p: &Path) -> PathBuf {
 }
 
 /// Lexically resolve `.` and `..` in a path without touching the filesystem
-/// (so a non-existent dependency path still normalizes correctly).
-fn normalize(p: &Path) -> PathBuf {
+/// (so a non-existent dependency path still normalizes correctly). `pub(crate)`
+/// since `run.rs`'s output-vs-source collision check (PR-it781) reuses this
+/// exact same-file-identity convention -- see `dep_identity` above for why a
+/// canonicalize-with-lexical-fallback comparison is the right shape.
+pub(crate) fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
         use std::path::Component::*;

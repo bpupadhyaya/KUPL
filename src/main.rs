@@ -281,6 +281,20 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
                 format!("{stem}.kx")
             }
         });
+    // A CRITICAL data-loss bug found+fixed (production-hardening PR-it781):
+    // `build` always appends `.kx` to its default output path, so it can
+    // never collide with the source by construction -- but `bundle`'s
+    // default is the BARE stem (no suffix), a no-op if `file` doesn't
+    // literally end in `.kupl`, and an explicit `-o` can name the source
+    // path for either. See `run::output_would_overwrite_source`'s own doc
+    // comment for the full live repro and design rationale.
+    if run::output_would_overwrite_source(&out, file) {
+        eprintln!(
+            "error: refusing to overwrite the source file {file} -- the output path resolves to the \
+             same file (use -o to choose a different output path)"
+        );
+        return 1;
+    }
     let bytes = if bundle {
         let exe = match std::env::current_exe().and_then(std::fs::read) {
             Ok(b) => b,
@@ -661,6 +675,45 @@ mod tests {
         assert!(module.funs.contains_key("mean"), "compiled module must resolve `use lib.stats`'s `mean`");
         assert!(module.funs.contains_key("label"), "compiled module must resolve `use util`'s `label`");
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// A CRITICAL data-loss bug found+fixed (production-hardening PR-it781, an
+    /// Explore survey finding, independently re-verified live before
+    /// implementing): `bundle`'s default output path is the source path with
+    /// `.kupl` trimmed off, a no-op when the source file doesn't literally
+    /// end in `.kupl` -- so the computed output SILENTLY COLLIDED WITH THE
+    /// SOURCE FILE and overwrote it with a compiled executable, no warning,
+    /// no confirmation, permanently. Confirmed live before this fix: `kupl
+    /// bundle foo` (source file literally named `foo`) destroyed `foo`,
+    /// replacing it with a Mach-O executable, exit code 0. `build` always
+    /// appends `.kx` so its DEFAULT path can never collide by construction,
+    /// but an explicit `-o <source-path>` hits the identical collision for
+    /// either -- covers both the bundle-default and the build-explicit-`-o`
+    /// shapes of the same underlying bug.
+    #[test]
+    fn bundle_and_build_refuse_to_overwrite_the_source_file() {
+        let dir = std::env::temp_dir().join(format!("kupl-owos-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+
+        // `bundle`, extensionless source -> the computed default collides.
+        let extensionless = dir.join("foo");
+        std::fs::write(&extensionless, src).unwrap();
+        let p = extensionless.to_str().unwrap().to_string();
+        let code = build_module(&[], &p, true);
+        assert_eq!(code, 1, "bundle must refuse rather than overwrite the source");
+        assert_eq!(std::fs::read_to_string(&extensionless).unwrap(), src, "source must be untouched");
+
+        // `build`, a normal `.kupl` file but an explicit `-o` naming the source itself.
+        let named = dir.join("selfout.kupl");
+        std::fs::write(&named, src).unwrap();
+        let p2 = named.to_str().unwrap().to_string();
+        let args = vec!["build".to_string(), p2.clone(), "-o".to_string(), p2.clone()];
+        let code2 = build_module(&args, &p2, false);
+        assert_eq!(code2, 1, "an explicit -o matching the source must also be refused");
+        assert_eq!(std::fs::read_to_string(&named).unwrap(), src, "source must be untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
