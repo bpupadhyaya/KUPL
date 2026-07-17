@@ -300,19 +300,19 @@ fn emit_ai_shape(out: &mut String, shape: &crate::ai::AiShape, ctr: &mut usize) 
     let id = *ctr;
     *ctr += 1;
     match shape {
-        AiShape::Str => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 0, 0, 0, 0, 0, 0 }};"); }
-        AiShape::Int => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 1, 0, 0, 0, 0, 0 }};"); }
-        AiShape::Float => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 2, 0, 0, 0, 0, 0 }};"); }
-        AiShape::Bool => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 3, 0, 0, 0, 0, 0 }};"); }
+        AiShape::Str => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 0, 0, 0, 0, 0, 0, 0 }};"); }
+        AiShape::Int => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 1, 0, 0, 0, 0, 0, 0 }};"); }
+        AiShape::Float => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 2, 0, 0, 0, 0, 0, 0 }};"); }
+        AiShape::Bool => { let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 3, 0, 0, 0, 0, 0, 0 }};"); }
         AiShape::List(inner) => {
             let ia = emit_ai_shape(out, inner, ctr);
-            let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 4, {ia}, 0, 0, 0, 0 }};");
+            let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 4, {ia}, 0, 0, 0, 0, 0 }};");
         }
         AiShape::Option(inner) => {
             let ia = emit_ai_shape(out, inner, ctr);
-            let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 5, {ia}, 0, 0, 0, 0 }};");
+            let _ = writeln!(out, "static const KAiShape AISH_{id} = {{ 5, {ia}, 0, 0, 0, 0, 0 }};");
         }
-        AiShape::Record { variant, fields, .. } => {
+        AiShape::Record { ty, variant, fields } => {
             let field_addrs: Vec<String> =
                 fields.iter().map(|(_, s)| emit_ai_shape(out, s, ctr)).collect();
             let names: Vec<String> =
@@ -323,9 +323,10 @@ fn emit_ai_shape(out: &mut String, shape: &crate::ai::AiShape, ctr: &mut usize) 
             let _ = writeln!(out, "static const KAiShape* const AISH_{id}_S[] = {{ {s_expr} }};");
             let _ = writeln!(
                 out,
-                "static const KAiShape AISH_{id} = {{ 6, 0, \"{}\", AISH_{id}_N, AISH_{id}_S, {} }};",
+                "static const KAiShape AISH_{id} = {{ 6, 0, \"{}\", AISH_{id}_N, AISH_{id}_S, {}, \"{}\" }};",
                 c_escape(variant),
-                fields.len()
+                fields.len(),
+                c_escape(ty)
             );
         }
     }
@@ -3426,6 +3427,12 @@ struct KAiShape {
     const KAiShape* inner;    /* List/Option element */
     const char* variant;      /* Record: the constructor name */
     const char* const* fnames; const KAiShape* const* fshapes; int nfields;  /* Record */
+    const char* ty;           /* Record: the ADT type name (mirrors AiShape::Record's
+                                  `ty`, distinct from `variant` -- e.g. `-> Shape`
+                                  constructed via `Circle` has ty="Shape",
+                                  variant="Circle"; user-facing shape-mismatch
+                                  messages name the TYPE, not the specific
+                                  constructor -- production-hardening PR-it793) */
 };
 typedef struct { const char* name; int fnid; const char* const* pnames; const KAiShape* const* pshapes; int nparams; } KAiTool;
 typedef struct { const char* name; const char* mock_key; const KAiShape* shape; int wraps_result; int has_tools; const KAiTool* tools; int ntools; } KAiFun;
@@ -3435,6 +3442,100 @@ static int k_ai_ok = 1;
 static char k_ai_err[256];
 static const char* k_json_var(KValue j) { return j.tag == K_CTOR ? CTORS[j.as.ctor->ctor].variant : "?"; }
 static KValue k_json_field0(KValue j) { return j.as.ctor->fields[0]; }
+
+/* User-facing KUPL-syntax rendering of an AiShape (mirrors ai.rs::shape_name
+   exactly), for shape-mismatch messages -- production-hardening PR-it793.
+   Heap-allocated since List[X]/Option[X] recurse. */
+static char* k_ai_shape_name(const KAiShape* s) {
+    switch (s->kind) {
+        case 0: return k_strdup("Str");
+        case 1: return k_strdup("Int");
+        case 2: return k_strdup("Float");
+        case 3: return k_strdup("Bool");
+        case 4: { char* in = k_ai_shape_name(s->inner); char* out = (char*)k_alloc(strlen(in) + 7); snprintf(out, strlen(in) + 7, "List[%s]", in); return out; }
+        case 5: { char* in = k_ai_shape_name(s->inner); char* out = (char*)k_alloc(strlen(in) + 9); snprintf(out, strlen(in) + 9, "Option[%s]", in); return out; }
+        default: return k_strdup(s->ty);
+    }
+}
+/* mirrors diag::json_escape exactly (ai.rs::dump_json's own string escaping) --
+   deliberately NOT json.rs's write_string, which additionally special-cases
+   \b/\f: dump_json goes through diag::json_escape, which falls those two
+   through to the generic `\u00XX` branch instead. Byte-safe for UTF-8: every
+   byte >= 0x80 (a multi-byte sequence's lead/continuation byte) never equals
+   any of the ASCII special-case bytes below, so raw byte iteration (no
+   codepoint decoding needed) reproduces `s.chars()` behavior exactly. */
+static void k_ai_dump_str_escaped(KBuf* b, const char* s) {
+    kb_puts(b, "\"");
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        unsigned char c = *p;
+        if (c == '"') kb_puts(b, "\\\"");
+        else if (c == '\\') kb_puts(b, "\\\\");
+        else if (c == '\n') kb_puts(b, "\\n");
+        else if (c == '\r') kb_puts(b, "\\r");
+        else if (c == '\t') kb_puts(b, "\\t");
+        else if (c < 0x20) { char t[8]; snprintf(t, sizeof t, "\\u%04x", c); kb_puts(b, t); }
+        else { char t[2] = { (char)c, 0 }; kb_puts(b, t); }
+    }
+    kb_puts(b, "\"");
+}
+/* mirrors ai.rs::dump_json exactly (production-hardening PR-it793) -- used to
+   echo the model's ACTUAL response into a shape-mismatch message. Compact
+   (no whitespace), matching json.rs's own `stringify` STRUCTURALLY, but with
+   a DIFFERENT number-formatting threshold: `stringify`'s `format_num` uses
+   `n.abs() < 1e15`, while `dump_json` uses the FULL i64 range
+   (`i64::MIN..i64::MAX`, matching k_ai_from_json's own Int-conversion bound
+   just below) -- these are two genuinely different Rust functions with
+   different thresholds, so k_json_stringify's writer isn't reusable WHOLESALE
+   here, but its OWN number formatter, `k_json_num`, IS the right building
+   block for the float-fallback branch below: an EARLIER draft of this fix
+   used `k_fmt_float` instead (KUPL's `Value::Float` Display, which always
+   appends a mandatory ".0") -- live-tested and caught two real mismatches
+   (`KUPL_AI_MOCK_CLASSIFY=1e20` gave native "...000.0" vs interp's bare
+   "...000"; `=9223372036854775808` gave native the EXACT decimal expansion
+   vs interp's Rust `to_string()` shortest-round-tripping digits). `dump_json`
+   calls bare `format!("{n}")` on a raw f64, NOT `Value::Float`'s Display --
+   `k_json_num` (already fuzz-confirmed at PR-it722 to match Rust's
+   `f64::to_string()` byte-for-byte, including the shortest-round-tripping-
+   decimal algorithm for large whole numbers) is the correct mirror. */
+static void k_ai_dump_json_into(KBuf* b, KValue j) {
+    const char* v = k_json_var(j);
+    if (!strcmp(v, "JNull")) { kb_puts(b, "null"); return; }
+    if (!strcmp(v, "JBool")) { kb_puts(b, k_json_field0(j).as.b ? "true" : "false"); return; }
+    if (!strcmp(v, "JNum")) {
+        double n = k_json_field0(j).as.f;
+        if (isfinite(n) && n == floor(n) && n >= -9223372036854775808.0 && n < 9223372036854775808.0) {
+            char t[32]; snprintf(t, sizeof t, "%lld", (long long)n); kb_puts(b, t);
+        } else {
+            k_json_num(b, n);
+        }
+        return;
+    }
+    if (!strcmp(v, "JStr")) { k_ai_dump_str_escaped(b, k_json_field0(j).as.s); return; }
+    if (!strcmp(v, "JArr")) {
+        kb_puts(b, "[");
+        KList* items = k_json_field0(j).as.list;
+        for (int64_t i = 0; i < items->len; i++) { if (i) kb_puts(b, ","); k_ai_dump_json_into(b, items->items[i]); }
+        kb_puts(b, "]");
+        return;
+    }
+    if (!strcmp(v, "JObj")) {
+        kb_puts(b, "{");
+        KMap* m = k_json_field0(j).as.map;
+        for (int64_t i = 0; i < m->len; i++) {
+            if (i) kb_puts(b, ",");
+            k_ai_dump_str_escaped(b, m->keys[i].as.s);
+            kb_puts(b, ":");
+            k_ai_dump_json_into(b, m->vals[i]);
+        }
+        kb_puts(b, "}");
+        return;
+    }
+}
+static char* k_ai_dump_json(KValue j) {
+    KBuf b = { 0, 0, 0 };
+    k_ai_dump_json_into(&b, j);
+    return b.buf ? b.buf : k_strdup("");
+}
 
 /* shape-directed conversion of a parsed Json value into the declared type */
 static KValue k_ai_from_json(const KAiShape* s, KValue j) {
@@ -3489,7 +3590,20 @@ static KValue k_ai_from_json(const KAiShape* s, KValue j) {
             }
             break;
     }
-    snprintf(k_ai_err, sizeof k_ai_err, "model response does not match the declared type");
+    /* A REAL cross-engine wording divergence found+fixed (production-hardening
+       PR-it793, the SAME root cause as it792 but in the shape-conversion
+       layer rather than the JSON-parsing layer): ai.rs::value_from_json's own
+       fallback arm names the EXPECTED shape and echoes the model's ACTUAL
+       response (`format!("expected {}, model returned {}", shape_name(want),
+       dump_json(got))`) -- this used to be a bare, generic "model response
+       does not match the declared type" with NO detail at all, confirmed
+       live via `KUPL_AI_MOCK_CLASSIFY='"hello"'` on an `ai fun -> Int`:
+       interp/vm panicked with `expected Int, model returned "hello"`, native
+       with the bare message above. `k_ai_shape_name`/`k_ai_dump_json` mirror
+       `shape_name`/`dump_json` exactly (see their own doc comments). */
+    char* want = k_ai_shape_name(s);
+    char* got = k_ai_dump_json(j);
+    snprintf(k_ai_err, sizeof k_ai_err, "expected %s, model returned %s", want, got);
     k_ai_ok = 0; return k_unit();
 }
 
@@ -7251,6 +7365,76 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let _ = std::fs::remove_file(&flt);
         let _ = std::fs::remove_file(&bl);
         let _ = std::fs::remove_file(&li);
+    }
+
+    /// A REAL cross-engine wording gap found+fixed (production-hardening
+    /// PR-it793, the SAME root cause and shape as it792 but one layer
+    /// downstream -- SHAPE conversion of already-valid JSON, not JSON
+    /// PARSING): `ai.rs::value_from_json`'s fallback arm names the expected
+    /// shape and echoes the model's actual response (`format!("expected {},
+    /// model returned {}", shape_name(want), dump_json(got))`) for EVERY
+    /// valid-JSON-but-wrong-shape mock response -- `k_ai_from_json`'s mirror
+    /// used to be a bare, generic "model response does not match the
+    /// declared type" with NO detail at all, confirmed live across every
+    /// shape kind (`Str`/`Int`/`Bool`/`List[Int]`/`Option[Int]`/a
+    /// single-variant record). Fixed with new `k_ai_shape_name`/
+    /// `k_ai_dump_json` helpers mirroring `shape_name`/`dump_json` exactly,
+    /// including a NEW `ty` field added to `KAiShape` (cgen.rs's C mirror
+    /// previously stored ONLY `variant`, the specific constructor name --
+    /// `shape_name`'s Record case names the ADT TYPE, e.g. `Point`, not the
+    /// constructor, so recovering it needed threading a genuinely new field
+    /// through `emit_ai_shape`'s codegen, not just C-side logic). An EARLIER
+    /// draft of `k_ai_dump_json`'s number-formatting fallback reused
+    /// `k_fmt_float` (KUPL's `Value::Float` Display, which always appends a
+    /// mandatory ".0") -- live-tested and caught two real mismatches before
+    /// finalizing (`1e20` and `9223372036854775808` as mock payloads); fixed
+    /// by reusing `k_json_num` instead (already fuzz-confirmed at PR-it722 to
+    /// match Rust's bare `f64::to_string()` byte-for-byte, which is what
+    /// `dump_json`'s `format!("{n}")` fallback actually calls, NOT
+    /// `Value::Float`'s Display).
+    #[test]
+    fn native_ai_shape_mismatch_message_names_the_expected_shape_and_echoes_the_response() {
+        if !cc_available() {
+            return;
+        }
+        let run = |envk: &str, mock: &str, fnname: &str| -> String {
+            let src2 = format!(
+                "type Point = Point(x: Int, y: Int)\n\
+                 ai fun i(t: Str) -> Int {{ intent \"i {{t}}\" }}\n\
+                 ai fun li(t: Str) -> List[Int] {{ intent \"li {{t}}\" }}\n\
+                 ai fun pt(t: Str) -> Point {{ intent \"pt {{t}}\" }}\n\
+                 fun main() uses io {{ print(\"{{{fnname}(\"x\")}}\") }}\n"
+            );
+            let compiled2 = crate::run::compile(&src2).expect("compiles");
+            let module2 =
+                crate::compile::compile_module(&compiled2.program, &compiled2.checked).unwrap();
+            let c2 = super::emit_c(&module2).expect("emit_c");
+            assert!(
+                c2.contains("k_ai_shape_name") && c2.contains("k_ai_dump_json"),
+                "the fix's helpers must be emitted"
+            );
+            let base2 =
+                std::env::temp_dir().join(format!("kupl-aishapemsg2-{fnname}-{}", std::process::id()));
+            let (cp2, bin2) = (base2.with_extension("c"), base2.with_extension("out"));
+            std::fs::write(&cp2, &c2).unwrap();
+            assert!(std::process::Command::new(cc())
+                .args(["-O2", "-o", bin2.to_str().unwrap(), cp2.to_str().unwrap()])
+                .status().unwrap().success());
+            let out = std::process::Command::new(&bin2).env(envk, mock).output().unwrap();
+            let _ = std::fs::remove_file(&cp2);
+            let _ = std::fs::remove_file(&bin2);
+            String::from_utf8_lossy(&out.stderr).trim().to_string()
+        };
+        assert_eq!(run("KUPL_AI_MOCK_I", "\"hello\"", "i"), "panic: ai `i`: expected Int, model returned \"hello\"");
+        assert_eq!(run("KUPL_AI_MOCK_LI", "true", "li"), "panic: ai `li`: expected List[Int], model returned true");
+        assert_eq!(run("KUPL_AI_MOCK_PT", "\"hello\"", "pt"), "panic: ai `pt`: expected Point, model returned \"hello\"");
+        assert_eq!(
+            run("KUPL_AI_MOCK_I", "{\"a\":1,\"b\":[1,2,\"x\\ny\"]}", "i"),
+            "panic: ai `i`: expected Int, model returned {\"a\":1,\"b\":[1,2,\"x\\ny\"]}"
+        );
+        // `null` for an `Int` target hits the GENERIC fallback (not the
+        // dedicated Int-vs-fraction branch, which only fires for Json::Num).
+        assert_eq!(run("KUPL_AI_MOCK_I", "null", "i"), "panic: ai `i`: expected Int, model returned null");
     }
 
     /// Native read_file rejects a NUL / invalid-UTF-8 file like the interpreter
