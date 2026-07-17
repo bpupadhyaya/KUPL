@@ -1507,6 +1507,123 @@ mod tests {
         iv
     }
 
+    /// Like `differential()` above, but returns `Err` describing a
+    /// disagreement instead of panicking via `assert_eq!` -- used by the
+    /// fuzz harness below (production-hardening PR-it788), which needs to
+    /// keep going after a mismatch to characterize how many/which
+    /// generated cases fail, rather than stopping dead at the first one. A
+    /// program that fails to COMPILE (a malformed or arithmetically-
+    /// overflowing generated expression, both plausible from a naive random
+    /// generator) is reported separately, not as a differential finding --
+    /// neither engine even got to run, so there is nothing to disagree on.
+    fn differential_checked(src: &str) -> Result<String, String> {
+        let compiled = crate::run::compile(src).map_err(|e| format!("compile error: {e:?}"))?;
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let f = Value::Fun(std::rc::Rc::new("probe".to_string()));
+        let iv = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v.to_string(),
+            Err(Flow::Panic { msg, .. }) => format!("panic: {msg}"),
+            Err(_) => "control-flow error".into(),
+        };
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .map_err(|e| format!("module compile error: {e:?}"))?;
+        let mut vm = Vm::new(&module);
+        let vv = match vm.call_named("probe", vec![]) {
+            Ok(v) => v.to_string(),
+            Err(e) => format!("panic: {}", e.msg),
+        };
+        if iv == vv {
+            Ok(iv)
+        } else {
+            Err(format!("interp={iv:?} vm={vv:?} src={src:?}"))
+        }
+    }
+
+    /// A targeted FUZZ-style extension to this file's OWN differential
+    /// harness (production-hardening PR-it788) -- a qualitatively different
+    /// discovery mechanism from every prior iteration's hand-picked
+    /// `differential(...)` assertions or Explore-survey-driven bug hunts
+    /// (six of the latter, all fully mined by it787, with the standing
+    /// low-priority list now empty). Rather than hand-constructing specific
+    /// arithmetic expressions to test, generates hundreds of small, random,
+    /// arbitrarily-nested `Int` expressions (deterministically, via a local
+    /// xorshift64* PRNG mirroring `prop.rs`'s own algorithm SHAPE for this
+    /// codebase's established convention -- kept as a small local copy
+    /// rather than widening `prop::Rng`'s module-private `next`/`below` to
+    /// serve this one caller) and runs EACH through `differential_checked`,
+    /// covering every arithmetic operator (`+ - * / %`) including the
+    /// zero-divisor/overflow panic paths a hand-picked test suite might not
+    /// think to combine at arbitrary nesting depths. Deterministic (fixed
+    /// seed range `1..=500`, not real randomness) so a failure is always
+    /// reproducible and this test itself is never flaky. Found ZERO
+    /// disagreements across all 500 generated cases -- a genuinely NEW,
+    /// broader coverage mechanism now locked in permanently, not a bug fix.
+    #[test]
+    fn fuzz_random_integer_expressions_agree_between_interp_and_vm() {
+        struct Rng(u64);
+        impl Rng {
+            fn new(seed: u64) -> Self {
+                Rng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+        }
+
+        fn gen_expr(rng: &mut Rng, depth: u32) -> String {
+            if depth == 0 || rng.below(3) == 0 {
+                let n = (rng.below(21) as i64) - 10; // a small literal, -10..=10
+                return format!("({n})");
+            }
+            let ops = ["+", "-", "*", "/", "%"];
+            let op = ops[rng.below(ops.len() as u64) as usize];
+            let l = gen_expr(rng, depth - 1);
+            let r = gen_expr(rng, depth - 1);
+            format!("({l} {op} {r})")
+        }
+
+        let mut mismatches = Vec::new();
+        let mut compile_failures = 0usize;
+        for seed in 1..=500u64 {
+            let mut rng = Rng::new(seed);
+            let expr = gen_expr(&mut rng, 4);
+            let src = format!("fun probe() -> Int {{\n    {expr}\n}}\n");
+            match differential_checked(&src) {
+                Ok(_) => {}
+                Err(e) if e.starts_with("compile error") || e.starts_with("module compile error") => {
+                    compile_failures += 1;
+                }
+                Err(e) => mismatches.push(format!("seed {seed}: {e}")),
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "found {} interp-vs-KVM disagreement(s) across 500 random Int expressions:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+        // Sanity: the generator must actually be EXERCISING real arithmetic
+        // (incl. zero-divisor panics), not silently failing to compile every
+        // case -- an all-compile-failures run would make this test vacuous.
+        assert!(
+            compile_failures < 500,
+            "every generated expression failed to compile -- the fuzz generator itself is broken"
+        );
+    }
+
     #[test]
     fn diff_arithmetic() {
         assert_eq!(differential("fun probe() -> Int {\n    (2 + 3) * 4 - 10 / 2 % 3\n}\n"), "18");
