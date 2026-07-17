@@ -1076,7 +1076,6 @@ pub fn disassemble(path: &str) -> i32 {
 /// `kupl test`: run every `example` block of every component.
 pub fn run_tests(path: &str) -> i32 {
     let Ok((compiled, map)) = load_compile(path) else { return 1 };
-    let src: &str = &map.concat;
 
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -1094,11 +1093,64 @@ pub fn run_tests(path: &str) -> i32 {
                 println!("ok    {label}");
                 passed += 1;
             }
+            // A REAL text-consistency bug found+fixed (production-hardening
+            // PR-it783, an Explore survey finding, independently re-verified
+            // live before implementing): the OLD `snippet(src, span)` call
+            // re-sliced raw SOURCE using `span`, which `parser.rs` builds by
+            // merging the `expect` KEYWORD's own span with the condition
+            // expression's span -- so the rendered text was `` `expect
+            // doubled >= -50` `` (keyword included), unlike `run_forall`'s
+            // OWN failure text (PR-it771), which is built from the ALREADY-
+            // COMPUTED `msg` (interp.rs's `Stmt::Expect` panic message,
+            // itself rendered via `fmt::expr_str`, which never includes the
+            // keyword) and so correctly shows just `` `doubled >= -50` ``.
+            // PR-it771's own doc comment explicitly says the two are
+            // MEANT to match -- they didn't. Confirmed live: `law "plain" {
+            // expect 1 == 2 }` printed `` `expect 1 == 2` was not satisfied
+            // `` while an equivalent `forall`-wrapped `expect` printed just
+            // `` `1 == 2` was not satisfied ``. Fixed by reusing `msg`'s
+            // already-clean text here too, mirroring `run_forall`'s EXACT
+            // pattern -- `snippet()` is no longer called anywhere after this
+            // fix (see its sibling fixes below), so it's removed as dead
+            // code rather than left orphaned.
             Err(Flow::Panic { msg, span }) => {
-                let detail = if msg.starts_with("expectation failed") {
-                    format!("`{}` was not satisfied", snippet(src, span))
-                } else {
+                let detail = if let Some(cond) = msg.strip_prefix("expectation failed: ") {
+                    format!("`{cond}` was not satisfied")
+                } else if msg.starts_with("property failed for ") {
+                    // A `forall` counterexample (interp.rs's `run_forall`) is
+                    // ALREADY a complete, self-descriptive test-failure
+                    // message in its own right (PR-it771) -- not a genuine
+                    // interpreter panic needing a source-pointing diagnostic,
+                    // even when the inner cause it names WAS a genuine panic
+                    // (`run_forall`'s own message already wraps that case as
+                    // `"... (panic: {msg})"`). Left OUT of scope for this
+                    // iteration's `report_panic_map`/`"panic: "` fix below --
+                    // an EARLIER draft of this fix wrapped this case too,
+                    // caught live: it made an ORDINARY property-test failure
+                    // (`forall x: Int { expect x == 999999 }`, deterministically
+                    // false at x=0) print a spurious `error[K0900]` block, as
+                    // if the interpreter itself had crashed.
                     msg
+                } else {
+                    // A REAL reporting-consistency bug found+fixed (same
+                    // PR-it783 finding): a genuine runtime panic (as opposed
+                    // to an ordinary `expect` failure OR a `forall` failure,
+                    // both handled above) in a top-level law printed a
+                    // stdout FAIL line but NOTHING on stderr -- unlike the
+                    // structurally identical component-example panic case
+                    // just below, which ALREADY calls `report_panic_map`
+                    // for a rich, source-pointing diagnostic. Confirmed
+                    // live: a `law` whose body divides by zero left stderr
+                    // completely empty, while the identical panic inside a
+                    // component `example` produced a full `error[K0900]`
+                    // block with a caret. Both branches now call the SAME
+                    // `report_panic_map`, and both now use the SAME
+                    // "panic: {msg}" stdout wording, closing this gap for
+                    // every one of `kupl test`'s three test-item categories
+                    // uniformly (the contract-law loop below gets the
+                    // identical fix).
+                    report_panic_map(&msg, span, &map);
+                    format!("panic: {msg}")
                 };
                 println!("FAIL  {label}: {detail}");
                 failed += 1;
@@ -1129,7 +1181,7 @@ pub fn run_tests(path: &str) -> i32 {
             };
             let db = ProgramDb::build(&compiled.program, &compiled.checked);
             let mut interp = Interp::new(db);
-            let result = run_example(&mut interp, &c.name, example, src);
+            let result = run_example(&mut interp, &c.name, example);
             match result {
                 Ok(None) => {
                     println!("ok    {label}");
@@ -1210,10 +1262,22 @@ pub fn run_tests(path: &str) -> i32 {
                         println!("ok    {label}");
                         passed += 1;
                     }
+                    // Same three-way PR-it783 fix as the top-level law loop
+                    // above: reuse `msg`'s already-clean, keyword-free
+                    // condition text instead of re-slicing source with a
+                    // keyword-inclusive span; leave a `forall` counterexample's
+                    // own already-complete message alone (NOT a genuine
+                    // panic, see the sibling comment above); and call
+                    // `report_panic_map` for a genuine panic so contract-law
+                    // failures get the SAME rich stderr diagnostic as a
+                    // component-example panic.
                     Err(Flow::Panic { msg, span }) => {
-                        let detail = if msg.starts_with("expectation failed") {
-                            format!("`{}` was not satisfied", snippet(src, span))
+                        let detail = if let Some(cond) = msg.strip_prefix("expectation failed: ") {
+                            format!("`{cond}` was not satisfied")
+                        } else if msg.starts_with("property failed for ") {
+                            msg
                         } else {
+                            report_panic_map(&msg, span, &map);
                             format!("panic: {msg}")
                         };
                         println!("FAIL  {label}: {detail}");
@@ -1240,7 +1304,6 @@ fn run_example(
     interp: &mut Interp,
     comp_name: &str,
     example: &crate::ast::Example,
-    src: &str,
 ) -> Result<Option<String>, Flow> {
     use crate::ast::ExampleStep;
 
@@ -1262,7 +1325,7 @@ fn run_example(
                 };
                 interp.send(id, port, payload)?;
             }
-            ExampleStep::Expect { expr, span } => {
+            ExampleStep::Expect { expr, .. } => {
                 // out ports are visible by name, bound to their last emitted value
                 let env = interp.instances[id].env.child();
                 let ports: Vec<String> = interp.instances[id]
@@ -1282,7 +1345,20 @@ fn run_example(
                 }
                 let result = interp.eval(expr, &env)?;
                 if result != Value::Bool(true) {
-                    let text = snippet(src, *span);
+                    // A REAL text-consistency bug found+fixed (production-
+                    // hardening PR-it783, matching this file's own law-loop
+                    // fix above): `snippet(src, *span)` re-sliced raw source
+                    // using a span that includes the `expect` KEYWORD itself
+                    // (parser.rs merges the keyword's span with the
+                    // condition's), so an example's failed `expect` showed
+                    // `` `expect ok == 0` was not satisfied `` instead of
+                    // just `` `ok == 0` was not satisfied ``. Unlike the law
+                    // loops, this path has no panic `msg` to reuse -- render
+                    // the condition via `fmt::expr_str` directly instead,
+                    // the SAME renderer `Stmt::Expect`'s own panic message
+                    // uses (interp.rs), so this now matches every OTHER
+                    // "was not satisfied" site in the codebase.
+                    let text = crate::fmt::expr_str(expr, 0);
                     return Ok(Some(format!("`{text}` was not satisfied")));
                 }
             }
@@ -1292,12 +1368,6 @@ fn run_example(
         }
     }
     Ok(None)
-}
-
-fn snippet(src: &str, span: Span) -> String {
-    let start = (span.start as usize).min(src.len());
-    let end = (span.end as usize).min(src.len());
-    src[start..end].trim().to_string()
 }
 
 #[cfg(test)]
@@ -1608,6 +1678,213 @@ mod tests {
         // a file with no laws is not an error.
         let none = write("none.kupl", "fun add(a: Int, b: Int) -> Int { a + b }\n");
         assert_eq!(super::run_tests(&none), 0, "no tests is a clean pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL usability bug found+fixed (production-hardening PR-it783, an
+    /// Explore survey finding, independently re-verified live before
+    /// implementing): `native`/`build`/`bundle` already reject a compiled
+    /// `.kx` file cleanly (PR-it782), but `kupl test`/`check`/`context`/
+    /// `manifest` had no equivalent guard -- all four route through
+    /// `loader::load`/`load_with` (via `load_compile` or, for `check`,
+    /// directly), which had no `.kx`-extension check, so any of them fed a
+    /// `.kx` file tried to LEX the raw bytecode as source, one `K0001:
+    /// unexpected character` diagnostic per non-token byte. Confirmed live
+    /// before this fix: `kupl test sample.kx` printed 1290 lines of
+    /// garbage; identical for `check`/`manifest`/`context`. Fixed ONCE in
+    /// the shared `loader::load_with`, not four separate call sites.
+    #[test]
+    fn kx_input_is_rejected_cleanly_by_test_check_context_and_manifest() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-kx-input-guard-shared-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("sample.kupl");
+        std::fs::write(&src, "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n").unwrap();
+        let kx = dir.join("sample.kx");
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let built = run(&["build", src.to_str().unwrap(), "-o", kx.to_str().unwrap()]);
+        assert_eq!(built.status.code(), Some(0), "{built:?}");
+
+        for args in [
+            vec!["test", kx.to_str().unwrap()],
+            vec!["check", kx.to_str().unwrap()],
+            vec!["manifest", kx.to_str().unwrap()],
+            vec!["context", kx.to_str().unwrap(), "add"],
+        ] {
+            let out = run(&args);
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.lines().count(),
+                1,
+                "{args:?} on a .kx file must report ONE clean line, not a lexer-error dump: {stderr:?}"
+            );
+            assert!(stderr.contains("already compiled bytecode"), "{args:?}: {stderr:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL text-consistency bug found+fixed (production-hardening
+    /// PR-it783, the same survey's finding 2, independently re-verified
+    /// live before implementing): a PLAIN (non-`forall`) failed `expect`'s
+    /// "was not satisfied" text was built by re-slicing raw SOURCE with a
+    /// span that (per `parser.rs`) includes the `expect` KEYWORD itself, so
+    /// it read `` `expect 1 == 2` was not satisfied ``, while the
+    /// STRUCTURALLY IDENTICAL failure inside a `forall` (built from the
+    /// already-clean `fmt::expr_str`-rendered condition, PR-it771) read
+    /// just `` `1 == 2` was not satisfied `` -- PR-it771's own doc comment
+    /// explicitly says the two are MEANT to match. Confirmed live before
+    /// this fix, exactly as here. Fixed by reusing the already-clean
+    /// `msg`-derived text for the plain case too (law and contract-law
+    /// loops), and by rendering via `fmt::expr_str` instead of source-
+    /// slicing for a component example's own `expect` (which has no `msg`
+    /// to reuse). This test ALSO guards the regression caught mid-
+    /// implementation: an early draft made this fix ALSO wrap a `forall`
+    /// counterexample's OWN already-complete message as a genuine panic
+    /// (spurious `error[K0900]`) -- asserts stderr stays clean for the
+    /// `forall` case specifically.
+    #[test]
+    fn plain_and_forall_expect_failures_render_the_condition_identically() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-expect-text-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("expecttext.kupl");
+        std::fs::write(
+            &file,
+            "law \"plain\" {\n    expect 1 == 2\n}\n\n\
+             law \"quantified\" {\n    forall x: Int {\n        expect x == 999999\n    }\n}\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["test", file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("`1 == 2` was not satisfied"),
+            "the plain law must not leak the `expect` keyword into the quoted condition: {stdout:?}"
+        );
+        assert!(!stdout.contains("`expect 1 == 2`"), "the `expect` keyword must not leak: {stdout:?}");
+        assert!(
+            stdout.contains("`x == 999999` was not satisfied"),
+            "the forall-wrapped condition must still render cleanly too: {stdout:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.is_empty(),
+            "a forall property-test failure (an EXPECTED test outcome, not a genuine \
+             interpreter panic) must not produce a report_panic_map diagnostic: {stderr:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL text-consistency bug found+fixed (production-hardening
+    /// PR-it783, the same finding as `plain_and_forall_expect_failures_...`
+    /// above, but at a DIFFERENT site with no shared code path: a component
+    /// `example`'s own failed `expect` step (`run_example`'s
+    /// `ExampleStep::Expect` handling) has NO panic `msg` to reuse (unlike
+    /// a `law`'s `expect`, which raises a `Flow::Panic`) -- it directly
+    /// re-sliced raw source with a keyword-inclusive span instead, the
+    /// SAME underlying bug as the law loops but requiring a SEPARATE fix
+    /// (render via `fmt::expr_str` instead). Caught mid-implementation as a
+    /// GENUINE COVERAGE GAP: the sibling law-focused test above still
+    /// PASSED when `run_example`'s own fix was reverted in isolation (it
+    /// only exercises `law`/`forall`, never a component `example`), which
+    /// is exactly this campaign's own "a revert-and-verify test that
+    /// unexpectedly still passes is a MANDATORY red flag" rule -- added
+    /// THIS test specifically to close that gap, confirmed it fails when
+    /// `run_example`'s fix is reverted, restored the fix.
+    #[test]
+    fn a_failed_expect_inside_a_component_example_also_renders_without_the_keyword() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-example-expect-text-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("exampleexpect.kupl");
+        std::fs::write(
+            &file,
+            "component Widget {\n    intent \"w\"\n    in click: Int\n    out ok: Int\n    \
+             on click(n) { emit ok(n) }\n    example {\n        send click(5)\n        \
+             expect ok == 999999\n    }\n}\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["test", file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("`ok == 999999` was not satisfied"),
+            "a component example's failed expect must not leak the `expect` keyword: {stdout:?}"
+        );
+        assert!(!stdout.contains("`expect ok == 999999`"), "the `expect` keyword must not leak: {stdout:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL reporting-consistency bug found+fixed (production-hardening
+    /// PR-it783, the same survey's finding 3, independently re-verified
+    /// live before implementing): a genuine runtime panic (e.g. division by
+    /// zero) inside a top-level `law` or a contract `law` produced a stdout
+    /// FAIL line but NOTHING on stderr, while the STRUCTURALLY IDENTICAL
+    /// panic inside a component `example` already got a full `error[K0900]`
+    /// source-pointing diagnostic via `report_panic_map` -- a purely
+    /// accidental omission (only one of `kupl test`'s three symmetric
+    /// test-item categories was wired up). Confirmed live before this fix:
+    /// a law dividing by zero left stderr completely empty. Now all three
+    /// categories call the same `report_panic_map` for a genuine panic.
+    #[test]
+    fn law_and_contract_law_panics_get_the_same_stderr_diagnostic_as_component_examples() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-law-panic-diag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let law_file = dir.join("lawpanic.kupl");
+        std::fs::write(&law_file, "fun bad(n: Int) -> Int {\n    n / 0\n}\n\nlaw \"boom\" {\n    expect bad(5) == 0\n}\n")
+            .unwrap();
+        let law_out = std::process::Command::new(&bin)
+            .args(["test", law_file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let law_stderr = String::from_utf8_lossy(&law_out.stderr);
+        assert!(law_stderr.contains("K0900"), "a genuine panic in a law must get a report_panic_map diagnostic: {law_stderr:?}");
+        let law_stdout = String::from_utf8_lossy(&law_out.stdout);
+        assert!(law_stdout.contains("panic: division by zero"), "{law_stdout:?}");
+
+        let contract_file = dir.join("contractlaw.kupl");
+        std::fs::write(
+            &contract_file,
+            "contract Doubler {\n    intent \"d\"\n    expose fun value() -> Int\n    \
+             law \"doubled\" {\n        expect value() / 0 == 999999\n    }\n}\n\
+             component Impl fulfills Doubler {\n    intent \"impl\"\n    \
+             expose fun value() -> Int {\n        21\n    }\n}\n",
+        )
+        .unwrap();
+        let contract_out = std::process::Command::new(&bin)
+            .args(["test", contract_file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let contract_stderr = String::from_utf8_lossy(&contract_out.stderr);
+        assert!(
+            contract_stderr.contains("K0900"),
+            "a genuine panic in a contract law must ALSO get a report_panic_map diagnostic: {contract_stderr:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

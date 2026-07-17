@@ -466,6 +466,33 @@ pub fn load_with(
     let mut diags: Vec<Diag> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
+    // A REAL usability bug found+fixed (production-hardening PR-it783, an
+    // Explore survey finding, independently re-verified live before
+    // implementing): `native`/`build`/`bundle` already reject a compiled
+    // `.kx` file cleanly (PR-it782), but `load`/`load_with` -- the SHARED
+    // entry point behind `load_compile` (so `kupl test`/`context`/`manifest`/
+    // `run`) AND `check_cmd`'s own direct `loader::load` call (so `kupl
+    // check`) -- had no equivalent guard, so any of THOSE subcommands fed a
+    // `.kx` file instead tried to LEX the raw bytecode as source, one
+    // `K0001: unexpected character` diagnostic per non-token byte. Confirmed
+    // live before this fix: `kupl test sample.kx` printed 1290 lines of
+    // garbage; identical for `check`/`manifest`/`context`. Fixed ONCE here,
+    // at the lowest shared point, rather than patching each of the four
+    // call sites separately -- `native`/`build`/`bundle`'s own earlier
+    // guards (PR-it782) already return before ever reaching this function,
+    // so this is a harmless no-op for them, not a duplicate check.
+    if entry.ends_with(".kx") {
+        diags.push(Diag::error(
+            "K0402",
+            format!(
+                "{entry} is already compiled bytecode (.kx) -- this command needs `.kupl` \
+                 source, not an existing module"
+            ),
+            Span::default(),
+        ));
+        return Err((diags, map));
+    }
+
     let entry_path = PathBuf::from(entry);
     let root_dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
     let root_ctx = pkg_ctx(&root_dir, true, "");
