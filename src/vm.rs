@@ -2091,6 +2091,158 @@ mod tests {
         );
     }
 
+    /// A REAL structural test-coverage gap found+closed (production-hardening
+    /// PR-it786, an Explore survey finding into the differential-testing
+    /// harness's OWN meta-level coverage, the SAME survey as PR-it785,
+    /// independently re-verified live before implementing): `Value::Range`
+    /// (value.rs:284) is a genuine, storable, first-class value -- `let r =
+    /// 1..5` compiles and type-checks fine, it has its own `PartialEq` arm
+    /// (value.rs:412) AND its own `value_key_eq` arm (value.rs:472, used
+    /// when a `Range` is a Map key or Set element) -- but across every
+    /// `differential()`-based test in this file, `N..M` only EVER appears
+    /// inside a `for i in ... {}` loop header, where only the loop's
+    /// ACCUMULATED EFFECT is compared, never the raw `Range` value's own
+    /// `Display`/equality/use as a container key. INDEPENDENTLY VERIFIED
+    /// clean before adding this test (no bug found -- this closes a
+    /// coverage gap, not a divergence, per this campaign's own standing
+    /// rule for coverage-gap findings): `1..5`/`1..=5` printed identically
+    /// on both engines, and `Map().insert(1..5, "a")` used AS a real Map
+    /// key (both a hit and a distinct-range miss) plus a `Set` deduping two
+    /// equal `Range`s against one distinct one all matched identically too.
+    #[test]
+    fn diff_range_is_a_first_class_value_display_equality_and_container_key() {
+        // exclusive vs. inclusive Display -- the third `bool` field of
+        // `Value::Range(i64, i64, bool)` controls the `=` in `a..=b`.
+        assert_eq!(differential("fun probe() -> Str {\n    \"{1..5}\"\n}\n"), "1..5");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{1..=5}\"\n}\n"), "1..=5");
+        // equality: same bounds+inclusivity is equal; differing inclusivity is not,
+        // even with identical bounds (a REAL, distinct axis `PartialEq` must respect).
+        assert_eq!(differential("fun probe() -> Bool {\n    (1..5) == (1..5)\n}\n"), "true");
+        assert_eq!(differential("fun probe() -> Bool {\n    (1..5) == (1..=5)\n}\n"), "false");
+        // `Range` as an actual Map key (`value_key_eq`, not just `PartialEq`) --
+        // a hit on the exact same range, a miss on a structurally different one.
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let m = Map().insert(1..5, \"a\")\n    \
+                 \"{m.get(1..5)} {m.get(1..6)}\"\n}\n"
+            ),
+            "Some(\"a\") None"
+        );
+        // `Range` as a Set element -- two structurally-equal ranges dedup to one.
+        assert_eq!(
+            differential("fun probe() -> Int {\n    Set().insert(1..5).insert(1..5).insert(2..6).len()\n}\n"),
+            "2"
+        );
+    }
+
+    /// A REAL structural test-coverage gap found+closed (production-hardening
+    /// PR-it786, the SAME it785 survey's finding (a), independently
+    /// re-verified live before implementing): `BUILTIN_HTTP_SERVE`'s VM
+    /// dispatch (this file, `run()`'s big match) wraps a genuinely
+    /// VM-SPECIFIC reentrant callback -- `call_value_nested` (this file,
+    /// above), which re-enters `self.run()` from a NEW frame-stack depth
+    /// once per accepted connection -- around the SAME shared
+    /// `interp::serve_http` accept loop `interp.rs` and `cgen.rs` already
+    /// use. `interp.rs` has real-socket coverage for this (`json_api_routes`,
+    /// `serves_a_request`, plus timeout/trickle-client hardening tests) and
+    /// `cgen.rs` has SIX of its own (`native_http_serve` and siblings, incl.
+    /// its own panicking-handler test) -- `vm.rs` had ZERO, despite the
+    /// reentrant frame bookkeeping being exactly the kind of VM-specific
+    /// mechanism a future change to `call_value_nested`/`push_frame` could
+    /// silently regress with nothing in this file's own suite to catch it.
+    /// INDEPENDENTLY VERIFIED clean before adding this test: `kupl run` vs
+    /// `kupl run --vm` against a real socket, one normal POST request and
+    /// one that makes the handler panic, produced identical echoed body,
+    /// identical 500 status, identical "kaboom"-style panic text on both.
+    #[test]
+    fn vm_http_serve_answers_real_requests() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let port: u16 = 38911;
+        let src = format!(
+            "fun h(m: Str, p: Str, b: Str) -> Str {{\n    \"{{m}} {{p}} [{{b}}]\"\n}}\n\
+             fun main() uses io {{ let _ = http_serve({port}, h) }}\n"
+        );
+        let compiled = crate::run::compile(&src).expect("compiles");
+        std::thread::spawn(move || {
+            let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+            let mut vm = Vm::new(&module);
+            let _ = vm.call_named("main", vec![]);
+        });
+        let mut stream = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let mut stream = stream.expect("server should be listening");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        stream
+            .write_all(b"POST /greet HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+            .unwrap();
+        let mut resp = String::new();
+        let _ = stream.read_to_string(&mut resp);
+        assert!(resp.contains("HTTP/1.1 200 OK"), "resp: {resp}");
+        assert!(resp.ends_with("POST /greet [hello]"), "resp: {resp}");
+    }
+
+    /// A REAL structural test-coverage gap found+closed (production-hardening
+    /// PR-it786, same survey/finding as `vm_http_serve_answers_real_requests`
+    /// above; independently re-verified live before implementing): mirrors
+    /// `cgen.rs`'s own `native_http_serve_survives_a_panicking_handler`
+    /// EXACT shape (per this campaign's "mirror the actual existing
+    /// algorithm/test shape" rule) for the VM specifically -- a handler
+    /// panic must become a clean 500 response, AND the server must survive
+    /// to answer a SECOND, later connection, proving the VM's reentrant
+    /// `call_value_nested` correctly unwinds its frame stack back to the
+    /// accept loop's own depth after a panic rather than corrupting it (the
+    /// single most VM-specific risk this whole gap covers).
+    #[test]
+    fn vm_http_serve_survives_a_panicking_handler() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let port: u16 = 38912;
+        let src = format!(
+            "fun h(m: Str, p: Str, b: Str) -> Str {{\n    \
+             if p == \"/boom\" {{\n        let x = 1 / 0\n        \"unreached {{x}}\"\n    }} else {{\n        \"ok {{p}}\"\n    }}\n}}\n\
+             fun main() uses io {{ let _ = http_serve({port}, h) }}\n"
+        );
+        let compiled = crate::run::compile(&src).expect("compiles");
+        std::thread::spawn(move || {
+            let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+            let mut vm = Vm::new(&module);
+            let _ = vm.call_named("main", vec![]);
+        });
+        let connect = || {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        // request 1: the handler panics -> must get a clean 500, not a dropped connection.
+        let mut s1 = connect().expect("server should be listening");
+        s1.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        s1.write_all(b"GET /boom HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut resp1 = String::new();
+        let _ = s1.read_to_string(&mut resp1);
+        assert!(resp1.contains("HTTP/1.1 500 Internal Server Error"), "resp1: {resp1}");
+        assert!(resp1.ends_with("division by zero"), "resp1: {resp1}");
+        // request 2: a FRESH connection after the panic -- the server must still be
+        // alive and serving normally, proving it survived the first request's panic.
+        let mut s2 = connect().expect("server should still be listening after the panic");
+        s2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        s2.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut resp2 = String::new();
+        let _ = s2.read_to_string(&mut resp2);
+        assert!(resp2.contains("HTTP/1.1 200 OK"), "resp2: {resp2}");
+        assert!(resp2.ends_with("ok /ok"), "resp2: {resp2}");
+    }
+
     #[test]
     fn diff_float_display_positional() {
         // f64 Display is positional shortest-round-trip on both engines — small
