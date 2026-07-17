@@ -1105,6 +1105,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it780, the first half
+    /// of a late-delivered Explore survey finding, agentId aaed1d00a40c9e7b6,
+    /// independently re-verified live before implementing): PR-it628 (the
+    /// test right above) fixed the Display/type-mismatch leak, but
+    /// `check.rs`'s own component-construction diagnostics (`check_ctor_args`
+    /// for K0215/K0216, `wire_port_ty` for K0214) were never covered by that
+    /// fix and still built their messages from the raw, possibly-mangled
+    /// `comp_name` directly. Confirmed live: constructing a dependency's
+    /// component with a missing required prop reported `missing required
+    /// prop \`shade\` when constructing \`dep$Widget\`` (K0216) instead of
+    /// naming it `Widget`; an extra/unknown prop hit the same leak via K0215.
+    /// `wire`'s K0214 needs a DIFFERENT construction: child declarations
+    /// can't syntactically reference another package's component at all
+    /// (`parser.rs`'s child-decl grammar only accepts a bare, unqualified
+    /// component name) -- the only way `comp_name` is EVER mangled at a
+    /// `wire` site is a dependency's OWN component wiring one of its OWN
+    /// sibling components as a child, which only becomes visible once that
+    /// dependency is mangled by being loaded as someone else's dependency
+    /// (`dep`'s `Top` below has a real K0214 typo purely internal to `dep`,
+    /// unrelated to `app` referencing it at all).
+    #[test]
+    fn cross_package_component_names_are_demangled_in_ctor_and_wire_diagnostics() {
+        let base = std::env::temp_dir().join(format!("kupl-ctor-wire-demangle-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "pub component Widget {\n    intent \"w\"\n    prop shade: Int\n}\n\n\
+             pub component Producer {\n    intent \"p\"\n    out value: Int\n}\n\
+             pub component Consumer {\n    intent \"c\"\n    in value: Int\n}\n\
+             pub component Top {\n    intent \"t\"\n    \
+             let producer = Producer()\n    let consumer = Consumer()\n    \
+             wire producer.valu -> consumer.value\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun missing_prop() {\n    dep.Widget()\n}\n\n\
+             fun bad_prop() {\n    dep.Widget(shade: 1, bogus: 2)\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its dep dependency");
+        let (_, diags) = crate::check::check(&program);
+        let errors: Vec<&crate::diag::Diag> =
+            diags.iter().filter(|d| d.severity == crate::diag::Severity::Error).collect();
+
+        let k0216 = errors.iter().find(|d| d.code == "K0216").expect("missing-prop must be reported");
+        assert!(
+            k0216.message.contains('`') && k0216.message.contains("Widget") && !k0216.message.contains("dep$Widget"),
+            "K0216 must name the component as `Widget`, not the mangled `dep$Widget`: {}",
+            k0216.message
+        );
+
+        let k0215 = errors.iter().find(|d| d.code == "K0215").expect("the extra/unknown prop must be reported");
+        assert!(
+            !k0215.message.contains("dep$Widget"),
+            "K0215 must not leak the mangled `dep$Widget` name: {}",
+            k0215.message
+        );
+
+        let k0214 = errors.iter().find(|d| d.code == "K0214").expect("the wire port typo must be reported");
+        assert!(
+            k0214.message.contains("`Producer`") && !k0214.message.contains("dep$Producer"),
+            "K0214 must name the component as `Producer`, not the mangled `dep$Producer`: {}",
+            k0214.message
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it684): `resolve.rs`'s
     /// `Rewriter::component` visited a component's `props`/`state` field
     /// DECLARATIONS (types, default/init expressions) but never bound their

@@ -1516,6 +1516,11 @@ impl Checker {
                 // Did-you-mean, matching the sibling child-name lookup right above
                 // (K0213) -- a typo'd PORT name (once the child itself resolved fine)
                 // named the miss but never suggested the close in-scope port (PR-it582).
+                // `comp_name` names the child's component TYPE, which may live in a
+                // dependency package and so may be `isolate()`-mangled -- demangle for
+                // display (production-hardening PR-it780, matching `check_ctor_args`'s
+                // sibling fix just below and PR-it628's precedent).
+                let comp_name = crate::resolve::demangle_for_display(comp_name);
                 let mut msg = format!("component `{comp_name}` has no `{kind}` port named `{port}`");
                 if let Some(s) = suggest(port, map.keys().map(String::as_str)) {
                     msg.push_str(&format!(" — did you mean `{s}`?"));
@@ -1538,6 +1543,16 @@ impl Checker {
         span: Span,
         ctx: &mut Ctx,
     ) {
+        // `comp_name` names the component TYPE being constructed, which may
+        // live in a dependency package and so may be `isolate()`-mangled to
+        // `pkg$Name` -- demangle once, up front, for every message this
+        // function builds below (production-hardening PR-it780: a live repro
+        // showed `missing required prop \`shade\` when constructing
+        // \`dep$Widget\`` instead of the intended \`Widget\`; matches
+        // PR-it628's precedent elsewhere in this file). Safe to shadow
+        // unconditionally since `comp_name` is used only for display in this
+        // function, never as a lookup key.
+        let comp_name = crate::resolve::demangle_for_display(comp_name);
         let mut supplied: HashSet<String> = HashSet::new();
         for (i, arg) in args.iter().enumerate() {
             let target = match &arg.name {

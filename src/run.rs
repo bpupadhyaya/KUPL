@@ -88,15 +88,55 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
             Item::Law(l) => (l.name.as_str(), l.span),
         })
         .collect();
-    let Some(target) = compiled.program.items.iter().find(|item| match item {
-        Item::Fun(f) => f.name == name,
-        Item::Type(t) => t.name == name,
-        Item::Component(c) => c.name == name,
-        Item::Contract(ct) => ct.name == name,
-        Item::Law(l) => l.name == name,
-    }) else {
-        eprintln!("error: no item named `{name}` in {file}");
-        return 1;
+    fn item_name(item: &Item) -> &str {
+        match item {
+            Item::Fun(f) => &f.name,
+            Item::Type(t) => &t.name,
+            Item::Component(c) => &c.name,
+            Item::Contract(ct) => &ct.name,
+            Item::Law(l) => &l.name,
+        }
+    }
+    // A REAL usability gap found+fixed (production-hardening PR-it780, the
+    // second half of a late-delivered Explore survey finding, agentId
+    // aaed1d00a40c9e7b6, independently re-verified live before implementing):
+    // a dependency's item is stored under its `isolate()`-mangled name
+    // (`dep$Widget`), which `kupl manifest` used to leak verbatim (fixed
+    // above) but even after that fix a user/LLM reading `kupl manifest`'s now-
+    // clean `"Widget"` had no way to ask `kupl context` about it -- `kupl
+    // context main.kupl Widget` failed with "no item named `Widget`", forcing
+    // the caller to already know the internal `dep$Widget` mangling syntax,
+    // which is never surfaced anywhere else in the CLI. Fix: try an exact
+    // match first (covers root-package items, which are never mangled, and a
+    // caller who already knows the mangled form), and only if that misses,
+    // fall back to a demangled match. Two different dependencies could both
+    // declare `Widget`, demangling to the same bare name -- report that
+    // explicitly as an ambiguity rather than silently picking one.
+    let exact = compiled.program.items.iter().find(|item| item_name(item) == name);
+    let target = if let Some(t) = exact {
+        t
+    } else {
+        let matches: Vec<&Item> = compiled
+            .program
+            .items
+            .iter()
+            .filter(|item| crate::resolve::demangle_for_display(item_name(item)) == name)
+            .collect();
+        match matches.as_slice() {
+            [] => {
+                eprintln!("error: no item named `{name}` in {file}");
+                return 1;
+            }
+            [only] => *only,
+            many => {
+                let candidates: Vec<&str> = many.iter().map(|item| item_name(item)).collect();
+                eprintln!(
+                    "error: `{name}` is ambiguous across dependencies — did you mean one of: {}?",
+                    candidates.join(", ")
+                );
+                return 1;
+            }
+        }
     };
 
     // Names the target references, resolved to item names.
@@ -698,9 +738,16 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             out.push(',');
         }
         first = false;
+        // `c.name`/`fulfills`/`children[].component` all name a top-level item
+        // that may live in a dependency package, so `isolate()` may have
+        // mangled it to `pkg$Name` -- demangle for display here, matching
+        // `ty_str`'s own PR-it780 fix just above (and PR-it628's precedent in
+        // check.rs/types.rs/value.rs). `ports`/`props`/`state`/`exposes`/
+        // `children[].name`/`supervises[].child` are all LOCAL names, never
+        // mangled, and need no such treatment.
         out.push_str(&format!(
             "{{\"name\":\"{}\",\"kind\":\"{}\",\"intent\":\"{}\"",
-            esc(&c.name),
+            esc(crate::resolve::demangle_for_display(&c.name)),
             if c.is_app { "app" } else { "component" },
             esc(c.intent.as_deref().unwrap_or("")),
         ));
@@ -786,12 +833,22 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             })
             .collect();
         out.push_str(&format!(",\"exposes\":[{}]", exposes.join(",")));
-        let fulfills: Vec<String> = c.fulfills.iter().map(|f| format!("\"{}\"", esc(f))).collect();
+        let fulfills: Vec<String> = c
+            .fulfills
+            .iter()
+            .map(|f| format!("\"{}\"", esc(crate::resolve::demangle_for_display(f))))
+            .collect();
         out.push_str(&format!(",\"fulfills\":[{}]", fulfills.join(",")));
         let children: Vec<String> = c
             .children
             .iter()
-            .map(|ch| format!("{{\"name\":\"{}\",\"component\":\"{}\"}}", esc(&ch.name), esc(&ch.component)))
+            .map(|ch| {
+                format!(
+                    "{{\"name\":\"{}\",\"component\":\"{}\"}}",
+                    esc(&ch.name),
+                    esc(crate::resolve::demangle_for_display(&ch.component))
+                )
+            })
             .collect();
         out.push_str(&format!(",\"children\":[{}]", children.join(",")));
         let wires: Vec<String> = c
@@ -1327,6 +1384,72 @@ mod tests {
         assert!(state[0].get("init").is_none(), "init is deliberately excluded, not just empty");
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it780, the first half
+    /// of a late-delivered Explore survey finding, agentId aaed1d00a40c9e7b6,
+    /// independently re-verified live before implementing): `manifest_json`
+    /// walks `compiled.program`, which has already been through
+    /// `resolve::isolate()`'s load-time name mangling -- so a dependency's
+    /// own component came out as `"name":"dep$Widget"`, not `"Widget"`, and a
+    /// prop typed with one of that dependency's OWN types leaked the same
+    /// way (`"type":"dep$Color"` instead of `"Color"`, via `fmt::ty_str`,
+    /// which had never demangled at all). Confirmed live before this fix.
+    /// Fixed by demangling `name`/`fulfills`/`children[].component` at their
+    /// call sites in this function, plus `ty_str` itself (so `ports`/`props`/
+    /// `state`/`exposes` types are covered for every caller, not just this
+    /// one). Uses `loader.rs`'s established two-package temp-dir convention
+    /// since mangling only exists once a real dependency graph is loaded.
+    #[test]
+    fn manifest_demangles_a_dependencys_component_name_and_type_references() {
+        let base = std::env::temp_dir().join(format!("kupl-manifest-demangle-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "pub type Color = Red | Green | Blue\n\n\
+             pub component Widget {\n    intent \"a widget\"\n    prop shade: Color\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun main() uses io {\n    \
+             let w = dep.Widget(shade: dep.Red)\n    print(w)\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = crate::loader::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its dep dependency");
+        let json = super::manifest_json(&program);
+        assert!(
+            !json.contains('$'),
+            "no `pkg$Name` mangling artifact should ever reach the manifest's JSON output: {json}"
+        );
+        let v = crate::lsp::parse_json(&json).expect("manifest must be valid JSON");
+        let comp = v.get("components").and_then(|c| c.index(0)).expect("component 0 (Widget)");
+        assert_eq!(comp.get("name").and_then(|n| n.str()), Some("Widget"));
+        let props = match comp.get("props") {
+            Some(crate::lsp::Json::Arr(a)) => a.clone(),
+            other => panic!("props must be an array: {other:?}"),
+        };
+        assert_eq!(props[0].get("name").and_then(|n| n.str()), Some("shade"));
+        assert_eq!(
+            props[0].get("type").and_then(|t| t.str()),
+            Some("Color"),
+            "a prop typed with the dependency's OWN type must report the bare name, not `dep$Color`"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn disassemble_handles_source_and_compiled_modules() {
         // `kupl dis` disassembles a .kupl source (compile -> disassemble)...
@@ -1525,6 +1648,127 @@ mod tests {
         assert_eq!(super::emit_context(p, "target"), 0, "a present item resolves");
         assert_eq!(super::emit_context(p, "does_not_exist"), 1, "a missing item is a clean error");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL usability gap found+fixed (production-hardening PR-it780, the
+    /// second half of a late-delivered Explore survey finding, agentId
+    /// aaed1d00a40c9e7b6, independently re-verified live before
+    /// implementing): a dependency's item is stored under its
+    /// `isolate()`-mangled name, so `kupl context app.kupl Widget` used to
+    /// fail with "no item named `Widget`" even though `kupl manifest`
+    /// reports the SAME component (post-PR-it780's OTHER fix, above) as
+    /// plain `Widget` -- forcing a caller to already know the internal
+    /// `dep$Widget` mangling syntax, never surfaced anywhere else. Fixed by
+    /// falling back to a demangled-name match when an exact match misses.
+    /// Subprocess test (matching this file's own established pattern,
+    /// PR-it777) since the point is to inspect PRINTED content, not just the
+    /// exit code.
+    #[test]
+    fn emit_context_resolves_a_dependencys_item_by_its_demangled_name() {
+        let base = std::env::temp_dir().join(format!("kupl-ctx-demangle-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "pub component Widget {\n    intent \"a widget\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun main() uses io {\n    let w = dep.Widget()\n    print(w)\n}\n",
+        )
+        .unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // no debug binary built yet -- nothing to test
+        }
+        let main = app.join("main.kupl");
+        let out = std::process::Command::new(&bin)
+            .args(["context", main.to_str().unwrap(), "Widget"])
+            .output()
+            .expect("kupl context runs");
+        assert!(out.status.success(), "the bare demangled name must resolve: {:?}", out);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("component Widget"), "must print the resolved component: {stdout:?}");
+        assert!(!stdout.contains("dep$Widget"), "the mangled name must never leak into the output: {stdout:?}");
+
+        // the mangled form itself must keep working too (an exact match wins
+        // over the demangled fallback).
+        let exact = std::process::Command::new(&bin)
+            .args(["context", main.to_str().unwrap(), "dep$Widget"])
+            .output()
+            .expect("kupl context runs");
+        assert!(exact.status.success(), "the exact mangled name must still resolve: {:?}", exact);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Two dependencies that both declare a same-named public item demangle
+    /// to the SAME bare name -- resolving `kupl context app.kupl Widget`
+    /// arbitrarily between them would be a real, silent correctness trap for
+    /// an LLM caller (production-hardening PR-it780, designed alongside the
+    /// demangled-lookup fix above, per the survey's own suggested fix
+    /// direction). Must report an explicit ambiguity error instead.
+    #[test]
+    fn emit_context_reports_ambiguity_when_two_dependencies_demangle_to_the_same_name() {
+        let base = std::env::temp_dir().join(format!("kupl-ctx-ambiguous-test-{}", std::process::id()));
+        let dep_a = base.join("dep_a");
+        let dep_b = base.join("dep_b");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep_a).unwrap();
+        std::fs::create_dir_all(&dep_b).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep_a.join("kupl.toml"), "[project]\nname = \"dep_a\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(dep_a.join("main.kupl"), "pub component Widget {\n    intent \"a\"\n}\n").unwrap();
+        std::fs::write(dep_b.join("kupl.toml"), "[project]\nname = \"dep_b\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(dep_b.join("main.kupl"), "pub component Widget {\n    intent \"b\"\n}\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n\
+             [dependencies]\ndep_a = { path = \"../dep_a\" }\ndep_b = { path = \"../dep_b\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep_a\nuse dep_b\n\nfun main() uses io {\n    \
+             let a = dep_a.Widget()\n    let b = dep_b.Widget()\n    print(a)\n    print(b)\n}\n",
+        )
+        .unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // no debug binary built yet -- nothing to test
+        }
+        let main = app.join("main.kupl");
+        let out = std::process::Command::new(&bin)
+            .args(["context", main.to_str().unwrap(), "Widget"])
+            .output()
+            .expect("kupl context runs");
+        assert!(!out.status.success(), "an ambiguous bare name must be a clean error, not an arbitrary pick");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("ambiguous"), "must explain the ambiguity, not just say \"no item named\": {stderr:?}");
+        assert!(
+            stderr.contains("dep_a$Widget") && stderr.contains("dep_b$Widget"),
+            "must list both candidates so the caller can pick the exact mangled form: {stderr:?}"
+        );
+
+        // each exact mangled form must still resolve unambiguously.
+        let a = std::process::Command::new(&bin)
+            .args(["context", main.to_str().unwrap(), "dep_a$Widget"])
+            .output()
+            .expect("kupl context runs");
+        assert!(a.status.success(), "the exact mangled name must resolve despite the ambiguous bare name: {:?}", a);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it777, an Explore

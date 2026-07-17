@@ -794,10 +794,21 @@ fn pattern_str(p: &Pattern) -> String {
 
 pub fn ty_str(t: &TyExpr) -> String {
     match &t.kind {
-        TyExprKind::Name(n) => n.clone(),
+        // A REAL cross-package leak found+fixed (production-hardening PR-it780,
+        // a late-delivered Explore survey finding, agentId aaed1d00a40c9e7b6,
+        // independently re-verified live before implementing): a dependency's
+        // own port/prop/state field typed with one of THAT dependency's own
+        // types was rewritten by `resolve::isolate()` to the mangled
+        // `pkg$Name` form, and `ty_str` -- used by `manifest_json`, `kupl fmt`,
+        // LSP hover/signature help, and `sdiff.rs` -- rendered it verbatim,
+        // e.g. `kupl manifest` reporting a prop's `"type"` as `"dep$Color"`
+        // instead of `"Color"`. `demangle_for_display` is a safe no-op for any
+        // name that was never mangled (`$` never appears in a source
+        // identifier), so applying it here is correct for every caller.
+        TyExprKind::Name(n) => crate::resolve::demangle_for_display(n).to_string(),
         TyExprKind::Generic(n, args) => {
             let a: Vec<String> = args.iter().map(ty_str).collect();
-            format!("{n}[{}]", a.join(", "))
+            format!("{}[{}]", crate::resolve::demangle_for_display(n), a.join(", "))
         }
         TyExprKind::Fun(params, ret) => {
             let p: Vec<String> = params.iter().map(ty_str).collect();
