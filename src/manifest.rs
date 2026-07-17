@@ -39,6 +39,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     let mut entry = "main.kupl".to_string();
     let mut deps: Vec<Dep> = Vec::new();
     let mut section = "";
+    let mut seen_project = false;
 
     for (i, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
@@ -47,7 +48,28 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         }
         if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             section = match sec.trim() {
-                "project" => "project",
+                // A REAL bug found+fixed (production-hardening PR-it784, an
+                // Explore survey finding, independently re-verified live
+                // before implementing): a SECOND `[project]` section later
+                // in the same file was accepted exactly like the first,
+                // silently overwriting `name`/`version`/`entry` -- the same
+                // "silently last-wins" shape this file already fixed twice
+                // for a duplicate dependency NAME (PR-it747) and a
+                // duplicate inline-table KEY (PR-it752), both citing "a
+                // plausible copy-paste manifest mistake" as the motivating
+                // scenario, which applies equally here. Confirmed live: a
+                // dependency's OWN `kupl.toml` with `entry = "main.kupl"`
+                // then a second `[project]` block with `entry =
+                // "other.kupl"` silently compiled `other.kupl` in its
+                // place, with NO diagnostic -- `dep.greet()` resolved to
+                // `other.kupl`'s definition, not `main.kupl`'s.
+                "project" if seen_project => {
+                    return Err(format!("line {}: duplicate `[project]` section", i + 1));
+                }
+                "project" => {
+                    seen_project = true;
+                    "project"
+                }
                 "dependencies" => "dependencies",
                 other => return Err(format!("line {}: unknown section `[{other}]`", i + 1)),
             };
@@ -60,11 +82,34 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         let value = value.trim();
         match section {
             "project" => {
-                let s = parse_string(value).ok_or_else(|| format!("line {}: expected a string", i + 1))?;
+                // A REAL bug found+fixed (production-hardening PR-it784, an
+                // Explore survey finding, independently re-verified live
+                // before implementing): this module's OWN doc comment above
+                // promises "unknown `[project]` keys are ignored" -- but the
+                // OLD code called `parse_string(value)` and propagated its
+                // error via `?` BEFORE the `match key` dispatch even ran, so
+                // an unrecognized key whose value wasn't a bare quoted
+                // string (a bool, number, array, or inline table -- all
+                // perfectly valid TOML, not "syntactically malformed" by
+                // any reasonable reading) hard-failed the ENTIRE manifest
+                // parse instead of being ignored. Confirmed live: `private
+                // = true` under `[project]` failed with "line N: expected a
+                // string", while the SAME key quoted (`private = "true"`)
+                // parsed cleanly and was silently dropped -- the exact
+                // "ignored" behavior the doc comment promises, just not for
+                // every TOML value shape. This broke forward-compatibility
+                // for precisely the case "ignore unknown keys" exists to
+                // protect: a newer non-string field read by an older
+                // binary. Fixed by moving the string-parse INSIDE each
+                // KNOWN key's own arm, so an unknown key's value is never
+                // even inspected, regardless of its TOML type.
+                let parse_str =
+                    |value: &str| parse_string(value).ok_or_else(|| format!("line {}: expected a string", i + 1));
                 match key {
-                    "name" => name = s,
-                    "version" => version = s,
+                    "name" => name = parse_str(value)?,
+                    "version" => version = parse_str(value)?,
                     "entry" => {
+                        let s = parse_str(value)?;
                         // A REAL, live-confirmed bug found+fixed (production-hardening
                         // PR-it766): `entry` was accepted VERBATIM with zero path
                         // validation, then resolved as `dep_dir.join(&m.entry)`
@@ -392,6 +437,57 @@ mod tests {
             .expect("one path key + one version key must still parse cleanly");
         assert_eq!(m.deps[0].path, Some("../web".to_string()));
         assert_eq!(m.deps[0].version, Some("1.0.0".to_string()));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it784, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// a SECOND `[project]` section later in the same file used to be
+    /// accepted exactly like the first, silently overwriting
+    /// `name`/`version`/`entry` -- the SAME "silently last-wins" shape as
+    /// `duplicate_dependency_name_...` and `duplicate_key_inside_an_inline_
+    /// table_...` above, one level up (a whole SECTION rather than a
+    /// dependency name or an inline-table key). Live-confirmed BEFORE this
+    /// fix: a dependency's own `kupl.toml` with `entry = "main.kupl"` then
+    /// a second `[project]` block with `entry = "other.kupl"` silently
+    /// compiled `other.kupl` in `main.kupl`'s place, end-to-end, with ZERO
+    /// diagnostic anywhere.
+    #[test]
+    fn duplicate_project_section_is_a_clean_error_not_silently_last_wins() {
+        let err = parse("[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[project]\nentry = \"other.kupl\"\n")
+            .expect_err("a second [project] section must be a clean error, not silently accepted");
+        assert!(err.contains("duplicate") && err.contains("[project]"), "{err}");
+
+        // sanity: exactly one [project] section still parses fine.
+        let m = parse("[project]\nname = \"app\"\nentry = \"main.kupl\"\n").expect("a single [project] section is fine");
+        assert_eq!(m.name, "app");
+        assert_eq!(m.entry, "main.kupl");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it784, the same
+    /// survey's second finding, independently re-verified live before
+    /// implementing): this module's own doc comment (top of file) promises
+    /// "unknown `[project]` keys are ignored" -- but the OLD code called
+    /// `parse_string(value)` and propagated its error BEFORE the `match
+    /// key` dispatch even ran, so an unrecognized key whose value wasn't a
+    /// bare quoted string (a bool/number/array/inline-table -- all
+    /// perfectly valid TOML) hard-failed the ENTIRE manifest parse instead
+    /// of being ignored, contradicting the doc comment. Live-confirmed
+    /// BEFORE this fix: `private = true` failed with "line N: expected a
+    /// string", while the SAME key quoted (`private = "true"`) parsed
+    /// cleanly and was silently dropped -- same key, only the TOML value
+    /// type differed.
+    #[test]
+    fn unknown_project_keys_are_ignored_regardless_of_their_toml_value_type() {
+        for value in ["true", "42", "[1, 2, 3]", "{ x = 1 }"] {
+            let src = format!("[project]\nname = \"app\"\nentry = \"main.kupl\"\nprivate = {value}\n");
+            let m = parse(&src)
+                .unwrap_or_else(|e| panic!("an unknown key with value `{value}` must be ignored, not a parse error: {e}"));
+            assert_eq!(m.name, "app", "the rest of the manifest must still parse correctly");
+        }
+        // sanity: a KNOWN key (`entry`) with a non-string value must still be a clean error --
+        // this fix must not accidentally widen ignoring to apply to recognized keys too.
+        let err = parse("[project]\nname = \"app\"\nentry = 42\n").expect_err("a known key still needs its declared type");
+        assert!(err.contains("expected a string"), "{err}");
     }
 
     /// A REAL sibling bug to `hash_inside_a_string_value_is_not_treated_as_a_
