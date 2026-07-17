@@ -730,7 +730,42 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             })
             .collect();
         out.push_str(&format!(",\"props\":[{}]", props.join(",")));
-        let state: Vec<String> = c.state.iter().map(|s| format!("\"{}\"", esc(&s.name))).collect();
+        // A REAL schema-consistency bug found+fixed (production-hardening
+        // PR-it778, an Explore survey finding, agentId ad3c3f6ee2f0cd891,
+        // independently re-verified live before implementing): `state` was
+        // emitted as a BARE ARRAY OF NAME STRINGS (`["count"]`) while `ports`/
+        // `props` are arrays of STRUCTURED OBJECTS carrying a `type` field --
+        // a visual-tool consumer got zero type info for state fields
+        // specifically. DELIBERATELY NARROWER than the survey's own framing,
+        // per this file's OWN prior documented reasoning (see
+        // `manifest_reports_supervises_and_handlers`'s doc comment, PR-it647):
+        // `state`'s name-only serialization was NOT an oversight of the SAME
+        // shape as PR-it647's `supervises`/`handlers` gap -- it was a
+        // DELIBERATE choice, because `init` is "an arbitrary expression, not
+        // simple manifest data." That reasoning still holds and is NOT
+        // re-litigated here: `init` stays OUT of the manifest, matching
+        // `props`'s OWN identical precedent (a prop's default value is
+        // likewise never rendered as expression text -- only a derived
+        // `required: bool`). What genuinely WAS missing, and is NOT an
+        // arbitrary-expression concern, is `type` -- a `TyExpr`, exactly as
+        // simple and structurally serializable as `ports`/`props`'s OWN
+        // `type` fields (rendered via the SAME `ty_str`). `ty` is optional in
+        // the grammar (`state count = 0` infers its type at check-time,
+        // unavailable to this function given only the raw, unchecked
+        // `Program`) -- falls back to `""`, matching this SAME function's
+        // own existing convention for `intent` (`Option<String>` ->
+        // `unwrap_or("")`).
+        let state: Vec<String> = c
+            .state
+            .iter()
+            .map(|s| {
+                format!(
+                    "{{\"name\":\"{}\",\"type\":\"{}\"}}",
+                    esc(&s.name),
+                    esc(&s.ty.as_ref().map(crate::fmt::ty_str).unwrap_or_default()),
+                )
+            })
+            .collect();
         out.push_str(&format!(",\"state\":[{}]", state.join(",")));
         let exposes: Vec<String> = c
             .exposes
@@ -1207,9 +1242,11 @@ mod tests {
     /// tool needs) were already included, making the omission of `supervises`
     /// (a supervision-tree edge) and `handlers` (which triggers a component
     /// reacts to) an inconsistent, silent gap rather than a deliberate design
-    /// choice like `state`'s name-only serialization (state's `init` is an
-    /// arbitrary expression, not simple manifest data, unlike `SuperviseDecl`/
-    /// `Trigger` which are both small, fully-serializable structures).
+    /// choice like `state`'s continued exclusion of `init` (still true after
+    /// PR-it778 added `state`'s own `type` field: `init` is an arbitrary
+    /// expression, not simple manifest data, unlike `SuperviseDecl`/
+    /// `Trigger` which are both small, fully-serializable structures --
+    /// `type`, unlike `init`, IS exactly that kind of simple structure).
     #[test]
     fn manifest_reports_supervises_and_handlers() {
         let src = "component Child {\n    intent \"c\"\n}\n\
@@ -1250,6 +1287,44 @@ mod tests {
         let child = v.get("components").and_then(|c| c.index(0)).expect("component 0 (Child)");
         assert_eq!(arr_len(child.get("supervises")), Some(0));
         assert_eq!(arr_len(child.get("handlers")), Some(0));
+    }
+
+    /// A REAL schema-consistency bug found+fixed (production-hardening
+    /// PR-it778, an Explore survey finding, agentId ad3c3f6ee2f0cd891,
+    /// independently re-verified live before implementing): `state` was
+    /// emitted as a bare array of NAME STRINGS (`["count"]`) while `ports`/
+    /// `props` are arrays of structured objects carrying a `type` field --
+    /// a visual-tool consumer got zero type info for state fields
+    /// specifically. Fixed by adding `state`'s own `type` field (falling
+    /// back to `""` when the state declaration has no explicit type
+    /// annotation, since that's inferred at check-time and unavailable to
+    /// this function). Deliberately does NOT add `init` -- see
+    /// `manifest_reports_supervises_and_handlers`'s own doc comment for why
+    /// that specific exclusion is a pre-existing, still-valid design choice,
+    /// not re-litigated by this fix.
+    #[test]
+    fn manifest_reports_states_own_type() {
+        let src = "component Counter778 {\n    intent \"c\"\n    \
+                   state count: Int = 0\n    state untyped = \"x\"\n    on start { }\n}\n";
+        let compiled = compile(src).expect("compiles");
+        let json = super::manifest_json(&compiled.program);
+        let v = crate::lsp::parse_json(&json).expect("manifest must be valid JSON");
+        let comp = v.get("components").and_then(|c| c.index(0)).expect("component 0");
+        let state = match comp.get("state") {
+            Some(crate::lsp::Json::Arr(a)) => a.clone(),
+            other => panic!("state must be an array of objects: {other:?}"),
+        };
+        assert_eq!(state.len(), 2);
+        assert_eq!(state[0].get("name").and_then(|n| n.str()), Some("count"));
+        assert_eq!(state[0].get("type").and_then(|t| t.str()), Some("Int"), "an explicitly-typed state field reports its type");
+        assert_eq!(state[1].get("name").and_then(|n| n.str()), Some("untyped"));
+        assert_eq!(
+            state[1].get("type").and_then(|t| t.str()),
+            Some(""),
+            "an untyped state field (type inferred at check-time) falls back to empty, not omitted or a crash"
+        );
+        // `init` is deliberately NOT present -- see this test's own doc comment.
+        assert!(state[0].get("init").is_none(), "init is deliberately excluded, not just empty");
     }
 
     #[test]
