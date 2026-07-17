@@ -12948,6 +12948,54 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         );
     }
 
+    /// Production-hardening PR-it793's own dotfiles NEXT-note flagged
+    /// `k_big_pow`'s exponent-bound math as an UN-verified angle (the
+    /// PANIC-wording test just above only exercises a value hugely past the
+    /// limit, `big(2).pow(1000000000)` -- 1 limb, exponent a billion, nowhere
+    /// near the boundary itself). `bigint.rs::pow` estimates the result via
+    /// `base_limbs.checked_mul(exp) > MAX_BIGINT_LIMBS`; `k_big_pow` computes
+    /// the ALGEBRAICALLY EQUIVALENT but overflow-free rearrangement
+    /// `b->n > K_MAX_BIGINT_LIMBS / e` (floor division) instead of a direct
+    /// multiply -- for positive integers `n > floor(K/e)` iff `n*e > K` is a
+    /// genuine number-theory identity, so this is a DIFFERENT algebraic
+    /// shape computing the SAME boundary, not a shortcut that could
+    /// introduce an off-by-one. Verified this holds EXACTLY at the boundary
+    /// itself (not just "hugely over"), both directions: `big(10000000000)`
+    /// (a 2-limb base, 10000000000 = 10^10) raised to 10001 makes
+    /// `2*10001=20002 > 20000` -- just ONE past the limit, must panic;
+    /// raised to 10000 makes `2*10000=20000`, NOT `> 20000` -- exactly AT
+    /// the limit, must succeed and produce `10^100000` EXACTLY (a decimal
+    /// `1` followed by 100000 `0`s, confirmed byte-identical against a live
+    /// interp run, not a hand-derived constant). No divergence found --
+    /// this is coverage-locking, not a bug fix.
+    #[test]
+    fn native_bigint_pow_boundary_is_exact_one_past_the_limit_panics_exactly_at_it_succeeds() {
+        if !cc_available() {
+            return;
+        }
+        assert_panic_wording_matches(
+            "fun main() uses io { print(big(10000000000).pow(10001)) }\n",
+            "bigpowboundaryreject",
+        );
+        // allowed side: compute directly via `probe()` on interp (no `print`/
+        // stdout capture needed -- `.to_string()` on the returned Value IS
+        // this program's Display output, matching what `print` would emit).
+        let src = "fun probe() -> BigInt { big(10000000000).pow(10000) }\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("probe".to_string()));
+        let interp_val = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v.to_string(),
+            Err(_) => panic!("bigpowboundaryok: interp must succeed at the exact boundary"),
+        };
+        let expected = format!("1{}", "0".repeat(100000));
+        assert_eq!(interp_val, expected, "interp must produce EXACTLY 10^100000 at the allowed boundary");
+        let native_src = "fun main() uses io { print(big(10000000000).pow(10000)) }\n";
+        let native_out = native_main_stdout(native_src, "bigpowboundaryok");
+        assert_eq!(native_out.trim(), expected, "native must produce EXACTLY 10^100000 at the allowed boundary");
+    }
+
     /// The native mirror of `diff_named_argument_calls_evaluate_side_effects_in_source_written_order`
     /// (vm.rs, PR-it719): `callargs.rs`'s named-argument evaluation-order fix
     /// is a SINGLE AST-rewrite pass that runs upstream of ALL FOUR engines
