@@ -1082,6 +1082,34 @@ fn shadow_zones(program: &crate::ast::Program, name: &str) -> Vec<crate::diag::S
     zones
 }
 
+/// Whether `name` is already declared as a TOP-LEVEL item (a `fun`, a `type`
+/// or one of its variant/constructor names, a `component`, or a `contract`)
+/// somewhere in `program` -- a `law`'s own name is a string literal, not an
+/// identifier, so it can never collide with a rename target and is excluded.
+/// Used by the `textDocument/rename` handler (production-hardening PR-it787,
+/// closing a gap carried forward since PR-it767/it780) to detect a genuine
+/// collision BEFORE generating a rename edit that would otherwise silently
+/// produce a duplicate top-level definition -- e.g. renaming `fun helper`
+/// to `main` when `fun main` already exists in the SAME file. Deliberately
+/// scoped to SAME-FILE top-level items only, not cross-file: a top-level
+/// item in a DIFFERENT (`use`d) file lives in that file's own mangled
+/// package namespace (`resolve.rs`'s `pkg$name` scheme) and is only ever
+/// reachable via a qualified `pkg.name`, never a bare identifier, so it
+/// cannot actually collide with a bare rename in THIS file. Also
+/// deliberately does NOT check local bindings (function params/`let`s) --
+/// a local legitimately shadowing a top-level name is ordinary, legal
+/// scoping, not a collision.
+fn top_level_item_named(program: &crate::ast::Program, name: &str) -> bool {
+    use crate::ast::Item;
+    program.items.iter().any(|item| match item {
+        Item::Fun(f) => f.name == name,
+        Item::Type(t) => t.name == name || t.variants.iter().any(|v| v.name == name),
+        Item::Component(c) => c.name == name,
+        Item::Contract(ct) => ct.name == name,
+        Item::Law(_) => false,
+    })
+}
+
 /// Whether `name` is bound anywhere inside `block` by a `let`/`var`, a `for`
 /// loop variable, a `forall` property variable, a lambda parameter, or a
 /// `match` pattern binding (`x`, `x @ pat`, or a `Ctor(x)` sub-pattern) --
@@ -2281,6 +2309,28 @@ pub fn serve() -> i32 {
                     // file into a proper multi-file WorkspaceEdit.
                     let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
                     let off = offset_at(&text, line, ch);
+                    // A REAL gap found+fixed (production-hardening PR-it787, carried
+                    // forward since PR-it767/it780 as the known, deliberately-deferred
+                    // sub-case of rename validation): `is_valid_new_identifier` above
+                    // only ever checked `new_name`'s own SYNTACTIC well-formedness --
+                    // nothing checked whether `new_name` ALREADY names a DIFFERENT
+                    // top-level item in this file. Renaming `fun helper` to `main` when
+                    // `fun main` already exists used to silently produce a
+                    // WorkspaceEdit that, once applied, left TWO top-level items named
+                    // `main` -- a duplicate-definition compile error the editor gave
+                    // zero warning about before applying the edit. Only checked when
+                    // `name` itself is NOT locally bound (a top-level rename target) --
+                    // a local shadowing a top-level name is ordinary, legal scoping,
+                    // not a collision (see `top_level_item_named`'s own doc comment for
+                    // why this is deliberately SAME-FILE-only, not cross-file).
+                    if new_name != name {
+                        let (program, _diags) = crate::parser::parse(&text);
+                        if local_binding_scope(&program, off, &name).is_none()
+                            && top_level_item_named(&program, new_name)
+                        {
+                            return None;
+                        }
+                    }
                     let mut by_file: Vec<(String, Vec<String>)> = Vec::new();
                     for (target_uri, l0, c0, l1, c1) in occurrences_cross_file(&text, &name, off, &dir, &buffers) {
                         let u = if target_uri.is_empty() { uri.to_string() } else { target_uri };
@@ -3775,6 +3825,77 @@ mod tests {
         assert!(
             stdout.contains(r#""id":4,"result":{"changes""#),
             "a genuinely valid rename must still work: {stdout}"
+        );
+    }
+
+    /// A REAL gap found+fixed (production-hardening PR-it787): carried
+    /// forward, deliberately deferred, and never actually attempted since
+    /// PR-it767 (which fixed `newName`'s own SYNTACTIC validation but
+    /// explicitly left this sub-case open) and reconfirmed by an Explore
+    /// survey at PR-it780 -- `textDocument/rename` never checked whether
+    /// `newName` ALREADY names a DIFFERENT top-level item in the SAME file.
+    /// Live-confirmed BEFORE this fix via a raw LSP stdio session (this
+    /// file's own established subprocess pattern, mirroring the test right
+    /// above): renaming `fun helper` to `main`, when `fun main` already
+    /// exists in the same file, returned a well-formed, non-null
+    /// `WorkspaceEdit` that a client would apply immediately and
+    /// unconditionally, silently producing a file with TWO top-level items
+    /// named `main` -- a duplicate-definition compile error with zero
+    /// warning before the edit landed. Also confirms two things the fix must
+    /// NOT break: renaming to a genuinely free name still works, and a
+    /// same-name "rename" (`newName` identical to the current name) is not
+    /// mistaken for a self-collision.
+    #[test]
+    fn rename_into_an_existing_top_level_name_returns_null_not_a_duplicate_definition() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let src = "fun helper() -> Int {\n    1\n}\n\nfun main() {\n    print(helper())\n}\n";
+        let did_open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///rename_collision_it787.kupl","text":{src:?}}}}}}}"#
+        );
+        // cursor on `helper`'s own declaration (line 0, "fun " is 4 chars).
+        let rename_collides = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_collision_it787.kupl"},"position":{"line":0,"character":4},"newName":"main"}}"#;
+        let rename_same_name = r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_collision_it787.kupl"},"position":{"line":0,"character":4},"newName":"helper"}}"#;
+        let rename_ok = r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_collision_it787.kupl"},"position":{"line":0,"character":4},"newName":"compute"}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init.to_string(), did_open, rename_collides.to_string(), rename_same_name.to_string(), rename_ok.to_string()] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung on a rename request");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":2,"result":null"#),
+            "renaming into an EXISTING top-level name must return null, not a duplicate-definition edit: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":3,"result":{"changes""#),
+            "a same-name \"rename\" must not be mistaken for a self-collision: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":4,"result":{"changes""#),
+            "renaming to a genuinely free name must still work: {stdout}"
         );
     }
 
