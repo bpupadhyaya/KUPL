@@ -6867,6 +6867,57 @@ mod tests {
         );
     }
 
+    /// Production-hardening PR-it790: a close structural read of `emit_op`'s
+    /// self-rebind fast paths (following it615's real parameter-alias bug)
+    /// surfaced that `aliasing_regs` (bytecode.rs) never lists `Op::Method`
+    /// itself among the ops that can hand a register's value out to another
+    /// live location -- only `Move`/`Call*`/`MakeList`/`MakeCtor`/
+    /// `MakeClosure`/`WithField`/`StateSet`/`EmitOp` are tracked. On paper
+    /// that looks like a hole: `history.push(acc)` stores `acc`'s CURRENT
+    /// list as an element of `history`, which is exactly the kind of
+    /// pointer hand-off `method_recv_escapes` exists to catch -- yet
+    /// `Op::Method`'s own `start..start+argc` args are absent from
+    /// `aliasing_regs`'s match. Investigated whether this classic
+    /// "accumulate a list of growing-list snapshots inside a loop" pattern
+    /// (the same shape as Python's `history.append(acc)` without `.copy()`
+    /// gotcha) lets a later `acc = acc.push(x)` wrongly take the in-place
+    /// `k_list_push_inplace` fast path and corrupt an EARLIER snapshot
+    /// already stored inside `history`. Live repro across several variants
+    /// (inspected with `--keep-c`) showed the compiled shape is always
+    /// SAFE in practice: `history.push(acc)` requires `acc`'s value to be
+    /// copied into the call's argument register via an explicit `Op::Move`
+    /// first, and THAT `Move` (unlike `Op::Method` itself) *is* tracked by
+    /// `aliasing_regs` -- so `acc`'s later self-push sees itself as escaped
+    /// via the Move, not via the Method call, and correctly falls back to
+    /// the always-copies `k_method` path. No divergence found (byte-
+    /// identical across interp/KVM/native) -- this is coverage-locking
+    /// infrastructure for a previously-untested interaction between TWO
+    /// self-rebind fast paths on DIFFERENT variables in the same chunk, not
+    /// a bug fix; grep confirms no prior test exercised this shape.
+    #[test]
+    fn native_self_rebind_growing_list_pushed_as_a_snapshot_into_a_sibling_list_is_not_corrupted() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   var history: List[List[Int]] = []\n    \
+                   var acc: List[Int] = []\n    \
+                   var i = 0\n    \
+                   while i < 3 {\n        \
+                   history = history.push(acc)\n        \
+                   acc = acc.push(i)\n        \
+                   i = i + 1\n    \
+                   }\n    \
+                   print(\"{history}|{acc}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_snapshot_sibling_list");
+        assert_eq!(
+            out.trim(),
+            "[[], [0], [0, 1]]|[0, 1, 2]",
+            "each history snapshot must keep the value acc had AT PUSH TIME, not alias acc's \
+             later growth -- matches interp/KVM"
+        );
+    }
+
     /// `ai fun` compiles and RUNS on native, agreeing byte-for-byte with the
     /// interpreter/KVM. Bug-hunt batch 145 (PR-it537): LANGUAGE-REFERENCE.md's
     /// own execution-modes table marked "ai fun **[design]**" for native --
