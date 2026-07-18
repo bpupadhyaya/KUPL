@@ -2383,13 +2383,69 @@ pub fn shared_method(
             _ => Err("`concat` needs a List".into()),
         },
         (Value::List(items), "unique") => {
-            let mut out: Vec<Value> = Vec::new();
-            for it in items.iter() {
-                if !out.iter().any(|x| x == it) {
-                    out.push(it.clone());
-                }
+            // A REAL, live-confirmed severe latency divergence found+fixed
+            // (production-hardening PR-it825): the naive O(n^2) scan below
+            // (each element linearly rescans the whole accumulator built so
+            // far) took 78s on a compiled NATIVE binary to deduplicate a
+            // 100,000-element List[Int] -- an ordinary, non-adversarial
+            // operation (deduplicating IDs/log-lines/tags is mundane).
+            // FAST PATH: sort-then-adjacent-dedup is O(n log n), reusing the
+            // SAME `sort_order` comparator `.sort()` was already fixed with
+            // (PR-it711/it818's native `k_list_order` counterpart) -- but
+            // UNLIKE `.sort()` (K0234-restricted to orderable types),
+            // `.unique()` has NO type restriction and must keep working on
+            // EVERY `List[T]` (Bool, ADTs, nested List/Map/Set, …), so this
+            // only fires for the types below and falls back to the ORIGINAL
+            // O(n^2) `==`-based scan otherwise -- a list is homogeneous
+            // (KUPL's static typing), so checking just the FIRST element's
+            // tag decides it for the whole list. Rational is DELIBERATELY
+            // EXCLUDED even though `sort_order` technically supports it:
+            // `Rational`'s `==` is a cheap derived structural comparison,
+            // but `sort_order`'s `<`-based ordering goes through
+            // `cmp_would_be_too_expensive`'s cross-multiplication guard
+            // (PR-it718) -- switching `.unique()` to the sort-based path
+            // for Rational would introduce a NEW resource-exhaustion/error
+            // risk for huge-Rational lists that the cheap `==`-based path
+            // never had, a genuine behavioral regression this fix must not
+            // introduce. The adjacent-duplicate check after sorting uses
+            // `==` (`PartialEq`), NOT `sort_order`'s own notion of
+            // equality, specifically so a run of `sort_order`-tied-but-not-
+            // `==`-equal elements (the ONLY case: multiple NaNs, which
+            // `sort_order` treats as mutually "equal" for ordering purposes
+            // but `==` correctly keeps as IEEE-distinct) still keeps every
+            // element, preserving `.unique()`'s existing, already-tested
+            // "duplicate NaNs are NOT collapsed" behavior exactly.
+            fn unique_fast_eligible(v: &Value) -> bool {
+                matches!(
+                    v,
+                    Value::Int(_)
+                        | Value::Float(_)
+                        | Value::F32(_)
+                        | Value::Str(_)
+                        | Value::SizedInt(_)
+                        | Value::BigInt(_)
+                )
             }
-            Ok(Value::List(Rc::new(out)))
+            if items.len() > 1 && items.first().is_some_and(unique_fast_eligible) {
+                let mut indexed: Vec<(usize, &Value)> = items.iter().enumerate().collect();
+                indexed.sort_by(|a, b| sort_order(a.1, b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut kept: Vec<(usize, &Value)> = Vec::with_capacity(indexed.len());
+                for pair in indexed {
+                    if kept.last().is_none_or(|last: &(usize, &Value)| last.1 != pair.1) {
+                        kept.push(pair);
+                    }
+                }
+                kept.sort_by_key(|(idx, _)| *idx);
+                Ok(Value::List(Rc::new(kept.into_iter().map(|(_, v)| v.clone()).collect())))
+            } else {
+                let mut out: Vec<Value> = Vec::new();
+                for it in items.iter() {
+                    if !out.iter().any(|x| x == it) {
+                        out.push(it.clone());
+                    }
+                }
+                Ok(Value::List(Rc::new(out)))
+            }
         }
         // Collapse runs of CONSECUTIVE equal elements (Unix `uniq`) — unlike `unique`, a value can
         // reappear later if it isn't adjacent to its previous occurrence.

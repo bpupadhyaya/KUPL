@@ -18953,6 +18953,28 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         );
     }
 
+    /// `.unique()`'s new O(n log n) fast path (production-hardening PR-it825,
+    /// replacing an O(n^2) scan that took 78s on native to dedup a 100,000-
+    /// element List[Int]) is deliberately type-gated: confirm it correctly
+    /// covers BigInt/SizedInt/F32 (not exercised by `diff_stdlib_batch_it12`'s
+    /// Int-only case) and that Rational -- deliberately EXCLUDED from the fast
+    /// path, since its `==` is cheap but `sort_order`'s ordering goes through
+    /// the expensive cross-multiplication cap (PR-it718) -- still works
+    /// correctly via the unchanged O(n^2) fallback.
+    #[test]
+    fn diff_unique_fast_path_covers_bigint_sizedint_f32_and_excludes_rational() {
+        assert_eq!(
+            differential("fun probe() -> List[BigInt] {\n    [big(5), big(3), big(5), big(1), big(3)].unique()\n}\n"),
+            "[5, 3, 1]"
+        );
+        assert_eq!(differential("fun probe() -> List[i32] {\n    [5i32, 3i32, 5i32, 1i32].unique()\n}\n"), "[5, 3, 1]");
+        assert_eq!(differential("fun probe() -> List[f32] {\n    [5.0f32, 3.0f32, 5.0f32].unique()\n}\n"), "[5.0, 3.0]");
+        assert_eq!(
+            differential("fun probe() -> List[Rational] {\n    [rat(1, 2), rat(1, 3), rat(1, 2)].unique()\n}\n"),
+            "[1/2, 1/3]"
+        );
+    }
+
     #[test]
     fn diff_par_fork_join() {
         // structured fork-join: independent branches collected into a list,

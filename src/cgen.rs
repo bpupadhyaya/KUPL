@@ -5388,6 +5388,14 @@ static int k_sort_cmp(const void* a, const void* b) {
     if (c != 0) return c;
     return x->idx - y->idx;
 }
+/* Sort a KSortListItem array back into ORIGINAL-index order -- the second
+   sort in `.unique()`'s fast path below (production-hardening PR-it825),
+   restoring input order after the survivors were found by sorting by VALUE. */
+static int k_sortidx_cmp(const void* a, const void* b) {
+    const KSortListItem* x = (const KSortListItem*)a;
+    const KSortListItem* y = (const KSortListItem*)b;
+    return x->idx - y->idx;
+}
 
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     if (recv.tag == K_BIGINT) {
@@ -5705,6 +5713,55 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_list(out, (int)(l->len + o->len));
         }
         if (!strcmp(name, "unique")) {
+            /* A REAL, live-confirmed severe latency divergence found+fixed
+               (production-hardening PR-it825): the naive O(n^2) fallback
+               below (each element linearly rescans the whole accumulator
+               built so far) took 78s to deduplicate a 100,000-element
+               List[Int] on a compiled native binary -- an ordinary,
+               non-adversarial operation. FAST PATH: sort-then-adjacent-
+               dedup is O(n log n), reusing the SAME KSortListItem/
+               k_sort_cmp/k_list_order machinery `.sort()` was already
+               fixed with (PR-it818) -- but UNLIKE `.sort()` (restricted to
+               orderable types by the type checker), `.unique()` has NO
+               type restriction and must keep working on EVERY List[T]
+               (Bool, Ctor/ADT, nested List/Map/Set, ...), so this only
+               fires for the tag check below and falls back to the
+               ORIGINAL O(n^2) scan otherwise -- a list is homogeneous
+               (KUPL's static typing), so checking just the FIRST
+               element's tag decides it for the whole list. K_RATIONAL is
+               DELIBERATELY EXCLUDED even though k_list_order technically
+               supports it: Rational's k_eq is a cheap structural
+               comparison, but k_list_order's ordering goes through
+               k_cmp's cross-multiplication cost guard (PR-it718) --
+               switching `.unique()` to the sort-based path for Rational
+               would introduce a NEW resource-exhaustion/error risk for
+               huge-Rational lists the cheap k_eq-based path never had.
+               The adjacent-duplicate check after sorting uses k_eq, NOT
+               k_list_order's own notion of equality, mirroring interp.rs's
+               identical rationale: a run of k_list_order-tied-but-not-
+               k_eq-equal elements (the only case: multiple NaNs, which
+               k_list_order treats as mutually "equal" for ordering but
+               k_eq correctly keeps IEEE-distinct) still keeps every
+               element, preserving `.unique()`'s existing "duplicate NaNs
+               are NOT collapsed" behavior exactly. */
+            int fast_eligible = l->len > 1
+                && (l->items[0].tag == K_INT || l->items[0].tag == K_FLOAT || l->items[0].tag == K_F32
+                    || l->items[0].tag == K_STR || l->items[0].tag == K_SIZEDINT || l->items[0].tag == K_BIGINT);
+            if (fast_eligible) {
+                int64_t n = l->len;
+                KSortListItem* arr = (KSortListItem*)k_alloc(sizeof(KSortListItem) * n);
+                for (int64_t i = 0; i < n; i++) { arr[i].v = l->items[i]; arr[i].idx = (int)i; }
+                qsort(arr, n, sizeof(KSortListItem), k_sort_cmp);
+                KSortListItem* kept = (KSortListItem*)k_alloc(sizeof(KSortListItem) * n);
+                int64_t kn = 0;
+                for (int64_t i = 0; i < n; i++) {
+                    if (kn == 0 || !k_eq(kept[kn - 1].v, arr[i].v)) kept[kn++] = arr[i];
+                }
+                qsort(kept, kn, sizeof(KSortListItem), k_sortidx_cmp);
+                KValue* out = (KValue*)k_alloc(sizeof(KValue) * (kn < 1 ? 1 : kn));
+                for (int64_t i = 0; i < kn; i++) out[i] = kept[i].v;
+                return k_list(out, (int)kn);
+            }
             KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
             int64_t n = 0;
             for (int64_t i = 0; i < l->len; i++) {
@@ -8949,6 +9006,36 @@ fun main() uses io {
             native_main_stdout(src, "nancoll").trim(),
             "[1.0, 2.0, 3.0, NaN]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|2"
         );
+    }
+
+    /// A REAL, live-confirmed severe latency divergence found+fixed
+    /// (production-hardening PR-it825): native's `.unique()` was an O(n^2)
+    /// nested scan, taking 78s to deduplicate a 100,000-element List[Int]
+    /// -- an ordinary, non-adversarial operation (deduplicating IDs/log-
+    /// lines/tags is mundane). Fixed via a new O(n log n) fast path
+    /// (sort-then-adjacent-dedup-then-restore-order, reusing the SAME
+    /// KSortListItem/k_sort_cmp/k_list_order machinery `.sort()` was
+    /// already fixed with, PR-it818), deliberately type-gated since
+    /// `.unique()` (unlike `.sort()`) has NO type restriction: covers Int/
+    /// Float/F32/Str/SizedInt/BigInt, falling back to the ORIGINAL O(n^2)
+    /// scan for everything else. Confirms the fast path covers BigInt/
+    /// SizedInt (not exercised by `native_nan_in_collections`'s Float-only
+    /// case) and that Rational -- deliberately EXCLUDED from the fast path
+    /// since its `k_eq` is cheap but `k_list_order`'s ordering goes
+    /// through `k_cmp`'s expensive cross-multiplication cap, PR-it718 --
+    /// still works correctly via the unchanged O(n^2) fallback.
+    #[test]
+    fn native_unique_fast_path_covers_bigint_sizedint_and_excludes_rational() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let bs = [big(5), big(3), big(5), big(1), big(3)].unique()\n    \
+                   let ss = [5i32, 3i32, 5i32, 1i32].unique()\n    \
+                   let rs = [rat(1, 2), rat(1, 3), rat(1, 2)].unique()\n    \
+                   print(\"{bs}|{ss}|{rs}\")\n}\n";
+        let out = native_main_stdout(src, "unique_bigint_sizedint_rational");
+        assert_eq!(out.trim(), "[5, 3, 1]|[5, 3, 1]|[1/2, 1/3]");
     }
 
     /// Native `.sort()` correctly sorts a large (30,000-element) reverse-sorted list --
