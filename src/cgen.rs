@@ -5390,6 +5390,26 @@ static int k_sortidx_cmp(const void* a, const void* b) {
     return x->idx - y->idx;
 }
 
+/* List.group_by's fast-path helper struct (production-hardening PR-it827):
+   unlike KSortListItem, a group_by element needs its KEY (the value being
+   grouped on, used for sorting/equality) kept separate from its ITEM (the
+   original list element, which is what actually lands in the output
+   bucket) -- the two differ whenever the grouping closure isn't the
+   identity function. */
+typedef struct { KValue key; KValue item; int idx; } KGroupByItem;
+static int k_groupby_cmp(const void* a, const void* b) {
+    const KGroupByItem* x = (const KGroupByItem*)a;
+    const KGroupByItem* y = (const KGroupByItem*)b;
+    int c = k_list_order(x->key, y->key);
+    if (c != 0) return c;
+    return x->idx - y->idx;
+}
+static int k_groupby_idx_cmp(const void* a, const void* b) {
+    const KGroupByItem* x = (const KGroupByItem*)a;
+    const KGroupByItem* y = (const KGroupByItem*)b;
+    return x->idx - y->idx;
+}
+
 /* A REAL, live-confirmed severe latency divergence found+fixed
    (production-hardening PR-it826), the Set(list)-conversion analogue of
    PR-it825's List.unique() fix, with an even WORSE observed constant
@@ -5964,27 +5984,82 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_list(out, (int)n);
         }
         if (!strcmp(name, "group_by")) {
+            /* A REAL, live-confirmed severe latency divergence found+fixed
+               (production-hardening PR-it827), the FIFTH instance of this
+               campaign's recurring "naive O(n^2) collection algorithm" bug
+               class (after Int.pow it814, List.sort it818, List.unique
+               it825, set_from_list it826): the naive fallback below finds
+               each item's bucket via a LINEAR SCAN through the buckets
+               seen so far, so grouping by a mostly-distinct key is O(n^2).
+               Keys are computed EAGERLY, in original list order, BEFORE
+               branching, so the closure's call count/order (and any side
+               effects) are IDENTICAL either way. FAST PATH (type-gated on
+               the KEY's runtime tag, exactly like PR-it825/it826, Rational
+               excluded for the same cheap-`==`-vs-expensive-`sort_order`
+               asymmetry): sort by (key via `k_list_order`, then original
+               index) so equal-key runs are contiguous AND already in
+               original list order (`k_groupby_cmp` mirrors `k_sort_cmp`'s
+               own idx tiebreak, needed since `qsort` isn't stable). Runs
+               are split via `k_key_eq` (matching `Map`'s own key
+               identity, NaN-collapsing, same as PR-it826) -- sort-order-
+               equal implies `k_key_eq`-equal for every type in this
+               fast-path set, so no non-contiguous equal-key elements can
+               be missed. Group order is then restored to FIRST-SEEN order
+               (the documented contract) via each run's smallest original
+               index, reusing the same struct+idx-sort shape a second
+               time. */
             int64_t n = l->len;
+            KGroupByItem* keyed = (KGroupByItem*)k_alloc(sizeof(KGroupByItem) * (n < 1 ? 1 : n));
+            for (int64_t i = 0; i < n; i++) {
+                keyed[i].key = k_call(args[0], &l->items[i], 1);
+                keyed[i].item = l->items[i];
+                keyed[i].idx = (int)i;
+            }
+            int fast_eligible = n > 1
+                && (keyed[0].key.tag == K_INT || keyed[0].key.tag == K_FLOAT || keyed[0].key.tag == K_F32
+                    || keyed[0].key.tag == K_STR || keyed[0].key.tag == K_SIZEDINT || keyed[0].key.tag == K_BIGINT);
+            if (fast_eligible) {
+                qsort(keyed, n, sizeof(KGroupByItem), k_groupby_cmp);
+                KGroupByItem* out = (KGroupByItem*)k_alloc(sizeof(KGroupByItem) * n);
+                int64_t ng = 0;
+                int64_t i = 0;
+                while (i < n) {
+                    int64_t j = i + 1;
+                    while (j < n && k_key_eq(keyed[i].key, keyed[j].key)) j++;
+                    KValue* bucket = (KValue*)k_alloc(sizeof(KValue) * (j - i));
+                    for (int64_t x = i; x < j; x++) bucket[x - i] = keyed[x].item;
+                    out[ng].key = keyed[i].key;
+                    out[ng].item = k_list(bucket, (int)(j - i));
+                    out[ng].idx = keyed[i].idx;
+                    ng++;
+                    i = j;
+                }
+                qsort(out, ng, sizeof(KGroupByItem), k_groupby_idx_cmp);
+                KValue* gkeys = (KValue*)k_alloc(sizeof(KValue) * (ng < 1 ? 1 : ng));
+                KValue* gvals = (KValue*)k_alloc(sizeof(KValue) * (ng < 1 ? 1 : ng));
+                for (int64_t k = 0; k < ng; k++) { gkeys[k] = out[k].key; gvals[k] = out[k].item; }
+                return k_map_make(gkeys, gvals, (int)ng);
+            }
             KValue* keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
             KValue** buckets = k_alloc(sizeof(KValue*) * (n < 1 ? 1 : n));
             int64_t* counts = k_alloc(sizeof(int64_t) * (n < 1 ? 1 : n));
-            int64_t ng = 0;
+            int64_t ng2 = 0;
             for (int64_t i = 0; i < n; i++) {
-                KValue key = k_call(args[0], &l->items[i], 1);
+                KValue key = keyed[i].key;
                 int64_t g = -1;
-                for (int64_t j = 0; j < ng; j++) if (k_key_eq(keys[j], key)) { g = j; break; }
+                for (int64_t j = 0; j < ng2; j++) if (k_key_eq(keys[j], key)) { g = j; break; }
                 if (g < 0) {
-                    g = ng;
-                    keys[ng] = key;
-                    buckets[ng] = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
-                    counts[ng] = 0;
-                    ng++;
+                    g = ng2;
+                    keys[ng2] = key;
+                    buckets[ng2] = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+                    counts[ng2] = 0;
+                    ng2++;
                 }
-                buckets[g][counts[g]++] = l->items[i];
+                buckets[g][counts[g]++] = keyed[i].item;
             }
-            KValue* vals = k_alloc(sizeof(KValue) * (ng < 1 ? 1 : ng));
-            for (int64_t j = 0; j < ng; j++) vals[j] = k_list(buckets[j], (int)counts[j]);
-            return k_map_make(keys, vals, ng);
+            KValue* vals = k_alloc(sizeof(KValue) * (ng2 < 1 ? 1 : ng2));
+            for (int64_t j = 0; j < ng2; j++) vals[j] = k_list(buckets[j], (int)counts[j]);
+            return k_map_make(keys, vals, ng2);
         }
         if (!strcmp(name, "position")) {
             for (int64_t i = 0; i < l->len; i++)
@@ -9108,6 +9183,27 @@ fun main() uses io {
                    print(\"{bs.len()}|{bs.contains(big(5))}|{ss.len()}|{rs.len()}|{rs.contains(rat(1, 2))}\")\n}\n";
         let out = native_main_stdout(src, "set_from_list_bigint_sizedint_rational");
         assert_eq!(out.trim(), "3|true|3|2|true");
+    }
+
+    /// `List.group_by`'s own O(n log n) fast path (production-hardening
+    /// PR-it827, the FIFTH instance of the naive-O(n^2)-collection-algorithm
+    /// bug class): confirms BigInt/SizedInt/F32 KEY coverage and Rational
+    /// KEY exclusion, gated on the grouping key's runtime type (not the
+    /// list element's) -- `k_groupby_cmp`/`k_groupby_idx_cmp`/
+    /// `KGroupByItem` mirror `k_sort_cmp`/`k_sortidx_cmp`/`KSortListItem`.
+    #[test]
+    fn native_group_by_fast_path_covers_bigint_sizedint_f32_and_excludes_rational() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let gb = [big(5), big(3), big(5), big(1)].group_by(fn x { x })\n    \
+                   let gi = [5i32, 3i32, 5i32, 1i32].group_by(fn x { x })\n    \
+                   let gf = [5.0f32, 3.0f32, 5.0f32].group_by(fn x { x })\n    \
+                   let gr = [rat(1, 2), rat(1, 3), rat(1, 2)].group_by(fn x { x })\n    \
+                   print(\"{gb.len()}|{gb.get_or(big(5), []).len()}|{gi.len()}|{gf.len()}|{gr.len()}|{gr.get_or(rat(1, 2), []).len()}\")\n}\n";
+        let out = native_main_stdout(src, "group_by_bigint_sizedint_f32_rational");
+        assert_eq!(out.trim(), "3|2|3|2|2|2");
     }
 
     /// Native `.sort()` correctly sorts a large (30,000-element) reverse-sorted list --

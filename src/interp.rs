@@ -2631,13 +2631,73 @@ pub fn shared_method(
         }
         (Value::List(items), "group_by") => {
             let f = args.into_iter().next().ok_or("`group_by` needs a function")?;
+            // A REAL, live-confirmed severe latency divergence found+fixed
+            // (production-hardening PR-it827), the FIFTH instance of this
+            // campaign's recurring "naive O(n^2) collection algorithm" bug
+            // class (after Int.pow it814, List.sort it818, List.unique
+            // it825, set_from_list it826): the naive fallback below finds
+            // each item's bucket via a LINEAR SCAN through the buckets
+            // seen so far, so grouping by a mostly-distinct key is O(n^2)
+            // (live-confirmed: 1.38s/22.08s for 5,000/20,000 distinct-key
+            // Ints, ~16x time for 4x size). Keys are computed EAGERLY, in
+            // original list order, BEFORE branching on which path runs, so
+            // `f`'s call count/order (and any side effects) are IDENTICAL
+            // either way. FAST PATH (type-gated exactly like PR-it825/
+            // it826, on the KEY's runtime type -- guaranteed homogeneous by
+            // KUPL's static typing the same way the list's OWN element
+            // type is, Rational excluded for the same cheap-`==`-vs-
+            // expensive-`sort_order` asymmetry): sort by (key via
+            // `sort_order`, then original index) so equal-key runs are
+            // contiguous AND already in original list order -- the index
+            // tiebreaker is needed because `qsort`'s C mirror isn't
+            // guaranteed stable. Runs are split via `value_key_eq`
+            // (matching `Map`'s OWN key identity, NaN-collapsing, same as
+            // PR-it826) -- `sort_order`-equal implies `value_key_eq`-equal
+            // for every type in this fast-path set (NaN-clustering agrees
+            // with NaN-collapsing here, as PR-it826 already established),
+            // so no non-contiguous equal-key elements can be missed.
+            // Group order is then restored to FIRST-SEEN order (the
+            // documented contract) via each run's smallest original index.
+            fn group_by_fast_eligible(v: &Value) -> bool {
+                matches!(
+                    v,
+                    Value::Int(_)
+                        | Value::Float(_)
+                        | Value::F32(_)
+                        | Value::Str(_)
+                        | Value::SizedInt(_)
+                        | Value::BigInt(_)
+                )
+            }
+            let mut keyed: Vec<(Value, Value, usize)> = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let key = call(f.clone(), vec![item.clone()])?;
+                keyed.push((key, item.clone(), i));
+            }
+            if keyed.len() > 1 && keyed.first().is_some_and(|(k, _, _)| group_by_fast_eligible(k)) {
+                keyed.sort_by(|a, b| sort_order(&a.0, &b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.2.cmp(&b.2)));
+                let mut groups: Vec<(Value, Vec<Value>, usize)> = Vec::new();
+                let mut i = 0;
+                while i < keyed.len() {
+                    let mut j = i + 1;
+                    while j < keyed.len() && value_key_eq(&keyed[i].0, &keyed[j].0) {
+                        j += 1;
+                    }
+                    let first_idx = keyed[i].2;
+                    let bucket = keyed[i..j].iter().map(|(_, v, _)| v.clone()).collect();
+                    groups.push((keyed[i].0.clone(), bucket, first_idx));
+                    i = j;
+                }
+                groups.sort_by_key(|(_, _, first_idx)| *first_idx);
+                let pairs = groups.into_iter().map(|(k, vs, _)| (k, Value::List(Rc::new(vs)))).collect();
+                return Ok(Value::Map(Rc::new(pairs)));
+            }
             // first-seen key order preserved (Map is insertion-ordered)
             let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
-            for item in items.iter() {
-                let key = call(f.clone(), vec![item.clone()])?;
+            for (key, item, _) in keyed {
                 match groups.iter_mut().find(|(k, _)| value_key_eq(k, &key)) {
-                    Some((_, list)) => list.push(item.clone()),
-                    None => groups.push((key, vec![item.clone()])),
+                    Some((_, list)) => list.push(item),
+                    None => groups.push((key, vec![item])),
                 }
             }
             let pairs = groups

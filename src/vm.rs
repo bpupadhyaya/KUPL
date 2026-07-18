@@ -16998,6 +16998,11 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
         let sm = "fun probe() -> Str { let nan = 0.0 / 0.0\n    let s = Set([nan, nan, 1.0])\n    \
                   let m = Map().insert(nan, 1).insert(nan, 2)\n    \"{s.len()}|{m.len()}|{m.get_or(nan, 0 - 1)}\" }\n";
         assert_eq!(differential(sm), "2|1|2");
+        // group_by's output is a Map, so its key identity is the same NaN-collapsing
+        // notion (production-hardening PR-it827): two NaN keys land in ONE bucket, not two.
+        let gb = "fun probe() -> Str { let nan = 0.0 / 0.0\n    \
+                  let g = [nan, nan, 1.0].group_by(fn x { x })\n    \"{g.len()}\" }\n";
+        assert_eq!(differential(gb), "2");
     }
 
     #[test]
@@ -19006,6 +19011,37 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
                 "fun probe() -> Str {\n    let s = Set([rat(1, 2), rat(1, 3), rat(1, 2)])\n    \"{s.len()}|{s.contains(rat(1, 2))}\"\n}\n"
             ),
             "2|true"
+        );
+    }
+
+    /// `List.group_by`'s own O(n log n) fast path (production-hardening
+    /// PR-it827, the FIFTH instance of the naive-O(n^2)-collection-algorithm
+    /// bug class, after Int.pow it814/List.sort it818/List.unique it825/
+    /// set_from_list it826): confirms BigInt/SizedInt/F32 KEY coverage and
+    /// Rational KEY exclusion, gated on the grouping key's runtime type
+    /// (not the list element's), plus that the fallback path still groups
+    /// Rational keys correctly (just via the O(n^2) scan).
+    #[test]
+    fn diff_group_by_fast_path_covers_bigint_sizedint_f32_and_excludes_rational() {
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let g = [big(5), big(3), big(5), big(1)].group_by(fn x { x })\n    \"{g.len()}|{g.get_or(big(5), []).len()}\"\n}\n"
+            ),
+            "3|2"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    [5i32, 3i32, 5i32, 1i32].group_by(fn x { x }).len()\n}\n"),
+            "3"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    [5.0f32, 3.0f32, 5.0f32].group_by(fn x { x }).len()\n}\n"),
+            "2"
+        );
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let g = [rat(1, 2), rat(1, 3), rat(1, 2)].group_by(fn x { x })\n    \"{g.len()}|{g.get_or(rat(1, 2), []).len()}\"\n}\n"
+            ),
+            "2|2"
         );
     }
 
