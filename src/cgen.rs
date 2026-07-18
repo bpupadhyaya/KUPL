@@ -1837,6 +1837,21 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
                 /* mirror value.rs F32 Display: whole -> "%.1f", else the shortest
                    decimal that round-trips AS A FLOAT (strtof, not strtod) */
                 float ff = x.as.f32v;
+                /* Match Rust's f32 Display for non-finite values
+                   (production-hardening PR-it830): NaN -> "NaN", infinities
+                   -> "inf"/"-inf" -- mirrors k_fmt_float's OWN identical
+                   guard for f64/Float, just below in this file. Before this
+                   fix, NaN fell through to the %g-based loop below, which
+                   this libc renders as lowercase "nan" (a real, live-
+                   confirmed diagnostic-text divergence from interp's
+                   "NaN", discovered as a byproduct of PR-it828's testing).
+                   Infinity happened to already match by coincidence of
+                   this libc's own %g spelling, but an explicit guard is
+                   added for the SAME portability reason k_fmt_float
+                   already documents (some libc's spell infinity
+                   differently via %g, e.g. "1.#INF"). */
+                if (isnan(ff)) { kb_puts(b, "NaN"); break; }
+                if (isinf(ff)) { kb_puts(b, ff < 0 ? "-inf" : "inf"); break; }
                 if (isfinite(ff) && ff == floorf(ff)) {
                     snprintf(tmp, sizeof tmp, "%.1f", (double)ff);
                 } else {
@@ -9357,20 +9372,12 @@ fun main() uses io {
                    let ur = Set([rat(1, 2), rat(1, 3)]).union(Set([rat(1, 3), rat(2, 3)]))\n    \
                    print(\"{ub}|{ui}|{uf}|{ur}\")\n}\n";
         let out = native_main_stdout(src, "set_union_bigint_sizedint_f32_rational");
-        // NOTE: native prints F32 NaN as lowercase "nan", NOT "NaN" like interp/
-        // Float (f64) -- a REAL, PRE-EXISTING diagnostic-text-only divergence
-        // discovered as a byproduct of writing this test (unrelated to this
-        // fix's own correctness: `k_fmt_float` for f64 has an explicit
-        // `if (isnan(f)) { kb_puts(b, "NaN"); return; }` guard, but F32's own
-        // inlined display code has NO equivalent guard and falls through to a
-        // `%g`-based loop, which this libc renders as lowercase "nan"). Left
-        // OUT OF SCOPE for this iteration (Set.union's O(n^2) fix); flagged
-        // for a future iteration via dotfiles memory. This assertion pins the
-        // CURRENT (buggy) native behavior so this test doesn't spuriously fail
-        // on an unrelated issue; the union FAST PATH's own NaN-collapsing
-        // correctness is separately confirmed via the vm.rs differential test
-        // (interp vs VM, both correctly showing "NaN").
-        assert_eq!(out.trim(), "Set{3, 1, 4, 5}|3|Set{1.0, nan, 2.0}|Set{1/2, 1/3, 2/3}");
+        // Native's F32 NaN Display previously printed lowercase "nan" here
+        // (a real, pre-existing divergence discovered as a byproduct of
+        // writing this test at PR-it828, fixed at PR-it830 by adding the
+        // same `isnan` guard `k_fmt_float` already has for f64) -- now
+        // matches interp's "NaN" exactly.
+        assert_eq!(out.trim(), "Set{3, 1, 4, 5}|3|Set{1.0, NaN, 2.0}|Set{1/2, 1/3, 2/3}");
     }
 
     /// `Set.intersect`/`difference`/`symmetric_difference`/`is_subset`/
@@ -9397,14 +9404,11 @@ fun main() uses io {
                    print(\"{ar.intersect(br)}|{ar.difference(br)}|{ar.is_superset(br)}\")\n    \
                    print(\"{empty.is_subset(ie)}|{ie.is_subset(empty)}|{ie.is_superset(empty)}|{ie.intersect(ie).len()}|{ie.difference(ie).len()}\")\n}\n";
         let out = native_main_stdout(src, "set_algebra_bigint_sizedint_f32_rational");
-        // NOTE: native's F32 NaN prints as lowercase "nan" (the SAME pre-
-        // existing, out-of-scope divergence documented in the `union` test
-        // above) -- pinned here, not re-litigated.
         assert_eq!(
             out.trim(),
             "Set{1, 4}|Set{3}|Set{3}|false|true\n\
              1|1|2\n\
-             Set{nan}|Set{1.0, 2.0}|Set{1.0, 2.0, 3.0}\n\
+             Set{NaN}|Set{1.0, 2.0}|Set{1.0, 2.0, 3.0}\n\
              Set{1/3}|Set{1/2}|false\n\
              true|false|true|3|0"
         );
@@ -12285,6 +12289,30 @@ fun main() uses io {
                    print(1.0 / 0.0)\n    print(-1.0 / 0.0)\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "naninf"), "NaN\ninf\n-inf\n");
+        }
+    }
+
+    /// The F32 analogue of `native_nan_inf_display` above (production-
+    /// hardening PR-it830): F32's OWN inlined Display case (distinct from
+    /// `k_fmt_float`, which only handles f64/`Float`) was MISSING the
+    /// `isnan`/`isinf` guards entirely, so NaN fell through to a `%g`-based
+    /// loop that this libc renders as lowercase "nan" (live-confirmed via a
+    /// standalone `print(0.0f32/0.0f32)` repro, discovered as a byproduct
+    /// of PR-it828's own testing) -- infinity happened to already match by
+    /// coincidence of this libc's `%g` spelling. FIX added the SAME two
+    /// guards `k_fmt_float` already has, confirmed via `interp::format_float`
+    /// (backing `Float.fmt()`, which F32 has no equivalent of) that the
+    /// lowercase "nan" convention documented in `k_fmt_float`'s own comment
+    /// is specific to `.fmt()`, NOT Display -- so this was a genuine
+    /// divergence from `value.rs`'s canonical `Value::F32` Display (which
+    /// uses the SAME `write!(f, "{x}")` as `Value::Float`, both relying on
+    /// Rust's own float Display, which prints "NaN" for both f32 and f64).
+    #[test]
+    fn native_f32_nan_inf_display() {
+        let src = "fun main() uses io {\n    print(0.0f32 / 0.0f32)\n    \
+                   print(1.0f32 / 0.0f32)\n    print(-1.0f32 / 0.0f32)\n}\n";
+        if cc_available() {
+            assert_eq!(native_main_stdout(src, "f32naninf"), "NaN\ninf\n-inf\n");
         }
     }
 
