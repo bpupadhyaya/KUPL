@@ -340,9 +340,50 @@ fn gate(recv: &Value, args: &[Value], image: &ProgramImage) -> Option<(Vec<Porta
 }
 
 /// Evaluate `fname` on every element across worker threads, returning the
-/// per-element results in INPUT-INDEX ORDER. Each worker owns a disjoint index
-/// range, builds one thread-local `Interp`, and returns its results in order;
-/// `PortableValue` is the only thing that crosses a thread boundary.
+/// per-element results in INPUT-INDEX ORDER (or a PREFIX of them, up through
+/// and including the first error — see below). Each worker owns a disjoint
+/// index range, builds one thread-local `Interp`, and returns its results in
+/// order; `PortableValue` is the only thing that crosses a thread boundary.
+///
+/// UNSCOPED threads + a channel, not `std::thread::scope` (production-
+/// hardening PR-it821): a REAL, live-confirmed HANG bug found+fixed. `scope()`
+/// is a Rust std API GUARANTEE that it cannot return until EVERY spawned
+/// thread has been joined — so if ANY worker's chunk contains a genuinely
+/// non-terminating element (an infinite loop; `eval_one` only catches KUPL-
+/// level PANICS, `Err(Flow::Panic{..})`, not non-termination), the WHOLE call
+/// hangs forever, even when a DIFFERENT worker already found a definitive
+/// error. Confirmed live (it815): a 400-element list, index 0 panics
+/// (division by zero), index 300 never terminates — `kupl run`/`--vm` hung
+/// indefinitely (required `kill -9`); `kupl native` (no real threading here)
+/// completed instantly with a clean panic. Sequential `interp.rs` evaluates
+/// index by index and stops at the FIRST error, so it does NOT hang on this
+/// exact input (it never reaches index 300) — the threaded path must match
+/// that, not just avoid hanging in general.
+///
+/// Each worker sends `(worker_index, Vec<Result<..>>)` back over an
+/// `mpsc::channel` as soon as its OWN chunk finishes (whether every element
+/// succeeded or one panicked — `.map().collect()` doesn't short-circuit
+/// internally, so a worker always finishes its full chunk quickly unless one
+/// of ITS OWN elements doesn't terminate). After every message, check whether
+/// the CONTIGUOUS PREFIX of workers received so far (worker 0, then 1, then
+/// 2, …, with no gap) contains an error anywhere: if so, return immediately
+/// with just that prefix — this is enough for the caller (`try_par_map`/
+/// `try_par_filter`, which already short-circuits at the first `Err` in
+/// index order) to produce the byte-identical answer, and it means we never
+/// need to wait on a worker whose chunk starts AFTER the earliest error,
+/// hung or not. A worker whose chunk starts BEFORE an unresolved gap can
+/// never be skipped this way — matching interp: if the EARLIEST failing (or
+/// non-terminating) element is genuinely upstream of everything else, both
+/// engines block on it identically, which is correct, not a regression.
+///
+/// Any worker we return without waiting for is simply ABANDONED: its
+/// `JoinHandle` (implicitly, since it's never bound to a variable) is
+/// dropped, which DETACHES the OS thread rather than killing it — it keeps
+/// running in the background, holding its own `Arc<ProgramImage>` clone and
+/// owned input slice, until it naturally finishes or the whole process
+/// exits. Rust has no safe thread-cancellation API; this is the best
+/// achievable outcome without one, and was the exact tradeoff already
+/// reasoned through (but not yet implemented) at PR-it815.
 fn par_eval(
     portable: &[PortableValue],
     fname: &str,
@@ -352,54 +393,74 @@ fn par_eval(
     let workers =
         std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).clamp(1, n.max(1));
     let chunk = n.div_ceil(workers);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for w in 0..workers {
-            let start = w * chunk;
-            if start >= n {
-                break;
+
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<Result<PortableValue, String>>)>();
+    let mut num_spawned = 0usize;
+    for w in 0..workers {
+        let start = w * chunk;
+        if start >= n {
+            break;
+        }
+        let end = ((w + 1) * chunk).min(n);
+        // Owned, not borrowed: an unscoped thread must be `'static`.
+        let owned_slice: Vec<PortableValue> = portable[start..end].to_vec();
+        let image = Arc::clone(image);
+        let fname = fname.to_string();
+        let tx = tx.clone();
+        // Same 2GiB stack sizing as before (PR-it729) -- unrelated to this
+        // fix, still required for the SAME reason (a pure function
+        // recursing near MAX_CALL_DEPTH must hit the clean guard panic, not
+        // a real native stack overflow).
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(move || {
+                let mut interp = crate::interp::Interp::new_bare(image.worker_db());
+                let results =
+                    owned_slice.iter().map(|p| eval_one(&mut interp, &fname, p)).collect::<Vec<_>>();
+                // Ignore a send failure: it only means the receiver already
+                // returned early (an earlier worker's prefix had an error)
+                // and dropped `rx` -- this worker's own result is simply
+                // discarded, exactly as intended.
+                let _ = tx.send((w, results));
+            })
+            .expect("spawn par_map/par_filter worker thread");
+        num_spawned += 1;
+    }
+    drop(tx); // our own extra sender; each worker holds its own clone
+
+    let mut slots: Vec<Option<Vec<Result<PortableValue, String>>>> = vec![None; num_spawned];
+    let mut received = 0usize;
+    while received < num_spawned {
+        match rx.recv() {
+            Ok((w, results)) => {
+                slots[w] = Some(results);
+                received += 1;
             }
-            let end = ((w + 1) * chunk).min(n);
-            let slice = &portable[start..end];
-            let image = image;
-            // A REAL, uncatchable-crash bug found+fixed (production-hardening
-            // PR-it729, found via a scoped Explore survey): `scope.spawn`
-            // gives a worker thread Rust's DEFAULT stack size, unlike
-            // main.rs's OWN main thread, which is deliberately spawned with a
-            // 2GiB stack SPECIFICALLY so the interpreter's recursion can
-            // reach `MAX_CALL_DEPTH` (10 000) and hit that guard's CLEAN
-            // "stack overflow" panic before exhausting the native stack. A
-            // pure function recursing to depth 9500 -- legitimately within
-            // the documented limit, and confirmed to succeed cleanly when
-            // called SEQUENTIALLY (the main thread's own large stack) --
-            // crashed the WHOLE PROCESS when routed through `par_map`
-            // instead: `thread '<unknown>' has overflowed its stack`,
-            // `fatal runtime error: stack overflow, aborting`, exit code 134
-            // (SIGABRT) -- a genuine, uncatchable process abort, not the
-            // clean `MAX_CALL_DEPTH` panic every OTHER recursion path
-            // produces. `std::thread::Builder::spawn_scoped` (stable since
-            // Rust 1.63) lets a worker use the SAME `Builder` configuration
-            // (including `stack_size`) as a plain scoped `spawn`, so this
-            // gives every worker the IDENTICAL 2GiB reservation main.rs's
-            // own comment already justifies as cheap (the reservation is
-            // virtual; only touched pages commit) -- closing the gap with
-            // the SAME technique already trusted elsewhere in this codebase,
-            // not a new one.
-            let handle = std::thread::Builder::new()
-                .stack_size(2 * 1024 * 1024 * 1024)
-                .spawn_scoped(scope, move || {
-                    let mut interp = crate::interp::Interp::new_bare(image.worker_db());
-                    slice.iter().map(|p| eval_one(&mut interp, fname, p)).collect::<Vec<_>>()
-                })
-                .expect("spawn par_map/par_filter worker thread");
-            handles.push(handle);
+            // All senders dropped without every worker reporting -- only
+            // possible if a worker suffered a REAL Rust panic (not a KUPL
+            // one; those are already caught inside `eval_one`), which drops
+            // its `tx` clone during unwinding. Break out; the `.expect(..)`
+            // below turns this into a loud, unmissable crash, matching the
+            // ORIGINAL code's own `.expect("par worker thread panicked")`
+            // intent for this exceedingly rare, non-user-triggered case.
+            Err(_) => break,
         }
-        let mut all = Vec::with_capacity(n);
-        for h in handles {
-            all.extend(h.join().expect("par worker thread panicked"));
+        let prefix_len = slots.iter().take_while(|s| s.is_some()).count();
+        let has_error =
+            slots[..prefix_len].iter().any(|s| s.as_ref().unwrap().iter().any(|r| r.is_err()));
+        if has_error {
+            let mut out = Vec::with_capacity(n);
+            for slot in &slots[..prefix_len] {
+                out.extend(slot.as_ref().unwrap().iter().cloned());
+            }
+            return out;
         }
-        all
-    })
+    }
+    let mut out = Vec::with_capacity(n);
+    for slot in slots {
+        out.extend(slot.expect("par worker thread panicked (no result received)"));
+    }
+    out
 }
 
 /// Evaluate the pure function on one element (thread-local `Value`s only).
@@ -476,5 +537,158 @@ mod tests {
         // a list containing a non-portable element is itself non-portable
         let mixed = Value::List(Rc::new(vec![Value::Int(1), Value::Fun(Rc::new("f".into()))]));
         assert!(to_portable(&mixed).is_none());
+    }
+
+    /// Runs a REAL `kupl run`/`kupl run --vm` subprocess and returns its output,
+    /// or `None` if it doesn't finish within `timeout` -- a genuine hang, not
+    /// just a slow run. Mirrors `main.rs::tests::wait_with_timeout` exactly
+    /// (same reasoning: `wait_with_output`, not a hand-rolled `try_wait`
+    /// polling loop, so the child's stdout/stderr get drained concurrently on
+    /// a background thread and can never pipe-deadlock against this test,
+    /// racing that against the timeout via a channel). Duplicated rather than
+    /// shared across crates/modules since `main.rs`'s copy is private to its
+    /// own `#[cfg(test)]` module.
+    fn wait_with_timeout(
+        child: std::process::Child,
+        timeout: std::time::Duration,
+    ) -> Option<std::process::Output> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        rx.recv_timeout(timeout).ok().and_then(Result::ok)
+    }
+
+    /// A REAL, live-confirmed HANG bug found+fixed (production-hardening
+    /// PR-it821, first surfaced and deliberately deferred at PR-it815): a
+    /// `par_map`/`par_filter` call over a `THRESHOLD`-or-larger list whose
+    /// EARLIEST panicking element sits in one worker's chunk while a LATER,
+    /// genuinely non-terminating element sits in a DIFFERENT worker's chunk
+    /// used to hang the whole program forever -- `std::thread::scope`
+    /// guarantees it cannot return until every spawned thread joins, so the
+    /// hung worker blocked the entire call even though a definitive error was
+    /// already available. Sequential `interp.rs` does NOT hang on this input
+    /// (it evaluates index by index and stops at the FIRST error, never
+    /// reaching the later non-terminating element), so the threaded path
+    /// must match that -- not merely "avoid hanging in general," but resolve
+    /// exactly when interp itself would. Spawns a REAL `kupl run`/`kupl run
+    /// --vm` subprocess (not an in-process call) since the hang is a genuine
+    /// OS-thread block that an in-process test could itself get stuck on;
+    /// bounded to 15s (this repro resolves in ~1-2s when fixed; 15s is a
+    /// wide, CI-safe margin with no risk of confusing "slow" with "hung",
+    /// unlike a tight wall-clock LATENCY assertion -- the two outcomes here
+    /// are "resolves in a couple seconds" vs "never resolves at all," not a
+    /// close call sensitive to CPU contention).
+    #[test]
+    fn par_map_does_not_hang_when_an_earlier_panic_makes_a_later_infinite_loop_unreachable() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let src = "fun bad(x: Int) -> Int {\n    \
+                   if x == 0 {\n        1 / x\n    } else if x == 300 {\n        \
+                   var y = 0\n        while true {\n            y = y + 1\n        }\n        y\n    \
+                   } else {\n        x\n    }\n}\n\
+                   fun main() uses io {\n    \
+                   var xs = []\n    var i = 0\n    while i < 400 {\n        xs = xs.push(i)\n        i = i + 1\n    }\n    \
+                   let ys = xs.par_map(bad)\n    print(\"{ys.len()}\")\n}\n";
+        let dir = std::env::temp_dir().join(format!("kupl-parallel-hang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hang.kupl");
+        std::fs::write(&path, src).unwrap();
+        for extra_args in [vec![], vec!["--vm".to_string()]] {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.arg("run");
+            for a in &extra_args {
+                cmd.arg(a);
+            }
+            cmd.arg(&path);
+            let child = cmd
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("kupl run spawns");
+            let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+            let out = out.unwrap_or_else(|| {
+                panic!("kupl run {extra_args:?} hung instead of returning the earlier panic")
+            });
+            let combined =
+                format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(
+                combined.contains("division by zero"),
+                "expected the earlier (index 0) panic, got: {combined:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `par_filter` analogue of the hang-fix test above, same root cause
+    /// and same fix -- `try_par_filter` shares the exact same `par_eval`.
+    #[test]
+    fn par_filter_does_not_hang_when_an_earlier_panic_makes_a_later_infinite_loop_unreachable() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let src = "fun badpred(x: Int) -> Bool {\n    \
+                   if x == 0 {\n        1 / x == 0\n    } else if x == 300 {\n        \
+                   var y = 0\n        while true {\n            y = y + 1\n        }\n        y == 0\n    \
+                   } else {\n        x % 2 == 0\n    }\n}\n\
+                   fun main() uses io {\n    \
+                   var xs = []\n    var i = 0\n    while i < 400 {\n        xs = xs.push(i)\n        i = i + 1\n    }\n    \
+                   let ys = xs.par_filter(badpred)\n    print(\"{ys.len()}\")\n}\n";
+        let dir = std::env::temp_dir().join(format!("kupl-parallel-filter-hang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("filterhang.kupl");
+        std::fs::write(&path, src).unwrap();
+        let child = std::process::Command::new(&bin)
+            .arg("run")
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.unwrap_or_else(|| panic!("kupl run par_filter hung instead of returning the earlier panic"));
+        let combined =
+            format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(combined.contains("division by zero"), "expected the earlier (index 0) panic, got: {combined:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `par_map`/`par_filter`'s happy path (no errors anywhere) is unaffected
+    /// by the hang fix above -- still produces the SAME result as sequential
+    /// `map`/`filter`, exercised via the real threaded fast path (both
+    /// callbacks are named top-level pure functions over a list well past
+    /// `THRESHOLD`).
+    #[test]
+    fn par_map_and_par_filter_happy_path_matches_sequential_after_the_hang_fix() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let src = "fun sq(x: Int) -> Int { x * x }\n\
+                   fun div7(x: Int) -> Bool { x % 7 == 0 }\n\
+                   fun main() uses io {\n    \
+                   var xs = []\n    var i = 0\n    while i < 500 {\n        xs = xs.push(i)\n        i = i + 1\n    }\n    \
+                   let ys = xs.par_map(sq)\n    let zs = xs.par_filter(div7)\n    \
+                   let seq_ys = xs.map(sq)\n    let seq_zs = xs.filter(div7)\n    \
+                   print(\"{ys == seq_ys}|{zs == seq_zs}|{ys.len()}|{zs.len()}\")\n}\n";
+        let dir = std::env::temp_dir().join(format!("kupl-parallel-happy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("happy.kupl");
+        std::fs::write(&path, src).unwrap();
+        let child = std::process::Command::new(&bin)
+            .arg("run")
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.unwrap_or_else(|| panic!("kupl run par_map/par_filter happy path hung"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout.trim(), "true|true|500|72", "stdout={stdout:?} stderr={:?}", String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
