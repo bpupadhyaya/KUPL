@@ -7623,6 +7623,60 @@ mod tests {
         );
     }
 
+    /// A REAL, live-confirmed silent value-corruption bug found+fixed
+    /// (production-hardening PR-it822), a FOURTH untracked edge in
+    /// `reg_traces_to_a_parameter` (Move/PR-it615, GetField/PR-it819,
+    /// IterGet/PR-it820, now StateGet/PR-it822): `var xs = items; xs =
+    /// xs.push(item)` -- snapshotting a component STATE field into a local
+    /// -- compiles `items`'s read to `Op::StateGet`, entirely untracked by
+    /// the escape analysis. `k_state_get` (cgen.rs) is a shallow struct
+    /// copy with no clone/refcount bump, so `xs` becomes the literal same
+    /// heap object the instance's OWN state slot holds. `xs.push(item)`
+    /// then wrongly took the in-place fast path, silently mutating the
+    /// component's persisted state with no `items = ...` assignment
+    /// anywhere in the source. Fixed by treating any register written by
+    /// `Op::StateGet` as unconditionally unsafe (it has no source register
+    /// to recurse into at all, unlike `GetField`/`IterGet` -- a state slot
+    /// can be read again by ANY future handler call on this instance, an
+    /// even stronger case for "always unsafe" than a loop variable).
+    #[test]
+    fn native_self_rebind_of_a_local_snapshot_of_component_state_does_not_corrupt_the_state() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Leaker {\n    intent \"l\"\n    state items: List[Int] = []\n    \
+                   expose fun poke() -> List[Int] {\n        var xs = items\n        xs = xs.push(99)\n        items\n    }\n}\n\
+                   fun main() uses io {\n    let l = Leaker()\n    print(\"{l.poke()}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_state_list");
+        assert_eq!(
+            out.trim(),
+            "[]",
+            "native must not corrupt the component's `items` state via poke's internal self-push \
+             on a value snapshotted from state"
+        );
+    }
+
+    /// The Map/Set analogues of the state-snapshot bug above, same root
+    /// cause and same fix.
+    #[test]
+    fn native_self_rebind_of_a_local_snapshot_of_component_state_does_not_corrupt_map_or_set() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component MLeaker {\n    intent \"m\"\n    state m: Map[Str, Int] = Map()\n    \
+                   expose fun poke() -> Map[Str, Int] {\n        var m2 = m\n        m2 = m2.insert(\"z\", 99)\n        m\n    }\n}\n\
+                   component SLeaker {\n    intent \"s\"\n    state s: Set[Int] = Set()\n    \
+                   expose fun poke() -> Set[Int] {\n        var s2 = s\n        s2 = s2.insert(99)\n        s\n    }\n}\n\
+                   fun main() uses io {\n    let ml = MLeaker()\n    let sl = SLeaker()\n    \
+                   print(\"{ml.poke()}|{sl.poke()}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_state_mapset");
+        assert_eq!(
+            out.trim(),
+            "Map{}|Set{}",
+            "native must not corrupt component state via poke's internal self-insert on a value snapshotted from state"
+        );
+    }
+
     /// Production-hardening PR-it790: a close structural read of `emit_op`'s
     /// self-rebind fast paths (following it615's real parameter-alias bug)
     /// surfaced that `aliasing_regs` (bytecode.rs) never lists `Op::Method`

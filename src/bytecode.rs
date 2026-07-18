@@ -456,6 +456,33 @@ pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool
                     return true;
                 }
             }
+            // production-hardening PR-it822: a REAL, live-confirmed silent
+            // value-corruption bug -- the FOURTH untracked edge found in
+            // this exact function (Move/PR-it615, GetField/PR-it819,
+            // IterGet/PR-it820). `var xs = items` (snapshotting a component
+            // STATE field into a local) compiles to `Op::StateGet(dst,
+            // slot)` followed by a `Move` into the local's own register.
+            // `k_state_get` (cgen.rs) is `return k_insts[cur].slots[slot];`
+            // -- a shallow copy, no clone/refcount bump -- so `xs` becomes
+            // the literal same heap object the instance's OWN state slot
+            // holds. `xs = xs.push(item)` then wrongly took the in-place
+            // fast path, silently mutating the component's persisted state
+            // with no `items = ...` assignment anywhere in the source.
+            // UNLIKE `GetField`/`IterGet`, `Op::StateGet` has no source
+            // REGISTER to recurse into at all (it reads directly from the
+            // instance's state array by a compile-time slot index, not
+            // another chunk register) -- so there is no recursive case to
+            // write here, only an unconditional one. This is in fact an
+            // EVEN STRONGER case for "always unsafe" than `IterGet`: a
+            // state slot's value can be read again by ANY future handler
+            // invocation on this same instance, for the ENTIRE remaining
+            // lifetime of the component -- far beyond anything even a
+            // whole-chunk (let alone loop-body) window could ever see.
+            if let Op::StateGet(dst, _) = op {
+                if *dst == reg {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -925,6 +952,30 @@ mod escape_tests {
         // IterGet-written register, same as the field-read chain test
         // above but for the iteration-variable case.
         let c = chunk_with_params(0, vec![Op::IterGet { dst: 0, iter: 5, idx: 6 }, Op::Move(1, 0), self_push(1)]);
+        assert!(reg_traces_to_a_parameter(&c, 2, 1));
+    }
+
+    #[test]
+    fn a_component_state_read_always_traces_to_a_parameter() {
+        // production-hardening PR-it822: `var xs = items; xs = xs.push(item)`
+        // -- items is a component STATE field, not a parameter or capture,
+        // so nparams=0 here too, same shape as the IterGet case above.
+        // Unlike GetField/IterGet, Op::StateGet has no source REGISTER at
+        // all (it reads directly from the instance's state array by a
+        // compile-time slot index) -- so there's nothing to recurse into;
+        // any register it writes must be unconditionally unsafe, since a
+        // state slot's value can be read again by ANY future handler
+        // invocation on this same instance, for the component's entire
+        // remaining lifetime.
+        let c = chunk_with_params(0, vec![Op::StateGet(0, 0), self_push(0)]);
+        assert!(reg_traces_to_a_parameter(&c, 1, 0));
+    }
+
+    #[test]
+    fn a_move_from_a_state_get_result_is_still_caught() {
+        // var xs = items; xs = xs.push(item) -- via one Move hop, same as
+        // the field-read and iteration-variable chain tests above.
+        let c = chunk_with_params(0, vec![Op::StateGet(0, 0), Op::Move(1, 0), self_push(1)]);
         assert!(reg_traces_to_a_parameter(&c, 2, 1));
     }
 }
