@@ -3716,13 +3716,60 @@ fn sort_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
 pub fn set_from_list(v: &Value) -> Result<Value, String> {
     match v {
         Value::List(items) => {
-            let mut out: Vec<Value> = Vec::new();
-            for it in items.iter() {
-                if !out.iter().any(|x| value_key_eq(x, it)) {
-                    out.push(it.clone());
-                }
+            // A REAL, live-confirmed severe latency divergence found+fixed
+            // (production-hardening PR-it826), the Set(list)-conversion
+            // analogue of PR-it825's `List.unique()` fix, with an even
+            // WORSE observed constant factor (`value_key_eq`'s structural
+            // comparison is more expensive per-call than `==`): the naive
+            // O(n^2) fallback below took 2.09s/29.30s to convert an
+            // 8,000/32,000-element `List[Int]` to a `Set`. FAST PATH:
+            // sort-then-adjacent-dedup is O(n log n), reusing the SAME
+            // `sort_order`/`KSortListItem`/`k_sort_cmp` machinery PR-it825
+            // already established, deliberately type-gated identically
+            // (Int/Float/F32/Str/SizedInt/BigInt only, Rational excluded
+            // for the SAME cheap-`==`-vs-expensive-`sort_order` asymmetry
+            // reason -- `Set(list)` has NO element-type restriction
+            // either, so this falls back to the ORIGINAL O(n^2) scan for
+            // every other type). UNLIKE PR-it825, the adjacent-duplicate
+            // check here uses `value_key_eq`, NOT `==`: Set element
+            // identity is intentionally NaN-COLLAPSING (PR-it691,
+            // `Set([nan, nan, 1.0]).len() == 2`), the OPPOSITE of
+            // `.unique()`'s IEEE-`==`-based, NaN-PRESERVING identity --
+            // and `sort_order`'s own NaN-clustering (PR-it711, all NaNs
+            // sort adjacent) happens to AGREE with `value_key_eq`'s NaN-
+            // collapsing here, unlike PR-it825's case, so no special
+            // handling beyond the equality-predicate swap is needed.
+            fn set_fast_eligible(v: &Value) -> bool {
+                matches!(
+                    v,
+                    Value::Int(_)
+                        | Value::Float(_)
+                        | Value::F32(_)
+                        | Value::Str(_)
+                        | Value::SizedInt(_)
+                        | Value::BigInt(_)
+                )
             }
-            Ok(Value::Set(Rc::new(out)))
+            if items.len() > 1 && items.first().is_some_and(set_fast_eligible) {
+                let mut indexed: Vec<(usize, &Value)> = items.iter().enumerate().collect();
+                indexed.sort_by(|a, b| sort_order(a.1, b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut kept: Vec<(usize, &Value)> = Vec::with_capacity(indexed.len());
+                for pair in indexed {
+                    if kept.last().is_none_or(|last: &(usize, &Value)| !value_key_eq(last.1, pair.1)) {
+                        kept.push(pair);
+                    }
+                }
+                kept.sort_by_key(|(idx, _)| *idx);
+                Ok(Value::Set(Rc::new(kept.into_iter().map(|(_, v)| v.clone()).collect())))
+            } else {
+                let mut out: Vec<Value> = Vec::new();
+                for it in items.iter() {
+                    if !out.iter().any(|x| value_key_eq(x, it)) {
+                        out.push(it.clone());
+                    }
+                }
+                Ok(Value::Set(Rc::new(out)))
+            }
         }
         other => Err(format!("Set(...) needs a List, found {}", other.type_name())),
     }

@@ -18975,6 +18975,40 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         );
     }
 
+    /// The `Set(list)`-conversion analogue of `diff_unique_fast_path_covers_
+    /// bigint_sizedint_f32_and_excludes_rational` above (production-hardening
+    /// PR-it826, `set_from_list`'s own O(n log n) fast path): confirms
+    /// BigInt/SizedInt/F32 coverage and Rational exclusion, same as
+    /// `.unique()`, but via `Str`/`.len()` since `Set`'s own iteration order
+    /// (unlike `List`) isn't part of its `PartialEq`-based `==`/Display
+    /// contract the same way -- checking `.len()` plus a couple of
+    /// `.contains()` probes is enough to prove dedup correctness without
+    /// depending on Set's insertion-order Display formatting matching
+    /// exactly across a differential comparison.
+    #[test]
+    fn diff_set_from_list_fast_path_covers_bigint_sizedint_f32_and_excludes_rational() {
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let s = Set([big(5), big(3), big(5), big(1), big(3)])\n    \"{s.len()}|{s.contains(big(5))}|{s.contains(big(9))}\"\n}\n"
+            ),
+            "3|true|false"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    Set([5i32, 3i32, 5i32, 1i32]).len()\n}\n"),
+            "3"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    Set([5.0f32, 3.0f32, 5.0f32]).len()\n}\n"),
+            "2"
+        );
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let s = Set([rat(1, 2), rat(1, 3), rat(1, 2)])\n    \"{s.len()}|{s.contains(rat(1, 2))}\"\n}\n"
+            ),
+            "2|true"
+        );
+    }
+
     #[test]
     fn diff_par_fork_join() {
         // structured fork-join: independent branches collected into a list,

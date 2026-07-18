@@ -1636,19 +1636,12 @@ static KValue k_set_insert_inplace(KValue recv, KValue item) {
     s->items[s->len++] = item;
     return recv;
 }
-static KValue k_set_from(KValue v) {
-    if (v.tag != K_LIST) k_panic("Set(...) needs a List");
-    KList* l = v.as.list;
-    KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
-    int64_t n = 0;
-    for (int64_t i = 0; i < l->len; i++) {
-        int dup = 0;
-        for (int64_t j = 0; j < n; j++)
-            if (k_key_eq(out[j], l->items[i])) { dup = 1; break; }
-        if (!dup) out[n++] = l->items[i];
-    }
-    return k_set_make(out, n);
-}
+/* k_set_from's definition is placed later in this file (after KSortListItem/
+   k_sort_cmp/k_sortidx_cmp, which it reuses for an O(n log n) fast path,
+   production-hardening PR-it826) -- it has exactly ONE call site, from
+   generated user-chunk code, which `emit_c` always places at the very END
+   of the file (after every runtime-prelude function), so no forward
+   declaration is needed for this relocation to be safe. */
 
 static KValue k_bt_tensor(KValue v) {
     if (v.tag != K_LIST) k_panic("tensor() needs a List[Float]");
@@ -5397,6 +5390,63 @@ static int k_sortidx_cmp(const void* a, const void* b) {
     return x->idx - y->idx;
 }
 
+/* A REAL, live-confirmed severe latency divergence found+fixed
+   (production-hardening PR-it826), the Set(list)-conversion analogue of
+   PR-it825's List.unique() fix, with an even WORSE observed constant
+   factor (k_key_eq's structural comparison is more expensive per-call
+   than k_eq's): the naive O(n^2) fallback below took ~1.3s to convert an
+   8,000-element List[Int] to a Set on a compiled native binary. FAST
+   PATH: sort-then-adjacent-dedup is O(n log n), reusing the SAME
+   KSortListItem/k_sort_cmp/k_sortidx_cmp/k_list_order machinery
+   PR-it825 already established -- relocated here (this function used to
+   sit much earlier in the file, before those were defined) since C
+   needs their full definitions visible for `sizeof`/direct use; this has
+   exactly one call site, from generated user-chunk code, which `emit_c`
+   always places at the very end of the file, so the relocation needed
+   no forward declaration. Deliberately type-gated identically to
+   PR-it825 (Int/Float/F32/Str/SizedInt/BigInt only, Rational excluded
+   for the SAME cheap-k_eq-vs-expensive-k_cmp asymmetry reason, PR-it718)
+   -- Set(list) has NO element-type restriction either, so this falls
+   back to the ORIGINAL O(n^2) scan for every other type. UNLIKE
+   PR-it825, the adjacent-duplicate check here uses k_key_eq, NOT k_eq:
+   Set element identity is intentionally NaN-COLLAPSING (PR-it691,
+   `Set([nan, nan, 1.0]).len() == 2`), the OPPOSITE of `.unique()`'s
+   IEEE-`==`-based, NaN-PRESERVING identity -- and k_list_order's own
+   NaN-clustering (PR-it711, all NaNs sort adjacent) happens to AGREE
+   with k_key_eq's NaN-collapsing here, unlike PR-it825's case, so no
+   special handling beyond the equality-predicate swap is needed. */
+static KValue k_set_from(KValue v) {
+    if (v.tag != K_LIST) k_panic("Set(...) needs a List");
+    KList* l = v.as.list;
+    int fast_eligible = l->len > 1
+        && (l->items[0].tag == K_INT || l->items[0].tag == K_FLOAT || l->items[0].tag == K_F32
+            || l->items[0].tag == K_STR || l->items[0].tag == K_SIZEDINT || l->items[0].tag == K_BIGINT);
+    if (fast_eligible) {
+        int64_t n = l->len;
+        KSortListItem* arr = (KSortListItem*)k_alloc(sizeof(KSortListItem) * n);
+        for (int64_t i = 0; i < n; i++) { arr[i].v = l->items[i]; arr[i].idx = (int)i; }
+        qsort(arr, n, sizeof(KSortListItem), k_sort_cmp);
+        KSortListItem* kept = (KSortListItem*)k_alloc(sizeof(KSortListItem) * n);
+        int64_t kn = 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (kn == 0 || !k_key_eq(kept[kn - 1].v, arr[i].v)) kept[kn++] = arr[i];
+        }
+        qsort(kept, kn, sizeof(KSortListItem), k_sortidx_cmp);
+        KValue* out = (KValue*)k_alloc(sizeof(KValue) * (kn < 1 ? 1 : kn));
+        for (int64_t i = 0; i < kn; i++) out[i] = kept[i].v;
+        return k_set_make(out, kn);
+    }
+    KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
+    int64_t n = 0;
+    for (int64_t i = 0; i < l->len; i++) {
+        int dup = 0;
+        for (int64_t j = 0; j < n; j++)
+            if (k_key_eq(out[j], l->items[i])) { dup = 1; break; }
+        if (!dup) out[n++] = l->items[i];
+    }
+    return k_set_make(out, n);
+}
+
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     if (recv.tag == K_BIGINT) {
         if (!strcmp(name, "pow")) { (void)argc; if (args[0].as.i < 0) k_panic("`pow` exponent must be non-negative"); return k_big_v(k_big_pow(recv, args[0].as.i)); }
@@ -9036,6 +9086,28 @@ fun main() uses io {
                    print(\"{bs}|{ss}|{rs}\")\n}\n";
         let out = native_main_stdout(src, "unique_bigint_sizedint_rational");
         assert_eq!(out.trim(), "[5, 3, 1]|[5, 3, 1]|[1/2, 1/3]");
+    }
+
+    /// The `Set(list)`-conversion analogue of `native_unique_fast_path_covers_
+    /// bigint_sizedint_and_excludes_rational` above (production-hardening
+    /// PR-it826, `k_set_from`'s own O(n log n) fast path -- relocated later
+    /// in the generated C source so `KSortListItem`/`k_sort_cmp` are already
+    /// defined, since C needs the full struct definition visible for
+    /// `sizeof`): confirms BigInt/SizedInt coverage and Rational exclusion,
+    /// same as `.unique()`, via `.len()`/`.contains()` rather than Display
+    /// (Set's insertion-order formatting isn't the point of this test).
+    #[test]
+    fn native_set_from_list_fast_path_covers_bigint_sizedint_and_excludes_rational() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let bs = Set([big(5), big(3), big(5), big(1), big(3)])\n    \
+                   let ss = Set([5i32, 3i32, 5i32, 1i32])\n    \
+                   let rs = Set([rat(1, 2), rat(1, 3), rat(1, 2)])\n    \
+                   print(\"{bs.len()}|{bs.contains(big(5))}|{ss.len()}|{rs.len()}|{rs.contains(rat(1, 2))}\")\n}\n";
+        let out = native_main_stdout(src, "set_from_list_bigint_sizedint_rational");
+        assert_eq!(out.trim(), "3|true|3|2|true");
     }
 
     /// Native `.sort()` correctly sorts a large (30,000-element) reverse-sorted list --
