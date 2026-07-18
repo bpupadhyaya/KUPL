@@ -15466,6 +15466,41 @@ fun probe() -> Str {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it840),
+    /// found by a DELIBERATE, EXHAUSTIVE audit of every Expr-bearing AST field
+    /// against `callargs.rs`'s item walker (prompted by PR-it839 being the
+    /// THIRD gap found in that same walker): an `ai fun`'s body is always a
+    /// parser-synthesized EMPTY block (see `parser.rs::parse_ai_fun`) -- the
+    /// real content lives in `f.ai.intent_expr` (the `intent "..."` string's
+    /// interpolation pieces, a fully general expression), which `check.rs`
+    /// DOES type-check and `interp.rs`/`compile.rs` DO evaluate/compile
+    /// directly, but which `Item::Fun`'s arm never walked (only `f.body`,
+    /// always empty for an `ai fun`). Unlike PR-it839's prop defaults (which
+    /// `check.rs` never visits at all, so THAT gap was silent value
+    /// corruption), `check.rs` DOES visit `intent_expr`, so this gap instead
+    /// caused a LOUD, misleading K0241/K0242 false-rejection of an otherwise-
+    /// legitimate call -- the FOURTH instance of this exact "field missing
+    /// from the item walker" class in this file (after PR-it769's
+    /// `examples`/`laws`, PR-it839's `props[i].default`/`children[i].args`).
+    /// This test uses the SAME `panic("A")`/`panic("B")` side-effect-order
+    /// probe as `diff_named_argument_calls_evaluate_side_effects_in_source_
+    /// written_order` above: the panic fires while evaluating `intent_expr`,
+    /// BEFORE `ai::ai_call` is ever reached, so no real/mocked AI provider
+    /// call happens -- this observes the REWRITE'S effect on evaluation
+    /// order directly, not just that `kupl check` stays silent.
+    #[test]
+    fn diff_named_args_resolve_inside_an_ai_funs_intent_interpolation() {
+        assert_eq!(
+            differential(
+                "fun sub(a: Int, b: Int) -> Int { a - b }\n\
+                 ai fun helper(x: Int) -> Str {\n    \
+                 intent \"{sub(b: panic(\"SIDE_B\"), a: panic(\"SIDE_A\"))}\"\n}\n\
+                 fun probe() -> Str { helper(1) }\n"
+            ),
+            "panic: SIDE_B"
+        );
+    }
+
     #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose

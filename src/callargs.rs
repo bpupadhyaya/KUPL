@@ -59,7 +59,35 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
 
     for item in &mut program.items {
         match item {
-            Item::Fun(f) => walk_block(&mut f.body, &mut visit),
+            // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+            // PR-it840): an `ai fun`'s body is always a parser-synthesized
+            // EMPTY block (see parser.rs's `parse_ai_fun`) -- the actual
+            // content is `f.ai`'s `intent_expr`, a fully general expression
+            // (the `intent "..."` string's interpolation pieces, parsed via
+            // `str_parts_expr`) that `check.rs::check_fun` DOES type-check
+            // (`self.infer_expr(&ai.intent_expr, &mut ctx)`) and that
+            // `interp.rs::call_fun_body`/`compile.rs::compile_ai_fun` DO
+            // evaluate/compile directly -- but this arm only ever walked the
+            // (always-empty) `f.body`, never `f.ai`, so a named-argument or
+            // trailing-default-relying call inside an `intent` interpolation
+            // was silently rejected, the FOURTH instance of this file's
+            // "an Expr-bearing field simply missing from the item walker"
+            // gap class (after PR-it769's `examples`/`laws`, PR-it839's
+            // `props[i].default`/`children[i].args`). Because `check.rs`
+            // DOES independently visit `intent_expr` (unlike PR-it839's prop
+            // defaults, which it skips entirely), this manifests as a LOUD
+            // false-rejection, not silent corruption -- live-confirmed:
+            // `intent "value: {sub(b: panic("B"), a: panic("A"))}"` against
+            // `fun sub(a: Int, b: Int) -> Int { a - b }` failed K0241 on
+            // `kupl check`/`run`/`run --vm` even though the identical call
+            // compiles cleanly everywhere else; `intent "value: {add(10)}"`
+            // against `fun add(a: Int, b: Int = 5) -> Int` failed K0242.
+            Item::Fun(f) => {
+                walk_block(&mut f.body, &mut visit);
+                if let Some(ai) = &mut f.ai {
+                    walk_expr(&mut ai.intent_expr, &mut visit);
+                }
+            }
             Item::Law(l) => walk_block(&mut l.body, &mut visit),
             Item::Component(c) => {
                 for h in &mut c.handlers {
@@ -462,6 +490,40 @@ mod tests {
             errors(contract_named).is_empty(),
             "a named-argument call inside a contract law must resolve like it does everywhere else: {:?}",
             errors(contract_named)
+        );
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it840):
+    /// `Item::Fun`'s arm only ever walked `f.body` -- always a parser-
+    /// synthesized EMPTY block for an `ai fun` (see `parser.rs::
+    /// parse_ai_fun`) -- never `f.ai.intent_expr`, the `intent "..."` string's
+    /// actual interpolated content, which `check.rs` DOES type-check. So a
+    /// named-argument or trailing-default-relying call inside an `intent`
+    /// interpolation was silently rejected with a misleading K0241/K0242,
+    /// even though the identical call compiles cleanly everywhere else. The
+    /// FOURTH instance of this file's "an Expr-bearing field missing from the
+    /// item walker" class (after PR-it769's `examples`/`laws`, PR-it839's
+    /// `props[i].default`/`children[i].args`), found via a deliberate,
+    /// exhaustive audit of every Expr-bearing AST field prompted by it839
+    /// being the third such gap.
+    #[test]
+    fn default_params_and_named_args_resolve_inside_an_ai_funs_intent() {
+        // named arguments, inside an `intent` interpolation.
+        let named = "fun sub(a: Int, b: Int) -> Int {\n    a - b\n}\n\
+                      ai fun helper(x: Int) -> Str {\n    intent \"{sub(b: 3, a: 10)}\"\n}\n";
+        assert!(
+            errors(named).is_empty(),
+            "a named-argument call inside an ai fun's intent must resolve like it does everywhere else: {:?}",
+            errors(named)
+        );
+
+        // a trailing default, inside an `intent` interpolation.
+        let default = "fun add(a: Int, b: Int = 5) -> Int {\n    a + b\n}\n\
+                        ai fun helper(x: Int) -> Str {\n    intent \"{add(10)}\"\n}\n";
+        assert!(
+            errors(default).is_empty(),
+            "a default-param call inside an ai fun's intent must resolve like it does everywhere else: {:?}",
+            errors(default)
         );
     }
 }
