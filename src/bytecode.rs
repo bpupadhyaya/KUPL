@@ -421,6 +421,41 @@ pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool
                     return true;
                 }
             }
+            // production-hardening PR-it820: a REAL, live-confirmed silent
+            // value-corruption bug, ONE HOP past PR-it819's GetField fix --
+            // `for x in xs { var y = x; y = y.push(item) }` compiles `x`'s
+            // per-iteration binding to `Op::IterGet { dst, iter, idx }`.
+            // `k_iter_get`'s `K_LIST` case (cgen.rs) returns
+            // `v.as.list->items[idx]` by shallow copy, no clone/refcount
+            // bump -- `y`'s value becomes the literal same heap object as
+            // one of `xs`'s own elements, so `y.push(item)` taken as an
+            // in-place mutation corrupts `xs` itself. UNLIKE `GetField`
+            // (where recursing into `obj` and checking whether `obj` is a
+            // parameter is sufficient, since a genuinely chunk-local,
+            // non-escaping record's field really is safe to mutate through)
+            // this canNOT simply recurse into `iter` and check whether
+            // `iter` traces to a parameter: `xs` here is a perfectly
+            // ordinary chunk-local list, not a parameter, and the
+            // loop-body-scoped window `enclosing_loop_range` deliberately
+            // narrows to (see `method_recv_escapes`'s own doc comment) does
+            // NOT extend to `xs`'s uses AFTER the loop exits (e.g. `print
+            // (xs)` following the loop) -- confirmed empirically: a
+            // recurse-into-`iter` variant of this fix, tested BEFORE this
+            // one was written, still let the corruption through, because
+            // `iter`'s own register traces cleanly to a `MakeList` outside
+            // the loop body window and never appears live within it. Since
+            // this analysis has no cheap, sound way to prove `iter`'s
+            // container is unused for the REST of the chunk (before AND
+            // after the loop, potentially across nested loops), the
+            // correct, conservative choice is to treat ANY register whose
+            // value came from `Op::IterGet` as unconditionally unsafe --
+            // exactly like reaching an actual parameter/capture -- rather
+            // than attempting (and failing) to prove it safe.
+            if let Op::IterGet { dst, .. } = op {
+                if *dst == reg {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -867,5 +902,29 @@ mod escape_tests {
             vec![Op::Move(1, 0), Op::GetFieldNamed { dst: 2, obj: 1, name: 0 }, self_push(2)],
         );
         assert!(reg_traces_to_a_parameter(&c, 2, 2));
+    }
+
+    #[test]
+    fn a_for_loop_iteration_variable_always_traces_to_a_parameter() {
+        // production-hardening PR-it820: `for x in xs { var y = x; y =
+        // y.push(item) }` -- xs is a PLAIN CHUNK-LOCAL list (nparams=0), not
+        // a parameter, so this is UNLIKE every other case in this module:
+        // there is no register to recurse into and prove safe/unsafe, since
+        // k_iter_get (cgen.rs) hands back a SHALLOW alias of one of xs's own
+        // elements with no way for this window-bounded, loop-body-scoped
+        // analysis to know whether xs is read again after the loop. Any
+        // register written by Op::IterGet must be treated as
+        // unconditionally unsafe, exactly like reaching a real parameter.
+        let c = chunk_with_params(0, vec![Op::IterGet { dst: 0, iter: 5, idx: 6 }, self_push(0)]);
+        assert!(reg_traces_to_a_parameter(&c, 1, 0));
+    }
+
+    #[test]
+    fn a_move_from_an_iter_get_result_is_still_caught() {
+        // var y = x; y = y.push(item) -- one Move hop away from the
+        // IterGet-written register, same as the field-read chain test
+        // above but for the iteration-variable case.
+        let c = chunk_with_params(0, vec![Op::IterGet { dst: 0, iter: 5, idx: 6 }, Op::Move(1, 0), self_push(1)]);
+        assert!(reg_traces_to_a_parameter(&c, 2, 1));
     }
 }

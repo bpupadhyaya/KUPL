@@ -7566,6 +7566,63 @@ mod tests {
         );
     }
 
+    /// A REAL, live-confirmed silent value-corruption bug found+fixed
+    /// (production-hardening PR-it820), ONE HOP past PR-it819's field-
+    /// extraction fix: `for x in xs { var y = x; y = y.push(item) }` --
+    /// `x`'s per-iteration binding compiles to `Op::IterGet`, and
+    /// `k_iter_get`'s `K_LIST` case (cgen.rs) hands back a SHALLOW alias of
+    /// one of `xs`'s own elements (no clone/refcount bump). Unlike
+    /// `GetField` (where recursing into the field's source object and
+    /// checking whether THAT traces to a parameter is sufficient),
+    /// `reg_traces_to_a_parameter` cannot safely recurse into `iter` here:
+    /// `xs` is an ordinary chunk-local list, not a parameter, and the
+    /// loop-body-scoped analysis window cannot see whether `xs` is read
+    /// again AFTER the loop exits. Fixed by treating any register written
+    /// by `Op::IterGet` as unconditionally unsafe, exactly like reaching an
+    /// actual parameter/capture, rather than attempting (and failing) to
+    /// prove the source container safe.
+    #[test]
+    fn native_self_rebind_of_a_for_loop_iteration_variable_does_not_corrupt_the_iterated_list() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   var xs = [[1, 2, 3], [4, 5, 6]]\n    \
+                   for inner in xs {\n        var y = inner\n        y = y.push(99)\n    }\n    \
+                   print(\"{xs}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_itervar_list");
+        assert_eq!(
+            out.trim(),
+            "[[1, 2, 3], [4, 5, 6]]",
+            "native must not corrupt the iterated `xs` via the loop body's internal self-push \
+             on the per-iteration binding `inner`"
+        );
+    }
+
+    /// The Map/Set/Str analogues of the loop-iteration-variable bug above,
+    /// same root cause and same fix.
+    #[test]
+    fn native_self_rebind_of_a_for_loop_iteration_variable_does_not_corrupt_map_set_or_str() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   var ms = [Map().insert(\"a\", 1), Map().insert(\"b\", 2)]\n    \
+                   for inner in ms {\n        var m2 = inner\n        m2 = m2.insert(\"z\", 99)\n    }\n    \
+                   var ss = [Set([1, 2]), Set([3, 4])]\n    \
+                   for inner in ss {\n        var s2 = inner\n        s2 = s2.insert(99)\n    }\n    \
+                   var padded = \"hi\"\n    padded = padded + \"!\"\n    \
+                   var ts = [padded, padded]\n    \
+                   for inner in ts {\n        var t2 = inner\n        t2 = t2 + \"?\"\n    }\n    \
+                   print(\"{ms}|{ss}|{ts}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_itervar_mapsetstr");
+        assert_eq!(
+            out.trim(),
+            "[Map{\"a\": 1}, Map{\"b\": 2}]|[Set{1, 2}, Set{3, 4}]|[\"hi!\", \"hi!\"]",
+            "native must not corrupt the iterated ms/ss/ts via each loop body's internal self-insert/self-append"
+        );
+    }
+
     /// Production-hardening PR-it790: a close structural read of `emit_op`'s
     /// self-rebind fast paths (following it615's real parameter-alias bug)
     /// surfaced that `aliasing_regs` (bytecode.rs) never lists `Op::Method`
