@@ -552,6 +552,55 @@ pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool
                     return true;
                 }
             }
+            // A SEVENTH untracked edge (production-hardening PR-it847, the
+            // TWENTY-SEVENTH broad Explore survey): `Op::MakeCtor` builds a
+            // record's `KValue` fields via a plain, unchecked `memcpy`
+            // (cgen.rs's `k_ctor`) from the `start..start+len` staging
+            // window `order_ctor_args` fills -- if one of those staging
+            // registers itself traces to a parameter (e.g. `Box(items:
+            // some_param)`), the constructed record's field is just as
+            // aliased as the parameter itself, and a LATER `GetFieldNamed`
+            // extracting that field (already a tracked edge since PR-it819)
+            // inherits that same aliasing -- but this function had NO arm
+            // for `MakeCtor` at all, so `go()` fell through the whole loop
+            // and returned `false` ("safe") for a register reached only via
+            // `GetFieldNamed(obj: <MakeCtor's dst>)`. CONFIRMED via a
+            // hand-built-chunk unit test (mirroring this module's own
+            // established testing convention, since compile.rs's actual
+            // register allocator turned out to reliably mask this: in every
+            // KUPL-source-level repro attempted, the ctor's own transient
+            // result register gets freed and immediately reused by the
+            // following field-read's own transient register, which creates
+            // a self-referential Move/GetFieldNamed cycle this function's
+            // existing depth-bound cycle guard resolves conservatively
+            // "safe" as a side effect -- a real, structural interaction of
+            // THIS compiler's specific register-reuse strategy, not a fluke,
+            // but not something a static analysis fix should ever rely on
+            // holding forever). Confirmed the analogous `MakeInstance`
+            // (component construction) case is NOT a live gap: a
+            // component's props are not externally-visible record fields at
+            // all -- `w.prop_name` is rejected at type-check time (K0233,
+            // "only records and components have fields" -- components
+            // expose behavior via methods, not `GetFieldNamed`), so no
+            // `GetFieldNamed { obj: <MakeInstance result> }` can ever be
+            // emitted; `MakeInstance` was left untouched. Fixed by
+            // recursing into EVERY register in the constructor's own
+            // `start..start+len` staging window -- mirroring
+            // `aliasing_regs`'s existing (forward-direction) `MakeCtor`
+            // handling exactly, and conservative in the same spirit as
+            // `WithField`: if ANY field could be aliased, the whole
+            // constructed value is treated as unsafe, since this analysis
+            // doesn't track which specific field a later `GetFieldNamed`
+            // will extract.
+            if let Op::MakeCtor { dst, start, len, .. } = op {
+                if *dst == reg {
+                    for r in *start..start.saturating_add(*len) {
+                        if go(chunk, op_idx, r, depth + 1) {
+                            return true;
+                        }
+                    }
+                }
+            }
         }
         false
     }
@@ -987,6 +1036,38 @@ mod escape_tests {
             ],
         );
         assert!(!reg_traces_to_a_parameter(&c, 2, 1));
+    }
+
+    /// A REAL, SEVENTH untracked edge found+fixed (production-hardening
+    /// PR-it847, the TWENTY-SEVENTH broad Explore survey): `fun f(p: List[
+    /// Int]) { let b = Box(items: p); var xs = b.items; xs = xs.push(item)
+    /// }` -- `b` is chunk-local (built via `MakeCtor`), so the PRIOR test
+    /// above (`a_field_read_out_of_a_fresh_chunk_local_record_does_not_
+    /// trace_to_a_parameter`) would wrongly conclude this is ALSO safe --
+    /// but here `b`'s `items` field was constructed FROM the parameter `p`
+    /// itself (`MakeCtor`'s own `start..start+len` staging window includes
+    /// register 0, which traces directly to the parameter), so extracting
+    /// `items` back out and mutating it in place aliases the CALLER's own
+    /// `p`. Deliberately uses STRICTLY INCREASING, never-reused register
+    /// numbers (0, 1, 2, 3) so this test is NOT accidentally rescued by the
+    /// depth-bound cycle guard the way every KUPL-source-level compilation
+    /// attempt was during this bug's OWN investigation (see this file's
+    /// `reg_traces_to_a_parameter`/`go` doc comment on its new `MakeCtor`
+    /// arm for the full story) -- this test exercises the underlying
+    /// analysis gap directly, independent of compile.rs's specific
+    /// register-allocation behavior.
+    #[test]
+    fn a_field_read_out_of_a_ctor_built_from_a_parameter_traces_to_it() {
+        let c = chunk_with_params(
+            1,
+            vec![
+                Op::Move(1, 0),
+                Op::MakeCtor { dst: 2, ctor: 0, start: 1, len: 1 },
+                Op::GetFieldNamed { dst: 3, obj: 2, name: 0 },
+                self_push(3),
+            ],
+        );
+        assert!(reg_traces_to_a_parameter(&c, 3, 3));
     }
 
     #[test]
