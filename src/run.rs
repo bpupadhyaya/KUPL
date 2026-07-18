@@ -1017,9 +1017,22 @@ pub fn native(path: &str, args: &[String]) -> i32 {
 }
 
 /// Execute an already-compiled module: the first `app`, else `fun main`.
-pub fn run_module(module: &crate::bytecode::Module, origin: &str) -> i32 {
+///
+/// `args_override`: when `Some`, `args()` returns this list directly instead
+/// of going through `program_args()`'s `--`-separator convention (correct
+/// ONLY for the `kupl run`/`kupl run --vm` CLI-wrapper invocation shape) --
+/// production-hardening PR-it798. `run_module` has two callers with
+/// genuinely different correct `args()` semantics: a `kupl bundle`-produced
+/// self-contained executable IS the whole running process (invoked directly,
+/// `./myapp a b c`, no wrapper, no `--` needed, exactly like `kupl native`'s
+/// own `argv[1..]`), so it passes `Some(argv[1..])`; `kupl run some.kx --
+/// a b c` (a precompiled `.kx` run through the ordinary `kupl` CLI wrapper)
+/// passes `None`, preserving the SAME `--`-required convention as running a
+/// `.kupl` source file the normal way.
+pub fn run_module(module: &crate::bytecode::Module, origin: &str, args_override: Option<Vec<String>>) -> i32 {
     let mut vm = crate::vm::Vm::new(module);
     vm.print_unwired = true;
+    vm.args_override = args_override;
     let app = module.components.iter().find(|c| c.is_app).map(|c| c.name.clone());
     let outcome = match app {
         Some(name) => vm.run_app(&name).map(|_| Value::Unit),

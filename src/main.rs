@@ -64,7 +64,24 @@ fn run_cli() -> ExitCode {
         if let Ok(bytes) = std::fs::read(&exe) {
             if let Some(result) = kupl::kx::read_bundle(&bytes) {
                 return match result {
-                    Ok(module) => ExitCode::from(run::run_module(&module, "bundled module") as u8),
+                    Ok(module) => {
+                        // A REAL, live-confirmed cross-engine divergence found+fixed
+                        // (production-hardening PR-it798, found via an Explore-agent
+                        // survey): this executable IS the whole running process (no
+                        // `kupl run`/`--` wrapper at all), so its own args are
+                        // EVERYTHING after the binary name -- `program_args()`'s
+                        // `--`-separator convention (correct only for the `kupl run`
+                        // CLI-wrapper shape) doesn't apply here, but `run_module`
+                        // used to always go through it, so `args()` silently
+                        // returned `[]` unless invoked with a bizarre spurious
+                        // `./myapp -- a b c`. Matches `program_args()`'s OWN
+                        // invalid-UTF8-placeholder handling for consistency.
+                        let raw_args: Vec<String> = std::env::args_os()
+                            .skip(1)
+                            .map(|a| a.to_str().map(str::to_string).unwrap_or_else(|| "\u{FFFD}".to_string()))
+                            .collect();
+                        ExitCode::from(run::run_module(&module, "bundled module", Some(raw_args)) as u8)
+                    }
                     Err(e) => {
                         eprintln!("error: corrupt bundle: {e}");
                         ExitCode::from(1)
@@ -98,7 +115,7 @@ fn run_cli() -> ExitCode {
     let code = match (args.first().map(String::as_str), kx_path) {
         (Some("run"), Some(path)) => match std::fs::read(&path) {
             Ok(bytes) => match kupl::kx::decode(&bytes) {
-                Ok(module) => run::run_module(&module, &path),
+                Ok(module) => run::run_module(&module, &path, None),
                 Err(e) => {
                     eprintln!("error: {e}");
                     1
@@ -429,11 +446,28 @@ fn scaffold_project(name: &str) -> i32 {
 /// was silently DROPPED with no diagnostic at all — confirmed live running
 /// `foo.kupl` and exiting 0, `bar.kupl` never even read. Returns the path,
 /// or a usage-error message (missing path / an unexpected extra argument).
+///
+/// A THIRD REAL bug found+fixed (production-hardening PR-it798, found while
+/// verifying a related fix): a bare `--` token used to be treated the SAME
+/// as any OTHER long-form flag (`a.starts_with("--")` matches `"--"`
+/// trivially too) — just skipped, scanning continuing past it — instead of
+/// being recognized as the documented separator meaning "everything after
+/// this belongs to the PROGRAM being run, stop looking for kupl's own
+/// arguments" (`program_args()`'s own doc comment, and `examples/cli.kupl`'s
+/// own usage instructions, both document `kupl run prog.kupl -- a b c` as
+/// the correct way to pass a program its own arguments). Confirmed live
+/// before this fix: `kupl run examples/cli.kupl -- Ada Grace` failed with
+/// `error: unexpected extra argument \`Ada\`` (exit 2) — the EXACT
+/// documented usage pattern for `args()`, broken. Now a bare `--` stops
+/// scanning immediately, matching `program_args()`'s own semantics.
 fn find_path_arg(args: &[String]) -> Result<&str, String> {
     let mut path: Option<&str> = None;
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
+        if a == "--" {
+            break; // everything after this belongs to the program, not kupl
+        }
         if a == "-o" {
             i += 2; // the flag AND its value, as a unit
             continue;
@@ -650,6 +684,27 @@ mod tests {
         assert_eq!(find_path_arg(&s(&["run", "foo.kupl"])), Ok("foo.kupl"));
         // no path at all is the pre-existing missing-argument error, unchanged.
         assert_eq!(find_path_arg(&s(&["run"])), Err("missing <file.kupl> argument".to_string()));
+    }
+
+    /// A REAL, previously-silent bug (production-hardening PR-it798, found
+    /// while verifying an unrelated fix): a bare `--` used to be treated
+    /// like any other `--foo`-style flag -- skipped, with scanning
+    /// continuing past it -- instead of the documented separator meaning
+    /// "everything after this belongs to the PROGRAM, not to kupl's own
+    /// CLI parsing" (`kupl run prog.kupl -- a b c`, per `program_args()`'s
+    /// own doc comment and `examples/cli.kupl`'s usage instructions).
+    /// Confirmed live before the fix: `kupl run examples/cli.kupl -- Ada
+    /// Grace` failed with `error: unexpected extra argument \`Ada\``.
+    #[test]
+    fn find_path_arg_treats_a_bare_separator_as_a_hard_stop() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // args after `--` are the PROGRAM's, not extra positional arguments.
+        assert_eq!(find_path_arg(&s(&["run", "foo.kupl", "--", "Ada", "Grace"])), Ok("foo.kupl"));
+        // even a `--`-prefixed-looking program arg is left alone once past the separator.
+        assert_eq!(find_path_arg(&s(&["run", "foo.kupl", "--", "--not-a-kupl-flag"])), Ok("foo.kupl"));
+        // `--` with nothing after it is still just a normal, valid separator.
+        assert_eq!(find_path_arg(&s(&["run", "foo.kupl", "--"])), Ok("foo.kupl"));
     }
 
     #[test]

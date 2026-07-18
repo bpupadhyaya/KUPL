@@ -134,6 +134,20 @@ pub struct Vm<'m> {
     instances: Vec<VmInstance>,
     queue: std::collections::VecDeque<(usize, String, Value)>,
     pub print_unwired: bool,
+    /// Overrides `args()`'s normal `program_args()` lookup (which requires a
+    /// `--` separator, correct for the `kupl run`/`kupl run --vm` CLI-wrapper
+    /// invocation shape) with a raw, pre-computed argument list -- production-
+    /// hardening PR-it798. Set ONLY when this `Vm` IS the whole running
+    /// process (a `kupl bundle`-produced self-contained executable, invoked
+    /// directly as `./myapp a b c` with no `kupl run`/`--` wrapper at all,
+    /// exactly like a `kupl native` executable's own `argv[1..]`) -- a REAL,
+    /// live-confirmed cross-engine divergence found via an Explore-agent
+    /// survey: `kupl bundle`'s output silently returned `[]` from `args()`
+    /// unless invoked with a spurious leading `./myapp -- a b c`, while
+    /// `kupl native`'s output (which reads `argv[1..]` directly, see
+    /// cgen.rs's `k_args()`) worked correctly with plain arguments -- the
+    /// whole POINT of `kupl bundle` producing a "self-contained executable".
+    pub args_override: Option<Vec<String>>,
     /// Virtual clock (ms), advanced explicitly — same model as the interpreter.
     now: i64,
     /// Send+Sync program snapshot enabling the real-thread `par_map`/`par_filter`
@@ -152,6 +166,7 @@ impl<'m> Vm<'m> {
             instances: Vec::new(),
             queue: std::collections::VecDeque::new(),
             print_unwired: false,
+            args_override: None,
             now: 0,
             image: None,
         }
@@ -851,6 +866,10 @@ impl<'m> Vm<'m> {
                             Ok(s) => set!(dst, Value::str(s)),
                             Err(msg) => return Err(VmError { msg, span }),
                         },
+                        BUILTIN_ARGS if self.args_override.is_some() => {
+                            let raw = self.args_override.clone().unwrap();
+                            set!(dst, Value::List(Rc::new(raw.into_iter().map(Value::str).collect())));
+                        }
                         BUILTIN_ENV_VAR | BUILTIN_ARGS | BUILTIN_EPRINT
                         | BUILTIN_READ_LINE | BUILTIN_READ_ALL => {
                             let name = match which {
