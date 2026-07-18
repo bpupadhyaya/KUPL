@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use crate::diag::{json_escape, line_col, line_col_utf16, Severity};
+use crate::diag::{json_escape, line_col_utf16, Severity};
 
 // ---------------- tiny JSON ----------------
 
@@ -1390,6 +1390,20 @@ impl LineIndex {
         }
         (line_idx + 1, col)
     }
+
+    /// Resolve a byte offset to just its 1-based LINE number, with NO column
+    /// computation -- cheaper than `resolve_utf16` for callers (like
+    /// `folding_ranges`) that only ever use the line, via binary search
+    /// alone with no per-line scan at all. `src_len` mirrors
+    /// `resolve_utf16`'s own out-of-range clamping (to `.min(src_len)`).
+    fn resolve_line(&self, src_len: usize, offset: u32) -> usize {
+        let offset = (offset as usize).min(src_len);
+        let line_idx = match self.line_starts.binary_search(&(offset as u32)) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        line_idx + 1
+    }
 }
 
 /// Every occurrence of `name` in the current file, PLUS every occurrence in a
@@ -1481,9 +1495,29 @@ fn scoped_occurrences(
     offset: usize,
 ) -> (Vec<(usize, usize, usize, usize)>, Option<crate::diag::Span>) {
     let local_scope = local_binding_scope(program, offset, name);
+    // Built ONCE (production-hardening PR-it836, found auditing lsp.rs
+    // further after the SAME class of bug it835 fixed): the OLD
+    // `crate::diag::line_col(text, ...)` call here is O(L) per call, and
+    // this closure runs inside a filter checked for EVERY occurrence
+    // against EVERY shadow zone below -- an O(occurrences * zones) nested
+    // loop that was ALSO paying an O(L) tax per comparison, giving O(M*Z*L)
+    // overall. Live-confirmed CUBIC-looking scaling before this fix (100/
+    // 200/400/800 functions each locally shadowing a common name, one
+    // `documentHighlight` query on an unrelated top-level use of that same
+    // name): 12.7ms/104.0ms/770.7ms/6.16s -- roughly 8x time per 2x size
+    // (2^3), far worse than it835's quadratic finding. `line_range` only
+    // ever uses the LINE component (the column is discarded, `_`), so
+    // `LineIndex::resolve_line` -- binary search alone, no per-line
+    // column scan -- replaces the O(L) rescan with O(log L), turning the
+    // whole thing into O((M+Z) log L + M*Z): still quadratic in the
+    // occurrence/zone counts themselves (a separate, more invasive
+    // algorithmic-redesign concern deliberately NOT tackled here -- see
+    // this fix's own commit/memory notes), but no longer ALSO
+    // proportional to document length on top of that.
+    let line_index = LineIndex::build(text);
     let line_range = |span: crate::diag::Span| {
-        let (start_line, _) = crate::diag::line_col(text, span.start);
-        let (end_line, _) = crate::diag::line_col(text, span.end);
+        let start_line = line_index.resolve_line(text.len(), span.start);
+        let end_line = line_index.resolve_line(text.len(), span.end);
         (start_line - 1)..=(end_line - 1)
     };
     let other_shadow_zones: Vec<crate::diag::Span> =
@@ -1706,14 +1740,30 @@ fn document_symbols(text: &str) -> Option<String> {
     if diags.iter().any(|d| d.severity == Severity::Error) {
         return None;
     }
-    let syms: Vec<String> = program.items.iter().map(|item| item_symbol(text, item)).collect();
+    let line_index = LineIndex::build(text);
+    let syms: Vec<String> = program.items.iter().map(|item| item_symbol(text, item, &line_index)).collect();
     Some(format!("[{}]", syms.join(",")))
 }
 
 /// LSP `Range` for a span, rendered inline as a JSON object literal.
-fn lsp_range(text: &str, span: crate::diag::Span) -> String {
-    let (l0, c0) = line_col_utf16(text, span.start);
-    let (l1, c1) = line_col_utf16(text, span.end);
+///
+/// Takes a precomputed `&LineIndex` (production-hardening PR-it836, a
+/// follow-up to it835's `collect_occurrences` fix mining the SAME
+/// per-symbol full-document-rescan shape): `item_symbol`/
+/// `maybe_push_symbol_info` call this once per SYMBOL in a file (functions,
+/// types+variants, components+their nested state/methods, contracts+sigs),
+/// so `textDocument/documentSymbol` and `workspace/symbol` were ALSO O(S*L)
+/// -- live-confirmed via a standalone timing probe (500/1000/2000/4000
+/// functions in one file): `document_symbols` took 6.4ms/22.6ms/84.9ms/
+/// 334.5ms, `folding_ranges` (a separate but analogous bug, see below) took
+/// 5.0ms/21.5ms/74.5ms/308.6ms -- both ~3.5-4x time per 2x size, the same
+/// O(n^2) signature as it835's finding. `LineIndex` is built ONCE per file
+/// by each of this function's callers and threaded through, instead of
+/// each of the S symbols in that file independently rescanning the whole
+/// document.
+fn lsp_range(line_index: &LineIndex, text: &str, span: crate::diag::Span) -> String {
+    let (l0, c0) = line_index.resolve_utf16(text, span.start);
+    let (l1, c1) = line_index.resolve_utf16(text, span.end);
     format!(
         "{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}}",
         l0 - 1,
@@ -1759,44 +1809,48 @@ fn variant_detail(v: &crate::ast::Variant) -> String {
 
 /// LSP `SymbolKind` numeric codes used here: Method=6, Function=12, Field=8,
 /// EnumMember=22, Enum=10, Class=5, Interface=11.
-fn item_symbol(text: &str, item: &crate::ast::Item) -> String {
+fn item_symbol(text: &str, item: &crate::ast::Item, line_index: &LineIndex) -> String {
     use crate::ast::Item;
     use crate::fmt::ty_str;
     match item {
-        Item::Fun(f) => symbol_json(&f.name, 12, &lsp_range(text, f.span), &fun_sig_str(f), &[]),
+        Item::Fun(f) => symbol_json(&f.name, 12, &lsp_range(line_index, text, f.span), &fun_sig_str(f), &[]),
         Item::Type(t) => {
             let children: Vec<String> = t
                 .variants
                 .iter()
-                .map(|v| symbol_json(&v.name, 22, &lsp_range(text, v.span), &variant_detail(v), &[]))
+                .map(|v| symbol_json(&v.name, 22, &lsp_range(line_index, text, v.span), &variant_detail(v), &[]))
                 .collect();
-            symbol_json(&t.name, 10, &lsp_range(text, t.span), "", &children)
+            symbol_json(&t.name, 10, &lsp_range(line_index, text, t.span), "", &children)
         }
         Item::Contract(c) => {
             let children: Vec<String> = c
                 .sigs
                 .iter()
-                .map(|s| symbol_json(&s.name, 6, &lsp_range(text, s.span), &contract_sig_str(s), &[]))
+                .map(|s| symbol_json(&s.name, 6, &lsp_range(line_index, text, s.span), &contract_sig_str(s), &[]))
                 .collect();
-            symbol_json(&c.name, 11, &lsp_range(text, c.span), "", &children)
+            symbol_json(&c.name, 11, &lsp_range(line_index, text, c.span), "", &children)
         }
-        Item::Law(l) => symbol_json(&l.name, 12, &lsp_range(text, l.span), "", &[]),
+        Item::Law(l) => symbol_json(&l.name, 12, &lsp_range(line_index, text, l.span), "", &[]),
         Item::Component(c) => {
             let mut children: Vec<String> = c
                 .state
                 .iter()
                 .map(|s| {
                     let detail = s.ty.as_ref().map(ty_str).unwrap_or_default();
-                    symbol_json(&s.name, 8, &lsp_range(text, s.span), &detail, &[])
+                    symbol_json(&s.name, 8, &lsp_range(line_index, text, s.span), &detail, &[])
                 })
                 .collect();
             children.extend(
-                c.exposes.iter().map(|f| symbol_json(&f.name, 6, &lsp_range(text, f.span), &fun_sig_str(f), &[])),
+                c.exposes
+                    .iter()
+                    .map(|f| symbol_json(&f.name, 6, &lsp_range(line_index, text, f.span), &fun_sig_str(f), &[])),
             );
             children.extend(
-                c.funs.iter().map(|f| symbol_json(&f.name, 6, &lsp_range(text, f.span), &fun_sig_str(f), &[])),
+                c.funs
+                    .iter()
+                    .map(|f| symbol_json(&f.name, 6, &lsp_range(line_index, text, f.span), &fun_sig_str(f), &[])),
             );
-            symbol_json(&c.name, 5, &lsp_range(text, c.span), "", &children)
+            symbol_json(&c.name, 5, &lsp_range(line_index, text, c.span), "", &children)
         }
     }
 }
@@ -1842,11 +1896,12 @@ fn folding_ranges(text: &str) -> Option<String> {
     for item in &program.items {
         foldable_spans(item, &mut spans);
     }
+    let line_index = LineIndex::build(text);
     let ranges: Vec<String> = spans
         .into_iter()
         .filter_map(|span| {
-            let (l0, _) = line_col(text, span.start);
-            let (l1, _) = line_col(text, span.end);
+            let l0 = line_index.resolve_line(text.len(), span.start);
+            let l1 = line_index.resolve_line(text.len(), span.end);
             if l0 == l1 {
                 return None;
             }
@@ -1936,8 +1991,12 @@ fn workspace_symbols(root: &std::path::Path, query: &str, buffers: &HashMap<Path
             continue;
         }
         let uri = path_to_uri(&path);
+        // Built ONCE per file (production-hardening PR-it836), not once per
+        // symbol -- see `lsp_range`'s own doc comment for the full
+        // live-confirmed O(S*L) latency bug this closes.
+        let line_index = LineIndex::build(&text);
         for item in &program.items {
-            collect_workspace_symbol_matches(&text, &uri, item, &needle, &mut out);
+            collect_workspace_symbol_matches(&text, &uri, item, &needle, &line_index, &mut out);
         }
     }
     format!("[{}]", out.join(","))
@@ -1951,13 +2010,14 @@ fn maybe_push_symbol_info(
     kind: u8,
     span: crate::diag::Span,
     needle: &str,
+    line_index: &LineIndex,
 ) {
     if needle.is_empty() || name.to_lowercase().contains(needle) {
         out.push(format!(
             "{{\"name\":\"{}\",\"kind\":{kind},\"location\":{{\"uri\":\"{}\",\"range\":{}}}}}",
             json_escape(name),
             json_escape(uri),
-            lsp_range(text, span)
+            lsp_range(line_index, text, span)
         ));
     }
 }
@@ -1967,34 +2027,35 @@ fn collect_workspace_symbol_matches(
     uri: &str,
     item: &crate::ast::Item,
     needle: &str,
+    line_index: &LineIndex,
     out: &mut Vec<String>,
 ) {
     use crate::ast::Item;
     match item {
-        Item::Fun(f) => maybe_push_symbol_info(out, text, uri, &f.name, 12, f.span, needle),
+        Item::Fun(f) => maybe_push_symbol_info(out, text, uri, &f.name, 12, f.span, needle, line_index),
         Item::Type(t) => {
-            maybe_push_symbol_info(out, text, uri, &t.name, 10, t.span, needle);
+            maybe_push_symbol_info(out, text, uri, &t.name, 10, t.span, needle, line_index);
             for v in &t.variants {
-                maybe_push_symbol_info(out, text, uri, &v.name, 22, v.span, needle);
+                maybe_push_symbol_info(out, text, uri, &v.name, 22, v.span, needle, line_index);
             }
         }
         Item::Contract(c) => {
-            maybe_push_symbol_info(out, text, uri, &c.name, 11, c.span, needle);
+            maybe_push_symbol_info(out, text, uri, &c.name, 11, c.span, needle, line_index);
             for s in &c.sigs {
-                maybe_push_symbol_info(out, text, uri, &s.name, 6, s.span, needle);
+                maybe_push_symbol_info(out, text, uri, &s.name, 6, s.span, needle, line_index);
             }
         }
-        Item::Law(l) => maybe_push_symbol_info(out, text, uri, &l.name, 12, l.span, needle),
+        Item::Law(l) => maybe_push_symbol_info(out, text, uri, &l.name, 12, l.span, needle, line_index),
         Item::Component(c) => {
-            maybe_push_symbol_info(out, text, uri, &c.name, 5, c.span, needle);
+            maybe_push_symbol_info(out, text, uri, &c.name, 5, c.span, needle, line_index);
             for s in &c.state {
-                maybe_push_symbol_info(out, text, uri, &s.name, 8, s.span, needle);
+                maybe_push_symbol_info(out, text, uri, &s.name, 8, s.span, needle, line_index);
             }
             for f in &c.exposes {
-                maybe_push_symbol_info(out, text, uri, &f.name, 6, f.span, needle);
+                maybe_push_symbol_info(out, text, uri, &f.name, 6, f.span, needle, line_index);
             }
             for f in &c.funs {
-                maybe_push_symbol_info(out, text, uri, &f.name, 6, f.span, needle);
+                maybe_push_symbol_info(out, text, uri, &f.name, 6, f.span, needle, line_index);
             }
         }
     }
@@ -2613,6 +2674,38 @@ mod tests {
                 assert_eq!(
                     actual, expected,
                     "mismatch at offset {offset} in {doc:?}: LineIndex gave {actual:?}, line_col_utf16 gave {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// The analogous exhaustive differential check for `LineIndex::
+    /// resolve_line` (production-hardening PR-it836's NEW method, added
+    /// for `folding_ranges`/`scoped_occurrences`'s line-only callers) --
+    /// must match `diag::line_col`'s own LINE component (its column is
+    /// unused by either caller and deliberately not part of this
+    /// method's contract) for every offset, across the same document
+    /// shapes as the UTF-16 variant above.
+    #[test]
+    fn line_index_resolve_line_matches_line_col_for_every_offset() {
+        let docs = [
+            "",
+            "x",
+            "fun main() {\n    let x = 0\n    print(x)\n}\n",
+            "no\ntrailing\nnewline",
+            "\n\n\n",
+            "line one\n\nline three (blank line two)\n",
+            "fun main() {\n    let s = \"🎉 emoji line\"\n    print(s)\n}",
+            "🎉🎉🎉\nmore🎉text\n",
+        ];
+        for doc in docs {
+            let index = LineIndex::build(doc);
+            for offset in 0..=(doc.len() as u32 + 2) {
+                let (expected_line, _) = crate::diag::line_col(doc, offset);
+                let actual_line = index.resolve_line(doc.len(), offset);
+                assert_eq!(
+                    actual_line, expected_line,
+                    "mismatch at offset {offset} in {doc:?}: resolve_line gave {actual_line}, line_col gave {expected_line}"
                 );
             }
         }
