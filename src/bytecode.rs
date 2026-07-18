@@ -483,6 +483,50 @@ pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool
                     return true;
                 }
             }
+            // production-hardening PR-it823: a FIFTH untracked edge, found
+            // via a systematic completeness sweep of this function against
+            // every `Op` variant after FOUR independent instances of this
+            // same gap shape (Move/it615, GetField/it819, IterGet/it820,
+            // StateGet/it822) -- `Op::Call`/`Op::CallComp`/`Op::CallValue`
+            // (a user-defined function/closure call) and `Op::Method` (a
+            // builtin OR component method call) can each return a value
+            // that ALIASES one of the CALLEE's own live values, invisible
+            // to this single-chunk analysis: a callee can return one of its
+            // OWN parameters/captures unchanged (an identity/pass-through
+            // function, live-confirmed via `fun identity(a) { a }`), or a
+            // builtin method can return its receiver/argument unchanged on
+            // some path (already the exact PR-it811 finding for
+            // `Str.replace_first`'s no-match case -- that fix only taught
+            // `aliasing_regs` that a `Method` op READS its recv/args in a
+            // way that could hand them out elsewhere; it never taught THIS
+            // function that a `Method`'s own `dst` could likewise BE one of
+            // those same values). Unlike `GetField` (where recursing into
+            // `obj` and checking whether `obj` traces to a parameter is
+            // enough, since a genuinely local record's field really is
+            // safe), this analysis is explicitly INTRAPROCEDURAL by design
+            // (see this function's own doc comment) and has no way to see
+            // what the CALLEE's own body does with ITS parameters/captures/
+            // state -- even confirming every argument register here traces
+            // to something safe would NOT prove the callee's return value
+            // is safe, since the callee could derive it from something this
+            // window can never observe. Any register written by one of
+            // these ops must be treated as unconditionally unsafe, the
+            // same conservative posture as `IterGet`/`StateGet`.
+            // CONFIRMED LIVE for both: `fun identity(a){a}`, called as
+            // `identity(ys)` then self-pushed, corrupted the caller's `ys`
+            // on native; `s.replace_first("nomatch","y")` (no match, so
+            // native's C mirror returns `s` unchanged) then self-appended
+            // similarly corrupted the caller's string once it had spare
+            // capacity to grow in place.
+            if let Op::Call { dst, .. }
+            | Op::CallComp { dst, .. }
+            | Op::CallValue { dst, .. }
+            | Op::Method { dst, .. } = op
+            {
+                if *dst == reg {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -977,5 +1021,49 @@ mod escape_tests {
         // the field-read and iteration-variable chain tests above.
         let c = chunk_with_params(0, vec![Op::StateGet(0, 0), Op::Move(1, 0), self_push(1)]);
         assert!(reg_traces_to_a_parameter(&c, 2, 1));
+    }
+
+    #[test]
+    fn a_call_result_that_could_be_a_pass_through_parameter_always_traces_to_a_parameter() {
+        // production-hardening PR-it823: `fun identity(a) { a }` called as
+        // `xs = identity(ys); xs = xs.push(item)` where `ys` traces to a
+        // parameter -- this analysis is intraprocedural, so it cannot see
+        // that `identity`'s body just returns its own argument unchanged;
+        // any `Op::Call` result must be treated as unconditionally unsafe.
+        let c = chunk_with_params(1, vec![Op::Call { dst: 1, fun: 0, start: 0, argc: 1 }, self_push(1)]);
+        assert!(reg_traces_to_a_parameter(&c, 1, 1));
+    }
+
+    #[test]
+    fn a_call_value_closure_result_always_traces_to_a_parameter() {
+        // Same as above but for a closure invoked via Op::CallValue --
+        // structurally identical concern (an identity closure).
+        let c = chunk_with_params(1, vec![Op::CallValue { dst: 1, f: 0, start: 0, argc: 1 }, self_push(1)]);
+        assert!(reg_traces_to_a_parameter(&c, 1, 1));
+    }
+
+    #[test]
+    fn a_method_call_result_always_traces_to_a_parameter() {
+        // production-hardening PR-it823: a builtin OR component method can
+        // return its receiver/argument unchanged on some path (the exact
+        // PR-it811 finding for `Str.replace_first`'s no-match case) --
+        // `xs = ys.someMethod(); xs = xs.push(item)` must be unconditionally
+        // unsafe for the SAME reason `Call`'s result is.
+        let c = chunk_with_params(
+            1,
+            vec![Op::Method { dst: 1, recv: 0, name: 0, start: 0, argc: 0 }, self_push(1)],
+        );
+        assert!(reg_traces_to_a_parameter(&c, 1, 1));
+    }
+
+    #[test]
+    fn a_move_from_a_call_result_is_still_caught() {
+        // var xs = identity(ys); var y2 = xs; y2 = y2.push(item) -- one Move
+        // hop away from the Call-written register.
+        let c = chunk_with_params(
+            1,
+            vec![Op::Call { dst: 1, fun: 0, start: 0, argc: 1 }, Op::Move(2, 1), self_push(2)],
+        );
+        assert!(reg_traces_to_a_parameter(&c, 2, 2));
     }
 }

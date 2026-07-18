@@ -7677,6 +7677,71 @@ mod tests {
         );
     }
 
+    /// A REAL, live-confirmed silent value-corruption bug found+fixed
+    /// (production-hardening PR-it823), a FIFTH untracked edge in
+    /// `reg_traces_to_a_parameter` (Move/PR-it615, GetField/PR-it819,
+    /// IterGet/PR-it820, StateGet/PR-it822, now Call/CallValue/Method/
+    /// PR-it823), found via a systematic completeness sweep of that one
+    /// function against every `Op` variant: `Op::Call`/`Op::CallComp`/
+    /// `Op::CallValue` (a user-defined function/closure call) can return a
+    /// value that ALIASES one of the CALLEE's own live values -- a callee
+    /// can return one of its own parameters/captures unchanged (an
+    /// identity/pass-through function). `var xs = identity(ys); xs =
+    /// xs.push(item)` silently corrupted the caller's `ys` on native, since
+    /// this intraprocedural analysis has no way to see that `identity`'s
+    /// body just returns its own argument unchanged. Fixed by treating any
+    /// register written by `Call`/`CallComp`/`CallValue`/`Method` as
+    /// unconditionally unsafe, same as `IterGet`/`StateGet`.
+    #[test]
+    fn native_self_rebind_of_a_call_result_does_not_corrupt_the_callers_argument() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun identity(a: List[Int]) -> List[Int] {\n    a\n}\n\
+                   fun mutate(ys: List[Int], item: Int) -> List[Int] {\n    \
+                   var xs = identity(ys)\n    xs = xs.push(item)\n    xs\n}\n\
+                   fun main() uses io {\n    \
+                   var outer = [1, 2, 3]\n    var result = mutate(outer, 99)\n    \
+                   print(\"{result}|{outer}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_call_result");
+        assert_eq!(
+            out.trim(),
+            "[1, 2, 3, 99]|[1, 2, 3]",
+            "native must not corrupt the caller's `outer` via mutate's internal self-push \
+             on a value returned by an identity-shaped function call"
+        );
+    }
+
+    /// The `Op::Method` analogue of the `Call`-result bug above, same root
+    /// cause and same fix -- a builtin method can return its receiver/
+    /// argument unchanged on some path (the exact PR-it811 finding for
+    /// `Str.replace_first`'s no-match case). The string needs SPARE
+    /// capacity (built via a prior in-place append, not a fresh literal)
+    /// for the corruption to be observable, matching the SAME PR-it819/
+    /// PR-it820/PR-it822 Str-specific distinction: a literal's `KStrHdr`
+    /// always has `cap == len`, so the first append after aliasing
+    /// reallocates regardless and coincidentally leaves the original
+    /// untouched.
+    #[test]
+    fn native_self_rebind_of_a_method_call_result_does_not_corrupt_the_callers_string() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun mutate(s: Str) -> Str {\n    \
+                   var backup = s.replace_first(\"nomatch\", \"y\")\n    backup = backup + \"?\"\n    backup\n}\n\
+                   fun main() uses io {\n    \
+                   var padded = \"ab\"\n    padded = padded + \"c\"\n    \
+                   var result = mutate(padded)\n    \
+                   print(\"{result}|{padded}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_method_result");
+        assert_eq!(
+            out.trim(),
+            "abc?|abc",
+            "native must not corrupt the caller's `padded` via mutate's internal self-append \
+             on a value returned by replace_first's no-match passthrough"
+        );
+    }
+
     /// Production-hardening PR-it790: a close structural read of `emit_op`'s
     /// self-rebind fast paths (following it615's real parameter-alias bug)
     /// surfaced that `aliasing_regs` (bytecode.rs) never lists `Op::Method`
