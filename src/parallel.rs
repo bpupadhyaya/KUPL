@@ -781,6 +781,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A coverage-closing test (production-hardening PR-it845, no NEW bug
+    /// found): the `par_filter` intra-worker analogue of the `par_map` test
+    /// above. Both `try_par_map` and `try_par_filter` call the identical
+    /// shared `par_eval`, so this was expected to already pass given it844's
+    /// fix -- confirmed live rather than assumed, per this campaign's own
+    /// discipline of verifying shared-code-path assumptions explicitly. Adds
+    /// the missing half of the intra-worker pairing: it844 only added a
+    /// dedicated intra-worker test for `par_map` (mirroring how PR-it821
+    /// itself dual-tested BOTH `par_map` and `par_filter` for the
+    /// cross-worker case) -- this closes that asymmetry.
+    #[test]
+    fn par_filter_does_not_hang_when_an_earlier_panic_and_a_later_infinite_loop_share_one_workers_own_chunk()
+    {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let src = "fun badpred(x: Int) -> Bool {\n    \
+                   if x == 0 {\n        1 / x == 0\n    } else if x == 50 {\n        \
+                   var y = 0\n        while true {\n            y = y + 1\n        }\n        y == 0\n    \
+                   } else {\n        x % 2 == 0\n    }\n}\n\
+                   fun main() uses io {\n    \
+                   var xs: List[Int] = []\n    var i = 0\n    while i < 10000 {\n        xs = xs.push(i)\n        i = i + 1\n    }\n    \
+                   let ys = xs.par_filter(badpred)\n    print(\"{ys.len()}\")\n}\n";
+        let dir = std::env::temp_dir().join(format!("kupl-parallel-filter-intraworker-hang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("filterhang.kupl");
+        std::fs::write(&path, src).unwrap();
+        for extra_args in [vec![], vec!["--vm".to_string()]] {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.arg("run");
+            for a in &extra_args {
+                cmd.arg(a);
+            }
+            cmd.arg(&path);
+            let child = cmd
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("kupl run spawns");
+            let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+            let out = out.unwrap_or_else(|| {
+                panic!("kupl run {extra_args:?} par_filter hung instead of returning the earlier panic")
+            });
+            let combined =
+                format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(
+                combined.contains("division by zero"),
+                "expected the earlier (index 0) panic, got: {combined:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `par_map`/`par_filter`'s happy path (no errors anywhere) is unaffected
     /// by the hang fix above -- still produces the SAME result as sequential
     /// `map`/`filter`, exercised via the real threaded fast path (both
