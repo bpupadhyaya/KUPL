@@ -424,14 +424,44 @@ fn mock_response(fun_name: &str) -> Option<String> {
     env(&key).or_else(|| env("KUPL_AI_MOCK"))
 }
 
-/// Run `curl` against `url` with headers and a JSON body; return the body.
-fn http_post(url: &str, headers: &[String], body: &str) -> Result<String, String> {
+/// A REAL, live-confirmed resource-exhaustion gap found+fixed (production-
+/// hardening PR-it797, found via an Explore-agent survey): `child.
+/// wait_with_output()` below buffers the ENTIRE response body into memory
+/// before this function returns, and (unlike `registry.rs::curl_get`, fixed
+/// at PR-it751, and `interp.rs::run_curl`/`base_curl_cmd`, which already has
+/// the identical cap) this `curl` invocation had NO `--max-filesize` flag at
+/// all. `KUPL_AI_BASE_URL` is explicitly documented and user-settable (to
+/// support self-hosted/ollama-style endpoints), so a misbehaving or
+/// malicious endpoint returning an arbitrarily large body is a realistic
+/// threat, not a contrived edge case. Confirmed live BEFORE this fix: a
+/// local test server returning a 200MB body drove this process's peak
+/// memory footprint to ~216MB (the full body plus overhead); the SAME
+/// server against the already-capped `http_post`/`http_get` KUPL builtins
+/// (`interp.rs::run_curl`) stayed under 15MB and cleanly errored with
+/// "curl: (63) Maximum file size exceeded". Same value as
+/// `interp.rs::MAX_HTTP_RESPONSE_SIZE`/`registry.rs::MAX_REGISTRY_RESPONSE_SIZE`
+/// for consistency across all three independent uses of this same pattern.
+const MAX_AI_RESPONSE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Build (but don't spawn) `http_post`'s `curl` invocation, split out purely
+/// so a unit test can introspect the exact args via `Command::get_args()`
+/// without spawning a real `curl` subprocess or a network dependency --
+/// mirrors `interp.rs::base_curl_cmd`'s own identical split, done for the
+/// identical reason.
+fn build_http_post_cmd(url: &str, headers: &[String]) -> std::process::Command {
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-sS", "--max-time", "120", "-X", "POST", url]);
+    cmd.args(["--max-filesize", &MAX_AI_RESPONSE_SIZE.to_string()]);
     for h in headers {
         cmd.args(["-H", h]);
     }
     cmd.args(["-H", "content-type: application/json", "--data-binary", "@-"]);
+    cmd
+}
+
+/// Run `curl` against `url` with headers and a JSON body; return the body.
+fn http_post(url: &str, headers: &[String], body: &str) -> Result<String, String> {
+    let mut cmd = build_http_post_cmd(url, headers);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -1086,6 +1116,36 @@ mod tests {
     fn run(m: &AiFunMeta, args: &[Value]) -> Result<Value, String> {
         let intent = m.intent.clone();
         ai_call(m, &intent, args, &mut NullToolHost)
+    }
+
+    /// A REAL, live-confirmed resource-exhaustion gap found+fixed (production-
+    /// hardening PR-it797, found via an Explore-agent survey, the SAME bug
+    /// class as `interp.rs::base_curl_cmd_caps_the_response_size_it_will_
+    /// buffer_into_memory` at PR-it751 and `registry.rs`'s `MAX_REGISTRY_
+    /// RESPONSE_SIZE` at PR-it751 -- apparently missed here): `http_post`'s
+    /// `child.wait_with_output()` buffers the ENTIRE response body into
+    /// memory before `anthropic_call`/`openai_call` get a chance to look at
+    /// it. `KUPL_AI_BASE_URL` is documented and user-settable (for
+    /// self-hosted/ollama-style endpoints), so an oversized response from a
+    /// misbehaving or malicious endpoint is a realistic threat. Confirmed
+    /// live BEFORE this fix, outside this test (a local test HTTP server
+    /// returning a 200MB body): peak process memory hit ~216MB with NO cap;
+    /// the SAME server against the already-capped `http_post`/`http_get`
+    /// KUPL builtins (`interp.rs::run_curl`) stayed under 15MB and cleanly
+    /// errored with "curl: (63) Maximum file size exceeded". This test does
+    /// NOT spawn a real `curl` subprocess or network connection -- mirrors
+    /// `interp.rs`'s own established convention exactly, introspecting the
+    /// ACTUAL `Command` `http_post` would spawn via `Command::get_args()`.
+    #[test]
+    fn http_post_caps_the_response_size_it_will_buffer_into_memory() {
+        let cmd = build_http_post_cmd("https://example.com/v1/messages", &[]);
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let flag_pos = args.iter().position(|a| a == "--max-filesize");
+        assert!(flag_pos.is_some(), "http_post must pass --max-filesize: {args:?}");
+        let limit: u64 =
+            args[flag_pos.unwrap() + 1].parse().expect("--max-filesize value must be numeric");
+        assert_eq!(limit, MAX_AI_RESPONSE_SIZE, "{args:?}");
     }
 
     #[test]
