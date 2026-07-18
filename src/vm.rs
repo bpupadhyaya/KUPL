@@ -15501,6 +15501,78 @@ fun probe() -> Str {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it843,
+    /// the TWENTY-FOURTH broad Explore survey): `compile.rs`'s
+    /// `order_ctor_args`/`instance_expr` -- the SOLE lowering path feeding
+    /// the KVM, native (cgen.rs), AND `.kx` -- reordered a constructor's or
+    /// component's NAMED-ARGUMENT expressions into field/prop-DECLARATION
+    /// order BEFORE evaluating anything, while `interp.rs`'s own constructor
+    /// and component-construction branches of `eval_call` evaluate every
+    /// argument expression in SOURCE-WRITTEN order (exactly like the SAME
+    /// `panic("A")`/`panic("B")` probe used by
+    /// `diff_named_argument_calls_evaluate_side_effects_in_source_written_
+    /// order` above, which PR-it719 already fixed for ordinary top-level
+    /// `fun` calls -- but that fix's own doc comment explicitly scopes it to
+    /// "not constructors, methods, or UFCS", so constructors/components kept
+    /// their own, independently-wrong ordering logic here). Live-confirmed
+    /// before fixing: `Pair(b: panic("B"), a: panic("A"))` (`type Pair =
+    /// Pair(a: Int, b: Int)`) panicked "B" on `kupl run` but "A" on
+    /// `kupl run --vm` AND a `kupl native` binary -- a silent, deterministic
+    /// 3-way-vs-1 divergence in which side effect a program observes first.
+    /// FIXED by evaluating each arg's expression in SOURCE-WRITTEN order
+    /// FIRST, then slotting the already-evaluated REGISTER into its field/
+    /// prop position -- matching interp.rs exactly, and covering
+    /// constructors, direct component construction, AND a component's own
+    /// `children` list construction (which shares `instance_expr`).
+    #[test]
+    fn diff_named_ctor_and_component_args_evaluate_side_effects_in_source_written_order() {
+        // a user constructor: written b-then-a -> B's panic must fire, not A's.
+        assert_eq!(
+            differential(
+                "type Pair = Pair(a: Int, b: Int)\n\
+                 fun probe() -> Str { \"{Pair(b: panic(\"B\"), a: panic(\"A\"))}\" }\n"
+            ),
+            "panic: B"
+        );
+        // direct component construction: same ordering requirement.
+        assert_eq!(
+            differential(
+                "component Widget {\n    intent \"w\"\n    prop a: Int\n    prop b: Int\n    \
+                 expose fun get() -> Int { a }\n}\n\
+                 fun probe() -> Str { \"{Widget(b: panic(\"B\"), a: panic(\"A\")).get()}\" }\n"
+            ),
+            "panic: B"
+        );
+        // a component's own CHILD construction (shares instance_expr with
+        // direct construction, but is a structurally separate call site).
+        assert_eq!(
+            differential(
+                "component Child {\n    intent \"c\"\n    prop a: Int\n    prop b: Int\n    \
+                 expose fun get() -> Int { a }\n}\n\
+                 component Parent {\n    intent \"p\"\n    \
+                 let c = Child(b: panic(\"B\"), a: panic(\"A\"))\n    \
+                 expose fun get_c() -> Int { c.get() }\n}\n\
+                 fun probe() -> Str { \"{Parent().get_c()}\" }\n"
+            ),
+            "panic: B"
+        );
+        // correctness (not just order): named args in non-declaration order
+        // must still land in the RIGHT fields/props, confirmed via the
+        // actual computed value, not just a panic message.
+        assert_eq!(
+            differential("type Pair = Pair(a: Int, b: Int)\nfun probe() -> Str { \"{Pair(b: 2, a: 1)}\" }\n"),
+            "Pair(1, 2)"
+        );
+        assert_eq!(
+            differential(
+                "component Widget {\n    intent \"w\"\n    prop a: Int\n    prop b: Int\n    \
+                 expose fun get() -> Int { a * 100 + b }\n}\n\
+                 fun probe() -> Int { Widget(b: 2, a: 1).get() }\n"
+            ),
+            "102"
+        );
+    }
+
     #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose

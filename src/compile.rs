@@ -490,21 +490,33 @@ impl<'s> FnCompiler<'s> {
             return self.const_reg(Value::Unit, span);
         };
         let props = self.shared.comp_props.get(comp_name).cloned().unwrap_or_default();
-        let mut supplied: Vec<Option<Expr>> = vec![None; props.len()];
+        // PR-it843 (same root cause and fix shape as order_ctor_args's own
+        // doc comment above): evaluate each supplied arg in SOURCE-WRITTEN
+        // order (this loop's own iteration order), THEN slot the already-
+        // evaluated register into its prop position -- previously this
+        // cloned the raw EXPRESSIONS into prop-declaration order first and
+        // evaluated them in THAT order below, diverging from interp.rs's
+        // `eval_call` (which evaluates a component's constructor args in
+        // source order before ever calling `instantiate`). Live-confirmed:
+        // `Widget(b: panic("B"), a: panic("A"))` for a component with
+        // `prop a: Int` declared before `prop b: Int` panicked "B" on
+        // `kupl run` but "A" on `kupl run --vm`/`kupl native`.
+        let mut supplied: Vec<Option<Reg>> = vec![None; props.len()];
         for (i, a) in args.iter().enumerate() {
             let idx = match &a.name {
                 Some(n) => props.iter().position(|(pn, _)| pn == n).unwrap_or(i),
                 None => i,
             };
+            let r = self.expr(&a.value);
             if idx < supplied.len() {
-                supplied[idx] = Some(a.value.clone());
+                supplied[idx] = Some(r);
             }
         }
         let temps: Vec<Reg> = props
             .iter()
             .zip(supplied)
             .map(|((pname, default), s)| match s {
-                Some(e) => self.expr(&e),
+                Some(r) => r,
                 None => match default {
                     Some(chunk) => {
                         let dst = self.alloc(span);
@@ -1282,11 +1294,10 @@ impl<'s> FnCompiler<'s> {
                        && self.lookup(name).is_none()
             }) {
                 let meta = self.shared.module.ctors[idx as usize].clone();
-                // order named args by ctor field order
-                let ordered = self.order_ctor_args(&meta.variant, args, span);
-                let start = self.consecutive(&ordered, span);
+                // order named args by ctor field order, evaluated in SOURCE order (PR-it843)
+                let start = self.order_ctor_args(&meta.variant, args, span);
                 let dst = self.alloc(span);
-                self.emit(Op::MakeCtor { dst, ctor: idx, start, len: ordered.len() as u8 }, span);
+                self.emit(Op::MakeCtor { dst, ctor: idx, start, len: args.len() as u8 }, span);
                 return dst;
             }
             // component-local function (private or exposed)
@@ -1327,31 +1338,78 @@ impl<'s> FnCompiler<'s> {
         dst
     }
 
-    /// Reorder constructor args to field order using named-arg info.
-    fn order_ctor_args(&mut self, variant: &str, args: &[Arg], span: Span) -> Vec<Expr> {
+    /// Evaluate constructor args and land them in field order, returning the
+    /// start of a consecutive register block (like `consecutive()`, which
+    /// this replaces for the constructor-call site).
+    ///
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it843, the TWENTY-FOURTH broad Explore survey, independently
+    /// re-verified live before implementing since the survey itself could
+    /// not execute code): the OLD version of this function reordered the
+    /// ARGUMENT EXPRESSIONS THEMSELVES into field-declaration order before
+    /// anything was evaluated (`ordered: Vec<Option<Expr>>`, cloned from
+    /// `a.value`), and the caller then evaluated that FIELD-ordered list via
+    /// `consecutive()` -- so `Pair(b: EXPR_B, a: EXPR_A)` evaluated
+    /// EXPR_A (field `a`, declared first) BEFORE EXPR_B, the REVERSE of how
+    /// the call reads. `interp.rs`'s constructor branch of `eval_call`
+    /// (~line 1475) does the opposite: it evaluates each arg's expression in
+    /// `args.iter().enumerate()` -- i.e. SOURCE-WRITTEN order -- and only
+    /// AFTERWARD uses `a.name` to decide which field slot the ALREADY-
+    /// evaluated value lands in. This is EXACTLY the same "two independent
+    /// implementations disagree on evaluation order" root cause PR-it719
+    /// already fixed for ordinary top-level `fun` calls (via `callargs.rs`'s
+    /// source-order temp-binding rewrite) -- but `callargs.rs`'s own doc
+    /// comment explicitly scopes that fix to "direct calls of top-level
+    /// `fun`s (not constructors, methods, or UFCS)", so constructor calls
+    /// were never covered and kept their own, independently-wrong ordering
+    /// logic here in `compile.rs`. Since `kupl native`/cgen.rs and `.kx`
+    /// both consume the ALREADY-compiled `Module` this function produces,
+    /// this is interp.rs (1 engine, source order) vs. {VM, native, .kx} (3
+    /// engines, field order), not a KVM-only quirk. Live-confirmed before
+    /// fixing: `Pair(b: panic("B"), a: panic("A"))` (for `type Pair =
+    /// Pair(a: Int, b: Int)`) panicked with "B" on `kupl run` but "A" on
+    /// `kupl run --vm` AND a `kupl native` binary -- a silent, deterministic
+    /// divergence in which side effect (or which of two differently-failing
+    /// field expressions) a program observes first, matching this
+    /// campaign's category-2 severity (silent value/behavior corruption).
+    /// FIXED by evaluating each `a.value` in SOURCE-WRITTEN order (this
+    /// loop's own iteration order over `args`) into a register FIRST, and
+    /// only THEN slotting that already-evaluated register into its field
+    /// position -- mirroring `consecutive()`'s own two-phase "resolve all
+    /// sources, then move into a consecutive block" structure so the
+    /// register-range contract callers rely on (`Op::MakeCtor`'s `start`/
+    /// `len`) is preserved exactly.
+    fn order_ctor_args(&mut self, variant: &str, args: &[Arg], span: Span) -> Reg {
         // field names come from Checked via ctor order captured at module build;
         // for builtin ctors and positional calls this is the identity.
         let field_names = self.shared.ctor_fields.get(variant).cloned().unwrap_or_default();
-        let mut ordered: Vec<Option<Expr>> = vec![None; args.len()];
+        let mut ordered: Vec<Option<Reg>> = vec![None; args.len()];
         for (i, a) in args.iter().enumerate() {
             let idx = match &a.name {
                 Some(n) => field_names.iter().position(|f| f == n).unwrap_or(i),
                 None => i,
             };
+            let r = self.expr(&a.value);
             if idx < ordered.len() {
-                ordered[idx] = Some(a.value.clone());
+                ordered[idx] = Some(r);
             }
         }
-        ordered
+        let srcs: Vec<Reg> = ordered
             .into_iter()
             .enumerate()
-            .map(|(i, e)| {
-                e.unwrap_or_else(|| {
+            .map(|(i, slot)| {
+                slot.unwrap_or_else(|| {
                     self.err("K0243", format!("missing field {i} for `{variant}`"), span);
-                    Expr { kind: ExprKind::Unit, span }
+                    self.const_reg(Value::Unit, span)
                 })
             })
-            .collect()
+            .collect();
+        let start = self.next as Reg;
+        for src in srcs {
+            let r = self.alloc(span);
+            self.emit(Op::Move(r, src), span);
+        }
+        start
     }
 
     // ---------------- patterns ----------------
