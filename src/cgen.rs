@@ -6393,9 +6393,36 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         }
         if (!strcmp(name, "parse_float")) {
             /* Match Rust: no leading whitespace (strtod skips it). Overflow to
-               inf is fine — Rust parses "1e999" as inf too. */
+               inf is fine — Rust parses "1e999" as inf too.
+               A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+               PR-it848, the TWENTY-EIGHTH broad Explore survey): `strtod`
+               also implements TWO C99 grammar extensions Rust's
+               `f64::from_str` does not recognize at all -- hexadecimal
+               floating-point literals (`0x1p0`, `0x1.8p3`, with a REQUIRED
+               binary exponent `p`/`P`) and NaN-with-payload syntax
+               (`nan(123)`) -- so `"0x1p0".parse_float()` returned `None` on
+               interp/VM/.kx (Rust rejects it: `ParseFloatError { kind:
+               Invalid }`, independently verified via `rustc` directly) but
+               `Some(1.0)` on `kupl native`, a silent, reachable cross-engine
+               value-corruption divergence for any program parsing untrusted
+               numeric input. Confirmed live for all of `0x1p0`, `0x1.8p3`,
+               `-0x10` (`Some(1.0)`/`Some(12.0)`/`Some(-16.0)` on native vs
+               `None` everywhere else), and `nan(123)` (`Some(NaN)` on
+               native vs `None` elsewhere) -- but bare `nan`/`NaN`/`NAN`
+               (no payload) and `inf`/`infinity`/`Infinity` (any case) are
+               ALREADY correctly accepted on every engine (Rust accepts
+               these too), so the fix below is scoped to ONLY the two
+               genuinely-divergent syntaxes, mirroring `parse_radix`'s own
+               established "guard strtod's superset grammar down to Rust's"
+               technique one function above. */
             char c0 = s[0];
             if (c0==' '||c0=='\t'||c0=='\n'||c0=='\r'||c0=='\v'||c0=='\f') return k_none();
+            const char* p = s;
+            if (*p=='+'||*p=='-') p++;
+            if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) return k_none();
+            if ((p[0]=='n'||p[0]=='N') && (p[1]=='a'||p[1]=='A') && (p[2]=='n'||p[2]=='N') && p[3]=='(') {
+                return k_none();
+            }
             char* end;
             double v = strtod(s, &end);
             if (end == s || *end != 0) return k_none();
@@ -9243,6 +9270,36 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "numparse").trim(),
             "Some(42)|None|None|Some(3.14)|Some(inf)|Some(inf)|None"
+        );
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it848,
+    /// the TWENTY-EIGHTH broad Explore survey): PR-it131's own strict-parsing
+    /// fix above closed the whitespace-skipping and overflow-saturating
+    /// leniency gaps between `strtod`/`strtoll` and Rust's parsers, but did
+    /// not consider TWO further C99 `strtod` grammar extensions Rust's
+    /// `f64::from_str` doesn't recognize at all: hexadecimal floating-point
+    /// literals (`0x1p0`, with a REQUIRED binary exponent) and NaN-with-
+    /// payload syntax (`nan(123)`) -- confirmed via `rustc` directly that
+    /// Rust rejects both (`ParseFloatError { kind: Invalid }`). Live-
+    /// confirmed BEFORE this fix: `"0x1p0".parse_float()` returned `None`
+    /// on interp/`--vm` but `Some(1.0)` on `kupl native` -- a silent
+    /// cross-engine value-corruption divergence. Bare `nan`/`NaN`/`inf`/
+    /// `infinity` (no payload/prefix) are deliberately NOT rejected here --
+    /// Rust accepts those too, and this test also confirms they still parse
+    /// correctly after the fix.
+    #[test]
+    fn native_parse_float_rejects_hex_float_and_nan_payload_syntax_like_rust_does() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{\"0x1p0\".parse_float()}|{\"0x1.8p3\".parse_float()}|{\"-0x10\".parse_float()}|\
+                   {\"nan(123)\".parse_float()}|{\"nan\".parse_float()}|{\"NaN\".parse_float()}|\
+                   {\"inf\".parse_float()}|{\"-inf\".parse_float()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "hexfloatparse").trim(),
+            "None|None|None|None|Some(NaN)|Some(NaN)|Some(inf)|Some(-inf)"
         );
     }
 
