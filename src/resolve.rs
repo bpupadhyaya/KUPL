@@ -408,6 +408,46 @@ impl Rewriter<'_> {
                 for arm in arms {
                     self.push();
                     self.pattern(&mut arm.pattern);
+                    // A REAL, LIVE-CONFIRMED bug found+fixed (production-
+                    // hardening PR-it841): this loop never visited
+                    // `arm.guard` (the `if COND` clause of `x if COND =>
+                    // body`, a fully general `Option<Expr>` -- parsed,
+                    // type-checked, compiled, and interpreted throughout the
+                    // pipeline), so a reference inside a match guard to one
+                    // of THIS package's own definitions was never mangled to
+                    // `pkg$name` -- staying bare while every OTHER reference
+                    // in the same function got rewritten. Since a mangled
+                    // package's definitions and the (never-mangled) root
+                    // package's definitions share ONE flat namespace in
+                    // check.rs/interp.rs's function maps (this module's own
+                    // top-of-file doc comment), a leftover bare name inside a
+                    // guard could silently resolve to a DIFFERENT, same-named
+                    // function elsewhere in the program instead of erroring
+                    // -- directly contradicting this module's own documented
+                    // invariant ("A missed rewrite surfaces as a loud
+                    // unresolved-name error, never silent divergence") and
+                    // matching PR-it698's severity class exactly (silent
+                    // cross-package function invocation), just via a
+                    // different root cause (an unwalked AST field, not the
+                    // alias-resolution logic PR-it698 fixed). Live-confirmed:
+                    // a `dep` package's private `fun is_valid(x: Int) -> Bool
+                    // { x > 0 }`, referenced only inside `pub fun
+                    // classify(x)`'s match guard (`n if is_valid(n) => ...`),
+                    // collided with an UNRELATED root-level `fun
+                    // is_valid(x: Int) -> Bool { x < 0 }` of opposite
+                    // meaning -- `dep.classify(5)` printed "dep-invalid"
+                    // instead of the correct "dep-valid" (5 > 0 per dep's OWN
+                    // is_valid), with `kupl check` reporting ZERO
+                    // diagnostics, identically wrong on interp/KVM/native
+                    // since `resolve::isolate()` runs once upstream of all
+                    // three. Pattern bindings are pushed into scope by
+                    // `self.pattern` just above, so the guard sees them (a
+                    // guard can legitimately reference pattern-bound
+                    // variables, e.g. `Some(n) if n > 0 => ...`), matching
+                    // `interp.rs`'s own pattern-then-guard evaluation order.
+                    if let Some(g) = &mut arm.guard {
+                        self.expr(g);
+                    }
                     self.expr(&mut arm.body);
                     self.pop();
                 }

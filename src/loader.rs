@@ -1357,6 +1357,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it841,
+    /// the TWENTY-THIRD broad Explore survey, independently re-verified live
+    /// before implementing): `resolve.rs`'s `Rewriter::expr`'s `ExprKind::
+    /// Match` arm walked `scrutinee`, each arm's `pattern`, and each arm's
+    /// `body` -- but never `arm.guard` (`MatchArm.guard: Option<Expr>`, the
+    /// `if COND` clause of `x if COND => body`). Since a mangled package's
+    /// definitions and the never-mangled root package's definitions share ONE
+    /// flat namespace in check.rs/interp.rs's function maps, a reference
+    /// inside a guard to one of THIS package's own definitions stayed BARE
+    /// while every OTHER reference in the same function got rewritten to
+    /// `pkg$name` -- so it could silently resolve to a DIFFERENT, same-named
+    /// function elsewhere in the program instead of erroring, directly
+    /// contradicting `resolve.rs`'s own documented invariant ("a missed
+    /// rewrite surfaces as a loud unresolved-name error, never silent
+    /// divergence") and matching PR-it698's severity class (silent
+    /// cross-package function invocation) via a different root cause (an
+    /// unwalked AST field, not the alias-resolution logic PR-it698 fixed).
+    /// Live-confirmed BEFORE this fix: `dep`'s private `fun is_valid(x: Int)
+    /// -> Bool { x > 0 }`, referenced only inside `pub fun classify(x)`'s
+    /// match guard, collided with an UNRELATED root-level `fun is_valid(x:
+    /// Int) -> Bool { x < 0 }` of OPPOSITE meaning -- `dep.classify(5)`
+    /// returned `"dep-invalid"` instead of the correct `"dep-valid"` (5 > 0
+    /// per dep's OWN is_valid), with `kupl check` reporting ZERO diagnostics,
+    /// identically wrong on interp/KVM/native since `resolve::isolate()` runs
+    /// once upstream of all three (confirmed via the CLI on all three engines
+    /// before implementing the fix, in addition to this test).
+    #[test]
+    fn a_match_guards_reference_to_its_own_packages_function_is_mangled_not_left_to_collide() {
+        let base = std::env::temp_dir().join(format!("kupl-guard-mangle-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "fun is_valid(x: Int) -> Bool {\n    x > 0\n}\n\n\
+             pub fun classify(x: Int) -> Str {\n    \
+             match x {\n        \
+             n if is_valid(n) => \"dep-valid\"\n        \
+             _ => \"dep-invalid\"\n    \
+             }\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            // an UNRELATED root-level `is_valid` with the OPPOSITE meaning --
+            // if the guard's reference to `dep`'s OWN `is_valid` is left
+            // unmangled, it silently resolves to THIS one instead.
+            "use dep\n\nfun is_valid(x: Int) -> Bool {\n    x < 0\n}\n\n\
+             fun main() -> Str {\n    dep.classify(5)\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its dep dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "a match guard referencing the dependency's own function must not produce any diagnostic: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let result = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v,
+            Err(crate::interp::Flow::Panic { msg, .. }) => panic!("main() should run cleanly, but panicked: {msg}"),
+            Err(_) => panic!("main() should run cleanly, but hit a control-flow error"),
+        };
+        assert_eq!(
+            result.to_string(),
+            "dep-valid",
+            "the match guard must call dep's OWN is_valid (mangled to dep$is_valid), not silently collide with the unrelated root-level is_valid"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn two_packages_same_name_dont_collide() {
         // two dependencies BOTH define `helper` — namespace isolation keeps them
