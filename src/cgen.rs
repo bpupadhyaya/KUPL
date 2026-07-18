@@ -3755,12 +3755,33 @@ static KValue k_http_serve(KValue port, KValue handler) {
     }
 }
 
+/* `--max-filesize 10485760` (production-hardening PR-it809): a REAL, live-
+   confirmed resource-exhaustion bug -- unlike interp.rs's shared
+   `base_curl_cmd()` (used by BOTH `interp.rs` and `vm.rs` via
+   `interp::http_builtin`, which passes this SAME flag sized to
+   `MAX_HTTP_RESPONSE_SIZE`, 10 * 1024 * 1024, with its own dedicated
+   regression test), native's `k_http_get`/`k_http_post` had NO size cap on
+   the response body at all -- confirmed live: a local test server returning
+   a 50MB body made `kupl run`/`kupl run --vm` cleanly error ("curl: (63)
+   Maximum file size exceeded", ~15MB peak RSS) while a `kupl native`-compiled
+   binary calling the SAME `http_get` buffered the WHOLE 50MB into memory
+   (~107MB peak RSS) with no error at all -- a genuine crash-vs-clean-error
+   AND resource-exhaustion divergence, in the exact deployment mode
+   (standalone native binaries facing untrusted network input) most exposed
+   to it. The literal (rather than a stringified macro) matches
+   `K_MAX_HTTP_BODY`'s numeric value -- C's `#` stringification operator
+   captures raw tokens, not an evaluated arithmetic result, so stringifying
+   the `(10 * 1024 * 1024)` macro would produce `"(10 * 1024 * 1024)"`, not
+   a value curl's `--max-filesize` can parse. */
 static KValue k_http_get(KValue url) {
-    char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30", (char*)k_as_str(url), 0 };
+    char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30",
+                      (char*)"--max-filesize", (char*)"10485760", (char*)k_as_str(url), 0 };
     return k_run_curl(argv, 0);
 }
 static KValue k_http_post(KValue url, KValue body) {
-    char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30", (char*)"-X", (char*)"POST", (char*)"--data-binary", (char*)"@-", (char*)k_as_str(url), 0 };
+    char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30",
+                      (char*)"--max-filesize", (char*)"10485760", (char*)"-X", (char*)"POST",
+                      (char*)"--data-binary", (char*)"@-", (char*)k_as_str(url), 0 };
     return k_run_curl(argv, k_as_str(body));
 }
 
