@@ -6157,7 +6157,20 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 const char* q = strchr(p, '\n');
                 const char* end = q ? q : p + strlen(p);
                 const char* z = end;
-                if (z > p && z[-1] == '\r') z--;              /* strip trailing CR */
+                /* Only strip a CR that directly precedes a real '\n' terminator
+                   (production-hardening PR-it817): a REAL bug found+fixed --
+                   this used to strip ANY trailing '\r', including a bare one
+                   with no following '\n' at all (the final, `q == NULL` chunk
+                   of the string). Rust's `str::lines()` (interp.rs/vm.rs's
+                   shared reference semantics) only treats "\r\n" as a unit;
+                   a lone trailing '\r' with no '\n' is ordinary content and
+                   must be preserved, e.g. `"hello\r".lines()` ==
+                   `["hello\r"]`, not `["hello"]`. Confirmed live: this was a
+                   silent value-corruption divergence reachable through
+                   ordinary text (any file/HTTP payload/user input ending in
+                   a stray CR with no trailing LF, e.g. old Mac-style line
+                   endings or a truncated CRLF stream). */
+                if (q && z > p && z[-1] == '\r') z--;         /* strip trailing CR before a real \n */
                 char* piece = k_alloc((size_t)(z - p) + 1);
                 memcpy(piece, p, (size_t)(z - p)); piece[z - p] = 0;
                 if (n == cap) { cap *= 2; parts = (KValue*)realloc(parts, sizeof(KValue) * cap); }
@@ -8989,6 +9002,27 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "strsplit").trim(),
             "Some([\"a\", \"b=c\"])|bb|Some(2)|[\"a\", \"b\", \"\", \"c\"]|hé***|olléh"
+        );
+    }
+
+    /// Native `Str.lines()` matches interp/KVM's Rust `str::lines()` semantics: a CR is only
+    /// swallowed when it directly precedes a real `\n` terminator -- a bare trailing `\r` with
+    /// no following `\n` is ordinary content and must be preserved (production-hardening
+    /// PR-it817): a REAL, live-confirmed silent value-corruption bug -- native's C mirror
+    /// unconditionally stripped ANY trailing `\r`, including the final `\r`-with-no-`\n` chunk
+    /// of the string, silently dropping a byte of real content on entirely ordinary text (e.g.
+    /// old Mac-style line endings, or a truncated CRLF stream). `"hello\r".lines()` must stay
+    /// `["hello\r"]`, not silently become `["hello"]`.
+    #[test]
+    fn native_lines_preserves_a_bare_trailing_carriage_return() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{\"hello\\r\".lines()}|{\"a\\nb\\r\".lines()}|{\"a\\r\\n\\r\".lines()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "linescr").trim(),
+            "[\"hello\r\"]|[\"a\", \"b\r\"]|[\"a\", \"\r\"]"
         );
     }
 
