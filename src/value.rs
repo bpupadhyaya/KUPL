@@ -680,116 +680,171 @@ pub fn value_key_eq(a: &Value, b: &Value) -> bool {
     true
 }
 
+/// Work items for `Value`'s iterative Display formatter (production-
+/// hardening PR-it802) -- see the `impl fmt::Display for Value` doc comment
+/// below for why this exists. `Val`/`QuotedVal` are values still needing
+/// formatting; `Str`/`Owned` are literal text fragments already queued for
+/// output (`Owned` for text computed at push time, like a demangled ctor
+/// name, that can't be a `&'static str`).
+enum DisplayItem<'a> {
+    Str(&'static str),
+    Owned(String),
+    Val(&'a Value),
+    /// Like `Val`, but a `Str` renders quoted -- matches the OLD `DebugStr`
+    /// helper's behavior for elements nested inside a container.
+    QuotedVal(&'a Value),
+}
+
 impl fmt::Display for Value {
+    // Iterative (production-hardening PR-it802): the List/Ctor/Map/Set arms
+    // used to recurse through plain `write!(f, "{}", DebugStr(item))` calls
+    // for each nested element, so `print()`-ing (or any `{value}`
+    // interpolation, or `.to_string()`) of a deeply-nested structure built
+    // ITERATIVELY (the SAME `type Chain = Wrap(next: Chain) | End`-style
+    // repro used to find+fix PR-it799's Drop bug and PR-it800/it801's
+    // equality bug) stack-overflowed -- confirmed live crashing BOTH
+    // interp.rs and vm.rs (this `impl` is shared code, one fix point for
+    // both, exactly like the Drop/PartialEq fixes before it) with `fatal
+    // runtime error: stack overflow, aborting`. `kupl native`'s C mirror
+    // (`cgen.rs`'s `k_display`) has the IDENTICAL bug shape and is
+    // DELIBERATELY NOT fixed in this same change -- an ordered, iterative
+    // tree-serializer is a meaningfully different (and larger) rewrite than
+    // Drop's unordered teardown or equality's short-circuiting comparison,
+    // so the native C fix is scoped to a dedicated followup iteration,
+    // mirroring exactly how PR-it800/it801 split the equality fix across
+    // two iterations (Rust, then C).
+    //
+    // Unlike Drop (order doesn't matter, PR-it799) or equality (short-
+    // circuits on the first mismatch, PR-it800), formatting must emit
+    // output in the EXACT correct left-to-right nested order -- this needs
+    // an explicit stack of PENDING WORK ITEMS, not just pending values:
+    // each container pushes its own closing bracket, its children
+    // (interleaved with separators), and its opening bracket, in REVERSE
+    // of their desired output order (since a stack pops last-pushed-first,
+    // pushing in reverse makes the FIRST thing to output the LAST thing
+    // pushed, so it pops first). A scalar `Val`/`QuotedVal` writes directly
+    // with no further pushes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Int(v) => write!(f, "{v}"),
-            Value::SizedInt(b) => write!(f, "{}", b.0),
-            Value::BigInt(b) => write!(f, "{b}"),
-            Value::Rational(r) => write!(f, "{r}"),
-            Value::F32(v) => {
-                if v.fract() == 0.0 && v.is_finite() {
-                    write!(f, "{v:.1}")
-                } else {
-                    write!(f, "{v}")
+        let mut stack: Vec<DisplayItem> = vec![DisplayItem::Val(self)];
+        while let Some(item) = stack.pop() {
+            let v = match item {
+                DisplayItem::Str(s) => {
+                    write!(f, "{s}")?;
+                    continue;
                 }
-            }
-            Value::Float(v) => {
-                if v.fract() == 0.0 && v.is_finite() {
-                    write!(f, "{v:.1}")
-                } else {
-                    write!(f, "{v}")
+                DisplayItem::Owned(s) => {
+                    write!(f, "{s}")?;
+                    continue;
                 }
-            }
-            Value::Bool(v) => write!(f, "{v}"),
-            Value::Str(s) => write!(f, "{s}"),
-            Value::Unit => write!(f, "()"),
-            Value::List(items) => {
-                write!(f, "[")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
+                DisplayItem::QuotedVal(Value::Str(s)) => {
+                    write!(f, "\"{s}\"")?;
+                    continue;
+                }
+                DisplayItem::QuotedVal(v) | DisplayItem::Val(v) => v,
+            };
+            match v {
+                Value::Int(x) => write!(f, "{x}")?,
+                Value::SizedInt(b) => write!(f, "{}", b.0)?,
+                Value::BigInt(b) => write!(f, "{b}")?,
+                Value::Rational(r) => write!(f, "{r}")?,
+                Value::F32(x) => {
+                    if x.fract() == 0.0 && x.is_finite() {
+                        write!(f, "{x:.1}")?;
+                    } else {
+                        write!(f, "{x}")?;
                     }
-                    write!(f, "{}", DebugStr(item))?;
                 }
-                write!(f, "]")
-            }
-            Value::Ctor { variant, fields, .. } => {
-                // A REAL bug found+fixed (production-hardening PR-it628): a
-                // cross-package constructor's mangled name (`pkg$Name`, see
-                // resolve.rs) used to leak verbatim into `print()` output --
-                // demangled here for display; `variant` itself stays the
-                // full mangled name for equality/matching (see `PartialEq`
-                // below and interp.rs's pattern matching), only this
-                // rendering is affected.
-                write!(f, "{}", crate::resolve::demangle_for_display(variant))?;
-                if !fields.is_empty() {
-                    write!(f, "(")?;
-                    for (i, field) in fields.iter().enumerate() {
+                Value::Float(x) => {
+                    if x.fract() == 0.0 && x.is_finite() {
+                        write!(f, "{x:.1}")?;
+                    } else {
+                        write!(f, "{x}")?;
+                    }
+                }
+                Value::Bool(x) => write!(f, "{x}")?,
+                Value::Str(s) => write!(f, "{s}")?,
+                Value::Unit => write!(f, "()")?,
+                Value::List(items) => {
+                    stack.push(DisplayItem::Str("]"));
+                    for (i, item) in items.iter().enumerate().rev() {
+                        stack.push(DisplayItem::QuotedVal(item));
+                        if i > 0 {
+                            stack.push(DisplayItem::Str(", "));
+                        }
+                    }
+                    stack.push(DisplayItem::Str("["));
+                }
+                Value::Ctor { variant, fields, .. } => {
+                    if !fields.is_empty() {
+                        stack.push(DisplayItem::Str(")"));
+                        for (i, field) in fields.iter().enumerate().rev() {
+                            stack.push(DisplayItem::QuotedVal(field));
+                            if i > 0 {
+                                stack.push(DisplayItem::Str(", "));
+                            }
+                        }
+                        stack.push(DisplayItem::Str("("));
+                    }
+                    // A REAL bug found+fixed (production-hardening PR-it628): a
+                    // cross-package constructor's mangled name (`pkg$Name`, see
+                    // resolve.rs) used to leak verbatim into `print()` output --
+                    // demangled here for display; `variant` itself stays the
+                    // full mangled name for equality/matching (see `PartialEq`
+                    // below and interp.rs's pattern matching), only this
+                    // rendering is affected.
+                    stack.push(DisplayItem::Owned(crate::resolve::demangle_for_display(variant).to_string()));
+                }
+                Value::Closure(_) => write!(f, "<fn>")?,
+                Value::Fun(name) => write!(f, "<fn {name}>")?,
+                Value::Component(id) => write!(f, "<component #{id}>")?,
+                Value::Bound(id, name) => write!(f, "<fn {name} of #{id}>")?,
+                Value::VmClosure(proto, _, _) => write!(f, "<fn @{proto}>")?,
+                Value::Map(pairs) => {
+                    stack.push(DisplayItem::Str("}"));
+                    for (i, (k, val)) in pairs.iter().enumerate().rev() {
+                        stack.push(DisplayItem::QuotedVal(val));
+                        stack.push(DisplayItem::Str(": "));
+                        stack.push(DisplayItem::QuotedVal(k));
+                        if i > 0 {
+                            stack.push(DisplayItem::Str(", "));
+                        }
+                    }
+                    stack.push(DisplayItem::Str("Map{"));
+                }
+                Value::Set(items) => {
+                    stack.push(DisplayItem::Str("}"));
+                    for (i, item) in items.iter().enumerate().rev() {
+                        stack.push(DisplayItem::QuotedVal(item));
+                        if i > 0 {
+                            stack.push(DisplayItem::Str(", "));
+                        }
+                    }
+                    stack.push(DisplayItem::Str("Set{"));
+                }
+                // `Tensor` holds a flat `Rc<Vec<f64>>` -- f64 is a leaf, not a
+                // nested `Value`, so this can never recurse to unbounded depth
+                // and is safe to format directly without going through the
+                // work-list.
+                Value::Tensor(data) => {
+                    write!(f, "Tensor([")?;
+                    for (i, x) in data.iter().enumerate() {
                         if i > 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{}", DebugStr(field))?;
+                        write!(f, "{}", Value::Float(*x))?;
                     }
-                    write!(f, ")")?;
+                    write!(f, "])")?;
                 }
-                Ok(())
+                Value::Range(a, b, incl) => write!(f, "{a}..{}{b}", if *incl { "=" } else { "" })?,
             }
-            Value::Closure(_) => write!(f, "<fn>"),
-            Value::Fun(name) => write!(f, "<fn {name}>"),
-            Value::Component(id) => write!(f, "<component #{id}>"),
-            Value::Bound(id, name) => write!(f, "<fn {name} of #{id}>"),
-            Value::VmClosure(proto, _, _) => write!(f, "<fn @{proto}>"),
-            Value::Map(pairs) => {
-                write!(f, "Map{{")?;
-                for (i, (k, v)) in pairs.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}: {}", DebugStr(k), DebugStr(v))?;
-                }
-                write!(f, "}}")
-            }
-            Value::Set(items) => {
-                write!(f, "Set{{")?;
-                for (i, x) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", DebugStr(x))?;
-                }
-                write!(f, "}}")
-            }
-            Value::Tensor(data) => {
-                write!(f, "Tensor([")?;
-                for (i, x) in data.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", Value::Float(*x))?;
-                }
-                write!(f, "])")
-            }
-            Value::Range(a, b, incl) => write!(f, "{a}..{}{b}", if *incl { "=" } else { "" }),
         }
+        Ok(())
     }
 }
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self}")
-    }
-}
-
-/// Like Display, but strings are quoted (used inside containers).
-struct DebugStr<'a>(&'a Value);
-
-impl fmt::Display for DebugStr<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Value::Str(s) => write!(f, "\"{s}\""),
-            other => write!(f, "{other}"),
-        }
     }
 }
 
