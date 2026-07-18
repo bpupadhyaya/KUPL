@@ -276,6 +276,34 @@ fn aliasing_regs(op: &Op) -> Vec<Reg> {
         | Op::CallComp { start, argc, .. }
         | Op::CallBuiltin { start, argc, .. }
         | Op::CallValue { start, argc, .. } => (*start..start.saturating_add(*argc)).collect(),
+        // A REAL gap found+fixed (production-hardening PR-it811): `Op::Method`
+        // was entirely absent from this match (falling through to the `_`
+        // catch-all), so NO method call was ever treated as a potential alias
+        // site -- despite this function's own doc comment explicitly warning
+        // "this should be re-examined per-method before any backend relies on
+        // this analysis for a method whose semantics could stash the receiver
+        // elsewhere." At least one builtin method DOES exactly that: native's
+        // `Str.replace_first` short-circuits to `return recv;` (unchanged,
+        // same pointer) when the pattern isn't found (cgen.rs) -- so
+        // `let backup = s.replace_first("nomatch", "y")` makes `backup` a
+        // genuine alias of `s` in native (never in interp/vm, which always
+        // reallocate via `replacen` regardless of match). A later self-append
+        // `s = s + "!"` -- gated on `add_lhs_escapes` seeing no alias of `s`
+        // -- then mutated the SHARED buffer in place via
+        // `k_str_append_inplace`, silently corrupting `backup` too. CONFIRMED
+        // LIVE before this fix: `var s = "a"; s = s + "b"; s = s + "c"; let
+        // backup = s.replace_first("nomatch", "y"); s = s + "d";` printed
+        // `backup=abc` on interp/vm (correct) but `backup=abcd` (corrupted)
+        // on `kupl native` -- a genuine, silent WRONG-ANSWER divergence, not
+        // a crash. Both `recv` and the argument registers are treated as
+        // escaping, matching `Call`/`CallBuiltin`'s existing conservative
+        // treatment of their own argument ranges -- a method could just as
+        // plausibly return one of its ARGUMENTS unchanged as its receiver.
+        Op::Method { recv, start, argc, .. } => {
+            let mut regs = vec![*recv];
+            regs.extend(*start..start.saturating_add(*argc));
+            regs
+        }
         Op::MakeList { start, len, .. } | Op::MakeCtor { start, len, .. } => {
             (*start..start.saturating_add(*len)).collect()
         }
@@ -515,6 +543,26 @@ mod escape_tests {
     }
 
     #[test]
+    fn method_call_reading_the_receiver_before_push_escapes() {
+        // production-hardening PR-it811: a method call that merely READS
+        // `recv` as its receiver (e.g. `let backup = xs.replace_first(...)`)
+        // must be treated as a potential alias site -- `Op::Method` was
+        // entirely absent from `aliasing_regs` before this fix, so no method
+        // call was ever recognized as escaping. Some builtin methods DO
+        // return their receiver unchanged (native's `Str.replace_first` on
+        // no match, `Set.insert` on a duplicate), making `backup` and `xs`
+        // share the same underlying pointer in native's C backend -- a
+        // subsequent in-place self-rebind mutation of `xs` would then
+        // silently corrupt `backup` too, confirmed live before this fix.
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::Method { dst: 1, recv: 0, name: PUSH, start: 2, argc: 0 }, // xs read as a receiver
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
     fn closure_capture_before_push_escapes() {
         let c = chunk(vec![
             Op::MakeList { dst: 0, start: 0, len: 0 },
@@ -662,6 +710,21 @@ mod escape_tests {
         let c = chunk(vec![
             Op::Const(0, 0),
             Op::Call { dst: 1, fun: 0, start: 0, argc: 1 }, // s passed as an arg
+            Op::Const(2, 1),
+            self_add(0, 2),
+        ]);
+        assert!(add_lhs_escapes(&c, 3));
+    }
+
+    #[test]
+    fn method_call_reading_the_receiver_before_self_add_escapes() {
+        // production-hardening PR-it811, the Add-side counterpart of
+        // `method_call_reading_the_receiver_before_push_escapes` -- see that
+        // test's comment for the concrete `Str.replace_first` corruption
+        // this closes.
+        let c = chunk(vec![
+            Op::Const(0, 0),
+            Op::Method { dst: 1, recv: 0, name: PUSH, start: 2, argc: 0 }, // s read as a receiver
             Op::Const(2, 1),
             self_add(0, 2),
         ]);
