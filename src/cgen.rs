@@ -7742,6 +7742,40 @@ mod tests {
         );
     }
 
+    /// A REAL, live-confirmed silent value-corruption bug found+fixed
+    /// (production-hardening PR-it824), a SIXTH untracked edge in
+    /// `reg_traces_to_a_parameter` (Move/PR-it615, GetField/PR-it819,
+    /// IterGet/PR-it820, StateGet/PR-it822, Call+CallComp+CallValue+Method/
+    /// PR-it823, now WithField/PR-it824), found finishing the systematic
+    /// completeness sweep's remaining tail: `k_with_field` (cgen.rs)
+    /// allocates a FRESH fields array but memcpy's `obj`'s OWN field array
+    /// into it before overwriting just the one updated field -- so `(b
+    /// with x: 99).items` (a field OTHER than the one just updated)
+    /// aliases `b`'s own `items` field exactly as directly as a plain
+    /// `b.items` `GetField` would. Fixed by recursing into `WithField`'s
+    /// `obj` register, mirroring `GetField`'s treatment exactly (unlike
+    /// `IterGet`/`StateGet`/`Call`/`Method`, `WithField` DOES have a
+    /// genuine source register to recurse into and reason about).
+    #[test]
+    fn native_self_rebind_of_a_with_field_untouched_field_does_not_corrupt_the_callers_struct() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Box = Box(x: Int, items: List[Int])\n\
+                   fun mutate(b: Box, item: Int) -> List[Int] {\n    \
+                   var xs = (b with x: 99).items\n    xs = xs.push(item)\n    xs\n}\n\
+                   fun main() uses io {\n    \
+                   let b = Box(x: 1, items: [1, 2, 3])\n    let ys = mutate(b, 999)\n    \
+                   print(\"{ys}|{b.items}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_withfield_result");
+        assert_eq!(
+            out.trim(),
+            "[1, 2, 3, 999]|[1, 2, 3]",
+            "native must not corrupt the caller's `b.items` via mutate's internal self-push \
+             on a value extracted from a WithField's untouched field"
+        );
+    }
+
     /// Production-hardening PR-it790: a close structural read of `emit_op`'s
     /// self-rebind fast paths (following it615's real parameter-alias bug)
     /// surfaced that `aliasing_regs` (bytecode.rs) never lists `Op::Method`

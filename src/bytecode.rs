@@ -527,6 +527,31 @@ pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool
                     return true;
                 }
             }
+            // production-hardening PR-it824: a SIXTH untracked edge, found
+            // finishing the systematic completeness sweep's remaining tail
+            // (Op::WithField and Op::CallAi -- CallAi confirmed safe, see
+            // this arm's sibling comment below). `dst <- copy of regs[obj]
+            // with field consts[name] replaced by regs[value]` -- `b with
+            // x: 99` -- compiles to `Op::WithField`. `k_with_field`
+            // (cgen.rs) allocates a FRESH fields array and memcpy's `obj`'s
+            // OWN field array into it before overwriting just the ONE
+            // updated field -- so every OTHER (unchanged) field's `KValue`
+            // is a SHALLOW copy of `obj`'s corresponding slot, no clone/
+            // refcount bump. `(b with x: 99).items` (a field OTHER than
+            // the one just updated) therefore aliases `b`'s own `items`
+            // field exactly as directly as a plain `b.items` `GetField`
+            // would. UNLIKE `IterGet`/`StateGet`/`Call`/`Method` (which
+            // have no sound way to prove their result safe and so are
+            // treated unconditionally unsafe), `WithField` DOES have a
+            // genuine source register to recurse into here -- `obj` -- and
+            // the SAME reasoning as `GetField` applies: if `obj` itself
+            // doesn't trace to a parameter, a field carried through from a
+            // truly local, non-escaping `obj` really is safe to mutate.
+            if let Op::WithField { dst, obj, .. } = op {
+                if *dst == reg && go(chunk, op_idx, *obj, depth + 1) {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -1063,6 +1088,53 @@ mod escape_tests {
         let c = chunk_with_params(
             1,
             vec![Op::Call { dst: 1, fun: 0, start: 0, argc: 1 }, Op::Move(2, 1), self_push(2)],
+        );
+        assert!(reg_traces_to_a_parameter(&c, 2, 2));
+    }
+
+    #[test]
+    fn a_with_field_of_a_parameter_traces_to_it_via_its_obj_register() {
+        // production-hardening PR-it824: `(b with x: 99).items` -- reading
+        // a DIFFERENT field than the one just updated -- compiles to
+        // WithField then GetFieldNamed. k_with_field (cgen.rs) shallow-
+        // copies every OTHER field from `obj`, so if `obj` (here, the
+        // parameter `b`) traces to a parameter, WithField's `dst` aliases
+        // `obj`'s untouched fields exactly as directly as GetField would.
+        // Unlike IterGet/StateGet/Call/Method, WithField DOES have a real
+        // source register (`obj`) to recurse into, mirroring GetField.
+        let c = chunk_with_params(1, vec![Op::WithField { dst: 1, obj: 0, name: 0, value: 0 }, self_push(1)]);
+        assert!(reg_traces_to_a_parameter(&c, 1, 1));
+    }
+
+    #[test]
+    fn a_with_field_of_a_fresh_chunk_local_ctor_does_not_trace_to_a_parameter() {
+        // fun f() { let b = Box(items: []); var xs = (b with x: 1).items;
+        // xs = xs.push(item) } -- b itself is chunk-local (MakeCtor, never
+        // a parameter), so a field carried through unchanged really is
+        // safe to mutate. Must NOT be disqualified, mirroring the existing
+        // GetField/IterGet "fresh chunk-local" preservation checks.
+        let c = chunk_with_params(
+            0,
+            vec![
+                Op::MakeCtor { dst: 0, ctor: 0, start: 1, len: 0 },
+                Op::WithField { dst: 1, obj: 0, name: 0, value: 0 },
+                self_push(1),
+            ],
+        );
+        assert!(!reg_traces_to_a_parameter(&c, 2, 1));
+    }
+
+    #[test]
+    fn a_get_field_through_a_with_field_of_a_parameter_is_still_caught() {
+        // (b with x: 99).items -- a GetFieldNamed hop reading a WithField's
+        // dst, which itself traces back to the parameter `b`.
+        let c = chunk_with_params(
+            1,
+            vec![
+                Op::WithField { dst: 1, obj: 0, name: 0, value: 0 },
+                Op::GetFieldNamed { dst: 2, obj: 1, name: 1 },
+                self_push(2),
+            ],
         );
         assert!(reg_traces_to_a_parameter(&c, 2, 2));
     }
