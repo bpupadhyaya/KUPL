@@ -5369,6 +5369,26 @@ static int k_sortby_cmp(const void* a, const void* b) {
     return x->idx - y->idx;
 }
 
+/* stable sort by k_list_order: qsort with an original-index tiebreak, same shape as
+   k_sortby_cmp just above but for `.sort()`'s general value comparator instead of an
+   Int key (production-hardening PR-it818): a REAL, live-confirmed latency divergence --
+   `.sort()` used to be a hand-rolled INSERTION sort (O(n^2) worst case, see its old
+   comment below this struct for why it needs k_list_order rather than k_cmp), unlike
+   interp.rs/vm.rs's Rust `slice::sort_by` (O(n log n) always -- the VM routes `.sort()`
+   through the EXACT SAME shared_method Rust code as the interpreter, so those two can
+   never diverge from each other here) and unlike THIS FILE's own sibling `.sort_by()`
+   just above, which already uses qsort. Confirmed live: sorting a 40,000-element
+   reverse-sorted Int list (ordinary, non-adversarial input) took 0.03s on interp/vm but
+   5.2s on native -- a ~185x latency divergence, growing quadratically with list size. */
+typedef struct { KValue v; int idx; } KSortListItem;
+static int k_sort_cmp(const void* a, const void* b) {
+    const KSortListItem* x = (const KSortListItem*)a;
+    const KSortListItem* y = (const KSortListItem*)b;
+    int c = k_list_order(x->v, y->v);
+    if (c != 0) return c;
+    return x->idx - y->idx;
+}
+
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
     if (recv.tag == K_BIGINT) {
         if (!strcmp(name, "pow")) { (void)argc; if (args[0].as.i < 0) k_panic("`pow` exponent must be non-negative"); return k_big_v(k_big_pow(recv, args[0].as.i)); }
@@ -5590,31 +5610,26 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_bool(1);
         }
         if (!strcmp(name, "sort")) {
-            KValue* out = k_alloc(sizeof(KValue) * (l->len < 1 ? 1 : l->len));
-            memcpy(out, l->items, sizeof(KValue) * l->len);
-            /* insertion sort: stable, no globals needed for the comparator. Delegates to
-               k_list_order (PR-it549 originally routed this through k_cmp directly;
-               PR-it711 introduced this DEDICATED comparator, used ONLY by `.sort()`, not
-               by min/max/min_by/max_by above, which keep k_cmp unchanged) -- supports
-               SizedInt/f32/BigInt/Rational alongside Int/Float/Str, same as k_cmp, but
-               ALSO defines a genuine total order over NaN-containing float lists: k_cmp's
-               raw `<`/`>` is correct for the user-facing comparison operators (NaN must
-               never beat anything there) but is NOT a valid total order for a SORT
-               algorithm, which used to make the INTERPRETER's own `.sort()` (built on
-               Rust's `slice::sort_by`, which shared this same non-transitive ordering
-               relation before PR-it711) crash the whole process with an internal Rust
-               panic on a NaN-containing list of non-trivial size. */
-            for (int64_t i = 1; i < l->len; i++) {
-                KValue key = out[i];
-                int64_t j = i - 1;
-                while (j >= 0) {
-                    if (k_list_order(out[j], key) <= 0) break; /* out[j] > key */
-                    out[j + 1] = out[j];
-                    j--;
-                }
-                out[j + 1] = key;
-            }
-            return k_list(out, (int)l->len);
+            /* stable qsort (production-hardening PR-it818, replacing an O(n^2) insertion
+               sort -- see k_sort_cmp's own comment above for the latency-divergence
+               rationale). Delegates to k_list_order (PR-it549 originally routed this
+               through k_cmp directly; PR-it711 introduced this DEDICATED comparator, used
+               ONLY by `.sort()`, not by min/max/min_by/max_by above, which keep k_cmp
+               unchanged) -- supports SizedInt/f32/BigInt/Rational alongside Int/Float/Str,
+               same as k_cmp, but ALSO defines a genuine total order over NaN-containing
+               float lists: k_cmp's raw `<`/`>` is correct for the user-facing comparison
+               operators (NaN must never beat anything there) but is NOT a valid total
+               order for a SORT algorithm, which used to make the INTERPRETER's own
+               `.sort()` (built on Rust's `slice::sort_by`, which shared this same
+               non-transitive ordering relation before PR-it711) crash the whole process
+               with an internal Rust panic on a NaN-containing list of non-trivial size. */
+            int64_t n = l->len;
+            KSortListItem* arr = (KSortListItem*)k_alloc(sizeof(KSortListItem) * (n < 1 ? 1 : n));
+            for (int64_t i = 0; i < n; i++) { arr[i].v = l->items[i]; arr[i].idx = (int)i; }
+            qsort(arr, n, sizeof(KSortListItem), k_sort_cmp);
+            KValue* out = (KValue*)k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
+            for (int64_t i = 0; i < n; i++) out[i] = arr[i].v;
+            return k_list(out, (int)n);
         }
         if (!strcmp(name, "take") || !strcmp(name, "drop")) {
             if (args[0].tag != K_INT) k_panic("`take`/`drop` needs an Int");
@@ -8646,6 +8661,33 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "nancoll").trim(),
             "[1.0, 2.0, 3.0, NaN]|Some(1.0)|Some(3.0)|[NaN, NaN, 1.0]|2"
+        );
+    }
+
+    /// Native `.sort()` correctly sorts a large (30,000-element) reverse-sorted list --
+    /// exercises the qsort-based implementation's heap allocation/comparator at a size
+    /// where a subtle indexing bug could plausibly only show up at scale (production-
+    /// hardening PR-it818, replacing a hand-rolled O(n^2) insertion sort with a stable
+    /// `qsort` + original-index tiebreak, mirroring this file's own `.sort_by()`). The
+    /// LATENCY improvement itself (~3.0s insertion sort -> ~0.2s qsort on this input,
+    /// confirmed live via revert-and-verify, matching interp.rs/vm.rs's shared O(n log n)
+    /// Rust `slice::sort_by`) is intentionally NOT asserted here as a wall-clock threshold:
+    /// under full-suite parallel `cargo test` CPU contention (many concurrent `cc`-spawning
+    /// native tests), a fixed-threshold timing assertion was confirmed LIVE to be flaky --
+    /// it passed reliably in isolation (~0.7s) but failed under full-suite contention,
+    /// which inflates wall-clock time for BOTH the fast and slow algorithm unpredictably.
+    #[test]
+    fn native_sort_of_a_large_reverse_sorted_list_is_correct() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    var xs = []\n    var i = 0\n    let n = 30000\n    \
+                   while i < n {\n        xs = xs.push(n - i)\n        i = i + 1\n    }\n    \
+                   let sorted = xs.sort()\n    \
+                   print(\"len={sorted.len()} first={sorted.first().unwrap_or(0 - 1)} last={sorted.last().unwrap_or(0 - 1)}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "sortlarge").trim(),
+            "len=30000 first=1 last=30000"
         );
     }
 
