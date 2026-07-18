@@ -2126,6 +2126,20 @@ fn resolve_formatting(text: &str) -> Option<String> {
     if formatted == text {
         return Some("[]".to_string());
     }
+    // The SAME safety net as `kupl fmt --write` (production-hardening
+    // PR-it837): `format_program` can, for at least one confirmed case (a
+    // Float/F32 literal overflowing to infinity, silently accepted with no
+    // diagnostic), render text that does NOT compile -- `inf` re-lexes as a
+    // bare identifier, syntactically valid (a PLAIN re-parse would MISS
+    // this), but fails "unknown name" (K0240) once the full checker runs.
+    // Format-on-save applying such an edit would corrupt the buffer with NO
+    // chance for the user to notice or undo (unlike the CLI, which at least
+    // prints `formatted: <file>` after the fact). A safe no-op (`[]`, the
+    // SAME return already used for the comments/already-formatted cases
+    // just above) is far better than proposing a destructive edit.
+    if crate::run::compile(&formatted).is_err() {
+        return Some("[]".to_string());
+    }
     let (end_line, end_col) = line_col_utf16(text, text.len() as u32);
     Some(format!(
         "[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":{},\"character\":{}}}}},\"newText\":\"{}\"}}]",
@@ -4423,6 +4437,48 @@ mod tests {
 
         // unparseable source: nothing safe to format at all
         assert_eq!(resolve_formatting("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
+    }
+
+    /// A REAL, live-confirmed DATA-LOSS bug found+fixed (production-hardening
+    /// PR-it837): a `Float`/`F32` literal whose magnitude overflows to
+    /// infinity (`1e400`, `1e40f32`, ...) is silently accepted by the lexer
+    /// with ZERO diagnostic anywhere in the pipeline -- `let x: Float =
+    /// 1e400` runs fine, printing `inf`. But `fmt::format_program` renders
+    /// the resulting non-finite value via `Display`, producing the bare text
+    /// `inf`/`-inf`/`inff32` -- NOT valid KUPL syntax (the lexer has no
+    /// `inf`/`nan` literal form; it re-lexes as an ordinary IDENTIFIER,
+    /// syntactically fine but an "unknown name" once the checker runs,
+    /// K0240). `textDocument/formatting` used to propose this AS a
+    /// format-on-save edit; the CLI's `kupl fmt --write` used to overwrite
+    /// the file with it UNCONDITIONALLY, permanently destroying the
+    /// original with no backup. Both are now a safe no-op (`[]`) here / a
+    /// refused write with the file left untouched (see `main.rs`'s own
+    /// `--write` handler and its matching test in `main.rs`'s own test
+    /// module). A PLAIN re-parse alone would NOT have caught this -- `inf`
+    /// as a bare identifier parses cleanly; only the FULL `run::compile`
+    /// pipeline (parser + checker) surfaces K0240.
+    #[test]
+    fn formatting_never_proposes_a_non_reparseable_edit_for_an_overflowing_float_literal() {
+        let src = "fun main() uses io {\n    let x: Float = 1e400\n    print(\"{x}\")\n}\n";
+        // confirm the ROOT CAUSE precisely: the ORIGINAL source is valid and
+        // runs fine (silently becoming `inf`), but format_program's rendering
+        // of that Float value does NOT compile.
+        assert!(crate::run::compile(src).is_ok(), "the original 1e400 literal must compile fine");
+        let (program, _diags) = crate::parser::parse(src);
+        let formatted = crate::fmt::format_program(&program);
+        assert!(formatted.contains("inf"), "sanity: the bug's exact mechanism -- {formatted}");
+        assert!(crate::run::compile(&formatted).is_err(), "sanity: the formatted `inf` text must NOT compile -- {formatted}");
+        // the actual fix: resolve_formatting must refuse to propose this edit
+        assert_eq!(
+            resolve_formatting(src),
+            Some("[]".to_string()),
+            "must not propose a format-on-save edit that would corrupt the file"
+        );
+
+        // the F32 variant shares the identical mechanism.
+        let src_f32 = "fun main() uses io { let x = 1e40f32 ; print(\"{x}\") }\n";
+        assert!(crate::run::compile(src_f32).is_ok());
+        assert_eq!(resolve_formatting(src_f32), Some("[]".to_string()));
     }
 
     #[test]

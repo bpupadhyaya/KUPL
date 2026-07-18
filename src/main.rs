@@ -241,6 +241,38 @@ fn run_cli() -> ExitCode {
                 return 1;
             }
             if write {
+                // A REAL, live-confirmed DATA-LOSS bug found+fixed (production-
+                // hardening PR-it837): `format_program`'s AST-to-source rendering
+                // can, for at least one confirmed pathological case (a `Float`/
+                // `F32` literal whose magnitude overflows to infinity -- e.g.
+                // `1e400` -- which the lexer silently accepts as a valid `inf`
+                // value with NO diagnostic anywhere in the pipeline), produce
+                // text that does NOT compile as valid KUPL: `let x: Float =
+                // 1e400` formats to `let x: Float = inf`, and the KUPL lexer has
+                // no `inf`/`nan` literal syntax, so `inf` re-lexes as a bare
+                // IDENTIFIER reference -- syntactically valid (the PARSER alone
+                // does not catch this; `inf` parses fine as a name), but an
+                // "unknown name" (K0240) once the FULL checker runs. `--write`
+                // used to overwrite the file UNCONDITIONALLY with this invalid
+                // text -- no backup, no validity check -- PERMANENTLY destroying
+                // the original, valid source with no way to recover it. This is a
+                // general safety net closing the whole BUG CLASS (any current or
+                // future formatter defect that could produce broken output), not
+                // just the one confirmed instance: recompile the freshly-
+                // formatted text through the FULL pipeline (`run::compile`, not
+                // just `parser::parse` -- a bare re-parse would have MISSED this
+                // exact bug, since `inf` parses cleanly and only fails at
+                // check-time) and refuse to write if it doesn't come back clean,
+                // since `format_program`'s own doc comment promise ("any two
+                // programs with the same AST render identically") implies
+                // round-tripping, which this enforces defensively rather than
+                // trusting silently.
+                if let Err(_compile_errors) = kupl::run::compile(&formatted) {
+                    eprintln!(
+                        "error: internal formatter bug producing invalid output for {file} -- refusing to overwrite the file (original left untouched; please report this as a KUPL bug)"
+                    );
+                    return 1;
+                }
                 if let Err(e) = std::fs::write(file, &formatted) {
                     eprintln!("error: cannot write {file}: {e}");
                     return 1;
@@ -628,6 +660,62 @@ mod tests {
         assert_eq!(std::fs::read(&tmp).unwrap(), dirty, "a rejected combination must not write either");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A REAL, live-confirmed DATA-LOSS bug found+fixed (production-hardening
+    /// PR-it837): a `Float`/`F32` literal whose magnitude overflows to
+    /// infinity (`1e400`, `1e40f32`, ...) is silently accepted by the lexer
+    /// with ZERO diagnostic -- the program runs fine, printing `inf`. But
+    /// `fmt::format_program` renders the resulting non-finite value via
+    /// `Display`, producing the bare text `inf` -- NOT valid KUPL syntax (no
+    /// `inf`/`nan` literal form exists; it re-lexes as an ordinary
+    /// identifier, syntactically fine but an "unknown name" once the checker
+    /// runs, K0240). `kupl fmt --write` used to overwrite the file with this
+    /// broken text UNCONDITIONALLY -- no backup, no validity check --
+    /// PERMANENTLY destroying the original, valid source with no way to
+    /// recover it (confirmed live before this fix: the file's content after
+    /// `--write` was literally unparseable, exit-code-1-on-every-subsequent-
+    /// `kupl run`). Fixed by recompiling the freshly-formatted text through
+    /// the FULL pipeline (`run::compile`, not a bare re-parse -- `inf` as an
+    /// identifier parses cleanly, only the checker catches it) before
+    /// writing, refusing (exit 1, clear error, file left byte-for-byte
+    /// untouched) if it doesn't come back clean.
+    #[test]
+    fn fmt_write_refuses_to_corrupt_the_file_when_formatting_an_overflowing_float_literal() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let tmp = std::env::temp_dir().join(format!("kupl_it837_fmt_write_{}.kupl", std::process::id()));
+        let original = b"fun main() uses io {\n    let x: Float = 1e400\n    print(\"{x}\")\n}\n".to_vec();
+        std::fs::write(&tmp, &original).unwrap();
+
+        // sanity: the ORIGINAL file is valid and runs fine before touching `fmt` at all.
+        let ran = run(&["run", tmp.to_str().unwrap()]);
+        assert_eq!(ran.status.code(), Some(0), "the original 1e400 literal must run fine: {ran:?}");
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "inf");
+
+        let written = run(&["fmt", tmp.to_str().unwrap(), "--write"]);
+        assert_eq!(written.status.code(), Some(1), "must refuse to write, not silently corrupt: {written:?}");
+        assert!(
+            String::from_utf8_lossy(&written.stderr).contains("refusing to overwrite"),
+            "{written:?}"
+        );
+        assert_eq!(std::fs::read(&tmp).unwrap(), original, "the file must be BYTE-FOR-BYTE untouched, not corrupted");
+
+        // the F32 variant shares the identical mechanism.
+        let tmp_f32 = std::env::temp_dir().join(format!("kupl_it837_fmt_write_f32_{}.kupl", std::process::id()));
+        let original_f32 = b"fun main() uses io { let x = 1e40f32 ; print(\"{x}\") }\n".to_vec();
+        std::fs::write(&tmp_f32, &original_f32).unwrap();
+        let written_f32 = run(&["fmt", tmp_f32.to_str().unwrap(), "--write"]);
+        assert_eq!(written_f32.status.code(), Some(1), "{written_f32:?}");
+        assert_eq!(std::fs::read(&tmp_f32).unwrap(), original_f32, "F32 case must also be untouched");
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&tmp_f32);
     }
 
     #[test]
