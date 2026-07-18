@@ -316,20 +316,46 @@ impl Value {
     /// interp.rs, vm.rs (reuses this), and cgen.rs's C mirror
     /// (`k_value_approx_size`) for any equivalent value -- all three engines
     /// cross the cap at the exact same message.
+    // Iterative (production-hardening PR-it804): the List/Set/Ctor/Map arms
+    // used to recurse via `.iter().map(Value::approx_byte_size).sum()`, so a
+    // sufficiently deep structure (the SAME `Wrap(next: Chain)`-style repro
+    // used to find+fix the other three members of this bug family --
+    // Drop at it799, equality at it800-801, Display at it802-803) crashed
+    // this function's OWN size CHECK, which exists specifically to bound
+    // unbounded payload growth in a `wire` cycle -- ironic, since a deep-
+    // enough payload stack-overflowed the very guard meant to reject it,
+    // rather than ever reaching the `MAX_COMPONENT_MESSAGE_BYTES` panic.
+    // Confirmed live crashing ALL THREE engines (interp/vm via Rust; native
+    // via cgen.rs's `k_value_approx_size`, an identically-shaped recursive
+    // C function -- unlike PR-it799's Drop bug, which spared native because
+    // its arena allocator never frees, a size COMPUTATION has no such
+    // protection, matching the equality/Display bugs' shape instead). This
+    // is the SIMPLEST bug-family member to fix: unlike Drop (conditional
+    // `Rc::get_mut`-gated teardown) or Display (must preserve exact output
+    // order) or equality (must short-circuit on the first mismatch), a
+    // byte-size SUM has no ordering or early-exit constraint at all -- a
+    // flat work-list of not-yet-counted `&Value` references, popped in a
+    // loop and accumulated into a running total, is a direct, unconditional
+    // port with no design questions left to resolve.
     pub fn approx_byte_size(&self) -> u64 {
-        match self {
-            Value::Str(s) => s.len() as u64,
-            Value::List(xs) | Value::Set(xs) => {
-                xs.iter().map(Value::approx_byte_size).sum()
+        let mut stack: Vec<&Value> = vec![self];
+        let mut total: u64 = 0;
+        while let Some(v) = stack.pop() {
+            match v {
+                Value::Str(s) => total += s.len() as u64,
+                Value::List(xs) | Value::Set(xs) => stack.extend(xs.iter()),
+                Value::Ctor { fields, .. } => stack.extend(fields.iter()),
+                Value::Map(entries) => {
+                    for (k, val) in entries.iter() {
+                        stack.push(k);
+                        stack.push(val);
+                    }
+                }
+                Value::Tensor(xs) => total += xs.len() as u64 * 8,
+                _ => total += 8,
             }
-            Value::Ctor { fields, .. } => fields.iter().map(Value::approx_byte_size).sum(),
-            Value::Map(entries) => entries
-                .iter()
-                .map(|(k, v)| k.approx_byte_size() + v.approx_byte_size())
-                .sum(),
-            Value::Tensor(xs) => xs.len() as u64 * 8,
-            _ => 8,
         }
+        total
     }
 
     pub fn str(s: impl Into<String>) -> Value {

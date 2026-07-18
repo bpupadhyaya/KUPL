@@ -6735,33 +6735,60 @@ static void k_dispatch(int id, int chunk, KValue* arg) {
    deliberately left at the flat 8-byte leaf cost -- both already
    independently cap their own limb count (bigint.rs::MAX_BIGINT_LIMBS), so
    neither can grow large enough on its own to matter here. */
+/* Iterative (production-hardening PR-it804): the K_LIST/K_SET/K_CTOR/K_MAP
+   cases used to recurse via plain C function calls (`sz +=
+   k_value_approx_size(v.as.list->items[i])`), so a sufficiently deep
+   structure segfaulted this function's OWN size CHECK -- the SAME bug
+   shape as its Rust sibling `Value::approx_byte_size` (value.rs), fixed
+   together at PR-it804. Unlike `k_display`'s PR-it803 rewrite (which
+   needed a tagged work-item struct to preserve output ORDER), a byte-size
+   SUM has no ordering or short-circuit constraint at all -- a flat,
+   capacity-doubling `realloc`'d array of plain `KValue`s still needing
+   their size counted, popped in a loop and accumulated into a running
+   `total`, is the simplest possible port, mirroring this file's own
+   established growable-array convention (matches PR-it801/it803's `k_eq`/
+   `k_display` fixes and `k_url_decode_lossy`'s `pairs` array). */
 static uint64_t k_value_approx_size(KValue v) {
-    switch (v.tag) {
-        case K_STR: return (uint64_t)strlen(v.as.s);
-        case K_LIST: {
-            uint64_t sz = 0;
-            for (int64_t i = 0; i < v.as.list->len; i++) sz += k_value_approx_size(v.as.list->items[i]);
-            return sz;
+    int cap = 16, n = 0;
+    KValue* stack = (KValue*)k_alloc(sizeof(KValue) * cap);
+    stack[n++] = v;
+    uint64_t total = 0;
+    while (n > 0) {
+        KValue x = stack[--n];
+        switch (x.tag) {
+            case K_STR: total += (uint64_t)strlen(x.as.s); break;
+            case K_LIST:
+                for (int64_t i = 0; i < x.as.list->len; i++) {
+                    if (n == cap) { cap *= 2; stack = (KValue*)realloc(stack, sizeof(KValue) * cap); }
+                    stack[n++] = x.as.list->items[i];
+                }
+                break;
+            case K_SET:
+                for (int64_t i = 0; i < x.as.set->len; i++) {
+                    if (n == cap) { cap *= 2; stack = (KValue*)realloc(stack, sizeof(KValue) * cap); }
+                    stack[n++] = x.as.set->items[i];
+                }
+                break;
+            case K_CTOR:
+                for (int i = 0; i < x.as.ctor->nfields; i++) {
+                    if (n == cap) { cap *= 2; stack = (KValue*)realloc(stack, sizeof(KValue) * cap); }
+                    stack[n++] = x.as.ctor->fields[i];
+                }
+                break;
+            case K_MAP:
+                for (int64_t i = 0; i < x.as.map->len; i++) {
+                    if (n == cap) { cap *= 2; stack = (KValue*)realloc(stack, sizeof(KValue) * cap); }
+                    stack[n++] = x.as.map->keys[i];
+                    if (n == cap) { cap *= 2; stack = (KValue*)realloc(stack, sizeof(KValue) * cap); }
+                    stack[n++] = x.as.map->vals[i];
+                }
+                break;
+            case K_TENSOR: total += (uint64_t)x.as.ten->len * 8; break;
+            default: total += 8; break;
         }
-        case K_SET: {
-            uint64_t sz = 0;
-            for (int64_t i = 0; i < v.as.set->len; i++) sz += k_value_approx_size(v.as.set->items[i]);
-            return sz;
-        }
-        case K_CTOR: {
-            uint64_t sz = 0;
-            for (int i = 0; i < v.as.ctor->nfields; i++) sz += k_value_approx_size(v.as.ctor->fields[i]);
-            return sz;
-        }
-        case K_MAP: {
-            uint64_t sz = 0;
-            for (int64_t i = 0; i < v.as.map->len; i++)
-                sz += k_value_approx_size(v.as.map->keys[i]) + k_value_approx_size(v.as.map->vals[i]);
-            return sz;
-        }
-        case K_TENSOR: return (uint64_t)v.as.ten->len * 8;
-        default: return 8;
     }
+    free(stack);
+    return total;
 }
 
 /* drain the queue to quiescence: pop front, dispatch by first-match handler */
