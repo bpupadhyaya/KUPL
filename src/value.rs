@@ -471,44 +471,135 @@ impl Drop for Value {
 }
 
 impl PartialEq for Value {
+    // Iterative comparison (production-hardening PR-it800): the List/Ctor
+    // arms used to recurse through `Vec<Value>`'s own derived `PartialEq`
+    // (`a == b` on an `Rc<Vec<Value>>`), so comparing TWO INDEPENDENTLY-
+    // built EQUAL deep structures (e.g. two 20 000 000-deep `Wrap(next:
+    // Chain)` chains, each grown by its OWN iterative `while` loop -- no
+    // KUPL-level call recursion, `MAX_CALL_DEPTH` never applies) via `==`
+    // stack-overflowed -- confirmed live crashing ALL THREE engines (interp
+    // and vm.rs abort with `fatal runtime error: stack overflow, aborting`;
+    // `kupl native` ALSO crashes here, unlike the sibling `Drop` bug fixed
+    // at PR-it799 -- native's arena allocator sidesteps deep FREES, but
+    // `cgen.rs`'s `k_eq` is its own genuinely recursive C function
+    // (`k_eq(a.as.ctor->fields[i], b.as.ctor->fields[i])`), so this is a
+    // SEVERE bug shared by all three engines identically, not a cross-
+    // engine divergence the way the Drop bug was -- native's OWN fix is
+    // deliberately scoped OUT of this iteration (a C-side iterative
+    // rewrite of `k_eq`/`k_key_eq` is a separate, larger undertaking; see
+    // dotfiles memory PR-it800 for the followup plan). A flat work-list of
+    // PENDING PAIRS to compare, processed in a `while` loop instead of via
+    // recursive calls, avoids growing the native stack with structure
+    // depth. Any mismatch found ANYWHERE returns `false` immediately --
+    // preserving the ORIGINAL code's `&&`/`.all()` short-circuit semantics
+    // exactly, not just its final answer.
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Int(a), Value::Int(b)) => a == b,
-            // sized ints are equal iff both value AND width match
-            (Value::SizedInt(a), Value::SizedInt(b)) => a == b,
-            (Value::BigInt(a), Value::BigInt(b)) => a == b,
-            (Value::Rational(a), Value::Rational(b)) => a == b,
-            (Value::F32(a), Value::F32(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
-            (Value::Unit, Value::Unit) => true,
-            (Value::List(a), Value::List(b)) => a == b,
-            (
-                Value::Ctor { ty: t1, variant: v1, fields: f1 },
-                Value::Ctor { ty: t2, variant: v2, fields: f2 },
-            ) => t1 == t2 && v1 == v2 && f1 == f2,
-            (Value::Component(a), Value::Component(b)) => a == b,
-            (Value::Range(a, b, i), Value::Range(c, d, j)) => a == c && b == d && i == j,
-            (Value::Tensor(a), Value::Tensor(b)) => a == b,
-            // Map/Set equality is order-insensitive (Python dict/set semantics).
-            // Keys/elements compare via `value_key_eq` (PR-it691), not plain
-            // `==`, so a `NaN` key/element compares consistently with what
-            // `.get`/`.contains_key`/`.contains` would actually find --
-            // otherwise `Map` `A` and `Map` `B` could each independently
-            // report `.contains_key(nan)` as true while `A == B` disagreed
-            // with that, an inconsistency worse than either alone.
-            (Value::Map(a), Value::Map(b)) => {
-                a.len() == b.len()
-                    && a.iter().all(|(k, v)| {
-                        b.iter().any(|(k2, v2)| value_key_eq(k, k2) && value_key_eq(v, v2))
-                    })
+        let mut stack: Vec<(&Value, &Value)> = vec![(self, other)];
+        while let Some((a, b)) = stack.pop() {
+            match (a, b) {
+                (Value::Int(x), Value::Int(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                // sized ints are equal iff both value AND width match
+                (Value::SizedInt(x), Value::SizedInt(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::BigInt(x), Value::BigInt(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::Rational(x), Value::Rational(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::F32(x), Value::F32(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::Float(x), Value::Float(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::Bool(x), Value::Bool(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::Str(x), Value::Str(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::Unit, Value::Unit) => {}
+                (Value::List(x), Value::List(y)) => {
+                    if x.len() != y.len() {
+                        return false;
+                    }
+                    stack.extend(x.iter().zip(y.iter()));
+                }
+                (
+                    Value::Ctor { ty: t1, variant: v1, fields: f1 },
+                    Value::Ctor { ty: t2, variant: v2, fields: f2 },
+                ) => {
+                    if t1 != t2 || v1 != v2 || f1.len() != f2.len() {
+                        return false;
+                    }
+                    stack.extend(f1.iter().zip(f2.iter()));
+                }
+                (Value::Component(x), Value::Component(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::Range(a1, b1, i1), Value::Range(a2, b2, i2)) => {
+                    if a1 != a2 || b1 != b2 || i1 != i2 {
+                        return false;
+                    }
+                }
+                (Value::Tensor(x), Value::Tensor(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                // Map/Set equality is order-insensitive (Python dict/set semantics).
+                // Keys/elements compare via `value_key_eq` (PR-it691), not plain
+                // `==`, so a `NaN` key/element compares consistently with what
+                // `.get`/`.contains_key`/`.contains` would actually find --
+                // otherwise `Map` `A` and `Map` `B` could each independently
+                // report `.contains_key(nan)` as true while `A == B` disagreed
+                // with that, an inconsistency worse than either alone.
+                // `value_key_eq` is ITSELF made iterative below (the same bug,
+                // reached via a DIFFERENT recursive call chain) -- this arm
+                // doesn't need to push onto `stack` since the recursion into
+                // nested keys/values happens entirely inside `value_key_eq`.
+                (Value::Map(x), Value::Map(y)) => {
+                    let equal = x.len() == y.len()
+                        && x.iter().all(|(k, v)| {
+                            y.iter().any(|(k2, v2)| value_key_eq(k, k2) && value_key_eq(v, v2))
+                        });
+                    if !equal {
+                        return false;
+                    }
+                }
+                (Value::Set(x), Value::Set(y)) => {
+                    let equal =
+                        x.len() == y.len() && x.iter().all(|x| y.iter().any(|y| value_key_eq(x, y)));
+                    if !equal {
+                        return false;
+                    }
+                }
+                _ => return false,
             }
-            (Value::Set(a), Value::Set(b)) => {
-                a.len() == b.len() && a.iter().all(|x| b.iter().any(|y| value_key_eq(x, y)))
-            }
-            _ => false,
         }
+        true
     }
 }
 
@@ -533,38 +624,60 @@ impl PartialEq for Value {
 /// a top-level `Float`/`F32`) so a NaN buried inside a List/Ctor/Map/Set/
 /// Range/Tensor used AS a Map key or Set element is ALSO handled correctly,
 /// not just a bare NaN key.
+///
+/// Made iterative (production-hardening PR-it800), the SAME bug class and
+/// fix technique as `Value`'s own `PartialEq::eq` just above -- a
+/// SEPARATE, independently recursive call chain (List/Ctor here recurse
+/// via `value_key_eq` calling itself directly, not through `PartialEq`),
+/// reachable via ANY Map/Set operation (`insert`/`get`/`contains_key`/
+/// `merge`/`union`/...), not just `==` -- so arguably an even more
+/// EASILY-triggered path in practice than the plain `==` operator.
 pub fn value_key_eq(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::F32(x), Value::F32(y)) => x == y || (x.is_nan() && y.is_nan()),
-        (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
-        (Value::List(x), Value::List(y)) => {
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| value_key_eq(xi, yi))
+    let mut stack: Vec<(&Value, &Value)> = vec![(a, b)];
+    while let Some((a, b)) = stack.pop() {
+        let equal = match (a, b) {
+            (Value::F32(x), Value::F32(y)) => x == y || (x.is_nan() && y.is_nan()),
+            (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
+            (Value::List(x), Value::List(y)) => {
+                if x.len() != y.len() {
+                    false
+                } else {
+                    stack.extend(x.iter().zip(y.iter()));
+                    true
+                }
+            }
+            (
+                Value::Ctor { ty: t1, variant: v1, fields: f1 },
+                Value::Ctor { ty: t2, variant: v2, fields: f2 },
+            ) => {
+                if t1 != t2 || v1 != v2 || f1.len() != f2.len() {
+                    false
+                } else {
+                    stack.extend(f1.iter().zip(f2.iter()));
+                    true
+                }
+            }
+            (Value::Range(a1, b1, i1), Value::Range(a2, b2, i2)) => a1 == a2 && b1 == b2 && i1 == i2,
+            (Value::Tensor(x), Value::Tensor(y)) => {
+                x.len() == y.len()
+                    && x.iter().zip(y.iter()).all(|(xi, yi)| xi == yi || (xi.is_nan() && yi.is_nan()))
+            }
+            (Value::Map(x), Value::Map(y)) => {
+                x.len() == y.len()
+                    && x.iter().all(|(k, v)| {
+                        y.iter().any(|(k2, v2)| value_key_eq(k, k2) && value_key_eq(v, v2))
+                    })
+            }
+            (Value::Set(x), Value::Set(y)) => {
+                x.len() == y.len() && x.iter().all(|xi| y.iter().any(|yi| value_key_eq(xi, yi)))
+            }
+            _ => a == b,
+        };
+        if !equal {
+            return false;
         }
-        (
-            Value::Ctor { ty: t1, variant: v1, fields: f1 },
-            Value::Ctor { ty: t2, variant: v2, fields: f2 },
-        ) => {
-            t1 == t2
-                && v1 == v2
-                && f1.len() == f2.len()
-                && f1.iter().zip(f2.iter()).all(|(x, y)| value_key_eq(x, y))
-        }
-        (Value::Range(a1, b1, i1), Value::Range(a2, b2, i2)) => a1 == a2 && b1 == b2 && i1 == i2,
-        (Value::Tensor(x), Value::Tensor(y)) => {
-            x.len() == y.len()
-                && x.iter().zip(y.iter()).all(|(xi, yi)| xi == yi || (xi.is_nan() && yi.is_nan()))
-        }
-        (Value::Map(x), Value::Map(y)) => {
-            x.len() == y.len()
-                && x.iter().all(|(k, v)| {
-                    y.iter().any(|(k2, v2)| value_key_eq(k, k2) && value_key_eq(v, v2))
-                })
-        }
-        (Value::Set(x), Value::Set(y)) => {
-            x.len() == y.len() && x.iter().all(|xi| y.iter().any(|yi| value_key_eq(xi, yi)))
-        }
-        _ => a == b,
     }
+    true
 }
 
 impl fmt::Display for Value {
