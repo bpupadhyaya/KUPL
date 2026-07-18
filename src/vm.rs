@@ -2282,6 +2282,39 @@ mod tests {
         );
     }
 
+    /// `json_parse` object-key dedup's own O(n log n) fast path
+    /// (production-hardening PR-it838, a SIXTEENTH+ instance of the naive-
+    /// O(n^2)-collection-algorithm bug class, previously closed 11 times
+    /// across List/Set methods but never audited in `json.rs`/`cgen.rs`'s
+    /// `kjp_object`). `diff_json_key_order_and_sort_stability` above already
+    /// covers simple, non-interleaved duplicate keys -- this specifically
+    /// pins the INTERLEAVED case (multiple DIFFERENT keys between a
+    /// duplicate key's occurrences), the shape most likely to expose a bug
+    /// in a sort-based dedup rewrite: "first-seen position" and "last-wins
+    /// value" must be tracked INDEPENDENTLY per key, not conflated.
+    #[test]
+    fn diff_json_duplicate_keys_interleaved_with_other_keys() {
+        assert_eq!(
+            differential(r#"fun probe() -> Str {
+    match json_parse("{{ \"a\": 1, \"b\": 2, \"a\": 3, \"c\": 4, \"b\": 5 }}") { Ok(j) => json_stringify(j), Err(e) => e }
+}
+"#),
+            // a: LAST value 3, at a's FIRST-SEEN position (before b, c)
+            // b: LAST value 5, at b's FIRST-SEEN position (between a and c)
+            // c: only ever 4, at its own first-seen position
+            r#"{"a":3,"b":5,"c":4}"#
+        );
+        // THREE occurrences of the same key, values threaded through
+        // unrelated keys on every side.
+        assert_eq!(
+            differential(r#"fun probe() -> Str {
+    match json_parse("{{ \"x\": 1, \"k\": 10, \"y\": 2, \"k\": 20, \"z\": 3, \"k\": 30 }}") { Ok(j) => json_stringify(j), Err(e) => e }
+}
+"#),
+            r#"{"x":1,"k":30,"y":2,"z":3}"#
+        );
+    }
+
     #[test]
     fn diff_map_set_insertion_order_deterministic() {
         // Map/Set iterate in INSERTION order — deterministic and identical on both

@@ -2962,11 +2962,45 @@ static KValue kjp_array(KJP* p) {
     KValue l = k_list(items, n);
     return k_jc_("JArr", &l, 1);
 }
+/* json_parse's object-key dedup helper (production-hardening PR-it838, the
+   native mirror of interp.rs/json.rs's OWN fix for the SAME bug): a
+   SIXTEENTH+ instance of this campaign's recurring naive-O(n^2)-collection
+   bug class, previously closed 11 times across List/Set methods but never
+   audited in this file. The ORIGINAL code below did a FULL LINEAR SCAN
+   (`for (i=0;i<n;i++) if (!strcmp(keys[i].as.s, key)) ...`) over every
+   PREVIOUSLY-parsed key for EVERY new key, to implement "last key wins"
+   duplicate-key semantics -- O(n^2) for an N-key object. Live-confirmed on
+   the Rust side (json.rs): 5,000/10,000/20,000/40,000-key ordinary JSON
+   objects took 134.8ms/562.9ms/2.11s/8.45s -- ~4x time per 2x size, the
+   textbook O(n^2) signature. Unlike the streaming Rust fix (which uses a
+   HashMap for O(1) average-case per-key lookup during parsing), C has no
+   built-in hash table here, and this codebase has never hand-rolled one --
+   so this reuses the ALREADY-ESTABLISHED, lower-risk sort-based technique
+   this campaign trusts instead: collect ALL (key, value, original-index)
+   entries append-only during parsing (no more per-key duplicate check),
+   then sort a copy by (key text, index) so equal-key runs are contiguous
+   and index-ascending, keep the LAST entry per run (highest index = latest
+   occurrence = "last key wins"), remember each kept entry's FIRST
+   occurrence's index (smallest in the run) to restore first-seen position
+   afterward, exactly mirroring `.unique()`/`set_from_list`/`group_by`'s own
+   established sort-then-restore-order shape (PR-it825-it827). */
+typedef struct { char* key; KValue val; int idx; } KJsonKV;
+static int kjp_kv_keycmp(const void* a, const void* b) {
+    const KJsonKV* x = (const KJsonKV*)a;
+    const KJsonKV* y = (const KJsonKV*)b;
+    int c = strcmp(x->key, y->key);
+    if (c != 0) return c;
+    return x->idx - y->idx;
+}
+static int kjp_kv_idxcmp(const void* a, const void* b) {
+    const KJsonKV* x = (const KJsonKV*)a;
+    const KJsonKV* y = (const KJsonKV*)b;
+    return x->idx - y->idx;
+}
 static KValue kjp_object(KJP* p) {
     p->pos++;  /* '{' */
     int cap = 8, n = 0;
-    KValue* keys = k_alloc(sizeof(KValue) * cap);
-    KValue* vals = k_alloc(sizeof(KValue) * cap);
+    KJsonKV* items = k_alloc(sizeof(KJsonKV) * cap);
     kjp_ws(p);
     if (kjp_peek(p) == '}') { p->pos++; KMap* m = k_alloc(sizeof(KMap)); m->len = 0; m->cap = 0; m->keys = k_alloc(1); m->vals = k_alloc(1); KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1); }
     for (;;) {
@@ -2978,28 +3012,40 @@ static KValue kjp_object(KJP* p) {
         if (!(p->pos < p->len && p->s[p->pos++] == ':')) { kjp_fail(p, "expected `:` in object"); break; }
         KValue val = kjp_value(p);
         if (p->failed) break;
-        KValue kv = k_str(key);
-        int found = -1;
-        for (int i = 0; i < n; i++) if (!strcmp(keys[i].as.s, key)) { found = i; break; }
-        if (found >= 0) vals[found] = val;
-        else {
-            if (n >= cap) {
-                int nc = cap * 2;
-                KValue* nk = k_alloc(sizeof(KValue) * nc); memcpy(nk, keys, sizeof(KValue) * n); keys = nk;
-                KValue* nv = k_alloc(sizeof(KValue) * nc); memcpy(nv, vals, sizeof(KValue) * n); vals = nv;
-                cap = nc;
-            }
-            keys[n] = kv; vals[n] = val; n++;
+        if (n >= cap) {
+            int nc = cap * 2;
+            KJsonKV* ni = k_alloc(sizeof(KJsonKV) * nc); memcpy(ni, items, sizeof(KJsonKV) * n); items = ni;
+            cap = nc;
         }
+        items[n].key = key; items[n].val = val; items[n].idx = n; n++;
         kjp_ws(p);
         int c = p->pos < p->len ? p->s[p->pos++] : -1;
         if (c == ',') continue;
         if (c == '}') break;
         kjp_fail(p, "expected `,` or `}` in object"); break;
     }
+    KJsonKV* sorted = k_alloc(sizeof(KJsonKV) * (n < 1 ? 1 : n));
+    memcpy(sorted, items, sizeof(KJsonKV) * n);
+    qsort(sorted, n, sizeof(KJsonKV), kjp_kv_keycmp);
+    KJsonKV* kept = k_alloc(sizeof(KJsonKV) * (n < 1 ? 1 : n));
+    int kn = 0;
+    int i = 0;
+    while (i < n) {
+        int j = i + 1;
+        while (j < n && !strcmp(sorted[i].key, sorted[j].key)) j++;
+        /* idx is ascending within a run (the composite sort's own tiebreak),
+           so sorted[j-1] is the LAST occurrence (last key wins) and
+           sorted[i]'s idx is the FIRST occurrence (first-seen position). */
+        kept[kn].key = sorted[j - 1].key;
+        kept[kn].val = sorted[j - 1].val;
+        kept[kn].idx = sorted[i].idx;
+        kn++;
+        i = j;
+    }
+    qsort(kept, kn, sizeof(KJsonKV), kjp_kv_idxcmp);
     KMap* m = k_alloc(sizeof(KMap));
-    m->len = n; m->cap = n; m->keys = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n)); m->vals = k_alloc(sizeof(KValue) * (n < 1 ? 1 : n));
-    memcpy(m->keys, keys, sizeof(KValue) * n); memcpy(m->vals, vals, sizeof(KValue) * n);
+    m->len = kn; m->cap = kn; m->keys = k_alloc(sizeof(KValue) * (kn < 1 ? 1 : kn)); m->vals = k_alloc(sizeof(KValue) * (kn < 1 ? 1 : kn));
+    for (int k2 = 0; k2 < kn; k2++) { m->keys[k2] = k_str(kept[k2].key); m->vals[k2] = kept[k2].val; }
     KValue mv; mv.tag = K_MAP; mv.as.map = m; return k_jc_("JObj", &mv, 1);
 }
 static KValue kjp_value(KJP* p) {
