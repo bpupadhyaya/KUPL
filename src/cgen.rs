@@ -1731,107 +1731,184 @@ static void k_fmt_float(KBuf* b, double f) {
 }
 
 static void k_display(KBuf* b, KValue v, int quote_str);
-static void k_display_inner(KBuf* b, KValue v) { k_display(b, v, 1); }
 
+/* A pending work item for the iterative `k_display` below (production-
+   hardening PR-it803, the native half of PR-it802's Rust-side fix):
+   `kind == 0` is a literal string fragment to append directly (`lit` --
+   either a true C string literal like `"["`, or `k_demangle_for_display`'s
+   return value, which is a POINTER INTO the static `CTORS` table, never
+   allocated, so no ownership/lifetime concern -- unlike value.rs's sibling
+   fix, which needed an `Owned(String)` variant because Rust's borrow
+   checker requires it, C has no such requirement here); `kind == 1` is a
+   `KValue` still needing formatting, with `quote_str` carrying the SAME
+   per-value quoting flag the original recursive `k_display`/`k_display_inner`
+   split expressed via a function parameter. */
+typedef struct {
+    int kind;
+    const char* lit;
+    KValue v;
+    int quote_str;
+} KDisplayItem;
+
+/* Iterative (production-hardening PR-it803): the K_LIST/K_CTOR/K_MAP/K_SET
+   cases used to recurse via `k_display_inner` calling back into `k_display`
+   for each nested element, so `print()`-ing a deeply-nested structure built
+   ITERATIVELY (the SAME 20 000 000-deep `Wrap(next: Chain)`-style repro
+   used to find+fix value.rs's sibling `Display` bug at PR-it802) segfaulted
+   -- confirmed live before this fix. Unlike PR-it801's `k_eq`/`k_key_eq`
+   (which only needed to short-circuit a comparison, order didn't matter),
+   formatting must emit output in the EXACT correct left-to-right nested
+   order -- mirrors value.rs's `DisplayItem` work-list technique exactly: a
+   flat, capacity-doubling `realloc`'d array of PENDING WORK ITEMS
+   (`KDisplayItem`, playing the role Rust's `enum` + `Vec` combo played),
+   processed in a `while` loop. Each container pushes its own closing
+   bracket, its children interleaved with separators, and its opening
+   bracket -- in REVERSE of desired output order, since popping a stack
+   yields the LAST-pushed item first, so the FIRST thing that should be
+   OUTPUT must be the LAST thing PUSHED (verified against value.rs's own
+   by-hand trace for a 3-element list before trusting the pattern here). */
 static void k_display(KBuf* b, KValue v, int quote_str) {
-    char tmp[64];
-    switch (v.tag) {
-        case K_INT: snprintf(tmp, sizeof tmp, "%lld", (long long)v.as.i); kb_puts(b, tmp); break;
-        case K_BIGINT: kb_puts(b, k_big_to_decimal(v.as.big)); break;
-        case K_RATIONAL: kb_puts(b, k_rat_to_decimal(v.as.rat)); break;
-        case K_FLOAT: k_fmt_float(b, v.as.f); break;
-        case K_BOOL: kb_puts(b, v.as.b ? "true" : "false"); break;
-        case K_UNIT: kb_puts(b, "()"); break;
-        case K_STR:
-            if (quote_str) { kb_puts(b, "\""); kb_puts(b, v.as.s); kb_puts(b, "\""); }
-            else kb_puts(b, v.as.s);
-            break;
-        case K_LIST: {
-            kb_puts(b, "[");
-            for (int64_t i = 0; i < v.as.list->len; i++) {
-                if (i) kb_puts(b, ", ");
-                k_display_inner(b, v.as.list->items[i]);
-            }
-            kb_puts(b, "]");
-            break;
+    int cap = 16, n = 0;
+    KDisplayItem* stack = (KDisplayItem*)k_alloc(sizeof(KDisplayItem) * cap);
+    stack[n].kind = 1; stack[n].v = v; stack[n].quote_str = quote_str; n++;
+    while (n > 0) {
+        KDisplayItem item = stack[--n];
+        if (item.kind == 0) {
+            kb_puts(b, item.lit);
+            continue;
         }
-        case K_CTOR: {
-            kb_puts(b, k_demangle_for_display(CTORS[v.as.ctor->ctor].variant));
-            if (v.as.ctor->nfields > 0) {
-                kb_puts(b, "(");
-                for (int i = 0; i < v.as.ctor->nfields; i++) {
+        KValue x = item.v;
+        char tmp[64];
+        if (item.quote_str && x.tag == K_STR) {
+            kb_puts(b, "\""); kb_puts(b, x.as.s); kb_puts(b, "\"");
+            continue;
+        }
+        switch (x.tag) {
+            case K_INT: snprintf(tmp, sizeof tmp, "%lld", (long long)x.as.i); kb_puts(b, tmp); break;
+            case K_BIGINT: kb_puts(b, k_big_to_decimal(x.as.big)); break;
+            case K_RATIONAL: kb_puts(b, k_rat_to_decimal(x.as.rat)); break;
+            case K_FLOAT: k_fmt_float(b, x.as.f); break;
+            case K_BOOL: kb_puts(b, x.as.b ? "true" : "false"); break;
+            case K_UNIT: kb_puts(b, "()"); break;
+            case K_STR: kb_puts(b, x.as.s); break;
+            case K_LIST: {
+                if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = "]"; n++;
+                for (int64_t i = x.as.list->len - 1; i >= 0; i--) {
+                    if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                    stack[n].kind = 1; stack[n].v = x.as.list->items[i]; stack[n].quote_str = 1; n++;
+                    if (i > 0) {
+                        if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                        stack[n].kind = 0; stack[n].lit = ", "; n++;
+                    }
+                }
+                if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = "["; n++;
+                break;
+            }
+            case K_CTOR: {
+                if (x.as.ctor->nfields > 0) {
+                    if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                    stack[n].kind = 0; stack[n].lit = ")"; n++;
+                    for (int i = x.as.ctor->nfields - 1; i >= 0; i--) {
+                        if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                        stack[n].kind = 1; stack[n].v = x.as.ctor->fields[i]; stack[n].quote_str = 1; n++;
+                        if (i > 0) {
+                            if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                            stack[n].kind = 0; stack[n].lit = ", "; n++;
+                        }
+                    }
+                    if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                    stack[n].kind = 0; stack[n].lit = "("; n++;
+                }
+                if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = k_demangle_for_display(CTORS[x.as.ctor->ctor].variant); n++;
+                break;
+            }
+            case K_CLOSURE: kb_puts(b, "<fn>"); break;
+            case K_FUN: kb_puts(b, "<fn>"); break;
+            case K_COMPONENT:
+                snprintf(tmp, sizeof tmp, "<component #%lld>", (long long)x.as.i);
+                kb_puts(b, tmp);
+                break;
+            case K_SIZEDINT:
+                /* the stored value always fits its width (≤64 bits); print signed
+                   widths with %lld and unsigned with %llu — matches value.rs {b.0} */
+                if (k_iw_signed(x.as.sized->width))
+                    snprintf(tmp, sizeof tmp, "%lld", (long long)x.as.sized->v);
+                else
+                    snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)x.as.sized->v);
+                kb_puts(b, tmp);
+                break;
+            case K_F32: {
+                /* mirror value.rs F32 Display: whole -> "%.1f", else the shortest
+                   decimal that round-trips AS A FLOAT (strtof, not strtod) */
+                float ff = x.as.f32v;
+                if (isfinite(ff) && ff == floorf(ff)) {
+                    snprintf(tmp, sizeof tmp, "%.1f", (double)ff);
+                } else {
+                    for (int prec = 1; prec <= 9; prec++) {
+                        snprintf(tmp, sizeof tmp, "%.*g", prec, (double)ff);
+                        if (strtof(tmp, 0) == ff) break;
+                    }
+                }
+                kb_puts(b, tmp);
+                break;
+            }
+            case K_RANGE:
+                snprintf(tmp, sizeof tmp, "%lld..%s%lld", (long long)x.as.range.lo,
+                         x.as.range.incl ? "=" : "", (long long)x.as.range.hi);
+                kb_puts(b, tmp);
+                break;
+            case K_MAP: {
+                if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = "}"; n++;
+                for (int64_t i = x.as.map->len - 1; i >= 0; i--) {
+                    if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                    stack[n].kind = 1; stack[n].v = x.as.map->vals[i]; stack[n].quote_str = 1; n++;
+                    if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                    stack[n].kind = 0; stack[n].lit = ": "; n++;
+                    if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                    stack[n].kind = 1; stack[n].v = x.as.map->keys[i]; stack[n].quote_str = 1; n++;
+                    if (i > 0) {
+                        if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                        stack[n].kind = 0; stack[n].lit = ", "; n++;
+                    }
+                }
+                if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = "Map{"; n++;
+                break;
+            }
+            case K_SET: {
+                if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = "}"; n++;
+                for (int64_t i = x.as.set->len - 1; i >= 0; i--) {
+                    if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                    stack[n].kind = 1; stack[n].v = x.as.set->items[i]; stack[n].quote_str = 1; n++;
+                    if (i > 0) {
+                        if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                        stack[n].kind = 0; stack[n].lit = ", "; n++;
+                    }
+                }
+                if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = "Set{"; n++;
+                break;
+            }
+            // `Tensor` holds a flat array of `double` -- a leaf, not a nested
+            // `KValue` -- so this can never recurse to unbounded depth and is
+            // safe to format directly without going through the work-list.
+            case K_TENSOR: {
+                kb_puts(b, "Tensor([");
+                for (int64_t i = 0; i < x.as.ten->len; i++) {
                     if (i) kb_puts(b, ", ");
-                    k_display_inner(b, v.as.ctor->fields[i]);
+                    k_fmt_float(b, x.as.ten->data[i]);
                 }
-                kb_puts(b, ")");
+                kb_puts(b, "])");
+                break;
             }
-            break;
-        }
-        case K_CLOSURE: kb_puts(b, "<fn>"); break;
-        case K_FUN: kb_puts(b, "<fn>"); break;
-        case K_COMPONENT:
-            snprintf(tmp, sizeof tmp, "<component #%lld>", (long long)v.as.i);
-            kb_puts(b, tmp);
-            break;
-        case K_SIZEDINT:
-            /* the stored value always fits its width (≤64 bits); print signed
-               widths with %lld and unsigned with %llu — matches value.rs {b.0} */
-            if (k_iw_signed(v.as.sized->width))
-                snprintf(tmp, sizeof tmp, "%lld", (long long)v.as.sized->v);
-            else
-                snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)v.as.sized->v);
-            kb_puts(b, tmp);
-            break;
-        case K_F32: {
-            /* mirror value.rs F32 Display: whole -> "%.1f", else the shortest
-               decimal that round-trips AS A FLOAT (strtof, not strtod) */
-            float ff = v.as.f32v;
-            if (isfinite(ff) && ff == floorf(ff)) {
-                snprintf(tmp, sizeof tmp, "%.1f", (double)ff);
-            } else {
-                for (int prec = 1; prec <= 9; prec++) {
-                    snprintf(tmp, sizeof tmp, "%.*g", prec, (double)ff);
-                    if (strtof(tmp, 0) == ff) break;
-                }
-            }
-            kb_puts(b, tmp);
-            break;
-        }
-        case K_RANGE:
-            snprintf(tmp, sizeof tmp, "%lld..%s%lld", (long long)v.as.range.lo,
-                     v.as.range.incl ? "=" : "", (long long)v.as.range.hi);
-            kb_puts(b, tmp);
-            break;
-        case K_MAP: {
-            kb_puts(b, "Map{");
-            for (int64_t i = 0; i < v.as.map->len; i++) {
-                if (i) kb_puts(b, ", ");
-                k_display_inner(b, v.as.map->keys[i]);
-                kb_puts(b, ": ");
-                k_display_inner(b, v.as.map->vals[i]);
-            }
-            kb_puts(b, "}");
-            break;
-        }
-        case K_SET: {
-            kb_puts(b, "Set{");
-            for (int64_t i = 0; i < v.as.set->len; i++) {
-                if (i) kb_puts(b, ", ");
-                k_display_inner(b, v.as.set->items[i]);
-            }
-            kb_puts(b, "}");
-            break;
-        }
-        case K_TENSOR: {
-            kb_puts(b, "Tensor([");
-            for (int64_t i = 0; i < v.as.ten->len; i++) {
-                if (i) kb_puts(b, ", ");
-                k_fmt_float(b, v.as.ten->data[i]);
-            }
-            kb_puts(b, "])");
-            break;
         }
     }
+    free(stack);
 }
 
 static const char* k_show(KValue v) {
