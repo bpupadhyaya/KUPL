@@ -353,8 +353,8 @@ pub fn is_chunk_local_reg(chunk: &Chunk, reg: Reg) -> bool {
 }
 
 /// True if the value in register `reg`, as observed at `op_idx`, could have
-/// originated — directly, or through a chain of `Move`s — from a capture or
-/// parameter register.
+/// originated — directly, or through a chain of `Move`s and/or field reads —
+/// from a capture or parameter register.
 ///
 /// This closes a real gap `is_chunk_local_reg` alone misses: the common
 /// `fun f(xs: List[Int]) { var ys = xs; ys = ys.push(item) }` shape compiles
@@ -362,17 +362,24 @@ pub fn is_chunk_local_reg(chunk: &Chunk, reg: Reg) -> bool {
 /// chunk-local register number (so `is_chunk_local_reg` alone says "safe"),
 /// but its value is a Move'd ALIAS of the parameter `xs`, exactly as unsafe
 /// to mutate in place as `xs` itself: the CALLER's own reference to the list
-/// it passed as `xs` would observe the mutation too.
+/// it passed as `xs` would observe the mutation too. `Op::GetField`/
+/// `Op::GetFieldNamed` (production-hardening PR-it819) are the SAME kind of
+/// hazard one layer down: `fun f(b: Box) { var xs = b.items; xs =
+/// xs.push(item) }` reads a field OUT of a parameter — `k_field`/
+/// `k_field_named` (cgen.rs) copy the field's `KValue` with NO clone/
+/// refcount bump, so `xs` and `b`'s stored field become the literal same
+/// heap object, just as aliased as a direct `Move` from the parameter.
 ///
-/// Recursive: follows every `Move` writing into `reg` within the same
-/// loop-body-or-whole-prefix window [`reg_escapes`] scans (same soundness
-/// argument — see `method_recv_escapes`'s doc comment), and treats ANY path
-/// that reaches a parameter/capture as tainting the whole thing —
-/// conservative, since a register conditionally assigned from either a safe
-/// or unsafe source on different branches must be treated as unsafe on the
-/// union of both. Depth-bounded by `nregs` as a cycle guard (a well-formed
-/// chunk's Move chain can't legitimately need more hops than it has
-/// registers); hitting the bound is conservatively treated as unsafe.
+/// Recursive: follows every `Move`/`GetField`/`GetFieldNamed` writing into
+/// `reg` within the same loop-body-or-whole-prefix window [`reg_escapes`]
+/// scans (same soundness argument — see `method_recv_escapes`'s doc
+/// comment), and treats ANY path that reaches a parameter/capture as
+/// tainting the whole thing — conservative, since a register conditionally
+/// assigned from either a safe or unsafe source on different branches must
+/// be treated as unsafe on the union of both. Depth-bounded by `nregs` as a
+/// cycle guard (a well-formed chunk's Move/GetField chain can't legitimately
+/// need more hops than it has registers); hitting the bound is
+/// conservatively treated as unsafe.
 pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool {
     fn go(chunk: &Chunk, op_idx: usize, reg: Reg, depth: u16) -> bool {
         if !is_chunk_local_reg(chunk, reg) {
@@ -391,6 +398,26 @@ pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool
             }
             if let Op::Move(dst, src) = op {
                 if *dst == reg && go(chunk, op_idx, *src, depth + 1) {
+                    return true;
+                }
+            }
+            // production-hardening PR-it819: a REAL, live-confirmed silent
+            // value-corruption bug -- this trace used to follow ONLY
+            // `Op::Move` edges, so `var xs = b.items` (a `GetField`/
+            // `GetFieldNamed` reading a field OUT of a parameter/capture,
+            // `b`) dead-ended at the field-read's own `dst` register
+            // instead of continuing into `obj` (`b`). `k_field`/
+            // `k_field_named` (cgen.rs) copy the field's `KValue` out with
+            // NO clone/refcount bump (this runtime has no refcounting), so
+            // `xs` and `b`'s stored field become the SAME heap object --
+            // exactly as aliased as if `xs` had been `Move`'d directly from
+            // a parameter. `xs = xs.push(item)` then wrongly took the
+            // in-place fast path (this proof reported "not traced to a
+            // parameter"), silently mutating the CALLER's own struct field.
+            // Treat a field read as the same kind of taint-propagating edge
+            // as a `Move`, recursing into the field's `obj` register.
+            if let Op::GetField { dst, obj, .. } | Op::GetFieldNamed { dst, obj, .. } = op {
+                if *dst == reg && go(chunk, op_idx, *obj, depth + 1) {
                     return true;
                 }
             }
@@ -783,5 +810,62 @@ mod escape_tests {
         let mut c = chunk(vec![Op::Move(1, 0), self_push(1)]);
         c.ncaps = 1;
         assert!(reg_traces_to_a_parameter(&c, 1, 1));
+    }
+
+    #[test]
+    fn a_field_read_out_of_a_parameter_traces_to_it_just_like_a_move(
+    ) {
+        // production-hardening PR-it819: `fun f(b: Box) { var xs = b.items;
+        // xs = xs.push(item) }` -- register 0 is the sole parameter `b`,
+        // GetFieldNamed reads `b.items` into register 1, and register 1 is
+        // never itself `Move`'d from anywhere. Before this fix, the trace
+        // only followed `Op::Move` edges, so it dead-ended here and wrongly
+        // reported "safe" -- even though `xs`'s VALUE is the literal same
+        // heap object as `b`'s stored field (k_field/k_field_named copy the
+        // KValue with no clone/refcount bump), exactly as aliased as a
+        // direct Move from the parameter would be.
+        let c = chunk_with_params(1, vec![Op::GetFieldNamed { dst: 1, obj: 0, name: 0 }, self_push(1)]);
+        assert!(reg_traces_to_a_parameter(&c, 1, 1));
+    }
+
+    #[test]
+    fn a_field_read_via_the_indexed_getfield_variant_also_traces_to_a_parameter() {
+        // Same as above but for the tuple/positional `Op::GetField` variant
+        // (named-field access desugars to one or the other depending on
+        // context) -- both must be covered, not just GetFieldNamed.
+        let c = chunk_with_params(1, vec![Op::GetField { dst: 1, obj: 0, idx: 0 }, self_push(1)]);
+        assert!(reg_traces_to_a_parameter(&c, 1, 1));
+    }
+
+    #[test]
+    fn a_field_read_out_of_a_fresh_chunk_local_record_does_not_trace_to_a_parameter() {
+        // fun f() { let b = Box(items: []); var xs = b.items; xs =
+        // xs.push(item) } -- `b` itself is chunk-local (built via MakeCtor,
+        // never a parameter or capture), so extracting a field from it and
+        // mutating that field's value in place is genuinely safe: no other
+        // live reference to it exists. This must NOT be disqualified by the
+        // new GetField/GetFieldNamed edge, mirroring the existing
+        // `a_fresh_chunk_local_value_moved_into_its_bound_register_does_not_trace_to_a_parameter`
+        // check for the Move case.
+        let c = chunk_with_params(
+            0,
+            vec![
+                Op::MakeCtor { dst: 0, ctor: 0, start: 1, len: 0 },
+                Op::GetFieldNamed { dst: 1, obj: 0, name: 0 },
+                self_push(1),
+            ],
+        );
+        assert!(!reg_traces_to_a_parameter(&c, 2, 1));
+    }
+
+    #[test]
+    fn a_move_then_field_read_chain_from_a_parameter_is_still_caught() {
+        // var tmp = b; var xs = tmp.items; xs = xs.push(item) -- a Move hop
+        // followed by a field-read hop, both from the same parameter.
+        let c = chunk_with_params(
+            1,
+            vec![Op::Move(1, 0), Op::GetFieldNamed { dst: 2, obj: 1, name: 0 }, self_push(2)],
+        );
+        assert!(reg_traces_to_a_parameter(&c, 2, 2));
     }
 }

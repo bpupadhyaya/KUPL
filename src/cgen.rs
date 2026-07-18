@@ -7489,6 +7489,83 @@ mod tests {
         );
     }
 
+    /// A REAL, live-confirmed silent value-corruption bug found+fixed
+    /// (production-hardening PR-it819), ONE HOP past PR-it615's parameter-
+    /// alias fix above: `reg_traces_to_a_parameter` (bytecode.rs) only
+    /// followed `Op::Move` edges, so `fun mutate(b: Box) -> List[Int] { var
+    /// xs = b.items; xs = xs.push(item) }` -- reading a FIELD out of a
+    /// parameter, rather than the parameter itself -- dead-ended the trace
+    /// at the field-read's own destination register instead of continuing
+    /// into `b`. `k_field`/`k_field_named` (cgen.rs) copy the field's
+    /// `KValue` with NO clone/refcount bump (this runtime has no
+    /// refcounting), so `xs` and `b.items` become the literal same heap
+    /// object -- exactly as aliased as a direct parameter reference. Fixed
+    /// by giving `reg_traces_to_a_parameter` a `GetField`/`GetFieldNamed`
+    /// case alongside its existing `Move` case, recursing into the field
+    /// read's `obj` register the same way it already recurses into a
+    /// `Move`'s `src`.
+    #[test]
+    fn native_self_rebind_through_a_field_extracted_from_a_parameter_does_not_corrupt_the_callers_struct() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Box = Box(items: List[Int])\n\
+                   fun mutate(b: Box) -> List[Int] {\n    \
+                   var xs = b.items\n    xs = xs.push(99)\n    xs\n}\n\
+                   fun main() uses io {\n    \
+                   let b = Box(items: [1, 2, 3])\n    let ys = mutate(b)\n    \
+                   print(\"{ys}|{b.items}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_field_of_param_list");
+        assert_eq!(
+            out.trim(),
+            "[1, 2, 3, 99]|[1, 2, 3]",
+            "native must not corrupt the caller's `b.items` via mutate's internal self-push \
+             on a value extracted from `b`'s own field"
+        );
+    }
+
+    /// The Map/Set/Str analogues of the field-extraction bug above, same
+    /// root cause and same fix. The Str case specifically needs the
+    /// extracted string to have SPARE capacity (built via a prior in-place
+    /// append, not a fresh literal) for the corruption to be observable --
+    /// a literal's `KStrHdr` always has `cap == len`, so the first append
+    /// after extraction reallocates regardless and coincidentally leaves
+    /// the original untouched; confirmed this distinction live via
+    /// revert-and-verify before adding this test, to make sure it actually
+    /// exercises the buggy path.
+    #[test]
+    fn native_self_rebind_through_a_field_extracted_from_a_parameter_does_not_corrupt_map_set_or_str(
+    ) {
+        if !cc_available() {
+            return;
+        }
+        let src = "type MBox = MBox(m: Map[Str, Int])\n\
+                   fun mutate_map(b: MBox) -> Map[Str, Int] {\n    \
+                   var m2 = b.m\n    m2 = m2.insert(\"z\", 99)\n    m2\n}\n\
+                   type SBox = SBox(s: Set[Int])\n\
+                   fun mutate_set(b: SBox) -> Set[Int] {\n    \
+                   var s2 = b.s\n    s2 = s2.insert(99)\n    s2\n}\n\
+                   type TBox = TBox(t: Str)\n\
+                   fun mutate_str(b: TBox) -> Str {\n    \
+                   var t2 = b.t\n    t2 = t2 + \"?\"\n    t2\n}\n\
+                   fun main() uses io {\n    \
+                   let mb = MBox(m: Map().insert(\"a\", 1).insert(\"b\", 2))\n    \
+                   let r = mutate_map(mb)\n    \
+                   let sb = SBox(s: Set([1, 2, 3]))\n    \
+                   let sr = mutate_set(sb)\n    \
+                   var padded = \"hi\"\n    padded = padded + \"!\"\n    \
+                   let tb = TBox(t: padded)\n    \
+                   let tr = mutate_str(tb)\n    \
+                   print(\"{r.len()}|{mb.m.len()}|{sr.len()}|{sb.s.len()}|{tr}|{tb.t}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_field_of_param_mapsetstr");
+        assert_eq!(
+            out.trim(),
+            "3|2|4|3|hi!?|hi!",
+            "native must not corrupt mb.m/sb.s/tb.t via the mutate_*'s internal self-insert/self-append \
+             on a value extracted from a field"
+        );
+    }
+
     /// Production-hardening PR-it790: a close structural read of `emit_op`'s
     /// self-rebind fast paths (following it615's real parameter-alias bug)
     /// surfaced that `aliasing_regs` (bytecode.rs) never lists `Op::Method`
