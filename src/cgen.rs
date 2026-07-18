@@ -5410,6 +5410,28 @@ static int k_groupby_idx_cmp(const void* a, const void* b) {
     return x->idx - y->idx;
 }
 
+/* Plain-KValue qsort comparator (production-hardening PR-it828, Set.union's
+   fast path): unlike KSortListItem/KGroupByItem, no idx tiebreak is needed
+   here -- the sorted copy is used ONLY as a throwaway binary-search lookup
+   structure, never as an output, so its internal order is irrelevant. */
+static int k_value_cmp(const void* a, const void* b) {
+    return k_list_order(*(const KValue*)a, *(const KValue*)b);
+}
+/* Binary search a SORTED KValue array for `x`. `sort_order`-equal implies
+   `value_key_eq`/`k_key_eq`-equal for every type in the fast-path type set
+   (the SAME equivalence PR-it825/it826/it827 established), so finding ANY
+   matching position correctly answers Set membership. */
+static int k_value_bsearch(KValue* sorted, int64_t n, KValue x) {
+    int64_t lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        int c = k_list_order(sorted[mid], x);
+        if (c == 0) return 1;
+        if (c < 0) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
+
 /* A REAL, live-confirmed severe latency divergence found+fixed
    (production-hardening PR-it826), the Set(list)-conversion analogue of
    PR-it825's List.unique() fix, with an even WORSE observed constant
@@ -6837,15 +6859,48 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_set_make(out, n);
         }
         if (!strcmp(name, "union")) {
+            /* A REAL, live-confirmed severe latency divergence found+fixed
+               (production-hardening PR-it828), a SIXTH instance of this
+               campaign's recurring "naive O(n^2) collection algorithm" bug
+               class (after Int.pow it814, List.sort it818, List.unique
+               it825, set_from_list it826, group_by it827): the naive
+               fallback's membership test is a LINEAR SCAN, run once per
+               element of `o`, so unioning two mostly-disjoint Sets is
+               O(n*m). UNLIKE `.unique()`/`set_from_list`/`group_by`, this
+               fix does NOT reorder or restore order of the OUTPUT at all:
+               `union`'s existing contract keeps `st`'s items in their
+               original order, followed by `o`'s new items in ITS original
+               order -- neither array is ever resorted in place. Only a
+               SEPARATE, temporary SORTED COPY of `st` is built (once,
+               O(n log n)) purely for FAST membership testing via
+               `k_value_bsearch` -- each of `o`'s `m` items is then tested
+               in O(log n) instead of O(n). Type-gated identically to
+               PR-it825/it826/it827 (Int/Float/F32/Str/SizedInt/BigInt,
+               Rational excluded for the same cheap-`k_eq`-vs-expensive-
+               `k_list_order` asymmetry) -- falls back to the ORIGINAL
+               O(n*m) scan when either Set is empty (trivially fast
+               already) or holds an unsupported type. */
             KSet* o = args[0].as.set;
+            int fast_eligible = st->len > 0 && o->len > 0
+                && (st->items[0].tag == K_INT || st->items[0].tag == K_FLOAT || st->items[0].tag == K_F32
+                    || st->items[0].tag == K_STR || st->items[0].tag == K_SIZEDINT || st->items[0].tag == K_BIGINT);
             KValue* out = k_alloc(sizeof(KValue) * (st->len + o->len < 1 ? 1 : st->len + o->len));
             memcpy(out, st->items, sizeof(KValue) * st->len);
             int64_t n = st->len;
-            for (int64_t i = 0; i < o->len; i++) {
-                int dup = 0;
-                for (int64_t j = 0; j < n; j++)
-                    if (k_key_eq(out[j], o->items[i])) { dup = 1; break; }
-                if (!dup) out[n++] = o->items[i];
+            if (fast_eligible) {
+                KValue* sorted_self = (KValue*)k_alloc(sizeof(KValue) * st->len);
+                memcpy(sorted_self, st->items, sizeof(KValue) * st->len);
+                qsort(sorted_self, st->len, sizeof(KValue), k_value_cmp);
+                for (int64_t i = 0; i < o->len; i++) {
+                    if (!k_value_bsearch(sorted_self, st->len, o->items[i])) out[n++] = o->items[i];
+                }
+            } else {
+                for (int64_t i = 0; i < o->len; i++) {
+                    int dup = 0;
+                    for (int64_t j = 0; j < n; j++)
+                        if (k_key_eq(out[j], o->items[i])) { dup = 1; break; }
+                    if (!dup) out[n++] = o->items[i];
+                }
             }
             return k_set_make(out, n);
         }
@@ -9204,6 +9259,43 @@ fun main() uses io {
                    print(\"{gb.len()}|{gb.get_or(big(5), []).len()}|{gi.len()}|{gf.len()}|{gr.len()}|{gr.get_or(rat(1, 2), []).len()}\")\n}\n";
         let out = native_main_stdout(src, "group_by_bigint_sizedint_f32_rational");
         assert_eq!(out.trim(), "3|2|3|2|2|2");
+    }
+
+    /// `Set.union`'s own O((n+m) log n) fast path (production-hardening
+    /// PR-it828, the SIXTH instance of the naive-O(n^2)-collection-algorithm
+    /// bug class): confirms BigInt/SizedInt/F32 coverage, Rational exclusion,
+    /// NaN-collapsing, and that both `self`'s and `other`'s original
+    /// relative order are preserved exactly -- `k_value_cmp`/
+    /// `k_value_bsearch` are the new helpers (no idx-carrying struct is
+    /// needed here, since the sorted copy is a throwaway lookup structure,
+    /// never an output).
+    #[test]
+    fn native_set_union_fast_path_covers_bigint_sizedint_f32_preserves_order_and_excludes_rational() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let ub = Set([big(3), big(1), big(4)]).union(Set([big(4), big(5)]))\n    \
+                   let ui = Set([5i32, 3i32]).union(Set([3i32, 1i32])).len()\n    \
+                   let nan = 0.0f32 / 0.0f32\n    \
+                   let uf = Set([1.0f32, nan]).union(Set([nan, 2.0f32]))\n    \
+                   let ur = Set([rat(1, 2), rat(1, 3)]).union(Set([rat(1, 3), rat(2, 3)]))\n    \
+                   print(\"{ub}|{ui}|{uf}|{ur}\")\n}\n";
+        let out = native_main_stdout(src, "set_union_bigint_sizedint_f32_rational");
+        // NOTE: native prints F32 NaN as lowercase "nan", NOT "NaN" like interp/
+        // Float (f64) -- a REAL, PRE-EXISTING diagnostic-text-only divergence
+        // discovered as a byproduct of writing this test (unrelated to this
+        // fix's own correctness: `k_fmt_float` for f64 has an explicit
+        // `if (isnan(f)) { kb_puts(b, "NaN"); return; }` guard, but F32's own
+        // inlined display code has NO equivalent guard and falls through to a
+        // `%g`-based loop, which this libc renders as lowercase "nan"). Left
+        // OUT OF SCOPE for this iteration (Set.union's O(n^2) fix); flagged
+        // for a future iteration via dotfiles memory. This assertion pins the
+        // CURRENT (buggy) native behavior so this test doesn't spuriously fail
+        // on an unrelated issue; the union FAST PATH's own NaN-collapsing
+        // correctness is separately confirmed via the vm.rs differential test
+        // (interp vs VM, both correctly showing "NaN").
+        assert_eq!(out.trim(), "Set{3, 1, 4, 5}|3|Set{1.0, nan, 2.0}|Set{1/2, 1/3, 2/3}");
     }
 
     /// Native `.sort()` correctly sorts a large (30,000-element) reverse-sorted list --

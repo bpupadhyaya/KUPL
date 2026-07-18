@@ -19045,6 +19045,40 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         );
     }
 
+    /// `Set.union`'s own O((n+m) log n) fast path (production-hardening
+    /// PR-it828, the SIXTH instance of the naive-O(n^2)-collection-algorithm
+    /// bug class): confirms BigInt/SizedInt/F32 coverage, Rational exclusion,
+    /// NaN-collapsing (a duplicate NaN across both Sets stays a SINGLE
+    /// element), and that `self`'s original order + `other`'s new-item order
+    /// are both preserved exactly (via Display, since unlike PR-it826's
+    /// `set_from_list` this fix explicitly promises NOT to reorder either
+    /// input array).
+    #[test]
+    fn diff_set_union_fast_path_covers_bigint_sizedint_f32_preserves_order_and_excludes_rational() {
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let a = Set([big(3), big(1), big(4)])\n    let b = Set([big(4), big(5)])\n    \"{a.union(b)}\"\n}\n"
+            ),
+            "Set{3, 1, 4, 5}"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    Set([5i32, 3i32]).union(Set([3i32, 1i32])).len()\n}\n"),
+            "3"
+        );
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let nan = 0.0f32 / 0.0f32\n    let a = Set([1.0f32, nan])\n    let b = Set([nan, 2.0f32])\n    \"{a.union(b)}\"\n}\n"
+            ),
+            "Set{1.0, NaN, 2.0}"
+        );
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let a = Set([rat(1, 2), rat(1, 3)])\n    let b = Set([rat(1, 3), rat(2, 3)])\n    \"{a.union(b)}\"\n}\n"
+            ),
+            "Set{1/2, 1/3, 2/3}"
+        );
+    }
+
     #[test]
     fn diff_par_fork_join() {
         // structured fork-join: independent branches collected into a list,
