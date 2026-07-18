@@ -396,7 +396,7 @@ mod tests {
     /// re-stringified JSON text), or the parse error.
     fn decoded_str(s: &str) -> Result<String, String> {
         match parse(s)? {
-            Value::Ctor { variant, fields, .. } if variant.as_str() == "JStr" => match &fields[0] {
+            Value::Ctor { ref variant, ref fields, .. } if variant.as_str() == "JStr" => match &fields[0] {
                 Value::Str(s) => Ok(s.to_string()),
                 _ => panic!("JStr with a non-Str field"),
             },

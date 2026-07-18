@@ -390,6 +390,86 @@ impl Value {
     }
 }
 
+/// Iterative teardown for deeply-nested containers (production-hardening
+/// PR-it799) -- avoids the stack overflow Rust's DEFAULT recursive `Drop`
+/// would otherwise cause. `List`/`Ctor`/`Map`/`Set` all wrap an
+/// `Rc<Vec<Value>>` (or `Rc<Vec<(Value, Value)>>`); an ordinary KUPL program
+/// that builds a long chain ITERATIVELY (e.g. `type Chain = Wrap(next:
+/// Chain) | End` grown via a `while` loop to millions of links -- no KUPL-
+/// level function-call recursion at all, so `MAX_CALL_DEPTH` never applies)
+/// then drops it (reassignment, scope exit, ...) used to recurse one Rust
+/// stack frame per link: dropping the outer `Vec<Value>` drops its one
+/// `Value` element, which is itself a container, so dropping THAT `Vec`
+/// recurses again, and so on -- `fatal runtime error: stack overflow,
+/// aborting` (SIGABRT), not a catchable panic. Confirmed live: interp.rs and
+/// vm.rs both crash on a 50,000,000-deep chain; `kupl native` does NOT (its
+/// "v0 memory model" is a pure arena allocator that never frees anything at
+/// all, so it was never exposed to this class of bug in the first place).
+///
+/// The fix mirrors the standard technique for avoiding recursive-drop stack
+/// overflow in a linked structure: instead of letting a container's normal
+/// drop glue recurse into its children, pull the children out into a flat,
+/// heap-allocated work list and finish tearing them down in a `while` LOOP
+/// (bounded stack depth, unbounded iteration count) instead of Rust's own
+/// call stack. `Rc::get_mut` is the key primitive -- it succeeds ONLY when
+/// this is the LAST owner (`strong_count == 1`, `weak_count == 0`; nothing
+/// in this codebase ever takes a `Weak<Vec<Value>>`/`Weak<Vec<(Value,
+/// Value)>>` of these, confirmed via grep), which is exactly the condition
+/// under which the container is ABOUT to be freed for real -- if another
+/// clone of the same `Rc` is still alive elsewhere, `get_mut` correctly
+/// fails and this function does nothing, leaving the ordinary `Rc` drop
+/// glue to just decrement the refcount (an O(1) operation, not a deep
+/// free) -- refcounts are respected exactly like the survey's fix
+/// suggestion required, never blindly walked and freed regardless of
+/// sharing. `Closure`/`VmClosure` (which can also capture arbitrary
+/// `Value`s) were considered but deliberately NOT given their own
+/// `collect_children` arm: they don't need one, since whatever `Value` they
+/// capture is torn down through ITS OWN `Drop` impl when the closure's
+/// captures `Vec` is freed -- which is this same, now-safe, iterative
+/// `Value::drop` regardless of who holds the reference. A contrived chain
+/// of closures each capturing the next closure value is a structurally
+/// different (and far more unusual) recursion path than the survey's
+/// ADT-chain repro and was not attempted/verified here; the identical
+/// `Rc::get_mut`-and-drain technique would extend to it if ever found to
+/// matter in practice.
+fn collect_children(v: &mut Value, stack: &mut Vec<Value>) {
+    match v {
+        Value::List(rc) | Value::Set(rc) => {
+            if let Some(vec) = Rc::get_mut(rc) {
+                stack.extend(vec.drain(..));
+            }
+        }
+        Value::Ctor { fields, .. } => {
+            if let Some(vec) = Rc::get_mut(fields) {
+                stack.extend(vec.drain(..));
+            }
+        }
+        Value::Map(rc) => {
+            if let Some(vec) = Rc::get_mut(rc) {
+                for (k, val) in vec.drain(..) {
+                    stack.push(k);
+                    stack.push(val);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+impl Drop for Value {
+    fn drop(&mut self) {
+        let mut stack: Vec<Value> = Vec::new();
+        collect_children(self, &mut stack);
+        while let Some(mut child) = stack.pop() {
+            collect_children(&mut child, &mut stack);
+            // `child`'s own container fields (if any) were just emptied above,
+            // so its drop here -- and the recursive call back into THIS same
+            // `Drop::drop` that it triggers -- does zero further work: O(1),
+            // not a second recursion into the structure.
+        }
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

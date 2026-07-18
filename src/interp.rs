@@ -793,7 +793,7 @@ impl Interp {
                             step!(Value::Int(i));
                         }
                     }
-                    Value::List(items) => {
+                    Value::List(ref items) => {
                         for item in items.iter() {
                             step!(item.clone());
                         }
@@ -997,7 +997,7 @@ impl Interp {
             ExprKind::Field { recv, name } => {
                 let r = self.eval(recv, env)?;
                 match r {
-                    Value::Ctor { ty, variant, fields } => {
+                    Value::Ctor { ref ty, ref variant, ref fields } => {
                         let field_names = self
                             .db
                             .ctors
@@ -1154,7 +1154,7 @@ impl Interp {
             }
             ExprKind::With { recv, updates } => {
                 let base = self.eval(recv, env)?;
-                let Value::Ctor { ty, variant, fields } = base else {
+                let Value::Ctor { ref ty, ref variant, ref fields } = base else {
                     return Err(Self::panic_flow(
                         format!("{} has no fields to update", base.type_name()),
                         expr.span,
@@ -1202,7 +1202,7 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Ctor { ty, variant, fields: Rc::new(new_fields) })
+                Ok(Value::Ctor { ty: ty.clone(), variant: variant.clone(), fields: Rc::new(new_fields) })
             }
             ExprKind::Try(inner) => {
                 let v = self.eval(inner, env)?;
@@ -1547,14 +1547,14 @@ impl Interp {
 
     pub fn call_value(&mut self, f: Value, args: Vec<Value>, span: Span) -> EvalResult {
         match f {
-            Value::Bound(id, name) => self.eval_method(Value::Component(id), &name, args, span),
-            Value::Fun(name) => {
+            Value::Bound(id, ref name) => self.eval_method(Value::Component(id), name, args, span),
+            Value::Fun(ref name) => {
                 let Some(decl) = self.db.funs.get(name.as_str()).cloned() else {
                     return Err(Self::panic_flow(format!("unknown function `{name}`"), span));
                 };
                 self.call_fun(&decl, args, &self.globals.clone(), span)
             }
-            Value::Closure(c) => {
+            Value::Closure(ref c) => {
                 if c.params.len() != args.len() {
                     return Err(Self::panic_flow(
                         format!("closure takes {} argument(s), {} given", c.params.len(), args.len()),
@@ -1737,16 +1737,16 @@ pub fn raw_unary_op(op: UnOp, v: Value) -> Result<Value, String> {
         }
         (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
         (UnOp::Neg, Value::F32(f)) => Ok(Value::F32(-f)),
-        (UnOp::Neg, Value::SizedInt(b)) => {
-            let (v, w) = *b;
+        (UnOp::Neg, Value::SizedInt(ref b)) => {
+            let (v, w) = **b;
             if w.check_range(-v) {
                 Ok(Value::SizedInt(Box::new((-v, w))))
             } else {
                 Err("integer overflow in negation".into())
             }
         }
-        (UnOp::Neg, Value::BigInt(b)) => Ok(Value::BigInt(Rc::new(b.negate()))),
-        (UnOp::Neg, Value::Rational(r)) => Ok(Value::Rational(Rc::new(r.negate()))),
+        (UnOp::Neg, Value::BigInt(ref b)) => Ok(Value::BigInt(Rc::new(b.negate()))),
+        (UnOp::Neg, Value::Rational(ref r)) => Ok(Value::Rational(Rc::new(r.negate()))),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (_, other) => Err(format!("invalid operand type {}", other.type_name())),
     }
@@ -2082,7 +2082,7 @@ pub fn shared_method(
             let mut it = args.into_iter();
             let other = it.next().ok_or("`zip_with` needs a second list")?;
             let f = it.next().ok_or("`zip_with` needs a function")?;
-            let Value::List(other) = other else {
+            let Value::List(ref other) = other else {
                 return Err("`zip_with` needs a List".into());
             };
             let n = items.len().min(other.len());
@@ -2367,7 +2367,7 @@ pub fn shared_method(
         },
         (Value::List(items), "join") => {
             let sep = match args.into_iter().next() {
-                Some(Value::Str(s)) => s.as_str().to_string(),
+                Some(Value::Str(ref s)) => s.as_str().to_string(),
                 _ => return Err("`join` needs a Str separator".into()),
             };
             let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
@@ -2375,7 +2375,7 @@ pub fn shared_method(
         }
         (Value::List(items), "is_empty") => Ok(Value::Bool(items.is_empty())),
         (Value::List(items), "concat") => match args.into_iter().next() {
-            Some(Value::List(other)) => {
+            Some(Value::List(ref other)) => {
                 let mut out = items.as_ref().clone();
                 out.extend(other.iter().cloned());
                 Ok(Value::List(Rc::new(out)))
@@ -2554,7 +2554,7 @@ pub fn shared_method(
             let mut out = Vec::new();
             for item in items.iter() {
                 match call(f.clone(), vec![item.clone()])? {
-                    Value::List(inner) => out.extend(inner.iter().cloned()),
+                    Value::List(ref inner) => out.extend(inner.iter().cloned()),
                     other => return Err(format!("`flat_map` function must return a List, got {}", other.type_name())),
                 }
             }
@@ -2637,11 +2637,11 @@ pub fn shared_method(
         },
         (Value::Str(s), "len") => Ok(Value::Int(s.chars().count() as i64)),
         (Value::Str(s), "contains") => match args.into_iter().next() {
-            Some(Value::Str(n)) => Ok(Value::Bool(s.contains(n.as_str()))),
+            Some(Value::Str(ref n)) => Ok(Value::Bool(s.contains(n.as_str()))),
             _ => Err("`contains` needs a Str".into()),
         },
         (Value::Str(s), "starts_with") => match args.into_iter().next() {
-            Some(Value::Str(n)) => Ok(Value::Bool(s.starts_with(n.as_str()))),
+            Some(Value::Str(ref n)) => Ok(Value::Bool(s.starts_with(n.as_str()))),
             _ => Err("`starts_with` needs a Str".into()),
         },
         // ASCII-only case mapping: non-ASCII characters pass through unchanged.
@@ -2686,13 +2686,13 @@ pub fn shared_method(
             Ok(Value::str(s.trim_end_matches([' ', '\t', '\n', '\r']).to_string()))
         }
         (Value::Str(s), "ends_with") => match args.into_iter().next() {
-            Some(Value::Str(n)) => Ok(Value::Bool(s.ends_with(n.as_str()))),
+            Some(Value::Str(ref n)) => Ok(Value::Bool(s.ends_with(n.as_str()))),
             _ => Err("`ends_with` needs a Str".into()),
         },
         (Value::Str(s), "replace") => {
             let mut it = args.into_iter();
             match (it.next(), it.next()) {
-                (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                (Some(Value::Str(ref from)), Some(Value::Str(ref to))) => {
                     if from.is_empty() {
                         return Err("`replace` needs a non-empty pattern".into());
                     }
@@ -2732,7 +2732,7 @@ pub fn shared_method(
             .map(|v| Value::some(Value::Float(v)))
             .unwrap_or_else(|_| Value::none())),
         (Value::Str(s), "split") => match args.into_iter().next() {
-            Some(Value::Str(sep)) if !sep.is_empty() => Ok(Value::List(Rc::new(
+            Some(Value::Str(ref sep)) if !sep.is_empty() => Ok(Value::List(Rc::new(
                 s.split(sep.as_str()).map(Value::str).collect(),
             ))),
             Some(Value::Str(_)) => Err("`split` needs a non-empty separator".into()),
@@ -2741,7 +2741,7 @@ pub fn shared_method(
         (Value::Str(s), "is_empty") => Ok(Value::Bool(s.is_empty())),
         (Value::Str(s), "reverse") => Ok(Value::str(s.chars().rev().collect::<String>())),
         (Value::Str(s), "rfind") => match args.into_iter().next() {
-            Some(Value::Str(sub)) => Ok(match s.rfind(sub.as_str()) {
+            Some(Value::Str(ref sub)) => Ok(match s.rfind(sub.as_str()) {
                 // byte offset -> character index (matches `index_of`)
                 Some(byte) => Value::some(Value::Int(s[..byte].chars().count() as i64)),
                 None => Value::none(),
@@ -2751,7 +2751,7 @@ pub fn shared_method(
         (Value::Str(s), "replace_first") => {
             let mut it = args.into_iter();
             match (it.next(), it.next()) {
-                (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                (Some(Value::Str(ref from)), Some(Value::Str(ref to))) => {
                     if from.is_empty() {
                         return Err("`replace_first` needs a non-empty pattern".into());
                     }
@@ -2761,7 +2761,7 @@ pub fn shared_method(
             }
         }
         (Value::Str(s), "split_once") => match args.into_iter().next() {
-            Some(Value::Str(sep)) => Ok(match s.as_str().split_once(sep.as_str()) {
+            Some(Value::Str(ref sep)) => Ok(match s.as_str().split_once(sep.as_str()) {
                 Some((a, b)) => Value::some(Value::List(Rc::new(vec![
                     Value::str(a.to_string()),
                     Value::str(b.to_string()),
@@ -2774,7 +2774,7 @@ pub fn shared_method(
             s.lines().map(Value::str).collect(),
         ))),
         (Value::Str(s), "index_of") => match args.into_iter().next() {
-            Some(Value::Str(sub)) => Ok(match s.find(sub.as_str()) {
+            Some(Value::Str(ref sub)) => Ok(match s.find(sub.as_str()) {
                 // byte offset -> character index
                 Some(byte) => Value::some(Value::Int(s[..byte].chars().count() as i64)),
                 None => Value::none(),
@@ -2782,7 +2782,7 @@ pub fn shared_method(
             _ => Err("`index_of` needs a Str".into()),
         },
         (Value::Str(s), "count") => match args.into_iter().next() {
-            Some(Value::Str(sub)) if !sub.is_empty() => {
+            Some(Value::Str(ref sub)) if !sub.is_empty() => {
                 Ok(Value::Int(s.matches(sub.as_str()).count() as i64))
             }
             Some(Value::Str(_)) => Err("`count` needs a non-empty Str".into()),
@@ -2807,7 +2807,7 @@ pub fn shared_method(
             let left = name == "pad_left";
             let mut it = args.into_iter();
             match (it.next(), it.next()) {
-                (Some(Value::Int(width)), Some(Value::Str(ch))) => {
+                (Some(Value::Int(width)), Some(Value::Str(ref ch))) => {
                     let fill = ch.chars().next().unwrap_or(' ');
                     let cur = s.chars().count() as i64;
                     if cur >= width || width > 100_000_000 {
@@ -2830,7 +2830,7 @@ pub fn shared_method(
             // width <= current length (or absurdly large) returns the string unchanged.
             let mut it = args.into_iter();
             match (it.next(), it.next()) {
-                (Some(Value::Int(width)), Some(Value::Str(ch))) => {
+                (Some(Value::Int(width)), Some(Value::Str(ref ch))) => {
                     let fill = ch.chars().next().unwrap_or(' ');
                     let cur = s.chars().count() as i64;
                     if cur >= width || width > 100_000_000 {
@@ -2894,7 +2894,7 @@ pub fn shared_method(
         {
             let (a, w) = (b.0, b.1);
             let rhs = match args.into_iter().next() {
-                Some(Value::SizedInt(o)) if o.1 == w => o.0,
+                Some(Value::SizedInt(ref o)) if o.1 == w => o.0,
                 _ => return Err(format!("`{m}` needs a `{}`", w.name())),
             };
             let bits = w.bits();
@@ -3293,7 +3293,7 @@ pub fn shared_method(
                 .unwrap_or(default))
         }
         (Value::Map(pairs), "merge") => match args.into_iter().next() {
-            Some(Value::Map(other)) => {
+            Some(Value::Map(ref other)) => {
                 let mut out = pairs.as_ref().clone();
                 for (k, v) in other.iter() {
                     match out.iter_mut().find(|(pk, _)| value_key_eq(pk, k)) {
@@ -3354,7 +3354,7 @@ pub fn shared_method(
         }
         (Value::Set(items), "len") => Ok(Value::Int(items.len() as i64)),
         (Value::Set(items), "union") => match args.into_iter().next() {
-            Some(Value::Set(other)) => {
+            Some(Value::Set(ref other)) => {
                 let mut out = items.as_ref().clone();
                 for x in other.iter() {
                     if !out.iter().any(|y| value_key_eq(y, x)) {
@@ -3366,19 +3366,19 @@ pub fn shared_method(
             _ => Err("`union` needs a Set".into()),
         },
         (Value::Set(items), "intersect") => match args.into_iter().next() {
-            Some(Value::Set(other)) => Ok(Value::Set(Rc::new(
+            Some(Value::Set(ref other)) => Ok(Value::Set(Rc::new(
                 items.iter().filter(|x| other.iter().any(|y| value_key_eq(y, x))).cloned().collect(),
             ))),
             _ => Err("`intersect` needs a Set".into()),
         },
         (Value::Set(items), "difference") => match args.into_iter().next() {
-            Some(Value::Set(other)) => Ok(Value::Set(Rc::new(
+            Some(Value::Set(ref other)) => Ok(Value::Set(Rc::new(
                 items.iter().filter(|x| !other.iter().any(|y| value_key_eq(y, x))).cloned().collect(),
             ))),
             _ => Err("`difference` needs a Set".into()),
         },
         (Value::Set(items), "symmetric_difference") => match args.into_iter().next() {
-            Some(Value::Set(other)) => {
+            Some(Value::Set(ref other)) => {
                 // (in self, not other) then (in other, not self) — deterministic order
                 let mut out: Vec<Value> =
                     items.iter().filter(|x| !other.iter().any(|y| value_key_eq(y, x))).cloned().collect();
@@ -3394,14 +3394,14 @@ pub fn shared_method(
         (Value::Set(items), "to_list") => Ok(Value::List(Rc::new(items.as_ref().clone()))),
         (Value::Set(items), "is_empty") => Ok(Value::Bool(items.is_empty())),
         (Value::Set(items), "is_subset") => match args.into_iter().next() {
-            Some(Value::Set(other)) => {
+            Some(Value::Set(ref other)) => {
                 Ok(Value::Bool(items.iter().all(|x| other.iter().any(|y| value_key_eq(y, x)))))
             }
             _ => Err("`is_subset` needs a Set".into()),
         },
         (Value::Set(items), "is_superset") => match args.into_iter().next() {
             // The mirror of is_subset: every element of `other` is contained in the receiver.
-            Some(Value::Set(other)) => {
+            Some(Value::Set(ref other)) => {
                 Ok(Value::Bool(other.iter().all(|x| items.iter().any(|y| value_key_eq(y, x)))))
             }
             _ => Err("`is_superset` needs a Set".into()),
@@ -3439,7 +3439,7 @@ pub fn shared_method(
             .map(Value::Float)
             .ok_or_else(|| "min of an empty tensor".to_string()),
         (Value::Tensor(a), "dot") => match args.into_iter().next() {
-            Some(Value::Tensor(b)) => {
+            Some(Value::Tensor(ref b)) => {
                 if a.len() != b.len() {
                     return Err(format!("dot: length mismatch ({} vs {})", a.len(), b.len()));
                 }
@@ -4582,7 +4582,7 @@ fn builtin_method(
 #[cfg(test)]
 mod server_tests {
     use super::{
-        http_response, parse_request_line, serve_http, serve_http_with_read_timeout, Flow, Interp, ProgramDb, Value,
+        http_response, parse_request_line, serve_http, serve_http_with_read_timeout, Interp, ProgramDb, Value,
     };
     use std::io::{Read, Write};
     use std::net::TcpStream;

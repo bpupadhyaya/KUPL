@@ -548,14 +548,14 @@ impl<'m> Vm<'m> {
     fn call_value_nested(&mut self, f: Value, args: Vec<Value>) -> Result<Value, String> {
         let depth = self.frames.len();
         match f {
-            Value::Fun(name) => {
+            Value::Fun(ref name) => {
                 let Some(&idx) = self.module.funs.get(name.as_str()) else {
                     return Err(format!("no function `{name}`"));
                 };
                 self.push_frame(idx, &args, 0, None).map_err(|e| e.msg)?;
             }
-            Value::VmClosure(proto, caps, origin_inst) => {
-                self.push_closure_frame(proto, &caps, &args, 0, origin_inst).map_err(|e| e.msg)?;
+            Value::VmClosure(proto, ref caps, origin_inst) => {
+                self.push_closure_frame(proto, caps, &args, 0, origin_inst).map_err(|e| e.msg)?;
             }
             other => return Err(format!("{} is not callable", other.type_name())),
         }
@@ -1033,7 +1033,7 @@ impl<'m> Vm<'m> {
                     let callee = reg!(f);
                     let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
                     match callee {
-                        Value::Fun(name) => {
+                        Value::Fun(ref name) => {
                             let Some(&idx) = self.module.funs.get(name.as_str()) else {
                                 return Err(VmError { msg: format!("no function `{name}`"), span });
                             };
@@ -1042,8 +1042,8 @@ impl<'m> Vm<'m> {
                                 e
                             })?;
                         }
-                        Value::VmClosure(proto, caps, origin_inst) => {
-                            self.push_closure_frame(proto, &caps, &args, dst, origin_inst)
+                        Value::VmClosure(proto, ref caps, origin_inst) => {
+                            self.push_closure_frame(proto, caps, &args, dst, origin_inst)
                                 .map_err(|mut e| {
                                     e.span = span;
                                     e
@@ -1255,7 +1255,7 @@ impl<'m> Vm<'m> {
                     );
                 }
                 Op::GetField { dst, obj, idx } => match reg!(obj) {
-                    Value::Ctor { fields, .. } => match fields.get(idx as usize) {
+                    Value::Ctor { ref fields, .. } => match fields.get(idx as usize) {
                         Some(v) => set!(dst, v.clone()),
                         None => return Err(VmError { msg: "field index out of range".into(), span }),
                     },
@@ -1272,7 +1272,7 @@ impl<'m> Vm<'m> {
                         _ => return Err(VmError { msg: "bad field name".into(), span }),
                     };
                     match reg!(obj) {
-                        Value::Ctor { variant, fields, ty } => {
+                        Value::Ctor { ref variant, ref fields, ref ty } => {
                             let position = self
                                 .module
                                 .ctor_field_names
@@ -1302,7 +1302,7 @@ impl<'m> Vm<'m> {
                         _ => return Err(VmError { msg: "bad field name".into(), span }),
                     };
                     match reg!(obj) {
-                        Value::Ctor { ty, variant, fields } => {
+                        Value::Ctor { ref ty, ref variant, ref fields } => {
                             let position = self
                                 .module
                                 .ctor_field_names
@@ -1331,7 +1331,7 @@ impl<'m> Vm<'m> {
                                             })
                                         }
                                     }
-                                    set!(dst, Value::Ctor { ty, variant, fields: Rc::new(new_fields) });
+                                    set!(dst, Value::Ctor { ty: ty.clone(), variant: variant.clone(), fields: Rc::new(new_fields) });
                                 }
                                 None => {
                                     return Err(VmError {
@@ -1356,7 +1356,7 @@ impl<'m> Vm<'m> {
                         msg: "corrupt .kx module: ctor index out of range".into(),
                         span,
                     })?;
-                    let is = matches!(reg!(obj), Value::Ctor { variant, .. } if *variant == meta.variant);
+                    let is = matches!(reg!(obj), Value::Ctor { ref variant, .. } if **variant == meta.variant);
                     set!(dst, Value::Bool(is));
                 }
                 Op::MakeClosure { dst, proto, start, ncaps } => {
@@ -1374,7 +1374,7 @@ impl<'m> Vm<'m> {
                         let hi = if incl { b + 1 } else { b };
                         set!(dst, Value::Int((hi - a).max(0)));
                     }
-                    Value::List(items) => set!(dst, Value::Int(items.len() as i64)),
+                    Value::List(ref items) => set!(dst, Value::Int(items.len() as i64)),
                     other => {
                         return Err(VmError {
                             msg: format!("`for` needs a Range or List, found {}", other.type_name()),
@@ -1389,7 +1389,7 @@ impl<'m> Vm<'m> {
                     };
                     match reg!(iter) {
                         Value::Range(a, _, _) => set!(dst, Value::Int(a + i)),
-                        Value::List(items) => match items.get(i as usize) {
+                        Value::List(ref items) => match items.get(i as usize) {
                             Some(v) => set!(dst, v.clone()),
                             None => return Err(VmError { msg: "list index out of range".into(), span }),
                         },
