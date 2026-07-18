@@ -1284,6 +1284,74 @@ impl Checker {
             if ret != Ty::Unit {
                 self.check_assign(&ret, &body_ty, f.body.span, &format!("return value of `{}`", f.name));
             }
+            // A REAL, live-confirmed type-soundness bug found+fixed
+            // (production-hardening PR-it832): each of `f.type_params` is
+            // bound to a fresh, ORDINARY `Ty::Var` above (line ~1256) for
+            // checking the BODY -- but an ordinary `Ty::Var` unifies freely
+            // with ANY concrete type (`Unifier::unify`, types.rs), so a
+            // generic function's body could silently narrow its own type
+            // parameter to a concrete type with ZERO diagnostic: `fun
+            // weird[T](x: T) -> T { 5 }` type-checked cleanly (`kupl check`
+            // said "ok"), yet `let s: Str = weird("hello")` then ran `s` as
+            // the Int `5` at runtime -- `print(s)` printed `5` where the
+            // checker had promised a `Str`, and `s.len()` panicked with a
+            // raw "Int has no method `len`" runtime error the type system
+            // was supposed to prevent entirely. Every existing occurrence of
+            // a type-parameter name within ONE function body/signature
+            // already resolves to the exact SAME `Ty::Var` id (looked up
+            // from `self.tyvars`, never freshened per-use) -- so in a
+            // genuinely parametric (sound) function body, NONE of these vars
+            // ever need to be bound to anything: unifying a var with itself
+            // (`Ty::Var(x) == Ty::Var(x)`) is a no-op, not a substitution.
+            // This makes a POST-CHECK viable: after the body is fully
+            // checked, if a function's own type-parameter var resolved to a
+            // CONCRETE type, or to a DIFFERENT one of the function's own
+            // type-parameter vars (e.g. `T` and `U` silently forced equal),
+            // the body illegitimately narrowed/constrained an abstract,
+            // caller-controlled type -- a parametricity violation. This is
+            // deliberately a post-hoc verification rather than a new
+            // `Ty::Rigid` variant threaded through `Unifier::unify`
+            // (types.rs) -- far lower risk of regressing unrelated
+            // inference, since it doesn't touch the core unification
+            // algorithm at all. Resolving to some OTHER, still-abstract,
+            // externally-fresh `Ty::Var` (e.g. `List[T].first()`'s own
+            // polymorphic `Option[T']` return type unifying `T'` with this
+            // function's `T` when returning `xs.first()` from a body typed
+            // `Option[T]`) is NOT flagged -- confirmed live-necessary via a
+            // `list_head[T](xs: List[T]) -> Option[T] { xs.first() }`-shaped
+            // false positive during this fix's own development, which this
+            // exact distinction (own vars vs. foreign vars) resolves.
+            for (tp, v) in self.tyvars.clone() {
+                let resolved = self.uni.resolve(&v);
+                if resolved == v {
+                    continue;
+                }
+                // If narrowed to ANOTHER of this function's own type
+                // parameters, name it directly (e.g. "type parameter `U`")
+                // rather than showing `resolved`'s raw internal `?N` var
+                // display, which is meaningless to a user. Resolving to some
+                // OTHER, still-abstract, externally-fresh `Ty::Var` that
+                // ISN'T one of this function's own type parameters (e.g.
+                // `List[T].first()`'s own polymorphic return type) is safe
+                // and not a violation.
+                let other_tp = self.tyvars.iter().find(|(_, ov)| **ov == resolved).map(|(n, _)| n.clone());
+                let violates = other_tp.is_some() || !matches!(&resolved, Ty::Var(_));
+                if violates {
+                    let narrowed_to = match &other_tp {
+                        Some(u) => format!("type parameter `{u}`"),
+                        None => format!("`{}`", self.uni.apply(&resolved)),
+                    };
+                    self.err(
+                        "K0281",
+                        format!(
+                            "generic type parameter `{tp}` of `{}` cannot be narrowed to {narrowed_to} inside its own body -- \
+                             a generic function must treat its type parameters abstractly, not specialize them",
+                            f.name
+                        ),
+                        f.body.span,
+                    );
+                }
+            }
         }
         self.tyvars.clear();
     }
@@ -5497,5 +5565,68 @@ mod generic_tests {
             "type Box[T] = Box(v: T)\nfun main() {\n  let a = Box(v: 1)\n  let b = Box(v: \"s\")\n}\n"
         )
         .is_empty());
+    }
+
+    /// A REAL, live-confirmed type-SOUNDNESS bug found+fixed (production-
+    /// hardening PR-it832): `generic_adt_infers_and_is_sound` above pins
+    /// parametricity for a generic ADT's OWN type parameter, but generic
+    /// FUNCTIONS had no equivalent check at all -- `fun weird[T](x: T) -> T
+    /// { 5 }` type-checked with ZERO diagnostics (`T`'s body-local `Ty::Var`
+    /// unified freely with `Int`, since an ordinary unification var has no
+    /// notion of "this represents an abstract, caller-controlled type").
+    /// `let s: Str = weird("hello")` then type-checked too (the STORED
+    /// function scheme, instantiated fresh per call site, is unaffected by
+    /// what happened inside the body), so `s` held the raw Int `5` at
+    /// runtime with no compile error and no crash -- a genuine silent
+    /// value-type-confusion, this campaign's most severe tracked class.
+    #[test]
+    fn generic_fun_cannot_narrow_its_own_type_parameter() {
+        // The exact live-confirmed repro: T silently narrowed to Int via the
+        // return value, with zero diagnostics before this fix.
+        let e = errors("fun weird[T](x: T) -> T { 5 }\nfun main() { let s: Str = weird(\"hello\")\n    print(s) }\n");
+        assert!(e.iter().any(|d| d.code == "K0281"), "T narrowed to Int via return value: {e:?}");
+        // Narrowing via an internal `let` annotation, not just the return
+        // value, must ALSO be caught -- the check inspects the type
+        // parameter's FINAL resolved state after the whole body is checked,
+        // not just the return-type check site.
+        let e2 = errors("fun sneaky[T](x: T) -> T {\n    let y: Int = x\n    x\n}\nfun main() { let _: Str = sneaky(\"hi\") }\n");
+        assert!(e2.iter().any(|d| d.code == "K0281"), "T narrowed via internal let: {e2:?}");
+        // Two DISTINCT type parameters silently forced equal (T aliased with
+        // U) is the same class of violation, just without a concrete type
+        // anywhere -- must ALSO be caught, and should name `U` by its
+        // declared name rather than an internal `?N` var id.
+        let e3 = errors("fun bad[T, U](a: T, b: U) -> T { b }\nfun main() { let _: Str = bad(\"hi\", 5) }\n");
+        let d3 = e3.iter().find(|d| d.code == "K0281").expect("T aliased with U must be K0281");
+        assert!(d3.message.contains("type parameter `U`"), "should name U, not a raw var id: {}", d3.message);
+
+        // Genuinely parametric (sound) generic functions must NOT be
+        // flagged -- confirmed via the exact shapes this fix's own
+        // development found regressions in before narrowing the check.
+        assert!(errors("fun identity[T](x: T) -> T { x }\nfun main() { print(identity(5)) }\n").is_empty());
+        assert!(
+            errors("fun pick[T, U](a: T, b: U) -> T { a }\nfun main() { print(pick(1, \"two\")) }\n").is_empty(),
+            "two independent type parameters, each used consistently with itself, must be sound"
+        );
+        // A REAL false positive found during this fix's own development:
+        // unifying a function's own type-parameter var with an UNRELATED,
+        // still-abstract, externally-fresh var from a DIFFERENT generic call
+        // (here `List[T].first() -> Option[T']`) must NOT be flagged -- only
+        // narrowing to a CONCRETE type, or aliasing with ANOTHER of the
+        // SAME function's own type parameters, is a violation.
+        assert!(
+            errors(
+                "fun list_head[T](xs: List[T]) -> Option[T] {\n    match xs.first() {\n        Some(v) => Some(v)\n        None => None\n    }\n}\nfun main() { print(list_head([1, 2, 3])) }\n"
+            )
+            .is_empty(),
+            "unifying with an external, still-abstract var from a different generic call must not be flagged"
+        );
+        // A generic function recursing on itself with the SAME type
+        // parameter, unchanged, must also stay sound.
+        assert!(
+            errors(
+                "fun recurse_id[T](x: T, n: Int) -> T {\n    if n <= 0 { x } else { recurse_id(x, n - 1) }\n}\nfun main() { print(recurse_id(\"done\", 3)) }\n"
+            )
+            .is_empty()
+        );
     }
 }
