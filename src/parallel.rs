@@ -49,69 +49,181 @@ pub enum PortableValue {
 
 /// Convert a `Value` to its portable form, or `None` if it holds anything
 /// non-portable (a closure, function reference, live component, or VM closure).
+///
+/// Iterative (production-hardening PR-it807): plain recursion here is the SIXTH
+/// instance of the Value stack-overflow bug family (Drop it799, equality
+/// it800-801/805, Display it802-803, approx_byte_size it804, json_stringify
+/// it806) -- a `Value` built ITERATIVELY to be deeply nested, then passed to
+/// `xs.par_map(pure_fn)`/`par_filter` with `xs.len() >= THRESHOLD`, crashes the
+/// native call stack converting just ONE deeply-nested element. Unlike the prior
+/// five fixes (which reduce an existing tree to a scalar/bool/string), this
+/// function BUILDS A NEW TREE (`Value` -> `PortableValue`), so the technique is
+/// different again: an explicit post-order work-stack, where a container first
+/// pushes a "build" marker (how many just-converted children to collect) then
+/// its children (so they're converted first), and popping a "build" marker
+/// assembles the container from the last N entries already on the results
+/// stack -- the same idea a stack-based bytecode VM uses to evaluate an
+/// expression tree without a native call per node.
 pub fn to_portable(v: &Value) -> Option<PortableValue> {
-    Some(match v {
-        Value::Int(n) => PortableValue::Int(*n),
-        Value::SizedInt(b) => PortableValue::SizedInt(b.0, b.1),
-        Value::F32(f) => PortableValue::F32(*f),
-        Value::BigInt(b) => PortableValue::BigInt((**b).clone()),
-        Value::Rational(r) => PortableValue::Rational((**r).clone()),
-        Value::Float(f) => PortableValue::Float(*f),
-        Value::Bool(b) => PortableValue::Bool(*b),
-        Value::Str(s) => PortableValue::Str((**s).clone()),
-        Value::Unit => PortableValue::Unit,
-        Value::List(xs) => {
-            PortableValue::List(xs.iter().map(to_portable).collect::<Option<_>>()?)
+    enum Frame<'a> {
+        Visit(&'a Value),
+        BuildList(usize),
+        BuildCtor(String, String, usize),
+        BuildMap(usize),
+        BuildSet(usize),
+    }
+    let mut stack: Vec<Frame> = vec![Frame::Visit(v)];
+    let mut results: Vec<PortableValue> = Vec::new();
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Visit(x) => match x {
+                Value::Int(n) => results.push(PortableValue::Int(*n)),
+                Value::SizedInt(b) => results.push(PortableValue::SizedInt(b.0, b.1)),
+                Value::F32(f) => results.push(PortableValue::F32(*f)),
+                Value::BigInt(b) => results.push(PortableValue::BigInt((**b).clone())),
+                Value::Rational(r) => results.push(PortableValue::Rational((**r).clone())),
+                Value::Float(f) => results.push(PortableValue::Float(*f)),
+                Value::Bool(b) => results.push(PortableValue::Bool(*b)),
+                Value::Str(s) => results.push(PortableValue::Str((**s).clone())),
+                Value::Unit => results.push(PortableValue::Unit),
+                Value::List(xs) => {
+                    stack.push(Frame::BuildList(xs.len()));
+                    for item in xs.iter().rev() {
+                        stack.push(Frame::Visit(item));
+                    }
+                }
+                Value::Ctor { ty, variant, fields } => {
+                    stack.push(Frame::BuildCtor((**ty).clone(), (**variant).clone(), fields.len()));
+                    for f in fields.iter().rev() {
+                        stack.push(Frame::Visit(f));
+                    }
+                }
+                Value::Tensor(d) => results.push(PortableValue::Tensor((**d).clone())),
+                Value::Map(pairs) => {
+                    stack.push(Frame::BuildMap(pairs.len()));
+                    for (k, val) in pairs.iter().rev() {
+                        stack.push(Frame::Visit(val));
+                        stack.push(Frame::Visit(k));
+                    }
+                }
+                Value::Set(xs) => {
+                    stack.push(Frame::BuildSet(xs.len()));
+                    for item in xs.iter().rev() {
+                        stack.push(Frame::Visit(item));
+                    }
+                }
+                Value::Range(a, b, inc) => results.push(PortableValue::Range(*a, *b, *inc)),
+                Value::Closure(_)
+                | Value::Fun(_)
+                | Value::Component(_)
+                | Value::Bound(..)
+                | Value::VmClosure(..) => return None,
+            },
+            Frame::BuildList(n) => {
+                let items = results.split_off(results.len() - n);
+                results.push(PortableValue::List(items));
+            }
+            Frame::BuildCtor(ty, variant, n) => {
+                let fields = results.split_off(results.len() - n);
+                results.push(PortableValue::Ctor { ty, variant, fields });
+            }
+            Frame::BuildMap(n) => {
+                let flat = results.split_off(results.len() - 2 * n);
+                let mut pairs = Vec::with_capacity(n);
+                let mut it = flat.into_iter();
+                while let (Some(k), Some(val)) = (it.next(), it.next()) {
+                    pairs.push((k, val));
+                }
+                results.push(PortableValue::Map(pairs));
+            }
+            Frame::BuildSet(n) => {
+                let items = results.split_off(results.len() - n);
+                results.push(PortableValue::Set(items));
+            }
         }
-        Value::Ctor { ty, variant, fields } => PortableValue::Ctor {
-            ty: (**ty).clone(),
-            variant: (**variant).clone(),
-            fields: fields.iter().map(to_portable).collect::<Option<_>>()?,
-        },
-        Value::Tensor(d) => PortableValue::Tensor((**d).clone()),
-        Value::Map(pairs) => PortableValue::Map(
-            pairs
-                .iter()
-                .map(|(k, v)| Some((to_portable(k)?, to_portable(v)?)))
-                .collect::<Option<_>>()?,
-        ),
-        Value::Set(xs) => {
-            PortableValue::Set(xs.iter().map(to_portable).collect::<Option<_>>()?)
-        }
-        Value::Range(a, b, inc) => PortableValue::Range(*a, *b, *inc),
-        Value::Closure(_)
-        | Value::Fun(_)
-        | Value::Component(_)
-        | Value::Bound(..)
-        | Value::VmClosure(..) => return None,
-    })
+    }
+    results.pop()
 }
 
 /// Rebuild a `Value` from its portable form (thread-local; makes fresh `Rc`s).
+///
+/// Iterative (production-hardening PR-it807, the mirror side of `to_portable`'s
+/// fix): same post-order work-stack technique, always succeeds so no early-exit
+/// `None` case to handle.
 pub fn from_portable(p: &PortableValue) -> Value {
-    match p {
-        PortableValue::Int(n) => Value::Int(*n),
-        PortableValue::SizedInt(v, w) => Value::SizedInt(Box::new((*v, *w))),
-        PortableValue::F32(f) => Value::F32(*f),
-        PortableValue::BigInt(b) => Value::BigInt(std::rc::Rc::new(b.clone())),
-        PortableValue::Rational(r) => Value::Rational(std::rc::Rc::new(r.clone())),
-        PortableValue::Float(f) => Value::Float(*f),
-        PortableValue::Bool(b) => Value::Bool(*b),
-        PortableValue::Str(s) => Value::Str(Rc::new(s.clone())),
-        PortableValue::Unit => Value::Unit,
-        PortableValue::List(xs) => Value::List(Rc::new(xs.iter().map(from_portable).collect())),
-        PortableValue::Ctor { ty, variant, fields } => Value::Ctor {
-            ty: Rc::new(ty.clone()),
-            variant: Rc::new(variant.clone()),
-            fields: Rc::new(fields.iter().map(from_portable).collect()),
-        },
-        PortableValue::Tensor(d) => Value::Tensor(Rc::new(d.clone())),
-        PortableValue::Map(pairs) => Value::Map(Rc::new(
-            pairs.iter().map(|(k, v)| (from_portable(k), from_portable(v))).collect(),
-        )),
-        PortableValue::Set(xs) => Value::Set(Rc::new(xs.iter().map(from_portable).collect())),
-        PortableValue::Range(a, b, inc) => Value::Range(*a, *b, *inc),
+    enum Frame<'a> {
+        Visit(&'a PortableValue),
+        BuildList(usize),
+        BuildCtor(String, String, usize),
+        BuildMap(usize),
+        BuildSet(usize),
     }
+    let mut stack: Vec<Frame> = vec![Frame::Visit(p)];
+    let mut results: Vec<Value> = Vec::new();
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Visit(x) => match x {
+                PortableValue::Int(n) => results.push(Value::Int(*n)),
+                PortableValue::SizedInt(v, w) => results.push(Value::SizedInt(Box::new((*v, *w)))),
+                PortableValue::F32(f) => results.push(Value::F32(*f)),
+                PortableValue::BigInt(b) => results.push(Value::BigInt(Rc::new(b.clone()))),
+                PortableValue::Rational(r) => results.push(Value::Rational(Rc::new(r.clone()))),
+                PortableValue::Float(f) => results.push(Value::Float(*f)),
+                PortableValue::Bool(b) => results.push(Value::Bool(*b)),
+                PortableValue::Str(s) => results.push(Value::Str(Rc::new(s.clone()))),
+                PortableValue::Unit => results.push(Value::Unit),
+                PortableValue::List(xs) => {
+                    stack.push(Frame::BuildList(xs.len()));
+                    for item in xs.iter().rev() {
+                        stack.push(Frame::Visit(item));
+                    }
+                }
+                PortableValue::Ctor { ty, variant, fields } => {
+                    stack.push(Frame::BuildCtor(ty.clone(), variant.clone(), fields.len()));
+                    for f in fields.iter().rev() {
+                        stack.push(Frame::Visit(f));
+                    }
+                }
+                PortableValue::Tensor(d) => results.push(Value::Tensor(Rc::new(d.clone()))),
+                PortableValue::Map(pairs) => {
+                    stack.push(Frame::BuildMap(pairs.len()));
+                    for (k, val) in pairs.iter().rev() {
+                        stack.push(Frame::Visit(val));
+                        stack.push(Frame::Visit(k));
+                    }
+                }
+                PortableValue::Set(xs) => {
+                    stack.push(Frame::BuildSet(xs.len()));
+                    for item in xs.iter().rev() {
+                        stack.push(Frame::Visit(item));
+                    }
+                }
+                PortableValue::Range(a, b, inc) => results.push(Value::Range(*a, *b, *inc)),
+            },
+            Frame::BuildList(n) => {
+                let items = results.split_off(results.len() - n);
+                results.push(Value::List(Rc::new(items)));
+            }
+            Frame::BuildCtor(ty, variant, n) => {
+                let fields = results.split_off(results.len() - n);
+                results.push(Value::Ctor { ty: Rc::new(ty), variant: Rc::new(variant), fields: Rc::new(fields) });
+            }
+            Frame::BuildMap(n) => {
+                let flat = results.split_off(results.len() - 2 * n);
+                let mut pairs = Vec::with_capacity(n);
+                let mut it = flat.into_iter();
+                while let (Some(k), Some(val)) = (it.next(), it.next()) {
+                    pairs.push((k, val));
+                }
+                results.push(Value::Map(Rc::new(pairs)));
+            }
+            Frame::BuildSet(n) => {
+                let items = results.split_off(results.len() - n);
+                results.push(Value::Set(Rc::new(items)));
+            }
+        }
+    }
+    results.pop().expect("from_portable always produces exactly one Value")
 }
 
 /// Everything a PURE function needs to evaluate on a worker thread, in a
