@@ -700,6 +700,71 @@ impl Checker {
                                 f.span,
                             );
                         }
+                        // A REAL, confirmed-non-exploitable bug found+explicitly
+                        // rejected (production-hardening PR-it834, a follow-up
+                        // audit to PR-it832's generic-function-body soundness
+                        // fix): component methods (private OR exposed) declaring
+                        // their OWN `[T]` type parameters were never actually
+                        // SUPPORTED by this component-method machinery -- unlike
+                        // top-level `fun`s, which get a proper `qvars`-based
+                        // scheme (populated here in `collect()`, freshly
+                        // instantiated per call site via `instantiate_scheme`),
+                        // a component method's signature is built DIRECTLY via
+                        // `resolve_ty` in exactly THREE separate places (this
+                        // component's OWN `sig.exposes` registration just below;
+                        // `bind_component_env`'s cross-method-visibility pass,
+                        // used for calls BETWEEN sibling methods; and the
+                        // analogous pass reachable via `check_fulfills`) -- NONE
+                        // of which populate `self.tyvars` with the DECLARING
+                        // method's own type-parameter names, so `T` in `x: T`
+                        // resolves as an "unknown type" (K0205) via the generic
+                        // fallback branch of `resolve_ty`, or -- via
+                        // `bind_component_env`'s coincidental reuse of
+                        // WHICHEVER method is CURRENTLY being body-checked's
+                        // OWN `self.tyvars` -- occasionally "succeeds" by
+                        // silently aliasing one method's type parameter to an
+                        // UNRELATED sibling's, which is at best confusing and at
+                        // worst a genuine cross-method type-parameter mixup.
+                        // CAREFULLY CHARACTERIZED LIVE (multiple constructed
+                        // repros, including the "every method shares the exact
+                        // same type-parameter name, single call site" shape most
+                        // likely to slip through silently) before deciding on a
+                        // fix: `collect()`'s OWN `sig.exposes` registration (the
+                        // very next loop below) runs UNCONDITIONALLY with
+                        // `self.tyvars` EMPTY -- BEFORE any method-specific body
+                        // check ever runs -- so ANY exposed method with `[T]`
+                        // ALWAYS hits K0205 here, with no way to route around
+                        // it; and any sibling method WITHOUT a matching type
+                        // parameter (needed for ANY component to be USABLE from
+                        // `main()` in the first place, since every reachable
+                        // component needs at least one exposed entry point)
+                        // triggers the SAME K0205 as a "bystander" via
+                        // `bind_component_env`. In every repro constructed, the
+                        // OVERALL compile ALWAYS reported at least one error --
+                        // this is confirmed to be a FALSE-REJECTION-class bug
+                        // (the feature is simply broken/unusable), NOT a
+                        // K0281-class SILENT unsoundness (`kupl check` never
+                        // reports "ok" for a program that would actually
+                        // exercise this gap). Given a PROPER fix requires giving
+                        // component methods their own `qvars`/scheme +
+                        // `instantiate_scheme` machinery threaded through THREE
+                        // separate call sites (a materially larger, riskier
+                        // change than a single-function fix), and the confirmed
+                        // lower severity doesn't justify that risk in one pass,
+                        // this instead converts the current CONFUSING "unknown
+                        // type `T`" cascade into ONE clear, honest, dedicated
+                        // diagnostic explaining the actual limitation.
+                        if !f.type_params.is_empty() {
+                            self.err(
+                                "K0282",
+                                format!(
+                                    "method `{}` cannot declare type parameters -- component methods do not \
+                                     yet support generics (only top-level `fun`s can be generic)",
+                                    f.name
+                                ),
+                                f.span,
+                            );
+                        }
                     }
                     for f in &c.exposes {
                         self.reject_param_defaults(&f.params, &format!("exposed method `{}`'s parameters", f.name));
@@ -5627,6 +5692,77 @@ mod generic_tests {
                 "fun recurse_id[T](x: T, n: Int) -> T {\n    if n <= 0 { x } else { recurse_id(x, n - 1) }\n}\nfun main() { print(recurse_id(\"done\", 3)) }\n"
             )
             .is_empty()
+        );
+    }
+
+    /// A REAL, confirmed-non-exploitable bug found+explicitly rejected
+    /// (production-hardening PR-it834, a follow-up audit to PR-it832's
+    /// generic-function-body soundness fix): component methods declaring
+    /// their own `[T]` type parameters were never actually supported by
+    /// the component-method machinery -- `resolve_ty`'s lookup of `T` fails
+    /// in all three places a component method's signature gets built
+    /// (`collect()`'s own `sig.exposes` registration, `bind_component_env`'s
+    /// cross-method-visibility pass, and the analogous pass reachable via
+    /// `check_fulfills`), none of which populate `self.tyvars` with the
+    /// declaring method's own type-parameter names. CAREFULLY
+    /// characterized via multiple live repros (including the "every method
+    /// shares the exact same type-parameter name, single call site" shape
+    /// most likely to slip through silently) that this is a FALSE-
+    /// REJECTION-class bug, NOT a K0281-class silent unsoundness --
+    /// `collect()`'s exposes-registration runs UNCONDITIONALLY with
+    /// `self.tyvars` empty, so ANY exposed generic method always hits
+    /// K0205, and any non-generic sibling (required for the component to
+    /// be reachable from `main()` at all) triggers the same K0205 as a
+    /// bystander via `bind_component_env` -- in every constructed repro,
+    /// the overall compile always reported at least one error; `kupl
+    /// check` never reports "ok" for a program that would actually
+    /// exercise this gap. Given a PROPER fix requires giving component
+    /// methods their own `qvars`/scheme + `instantiate_scheme` machinery
+    /// threaded through three separate call sites -- a materially larger,
+    /// riskier change than a single-function fix -- and the confirmed
+    /// lower severity doesn't justify that risk in one pass, this instead
+    /// converts the previously CONFUSING "unknown type `T`" cascade into
+    /// one clear, honest, dedicated diagnostic (K0282) explaining the
+    /// actual limitation, fired BEFORE the confusing fallout (though the
+    /// fallout may still additionally appear -- fully suppressing it would
+    /// require the same broader, deferred architectural work).
+    #[test]
+    fn component_method_type_parameters_are_explicitly_rejected() {
+        // A private method with its own [T].
+        let e1 = errors(
+            "component Box {\n    state v: Int = 0\n    fun weird[T](x: T) -> T { 5 }\n    expose fun probe() -> Int { let s: Int = weird(99)\n        s }\n}\nfun main() { print(Box().probe()) }\n",
+        );
+        let d1 = e1.iter().find(|d| d.code == "K0282").expect("private generic method must be K0282");
+        assert!(d1.message.contains("`weird`"), "{}", d1.message);
+
+        // An exposed method with its own [T].
+        let e2 = errors(
+            "component Box {\n    state v: Int = 0\n    expose fun run[T](x: T) -> T { x }\n}\nfun main() { print(Box().run(5)) }\n",
+        );
+        let d2 = e2.iter().find(|d| d.code == "K0282").expect("exposed generic method must be K0282");
+        assert!(d2.message.contains("`run`"), "{}", d2.message);
+
+        // Both private AND exposed sharing the SAME type-parameter name --
+        // the shape most likely to slip through silently if this check
+        // didn't exist -- must ALSO be caught, for BOTH methods.
+        let e3 = errors(
+            "component Box {\n    state v: Int = 0\n    fun idA[T](x: T) -> T { x }\n    expose fun run[T](seed: T) -> T { idA(seed) }\n}\nfun main() { print(Box().run(5)) }\n",
+        );
+        assert_eq!(
+            e3.iter().filter(|d| d.code == "K0282").count(),
+            2,
+            "both idA and run must be independently flagged: {e3:?}"
+        );
+
+        // An ordinary, non-generic component method must be completely
+        // unaffected -- K0282 only fires when `type_params` is non-empty.
+        assert!(
+            errors(
+                "component Box {\n    state v: Int = 0\n    fun helper(x: Int) -> Int { x + 1 }\n    expose fun probe() -> Int { helper(v) }\n}\nfun main() { print(Box().probe()) }\n"
+            )
+            .iter()
+            .all(|d| d.code != "K0282"),
+            "an ordinary non-generic component method must never trigger K0282"
         );
     }
 }
