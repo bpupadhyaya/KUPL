@@ -1859,92 +1859,137 @@ static KValue k_concat(KValue a, KValue b) {
 
 /* ---- operators (mirror interp raw_binary_op) ---- */
 
+/* Iterative comparison (production-hardening PR-it801): the K_LIST/K_CTOR
+   cases used to recurse via plain C function calls (`k_eq(a.as.list->
+   items[i], ...)`), so comparing two INDEPENDENTLY-built EQUAL deep
+   structures (the SAME 20 000 000-deep `Wrap(next: Chain)`-style repro
+   used to fix the Rust-side sibling, value.rs's `PartialEq::eq`, at
+   PR-it800) segfaulted -- confirmed live: unlike PR-it799's Drop bug
+   (where native's arena allocator, which never frees, sidestepped the
+   crash entirely), THIS bug affected ALL THREE engines identically, since
+   comparing doesn't free anything and native has no equivalent protection
+   against comparison-call-depth. Fixed with the C-side equivalent of
+   value.rs's flat work-list technique: two parallel, capacity-doubling
+   `realloc`'d arrays (`sa`/`sb`, mirroring this file's OWN established
+   growable-array idiom used elsewhere, e.g. `k_url_decode_lossy`'s `pairs`
+   array) hold PENDING PAIRS still needing comparison, processed in a
+   `while` loop instead of via recursive calls. `result` short-circuits to
+   0 (and the `while (n > 0 && result)` loop condition then exits) the
+   MOMENT any mismatch is found anywhere -- preserving the original code's
+   early-return-on-mismatch semantics exactly, not just the final answer.
+   Map/Set's own order-insensitive O(n^2)-in-entry-count scan is UNCHANGED
+   (bounded by entry count, not nesting depth) -- only their delegated
+   `k_key_eq` calls needed the iterative treatment, which `k_key_eq` gets
+   at its own definition below, matching value.rs's `value_key_eq` split. */
 static int k_eq(KValue a, KValue b) {
-    // Every case below (including the multi-line Map/Set/List/Ctor/Tensor
-    // ones) already implicitly required `a.tag == b.tag` -- each was
-    // previously its own leading `a.tag == X && b.tag == X` check, so a
-    // mismatched tag fell through every one of them in sequence before
-    // reaching the OLD trailing `a.tag != b.tag` check. Hoisting that single
-    // check to the top and switching on `a.tag` once (an O(1) jump-table
-    // dispatch, replacing up to 6 sequential double-tag comparisons per call
-    // for the common Int/Str/Float/Bool cases) is behavior-preserving --
-    // confirmed profiling `k_eq` as the dominant cost (~92% of samples) of
-    // native Map.insert's O(n) duplicate-key scan (production-hardening
-    // PR-it650, closing the residual ~1.5x native-vs-interp/vm perf gap it610
-    // first measured and attributed to "plausibly k_eq's per-comparison cost").
-    if (a.tag != b.tag) return 0;
-    switch (a.tag) {
-        case K_INT: return a.as.i == b.as.i;
-        case K_FLOAT: return a.as.f == b.as.f;
-        case K_BOOL: return a.as.b == b.as.b;
-        case K_UNIT: return 1;
-        case K_COMPONENT: return a.as.i == b.as.i;
-        case K_STR: return strcmp(a.as.s, b.as.s) == 0;
-        case K_SIZEDINT: return a.as.sized->width == b.as.sized->width && a.as.sized->v == b.as.sized->v;
-        case K_F32: return a.as.f32v == b.as.f32v;
-        case K_BIGINT: return k_big_cmp(a, b) == 0;
-        /* PR-it718: structural equality (num/den each compared directly via
-           the cheap k_big_cmp, no multiplication), matching interp.rs's
-           `#[derive(PartialEq)]` on Rational exactly -- a Rational is ALWAYS
-           stored reduced (k_rat_norm), so structural equality of the reduced
-           num/den IS correct mathematical equality, with no need for the
-           cross-multiplication k_rat_cmp uses for genuine ORDERING. Using
-           k_rat_cmp here (as this line originally did) would route `==`
-           through the SAME expensive-multiplication guard `<`/`<=`/`>`/`>=`
-           now correctly need (see k_rat_cmp above) -- but Rust's `==` never
-           pays that cost at all, so reusing k_rat_cmp here would make native
-           panic on an asymmetric huge/tiny Rational pair where interp/KVM's
-           cheap structural `==` succeeds instantly: a cross-engine
-           divergence this fix must NOT introduce. */
-        case K_RATIONAL: return k_big_cmp(k_big_v(a.as.rat->num), k_big_v(b.as.rat->num)) == 0
-                             && k_big_cmp(k_big_v(a.as.rat->den), k_big_v(b.as.rat->den)) == 0;
-        case K_LIST:
-            if (a.as.list->len != b.as.list->len) return 0;
-            for (int64_t i = 0; i < a.as.list->len; i++)
-                if (!k_eq(a.as.list->items[i], b.as.list->items[i])) return 0;
-            return 1;
-        case K_CTOR: {
-            if (strcmp(CTORS[a.as.ctor->ctor].variant, CTORS[b.as.ctor->ctor].variant)) return 0;
-            if (a.as.ctor->nfields != b.as.ctor->nfields) return 0;
-            for (int i = 0; i < a.as.ctor->nfields; i++)
-                if (!k_eq(a.as.ctor->fields[i], b.as.ctor->fields[i])) return 0;
-            return 1;
-        }
-        case K_RANGE:
-            return a.as.range.lo == b.as.range.lo && a.as.range.hi == b.as.range.hi
-                && a.as.range.incl == b.as.range.incl;
-        case K_TENSOR:
-            if (a.as.ten->len != b.as.ten->len) return 0;
-            for (int64_t i = 0; i < a.as.ten->len; i++)
-                if (a.as.ten->data[i] != b.as.ten->data[i]) return 0;
-            return 1;
-        case K_MAP: {
-            /* Key/value identity here uses k_key_eq, not k_eq (PR-it691) --
-               mirrors value.rs's PartialEq for Value::Map, which does the
-               same, so a `NaN` key compares consistently between `map1 ==
-               map2` and `map1.get(nan)`/`map1.contains_key(nan)`. */
-            if (a.as.map->len != b.as.map->len) return 0;
-            for (int64_t i = 0; i < a.as.map->len; i++) {
-                int found = 0;
-                for (int64_t j = 0; j < b.as.map->len; j++)
-                    if (k_key_eq(a.as.map->keys[i], b.as.map->keys[j])
-                        && k_key_eq(a.as.map->vals[i], b.as.map->vals[j])) { found = 1; break; }
-                if (!found) return 0;
+    int cap = 16, n = 0;
+    KValue* sa = (KValue*)k_alloc(sizeof(KValue) * cap);
+    KValue* sb = (KValue*)k_alloc(sizeof(KValue) * cap);
+    sa[n] = a; sb[n] = b; n++;
+    int result = 1;
+    while (n > 0 && result) {
+        KValue x = sa[--n], y = sb[n];
+        // Every case below (including the multi-line Map/Set/List/Ctor/Tensor
+        // ones) already implicitly required `x.tag == y.tag` -- each was
+        // previously its own leading `a.tag == X && b.tag == X` check, so a
+        // mismatched tag fell through every one of them in sequence before
+        // reaching the OLD trailing `a.tag != b.tag` check. Hoisting that single
+        // check to the top and switching on `x.tag` once (an O(1) jump-table
+        // dispatch, replacing up to 6 sequential double-tag comparisons per call
+        // for the common Int/Str/Float/Bool cases) is behavior-preserving --
+        // confirmed profiling `k_eq` as the dominant cost (~92% of samples) of
+        // native Map.insert's O(n) duplicate-key scan (production-hardening
+        // PR-it650, closing the residual ~1.5x native-vs-interp/vm perf gap it610
+        // first measured and attributed to "plausibly k_eq's per-comparison cost").
+        if (x.tag != y.tag) { result = 0; break; }
+        switch (x.tag) {
+            case K_INT: result = (x.as.i == y.as.i); break;
+            case K_FLOAT: result = (x.as.f == y.as.f); break;
+            case K_BOOL: result = (x.as.b == y.as.b); break;
+            case K_UNIT: break;
+            case K_COMPONENT: result = (x.as.i == y.as.i); break;
+            case K_STR: result = (strcmp(x.as.s, y.as.s) == 0); break;
+            case K_SIZEDINT: result = (x.as.sized->width == y.as.sized->width && x.as.sized->v == y.as.sized->v); break;
+            case K_F32: result = (x.as.f32v == y.as.f32v); break;
+            case K_BIGINT: result = (k_big_cmp(x, y) == 0); break;
+            /* PR-it718: structural equality (num/den each compared directly via
+               the cheap k_big_cmp, no multiplication), matching interp.rs's
+               `#[derive(PartialEq)]` on Rational exactly -- a Rational is ALWAYS
+               stored reduced (k_rat_norm), so structural equality of the reduced
+               num/den IS correct mathematical equality, with no need for the
+               cross-multiplication k_rat_cmp uses for genuine ORDERING. Using
+               k_rat_cmp here (as this line originally did) would route `==`
+               through the SAME expensive-multiplication guard `<`/`<=`/`>`/`>=`
+               now correctly need (see k_rat_cmp above) -- but Rust's `==` never
+               pays that cost at all, so reusing k_rat_cmp here would make native
+               panic on an asymmetric huge/tiny Rational pair where interp/KVM's
+               cheap structural `==` succeeds instantly: a cross-engine
+               divergence this fix must NOT introduce. */
+            case K_RATIONAL:
+                result = (k_big_cmp(k_big_v(x.as.rat->num), k_big_v(y.as.rat->num)) == 0
+                       && k_big_cmp(k_big_v(x.as.rat->den), k_big_v(y.as.rat->den)) == 0);
+                break;
+            case K_LIST:
+                if (x.as.list->len != y.as.list->len) { result = 0; break; }
+                for (int64_t i = 0; i < x.as.list->len; i++) {
+                    if (n == cap) { cap *= 2; sa = (KValue*)realloc(sa, sizeof(KValue) * cap); sb = (KValue*)realloc(sb, sizeof(KValue) * cap); }
+                    sa[n] = x.as.list->items[i]; sb[n] = y.as.list->items[i]; n++;
+                }
+                break;
+            case K_CTOR:
+                if (strcmp(CTORS[x.as.ctor->ctor].variant, CTORS[y.as.ctor->ctor].variant)) { result = 0; break; }
+                if (x.as.ctor->nfields != y.as.ctor->nfields) { result = 0; break; }
+                for (int i = 0; i < x.as.ctor->nfields; i++) {
+                    if (n == cap) { cap *= 2; sa = (KValue*)realloc(sa, sizeof(KValue) * cap); sb = (KValue*)realloc(sb, sizeof(KValue) * cap); }
+                    sa[n] = x.as.ctor->fields[i]; sb[n] = y.as.ctor->fields[i]; n++;
+                }
+                break;
+            case K_RANGE:
+                result = (x.as.range.lo == y.as.range.lo && x.as.range.hi == y.as.range.hi
+                    && x.as.range.incl == y.as.range.incl);
+                break;
+            case K_TENSOR: {
+                if (x.as.ten->len != y.as.ten->len) { result = 0; break; }
+                int ok = 1;
+                for (int64_t i = 0; i < x.as.ten->len; i++)
+                    if (x.as.ten->data[i] != y.as.ten->data[i]) { ok = 0; break; }
+                result = ok;
+                break;
             }
-            return 1;
-        }
-        case K_SET: {
-            if (a.as.set->len != b.as.set->len) return 0;
-            for (int64_t i = 0; i < a.as.set->len; i++) {
-                int found = 0;
-                for (int64_t j = 0; j < b.as.set->len; j++)
-                    if (k_key_eq(a.as.set->items[i], b.as.set->items[j])) { found = 1; break; }
-                if (!found) return 0;
+            case K_MAP: {
+                /* Key/value identity here uses k_key_eq, not k_eq (PR-it691) --
+                   mirrors value.rs's PartialEq for Value::Map, which does the
+                   same, so a `NaN` key compares consistently between `map1 ==
+                   map2` and `map1.get(nan)`/`map1.contains_key(nan)`. */
+                if (x.as.map->len != y.as.map->len) { result = 0; break; }
+                int ok = 1;
+                for (int64_t i = 0; i < x.as.map->len && ok; i++) {
+                    int found = 0;
+                    for (int64_t j = 0; j < y.as.map->len; j++)
+                        if (k_key_eq(x.as.map->keys[i], y.as.map->keys[j])
+                            && k_key_eq(x.as.map->vals[i], y.as.map->vals[j])) { found = 1; break; }
+                    if (!found) ok = 0;
+                }
+                result = ok;
+                break;
             }
-            return 1;
+            case K_SET: {
+                if (x.as.set->len != y.as.set->len) { result = 0; break; }
+                int ok = 1;
+                for (int64_t i = 0; i < x.as.set->len && ok; i++) {
+                    int found = 0;
+                    for (int64_t j = 0; j < y.as.set->len; j++)
+                        if (k_key_eq(x.as.set->items[i], y.as.set->items[j])) { found = 1; break; }
+                    if (!found) ok = 0;
+                }
+                result = ok;
+                break;
+            }
+            default: result = 0; break;
         }
-        default: return 0;
     }
+    free(sa); free(sb);
+    return result;
 }
 
 /* Key/element identity for Map/Set (insert/get/contains_key/remove/get_or/
@@ -1960,57 +2005,84 @@ static int k_eq(KValue a, KValue b) {
    positionally" contract on native, exactly as it did on interp/KVM before
    their sibling fix. Recurses through composite types so a NaN buried
    inside a List/Ctor/Map/Set/Range/Tensor used AS a key is also handled
-   correctly, not just a bare NaN key. */
+   correctly, not just a bare NaN key.
+
+   Made iterative (production-hardening PR-it801), mirroring `k_eq`'s own
+   fix just above and value.rs's `value_key_eq` -- a SEPARATE, independently
+   recursive call chain (List/Ctor here recurse via `k_key_eq` calling
+   itself directly, not through `k_eq`), reachable via ANY Map/Set
+   operation, not just `==`. */
 static int k_key_eq(KValue a, KValue b) {
-    if (a.tag != b.tag) return 0;
-    switch (a.tag) {
-        case K_FLOAT: return a.as.f == b.as.f || (isnan(a.as.f) && isnan(b.as.f));
-        case K_F32: return a.as.f32v == b.as.f32v || (isnan(a.as.f32v) && isnan(b.as.f32v));
-        case K_LIST:
-            if (a.as.list->len != b.as.list->len) return 0;
-            for (int64_t i = 0; i < a.as.list->len; i++)
-                if (!k_key_eq(a.as.list->items[i], b.as.list->items[i])) return 0;
-            return 1;
-        case K_CTOR: {
-            if (strcmp(CTORS[a.as.ctor->ctor].variant, CTORS[b.as.ctor->ctor].variant)) return 0;
-            if (a.as.ctor->nfields != b.as.ctor->nfields) return 0;
-            for (int i = 0; i < a.as.ctor->nfields; i++)
-                if (!k_key_eq(a.as.ctor->fields[i], b.as.ctor->fields[i])) return 0;
-            return 1;
-        }
-        case K_RANGE:
-            return a.as.range.lo == b.as.range.lo && a.as.range.hi == b.as.range.hi
-                && a.as.range.incl == b.as.range.incl;
-        case K_TENSOR:
-            if (a.as.ten->len != b.as.ten->len) return 0;
-            for (int64_t i = 0; i < a.as.ten->len; i++) {
-                double x = a.as.ten->data[i], y = b.as.ten->data[i];
-                if (!(x == y || (isnan(x) && isnan(y)))) return 0;
+    int cap = 16, n = 0;
+    KValue* sa = (KValue*)k_alloc(sizeof(KValue) * cap);
+    KValue* sb = (KValue*)k_alloc(sizeof(KValue) * cap);
+    sa[n] = a; sb[n] = b; n++;
+    int result = 1;
+    while (n > 0 && result) {
+        KValue x = sa[--n], y = sb[n];
+        if (x.tag != y.tag) { result = 0; break; }
+        switch (x.tag) {
+            case K_FLOAT: result = (x.as.f == y.as.f || (isnan(x.as.f) && isnan(y.as.f))); break;
+            case K_F32: result = (x.as.f32v == y.as.f32v || (isnan(x.as.f32v) && isnan(y.as.f32v))); break;
+            case K_LIST:
+                if (x.as.list->len != y.as.list->len) { result = 0; break; }
+                for (int64_t i = 0; i < x.as.list->len; i++) {
+                    if (n == cap) { cap *= 2; sa = (KValue*)realloc(sa, sizeof(KValue) * cap); sb = (KValue*)realloc(sb, sizeof(KValue) * cap); }
+                    sa[n] = x.as.list->items[i]; sb[n] = y.as.list->items[i]; n++;
+                }
+                break;
+            case K_CTOR:
+                if (strcmp(CTORS[x.as.ctor->ctor].variant, CTORS[y.as.ctor->ctor].variant)) { result = 0; break; }
+                if (x.as.ctor->nfields != y.as.ctor->nfields) { result = 0; break; }
+                for (int i = 0; i < x.as.ctor->nfields; i++) {
+                    if (n == cap) { cap *= 2; sa = (KValue*)realloc(sa, sizeof(KValue) * cap); sb = (KValue*)realloc(sb, sizeof(KValue) * cap); }
+                    sa[n] = x.as.ctor->fields[i]; sb[n] = y.as.ctor->fields[i]; n++;
+                }
+                break;
+            case K_RANGE:
+                result = (x.as.range.lo == y.as.range.lo && x.as.range.hi == y.as.range.hi
+                    && x.as.range.incl == y.as.range.incl);
+                break;
+            case K_TENSOR: {
+                if (x.as.ten->len != y.as.ten->len) { result = 0; break; }
+                int ok = 1;
+                for (int64_t i = 0; i < x.as.ten->len; i++) {
+                    double xv = x.as.ten->data[i], yv = y.as.ten->data[i];
+                    if (!(xv == yv || (isnan(xv) && isnan(yv)))) { ok = 0; break; }
+                }
+                result = ok;
+                break;
             }
-            return 1;
-        case K_MAP: {
-            if (a.as.map->len != b.as.map->len) return 0;
-            for (int64_t i = 0; i < a.as.map->len; i++) {
-                int found = 0;
-                for (int64_t j = 0; j < b.as.map->len; j++)
-                    if (k_key_eq(a.as.map->keys[i], b.as.map->keys[j])
-                        && k_key_eq(a.as.map->vals[i], b.as.map->vals[j])) { found = 1; break; }
-                if (!found) return 0;
+            case K_MAP: {
+                if (x.as.map->len != y.as.map->len) { result = 0; break; }
+                int ok = 1;
+                for (int64_t i = 0; i < x.as.map->len && ok; i++) {
+                    int found = 0;
+                    for (int64_t j = 0; j < y.as.map->len; j++)
+                        if (k_key_eq(x.as.map->keys[i], y.as.map->keys[j])
+                            && k_key_eq(x.as.map->vals[i], y.as.map->vals[j])) { found = 1; break; }
+                    if (!found) ok = 0;
+                }
+                result = ok;
+                break;
             }
-            return 1;
-        }
-        case K_SET: {
-            if (a.as.set->len != b.as.set->len) return 0;
-            for (int64_t i = 0; i < a.as.set->len; i++) {
-                int found = 0;
-                for (int64_t j = 0; j < b.as.set->len; j++)
-                    if (k_key_eq(a.as.set->items[i], b.as.set->items[j])) { found = 1; break; }
-                if (!found) return 0;
+            case K_SET: {
+                if (x.as.set->len != y.as.set->len) { result = 0; break; }
+                int ok = 1;
+                for (int64_t i = 0; i < x.as.set->len && ok; i++) {
+                    int found = 0;
+                    for (int64_t j = 0; j < y.as.set->len; j++)
+                        if (k_key_eq(x.as.set->items[i], y.as.set->items[j])) { found = 1; break; }
+                    if (!found) ok = 0;
+                }
+                result = ok;
+                break;
             }
-            return 1;
+            default: result = k_eq(x, y); break;
         }
-        default: return k_eq(a, b);
     }
+    free(sa); free(sb);
+    return result;
 }
 
 static KValue k_tensor_binop(KValue a, KValue b, int op) { /* 0:+ 1:- 2:* 3:/ */
