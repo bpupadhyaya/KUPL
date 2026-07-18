@@ -19079,6 +19079,49 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         );
     }
 
+    /// `Set.intersect`/`difference`/`symmetric_difference`/`is_subset`/
+    /// `is_superset`'s own O((n+m) log n) fast paths (production-hardening
+    /// PR-it829, the SEVENTH through ELEVENTH instances of the naive-O(n^2)-
+    /// collection-algorithm bug class, follow-ups to PR-it828's `union`):
+    /// confirms BigInt/SizedInt/F32 coverage, Rational exclusion (via the
+    /// naive fallback still working correctly), NaN-collapsing, and
+    /// self-order preservation for `intersect`/`difference`/
+    /// `symmetric_difference`.
+    #[test]
+    fn diff_set_algebra_fast_paths_cover_bigint_sizedint_f32_and_exclude_rational() {
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let a = Set([big(3), big(1), big(4)])\n    let b = Set([big(4), big(1)])\n    \"{a.intersect(b)}|{a.difference(b)}|{a.symmetric_difference(b)}|{a.is_subset(b)}|{b.is_subset(a)}\"\n}\n"
+            ),
+            "Set{1, 4}|Set{3}|Set{3}|false|true"
+        );
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let a = Set([5i32, 3i32])\n    let b = Set([3i32, 1i32])\n    \"{a.intersect(b).len()}|{a.difference(b).len()}|{a.symmetric_difference(b).len()}\"\n}\n"
+            ),
+            "1|1|2"
+        );
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let nan = 0.0f32 / 0.0f32\n    let a = Set([1.0f32, nan, 2.0f32])\n    let b = Set([nan, 3.0f32])\n    \"{a.intersect(b)}|{a.difference(b)}|{a.symmetric_difference(b)}\"\n}\n"
+            ),
+            "Set{NaN}|Set{1.0, 2.0}|Set{1.0, 2.0, 3.0}"
+        );
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let a = Set([rat(1, 2), rat(1, 3)])\n    let b = Set([rat(1, 3), rat(2, 3)])\n    \"{a.intersect(b)}|{a.difference(b)}|{a.is_superset(b)}\"\n}\n"
+            ),
+            "Set{1/3}|Set{1/2}|false"
+        );
+        // empty/self edge cases, on the fast-eligible Int type
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    let a = Set([1, 2, 3])\n    let empty: Set[Int] = Set([])\n    \"{empty.is_subset(a)}|{a.is_subset(empty)}|{a.is_superset(empty)}|{a.intersect(a).len()}|{a.difference(a).len()}\"\n}\n"
+            ),
+            "true|false|true|3|0"
+        );
+    }
+
     #[test]
     fn diff_par_fork_join() {
         // structured fork-join: independent branches collected into a list,

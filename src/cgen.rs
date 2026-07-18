@@ -6905,38 +6905,99 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_set_make(out, n);
         }
         if (!strcmp(name, "intersect") || !strcmp(name, "difference")) {
+            /* production-hardening PR-it829, the SEVENTH/EIGHTH instances of
+               this campaign's recurring naive-O(n^2)-collection bug class
+               (follow-ups to PR-it828's `union`): membership testing was a
+               LINEAR SCAN, run once per element of `st`, so intersecting/
+               differencing two mostly-overlapping-or-disjoint Sets is O(n*m).
+               FAST PATH: `intersect`/`difference` both keep `st`'s items,
+               filtered by membership in `o`, in `st`'s original order, so
+               only a throwaway sorted copy of `o` is needed (O(m log m)) for
+               binary-search membership testing via `k_value_bsearch`. */
             KSet* o = args[0].as.set;
             int want = name[0] == 'i';
+            int fast_eligible = st->len > 0 && o->len > 0
+                && (st->items[0].tag == K_INT || st->items[0].tag == K_FLOAT || st->items[0].tag == K_F32
+                    || st->items[0].tag == K_STR || st->items[0].tag == K_SIZEDINT || st->items[0].tag == K_BIGINT);
             KValue* out = k_alloc(sizeof(KValue) * (st->len < 1 ? 1 : st->len));
             int64_t n = 0;
-            for (int64_t i = 0; i < st->len; i++) {
-                int found = 0;
-                for (int64_t j = 0; j < o->len; j++)
-                    if (k_key_eq(st->items[i], o->items[j])) { found = 1; break; }
-                if (found == want) out[n++] = st->items[i];
+            if (fast_eligible) {
+                KValue* sorted_other = (KValue*)k_alloc(sizeof(KValue) * o->len);
+                memcpy(sorted_other, o->items, sizeof(KValue) * o->len);
+                qsort(sorted_other, o->len, sizeof(KValue), k_value_cmp);
+                for (int64_t i = 0; i < st->len; i++) {
+                    int found = k_value_bsearch(sorted_other, o->len, st->items[i]);
+                    if (found == want) out[n++] = st->items[i];
+                }
+            } else {
+                for (int64_t i = 0; i < st->len; i++) {
+                    int found = 0;
+                    for (int64_t j = 0; j < o->len; j++)
+                        if (k_key_eq(st->items[i], o->items[j])) { found = 1; break; }
+                    if (found == want) out[n++] = st->items[i];
+                }
             }
             return k_set_make(out, n);
         }
         if (!strcmp(name, "symmetric_difference")) {
+            /* production-hardening PR-it829, the NINTH instance: same O(n*m)
+               shape, needing sorted copies of BOTH sides (one per
+               direction's membership test) since output order is (self
+               items not in other, self order) ++ (other items not in self,
+               other order) -- neither pass alone suffices, unlike
+               `union`'s single sorted copy of `self`. */
             KSet* o = args[0].as.set;
+            int fast_eligible = st->len > 0 && o->len > 0
+                && (st->items[0].tag == K_INT || st->items[0].tag == K_FLOAT || st->items[0].tag == K_F32
+                    || st->items[0].tag == K_STR || st->items[0].tag == K_SIZEDINT || st->items[0].tag == K_BIGINT);
             KValue* out = k_alloc(sizeof(KValue) * ((st->len + o->len) < 1 ? 1 : st->len + o->len));
             int64_t n = 0;
-            for (int64_t i = 0; i < st->len; i++) {
-                int found = 0;
-                for (int64_t j = 0; j < o->len; j++) if (k_key_eq(st->items[i], o->items[j])) { found = 1; break; }
-                if (!found) out[n++] = st->items[i];
-            }
-            for (int64_t i = 0; i < o->len; i++) {
-                int found = 0;
-                for (int64_t j = 0; j < st->len; j++) if (k_key_eq(o->items[i], st->items[j])) { found = 1; break; }
-                if (!found) out[n++] = o->items[i];
+            if (fast_eligible) {
+                KValue* sorted_other = (KValue*)k_alloc(sizeof(KValue) * o->len);
+                memcpy(sorted_other, o->items, sizeof(KValue) * o->len);
+                qsort(sorted_other, o->len, sizeof(KValue), k_value_cmp);
+                KValue* sorted_self = (KValue*)k_alloc(sizeof(KValue) * st->len);
+                memcpy(sorted_self, st->items, sizeof(KValue) * st->len);
+                qsort(sorted_self, st->len, sizeof(KValue), k_value_cmp);
+                for (int64_t i = 0; i < st->len; i++) {
+                    if (!k_value_bsearch(sorted_other, o->len, st->items[i])) out[n++] = st->items[i];
+                }
+                for (int64_t i = 0; i < o->len; i++) {
+                    if (!k_value_bsearch(sorted_self, st->len, o->items[i])) out[n++] = o->items[i];
+                }
+            } else {
+                for (int64_t i = 0; i < st->len; i++) {
+                    int found = 0;
+                    for (int64_t j = 0; j < o->len; j++) if (k_key_eq(st->items[i], o->items[j])) { found = 1; break; }
+                    if (!found) out[n++] = st->items[i];
+                }
+                for (int64_t i = 0; i < o->len; i++) {
+                    int found = 0;
+                    for (int64_t j = 0; j < st->len; j++) if (k_key_eq(o->items[i], st->items[j])) { found = 1; break; }
+                    if (!found) out[n++] = o->items[i];
+                }
             }
             return k_set_make(out, n);
         }
         if (!strcmp(name, "to_list")) return k_list(st->items, (int)st->len);
         if (!strcmp(name, "is_empty")) return k_bool(st->len == 0);
         if (!strcmp(name, "is_subset")) {
+            /* production-hardening PR-it829, the TENTH instance: same O(n*m)
+               membership-scan shape (`all`/`any`'s short-circuiting only
+               helps the FALSE case; a genuine subset still scans every
+               element). */
             KSet* o = args[0].as.set;
+            int fast_eligible = st->len > 0 && o->len > 0
+                && (st->items[0].tag == K_INT || st->items[0].tag == K_FLOAT || st->items[0].tag == K_F32
+                    || st->items[0].tag == K_STR || st->items[0].tag == K_SIZEDINT || st->items[0].tag == K_BIGINT);
+            if (fast_eligible) {
+                KValue* sorted_o = (KValue*)k_alloc(sizeof(KValue) * o->len);
+                memcpy(sorted_o, o->items, sizeof(KValue) * o->len);
+                qsort(sorted_o, o->len, sizeof(KValue), k_value_cmp);
+                for (int64_t i = 0; i < st->len; i++)
+                    if (!k_value_bsearch(sorted_o, o->len, st->items[i])) return k_bool(0);
+                return k_bool(1);
+            }
             for (int64_t i = 0; i < st->len; i++) {
                 int found = 0;
                 for (int64_t j = 0; j < o->len; j++) if (k_key_eq(st->items[i], o->items[j])) { found = 1; break; }
@@ -6945,8 +7006,22 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             return k_bool(1);
         }
         if (!strcmp(name, "is_superset")) {
-            /* Mirror of is_subset: every element of the argument set is in the receiver. */
+            /* Mirror of is_subset: every element of the argument set is in
+               the receiver. production-hardening PR-it829, the ELEVENTH
+               instance -- same fast-path technique, sorting `st` instead
+               (the LOOKUP side here) and probing `o`'s elements. */
             KSet* o = args[0].as.set;
+            int fast_eligible = o->len > 0 && st->len > 0
+                && (o->items[0].tag == K_INT || o->items[0].tag == K_FLOAT || o->items[0].tag == K_F32
+                    || o->items[0].tag == K_STR || o->items[0].tag == K_SIZEDINT || o->items[0].tag == K_BIGINT);
+            if (fast_eligible) {
+                KValue* sorted_self = (KValue*)k_alloc(sizeof(KValue) * st->len);
+                memcpy(sorted_self, st->items, sizeof(KValue) * st->len);
+                qsort(sorted_self, st->len, sizeof(KValue), k_value_cmp);
+                for (int64_t i = 0; i < o->len; i++)
+                    if (!k_value_bsearch(sorted_self, st->len, o->items[i])) return k_bool(0);
+                return k_bool(1);
+            }
             for (int64_t i = 0; i < o->len; i++) {
                 int found = 0;
                 for (int64_t j = 0; j < st->len; j++) if (k_key_eq(o->items[i], st->items[j])) { found = 1; break; }
@@ -9296,6 +9371,43 @@ fun main() uses io {
         // correctness is separately confirmed via the vm.rs differential test
         // (interp vs VM, both correctly showing "NaN").
         assert_eq!(out.trim(), "Set{3, 1, 4, 5}|3|Set{1.0, nan, 2.0}|Set{1/2, 1/3, 2/3}");
+    }
+
+    /// `Set.intersect`/`difference`/`symmetric_difference`/`is_subset`/
+    /// `is_superset`'s own O((n+m) log n) fast paths (production-hardening
+    /// PR-it829, the SEVENTH through ELEVENTH instances of the naive-O(n^2)-
+    /// collection-algorithm bug class, follow-ups to PR-it828's `union`):
+    /// confirms BigInt/SizedInt/F32 coverage, Rational exclusion (via the
+    /// naive fallback), NaN-collapsing, and self-order preservation.
+    #[test]
+    fn native_set_algebra_fast_paths_cover_bigint_sizedint_f32_and_exclude_rational() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let ab = Set([big(3), big(1), big(4)])\n    let bb = Set([big(4), big(1)])\n    \
+                   let ai = Set([5i32, 3i32])\n    let bi = Set([3i32, 1i32])\n    \
+                   let nan = 0.0f32 / 0.0f32\n    \
+                   let af = Set([1.0f32, nan, 2.0f32])\n    let bf = Set([nan, 3.0f32])\n    \
+                   let ar = Set([rat(1, 2), rat(1, 3)])\n    let br = Set([rat(1, 3), rat(2, 3)])\n    \
+                   let empty: Set[Int] = Set([])\n    let ie = Set([1, 2, 3])\n    \
+                   print(\"{ab.intersect(bb)}|{ab.difference(bb)}|{ab.symmetric_difference(bb)}|{ab.is_subset(bb)}|{bb.is_subset(ab)}\")\n    \
+                   print(\"{ai.intersect(bi).len()}|{ai.difference(bi).len()}|{ai.symmetric_difference(bi).len()}\")\n    \
+                   print(\"{af.intersect(bf)}|{af.difference(bf)}|{af.symmetric_difference(bf)}\")\n    \
+                   print(\"{ar.intersect(br)}|{ar.difference(br)}|{ar.is_superset(br)}\")\n    \
+                   print(\"{empty.is_subset(ie)}|{ie.is_subset(empty)}|{ie.is_superset(empty)}|{ie.intersect(ie).len()}|{ie.difference(ie).len()}\")\n}\n";
+        let out = native_main_stdout(src, "set_algebra_bigint_sizedint_f32_rational");
+        // NOTE: native's F32 NaN prints as lowercase "nan" (the SAME pre-
+        // existing, out-of-scope divergence documented in the `union` test
+        // above) -- pinned here, not re-litigated.
+        assert_eq!(
+            out.trim(),
+            "Set{1, 4}|Set{3}|Set{3}|false|true\n\
+             1|1|2\n\
+             Set{nan}|Set{1.0, 2.0}|Set{1.0, 2.0, 3.0}\n\
+             Set{1/3}|Set{1/2}|false\n\
+             true|false|true|3|0"
+        );
     }
 
     /// Native `.sort()` correctly sorts a large (30,000-element) reverse-sorted list --

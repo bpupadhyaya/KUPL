@@ -3539,46 +3539,164 @@ pub fn shared_method(
             }
             _ => Err("`union` needs a Set".into()),
         },
-        (Value::Set(items), "intersect") => match args.into_iter().next() {
-            Some(Value::Set(ref other)) => Ok(Value::Set(Rc::new(
-                items.iter().filter(|x| other.iter().any(|y| value_key_eq(y, x))).cloned().collect(),
-            ))),
-            _ => Err("`intersect` needs a Set".into()),
-        },
-        (Value::Set(items), "difference") => match args.into_iter().next() {
-            Some(Value::Set(ref other)) => Ok(Value::Set(Rc::new(
-                items.iter().filter(|x| !other.iter().any(|y| value_key_eq(y, x))).cloned().collect(),
-            ))),
-            _ => Err("`difference` needs a Set".into()),
+        // `intersect`/`difference` (production-hardening PR-it829, the SEVENTH
+        // and EIGHTH instances of this campaign's recurring "naive O(n^2)
+        // collection algorithm" bug class -- follow-ups explicitly flagged by
+        // PR-it828's `union` fix): membership testing was a LINEAR SCAN
+        // (`other.iter().any(value_key_eq(...))`), run once per element of
+        // `items`, so intersecting/differencing two mostly-overlapping-or-
+        // disjoint Sets is O(n*m) (live-confirmed: 0.29s/4.42s for two
+        // 2,000/8,000-element Sets, ~15-16x time for 4x size on both).
+        // FAST PATH (identical technique to PR-it828's `union`, just testing
+        // `items` against a sorted copy of `other` instead of the reverse):
+        // neither array is ever resorted in the OUTPUT -- `intersect`/
+        // `difference` both keep `self`'s items, filtered by membership in
+        // `other`, in `self`'s original order -- so only a throwaway sorted
+        // copy of `other` is built once (O(m log m)) for binary-search
+        // membership testing (`sort_order`-equal implies `value_key_eq`-equal
+        // for every fast-path type, the SAME equivalence PR-it825-828
+        // established). Combined into ONE match arm (mirroring cgen.rs's own
+        // existing combined `intersect`||`difference` C block) since they
+        // differ only in whether "found" or "not found" is kept.
+        (Value::Set(items), "intersect") | (Value::Set(items), "difference") => match args.into_iter().next() {
+            Some(Value::Set(ref other)) => {
+                let want_found = name == "intersect";
+                fn set_op_fast_eligible(v: &Value) -> bool {
+                    matches!(
+                        v,
+                        Value::Int(_)
+                            | Value::Float(_)
+                            | Value::F32(_)
+                            | Value::Str(_)
+                            | Value::SizedInt(_)
+                            | Value::BigInt(_)
+                    )
+                }
+                if !items.is_empty() && !other.is_empty() && items.first().is_some_and(set_op_fast_eligible) {
+                    let mut sorted_other: Vec<&Value> = other.iter().collect();
+                    sorted_other.sort_by(|a, b| sort_order(a, b).unwrap_or(std::cmp::Ordering::Equal));
+                    let out: Vec<Value> = items
+                        .iter()
+                        .filter(|x| {
+                            let found = sorted_other
+                                .binary_search_by(|probe| sort_order(probe, x).unwrap_or(std::cmp::Ordering::Equal))
+                                .is_ok();
+                            found == want_found
+                        })
+                        .cloned()
+                        .collect();
+                    Ok(Value::Set(Rc::new(out)))
+                } else {
+                    let out: Vec<Value> = items
+                        .iter()
+                        .filter(|x| other.iter().any(|y| value_key_eq(y, x)) == want_found)
+                        .cloned()
+                        .collect();
+                    Ok(Value::Set(Rc::new(out)))
+                }
+            }
+            _ => Err(format!("`{name}` needs a Set")),
         },
         (Value::Set(items), "symmetric_difference") => match args.into_iter().next() {
             Some(Value::Set(ref other)) => {
-                // (in self, not other) then (in other, not self) — deterministic order
-                let mut out: Vec<Value> =
-                    items.iter().filter(|x| !other.iter().any(|y| value_key_eq(y, x))).cloned().collect();
-                for x in other.iter() {
-                    if !items.iter().any(|y| value_key_eq(y, x)) {
-                        out.push(x.clone());
-                    }
+                // Follow-up to PR-it828/it829's `union`/`intersect`/`difference`
+                // fixes (production-hardening PR-it829, the NINTH instance):
+                // same O(n*m) shape, needing sorted copies of BOTH sides (one
+                // per direction's membership test) since output order is (self
+                // items not in other, self order) ++ (other items not in
+                // self, other order) -- neither pass alone suffices, unlike
+                // `union`'s single sorted copy of `self`.
+                fn set_op_fast_eligible(v: &Value) -> bool {
+                    matches!(
+                        v,
+                        Value::Int(_)
+                            | Value::Float(_)
+                            | Value::F32(_)
+                            | Value::Str(_)
+                            | Value::SizedInt(_)
+                            | Value::BigInt(_)
+                    )
                 }
-                Ok(Value::Set(Rc::new(out)))
+                if !items.is_empty() && !other.is_empty() && items.first().is_some_and(set_op_fast_eligible) {
+                    let mut sorted_other: Vec<&Value> = other.iter().collect();
+                    sorted_other.sort_by(|a, b| sort_order(a, b).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut sorted_self: Vec<&Value> = items.iter().collect();
+                    sorted_self.sort_by(|a, b| sort_order(a, b).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut out: Vec<Value> = items
+                        .iter()
+                        .filter(|x| {
+                            !sorted_other
+                                .binary_search_by(|probe| sort_order(probe, x).unwrap_or(std::cmp::Ordering::Equal))
+                                .is_ok()
+                        })
+                        .cloned()
+                        .collect();
+                    for x in other.iter() {
+                        let found = sorted_self
+                            .binary_search_by(|probe| sort_order(probe, x).unwrap_or(std::cmp::Ordering::Equal))
+                            .is_ok();
+                        if !found {
+                            out.push(x.clone());
+                        }
+                    }
+                    Ok(Value::Set(Rc::new(out)))
+                } else {
+                    // (in self, not other) then (in other, not self) — deterministic order
+                    let mut out: Vec<Value> =
+                        items.iter().filter(|x| !other.iter().any(|y| value_key_eq(y, x))).cloned().collect();
+                    for x in other.iter() {
+                        if !items.iter().any(|y| value_key_eq(y, x)) {
+                            out.push(x.clone());
+                        }
+                    }
+                    Ok(Value::Set(Rc::new(out)))
+                }
             }
             _ => Err("`symmetric_difference` needs a Set".into()),
         },
         (Value::Set(items), "to_list") => Ok(Value::List(Rc::new(items.as_ref().clone()))),
         (Value::Set(items), "is_empty") => Ok(Value::Bool(items.is_empty())),
-        (Value::Set(items), "is_subset") => match args.into_iter().next() {
+        // `is_subset`/`is_superset` (production-hardening PR-it829, the TENTH
+        // and ELEVENTH instances -- found alongside `intersect`/`difference`/
+        // `symmetric_difference` while auditing this SAME match block, not
+        // originally flagged by PR-it828's NEXT-note): same O(n*m) membership-
+        // scan shape (live-confirmed: 0.23s/3.61s for a 2,000/8,000-element
+        // Set tested against itself, ~16x for 4x size). `all`/`any`'s
+        // short-circuiting only helps the FALSE case (first miss found
+        // early); the TRUE case (genuinely a subset/superset) still scans
+        // every element. Combined into one arm; `want_subset` picks which
+        // side is iterated vs. which side is sorted for lookup.
+        (Value::Set(items), "is_subset") | (Value::Set(items), "is_superset") => match args.into_iter().next() {
             Some(Value::Set(ref other)) => {
-                Ok(Value::Bool(items.iter().all(|x| other.iter().any(|y| value_key_eq(y, x)))))
+                let want_subset = name == "is_subset";
+                let (probe_side, lookup_side): (&[Value], &[Value]) =
+                    if want_subset { (items, other) } else { (other, items) };
+                fn set_op_fast_eligible(v: &Value) -> bool {
+                    matches!(
+                        v,
+                        Value::Int(_)
+                            | Value::Float(_)
+                            | Value::F32(_)
+                            | Value::Str(_)
+                            | Value::SizedInt(_)
+                            | Value::BigInt(_)
+                    )
+                }
+                if !probe_side.is_empty() && !lookup_side.is_empty() && probe_side.first().is_some_and(set_op_fast_eligible) {
+                    let mut sorted_lookup: Vec<&Value> = lookup_side.iter().collect();
+                    sorted_lookup.sort_by(|a, b| sort_order(a, b).unwrap_or(std::cmp::Ordering::Equal));
+                    Ok(Value::Bool(probe_side.iter().all(|x| {
+                        sorted_lookup
+                            .binary_search_by(|probe| sort_order(probe, x).unwrap_or(std::cmp::Ordering::Equal))
+                            .is_ok()
+                    })))
+                } else {
+                    Ok(Value::Bool(
+                        probe_side.iter().all(|x| lookup_side.iter().any(|y| value_key_eq(y, x))),
+                    ))
+                }
             }
-            _ => Err("`is_subset` needs a Set".into()),
-        },
-        (Value::Set(items), "is_superset") => match args.into_iter().next() {
-            // The mirror of is_subset: every element of `other` is contained in the receiver.
-            Some(Value::Set(ref other)) => {
-                Ok(Value::Bool(other.iter().all(|x| items.iter().any(|y| value_key_eq(y, x)))))
-            }
-            _ => Err("`is_superset` needs a Set".into()),
+            _ => Err(format!("`{name}` needs a Set")),
         },
         (Value::Tensor(d), "len") => Ok(Value::Int(d.len() as i64)),
         (Value::Tensor(d), "get") => match args.into_iter().next() {
