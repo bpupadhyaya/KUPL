@@ -10856,6 +10856,38 @@ fun main() uses io {
         );
     }
 
+    /// Native named-argument/default-parameter calls inside a prop default or a child's own
+    /// constructor args resolve like they do everywhere else, matching interp/KVM (PR-it839):
+    /// `callargs.rs` used to skip both AST locations, so native silently agreed with interp/KVM
+    /// on the WRONG source-order-positional value for a prop default (zero diagnostics either).
+    #[test]
+    fn native_named_args_resolve_inside_prop_defaults_and_child_constructor_args() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun sub(a: Int, b: Int) -> Int {
+    a - b
+}
+component Child {
+    intent "c"
+    prop y: Int
+    expose fun get_y() -> Int { y }
+}
+component Parent {
+    intent "p"
+    prop x: Int = sub(b: 3, a: 10)
+    let c = Child(y: sub(b: 3, a: 10))
+    expose fun get_x() -> Int { x }
+    expose fun get_c() -> Int { c.get_y() }
+}
+fun main() uses io {
+    let p = Parent()
+    print("{p.get_x()}|{p.get_c()}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "propnamedargs").trim(), "7|7");
+    }
+
     /// Native sets preserve insertion order through mutation, matching interp/KVM: insert-
     /// existing is a no-op keeping order, remove-then-reinsert moves to end, dedup is
     /// first-occurrence, and set algebra is deterministically ordered (PR-it161).

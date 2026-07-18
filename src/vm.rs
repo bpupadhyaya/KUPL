@@ -15414,6 +15414,58 @@ fun probe() -> Str {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it839):
+    /// `callargs.rs`'s `Item::Component` arm never walked `c.props[i].default`
+    /// or `c.children[i].args[j].value`, so a named-argument or trailing-
+    /// default-relying call inside either location bypassed the positional
+    /// rewrite every OTHER call site gets. For a prop default this was SILENT
+    /// VALUE CORRUPTION: `interp.rs::instantiate` and `compile.rs`'s prop-
+    /// default-chunk compilation both evaluate the raw, un-rewritten default
+    /// expression positionally by SOURCE-WRITTEN order, ignoring argument
+    /// names entirely -- `sub(b: 3, a: 10)` against `fun sub(a: Int, b: Int)
+    /// -> Int { a - b }` silently computed `3 - 10 = -7` instead of the
+    /// correct `10 - 3 = 7`, with ZERO diagnostics from `kupl check`,
+    /// identically wrong on interp/KVM/native since the rewrite runs once
+    /// upstream of all three. For a child's own constructor args the same gap
+    /// instead produced a misleading K0241 "named arguments only allowed for
+    /// constructors and props" false-rejection of an otherwise-legitimate
+    /// call.
+    #[test]
+    fn diff_named_args_and_defaults_resolve_inside_prop_defaults_and_child_constructor_args() {
+        // named arguments, inside a prop default -- the silent-corruption case.
+        assert_eq!(
+            differential(
+                "fun sub(a: Int, b: Int) -> Int { a - b }\n\
+                 component Widget {\n    intent \"w\"\n    prop x: Int = sub(b: 3, a: 10)\n    \
+                 expose fun get_x() -> Int { x }\n}\n\
+                 fun probe() -> Int { Widget().get_x() }\n"
+            ),
+            "7"
+        );
+        // a trailing default, inside a prop default.
+        assert_eq!(
+            differential(
+                "fun add(a: Int, b: Int = 5) -> Int { a + b }\n\
+                 component Widget {\n    intent \"w\"\n    prop x: Int = add(10)\n    \
+                 expose fun get_x() -> Int { x }\n}\n\
+                 fun probe() -> Int { Widget().get_x() }\n"
+            ),
+            "15"
+        );
+        // named arguments, inside a child's own constructor args.
+        assert_eq!(
+            differential(
+                "fun sub(a: Int, b: Int) -> Int { a - b }\n\
+                 component Child {\n    intent \"c\"\n    prop y: Int\n    \
+                 expose fun get_y() -> Int { y }\n}\n\
+                 component Parent {\n    intent \"p\"\n    let c = Child(y: sub(b: 3, a: 10))\n    \
+                 expose fun get_c() -> Int { c.get_y() }\n}\n\
+                 fun probe() -> Int { Parent().get_c() }\n"
+            ),
+            "7"
+        );
+    }
+
     #[test]
     fn diff_match_first_match_wins_and_guards() {
         // `match` evaluates arms top-to-bottom and takes the FIRST whose pattern matches AND whose

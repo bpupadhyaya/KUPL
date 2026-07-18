@@ -71,6 +71,46 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
                 for s in &mut c.state {
                     walk_expr(&mut s.init, &mut visit);
                 }
+                // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+                // PR-it839): this arm never walked `c.props[i].default` (a
+                // `prop x: Int = EXPR` default value, a fully general
+                // expression per the parser) or `c.children[i].args[j].value`
+                // (a child's own constructor arguments, `let c =
+                // Child(y: EXPR)`) -- so a call relying on named arguments or
+                // a default parameter value inside either location was never
+                // rewritten to positional form, unlike the IDENTICAL call
+                // written anywhere else (top-level, handlers, examples,
+                // contract laws). For a prop default this was SILENT VALUE
+                // CORRUPTION, not a rejection: `interp.rs::instantiate`
+                // evaluates the raw default via `self.eval(d, &env)`, and
+                // `compile.rs`'s prop-default-chunk compilation (`fc.expr(d)`)
+                // compiles it the same un-rewritten way -- both simply
+                // evaluate each argument in SOURCE-WRITTEN order and ignore
+                // `a.name`, exactly like an ordinary un-rewritten call. Since
+                // this rewrite runs ONCE upstream of check/interp/VM/native,
+                // all four engines silently agreed on the WRONG value with
+                // zero diagnostics. Live-confirmed: `prop x: Int =
+                // sub(b: 3, a: 10)` against `fun sub(a: Int, b: Int) -> Int
+                // { a - b }` printed `-7` (the wrong, source-order-positional
+                // result) instead of `7` on `kupl run`, `kupl run --vm`, AND
+                // `kupl native`, with `kupl check` reporting zero
+                // diagnostics. For a child's constructor args the same gap
+                // instead produced a misleading K0241 "named arguments only
+                // allowed for constructors and props" rejection of an
+                // otherwise-legitimate call -- the exact same
+                // diagnostic-mismatch shape PR-it769 already fixed for
+                // `examples`/`laws`, just two more AST locations that match
+                // never covered.
+                for p in &mut c.props {
+                    if let Some(d) = &mut p.default {
+                        walk_expr(d, &mut visit);
+                    }
+                }
+                for child in &mut c.children {
+                    for a in &mut child.args {
+                        walk_expr(&mut a.value, &mut visit);
+                    }
+                }
                 // A REAL bug found+fixed (production-hardening PR-it769): this
                 // arm never walked `c.examples` -- the `example { send ...;
                 // expect ... }` blocks `kupl test` runs directly -- so a call
