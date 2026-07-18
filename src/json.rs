@@ -257,56 +257,85 @@ pub fn stringify(v: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Iterative to survive arbitrarily deep `JArr`/`JObj` nesting — a `Json`
+/// value can be built directly via KUPL's own `JArr`/`JObj` constructors
+/// (bypassing `json_parse`'s `MAX_JSON_DEPTH`, which only bounds the
+/// text-to-`Json` parsing direction), so plain recursion here would blow the
+/// native call stack on a deep enough tree (production-hardening PR-it806).
+/// Uses an explicit work-stack of literal fragments interleaved with
+/// still-to-format values, pushed in reverse so they pop in left-to-right
+/// output order — the same technique `Value`'s own `Display` impl uses.
 fn write_value(v: &Value, out: &mut String) -> Result<(), String> {
-    let Value::Ctor { variant, fields, .. } = v else {
-        return Err(format!("json_stringify needs a Json value, found {}", v.type_name()));
-    };
-    match variant.as_str() {
-        "JNull" => out.push_str("null"),
-        "JBool" => match fields.first() {
-            Some(Value::Bool(b)) => out.push_str(if *b { "true" } else { "false" }),
-            _ => return Err("malformed JBool".into()),
-        },
-        "JNum" => match fields.first() {
-            Some(Value::Float(n)) => out.push_str(&format_num(*n)?),
-            _ => return Err("malformed JNum".into()),
-        },
-        "JStr" => match fields.first() {
-            Some(Value::Str(s)) => write_string(s, out),
-            _ => return Err("malformed JStr".into()),
-        },
-        "JArr" => match fields.first() {
-            Some(Value::List(items)) => {
-                out.push('[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    write_value(item, out)?;
+    enum Item<'a> {
+        Lit(&'static str),
+        Owned(String),
+        Val(&'a Value),
+    }
+    let mut stack: Vec<Item> = vec![Item::Val(v)];
+    while let Some(item) = stack.pop() {
+        match item {
+            Item::Lit(s) => out.push_str(s),
+            Item::Owned(s) => out.push_str(&s),
+            Item::Val(v) => {
+                let Value::Ctor { variant, fields, .. } = v else {
+                    return Err(format!("json_stringify needs a Json value, found {}", v.type_name()));
+                };
+                match variant.as_str() {
+                    "JNull" => out.push_str("null"),
+                    "JBool" => match fields.first() {
+                        Some(Value::Bool(b)) => out.push_str(if *b { "true" } else { "false" }),
+                        _ => return Err("malformed JBool".into()),
+                    },
+                    "JNum" => match fields.first() {
+                        Some(Value::Float(n)) => out.push_str(&format_num(*n)?),
+                        _ => return Err("malformed JNum".into()),
+                    },
+                    "JStr" => match fields.first() {
+                        Some(Value::Str(s)) => write_string(s, out),
+                        _ => return Err("malformed JStr".into()),
+                    },
+                    "JArr" => match fields.first() {
+                        Some(Value::List(items)) => {
+                            out.push('[');
+                            stack.push(Item::Lit("]"));
+                            for (i, item) in items.iter().enumerate().rev() {
+                                stack.push(Item::Val(item));
+                                if i > 0 {
+                                    stack.push(Item::Lit(","));
+                                }
+                            }
+                        }
+                        _ => return Err("malformed JArr".into()),
+                    },
+                    "JObj" => match fields.first() {
+                        Some(Value::Map(pairs)) => {
+                            out.push('{');
+                            stack.push(Item::Lit("}"));
+                            for (i, (k, val)) in pairs.iter().enumerate().rev() {
+                                stack.push(Item::Val(val));
+                                stack.push(Item::Lit(":"));
+                                let key_str = match k {
+                                    Value::Str(s) => {
+                                        let mut ks = String::new();
+                                        write_string(s, &mut ks);
+                                        ks
+                                    }
+                                    other => {
+                                        return Err(format!("JObj key must be Str, found {}", other.type_name()))
+                                    }
+                                };
+                                stack.push(Item::Owned(key_str));
+                                if i > 0 {
+                                    stack.push(Item::Lit(","));
+                                }
+                            }
+                        }
+                        _ => return Err("malformed JObj".into()),
+                    },
+                    other => return Err(format!("`{other}` is not a Json constructor")),
                 }
-                out.push(']');
             }
-            _ => return Err("malformed JArr".into()),
-        },
-        "JObj" => match fields.first() {
-            Some(Value::Map(pairs)) => {
-                out.push('{');
-                for (i, (k, val)) in pairs.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    match k {
-                        Value::Str(s) => write_string(s, out),
-                        other => return Err(format!("JObj key must be Str, found {}", other.type_name())),
-                    }
-                    out.push(':');
-                    write_value(val, out)?;
-                }
-                out.push('}');
-            }
-            _ => return Err("malformed JObj".into()),
-        },
-        other => return Err(format!("`{other}` is not a Json constructor")),
+        }
     }
     Ok(())
 }

@@ -2729,25 +2729,86 @@ static void k_json_str(KBuf* b, const char* s) {
     }
     kb_putc(b, '"');
 }
+/* A pending work item for the iterative `k_json_write` below (production-
+   hardening PR-it806, the native half of json.rs's `write_value` fix):
+   `kind == 0` is a literal fragment to append directly -- `owned` marks
+   whether `lit` is a heap buffer (an escaped `JObj` key, built via
+   `k_json_str` into a scratch `KBuf`) that must be `free()`d after use,
+   vs. a true string literal like `"]"` that isn't owned; `kind == 1` is a
+   `KValue` still needing to be written. */
+typedef struct {
+    int kind;
+    const char* lit;
+    int owned;
+    KValue v;
+} KJsonItem;
+
+/* Iterative (production-hardening PR-it806): used to recurse via
+   `k_json_write` calling itself for each `JArr` item / `JObj` value, so
+   `json_stringify`-ing a deeply-nested `Json` value built ITERATIVELY
+   (`JArr([j])` grown in a `while` loop -- bypasses `json_parse`'s own
+   `MAX_JSON_DEPTH`, which only bounds the text-to-`Json` parsing direction,
+   not values built directly via KUPL's own `JArr`/`JObj` constructors)
+   segfaulted -- confirmed live before this fix. Mirrors `k_display`'s
+   (PR-it803) work-list technique: output order matters here (unlike
+   `k_eq`/`k_key_eq`), so opening brackets and leaf values are written
+   directly the moment their container is popped, while closing brackets,
+   separators, and not-yet-formatted child values are pushed in REVERSE so
+   they pop in left-to-right output order. */
 static void k_json_write(KBuf* b, KValue v) {
-    if (v.tag != K_CTOR) k_panic("json_stringify needs a Json value");
-    const char* var = CTORS[v.as.ctor->ctor].variant;
-    KValue* f = v.as.ctor->fields;
-    if (!strcmp(var, "JNull")) kb_puts(b, "null");
-    else if (!strcmp(var, "JBool")) kb_puts(b, f[0].as.b ? "true" : "false");
-    else if (!strcmp(var, "JNum")) k_json_num(b, f[0].as.f);
-    else if (!strcmp(var, "JStr")) k_json_str(b, f[0].as.s);
-    else if (!strcmp(var, "JArr")) {
-        kb_putc(b, '[');
-        KList* l = f[0].as.list;
-        for (int64_t i = 0; i < l->len; i++) { if (i) kb_putc(b, ','); k_json_write(b, l->items[i]); }
-        kb_putc(b, ']');
-    } else if (!strcmp(var, "JObj")) {
-        kb_putc(b, '{');
-        KMap* m = f[0].as.map;
-        for (int64_t i = 0; i < m->len; i++) { if (i) kb_putc(b, ','); k_json_str(b, m->keys[i].as.s); kb_putc(b, ':'); k_json_write(b, m->vals[i]); }
-        kb_putc(b, '}');
-    } else k_panic("not a Json constructor");
+    int cap = 16, n = 0;
+    KJsonItem* stack = (KJsonItem*)k_alloc(sizeof(KJsonItem) * cap);
+    stack[n].kind = 1; stack[n].v = v; n++;
+    while (n > 0) {
+        KJsonItem item = stack[--n];
+        if (item.kind == 0) {
+            kb_puts(b, item.lit);
+            if (item.owned) free((void*)item.lit);
+            continue;
+        }
+        KValue x = item.v;
+        if (x.tag != K_CTOR) k_panic("json_stringify needs a Json value");
+        const char* var = CTORS[x.as.ctor->ctor].variant;
+        KValue* f = x.as.ctor->fields;
+        if (!strcmp(var, "JNull")) kb_puts(b, "null");
+        else if (!strcmp(var, "JBool")) kb_puts(b, f[0].as.b ? "true" : "false");
+        else if (!strcmp(var, "JNum")) k_json_num(b, f[0].as.f);
+        else if (!strcmp(var, "JStr")) k_json_str(b, f[0].as.s);
+        else if (!strcmp(var, "JArr")) {
+            kb_putc(b, '[');
+            KList* l = f[0].as.list;
+            if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+            stack[n].kind = 0; stack[n].lit = "]"; stack[n].owned = 0; n++;
+            for (int64_t i = l->len - 1; i >= 0; i--) {
+                if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                stack[n].kind = 1; stack[n].v = l->items[i]; n++;
+                if (i > 0) {
+                    if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                    stack[n].kind = 0; stack[n].lit = ","; stack[n].owned = 0; n++;
+                }
+            }
+        } else if (!strcmp(var, "JObj")) {
+            kb_putc(b, '{');
+            KMap* m = f[0].as.map;
+            if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+            stack[n].kind = 0; stack[n].lit = "}"; stack[n].owned = 0; n++;
+            for (int64_t i = m->len - 1; i >= 0; i--) {
+                if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                stack[n].kind = 1; stack[n].v = m->vals[i]; n++;
+                if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = ":"; stack[n].owned = 0; n++;
+                KBuf kb = { 0, 0, 0 };
+                k_json_str(&kb, m->keys[i].as.s);
+                if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = kb.buf; stack[n].owned = 1; n++;
+                if (i > 0) {
+                    if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                    stack[n].kind = 0; stack[n].lit = ","; stack[n].owned = 0; n++;
+                }
+            }
+        } else k_panic("not a Json constructor");
+    }
+    free(stack);
 }
 static KValue k_json_stringify(KValue v) {
     KBuf b = { 0, 0, 0 }; k_json_write(&b, v);
