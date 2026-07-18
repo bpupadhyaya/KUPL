@@ -4558,10 +4558,17 @@ static KValue k_base64_decode(KValue sv) {
     if (rn % 4 != 0) return k_err(k_str("invalid base64: length not a multiple of 4"));
     unsigned char* out = k_alloc(rn / 4 * 3 + 1);
     size_t o = 0;
+    /* mirrors encoding.rs::base64_decode's PR-it796 fix exactly: `seen_padding`
+       tracks whether a PRIOR 4-byte group already used padding -- any group
+       reached after that point is rejected, since RFC 4648 permits `=` only
+       in the FINAL quantum of the whole string, not independently per group. */
+    int seen_padding = 0;
     for (size_t i = 0; i < rn; i += 4) {
+        if (seen_padding) return k_err(k_str("invalid base64: padding is only allowed in the final group"));
         int pad = 0;
         for (int k = 0; k < 4; k++) if (raw[i + k] == '=') pad++;
         if (pad > 2) return k_err(k_str("invalid base64: too much padding"));
+        if (pad > 0) seen_padding = 1;
         unsigned int x = 0;
         for (int k = 0; k < 4; k++) {
             int v;
@@ -10932,6 +10939,37 @@ fun main() uses io {
                 "Err(\"invalid hex: odd length\")\n\
                  Err(\"invalid percent-encoding: bad hex\")\n\
                  Ok(\"hello\")\n"
+            );
+        }
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it796, found via an
+    /// Explore-agent survey): `k_base64_decode` checked padding validity
+    /// WITHIN each 4-byte group independently, with no state carried between
+    /// groups, so a padded group followed by ANOTHER group (padded or not)
+    /// was silently accepted -- `base64_decode("YQ==YQ==")` decoded to
+    /// `"aa"` instead of erroring, even though RFC 4648 permits `=` only in
+    /// the FINAL quantum of the whole string. Confirmed live BEFORE this fix
+    /// that all three engines agreed on the SAME wrong `Ok` result (a shared
+    /// correctness bug mirrored byte-for-byte between `encoding.rs` and this
+    /// file, not a cross-engine divergence) -- this test locks in the fixed,
+    /// now-correct behavior matching interp/KVM exactly.
+    #[test]
+    fn native_base64_decode_rejects_padding_before_the_final_group() {
+        let src = "fun main() uses io {\n    \
+                   print(base64_decode(\"YQ==YQ==\"))\n    \
+                   print(base64_decode(\"YQ==QQ==\"))\n    \
+                   print(base64_decode(\"YQ==YWJj\"))\n    \
+                   print(base64_decode(\"SGVsbG8sIHdvcmxkIQ==\"))\n    \
+                   print(base64_decode(\"YQ==\"))\n}\n";
+        if cc_available() {
+            assert_eq!(
+                native_main_stdout(src, "base64padgroup"),
+                "Err(\"invalid base64: padding is only allowed in the final group\")\n\
+                 Err(\"invalid base64: padding is only allowed in the final group\")\n\
+                 Err(\"invalid base64: padding is only allowed in the final group\")\n\
+                 Ok(\"Hello, world!\")\n\
+                 Ok(\"a\")\n"
             );
         }
     }

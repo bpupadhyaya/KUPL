@@ -51,10 +51,28 @@ pub fn base64_decode(s: &str) -> Result<String, String> {
         return Err("invalid base64: length not a multiple of 4".into());
     }
     let mut out = Vec::with_capacity(raw.len() / 4 * 3);
+    // A REAL bug found+fixed (production-hardening PR-it796, found via an
+    // Explore-agent survey): padding validity was checked WITHIN each 4-byte
+    // group independently, with no state carried BETWEEN groups -- so a
+    // padded group followed by ANOTHER group (padded or not) was silently
+    // accepted, e.g. `"YQ==YQ=="` decoded to `"aa"` instead of erroring, even
+    // though RFC 4648 permits `=` only in the FINAL quantum of the whole
+    // string. Confirmed live across all three engines (interp/KVM/native all
+    // agreed on the SAME wrong `Ok` result -- a shared correctness bug, not a
+    // cross-engine divergence). `seen_padding` tracks whether a PRIOR group
+    // already used padding; any group reached after that point is rejected
+    // regardless of its own content.
+    let mut seen_padding = false;
     for chunk in raw.chunks(4) {
+        if seen_padding {
+            return Err("invalid base64: padding is only allowed in the final group".into());
+        }
         let pad = chunk.iter().filter(|&&c| c == b'=').count();
         if pad > 2 {
             return Err("invalid base64: too much padding".into());
+        }
+        if pad > 0 {
+            seen_padding = true;
         }
         let mut n = 0u32;
         for (i, &c) in chunk.iter().enumerate() {
@@ -143,6 +161,27 @@ mod tests {
         assert!(base64_decode("abc").is_err()); // bad length
         assert!(base64_decode("****").is_err()); // bad chars
         assert!(base64_decode("a===").is_err()); // too much padding
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it796, found via an
+    /// Explore-agent survey, live-confirmed before fixing): padding validity
+    /// was checked WITHIN each 4-byte group independently, with no state
+    /// carried between groups, so a padded group followed by ANOTHER group
+    /// (padded or not) was silently accepted -- `base64_decode("YQ==YQ==")`
+    /// decoded to `"aa"` instead of erroring, even though RFC 4648 permits
+    /// `=` only in the FINAL quantum of the whole string. Confirmed live
+    /// across all three engines before this fix (interp/KVM/native all
+    /// agreed on the SAME wrong `Ok` result) -- a shared correctness bug in
+    /// this module (mirrored byte-for-byte in `cgen.rs`), not a
+    /// cross-engine divergence.
+    #[test]
+    fn base64_decode_rejects_padding_before_the_final_group() {
+        assert!(base64_decode("YQ==YQ==").is_err(), "padding in a non-final group must be rejected");
+        assert!(base64_decode("YQ==QQ==").is_err(), "padding in a non-final group must be rejected");
+        assert!(base64_decode("YQ==YWJj").is_err(), "a group after a padded group must be rejected even with no padding of its own");
+        // padding correctly placed ONLY in the final group still decodes.
+        assert_eq!(base64_decode("SGVsbG8sIHdvcmxkIQ==").unwrap(), "Hello, world!");
+        assert_eq!(base64_decode("YQ==").unwrap(), "a");
     }
 
     #[test]
