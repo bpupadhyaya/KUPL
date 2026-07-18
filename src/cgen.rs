@@ -9581,6 +9581,39 @@ fun main() uses io {
         );
     }
 
+    /// `Tensor.dot`'s accumulator (`s += a[i] * b[i]`, a single C expression)
+    /// is exactly the shape a compiler's fused-multiply-add CONTRACTION can
+    /// silently fuse into one hardware `fmadd` (single rounding) instead of
+    /// two separate IEEE-754 roundings -- a REAL, live-confirmed silent value-
+    /// corruption bug found+fixed (production-hardening PR-it813): unlike
+    /// Rust's `*`/`+` (which never auto-fuse; only `f64::mul_add`'s EXPLICIT
+    /// fusion does, already mirrored by cgen.rs's own explicit `fma()` call
+    /// for `Float.mul_add`), `-O2` alone leaves the C compiler free to fuse
+    /// this shape, and CONFIRMED LIVE on an AArch64 host (FMA baseline there,
+    /// not gated behind a march flag) that it actually did: this EXACT pair,
+    /// pre-fix, printed `681687.4099819507` on interp/vm but
+    /// `681687.4099819508` on native -- a genuine last-bit divergence, no
+    /// crash, no panic. Fixed by adding `-ffp-contract=off` to both the real
+    /// `kupl native` compile path (run.rs) and this test harness's own
+    /// `native_main_stdout_env` helper (kept in sync so this test actually
+    /// exercises what real users get). A 20-case randomized battery (not
+    /// preserved as a permanent test, too large/non-deterministic across
+    /// re-runs) found ~40% of arbitrary-magnitude float pairs diverged pre-
+    /// fix, confirming this is a HIGH-frequency, not a rare-edge-case, bug.
+    #[test]
+    fn native_tensor_dot_does_not_silently_fuse_multiply_add() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let a = tensor([-15.885545904716025234, -821.03283107768288573])
+    let b = tensor([1.0, -830.29967831256601585])
+    print(a.dot(b))
+}
+"#;
+        assert_eq!(native_main_stdout(src, "tensordotfma").trim(), "681687.4099819507");
+    }
+
     /// Native components isolate per-instance state like interp/KVM: two Counter instances keep
     /// independent counts, and an Aggregator holding a Counter as state delegates (PR-it171).
     #[test]
@@ -12767,8 +12800,15 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         let cpath = base.with_extension("c");
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
+        // `-ffp-contract=off` (production-hardening PR-it813): matches the
+        // SAME flag added to run.rs's real `kupl native` compile path --
+        // without it, `-O2` alone leaves fused-multiply-add contraction
+        // enabled, so a `s += a * b`-shaped accumulator (Tensor.dot) can
+        // silently round DIFFERENTLY here than interp.rs/vm.rs, which never
+        // auto-fuse. Kept in sync with run.rs's flag so THIS test harness
+        // exercises the exact same compile settings real users get.
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");

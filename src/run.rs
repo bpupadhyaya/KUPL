@@ -989,9 +989,30 @@ pub fn native(path: &str, args: &[String]) -> i32 {
         eprintln!("error: cannot write {c_path}: {e}");
         return 1;
     }
+    // `-ffp-contract=off` (production-hardening PR-it813): a REAL, live-confirmed
+    // silent value-corruption bug -- `-O2` alone leaves fused-multiply-add
+    // CONTRACTION enabled (clang/gcc's default at -O2 is `fast`/`on`, both of
+    // which permit fusing `a * b + c`-shaped expressions into a single hardware
+    // `fmadd`/`fmla` with ONE rounding, vs. two separate IEEE-754 roundings).
+    // `Tensor.dot`'s accumulator loop (`s += t->data[i] * args[0].as.ten->data[i]`,
+    // cgen.rs) is exactly that shape, and generated C has no `#pragma STDC
+    // FP_CONTRACT OFF` guarding it -- Rust's `*`/`+` NEVER auto-fuse (only
+    // `f64::mul_add`'s EXPLICIT fusion does, already mirrored via cgen.rs's own
+    // explicit `fma()` call for `Float.mul_add`), so interp.rs/vm.rs always
+    // compute two roundings while native's C compiler was free to compute one --
+    // CONFIRMED LIVE on this (AArch64, where FMA is a baseline instruction, not
+    // gated behind a march flag) machine: `tensor([-15.885545904716025234,
+    // -821.03283107768288573]).dot(tensor([1.0, -830.29967831256601585]))`
+    // printed `681687.4099819507` on `kupl run`/`kupl run --vm` but
+    // `681687.4099819508` on `kupl native` -- a genuine last-bit divergence, no
+    // crash, no panic, a silent WRONG ANSWER in ordinary floating-point Tensor
+    // code. This flag is a portable, deterministic fix (disables the compiler's
+    // discretion outright, rather than depending on any particular
+    // architecture's or compiler's default), so post-fix all three engines are
+    // BIT-IDENTICAL regardless of the build machine's ISA.
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = std::process::Command::new(&cc)
-        .args(["-O2", "-o", &out, &c_path])
+        .args(["-O2", "-ffp-contract=off", "-o", &out, &c_path])
         .status();
     let keep_c = args.iter().any(|a| a == "--keep-c");
     match status {
