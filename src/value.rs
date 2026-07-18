@@ -658,52 +658,176 @@ impl PartialEq for Value {
 /// reachable via ANY Map/Set operation (`insert`/`get`/`contains_key`/
 /// `merge`/`union`/...), not just `==` -- so arguably an even more
 /// EASILY-triggered path in practice than the plain `==` operator.
+///
+/// A REAL, live-confirmed GAP in that it800 fix (production-hardening
+/// PR-it805, found by a fresh Explore-agent survey and independently
+/// re-verified via live reproduction before fixing): the `Map`/`Set` arms
+/// STILL called `value_key_eq` directly for each key/value candidate
+/// comparison -- a genuine Rust function call, not a push onto the flat
+/// `stack` above -- so a `Map`/`Set` NESTED INSIDE ITSELF (e.g. `type
+/// Chain = Wrap(m: Map[Str, Chain]) | End`, grown 2,000,000 deep via an
+/// ordinary iterative `while` loop, then compared with `==`) still
+/// recursed one native stack frame per NESTING LEVEL and stack-overflowed
+/// -- confirmed live crashing interp.rs and vm.rs (SIGABRT) and `kupl
+/// native`'s `k_key_eq` mirror (SIGSEGV), the exact same bug class the
+/// it799-804 campaign was fixing, just left open for this one shape.
+///
+/// Unlike `List`/`Ctor` (a pure CONJUNCTION: every positional child must
+/// match, so "push all children onto the flat stack" is correct and
+/// sufficient -- see `PartialEq::eq` and this function's own arms above),
+/// `Map`/`Set` key identity is a DISJUNCTIVE SEARCH per entry ("does x's
+/// i-th entry match ANY of y's entries") with retry-on-mismatch, which a
+/// simple flat "push and continue" stack cannot express (there's no way
+/// to say "if this specific candidate comparison fails, try the NEXT
+/// candidate" using a plain LIFO of independent obligations -- a naive
+/// stack can only express "if ANY of these fail, the WHOLE thing fails,"
+/// which is conjunction, not the OR-with-retry Map/Set actually needs).
+///
+/// Fixed with a genuinely different, still fully iterative technique: an
+/// explicit two-phase node graph, mirroring how a compiler lowers a
+/// boolean expression to a flat instruction list instead of a recursive
+/// AST walk. PHASE 1 (build) expands the WHOLE comparison into a flat
+/// `Vec<Node>` via its OWN work QUEUE (a loop, never Rust recursion) --
+/// `List`/`Ctor` become `And` nodes over their children (identical
+/// semantics to the flat-stack version above); `Map`/`Set` become an
+/// `And` (every x-entry must match) of `Or` nodes (each x-entry's search
+/// over y-candidates), where each OR branch is itself an `And` of the
+/// key-comparison and value-comparison sub-nodes -- so nested Map/Set
+/// candidates expand into MORE nodes on the SAME flat list, never a
+/// fresh call frame. EVERY combinator node (not just the top-level ones --
+/// this matters, see below) is created via a SINGLE uniform `child!`
+/// deferred-expansion helper: reserve a placeholder index NOW, queue the
+/// REAL expansion for later. This guarantees every node's `kids` indices
+/// are STRICTLY GREATER than the node's own index (a child's slot is
+/// always reserved AFTER its parent's), which is exactly the invariant
+/// PHASE 2 (evaluate) needs: a single `for i in (0..nodes.len()).rev()`
+/// pass resolves the WHOLE graph bottom-up, since by the time node `i` is
+/// reached, everything it references (strictly higher indices) is already
+/// a resolved leaf boolean. (A first draft of this fix built the Map/Set
+/// "candidate AND" and "search OR" nodes INLINE -- immediately, referencing
+/// already-existing lower-index children, rather than via `child!` -- which
+/// silently produced WRONG answers, not just a crash: `Map{"x": Map{"y":
+/// 1}} == Map{"x": Map{"y": 1}}` incorrectly evaluated to `false`, because
+/// the inner Map's own search/candidate nodes got created with HIGHER
+/// indices than nodes that referenced them, breaking the single-pass
+/// reverse-order evaluation invariant. Caught by the SAME correctness
+/// battery used for the sibling PR-it799-804 fixes before this landed --
+/// worth recording as a concrete example of why "iterative work-list, but
+/// with an inconsistent index-ordering invariant" is a plausible-looking
+/// but WRONG shortcut, not just a style choice.) Total heap use is bounded
+/// by the VALUE's total node/entry count (like this campaign's other
+/// iterative rewrites), never by nesting depth -- unbounded input depth
+/// can grow the heap, never the native stack. CONSIDERED, deliberately
+/// scoped out: PHASE 1 always fully expands the comparison graph before
+/// evaluating, so unlike the OLD recursive version (which could bail out
+/// the instant it found the FIRST mismatch anywhere in a huge structure),
+/// this version does NOT short-circuit on an early mismatch -- correctness-
+/// preserving but measurably slower for LARGE, early-differing values. A
+/// hybrid that also short-circuits Phase 1 was considered, but the added
+/// complexity (partial expansion + resumable search state) isn't justified
+/// by this campaign's priority (production-safety over micro-optimizing an
+/// already-rare pathological-comparison case); ordinary Map/Set sizes in
+/// real KUPL code make this a non-issue in practice.
 pub fn value_key_eq(a: &Value, b: &Value) -> bool {
-    let mut stack: Vec<(&Value, &Value)> = vec![(a, b)];
-    while let Some((a, b)) = stack.pop() {
-        let equal = match (a, b) {
-            (Value::F32(x), Value::F32(y)) => x == y || (x.is_nan() && y.is_nan()),
-            (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
-            (Value::List(x), Value::List(y)) => {
-                if x.len() != y.len() {
-                    false
-                } else {
-                    stack.extend(x.iter().zip(y.iter()));
-                    true
-                }
-            }
-            (
-                Value::Ctor { ty: t1, variant: v1, fields: f1 },
-                Value::Ctor { ty: t2, variant: v2, fields: f2 },
-            ) => {
-                if t1 != t2 || v1 != v2 || f1.len() != f2.len() {
-                    false
-                } else {
-                    stack.extend(f1.iter().zip(f2.iter()));
-                    true
-                }
-            }
-            (Value::Range(a1, b1, i1), Value::Range(a2, b2, i2)) => a1 == a2 && b1 == b2 && i1 == i2,
-            (Value::Tensor(x), Value::Tensor(y)) => {
-                x.len() == y.len()
-                    && x.iter().zip(y.iter()).all(|(xi, yi)| xi == yi || (xi.is_nan() && yi.is_nan()))
-            }
-            (Value::Map(x), Value::Map(y)) => {
-                x.len() == y.len()
-                    && x.iter().all(|(k, v)| {
-                        y.iter().any(|(k2, v2)| value_key_eq(k, k2) && value_key_eq(v, v2))
-                    })
-            }
-            (Value::Set(x), Value::Set(y)) => {
-                x.len() == y.len() && x.iter().all(|xi| y.iter().any(|yi| value_key_eq(xi, yi)))
-            }
-            _ => a == b,
-        };
-        if !equal {
-            return false;
-        }
+    enum Node {
+        Leaf(bool),
+        And(Vec<usize>),
+        Or(Vec<usize>),
     }
-    true
+    /// A unit of comparison work still to be expanded into `Node`s.
+    /// `Cmp` is a direct value-pair comparison (the general case);
+    /// `MapSearch`/`SetSearch` and `MapPair` exist so a Map/Set's per-entry
+    /// SEARCH (an OR over `y`'s candidates, each an AND of a key- and a
+    /// value-comparison) is ALSO expanded via the SAME deferred `child!`
+    /// mechanism as everything else, preserving the child-index-greater-
+    /// than-parent-index invariant PHASE 2 depends on.
+    enum Task<'a> {
+        Cmp(&'a Value, &'a Value),
+        MapSearch(&'a Value, &'a Value, &'a [(Value, Value)]),
+        MapPair(&'a Value, &'a Value, &'a Value, &'a Value),
+        SetSearch(&'a Value, &'a [Value]),
+    }
+
+    let mut nodes: Vec<Node> = vec![Node::Leaf(false)];
+    let mut work: Vec<(usize, Task)> = vec![(0, Task::Cmp(a, b))];
+    while let Some((idx, task)) = work.pop() {
+        // Reserve a placeholder slot for a child task, queue its expansion
+        // for later, and return its (now-fixed) index. Every call happens
+        // AFTER `idx`'s own slot was already reserved, so every child index
+        // this produces is strictly greater than every node that uses it.
+        macro_rules! child {
+            ($t:expr) => {{
+                let child_idx = nodes.len();
+                nodes.push(Node::Leaf(false));
+                work.push((child_idx, $t));
+                child_idx
+            }};
+        }
+        let node = match task {
+            Task::Cmp(x, y) => match (x, y) {
+                (Value::F32(p), Value::F32(q)) => Node::Leaf(p == q || (p.is_nan() && q.is_nan())),
+                (Value::Float(p), Value::Float(q)) => Node::Leaf(p == q || (p.is_nan() && q.is_nan())),
+                (Value::List(xs), Value::List(ys)) => {
+                    if xs.len() != ys.len() {
+                        Node::Leaf(false)
+                    } else {
+                        Node::And(xs.iter().zip(ys.iter()).map(|(xi, yi)| child!(Task::Cmp(xi, yi))).collect())
+                    }
+                }
+                (
+                    Value::Ctor { ty: t1, variant: v1, fields: f1 },
+                    Value::Ctor { ty: t2, variant: v2, fields: f2 },
+                ) => {
+                    if t1 != t2 || v1 != v2 || f1.len() != f2.len() {
+                        Node::Leaf(false)
+                    } else {
+                        Node::And(f1.iter().zip(f2.iter()).map(|(xi, yi)| child!(Task::Cmp(xi, yi))).collect())
+                    }
+                }
+                (Value::Range(a1, b1, i1), Value::Range(a2, b2, i2)) => {
+                    Node::Leaf(a1 == a2 && b1 == b2 && i1 == i2)
+                }
+                (Value::Tensor(xs), Value::Tensor(ys)) => Node::Leaf(
+                    xs.len() == ys.len()
+                        && xs.iter().zip(ys.iter()).all(|(p, q)| p == q || (p.is_nan() && q.is_nan())),
+                ),
+                (Value::Map(xs), Value::Map(ys)) => {
+                    if xs.len() != ys.len() {
+                        Node::Leaf(false)
+                    } else {
+                        Node::And(
+                            xs.iter().map(|(xk, xv)| child!(Task::MapSearch(xk, xv, ys))).collect(),
+                        )
+                    }
+                }
+                (Value::Set(xs), Value::Set(ys)) => {
+                    if xs.len() != ys.len() {
+                        Node::Leaf(false)
+                    } else {
+                        Node::And(xs.iter().map(|xi| child!(Task::SetSearch(xi, ys))).collect())
+                    }
+                }
+                _ => Node::Leaf(x == y),
+            },
+            Task::MapSearch(xk, xv, ys) => {
+                Node::Or(ys.iter().map(|(yk, yv)| child!(Task::MapPair(xk, xv, yk, yv))).collect())
+            }
+            Task::MapPair(xk, xv, yk, yv) => {
+                Node::And(vec![child!(Task::Cmp(xk, yk)), child!(Task::Cmp(xv, yv))])
+            }
+            Task::SetSearch(xi, ys) => Node::Or(ys.iter().map(|yi| child!(Task::Cmp(xi, yi))).collect()),
+        };
+        nodes[idx] = node;
+    }
+    for i in (0..nodes.len()).rev() {
+        let resolved = match &nodes[i] {
+            Node::Leaf(b) => *b,
+            Node::And(kids) => kids.iter().all(|&k| matches!(nodes[k], Node::Leaf(true))),
+            Node::Or(kids) => kids.iter().any(|&k| matches!(nodes[k], Node::Leaf(true))),
+        };
+        nodes[i] = Node::Leaf(resolved);
+    }
+    matches!(nodes[0], Node::Leaf(true))
 }
 
 /// Work items for `Value`'s iterative Display formatter (production-

@@ -2088,77 +2088,212 @@ static int k_eq(KValue a, KValue b) {
    fix just above and value.rs's `value_key_eq` -- a SEPARATE, independently
    recursive call chain (List/Ctor here recurse via `k_key_eq` calling
    itself directly, not through `k_eq`), reachable via ANY Map/Set
-   operation, not just `==`. */
+   operation, not just `==`.
+
+   That it801 fix left a REAL GAP (production-hardening PR-it805, found by
+   a fresh Explore-agent survey and independently re-verified live before
+   fixing, mirroring the SAME gap found+fixed in value.rs's own
+   `value_key_eq` at the same iteration): the K_MAP/K_SET cases still
+   called `k_key_eq` directly for each key/value candidate -- a genuine C
+   function call, not a push onto the flat `sa`/`sb` arrays above -- so a
+   Map/Set nested inside ITSELF still recursed one native stack frame per
+   nesting level and segfaulted. See value.rs's `value_key_eq` doc comment
+   for the full design rationale (an explicit two-phase node-graph: build
+   via a work queue, evaluate bottom-up by index) -- this is its direct C
+   port, using the SAME tagged-struct-plus-growable-array technique as
+   `k_display`'s PR-it803 fix instead of Rust's `enum`. */
+typedef struct {
+    int kind; /* 0=Leaf, 1=And, 2=Or */
+    int leaf_val;
+    int* kids;
+    int nkids;
+} KEqNode;
+
+typedef struct {
+    int kind; /* 0=Cmp(xk,xv), 1=MapSearch(xk,xv over y_keys/y_vals), 2=MapPair(xk,xv,yk,yv), 3=SetSearch(xk over y_items) */
+    KValue xk, xv, yk, yv;
+    KValue* y_keys;
+    KValue* y_vals;
+    KValue* y_items;
+    int64_t y_len;
+} KEqTask;
+
+typedef struct {
+    int node_idx;
+    KEqTask task;
+} KEqWork;
+
+/* Reserve a placeholder node slot, queue its expansion, and return the
+   slot's (now-fixed) index -- every call happens strictly after the
+   CALLER's own slot was reserved, so every index this returns is greater
+   than every node that references it. This is the invariant PHASE 2
+   (evaluate) depends on: a single reverse-index pass resolves the whole
+   graph bottom-up. Growable via realloc, mirroring this file's own
+   established growable-array convention. */
+static int keq_push(KEqNode** nodes, int* ncap, int* nn, KEqWork** work, int* wcap, int* wn, KEqTask task) {
+    if (*nn == *ncap) { *ncap *= 2; *nodes = (KEqNode*)realloc(*nodes, sizeof(KEqNode) * (size_t)*ncap); }
+    int idx = *nn;
+    (*nodes)[idx].kind = 0; (*nodes)[idx].leaf_val = 0; (*nodes)[idx].kids = NULL; (*nodes)[idx].nkids = 0;
+    (*nn)++;
+    if (*wn == *wcap) { *wcap *= 2; *work = (KEqWork*)realloc(*work, sizeof(KEqWork) * (size_t)*wcap); }
+    (*work)[*wn].node_idx = idx; (*work)[*wn].task = task;
+    (*wn)++;
+    return idx;
+}
+
 static int k_key_eq(KValue a, KValue b) {
-    int cap = 16, n = 0;
-    KValue* sa = (KValue*)k_alloc(sizeof(KValue) * cap);
-    KValue* sb = (KValue*)k_alloc(sizeof(KValue) * cap);
-    sa[n] = a; sb[n] = b; n++;
-    int result = 1;
-    while (n > 0 && result) {
-        KValue x = sa[--n], y = sb[n];
-        if (x.tag != y.tag) { result = 0; break; }
-        switch (x.tag) {
-            case K_FLOAT: result = (x.as.f == y.as.f || (isnan(x.as.f) && isnan(y.as.f))); break;
-            case K_F32: result = (x.as.f32v == y.as.f32v || (isnan(x.as.f32v) && isnan(y.as.f32v))); break;
-            case K_LIST:
-                if (x.as.list->len != y.as.list->len) { result = 0; break; }
-                for (int64_t i = 0; i < x.as.list->len; i++) {
-                    if (n == cap) { cap *= 2; sa = (KValue*)realloc(sa, sizeof(KValue) * cap); sb = (KValue*)realloc(sb, sizeof(KValue) * cap); }
-                    sa[n] = x.as.list->items[i]; sb[n] = y.as.list->items[i]; n++;
+    int ncap = 16, nn = 0;
+    KEqNode* nodes = (KEqNode*)k_alloc(sizeof(KEqNode) * (size_t)ncap);
+    int wcap = 16, wn = 0;
+    KEqWork* work = (KEqWork*)k_alloc(sizeof(KEqWork) * (size_t)wcap);
+    KEqTask t0 = {0}; t0.kind = 0; t0.xk = a; t0.xv = b;
+    keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, t0);
+    /* keq_push always appends at index `nn - 1` == 0 on this first call. */
+
+    while (wn > 0) {
+        wn--;
+        int idx = work[wn].node_idx;
+        KEqTask task = work[wn].task;
+        KEqNode node; node.kind = 0; node.leaf_val = 0; node.kids = NULL; node.nkids = 0;
+        if (task.kind == 0) {
+            /* Cmp: general value-pair comparison, the direct C mirror of
+               value.rs's `Task::Cmp` arm. */
+            KValue x = task.xk, y = task.xv;
+            if (x.tag != y.tag) {
+                node.kind = 0; node.leaf_val = 0;
+            } else switch (x.tag) {
+                case K_FLOAT: node.leaf_val = (x.as.f == y.as.f || (isnan(x.as.f) && isnan(y.as.f))); break;
+                case K_F32: node.leaf_val = (x.as.f32v == y.as.f32v || (isnan(x.as.f32v) && isnan(y.as.f32v))); break;
+                case K_LIST:
+                    if (x.as.list->len != y.as.list->len) { node.leaf_val = 0; }
+                    else {
+                        node.kind = 1;
+                        node.nkids = (int)x.as.list->len;
+                        node.kids = (int*)k_alloc(sizeof(int) * (size_t)(node.nkids < 1 ? 1 : node.nkids));
+                        for (int64_t i = 0; i < x.as.list->len; i++) {
+                            KEqTask t = {0}; t.kind = 0; t.xk = x.as.list->items[i]; t.xv = y.as.list->items[i];
+                            node.kids[i] = keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, t);
+                        }
+                    }
+                    break;
+                case K_CTOR:
+                    if (strcmp(CTORS[x.as.ctor->ctor].variant, CTORS[y.as.ctor->ctor].variant)
+                        || x.as.ctor->nfields != y.as.ctor->nfields) {
+                        node.leaf_val = 0;
+                    } else {
+                        node.kind = 1;
+                        node.nkids = x.as.ctor->nfields;
+                        node.kids = (int*)k_alloc(sizeof(int) * (size_t)(node.nkids < 1 ? 1 : node.nkids));
+                        for (int i = 0; i < x.as.ctor->nfields; i++) {
+                            KEqTask t = {0}; t.kind = 0; t.xk = x.as.ctor->fields[i]; t.xv = y.as.ctor->fields[i];
+                            node.kids[i] = keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, t);
+                        }
+                    }
+                    break;
+                case K_RANGE:
+                    node.leaf_val = (x.as.range.lo == y.as.range.lo && x.as.range.hi == y.as.range.hi
+                        && x.as.range.incl == y.as.range.incl);
+                    break;
+                case K_TENSOR: {
+                    int ok = (x.as.ten->len == y.as.ten->len);
+                    for (int64_t i = 0; ok && i < x.as.ten->len; i++) {
+                        double xv = x.as.ten->data[i], yv = y.as.ten->data[i];
+                        if (!(xv == yv || (isnan(xv) && isnan(yv)))) ok = 0;
+                    }
+                    node.leaf_val = ok;
+                    break;
                 }
-                break;
-            case K_CTOR:
-                if (strcmp(CTORS[x.as.ctor->ctor].variant, CTORS[y.as.ctor->ctor].variant)) { result = 0; break; }
-                if (x.as.ctor->nfields != y.as.ctor->nfields) { result = 0; break; }
-                for (int i = 0; i < x.as.ctor->nfields; i++) {
-                    if (n == cap) { cap *= 2; sa = (KValue*)realloc(sa, sizeof(KValue) * cap); sb = (KValue*)realloc(sb, sizeof(KValue) * cap); }
-                    sa[n] = x.as.ctor->fields[i]; sb[n] = y.as.ctor->fields[i]; n++;
-                }
-                break;
-            case K_RANGE:
-                result = (x.as.range.lo == y.as.range.lo && x.as.range.hi == y.as.range.hi
-                    && x.as.range.incl == y.as.range.incl);
-                break;
-            case K_TENSOR: {
-                if (x.as.ten->len != y.as.ten->len) { result = 0; break; }
-                int ok = 1;
-                for (int64_t i = 0; i < x.as.ten->len; i++) {
-                    double xv = x.as.ten->data[i], yv = y.as.ten->data[i];
-                    if (!(xv == yv || (isnan(xv) && isnan(yv)))) { ok = 0; break; }
-                }
-                result = ok;
-                break;
+                case K_MAP:
+                    if (x.as.map->len != y.as.map->len) { node.leaf_val = 0; }
+                    else {
+                        node.kind = 1;
+                        node.nkids = (int)x.as.map->len;
+                        node.kids = (int*)k_alloc(sizeof(int) * (size_t)(node.nkids < 1 ? 1 : node.nkids));
+                        for (int64_t i = 0; i < x.as.map->len; i++) {
+                            KEqTask t = {0};
+                            t.kind = 1; t.xk = x.as.map->keys[i]; t.xv = x.as.map->vals[i];
+                            t.y_keys = y.as.map->keys; t.y_vals = y.as.map->vals; t.y_len = y.as.map->len;
+                            node.kids[i] = keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, t);
+                        }
+                    }
+                    break;
+                case K_SET:
+                    if (x.as.set->len != y.as.set->len) { node.leaf_val = 0; }
+                    else {
+                        node.kind = 1;
+                        node.nkids = (int)x.as.set->len;
+                        node.kids = (int*)k_alloc(sizeof(int) * (size_t)(node.nkids < 1 ? 1 : node.nkids));
+                        for (int64_t i = 0; i < x.as.set->len; i++) {
+                            KEqTask t = {0};
+                            t.kind = 3; t.xk = x.as.set->items[i];
+                            t.y_items = y.as.set->items; t.y_len = y.as.set->len;
+                            node.kids[i] = keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, t);
+                        }
+                    }
+                    break;
+                default: node.leaf_val = k_eq(x, y); break;
             }
-            case K_MAP: {
-                if (x.as.map->len != y.as.map->len) { result = 0; break; }
-                int ok = 1;
-                for (int64_t i = 0; i < x.as.map->len && ok; i++) {
-                    int found = 0;
-                    for (int64_t j = 0; j < y.as.map->len; j++)
-                        if (k_key_eq(x.as.map->keys[i], y.as.map->keys[j])
-                            && k_key_eq(x.as.map->vals[i], y.as.map->vals[j])) { found = 1; break; }
-                    if (!found) ok = 0;
-                }
-                result = ok;
-                break;
+        } else if (task.kind == 1) {
+            /* MapSearch: does (xk, xv) match ANY (y_keys[j], y_vals[j])? */
+            node.kind = 2;
+            node.nkids = (int)task.y_len;
+            node.kids = (int*)k_alloc(sizeof(int) * (size_t)(node.nkids < 1 ? 1 : node.nkids));
+            for (int64_t j = 0; j < task.y_len; j++) {
+                KEqTask t = {0};
+                t.kind = 2; t.xk = task.xk; t.xv = task.xv; t.yk = task.y_keys[j]; t.yv = task.y_vals[j];
+                node.kids[j] = keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, t);
             }
-            case K_SET: {
-                if (x.as.set->len != y.as.set->len) { result = 0; break; }
-                int ok = 1;
-                for (int64_t i = 0; i < x.as.set->len && ok; i++) {
-                    int found = 0;
-                    for (int64_t j = 0; j < y.as.set->len; j++)
-                        if (k_key_eq(x.as.set->items[i], y.as.set->items[j])) { found = 1; break; }
-                    if (!found) ok = 0;
-                }
-                result = ok;
-                break;
+        } else if (task.kind == 2) {
+            /* MapPair: does this ONE candidate's key AND value both match? */
+            node.kind = 1;
+            node.nkids = 2;
+            node.kids = (int*)k_alloc(sizeof(int) * 2);
+            KEqTask tk = {0}; tk.kind = 0; tk.xk = task.xk; tk.xv = task.yk;
+            KEqTask tv = {0}; tv.kind = 0; tv.xk = task.xv; tv.xv = task.yv;
+            node.kids[0] = keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, tk);
+            node.kids[1] = keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, tv);
+        } else {
+            /* SetSearch: does xk match ANY of y_items? */
+            node.kind = 2;
+            node.nkids = (int)task.y_len;
+            node.kids = (int*)k_alloc(sizeof(int) * (size_t)(node.nkids < 1 ? 1 : node.nkids));
+            for (int64_t j = 0; j < task.y_len; j++) {
+                KEqTask t = {0}; t.kind = 0; t.xk = task.xk; t.xv = task.y_items[j];
+                node.kids[j] = keq_push(&nodes, &ncap, &nn, &work, &wcap, &wn, t);
             }
-            default: result = k_eq(x, y); break;
         }
+        nodes[idx] = node;
     }
-    free(sa); free(sb);
+
+    for (int i = nn - 1; i >= 0; i--) {
+        int resolved;
+        if (nodes[i].kind == 0) {
+            resolved = nodes[i].leaf_val;
+        } else if (nodes[i].kind == 1) {
+            resolved = 1;
+            for (int k = 0; k < nodes[i].nkids; k++)
+                if (!(nodes[nodes[i].kids[k]].kind == 0 && nodes[nodes[i].kids[k]].leaf_val)) { resolved = 0; break; }
+        } else {
+            resolved = 0;
+            for (int k = 0; k < nodes[i].nkids; k++)
+                if (nodes[nodes[i].kids[k]].kind == 0 && nodes[nodes[i].kids[k]].leaf_val) { resolved = 1; break; }
+        }
+        /* This is a SCRATCH structure local to this call (unlike a
+           KValue's own arena-allocated payload, which deliberately lives
+           for the whole program per k_alloc's convention) -- free each
+           node's `kids` array as we finish with it, matching k_eq/
+           k_display's own "free before returning" pattern for their flat
+           scratch arrays, just extended here to cover the PER-NODE nested
+           allocations this richer graph needs. Called on every Map/Set
+           operation, so leaking here would accumulate across a long-
+           running program's lifetime, unlike a one-shot leak. */
+        if (nodes[i].kids) free(nodes[i].kids);
+        nodes[i].kind = 0;
+        nodes[i].leaf_val = resolved;
+    }
+    int result = nodes[0].leaf_val;
+    free(nodes);
+    free(work);
     return result;
 }
 
