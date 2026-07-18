@@ -787,10 +787,36 @@ impl Interp {
                 // held Rc is an immutable snapshot — a body that rebuilds the source
                 // list can't affect this iteration.
                 match it {
+                    // A REAL, LIVE-CONFIRMED bug found+fixed (production-
+                    // hardening PR-it846, found alongside vm.rs's/cgen.rs's
+                    // own Op::IterLen overflow bug, see that fix's doc
+                    // comment for the general finding): converting an
+                    // inclusive range to exclusive via `hi + 1` overflows
+                    // `i64` when `hi == i64::MAX` -- in a DEBUG build this
+                    // panicked ("internal compiler error" crash); in a
+                    // RELEASE build it wrapped to `i64::MIN`, so `lo..hi`
+                    // (with `lo` presumably far greater than the wrapped
+                    // `hi`) became an EMPTY range and silently skipped a
+                    // loop body that should have run. Live-confirmed:
+                    // `for i in (i64::MAX - 2)..=i64::MAX { count += 1 }`
+                    // crashed in debug and printed `count = 0` (instead of
+                    // the correct `3`) in release. Fixed by using Rust's own
+                    // `RangeInclusive` iterator (`lo..=hi`) directly for the
+                    // inclusive case, instead of manually converting to an
+                    // exclusive range first -- `RangeInclusive`'s standard-
+                    // library `Iterator` implementation tracks exhaustion
+                    // internally rather than computing `hi + 1`, so it
+                    // handles `hi == i64::MAX` correctly with no overflow
+                    // possible, by construction.
                     Value::Range(lo, hi, incl) => {
-                        let hi = if incl { hi + 1 } else { hi };
-                        for i in lo..hi {
-                            step!(Value::Int(i));
+                        if incl {
+                            for i in lo..=hi {
+                                step!(Value::Int(i));
+                            }
+                        } else {
+                            for i in lo..hi {
+                                step!(Value::Int(i));
+                            }
                         }
                     }
                     Value::List(ref items) => {

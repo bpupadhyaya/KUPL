@@ -1370,9 +1370,47 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::IterLen(dst, x) => match reg!(x) {
+                    // A REAL, LIVE-CONFIRMED bug found+fixed (production-
+                    // hardening PR-it846, the TWENTY-SIXTH broad Explore
+                    // survey): this used to compute `hi - a` in plain `i64`
+                    // arithmetic. `interp.rs`'s `for` loop (Stmt::For) never
+                    // does this subtraction at all -- it iterates a Range
+                    // via Rust's native `lo..hi` comparison-based iterator,
+                    // which only ever compares `i < hi`, never computes a
+                    // length -- so a Range whose bounds are far enough apart
+                    // to overflow `i64` on subtraction (e.g. lo near
+                    // i64::MIN, hi near i64::MAX) diverged: in a DEBUG
+                    // build, `hi - a` panicked (`attempt to subtract with
+                    // overflow`), surfacing as an "internal compiler error"
+                    // crash on `kupl run --vm`, while `interp.rs` ran the
+                    // identical program cleanly; in a RELEASE build, the
+                    // subtraction wrapped (Rust's default release behavior),
+                    // landing on a large-magnitude NEGATIVE i64, which
+                    // `.max(0)` then clamped to `0` -- so the VM silently
+                    // believed the range was EMPTY and skipped the loop body
+                    // entirely, while `interp.rs` correctly ran it. Since
+                    // `kupl native` (cgen.rs's `k_iter_len`) mirrors this
+                    // exact computation in C, it shared the identical
+                    // release-mode silent-empty-range bug. Live-confirmed:
+                    // `for i in (i64::MIN)..2 { count += 1; if count > 3 {
+                    // break } }` printed `count = 4` on `kupl run` (both
+                    // debug and release) but crashed with an internal-
+                    // compiler-error on debug `kupl run --vm` and silently
+                    // printed `count = 0` on release `kupl run --vm` AND a
+                    // `kupl native` binary. Fixed by widening the whole
+                    // computation to `i128` (this codebase's own established
+                    // pattern for exactly this class of overflow-safe
+                    // arithmetic, e.g. `IntW`'s width arithmetic in
+                    // value.rs, and `__int128` used pervasively in cgen.rs)
+                    // before clamping back into `i64` range -- `i128` can
+                    // represent any `i64` difference (or `i64::MAX + 1`)
+                    // exactly, with no possibility of overflow, so this is a
+                    // correctness fix, not just a wider-but-still-fallible
+                    // approximation.
                     Value::Range(a, b, incl) => {
-                        let hi = if incl { b + 1 } else { b };
-                        set!(dst, Value::Int((hi - a).max(0)));
+                        let hi = b as i128 + if incl { 1 } else { 0 };
+                        let len = (hi - a as i128).clamp(0, i64::MAX as i128) as i64;
+                        set!(dst, Value::Int(len));
                     }
                     Value::List(ref items) => set!(dst, Value::Int(items.len() as i64)),
                     other => {
@@ -16670,6 +16708,59 @@ fun probe() -> Str {
                    var out: List[Int] = []\n    for i in 1..3 {\n        for j in 1..3 {\n            out = out.push(i * j)\n        }\n    }\n    \
                    \"{a}|{b}|{c}|{d}|{s}|{t}|{out}\"\n}\n";
         assert_eq!(differential(src), "6|0|0|-6|312|0|[1, 2, 2, 4]");
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it846,
+    /// the TWENTY-SIXTH broad Explore survey): two related `i64`-overflow
+    /// bugs in `for`-loop range handling, both reachable through ordinary
+    /// (if extreme-valued) `for i in lo..hi`/`lo..=hi` loops.
+    ///
+    /// (1) `vm.rs`'s `Op::IterLen` (and `cgen.rs`'s `k_iter_len` mirror,
+    /// which the KVM's compiled bytecode also drives `kupl native` through)
+    /// computed a range's length via plain `hi - lo` in `i64` -- but
+    /// `interp.rs`'s `for` loop never computes a length at all; it just
+    /// iterates Rust's native `lo..hi` comparison-based range. A Range whose
+    /// bounds are far enough apart to overflow `i64` on subtraction (lo near
+    /// `i64::MIN`, hi near `i64::MAX`) diverged: interp.rs ran the loop
+    /// correctly, while the VM/native either panicked (debug build) or
+    /// silently treated the range as EMPTY and skipped the body entirely
+    /// (release build, since the wrapped negative subtraction result got
+    /// clamped to 0 by the existing `.max(0)`).
+    ///
+    /// (2) Separately, converting an INCLUSIVE range to exclusive via
+    /// `hi + 1` (done independently by interp.rs's own for-loop, vm.rs's
+    /// `Op::IterLen`, AND cgen.rs's `k_iter_len`) overflows when
+    /// `hi == i64::MAX` -- panicking in debug, silently producing a wrong
+    /// (usually empty) range in release, on ALL THREE of interp.rs, vm.rs,
+    /// AND cgen.rs alike (this one affected even the sequential reference
+    /// engine, not just the two downstream ones).
+    ///
+    /// Fixed by widening `Op::IterLen`'s computation to `i128` (vm.rs) /
+    /// `__int128` (cgen.rs), and by having interp.rs use Rust's own
+    /// `RangeInclusive` iterator (`lo..=hi`) directly for the inclusive
+    /// case instead of manually converting to exclusive first -- avoiding
+    /// the overflow-prone `hi + 1` step entirely rather than working around
+    /// it. This test only exercises the RELEASE-mode value-correctness
+    /// symptom (this campaign always runs `cargo test --release`); the
+    /// DEBUG-mode "internal compiler error" panics were separately
+    /// live-confirmed via manually-built debug binaries before implementing
+    /// the fix, but the SAME root-cause fix eliminates both symptoms at
+    /// once, so a single correctness-focused differential test is adequate
+    /// regression coverage for both.
+    #[test]
+    fn diff_for_loop_over_an_extreme_range_does_not_overflow_the_length_or_bound_computation() {
+        // lo/hi far enough apart that `hi - lo` overflows i64 on subtraction.
+        let wide = "fun probe() -> Int {\n    \
+                    let lo = 0 - 9223372036854775807 - 1\n    let hi = 2\n    \
+                    var count = 0\n    for i in lo..hi {\n        count = count + 1\n        \
+                    if count > 3 { break }\n    }\n    count\n}\n";
+        assert_eq!(differential(wide), "4");
+        // an inclusive range ending exactly at i64::MAX: `hi + 1` overflows.
+        let incl_max = "fun probe() -> Int {\n    \
+                        let hi = 9223372036854775807\n    let lo = hi - 2\n    \
+                        var count = 0\n    for i in lo..=hi {\n        count = count + 1\n        \
+                        if count > 10 { break }\n    }\n    count\n}\n";
+        assert_eq!(differential(incl_max), "3");
     }
 
     #[test]

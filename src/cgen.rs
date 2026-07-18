@@ -2602,11 +2602,19 @@ static int k_tag_is(KValue v, int ctor) {
     return v.tag == K_CTOR && strcmp(CTORS[v.as.ctor->ctor].variant, CTORS[ctor].variant) == 0;
 }
 
+/* A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it846):
+   this used to compute `hi - lo` in plain int64_t, matching vm.rs's own
+   pre-fix bug exactly (see that file's OWN doc comment on Op::IterLen for
+   the full live-confirmed repro and severity) -- widened to __int128 here
+   too, this codebase's own established pattern for overflow-safe integer
+   arithmetic in C (already used pervasively for SizedInt width math). */
 static KValue k_iter_len(KValue v) {
     if (v.tag == K_RANGE) {
-        int64_t hi = v.as.range.incl ? v.as.range.hi + 1 : v.as.range.hi;
-        int64_t n = hi - v.as.range.lo;
-        return k_int(n > 0 ? n : 0);
+        __int128 hi = (__int128)v.as.range.hi + (v.as.range.incl ? 1 : 0);
+        __int128 n = hi - (__int128)v.as.range.lo;
+        if (n < 0) n = 0;
+        if (n > (__int128)INT64_MAX) n = (__int128)INT64_MAX;
+        return k_int((int64_t)n);
     }
     if (v.tag == K_LIST) return k_int(v.as.list->len);
     k_panic("`for` needs a Range or List"); return k_unit();
@@ -11219,6 +11227,36 @@ fun main() uses io {
                    var out: List[Int] = []\n    for i in 1..3 {\n        for j in 1..3 {\n            out = out.push(i * j)\n        }\n    }\n    \
                    print(\"{a}|{c}|{d}|{s}|{out}\")\n}\n";
         assert_eq!(native_main_stdout(src, "forloop").trim(), "6|0|-6|312|[1, 2, 2, 4]");
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it846):
+    /// `k_iter_len` (this file's C mirror of vm.rs's `Op::IterLen`, which native
+    /// inherits since `kupl native` compiles the SAME bytecode Module the KVM
+    /// runs) computed a range's length via plain `hi - lo` in `int64_t` -- a
+    /// range whose bounds are far enough apart to overflow on subtraction (lo
+    /// near i64::MIN, hi near i64::MAX) silently wrapped to a large negative
+    /// number, clamped to 0 by the existing `n > 0 ? n : 0`, so native believed
+    /// the range was EMPTY and skipped the loop body entirely. Separately, the
+    /// inclusive-to-exclusive `hi + 1` conversion overflows when `hi ==
+    /// i64::MAX`. Both fixed by widening to `__int128`. See vm.rs's own
+    /// `Op::IterLen` doc comment for the full live-confirmed repro and
+    /// interp/VM comparison; this test confirms native specifically, since
+    /// `cgen.rs`'s C reimplementation is an independent code path the shared
+    /// interp/KVM differential test doesn't exercise.
+    #[test]
+    fn native_for_loop_over_an_extreme_range_does_not_overflow_the_length_or_bound_computation() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let lo = 0 - 9223372036854775807 - 1\n    let hi = 2\n    \
+                   var count = 0\n    for i in lo..hi {\n        count = count + 1\n        \
+                   if count > 3 { break }\n    }\n    \
+                   let ihi = 9223372036854775807\n    let ilo = ihi - 2\n    \
+                   var icount = 0\n    for i in ilo..=ihi {\n        icount = icount + 1\n        \
+                   if icount > 10 { break }\n    }\n    \
+                   print(\"{count}|{icount}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "rangeoverflow").trim(), "4|3");
     }
 
     /// Native recursive ADTs (self-referential heap-allocated values) build, traverse,
