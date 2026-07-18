@@ -6857,7 +6857,7 @@ static long long k_vnow = 0;  /* virtual clock (ms), advanced explicitly */
 static void k_run_lifecycle(int id, const char* key);
 static void k_arm_timers(int id);
 static void k_restart(int id, const char* msg);
-static void k_dispatch(int id, int chunk, KValue* arg);
+static int k_dispatch(int id, int chunk, KValue* arg);
 
 /* FIFO message queue (grow-only; head advances — arena model, bounded runs) */
 typedef struct { int id; const char* port; KValue value; } KMsg;
@@ -6950,12 +6950,26 @@ static void k_emit(const char* port, KValue value) {
    `k_depth` before the dispatch attempt and restoring it in the
    panic-caught branch, undoing exactly the increments the skipped
    decrements would otherwise have undone. */
-static void k_dispatch(int id, int chunk, KValue* arg) {
+/* Returns 1 if the handler panicked and triggered a supervised restart, 0
+   otherwise (production-hardening PR-it816) -- k_advance's own doc comment
+   claimed this driver was "verbatim from vm.rs::advance," but it was
+   missing vm.rs/interp.rs's PR-it509 `restarted` guard entirely: `restart()`
+   (via k_restart -> k_arm_timers) freshly re-arms EVERY timer on the
+   instance, so a caller that unconditionally applies the ordinary post-fire
+   timer update on top of that fresh re-arm double-delays a recurring timer
+   (an always-panicking supervised `on every` timer fired at exactly HALF
+   the rate of an unsupervised twin, confirmed live) or immediately re-kills
+   a freshly re-armed one-shot timer (a supervised `on after` timer fired
+   exactly ONCE ever instead of once per restart, confirmed live). This
+   return value lets k_advance apply the SAME guard interp.rs/vm.rs already
+   have; k_drain's OWN call site has no equivalent post-dispatch state to
+   guard, so it simply discards the return value. */
+static int k_dispatch(int id, int chunk, KValue* arg) {
     if (!k_insts[id].restart_on_failure) {
         int saved = k_cur_inst; k_cur_inst = id;
         CHUNKS[chunk](0, arg);
         k_cur_inst = saved;
-        return;
+        return 0;
     }
     jmp_buf pad; jmp_buf* prev = k_pad; k_pad = &pad;
     int saved = k_cur_inst; k_cur_inst = id;
@@ -6963,10 +6977,12 @@ static void k_dispatch(int id, int chunk, KValue* arg) {
     if (setjmp(pad) == 0) {
         CHUNKS[chunk](0, arg);
         k_cur_inst = saved; k_pad = prev;
+        return 0;
     } else {
         /* panic caught: restore, then restart this instance */
         k_cur_inst = saved; k_pad = prev; k_depth = saved_depth;
         k_restart(id, k_panic_buf);
+        return 1;
     }
 }
 
@@ -7155,10 +7171,20 @@ static void k_advance(long long dur) {
             k_panic("`advance` would fire more than 10000000 timer events; use a smaller duration or a longer timer interval");
         }
         k_vnow = bt;
-        k_dispatch(bi, k_insts[bi].timers[btk].chunk, 0);
+        int restarted = k_dispatch(bi, k_insts[bi].timers[btk].chunk, 0);
         k_drain();
-        KTimer* t = &k_insts[bi].timers[btk];
-        if (t->every) t->next_fire += t->interval; else t->active = 0;
+        /* SOUNDNESS FIX (PR-it816, mirrors interp.rs/vm.rs's PR-it509): a
+           panicking timer handler that triggers a supervised restart must
+           NOT also get the ordinary post-fire update below -- k_restart
+           (via k_arm_timers) already freshly re-armed EVERY timer on this
+           instance relative to the CURRENT virtual time. Applying
+           next_fire += interval / active = 0 on TOP of that fresh state
+           double-delays a recurring timer, or immediately re-kills a
+           freshly re-armed one-shot timer. */
+        if (!restarted) {
+            KTimer* t = &k_insts[bi].timers[btk];
+            if (t->every) t->next_fire += t->interval; else t->active = 0;
+        }
     }
     k_vnow = target;
 }
@@ -12758,6 +12784,52 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counter = Co
         // even under repeated supervised restarts (was 50 before the it509 fix).
         assert!(out.ends_with("Counter.total = 100\n"), "{out:?}");
         assert_eq!(out.lines().count(), 100, "{out:?}");
+    }
+
+    /// `k_advance` (cgen.rs) itself was MISSING the it509 `restarted` guard entirely
+    /// despite its own doc comment claiming to be "verbatim from vm.rs::advance"
+    /// (production-hardening PR-it816, found by a broad Explore-agent survey,
+    /// independently re-verified live before trusting it): a supervised, always-
+    /// panicking `on every`/`on after` timer handler's restart (`k_restart` ->
+    /// `k_arm_timers`) freshly re-arms EVERY timer on the instance, but
+    /// `k_advance` then UNCONDITIONALLY applied the ordinary post-fire update on
+    /// top of that fresh state, double-delaying a recurring timer or instantly
+    /// re-killing a freshly re-armed one-shot. The EXISTING
+    /// `native_supervised_restart_does_not_double_delay_timers` test above
+    /// couldn't actually detect this: `kupl run`'s bounded timer-firing counts
+    /// TOTAL FIRE EVENTS, not virtual time, and the Ticker's `emit tick(1)`
+    /// happens BEFORE its `panic`, so every firing (correctly-spaced or
+    /// double-delayed) still emits exactly one message -- the bug only shows up
+    /// as a WRONG VIRTUAL-TIME RATE, invisible to a fire-count-only assertion.
+    /// This test instead races a supervised, always-panicking `on every 10ms`
+    /// timer against an UNSUPERVISED, never-panicking `on every 10ms` control
+    /// timer on a SEPARATE, unrelated component pair -- both must reach the
+    /// SAME final count in the SAME bounded run, since they fire at the
+    /// identical nominal rate; pre-fix, the supervised timer reached only 49-50
+    /// while the control reached 100 (confirmed live before writing this test).
+    #[test]
+    fn native_supervised_restart_of_a_racing_timer_keeps_pace_with_an_unsupervised_twin() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Ticker {\n    intent \"ticker\"\n    out tick: Int\n\
+    on every 10ms {\n        emit tick(1)\n        panic(\"boom\")\n    }\n}\n\
+component Beacon {\n    intent \"beacon\"\n    out beat: Int\n    state n: Int = 0\n\
+    on every 10ms {\n        n = n + 1\n        emit beat(n)\n    }\n}\n\
+component CounterT {\n    intent \"counterT\"\n    in tick: Int\n    out total: Int\n    state n: Int = 0\n\
+    on tick(v) {\n        n = n + v\n        emit total(n)\n    }\n}\n\
+component CounterB {\n    intent \"counterB\"\n    in beat: Int\n    out total2: Int\n    state n: Int = 0\n\
+    on beat(v) {\n        n = v\n        emit total2(n)\n    }\n}\n\
+app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Beacon()\n\
+    let ct = CounterT()\n    let cb = CounterB()\n\
+    wire ticker.tick -> ct.tick\n    wire beacon.beat -> cb.beat\n\
+    supervise ticker restart on_failure\n}\n";
+        let out = native_stdout(src, "supracet");
+        assert!(
+            out.ends_with("CounterT.total = 100\nCounterB.total2 = 100\n"),
+            "supervised timer must keep pace with its unsupervised twin, both reaching 100: {out:?}"
+        );
+        assert_eq!(out.lines().count(), 200, "{out:?}");
     }
 
     /// Native ONE-SHOT `on after` timers (bug-hunt batch 162, PR-it554): had ZERO native
