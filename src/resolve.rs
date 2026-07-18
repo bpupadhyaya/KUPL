@@ -156,6 +156,37 @@ impl Rewriter<'_> {
         }
         for p in &mut f.params {
             self.ty(&mut p.ty);
+            // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+            // PR-it842, a targeted completeness sweep of this file's OTHER
+            // `Expr`-bearing fields prompted by PR-it775/PR-it841 both
+            // finding a gap here): `p.default` (a function parameter's
+            // default value, `fun f(a, b: Int = EXPR)`) was never walked --
+            // this loop only ever mangled `p.ty`. `callargs.rs`'s
+            // `resolve_one` clones this raw `p.default` expression DIRECTLY
+            // into whichever call site omits that trailing argument, so an
+            // unmangled reference inside it travels along unrewritten to
+            // check.rs/interp.rs/compile.rs, exactly like PR-it841's
+            // match-guard gap and PR-it684's prop-default gap before it --
+            // a THIRD instance of the SAME "unwalked AST field lets a
+            // package's own reference silently collide with an unrelated
+            // same-named definition" root cause in this one file.
+            // Live-confirmed: `dep`'s private `fun default_flag() -> Bool {
+            // true }`, referenced only as `pub fun classify(valid: Bool =
+            // default_flag())`'s default, collided with an UNRELATED
+            // root-level `fun default_flag() -> Bool { false }` --
+            // `dep.classify()` (omitting the default) printed "dep-invalid"
+            // instead of the correct "dep-valid" (dep's OWN default_flag()
+            // returns true), with `kupl check` reporting ZERO diagnostics,
+            // identically wrong on interp/KVM/native. Walked HERE, BEFORE
+            // `self.push()` binds this function's own params into scope
+            // below -- a default is evaluated at the CALL SITE, in the
+            // CALLER's scope (K0280 already rejects a default referencing
+            // a SIBLING parameter of the same function for exactly this
+            // reason), so mangling it must NOT treat this function's own
+            // params as locally in scope.
+            if let Some(d) = &mut p.default {
+                self.expr(d);
+            }
         }
         if let Some(r) = &mut f.ret {
             self.ty(r);

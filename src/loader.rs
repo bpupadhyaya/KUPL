@@ -1442,6 +1442,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it842,
+    /// found by a targeted completeness sweep of resolve.rs's OTHER
+    /// `Expr`-bearing fields prompted by PR-it775/PR-it841 both finding a gap
+    /// in this same file): `Rewriter::fun`'s param loop walked `p.ty` for
+    /// every parameter but never `p.default` (a function parameter's default
+    /// value, `fun f(a, b: Int = EXPR)`). `callargs.rs`'s `resolve_one`
+    /// clones this raw `p.default` expression DIRECTLY into whichever call
+    /// site omits that trailing argument, so an unmangled reference inside
+    /// it travels along unrewritten to check.rs/interp.rs/compile.rs -- a
+    /// THIRD instance of the SAME "unwalked AST field lets a package's own
+    /// reference silently collide with an unrelated same-named definition"
+    /// root cause in this one file (after PR-it775's Or/At patterns and
+    /// PR-it841's match-arm guard). Live-confirmed BEFORE this fix: `dep`'s
+    /// private `fun default_flag() -> Bool { true }`, referenced only as
+    /// `pub fun classify(valid: Bool = default_flag())`'s default, collided
+    /// with an UNRELATED root-level `fun default_flag() -> Bool { false }`
+    /// -- `dep.classify()` (omitting the default) printed `"dep-invalid"`
+    /// instead of the correct `"dep-valid"` (dep's OWN default_flag()
+    /// returns true), with `kupl check` reporting ZERO diagnostics,
+    /// identically wrong on interp/KVM/native. Also confirmed the
+    /// PRE-EXISTING K0280 diagnostic (a default referencing a SIBLING
+    /// parameter of the same function, evaluated in the CALLER's scope) is
+    /// unaffected by this fix -- still correctly rejected.
+    #[test]
+    fn a_function_params_default_value_reference_to_its_own_packages_function_is_mangled_not_left_to_collide() {
+        let base = std::env::temp_dir().join(format!("kupl-param-default-mangle-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "fun default_flag() -> Bool {\n    true\n}\n\n\
+             pub fun classify(valid: Bool = default_flag()) -> Str {\n    \
+             if valid {\n        \"dep-valid\"\n    } else {\n        \"dep-invalid\"\n    }\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            // an UNRELATED root-level `default_flag` with the OPPOSITE value
+            // -- if the parameter default's reference to `dep`'s OWN
+            // `default_flag` is left unmangled, it silently resolves to
+            // THIS one instead.
+            "use dep\n\nfun default_flag() -> Bool {\n    false\n}\n\n\
+             fun main() -> Str {\n    dep.classify()\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its dep dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "a parameter default referencing the dependency's own function must not produce any diagnostic: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let result = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v,
+            Err(crate::interp::Flow::Panic { msg, .. }) => panic!("main() should run cleanly, but panicked: {msg}"),
+            Err(_) => panic!("main() should run cleanly, but hit a control-flow error"),
+        };
+        assert_eq!(
+            result.to_string(),
+            "dep-valid",
+            "the parameter default must call dep's OWN default_flag (mangled to dep$default_flag), not silently collide with the unrelated root-level default_flag"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn two_packages_same_name_dont_collide() {
         // two dependencies BOTH define `helper` — namespace isolation keeps them
