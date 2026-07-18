@@ -415,8 +415,66 @@ fn par_eval(
             .stack_size(2 * 1024 * 1024 * 1024)
             .spawn(move || {
                 let mut interp = crate::interp::Interp::new_bare(image.worker_db());
-                let results =
-                    owned_slice.iter().map(|p| eval_one(&mut interp, &fname, p)).collect::<Vec<_>>();
+                // A REAL, LIVE-CONFIRMED HANG bug found+fixed (production-
+                // hardening PR-it844, the TWENTY-FIFTH broad Explore survey):
+                // PR-it821's own fix (see this function's doc comment above)
+                // only closed the gap ACROSS workers -- a worker whose chunk
+                // starts after the earliest error is safely abandoned once
+                // that error is known. But WITHIN a single worker, the OLD
+                // `owned_slice.iter().map(|p| eval_one(..)).collect::<Vec<_>>()`
+                // never short-circuits: plain `Iterator::map().collect()`
+                // always evaluates every element regardless of an earlier
+                // `Err`, so a worker whose OWN chunk contains BOTH an early
+                // panicking index AND a later genuinely non-terminating index
+                // hung forever inside its own `collect()` call, never reaching
+                // `tx.send` at all -- exactly the same "sequential interp
+                // stops at the first error, the threaded path must match
+                // that" violation PR-it821 fixed one level up, just not
+                // caught at THIS granularity. Live-confirmed: a 10,000-
+                // element list, index 0 divides by zero, index 50 never
+                // terminates (`chunk = 10000.div_ceil(18) = 556` on this
+                // machine's 18 cores, so worker 0 alone spans indices
+                // [0, 556) -- comfortably containing both) hung `kupl run`
+                // and `kupl run --vm` indefinitely (required `kill -9`);
+                // `kupl native` (no real threading here) completed instantly
+                // with a clean panic, confirming a genuine engine divergence
+                // on top of the hang itself. (A first repro attempt using an
+                // explicit `panic(...)` call instead of `1 / x` did NOT
+                // reproduce the hang -- traced to an UNRELATED, pre-existing,
+                // NOT-a-bug quirk: `effects.rs::collect_expr` doesn't
+                // recognize a bare `panic(...)` call as a "resolved" builtin
+                // for purity purposes, since `builtin_effects("panic")`
+                // returns `None`, so a function containing an explicit
+                // `panic()` call is conservatively marked `unresolved` and
+                // excluded from `pure_funs()` entirely -- it never enters the
+                // real-thread fast path at all, falling back to the ALREADY-
+                // correct sequential `map`/`filter`. This is a safe,
+                // over-conservative purity classification consistent with
+                // this module's own established "over-attribution is sound"
+                // philosophy, not a bug -- but it means a runtime error that
+                // is NOT an explicit `panic()` call, like a division by zero
+                // or an out-of-bounds index, is required to reach this
+                // specific hang.) FIXED by evaluating this worker's OWN
+                // slice one element at a time and breaking out IMMEDIATELY
+                // after the first `Err`, before ever evaluating the NEXT
+                // element -- mirroring interp.rs's own stop-at-first-error
+                // semantics one level deeper than PR-it821 reached. A
+                // resulting `results` vec shorter than this worker's chunk
+                // (because it stopped early) is fully compatible with every
+                // consumer: the receiving loop below just extends `out` with
+                // whatever is present, and `try_par_map`/`try_par_filter`
+                // (this function's own callers) already stop at the first
+                // `Err` they see regardless of how many elements follow it.
+                let mut results: Vec<Result<PortableValue, String>> =
+                    Vec::with_capacity(owned_slice.len());
+                for p in &owned_slice {
+                    let r = eval_one(&mut interp, &fname, p);
+                    let is_err = r.is_err();
+                    results.push(r);
+                    if is_err {
+                        break;
+                    }
+                }
                 // Ignore a send failure: it only means the receiver already
                 // returned early (an earlier worker's prefix had an error)
                 // and dropped `rx` -- this worker's own result is simply
@@ -593,6 +651,73 @@ mod tests {
                    var xs = []\n    var i = 0\n    while i < 400 {\n        xs = xs.push(i)\n        i = i + 1\n    }\n    \
                    let ys = xs.par_map(bad)\n    print(\"{ys.len()}\")\n}\n";
         let dir = std::env::temp_dir().join(format!("kupl-parallel-hang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hang.kupl");
+        std::fs::write(&path, src).unwrap();
+        for extra_args in [vec![], vec!["--vm".to_string()]] {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.arg("run");
+            for a in &extra_args {
+                cmd.arg(a);
+            }
+            cmd.arg(&path);
+            let child = cmd
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("kupl run spawns");
+            let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+            let out = out.unwrap_or_else(|| {
+                panic!("kupl run {extra_args:?} hung instead of returning the earlier panic")
+            });
+            let combined =
+                format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(
+                combined.contains("division by zero"),
+                "expected the earlier (index 0) panic, got: {combined:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, live-confirmed HANG bug found+fixed (production-hardening
+    /// PR-it844, the TWENTY-FIFTH broad Explore survey): PR-it821's fix above
+    /// only closed the gap ACROSS workers (a panicking element in one
+    /// worker's chunk, a non-terminating element in a DIFFERENT worker's
+    /// chunk). This is the finer-grained sibling: an early panic and a later
+    /// non-terminating element landing in the SAME worker's OWN chunk still
+    /// hung, since `owned_slice.iter().map(..).collect::<Vec<_>>()` never
+    /// short-circuits WITHIN one worker's own iteration -- fixed by breaking
+    /// out of that iteration immediately after the first `Err`. Uses a
+    /// 10,000-element list specifically so `chunk = n.div_ceil(workers)`
+    /// comfortably exceeds the gap between the panicking index (0) and the
+    /// non-terminating index (50) on any realistic core count, guaranteeing
+    /// BOTH land in worker 0's own chunk (unlike PR-it821's own 400-element/
+    /// index-300 repro, sized specifically to land in a DIFFERENT worker and
+    /// exercise the cross-worker case instead). Deliberately uses `1 / x`,
+    /// not an explicit `panic(...)` call, to trigger the runtime error: a
+    /// bare `panic(...)` call is conservatively (and separately, correctly)
+    /// excluded from `pure_funs()` by `effects.rs::collect_expr` (it doesn't
+    /// recognize `panic` as a "resolved" builtin call for purity purposes),
+    /// so a function containing one never enters the real-thread fast path
+    /// at all and this hang wouldn't reproduce -- confirmed by hand during
+    /// investigation, not itself a bug given this module's own established
+    /// "over-attribution [of impurity] is sound" philosophy.
+    #[test]
+    fn par_map_does_not_hang_when_an_earlier_panic_and_a_later_infinite_loop_share_one_workers_own_chunk()
+    {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let src = "fun bad(x: Int) -> Int {\n    \
+                   if x == 0 {\n        1 / x\n    } else if x == 50 {\n        \
+                   var y = 0\n        while true {\n            y = y + 1\n        }\n        y\n    \
+                   } else {\n        x\n    }\n}\n\
+                   fun main() uses io {\n    \
+                   var xs: List[Int] = []\n    var i = 0\n    while i < 10000 {\n        xs = xs.push(i)\n        i = i + 1\n    }\n    \
+                   let ys = xs.par_map(bad)\n    print(\"{ys.len()}\")\n}\n";
+        let dir = std::env::temp_dir().join(format!("kupl-parallel-intraworker-hang-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hang.kupl");
         std::fs::write(&path, src).unwrap();
