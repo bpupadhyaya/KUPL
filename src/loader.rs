@@ -286,6 +286,34 @@ pub struct ResolvedDep {
 /// `kupl.lock` with exit 0, instead of the same "cannot read" error every
 /// other subcommand (`run`/`check`/`native`/`test`/`build`, all routed
 /// through `load`/`load_compile`) gives for a bad entry path.
+///
+/// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it896, an
+/// Explore survey finding, agentId a2ec990b1921941fb, independently
+/// re-verified live before implementing): a pinned dependency version
+/// (`math = { path = "../math", version = "2.0.0" }`) that doesn't match the
+/// dependency's OWN manifest is a hard `K0401` error for every compile-
+/// oriented subcommand -- `load_with`'s `use`-resolution loop (below) checks
+/// `req_version` against the dependency's actual `version` and rejects a
+/// mismatch. This function backs `kupl pkg tree`/`kupl pkg lock` instead, and
+/// used to read the SAME `req_version` out of `ctx.deps` only to immediately
+/// discard it (bound to `_req`, never consulted) -- so `pkg tree`/`pkg lock`
+/// silently reported the mismatched dependency as cleanly resolved, and `pkg
+/// lock` happily wrote a `kupl.lock` entry for it, with ZERO indication that
+/// `kupl run`/`check` on the IDENTICAL project unconditionally reject it.
+/// Live-confirmed: a `math` package with `version = "1.0.0"`, depended on via
+/// `math = { path = "../math", version = "2.0.0" }` -- `kupl run`/`kupl
+/// check` both correctly fail with `K0401: dependency \`math\` requires
+/// version 2.0.0 but found 1.0.0` (exit 1), while `kupl pkg tree` printed
+/// `math @ 1.0.0` (exit 0) and `kupl pkg lock` wrote a `kupl.lock` entry
+/// vouching for the exact version the real build rejects (exit 0) -- a
+/// lockfile silently endorsing a dependency graph that can never actually
+/// compile. Fixed by running the identical check here, mirroring
+/// `load_with`'s own wording exactly (an empty `version` in the dependency's
+/// manifest means "unversioned," matching that check's existing skip
+/// condition) and returning it through this function's own established
+/// `Result<_, String>` error convention -- both `pkg_tree`/`pkg_lock`
+/// (run.rs) already propagate any `Err` from this function as `eprintln!
+/// ("error: {e}"); return 1;`, so no caller-side change is needed.
 pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
     let entry_path = PathBuf::from(entry);
     if let Err(e) = std::fs::read_to_string(&entry_path) {
@@ -300,9 +328,14 @@ pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
     let mut names: Vec<&String> = ctx.deps.keys().collect();
     names.sort();
     for name in names {
-        let (dep_dir, _req) = &ctx.deps[name];
+        let (dep_dir, req) = &ctx.deps[name];
         let m = crate::manifest::read(&dep_dir.join("kupl.toml"))
             .map_err(|e| format!("dependency `{name}`: {e}"))?;
+        if let Some(req) = req {
+            if !m.version.is_empty() && &m.version != req {
+                return Err(format!("dependency `{name}` requires version {req} but found {}", m.version));
+            }
+        }
         let entry_file = dep_dir.join(&m.entry);
         let src = std::fs::read_to_string(&entry_file)
             .map_err(|e| format!("dependency `{name}` entry {}: {e}", entry_file.display()))?;
@@ -1860,6 +1893,55 @@ mod tests {
         std::fs::write(math.join("main.kupl"), "pub fun add(a: Int, b: Int) -> Int {\n    a + b + 1\n}\n").unwrap();
         let deps2 = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).unwrap();
         assert_ne!(deps2[0].hash, deps[0].hash, "editing the dep changes its hash");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it896,
+    /// an Explore survey finding, agentId a2ec990b1921941fb, independently
+    /// re-verified live before implementing -- see `resolve_deps`'s own doc
+    /// comment for the full writeup). The test just above only ever calls
+    /// `resolve_deps` (which backs `kupl pkg tree`/`kupl pkg lock`) with a
+    /// MATCHING version -- the manifest is reset to `version = "1.0.0"`
+    /// BEFORE `resolve_deps` is ever invoked, so the mismatched-version case
+    /// it exercises through `super::load` a few lines above was never
+    /// ALSO exercised through `resolve_deps`, leaving this exact gap
+    /// uncovered: `resolve_deps` used to silently discard the pinned
+    /// `req_version` it read out of `ctx.deps` (bound to `_req`, never
+    /// consulted), so `kupl pkg tree`/`kupl pkg lock` reported a
+    /// version-mismatched dependency as cleanly resolved -- and `pkg lock`
+    /// would happily WRITE a `kupl.lock` entry for it -- even though `kupl
+    /// run`/`check` on the IDENTICAL project unconditionally reject it with
+    /// K0401.
+    #[test]
+    fn resolve_deps_rejects_a_pinned_version_mismatch_the_same_way_load_does() {
+        let base = std::env::temp_dir().join(format!("kupl-resolve-deps-ver-test-{}", std::process::id()));
+        let math = base.join("math");
+        let app = base.join("app");
+        std::fs::create_dir_all(&math).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(math.join("kupl.toml"), "[project]\nname = \"math\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(math.join("main.kupl"), "pub fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = { path = \"../math\", version = \"2.0.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use math\n\nfun main() {\n    let _ = math.add(1, 2)\n}\n").unwrap();
+
+        // `super::load` (kupl run/check) already correctly rejects this --
+        // `resolve_deps` (kupl pkg tree/pkg lock's own foundation) must too,
+        // not silently resolve a dependency graph the real build rejects.
+        match super::resolve_deps(app.join("main.kupl").to_str().unwrap()) {
+            Err(e) => {
+                assert!(e.contains("math"), "must name the dependency: {e}");
+                assert!(e.contains("2.0.0") && e.contains("1.0.0"), "must name BOTH the required and found versions: {e}");
+            }
+            Ok(deps) => {
+                let found: Vec<(&str, &str)> = deps.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+                panic!("a pinned version mismatch must be a clean error, not a silently resolved dependency: {found:?}");
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
