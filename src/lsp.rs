@@ -711,6 +711,21 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
                 return Some(format!("state {}{ty}\n// state field of component {}", s.name, c.name));
             }
         }
+        // A component's own PROP -- the SAME gap class as state fields above
+        // (PR-it871), never itself mirrored for `ComponentDecl.props`: hovering
+        // a prop (its own declaration, or a bare reference inside a method
+        // body -- props are scoped identically to state in `check.rs`'s
+        // `put_props_and_state_in_scope`, just immutable) returned no hover at
+        // all, since only `state`/`exposes`/`funs` were ever searched, never
+        // `props` (production-hardening PR-it872). Confirmed live before this
+        // fix via a real `kupl lsp` JSON-RPC session: hovering `label` at
+        // `prop label: Str` returned `null`, while hovering the sibling
+        // method `bump` correctly returned its signature.
+        if let Item::Component(c) = item {
+            if let Some(p) = c.props.iter().find(|p| p.name == name) {
+                return Some(format!("prop {}: {}\n// prop of component {}", p.name, ty_str(&p.ty), c.name));
+            }
+        }
     }
     None
 }
@@ -1005,13 +1020,18 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
         // for `ComponentDecl.state` (production-hardening PR-it871): "go to
         // definition" on a state field found nothing at all, since only
         // `exposes`/`funs` were ever searched here.
+        // Also a component's own PROP -- the SAME gap class as state above,
+        // never mirrored for `ComponentDecl.props` (production-hardening
+        // PR-it872): "go to definition" on a prop found nothing at all,
+        // since only `exposes`/`funs`/`state` were ever searched here.
         Item::Component(c) => c
             .exposes
             .iter()
             .chain(&c.funs)
             .find(|f| f.name == name)
             .map(|f| f.span)
-            .or_else(|| c.state.iter().find(|s| s.name == name).map(|s| s.span)),
+            .or_else(|| c.state.iter().find(|s| s.name == name).map(|s| s.span))
+            .or_else(|| c.props.iter().find(|p| p.name == name).map(|p| p.span)),
         // A contract's exposed method signature -- same gap, never mirrored for
         // `ContractDecl.sigs` (PR-it571).
         Item::Contract(c) => c.sigs.iter().find(|f| f.name == name).map(|f| f.span),
@@ -1733,6 +1753,14 @@ fn item_completions(program: &crate::ast::Program) -> Vec<(String, u8, String)> 
                 for s in &c.state {
                     out.push((s.name.clone(), 6, format!("state {}", s.name))); // 6 = Variable
                 }
+                // Props used to be completely invisible to completion, the SAME gap
+                // class as state fields above -- typing a prop name inside a
+                // component body (e.g. `label` in a method that just reads a prop)
+                // got no completion for it at all, since only `state` was ever
+                // pushed here, never `props` (production-hardening PR-it872).
+                for p in &c.props {
+                    out.push((p.name.clone(), 6, format!("prop {}", p.name))); // 6 = Variable
+                }
             }
             Item::Contract(c) => {
                 out.push((c.name.clone(), 8, format!("contract {}", c.name))); // 8 = Interface
@@ -1908,6 +1936,16 @@ fn item_symbol(text: &str, item: &crate::ast::Item, line_index: &LineIndex) -> S
                     symbol_json(&s.name, 8, &lsp_range(line_index, text, s.span), &detail, &[])
                 })
                 .collect();
+            // Props used to be entirely absent from the document/workspace symbol
+            // outline, the SAME gap class as state fields above -- a component's
+            // own declared props never appeared as child symbols at all, since
+            // only `state`/`exposes`/`funs` were ever walked here, never `props`
+            // (production-hardening PR-it872).
+            children.extend(
+                c.props
+                    .iter()
+                    .map(|p| symbol_json(&p.name, 8, &lsp_range(line_index, text, p.span), &ty_str(&p.ty), &[])),
+            );
             children.extend(
                 c.exposes
                     .iter()
@@ -2118,6 +2156,14 @@ fn collect_workspace_symbol_matches(
             maybe_push_symbol_info(out, text, uri, &c.name, 5, c.span, needle, line_index);
             for s in &c.state {
                 maybe_push_symbol_info(out, text, uri, &s.name, 8, s.span, needle, line_index);
+            }
+            // Props used to be entirely absent from `workspace/symbol` search
+            // results, the SAME gap class as state fields above -- searching for
+            // a prop's own name across the workspace found nothing, since only
+            // `state`/`exposes`/`funs` were ever walked here, never `props`
+            // (production-hardening PR-it872).
+            for p in &c.props {
+                maybe_push_symbol_info(out, text, uri, &p.name, 8, p.span, needle, line_index);
             }
             for f in &c.exposes {
                 maybe_push_symbol_info(out, text, uri, &f.name, 6, f.span, needle, line_index);
@@ -3077,6 +3123,60 @@ mod tests {
         let ch3 = src.lines().nth(method_line).unwrap().find("bump").unwrap() + 1;
         let h_method = resolve_hover(src, method_line, ch3).expect("hover on sibling method decl");
         assert!(h_method.contains("fun bump() -> Int"), "{h_method}");
+    }
+
+    /// A REAL LSP capability gap found+fixed (production-hardening PR-it872, a
+    /// carried-forward lead from it871's own survey, independently re-verified
+    /// live before implementing): the SAME gap class as it871's state-field fix
+    /// above (and it513's component-method fix before that), just never itself
+    /// mirrored for `ComponentDecl.props` -- hovering a prop (its own
+    /// declaration, or a bare reference inside a method body) returned NO hover
+    /// at all, and "go to definition" found nothing either, since
+    /// item_signature/item_definition's component fallthrough only ever
+    /// searched `exposes`/`funs`/`state`, never `props`. Props are scoped
+    /// identically to state in `check.rs`'s prop/state-in-scope setup (just
+    /// immutable), so there is no architectural reason for hover/definition to
+    /// treat them differently -- confirmed NOT a documented boundary:
+    /// `item_completions`/`item_symbol`/`workspace_symbols` (this file) also
+    /// never referenced `c.props` anywhere, the SAME oversight in four places
+    /// at once, all fixed together here. Confirmed live before this fix via a
+    /// real `kupl lsp` JSON-RPC session: hovering `label` at `prop label: Str`
+    /// returned `null`, hovering the bare `label` reference inside `show()`'s
+    /// body also returned `null`, goto-definition on that reference also
+    /// returned `null`, and the completion list inside the component body was
+    /// missing `label` entirely -- while hovering the sibling method `bump`
+    /// (already fixed by PR-it513) correctly returned its signature.
+    #[test]
+    fn hover_and_definition_work_on_component_props() {
+        let src = "component Widget {\n    intent \"w\"\n    prop label: Str\n    state total: Int = 0\n    expose fun bump() -> Int {\n        total += 1\n        total\n    }\n    expose fun show() -> Str {\n        label\n    }\n}\nfun main() {\n    let w = Widget(label: \"hi\")\n}\n";
+
+        // hover on the prop's own declaration
+        let decl_line = src.lines().position(|l| l.contains("prop label")).unwrap();
+        let ch = src.lines().nth(decl_line).unwrap().find("label").unwrap() + 1;
+        let h_decl = resolve_hover(src, decl_line, ch).expect("hover on prop decl");
+        assert!(h_decl.contains("prop label: Str"), "{h_decl}");
+        assert!(h_decl.contains("prop of component Widget"), "{h_decl}");
+
+        // hover on a BARE reference to the prop inside a method body
+        let ref_line = src.lines().position(|l| l.trim() == "label").unwrap();
+        let ch2 = src.lines().nth(ref_line).unwrap().find("label").unwrap() + 1;
+        let h_ref = resolve_hover(src, ref_line, ch2).expect("hover on prop reference");
+        assert!(h_ref.contains("prop label: Str"), "{h_ref}");
+
+        // go-to-definition on the reference resolves to the prop's OWN declaration line
+        let (l0, c0, _, _) = resolve_definition(src, ref_line, ch2).expect("definition of label");
+        assert_eq!(l0, decl_line, "definition should point at the `prop label` line");
+        assert_eq!(c0, src.lines().nth(decl_line).unwrap().find("label").unwrap());
+
+        // the sibling state field and method still hover as before (no regression)
+        let state_line = src.lines().position(|l| l.contains("state total")).unwrap();
+        let ch3 = src.lines().nth(state_line).unwrap().find("total").unwrap() + 1;
+        let h_state = resolve_hover(src, state_line, ch3).expect("hover on sibling state field decl");
+        assert!(h_state.contains("state total: Int"), "{h_state}");
+
+        // the prop is also a completion candidate, not just hover/definition
+        let labels: Vec<String> = completions(src).into_iter().map(|(l, ..)| l).collect();
+        assert!(labels.contains(&"label".to_string()), "prop must be a completion candidate: {labels:?}");
     }
 
     #[test]
@@ -4663,7 +4763,7 @@ mod tests {
         // bugs already this campaign (it513/it514) -- an outline that only
         // shows component NAMES, none of their methods, would repeat the same
         // mistake in a fourth place.
-        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\ntype Shape = Circle(r: Float) | Square(s: Float)\ncomponent Greeter {\n    intent \"g\"\n    state n: Int = 0\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\ncontract Store {\n    expose fun get(k: Str) -> Int\n}\n";
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\ntype Shape = Circle(r: Float) | Square(s: Float)\ncomponent Greeter {\n    intent \"g\"\n    prop label: Str\n    state n: Int = 0\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\ncontract Store {\n    expose fun get(k: Str) -> Int\n}\n";
         let syms = document_symbols(src).expect("parses cleanly, should outline");
 
         // top-level items present with the right kinds
@@ -4676,7 +4776,10 @@ mod tests {
         assert!(syms.contains("\"name\":\"Circle\",\"kind\":22"), "{syms}"); // EnumMember
         assert!(syms.contains("\"name\":\"Square\",\"kind\":22"), "{syms}");
 
-        // component state + BOTH exposed and private methods nested under the component
+        // component props (production-hardening PR-it872, the SAME gap class as
+        // state below, just never itself mirrored for `ComponentDecl.props`) +
+        // state + BOTH exposed and private methods, all nested under the component
+        assert!(syms.contains("\"name\":\"label\",\"kind\":8"), "{syms}"); // Field
         assert!(syms.contains("\"name\":\"n\",\"kind\":8"), "{syms}"); // Field
         assert!(syms.contains("\"name\":\"greet\",\"kind\":6"), "{syms}"); // Method
         assert!(syms.contains("\"name\":\"helper\",\"kind\":6"), "{syms}");
@@ -4845,10 +4948,20 @@ mod tests {
         std::fs::write(nested.join("util.kupl"), "fun addTwo(a: Int) -> Int {\n    a + 2\n}\n").unwrap();
         // a broken file must be silently skipped, not abort the whole search
         std::fs::write(dir.join("broken.kupl"), "fun bad(a: Int -> Int {\n    a\n}\n").unwrap();
+        // a component's own PROP must also be a searchable workspace symbol (production-
+        // hardening PR-it872, the SAME gap class as document-symbol nesting, just never
+        // itself mirrored for `ComponentDecl.props` in the workspace-wide search path
+        // either): searching for `addr` used to find nothing at all here.
+        std::fs::write(
+            dir.join("comp.kupl"),
+            "component Box {\n    intent \"b\"\n    prop addr: Str\n    expose fun show() -> Str {\n        addr\n    }\n}\n",
+        )
+        .unwrap();
 
         let matches = workspace_symbols(&dir, "add", &HashMap::new());
         assert!(matches.contains("\"name\":\"add\""), "{matches}");
         assert!(matches.contains("\"name\":\"addTwo\""), "{matches}"); // found in the NESTED file
+        assert!(matches.contains("\"name\":\"addr\""), "{matches}"); // the component's own prop
         assert!(matches.contains("main.kupl"), "{matches}");
         assert!(matches.contains("lib/util.kupl") || matches.contains("lib%2Futil.kupl"), "{matches}");
         // case-insensitive substring match, not exact-name
