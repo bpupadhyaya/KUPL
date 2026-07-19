@@ -15182,6 +15182,161 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         );
     }
 
+    /// A cross-engine fuzz pass against `json.rs`'s canonical `Parser`/
+    /// `stringify` vs `cgen.rs`'s independent C reimplementation
+    /// (`k_json_parse`/`k_json_stringify`), production-hardening PR-it886 --
+    /// the SAME xorshift64* fuzz-harness convention `csv.rs` (PR-it883) and
+    /// `regex.rs` (PR-it885) established, extended to a THIRD hand-rolled
+    /// untrusted-input parser with a real fix history that had never been
+    /// directly fuzzed (`json.rs::object`'s O(n^2) duplicate-key bug,
+    /// PR-it838; `k_json_num`'s shortest-round-trip divergence, PR-it722).
+    /// Generates syntactically-valid, randomly-nested JSON documents
+    /// (null/true/false, several number formats including exponents and
+    /// negatives, short quoted strings with a mix of literal chars and JSON
+    /// escape sequences, arrays, and OBJECTS whose small 3-key pool makes
+    /// duplicate keys a common, not just theoretical, occurrence -- directly
+    /// re-exercising the last-key-wins semantics PR-it838 fixed) and checks
+    /// that `json_stringify(json_parse(text))` produces EXACTLY the same
+    /// canonical text on native as computing the identical chain directly
+    /// via the canonical Rust `crate::json::parse`/`crate::json::stringify`
+    /// (the same functions interp/vm call). Strips exactly ONE trailing
+    /// newline from native's stdout (PR-it883's lesson, not a blanket
+    /// `.trim()`). Before trusting a clean first-run report, applied
+    /// PR-it885's own lesson -- verified this fuzzer's OWN detection power
+    /// with a deliberate injected bug (temporarily made `k_json_parse`'s
+    /// object-key dedup use FIRST-wins instead of last-wins, the exact
+    /// semantic PR-it838 established): the fuzzer caught it on the very
+    /// first re-run (multiple mismatches, given how densely the 3-key pool
+    /// produces duplicate keys), confirming real detection power BEFORE
+    /// trusting the subsequent clean result on unmodified code. Found ZERO
+    /// disagreements across all 70 generated cases on the real code -- a
+    /// genuinely broader coverage mechanism now locked in permanently, not
+    /// a bug fix.
+    #[test]
+    fn fuzz_random_json_documents_match_the_canonical_rust_parser_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+        }
+        fn fuzz_gen_json_string(rng: &mut FuzzRng) -> String {
+            let chars = ['a', 'b', 'c', ' ', '1'];
+            let escapes = ["\\n", "\\t", "\\\"", "\\\\", "\\u0041"];
+            let len = rng.below(4);
+            let mut s = String::from("\"");
+            for _ in 0..len {
+                if rng.below(3) == 0 {
+                    s.push_str(escapes[rng.below(escapes.len() as u64) as usize]);
+                } else {
+                    s.push(chars[rng.below(chars.len() as u64) as usize]);
+                }
+            }
+            s.push('"');
+            s
+        }
+        fn fuzz_gen_json_number(rng: &mut FuzzRng) -> String {
+            let choices = ["0", "1", "-1", "42", "-42", "3.14", "-3.14", "1e2", "1e-2", "-1.5e3", "0.5", "100000"];
+            choices[rng.below(choices.len() as u64) as usize].to_string()
+        }
+        fn fuzz_gen_json_value(rng: &mut FuzzRng, depth: u32) -> String {
+            if depth == 0 || rng.below(5) == 0 {
+                match rng.below(5) {
+                    0 => "null".to_string(),
+                    1 => "true".to_string(),
+                    2 => "false".to_string(),
+                    3 => fuzz_gen_json_number(rng),
+                    _ => fuzz_gen_json_string(rng),
+                }
+            } else if rng.below(2) == 0 {
+                let n = rng.below(3);
+                let items: Vec<String> = (0..n).map(|_| fuzz_gen_json_value(rng, depth - 1)).collect();
+                format!("[{}]", items.join(","))
+            } else {
+                let keys = ["a", "b", "c"];
+                let n = 1 + rng.below(3);
+                let mut pairs = Vec::new();
+                for _ in 0..n {
+                    let k = keys[rng.below(keys.len() as u64) as usize];
+                    let v = fuzz_gen_json_value(rng, depth - 1);
+                    pairs.push(format!("\"{k}\":{v}"));
+                }
+                format!("{{{}}}", pairs.join(","))
+            }
+        }
+        fn escape_kupl_str(s: &str) -> String {
+            // Unlike csv.rs/regex.rs's own local copies of this helper,
+            // JSON documents routinely contain literal `{`/`}` (every
+            // object), which KUPL string literals treat as INTERPOLATION
+            // syntax, not literal braces -- discovered live when this
+            // fuzzer's first run failed to even compile its own generated
+            // source for any JSON object. `\{`/`\}` are valid lexer escapes
+            // for a literal brace (see lexer.rs's string-escape table).
+            let mut out = String::new();
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '{' => out.push_str("\\{"),
+                    '}' => out.push_str("\\}"),
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
+        let mut mismatches = Vec::new();
+        let mut skipped_parse_error = 0usize;
+        for seed in 1..=70u64 {
+            let mut rng = FuzzRng::new(seed);
+            let text = fuzz_gen_json_value(&mut rng, 3);
+            let expected = match crate::json::parse(&text).and_then(|v| crate::json::stringify(&v)) {
+                Ok(s) => s,
+                Err(_) => {
+                    skipped_parse_error += 1;
+                    continue;
+                }
+            };
+            let src = format!(
+                "fun main() uses io {{\n    match json_parse(\"{}\") {{\n        Ok(j) => print(json_stringify(j))\n        Err(e) => print(\"PARSE_ERR:{{e}}\")\n    }}\n}}\n",
+                escape_kupl_str(&text)
+            );
+            let raw = native_main_stdout(&src, &format!("jsonfuzz{seed}"));
+            // strip exactly ONE trailing newline (print's own terminator) --
+            // not a blanket .trim(), per PR-it883's lesson.
+            let actual = raw.strip_suffix('\n').unwrap_or(&raw);
+            if actual != expected {
+                mismatches.push(format!("seed={seed} text={text:?} expected={expected:?} actual={actual:?}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native JSON diverges from the canonical Rust parser on {} generated cases (skipped {} parse errors):\n{}",
+            mismatches.len(),
+            skipped_parse_error,
+            mismatches.join("\n")
+        );
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it635) -- the SAME class
     /// of bug as `native_json_stringify_non_finite_panic_matches_interp_wording`
     /// just above, in a completely different module: `date_make` with an
