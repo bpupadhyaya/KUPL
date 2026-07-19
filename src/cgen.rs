@@ -7658,8 +7658,27 @@ static void k_restart(int id, const char* msg) {
 #define K_MAX_ADVANCE_FIRES 10000000
 
 /* advance the virtual clock to now+dur, firing due timers in (time, instance,
-   decl) order, draining between fires — verbatim from vm.rs::advance */
+   decl) order, draining between fires — mirrors vm.rs::advance (the doc
+   comment previously claimed this was "verbatim from vm.rs::advance", which
+   was already false once for the it509 restart guard (PR-it816) and was
+   ALSO false for this check: interp.rs::advance/vm.rs::advance both reject
+   `dur < 0` up front with a clean panic; k_advance had no such check at all,
+   so a negative duration would silently walk k_vnow BACKWARDS instead of
+   erroring. Not reachable via any current KUPL syntax -- parse_duration only
+   accepts a bare non-negative `Tok::Int` literal, and k_advance's one native
+   call site (`k_run_timers`) always passes a non-negative `bt - k_vnow` by
+   construction (every timer's `next_fire` is armed/rescheduled from the
+   CURRENT `k_vnow` plus a non-negative interval, so it can never fall behind
+   `k_vnow`) -- but interp.rs/vm.rs guard this at the function boundary
+   regardless of current reachability, and cgen.rs's C boundary should match
+   for the same reason: a future grammar change (e.g. a computed/signed
+   `advance` argument) would otherwise silently corrupt `k_vnow` in native
+   ONLY, diverging from interp/vm's clean panic (production-hardening
+   PR-it874). */
 static void k_advance(long long dur) {
+    if (dur < 0) {
+        k_panic("cannot advance the clock by a negative duration");
+    }
     long long target = k_vnow + dur;
     long long fires = 0;
     for (;;) {
