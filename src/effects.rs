@@ -195,6 +195,40 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                     calls.push(top_level);
                 }
             }
+            // A REAL bug found+fixed (production-hardening PR-it866), the
+            // SAME missed-traversal-site shape as it569/it584/it629/it689 in
+            // this same file: an `ai fun`'s `intent_expr` (the interpolated
+            // `intent "...{expr}..."` string) is evaluated on EVERY call --
+            // a real execution path, both `interp.rs::eval` and
+            // `compile.rs` genuinely evaluate it -- but was never walked
+            // here, only `ai.tools` (it689's own fix) and `decl.body` were.
+            // The it689 fix's OWN doc comment above claims "`tools` is the
+            // ONLY way an `ai fun` can indirectly perform an effect beyond
+            // `ai` itself" -- that reasoning was incomplete: a function
+            // called from INSIDE the intent string's own `{...}`
+            // interpolation is an equally real, unconditional call site.
+            // Confirmed via a live repro BEFORE this fix: `pub ai fun
+            // summarize(text: Str) -> Str { intent "...{noisy()}" }` (where
+            // `noisy` calls `print`, `uses io`) checked clean with NO `uses
+            // io` requirement on `summarize` at all, and `kupl run`
+            // genuinely printed the undeclared side effect. A positive
+            // control -- the identical `noisy()` call routed through
+            // `tools [noisy]` instead of `intent_expr` -- correctly
+            // triggered K0301, confirming this was specifically the
+            // `intent_expr` traversal that was missing.
+            walk_expr(&ai.intent_expr, &mut |expr| {
+                collect_expr(
+                    expr,
+                    info.component,
+                    &funs,
+                    &method_names,
+                    &fn_params,
+                    &mut eff,
+                    &mut calls,
+                    &mut unresolved,
+                    &mut plain_call,
+                );
+            });
         }
         walk_block(&info.decl.body, &mut |expr| {
             collect_expr(
@@ -1051,6 +1085,52 @@ mod tests {
             "pub ai fun classify(text: Str) -> Str {\n    intent \"Classify: {text}\"\n}\n",
         );
         assert!(no_tools.is_empty(), "{no_tools:?}");
+    }
+
+    #[test]
+    fn effect_propagates_through_an_ai_funs_intent_interpolation() {
+        // A REAL bug found+fixed (production-hardening PR-it866), the SAME
+        // missed-traversal-site shape as it569/it584/it629/it689 above: an
+        // `ai fun`'s `intent_expr` (the interpolated `intent
+        // "...{expr}..."` string) is evaluated on EVERY call -- a real
+        // execution path, both `interp.rs::eval` and `compile.rs` genuinely
+        // evaluate it -- but was never walked, only `ai.tools` (it689's own
+        // fix) and `decl.body` were. it689's own doc comment claimed
+        // "`tools` is the ONLY way an `ai fun` can indirectly perform an
+        // effect beyond `ai` itself" -- that reasoning was incomplete: a
+        // function called from INSIDE the intent string's own `{...}`
+        // interpolation is an equally real call site. Confirmed via a live
+        // repro BEFORE this fix: `pub ai fun summarize(text: Str) -> Str {
+        // intent "...{noisy()}" }` (where `noisy` calls `print`, `uses io`)
+        // checked clean with NO `uses io` requirement on `summarize` at
+        // all, and `kupl run` genuinely printed the undeclared side effect.
+        let d = diags_for(
+            "fun noisy() uses io -> Str {\n    print(\"side effect\")\n    \"logged\"\n}\n\
+             pub ai fun summarize(text: Str) -> Str {\n    \
+             intent \"Summarize: {text} note: {noisy()}\"\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K0301"), "{d:?}");
+        // and the corresponding declaration is accepted with no spurious
+        // "declared but unused" K0302 once correctly attributed.
+        let ok = diags_for(
+            "fun noisy() uses io -> Str {\n    print(\"side effect\")\n    \"logged\"\n}\n\
+             pub ai fun summarize(text: Str) uses io -> Str {\n    \
+             intent \"Summarize: {text} note: {noisy()}\"\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        // an `ai fun` whose intent calls a genuinely PURE function (or calls
+        // nothing at all) stays unaffected -- this isn't a blanket "ai funs
+        // must declare uses" rule, only a correct ATTRIBUTION of what the
+        // interpolated call itself does.
+        let pure_call = diags_for(
+            "fun square(x: Int) -> Int {\n    x * x\n}\n\
+             pub ai fun mathy(n: Int) -> Str {\n    intent \"Math: {square(n)}\"\n}\n",
+        );
+        assert!(pure_call.is_empty(), "{pure_call:?}");
+        let no_call = diags_for(
+            "pub ai fun classify(text: Str) -> Str {\n    intent \"Classify: {text}\"\n}\n",
+        );
+        assert!(no_call.is_empty(), "{no_call:?}");
     }
 
     #[test]
