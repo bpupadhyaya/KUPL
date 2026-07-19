@@ -687,13 +687,45 @@ impl<'s> FnCompiler<'s> {
                 // the op straight into x's register (dst == src, no Move) so the VM
                 // can mutate the uniquely-owned Str/List in place — turning an O(n^2)
                 // build loop into O(n). Any other shape uses the general path below.
+                //
+                // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+                // PR-it852, the THIRTY-FIRST survey, found via a lightweight fuzzing
+                // pass rather than a hand-picked repro): the `Op::Add`/`Op::Method`
+                // emitted here used to be tagged with `*span` (the WHOLE `Stmt::Assign`,
+                // i.e. all of `x = x + 1`) instead of `value.span` (just `x + 1`, the
+                // Binary/MethodCall expression's own span). This diverged from BOTH
+                // (a) the GENERAL (non-fast-path) case just below, which uses
+                // `self.expr(value)` and therefore `value.span` for the SAME shape
+                // when the assignment target differs from the addend (`y = x + 1`
+                // reports the narrow `x + 1` span on interp AND vm, confirmed live),
+                // and (b) interp.rs's OWN fast-path fallback (`Stmt::Assign`'s
+                // string-self-append special case, `interp.rs` line ~618/649/705),
+                // which explicitly passes `value.span` for exactly this reason.
+                // Live-confirmed BEFORE this fix: `var x = i64::MAX; x = x + 1` panics
+                // with `error[K0900]: panic: integer overflow in addition` on BOTH
+                // interp and vm (same message, same exit code 101) but at a
+                // DIFFERENT column -- interp points at `x + 1` (col 9), vm pointed at
+                // the whole `x = x + 1` (col 5) -- a diagnostic-TEXT-only divergence,
+                // this project's own lowest severity tier, but still a genuine
+                // violation of the "byte-identical across engines" invariant.
+                // Confirmed scoped to `x = x + e` specifically: `x -= `/`x *= ` and
+                // the general `y = x + 1` shape were already byte-identical; `x += 1`
+                // was ALSO already byte-identical (both engines agree on the WHOLE
+                // AssignOp::Add statement's span there, since unlike `x = x + e`
+                // there is no separate Binary sub-expression to point at more
+                // narrowly -- left unchanged, not in scope). The `x.push`/`.insert`
+                // sibling fast path below has the IDENTICAL span-choice bug in the
+                // code, but is NOT live-reachable (`List.push`/`Map.insert` can never
+                // themselves panic at runtime) -- fixed anyway as defensive
+                // consistency with the just-fixed Add case, mirroring this
+                // campaign's own "audit every analogous site" convention.
                 if *op == AssignOp::Set {
                     if let ExprKind::Ident(name) = &target.kind {
                         if let Some(local) = self.lookup(name) {
                             if let ExprKind::Binary { op: BinOp::Add, lhs, rhs } = &value.kind {
                                 if matches!(&lhs.kind, ExprKind::Ident(n) if n == name) {
                                     let b = self.expr(rhs);
-                                    self.emit(Op::Add(local, local, b), *span);
+                                    self.emit(Op::Add(local, local, b), value.span);
                                     return None;
                                 }
                             }
@@ -711,7 +743,7 @@ impl<'s> FnCompiler<'s> {
                                     let name_idx = self.const_idx(Value::str(m.to_string()), *span);
                                     self.emit(
                                         Op::Method { dst: local, recv: local, name: name_idx, start, argc: args.len() as u8 },
-                                        *span,
+                                        value.span,
                                     );
                                     return None;
                                 }

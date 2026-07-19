@@ -1851,6 +1851,52 @@ mod tests {
     }
 
     #[test]
+    fn self_add_overflow_panic_span_matches_across_engines() {
+        // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it852, the
+        // THIRTY-FIRST survey, found via a lightweight FUZZING pass rather than a
+        // hand-picked repro): `differential()` deliberately discards spans
+        // (`Err(Flow::Panic { msg, .. })`), so this divergence was invisible to every
+        // prior differential test above -- mirroring the exact PR-it522 "ai-fun
+        // tool-loop panic span" precedent (same root cause SHAPE: a fast path baked
+        // in the wrong span). compile.rs's `x = x + e` self-append fast path emitted
+        // `Op::Add` tagged with the WHOLE `Stmt::Assign`'s span instead of `value.span`
+        // (just `x + e`) -- confirmed via a real CLI diff (`kupl run` vs `kupl run
+        // --vm`) before fixing: identical "integer overflow in addition" message and
+        // exit code 101, but a DIFFERENT reported column (interp: under `x + 1`; vm:
+        // under the whole `x = x + 1`). The GENERAL (non-fast-path) case, `y = x + 1`,
+        // already agreed on the narrow span on both engines -- confirming the fast
+        // path was the outlier, not the general path. Fixed by using `value.span` in
+        // the fast path too, matching both the general path and interp.rs's own
+        // string-self-append fallback (which already used `value.span`).
+        let src = "fun probe() {\n    var x = 9223372036854775807\n    x = x + 1\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let f = Value::Fun(std::rc::Rc::new("probe".to_string()));
+        let i_span = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Err(Flow::Panic { span, .. }) => span,
+            other => panic!("expected a panic, got {other:?}", other = other.is_ok()),
+        };
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let v_span = match vm.call_named("probe", vec![]) {
+            Err(e) => e.span,
+            Ok(_) => panic!("expected a panic"),
+        };
+
+        assert_eq!(i_span, v_span, "interp and KVM must attribute the self-add overflow panic to the same span");
+        // the shared span is `x + 1`, NOT the whole `x = x + 1` assignment statement.
+        let narrow_start = src.find("x + 1").unwrap();
+        assert_eq!(
+            i_span.start, narrow_start as u32,
+            "the panic must point at `x + 1`, not the whole assignment statement"
+        );
+    }
+
+    #[test]
     fn diff_for_loop_lazy_semantics() {
         // The for loop iterates a Range lazily (no Vec materialization) and a List
         // over its shared Rc (no clone) — identical on both engines, and the List
