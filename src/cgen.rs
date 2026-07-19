@@ -4122,6 +4122,20 @@ static KValue k_ai_from_json(const KAiShape* s, KValue j) {
    `strip_fences` exactly -- the ASCII-only `\r`/`\n` fence-newline strip
    right after `json` is UNCHANGED (mirrors `trim_start_matches(['\r','\n'])`
    exactly, which really is ASCII-only in ai.rs too, not a gap). */
+/* Case-insensitive 4-byte-literal match, stopping (mismatch) as soon as a
+   NUL is seen so a shorter-than-4-byte `p` is never read past its own
+   terminator -- mirrors strncmp's short-string safety while adding the
+   case-insensitivity strncmp itself doesn't provide (needed by the
+   PR-it884 fix below). */
+static int k_ci_eq4(const char* p, const char* lit) {
+    for (int i = 0; i < 4; i++) {
+        char c = p[i];
+        if (c == 0) return 0;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != lit[i]) return 0;
+    }
+    return 1;
+}
 static const char* k_ai_strip(const char* text) {
     long a, z;
     k_utf8_trim_range(text, &a, &z);
@@ -4129,7 +4143,14 @@ static const char* k_ai_strip(const char* text) {
     char* s = (char*)k_alloc(n + 1); memcpy(s, text + a, n); s[n] = 0;
     if (strncmp(s, "```", 3) != 0) return s;
     char* p = s + 3;
-    if (strncmp(p, "json", 4) == 0) p += 4;
+    /* A REAL bug found+fixed (production-hardening PR-it884, mirrors
+       ai.rs::strip_fences's Rust fix exactly): the language-tag strip used
+       to be exact-case (`strncmp(p, "json", 4) == 0`) -- a fenced-code
+       language tag spelled any other way a real model provider might emit
+       (` ```JSON `, ` ```Json `) was left completely unstripped, so the
+       leftover tag text got prepended to the JSON parser's input and the
+       parse failed outright. */
+    if (k_ci_eq4(p, "json")) p += 4;
     while (*p == '\r' || *p == '\n') p++;
     long pn = (long)strlen(p);
     if (pn >= 3 && strcmp(p + pn - 3, "```") == 0) p[pn - 3] = 0;
@@ -8394,6 +8415,27 @@ mod tests {
                    fun main() uses io {\n    print(\"{classify(\"x\")}\")\n}\n";
         let out = native_main_stdout_env(src, "aifun", &[("KUPL_AI_MOCK_CLASSIFY", "42")]);
         assert_eq!(out, "42\n");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it884, matching the
+    /// fix + test in `ai.rs` itself this same iteration): `k_ai_strip`'s
+    /// language-tag strip (`strncmp(p, "json", 4) == 0`) was exact-case
+    /// only -- a fenced-code language tag spelled `JSON`/`Json` (a
+    /// plausible real model provider casing) was left unstripped, so the
+    /// leftover tag text broke the JSON parse.
+    #[test]
+    fn native_ai_fun_strips_code_fences_regardless_of_the_language_tags_casing() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun classify(text: Str) -> Int {\n    intent \"classify {text}\"\n}\n\
+                   fun main() uses io {\n    print(\"{classify(\"x\")}\")\n}\n";
+        let out = native_main_stdout_env(
+            src,
+            "aifunfenceupper",
+            &[("KUPL_AI_MOCK_CLASSIFY", "```JSON\n{\"value\": 43}\n```")],
+        );
+        assert_eq!(out, "43\n");
     }
 
     /// A REAL BUG found+fixed (bug-hunt batch 147, PR-it539): an ai-fun TOOL's

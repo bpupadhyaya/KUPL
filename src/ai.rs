@@ -613,10 +613,24 @@ fn raw_response(meta: &AiFunMeta, intent: &str, args: &[Value]) -> Result<String
 }
 
 /// Strip optional markdown code fences around a JSON payload.
+///
+/// A REAL bug found+fixed (production-hardening PR-it884): the language-tag
+/// strip used to be exact-case (`rest.strip_prefix("json")`) -- a fenced-
+/// code language tag spelled any other way a real model provider might
+/// emit (` ```JSON `, ` ```Json `) was left completely unstripped, so the
+/// leftover tag text got prepended to the JSON parser's input and the
+/// parse failed outright, turning a syntactically well-formed model
+/// response into a spurious application-level failure purely due to an
+/// incidental casing choice. `rest.get(..4)` (rather than a direct slice)
+/// avoids panicking on a fence with fewer than 4 bytes of content or a
+/// multi-byte character straddling the 4-byte boundary.
 fn strip_fences(text: &str) -> &str {
     let t = text.trim();
     let Some(rest) = t.strip_prefix("```") else { return t };
-    let rest = rest.strip_prefix("json").unwrap_or(rest);
+    let rest = match rest.get(..4) {
+        Some(tag) if tag.eq_ignore_ascii_case("json") => &rest[4..],
+        _ => rest,
+    };
     rest.trim_start_matches(['\r', '\n']).strip_suffix("```").unwrap_or(rest).trim()
 }
 
@@ -1445,6 +1459,26 @@ mod tests {
         std::env::set_var("KUPL_AI_MOCK_T_FENCE", "```json\n{\"value\": 42}\n```");
         let v = run(&meta("t_fence", AiShape::Int, false), &[Value::Int(1)]).unwrap();
         assert_eq!(v, Value::Int(42));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it884, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// `strip_fences`'s language-tag strip (`rest.strip_prefix("json")`) is
+    /// exact-case, exact-spelling only -- a fenced-code language tag
+    /// spelled any other way a real model provider might emit (`JSON`,
+    /// `Json`, `jsonc`) is left completely unstripped, so the leftover tag
+    /// text gets prepended to the JSON parser's input and the parse fails
+    /// outright, turning a syntactically well-formed model response into a
+    /// spurious application-level failure purely due to an incidental
+    /// casing choice.
+    #[test]
+    fn code_fences_are_stripped_regardless_of_the_language_tags_casing() {
+        std::env::set_var("KUPL_AI_MOCK_T_FENCE_UPPER", "```JSON\n{\"value\": 43}\n```");
+        let v = run(&meta("t_fence_upper", AiShape::Int, false), &[Value::Int(1)]).unwrap();
+        assert_eq!(v, Value::Int(43));
+        std::env::set_var("KUPL_AI_MOCK_T_FENCE_MIXED", "```Json\n{\"value\": 44}\n```");
+        let v = run(&meta("t_fence_mixed", AiShape::Int, false), &[Value::Int(1)]).unwrap();
+        assert_eq!(v, Value::Int(44));
     }
 
     #[test]
