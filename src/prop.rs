@@ -226,11 +226,31 @@ pub fn shrink(v: &Value) -> Vec<Value> {
         Value::Float(_) => Vec::new(),
         Value::Str(s) if !s.is_empty() => {
             let mut out = vec![Value::str(String::new())];
-            if s.chars().count() > 1 {
-                let half: String = s.chars().take(s.chars().count() / 2).collect();
+            let chars: Vec<char> = s.chars().collect();
+            if chars.len() > 1 {
+                let half: String = chars[..chars.len() / 2].iter().collect();
                 out.push(Value::str(half));
-                let drop_first: String = s.chars().skip(1).collect();
+                let drop_first: String = chars[1..].iter().collect();
                 out.push(Value::str(drop_first));
+            }
+            // drop each single character, not just the front-half/drop-first
+            // candidates above -- a REAL quality bug found+fixed (production-
+            // hardening PR-it869), the SAME shape PR-it749 already fixed for
+            // `List` (never extended to `Str`): only ever offering a
+            // front-truncated or front-dropped candidate means a character
+            // that must be removed from the MIDDLE or END of the string (to
+            // reach the true minimal counterexample) can never be eliminated
+            // -- the shrinker gets permanently stuck on a non-minimal result.
+            // Confirmed live before this fix: `forall s: Str { expect
+            // !(s.contains("q") && s.contains("z")) }` reported the
+            // counterexample `"qrzgz"` (5 chars, deterministic across
+            // reruns) instead of the true minimal `"qz"` (2 chars) -- the
+            // extraneous `r`/`g`/trailing `z` sit at positions the shrinker
+            // structurally could not remove.
+            for i in 0..chars.len() {
+                let mut smaller = chars.clone();
+                smaller.remove(i);
+                out.push(Value::str(smaller.into_iter().collect::<String>()));
             }
             out
         }
@@ -399,6 +419,29 @@ mod tests {
             cands.contains(&Value::List(Rc::new(vec![Value::Int(5), Value::Int(5), Value::Int(0)]))),
             "must offer a shrunk-index-2 candidate: {cands:?}"
         );
+    }
+
+    /// A REAL quality bug found+fixed (production-hardening PR-it869), the SAME
+    /// shape `shrink_list_offers_candidates_shrinking_every_element_not_just_the_
+    /// first` above already fixed for `List` (PR-it749) -- never extended to
+    /// `Str`: only ever offering a front-truncated (`half`) or front-dropped
+    /// (`drop_first`) candidate means a character that must be removed from the
+    /// MIDDLE or END of a string can never be individually eliminated. Confirmed
+    /// live via `kupl test` before this fix: `forall s: Str { expect
+    /// !(s.contains("q") && s.contains("z")) }` reported the non-minimal
+    /// counterexample `"qrzgz"` (5 chars, deterministic across reruns) instead of
+    /// the true minimal `"qz"` (2 chars).
+    #[test]
+    fn shrink_str_offers_candidates_dropping_any_single_character_not_just_the_front() {
+        let cands = shrink(&Value::str("qrz"));
+        // dropping the FIRST character is already covered by the pre-fix
+        // `drop_first` candidate.
+        assert!(cands.contains(&Value::str("rz")), "must still offer a drop-first candidate: {cands:?}");
+        // dropping a MIDDLE character must ALSO exist -- exactly what was
+        // missing before the fix.
+        assert!(cands.contains(&Value::str("qz")), "must offer a drop-middle-character candidate: {cands:?}");
+        // and dropping the LAST character too.
+        assert!(cands.contains(&Value::str("qr")), "must offer a drop-last-character candidate: {cands:?}");
     }
 
     #[test]
