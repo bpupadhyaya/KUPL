@@ -814,6 +814,18 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             })
             .collect();
         out.push_str(&format!(",\"state\":[{}]", state.join(",")));
+        // A REAL schema-consistency bug found+fixed (production-hardening
+        // PR-it856, an Explore survey finding, independently re-verified live
+        // before implementing): `exposes[].params` was a bare array of
+        // PRE-FORMATTED STRINGS (`["n: Int", "tag: Str"]`) while `ports`/
+        // `props`/`state` are all arrays of STRUCTURED OBJECTS carrying a
+        // separate `name`/`type` field -- the EXACT same shape of gap
+        // PR-it778 just above fixed for `state`, missed for this sibling
+        // field in that same sweep. A consumer had to re-parse each string
+        // (splitting on `": "`) instead of reading two JSON fields directly.
+        // No `init`-style "arbitrary expression" concern applies here (a
+        // param's type is a `TyExpr`, exactly as simple/serializable as
+        // `props`'s own `type` field, rendered via the SAME `ty_str`).
         let exposes: Vec<String> = c
             .exposes
             .iter()
@@ -821,7 +833,13 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
                 let params: Vec<String> = f
                     .params
                     .iter()
-                    .map(|p| format!("\"{}: {}\"", esc(&p.name), esc(&crate::fmt::ty_str(&p.ty))))
+                    .map(|p| {
+                        format!(
+                            "{{\"name\":\"{}\",\"type\":\"{}\"}}",
+                            esc(&p.name),
+                            esc(&crate::fmt::ty_str(&p.ty))
+                        )
+                    })
                     .collect();
                 format!(
                     "{{\"name\":\"{}\",\"params\":[{}],\"returns\":\"{}\",\"uses\":[{}]}}",
@@ -1599,6 +1617,45 @@ mod tests {
         );
         // `init` is deliberately NOT present -- see this test's own doc comment.
         assert!(state[0].get("init").is_none(), "init is deliberately excluded, not just empty");
+    }
+
+    /// A REAL schema-consistency bug found+fixed (production-hardening
+    /// PR-it856, an Explore survey finding, independently re-verified live
+    /// before implementing): `exposes[].params` was a bare array of
+    /// pre-formatted strings (`["n: Int", "tag: Str"]`) instead of an array
+    /// of structured `{"name":..., "type":...}` objects like `ports`/
+    /// `props`/`state` -- the EXACT gap this same sweep already fixed for
+    /// `state` (see `manifest_reports_states_own_type` above), missed for
+    /// this sibling field.
+    #[test]
+    fn manifest_reports_exposes_params_as_structured_objects() {
+        let src = "component Counter856 {\n    intent \"c\"\n    \
+                   expose fun add(n: Int, tag: Str) -> Int { n }\n    \
+                   expose fun noop() -> Unit { }\n}\n";
+        let compiled = compile(src).expect("compiles");
+        let json = super::manifest_json(&compiled.program);
+        let v = crate::lsp::parse_json(&json).expect("manifest must be valid JSON");
+        let comp = v.get("components").and_then(|c| c.index(0)).expect("component 0");
+        let exposes = match comp.get("exposes") {
+            Some(crate::lsp::Json::Arr(a)) => a.clone(),
+            other => panic!("exposes must be an array of objects: {other:?}"),
+        };
+        assert_eq!(exposes.len(), 2);
+        let params = match exposes[0].get("params") {
+            Some(crate::lsp::Json::Arr(a)) => a.clone(),
+            other => panic!("params must be an array of objects, not pre-formatted strings: {other:?}"),
+        };
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].get("name").and_then(|n| n.str()), Some("n"));
+        assert_eq!(params[0].get("type").and_then(|t| t.str()), Some("Int"));
+        assert_eq!(params[1].get("name").and_then(|n| n.str()), Some("tag"));
+        assert_eq!(params[1].get("type").and_then(|t| t.str()), Some("Str"));
+        // a zero-param expose still reports a valid, empty (not omitted/null) array.
+        let noop_params = match exposes[1].get("params") {
+            Some(crate::lsp::Json::Arr(a)) => a.clone(),
+            other => panic!("params must be an array even with zero params: {other:?}"),
+        };
+        assert!(noop_params.is_empty());
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it780, the first half
