@@ -1084,9 +1084,19 @@ pub fn native(path: &str, args: &[String]) -> i32 {
             return 1;
         }
     };
-    let out = args
-        .iter()
-        .position(|a| a == "-o")
+    // A REAL bug found+fixed (production-hardening PR-it862): the sibling
+    // site to `main.rs::build_module`'s identical `-o`-value-extraction shape
+    // -- a trailing `-o` with no following value silently fell back to the
+    // DEFAULT output path instead of erroring, since `args.get(i + 1))`
+    // returns `None` whether `-o` is absent or simply missing its value.
+    let o_pos = args.iter().position(|a| a == "-o");
+    if let Some(i) = o_pos {
+        if args.get(i + 1).is_none() {
+            eprintln!("error: -o requires a value");
+            return 2;
+        }
+    }
+    let out = o_pos
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_else(|| path.trim_end_matches(".kupl").to_string());
@@ -1578,6 +1588,39 @@ mod tests {
         assert_eq!(code, 1, "must refuse rather than overwrite the source");
         let after = std::fs::read_to_string(&bare).unwrap();
         assert_eq!(after, src, "the source file's content must be completely untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it862, the sibling
+    /// site to `main.rs::build_module`'s identical `-o`-value-extraction
+    /// shape, independently re-verified live before implementing): a
+    /// trailing `-o` with no following value used to be treated IDENTICALLY
+    /// to `-o` being absent entirely, silently falling back to the DEFAULT
+    /// output path instead of erroring. Live-confirmed BEFORE this fix: `kupl
+    /// native foo.kupl -o` silently overwrote a pre-existing, unrelated
+    /// executable at the default path, zero diagnostic, exit code 0.
+    #[test]
+    fn a_trailing_o_flag_with_no_value_is_a_clean_error_not_a_silent_default_fallback() {
+        let dir = std::env::temp_dir().join(format!("kupl-native-oflag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+        let source = dir.join("foo.kupl");
+        std::fs::write(&source, src).unwrap();
+        let p = source.to_str().unwrap().to_string();
+
+        // a pre-existing file at the DEFAULT output path must survive untouched.
+        let default_out = dir.join("foo");
+        std::fs::write(&default_out, "PRE-EXISTING-DATA").unwrap();
+
+        let args = vec!["-o".to_string()];
+        let code = super::native(&p, &args);
+        assert_eq!(code, 2, "a trailing -o with no value must be a clean usage error");
+        assert_eq!(
+            std::fs::read_to_string(&default_out).unwrap(),
+            "PRE-EXISTING-DATA",
+            "the default output path must NOT be silently overwritten"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

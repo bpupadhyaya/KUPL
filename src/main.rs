@@ -351,9 +351,25 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
             return 1;
         }
     };
-    let out = args
-        .iter()
-        .position(|a| a == "-o")
+    // A REAL bug found+fixed (production-hardening PR-it862, an Explore
+    // survey finding, independently re-verified live before implementing): a
+    // trailing `-o` with no following value (e.g. `kupl build foo.kupl -o`,
+    // a plausible fat-fingered mistake or an empty-string shell-expansion
+    // that dropped the intended value from argv) used to be treated
+    // IDENTICALLY to `-o` simply being absent -- `args.get(i + 1)` returns
+    // `None` either way, silently falling back to the DEFAULT output path
+    // instead of erroring. Live-confirmed BEFORE this fix: a pre-existing
+    // `foo.kx` at the default path was silently overwritten by `kupl build
+    // foo.kupl -o`, with zero diagnostic and exit code 0, even though the
+    // user explicitly asked for `-o` to control the output path.
+    let o_pos = args.iter().position(|a| a == "-o");
+    if let Some(i) = o_pos {
+        if args.get(i + 1).is_none() {
+            eprintln!("error: -o requires a value");
+            return 2;
+        }
+    }
+    let out = o_pos
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_else(|| {
@@ -889,6 +905,56 @@ mod tests {
         let code2 = build_module(&args, &p2, false);
         assert_eq!(code2, 1, "an explicit -o matching the source must also be refused");
         assert_eq!(std::fs::read_to_string(&named).unwrap(), src, "source must be untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it862, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// a trailing `-o` with no following value (a plausible fat-fingered
+    /// mistake, or an empty-string shell-expansion that dropped the intended
+    /// value from argv) used to be treated IDENTICALLY to `-o` being absent
+    /// entirely -- `args.get(i + 1)` returns `None` either way -- silently
+    /// falling back to the DEFAULT output path instead of erroring.
+    /// Live-confirmed BEFORE this fix: `kupl build foo.kupl -o` silently
+    /// overwrote a pre-existing, unrelated `foo.kx` at the default path with
+    /// zero diagnostic and exit code 0, even though the user explicitly
+    /// asked `-o` to control the output path. The IDENTICAL shape also
+    /// existed in `run::native`'s own `-o`-value extraction, fixed together.
+    #[test]
+    fn a_trailing_o_flag_with_no_value_is_a_clean_error_not_a_silent_default_fallback() {
+        let dir = std::env::temp_dir().join(format!("kupl-oflag-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+        let source = dir.join("foo.kupl");
+        std::fs::write(&source, src).unwrap();
+        let p = source.to_str().unwrap().to_string();
+
+        // a pre-existing file at the DEFAULT output path must survive untouched.
+        let default_out = dir.join("foo.kx");
+        std::fs::write(&default_out, "PRE-EXISTING-DATA").unwrap();
+
+        let args = vec!["build".to_string(), p.clone(), "-o".to_string()];
+        let code = build_module(&args, &p, false);
+        assert_eq!(code, 2, "a trailing -o with no value must be a clean usage error");
+        assert_eq!(
+            std::fs::read_to_string(&default_out).unwrap(),
+            "PRE-EXISTING-DATA",
+            "the default output path must NOT be silently overwritten"
+        );
+
+        // sanity: a genuine `-o <value>` still works normally (no regression).
+        let real_out = dir.join("real.kx");
+        let args2 = vec!["build".to_string(), p.clone(), "-o".to_string(), real_out.to_str().unwrap().to_string()];
+        let code2 = build_module(&args2, &p, false);
+        assert_eq!(code2, 0, "a genuine -o value must still work");
+        assert!(real_out.exists());
+
+        // sanity: NO -o at all still falls back to the default cleanly (no regression).
+        std::fs::remove_file(&default_out).unwrap();
+        let code3 = build_module(&[p.clone()], &p, false);
+        assert_eq!(code3, 0, "omitting -o entirely must still default normally");
+        assert!(default_out.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
