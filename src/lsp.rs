@@ -1084,6 +1084,31 @@ fn local_binding_scope(program: &crate::ast::Program, offset: usize, name: &str)
                     }
                 }
             }
+            // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it855,
+            // the THIRTY-FOURTH survey, found via the SAME "hardcoded item-kind list
+            // forgot an entry" pattern PR-it854 fixed in repl.rs's `is_item`): a
+            // top-level `law "..." { ... }` block's `body: Block` can contain `let`
+            // bindings exactly like a `fun` body (`ast::Law { name, body: Block,
+            // span }`), but this function only matched `Item::Fun`/`Item::Component`,
+            // falling through to `_ => {}` for `Item::Law` and `Item::Contract`'s
+            // nested laws -- so the it704/it739/it836 scope-safety net these two
+            // functions provide never applied to law bodies at all. Live-confirmed
+            // BEFORE this fix via a real `kupl lsp` rename session: renaming a LOCAL
+            // `let helper` inside a `law` block also silently renamed an UNRELATED
+            // top-level `fun helper` and its call site elsewhere in the file (and,
+            // symmetrically, renaming the top-level `fun helper` also corrupted the
+            // law's own unrelated local). Fixed by adding the identical
+            // `block_binds_name`-based arm already used for `Item::Fun`.
+            Item::Law(l) if in_span(l.span) => {
+                return block_binds_name(&l.body, name).then_some(l.span);
+            }
+            Item::Contract(c) => {
+                for l in &c.laws {
+                    if in_span(l.span) {
+                        return block_binds_name(&l.body, name).then_some(l.span);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1119,6 +1144,21 @@ fn shadow_zones(program: &crate::ast::Program, name: &str) -> Vec<crate::diag::S
                 for h in &c.handlers {
                     if h.param.as_deref() == Some(name) || block_binds_name(&h.body, name) {
                         zones.push(h.span);
+                    }
+                }
+            }
+            // See the matching fix + doc comment in `local_binding_scope` above
+            // (PR-it855): `Item::Law`/`Item::Contract`'s nested laws were missing
+            // from this function too, the symmetric half of the same gap.
+            Item::Law(l) => {
+                if block_binds_name(&l.body, name) {
+                    zones.push(l.span);
+                }
+            }
+            Item::Contract(c) => {
+                for l in &c.laws {
+                    if block_binds_name(&l.body, name) {
+                        zones.push(l.span);
                     }
                 }
             }
@@ -3296,6 +3336,64 @@ mod tests {
         let fun_locs = occurrences_cross_file(src, "mean", fun_off, dir, &empty_buffers);
         assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
         assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 4), "{fun_locs:?}");
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug (production-hardening PR-it855, the THIRTY-FOURTH
+    /// survey, found via the SAME "hardcoded item-kind list forgot an entry" pattern
+    /// PR-it854 fixed in repl.rs's `is_item`): `local_binding_scope`/`shadow_zones`
+    /// (the exact PR-it704/it739/it836 scope-safety-net functions this test's own
+    /// sibling above exercises for `fun`/`component`) only matched `Item::Fun`/
+    /// `Item::Component`, falling through to `_ => {}` for a top-level `law "..." {
+    /// ... }` block -- even though `Law.body: Block` can contain `let` bindings just
+    /// like a function body. Live-confirmed BEFORE this fix via a real `kupl lsp`
+    /// rename session: renaming the LOCAL `let helper` inside a `law` block ALSO
+    /// silently renamed an UNRELATED top-level `fun helper` and its call site
+    /// elsewhere in the file, and symmetrically renaming the top-level `fun helper`
+    /// corrupted the law's own unrelated local. This test is the direct Rust-level
+    /// mirror of that live session.
+    #[test]
+    fn local_binding_scope_suppresses_same_file_rename_into_an_unrelated_top_level_declaration_through_a_law() {
+        let src = "fun helper() -> Int { 1 }\nfun caller() -> Int { helper() }\nlaw \"shadowed\" {\n    let helper = 2\n    expect helper == 2\n}\n";
+
+        let all = occurrences(src, "helper");
+        assert_eq!(all.len(), 4, "unrelated fun decl + its call + local let + local use: {all:?}");
+
+        // The cursor is on the LOCAL `let helper` declaration inside the law.
+        let off = src.find("helper = 2").unwrap();
+        let dir = std::path::Path::new("/fake/lsp-it855");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+        let locs = occurrences_cross_file(src, "helper", off, dir, &empty_buffers);
+        assert_eq!(locs.len(), 2, "only the law's own local decl + use, NOT the unrelated fun: {locs:?}");
+        // Neither location may fall on line 0 (the unrelated `fun helper` declaration)
+        // or line 1 (its call site inside `caller()`).
+        assert!(locs.iter().all(|(_, l0, ..)| *l0 != 0 && *l0 != 1), "must not touch the unrelated fun: {locs:?}");
+
+        // Renaming the TOP-LEVEL `fun helper` itself is symmetrically protected:
+        // still finds only its own declaration + call site, not the law's local.
+        let fun_off = src.find("fun helper").unwrap() + 4;
+        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers);
+        assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
+        assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
+    }
+
+    /// Sibling of the test above (PR-it855), covering the SECOND code path the fix
+    /// touched: a law nested INSIDE a `contract` block (`ContractDecl.laws`), not a
+    /// standalone top-level `law`. Same shape, different AST route into `Item::Contract`.
+    #[test]
+    fn local_binding_scope_suppresses_same_file_rename_into_an_unrelated_top_level_declaration_through_a_contract_law() {
+        let src = "fun helper() -> Int { 1 }\nfun caller() -> Int { helper() }\ncontract Store {\n    intent \"x\"\n    expose fun get() -> Int\n    law \"shadowed\" {\n        let helper = 2\n        expect helper == 2\n    }\n}\n";
+
+        let off = src.find("helper = 2").unwrap();
+        let dir = std::path::Path::new("/fake/lsp-it855-contract");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+        let locs = occurrences_cross_file(src, "helper", off, dir, &empty_buffers);
+        assert_eq!(locs.len(), 2, "only the contract law's own local decl + use: {locs:?}");
+        assert!(locs.iter().all(|(_, l0, ..)| *l0 != 0 && *l0 != 1), "must not touch the unrelated fun: {locs:?}");
+
+        let fun_off = src.find("fun helper").unwrap() + 4;
+        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers);
+        assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
+        assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
     }
 
     /// A REAL bug (production-hardening PR-it742): unlike the cross-file rename/
