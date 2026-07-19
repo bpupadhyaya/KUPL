@@ -14608,6 +14608,110 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         assert_eq!(native_main_stdout(src, "queryparse4200").trim(), "4200");
     }
 
+    /// A cross-engine fuzz pass against `url.rs`'s `query_parse`/`query_build`
+    /// vs `cgen.rs`'s independent C reimplementation (`k_query_parse`/
+    /// `k_query_build`/`k_url_decode_into`), production-hardening PR-it887 --
+    /// the SAME xorshift64* fuzz-harness convention `csv.rs` (it883),
+    /// `regex.rs` (it885), and `json.rs` (it886) established, extended to a
+    /// FOURTH hand-rolled untrusted-input parser flagged by survey #51: 2
+    /// genuine prior fixes (PR-it45's interp-vs-native NUL-decode divergence;
+    /// PR-it557's native-only fixed-4096-slot truncation, the same bug class
+    /// as it556's regex truncation and it558's CSV truncation), a real
+    /// independent C mirror, and manually close-read "clean" multiple times
+    /// (it546/it661/it666/it831) but NEVER fuzzed -- exactly the profile
+    /// csv.rs/regex.rs/json.rs each had right before fuzzing found something
+    /// a manual read had missed. Generates adversarial raw query-string text
+    /// mixing plain ASCII, `&` `=` separators, `%`-escapes (both valid hex
+    /// digits and invalid ones, exercising the documented "malformed escape
+    /// falls back to raw text" behavior), `+`-as-space, and a multi-byte
+    /// UTF-8 character, and checks that `query_build(query_parse(text))`
+    /// produces EXACTLY the same canonical text on native as computing the
+    /// identical chain directly via the canonical Rust
+    /// `crate::url::query_parse`/`crate::url::query_build` (the same functions interp/vm
+    /// call). Strips exactly ONE trailing newline (PR-it883's lesson).
+    /// Before trusting a clean first-run report, applied the it885/it886
+    /// discipline: deliberately injected a real, narrow divergence into
+    /// native's `k_url_decode_into` (changed `+` -> space handling to leave
+    /// `+` literal, a plausible one-line regression) and confirmed the SAME
+    /// fuzz test caught it, before reverting and re-confirming a clean
+    /// result on the real code. Found ZERO disagreements on the real code --
+    /// a genuinely broader coverage mechanism now locked in permanently, not
+    /// a bug fix.
+    #[test]
+    fn fuzz_random_query_strings_match_the_canonical_rust_parser_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+        }
+        fn fuzz_gen_query_text(rng: &mut FuzzRng, max_len: usize) -> String {
+            let pool = ['a', 'b', 'c', '&', '=', '%', '+', '1', '2', 'A', 'F', 'z', 'é', ' '];
+            let len = rng.below(max_len as u64) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push(pool[rng.below(pool.len() as u64) as usize]);
+            }
+            s
+        }
+        fn escape_kupl_str(s: &str) -> String {
+            let mut out = String::new();
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '{' => out.push_str("\\{"),
+                    '}' => out.push_str("\\}"),
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let text = fuzz_gen_query_text(&mut rng, 16);
+            let expected = crate::url::query_build(&crate::url::query_parse(&text));
+            let src = format!(
+                "fun main() uses io {{\n    print(query_build(query_parse(\"{}\")))\n}}\n",
+                escape_kupl_str(&text)
+            );
+            let raw = native_main_stdout(&src, &format!("queryfuzz{seed}"));
+            // strip exactly ONE trailing newline (print's own terminator) --
+            // not a blanket .trim(), per PR-it883's lesson.
+            let actual = raw.strip_suffix('\n').unwrap_or(&raw);
+            if actual != expected {
+                mismatches.push(format!("seed={seed} text={text:?} expected={expected:?} actual={actual:?}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native query_parse/query_build diverges from the canonical Rust parser on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// A GREP SWEEP for the same fixed-buffer-truncation signature (bug-hunt batch
     /// 166, PR-it558) found SIX more real instances beyond regex/query_parse
     /// (it555-557): `Str.chars()` (was `KValue tmp_items[4096]`), `Str.reverse()`
