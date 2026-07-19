@@ -375,7 +375,40 @@ fn emit_chunk(out: &mut String, module: &Module, idx: usize, chunk: &Chunk) -> R
 
 fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
     Ok(match v {
-        Value::Int(x) => format!("k_int({x}LL)"),
+        Value::Int(x) => {
+            // A REAL (if low-severity) gap found+fixed (production-hardening
+            // PR-it851, a completeness audit of const_expr's Value-variant
+            // coverage prompted by it850's non-finite-Float fix): `i64::MIN`
+            // IS reachable as a source constant -- not via decimal negation
+            // (the raw magnitude `9223372036854775808` overflows Int before
+            // the unary `-` ever applies, a clean K0004) but via a hex/binary
+            // literal's own documented "full 64-bit bit patterns are
+            // writable" carve-out (lexer.rs's `lex_number`): `0x8000000000000000`
+            // lexes straight to `Tok::Int(i64::MIN)`. Confirmed `SizedInt`'s
+            // own `i64`-suffixed literal path is NOT similarly reachable (both
+            // `-9223372036854775808i64` and `0x8000000000000000i64` are
+            // cleanly rejected at lex time with K0009 -- `emit_sized`'s range
+            // check has no equivalent bit-pattern carve-out), so this is
+            // scoped to the unsized `Int` branch alone. The bare `-9223372036854775808LL`
+            // form used here previously is NOT valid as a single token in C:
+            // the unsuffixed magnitude `9223372036854775808` doesn't fit
+            // `long long` (max `i64::MAX`), so `cc` parses it as an
+            // "implicitly unsigned literal" before negating -- functionally
+            // correct on every mainstream compiler (confirmed live: same
+            // value on interp/VM/native), but noisy (`cc -Wall` warns
+            // `-Wimplicitly-unsigned-literal`) and relies on
+            // implementation-defined (not explicit) unsigned-to-signed
+            // narrowing. Made explicit instead: an unambiguous `ULL` literal
+            // (fits `unsigned long long` trivially) cast to `int64_t`, the
+            // exact same "unsigned literal, explicit signed cast" idiom this
+            // file already uses elsewhere for i64::MIN-adjacent runtime
+            // arithmetic (e.g. `digits`'s unsigned-negation comment above).
+            if *x == i64::MIN {
+                "k_int((int64_t)9223372036854775808ULL)".to_string()
+            } else {
+                format!("k_int({x}LL)")
+            }
+        }
         Value::Float(x) => {
             // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it850,
             // the THIRTIETH broad Explore survey): a source float literal that
@@ -9357,6 +9390,66 @@ fun main() uses io {
             native_main_stdout(src, "infliteral").trim(),
             "inf|-inf|true|true|true"
         );
+    }
+
+    /// A REAL (if low-severity) gap found+fixed (production-hardening
+    /// PR-it851, a completeness audit of `const_expr`'s Value-variant
+    /// coverage prompted by it850's non-finite-Float fix): `i64::MIN` IS
+    /// reachable as a KUPL source constant via a hex-literal bit pattern
+    /// (`0x8000000000000000`, lexer.rs's documented "full 64-bit bit
+    /// patterns are writable" carve-out for hex/binary literals; the
+    /// equivalent DECIMAL negation `-9223372036854775808` is cleanly
+    /// rejected -- the raw magnitude overflows `Int` before the unary `-`
+    /// ever applies). Before this fix, `const_expr`'s `Value::Int` branch
+    /// emitted the bare `k_int(-9223372036854775808LL)` -- valid, and
+    /// FUNCTIONALLY correct on every mainstream compiler (confirmed live:
+    /// byte-identical across interp/VM/native even before this fix), but
+    /// `cc -Wall` warns `-Wimplicitly-unsigned-literal` because the raw
+    /// digit sequence `9223372036854775808` doesn't fit `long long` (max
+    /// `i64::MAX`) before the negation applies. This test asserts BOTH the
+    /// correct runtime value AND (the part `native_main_stdout` alone can't
+    /// catch, since it only checks `cc`'s exit status, and the buggy form
+    /// still compiled successfully) that `cc` produces NO warnings at all.
+    #[test]
+    fn native_source_level_int_min_hex_literal_compiles_without_a_cc_warning() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let a = 0x8000000000000000\n    let b = 0xFFFFFFFFFFFFFFFF\n    let c = -42\n    \
+                   print(\"{a}|{b}|{c}|{a < 0}\")\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-intminhex-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        // Deliberately the SAME flags as `native_main_stdout_env` / the real
+        // `kupl native` compile path (no `-Wall`) -- this generated C
+        // prelude has pre-existing `-Wall`-gated warnings (unused static
+        // helper functions not called by every program) that are NOT what
+        // this test is about; `-Wimplicitly-unsigned-literal` (the warning
+        // this fix eliminates) is enabled by default on this platform's
+        // `cc`, confirmed live without `-Wall` before this fix existed.
+        let out = std::process::Command::new(cc())
+            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .output()
+            .expect("cc runs");
+        assert!(out.status.success(), "generated C must compile");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("warning"),
+            "generated C must compile with zero cc warnings, got: {stderr}"
+        );
+        let ran = std::process::Command::new(&bin).output().expect("binary runs");
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout).trim(),
+            "-9223372036854775808|-1|-42|true"
+        );
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
     }
 
     /// Native Int bitwise/shift methods match interp/KVM — arithmetic `shr` vs logical
