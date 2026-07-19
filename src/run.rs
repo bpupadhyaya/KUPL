@@ -869,12 +869,19 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             })
             .collect();
         out.push_str(&format!(",\"children\":[{}]", children.join(",")));
+        // A REAL schema-consistency bug found+fixed (production-hardening
+        // PR-it857, the SAME sweep that just fixed `exposes[].params` at
+        // it856): `from`/`to` were each flattened into a SINGLE dot-joined
+        // string (`"feed.numbers"`) instead of a structured `{"component":
+        // ..., "port":...}` object like `ports`/`props`/`state`/`children`/
+        // `exposes.params` -- forcing a consumer to re-parse by splitting on
+        // `.` instead of reading two JSON fields directly.
         let wires: Vec<String> = c
             .wires
             .iter()
             .map(|w| {
                 format!(
-                    "{{\"from\":\"{}.{}\",\"to\":\"{}.{}\"}}",
+                    "{{\"from\":{{\"component\":\"{}\",\"port\":\"{}\"}},\"to\":{{\"component\":\"{}\",\"port\":\"{}\"}}}}",
                     esc(&w.from.0),
                     esc(&w.from.1),
                     esc(&w.to.0),
@@ -905,18 +912,30 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             })
             .collect();
         out.push_str(&format!(",\"supervises\":[{}]", supervises.join(",")));
+        // A REAL schema-consistency bug found+fixed (production-hardening
+        // PR-it857, the SAME sweep that just fixed `exposes[].params` at
+        // it856, and `wires`'s own analogous fix just above): `trigger` was
+        // a SINGLE colon-joined string (`"port:input"`, `"every:5000"`)
+        // rather than a structured `{"kind":..., ...}` object -- the `Port`/
+        // `Every`/`After` variants each carry a genuine sub-value (a port
+        // name, or a millisecond count) a consumer had to re-parse out of
+        // the string instead of reading a direct field. `Start`/`Stop`
+        // (unit variants) get just `{"kind":"start"}`/`{"kind":"stop"}`,
+        // matching this SAME function's own established convention (e.g.
+        // `props`'s `required` boolean) of omitting a field entirely rather
+        // than emitting an empty/null placeholder when there's nothing to say.
         let handlers: Vec<String> = c
             .handlers
             .iter()
             .map(|h| {
                 let trigger = match &h.trigger {
-                    crate::ast::Trigger::Port(p) => format!("port:{}", esc(p)),
-                    crate::ast::Trigger::Start => "start".to_string(),
-                    crate::ast::Trigger::Stop => "stop".to_string(),
-                    crate::ast::Trigger::Every(ms) => format!("every:{ms}"),
-                    crate::ast::Trigger::After(ms) => format!("after:{ms}"),
+                    crate::ast::Trigger::Port(p) => format!("{{\"kind\":\"port\",\"port\":\"{}\"}}", esc(p)),
+                    crate::ast::Trigger::Start => "{\"kind\":\"start\"}".to_string(),
+                    crate::ast::Trigger::Stop => "{\"kind\":\"stop\"}".to_string(),
+                    crate::ast::Trigger::Every(ms) => format!("{{\"kind\":\"every\",\"ms\":{ms}}}"),
+                    crate::ast::Trigger::After(ms) => format!("{{\"kind\":\"after\",\"ms\":{ms}}}"),
                 };
-                format!("{{\"trigger\":\"{trigger}\"}}")
+                format!("{{\"trigger\":{trigger}}}")
             })
             .collect();
         out.push_str(&format!(",\"handlers\":[{}]", handlers.join(",")));
@@ -1518,8 +1537,12 @@ mod tests {
         // dropped entirely before PR-it647 (see `manifest_reports_supervises_
         // and_handlers` below for the full regression coverage).
         assert_eq!(arr_len(c.get("handlers")), Some(1));
-        let trigger = c.get("handlers").and_then(|h| h.index(0)).and_then(|h| h.get("trigger")).and_then(|t| t.str());
-        assert_eq!(trigger, Some("port:click"));
+        // `trigger` is a structured `{"kind":...}` object (PR-it857), not a
+        // bare colon-joined string -- see `manifest_reports_handler_
+        // triggers_and_wires_as_structured_objects` for full coverage.
+        let trigger = c.get("handlers").and_then(|h| h.index(0)).and_then(|h| h.get("trigger"));
+        assert_eq!(trigger.and_then(|t| t.get("kind")).and_then(|k| k.str()), Some("port"));
+        assert_eq!(trigger.and_then(|t| t.get("port")).and_then(|p| p.str()), Some("click"));
         // a program with no components is still valid JSON with an empty array
         let empty = super::manifest_json(&compile("fun main() {}\n").unwrap().program);
         let ev = crate::lsp::parse_json(&empty).expect("empty manifest is valid JSON");
@@ -1567,13 +1590,21 @@ mod tests {
         assert_eq!(sv.get("policy").and_then(|p| p.str()), Some("restart_on_failure"));
 
         assert_eq!(arr_len(parent.get("handlers")), Some(4));
-        let triggers: Vec<&str> = match parent.get("handlers") {
-            Some(crate::lsp::Json::Arr(hs)) => {
-                hs.iter().filter_map(|h| h.get("trigger")).filter_map(|t| t.str()).collect()
-            }
+        // `trigger` is a structured `{"kind":...}` object (PR-it857), not a
+        // bare colon-joined string -- see `manifest_reports_handler_triggers_
+        // and_wires_as_structured_objects` below for the full regression
+        // coverage of that fix; this test only asserts the COUNT here, which
+        // predates and is orthogonal to the trigger-shape fix.
+        let kinds: Vec<&str> = match parent.get("handlers") {
+            Some(crate::lsp::Json::Arr(hs)) => hs
+                .iter()
+                .filter_map(|h| h.get("trigger"))
+                .filter_map(|t| t.get("kind"))
+                .filter_map(|k| k.str())
+                .collect(),
             _ => Vec::new(),
         };
-        assert_eq!(triggers, vec!["start", "stop", "every:5000", "after:2000"]);
+        assert_eq!(kinds, vec!["start", "stop", "every", "after"]);
 
         // a component with neither must still emit empty arrays, not omit the keys.
         let child = v.get("components").and_then(|c| c.index(0)).expect("component 0 (Child)");
@@ -1656,6 +1687,58 @@ mod tests {
             other => panic!("params must be an array even with zero params: {other:?}"),
         };
         assert!(noop_params.is_empty());
+    }
+
+    /// A REAL schema-consistency bug found+fixed (production-hardening
+    /// PR-it857, the SAME sweep that just fixed `exposes[].params` at
+    /// it856 -- found by re-reading `manifest_json`'s remaining fields for
+    /// any OTHER sibling instance of the identical shape): `wires[].from`/
+    /// `.to` were each a single dot-joined string (`"feed.numbers"`)
+    /// instead of a structured `{"component":..., "port":...}` object, and
+    /// `handlers[].trigger` was a single colon-joined string
+    /// (`"port:input"`, `"every:5000"`) instead of a structured
+    /// `{"kind":..., ...}` object -- both forced a consumer to re-parse a
+    /// compound string instead of reading direct JSON fields, the same gap
+    /// already fixed for `state`/`exposes.params`.
+    #[test]
+    fn manifest_reports_handler_triggers_and_wires_as_structured_objects() {
+        let src = "component Child857 {\n    intent \"c\"\n    in input: Int\n    out output: Int\n}\n\
+                   component Parent857 {\n    intent \"p\"\n    in tick: Int\n    \
+                   let a = Child857()\n    let b = Child857()\n    \
+                   on tick(n) { }\n    on start { }\n    on stop { }\n    \
+                   on every 5s { }\n    on after 2s { }\n    wire a.output -> b.input\n}\n";
+        let compiled = compile(src).expect("compiles");
+        let json = super::manifest_json(&compiled.program);
+        let v = crate::lsp::parse_json(&json).expect("manifest must be valid JSON");
+        let parent = v.get("components").and_then(|c| c.index(1)).expect("component 1 (Parent857)");
+
+        let handlers = match parent.get("handlers") {
+            Some(crate::lsp::Json::Arr(a)) => a.clone(),
+            other => panic!("handlers must be an array: {other:?}"),
+        };
+        assert_eq!(handlers.len(), 5);
+        let trigger = |i: usize| handlers[i].get("trigger").expect("trigger present");
+        assert_eq!(trigger(0).get("kind").and_then(|k| k.str()), Some("port"));
+        assert_eq!(trigger(0).get("port").and_then(|p| p.str()), Some("tick"));
+        assert_eq!(trigger(1).get("kind").and_then(|k| k.str()), Some("start"));
+        assert!(trigger(1).get("port").is_none(), "start has no port field, not an empty/null one");
+        assert_eq!(trigger(2).get("kind").and_then(|k| k.str()), Some("stop"));
+        assert_eq!(trigger(3).get("kind").and_then(|k| k.str()), Some("every"));
+        assert_eq!(trigger(3).get("ms").and_then(|m| m.as_usize()), Some(5000));
+        assert_eq!(trigger(4).get("kind").and_then(|k| k.str()), Some("after"));
+        assert_eq!(trigger(4).get("ms").and_then(|m| m.as_usize()), Some(2000));
+
+        let wires = match parent.get("wires") {
+            Some(crate::lsp::Json::Arr(a)) => a.clone(),
+            other => panic!("wires must be an array: {other:?}"),
+        };
+        assert_eq!(wires.len(), 1);
+        let from = wires[0].get("from").expect("from present");
+        assert_eq!(from.get("component").and_then(|c| c.str()), Some("a"));
+        assert_eq!(from.get("port").and_then(|p| p.str()), Some("output"));
+        let to = wires[0].get("to").expect("to present");
+        assert_eq!(to.get("component").and_then(|c| c.str()), Some("b"));
+        assert_eq!(to.get("port").and_then(|p| p.str()), Some("input"));
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it780, the first half
