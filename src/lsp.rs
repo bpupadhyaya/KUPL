@@ -726,6 +726,26 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
                 return Some(format!("prop {}: {}\n// prop of component {}", p.name, ty_str(&p.ty), c.name));
             }
         }
+        // A component's own CHILD (`let child = Component(args)` inside the
+        // body) -- the SAME gap class as state/props above (PR-it871/PR-it872),
+        // never itself mirrored for `ComponentDecl.children`: hovering a child
+        // (its own declaration, or a bare reference inside a method body, e.g.
+        // `bulb.on_()`) returned no hover at all, since only `state`/`props`/
+        // `exposes`/`funs` were ever searched, never `children`
+        // (production-hardening PR-it873). Confirmed NOT a deliberate boundary:
+        // `check.rs`'s `bind_component_env` scopes children in the EXACT SAME
+        // function, via the same `ctx.scopes.insert`, as props/state --
+        // `ctx.scopes.insert(&child.name, Ty::Component(child.component.clone()),
+        // false)` -- so a child is just as much a first-class named identifier
+        // as a prop or state field. Confirmed live before this fix via a real
+        // `kupl lsp` JSON-RPC session: hovering `bulb` at `let bulb = Light()`
+        // returned `null`, while hovering the sibling method `status`
+        // correctly returned its signature.
+        if let Item::Component(c) = item {
+            if let Some(child) = c.children.iter().find(|ch| ch.name == name) {
+                return Some(format!("let {}: {}\n// child of component {}", child.name, child.component, c.name));
+            }
+        }
     }
     None
 }
@@ -1024,6 +1044,11 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
         // never mirrored for `ComponentDecl.props` (production-hardening
         // PR-it872): "go to definition" on a prop found nothing at all,
         // since only `exposes`/`funs`/`state` were ever searched here.
+        // Also a component's own CHILD -- the SAME gap class again, never
+        // mirrored for `ComponentDecl.children` (production-hardening
+        // PR-it873): "go to definition" on a child reference found nothing at
+        // all, since only `exposes`/`funs`/`state`/`props` were ever searched
+        // here.
         Item::Component(c) => c
             .exposes
             .iter()
@@ -1031,7 +1056,8 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
             .find(|f| f.name == name)
             .map(|f| f.span)
             .or_else(|| c.state.iter().find(|s| s.name == name).map(|s| s.span))
-            .or_else(|| c.props.iter().find(|p| p.name == name).map(|p| p.span)),
+            .or_else(|| c.props.iter().find(|p| p.name == name).map(|p| p.span))
+            .or_else(|| c.children.iter().find(|ch| ch.name == name).map(|ch| ch.span)),
         // A contract's exposed method signature -- same gap, never mirrored for
         // `ContractDecl.sigs` (PR-it571).
         Item::Contract(c) => c.sigs.iter().find(|f| f.name == name).map(|f| f.span),
@@ -1761,6 +1787,15 @@ fn item_completions(program: &crate::ast::Program) -> Vec<(String, u8, String)> 
                 for p in &c.props {
                     out.push((p.name.clone(), 6, format!("prop {}", p.name))); // 6 = Variable
                 }
+                // Children used to be completely invisible to completion too, the
+                // SAME gap class as props/state above -- typing a child's own name
+                // inside a component body (e.g. `bulb` in a method that calls
+                // `bulb.on_()`) got no completion for it at all, since only
+                // `state`/`props` were ever pushed here, never `children`
+                // (production-hardening PR-it873).
+                for child in &c.children {
+                    out.push((child.name.clone(), 6, format!("let {}: {}", child.name, child.component))); // 6 = Variable
+                }
             }
             Item::Contract(c) => {
                 out.push((c.name.clone(), 8, format!("contract {}", c.name))); // 8 = Interface
@@ -1945,6 +1980,16 @@ fn item_symbol(text: &str, item: &crate::ast::Item, line_index: &LineIndex) -> S
                 c.props
                     .iter()
                     .map(|p| symbol_json(&p.name, 8, &lsp_range(line_index, text, p.span), &ty_str(&p.ty), &[])),
+            );
+            // Children (`let child = Component(args)`) used to be entirely absent
+            // from the outline too, the SAME gap class as props/state above -- a
+            // component's own declared children never appeared as child symbols
+            // at all, since only `state`/`props`/`exposes`/`funs` were ever walked
+            // here, never `children` (production-hardening PR-it873).
+            children.extend(
+                c.children
+                    .iter()
+                    .map(|ch| symbol_json(&ch.name, 8, &lsp_range(line_index, text, ch.span), &ch.component, &[])),
             );
             children.extend(
                 c.exposes
@@ -2164,6 +2209,14 @@ fn collect_workspace_symbol_matches(
             // (production-hardening PR-it872).
             for p in &c.props {
                 maybe_push_symbol_info(out, text, uri, &p.name, 8, p.span, needle, line_index);
+            }
+            // Children used to be entirely absent from `workspace/symbol` search
+            // results too, the SAME gap class as props/state above -- searching
+            // for a child's own name across the workspace found nothing, since
+            // only `state`/`props`/`exposes`/`funs` were ever walked here, never
+            // `children` (production-hardening PR-it873).
+            for child in &c.children {
+                maybe_push_symbol_info(out, text, uri, &child.name, 8, child.span, needle, line_index);
             }
             for f in &c.exposes {
                 maybe_push_symbol_info(out, text, uri, &f.name, 6, f.span, needle, line_index);
@@ -3177,6 +3230,71 @@ mod tests {
         // the prop is also a completion candidate, not just hover/definition
         let labels: Vec<String> = completions(src).into_iter().map(|(l, ..)| l).collect();
         assert!(labels.contains(&"label".to_string()), "prop must be a completion candidate: {labels:?}");
+    }
+
+    /// A REAL LSP capability gap found+fixed (production-hardening PR-it873, a
+    /// standalone check of `ComponentDecl`'s OTHER fields beyond `props`/`state`
+    /// prompted by it872's own fix): the SAME gap class as it871's state-field
+    /// fix and it872's prop fix above, just never itself mirrored for
+    /// `ComponentDecl.children` -- hovering a child (`let child = Component(args)`
+    /// inside a component body: its own declaration, or a bare reference like
+    /// `bulb.on_()` inside a method body) returned NO hover at all, and "go to
+    /// definition" found nothing either, since item_signature/item_definition's
+    /// component fallthrough only ever searched `exposes`/`funs`/`state`/`props`,
+    /// never `children`. Confirmed NOT a documented boundary before implementing:
+    /// `check.rs`'s `bind_component_env` scopes children in the EXACT SAME
+    /// function, via the same `ctx.scopes.insert`, as props/state -- a child is
+    /// just as much a first-class named identifier as a prop or state field.
+    /// By contrast, `ComponentDecl.ports`/`wires`/`supervises` were checked and
+    /// confirmed genuinely DIFFERENT: `ports` are matched by string equality
+    /// against `ComponentSig`'s `in_ports`/`out_ports` maps (used only in `wire`/
+    /// `emit`/`on` trigger positions, never inserted into `ctx.scopes`), `wires`
+    /// have no `name` field at all (they connect two existing (component, port)
+    /// pairs), and `supervises` merely references an existing child's name (a
+    /// directive, not a new named declaration) -- none of these are genuine
+    /// "declaration missing from the symbol tables" gaps of the props/state/
+    /// children shape, so they were correctly left alone. `handlers` (which DO
+    /// appear in `lsp.rs`, 4 times) have no `name` field either and are already
+    /// covered by the SEPARATE, already-exhausted `local_binding_scope`/
+    /// `shadow_zones` machinery (it704/it739/it855) for their `param` binder.
+    /// Confirmed live before this fix via a real `kupl lsp` JSON-RPC session:
+    /// hovering `bulb` at `let bulb = Light()` returned `null`, hovering the bare
+    /// `bulb` reference inside `status()`'s body (`bulb.on_()`) also returned
+    /// `null`, goto-definition on that reference also returned `null`, and the
+    /// completion list inside the component body was missing `bulb` entirely --
+    /// while hovering the sibling method `status` correctly returned its
+    /// signature (an existing, working case, no regression).
+    #[test]
+    fn hover_and_definition_work_on_component_children() {
+        let src = "component Light {\n    intent \"l\"\n    expose fun on_() -> Bool {\n        true\n    }\n}\ncomponent Panel {\n    intent \"p\"\n    let bulb = Light()\n    expose fun status() -> Bool {\n        bulb.on_()\n    }\n}\nfun main() {\n    let p = Panel()\n}\n";
+
+        // hover on the child's own declaration
+        let decl_line = src.lines().position(|l| l.contains("let bulb")).unwrap();
+        let ch = src.lines().nth(decl_line).unwrap().find("bulb").unwrap() + 1;
+        let h_decl = resolve_hover(src, decl_line, ch).expect("hover on child decl");
+        assert!(h_decl.contains("let bulb: Light"), "{h_decl}");
+        assert!(h_decl.contains("child of component Panel"), "{h_decl}");
+
+        // hover on a BARE reference to the child inside a method body
+        let ref_line = src.lines().position(|l| l.trim() == "bulb.on_()").unwrap();
+        let ch2 = src.lines().nth(ref_line).unwrap().find("bulb").unwrap() + 1;
+        let h_ref = resolve_hover(src, ref_line, ch2).expect("hover on child reference");
+        assert!(h_ref.contains("let bulb: Light"), "{h_ref}");
+
+        // go-to-definition on the reference resolves to the child's OWN declaration line
+        let (l0, c0, _, _) = resolve_definition(src, ref_line, ch2).expect("definition of bulb");
+        assert_eq!(l0, decl_line, "definition should point at the `let bulb` line");
+        assert_eq!(c0, src.lines().nth(decl_line).unwrap().find("bulb").unwrap());
+
+        // the sibling method still hovers as before (no regression)
+        let method_line = src.lines().position(|l| l.contains("expose fun status")).unwrap();
+        let ch3 = src.lines().nth(method_line).unwrap().find("status").unwrap() + 1;
+        let h_method = resolve_hover(src, method_line, ch3).expect("hover on sibling method decl");
+        assert!(h_method.contains("fun status() -> Bool"), "{h_method}");
+
+        // the child is also a completion candidate, not just hover/definition
+        let labels: Vec<String> = completions(src).into_iter().map(|(l, ..)| l).collect();
+        assert!(labels.contains(&"bulb".to_string()), "child must be a completion candidate: {labels:?}");
     }
 
     #[test]
@@ -4763,7 +4881,7 @@ mod tests {
         // bugs already this campaign (it513/it514) -- an outline that only
         // shows component NAMES, none of their methods, would repeat the same
         // mistake in a fourth place.
-        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\ntype Shape = Circle(r: Float) | Square(s: Float)\ncomponent Greeter {\n    intent \"g\"\n    prop label: Str\n    state n: Int = 0\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\ncontract Store {\n    expose fun get(k: Str) -> Int\n}\n";
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\ntype Shape = Circle(r: Float) | Square(s: Float)\ncomponent Sensor {\n    intent \"s\"\n    expose fun read() -> Int {\n        0\n    }\n}\ncomponent Greeter {\n    intent \"g\"\n    prop label: Str\n    state n: Int = 0\n    let temp = Sensor()\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\ncontract Store {\n    expose fun get(k: Str) -> Int\n}\n";
         let syms = document_symbols(src).expect("parses cleanly, should outline");
 
         // top-level items present with the right kinds
@@ -4778,9 +4896,12 @@ mod tests {
 
         // component props (production-hardening PR-it872, the SAME gap class as
         // state below, just never itself mirrored for `ComponentDecl.props`) +
-        // state + BOTH exposed and private methods, all nested under the component
+        // state + a CHILD (production-hardening PR-it873, the SAME gap class
+        // again, never itself mirrored for `ComponentDecl.children`) + BOTH
+        // exposed and private methods, all nested under the component
         assert!(syms.contains("\"name\":\"label\",\"kind\":8"), "{syms}"); // Field
         assert!(syms.contains("\"name\":\"n\",\"kind\":8"), "{syms}"); // Field
+        assert!(syms.contains("\"name\":\"temp\",\"kind\":8"), "{syms}"); // Field (child)
         assert!(syms.contains("\"name\":\"greet\",\"kind\":6"), "{syms}"); // Method
         assert!(syms.contains("\"name\":\"helper\",\"kind\":6"), "{syms}");
 
@@ -4952,9 +5073,13 @@ mod tests {
         // hardening PR-it872, the SAME gap class as document-symbol nesting, just never
         // itself mirrored for `ComponentDecl.props` in the workspace-wide search path
         // either): searching for `addr` used to find nothing at all here.
+        // a component's own CHILD must also be a searchable workspace symbol
+        // (production-hardening PR-it873, the SAME gap class again, never itself
+        // mirrored for `ComponentDecl.children` in the workspace-wide search path
+        // either): searching for `addOn` used to find nothing at all here.
         std::fs::write(
             dir.join("comp.kupl"),
-            "component Box {\n    intent \"b\"\n    prop addr: Str\n    expose fun show() -> Str {\n        addr\n    }\n}\n",
+            "component Base {\n    intent \"b2\"\n    expose fun ping() -> Int {\n        0\n    }\n}\ncomponent Box {\n    intent \"b\"\n    prop addr: Str\n    let addOn = Base()\n    expose fun show() -> Str {\n        addr\n    }\n}\n",
         )
         .unwrap();
 
@@ -4962,6 +5087,7 @@ mod tests {
         assert!(matches.contains("\"name\":\"add\""), "{matches}");
         assert!(matches.contains("\"name\":\"addTwo\""), "{matches}"); // found in the NESTED file
         assert!(matches.contains("\"name\":\"addr\""), "{matches}"); // the component's own prop
+        assert!(matches.contains("\"name\":\"addOn\""), "{matches}"); // the component's own child
         assert!(matches.contains("main.kupl"), "{matches}");
         assert!(matches.contains("lib/util.kupl") || matches.contains("lib%2Futil.kupl"), "{matches}");
         // case-insensitive substring match, not exact-name
