@@ -2081,6 +2081,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it903,
+    /// an Explore survey finding, agentId a5870a9744357585b, independently
+    /// re-verified live before implementing -- see `interp.rs::forall_case`'s
+    /// own doc comment for the full writeup). A `forall` inside a contract
+    /// `law` runs its body against the SAME, single, already-instantiated
+    /// component instance for every one of the 100 generated cases AND every
+    /// candidate the shrinker tries -- if the property depends on the
+    /// component's own `state`, state silently ACCUMULATES across cases with
+    /// no reset between them, so a case can "fail" purely because of prior
+    /// accumulated state, and the greedy shrinker collapses onto whatever
+    /// candidate is tried FIRST once state has crossed the threshold -- a
+    /// PHANTOM counterexample. Live-confirmed BEFORE this fix: a `Store`
+    /// contract's law `forall k: Str { put(k, "x"); expect size() <= 3 }`
+    /// against an append-only `MemoryStore` reported `property failed for k
+    /// = ""`, but a standalone law running the IDENTICAL body against a
+    /// FRESH instance with that EXACT value (`put(""); expect size() <= 3`)
+    /// PASSED cleanly (size becomes 1) -- proving the reported "minimal
+    /// counterexample" never actually reproduced. Fixed by resetting every
+    /// component instance a `forall`'s scope references back to fresh state
+    /// before every case (`Env::bound_instance_ids` + `Interp::
+    /// reset_instance_state`, the same state-reinitialization logic
+    /// `restart` already used for supervision). This test covers both
+    /// directions: the exact phantom-failure shape above must now PASS, and
+    /// a property that genuinely fails independent of accumulated state
+    /// (`k.len() <= 3`, which the SAME `k` value fails standalone too) must
+    /// still be caught with an ACCURATE, reproducing counterexample.
+    #[test]
+    fn forall_resets_a_contract_laws_tested_instance_state_between_cases() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-forall-state-reset-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let component = "component MemoryStore fulfills Store {\n    \
+                          intent \"in-memory store\"\n    state entries: List[Str] = []\n    \
+                          expose fun put(key: Str, value: Str) -> Bool { entries = entries.push(key); true }\n    \
+                          expose fun size() -> Int { entries.len() }\n}\nfun main() {}\n";
+
+        // A property that ONLY appears to fail because state accumulates
+        // across cases (an append-only store's size grows monotonically) --
+        // for ANY single key, size stays well under the cap. Must now PASS.
+        let phantom_file = dir.join("phantom.kupl");
+        std::fs::write(
+            &phantom_file,
+            format!(
+                "contract Store {{\n    intent \"keyed store, size test\"\n    \
+                 expose fun put(key: Str, value: Str) -> Bool\n    expose fun size() -> Int\n\n    \
+                 law \"size stays small\" {{\n        forall k: Str {{\n            put(k, \"x\")\n            \
+                 expect size() <= 3\n        }}\n    }}\n}}\n\n{component}"
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["test", phantom_file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("1 passed, 0 failed"),
+            "a property that only APPEARED to fail due to state accumulated from EARLIER \
+             cases sharing one instance must now pass, each case judged on its own generated \
+             value against fresh state: {stdout:?}"
+        );
+
+        // A property that genuinely fails independent of accumulated state
+        // (a single put() of a too-long key already violates it) must still
+        // be caught, with an ACCURATE counterexample that reproduces alone.
+        let genuine_file = dir.join("genuine.kupl");
+        std::fs::write(
+            &genuine_file,
+            format!(
+                "contract Store {{\n    intent \"keyed store, rejects long keys\"\n    \
+                 expose fun put(key: Str, value: Str) -> Bool\n    expose fun size() -> Int\n\n    \
+                 law \"keys must be short\" {{\n        forall k: Str {{\n            put(k, \"x\")\n            \
+                 expect k.len() <= 3\n        }}\n    }}\n}}\n\n{component}"
+            ),
+        )
+        .unwrap();
+        let out2 = std::process::Command::new(&bin)
+            .args(["test", genuine_file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout2 = String::from_utf8_lossy(&out2.stdout);
+        assert!(
+            stdout2.contains("0 passed, 1 failed"),
+            "a property that genuinely fails must still be caught: {stdout2:?}"
+        );
+        assert!(
+            stdout2.contains("`k.len() <= 3` was not satisfied"),
+            "must name the actually-failing condition: {stdout2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL text-consistency bug found+fixed (production-hardening
     /// PR-it783, the same finding as `plain_and_forall_expect_failures_...`
     /// above, but at a DIFFERENT site with no shared code path: a component

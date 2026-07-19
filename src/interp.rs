@@ -503,16 +503,28 @@ impl Interp {
         Ok(())
     }
 
-    /// Supervision restart: reset state fields to their initial values, keep
-    /// props/children/wires, re-run `on start`.
-    fn restart(&mut self, id: usize, panic_msg: &str) -> Result<(), Flow> {
+    /// Re-evaluate instance `id`'s own `state` field initializers against its
+    /// existing `env`, overwriting their current values -- resets state back
+    /// to fresh/just-instantiated values in place, touching neither props,
+    /// children, wires, nor the instance's own identity/id. Shared by
+    /// `restart` (supervision) and `forall_case` (property-test isolation,
+    /// production-hardening PR-it903 -- see that function's own doc comment).
+    fn reset_instance_state(&mut self, id: usize) -> Result<(), Flow> {
         let comp = self.instances[id].comp.clone();
         let env = self.instances[id].env.clone();
-        eprintln!("[supervise] {} restarted after panic: {panic_msg}", comp.name);
         for s in &comp.state {
             let v = self.eval(&s.init, &env)?;
             env.define(&s.name, v);
         }
+        Ok(())
+    }
+
+    /// Supervision restart: reset state fields to their initial values, keep
+    /// props/children/wires, re-run `on start`.
+    fn restart(&mut self, id: usize, panic_msg: &str) -> Result<(), Flow> {
+        let comp = self.instances[id].comp.clone();
+        eprintln!("[supervise] {} restarted after panic: {panic_msg}", comp.name);
+        self.reset_instance_state(id)?;
         for h in &comp.handlers {
             if matches!(h.trigger, Trigger::Start) {
                 self.run_handler(id, h, Value::Unit)?;
@@ -917,6 +929,44 @@ impl Interp {
 
     /// Run the body with one binding. `Ok(None)` = passed, `Ok(Some(msg))` =
     /// failed (msg is the panic message), `Err(flow)` = unexpected control flow.
+    ///
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it903,
+    /// an Explore survey finding, agentId a5870a9744357585b, independently
+    /// re-verified live before implementing): a `forall` inside a contract
+    /// `law` runs its body against the SAME, single, already-instantiated
+    /// component instance for every one of `CASES` (100) generated cases,
+    /// AND for every candidate `shrink_forall` tries -- `run.rs`'s law
+    /// runner instantiates the fulfilling component ONCE per law and binds
+    /// its exposed functions (`Value::Bound(id, ..)`) to that ONE instance
+    /// for the law's entire body. If the property depends on the component's
+    /// own `state` (KUPL's headline stateful-component feature, and the
+    /// sanctioned pattern `examples/contracts.kupl` itself demonstrates for
+    /// testing components via their exposed interface), state silently
+    /// ACCUMULATES across cases/shrink-candidates with NO reset between
+    /// them -- so a later case can "fail" purely because of how much prior
+    /// state has built up, not because of its OWN generated value, and the
+    /// greedy shrinker then collapses onto whatever candidate is tried
+    /// FIRST (e.g. the empty string, first in `prop::shrink`'s own Str
+    /// candidate order) simply because state has ALREADY crossed the
+    /// property's threshold by that point -- a PHANTOM counterexample, not
+    /// a real one. Live-confirmed: a `Store` contract's law `forall k: Str {
+    /// put(k, "x"); expect size() <= 3 }` against an append-only
+    /// `MemoryStore` reported `property failed for k = ""`, but a standalone
+    /// law running the IDENTICAL body against a FRESH instance with that
+    /// EXACT literal value (`put(""); expect size() <= 3`) PASSES cleanly
+    /// (size becomes 1, well under 3) -- an airtight proof the reported
+    /// "minimal counterexample" does not actually reproduce, exactly the
+    /// kind of false report that would send a developer chasing a bug that
+    /// doesn't exist. Fixed by resetting every component instance this
+    /// scope references (found via `Env::bound_instance_ids`, walking `env`
+    /// and its ancestor scopes for `Value::Bound` bindings -- typically the
+    /// single instance a contract law's setup bound, but written generally
+    /// since a `forall` may reference more) back to fresh state before
+    /// EVERY case, so each case/candidate is judged purely on its own
+    /// generated value against a consistent baseline, matching what the
+    /// reported "property failed for k = X" message implies to a reader. A
+    /// `forall` with no bound component instance in scope (an ordinary,
+    /// stateless property) finds zero ids here and is completely unaffected.
     fn forall_case(
         &mut self,
         vars: &[(String, TyExpr)],
@@ -924,6 +974,11 @@ impl Interp {
         vals: &[Value],
         env: &Env,
     ) -> Result<Option<String>, Flow> {
+        let mut instance_ids = std::collections::HashSet::new();
+        env.bound_instance_ids(&mut instance_ids);
+        for id in instance_ids {
+            self.reset_instance_state(id)?;
+        }
         let scope = env.child();
         for ((name, _), v) in vars.iter().zip(vals) {
             scope.define(name, v.clone());

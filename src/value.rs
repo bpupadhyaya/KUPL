@@ -1197,6 +1197,28 @@ impl Env {
             None => false,
         }
     }
+
+    /// Collect the distinct component-instance ids referenced by any
+    /// `Value::Bound(id, _)` binding reachable from this scope (this scope's
+    /// own bindings AND every ancestor scope, since a `forall`'s own local
+    /// scope is a CHILD of whatever scope bound the contract's exposed
+    /// functions). Used by `interp.rs::forall_case` (production-hardening
+    /// PR-it903 -- see that function's own doc comment) to reset a
+    /// contract-law's tested component instance back to fresh state before
+    /// every property-test case, so each case is judged on its own generated
+    /// value rather than on how much state happened to accumulate from
+    /// EARLIER cases sharing the same live instance.
+    pub fn bound_instance_ids(&self, out: &mut std::collections::HashSet<usize>) {
+        let inner = self.0.borrow();
+        for (_, v) in &inner.vars {
+            if let Value::Bound(id, _) = v {
+                out.insert(*id);
+            }
+        }
+        if let Some(p) = &inner.parent {
+            p.bound_instance_ids(out);
+        }
+    }
 }
 
 impl Default for Env {
