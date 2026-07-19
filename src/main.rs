@@ -296,6 +296,33 @@ fn run_cli() -> ExitCode {
                 }
                 println!("formatted: {file}");
             } else {
+                // A REAL, live-confirmed bug found+fixed (production-hardening
+                // PR-it889, an Explore survey finding, independently re-verified
+                // live before implementing): the SAME formatter-bug-producing-
+                // invalid-output class PR-it837 already guards for `--write`
+                // above (and `lsp.rs::resolve_formatting`) was never applied to
+                // THIS plain-print path -- confirmed live before this fix, a
+                // pathological string-interpolation input (a literal `{{` inside
+                // an interpolated conditional expression, tripping
+                // `reindent_inline`'s naive per-line brace-count heuristic into
+                // its raw-multi-line-block fallback) formatted to text with
+                // literal newlines spliced into what was a single-line string
+                // interpolation -- syntactically invalid, 7 cascading parse
+                // errors on re-check, printed at exit 0 with zero diagnostic.
+                // Worse than the write-path gap PR-it837 closed: `kupl fmt
+                // file.kupl > file.kupl`, a natural shell-redirection workflow,
+                // would have the shell TRUNCATE the source file before this
+                // command even runs, so the file-level round-trip guard on
+                // `--write` never gets a chance to protect it either. Same fix:
+                // recompile the freshly-formatted text through the full
+                // pipeline and refuse to print it if it doesn't come back
+                // clean.
+                if let Err(_compile_errors) = kupl::run::compile(&formatted) {
+                    eprintln!(
+                        "error: internal formatter bug producing invalid output for {file} -- refusing to print it (please report this as a KUPL bug)"
+                    );
+                    return 1;
+                }
                 print!("{formatted}");
             }
             0
@@ -778,6 +805,57 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&tmp_f32);
+    }
+
+    /// A REAL, live-confirmed bug found+fixed (production-hardening PR-it889,
+    /// an Explore survey finding, independently re-verified live before
+    /// implementing): the SAME PR-it837 safety net `--write` above (and
+    /// `lsp.rs::resolve_formatting`) already had was never applied to the
+    /// PLAIN (no-flag) `kupl fmt` print path. A pathological string-
+    /// interpolation input -- a literal `{{` inside an interpolated
+    /// conditional expression, tripping `reindent_inline`'s naive per-line
+    /// brace-count heuristic into its raw-multi-line-block fallback --
+    /// formatted to text with literal newlines spliced into what was a
+    /// single-line string interpolation, syntactically INVALID (7 cascading
+    /// parse errors on re-check), printed unconditionally at exit 0 with
+    /// zero diagnostic. Confirmed live before this fix: `kupl fmt` on this
+    /// exact input printed the broken text at exit 0, while `kupl fmt
+    /// --write` on the SAME input already correctly refused. Worse than the
+    /// write-path gap PR-it837 closed: `kupl fmt file.kupl > file.kupl`, a
+    /// natural shell-redirection workflow, has the shell TRUNCATE the
+    /// source file before this command even runs -- the file-level
+    /// round-trip guard on `--write` never gets a chance to protect that
+    /// usage either. Fixed identically: recompile the freshly-formatted
+    /// text through the full pipeline and refuse to print it if it doesn't
+    /// come back clean.
+    #[test]
+    fn fmt_plain_print_refuses_to_emit_invalid_output_from_a_brace_counting_heuristic_gap() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let tmp = std::env::temp_dir().join(format!("kupl_it889_fmt_plain_{}.kupl", std::process::id()));
+        let original =
+            b"fun main() uses io {\n    var a = true\n    print(\"outer {if a { \"{{\" } else { \"y\" }} end\")\n}\n".to_vec();
+        std::fs::write(&tmp, &original).unwrap();
+
+        // sanity: the ORIGINAL file is valid and runs fine before touching `fmt` at all.
+        let ran = run(&["run", tmp.to_str().unwrap()]);
+        assert_eq!(ran.status.code(), Some(0), "the original program must run fine: {ran:?}");
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "outer { end");
+
+        let printed = run(&["fmt", tmp.to_str().unwrap()]);
+        assert_eq!(printed.status.code(), Some(1), "must refuse to print invalid output: {printed:?}");
+        assert!(
+            String::from_utf8_lossy(&printed.stderr).contains("refusing to print"),
+            "{printed:?}"
+        );
+        assert!(printed.stdout.is_empty(), "must not print anything on stdout when refusing: {printed:?}");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
