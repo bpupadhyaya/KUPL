@@ -153,6 +153,59 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
             referenced.insert(owner.to_string());
         }
     };
+    // A REAL usability gap found+fixed (production-hardening PR-it859, a
+    // quick follow-up re-audit of `emit_context`'s remaining code after
+    // it858's `children[].args` fix, following THIS campaign's own
+    // repeatedly-validated "re-audit a function with prior fix history"
+    // technique): a `FunDecl`'s `params[].default` (a param's default-value
+    // expression, e.g. `x: Int = default_provider()`) and `ai` field's
+    // `intent_expr`/`tools` (an ai-fun's interpolated intent and the list of
+    // top-level functions it may call) were NEVER walked -- so a function
+    // referenced ONLY via a default value, an ai-fun's intent interpolation,
+    // or an ai-fun's `tools` list never appeared in `kupl context`'s "direct
+    // dependencies", even though the target item's OWN printed source
+    // visibly shows it. Confirmed live BEFORE this fix for a TOP-LEVEL
+    // `Item::Fun`: `kupl context` printed
+    // `fun uses_default(x: Int = default_provider()) -> Int { x }` with an
+    // ENTIRELY EMPTY dependency closure (no `--- direct dependencies ---`
+    // section at all); same for
+    // `ai fun assistant(q: Str) -> Str tools [helper_tool] { intent "..." }`
+    // -- `helper_tool` never appeared despite being right there in
+    // `tools [...]`. Fixed by walking `p.default` and `ai.intent_expr`
+    // through the same pattern already used for `state[].init`, and
+    // `ai.tools` via `note()` directly (same treatment as `fulfills`). This
+    // helper is ALSO applied below to `Component`'s `exposes`/`funs` loop --
+    // confirmed DEFENSIVE there, not a second live bug: a param default on
+    // an exposed/internal component method is rejected at check time
+    // (K0275, "defaults only apply to top-level `fun` parameters"), and an
+    // `ai fun` can only ever be parsed as a TOP-LEVEL item (`parser.rs`'s
+    // `parse_item`, not `parse_component_member`/`parse_fun`), so `f.ai` is
+    // structurally always `None` for anything reached via `c.exposes`/
+    // `c.funs` today -- kept for the same reason bytecode.rs's PR-it847
+    // kept its own statically-confirmed-but-not-live-reachable fix: honest,
+    // future-proof completeness, not an observed live bug in this arm.
+    let walk_fun_extras = |f: &crate::ast::FunDecl, note: &mut dyn FnMut(&str)| {
+        for p in &f.params {
+            if let Some(d) = &p.default {
+                crate::effects::walk_block(
+                    &crate::ast::Block { stmts: vec![crate::ast::Stmt::Expr(d.clone())], span: d.span },
+                    &mut |e| collect_expr_names(e, note),
+                );
+            }
+        }
+        if let Some(ai) = &f.ai {
+            for tool in &ai.tools {
+                note(tool);
+            }
+            crate::effects::walk_block(
+                &crate::ast::Block {
+                    stmts: vec![crate::ast::Stmt::Expr(ai.intent_expr.clone())],
+                    span: ai.intent_expr.span,
+                },
+                &mut |e| collect_expr_names(e, note),
+            );
+        }
+    };
     match target {
         Item::Fun(f) => {
             for p in &f.params {
@@ -162,6 +215,7 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
                 collect_ty_names(r, &mut note);
             }
             crate::effects::walk_block(&f.body, &mut |e| collect_expr_names(e, &mut note));
+            walk_fun_extras(f, &mut note);
         }
         Item::Type(t) => {
             for v in &t.variants {
@@ -234,6 +288,7 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
                     collect_ty_names(r, &mut note);
                 }
                 crate::effects::walk_block(&f.body, &mut |e| collect_expr_names(e, &mut note));
+                walk_fun_extras(f, &mut note);
             }
         }
         Item::Law(l) => {
@@ -285,7 +340,7 @@ fn collect_ty_names(t: &crate::ast::TyExpr, f: &mut impl FnMut(&str)) {
     }
 }
 
-fn collect_expr_names(e: &crate::ast::Expr, f: &mut impl FnMut(&str)) {
+fn collect_expr_names(e: &crate::ast::Expr, f: &mut (impl FnMut(&str) + ?Sized)) {
     use crate::ast::ExprKind;
     match &e.kind {
         ExprKind::Ident(n) => f(n),
@@ -336,7 +391,7 @@ fn collect_expr_names(e: &crate::ast::Expr, f: &mut impl FnMut(&str)) {
 /// a different bug, same missing-case shape) so this doesn't reintroduce it
 /// here. `Wildcard`/`Bind`/`Int`/`Bool`/`Str`/`Range` are leaf patterns with
 /// no name to report.
-fn collect_pattern_names(p: &crate::ast::Pattern, f: &mut impl FnMut(&str)) {
+fn collect_pattern_names(p: &crate::ast::Pattern, f: &mut (impl FnMut(&str) + ?Sized)) {
     use crate::ast::PatternKind;
     match &p.kind {
         PatternKind::Ctor { name, args } => {
@@ -2457,6 +2512,71 @@ mod tests {
             "a function referenced ONLY in a POSITIONAL child-instantiation argument must appear \
              in the dependency closure: {stdout:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL usability gap found+fixed (production-hardening PR-it859, a
+    /// quick follow-up re-audit of `emit_context` after it858's fix,
+    /// following this campaign's own repeatedly-validated "re-audit a
+    /// function with prior fix history" technique): a TOP-LEVEL `fun`'s
+    /// param default-value expression (`x: Int = default_provider()`) and
+    /// an `ai fun`'s interpolated `intent` and `tools` list were NEVER
+    /// walked -- so a function referenced ONLY through one of these never
+    /// appeared in `kupl context`'s "direct dependencies", even though the
+    /// target item's own printed source visibly shows it. Confirmed live
+    /// BEFORE this fix: the dependency closure was ENTIRELY EMPTY (no
+    /// `--- direct dependencies ---` section at all) for both cases. Note:
+    /// this fix's `walk_fun_extras` helper is ALSO applied to `Component`'s
+    /// `exposes`/`funs` loop, but that application is confirmed DEFENSIVE
+    /// ONLY (not independently live-tested here) -- a param default on an
+    /// exposed/internal component method is rejected at check time (K0275),
+    /// and `ai fun` can only ever be parsed as a top-level item, so neither
+    /// sub-case can be constructed as a live component-scoped repro today;
+    /// see this fix's own code comment for the full reasoning.
+    #[test]
+    fn emit_context_includes_names_referenced_only_via_a_param_default_or_ai_fun_intent_and_tools() {
+        let dir = std::env::temp_dir().join(format!("kupl-ctx-aiextras-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.kupl");
+        std::fs::write(
+            &file,
+            "fun default_provider() -> Int { 99 }\n\
+             fun uses_default(x: Int = default_provider()) -> Int { x }\n\
+             fun helper_tool(a: Int) -> Int { a }\n\
+             fun make_greeting() -> Str { \"hi\" }\n\
+             ai fun assistant(q: Str) -> Str tools [helper_tool] {\n    \
+             intent \"{make_greeting()}: {q}\"\n}\n",
+        )
+        .unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no debug binary built yet -- nothing to test
+        }
+        let run_ctx = |name: &str| -> String {
+            let out = std::process::Command::new(&bin)
+                .args(["context", file.to_str().unwrap(), name])
+                .output()
+                .expect("kupl context runs");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let default_out = run_ctx("uses_default");
+        assert!(
+            default_out.contains("fun default_provider"),
+            "a function referenced ONLY via a param default must appear: {default_out:?}"
+        );
+
+        let ai_out = run_ctx("assistant");
+        assert!(
+            ai_out.contains("fun helper_tool"),
+            "a top-level ai fun's `tools` list must appear in the dependency closure: {ai_out:?}"
+        );
+        assert!(
+            ai_out.contains("fun make_greeting"),
+            "a function referenced ONLY via an ai fun's intent interpolation must appear: {ai_out:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
