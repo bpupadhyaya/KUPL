@@ -242,7 +242,29 @@ fn interface_of(item: &Item) -> String {
             }
             s.push_str(&format!(" uses[{}]", f.effects.join(",")));
             if let Some(ai) = &f.ai {
-                s.push_str(&format!(" ai[intent={} tools={}]", ai.intent, ai.tools.join(",")));
+                // A REAL bug found+fixed (production-hardening PR-it864, an
+                // Explore survey finding, independently re-verified live
+                // before implementing): the SAME sig-interface gap PR-it580/
+                // PR-it643 fixed for contract method effects and a type's
+                // own type parameters, found here for an `ai fun`'s `model`
+                // field -- `intent`/`tools` are both part of this fingerprint
+                // (an `ai fun`'s observable behavior), but `model` (which
+                // underlying LLM the call routes to, e.g. `claude-opus-4-8`
+                // vs a different vendor's model entirely) was omitted, so a
+                // model-only change was misclassified as "[implementation
+                // only]" instead of "[INTERFACE — breaking]". Live-confirmed
+                // before this fix: an `ai fun` differing ONLY in its `model`
+                // field reported `[implementation only]`, while the SAME
+                // function differing only in `intent` correctly reported
+                // `[INTERFACE — breaking]` -- the two fields control the
+                // exact same kind of caller-observable behavior change but
+                // were classified inconsistently.
+                s.push_str(&format!(
+                    " ai[intent={} model={} tools={}]",
+                    ai.intent,
+                    ai.model.as_deref().unwrap_or(""),
+                    ai.tools.join(",")
+                ));
             }
         }
         Item::Type(t) => {
@@ -713,6 +735,39 @@ mod tests {
             "type Pair[B, A] = Pair(first: A, second: B)\n",
         );
         assert_eq!(lines, vec!["interface Pair"]);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it864, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// the SAME sig-interface gap PR-it580/PR-it643 fixed for contract
+    /// method effects and a type's own type parameters, found here for an
+    /// `ai fun`'s `model` field -- `intent`/`tools` were both part of the
+    /// fingerprint, but `model` was omitted, so a model-only change was
+    /// misclassified as "[implementation only]" instead of "[INTERFACE —
+    /// breaking]", even though it controls the exact same kind of
+    /// caller-observable behavior change (which LLM the call routes to).
+    #[test]
+    fn ai_fun_model_change_is_interface_even_with_identical_intent_and_tools() {
+        let (lines, _) = diff_lines(
+            "ai fun haiku(topic: Str) -> Str {\n    intent \"Write a haiku about {topic}.\"\n    model \"claude-opus-4-8\"\n}\n",
+            "ai fun haiku(topic: Str) -> Str {\n    intent \"Write a haiku about {topic}.\"\n    model \"a-totally-different-vendor-model\"\n}\n",
+        );
+        assert_eq!(lines, vec!["interface haiku"]);
+
+        // sanity: an intent-only change (unrelated to this fix) still correctly
+        // reports interface -- locks the sibling shape doesn't regress.
+        let (lines, _) = diff_lines(
+            "ai fun haiku(topic: Str) -> Str {\n    intent \"Write a haiku about {topic}.\"\n    model \"claude-opus-4-8\"\n}\n",
+            "ai fun haiku(topic: Str) -> Str {\n    intent \"Compose a haiku about {topic}.\"\n    model \"claude-opus-4-8\"\n}\n",
+        );
+        assert_eq!(lines, vec!["interface haiku"]);
+
+        // sanity: no change at all (same model, same intent) is genuinely unchanged.
+        let (lines, changed) = diff_lines(
+            "ai fun haiku(topic: Str) -> Str {\n    intent \"Write a haiku about {topic}.\"\n    model \"claude-opus-4-8\"\n}\n",
+            "ai fun haiku(topic: Str) -> Str {\n    intent \"Write a haiku about {topic}.\"\n    model \"claude-opus-4-8\"\n}\n",
+        );
+        assert!(lines.is_empty() && !changed, "identical ai fun declarations must report no change: {lines:?}");
     }
 
     #[test]
