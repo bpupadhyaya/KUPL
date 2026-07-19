@@ -660,14 +660,44 @@ impl Checker {
                             self.err("K0204", format!("port `{}` declared twice", port.name), port.span);
                         }
                     }
+                    // A REAL cross-engine-divergence bug found+fixed (production-
+                    // hardening PR-it862, an Explore survey finding, independently
+                    // re-verified live before implementing): unlike its sibling
+                    // ports loop three lines above (K0204), this loop had NO
+                    // duplicate-name check at all -- `sig.props` is a plain `Vec`,
+                    // built by unconditionally pushing every `prop` declaration. The
+                    // PR-it701 doc comment immediately below this loop claims "props
+                    // K0215" is already a sibling duplicate-DECLARATION check, but
+                    // that's a mislabeled cross-reference: K0215 actually rejects a
+                    // duplicate prop NAME supplied at a CONSTRUCTION CALL SITE (e.g.
+                    // `C(w: 1, w: 2)`), a structurally different check from
+                    // declaring `prop w: Int` twice in the component body itself.
+                    // Confirmed live before this fix that this is a genuine ACCEPT-
+                    // vs-REJECT divergence, not merely a missing diagnostic:
+                    // `component C { prop w: Int; prop w: Int; expose fun sum() ->
+                    // Int { w } }` with `C(w: 1)` -- `kupl check`/`kupl run` both
+                    // silently ACCEPT and print `1` (interp.rs's constructor-call
+                    // path and `check_ctor_args` both track "supplied" props by
+                    // NAME, so a single named arg satisfies both duplicate slots),
+                    // while `kupl run --vm`/`kupl native` correctly REJECT with
+                    // `error[K0216]: missing required prop \`w\` for \`C\`` (
+                    // compile.rs's `instance_expr` tracks supplied props by
+                    // POSITIONAL INDEX, correctly noticing the second slot was
+                    // never filled) -- a direct violation of the four-engines-
+                    // byte-identical invariant on whether the program is even
+                    // valid, reachable from source with zero diagnostics on two of
+                    // the four engines.
                     for prop in &c.props {
                         let ty = self.resolve_ty(&prop.ty);
+                        if sig.props.iter().any(|(n, ..)| n == &prop.name) {
+                            self.err("K0283", format!("prop `{}` declared twice", prop.name), prop.span);
+                        }
                         sig.props.push((prop.name.clone(), ty, prop.default.is_some()));
                     }
                     // A REAL cross-engine-divergence bug (production-hardening
                     // PR-it701): unlike every sibling collection in this same
                     // function (ports K0204, children K0207, `on` handlers K0209,
-                    // props K0215, top-level funs K0203), a component's PRIVATE
+                    // props K0283, top-level funs K0203), a component's PRIVATE
                     // and EXPOSED methods had no duplicate-name check at all --
                     // `c.funs`/`c.exposes` are both plain `Vec<FunDecl>`, and
                     // nothing rejected two same-named methods (private+private,
@@ -5433,6 +5463,43 @@ mod generic_tests {
         assert!(
             fulfills_hole.iter().any(|d| d.code == "K0277" && d.message.contains("method `act`")),
             "{fulfills_hole:?}"
+        );
+    }
+
+    /// A REAL cross-engine-divergence bug found+fixed (production-hardening
+    /// PR-it862, an Explore survey finding, independently re-verified live
+    /// before implementing): unlike its sibling ports loop (K0204) in the
+    /// same component signature-collection pass, a component's `prop`
+    /// declarations had NO duplicate-name check at all -- `sig.props` is a
+    /// plain `Vec`, built by unconditionally pushing every declaration. This
+    /// is NOT the same check as K0215 (which rejects a duplicate prop name
+    /// supplied at a CONSTRUCTION CALL SITE, e.g. `C(w: 1, w: 2)`) -- a prior
+    /// fix's own doc comment mislabeled K0215 as covering this declaration-
+    /// site case too, which it never did. Confirmed live before this fix
+    /// that this is a genuine ACCEPT-vs-REJECT divergence, not merely a
+    /// missing diagnostic: `component C { prop w: Int; prop w: Int; expose
+    /// fun sum() -> Int { w } }` with `C(w: 1)` -- `kupl check`/`kupl run`
+    /// both silently accepted and printed `1` (both track "supplied" props
+    /// by NAME, so one named arg satisfies both duplicate slots), while
+    /// `kupl run --vm`/`kupl native` correctly rejected with `error[K0216]:
+    /// missing required prop \`w\` for \`C\`` (compile.rs's `instance_expr`
+    /// tracks supplied props by POSITIONAL INDEX instead) -- a direct
+    /// violation of the four-engines-byte-identical invariant on whether the
+    /// program is even valid.
+    #[test]
+    fn duplicate_component_prop_names_are_rejected() {
+        let dup = errors("component C {\n    intent \"dup\"\n    prop w: Int\n    prop w: Int\n    expose fun sum() -> Int { w }\n}\nfun main() {}\n");
+        assert!(
+            dup.iter().any(|d| d.code == "K0283" && d.message.contains("prop `w`") && d.message.contains("declared twice")),
+            "{dup:?}"
+        );
+        // a prop duplicated against a DIFFERENT type is still rejected the same way.
+        let dup_diff_ty = errors("component C {\n    intent \"dup\"\n    prop w: Int\n    prop w: Str\n    expose fun sum() -> Int { w }\n}\nfun main() {}\n");
+        assert!(dup_diff_ty.iter().any(|d| d.code == "K0283" && d.message.contains("prop `w`")), "{dup_diff_ty:?}");
+        // an ordinary component with distinctly-named props is unaffected.
+        assert!(
+            errors("component Ok {\n    intent \"ok\"\n    prop a: Int\n    prop b: Int\n    expose fun sum() -> Int { a + b }\n}\nfun main() {}\n")
+                .is_empty()
         );
     }
 
