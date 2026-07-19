@@ -171,6 +171,43 @@ pub fn parse_expr_fragment(src: &str, offset: u32) -> Result<Expr, Diag> {
     let mut p = Parser { toks, pos: 0, diags: Vec::new(), uses: Vec::new(), depth: 0 };
     p.skip_newlines();
     let expr = p.parse_expr()?;
+    // A REAL, live-confirmed SILENT MISPARSE found+fixed (production-
+    // hardening PR-it892, an Explore survey finding, independently
+    // re-verified live before implementing): unlike every other grammar
+    // entry point in this file (`parse_program`'s own loop runs to `Eof`;
+    // a parenthesized expression's `Tok::LParen` case explicitly `expect`s
+    // its closing `)`), this function never checked that `parse_expr`
+    // actually consumed the WHOLE fragment -- `parse_expr` returns as soon
+    // as it finds one complete expression and simply stops, so any tokens
+    // left over in a `{...}` string-interpolation slot were silently
+    // dropped with NO diagnostic. Confirmed live before this fix:
+    // `print("sum: {a b}")` (two adjacent identifiers, no operator between
+    // them -- most plausibly a forgotten `+`/`*`) printed `sum: 1`,
+    // silently discarding `b` from the AST entirely -- identical, wrong
+    // output across interp, `--vm`, `.kx`, AND native (this is a shared
+    // parser bug, not a cross-engine divergence). Worse: `kupl fmt`
+    // CANONICALIZES the bug away, silently rewriting the source text
+    // itself from `"sum: {a b}"` to `"sum: {a}"` -- with `--write`, this
+    // is genuine, silent, permanent data loss in the user's own file, not
+    // just a bad runtime result. Fixed by asserting the fragment is fully
+    // consumed, mirroring `self.expect`'s own "expected X, found Y"
+    // wording convention. (Checked the sibling `parse_stmt_fragment` above
+    // for the SAME gap -- it does NOT need this fix: `parse_stmt` already
+    // internally calls `expect_terminator` on every statement variant,
+    // which only accepts `Newline`/`RBrace`/`Eof`, so trailing garbage
+    // after a REPL statement is already a clean K0102 error, live-
+    // reconfirmed before ruling it out.)
+    p.skip_newlines();
+    if !matches!(p.peek(), Tok::Eof) {
+        return Err(Diag::error(
+            "K0100",
+            format!(
+                "expected end of expression, found {} — a string interpolation `{{...}}` must contain a single expression",
+                p.peek().describe()
+            ),
+            p.span(),
+        ));
+    }
     if let Some(d) = p.diags.into_iter().next() {
         return Err(d);
     }
@@ -2818,6 +2855,39 @@ mod tests {
                  fragment's own 0-based coordinates instead of the real file location: {diags:?}"
             );
         }
+    }
+
+    /// A REAL, live-confirmed SILENT MISPARSE (production-hardening PR-it892,
+    /// an Explore survey finding, independently re-verified live before
+    /// implementing): `parse_expr_fragment` never checked that `parse_expr`
+    /// consumed the WHOLE `{...}` interpolation fragment -- `parse_expr`
+    /// stops as soon as it finds one complete expression, so trailing tokens
+    /// (most plausibly a forgotten binary operator, e.g. `{a b}` meaning
+    /// `{a + b}`) were silently DROPPED from the AST with no diagnostic at
+    /// all. Confirmed live BEFORE this fix: `print("sum: {a b}")` printed
+    /// `sum: 1`, silently discarding `b` -- identical wrong output on
+    /// interp/`--vm`/native, and `kupl fmt` CANONICALIZED the bug into the
+    /// source text itself (rewriting `"sum: {a b}"` to `"sum: {a}"`),
+    /// meaning `--write` would have made the data loss permanent.
+    #[test]
+    fn a_string_interpolation_with_trailing_tokens_is_a_clean_error_not_a_silent_misparse() {
+        let src = "fun main() -> Int {\n    let a = 1\n    let b = 2\n    a\n}\nfun g() -> Str {\n    \"sum: {a b}\"\n}\n";
+        let (_, diags) = parse(src);
+        assert!(
+            diags.iter().any(|d| d.code == "K0100" && d.message.contains("expected end of expression")),
+            "trailing tokens after a complete interpolation expression must be a clean K0100 error, \
+             not silently dropped from the AST: {diags:?}"
+        );
+        // The error must point at the OFFENDING trailing token (`b`), not the
+        // start of the interpolation or the whole string literal.
+        let d = diags.iter().find(|d| d.code == "K0100" && d.message.contains("expected end of expression")).unwrap();
+        let bad_b = src.find("{a b}").unwrap() as u32 + 3; // offset of `b` within `{a b}`
+        assert_eq!(d.span.start, bad_b, "span must point at the trailing `b`, not elsewhere: {d:?}");
+        // A normal, single-expression interpolation -- including operators,
+        // method calls, and a NESTED if-expression interpolation -- must
+        // still parse cleanly with zero regression.
+        ok("fun main() uses io {\n    let a = 1\n    let b = 2\n    \
+            print(\"sum: {a + b}, product: {a * b}, nested: {if a > 0 { \"pos\" } else { \"neg\" }}\")\n}\n");
     }
 
     #[test]
