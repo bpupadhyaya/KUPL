@@ -3646,27 +3646,84 @@ static int k_ieq_ascii(char a, char b) {
 }
 /* Find a `Content-Length` header in a raw request head (case-insensitive
    name, must start a line) and return its value, capped at K_MAX_HTTP_BODY.
-   Missing/unparsable -> 0 (no body). Mirrors interp::parse_content_length. */
+   Missing/unparsable -> 0 (no body). Mirrors interp::parse_content_length.
+   A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it901, an
+   Explore survey finding, agentId a27959522f0a4531f, independently
+   re-verified live before implementing): this doc comment's own "unparsable
+   -> 0" contract was never actually implemented for a Content-Length value
+   with too many digits to fit -- `interp::parse_content_length`'s Rust
+   `value.trim().parse::<usize>()` is a CHECKED parse that returns `Err` (and
+   so falls through to 0) once the digits would overflow `usize`, but this C
+   accumulator instead SATURATED any excess digit count straight to
+   `K_MAX_HTTP_BODY` once `v` first exceeded it, treating an absurdly-long
+   digit string as "there really is a ~10MB body coming" rather than
+   "unparsable." Live-confirmed: `Content-Length: 999999999999999999999999
+   999999` (32 nines) made interp/`--vm` respond INSTANTLY with an empty body
+   (0 -- unparsable, per the documented contract), but native's single-
+   threaded, sequential `k_http_serve` accept loop (the SAME kind of "one
+   stalled connection wedges the WHOLE server" hazard PR-it623/it624/it867
+   already fixed for other trigger mechanisms) then blocked trying to read a
+   body that would never fully arrive -- a genuinely wedged server, verified
+   by holding the evil connection open and observing a SECOND, well-behaved
+   client time out waiting for its own turn, while interp served the second
+   client in under a millisecond regardless of the first. Fixed by detecting
+   genuine `uint64_t` overflow during digit accumulation (mirroring Rust's
+   own checked-parse semantics bit-for-bit, not just "exceeds the 10MB
+   cap") and treating an overflow as unparsable (return 0) rather than
+   clamping -- a merely LARGE-but-representable value (e.g. an ordinary
+   50000000, no overflow) is still correctly parsed and THEN capped to
+   K_MAX_HTTP_BODY, exactly as before.
+
+   A SECOND, closely-related divergence found+fixed in the same pass:
+   `interp::parse_content_length`'s `name.trim()` tolerates LEADING
+   WHITESPACE before the header name on its own line (e.g. a request head
+   containing " Content-Length: 11\r\n", a space before the name) --
+   Rust's naive per-line `head.split("\r\n")` + `split_once(':')` never
+   merges continuation lines, so this is simply matched as an ordinary,
+   valid header. The ORIGINAL version of this function's "must start a
+   line" check (`head[i - 1] != '\n'`) required the NEEDLE match to begin
+   EXACTLY at the byte right after a newline, with no tolerance for
+   leading whitespace -- so the identical request silently returned 0 (no
+   body) on native, live-confirmed to drop the entire "hello world" body
+   (native responded with an empty `[]` body where interp/`--vm` correctly
+   echoed back `[hello world]`) -- a genuine, silent cross-engine VALUE
+   divergence, not just a missing-header-vs-present-header distinction.
+   Fixed by restructuring the scan to walk line-by-line (splitting on `\n`,
+   matching the file's own pre-existing bare-LF-tolerant line-boundary
+   convention unchanged) and skipping leading spaces/tabs at the START of
+   each line before attempting the NEEDLE match, in ONE linear O(head_len)
+   pass overall (deliberately NOT a per-byte backward whitespace scan,
+   which would risk its own O(head_len^2) cost against the request head's
+   existing 64KB cap on an adversarial all-whitespace header block). */
 static long k_content_length(const char* head, long head_len) {
     static const char* NEEDLE = "content-length:";
     const long nlen = 15;
-    for (long i = 0; i < head_len; i++) {
-        if (i != 0 && head[i - 1] != '\n') continue;
-        if (i + nlen > head_len) continue;
+    long i = 0;
+    while (i < head_len) {
+        long line_start = i;
+        while (i < head_len && head[i] != '\n') i++;
+        if (i < head_len) i++; /* advance past the '\n' for the next iteration */
+
+        long p = line_start;
+        while (p < head_len && (head[p] == ' ' || head[p] == '\t')) p++;
+        if (p + nlen > head_len) continue;
         int match = 1;
-        for (long k = 0; k < nlen; k++) if (!k_ieq_ascii(head[i + k], NEEDLE[k])) { match = 0; break; }
+        for (long k = 0; k < nlen; k++) if (!k_ieq_ascii(head[p + k], NEEDLE[k])) { match = 0; break; }
         if (!match) continue;
-        long j = i + nlen;
+        long j = p + nlen;
         while (j < head_len && (head[j] == ' ' || head[j] == '\t')) j++;
         long start = j;
         while (j < head_len && head[j] >= '0' && head[j] <= '9') j++;
         if (j == start) return 0;
-        long v = 0;
+        uint64_t v = 0;
+        int overflowed = 0;
         for (long k = start; k < j; k++) {
-            if (v > K_MAX_HTTP_BODY) { v = K_MAX_HTTP_BODY; continue; }
-            v = v * 10 + (head[k] - '0');
+            uint64_t d = (uint64_t)(head[k] - '0');
+            if (v > (UINT64_MAX - d) / 10) { overflowed = 1; break; }
+            v = v * 10 + d;
         }
-        return v > K_MAX_HTTP_BODY ? K_MAX_HTTP_BODY : v;
+        if (overflowed) return 0;
+        return v > (uint64_t)K_MAX_HTTP_BODY ? K_MAX_HTTP_BODY : (long)v;
     }
     return 0;
 }
@@ -13430,6 +13487,81 @@ fun main() uses io {
             let _ = s2.read_to_string(&mut resp2);
             if !resp2.ends_with("POST /echo [later]") {
                 return Err(format!("bad resp2: {resp2}"));
+            }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it901, an Explore
+    /// survey finding, agentId a27959522f0a4531f, independently re-verified live before
+    /// implementing -- see `k_content_length`'s own doc comment for the full writeup).
+    /// Two distinct divergences from `interp::parse_content_length`, both in the same
+    /// function: (1) a `Content-Length` value with more digits than fit in a `uint64_t`
+    /// used to SATURATE to the 10MB body cap instead of being treated as unparsable (0,
+    /// no body) like interp/vm -- since native's single-threaded `k_http_serve` accept
+    /// loop then blocks trying to read a body that will never fully arrive, this silently
+    /// WEDGED THE WHOLE SERVER for any later connection, not just a wrong-value bug.
+    /// (2) leading whitespace before the header NAME on its own line (` Content-Length:
+    /// 11`) was never recognized at all, so native silently dropped the entire request
+    /// body where interp/vm correctly echo it back.
+    #[test]
+    fn native_http_serve_content_length_overflow_and_leading_whitespace() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str { \"{m} {p} [{b}]\" }\n\
+                   fun main() uses io { let _ = http_serve(38130, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srv-cl-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let mut stream = None;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38130u16)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let result = (|| {
+            // An overflowing Content-Length must be treated as unparsable (no body),
+            // NOT block waiting for a body that will never arrive.
+            let mut s1 = stream.ok_or("server should be listening")?;
+            s1.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s1.write_all(
+                b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999999999999999999999999\r\n\r\nhello world",
+            )
+            .map_err(|e| e.to_string())?;
+            let mut resp1 = String::new();
+            let _ = s1.read_to_string(&mut resp1);
+            if !resp1.ends_with("POST /echo []") {
+                return Err(format!("overflowing Content-Length must yield an empty body, not hang: {resp1}"));
+            }
+            // The server must still be alive and responsive for a later connection
+            // (proves the first request didn't wedge the accept loop).
+            let mut s2 = std::net::TcpStream::connect(("127.0.0.1", 38130u16)).map_err(|e| e.to_string())?;
+            s2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s2.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\n Content-Length: 11\r\n\r\nhello world")
+                .map_err(|e| e.to_string())?;
+            let mut resp2 = String::new();
+            let _ = s2.read_to_string(&mut resp2);
+            if !resp2.ends_with("POST /echo [hello world]") {
+                return Err(format!(
+                    "a Content-Length header preceded by leading whitespace must still be \
+                     recognized, matching interp/vm: {resp2}"
+                ));
             }
             Ok::<(), String>(())
         })();
