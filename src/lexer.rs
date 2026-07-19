@@ -466,6 +466,48 @@ impl<'a> Lexer<'a> {
                             }
                             Some(b'{') => depth += 1,
                             Some(b'}') => depth -= 1,
+                            // `//` line comment inside an interpolation: consume to
+                            // end of line (mirrors `run()`'s own top-level handling)
+                            // without counting any `{`/`}` inside toward `depth` --
+                            // otherwise a stray unmatched brace in the comment text
+                            // silently mis-splits the interpolation boundary.
+                            Some(b'/') if self.peek() == Some(b'/') => {
+                                while let Some(c) = self.peek() {
+                                    if c == b'\n' {
+                                        break;
+                                    }
+                                    self.bump();
+                                }
+                            }
+                            // `/* */` block comment inside an interpolation (nesting
+                            // allowed, mirrors `run()`'s own top-level handling) --
+                            // same rationale as the `//` arm above.
+                            Some(b'/') if self.peek() == Some(b'*') => {
+                                self.bump();
+                                let mut cdepth = 1usize;
+                                while cdepth > 0 {
+                                    match self.bump() {
+                                        None => {
+                                            self.diags.push(Diag::error(
+                                                "K0007",
+                                                "unterminated `{` interpolation in string",
+                                                self.span_from(expr_start.saturating_sub(1)),
+                                            ));
+                                            depth = 0;
+                                            break;
+                                        }
+                                        Some(b'/') if self.peek() == Some(b'*') => {
+                                            self.bump();
+                                            cdepth += 1;
+                                        }
+                                        Some(b'*') if self.peek() == Some(b'/') => {
+                                            self.bump();
+                                            cdepth -= 1;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             // nested string literal: skip it whole, so quotes
                             // and braces inside it don't confuse the scan —
                             // `"{xs.join(", ")}"` works without escaping
@@ -941,6 +983,68 @@ mod tests {
         // the reduced trigger emits a clean unterminated-interpolation diagnostic
         let (_t, diags) = lex("\"{");
         assert!(diags.iter().any(|d| d.code == "K0007"), "expected K0007, got {diags:?}");
+    }
+
+    #[test]
+    fn interpolation_line_comment_cannot_reach_a_closing_brace() {
+        // A REAL bug found+fixed (PR-it893, close-read sweep): the `{...}`
+        // interpolation-boundary scanner counted `{`/`}` bytes with no
+        // knowledge of `//`/`/* */` comments, unlike `run()`'s own top-level
+        // dispatcher. Since the captured raw fragment is LATER re-lexed by
+        // `parse_expr_fragment` via the full comment-aware lexer, the two
+        // passes could disagree on where the interpolation actually ends:
+        // `"{a // b}c}"` used to close at the FIRST `}` (right after `b`,
+        // inside what should be a comment), silently re-absorbing `c}` as
+        // ordinary trailing string text with zero diagnostics from either
+        // pass. A `//` comment runs to the next physical newline, and an
+        // interpolation can never span a newline (K0007), so a `}` after
+        // `//` can NEVER validly close the interpolation on the same line
+        // -- the fixed scanner now treats the whole rest of the line as
+        // comment, correctly reaching a clean K0007 in both the case that
+        // used to (by luck) parse "correctly" and the case that used to
+        // silently corrupt the output, rather than the two disagreeing.
+        for src in ["\"{a // b}c}\"", "\"{a // this is a trailing comment, no brace inside}\""] {
+            let (_toks, diags) = lex(src);
+            assert!(
+                diags.iter().any(|d| d.code == "K0007"),
+                "a `//` comment inside a single-line interpolation can never reach a real \
+                 closing `}}` before end-of-line, so this must be a clean K0007, not a silent \
+                 misparse: {src:?} -> {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpolation_block_comment_is_skipped_without_disturbing_brace_depth() {
+        // Companion to the line-comment case above: unlike `//`, a `/* */`
+        // block comment is self-delimiting, so it can be skipped as one
+        // atomic unit (nesting allowed, mirrors `run()`'s own top-level
+        // handling) and the interpolation can still close correctly
+        // afterward, even when the comment's own text contains a stray
+        // unmatched brace.
+        let (toks, diags) = lex("\"{a /* b}c */}\"");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &toks[0].tok {
+            Tok::Str(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert!(
+                    matches!(&parts[0], StrPart::Expr(s, _) if s == "a /* b}c */"),
+                    "must close at the true final `}}`, past the whole block comment: {parts:?}"
+                );
+            }
+            other => panic!("expected string, got {other:?}"),
+        }
+        // a block comment may itself span multiple physical lines, same as
+        // at the top level -- the newline inside it must not trip the
+        // interpolation's own no-newline rule.
+        let (toks2, diags2) = lex("\"{a /* b}\nc */}\"");
+        assert!(diags2.is_empty(), "{diags2:?}");
+        match &toks2[0].tok {
+            Tok::Str(parts) => {
+                assert!(matches!(&parts[0], StrPart::Expr(s, _) if s == "a /* b}\nc */"));
+            }
+            other => panic!("expected string, got {other:?}"),
+        }
     }
 
     #[test]
