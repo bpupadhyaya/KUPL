@@ -235,6 +235,55 @@ fn braces_balanced(src: &str) -> bool {
                     chars.next();
                 }
                 '"' => in_str = false,
+                // A REAL bug found+fixed (production-hardening PR-it870): a
+                // single `{` inside a string opens INTERPOLATION
+                // (`lexer.rs::lex_string`), which can itself contain a
+                // NESTED string literal (e.g. `"{f("(")}"`, or
+                // `"{xs.join(", ")}"`, lexer.rs's own documented example) --
+                // the real lexer skips such a nested string's quotes/braces
+                // WHOLE, so they never affect the outer string's own
+                // boundary. This scan's naive single `in_str` toggle had no
+                // such awareness: a `"` inside an interpolation expression
+                // was misread as the OUTER string's own closing quote,
+                // desyncing this function from the real lexer -- any
+                // bracket character that followed (now wrongly outside
+                // `in_str`) got counted toward `depth`, permanently
+                // unbalancing it and WEDGING the REPL exactly like it768/
+                // it779 (every subsequent line, including `:quit`, silently
+                // appended to the same dead buffer). Confirmed live before
+                // this fix via a piped `kupl repl` session: `"{f("(")}"`
+                // followed by `print("done-marker")` followed by `:quit`
+                // produced four stacked `..>` continuation prompts, never
+                // printed `done-marker`, never processed `:quit`. Fixed by
+                // tracking interpolation's OWN nested `{`/`}` depth and
+                // skipping any nested string literal whole, mirroring
+                // `lexer.rs::lex_string`'s exact algorithm (including its
+                // `{{` == literal-`{` priority check, checked FIRST, so a
+                // doubled brace never mistakenly opens interpolation).
+                '{' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                }
+                '{' => {
+                    let mut interp_depth: u32 = 1;
+                    while interp_depth > 0 {
+                        match chars.next() {
+                            None => break, // buffer ends mid-interpolation -- reported unbalanced below
+                            Some('{') => interp_depth += 1,
+                            Some('}') => interp_depth -= 1,
+                            Some('"') => loop {
+                                match chars.next() {
+                                    None => break,
+                                    Some('\\') => {
+                                        chars.next();
+                                    }
+                                    Some('"') => break,
+                                    _ => {}
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -293,10 +342,23 @@ mod tests {
         // an unclosed brace/paren keeps the REPL reading (a `..>` continuation)
         assert!(!braces_balanced("fun f() -> Int {"));
         assert!(!braces_balanced("foo("));
-        // braces INSIDE a string literal (incl. `{x}` interpolation) don't count —
-        // otherwise the REPL would hang waiting for a matching `}` that is text.
-        assert!(braces_balanced("print(\"a { b\")"));
+        // a COMPLETE `{x}` interpolation (a matching `}` before the string's
+        // own closing quote) is genuinely valid, complete syntax -- `kupl
+        // check`/`kupl run` both accept it and `x` is evaluated as a real
+        // expression, so it must NOT keep the REPL waiting for more input.
         assert!(braces_balanced("print(\"val {x}\")"));
+        // A REAL, PRE-EXISTING bug in this test itself, corrected as part of
+        // production-hardening PR-it870: this used to assert `print("a { b")`
+        // (a `{` with NO matching `}` before the string's own closing quote)
+        // was "balanced" -- but `kupl check` on this EXACT source reports
+        // real K0005/K0007 errors ("unterminated `{` interpolation in
+        // string"), confirming it's genuinely INCOMPLETE syntax, not text a
+        // user could legitimately finish typing on the same line. The
+        // original comment here ("braces INSIDE a string literal... don't
+        // count") was simply wrong about how `{` inside a KUPL string
+        // behaves -- a single unescaped `{` ALWAYS opens interpolation
+        // (`lexer.rs::lex_string`), it is never inert text.
+        assert!(!braces_balanced("print(\"a { b\")"));
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it768): `braces_balanced`
@@ -356,6 +418,36 @@ mod tests {
         // a GENUINELY unterminated string (odd trailing backslash with no
         // closing quote at all) must still correctly signal "keep reading".
         assert!(!braces_balanced("print(\"a\\"));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it870, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// a `{` inside a string ALWAYS opens interpolation (`lexer.rs::
+    /// lex_string`), which can itself contain a NESTED string literal (e.g.
+    /// `"{f("(")}"`, or `"{xs.join(", ")}"`, lexer.rs's own documented
+    /// example) -- the real lexer skips such a nested string's quotes/
+    /// braces WHOLE. This scan's naive single `in_str` toggle had no such
+    /// awareness: a `"` inside an interpolation expression was misread as
+    /// the OUTER string's own closing quote, desyncing this function from
+    /// the real lexer -- any bracket character that followed (now wrongly
+    /// treated as outside the string) got counted toward `depth`,
+    /// permanently unbalancing it. See the subprocess test below for the
+    /// full end-to-end repro.
+    #[test]
+    fn braces_balanced_handles_a_nested_string_inside_an_interpolation_expression() {
+        // a bracket char inside a NESTED string within an interpolation --
+        // the EXACT PR-it870 repro.
+        assert!(braces_balanced("print(\"{f(\"(\")}\")"));
+        // the lexer's OWN documented example: a comma inside a nested string
+        // argument to `join`, a completely ordinary, idiomatic use.
+        assert!(braces_balanced("print(\"{xs.join(\", \")}\")"));
+        // `{{` is a literal brace (not interpolation) -- must NOT be
+        // misread as opening interpolation, which would desync this scan
+        // against the REAL closing quote that follows.
+        assert!(braces_balanced("print(\"a{{b}\")"));
+        // a genuinely UNTERMINATED interpolation (no matching `}` at all)
+        // must still correctly signal "keep reading".
+        assert!(!braces_balanced("print(\"{f(\")"));
     }
 
     #[test]
@@ -463,6 +555,57 @@ mod tests {
         assert!(
             stdout.contains("done-marker"),
             "print(\"done-marker\") must actually run -- the escaped-backslash string must not wedge the REPL: {stdout}"
+        );
+        assert!(
+            !stdout.contains("should not run"),
+            ":quit must genuinely terminate the session, not get silently appended to a dead buffer: {stdout}"
+        );
+        assert!(out.status.success(), ":quit must exit cleanly: {out:?}");
+    }
+
+    /// End-to-end companion to
+    /// `braces_balanced_handles_a_nested_string_inside_an_interpolation_
+    /// expression` above: spawns the REAL `kupl repl` process to confirm
+    /// the full wedge is fixed, not just the underlying pure function.
+    /// Live-confirmed BEFORE this fix: `"{f("(")}"` (a bracket character
+    /// inside a nested string within an interpolation expression)
+    /// permanently wedged the session -- neither it nor any later line,
+    /// including `:quit`, ever ran; the process only exited via silent EOF
+    /// with the input never fully consumed.
+    #[test]
+    fn a_bracket_character_inside_a_nested_interpolation_string_does_not_wedge_the_session() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "\"{f(\"(\")}\"\nprint(\"done-marker\")\n:quit\nprint(\"should not run\")\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out
+            .expect("kupl repl hung on a bracket character inside a nested interpolation string")
+            .expect("wait_with_output succeeds");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("done-marker"),
+            "print(\"done-marker\") must actually run -- the nested-string interpolation must not wedge the REPL: {stdout}"
         );
         assert!(
             !stdout.contains("should not run"),
