@@ -145,8 +145,32 @@ pub fn repl() -> i32 {
 }
 
 fn is_item(src: &str) -> bool {
+    // A REAL bug found+fixed (production-hardening PR-it854, the THIRTY-THIRD
+    // survey): a top-level `law "..." { ... }` block is legitimate KUPL syntax
+    // (`ast::Item::Law`, used standalone in examples/properties.kupl and
+    // several others) but `"law"` was missing from this match arm, so typing
+    // one at the REPL prompt got misrouted into `parser::parse_stmt_fragment`
+    // (the statement/expression path just below), which can't parse it --
+    // producing a generic, misleading `K0102` "expected end of statement"
+    // error instead of `"defined."`, and the law was silently never captured
+    // (`:defs` stayed empty). The item-definition branch above already
+    // contained a `.filter(|it| !matches!(it, ast::Item::Law(_)))` guard --
+    // dead code until this fix, since a Law never reached that branch at
+    // all -- strong evidence this was an oversight (someone wrote handling
+    // for a Law reaching that path, then forgot to add "law" to the gate
+    // that lets it get there), not deliberate scoping. That filter itself is
+    // CORRECT as written and needs no change: duplicate top-level law names
+    // are legitimately allowed by the compiler (confirmed live -- two
+    // identically-named top-level laws both run independently under
+    // `kupl test`, no "duplicate definition" error), unlike fun/type/
+    // component, so a re-typed law should ADD another law rather than
+    // REPLACE the prior same-named one the way the dedup-by-name logic does
+    // for those.
     let first = src.split_whitespace().next().unwrap_or("");
-    matches!(first, "fun" | "type" | "component" | "app" | "pub" | "async" | "contract" | "use" | "module")
+    matches!(
+        first,
+        "fun" | "type" | "component" | "app" | "pub" | "async" | "contract" | "use" | "module" | "law"
+    )
 }
 
 /// A REAL bug found+fixed (production-hardening PR-it768): this used to be
@@ -340,6 +364,10 @@ mod tests {
         assert!(is_item("type P = Pt(x: Int)"));
         assert!(is_item("pub fun g() {}"));
         assert!(is_item("component C {}"));
+        // a top-level `law` block is a real item too (PR-it854): missing from
+        // this match arm before, so it fell through to statement-fragment
+        // parsing and produced a misleading K0102 error instead of "defined.".
+        assert!(is_item("law \"ok\" { expect 1 == 1 }"));
         // statements and expressions are not items (they run against current state)
         assert!(!is_item("let x = 1"));
         assert!(!is_item("2 + 3"));
@@ -439,6 +467,62 @@ mod tests {
         assert!(
             !stdout.contains("should not run"),
             ":quit must genuinely terminate the session, not get silently appended to a dead buffer: {stdout}"
+        );
+        assert!(out.status.success(), ":quit must exit cleanly: {out:?}");
+    }
+
+    /// End-to-end companion to `is_item_classifies_declarations_vs_expressions`
+    /// above: spawns the REAL `kupl repl` process to confirm a top-level `law`
+    /// is genuinely captured as a definition, not just that the pure `is_item`
+    /// function classifies it correctly. Live-confirmed BEFORE this fix
+    /// (production-hardening PR-it854, the THIRTY-THIRD survey): typing a
+    /// `law "..." { ... }` block at the REPL prompt produced a misleading
+    /// `error[K0102]: expected end of statement, found string literal`
+    /// instead of `"defined."`, and `:defs` never showed it. Also confirms
+    /// two identically-named laws BOTH get captured (duplicate law names are
+    /// legitimately allowed by the compiler, unlike fun/type/component) --
+    /// guards against a future "fix" that over-corrects into deduping laws
+    /// by name the way the general item-redefinition path does.
+    #[test]
+    fn a_top_level_law_is_captured_as_a_definition_not_a_parse_error() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "law \"one\" {\n    expect 1 == 1\n}\nlaw \"one\" {\n    expect 2 == 2\n}\n:defs\n:quit\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung on a top-level law").expect("wait_with_output succeeds");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stdout.matches("defined.").count(),
+            2,
+            "both laws must be captured as definitions, not misrouted to a parse error: stdout={stdout} stderr={stderr}"
+        );
+        assert!(!stderr.contains("K0102"), "no parse error should fire for a top-level law: stderr={stderr}");
+        assert_eq!(
+            stdout.matches("law \"one\"").count(),
+            2,
+            ":defs must list BOTH identically-named laws, not dedupe them by name: {stdout}"
         );
         assert!(out.status.success(), ":quit must exit cleanly: {out:?}");
     }
