@@ -12945,6 +12945,151 @@ fun main() uses io {
         }
     }
 
+    /// A cross-engine fuzz pass against `encoding.rs`'s `base64_decode`/
+    /// `hex_decode` vs `cgen.rs`'s independent C reimplementation
+    /// (`k_base64_decode`/`k_hex_decode`), production-hardening PR-it888 --
+    /// the SAME xorshift64* fuzz-harness convention `csv.rs` (it883),
+    /// `regex.rs` (it885), `json.rs` (it886), and `url.rs` (it887) each
+    /// established, extended to a FIFTH hand-rolled untrusted-input codec
+    /// flagged by survey #52: `base64_decode` has exactly ONE genuine prior
+    /// fix (PR-it796: padding validity was checked WITHIN each 4-byte group
+    /// independently, with no state carried BETWEEN groups, so
+    /// `"YQ==YQ=="` silently decoded instead of erroring) -- a real bug that
+    /// survived close-reading until an Explore-agent survey found it, the
+    /// exact profile that made fuzzing worthwhile for the four prior
+    /// targets even where manual review looked clean. Generates
+    /// syntactically-adversarial base64/hex TEXT directly (not merely
+    /// round-tripped through the encoder) with a base64 generator that
+    /// specifically builds MULTIPLE 4-character groups with padding placed
+    /// at potentially non-final positions -- directly re-exercising
+    /// PR-it796's exact bug shape -- plus a hex generator mixing valid
+    /// (mixed-case) and invalid digits at both even and odd lengths.
+    /// Compares native's `print(base64_decode(...))`/`print(hex_decode(...))`
+    /// output (which renders a `Result` directly as `Ok("...")`/`Err("...")`
+    /// with no `match` needed, unlike `json_parse`) against the identical
+    /// chain computed directly via the canonical Rust `crate::encoding::
+    /// base64_decode`/`crate::encoding::hex_decode` (the same functions
+    /// interp/vm call). Strips exactly ONE trailing newline (PR-it883's
+    /// lesson). Before trusting a clean first-run report, applied the
+    /// it885/it886/it887 discipline: deliberately injected a real,
+    /// precisely-targeted divergence into native's `k_base64_decode`
+    /// (reintroduced the EXACT PR-it796 bug shape by making `seen_padding`
+    /// a per-group-local variable instead of one that persists across the
+    /// loop, so padding-before-the-final-group would silently be accepted
+    /// again) and confirmed the fuzzer caught it, before reverting and
+    /// reconfirming a clean result on the real code. Found ZERO
+    /// disagreements on the real code -- a genuinely broader coverage
+    /// mechanism now locked in permanently, not a bug fix.
+    #[test]
+    fn fuzz_random_base64_and_hex_text_match_the_canonical_rust_decoder_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+        }
+        fn fuzz_gen_base64_group(rng: &mut FuzzRng) -> String {
+            let chars = ['A', 'b', '3', '+', '/', 'Z'];
+            let kind = rng.below(5);
+            let c = |rng: &mut FuzzRng| chars[rng.below(chars.len() as u64) as usize];
+            match kind {
+                0 => (0..4).map(|_| c(rng)).collect(),
+                1 => format!("{}{}{}=", c(rng), c(rng), c(rng)),
+                2 => format!("{}{}==", c(rng), c(rng)),
+                3 => "A!AA".to_string(),
+                _ => "====".to_string(),
+            }
+        }
+        fn fuzz_gen_base64_text(rng: &mut FuzzRng) -> String {
+            let n = 1 + rng.below(3);
+            (0..n).map(|_| fuzz_gen_base64_group(rng)).collect::<Vec<_>>().join("")
+        }
+        fn fuzz_gen_hex_text(rng: &mut FuzzRng) -> String {
+            let chars = ['0', '1', 'a', 'F', 'g', '9', 'Z'];
+            let len = rng.below(9) as usize;
+            (0..len).map(|_| chars[rng.below(chars.len() as u64) as usize]).collect()
+        }
+        fn escape_kupl_str(s: &str) -> String {
+            let mut out = String::new();
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '{' => out.push_str("\\{"),
+                    '}' => out.push_str("\\}"),
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
+        fn result_text(r: Result<String, String>) -> String {
+            // NOT Rust's `{:?}` Debug formatting -- confirmed live (both
+            // interp and native) that KUPL's own `Value::to_string()`
+            // embeds a decoded string's bytes RAW inside the quotes, with
+            // no control-character escaping (`\u{10}` etc.), unlike Rust's
+            // Debug impl. Using Debug formatting here produced 4 spurious
+            // "mismatches" on this test's own first run -- a harness bug,
+            // not a product one, caught before trusting the report.
+            match r {
+                Ok(s) => format!("Ok(\"{s}\")"),
+                Err(e) => format!("Err(\"{e}\")"),
+            }
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let b64_text = fuzz_gen_base64_text(&mut rng);
+            let hex_text = fuzz_gen_hex_text(&mut rng);
+            let expected_b64 = result_text(crate::encoding::base64_decode(&b64_text));
+            let expected_hex = result_text(crate::encoding::hex_decode(&hex_text));
+            let src = format!(
+                "fun main() uses io {{\n    print(base64_decode(\"{}\"))\n    print(hex_decode(\"{}\"))\n}}\n",
+                escape_kupl_str(&b64_text),
+                escape_kupl_str(&hex_text)
+            );
+            let raw = native_main_stdout(&src, &format!("b64hexfuzz{seed}"));
+            let mut lines = raw.lines();
+            let actual_b64 = lines.next().unwrap_or("");
+            let actual_hex = lines.next().unwrap_or("");
+            if actual_b64 != expected_b64 {
+                mismatches.push(format!(
+                    "seed={seed} kind=base64 text={b64_text:?} expected={expected_b64:?} actual={actual_b64:?}"
+                ));
+            }
+            if actual_hex != expected_hex {
+                mismatches.push(format!(
+                    "seed={seed} kind=hex text={hex_text:?} expected={expected_hex:?} actual={actual_hex:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native base64_decode/hex_decode diverges from the canonical Rust decoder on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// NaN/infinity Display matches the interpreter natively (was: `%g` -> "nan").
     #[test]
     fn native_nan_inf_display() {
