@@ -40,6 +40,9 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     let mut deps: Vec<Dep> = Vec::new();
     let mut section = "";
     let mut seen_project = false;
+    let mut seen_name = false;
+    let mut seen_version = false;
+    let mut seen_entry = false;
 
     for (i, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
@@ -106,9 +109,41 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                 let parse_str =
                     |value: &str| parse_string(value).ok_or_else(|| format!("line {}: expected a string", i + 1));
                 match key {
-                    "name" => name = parse_str(value)?,
-                    "version" => version = parse_str(value)?,
+                    // A REAL bug found+fixed (production-hardening PR-it860, an
+                    // Explore survey finding, independently re-verified live
+                    // before implementing): a duplicate KEY within a single
+                    // `[project]` block (e.g. `entry` declared twice) used to
+                    // silently resolve "last one wins" -- the SAME shape this
+                    // file already fixed for a duplicate dependency NAME
+                    // (PR-it747), a duplicate inline-table KEY (PR-it752), and
+                    // a duplicate `[project]` SECTION (PR-it784). For `entry`
+                    // specifically this is silent-value-corruption-tier: it
+                    // decides which physical file becomes a package's
+                    // compiled module (see PR-it766's own comment below).
+                    // Live-confirmed BEFORE this fix: a dependency's own
+                    // `kupl.toml` with `entry = "main.kupl"` then a second
+                    // `entry = "other.kupl"` line in the SAME `[project]`
+                    // block silently compiled `other.kupl` in its place, with
+                    // zero diagnostic.
+                    "name" if seen_name => {
+                        return Err(format!("line {}: duplicate key `name` in [project]", i + 1));
+                    }
+                    "version" if seen_version => {
+                        return Err(format!("line {}: duplicate key `version` in [project]", i + 1));
+                    }
+                    "entry" if seen_entry => {
+                        return Err(format!("line {}: duplicate key `entry` in [project]", i + 1));
+                    }
+                    "name" => {
+                        seen_name = true;
+                        name = parse_str(value)?;
+                    }
+                    "version" => {
+                        seen_version = true;
+                        version = parse_str(value)?;
+                    }
                     "entry" => {
+                        seen_entry = true;
                         let s = parse_str(value)?;
                         // A REAL, live-confirmed bug found+fixed (production-hardening
                         // PR-it766): `entry` was accepted VERBATIM with zero path
@@ -500,6 +535,41 @@ mod tests {
     /// split into two bogus fields. Confirmed live before this fix: `kupl
     /// pkg tree` on a manifest with `{ path = "my,dir" }` failed with a
     /// confusing "expected a string value" instead of parsing the path.
+    /// A REAL bug found+fixed (production-hardening PR-it860, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// a duplicate KEY within a single `[project]` block (e.g. `entry`
+    /// declared twice) used to silently resolve "last one wins" -- the SAME
+    /// shape already fixed for a duplicate dependency NAME (PR-it747), a
+    /// duplicate inline-table KEY (PR-it752), and a duplicate `[project]`
+    /// SECTION (PR-it784), just one level lower than the section-duplicate
+    /// case: a duplicate KEY inside a single section rather than the whole
+    /// section repeating. Live-confirmed BEFORE this fix, end-to-end with a
+    /// real multi-package `kupl run`: a dependency's own `kupl.toml` with
+    /// `entry = "main.kupl"` then a second `entry = "other.kupl"` line
+    /// silently compiled `other.kupl` in `main.kupl`'s place, with zero
+    /// diagnostic anywhere.
+    #[test]
+    fn duplicate_key_inside_project_is_a_clean_error_not_silently_last_wins() {
+        let err = parse("[project]\nname = \"app\"\nentry = \"main.kupl\"\nentry = \"other.kupl\"\n")
+            .expect_err("a duplicate `entry` key must be a clean error, not silently last-wins");
+        assert!(err.contains("duplicate") && err.contains("entry"), "{err}");
+
+        let err2 = parse("[project]\nname = \"app\"\nname = \"other\"\n")
+            .expect_err("a duplicate `name` key must be a clean error, not silently last-wins");
+        assert!(err2.contains("duplicate") && err2.contains("name"), "{err2}");
+
+        let err3 = parse("[project]\nname = \"app\"\nversion = \"1.0.0\"\nversion = \"2.0.0\"\n")
+            .expect_err("a duplicate `version` key must be a clean error, not silently last-wins");
+        assert!(err3.contains("duplicate") && err3.contains("version"), "{err3}");
+
+        // sanity: one of each key, each declared exactly once, still parses fine.
+        let m = parse("[project]\nname = \"app\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n")
+            .expect("one declaration per key must still parse cleanly");
+        assert_eq!(m.name, "app");
+        assert_eq!(m.version, "1.0.0");
+        assert_eq!(m.entry, "main.kupl");
+    }
+
     #[test]
     fn comma_inside_a_dependency_string_value_is_not_treated_as_a_field_separator() {
         let m = parse("[dependencies]\nmath = { path = \"my,dir\" }\n").unwrap();
