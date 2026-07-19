@@ -7058,18 +7058,37 @@ fun probe() -> Str {
         //   decode("IX") = 9               (I before X -> 10-1)
         //   decode("CMXCIV") = 994         ((1000-100) + (100-10) + (5-1))
         //   decode(encode(444)) = 444      (roundtrip through CDXLIV, all three subtractive forms)
-        // Magnitudes are kept modest so the recursive greedy build stays within the 2MB debug test-thread stack
-        // (the release binary handles far larger values, e.g. 3888 -> MMMDCCCLXXXVIII, identically). Byte-
-        // identical on interp/KVM (native per the sweep). Confirms that the greedy encoder selects the largest
-        // fitting value including the subtractive pairs, that it recurses on the remainder to build the string,
-        // that the decoder's pairwise lookahead subtracts a smaller-valued symbol that precedes a larger one and
-        // otherwise adds, that encode and decode are mutual inverses (444 -> CDXLIV -> 444, exercising all three
-        // subtractive forms CD/XL/IV at once), and that all three engines agree on both directions. This is the
-        // Roman-numeral conversion an AI writes for clock faces, outlines, or copyright years; a backend whose
+        // Byte-identical on interp/KVM (native per the sweep). Confirms that the greedy encoder selects the
+        // largest fitting value including the subtractive pairs, that it recurses on the remainder to build the
+        // string, that the decoder's pairwise lookahead subtracts a smaller-valued symbol that precedes a larger
+        // one and otherwise adds, that encode and decode are mutual inverses (444 -> CDXLIV -> 444, exercising all
+        // three subtractive forms CD/XL/IV at once), and that all three engines agree on both directions. This is
+        // the Roman-numeral conversion an AI writes for clock faces, outlines, or copyright years; a backend whose
         // greedy selection skipped the subtractive pairs, or whose decoder mishandled the lookahead, would emit
         // IIII for 4 or misread IX as 11. A non-sort lock certifying a subtractive-notation codec with an
         // encode/decode roundtrip.
-        let src = r#"fun vals() -> List[Int] { [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1] }
+        //
+        // A REAL bug found+fixed (production-hardening PR-it860, discovered as a side
+        // effect of investigating an unrelated fix's own "cargo test green" verification):
+        // this test's own comment used to claim magnitudes were "kept modest so the
+        // recursive greedy build stays within the 2MB debug test-thread stack" -- but that
+        // claim no longer holds; the test deterministically overflows the DEFAULT 2MiB
+        // test-thread stack in a debug build (confirmed: 4/4 isolated runs on a clean
+        // checkout, `signal: 6, SIGABRT`, no other test running concurrently). Live-checked
+        // this is a test-harness-only artifact, not a real product bug: the identical
+        // program run via `kupl run` (both debug and release binaries) executes cleanly and
+        // prints `CDXLIV`, because `main.rs` deliberately runs the CLI's actual work on an
+        // explicit 2GiB-stack thread (as do several other entry points -- vm.rs's own
+        // `call_named`/`call_value`, parallel.rs, check.rs) precisely to avoid this; only a
+        // bare `#[test]`-spawned thread, which gets the OS/std default stack with no such
+        // wrapping, is at risk. `check.rs::deep_nesting_is_a_clean_error_not_a_hang` and four
+        // sites in `parser.rs` already establish the fix for exactly this shape of gap:
+        // wrap the test body in `std::thread::Builder::new().stack_size(..).spawn(..)`. This
+        // test never adopted that pattern, instead trying to route around the problem by
+        // capping the roman-numeral magnitude low enough to (previously) fit -- a workaround
+        // that silently stopped holding once it did.
+        let body = || {
+            let src = r#"fun vals() -> List[Int] { [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1] }
 fun syms() -> List[Str] { ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"] }
 fun encAt(n: Int, i: Int) -> Str {
     if n <= 0 { "" }
@@ -7109,10 +7128,12 @@ fun probe() -> Str {
     "e4={e1}|e94={e2}|e49={e3}|e276={e4}|dIX={d1}|dCMXCIV={d2}|rt444={rt}"
 }
 "#;
-        assert_eq!(
-            differential(src),
-            "e4=IV|e94=XCIV|e49=XLIX|e276=CCLXXVI|dIX=9|dCMXCIV=994|rt444=444"
-        );
+            assert_eq!(
+                differential(src),
+                "e4=IV|e94=XCIV|e49=XLIX|e276=CCLXXVI|dIX=9|dCMXCIV=994|rt444=444"
+            );
+        };
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(body).unwrap().join().unwrap();
     }
 
     #[test]
