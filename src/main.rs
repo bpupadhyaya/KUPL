@@ -135,8 +135,25 @@ fn run_cli() -> ExitCode {
         Some("run") => with_path(&args, run::run_program),
         Some("dis") => with_path(&args, run::disassemble),
         Some("native") => with_path(&args, |path| run::native(path, &args)),
+        // A REAL bug found+fixed (production-hardening PR-it864, an Explore
+        // survey finding, independently re-verified live before
+        // implementing): the SAME "unexpected extra argument silently
+        // dropped" shape `find_path_arg`'s own fix (production-hardening
+        // PR-it697) already closed for every OTHER file-taking subcommand --
+        // `match (args.get(1), args.get(2))` never even looks at `args.get(3)`,
+        // so a genuinely unexpected THIRD positional argument (a plausible
+        // typo, or a leftover argument from a copy-pasted command) was
+        // silently IGNORED with zero diagnostic, running the diff on just the
+        // first two paths. Live-confirmed BEFORE this fix: `kupl diff
+        // old.kupl new.kupl extra_typo` ran the diff cleanly, exit 1/0
+        // depending on content, with `extra_typo` never examined or
+        // mentioned anywhere.
         Some("diff") => match (args.get(1), args.get(2)) {
-            (Some(old), Some(new)) => kupl::sdiff::semantic_diff(old, new),
+            (Some(old), Some(new)) if args.get(3).is_none() => kupl::sdiff::semantic_diff(old, new),
+            (Some(_), Some(_)) => {
+                eprintln!("error: unexpected extra argument `{}`", args[3]);
+                2
+            }
             _ => {
                 eprintln!("usage: kupl diff <old.kupl> <new.kupl>");
                 2
@@ -283,8 +300,17 @@ fn run_cli() -> ExitCode {
             }
             0
         }),
+        // A REAL bug found+fixed (production-hardening PR-it864): the SAME
+        // "unexpected extra argument silently dropped" shape as `diff`'s
+        // identical fix immediately above (both share this exact match
+        // pattern) -- `args.get(3)` was never examined, so a genuinely
+        // unexpected THIRD positional argument was silently ignored.
         Some("context") => match (args.get(1), args.get(2)) {
-            (Some(path), Some(name)) => run::emit_context(path, name),
+            (Some(path), Some(name)) if args.get(3).is_none() => run::emit_context(path, name),
+            (Some(_), Some(_)) => {
+                eprintln!("error: unexpected extra argument `{}`", args[3]);
+                2
+            }
             _ => {
                 eprintln!("usage: kupl context <file.kupl> <item-name>");
                 2
@@ -809,6 +835,57 @@ mod tests {
         assert_eq!(find_path_arg(&s(&["run", "foo.kupl", "--", "--not-a-kupl-flag"])), Ok("foo.kupl"));
         // `--` with nothing after it is still just a normal, valid separator.
         assert_eq!(find_path_arg(&s(&["run", "foo.kupl", "--"])), Ok("foo.kupl"));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it864, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// the SAME "unexpected extra argument silently dropped" shape
+    /// `find_path_arg`'s own fix (production-hardening PR-it697) already
+    /// closed for every OTHER file-taking subcommand -- `diff`/`context`
+    /// take their two positional arguments via a raw `match (args.get(1),
+    /// args.get(2))`, never even LOOKING at `args.get(3)`, so a genuinely
+    /// unexpected THIRD positional argument (a plausible typo, or a leftover
+    /// argument from a copy-pasted command) was silently IGNORED with zero
+    /// diagnostic. Live-confirmed BEFORE this fix: `kupl diff old.kupl
+    /// new.kupl extra_typo` ran the diff cleanly, `extra_typo` never
+    /// examined or mentioned anywhere.
+    #[test]
+    fn diff_and_context_reject_a_genuine_extra_argument_instead_of_silently_dropping_it() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-diffctx-extra-arg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.kupl");
+        let b = dir.join("b.kupl");
+        std::fs::write(&a, "fun main() uses io {\n    print(\"hi\")\n}\n").unwrap();
+        std::fs::write(&b, "fun main() uses io {\n    print(\"hi2\")\n}\n").unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+
+        let d = run(&["diff", a.to_str().unwrap(), b.to_str().unwrap(), "extra_typo"]);
+        assert_eq!(d.status.code(), Some(2), "{d:?}");
+        assert!(
+            String::from_utf8_lossy(&d.stderr).contains("unexpected extra argument `extra_typo`"),
+            "{d:?}"
+        );
+
+        let c = run(&["context", a.to_str().unwrap(), "main", "extra_typo"]);
+        assert_eq!(c.status.code(), Some(2), "{c:?}");
+        assert!(
+            String::from_utf8_lossy(&c.stderr).contains("unexpected extra argument `extra_typo`"),
+            "{c:?}"
+        );
+
+        // sanity: the ordinary two-argument form is entirely unaffected.
+        let d_ok = run(&["diff", a.to_str().unwrap(), b.to_str().unwrap()]);
+        assert_eq!(d_ok.status.code(), Some(1), "a real semantic change must still report exit 1: {d_ok:?}");
+        let c_ok = run(&["context", a.to_str().unwrap(), "main"]);
+        assert_eq!(c_ok.status.code(), Some(0), "{c_ok:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
