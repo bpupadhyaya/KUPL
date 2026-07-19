@@ -1283,6 +1283,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it895,
+    /// an Explore survey finding, agentId a7ba91a6862653340, independently
+    /// re-verified live before implementing -- see `resolve.rs`'s own
+    /// `Rewriter::method` doc comment for the full writeup). The SIBLING gap
+    /// to the state-field collision test just above: `resolve.rs`'s
+    /// `Rewriter::component` used to walk a component's OWN exposed/private
+    /// METHODS through the SAME `fun()` (rename-then-walk) as a top-level
+    /// `fun` -- but `defined_names` never adds a component's method names to
+    /// the per-package rename map (only the component's OWN top-level name),
+    /// so `self.rename.get(&f.name)` on a method was only ever a hit by pure
+    /// coincidence: whenever the SAME package ALSO happened to define an
+    /// unrelated top-level `fun` sharing the method's bare name, the method
+    /// got silently renamed to that unrelated fun's mangled name too, even
+    /// though every caller still looks the method up by its bare name on
+    /// the component. Live-confirmed BEFORE this fix: a `dep` package with a
+    /// top-level `pub fun greet() -> Str { "top-level" }` alongside `pub
+    /// component C { expose fun greet() -> Str { "method" } }`, called as
+    /// `dep.C().greet()`, failed to compile with `K0247: component
+    /// dep$C does not expose a function named greet` -- while the identical
+    /// component with the colliding top-level fun simply removed (a
+    /// same-shaped control case) compiled and ran fine.
+    #[test]
+    fn component_method_name_colliding_with_a_top_level_fun_is_not_mangled() {
+        let base = std::env::temp_dir().join(format!("kupl-method-collision-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "pub fun greet() -> Str {\n    \"top-level\"\n}\n\n\
+             pub component C {\n    \
+             intent \"a method colliding with a top-level fun by name\"\n    \
+             expose fun greet() -> Str {\n        \"method\"\n    }\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun probe() -> Str {\n    dep.C().greet()\n}\n\
+             fun probe_top_level() -> Str {\n    dep.greet()\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its dep dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "a component method's bare name colliding with an unrelated top-level fun in the \
+             SAME package must not be mistaken for it: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let probe = crate::value::Value::Fun(std::rc::Rc::new("probe".to_string()));
+        let result = match interp.call_value(probe, vec![], crate::diag::Span::default()) {
+            Ok(v) => v,
+            Err(_) => panic!("probe() should run cleanly"),
+        };
+        assert_eq!(
+            result.to_string(),
+            "method",
+            "must resolve to the COMPONENT's OWN method, not the unrelated top-level fun's mangled name"
+        );
+        // the unrelated top-level fun of the same bare name must ALSO still
+        // resolve correctly to ITS OWN definition, unaffected by this fix
+        // (only the method's own rename step is skipped, not the top-level
+        // fun's).
+        let probe_top = crate::value::Value::Fun(std::rc::Rc::new("probe_top_level".to_string()));
+        let result_top = match interp.call_value(probe_top, vec![], crate::diag::Span::default()) {
+            Ok(v) => v,
+            Err(_) => panic!("probe_top_level() should run cleanly"),
+        };
+        assert_eq!(result_top.to_string(), "top-level");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it775, an Explore
     /// survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
     /// live before implementing): `resolve.rs`'s `Rewriter::pattern` only

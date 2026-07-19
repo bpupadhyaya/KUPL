@@ -150,10 +150,61 @@ impl Rewriter<'_> {
         }
     }
 
+    /// Mangle a TOP-LEVEL `fun`'s own declared name (so its definition site
+    /// matches how OTHER items in this package reference it), then walk the
+    /// rest via `fun_body`.
     fn fun(&mut self, f: &mut FunDecl) {
         if let Some(m) = self.rename.get(&f.name) {
             f.name = m.clone();
         }
+        self.fun_body(f);
+    }
+
+    /// A component's OWN exposed/private method (`c.exposes`/`c.funs`) --
+    /// same `FunDecl` shape as a top-level `fun`, but its bare name is never
+    /// looked up through the package-level rename map at all (a method is
+    /// resolved relative to its OWN component, e.g. `dep$C`'s `greet`, not
+    /// through the flat `pkg$name` function namespace `defined_names`
+    /// populates), so it must NOT be renamed like one.
+    ///
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it895,
+    /// an Explore survey finding, agentId a7ba91a6862653340, independently
+    /// re-verified live before implementing): `component()` below used to
+    /// call the SAME `fun()` (rename-then-walk) for a component's own
+    /// methods as for a top-level `fun` -- but `defined_names` (this file's
+    /// own top-of-`isolate` helper) never adds a component's METHOD names to
+    /// the per-package rename map, only the component's OWN top-level name.
+    /// So `self.rename.get(&f.name)` on a method was only ever a HIT by pure
+    /// COINCIDENCE: whenever this SAME package also happened to define an
+    /// UNRELATED top-level `fun` sharing the method's bare name, that
+    /// entry -- meant for the top-level fun's own definition site -- got
+    /// applied to the method too, silently renaming e.g. `expose fun
+    /// greet()` to `dep$greet` even though every CALLER still looks up the
+    /// method by its bare, un-mangled name on the component (`dep.C().
+    /// greet()`), guaranteed to no longer match. Live-confirmed: a `dep`
+    /// package with a top-level `pub fun greet() -> Str { "top-level" }`
+    /// ALONGSIDE `pub component C { expose fun greet() -> Str { "method" } }`
+    /// -- loaded as a dependency and called as `dep.C().greet()` -- failed
+    /// to compile with `K0247: component \`dep$C\` does not expose a
+    /// function named \`greet\`` -- even though the IDENTICAL component,
+    /// with the same-named top-level fun simply deleted (a same-shaped
+    /// control case with no collision), compiles and runs fine (`method`).
+    /// Since this is a LOUD false-rejection (`resolve.rs`'s own top-of-file
+    /// doc comment: "a missed rewrite surfaces as a loud unresolved-name
+    /// error, never silent divergence"), not silent corruption, this
+    /// matches the file's own documented failure mode for this pass -- but
+    /// is still a genuine correctness bug: legitimate code using an exposed/
+    /// private method whose bare name happens to collide with an unrelated
+    /// top-level fun in the SAME package cannot compile as a dependency at
+    /// all. Fixed by giving component methods their own entry point that
+    /// skips the rename step entirely and only calls the shared `fun_body`
+    /// walk (params/ret/ai/body), matching how a method's bare name is
+    /// ACTUALLY resolved everywhere else in the pipeline.
+    fn method(&mut self, f: &mut FunDecl) {
+        self.fun_body(f);
+    }
+
+    fn fun_body(&mut self, f: &mut FunDecl) {
         for p in &mut f.params {
             self.ty(&mut p.ty);
             // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
@@ -277,7 +328,7 @@ impl Rewriter<'_> {
             self.pop();
         }
         for f in c.exposes.iter_mut().chain(c.funs.iter_mut()) {
-            self.fun(f);
+            self.method(f);
         }
         for ex in &mut c.examples {
             self.push();
