@@ -352,6 +352,30 @@ impl Value {
                     }
                 }
                 Value::Tensor(xs) => total += xs.len() as u64 * 8,
+                // A REAL bypass of this function's OWN size cap (production-
+                // hardening PR-it877, found via this campaign's "re-audit a
+                // function with prior fix history" technique): a closure's
+                // captured environment is a real, first-class part of its
+                // payload (captured BY VALUE at creation, per `Closure`'s own
+                // doc comment) -- e.g. `let f = fn n { n + big.len() }` where
+                // `big` is a captured Str -- but both `Closure`/`VmClosure`
+                // fell through to the flat 8-byte leaf-scalar case above,
+                // exactly like every OTHER container arm here (List/Set/Ctor/
+                // Map) once did before being added one by one. A function is a
+                // first-class `Value` that can flow through `emit`/the message
+                // queue like any other (confirmed live: a component can
+                // declare a `fn(...)-> ...`-typed port and `emit` a closure
+                // through it), so a growing payload smuggled inside a
+                // closure's captures silently bypassed the exact cap this
+                // function exists to enforce. Confirmed live before this fix:
+                // wiring a component that emits an 11MB `Str` directly through
+                // a `Str`-typed port correctly panics with K0900 ("component
+                // message payload too large"); the IDENTICAL 11MB `Str`
+                // captured inside a closure and emitted through a
+                // `fn(Int)->Int`-typed port instead ran to completion with NO
+                // panic, on BOTH interp and vm (this function is shared).
+                Value::Closure(c) => stack.extend(c.captures.iter().map(|(_, v)| v)),
+                Value::VmClosure(_, captures, _) => stack.extend(captures.iter()),
                 _ => total += 8,
             }
         }

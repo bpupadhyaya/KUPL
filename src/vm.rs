@@ -2942,6 +2942,69 @@ fun probe() -> Int {
         );
     }
 
+    /// A REAL bypass of the ABOVE test's own payload cap (production-hardening
+    /// PR-it877, found via this campaign's "re-audit a function with prior fix
+    /// history" technique on `Value::approx_byte_size`, which already has 2
+    /// prior fixes -- introduced it760, made iterative it804): a closure's
+    /// captured environment is a real part of its payload (captured BY VALUE
+    /// at creation), but `Value::Closure`/`Value::VmClosure` fell through to
+    /// the flat 8-byte leaf-scalar case, exactly like List/Set/Ctor/Map once
+    /// did before being added one by one. A function is a first-class `Value`
+    /// reachable through a `fn(...)-> ...`-typed port's `emit` (confirmed live
+    /// before this fix), so an oversized payload smuggled inside a closure's
+    /// captures silently bypassed the cap `diff_growing_self_wire_payload_is_
+    /// bounded_not_an_oom` (above) exists to enforce. Confirmed live BEFORE
+    /// this fix: wiring a component that emits an 11MB `Str` directly through
+    /// a `Str`-typed port correctly panicked with the SAME message as above;
+    /// the IDENTICAL 11MB `Str` captured inside a closure and emitted through
+    /// a `fn(Int)->Int`-typed port instead ran to completion with NO panic, on
+    /// BOTH interp and vm (this function is shared, so one fix covers both).
+    #[test]
+    fn diff_closure_captures_count_toward_the_payload_cap() {
+        let src = "component Emitter {\n    intent \"e\"\n    out cb: fn(Int) -> Int\n    \
+                   on start {\n        let big = \"x\".repeat(11000000)\n        \
+                   let f = fn n { n + big.len() }\n        emit cb(f)\n    }\n\
+                   }\ncomponent Receiver {\n    intent \"r\"\n    in cb: fn(Int) -> Int\n    \
+                   on cb(f) {\n    }\n\
+                   }\napp Panel {\n    intent \"p\"\n    let e = Emitter()\n    let r = Receiver()\n    \
+                   wire e.cb -> r.cb\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        match it.instantiate("Panel", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(_)) => {}
+            _ => panic!("interp instantiate failed"),
+        }
+        let i_msg = match it.start_all() {
+            Ok(()) => panic!("expected the payload cap to catch the closure's captured Str, got Ok"),
+            Err(Flow::Panic { msg, .. }) => msg,
+            Err(_) => panic!("expected a Panic, got some other control-flow error"),
+        };
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let idx = *module.component_names.get("Panel").expect("Panel in module");
+        vm.instantiate(idx, Vec::new()).expect("kvm instantiate");
+        for id in 0..vm.instances.len() {
+            vm.run_lifecycle(id, "@start").expect("kvm lifecycle");
+            vm.arm_timers(id);
+        }
+        let v_msg = match vm.drain() {
+            Ok(()) => panic!("expected the payload cap to catch the closure's captured Str, got Ok"),
+            Err(e) => e.msg,
+        };
+
+        assert_eq!(i_msg, v_msg, "interpreter and KVM disagree on the payload-cap panic message");
+        assert_eq!(
+            i_msg,
+            "component message payload too large (limit 10000000 bytes) — unbounded growth in a `wire` cycle?"
+        );
+    }
+
     #[test]
     fn diff_lists_lambdas() {
         let src = "fun probe() -> Int {\n    let xs = [1, 2, 3, 4, 5, 6]\n    xs.filter(fn n { n % 2 == 0 }).map(fn n { n * 10 }).sum()\n}\n";

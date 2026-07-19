@@ -7556,6 +7556,22 @@ static uint64_t k_value_approx_size(KValue v) {
                 }
                 break;
             case K_TENSOR: total += (uint64_t)x.as.ten->len * 8; break;
+            /* A REAL bypass of this function's OWN size cap (production-
+               hardening PR-it877, mirrors value.rs::approx_byte_size's
+               IDENTICAL fix): KClosure's `caps` array is a closure's captured
+               environment (by-value snapshot, matching Value::Closure's Rust
+               sibling), but fell through to the flat 8-byte `default` case
+               below, exactly like every OTHER container case here once did
+               before being added one by one. A closure is a first-class
+               KValue reachable through a `fn(...)-> ...`-typed port's `emit`,
+               so a growing payload smuggled inside its captures silently
+               bypassed the cap this function exists to enforce. */
+            case K_CLOSURE:
+                for (int i = 0; i < x.as.clo->ncaps; i++) {
+                    if (n == cap) { cap *= 2; stack = (KValue*)realloc(stack, sizeof(KValue) * cap); }
+                    stack[n++] = x.as.clo->caps[i];
+                }
+                break;
             default: total += 8; break;
         }
     }
@@ -9004,6 +9020,54 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             .expect("module compiles");
         let c = super::emit_c(&module).expect("emit_c succeeds");
         let base = std::env::temp_dir().join(format!("kupl-cgen-growpayload-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.trim(),
+            "panic: component message payload too large (limit 10000000 bytes) — unbounded growth in a `wire` cycle?",
+            "native must match interp/vm's payload-cap panic message: {stderr:?}"
+        );
+        assert!(out.stdout.is_empty(), "expected a bounded panic, no normal output");
+    }
+
+    /// A REAL bypass of the ABOVE test's own payload cap (production-hardening
+    /// PR-it877, mirrors `vm.rs::diff_closure_captures_count_toward_the_
+    /// payload_cap`'s IDENTICAL Rust-side fix): `k_value_approx_size`'s switch
+    /// had no `K_CLOSURE` case, so a closure's captured environment
+    /// (`KClosure.caps`) fell through to the flat 8-byte `default` case,
+    /// exactly like every other container case here once did before being
+    /// added one by one. Confirmed live before this fix: `kupl native`
+    /// compiling+running the SAME source as the Rust-side test ran to
+    /// completion with no panic and no output, unlike interp/vm which
+    /// correctly caught it -- a genuine three-engine divergence this fix
+    /// closes.
+    #[test]
+    fn native_closure_captures_count_toward_the_payload_cap() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Emitter {\n    intent \"e\"\n    out cb: fn(Int) -> Int\n    \
+                   on start {\n        let big = \"x\".repeat(11000000)\n        \
+                   let f = fn n { n + big.len() }\n        emit cb(f)\n    }\n\
+                   }\ncomponent Receiver {\n    intent \"r\"\n    in cb: fn(Int) -> Int\n    \
+                   on cb(f) {\n    }\n\
+                   }\napp Panel {\n    intent \"p\"\n    let e = Emitter()\n    let r = Receiver()\n    \
+                   wire e.cb -> r.cb\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-closurepayload-{}", std::process::id()));
         let cpath = base.with_extension("c");
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
