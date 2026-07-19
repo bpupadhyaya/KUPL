@@ -5367,6 +5367,20 @@ static KValue k_parse_iso(KValue sv) {
     if (*p == '-') { neg = 1; p++; }         /* negative year */
     char* time = 0;
     for (char* q = p; *q; q++) if (*q == 'T' || *q == ' ') { *q = 0; time = q + 1; break; }
+    /* A REAL bug found+fixed (production-hardening PR-it880, mirrors
+       time.rs::parse_iso's IDENTICAL fix): an explicit `T`/space separator
+       with NOTHING after it (e.g. "2024-01-01T") set `time` to point at the
+       string's own NUL terminator (an empty C string), indistinguishable
+       from `time == 0` (no separator at all, i.e. a genuinely valid
+       date-only string) by the `if (time && *time)` check below -- so ALL
+       time validation was silently skipped and hh/mi/ss defaulted to
+       midnight, exactly as if the caller had written the well-formed
+       date-only "2024-01-01". Confirmed live before this fix (on ALL THREE
+       engines, a shared bug, not a cross-engine divergence -- interp/vm's
+       shared time.rs::parse_iso had the identical bug): `parse_iso(
+       "2024-01-01T")` returned `Ok(1704067200)`, the SAME timestamp as the
+       genuinely valid `parse_iso("2024-01-01")`. */
+    if (time && !*time) return k_err(k_str(errbuf));
     /* date part: Y-M-D */
     char* dash1 = strchr(p, '-');
     if (!dash1) return k_err(k_str(errbuf));
@@ -9868,6 +9882,29 @@ fun main() uses io {
                    {parse_iso(\"1900-02-29\").is_ok()}|{parse_iso(\"2000-02-29\").is_ok()}|\
                    {parse_iso(\"2024-04-31\").is_ok()}|{parse_iso(\"2024-04-30\").is_ok()}\")\n}\n";
         assert_eq!(native_main_stdout(src, "iso").trim(), "false|true|false|true|false|true");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it880, mirrors
+    /// time.rs::parse_iso's IDENTICAL fix -- confirmed a SHARED bug across all
+    /// three engines before this fix, not a divergence between them): an
+    /// explicit `T`/space separator with NOTHING after it (e.g.
+    /// "2024-01-01T") set native's `time` pointer at the string's own NUL
+    /// terminator, indistinguishable from `time == 0` (no separator, i.e. a
+    /// genuinely valid date-only string) by `if (time && *time)` -- so ALL
+    /// time validation was silently skipped and defaulted to midnight, the
+    /// SAME timestamp as the genuinely valid date-only string. Confirmed live
+    /// on native BEFORE this fix: `parse_iso("2024-01-01T").is_ok()` was
+    /// `true`, identical to `parse_iso("2024-01-01").is_ok()`.
+    #[test]
+    fn native_parse_iso_rejects_a_trailing_separator_with_nothing_after_it() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{parse_iso(\"2024-01-01T\").is_ok()}|{parse_iso(\"2024-01-01T   \").is_ok()}|\
+                   {parse_iso(\"2024-01-01TZ\").is_ok()}|{parse_iso(\"2024-01-01\").is_ok()}|\
+                   {parse_iso(\"2024-01-01T12\").is_ok()}|{parse_iso(\"2024-01-01T00:00:00\").is_ok()}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "isotrail").trim(), "false|false|false|true|false|true");
     }
 
     /// A REAL BUG found+fixed (bug-hunt batch 168, PR-it560, found via an Explore-agent

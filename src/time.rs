@@ -185,6 +185,25 @@ pub fn parse_iso(s: &str) -> Result<i64, String> {
     let bad = || format!("invalid ISO-8601 timestamp: {s}");
     // date and optional time, split on 'T' or ' '
     let (date, time) = match s.find(['T', ' ']) {
+        // A REAL bug found+fixed (production-hardening PR-it880, the THIRD
+        // sibling instance of this function's "forgot one input shape in the
+        // validation chain" pattern -- it111 leap-year-aware day validation,
+        // it635 collapsing an unrepresentable-year internal error into this
+        // SAME generic wording): an explicit `T`/space separator with
+        // NOTHING after it (e.g. `"2024-01-01T"`) produced an EMPTY `time`
+        // slice, indistinguishable from the `None` arm below (genuinely no
+        // separator at all, i.e. a valid date-only string) -- so the
+        // `!time.is_empty()` check just below silently skipped ALL time
+        // validation and defaulted to midnight, exactly as if the caller had
+        // written the well-formed date-only `"2024-01-01"`. Confirmed live
+        // before this fix: `parse_iso("2024-01-01T")` returned
+        // `Ok(1704067200)` -- the SAME timestamp as the genuinely valid
+        // `parse_iso("2024-01-01")` -- instead of rejecting the malformed
+        // input the way `parse_iso("2024-01-01T12")` (a partial, incomplete
+        // time) already correctly does. An explicit separator PROMISES a
+        // time component follows; an empty one after it is malformed, not a
+        // date-only string in disguise.
+        Some(i) if s[i + 1..].is_empty() => return Err(bad()),
         Some(i) => (&s[..i], &s[i + 1..]),
         None => (s, ""),
     };
@@ -494,6 +513,31 @@ mod tests {
         let err = parse_iso("99999999999999-01-01").unwrap_err();
         assert!(err.contains("invalid ISO-8601 timestamp"), "{err}");
         assert!(err.contains("99999999999999"), "{err}");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it880, the THIRD sibling
+    /// instance of this function's "forgot one input shape in the validation
+    /// chain" pattern -- it111 leap-year-aware day validation, it635 collapsing
+    /// an unrepresentable-year internal error into this SAME generic wording):
+    /// an explicit `T`/space separator with NOTHING after it used to produce an
+    /// EMPTY `time` slice, indistinguishable from the date-only case (no
+    /// separator at all), so the `!time.is_empty()` guard silently skipped ALL
+    /// time validation and defaulted to midnight -- confirmed live before this
+    /// fix: `parse_iso("2024-01-01T")` returned the SAME `Ok` timestamp as the
+    /// genuinely valid `parse_iso("2024-01-01")`, unlike `parse_iso(
+    /// "2024-01-01T12")` (a partial, incomplete time), which was ALREADY
+    /// correctly rejected.
+    #[test]
+    fn parse_iso_rejects_a_trailing_separator_with_nothing_after_it() {
+        let err = parse_iso("2024-01-01T").unwrap_err();
+        assert!(err.contains("invalid ISO-8601 timestamp"), "{err}");
+        // trimmed whitespace/`Z` after the bare `T` reduce to the SAME shape.
+        assert!(parse_iso("2024-01-01T   ").is_err());
+        assert!(parse_iso("2024-01-01TZ").is_err());
+        // genuinely well-formed neighbors are all completely unaffected.
+        assert_eq!(parse_iso("2024-01-01").unwrap(), parse_iso("2024-01-01T00:00:00").unwrap());
+        assert!(parse_iso("2024-01-01T12").is_err(), "a partial time must still be rejected");
+        assert!(parse_iso("2024-01-01T00:00:00").is_ok());
     }
 
     #[test]
