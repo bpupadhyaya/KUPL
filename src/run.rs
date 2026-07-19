@@ -2255,6 +2255,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it905,
+    /// a direct, self-initiated sibling-path sweep of PR-it903/PR-it904's own
+    /// fix, independently re-verified live before implementing -- see
+    /// `Env::bound_instance_ids`'s own doc comment for the full writeup).
+    /// Both prior fixes only checked a variable's OWN DIRECT value, missing
+    /// a component instance NESTED inside a List/record or CAPTURED by a
+    /// closure -- the outer container itself is neither `Bound` nor
+    /// `Component`, so the id inside it was silently never reset, still
+    /// producing a phantom counterexample. This test locks all THREE newly-
+    /// covered nesting shapes (list, record, closure capture) in
+    /// permanently, each checked against the SAME append-only `Store`
+    /// shape PR-it903/PR-it904's own tests use.
+    #[test]
+    fn forall_resets_a_component_nested_inside_a_list_record_or_closure_capture() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-forall-nested-instance-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = "component Store {\n    intent \"append-only store\"\n    state entries: List[Str] = []\n    \
+                     expose fun put(key: Str) -> Bool { entries = entries.push(key); true }\n    \
+                     expose fun size() -> Int { entries.len() }\n}\n";
+        let run_law = |src: &str| -> String {
+            let file = dir.join(format!("case-{}.kupl", src.len()));
+            std::fs::write(&file, src).unwrap();
+            let out = std::process::Command::new(&bin).args(["test", file.to_str().unwrap()]).output().expect("kupl runs");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // nested inside a List, iterated via `for`
+        let list_stdout = run_law(&format!(
+            "{store}\nlaw \"component nested inside a list\" {{\n    let cs = [Store()]\n    \
+             forall k: Str {{\n        for s in cs {{\n            s.put(k)\n            expect s.size() <= 3\n        }}\n    }}\n}}\n\nfun main() {{}}\n"
+        ));
+        assert!(
+            list_stdout.contains("1 passed, 0 failed"),
+            "a component instance nested inside a List must also be reset per case: {list_stdout:?}"
+        );
+
+        // nested inside a record field
+        let record_stdout = run_law(&format!(
+            "{store}\ntype Holder = Holder(store: Store)\n\n\
+             law \"component nested inside a record\" {{\n    let h = Holder(Store())\n    \
+             forall k: Str {{\n        h.store.put(k)\n        expect h.store.size() <= 3\n    }}\n}}\n\nfun main() {{}}\n"
+        ));
+        assert!(
+            record_stdout.contains("1 passed, 0 failed"),
+            "a component instance nested inside a record field must also be reset per case: {record_stdout:?}"
+        );
+
+        // captured by a closure, with NO other direct binding to the instance
+        // visible in the forall's own scope
+        let closure_stdout = run_law(&format!(
+            "{store}\nfun makeStoreOp() -> fn(Str) -> Int {{\n    let c = Store()\n    \
+             fn key {{\n        c.put(key)\n        c.size()\n    }}\n}}\n\n\
+             law \"component captured by a closure, no other direct binding\" {{\n    \
+             let op = makeStoreOp()\n    forall k: Str {{\n        let sz = op(k)\n        expect sz <= 3\n    }}\n}}\n\nfun main() {{}}\n"
+        ));
+        assert!(
+            closure_stdout.contains("1 passed, 0 failed"),
+            "a component instance ONLY reachable through a closure's own captures must also be reset per case: {closure_stdout:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL text-consistency bug found+fixed (production-hardening
     /// PR-it783, the same finding as `plain_and_forall_expect_failures_...`
     /// above, but at a DIFFERENT site with no shared code path: a component

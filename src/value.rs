@@ -1235,18 +1235,65 @@ impl Env {
     /// EVERY case by construction, so there is no shared state to leak
     /// across cases in the first place -- confirmed via 100 passing cases
     /// each independently observing a freshly-bumped counter reading `1`.
+    ///
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it905, a direct, self-initiated sibling-path sweep of PR-it903/
+    /// PR-it904's own fix -- independently re-verified live before
+    /// implementing): both prior fixes only checked a variable's OWN
+    /// DIRECT value for `Value::Bound`/`Value::Component` -- but a
+    /// component instance NESTED inside a `List`/`Set`/`Map`/`Ctor` (record)
+    /// value, or CAPTURED by a `Closure`, is invisible to a shallow,
+    /// non-recursive scan: the OUTER container value itself is neither
+    /// `Bound` nor `Component`, so the instance id inside it was silently
+    /// never reset. Live-confirmed: `let cs = [Store()]; forall k: Str { for
+    /// s in cs { s.put(k); expect s.size() <= 3 } }` (an append-only `Store`
+    /// held inside a `List`, the exact same shared-instance shape PR-it904
+    /// fixed for a bare `let`, just one container layer deeper) STILL
+    /// reported a phantom `property failed for k = ""` even with BOTH prior
+    /// fixes applied -- the standalone equivalent (no forall, no
+    /// randomness) PASSED cleanly, the same airtight phantom proof used for
+    /// both prior fixes. Fixed by making the per-value scan RECURSIVE,
+    /// mirroring `Value::approx_byte_size`'s own established iterative
+    /// work-list pattern (PR-it804 converted that function from recursive
+    /// to iterative specifically to avoid a stack overflow on a
+    /// sufficiently deep structure; PR-it877 later found and fixed that
+    /// SAME function silently missing `Closure`/`VmClosure` captures as a
+    /// container needing the same treatment) -- deliberately reusing BOTH
+    /// established lessons here rather than writing a naive recursive
+    /// walk that could reintroduce either gap.
     pub fn bound_instance_ids(&self, out: &mut std::collections::HashSet<usize>) {
         let inner = self.0.borrow();
         for (_, v) in &inner.vars {
+            Self::collect_instance_ids(v, out);
+        }
+        if let Some(p) = &inner.parent {
+            p.bound_instance_ids(out);
+        }
+    }
+
+    /// Iterative work-list walk (see `bound_instance_ids`'s own doc comment
+    /// for why iterative, not recursive) collecting every component-
+    /// instance id reachable from `root`, including one nested inside a
+    /// List/Set/Map/Ctor(record) or captured by a Closure/VmClosure.
+    fn collect_instance_ids(root: &Value, out: &mut std::collections::HashSet<usize>) {
+        let mut stack: Vec<&Value> = vec![root];
+        while let Some(v) = stack.pop() {
             match v {
                 Value::Bound(id, _) | Value::Component(id) => {
                     out.insert(*id);
                 }
+                Value::List(xs) | Value::Set(xs) => stack.extend(xs.iter()),
+                Value::Ctor { fields, .. } => stack.extend(fields.iter()),
+                Value::Map(entries) => {
+                    for (k, val) in entries.iter() {
+                        stack.push(k);
+                        stack.push(val);
+                    }
+                }
+                Value::Closure(c) => stack.extend(c.captures.iter().map(|(_, v)| v)),
+                Value::VmClosure(_, captures, _) => stack.extend(captures.iter()),
                 _ => {}
             }
-        }
-        if let Some(p) = &inner.parent {
-            p.bound_instance_ids(out);
         }
     }
 }
