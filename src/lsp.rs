@@ -848,6 +848,23 @@ fn find_enclosing_call(program: &crate::ast::Program, offset: usize) -> Option<(
 /// `signatureHelp` at an LSP position: the enclosing call's signature label,
 /// its parameter labels, and which parameter is active (clamped into range),
 /// or None if the cursor isn't inside a resolvable call's argument list.
+///
+/// A REAL bug found+fixed (production-hardening PR-it878, found via this
+/// campaign's "re-audit a function with prior fix history" technique on the
+/// `locally_bound`/local-vs-top-level-collision family -- fixed FIVE times
+/// across `resolve_hover`/`resolve_hover_cross_file`/`resolve_definition`/
+/// `resolve_definition_cross_file`/`occurrences_cross_file`, PR-it704/it739/
+/// it741/it742/it743 -- but `signature_help_info`'s identical bare-name
+/// program-item scan never received the SAME guard): a local variable
+/// (`let`/parameter/lambda param) sharing a bare name with an unrelated
+/// top-level `fun` used to show that unrelated `fun`'s signature/parameter
+/// hints while typing a call to the LOCAL. Confirmed live before this fix:
+/// `let greet = fn y { y }; greet("hi")` (shadowing an unrelated top-level
+/// `fun greet(x: Str) -> Str`) reported signature help for the top-level
+/// `greet`, not "no signature" as the local-closure call warrants -- matching
+/// the SAME suppression convention `resolve_hover`'s own fix already
+/// established (return `None` rather than attempting to resolve to the
+/// local's own signature, a bigger feature not yet built).
 pub fn resolve_signature_help(text: &str, line: usize, character: usize) -> Option<(String, Vec<String>, usize)> {
     let offset = offset_at(text, line, character);
     let (program, diags) = crate::parser::parse(text);
@@ -855,6 +872,9 @@ pub fn resolve_signature_help(text: &str, line: usize, character: usize) -> Opti
         return None;
     }
     let (name, active) = find_enclosing_call(&program, offset)?;
+    if locally_bound(&program, offset, &name) {
+        return None;
+    }
     let (label, params) = signature_help_info(&program, &name)?;
     let active = if params.is_empty() { 0 } else { active.min(params.len() - 1) };
     Some((label, params, active))
@@ -3114,6 +3134,42 @@ mod tests {
             resolve_signature_help(src, method_line, greet_open).expect("signature help on a method call");
         assert!(label2.contains("greet(name: Str, loud: Bool)"), "{label2}");
         assert_eq!(params2, vec!["name: Str".to_string(), "loud: Bool".to_string()]);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it878, the SIXTH
+    /// sibling instance of the `locally_bound`/local-vs-top-level-collision
+    /// class -- fixed FIVE times already across `resolve_hover`/
+    /// `resolve_hover_cross_file`/`resolve_definition`/
+    /// `resolve_definition_cross_file`/`occurrences_cross_file`, PR-it704/
+    /// it739/it741/it742/it743, but `resolve_signature_help`'s identical
+    /// bare-name scan never received the SAME guard): a local closure sharing
+    /// a bare name with an unrelated top-level `fun` used to show that
+    /// unrelated `fun`'s signature/parameter hints while typing a call to the
+    /// LOCAL. Confirmed live before this fix (a scratch probe, later
+    /// converted into this permanent test): `let greet = fn y { y };
+    /// greet("hi")`, shadowing an unrelated top-level `fun greet(x: Str) ->
+    /// Str`, reported `Some(("fun greet(x: Str) -> Str", ["x: Str"], 0))` --
+    /// the WRONG signature -- instead of `None`.
+    #[test]
+    fn signature_help_suppressed_for_a_call_to_a_local_shadowing_an_unrelated_top_level_fun() {
+        let src = "fun greet(x: Str) -> Str {\n    x\n}\nfun report() -> Str {\n    let greet = fn y { y }\n    greet(\"hi\")\n}\n";
+        let call_line = src.lines().position(|l| l.contains("greet(\"hi\")")).unwrap();
+        let line = src.lines().nth(call_line).unwrap();
+        let open_paren = line.find("greet(").unwrap() + "greet(".len();
+        assert!(
+            resolve_signature_help(src, call_line, open_paren).is_none(),
+            "must NOT show the unrelated top-level `greet`'s signature for a call to the local closure"
+        );
+
+        // Sanity: a GENUINE call to the top-level `greet` (no local shadow in scope)
+        // still correctly resolves -- this fix must not be a blanket suppression.
+        let src2 = "fun greet(x: Str) -> Str {\n    x\n}\nfun main() -> Str {\n    greet(\"hi\")\n}\n";
+        let call_line2 = src2.lines().position(|l| l.contains("greet(\"hi\")")).unwrap();
+        let line2 = src2.lines().nth(call_line2).unwrap();
+        let open_paren2 = line2.find("greet(").unwrap() + "greet(".len();
+        let (label, ..) = resolve_signature_help(src2, call_line2, open_paren2)
+            .expect("a genuine top-level call must still resolve");
+        assert!(label.starts_with("fun greet("), "{label}");
     }
 
     #[test]
