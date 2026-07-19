@@ -3781,8 +3781,82 @@ impl Checker {
         // (e.g. `type Tree = Leaf | Node(l: Tree, r: Tree)`): without this
         // short-circuit, specializing an all-wildcard row by `Node` would
         // keep expanding into MORE wildcard `Tree` columns forever.
+        self.joint_exhaustive_bounded(rows, tys, 0)
+    }
+
+    /// A row/column count past which `joint_exhaustive`'s recursion is
+    /// treated as non-terminating and conservatively reported as
+    /// non-exhaustive (see the doc comment on `joint_exhaustive_bounded`
+    /// below for why "conservatively report non-exhaustive" is always
+    /// semantically SAFE here, never a source of a false accept).
+    const MAX_JOINT_EXHAUSTIVE_DEPTH: usize = 64;
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it899, an Explore survey finding, agentId a54c8ea397c734246,
+    /// independently re-verified live before implementing, WITH the
+    /// survey's own proposed fix independently found to be insufficient --
+    /// see below): specializing an all-wildcard-headed row against a
+    /// RECURSIVE constructor (e.g. `Node(l: Tree, r: Tree)`) always
+    /// SUCCEEDS in producing a non-empty specialized row (the wildcard
+    /// simply expands into fresh wildcard sub-fields), so `rows` never
+    /// actually goes empty along this path -- the survey's own diagnosis
+    /// ("an empty `rows` kept recursing forever") and its proposed
+    /// `rows.is_empty() -> return false` fix were independently found NOT
+    /// to touch the real growth mechanism at all when tried live (the exact
+    /// repro below still hung after applying that fix). The REAL mechanism:
+    /// when `variants` (a recursive ADT's own constructor list, iterated in
+    /// TYPE-DECLARATION order) is walked and the RECURSIVE variant happens
+    /// to be tried before a row's own concrete (non-wildcard) constraint
+    /// is ever reached, `specialize_ctor` keeps consuming the CURRENT
+    /// leftmost `Wild` column and re-expanding it into `arity` FRESH `Wild`
+    /// columns prepended to the row -- the row's own single real constraint
+    /// (e.g. a nested `Leaf` sub-pattern) just gets pushed further and
+    /// further to the right, NEVER reaching position 0 (`t0`, always
+    /// processed leftmost-first), and NEVER becoming the single element of
+    /// an all-catch-all row either (since that one real constraint never
+    /// goes away) -- an unbounded, ever-growing `rows`/`tys` state with
+    /// EXACTLY one live row throughout, not a stack overflow (heap growth,
+    /// not stack depth) but a genuine hang. Live-confirmed: `type Tree =
+    /// Leaf | Node(l: Tree, r: Tree)` with `match t { Leaf => 0, Node(Leaf,
+    /// _) => 1, Node(_, Leaf) => 2 }` (an ordinary, non-adversarial cross-
+    /// product-gap match) returns a clean K0257 in milliseconds -- but
+    /// swapping ONLY the type's own constructor declaration order (`type
+    /// Tree = Node(l: Tree, r: Tree) | Leaf`, the IDENTICAL match
+    /// unchanged) made `kupl check`/`run`/`native` (all three share this
+    /// ONE frontend pass) hang indefinitely, RSS climbing past 12GB within
+    /// 8 seconds with zero diagnostic ever printed -- purely a function of
+    /// an otherwise-meaningless stylistic choice in the type declaration.
+    /// Fixed with an explicit recursion-depth bound, bailing to `false`
+    /// ("not proven exhaustive") once exceeded -- semantically SAFE in
+    /// BOTH directions: (1) it can never cause a FALSE ACCEPT (silently
+    /// treating a genuinely non-exhaustive match as covered), since
+    /// bailing to `false` only makes the checker MORE conservative, never
+    /// less, and the worst possible outcome is an unnecessary K0257 asking
+    /// for an explicit catch-all the user didn't strictly need; (2) it
+    /// cannot introduce a NEW false-positive rejection of ordinary,
+    /// legitimately-exhaustive code either, since ANY row that's genuinely
+    /// fully covered (including one requiring an explicit non-wildcard
+    /// constructor arm rather than a trailing `_`) reaches the existing
+    /// all-catch-all short-circuit or the `tys.split_first() == None` base
+    /// case within a recursion depth bounded by the SOURCE TEXT's own
+    /// pattern nesting depth -- confirmed live: an intentionally-deep but
+    /// still genuinely finite/legitimate match (`Node(Node(Node(Leaf,
+    /// Leaf), Leaf), Leaf)`-shaped, 10 levels deep) still compiles cleanly
+    /// after this fix, well under the 64-deep bound.
+    fn joint_exhaustive_bounded(&self, rows: &[Vec<Slot>], tys: &[Ty], depth: usize) -> bool {
+        // A row where EVERY remaining position is a catch-all trivially
+        // covers ANY combination of values for `tys`, no matter how deep --
+        // this is both a correctness shortcut (a bare `_`/bind genuinely
+        // matches anything) and the common-case TERMINATION path for
+        // recursive ADTs (e.g. `type Tree = Leaf | Node(l: Tree, r: Tree)`):
+        // without this short-circuit, specializing an all-wildcard row by
+        // `Node` would keep expanding into MORE wildcard `Tree` columns
+        // forever even for an ordinarily-exhaustive match.
         if rows.iter().any(|r| r.iter().all(Slot::is_catch_all)) {
             return true;
+        }
+        if depth > Self::MAX_JOINT_EXHAUSTIVE_DEPTH {
+            return false;
         }
         let Some((t0, rest)) = tys.split_first() else {
             // no positions left to decide: covered iff some row reached here
@@ -3792,7 +3866,7 @@ impl Checker {
             Ty::Bool => {
                 for b in [true, false] {
                     let specialized = Self::specialize_bool(rows, b);
-                    if !self.joint_exhaustive(&specialized, rest) {
+                    if !self.joint_exhaustive_bounded(&specialized, rest, depth + 1) {
                         return false;
                     }
                 }
@@ -3808,7 +3882,7 @@ impl Checker {
                     let specialized = Self::specialize_ctor(rows, vname, field_tys.len());
                     let mut sub_tys = field_tys.clone();
                     sub_tys.extend(rest.iter().cloned());
-                    if !self.joint_exhaustive(&specialized, &sub_tys) {
+                    if !self.joint_exhaustive_bounded(&specialized, &sub_tys, depth + 1) {
                         return false;
                     }
                 }
@@ -3824,7 +3898,7 @@ impl Checker {
             // own leftover positions.
             _ => {
                 let passthrough: Vec<Vec<Slot>> = rows.iter().map(|r| r[1..].to_vec()).collect();
-                self.joint_exhaustive(&passthrough, rest)
+                self.joint_exhaustive_bounded(&passthrough, rest, depth + 1)
             }
         }
     }
@@ -4698,6 +4772,51 @@ mod generic_tests {
              fun main() {}\n",
         );
         assert!(non_exhaustive.iter().any(|d| d.code == "K0257"), "{non_exhaustive:?}");
+    }
+
+    /// A REAL, LIVE-CONFIRMED hang/memory-exhaustion bug found+fixed
+    /// (production-hardening PR-it899, an Explore survey finding, agentId
+    /// a54c8ea397c734246, independently re-verified live before
+    /// implementing): the test just above only exercises a non-exhaustive
+    /// recursive match with the type's SIMPLEST possible constructor order
+    /// (`Leaf` before `Node`) -- with a genuine multi-arm CROSS-PRODUCT gap
+    /// (not just a single missing arm) AND the RECURSIVE constructor
+    /// declared FIRST, `joint_exhaustive`'s recursion used to grow
+    /// unboundedly: a wildcard-headed row specializing against the
+    /// recursive variant BEFORE the row's own concrete constraint is ever
+    /// reached just keeps re-expanding into MORE wildcard columns forever
+    /// (a genuine hang/heap-exhaustion, not a stack overflow), purely
+    /// because of the type declaration's own constructor order -- an
+    /// otherwise semantically meaningless stylistic choice. Both the
+    /// non-exhaustive case (which must still cleanly report K0257, not
+    /// hang) and a same-shaped GENUINELY exhaustive case (which must NOT
+    /// spuriously reject) are checked, confirming the depth-bound fix is
+    /// conservative in the safe direction without over-rejecting valid code.
+    #[test]
+    fn exhaustiveness_checker_terminates_on_recursive_adt_matches_regardless_of_constructor_declaration_order() {
+        let non_exhaustive = errors(
+            "type Tree = Node(l: Tree, r: Tree) | Leaf\n\
+             fun sum(t: Tree) -> Int {\n    \
+             match t {\n        \
+             Leaf => 0\n        Node(Leaf, r) => 1\n        Node(l, Leaf) => 2\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(
+            non_exhaustive.iter().any(|d| d.code == "K0257"),
+            "a genuine cross-product gap with the recursive variant declared FIRST must still \
+             cleanly report K0257, not hang: {non_exhaustive:?}"
+        );
+        let exhaustive = errors(
+            "type Tree = Node(l: Tree, r: Tree) | Leaf\n\
+             fun sum(t: Tree) -> Int {\n    \
+             match t {\n        Leaf => 0\n        Node(l, r) => sum(l) + sum(r)\n    }\n}\n\
+             fun main() {}\n",
+        );
+        assert!(
+            exhaustive.is_empty(),
+            "a genuinely exhaustive match must not be spuriously rejected just because the \
+             recursive variant is declared first: {exhaustive:?}"
+        );
     }
 
     #[test]
