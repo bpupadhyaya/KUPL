@@ -693,6 +693,24 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
                 return Some(format!("{}\n// method of contract {}", contract_sig_str(f), c.name));
             }
         }
+        // A component's own state field -- the SAME gap class as component
+        // methods (PR-it513) and contract methods (PR-it571) above, but
+        // never mirrored for `ComponentDecl.state`: hovering a state field
+        // (its own declaration, or a bare reference inside a method body)
+        // returned no hover at all, since only `exposes`/`funs` were ever
+        // searched, never `state` (production-hardening PR-it871).
+        // `item_completions`/`workspace_symbols` (this file) already treat
+        // state fields as first-class named symbols; only hover/goto-
+        // definition forgot them. Confirmed live before this fix via a real
+        // `kupl lsp` JSON-RPC session: hovering `total` at `state total:
+        // Int = 0` returned `null`, while hovering the sibling method
+        // `bump` (fixed by PR-it513) correctly returned its signature.
+        if let Item::Component(c) = item {
+            if let Some(s) = c.state.iter().find(|s| s.name == name) {
+                let ty = s.ty.as_ref().map(|t| format!(": {}", ty_str(t))).unwrap_or_default();
+                return Some(format!("state {}{ty}\n// state field of component {}", s.name, c.name));
+            }
+        }
     }
     None
 }
@@ -982,8 +1000,18 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
         Item::Type(t) => t.variants.iter().find(|v| v.name == name).map(|v| v.span),
         // A method (exposed or private) of a component -- same gap as item_signature
         // above: "go to definition" on a component method used to find nothing
-        // because only TOP-LEVEL items were searched (PR-it513).
-        Item::Component(c) => c.exposes.iter().chain(&c.funs).find(|f| f.name == name).map(|f| f.span),
+        // because only TOP-LEVEL items were searched (PR-it513). Also a
+        // component's own STATE field -- the SAME gap class, never mirrored
+        // for `ComponentDecl.state` (production-hardening PR-it871): "go to
+        // definition" on a state field found nothing at all, since only
+        // `exposes`/`funs` were ever searched here.
+        Item::Component(c) => c
+            .exposes
+            .iter()
+            .chain(&c.funs)
+            .find(|f| f.name == name)
+            .map(|f| f.span)
+            .or_else(|| c.state.iter().find(|s| s.name == name).map(|s| s.span)),
         // A contract's exposed method signature -- same gap, never mirrored for
         // `ContractDecl.sigs` (PR-it571).
         Item::Contract(c) => c.sigs.iter().find(|f| f.name == name).map(|f| f.span),
@@ -3005,6 +3033,50 @@ mod tests {
         let ch4 = src.lines().nth(comp_line).unwrap().find("Greeter").unwrap() + 1;
         let h_comp = resolve_hover(src, comp_line, ch4).expect("hover on component ctor call");
         assert!(h_comp.contains("component Greeter"), "{h_comp}");
+    }
+
+    /// A REAL LSP capability gap found+fixed (production-hardening PR-it871,
+    /// an Explore survey finding, independently re-verified live before
+    /// implementing): the SAME gap class as it513's component-method fix and
+    /// it571's contract-method fix above, just never mirrored for
+    /// `ComponentDecl.state` -- hovering a state field (its own declaration,
+    /// or a bare reference inside a method body) returned NO hover at all,
+    /// and "go to definition" found nothing either, since
+    /// item_signature/item_definition's component fallthrough only ever
+    /// searched `exposes`/`funs`, never `state`. `item_completions`/
+    /// `workspace_symbols` already treated state fields as first-class named
+    /// symbols; only hover/goto-definition forgot them. Confirmed live
+    /// before this fix via a real `kupl lsp` JSON-RPC session: hovering
+    /// `total` at `state total: Int = 0` returned `null`, while hovering
+    /// the sibling method `bump` (already fixed by it513) correctly
+    /// returned its signature.
+    #[test]
+    fn hover_and_definition_work_on_component_state_fields() {
+        let src = "component Widget {\n    intent \"w\"\n    state total: Int = 0\n    expose fun bump() -> Int {\n        total += 1\n        total\n    }\n}\nfun main() {\n    let w = Widget()\n}\n";
+
+        // hover on the state field's own declaration
+        let decl_line = src.lines().position(|l| l.contains("state total")).unwrap();
+        let ch = src.lines().nth(decl_line).unwrap().find("total").unwrap() + 1;
+        let h_decl = resolve_hover(src, decl_line, ch).expect("hover on state field decl");
+        assert!(h_decl.contains("state total: Int"), "{h_decl}");
+        assert!(h_decl.contains("state field of component Widget"), "{h_decl}");
+
+        // hover on a BARE reference to the state field inside a method body
+        let ref_line = src.lines().position(|l| l.contains("total += 1")).unwrap();
+        let ch2 = src.lines().nth(ref_line).unwrap().find("total").unwrap() + 1;
+        let h_ref = resolve_hover(src, ref_line, ch2).expect("hover on state field reference");
+        assert!(h_ref.contains("state total: Int"), "{h_ref}");
+
+        // go-to-definition on the reference resolves to the field's OWN declaration line
+        let (l0, c0, _, _) = resolve_definition(src, ref_line, ch2).expect("definition of total");
+        assert_eq!(l0, decl_line, "definition should point at the `state total` line");
+        assert_eq!(c0, src.lines().nth(decl_line).unwrap().find("total").unwrap());
+
+        // the sibling method still hovers as before (no regression)
+        let method_line = src.lines().position(|l| l.contains("expose fun bump")).unwrap();
+        let ch3 = src.lines().nth(method_line).unwrap().find("bump").unwrap() + 1;
+        let h_method = resolve_hover(src, method_line, ch3).expect("hover on sibling method decl");
+        assert!(h_method.contains("fun bump() -> Int"), "{h_method}");
     }
 
     #[test]
