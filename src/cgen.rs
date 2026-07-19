@@ -3332,12 +3332,30 @@ static KValue k_csv_stringify(KValue lst) {
     if (lst.tag != K_LIST) k_panic("csv_stringify needs a list");
     KBuf b = { 0, 0, 0 };
     KList* rows = lst.as.list;
+    /* A REAL silent-data-loss bug found+fixed (production-hardening PR-it883,
+       mirrors csv.rs's Rust fix exactly, found by fuzzing the canonical Rust
+       parse/stringify round-trip): the LAST row's own lone empty field
+       ([""]) used to serialize to ZERO bytes -- k_csv_field on "" emits
+       nothing unquoted -- making it byte-for-byte indistinguishable from
+       "no more rows at all". k_csv_parse's own end-of-input flush
+       deliberately treats trailing empty field/row content as a phantom
+       (needed so a normal trailing newline doesn't create a bogus extra
+       record), so re-parsing this output silently DROPPED that entire last
+       row. Force-quoting specifically the last row's lone empty field to ""
+       (2 bytes) fixes it, exactly mirroring how a genuinely-quoted empty
+       field already survives via field_was_quoted (PR-it678's fix). */
+    int64_t last = rows->len - 1;
     for (int64_t r = 0; r < rows->len; r++) {
         if (r) kb_putc(&b, '\n');
         KList* row = rows->items[r].as.list;
         for (int64_t c = 0; c < row->len; c++) {
             if (c) kb_putc(&b, ',');
-            k_csv_field(&b, row->items[c].as.s);
+            if (r == last && row->len == 1 && row->items[c].as.s[0] == 0) {
+                kb_putc(&b, '"');
+                kb_putc(&b, '"');
+            } else {
+                k_csv_field(&b, row->items[c].as.s);
+            }
         }
     }
     return k_str(kb_take(&b));
@@ -12240,6 +12258,128 @@ fun main() uses io {
                    print(csv_parse(\"\\\"\\\"\"))\n    \
                    print(csv_parse(\"a\\n\\\"\\\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "csvlonefield").trim(), "[[\"\"]]\n[[\"a\"], [\"\"]]");
+    }
+
+    /// A REAL silent-data-loss bug (PR-it883, matching the fix + fuzz-found
+    /// test in `csv.rs` itself this same iteration, and mirroring the
+    /// SIBLING case `native_csv_lone_closed_empty_quoted_field_is_not_
+    /// silently_dropped` already covers for `csv_parse`): `k_csv_stringify`'s
+    /// LAST row's own lone empty field used to serialize to zero bytes,
+    /// indistinguishable from "no more rows" once re-parsed by `k_csv_parse`
+    /// -- silently dropping that entire row on a `csv_stringify` ->
+    /// `csv_parse` round trip.
+    #[test]
+    fn native_csv_stringify_quotes_a_lone_trailing_empty_field_so_it_survives_round_trip() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(csv_stringify([[\"\"]]))\n    \
+                   print(csv_parse(csv_stringify([[\"\"]])))\n    \
+                   print(csv_parse(csv_stringify([[\"a\"], [\"\"]])))\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "csvstrlonefield").trim(),
+            "\"\"\n[[\"\"]]\n[[\"a\"], [\"\"]]"
+        );
+    }
+
+    /// A cross-engine fuzz pass against `k_csv_parse`/`k_csv_stringify`
+    /// (production-hardening PR-it883, the fallback dispatched after survey
+    /// #48 came up genuinely dry at it882): generates hundreds of random,
+    /// adversarial raw CSV-shaped text strings (mixing the four characters
+    /// this parser treats specially -- `,` `"` `\n` `\r` -- with plain ASCII
+    /// and a multi-byte UTF-8 character) and checks that piping each one
+    /// through native's `csv_stringify(csv_parse(...))` produces EXACTLY the
+    /// same canonical text as computing the identical chain directly via the
+    /// canonical Rust `crate::csv::parse`/`crate::csv::stringify` (the same
+    /// functions interp/vm call) -- this is where this campaign's
+    /// highest-severity findings have historically hidden (PR-it738's own
+    /// csv_parse divergence, PR-it879's unrelated parse_value divergence),
+    /// since `cgen.rs` is an independent, hand-maintained C reimplementation
+    /// that can silently drift from the canonical Rust semantics. Kept to a
+    /// moderate seed count (each iteration is a full `cc -O2` compile+link+
+    /// run, unlike the cheap in-process Rust-only fuzz harness `csv.rs`'s own
+    /// `fuzz_random_field_content_round_trips_through_stringify_then_parse`
+    /// uses at 400 seeds). Found ZERO disagreements across all 60 generated
+    /// cases -- confirming the PR-it883 stringify fix above (already applied
+    /// to `k_csv_stringify` before this test was written) closes the gap on
+    /// native too, and finding no FURTHER native-specific divergence beyond
+    /// it. A genuinely broader coverage mechanism now locked in permanently,
+    /// not a second bug fix.
+    #[test]
+    fn fuzz_random_csv_text_matches_the_canonical_rust_parser_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+        }
+        fn fuzz_gen_csv_text(rng: &mut FuzzRng, max_len: usize) -> String {
+            let pool = ['a', 'b', ',', '"', '\n', '\r', 'z', '1', 'é', ' '];
+            let len = rng.below(max_len as u64) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push(pool[rng.below(pool.len() as u64) as usize]);
+            }
+            s
+        }
+        fn escape_kupl_str(s: &str) -> String {
+            let mut out = String::new();
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=60u64 {
+            let mut rng = FuzzRng::new(seed);
+            let text = fuzz_gen_csv_text(&mut rng, 14);
+            let expected = crate::csv::stringify(&crate::csv::parse(&text));
+            let escaped = escape_kupl_str(&text);
+            let src = format!("fun main() uses io {{\n    print(csv_stringify(csv_parse(\"{escaped}\")))\n}}\n");
+            let raw = native_main_stdout(&src, &format!("csvfuzz{seed}"));
+            // Strip exactly ONE trailing newline -- `print`'s own terminator
+            // -- not a general `.trim()`: fuzzed CSV content can legitimately
+            // contain leading/trailing newlines or spaces as real field
+            // content, which a blanket trim would wrongly discard, producing
+            // FALSE mismatches against the untrimmed `expected` (caught
+            // during this test's own initial write-up, before trusting any
+            // of its reported "divergences" -- see PR-it883's writeup).
+            let actual = raw.strip_suffix('\n').unwrap_or(&raw);
+            if actual != expected {
+                mismatches.push(format!("seed={seed} text={text:?} expected={expected:?} actual={actual:?}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native csv_parse/csv_stringify diverges from the canonical Rust parser on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
     }
 
     /// A REAL, cross-engine-DIVERGING bug found+fixed (production-hardening

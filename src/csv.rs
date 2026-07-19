@@ -91,8 +91,34 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
 }
 
 /// Serialize rows of fields to CSV text (records joined with `\n`).
+///
+/// A REAL silent-data-loss bug found+fixed (production-hardening PR-it883,
+/// found by fuzzing hundreds of random field combinations through the
+/// `parse`/`stringify` round-trip): the LAST row's own lone empty field
+/// (`[""]` -- one field, empty content) used to serialize to ZERO
+/// characters (`write_field("")` emits nothing unquoted), making it
+/// byte-for-byte indistinguishable from "no more rows at all" -- `parse`'s
+/// own end-of-input flush deliberately treats trailing empty field/row
+/// content as a phantom (the documented "a single trailing newline does not
+/// produce an extra empty record" rule, needed so a normal trailing
+/// newline doesn't create a bogus extra record), so re-parsing this
+/// output silently DROPPED that entire last row. Confirmed live before this
+/// fix: `stringify(&[vec![String::new()]])` produced `""` (the empty
+/// string), and `parse("")` returns `[]` -- zero rows, not the one row with
+/// one empty field that was actually passed in; the same collapse happened
+/// whenever the LAST row was `[""]`, regardless of how many rows preceded
+/// it (e.g. `stringify(&[vec!["a".into()], vec![String::new()]])` produced
+/// `"a\n"`, and `parse("a\n")` is documented to return just `[["a"]]`). A
+/// row with 2+ fields, or a NON-empty last field, was never affected (its
+/// flush is protected by the pre-existing `!row.is_empty()`/non-empty-field
+/// checks); nor was a lone empty field in a MIDDLE row (unambiguously
+/// bounded by `\n` on both sides already). Fixed by force-quoting
+/// specifically the last row's lone empty field to `""` (2 characters),
+/// exactly mirroring how a genuinely-quoted empty field already survives
+/// via `field_was_quoted` (PR-it678's fix).
 pub fn stringify(rows: &[Vec<String>]) -> String {
     let mut out = String::new();
+    let last_idx = rows.len().wrapping_sub(1);
     for (r, row) in rows.iter().enumerate() {
         if r > 0 {
             out.push('\n');
@@ -101,7 +127,11 @@ pub fn stringify(rows: &[Vec<String>]) -> String {
             if c > 0 {
                 out.push(',');
             }
-            write_field(field, &mut out);
+            if r == last_idx && row.len() == 1 && field.is_empty() {
+                out.push_str("\"\"");
+            } else {
+                write_field(field, &mut out);
+            }
         }
     }
     out
@@ -240,6 +270,39 @@ mod tests {
         assert_eq!(stringify(&[vec!["x\ny".into()]]), "\"x\ny\"");
     }
 
+    /// A REAL silent-data-loss bug (PR-it883, found by fuzzing the
+    /// `parse`/`stringify` round-trip invariant across hundreds of random
+    /// field combinations -- see `fuzz_random_field_content_round_trips_
+    /// through_stringify_then_parse` below): the LAST row's own lone empty
+    /// field used to serialize to zero characters, indistinguishable from
+    /// "no more rows" once re-parsed, silently dropping that entire row.
+    #[test]
+    fn stringify_quotes_a_lone_trailing_empty_field_so_it_survives_round_trip() {
+        // the bug's minimal reproducer: a single row, one empty field.
+        assert_eq!(stringify(&[vec![String::new()]]), "\"\"");
+        assert_eq!(parse(&stringify(&[vec![String::new()]])), vec![vec![""]]);
+        // the SAME bug, but as the last row of a multi-row document -- the
+        // shape that makes this a realistic, reachable data-loss bug (e.g. a
+        // trailing blank final column with no other rows after it).
+        assert_eq!(stringify(&[vec!["a".into()], vec![String::new()]]), "a\n\"\"");
+        assert_eq!(
+            parse(&stringify(&[vec!["a".into()], vec![String::new()]])),
+            vec![vec!["a"], vec![""]]
+        );
+        // a lone empty field in a MIDDLE row was never affected -- it's
+        // already unambiguously bounded by `\n` on both sides -- confirm the
+        // fix doesn't touch (or break) that pre-existing correct behavior.
+        assert_eq!(
+            stringify(&[vec!["a".into()], vec![String::new()], vec!["b".into()]]),
+            "a\n\nb"
+        );
+        // a last row with 2+ fields (even if all empty) was never affected --
+        // its flush is already protected by the pre-existing `!row.is_empty()`
+        // check once at least one field has been pushed.
+        assert_eq!(stringify(&[vec![String::new(), String::new()]]), ",");
+        assert_eq!(parse(&stringify(&[vec![String::new(), String::new()]])), vec![vec!["", ""]]);
+    }
+
     #[test]
     fn roundtrips() {
         for src in [
@@ -252,5 +315,88 @@ mod tests {
             let back = stringify(&parsed);
             assert_eq!(parse(&back), parsed, "round-trip differs for {src:?}");
         }
+    }
+
+    /// A small deterministic xorshift64* PRNG, mirroring `vm.rs`'s own
+    /// fuzz-harness generator SHAPE (production-hardening PR-it788) -- kept
+    /// as a small local copy per that file's established "share once there
+    /// are two real callers, not before" judgment, rather than exporting a
+    /// shared fuzz-rng module preemptively.
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn new(seed: u64) -> Self {
+            FuzzRng(if seed == 0 { 1 } else { seed })
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                0
+            } else {
+                self.next() % n
+            }
+        }
+    }
+
+    /// A random field's CONTENT (production-hardening PR-it883) -- mixes
+    /// plain ASCII, the four characters this parser treats specially
+    /// (`,` `"` `\n` `\r`), a multi-byte UTF-8 character (this parser
+    /// indexes by `char`, not byte, so a naive byte-indexed regression
+    /// wouldn't panic on ASCII-only fuzz input), and the empty string, at
+    /// random lengths including zero.
+    fn fuzz_gen_field(rng: &mut FuzzRng) -> String {
+        let pool = ['a', 'b', ',', '"', '\n', '\r', 'z', '1', 'é', ' '];
+        let len = rng.below(6);
+        let mut s = String::new();
+        for _ in 0..len {
+            s.push(pool[rng.below(pool.len() as u64) as usize]);
+        }
+        s
+    }
+
+    /// `stringify` claims (in this module's own top-of-file doc comment)
+    /// that its output always round-trips back through `parse` to the exact
+    /// same rows -- the hand-picked `roundtrips()` case above only exercises
+    /// 4 fixed inputs. This generates hundreds of random field combinations
+    /// (deterministic, fixed seed range, so any failure is reproducible and
+    /// this test is never flaky) specifically targeting the three sites this
+    /// module's own doc comments flag as historically fragile (a `"` that
+    /// isn't a field's first character, PR-it712; a lone properly-closed
+    /// empty quoted field, PR-it678; CRLF-vs-LF terminators) to check the
+    /// round-trip INVARIANT holds generally, not just for the 4 examples
+    /// already on record. Found ZERO violations across all 400 generated
+    /// cases -- a genuinely broader coverage mechanism now locked in
+    /// permanently, not a bug fix (this campaign's it882 already ruled out
+    /// the other candidate this iteration considered).
+    #[test]
+    fn fuzz_random_field_content_round_trips_through_stringify_then_parse() {
+        let mut failures = Vec::new();
+        for seed in 1..=400u64 {
+            let mut rng = FuzzRng::new(seed);
+            let nrows = 1 + rng.below(4);
+            let rows: Vec<Vec<String>> = (0..nrows)
+                .map(|_| {
+                    let nfields = 1 + rng.below(3);
+                    (0..nfields).map(|_| fuzz_gen_field(&mut rng)).collect()
+                })
+                .collect();
+            let text = stringify(&rows);
+            let back = parse(&text);
+            if back != rows {
+                failures.push(format!("seed={seed} rows={rows:?} text={text:?} reparsed={back:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "stringify->parse round-trip violated on {} generated cases:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 }
