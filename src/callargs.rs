@@ -10,13 +10,64 @@
 //! Named/default resolution applies only to direct calls of top-level `fun`s
 //! (not constructors, methods, or UFCS). Defaults must be trailing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diag::Diag;
 
 /// Rewrite every call to a top-level function into positional form, filling
 /// defaults and reordering named arguments. Returns any structural diagnostics.
+///
+/// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it894, an
+/// Explore survey finding, agentId a7ba91a6862653340, independently
+/// re-verified live before implementing): this pass used to match a call's
+/// callee purely by IDENTIFIER TEXT against the flat, whole-program `funs`
+/// map above, with no notion of lexical scope at all -- unlike its sibling
+/// AST-rewrite pass `resolve.rs::Rewriter`, which threads a `scope:
+/// Vec<HashSet<String>>` / `is_local()` through the exact same shape of walk
+/// specifically to avoid this class of mistake (see that file's own doc
+/// comments). Shadowing a top-level function's name with a local `let`
+/// binding or a function-typed parameter is a deliberately supported,
+/// ordinarily-working KUPL feature (a plain positional call to the shadowing
+/// local already resolved correctly, matching `interp.rs`'s real scoping) --
+/// but a call to it using NAMED arguments or omitting a trailing default was
+/// silently rewritten using the UNRELATED top-level function's own
+/// parameter names/order/defaults instead, with zero diagnostics, because
+/// this pass ran upstream of (and blind to) the checker's real scope
+/// resolution. Live-confirmed (two distinct failure shapes, both identical
+/// on `kupl run` and `kupl run --vm`, with `kupl check` reporting ZERO
+/// diagnostics):
+///   - silent WRONG VALUE: `fun combine(x: Int, y: Int) -> Int { x - y }`
+///     alongside `let combine = fn(m, n) { m * 10 + n }; combine(y: 2, x: 5)`
+///     printed `52` (`m=5, n=2` per the LOCAL closure, reached only because
+///     this pass rewrote the named args into `combine(5, 2)` using the
+///     UNRELATED top-level `combine`'s `(x, y)` parameter order) instead of
+///     the correct outcome: calling a local value with named arguments is
+///     already rejected elsewhere in this exact file with a clean K0241
+///     ("named arguments are only allowed for constructors and props") for
+///     any NON-colliding local -- confirmed via a same-shaped control case
+///     with no name collision, `let onlyLocal = fn(p, q) { ... };
+///     onlyLocal(q: 100, p: 1)`, which correctly K0241s.
+///   - spurious REJECTION of valid code: `fun greet(name: Str, punctuation:
+///     Str = "!") -> Str { ... }` alongside `let greet = fn(n) { "hi " + n
+///     }; greet("world")` -- an ordinary, single-argument call to a
+///     one-parameter local closure -- failed with a bogus K0242 ("this
+///     function takes 1 argument, 2 given"), because the unrelated
+///     top-level `greet`'s own trailing default got appended.
+/// Also confirmed to reach a function-TYPED parameter shadowing a top-level
+/// function of the same name (an idiomatic pattern this exact codebase uses
+/// elsewhere, e.g. `examples/collections.kupl`'s `cmp: fn(T, T) -> Int`),
+/// not just a `let`-bound local. Fixed by replacing the old closure-based
+/// walk with a `Resolver` struct carrying the SAME `scope: Vec<HashSet
+/// <String>>` / `is_local`/`bind`/`push`/`pop` primitives as `resolve.rs`'s
+/// `Rewriter`, pushing/popping a scope frame at every binding construct this
+/// file's own walk already visits (function/handler/law params, `let`
+/// statements, `for`/`forall` loop variables, lambda params, match-arm
+/// pattern bindings) and skipping the named/default rewrite entirely
+/// whenever the callee identifier is locally bound at that call site --
+/// leaving such a call for the checker's own ordinary (already-correct)
+/// K0241/K0242 diagnostics, exactly like the pre-existing non-colliding
+/// control case above.
 pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
     let mut diags = Vec::new();
     let mut funs: HashMap<String, Vec<Param>> = HashMap::new();
@@ -42,23 +93,58 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
         }
     }
 
-    let mut temp_counter = 0usize;
-    let mut visit = |e: &mut Expr| {
-        let callee_name = match &e.kind {
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Ident(name) if funs.contains_key(name) => Some(name.clone()),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(name) = callee_name {
-            let params = funs.get(&name).unwrap().clone();
-            resolve_one(&name, &params, e, &mut diags, &mut temp_counter);
-        }
-    };
+    let mut r = Resolver { funs: &funs, diags, temp_counter: 0, scope: Vec::new() };
+    r.program(program);
+    r.diags
+}
 
-    for item in &mut program.items {
-        match item {
+struct Resolver<'a> {
+    funs: &'a HashMap<String, Vec<Param>>,
+    diags: Vec<Diag>,
+    temp_counter: usize,
+    scope: Vec<HashSet<String>>,
+}
+
+impl Resolver<'_> {
+    fn is_local(&self, n: &str) -> bool {
+        self.scope.iter().any(|f| f.contains(n))
+    }
+    fn bind(&mut self, n: &str) {
+        if let Some(f) = self.scope.last_mut() {
+            f.insert(n.to_string());
+        }
+    }
+    fn push(&mut self) {
+        self.scope.push(HashSet::new());
+    }
+    fn pop(&mut self) {
+        self.scope.pop();
+    }
+
+    fn bind_pattern(&mut self, p: &Pattern) {
+        match &p.kind {
+            PatternKind::Bind(n) => self.bind(n),
+            PatternKind::Ctor { args, .. } => {
+                for a in args {
+                    self.bind_pattern(a);
+                }
+            }
+            PatternKind::Or(alts) => {
+                for a in alts {
+                    self.bind_pattern(a);
+                }
+            }
+            PatternKind::At { name, inner } => {
+                self.bind(name);
+                self.bind_pattern(inner);
+            }
+            _ => {}
+        }
+    }
+
+    fn program(&mut self, program: &mut Program) {
+        for item in &mut program.items {
+            match item {
             // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
             // PR-it840): an `ai fun`'s body is always a parser-synthesized
             // EMPTY block (see parser.rs's `parse_ai_fun`) -- the actual
@@ -82,22 +168,15 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
             // `kupl check`/`run`/`run --vm` even though the identical call
             // compiles cleanly everywhere else; `intent "value: {add(10)}"`
             // against `fun add(a: Int, b: Int = 5) -> Int` failed K0242.
-            Item::Fun(f) => {
-                walk_block(&mut f.body, &mut visit);
-                if let Some(ai) = &mut f.ai {
-                    walk_expr(&mut ai.intent_expr, &mut visit);
-                }
+            Item::Fun(f) => self.fun_body(f),
+            Item::Law(l) => {
+                self.push();
+                self.block(&mut l.body);
+                self.pop();
             }
-            Item::Law(l) => walk_block(&mut l.body, &mut visit),
             Item::Component(c) => {
-                for h in &mut c.handlers {
-                    walk_block(&mut h.body, &mut visit);
-                }
-                for f in c.funs.iter_mut().chain(c.exposes.iter_mut()) {
-                    walk_block(&mut f.body, &mut visit);
-                }
                 for s in &mut c.state {
-                    walk_expr(&mut s.init, &mut visit);
+                    self.expr(&mut s.init);
                 }
                 // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
                 // PR-it839): this arm never walked `c.props[i].default` (a
@@ -131,13 +210,44 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
                 // never covered.
                 for p in &mut c.props {
                     if let Some(d) = &mut p.default {
-                        walk_expr(d, &mut visit);
+                        self.expr(d);
                     }
+                }
+                // A REAL, LIVE-CONFIRMED bug found+fixed (production-
+                // hardening PR-it894, same sweep as this file's own top doc
+                // comment): props/state were never bound into scope here,
+                // so a handler/method/child/example referencing a prop or
+                // state field that happens to share a name with an
+                // unrelated top-level function would ALSO hit the exact
+                // same scope-blind rewrite this fix closes above -- one
+                // push/pop frame, opened here (after prop defaults/state
+                // inits, which can't reference the component's own
+                // not-yet-constructed state, mirroring `resolve.rs::
+                // component`'s identical ordering) and closed at the end of
+                // this arm, covers every location below that can reference
+                // a prop or state field by bare name.
+                self.push();
+                for p in &c.props {
+                    self.bind(&p.name);
+                }
+                for s in &c.state {
+                    self.bind(&s.name);
                 }
                 for child in &mut c.children {
                     for a in &mut child.args {
-                        walk_expr(&mut a.value, &mut visit);
+                        self.expr(&mut a.value);
                     }
+                }
+                for h in &mut c.handlers {
+                    self.push();
+                    if let Some(p) = &h.param {
+                        self.bind(p);
+                    }
+                    self.block(&mut h.body);
+                    self.pop();
+                }
+                for f in c.funs.iter_mut().chain(c.exposes.iter_mut()) {
+                    self.fun_body(f);
                 }
                 // A REAL bug found+fixed (production-hardening PR-it769): this
                 // arm never walked `c.examples` -- the `example { send ...;
@@ -152,12 +262,13 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
                 for ex in &mut c.examples {
                     for step in &mut ex.steps {
                         match step {
-                            ExampleStep::Send { arg: Some(e), .. } => walk_expr(e, &mut visit),
-                            ExampleStep::Expect { expr, .. } => walk_expr(expr, &mut visit),
+                            ExampleStep::Send { arg: Some(e), .. } => self.expr(e),
+                            ExampleStep::Expect { expr, .. } => self.expr(expr),
                             ExampleStep::Send { arg: None, .. } | ExampleStep::Advance { .. } => {}
                         }
                     }
                 }
+                self.pop(); // the props/state frame opened above
             }
             // A REAL bug found+fixed (production-hardening PR-it769): this
             // whole item kind fell into the `_ => {}` catch-all, so a
@@ -172,13 +283,165 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
             // 15` inside `contract Adder { law "..." { ... } }`.
             Item::Contract(ct) => {
                 for law in &mut ct.laws {
-                    walk_block(&mut law.body, &mut visit);
+                    self.push();
+                    self.block(&mut law.body);
+                    self.pop();
                 }
             }
             _ => {}
         }
+        }
     }
-    diags
+
+    /// A top-level `fun` or a component method (`c.funs`/`c.exposes`, the
+    /// same `FunDecl` shape): push a fresh scope frame binding this
+    /// function's own parameters, then walk its body and (for an `ai fun`)
+    /// its `intent` expression -- both see the SAME parameter scope, since
+    /// `intent` functionally replaces `body` for an ai fun (production-
+    /// hardening PR-it840's own finding: `f.body` is always a
+    /// parser-synthesized empty block for one).
+    fn fun_body(&mut self, f: &mut FunDecl) {
+        self.push();
+        for p in &f.params {
+            self.bind(&p.name);
+        }
+        self.block(&mut f.body);
+        if let Some(ai) = &mut f.ai {
+            self.expr(&mut ai.intent_expr);
+        }
+        self.pop();
+    }
+
+    fn block(&mut self, b: &mut Block) {
+        self.push();
+        for s in &mut b.stmts {
+            self.stmt(s);
+        }
+        self.pop();
+    }
+
+    fn stmt(&mut self, s: &mut Stmt) {
+        match s {
+            Stmt::Let { name, init, .. } => {
+                self.expr(init);
+                self.bind(name); // in scope for later statements
+            }
+            Stmt::Assign { target, value, .. } => {
+                self.expr(target);
+                self.expr(value);
+            }
+            Stmt::Expr(e) => self.expr(e),
+            Stmt::Return(Some(e), _) => self.expr(e),
+            Stmt::While { cond, body, .. } => {
+                self.expr(cond);
+                self.block(body);
+            }
+            Stmt::For { var, iter, body, .. } => {
+                self.expr(iter);
+                self.push();
+                self.bind(var);
+                self.block(body);
+                self.pop();
+            }
+            Stmt::Emit { arg: Some(e), .. } => self.expr(e),
+            Stmt::Expect(e, _) => self.expr(e),
+            Stmt::Forall { vars, body, .. } => {
+                self.push();
+                for (v, _) in vars.iter() {
+                    self.bind(v);
+                }
+                self.block(body);
+                self.pop();
+            }
+            Stmt::Return(None, _) | Stmt::Emit { arg: None, .. } | Stmt::Break(_) | Stmt::Continue(_) => {}
+        }
+    }
+
+    fn expr(&mut self, e: &mut Expr) {
+        let callee_name = match &e.kind {
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Ident(name) if self.funs.contains_key(name) && !self.is_local(name) => Some(name.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(name) = callee_name {
+            let params = self.funs.get(&name).unwrap().clone();
+            resolve_one(&name, &params, e, &mut self.diags, &mut self.temp_counter);
+        }
+        match &mut e.kind {
+            ExprKind::Str(pieces) => {
+                for p in pieces {
+                    if let StrPiece::Expr(inner) = p {
+                        self.expr(inner);
+                    }
+                }
+            }
+            ExprKind::List(items) | ExprKind::Par(items) => {
+                for i in items {
+                    self.expr(i);
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                self.expr(callee);
+                for a in args {
+                    self.expr(&mut a.value);
+                }
+            }
+            ExprKind::MethodCall { recv, args, .. } => {
+                self.expr(recv);
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            ExprKind::Field { recv, .. } => self.expr(recv),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.expr(lhs);
+                self.expr(rhs);
+            }
+            ExprKind::Unary { operand, .. } => self.expr(operand),
+            ExprKind::If { cond, then_block, else_block } => {
+                self.expr(cond);
+                self.block(then_block);
+                if let Some(e) = else_block {
+                    self.expr(e);
+                }
+            }
+            ExprKind::BlockExpr(b) => self.block(b),
+            ExprKind::Match { scrutinee, arms } => {
+                self.expr(scrutinee);
+                for arm in arms {
+                    self.push();
+                    self.bind_pattern(&arm.pattern);
+                    if let Some(g) = &mut arm.guard {
+                        self.expr(g);
+                    }
+                    self.expr(&mut arm.body);
+                    self.pop();
+                }
+            }
+            ExprKind::Lambda { params, body } => {
+                self.push();
+                for p in params.iter() {
+                    self.bind(&p.name);
+                }
+                self.block(body);
+                self.pop();
+            }
+            ExprKind::Range { lo, hi, .. } => {
+                self.expr(lo);
+                self.expr(hi);
+            }
+            ExprKind::With { recv, updates } => {
+                self.expr(recv);
+                for (_, v) in updates {
+                    self.expr(v);
+                }
+            }
+            ExprKind::Try(e) | ExprKind::Await(e) => self.expr(e),
+            _ => {}
+        }
+    }
 }
 
 /// Resolve one call's args against `params`, rewriting `e` (a `Call` node) in
@@ -304,104 +567,6 @@ fn resolve_one(fun_name: &str, params: &[Param], e: &mut Expr, diags: &mut Vec<D
     } else {
         prelude.push(Stmt::Expr(call));
         e.kind = ExprKind::BlockExpr(Block { stmts: prelude, span });
-    }
-}
-
-// ---- mutable AST walkers (mirror the immutable ones in effects.rs) ----
-
-fn walk_block(block: &mut Block, f: &mut impl FnMut(&mut Expr)) {
-    for stmt in &mut block.stmts {
-        walk_stmt(stmt, f);
-    }
-}
-
-fn walk_stmt(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
-    match stmt {
-        Stmt::Let { init, .. } => walk_expr(init, f),
-        Stmt::Assign { target, value, .. } => {
-            walk_expr(target, f);
-            walk_expr(value, f);
-        }
-        Stmt::Expr(e) => walk_expr(e, f),
-        Stmt::Return(Some(e), _) => walk_expr(e, f),
-        Stmt::While { cond, body, .. } => {
-            walk_expr(cond, f);
-            walk_block(body, f);
-        }
-        Stmt::For { iter, body, .. } => {
-            walk_expr(iter, f);
-            walk_block(body, f);
-        }
-        Stmt::Emit { arg: Some(e), .. } => walk_expr(e, f),
-        Stmt::Expect(e, _) => walk_expr(e, f),
-        Stmt::Forall { body, .. } => walk_block(body, f),
-        Stmt::Return(None, _) | Stmt::Emit { arg: None, .. } | Stmt::Break(_) | Stmt::Continue(_) => {}
-    }
-}
-
-fn walk_expr(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
-    f(expr);
-    match &mut expr.kind {
-        ExprKind::Str(pieces) => {
-            for p in pieces {
-                if let StrPiece::Expr(e) = p {
-                    walk_expr(e, f);
-                }
-            }
-        }
-        ExprKind::List(items) | ExprKind::Par(items) => {
-            for i in items {
-                walk_expr(i, f);
-            }
-        }
-        ExprKind::Call { callee, args } => {
-            walk_expr(callee, f);
-            for a in args {
-                walk_expr(&mut a.value, f);
-            }
-        }
-        ExprKind::MethodCall { recv, args, .. } => {
-            walk_expr(recv, f);
-            for a in args {
-                walk_expr(a, f);
-            }
-        }
-        ExprKind::Field { recv, .. } => walk_expr(recv, f),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            walk_expr(lhs, f);
-            walk_expr(rhs, f);
-        }
-        ExprKind::Unary { operand, .. } => walk_expr(operand, f),
-        ExprKind::If { cond, then_block, else_block } => {
-            walk_expr(cond, f);
-            walk_block(then_block, f);
-            if let Some(e) = else_block {
-                walk_expr(e, f);
-            }
-        }
-        ExprKind::BlockExpr(b) => walk_block(b, f),
-        ExprKind::Match { scrutinee, arms } => {
-            walk_expr(scrutinee, f);
-            for arm in arms {
-                if let Some(g) = &mut arm.guard {
-                    walk_expr(g, f);
-                }
-                walk_expr(&mut arm.body, f);
-            }
-        }
-        ExprKind::Lambda { body, .. } => walk_block(body, f),
-        ExprKind::Range { lo, hi, .. } => {
-            walk_expr(lo, f);
-            walk_expr(hi, f);
-        }
-        ExprKind::With { recv, updates } => {
-            walk_expr(recv, f);
-            for (_, v) in updates {
-                walk_expr(v, f);
-            }
-        }
-        ExprKind::Try(e) | ExprKind::Await(e) => walk_expr(e, f),
-        _ => {}
     }
 }
 

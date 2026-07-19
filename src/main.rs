@@ -1672,6 +1672,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it894,
+    /// an Explore survey finding, agentId a7ba91a6862653340, independently
+    /// re-verified live before implementing -- see `callargs.rs`'s own doc
+    /// comment on `resolve_call_args`/`Resolver` for the full writeup). A
+    /// local `let`/lambda-param binding that shadows a top-level function
+    /// name resolves correctly for an ORDINARY positional call (matching
+    /// `interp.rs`'s real scoping) -- but `callargs.rs`'s named-argument/
+    /// trailing-default rewrite used to match a call's callee by IDENTIFIER
+    /// TEXT alone, with no scope awareness, so a call to the SHADOWING local
+    /// using named arguments or a trailing default was silently rewritten
+    /// using the UNRELATED top-level function's own parameter names/order/
+    /// defaults -- either a silent WRONG VALUE (zero diagnostics) or a
+    /// spurious rejection of otherwise-valid code, identically on interp and
+    /// the VM, with `kupl check` reporting nothing.
+    #[test]
+    fn a_local_binding_that_shadows_a_top_level_fun_name_is_never_confused_with_it_by_the_named_arg_rewrite() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-it894-shadow-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_both = |file: &std::path::Path| -> (std::process::Output, std::process::Output) {
+            let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+            (interp, vm)
+        };
+
+        // A named-argument call to a LOCAL closure that shadows an unrelated
+        // top-level `combine(x, y)` used to silently rewrite `combine(y: 2,
+        // x: 5)` into the top-level function's `(x, y)` order and hand THAT
+        // to the local closure -- printing `52` (`m=5, n=2`) with exit 0 and
+        // zero diagnostics. The correct behavior is the SAME clean K0241
+        // ("named arguments are only allowed for constructors and props")
+        // that a non-colliding local already gets -- calling a plain local
+        // VALUE with named arguments is never valid, shadowing or not.
+        let wrong_value = dir.join("wrong_value.kupl");
+        std::fs::write(
+            &wrong_value,
+            "fun combine(x: Int, y: Int) -> Int {\n    x - y\n}\n\
+             fun outer() -> Int {\n    let combine = fn(m, n) { m * 10 + n }\n    combine(y: 2, x: 5)\n}\n\
+             fun main() uses io {\n    print(to_str(outer()))\n}\n",
+        )
+        .unwrap();
+        let (i1, v1) = run_both(&wrong_value);
+        assert_eq!(i1.stdout, v1.stdout, "interp/vm must agree");
+        assert_eq!(i1.status.code(), v1.status.code(), "interp/vm exit codes must agree");
+        assert_ne!(i1.status.code(), Some(0), "a named-arg call to a shadowing local must be a clean error, not silently succeed with a wrong value");
+        assert!(
+            String::from_utf8_lossy(&i1.stderr).contains("K0241"),
+            "must be the SAME K0241 a non-colliding local gets, not silently resolved: {i1:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&i1.stdout).contains('5'),
+            "must never print the wrong value `52` computed from the unrelated top-level function's argument order: {i1:?}"
+        );
+
+        // The mirror-image failure: omitting a trailing argument on a
+        // one-parameter LOCAL closure that shadows an unrelated top-level
+        // `greet(name, punctuation = "!")` used to spuriously fail with
+        // K0242 ("this function takes 1 argument, 2 given"), because the
+        // unrelated top-level function's own trailing default got appended
+        // to an otherwise complete, ordinary call.
+        let spurious_error = dir.join("spurious_error.kupl");
+        std::fs::write(
+            &spurious_error,
+            "fun greet(name: Str, punctuation: Str = \"!\") -> Str {\n    name + punctuation\n}\n\
+             fun outer() -> Str {\n    let greet = fn(n) { \"hi \" + n }\n    greet(\"world\")\n}\n\
+             fun main() uses io {\n    print(outer())\n}\n",
+        )
+        .unwrap();
+        let (i2, v2) = run_both(&spurious_error);
+        assert_eq!(i2.stdout, v2.stdout, "interp/vm must agree");
+        assert_eq!(i2.status.code(), Some(0), "an ordinary complete call to a shadowing local must not be rejected: {i2:?}");
+        assert_eq!(v2.status.code(), Some(0), "{v2:?}");
+        assert_eq!(String::from_utf8_lossy(&i2.stdout).trim(), "hi world");
+
+        // Sanity/regression: an ORDINARY POSITIONAL call to a shadowing
+        // local already resolved correctly before this fix and must be
+        // completely unaffected by it (this fix only touches the named-arg/
+        // trailing-default rewrite path).
+        let positional_ok = dir.join("positional_ok.kupl");
+        std::fs::write(
+            &positional_ok,
+            "fun add(x: Int, y: Int) -> Int {\n    x + y\n}\n\
+             fun outer() -> Int {\n    let add = fn(m, n) { m - n }\n    add(1, 100)\n}\n\
+             fun main() uses io {\n    print(to_str(outer()))\n}\n",
+        )
+        .unwrap();
+        let (i3, v3) = run_both(&positional_ok);
+        assert_eq!(i3.stdout, v3.stdout, "interp/vm must agree");
+        assert_eq!(i3.status.code(), Some(0), "{i3:?}");
+        assert_eq!(String::from_utf8_lossy(&i3.stdout).trim(), "-99", "an ordinary positional shadowing call must still resolve to the LOCAL closure, unaffected by this fix");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Waits for `child` to exit, but gives up after `timeout` rather than
     /// blocking forever -- `std::process::Child::wait_with_output` has no
     /// built-in deadline (and this repo's own convention is that macOS has
