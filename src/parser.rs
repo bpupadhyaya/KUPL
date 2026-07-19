@@ -1913,7 +1913,39 @@ impl Parser {
         }
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it890, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// unlike EVERY other recursive-descent path in this file (the chain
+    /// loops guarded via PR-it713's local `chain` counters, `parse_unary`/
+    /// `parse_pattern_primary`/`parse_block`/`parse_ty` all guarded via
+    /// `self.depth`), a chained `else if` used to recurse straight into
+    /// `parse_if_inner` again with NO depth accounting at all -- a long
+    /// `if x { } else if x { } else if x { } ...` chain grows the native
+    /// Rust call stack by one frame per arm, completely bypassing
+    /// `MAX_EXPR_DEPTH`. Confirmed live before this fix: a generated file
+    /// with ~3,000,000 chained `else if` arms crashed `kupl check` with an
+    /// uncatchable native stack overflow (`fatal runtime error: stack
+    /// overflow, aborting`, exit 134/SIGABRT) instead of a clean K0121
+    /// diagnostic -- ordinary, non-adversarial generated code (e.g. an
+    /// auto-generated dispatch/state-machine chain), not deliberately
+    /// pathological input. Fixed by wrapping the function in the SAME
+    /// depth-guard pattern `parse_expr` itself already uses (increment,
+    /// check, decrement around a call to the renamed inner
+    /// implementation), so `parse_if`'s own recursive `else if` calls now
+    /// count against the shared `MAX_EXPR_DEPTH` budget like every other
+    /// nesting construct in the grammar.
     fn parse_if(&mut self) -> PResult<Expr> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(self.expr_too_deep());
+        }
+        let r = self.parse_if_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_if_inner(&mut self) -> PResult<Expr> {
         let span = self.expect(Tok::KwIf)?;
         // `if let PATTERN = EXPR { … } else { … }` desugars to a `match` whose
         // wildcard arm is the else branch (or `()` when there is no else — which
@@ -2424,6 +2456,66 @@ mod tests {
                 let ok = "fun main() {\n    while true {\n        while true {\n            while true {\n                while true {\n                    while true {\n                        break\n                    }\n                    break\n                }\n                break\n            }\n            break\n        }\n        break\n    }\n}\n";
                 let (_, diags) = parse(ok);
                 assert!(diags.is_empty(), "a 5-level nested `while` must parse cleanly: {diags:?}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A REAL, LIVE-CRASHING bug (PR-it890, an Explore survey finding,
+    /// independently re-verified live before implementing): a chained
+    /// `else if` recurses straight into `parse_if_inner` again without
+    /// EVER touching `self.depth` -- unlike every other recursive-descent
+    /// path in this file (the it713/it714/it715 sweep just above). This
+    /// gap slipped past that sweep's own reasoning: PR-it715's doc comment
+    /// (right above) asserts "`if`/lambda/match-arm bodies happened to be
+    /// safe only because `if`/lambda/match are EXPRESSIONS reached via
+    /// `parse_expr`" -- true for the FIRST entry into `parse_if`, but the
+    /// `else if` chain's OWN self-recursion never re-enters through
+    /// `parse_expr` at all, so it was never actually covered. Confirmed
+    /// live BEFORE this fix: a ~3,000,000-arm `if x == 0 {} else if x == 1
+    /// {} else if ...` chain crashed `kupl check` with the same
+    /// uncatchable "fatal runtime error: stack overflow, aborting" abort
+    /// it713-it715 already fixed for expressions/patterns/loop bodies --
+    /// the `if`-chain-grammar sibling of that exact gap. Fixed by guarding
+    /// `parse_if` itself the same way `parse_expr` guards itself
+    /// (symmetric `self.depth` push/pop wrapping a renamed
+    /// `parse_if_inner`).
+    #[test]
+    fn a_deeply_chained_else_if_is_a_clean_k0121_not_a_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let n = MAX_EXPR_DEPTH + 2;
+                let chain: String =
+                    (0..n).map(|i| format!("else if x == {i} {{ {i} }}\n")).collect::<Vec<_>>().join("");
+                let src = format!("fun f(x: Int) -> Int {{\n    if x == 0 {{ 0 }}\n{chain}    else {{ -1 }}\n}}\n");
+                let (_, diags) = parse(&src);
+                assert!(
+                    diags.iter().any(|d| d.code == "K0121"),
+                    "a {n}-deep chained `else if` must hit K0121, not silently build an unbounded AST: {diags:?}"
+                );
+                // An `if let` chained `else if` (the desugared-to-`match` path,
+                // parser.rs's OTHER self-recursive `self.parse_if()?` call site)
+                // must ALSO be caught by the same guard.
+                let if_let_chain: String = (0..n)
+                    .map(|i| format!("else if let Some(y) = opt({i}) {{ y }}\n"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                let if_let_src = format!(
+                    "fun opt(x: Int) -> Option[Int] {{ Some(x) }}\nfun f(x: Int) -> Int {{\n    if let Some(y) = opt(x) {{ y }}\n{if_let_chain}    else {{ -1 }}\n}}\n"
+                );
+                let (_, diags) = parse(&if_let_src);
+                assert!(
+                    diags.iter().any(|d| d.code == "K0121"),
+                    "a {n}-deep chained `if let`/`else if` must hit K0121, not silently build an unbounded AST: {diags:?}"
+                );
+                // An ordinary, well-under-the-limit `else if` chain (5 arms)
+                // must NOT false-positive -- confirms the new guard doesn't
+                // regress normal conditional chains.
+                let ok = "fun classify(x: Int) -> Str {\n    if x < 0 {\n        \"negative\"\n    } else if x == 0 {\n        \"zero\"\n    } else if x < 10 {\n        \"small\"\n    } else if x < 100 {\n        \"medium\"\n    } else {\n        \"large\"\n    }\n}\n";
+                let (_, diags) = parse(ok);
+                assert!(diags.is_empty(), "a 5-arm `else if` chain must parse cleanly: {diags:?}");
             })
             .unwrap()
             .join()
