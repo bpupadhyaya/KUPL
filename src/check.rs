@@ -871,6 +871,24 @@ impl Checker {
         for item in &program.items {
             let Item::Fun(f) = item else { continue };
             let Some(ai) = &f.ai else { continue };
+            // A REAL diagnostic-quality gap (production-hardening PR-it875, a
+            // survey finding, independently re-verified live before fixing): the
+            // SAME `= EXPR` dead-default footgun class as PR-it677 (ADT
+            // constructor fields) and PR-it679 (component exposed/private
+            // methods, contract method signatures), just never itself extended
+            // to `ai fun` parameters. `parse_params` is reused verbatim by
+            // `parse_ai_fun`, so `ai fun greet(name: Str = "World") -> Str { ... }`
+            // parses cleanly, but `callargs.rs::resolve_call_args` explicitly
+            // skips ai funs ("ai funs are prompt templates, not ordinary calls")
+            // and `ai.rs` never reads `Param.default` anywhere -- the default is
+            // 100% dead with zero diagnostic. Confirmed live before this fix:
+            // `kupl check` reported `ok` for the above source, then `greet()`
+            // (omitting the "defaulted" argument) failed with
+            // `error[K0242]: this function takes 1 argument, 0 given` -- while
+            // the IDENTICAL signature on a genuine top-level `fun` correctly
+            // applies the default and runs. Fixed by calling the SAME
+            // `reject_param_defaults` helper it677/it679 already established.
+            self.reject_param_defaults(&f.params, &format!("`ai fun {}`'s parameters", f.name));
             let Some(ret) = &f.ret else {
                 self.err(
                     "K0270",
@@ -4882,6 +4900,41 @@ mod generic_tests {
         assert!(
             errors(&format!(
                 "component G {{\n    intent \"g\"\n    fun helper(name: Str) -> Str {{ name }}\n    expose fun greet(name: Str) -> Str {{ helper(name) }}\n}}{comp}"
+            ))
+            .is_empty()
+        );
+    }
+
+    /// A REAL silent-footgun bug (production-hardening PR-it875, a FOURTH sibling
+    /// instance of it677's constructor-field-default class, found+fixed via this
+    /// campaign's "re-audit a function with prior fix history" technique): `ai
+    /// fun` parameters reuse `Param` too (`parse_ai_fun` calls the SAME
+    /// `parse_params` as every other position), so `ai fun greet(name: Str =
+    /// "World") -> Str { intent "..." }` parses fine -- but `callargs.rs`
+    /// explicitly skips ai funs ("ai funs are prompt templates, not ordinary
+    /// calls") and `ai.rs` never reads `Param.default` anywhere, so the default
+    /// was 100% dead with zero diagnostic, the ONE position `reject_param_defaults`
+    /// (it677/it679) never reached. Confirmed live before this fix: `kupl check`
+    /// on the source above reported `ok`, then calling `greet()` (omitting the
+    /// "defaulted" argument) failed with `error[K0242]: this function takes 1
+    /// argument, 0 given` -- while the IDENTICAL signature on a genuine
+    /// top-level `fun` correctly applies the default and runs.
+    #[test]
+    fn ai_fun_parameter_defaults_are_rejected_at_check_time() {
+        let comp = "\nfun main() { let _ = 0 }\n";
+        let with_default = errors(&format!(
+            "ai fun greet(name: Str = \"World\") -> Str {{\n    intent \"greet {{name}}\"\n}}{comp}"
+        ));
+        assert!(
+            with_default
+                .iter()
+                .any(|d| d.code == "K0275" && d.message.contains("parameter `name`") && d.message.contains("`ai fun greet`")),
+            "{with_default:?}"
+        );
+        // An ai fun with NO defaults at all is unaffected.
+        assert!(
+            errors(&format!(
+                "ai fun greet(name: Str) -> Str {{\n    intent \"greet {{name}}\"\n}}{comp}"
             ))
             .is_empty()
         );
