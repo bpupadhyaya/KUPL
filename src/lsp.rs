@@ -1586,9 +1586,36 @@ pub fn occurrences_cross_file(
     for fs_path in used_file_paths(&program, dir) {
         let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
         let uri = path_to_uri(&fs_path);
+        // A REAL correctness bug in a MUTATING operation (production-hardening
+        // PR-it876, a survey finding, independently re-verified live before
+        // fixing): `scoped_occurrences` (called above for THIS file) already
+        // filters same-file occurrences against `shadow_zones` when `name` is
+        // a top-level symbol -- excluding any occurrence that falls inside a
+        // DIFFERENT function's unrelated local of the same bare name -- the
+        // SAME-file half of it704/it739's local-vs-top-level collision fix.
+        // This cross-file loop never applied that SAME filtering to the OTHER
+        // file's own occurrences: it called plain, unscoped `occurrences`
+        // here, with no notion of the OTHER file's local shadows at all.
+        // Confirmed live before this fix: renaming a genuine top-level
+        // `mean(xs)` call (in `main.kupl`, `use stats`) returned FIVE
+        // locations instead of the expected TWO (the call site + the real
+        // `fun mean` declaration) -- the extra three were `stats.kupl`'s own
+        // UNRELATED `let mean = 5.0` local inside a completely different
+        // function `other()`, which would have been silently renamed too,
+        // corrupting `other()`'s logic exactly like it704/it739's own
+        // "corrupting a completely unrelated file" severity framing.
+        let (other_program, _diags) = crate::parser::parse(&other_text);
+        let other_zones = shadow_zones(&other_program, name);
+        let other_line_index = LineIndex::build(&other_text);
+        let other_line_range = |span: crate::diag::Span| {
+            let start_line = other_line_index.resolve_line(other_text.len(), span.start);
+            let end_line = other_line_index.resolve_line(other_text.len(), span.end);
+            (start_line - 1)..=(end_line - 1)
+        };
         out.extend(
             occurrences(&other_text, name)
                 .into_iter()
+                .filter(|(l0, ..)| !other_zones.iter().any(|z| other_line_range(*z).contains(l0)))
                 .map(move |(l0, c0, l1, c1)| (uri.clone(), l0, c0, l1, c1)),
         );
     }
@@ -3477,6 +3504,42 @@ mod tests {
         let same_file = occurrences_cross_file(src, "add", add_off, dir, &empty_buffers);
         assert_eq!(same_file.len(), 2, "decl + call, both same-file: {same_file:?}");
         assert!(same_file.iter().all(|(u, ..)| u.is_empty()), "{same_file:?}");
+    }
+
+    /// A REAL correctness bug in a MUTATING operation (production-hardening
+    /// PR-it876, the THIRD sibling instance of it704/it739's local-vs-top-level
+    /// collision class, found via this campaign's "re-audit a function with
+    /// prior fix history" technique): `occurrences_cross_file`'s cross-file loop
+    /// never applied `shadow_zones` filtering to the OTHER file's own
+    /// occurrences -- only THIS file's occurrences were scoped (via
+    /// `scoped_occurrences`, it704/it739's fix). Renaming a genuine top-level
+    /// symbol from a real cross-file call site used to ALSO sweep up a
+    /// completely unrelated LOCAL variable of the same bare name inside a
+    /// different function in the USED file, corrupting that function's logic if
+    /// the rename were actually applied.
+    #[test]
+    fn cross_file_rename_does_not_reach_an_unrelated_local_in_the_used_file() {
+        let dir = std::path::Path::new("/fake/lsp-it876");
+        let main_text = "use stats\nfun report(xs: List[Int]) -> Float {\n    mean(xs)\n}\n";
+        let stats_text = "fun mean(xs: List[Int]) -> Float {\n    xs.sum().to_float() / xs.len().to_float()\n}\nfun other() -> Float {\n    let mean = 5.0\n    print(mean)\n    mean\n}\n";
+        let mut buffers: HashMap<PathBuf, String> = HashMap::new();
+        buffers.insert(dir.join("stats.kupl"), stats_text.to_string());
+
+        let off = main_text.find("mean(xs)").unwrap();
+        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers);
+        assert_eq!(
+            locs.len(),
+            2,
+            "must be exactly the call site (this file) + the real `fun mean` declaration (stats.kupl), \
+             NOT `other()`'s unrelated local: {locs:?}"
+        );
+        let local = locs.iter().filter(|(u, ..)| u.is_empty()).count();
+        let cross = locs.iter().filter(|(u, ..)| !u.is_empty()).count();
+        assert_eq!(local, 1, "exactly one same-file occurrence (the call site): {locs:?}");
+        assert_eq!(cross, 1, "exactly one cross-file occurrence (the real declaration, not the unrelated local): {locs:?}");
+        let (cross_uri, l0, c0, ..) = locs.iter().find(|(u, ..)| !u.is_empty()).unwrap().clone();
+        assert!(cross_uri.ends_with("stats.kupl"), "{cross_uri}");
+        assert_eq!((l0, c0), (0, 4), "must be `fun mean`'s OWN declaration, not `other()`'s `let mean`: {locs:?}");
     }
 
     /// A REAL bug (production-hardening PR-it704): `resolve_definition_cross_file`/
