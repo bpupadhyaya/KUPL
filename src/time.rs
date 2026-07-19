@@ -96,6 +96,30 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// count itself doesn't fit back into i64.
 fn days_from_civil_checked(y: i64, m: i64, d: i64) -> Option<i64> {
     let (y, m, d) = (y as i128, m as i128, d as i128);
+    // A REAL bug found+fixed (production-hardening PR-it868, an Explore
+    // survey finding, independently re-verified live before implementing):
+    // the single-year shift below (`y - 1` / `m + 9`, the classic Howard
+    // Hinnant month-normalization) only correctly compensates for a month
+    // within ONE year of the valid `[1, 12]` range -- matching the existing
+    // PR-it635/it682 test coverage (`m = 13`, exactly one year over). A
+    // month requiring a 2+ year shift silently produced a WRONG date with
+    // no error, contradicting this function's own caller's (`make`'s)
+    // documented contract that "out-of-range values normalize... matching
+    // civil arithmetic" for ANY out-of-range month, not just a one-year
+    // overflow. Confirmed live BEFORE this fix, byte-identical wrong on all
+    // three engines: `date_make(2024, 25, 1, 0, 0, 0)` (month 25 of 2024 is
+    // month 1 TWO years later) returned a timestamp 2 DAYS off from
+    // `date_make(2026, 1, 1, 0, 0, 0)`'s correct value; swept `m` from 15
+    // to 30 and -10 to -20, every value outside `[-9, 14]` mismatched by
+    // 1-5 days while `m` within that single-year window was already
+    // correct. Fixed by normalizing `m` into `[1, 12]` (adjusting `y` by
+    // however many whole years the overflow represents, via Euclidean
+    // division so negative months normalize correctly too) BEFORE the
+    // existing single-year shift, which now only ever sees an
+    // already-in-range `m` exactly as it did before this fix.
+    let extra_years = (m - 1).div_euclid(12);
+    let m = (m - 1).rem_euclid(12) + 1;
+    let y = y + extra_years;
     let y = if m <= 2 { y - 1 } else { y };
     // Plain TRUNCATING division, not `floor_div_128` -- same bug/fix as
     // `days_from_civil` above (PR-it682).
@@ -426,6 +450,34 @@ mod tests {
         assert!(make(2024, 1, 1, i64::MAX, 0, 0).is_err());
         // an ordinary, moderate "rollover" out-of-range value is UNAFFECTED --
         // month 13 still normalizes into the next year, exactly as documented.
+        assert_eq!(make(2024, 13, 1, 0, 0, 0), make(2025, 1, 1, 0, 0, 0));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it868, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// `days_from_civil_checked`'s single-year shift (the classic Howard
+    /// Hinnant month-normalization) only correctly compensates for a month
+    /// within ONE year of the valid `[1, 12]` range -- exactly matching
+    /// `make_rejects_components_too_extreme_to_represent_instead_of_
+    /// overflowing`'s own `month = 13` coverage above, but a month requiring
+    /// a 2+ year shift silently produced a WRONG date with no error, even
+    /// though this function's own doc comment promises normalization for
+    /// ANY out-of-range month. Confirmed live BEFORE this fix, byte-
+    /// identical wrong on all three engines: `date_make(2024, 25, 1, 0, 0,
+    /// 0)` (month 25 of 2024 is month 1 TWO years later) returned a
+    /// timestamp 2 DAYS off from `date_make(2026, 1, 1, 0, 0, 0)`'s correct
+    /// value.
+    #[test]
+    fn make_normalizes_a_month_requiring_a_multi_year_shift() {
+        // positive overflow, 2 years (month 25 -> month 1, +2 years).
+        assert_eq!(make(2024, 25, 1, 0, 0, 0), make(2026, 1, 1, 0, 0, 0));
+        // positive overflow, 3 years, non-January remainder (month 37 = 12*3+1).
+        assert_eq!(make(2024, 37, 1, 0, 0, 0), make(2027, 1, 1, 0, 0, 0));
+        // negative overflow, 1 year (month -11 -> month 1, -1 year).
+        assert_eq!(make(2024, -11, 1, 0, 0, 0), make(2023, 1, 1, 0, 0, 0));
+        // negative overflow, 2 years, with a non-trivial day.
+        assert_eq!(make(2024, -23, 15, 0, 0, 0), make(2022, 1, 15, 0, 0, 0));
+        // the existing single-year case (month 13) is unaffected by this fix.
         assert_eq!(make(2024, 13, 1, 0, 0, 0), make(2025, 1, 1, 0, 0, 0));
     }
 

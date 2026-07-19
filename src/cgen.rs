@@ -5236,12 +5236,29 @@ static int64_t k_days_from_civil(int64_t y, int64_t m, int64_t d) {
    can overflow it -- returns 0 (leaving *out unset) only if the FINAL day
    count doesn't fit back into int64_t. */
 static int k_days_from_civil_checked(int64_t y, int64_t m, int64_t d, int64_t* out) {
-    __int128 yy = (m <= 2) ? (__int128)y - 1 : (__int128)y;
+    /* A REAL bug found+fixed (production-hardening PR-it868), mirroring
+       time.rs::days_from_civil_checked's identical fix: the single-year
+       shift below only correctly compensates for a month within ONE year
+       of the valid [1,12] range. A month requiring a 2+ year shift (e.g.
+       date_make(2024, 25, 1, ...)) silently produced a WRONG date. Fixed
+       by normalizing m into [1,12] first, adjusting y by however many
+       whole years the overflow represents via FLOOR division (not
+       truncating -- 12 is always a positive divisor, so floor and
+       Euclidean division coincide here). */
+    __int128 mm1 = (__int128)m - 1;
+    __int128 extra_years = mm1 / 12;
+    __int128 mrem = mm1 % 12;
+    if (mrem < 0) {
+        extra_years -= 1;
+        mrem += 12;
+    }
+    __int128 mm = mrem + 1;
+    __int128 yy = (mm <= 2) ? (__int128)y + extra_years - 1 : (__int128)y + extra_years;
     /* Plain TRUNCATING division, not k_floor_div_128 -- same bug/fix as
        k_days_from_civil above (PR-it682). */
     __int128 era = (yy >= 0 ? yy : yy - 399) / 400;
     __int128 yoe = yy - era * 400;
-    __int128 doy = (153 * ((m > 2) ? (__int128)m - 3 : (__int128)m + 9) + 2) / 5 + (__int128)d - 1;
+    __int128 doy = (153 * ((mm > 2) ? mm - 3 : mm + 9) + 2) / 5 + (__int128)d - 1;
     __int128 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     __int128 days = era * 146097 + doe - 719468;
     if (days > (__int128)INT64_MAX || days < (__int128)INT64_MIN) return 0;
@@ -11160,6 +11177,28 @@ fun main() uses io {
             native_main_stdout(src, "datetime").trim(),
             "2024-2-29 wd=4|2024-02-29T00:00:00Z|3-1"
         );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it868), mirroring
+    /// `time.rs`'s identical fix: `k_days_from_civil_checked`'s single-year
+    /// month-normalization shift only correctly compensated for a month
+    /// within ONE year of the valid `[1, 12]` range -- a month requiring a
+    /// 2+ year shift silently produced a WRONG date. Confirmed live BEFORE
+    /// this fix that native diverged from interp/VM (both already correct)
+    /// on `date_make(2024, 25, 1, ...)`.
+    #[test]
+    fn native_date_make_normalizes_a_month_requiring_a_multi_year_shift() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"fun main() uses io {
+    let a = date_make(2024, 25, 1, 0, 0, 0) == date_make(2026, 1, 1, 0, 0, 0)
+    let b = date_make(2024, -11, 1, 0, 0, 0) == date_make(2023, 1, 1, 0, 0, 0)
+    let c = date_make(2024, 13, 1, 0, 0, 0) == date_make(2025, 1, 1, 0, 0, 0)
+    print("{a}|{b}|{c}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "datemulti").trim(), "true|true|true");
     }
 
     /// A REAL BUG found+fixed (PR-it576), the native-only twin of `k_floor_mod`'s overflow:
