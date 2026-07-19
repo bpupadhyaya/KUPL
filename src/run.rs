@@ -193,8 +193,29 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
             for p in &c.props {
                 collect_ty_names(&p.ty, &mut note);
             }
+            // A REAL usability gap found+fixed (production-hardening
+            // PR-it858, an Explore survey finding, independently
+            // re-verified live before implementing): a child instance's
+            // component TYPE (`child.component`) was noted, but its
+            // constructor ARGUMENTS (`child.args[].value`, e.g.
+            // `Holder(box: make_box())`) were never walked -- so a function
+            // referenced ONLY inside a child-instantiation argument (like
+            // `make_box` above) never made it into `kupl context`'s
+            // "direct dependencies" section, even though the target
+            // item's OWN printed source visibly calls it. Every OTHER
+            // expression-bearing field on this arm (`state[].init` just
+            // below, handler bodies) already gets this same treatment;
+            // `children[].args` was the one omission. Confirmed the SAME
+            // gap for both named (`Holder(box: make_box())`) and
+            // positional (`Holder(make_box())`) argument forms.
             for child in &c.children {
                 note(&child.component);
+                for a in &child.args {
+                    crate::effects::walk_block(
+                        &crate::ast::Block { stmts: vec![crate::ast::Stmt::Expr(a.value.clone())], span: a.value.span },
+                        &mut |e| collect_expr_names(e, &mut note),
+                    );
+                }
             }
             for s in &c.state {
                 crate::effects::walk_block(
@@ -2384,6 +2405,57 @@ mod tests {
             stdout.contains("type Shape"),
             "a type referenced ONLY via a match pattern (not the function's own signature) must still \
              appear in the dependency closure: {stdout:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL usability gap found+fixed (production-hardening PR-it858, an
+    /// Explore survey finding, independently re-verified live before
+    /// implementing): a child instance's component TYPE (`child.component`)
+    /// was noted, but its constructor ARGUMENTS (`child.args[].value`) were
+    /// NEVER walked -- so a function referenced ONLY inside a
+    /// child-instantiation argument (e.g. `Holder(box: make_box())`) never
+    /// appeared in `kupl context`'s "direct dependencies", even though the
+    /// target item's own printed source visibly calls it. Confirmed live
+    /// BEFORE this fix (both named and positional argument forms) via the
+    /// real `kupl context` CLI. Same subprocess-test pattern as this file's
+    /// own sibling test above (this command prints directly to stdout, no
+    /// in-process return value to inspect).
+    #[test]
+    fn emit_context_includes_a_function_referenced_only_in_a_child_instantiation_argument() {
+        let dir = std::env::temp_dir().join(format!("kupl-ctx-childargs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("c.kupl");
+        std::fs::write(
+            &file,
+            "fun compute_named() -> Int { 42 }\n\
+             fun compute_positional() -> Int { 7 }\n\
+             component Holder {\n    intent \"wraps a value\"\n    prop n: Int\n}\n\
+             component Main {\n    intent \"demo\"\n    \
+             let named = Holder(n: compute_named())\n    \
+             let positional = Holder(compute_positional())\n\
+             }\n",
+        )
+        .unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no debug binary built yet -- nothing to test
+        }
+        let out = std::process::Command::new(&bin)
+            .args(["context", file.to_str().unwrap(), "Main"])
+            .output()
+            .expect("kupl context runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("fun compute_named"),
+            "a function referenced ONLY in a NAMED child-instantiation argument must appear \
+             in the dependency closure: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("fun compute_positional"),
+            "a function referenced ONLY in a POSITIONAL child-instantiation argument must appear \
+             in the dependency closure: {stdout:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
