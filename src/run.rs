@@ -2177,6 +2177,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it904,
+    /// a direct, self-initiated follow-up audit of PR-it903's own fix,
+    /// independently re-verified live before implementing -- see
+    /// `Env::bound_instance_ids`'s own doc comment for the full writeup).
+    /// PR-it903 only reset instances bound via `Value::Bound` (the variant a
+    /// CONTRACT law's own exposed-function bindings use) -- but a PLAIN
+    /// top-level `law` (or a contract law, equally) can ALSO instantiate a
+    /// component directly via an ordinary `let c = SomeComponent()`
+    /// statement BEFORE a nested `forall`, bound as `Value::Component(id)`,
+    /// a variant PR-it903's fix never checked for -- so THIS shape still
+    /// reported a phantom counterexample even after PR-it903 landed.
+    /// Live-confirmed: `let c = Store(); forall k: Str { c.put(k); expect
+    /// c.size() <= 3 }` against an append-only `Store` reported `property
+    /// failed for k = ""`, while the standalone equivalent (no forall, no
+    /// randomness) PASSED cleanly -- the identical phantom shape, just via
+    /// this second binding path. This test locks BOTH the newly-fixed
+    /// shared-plain-instance case AND the already-safe-without-a-fix
+    /// per-case-fresh-instance case (a component instantiated INSIDE the
+    /// forall body itself needs no reset at all, since `instantiate` always
+    /// allocates fresh state on every call) in permanently.
+    #[test]
+    fn forall_resets_a_plain_shared_instance_too_but_not_a_freshly_instantiated_one() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-forall-plain-instance-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A component shared ACROSS forall cases via a plain outer `let`
+        // (Value::Component, not Value::Bound) must now get a fresh reset
+        // per case too.
+        let shared_file = dir.join("shared.kupl");
+        std::fs::write(
+            &shared_file,
+            "component Store {\n    intent \"append-only store\"\n    state entries: List[Str] = []\n    \
+             expose fun put(key: Str) -> Bool { entries = entries.push(key); true }\n    \
+             expose fun size() -> Int { entries.len() }\n}\n\n\
+             law \"shared instance across forall cases\" {\n    let c = Store()\n    \
+             forall k: Str {\n        c.put(k)\n        expect c.size() <= 3\n    }\n}\n\nfun main() {}\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["test", shared_file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("1 passed, 0 failed"),
+            "a component shared via a plain `let` (Value::Component) across forall cases must \
+             also be reset per case, not just a contract-bound (Value::Bound) instance: {stdout:?}"
+        );
+
+        // A component instantiated FRESH inside the forall body itself needs
+        // no fix at all -- each case gets its own brand new instance.
+        let fresh_file = dir.join("fresh.kupl");
+        std::fs::write(
+            &fresh_file,
+            "component Counter {\n    intent \"simple counter\"\n    state n: Int = 0\n    \
+             expose fun bump() -> Int { n = n + 1; n }\n}\n\n\
+             law \"each forall case gets a fresh Counter\" {\n    forall k: Int {\n        \
+             let c = Counter()\n        let v = c.bump()\n        expect v == 1\n    }\n}\n\nfun main() {}\n",
+        )
+        .unwrap();
+        let out2 = std::process::Command::new(&bin)
+            .args(["test", fresh_file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout2 = String::from_utf8_lossy(&out2.stdout);
+        assert!(
+            stdout2.contains("1 passed, 0 failed"),
+            "a component instantiated fresh inside the forall body needs no reset, and must \
+             not be broken by one either: {stdout2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL text-consistency bug found+fixed (production-hardening
     /// PR-it783, the same finding as `plain_and_forall_expect_failures_...`
     /// above, but at a DIFFERENT site with no shared code path: a component

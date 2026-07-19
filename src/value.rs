@@ -1199,20 +1199,50 @@ impl Env {
     }
 
     /// Collect the distinct component-instance ids referenced by any
-    /// `Value::Bound(id, _)` binding reachable from this scope (this scope's
-    /// own bindings AND every ancestor scope, since a `forall`'s own local
-    /// scope is a CHILD of whatever scope bound the contract's exposed
-    /// functions). Used by `interp.rs::forall_case` (production-hardening
-    /// PR-it903 -- see that function's own doc comment) to reset a
-    /// contract-law's tested component instance back to fresh state before
-    /// every property-test case, so each case is judged on its own generated
+    /// `Value::Bound(id, _)` OR `Value::Component(id)` binding reachable
+    /// from this scope (this scope's own bindings AND every ancestor scope,
+    /// since a `forall`'s own local scope is a CHILD of whatever scope
+    /// bound them). Used by `interp.rs::forall_case` (production-hardening
+    /// PR-it903/PR-it904 -- see that function's own doc comment) to reset a
+    /// law's tested component instance(s) back to fresh state before every
+    /// property-test case, so each case is judged on its own generated
     /// value rather than on how much state happened to accumulate from
-    /// EARLIER cases sharing the same live instance.
+    /// EARLIER cases sharing the same live instance(s).
+    ///
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it904, a direct, self-initiated follow-up audit of PR-it903's own
+    /// fix -- independently re-verified live before implementing): the
+    /// original PR-it903 fix only checked for `Value::Bound`, the variant
+    /// `run.rs`'s CONTRACT-law runner specifically uses to bind a contract's
+    /// exposed functions to its one instantiated component -- but a PLAIN
+    /// top-level `law` (or a contract law, equally) can ALSO instantiate a
+    /// component directly via an ordinary `let c = SomeComponent()`
+    /// statement BEFORE a nested `forall`, then call plain methods on it
+    /// (`c.put(...)`) inside the `forall` body -- `c` here is bound as
+    /// `Value::Component(id)`, a DIFFERENT variant `bound_instance_ids`
+    /// never looked for, so this shape was NOT covered by PR-it903's fix at
+    /// all. Live-confirmed the identical phantom-counterexample shape
+    /// through this second path: `let c = Store(); forall k: Str { c.put
+    /// (k); expect c.size() <= 3 }` (append-only `Store`, same as PR-it903's
+    /// own repro but via a plain top-level law with an OUTER `let` instead
+    /// of a contract binding) reported `property failed for k = ""`, while
+    /// the standalone equivalent (`let c = Store(); c.put(""); expect c.size
+    /// () <= 3`, no forall, no randomness) PASSES cleanly -- the exact same
+    /// airtight phantom proof as PR-it903's own repro. Also live-confirmed a
+    /// component instantiated FRESH *inside* the `forall` body itself
+    /// (`forall k: Int { let c = Counter(); ... }`) is genuinely SAFE
+    /// without any fix, needing none: a brand new instance is created on
+    /// EVERY case by construction, so there is no shared state to leak
+    /// across cases in the first place -- confirmed via 100 passing cases
+    /// each independently observing a freshly-bumped counter reading `1`.
     pub fn bound_instance_ids(&self, out: &mut std::collections::HashSet<usize>) {
         let inner = self.0.borrow();
         for (_, v) in &inner.vars {
-            if let Value::Bound(id, _) = v {
-                out.insert(*id);
+            match v {
+                Value::Bound(id, _) | Value::Component(id) => {
+                    out.insert(*id);
+                }
+                _ => {}
             }
         }
         if let Some(p) = &inner.parent {
