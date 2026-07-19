@@ -14674,6 +14674,194 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         }
     }
 
+    /// A cross-engine fuzz pass against `regex.rs`'s engine vs `cgen.rs`'s
+    /// independent C reimplementation (production-hardening PR-it885, the
+    /// fallback dispatched after survey #50 found no new 2+-prior-fix
+    /// candidate outside the exclusion list -- following the SAME xorshift64*
+    /// fuzz-harness convention `csv.rs`'s own fuzz tests established at
+    /// PR-it883, which found a real bug on its first run). Two prior real
+    /// bugs (PR-it658/PR-it659) both hit `char_class`/`atom_match`'s
+    /// character-class parsing on genuinely different input shapes each
+    /// time, so this generates syntactically-valid, randomly-nested regex
+    /// PATTERNS (literals, `.`, escape classes `\d \D \w \W \s \S`, small
+    /// character classes `[abc]`/`[a-c]`/`[^abc]`, quantifiers `* + ?`,
+    /// grouping, alternation, optional anchors) paired with random SUBJECT
+    /// text, and checks that `re_find_all(pattern, subject).join(",")`
+    /// produces EXACTLY the same canonical text on native as computing the
+    /// identical `crate::regex::compile(...).find_all(...)` chain directly
+    /// via the canonical Rust engine (the same one interp/vm call --
+    /// confirmed to be the ONLY cross-engine divergence axis, since
+    /// `vm.rs::regex_builtin` dispatch shares `interp.rs::regex_builtin`
+    /// directly, so interp/vm cannot diverge from each other). Cases where
+    /// the Rust side itself reports `budget_exceeded()` (a pathological
+    /// generated pattern blowing the backtracking-step budget) are skipped
+    /// from the comparison, not counted as mismatches -- this fuzzer targets
+    /// CORRECTNESS agreement on cases that actually complete, not the
+    /// already-covered ReDoS-budget-consistency question. Strips exactly ONE
+    /// trailing newline from native's stdout (NOT a blanket `.trim()`,
+    /// per PR-it883's own hard-won lesson: fuzzed subject text can
+    /// legitimately contain leading/trailing whitespace as real match
+    /// content, which a blanket trim would wrongly discard). Kept to a
+    /// moderate seed count (each iteration is a full `cc -O2` compile+link+
+    /// run, unlike a cheap in-process-only fuzzer). Found ZERO
+    /// disagreements across all 80 generated cases -- confirming
+    /// `char_class`/`atom_match`/`match_seq`/`match_piece`'s prior two fixes
+    /// (PR-it658/PR-it659) hold up against this broader, non-hand-picked
+    /// input space; a genuinely broader coverage mechanism now locked in
+    /// permanently, not a bug fix.
+    #[test]
+    fn fuzz_random_regex_patterns_and_subjects_match_the_canonical_rust_engine_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+        }
+        fn fuzz_gen_atom(rng: &mut FuzzRng) -> String {
+            match rng.below(3) {
+                0 => {
+                    let letters = ['a', 'b', 'c', '.'];
+                    letters[rng.below(letters.len() as u64) as usize].to_string()
+                }
+                1 => {
+                    let classes = ["\\d", "\\D", "\\w", "\\W", "\\s", "\\S"];
+                    classes[rng.below(classes.len() as u64) as usize].to_string()
+                }
+                _ => {
+                    let members = ["abc", "a-c", "^abc", "^a-c"];
+                    format!("[{}]", members[rng.below(members.len() as u64) as usize])
+                }
+            }
+        }
+        fn fuzz_gen_piece(rng: &mut FuzzRng, depth: u32) -> String {
+            let atom = if depth > 0 && rng.below(4) == 0 {
+                format!("({})", fuzz_gen_seq(rng, depth - 1))
+            } else {
+                fuzz_gen_atom(rng)
+            };
+            let quants = ["", "*", "+", "?"];
+            format!("{atom}{}", quants[rng.below(quants.len() as u64) as usize])
+        }
+        fn fuzz_gen_seq(rng: &mut FuzzRng, depth: u32) -> String {
+            let n = 1 + rng.below(3);
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(&fuzz_gen_piece(rng, depth));
+            }
+            // occasionally an alternation between two sequences
+            if depth > 0 && rng.below(4) == 0 {
+                let n2 = 1 + rng.below(3);
+                let mut s2 = String::new();
+                for _ in 0..n2 {
+                    s2.push_str(&fuzz_gen_piece(rng, depth - 1));
+                }
+                s = format!("{s}|{s2}");
+            }
+            s
+        }
+        fn fuzz_gen_pattern(rng: &mut FuzzRng) -> String {
+            let mut s = String::new();
+            if rng.below(4) == 0 {
+                s.push('^');
+            }
+            s.push_str(&fuzz_gen_seq(rng, 2));
+            if rng.below(4) == 0 {
+                s.push('$');
+            }
+            s
+        }
+        fn fuzz_gen_subject(rng: &mut FuzzRng, max_len: usize) -> String {
+            // A wide digit/letter spread (production-hardening PR-it885,
+            // widened after this fuzz test's own sanity-check discipline: a
+            // DELIBERATELY injected `\d` divergence in native's atom-level
+            // digit range wasn't caught with only '1'/'2' as the pool's sole
+            // digits and no uppercase/underscore coverage for `\w` -- a
+            // fresh instance of PR-it883's lesson to verify a new harness's
+            // own DETECTION POWER, not just trust a clean report).
+            let pool = ['a', 'b', 'c', 'd', 'A', 'B', '0', '1', '2', '5', '9', '_', ' ', '\t', '.', '\n'];
+            let len = rng.below(max_len as u64) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push(pool[rng.below(pool.len() as u64) as usize]);
+            }
+            s
+        }
+        fn escape_kupl_str(s: &str) -> String {
+            let mut out = String::new();
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
+        let mut mismatches = Vec::new();
+        let mut skipped_budget = 0usize;
+        let mut skipped_compile_error = 0usize;
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let pattern = fuzz_gen_pattern(&mut rng);
+            let subject = fuzz_gen_subject(&mut rng, 10);
+            let re = match crate::regex::compile(&pattern) {
+                Ok(re) => re,
+                Err(_) => {
+                    skipped_compile_error += 1;
+                    continue;
+                }
+            };
+            let matches = re.find_all(&subject);
+            if crate::regex::budget_exceeded() {
+                skipped_budget += 1;
+                continue;
+            }
+            let expected = matches.join(",");
+            let src = format!(
+                "fun main() uses io {{\n    print(re_find_all(\"{}\", \"{}\").join(\",\"))\n}}\n",
+                escape_kupl_str(&pattern),
+                escape_kupl_str(&subject)
+            );
+            let raw = native_main_stdout(&src, &format!("refuzz{seed}"));
+            // strip exactly ONE trailing newline (print's own terminator) --
+            // not a blanket .trim(), per PR-it883's lesson.
+            let actual = raw.strip_suffix('\n').unwrap_or(&raw);
+            if actual != expected {
+                mismatches.push(format!(
+                    "seed={seed} pattern={pattern:?} subject={subject:?} expected={expected:?} actual={actual:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native regex diverges from the canonical Rust engine on {} generated cases (skipped {} budget-exceeded, {} compile errors):\n{}",
+            mismatches.len(),
+            skipped_budget,
+            skipped_compile_error,
+            mismatches.join("\n")
+        );
+    }
+
     /// A REAL cross-engine bug (PR-it595): `regex.rs`'s `compile()` names the
     /// actual leftover character in its "unexpected `X` in pattern" panic
     /// (interp/KVM share this code), but native's C mirror (`k_re_compile`) used
