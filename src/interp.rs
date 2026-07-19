@@ -4627,7 +4627,45 @@ fn serve_http_with_read_timeout(
             Ok(body) => http_response("200 OK", &body),
             Err(msg) => http_response("500 Internal Server Error", &msg),
         };
-        let _ = stream.write_all(resp.as_bytes());
+        // A REAL, SEVERE availability bug found+fixed (production-hardening
+        // PR-it867), the SAME single-stalled-connection-wedges-the-whole-
+        // server class as it559/it577/it623/it624 above -- all four fixed
+        // the READ side of this exact function; the response WRITE side had
+        // NO timeout of any kind, a plain `stream.write_all(...)` that could
+        // block forever. A client that sends a valid request and then simply
+        // never reads the response (or reads it one byte at a time, slowly
+        // enough to keep the TCP send buffer full without ever fully
+        // stalling a single `write()` call -- the exact "trickle" shape
+        // it624 already fixed on the read side) wedges the single-threaded
+        // accept loop exactly as effectively as a stalled READ does.
+        // Confirmed live BEFORE this fix: a client that opened a connection,
+        // sent a request, and deliberately never read the (large) response
+        // caused a SECOND, well-behaved client's request to time out after
+        // 8s waiting for `accept()`/a reply -- once the first client closed
+        // its socket, a fresh control request was served instantly (0.00s),
+        // proving the server was genuinely wedged, not merely slow. Fixed
+        // with the IDENTICAL two-layer defense already used for reads: a
+        // per-write timeout (mirroring it623) PLUS a total elapsed-time
+        // deadline checked every loop iteration (mirroring it624), rather
+        // than relying on `set_write_timeout` alone -- a single
+        // `set_write_timeout` bounds only each individual `write()` syscall
+        // inside `write_all`'s internal retry loop, which resets on every
+        // partial write exactly like the per-read timeout did before it624,
+        // so it alone would NOT have closed the trickle variant.
+        let _ = stream.set_write_timeout(read_timeout);
+        let write_deadline = read_timeout.map(|d| std::time::Instant::now() + d);
+        let resp_bytes = resp.as_bytes();
+        let mut written = 0;
+        while written < resp_bytes.len() {
+            if write_deadline.is_some_and(|dl| std::time::Instant::now() >= dl) {
+                break;
+            }
+            match stream.write(&resp_bytes[written..]) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(_) => break,
+            }
+        }
     }
     Ok(())
 }
@@ -5274,6 +5312,77 @@ fun main() uses io { let _ = http_serve(38131, handle) }
         let resp = recovered
             .expect("server should recover after the trickle connection's total deadline expires");
         assert!(resp.ends_with("GET /world"), "resp: {resp}");
+    }
+
+    /// A REAL, SEVERE availability bug found+fixed (production-hardening
+    /// PR-it867), the SAME single-stalled-connection-wedges-the-whole-server
+    /// class as PR-it559/it577/it623/it624 above -- all four fixed the READ
+    /// side of this exact function; the response WRITE side had no timeout
+    /// of any kind at all. A client that sends a valid, complete request and
+    /// then simply never reads the response wedges the single-threaded
+    /// accept loop just as effectively as a stalled read does, since
+    /// `stream.write_all(...)` blocks forever once the OS's TCP send buffer
+    /// fills. Mirrors `serve_http_recovers_from_a_stalled_slow_client`'s
+    /// (it623) exact structure: connection 1 sends a complete request but
+    /// never reads the (deliberately large) response, held open well past
+    /// the injected timeout; connection 2 then proves the server recovers
+    /// and serves a fresh, small request promptly rather than staying
+    /// wedged.
+    #[test]
+    fn serve_http_recovers_from_a_client_that_never_reads_the_response() {
+        let port: u16 = 38115;
+        std::thread::spawn(move || {
+            let mut h = |m: String, p: String, _b: String| -> Result<String, String> {
+                if p == "/big" {
+                    Ok("x".repeat(5_000_000))
+                } else {
+                    Ok(format!("{m} {p}"))
+                }
+            };
+            let _ = serve_http_with_read_timeout(
+                port as i64,
+                &mut h,
+                Some(std::time::Duration::from_millis(200)),
+            );
+        });
+        let connect = || {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        // connection 1: a COMPLETE request for the large response, held open
+        // WITHOUT reading anything back. Before the fix, `write_all` would
+        // block on this forever (once the OS send buffer fills) and
+        // connection 2 below would never even be accepted.
+        let mut stalled = connect().expect("server should be listening");
+        stalled.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        // connection 2: retried for up to 2s (well past the 200ms injected
+        // timeout) -- proves the server recovers and serves a fresh request
+        // rather than staying wedged on connection 1's unread response.
+        let mut recovered = None;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                if s.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\n\r\n").is_err() {
+                    continue;
+                }
+                let mut resp = String::new();
+                let _ = s.read_to_string(&mut resp);
+                if resp.contains("HTTP/1.1 200 OK") {
+                    recovered = Some(resp);
+                    break;
+                }
+            }
+        }
+        let resp = recovered
+            .expect("server should recover and serve a fresh request after the unread response times out");
+        assert!(resp.ends_with("GET /world"), "resp: {resp}");
+        drop(stalled);
     }
 }
 
