@@ -377,7 +377,30 @@ fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
     Ok(match v {
         Value::Int(x) => format!("k_int({x}LL)"),
         Value::Float(x) => {
-            if x.fract() == 0.0 && x.is_finite() {
+            // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it850,
+            // the THIRTIETH broad Explore survey): a source float literal that
+            // overflows f64 (e.g. `1e999`) is lexed to `Tok::Float(f64::INFINITY)`
+            // with NO diagnostic -- Rust's `f64::from_str` saturates rather than
+            // erroring, and this codebase's own established precedent (parse_float,
+            // JSON number parsing) treats overflow-to-infinity as legitimate, not
+            // an error. interp/VM handle the resulting `Value::Float(inf)` constant
+            // fine (an ordinary f64 at runtime). But this branch used to fall into
+            // the `{x:?}` (Rust Debug) format for any non-finite `x`, which prints
+            // the bare tokens `inf`/`-inf`/`NaN` -- NOT valid C syntax (C has no
+            // such identifiers; it needs `INFINITY`/`-INFINITY`/`NAN` from
+            // <math.h>, already included) -- so the generated .c file failed to
+            // even COMPILE (`kupl native` on `let x = 1e999` errored with a raw cc
+            // diagnostic, no KUPL-level error at all), a crash-vs-clean-error
+            // divergence between native and interp/VM. Confirmed native's RUNTIME
+            // handling of infinite Float VALUES was already correct everywhere else
+            // (e.g. the ai-fun JSON-coercion test just above builds an actual
+            // runtime double via k_float(double), unaffected) -- this gap was
+            // specific to embedding a literal token straight into C source text.
+            if x.is_nan() {
+                "k_float(NAN)".to_string()
+            } else if x.is_infinite() {
+                format!("k_float({})", if *x > 0.0 { "INFINITY" } else { "-INFINITY" })
+            } else if x.fract() == 0.0 {
                 format!("k_float({x:.1})")
             } else {
                 format!("k_float({x:?})")
@@ -9300,6 +9323,39 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "hexfloatparse").trim(),
             "None|None|None|None|Some(NaN)|Some(NaN)|Some(inf)|Some(-inf)"
+        );
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it850,
+    /// the THIRTIETH broad Explore survey): a SOURCE-LEVEL float literal that
+    /// overflows f64 (e.g. `1e999`) lexes to `Tok::Float(f64::INFINITY)` with
+    /// NO diagnostic -- Rust's `f64::from_str` saturates rather than erroring,
+    /// and this codebase's own established precedent (`parse_float`, JSON
+    /// number parsing) already treats overflow-to-infinity as legitimate, not
+    /// an error. interp/VM handled the resulting `Value::Float(inf)` constant
+    /// fine (an ordinary f64 at runtime) -- confirmed BEFORE this fix via
+    /// `kupl run`/`kupl run --vm` on `let x = 1e999; print("{x}")`, both
+    /// printing `inf` cleanly. But `cgen.rs`'s `const_expr` (which serializes
+    /// constant-pool floats into literal C source text) fell into a Rust
+    /// `{x:?}` (Debug) format for any non-finite value, printing the BARE
+    /// tokens `inf`/`-inf` -- not valid C syntax at all -- so `kupl native`
+    /// on the IDENTICAL program failed to even COMPILE (a raw `cc` diagnostic
+    /// `use of undeclared identifier 'inf'`, no KUPL-level error whatsoever):
+    /// a crash-vs-clean-error divergence between native and interp/VM. Fixed
+    /// by special-casing non-finite floats to emit `INFINITY`/`-INFINITY`/
+    /// `NAN` (from `<math.h>`, already included) instead of Rust's Debug
+    /// tokens.
+    #[test]
+    fn native_source_level_float_literal_overflow_to_infinity_compiles_and_runs() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let pos = 1e999\n    let neg = -1e999\n    \
+                   print(\"{pos}|{neg}|{pos.is_infinite()}|{neg.is_infinite()}|{neg < 0.0}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "infliteral").trim(),
+            "inf|-inf|true|true|true"
         );
     }
 
