@@ -534,7 +534,27 @@ fn scaffold_project(name: &str) -> i32 {
 /// `error: unexpected extra argument \`Ada\`` (exit 2) — the EXACT
 /// documented usage pattern for `args()`, broken. Now a bare `--` stops
 /// scanning immediately, matching `program_args()`'s own semantics.
+///
+/// A FOURTH REAL bug found+fixed (production-hardening PR-it881, found while
+/// re-auditing this function's own carried-forward lead): this doc comment
+/// has said "`build`/`bundle`/`native` accept it" since PR-it697 — but the
+/// `-o`-pair-skipping below applied UNCONDITIONALLY to every subcommand
+/// routed through `with_path`/`with_file`, including `run`/`dis`/`manifest`/
+/// `test`/`check`/`fmt`/`pkg tree|lock|fetch`, none of which document or
+/// implement an `-o` flag at all. Confirmed live before this fix: `kupl run
+/// -o foo.kupl` (foo.kupl genuinely exists) reported `error: missing
+/// <file.kupl> argument` — the real path was silently swallowed as `-o`'s
+/// phantom "value" — and `kupl run foo.kupl -o bogus_junk` ran `foo.kupl`
+/// cleanly at exit 0, `-o bogus_junk` never examined, the EXACT "extra
+/// argument silently dropped" shape PR-it697/PR-it798 already close for every
+/// OTHER unrecognized token on these subcommands. `args[0]` (the subcommand
+/// word itself, already skipped by `i = 1` below) is checked to gate the
+/// special-case to just the three subcommands that genuinely accept `-o` —
+/// on any other subcommand `-o` is now just an ordinary token, correctly
+/// becoming the path or triggering "unexpected extra argument" like anything
+/// else.
 fn find_path_arg(args: &[String]) -> Result<&str, String> {
+    let accepts_o = matches!(args.first().map(String::as_str), Some("native") | Some("build") | Some("bundle"));
     let mut path: Option<&str> = None;
     let mut i = 1;
     while i < args.len() {
@@ -542,7 +562,7 @@ fn find_path_arg(args: &[String]) -> Result<&str, String> {
         if a == "--" {
             break; // everything after this belongs to the program, not kupl
         }
-        if a == "-o" {
+        if accepts_o && a == "-o" {
             i += 2; // the flag AND its value, as a unit
             continue;
         }
@@ -814,6 +834,53 @@ mod tests {
         assert_eq!(find_path_arg(&s(&["run", "foo.kupl"])), Ok("foo.kupl"));
         // no path at all is the pre-existing missing-argument error, unchanged.
         assert_eq!(find_path_arg(&s(&["run"])), Err("missing <file.kupl> argument".to_string()));
+    }
+
+    /// A REAL, previously-silent bug (production-hardening PR-it881, found
+    /// while re-auditing this function's own carried-forward lead): `-o`
+    /// pair-skipping applied to EVERY subcommand, not just the three
+    /// (`native`/`build`/`bundle`) that actually accept `-o` -- this
+    /// function's own doc comment already said so, but the code never
+    /// enforced it. On any subcommand that doesn't accept `-o`, the token
+    /// must be treated like any other ordinary argument: the path if none is
+    /// set yet, or a clean "unexpected extra argument" error otherwise.
+    #[test]
+    fn find_path_arg_only_special_cases_o_for_subcommands_that_accept_it() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Confirmed live before this fix: the real path was silently
+        // swallowed as `-o`'s phantom "value", reporting a misleading
+        // missing-argument error even though a path WAS given. Post-fix,
+        // `-o` is just an ordinary token on `run` -- it becomes the (bogus)
+        // path candidate itself, and the real file correctly surfaces as the
+        // genuine extra argument, matching this function's existing
+        // two-positional-arguments convention.
+        assert_eq!(
+            find_path_arg(&s(&["run", "-o", "foo.kupl"])),
+            Err("unexpected extra argument `foo.kupl`".to_string())
+        );
+        // Confirmed live before this fix: this ran clean at exit 0, `-o
+        // bogus_junk` never examined -- must now be a clean error, matching
+        // every other unrecognized extra argument on this subcommand.
+        assert_eq!(
+            find_path_arg(&s(&["run", "foo.kupl", "-o", "bogus_junk"])),
+            Err("unexpected extra argument `-o`".to_string())
+        );
+        // the SAME shape on `dis`/`manifest`/`test`/`check`/`fmt`/pkg's own
+        // `tree`/`lock`/`fetch` sub-subcommands (all routed through this
+        // function with none of them accepting `-o`).
+        assert_eq!(
+            find_path_arg(&s(&["dis", "foo.kupl", "-o", "bogus_junk"])),
+            Err("unexpected extra argument `-o`".to_string())
+        );
+        assert_eq!(
+            find_path_arg(&s(&["tree", "foo.kupl", "-o", "bogus_junk"])),
+            Err("unexpected extra argument `-o`".to_string())
+        );
+        // meanwhile the three subcommands that DO accept `-o` are entirely
+        // unaffected -- re-confirming the existing pair-skip behavior still
+        // works post-fix.
+        assert_eq!(find_path_arg(&s(&["native", "-o", "out", "foo.kupl"])), Ok("foo.kupl"));
     }
 
     /// A REAL, previously-silent bug (production-hardening PR-it798, found
