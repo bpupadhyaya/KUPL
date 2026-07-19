@@ -128,7 +128,36 @@ fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> 
                 return Err("JSON nested too deeply".into());
             }
             *pos += 1;
-            let mut pairs = Vec::new();
+            let mut pairs: Vec<(String, Json)> = Vec::new();
+            // A REAL cross-engine silent-value divergence found+fixed
+            // (production-hardening PR-it879, the FIFTH sibling instance of
+            // this parser's ongoing parity-with-`json.rs` effort -- it545/
+            // it620/it765/it792 each closed a different way this
+            // independently-reimplemented parser diverged from `json.rs`'s
+            // canonical one): `json.rs::Parser::object` deliberately
+            // implements "last key wins, first-seen position" duplicate-key
+            // semantics (its own doc comment names this, fixed for an O(n^2)
+            // performance bug at PR-it838) -- and `cgen.rs`'s native mirror
+            // (`kjp_object`) matches it exactly. This parser instead just
+            // unconditionally appended every `(key, val)` pair with NO
+            // dedup, so `Json::get`'s `.find()` (which returns the FIRST
+            // match) silently returned the FIRST occurrence of a duplicate
+            // key. `ai.rs::convert`/`ai.rs`'s tool-calling machinery
+            // (interp AND vm both share this SAME `lsp::parse_json`) parses
+            // AI-provider/mock responses through exactly this path, while
+            // native's `k_ai_convert` parses the SAME text through
+            // `k_json_parse`/`kjp_object` -- the canonical, last-key-wins
+            // parser. Live-confirmed before this fix: an `ai fun` returning
+            // `type Box = Box(x: Int)` mocked with `{"x": 1, "x": 2}`
+            // produced `Box(1)` on interp AND vm, but `Box(2)` on native --
+            // a genuine, silently WRONG value on two of the three engines,
+            // not just a diagnostic-text or latency difference. Fixed by
+            // mirroring `json.rs::object`'s exact O(1)-indexed "update the
+            // FIRST-SEEN position's value in place" algorithm, rather than a
+            // naive O(n^2) linear rescan per key (which would reintroduce
+            // the identical performance bug PR-it838 already closed in the
+            // canonical parser).
+            let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             skip_ws(b, pos);
             if *pos < b.len() && b[*pos] == b'}' {
                 *pos += 1;
@@ -146,7 +175,13 @@ fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> 
                 }
                 *pos += 1;
                 let val = parse_value(b, pos, depth)?;
-                pairs.push((key, val));
+                match index.get(&key) {
+                    Some(&i) => pairs[i].1 = val,
+                    None => {
+                        index.insert(key.clone(), pairs.len());
+                        pairs.push((key, val));
+                    }
+                }
                 skip_ws(b, pos);
                 match b.get(*pos) {
                     Some(b',') => {
@@ -4085,6 +4120,42 @@ mod tests {
         );
         // genuinely well-formed input is completely unaffected.
         assert_eq!(parse_json("  42  "), Ok(Json::Num(42.0)));
+    }
+
+    /// A REAL cross-engine SILENT VALUE DIVERGENCE found+fixed (production-
+    /// hardening PR-it879, the FIFTH sibling instance of this parser's
+    /// ongoing parity-with-`json.rs` effort -- it545/it620/it765/it792 each
+    /// closed a different way this independently-reimplemented parser
+    /// diverged from `json.rs`'s canonical one): `json.rs::Parser::object`
+    /// deliberately implements "last key wins, first-seen position"
+    /// duplicate-key semantics (fixed for an O(n^2) performance bug at
+    /// PR-it838), and `cgen.rs`'s native mirror (`kjp_object`) matches it
+    /// exactly -- but this parser just unconditionally appended every
+    /// `(key, val)` pair with no dedup at all, so `Json::get`'s `.find()`
+    /// (which returns the FIRST match) silently returned the FIRST
+    /// occurrence of a duplicate key instead. `ai.rs::convert`/`ai.rs`'s
+    /// tool-calling machinery (interp AND vm both share this SAME
+    /// `lsp::parse_json`) parses AI-provider/mock responses through exactly
+    /// this path, while native's `k_ai_convert` parses the SAME text
+    /// through the canonical, last-key-wins `k_json_parse`. Confirmed live
+    /// before this fix (a real `ai fun` returning `type Box = Box(x: Int)`,
+    /// mocked via `KUPL_AI_MOCK='{"x": 1, "x": 2}'`): `Box(1)` on interp AND
+    /// vm, but `Box(2)` on native -- a genuinely WRONG value on two of the
+    /// three engines.
+    #[test]
+    fn parse_json_last_key_wins_on_a_duplicate_object_key_matching_json_rs() {
+        assert_eq!(parse_json(r#"{"x": 1, "x": 2}"#), Ok(Json::Obj(vec![("x".into(), Json::Num(2.0))])));
+        // the FIRST-SEEN position is preserved, only the value updates --
+        // matching json.rs::object's own documented semantic exactly.
+        assert_eq!(
+            parse_json(r#"{"a": 1, "b": 2, "a": 3}"#),
+            Ok(Json::Obj(vec![("a".into(), Json::Num(3.0)), ("b".into(), Json::Num(2.0))]))
+        );
+        // a genuinely duplicate-free object is completely unaffected.
+        assert_eq!(
+            parse_json(r#"{"a": 1, "b": 2}"#),
+            Ok(Json::Obj(vec![("a".into(), Json::Num(1.0)), ("b".into(), Json::Num(2.0))]))
+        );
     }
 
     /// A REAL, SEVERE robustness bug found+fixed (production-hardening
