@@ -495,13 +495,40 @@ impl<'a> R<'a> {
         Ok(self.u32()? as usize)
     }
     /// A safe `Vec::with_capacity` hint for a count read from the (possibly
-    /// corrupt/untrusted) buffer: never pre-allocate for more items than there are
-    /// bytes left, since decoding each item consumes at least one byte. A tampered
-    /// count (e.g. 0xFFFFFFFF) therefore cannot trigger a multi-gigabyte allocation
-    /// that aborts the process — the following decode loop hits a clean
-    /// "truncated .kx module" error instead.
-    fn cap(&self, n: usize) -> usize {
-        n.min(self.buf.len().saturating_sub(self.pos))
+    /// corrupt/untrusted) buffer: never pre-allocate more BYTES than remain in
+    /// the buffer, since decoding each item consumes at least one byte. A
+    /// tampered count (e.g. 0xFFFFFFFF) therefore cannot trigger a multi-
+    /// gigabyte allocation that aborts (or, per PR-it926 below, merely stalls)
+    /// the process — the following decode loop hits a clean "truncated .kx
+    /// module" error instead.
+    ///
+    /// A REAL bug found+fixed (production-hardening PR-it926, a close-read
+    /// survey finding): this used to clamp only the ITEM COUNT to remaining
+    /// bytes (`n.min(remaining)`), silently assuming `Vec::with_capacity(n)`
+    /// allocates `n` BYTES — true only for a byte-sized element. It actually
+    /// allocates `n * size_of::<T>()` bytes, and EVERY element type this file
+    /// decodes into is far larger than 1 byte (`Value`/`String` = 24 bytes,
+    /// `ToolMeta` ~150+ bytes, …) except `Span` (which happens to be exactly
+    /// 8 bytes on the wire too) — so the old clamp's own safety claim was
+    /// false for every OTHER call site. Live-confirmed: a ~2GB crafted `.kx`
+    /// file (`nconsts = 0xFFFFFFFF` header + ~2GB of arbitrary padding)
+    /// forced roughly 9GB of REAL resident memory and ~10 seconds of CPU
+    /// time inside `Vec::<Value>::with_capacity` before `decode()`'s
+    /// following loop failed cleanly on `decode_const`'s very first call —
+    /// a genuine, measurable resource-exhaustion amplification from an
+    /// untrusted `.kx` file, this campaign's own established in-scope threat
+    /// model (PR-it687/688/726/729/730). The EXISTING `corrupt_kx_is_
+    /// rejected_not_a_crash` test's own huge-`nconsts` case never caught
+    /// this because it used ZERO padding bytes, so `cap` degenerately
+    /// clamped to 0 regardless of whether this bug existed — the test
+    /// exercised only the trivial case, not the one that actually matters.
+    /// Fixed by making `cap` generic over the element type and dividing the
+    /// byte-based clamp by `size_of::<T>()`, so the ACTUAL ALLOCATED BYTE
+    /// SIZE (not just the item count) is bounded by the bytes genuinely
+    /// remaining in the buffer.
+    fn cap<T>(&self, n: usize) -> usize {
+        let elem_size = std::mem::size_of::<T>().max(1);
+        n.min(self.buf.len().saturating_sub(self.pos) / elem_size)
     }
 }
 
@@ -530,16 +557,16 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let nparams = r.u8()?;
         let nregs = r.u16()?;
         let nconsts = r.u32()?;
-        let mut consts = Vec::with_capacity(r.cap(nconsts as usize));
+        let mut consts = Vec::with_capacity(r.cap::<Value>(nconsts as usize));
         for _ in 0..nconsts {
             consts.push(decode_const(&mut r)?);
         }
         let ncode = r.u32()?;
-        let mut code = Vec::with_capacity(r.cap(ncode as usize));
+        let mut code = Vec::with_capacity(r.cap::<Op>(ncode as usize));
         for _ in 0..ncode {
             code.push(decode_op(&mut r)?);
         }
-        let mut spans = Vec::with_capacity(r.cap(ncode as usize));
+        let mut spans = Vec::with_capacity(r.cap::<Span>(ncode as usize));
         for _ in 0..ncode {
             let start = r.u32()?;
             let end = r.u32()?;
@@ -567,7 +594,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
     for _ in 0..ncfn {
         let variant = r.s()?;
         let n = r.u32()?;
-        let mut fields = Vec::with_capacity(r.cap(n as usize));
+        let mut fields = Vec::with_capacity(r.cap::<String>(n as usize));
         for _ in 0..n {
             fields.push(r.s()?);
         }
@@ -579,7 +606,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let name = r.s()?;
         let is_app = r.u8()? != 0;
         let nprops = r.u32()?;
-        let mut props = Vec::with_capacity(r.cap(nprops as usize));
+        let mut props = Vec::with_capacity(r.cap::<(String, Option<u16>)>(nprops as usize));
         for _ in 0..nprops {
             let pname = r.s()?;
             let has_default = r.u8()? != 0;
@@ -590,7 +617,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let init_chunk = r.u16()?;
         let restart_chunk = r.u16()?;
         let nhandlers = r.u32()?;
-        let mut handlers = Vec::with_capacity(r.cap(nhandlers as usize));
+        let mut handlers = Vec::with_capacity(r.cap::<(String, u16, bool)>(nhandlers as usize));
         for _ in 0..nhandlers {
             let key = r.s()?;
             let chunk = r.u16()?;
@@ -605,12 +632,12 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
             exposes.insert(ename, chunk);
         }
         let nports = r.u32()?;
-        let mut out_ports = Vec::with_capacity(r.cap(nports as usize));
+        let mut out_ports = Vec::with_capacity(r.cap::<String>(nports as usize));
         for _ in 0..nports {
             out_ports.push(r.s()?);
         }
         let ntimers = r.u32()?;
-        let mut timers = Vec::with_capacity(r.cap(ntimers as usize));
+        let mut timers = Vec::with_capacity(r.cap::<TimerMeta>(ntimers as usize));
         for _ in 0..ntimers {
             let chunk = r.u16()?;
             let every = r.u8()? != 0;
@@ -638,19 +665,19 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let intent = r.s()?;
         let model = if r.u8()? != 0 { Some(r.s()?) } else { None };
         let nparams = r.u32()?;
-        let mut params = Vec::with_capacity(r.cap(nparams as usize));
+        let mut params = Vec::with_capacity(r.cap::<String>(nparams as usize));
         for _ in 0..nparams {
             params.push(r.s()?);
         }
         let shape = decode_shape(&mut r, 0)?;
         let wraps_result = r.u8()? != 0;
         let ntools = r.u32()?;
-        let mut tools = Vec::with_capacity(r.cap(ntools as usize));
+        let mut tools = Vec::with_capacity(r.cap::<crate::ai::ToolMeta>(ntools as usize));
         for _ in 0..ntools {
             let tname = r.s()?;
             let description = r.s()?;
             let nparams = r.u32()?;
-            let mut tparams = Vec::with_capacity(r.cap(nparams as usize));
+            let mut tparams = Vec::with_capacity(r.cap::<(String, crate::ai::AiShape)>(nparams as usize));
             for _ in 0..nparams {
                 let pname = r.s()?;
                 tparams.push((pname, decode_shape(&mut r, 0)?));
@@ -711,7 +738,7 @@ fn decode_shape(r: &mut R, depth: usize) -> DecodeResult<crate::ai::AiShape> {
             let ty = r.s()?;
             let variant = r.s()?;
             let n = r.u32()?;
-            let mut fields = Vec::with_capacity(r.cap(n as usize));
+            let mut fields = Vec::with_capacity(r.cap::<(String, crate::ai::AiShape)>(n as usize));
             for _ in 0..n {
                 let name = r.s()?;
                 fields.push((name, decode_shape(r, depth + 1)?));
@@ -841,6 +868,38 @@ pub fn read_bundle(exe: &[u8]) -> Option<DecodeResult<Module>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cap_bounds_allocated_bytes_not_just_item_count() {
+        // regression: PR-it926. `cap::<T>(n)` must ensure the resulting
+        // `Vec::with_capacity` allocation stays within the buffer's actual
+        // remaining BYTES (`cap * size_of::<T>() <= remaining`), not just
+        // clamp the ITEM COUNT to remaining bytes (which silently assumed a
+        // 1-byte element and let `Vec::with_capacity` over-allocate by a
+        // factor of `size_of::<T>()` for every other element type this file
+        // decodes into -- `Value`/`String` = 24 bytes, `ToolMeta` ~150+
+        // bytes -- confirmed live before this fix: a ~2GB crafted `.kx` file
+        // forced a `Vec::<Value>::with_capacity` request far beyond the
+        // buffer's own size).
+        let buf = vec![0u8; 1000];
+        let r = super::R { buf: &buf, pos: 0 };
+        let vsz = std::mem::size_of::<super::Value>();
+        let n = r.cap::<super::Value>(usize::MAX);
+        assert!(
+            n * vsz <= buf.len(),
+            "cap={n} * size_of::<Value>()={vsz} = {} exceeds remaining {} bytes",
+            n * vsz,
+            buf.len()
+        );
+        assert_eq!(n, buf.len() / vsz, "must use every remaining byte's worth of headroom, not less");
+        // a second, differently-sized type (Span, 8 bytes) hits the same invariant.
+        let ssz = std::mem::size_of::<super::Span>();
+        let n2 = r.cap::<super::Span>(usize::MAX);
+        assert!(n2 * ssz <= buf.len());
+        // a genuinely small requested count that already fits is never inflated.
+        assert_eq!(r.cap::<super::Value>(5), 5);
+        assert_eq!(r.cap::<super::Value>(0), 0);
+    }
+
     /// A REAL, uncatchable-crash bug found+fixed (production-hardening
     /// PR-it730): `decode_shape` (an `ai fun`'s structured-output type,
     /// decoded from an untrusted `.kx` byte buffer) had NO depth tracking
@@ -971,6 +1030,16 @@ mod tests {
         b.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nconsts = 4.29 billion
         // (no const bytes follow) — must be Err, must return fast (no huge alloc)
         assert!(super::decode(&b).is_err(), "huge nconsts must be a clean error");
+
+        // PR-it926: the case above has ZERO remaining bytes after the header,
+        // so it degenerately exercised `cap()`'s clamp regardless of whether
+        // the size_of::<T> bug existed. Repeat with SUBSTANTIAL padding
+        // (an invalid constant tag byte, so decode fails on the very first
+        // item rather than processing millions of valid-looking ones) to
+        // actually exercise a meaningful, non-degenerate capacity clamp.
+        let mut b2 = b.clone();
+        b2.resize(b2.len() + 10_000_000, 0xFFu8);
+        assert!(super::decode(&b2).is_err(), "huge nconsts with real padding must still be a clean error");
 
         // truncating a valid module at every prefix length is always a clean Err.
         let src = "fun add(a: Int, b: Int) -> Int { a + b }\nfun main() { print(add(2, 3)) }\n";
