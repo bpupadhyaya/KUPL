@@ -997,8 +997,44 @@ impl Interp {
                 }
             }
         }
+        // A REAL bug found+fixed (production-hardening PR-it955, survey
+        // #108's breadth-first fuzzing pass over contract/law interactions):
+        // this loop only re-ran `reset_instance_state` (state field
+        // initializers), never `on start` -- unlike `restart` (supervision),
+        // which ALSO re-runs every `on start` handler and re-arms timers
+        // after the SAME `reset_instance_state` call. The real execution
+        // path a law actually runs against (`run.rs`'s own contract-law
+        // loop) does `instantiate()` then `start_all()` -- which runs `on
+        // start` -- exactly ONCE before the law's body (and everything
+        // inside its `forall`) begins, so only the FIRST case ever saw a
+        // properly-started instance; every later case/shrink-candidate's
+        // reset silently reverted any state `on start` had established,
+        // landing on a state no real running instance could ever be in.
+        // Confirmed live via a `Divider` contract whose `SafeDivider`
+        // component seeds `state divisor: Int = 0` then sets it to a
+        // nonzero value in `on start`: a `forall x: Int { divide(x) }` law
+        // reported a spurious `property failed for x = 0 (panic: division
+        // by zero)`, while the IDENTICAL body run via the real single-shot
+        // law path (no `forall`, same `instantiate`+`start_all` route) and
+        // an isolation control (divisor seeded entirely by the bare state
+        // initializer, no `on start` needed) both passed cleanly -- proving
+        // the reported counterexample was a phantom, unreachable by any
+        // real running instance. This is the FIFTH distinct reachability
+        // path to this campaign's own "forall-phantom-counterexample" bug
+        // class, after PR-it903/it904/it905/it906's four (contract-law
+        // Bound bindings; plain Component let-bindings; container/closure
+        // nesting; transitive child-instance delegation) -- previously
+        // believed exhausted absent a genuinely new mechanism (it906's own
+        // NEXT-note), now shown not to be. Fixed by mirroring `restart`'s
+        // own established post-reset pattern exactly: re-run `on start`
+        // (via `run_lifecycle`, the same helper `start_all` itself uses)
+        // and re-arm timers for every reset instance, so a per-case reset
+        // is fully equivalent to a freshly-instantiated AND freshly-started
+        // instance, not merely a freshly-initialized one.
         for id in instance_ids {
             self.reset_instance_state(id)?;
+            self.run_lifecycle(id, &Trigger::Start)?;
+            self.arm_timers(id);
         }
         let scope = env.child();
         for ((name, _), v) in vars.iter().zip(vals) {

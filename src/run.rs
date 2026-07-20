@@ -2464,6 +2464,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it955,
+    /// found via survey #108's breadth-first fuzzing pass over contract/law
+    /// interactions -- independently re-verified live with a freshly hand-
+    /// written repro before implementing, per this campaign's own standing
+    /// discipline, especially given PR-it953's own recent lesson that a
+    /// survey's claims can be wrong even when the methodology looks sound).
+    /// `forall_case`'s per-case reset (PR-it903-906's own fix for the
+    /// sibling shapes above) only re-ran `reset_instance_state` -- the
+    /// state field INITIALIZERS -- never `on start`, unlike `restart`
+    /// (supervision), which re-runs `on start` after the SAME
+    /// `reset_instance_state` call. The real path a law actually runs
+    /// against (`run_tests`'s own per-law `instantiate()` + `start_all()`,
+    /// which DOES run `on start`) only does so ONCE before the law's body
+    /// -- and therefore before any `forall` inside it -- begins, so only
+    /// the FIRST case ever saw a properly-started instance;
+    /// every later case's reset silently reverted anything `on start` had
+    /// established, landing on a state no real running instance could ever
+    /// be in. This is the FIFTH distinct reachability path to this bug
+    /// class, after PR-it903/it904/it905/it906's four (contract-law `Bound`
+    /// bindings; plain `Component` let-bindings; container/closure nesting;
+    /// transitive child-instance delegation) -- previously believed
+    /// exhausted absent a genuinely new mechanism (it906's own NEXT-note),
+    /// shown here not to be. Fixed by mirroring `restart`'s own established
+    /// post-reset pattern in `forall_case`: re-run `on start` (via
+    /// `run_lifecycle`, the same helper `start_all` itself uses) and
+    /// re-arm timers for every reset instance, so a per-case reset is fully
+    /// equivalent to a freshly-instantiated AND freshly-started instance.
+    #[test]
+    fn forall_resets_re_run_on_start_so_a_divisor_seeded_there_stays_nonzero_every_case() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-forall-onstart-reset-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_test = |src: &str| -> String {
+            let file = dir.join(format!("case-{}.kupl", src.len()));
+            std::fs::write(&file, src).unwrap();
+            let out = std::process::Command::new(&bin).args(["test", file.to_str().unwrap()]).output().expect("kupl runs");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // A divisor seeded to nonzero ONLY by `on start` (bare state init
+        // stays 0) must stay nonzero across EVERY forall case, not just the
+        // first -- must now PASS instead of reporting a phantom `x = 0`
+        // division-by-zero counterexample.
+        let onstart_stdout = run_test(
+            "contract Divider {\n    intent \"divides by a divisor on-start seeds to nonzero\"\n    \
+             expose fun divide(x: Int) -> Int\n\n    \
+             law \"divide never panics once started\" {\n        forall x: Int {\n            \
+             let r = divide(x)\n            expect r == r\n        }\n    }\n}\n\n\
+             component SafeDivider fulfills Divider {\n    intent \"divisor nonzero once started\"\n    \
+             state divisor: Int = 0\n    on start { divisor = 7 }\n    \
+             expose fun divide(x: Int) -> Int { x / divisor }\n}\n",
+        );
+        assert!(
+            onstart_stdout.contains("1 passed, 0 failed"),
+            "a divisor seeded to nonzero only by `on start` must stay nonzero across EVERY \
+             forall case, not just the first: {onstart_stdout:?}"
+        );
+
+        // Isolation control: the SAME shape with the divisor seeded entirely
+        // by the bare state initializer (no `on start` at all) must already
+        // pass regardless -- confirms the fix didn't change unrelated
+        // behavior, only the `on start` reachability gap.
+        let no_onstart_stdout = run_test(
+            "contract Divider {\n    intent \"divides by a divisor seeded entirely by init\"\n    \
+             expose fun divide(x: Int) -> Int\n\n    \
+             law \"divide never panics (no on-start needed)\" {\n        forall x: Int {\n            \
+             let r = divide(x)\n            expect r == r\n        }\n    }\n}\n\n\
+             component PlainDivider fulfills Divider {\n    intent \"divisor from init only\"\n    \
+             state divisor: Int = 7\n    \
+             expose fun divide(x: Int) -> Int { x / divisor }\n}\n",
+        );
+        assert!(
+            no_onstart_stdout.contains("1 passed, 0 failed"),
+            "a divisor seeded entirely by the state initializer (no on-start) must already \
+             pass across every case: {no_onstart_stdout:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL text-consistency bug found+fixed (production-hardening
     /// PR-it783, the same finding as `plain_and_forall_expect_failures_...`
     /// above, but at a DIFFERENT site with no shared code path: a component
