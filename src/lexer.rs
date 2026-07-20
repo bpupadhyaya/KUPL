@@ -391,7 +391,16 @@ impl<'a> Lexer<'a> {
                     break;
                 }
                 Some(b'"') => break,
-                Some(b'\\') => match self.bump() {
+                Some(b'\\') => {
+                    // Position of the backslash itself -- captured BEFORE
+                    // consuming the escaped character below, so every
+                    // diagnostic in this arm anchors correctly regardless
+                    // of how many bytes that character turns out to need
+                    // (production-hardening PR-it934, replacing the
+                    // original single-byte-assuming `self.pos.saturating_
+                    // sub(2)` computations this arm used to repeat).
+                    let esc_start = self.pos - 1;
+                    match self.bump() {
                     Some(b'n') => text.push('\n'),
                     Some(b't') => text.push('\t'),
                     Some(b'r') => text.push('\r'),
@@ -407,22 +416,67 @@ impl<'a> Lexer<'a> {
                             "K0008",
                             "NUL (`\\0`) is not allowed in a string literal — `Str` is \
                              NUL-free UTF-8 text; use a byte list for binary data",
-                            self.span_from(self.pos.saturating_sub(2)),
+                            self.span_from(esc_start),
                         ));
                     }
-                    other => {
+                    // True EOF right after the backslash -- production-
+                    // hardening PR-it934. Emitting NOTHING here (rather
+                    // than a misleading "unknown escape sequence `\ `"
+                    // with a phantom space character that doesn't exist
+                    // anywhere in the source) is correct: the outer loop's
+                    // own EOF check, on its very next iteration, reports
+                    // the accurate K0005 "unterminated string literal".
+                    None => {}
+                    Some(c) => {
+                        // A REAL, uncatchable-crash bug found+fixed
+                        // (production-hardening PR-it934, a sibling of
+                        // PR-it924's own interpolation-scanner fix -- same
+                        // bug CLASS, different site, never covered by that
+                        // fix since it was scoped to the `{...}`
+                        // interpolation boundary scanner specifically, not
+                        // this string-literal escape-handling code). The
+                        // `self.bump()` above (fetching the escaped
+                        // character) only ever consumes ONE raw byte -- for
+                        // a multi-byte UTF-8 character (`c >= 0x80`),
+                        // that's just its LEAD byte, leaving the
+                        // character's remaining continuation byte(s)
+                        // "orphaned" for the NEXT loop iteration to consume
+                        // as if they started a fresh, independent byte
+                        // sequence -- corrupting `self.pos`'s alignment to
+                        // a valid char boundary and eventually panicking
+                        // when `self.src` is later sliced at that now-
+                        // invalid position (the plain-text scan's own "re-
+                        // do properly" logic below, which assumes whatever
+                        // it's handed IS a valid boundary). Live-confirmed:
+                        // `"\π"` (backslash immediately followed by a
+                        // 2-byte UTF-8 character) crashed with "internal
+                        // compiler error [src/lexer.rs:590]" instead of a
+                        // clean K0006. Fixed by reconstructing the FULL
+                        // character here too, mirroring the established
+                        // "re-do properly" pattern below exactly, before
+                        // reporting it in the diagnostic (so the message
+                        // also shows the real character instead of a mis-
+                        // decoded single byte).
+                        let ch = if c >= 0x80 {
+                            let ch_start = self.pos - 1;
+                            let ch = self.src[ch_start..].chars().next().unwrap_or('\u{fffd}');
+                            self.pos = ch_start + ch.len_utf8();
+                            ch
+                        } else {
+                            c as char
+                        };
                         self.diags.push(Diag::error(
                             "K0006",
                             format!(
-                                "unknown escape sequence `\\{}` — the valid escapes are \
+                                "unknown escape sequence `\\{ch}` — the valid escapes are \
                                  `\\n`, `\\t`, `\\r`, `\\\\`, `\\\"`, `\\{{` and `\\}}` \
-                                 (a literal backslash is `\\\\`)",
-                                other.map(|c| c as char).unwrap_or(' ')
+                                 (a literal backslash is `\\\\`)"
                             ),
-                            self.span_from(self.pos.saturating_sub(2)),
+                            self.span_from(esc_start),
                         ));
                     }
-                },
+                    }
+                }
                 Some(b'{') if self.peek() == Some(b'{') => {
                     // `{{` is a literal `{` (so JSON/CSS/`{…}` templates can be
                     // written directly); only a single `{` opens interpolation.
@@ -1032,6 +1086,61 @@ mod tests {
         }
         let (_t, diags) = lex("\"{π");
         assert!(diags.iter().any(|d| d.code == "K0007"), "expected K0007, got {diags:?}");
+    }
+
+    #[test]
+    fn an_unknown_escape_sequence_followed_by_a_multibyte_char_does_not_panic() {
+        // A REAL, uncatchable-crash bug found+fixed (production-hardening
+        // PR-it934, a sibling of PR-it924's own interpolation-scanner fix
+        // -- same bug CLASS (a byte-level scan losing UTF-8 char-boundary
+        // awareness), different site (string-literal ESCAPE handling, not
+        // the `{...}` interpolation boundary scanner), never covered by
+        // that earlier fix. `lex_string`'s unknown-escape fallback used to
+        // consume only ONE raw byte for the escaped character via its own
+        // `self.bump()` -- for a multi-byte UTF-8 character, that's just
+        // its lead byte, leaving the remaining continuation byte(s)
+        // "orphaned" for the next loop iteration to treat as the start of
+        // a fresh, independent byte sequence, corrupting `self.pos`'s
+        // alignment to a valid char boundary. Live-confirmed BEFORE this
+        // fix: `"\π"` (a backslash immediately followed by a 2-byte UTF-8
+        // character) panicked with a byte-index-not-a-char-boundary error
+        // instead of a clean K0006. None of these may panic (the point of
+        // the test is reaching the assertions below).
+        for src in ["\"\\π\"", "\"\\日本語\"", "\"a\\日b\"", "\"\\😀\"", "\"a\\\u{1F600}b\""] {
+            let _ = lex(src);
+        }
+        // the diagnostic must show the REAL character, not a mis-decoded
+        // single byte or a phantom placeholder.
+        let (_t, diags) = lex("\"\\π\"");
+        let d = diags.iter().find(|d| d.code == "K0006").expect(&format!("expected K0006, got {diags:?}"));
+        assert!(d.message.contains('π'), "expected the real character π in the message, got {:?}", d.message);
+    }
+
+    #[test]
+    fn a_backslash_right_at_true_eof_reports_only_unterminated_string_not_a_phantom_escape() {
+        // A REAL, live-confirmed misleading-diagnostic bug found+fixed
+        // (production-hardening PR-it934, found alongside the multibyte-
+        // panic sibling above during the same close-read): when a string
+        // literal ends abruptly right after a lone backslash (true EOF,
+        // `self.bump()` returning `None` while fetching the escaped
+        // character), the unknown-escape fallback used to synthesize a
+        // PHANTOM space character in its own diagnostic message (`other.
+        // map(|c| c as char).unwrap_or(' ')`) even though no space exists
+        // anywhere in the source. Live-confirmed BEFORE this fix:
+        // `"a\` (ending right there, no closing quote) reported `unknown
+        // escape sequence \` followed by a literal space, alongside the
+        // separately-correct K0005 "unterminated string literal" --
+        // confusing and simply false. Fixed by emitting NO escape
+        // diagnostic at all when the escaped-character fetch hits true
+        // EOF, letting the outer loop's own EOF check (which fires on its
+        // very next iteration) report K0005 alone, exactly as a plain
+        // (non-backslash) EOF inside a string already does.
+        let (_t, diags) = lex("\"a\\");
+        assert!(diags.iter().any(|d| d.code == "K0005"), "expected K0005, got {diags:?}");
+        assert!(
+            !diags.iter().any(|d| d.code == "K0006"),
+            "must NOT report a phantom unknown-escape diagnostic for true EOF: {diags:?}"
+        );
     }
 
     #[test]
