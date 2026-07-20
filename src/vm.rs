@@ -19281,6 +19281,37 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED silent-data-loss bug found+fixed (production-
+    /// hardening PR-it963, a background survey finding, independently
+    /// re-verified live with a FRESH repro before implementing): a
+    /// caller-constructed zero-field row (`[]`, not `[""]` -- CSV's own
+    /// grammar has no way to encode zero fields as distinct from no row at
+    /// all) used to silently serialize to nothing, indistinguishable from
+    /// "no row" on the next `csv_parse` round-trip -- the SAME shape as
+    /// PR-it883's already-fixed lone-empty-field case, but with no field
+    /// left to force-quote. Live-confirmed BEFORE this fix: `csv_stringify(
+    /// [["x","y"], []])` (2 rows) produced `"x,y\n"` (1 line), and
+    /// re-parsing it back produced only 1 row -- byte-identical (same
+    /// silently wrong result) on interp/vm/native. Fixed by rejecting a
+    /// zero-field row with a clean panic in the shared `csv_builtin`
+    /// (interp.rs, used by both interp and the KVM) instead of silently
+    /// losing data.
+    #[test]
+    fn diff_csv_stringify_rejects_a_zero_field_row() {
+        assert_eq!(
+            differential("fun probe() -> Str {\n    csv_stringify([[\"x\", \"y\"], []])\n}\n"),
+            "panic: `csv_stringify` cannot represent a row with zero fields -- CSV has no way to \
+             distinguish this from no row at all"
+        );
+        // a row with exactly one field, even an empty one, must NOT trip
+        // this new check -- it's the ALREADY-correctly-handled PR-it883
+        // case, not the zero-field case.
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    let rows = [[\"a\"], [\"\"]]\n    csv_parse(csv_stringify(rows)) == rows\n}\n"),
+            "true"
+        );
+    }
+
     #[test]
     fn diff_numeric_formatting_it24() {
         // Int radix formatting (lowercase, sign on the magnitude)

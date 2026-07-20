@@ -92,6 +92,24 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
 
 /// Serialize rows of fields to CSV text (records joined with `\n`).
 ///
+/// PRECONDITION (production-hardening PR-it963): every row must have AT
+/// LEAST ONE field. A zero-field row silently serializes to nothing at all
+/// (the per-row `for (c, field) in row.iter().enumerate()` loop below never
+/// runs its body), byte-for-byte indistinguishable from "no row" on the
+/// subsequent `parse` round-trip -- CSV's own grammar cannot represent
+/// "zero fields" as distinct from "no row" to begin with, so there is no
+/// encoding this function COULD use to preserve one even if it tried
+/// (contrast a row with a single EMPTY field, which the `PR-it883` fix
+/// just below correctly preserves via quoting). The one caller that
+/// exposes this function to KUPL programs (`interp::csv_builtin`, shared
+/// by the interpreter and the KVM) validates every row is non-empty and
+/// returns a clean error BEFORE ever reaching this function, so a
+/// zero-field row is unreachable from ordinary KUPL code; this function
+/// itself stays a pure, infallible primitive with the precondition
+/// documented here rather than threading a `Result` through every caller
+/// (including this file's own fuzz test below, which -- by construction,
+/// `nfields = 1 + rng.below(3)` -- never generates a violating case).
+///
 /// A REAL silent-data-loss bug found+fixed (production-hardening PR-it883,
 /// found by fuzzing hundreds of random field combinations through the
 /// `parse`/`stringify` round-trip): the LAST row's own lone empty field

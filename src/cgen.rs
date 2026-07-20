@@ -3394,10 +3394,32 @@ static KValue k_csv_stringify(KValue lst) {
        row. Force-quoting specifically the last row's lone empty field to ""
        (2 bytes) fixes it, exactly mirroring how a genuinely-quoted empty
        field already survives via field_was_quoted (PR-it678's fix). */
+    /* A REAL, LIVE-CONFIRMED silent-data-loss bug found+fixed (production-
+       hardening PR-it963, mirrors interp.rs::csv_builtin's IDENTICAL fix,
+       the SAME "empty content collapses to nothing on round-trip" shape as
+       PR-it883 immediately above -- but for ZERO fields, where there's no
+       field left to force-quote at all): the `for (c = 0; c < row->len;
+       c++)` loop just below never runs its body when `row->len == 0`, so
+       a zero-field row silently emits NOTHING, byte-for-byte
+       indistinguishable from "no row." `k_csv_parse` never produces a
+       zero-field row itself, but this function accepts an arbitrary
+       caller-constructed list with no validation. Live-confirmed BEFORE
+       this fix: `csv_stringify([["x","y"], []])` (2 rows) produced
+       `"x,y\n"` (1 line), silently dropping the second row on any
+       subsequent `csv_parse` round-trip. CSV's own grammar cannot
+       represent "zero fields" as distinct from "no row" at all -- reject
+       it with a clean panic instead, exactly matching the row-shape
+       check just above it (a non-List row). */
     int64_t last = rows->len - 1;
     for (int64_t r = 0; r < rows->len; r++) {
         if (r) kb_putc(&b, '\n');
         KList* row = rows->items[r].as.list;
+        if (row->len == 0) {
+            k_panic(
+                "`csv_stringify` cannot represent a row with zero fields -- CSV has no way to "
+                "distinguish this from no row at all"
+            );
+        }
         for (int64_t c = 0; c < row->len; c++) {
             if (c) kb_putc(&b, ',');
             if (r == last && row->len == 1 && row->items[c].as.s[0] == 0) {
@@ -15794,6 +15816,60 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         assert!(
             stderr.contains("unexpected `)` in pattern"),
             "native must name the offending character exactly like the interpreter does: {stderr:?}"
+        );
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-data-loss bug found+fixed (production-
+    /// hardening PR-it963, mirrors the identical fix + test added to
+    /// interp.rs::csv_builtin/vm.rs this same iteration): `k_csv_stringify`
+    /// had the SAME "zero-field row silently serializes to nothing" gap as
+    /// the shared Rust `csv_builtin` did before this fix -- confirmed live
+    /// BEFORE this fix via `csv_stringify([["x","y"], []])` (2 rows)
+    /// producing `"x,y\n"` (1 line) on native too, silently losing the
+    /// second row on any subsequent `csv_parse` round-trip. Fixed by
+    /// rejecting a zero-field row with a clean `k_panic`, matching
+    /// interp.rs's own new check and wording exactly.
+    #[test]
+    fn native_csv_stringify_rejects_a_zero_field_row_matching_interp_wording() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    print(csv_stringify([[\"x\", \"y\"], []]))\n}\n";
+        // the interpreter is the reference semantics -- confirm ITS wording first.
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let expected = "`csv_stringify` cannot represent a row with zero fields -- CSV has no way \
+                         to distinguish this from no row at all";
+        match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Err(crate::interp::Flow::Panic { msg, .. }) => {
+                assert!(msg.contains(expected), "{msg}");
+            }
+            Ok(_) => panic!("a zero-field row must panic, not succeed"),
+            Err(_) => panic!("a zero-field row must panic with Flow::Panic specifically"),
+        }
+
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-csvzero-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let out = std::process::Command::new(&bin).output().unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        assert!(out.stdout.is_empty(), "must panic before printing anything: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(expected),
+            "native must reject a zero-field row with the SAME wording as the interpreter: {stderr:?}"
         );
     }
 

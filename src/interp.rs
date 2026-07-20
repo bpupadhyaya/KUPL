@@ -4465,6 +4465,42 @@ pub fn csv_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
                     Value::List(fs) => fs,
                     other => return Err(format!("`csv_stringify` rows must be Lists, found {}", other.type_name())),
                 };
+                // A REAL, LIVE-CONFIRMED silent-data-loss bug found+fixed
+                // (production-hardening PR-it963, survey #112's close-read
+                // of csv.rs, independently re-verified live with a fresh
+                // repro before implementing): `csv::stringify`'s per-row
+                // loop iterates over EACH row's own fields to render them,
+                // and for a ZERO-FIELD row the loop body never runs at
+                // all, silently emitting NOTHING -- byte-for-byte
+                // indistinguishable from "no row," the exact same "empty
+                // content collapses to nothing on round-trip" bug SHAPE
+                // PR-it883 already fixed for a row with exactly ONE empty
+                // field (force-quoted to `""` so it survives), but that
+                // fix has no field to force-quote when there are ZERO
+                // fields to begin with. `csv_parse` itself never PRODUCES
+                // a zero-field row (every row it emits has >= 1 field,
+                // even a blank line), so this is unreachable from a
+                // genuine parse round-trip -- but `csv_stringify` accepts
+                // arbitrary caller-constructed `List[List[Str]]` with no
+                // validation, e.g. from filtering all columns off a row.
+                // Live-confirmed BEFORE this fix: `csv_stringify([["x",
+                // "y"], []])` (2 rows) produced `"x,y\n"` (1 line), and
+                // `csv_parse` of that back produced only 1 row -- silent
+                // row loss, byte-identical (same wrong result) on
+                // interp/vm/native, with zero diagnostic of any kind.
+                // CSV's own grammar cannot represent "zero fields" as
+                // distinct from "no row" at all (unlike a single empty
+                // field, which the quoting-based it883 fix can encode) --
+                // so rather than silently losing data, reject it with a
+                // clean error the same way an already-invalid row shape
+                // (a non-List row, the arm just above) is rejected.
+                if fields.is_empty() {
+                    return Err(
+                        "`csv_stringify` cannot represent a row with zero fields -- CSV has no \
+                         way to distinguish this from no row at all"
+                            .to_string(),
+                    );
+                }
                 grid.push(fields.iter().map(|f| match f {
                     Value::Str(s) => s.as_str().to_string(),
                     other => other.to_string(),
