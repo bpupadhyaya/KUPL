@@ -13,9 +13,18 @@
 //! The mangling sentinel `$` never appears in a source identifier, and these
 //! strings only ever become `HashMap<String, _>` keys in the checker/compiler/
 //! interpreter, so the engines handle them uniformly — this pass is purely a
-//! frontend rewrite and the interp==KVM==native invariant is untouched. A
-//! missed rewrite surfaces as a loud unresolved-name error, never silent
-//! divergence.
+//! frontend rewrite and the interp==KVM==native invariant is untouched.
+//!
+//! When every component-local binding source (props/state/ports/children —
+//! see `Rewriter::component`'s own doc comment) is correctly bound into
+//! scope, a missed rewrite surfaces as a loud unresolved-name error, never
+//! silent divergence — but this is the INTENDED failure mode for a
+//! bug-free pass, not an ironclad guarantee: it has been violated twice in
+//! this campaign's own history (PR-it684 for props/state, PR-it961 for
+//! ports/children), both times because a binding source's bare name was
+//! never added to `Rewriter`'s scope tracking, so a same-named top-level
+//! definition in the SAME package silently absorbed the reference instead
+//! of the checker ever seeing an unresolved name at all.
 
 use std::collections::{HashMap, HashSet};
 
