@@ -337,6 +337,50 @@ fn parse_dep(name: &str, value: &str, line: usize) -> Result<Dep, String> {
     if path.is_none() && version.is_none() {
         return Err(format!("line {line}: dependency `{name}` needs a `path` or `version`"));
     }
+    // A REAL bug found+fixed (production-hardening PR-it919, an Explore
+    // survey finding, independently re-verified live before implementing):
+    // this is the READ-side counterpart of the exact write-side bug
+    // `registry::is_safe_relative_path` was created to close (PR-it683,
+    // whose own doc comment already flagged "a module's own stated threat
+    // model is worth re-applying to EVERY value that flows into the same
+    // dangerous operation" -- a lead never actually followed up here). A
+    // version-only dependency (`{ version = ".." }`, no `path`) resolves via
+    // `loader.rs::pkg_ctx`'s `registry::cache_dir().join(&dep.name).join(v)`
+    // -- but neither `name` (this manifest's OWN `[dependencies]` KEY,
+    // taken verbatim with zero validation) nor `version` had any path-
+    // safety check, and `PathBuf::join` silently DISCARDS its left-hand
+    // base entirely when the joined argument is itself absolute (the SAME
+    // well-known footgun `entry`'s own PR-it766 fix already treats as
+    // security-relevant). Live-confirmed BEFORE this fix: a manifest with
+    // `[dependencies]` key set to an absolute path to an unrelated local
+    // project directory and `version = "."` (a no-op path segment,
+    // ALSO correctly rejected by `is_safe_relative_path` below, not just
+    // `..`/absolute paths) made `kupl pkg tree` silently read and report
+    // that ARBITRARY directory's own `kupl.toml` as if it were a
+    // legitimately cache-resolved dependency -- and per `pkg_ctx`'s own
+    // doc comment, this SAME `deps` map also feeds ordinary `use`-
+    // resolution/compilation, not just reporting commands, so a
+    // sufficiently-crafted manifest could cause an unrelated local
+    // directory's code to be silently compiled and run as a dependency.
+    // Rejected here, at the SAME "single earliest enforcement point"
+    // `is_safe_relative_path`'s own doc comment establishes for `path`/
+    // `url` in registry.rs, mirroring `entry`'s own precedent exactly --
+    // for BOTH `path`- and `version`-style dependencies uniformly (a
+    // dependency's own NAME should never plausibly need to look like an
+    // absolute path or contain `..`/bare `.` components, regardless of
+    // which resolution mechanism it uses).
+    if !crate::registry::is_safe_relative_path(&name) {
+        return Err(format!(
+            "line {line}: dependency name `{name}` must be a plain relative name, not an absolute path or contain `..`"
+        ));
+    }
+    if let Some(v) = &version {
+        if !crate::registry::is_safe_relative_path(v) {
+            return Err(format!(
+                "line {line}: dependency `{name}`'s version `{v}` must be a plain relative value, not an absolute path or contain `..`"
+            ));
+        }
+    }
     Ok(Dep { name, path, version })
 }
 
@@ -359,6 +403,69 @@ mod tests {
         assert_eq!(m.deps[0], Dep { name: "math".into(), path: Some("../math".into()), version: None });
         assert_eq!(m.deps[1], Dep { name: "util".into(), path: Some("vendor/util".into()), version: None });
         assert_eq!(m.deps[2], Dep { name: "web".into(), path: None, version: Some("1.2.0".into()) });
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it919, an Explore
+    /// survey finding, independently re-verified live before implementing):
+    /// this is the READ-side counterpart of `entry`'s own PR-it766 fix and
+    /// `registry.rs`'s write-side `is_safe_relative_path` (PR-it683) -- a
+    /// version-only dependency's `name`/`version` get filesystem-joined onto
+    /// `registry::cache_dir()` in `loader.rs::pkg_ctx`, with `PathBuf::join`
+    /// silently discarding its base when the joined value is itself
+    /// absolute. Live-confirmed BEFORE this fix, with a real multi-directory
+    /// repro: a manifest whose `[dependencies]` KEY was an absolute path to
+    /// an unrelated local project and `version = "."` (a no-op path segment)
+    /// made `kupl pkg tree` silently read and report that ARBITRARY
+    /// directory's own `kupl.toml` as a legitimately cache-resolved
+    /// dependency -- and since `pkg_ctx`'s `deps` map ALSO feeds ordinary
+    /// `use`-resolution/compilation (not just reporting commands), a
+    /// sufficiently-crafted manifest could cause an unrelated local
+    /// directory's code to be silently compiled and run as a dependency.
+    #[test]
+    fn a_version_only_dependencys_absolute_or_escaping_name_or_version_is_a_clean_parse_error() {
+        let abs_name = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\n/etc/passwd = { version = \".\" }\n",
+        );
+        assert!(
+            abs_name.is_err() && abs_name.unwrap_err().contains("must be a plain relative name"),
+            "an absolute dependency NAME must be a clean parse error"
+        );
+
+        let dotdot_name = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\n../../etc = { version = \"1.0\" }\n",
+        );
+        assert!(
+            dotdot_name.is_err() && dotdot_name.unwrap_err().contains("must be a plain relative name"),
+            "a `..`-containing dependency NAME must be a clean parse error"
+        );
+
+        let escaping_version = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\nweb = { version = \"../../etc\" }\n",
+        );
+        assert!(
+            escaping_version.is_err() && escaping_version.unwrap_err().contains("must be a plain relative value"),
+            "a `..`-containing dependency VERSION must be a clean parse error"
+        );
+
+        let bare_dot_version = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\nweb = { version = \".\" }\n",
+        );
+        assert!(
+            bare_dot_version.is_err() && bare_dot_version.unwrap_err().contains("must be a plain relative value"),
+            "a bare `.` dependency VERSION (a no-op path segment, not just `..`) must ALSO be a clean parse error"
+        );
+
+        // ordinary, legitimate dependencies of every shape are unaffected
+        let ok = parse(
+            "[project]\nname = \"app\"\n\n\
+             [dependencies]\nmath = { path = \"../math\" }\n\
+             abs_path_dep = { path = \"/opt/local/thing\" }\n\
+             web = { version = \"1.2.0\" }\n",
+        );
+        assert!(
+            ok.is_ok(),
+            "an ordinary relative/absolute PATH dependency and an ordinary VERSION string must still parse cleanly: {ok:?}"
+        );
     }
 
     #[test]

@@ -195,7 +195,12 @@ pub fn verify_hash(content: &str, expected_hash: &str) -> Result<(), String> {
 /// it (`../../.ssh/authorized_keys`). Deliberately conservative — a `.`
 /// component or a Windows-style drive prefix are also rejected, since a
 /// registry index has no legitimate reason to need either.
-fn is_safe_relative_path(path: &str) -> bool {
+///
+/// `pub(crate)` (production-hardening PR-it919): reused by
+/// `manifest.rs::parse_dep` for the identical write-side... now READ-side
+/// hazard on a version-only dependency's own `name`/`version` fields --
+/// see that call site's own doc comment for the full writeup.
+pub(crate) fn is_safe_relative_path(path: &str) -> bool {
     if path.is_empty() {
         return false;
     }
