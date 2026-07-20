@@ -517,6 +517,37 @@ fn fetch_package_with(
     if !is_safe_relative_path(version) {
         return Err(format!("unsafe package version `{version}`"));
     }
+    // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it930,
+    // a close-read survey finding re-examining PR-it921's own case-collision
+    // fix from a different angle): `cache_dir` (below) is a single, GLOBAL,
+    // per-USER directory (`~/.kupl/registry-cache`) SHARED across every
+    // project on the machine, keyed by `name` verbatim. On a case-
+    // insensitive filesystem (the DEFAULT for macOS/Windows), fetching a
+    // package named e.g. `lib` would silently WRITE OVER (materialize
+    // unconditionally overwrites — this module's own design never cache-
+    // skips) an entirely UNRELATED, already-cached `Lib` package belonging
+    // to some OTHER, unrelated project — a genuine cross-project cache
+    // CORRUPTION, not merely a read-time confusion (`loader.rs::pkg_ctx`'s
+    // OWN sibling fix, this same iteration, defends the READ side; this
+    // defends the WRITE side that would otherwise destroy the collided-with
+    // package's cache entry in the first place). Checked BEFORE any network
+    // fetch (fail fast, no wasted work) by scanning `cache_dir`'s existing
+    // top-level entries for a case-insensitive-but-not-exact match against
+    // `name`.
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        let name_fold = name.to_lowercase();
+        for entry in entries.flatten() {
+            let existing = entry.file_name();
+            let existing = existing.to_string_lossy();
+            if existing.as_ref() != name && existing.to_lowercase() == name_fold {
+                return Err(format!(
+                    "package name `{name}` collides with the already-cached package \
+                     `{existing}` on a case-insensitive filesystem — refusing to fetch \
+                     (this would silently overwrite an unrelated package's cache entry)"
+                ));
+            }
+        }
+    }
     let index_url = format!("{}/{name}.json", registry_url.trim_end_matches('/'));
     let index_text =
         fetch(&index_url).map_err(|e| format!("cannot fetch registry index for `{name}`: {e}"))?;
@@ -1174,6 +1205,46 @@ mod tests {
         // nothing was ever written, inside `dir` OR at the attempted escape target.
         assert!(!dir.exists());
         assert!(!escape_target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it930, a close-read survey finding re-examining PR-it921's own
+    /// case-collision fix from a different angle): `cache_dir` is a single,
+    /// GLOBAL, per-USER directory shared across every project on the
+    /// machine, keyed by package name verbatim -- on a case-insensitive
+    /// filesystem, fetching `lib` when an unrelated `Lib` is already cached
+    /// would silently overwrite `Lib`'s content (this module's own design
+    /// never cache-skips, always writes fresh). This test simulates the
+    /// case-insensitive-collision scenario directly (no real case-
+    /// insensitive filesystem needed to prove the CHECK fires): pre-creates
+    /// a cache entry under a name, then fetches a DIFFERENT name that
+    /// happens to be case-INSENSITIVE-equal to it -- must be a clean error,
+    /// and the pre-existing entry's content must be completely untouched.
+    #[test]
+    fn fetch_package_with_refuses_to_overwrite_a_case_colliding_cached_package() {
+        let dir = std::env::temp_dir().join(format!("kupl-registry-fetch-case-collide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let existing = dir.join("Lib").join("1.0.0");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("kupl.toml"), "[project]\nname = \"Lib\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(existing.join("main.kupl"), "pub fun greet() -> Str { \"original-Lib-content\" }\n").unwrap();
+
+        let (_hash, urls) = mock_index_and_files("lib", "1.0.0", "pub fun greet() -> Str { \"malicious-or-unrelated-lib-content\" }\n");
+        let err = fetch_package_with(mock_fetcher(urls), "https://registry.example.com", "lib", "1.0.0", &dir)
+            .unwrap_err();
+        assert!(err.contains("collides"), "{err}");
+        assert!(err.contains("Lib"), "{err}");
+
+        // the pre-existing `Lib` cache entry must be completely untouched --
+        // NOT `dir.join("lib")` (on a case-insensitive filesystem that IS
+        // the same path as `existing` itself, so checking it separately
+        // would prove nothing).
+        assert_eq!(
+            std::fs::read_to_string(existing.join("main.kupl")).unwrap(),
+            "pub fun greet() -> Str { \"original-Lib-content\" }\n"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

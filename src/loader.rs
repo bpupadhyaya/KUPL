@@ -133,7 +133,44 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
                             // resolve_deps/registry_only_deps split PR-it633 deferred).
                             all_registry.insert(dep.name.clone(), v.clone());
                             let cached = crate::registry::cache_dir().join(&dep.name).join(v);
-                            if cached.join("kupl.toml").is_file() {
+                            let cached_manifest = cached.join("kupl.toml");
+                            // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+                            // PR-it930, a close-read survey finding re-examining PR-it921's
+                            // own case-collision fix from a DIFFERENT angle): `cache_dir()`
+                            // is a single, GLOBAL, per-USER directory shared across EVERY
+                            // project on the machine (not per-project) -- and this "already
+                            // fetched" check keyed the cache path on `dep.name` verbatim,
+                            // with no verification that the content actually FOUND there
+                            // belongs to THIS package. On a case-insensitive filesystem
+                            // (the DEFAULT for macOS/Windows, independently confirmed this
+                            // campaign at PR-it919), two entirely UNRELATED, independently-
+                            // authored projects declaring registry dependencies whose names
+                            // differ only by case (`Lib` vs `lib`) at the same version
+                            // resolve to the SAME physical cache directory -- so the SECOND
+                            // project to load silently, with ZERO diagnostic, treats the
+                            // FIRST project's already-cached (and already hash-verified, but
+                            // for a DIFFERENT package) content as its own dependency's
+                            // source. Live-confirmed: a project declaring `lib = { version =
+                            // "1.0.0" }`, having NEVER itself run `kupl pkg fetch`, silently
+                            // printed content from a `Lib` package cached earlier by an
+                            // unrelated fetch -- `kupl run` exited 0 with the WRONG package's
+                            // code, no error at all. Fixed by verifying the cached
+                            // manifest's OWN declared `[project] name` matches `dep.name`
+                            // EXACTLY (case-sensitive) before trusting it as already-fetched
+                            // -- mirroring `registry.rs::fetch_package_with`'s own existing
+                            // `index.name != name` defense for the analogous "a
+                            // misconfigured/compromised registry could serve the wrong
+                            // package" concern. A mismatch (or unreadable/malformed cached
+                            // manifest) now falls through to `registry_only` exactly like a
+                            // genuinely-unfetched dependency, giving the user a clean
+                            // "not fetched" signal to re-run `kupl pkg fetch` (which itself
+                            // now also refuses to WRITE a colliding cache entry in the first
+                            // place -- see `fetch_package_with`'s own new check) instead of
+                            // silently running the wrong code.
+                            let identity_confirmed = crate::manifest::read(&cached_manifest)
+                                .map(|cm| cm.name == dep.name)
+                                .unwrap_or(false);
+                            if identity_confirmed {
                                 deps.insert(dep.name.clone(), (cached, Some(v.clone())));
                             } else {
                                 registry_only.insert(dep.name.clone(), v.clone());
@@ -754,6 +791,70 @@ pub fn load_with(
 
 #[cfg(test)]
 mod tests {
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it930, a close-read survey finding re-examining PR-it921's own
+    /// case-collision fix from a different angle): `registry::cache_dir()`
+    /// is a single, GLOBAL, per-USER directory (`~/.kupl/registry-cache`)
+    /// shared across EVERY project on the machine -- `pkg_ctx` used to
+    /// treat `cache_dir()/dep.name/version` as already-fetched purely
+    /// because a `kupl.toml` existed there, with NO check that its content
+    /// actually belongs to `dep.name`. On a case-insensitive filesystem
+    /// (the DEFAULT for macOS/Windows), a project declaring `lib = {
+    /// version = "1.0.0" }` silently, with ZERO diagnostic, resolved to an
+    /// entirely UNRELATED `Lib` package some OTHER project had already
+    /// cached — live-confirmed via the real CLI (`kupl run`, an isolated
+    /// `$HOME`) before this fix existed: it printed the OTHER package's
+    /// content. Fixed by verifying the cached manifest's own declared
+    /// `[project] name` matches `dep.name` EXACTLY before trusting it.
+    ///
+    /// This test overrides `$HOME` temporarily to point `cache_dir()` at
+    /// an isolated scratch directory — safe to do here because
+    /// `registry.rs::cache_dir()` is the ONLY place in this entire
+    /// codebase that reads `$HOME` (confirmed via `grep -rn '"HOME"'
+    /// src/*.rs`), and the only OTHER test that reads it
+    /// (`cache_dir_is_a_fixed_dot_kupl_registry_cache_location`) only
+    /// asserts path STRUCTURE, never the actual home value, so it cannot
+    /// be destabilized by a concurrent override; `$HOME` is restored
+    /// immediately after the one call that needs it, before any assertion.
+    #[test]
+    fn pkg_ctx_refuses_to_reuse_a_case_colliding_cached_registry_dependency() {
+        let fake_home = std::env::temp_dir().join(format!("kupl-pkgctx-case-collide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        let cached = fake_home.join(".kupl").join("registry-cache").join("Lib").join("1.0.0");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(cached.join("kupl.toml"), "[project]\nname = \"Lib\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(cached.join("main.kupl"), "pub fun greet() -> Str { \"from-Lib\" }\n").unwrap();
+
+        let proj = fake_home.join("projb");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("kupl.toml"),
+            "[project]\nname = \"projb\"\nentry = \"main.kupl\"\n\n[dependencies]\nlib = { version = \"1.0.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("main.kupl"), "use lib\n\nfun main() uses io {\n    print(lib.greet())\n}\n")
+            .unwrap();
+
+        let real_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &fake_home);
+        let deps = super::registry_only_deps(proj.join("main.kupl").to_str().unwrap());
+        match real_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        // `lib` must still be reported as NOT-yet-fetched (registry_only) --
+        // never silently satisfied from the case-colliding `Lib` cache entry.
+        let deps = deps.expect("registry_only_deps must not error");
+        assert!(
+            deps.iter().any(|(n, v)| n == "lib" && v == "1.0.0"),
+            "expected `lib` to still be registry_only (not silently resolved via the \
+             case-colliding `Lib` cache entry), got {deps:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     #[test]
     fn multi_file_load_and_diag_mapping() {
         let dir = std::env::temp_dir().join(format!("kupl-loader-test-{}", std::process::id()));
