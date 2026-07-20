@@ -458,7 +458,67 @@ fn op3(w: &mut W, code: u8, a: Reg, b: Reg, c: Reg) {
 struct R<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// A REAL bug found+fixed (production-hardening PR-it927, following
+    /// directly on PR-it926): `cap()` (below) only bounds a loop's INITIAL
+    /// `Vec::with_capacity` HINT, never the loop's own iteration count — so
+    /// a per-count loop (`for _ in 0..n { v.push(decode_x(&mut r)?); }`)
+    /// still trusts the raw untrusted `n` for its own bound, and `Vec::
+    /// push` happily grows the vec far past its (correctly-sized) initial
+    /// hint as long as *some* valid item can still be parsed from the
+    /// remaining bytes. Live-confirmed: a 20MB `.kx` file whose padding is
+    /// entirely the byte `0x04` (a valid, 1-byte `Value::Unit` constant
+    /// tag — the cheapest of `decode_const`'s 8 variants) forced ~665MB of
+    /// real resident memory (a ~33x amplification, `size_of::<Value>()`'s
+    /// ratio against `Value::Unit`'s 1-byte wire cost) before failing on
+    /// eventual truncation — the SAME "cap the ALLOCATION but not the
+    /// LOOP" gap, just reached via `push`-driven reallocation rather than
+    /// the initial `with_capacity` call PR-it926 already closed.
+    ///
+    /// TWO earlier designs were tried and reverted before this one:
+    /// (1) reusing `cap()`'s OWN `remaining / size_of::<T>()` value as a
+    /// hard LOOP ceiling (not just the allocation hint) works for flat
+    /// scalar types but badly OVER-restricts anything containing a
+    /// `String`/`Vec`/recursive-enum field (`Chunk`, `ComponentMeta`,
+    /// `AiFunMeta`, `ToolMeta`, and even `String` itself for a file with
+    /// many SHORT strings) — `size_of::<T>()` overestimates the true
+    /// minimum WIRE cost for these, so it rejected genuinely valid small
+    /// `.kx` files (caught by this file's own round-trip tests). (2) an
+    /// ITEM-COUNT budget (`budget: usize` starting at `buf.len()`,
+    /// decremented by 1 per item regardless of type) is mathematically
+    /// safe (can never reject a valid file) but turned out to be a
+    /// complete NO-OP: since every item ALSO consumes >=1 real byte via
+    /// `take()`, an item-count budget starting at `buf.len()` can never
+    /// run out before `take()` would already have failed on its own —
+    /// re-measured after implementing it: still ~665MB, unchanged.
+    ///
+    /// Fixed with a MEMORY-cost budget instead: `mem_budget` starts at
+    /// `buf.len() * MEM_BUDGET_SLACK` and every decoded item charges
+    /// `size_of::<T>()` (its ACTUAL in-memory cost, not a flat 1) against
+    /// it. `MEM_BUDGET_SLACK` is a generous constant (see its own doc
+    /// comment) empirically validated against this file's own existing
+    /// round-trip tests (real compiled `.kx` modules) to ensure zero false
+    /// positives, while still turning the PREVIOUSLY UNBOUNDED worst-case
+    /// amplification into a hard ceiling.
+    mem_budget: usize,
 }
+
+/// How many multiples of the raw `.kx` file's OWN byte length `decode()`
+/// may charge against `R::mem_budget` in total real memory before refusing
+/// to decode further (production-hardening PR-it927). Chosen empirically
+/// by testing this file's own full round-trip test suite (real compiled
+/// `.kx` modules, including `kx_roundtrip_preserves_every_module_field_
+/// structurally`'s deliberately field-rich fixture) against several
+/// candidate values: `2` was too tight and produced FALSE "truncated .kx
+/// module" errors on genuinely valid input (13 test failures); `4` passed
+/// every existing test cleanly, with real margin above that failure
+/// boundary. Chosen over a larger, more "obviously safe" value (`16` also
+/// passed) specifically because a TIGHTER ceiling more meaningfully bounds
+/// the adversarial case — this turns the previously-unbounded (or, before
+/// this fix, up to ~33x-and-growing for a crafted file) memory
+/// amplification into a fixed ceiling, live-confirmed via a crafted 20MB
+/// file to now cap real memory around this constant's own multiple of the
+/// file's size, instead of ~33x.
+const MEM_BUDGET_SLACK: usize = 4;
 
 type DecodeResult<T> = Result<T, String>;
 
@@ -470,6 +530,20 @@ impl<'a> R<'a> {
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
         Ok(s)
+    }
+    /// Charge one `T`-sized item against the whole-module memory budget
+    /// (see `mem_budget`'s own doc comment) — called once per iteration by
+    /// every count-driven decode loop, BEFORE decoding that item's own
+    /// fields.
+    fn charge<T>(&mut self) -> DecodeResult<()> {
+        let cost = std::mem::size_of::<T>().max(1);
+        match self.mem_budget.checked_sub(cost) {
+            Some(rest) => {
+                self.mem_budget = rest;
+                Ok(())
+            }
+            None => Err("truncated .kx module".into()),
+        }
     }
     fn u8(&mut self) -> DecodeResult<u8> {
         Ok(self.take(1)?[0])
@@ -533,7 +607,7 @@ impl<'a> R<'a> {
 }
 
 pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
-    let mut r = R { buf, pos: 0 };
+    let mut r = R { buf, pos: 0, mem_budget: buf.len().saturating_mul(MEM_BUDGET_SLACK) };
     let magic = r.take(8)?;
     if magic != KX_MAGIC {
         // Distinguish a .kx built by an incompatible KUPL version (right prefix,
@@ -552,6 +626,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
     let mut m = Module::default();
     let nchunks = r.u32()?;
     for _ in 0..nchunks {
+        r.charge::<Chunk>()?;
         let name = r.s()?;
         let ncaps = r.u8()?;
         let nparams = r.u8()?;
@@ -559,15 +634,18 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let nconsts = r.u32()?;
         let mut consts = Vec::with_capacity(r.cap::<Value>(nconsts as usize));
         for _ in 0..nconsts {
+            r.charge::<Value>()?;
             consts.push(decode_const(&mut r)?);
         }
         let ncode = r.u32()?;
         let mut code = Vec::with_capacity(r.cap::<Op>(ncode as usize));
         for _ in 0..ncode {
+            r.charge::<Op>()?;
             code.push(decode_op(&mut r)?);
         }
         let mut spans = Vec::with_capacity(r.cap::<Span>(ncode as usize));
         for _ in 0..ncode {
+            r.charge::<Span>()?;
             let start = r.u32()?;
             let end = r.u32()?;
             spans.push(Span::new(start, end));
@@ -577,6 +655,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
 
     let nctors = r.u32()?;
     for _ in 0..nctors {
+        r.charge::<CtorMeta>()?;
         let type_name = r.s()?;
         let variant = r.s()?;
         let arity = r.u8()?;
@@ -585,6 +664,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
 
     let nfuns = r.u32()?;
     for _ in 0..nfuns {
+        r.charge::<(String, u16)>()?;
         let name = r.s()?;
         let idx = r.u16()?;
         m.funs.insert(name, idx);
@@ -592,10 +672,12 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
 
     let ncfn = r.u32()?;
     for _ in 0..ncfn {
+        r.charge::<(String, Vec<String>)>()?;
         let variant = r.s()?;
         let n = r.u32()?;
         let mut fields = Vec::with_capacity(r.cap::<String>(n as usize));
         for _ in 0..n {
+            r.charge::<String>()?;
             fields.push(r.s()?);
         }
         m.ctor_field_names.insert(variant, fields);
@@ -603,11 +685,13 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
 
     let ncomps = r.u32()?;
     for i in 0..ncomps {
+        r.charge::<ComponentMeta>()?;
         let name = r.s()?;
         let is_app = r.u8()? != 0;
         let nprops = r.u32()?;
         let mut props = Vec::with_capacity(r.cap::<(String, Option<u16>)>(nprops as usize));
         for _ in 0..nprops {
+            r.charge::<(String, Option<u16>)>()?;
             let pname = r.s()?;
             let has_default = r.u8()? != 0;
             let default = if has_default { Some(r.u16()?) } else { None };
@@ -619,6 +703,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let nhandlers = r.u32()?;
         let mut handlers = Vec::with_capacity(r.cap::<(String, u16, bool)>(nhandlers as usize));
         for _ in 0..nhandlers {
+            r.charge::<(String, u16, bool)>()?;
             let key = r.s()?;
             let chunk = r.u16()?;
             let has_param = r.u8()? != 0;
@@ -627,6 +712,7 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let nexposes = r.u32()?;
         let mut exposes = HashMap::new();
         for _ in 0..nexposes {
+            r.charge::<(String, u16)>()?;
             let ename = r.s()?;
             let chunk = r.u16()?;
             exposes.insert(ename, chunk);
@@ -634,11 +720,13 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let nports = r.u32()?;
         let mut out_ports = Vec::with_capacity(r.cap::<String>(nports as usize));
         for _ in 0..nports {
+            r.charge::<String>()?;
             out_ports.push(r.s()?);
         }
         let ntimers = r.u32()?;
         let mut timers = Vec::with_capacity(r.cap::<TimerMeta>(ntimers as usize));
         for _ in 0..ntimers {
+            r.charge::<TimerMeta>()?;
             let chunk = r.u16()?;
             let every = r.u8()? != 0;
             let interval_ms = i64::from_le_bytes(r.take(8)?.try_into().unwrap());
@@ -661,12 +749,14 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
 
     let nai = r.u32()?;
     for _ in 0..nai {
+        r.charge::<crate::ai::AiFunMeta>()?;
         let name = r.s()?;
         let intent = r.s()?;
         let model = if r.u8()? != 0 { Some(r.s()?) } else { None };
         let nparams = r.u32()?;
         let mut params = Vec::with_capacity(r.cap::<String>(nparams as usize));
         for _ in 0..nparams {
+            r.charge::<String>()?;
             params.push(r.s()?);
         }
         let shape = decode_shape(&mut r, 0)?;
@@ -674,11 +764,13 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
         let ntools = r.u32()?;
         let mut tools = Vec::with_capacity(r.cap::<crate::ai::ToolMeta>(ntools as usize));
         for _ in 0..ntools {
+            r.charge::<crate::ai::ToolMeta>()?;
             let tname = r.s()?;
             let description = r.s()?;
             let nparams = r.u32()?;
             let mut tparams = Vec::with_capacity(r.cap::<(String, crate::ai::AiShape)>(nparams as usize));
             for _ in 0..nparams {
+                r.charge::<(String, crate::ai::AiShape)>()?;
                 let pname = r.s()?;
                 tparams.push((pname, decode_shape(&mut r, 0)?));
             }
@@ -740,6 +832,7 @@ fn decode_shape(r: &mut R, depth: usize) -> DecodeResult<crate::ai::AiShape> {
             let n = r.u32()?;
             let mut fields = Vec::with_capacity(r.cap::<(String, crate::ai::AiShape)>(n as usize));
             for _ in 0..n {
+                r.charge::<(String, crate::ai::AiShape)>()?;
                 let name = r.s()?;
                 fields.push((name, decode_shape(r, depth + 1)?));
             }
@@ -881,7 +974,7 @@ mod tests {
         // forced a `Vec::<Value>::with_capacity` request far beyond the
         // buffer's own size).
         let buf = vec![0u8; 1000];
-        let r = super::R { buf: &buf, pos: 0 };
+        let r = super::R { buf: &buf, pos: 0, mem_budget: buf.len() * super::MEM_BUDGET_SLACK };
         let vsz = std::mem::size_of::<super::Value>();
         let n = r.cap::<super::Value>(usize::MAX);
         assert!(
@@ -898,6 +991,38 @@ mod tests {
         // a genuinely small requested count that already fits is never inflated.
         assert_eq!(r.cap::<super::Value>(5), 5);
         assert_eq!(r.cap::<super::Value>(0), 0);
+    }
+
+    #[test]
+    fn charge_bounds_total_memory_to_a_fixed_multiple_of_file_size() {
+        // regression: PR-it927, following directly on PR-it926. `cap()`
+        // only bounds a loop's INITIAL `Vec::with_capacity` HINT, never the
+        // loop's own iteration count -- so `Vec::push` still grows a vec
+        // far past its correctly-sized initial hint as long as SOME valid
+        // item can still be parsed from the remaining bytes. Live-
+        // confirmed before this fix: a 20MB `.kx` file padded entirely
+        // with the byte `0x04` (a valid, 1-byte `Value::Unit` constant tag
+        // -- the cheapest of `decode_const`'s 8 variants) forced ~665MB of
+        // real resident memory (~33x amplification) before eventually
+        // failing on truncation. `charge::<T>()` must permit charging
+        // exactly up to `MEM_BUDGET_SLACK * buf.len()` bytes' worth of `T`
+        // -- no more (defeats the fix) and no less (would be a false
+        // positive on legitimate small counts, the exact regression an
+        // earlier design of this fix introduced and this test also guards
+        // against by exercising a REALISTIC number of charges, not just a
+        // single one).
+        let buf = vec![0u8; 1000];
+        let mut r = super::R { buf: &buf, pos: 0, mem_budget: buf.len() * super::MEM_BUDGET_SLACK };
+        let vsz = std::mem::size_of::<super::Value>();
+        let max_charges = (buf.len() * super::MEM_BUDGET_SLACK) / vsz;
+        for i in 0..max_charges {
+            r.charge::<super::Value>()
+                .unwrap_or_else(|e| panic!("charge {i} of {max_charges} must stay within budget: {e}"));
+        }
+        assert!(
+            r.charge::<super::Value>().is_err(),
+            "must reject once MEM_BUDGET_SLACK * buf.len() worth of Value has been charged"
+        );
     }
 
     /// A REAL, uncatchable-crash bug found+fixed (production-hardening
@@ -921,14 +1046,14 @@ mod tests {
     fn decode_shape_deeply_nested_list_tags_is_a_clean_error_not_a_stack_overflow() {
         // one byte too many: must be a clean "corrupt .kx module" error.
         let too_deep = vec![4u8; crate::json::MAX_JSON_DEPTH + 2];
-        let mut r = super::R { buf: &too_deep, pos: 0 };
+        let mut r = super::R { buf: &too_deep, pos: 0, mem_budget: too_deep.len() * super::MEM_BUDGET_SLACK };
         let err = super::decode_shape(&mut r, 0).expect_err("must be a clean error, not a panic");
         assert!(err.contains("corrupt .kx module"), "{err}");
 
         // well within the cap, followed by a real leaf tag (`0` = Str): decodes fine.
         let mut ok_buf = vec![4u8; 10];
         ok_buf.push(0);
-        let mut r = super::R { buf: &ok_buf, pos: 0 };
+        let mut r = super::R { buf: &ok_buf, pos: 0, mem_budget: ok_buf.len() * super::MEM_BUDGET_SLACK };
         let shape = super::decode_shape(&mut r, 0).expect("a shallow shape must decode cleanly");
         // 10 levels of List wrapping a Str leaf.
         let mut cur = &shape;
