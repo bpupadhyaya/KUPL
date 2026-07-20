@@ -223,11 +223,43 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     // SIGPIPE is safe for every native program, not just servers, since it
     // only changes a broken-pipe write from "kill the process" to "return -1
     // with errno=EPIPE", which every write loop in RUNTIME already handles.
+
+    // `setvbuf(stdout, NULL, _IOLBF, 0)` right after (production-hardening
+    // PR-it940): a REAL cross-engine ordering divergence, in the same
+    // "process-wide startup fix mirroring Rust's own runtime behavior"
+    // family as the SIGPIPE fix above. C's libc gives `stdout` full BLOCK
+    // buffering whenever it isn't a tty (piped, redirected to a file,
+    // captured by a test harness, `docker logs`, systemd/journald -- the
+    // overwhelmingly common non-interactive deployment case), while
+    // `stderr` is always unbuffered -- so native's `print()`/`eprint()`
+    // output (`k_print`/`k_eprint`) silently loses its chronological
+    // interleaving whenever stdout+stderr are combined (e.g. `2>&1`),
+    // since stdout only flushes once its buffer fills or the process
+    // exits. Rust's `std::io::Stdout`, by contrast, is ALWAYS a
+    // `LineWriter` regardless of tty status -- interp/vm flush on every
+    // `\n` unconditionally, so they always interleave correctly. Confirmed
+    // LIVE: a program alternating `print`/`eprint` five times (no
+    // components, no adversarial input, the plain "any KUPL program run
+    // non-interactively" case) printed in the CORRECT written order on
+    // interp/vm when piped through `2>&1 | cat`, but ALL of stderr before
+    // ANY of stdout on native (pre-fix) -- and under `supervise ...
+    // restart on_failure`, this meant every "[supervise] ... restarted"
+    // log line printed before ANY of the component's own `print()` output,
+    // regardless of the ACTUAL chronological order they happened in --
+    // exactly the kind of divergence that misleads a developer correlating
+    // combined logs while debugging a production supervision failure. Line
+    // buffering via `setvbuf` here (flushing stdout on every `\n`, matching
+    // Rust's `LineWriter` exactly) fixes `k_print`/`k_eprint`/`k_restart`'s
+    // supervise-log line/`k_panic`'s uncaught-panic message uniformly, since
+    // ALL of them route through the SAME `stdout` FILE* -- no per-call-site
+    // `fflush()` patching needed. `k_panic`'s own existing top-level
+    // `fflush(stdout)` (right before its `exit(101)`) becomes redundant but
+    // harmless after this fix; left in place since it's still correct.
     match entry {
         Entry::Main(main_idx) => {
             let _ = writeln!(
                 out,
-                "\nint main(int argc, char** argv) {{\n    signal(SIGPIPE, SIG_IGN);\n    k_argc = argc; k_argv = argv;\n    fun_{main_idx}(0, 0);\n    return 0;\n}}"
+                "\nint main(int argc, char** argv) {{\n    signal(SIGPIPE, SIG_IGN);\n    setvbuf(stdout, NULL, _IOLBF, 0);\n    k_argc = argc; k_argv = argv;\n    fun_{main_idx}(0, 0);\n    return 0;\n}}"
             );
         }
         Entry::App(app_idx) => {
@@ -268,7 +300,7 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             // must simply agree, and now they do.
             let _ = writeln!(
                 out,
-                "\nint main(int argc, char** argv) {{\n    signal(SIGPIPE, SIG_IGN);\n    k_argc = argc; k_argv = argv;\n    \
+                "\nint main(int argc, char** argv) {{\n    signal(SIGPIPE, SIG_IGN);\n    setvbuf(stdout, NULL, _IOLBF, 0);\n    k_argc = argc; k_argv = argv;\n    \
                  k_print_unwired = 1;\n    \
                  k_instantiate({app_idx}, 0, 0);\n    \
                  int k_n0 = k_ninsts;\n    \
@@ -15015,6 +15047,84 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
         String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Compile `src` to native, run it with stdout AND stderr redirected to
+    /// the SAME file descriptor (via `File::try_clone` -- a true OS-level
+    /// `dup`, exactly matching a shell's `2>&1`), and return the file's full
+    /// contents in the ACTUAL chronological write order. Unlike
+    /// `std::process::Command::output()` (used by every other native test
+    /// helper in this file), which captures stdout/stderr into two SEPARATE
+    /// buffers, this is the only way to observe cross-stream interleaving --
+    /// needed specifically for PR-it940's stdout-buffering-mode fix, since a
+    /// test using `output()` is structurally incapable of ever seeing this
+    /// class of bug (confirmed live: it's exactly why the existing test
+    /// suite never caught it despite `print`/`eprint` both being tested
+    /// extensively elsewhere).
+    fn native_combined_stdout_stderr(src: &str, tag: &str) -> String {
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-{tag}-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        let combined = base.with_extension("combined");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let f1 = std::fs::File::create(&combined).unwrap();
+        let f2 = f1.try_clone().unwrap();
+        let status = std::process::Command::new(&bin)
+            .stdout(std::process::Stdio::from(f1))
+            .stderr(std::process::Stdio::from(f2))
+            .status()
+            .expect("binary runs");
+        assert!(status.success(), "binary must exit cleanly");
+        let result = std::fs::read_to_string(&combined).unwrap();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let _ = std::fs::remove_file(&combined);
+        result
+    }
+
+    /// A REAL cross-engine ordering divergence found+fixed (production-
+    /// hardening PR-it940): C's libc gives `stdout` full BLOCK buffering
+    /// whenever it isn't a tty (piped, redirected, captured by a test
+    /// harness, `docker logs`, systemd/journald -- the overwhelmingly common
+    /// non-interactive deployment case), while `stderr` is always
+    /// unbuffered -- so native's `print()`/`eprint()` output lost its
+    /// chronological interleaving whenever stdout+stderr were combined
+    /// (e.g. `2>&1`), since stdout only flushed once its buffer filled or
+    /// the process exited. Rust's `std::io::Stdout`, by contrast, is ALWAYS
+    /// a `LineWriter` regardless of tty status, so interp/vm always
+    /// interleave correctly. Confirmed LIVE (before this test/fix): a plain
+    /// program alternating `print`/`eprint` printed in the CORRECT written
+    /// order on interp/vm when piped through `2>&1 | cat`, but ALL of
+    /// stderr before ANY of stdout on native. Fixed with
+    /// `setvbuf(stdout, NULL, _IOLBF, 0)` right after the existing
+    /// `signal(SIGPIPE, SIG_IGN)` call in BOTH `main()` generation sites
+    /// (`Entry::Main` and `Entry::App`), matching Rust's line-buffered
+    /// `Stdout` exactly.
+    #[test]
+    fn native_stdout_and_stderr_interleave_chronologically_when_combined() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"out1\")\n    eprint(\"err1\")\n    \
+                   print(\"out2\")\n    eprint(\"err2\")\n    \
+                   print(\"out3\")\n}\n";
+        assert_eq!(
+            native_combined_stdout_stderr(src, "interleave"),
+            "out1\nerr1\nout2\nerr2\nout3\n",
+            "stdout/stderr must interleave in the ACTUAL chronological write \
+             order when combined, not all-stderr-then-all-stdout (the old \
+             fully-block-buffered stdout only flushed at process exit)"
+        );
     }
 
     /// Sized integers compile to native and match the interpreter — arithmetic,
