@@ -2395,11 +2395,56 @@ impl Checker {
                 // types at runtime, so all three engines already agreed at
                 // runtime; the checker was simply over-rejecting valid
                 // programs before they ever reached any engine.
+                // A REAL, SEVERE bug found+fixed (production-hardening
+                // PR-it948, a SIBLING gap in the SAME shared-ctx shape
+                // PR-it947 fixed for `ret` -- found via a deliberate
+                // follow-up audit of `Ctx`'s OTHER fields): `loop_depth`
+                // and `in_handler` were ALSO never reset for a closure's own
+                // scope, unlike `ret` (now fixed just above) and `scopes`
+                // (already correctly pushed/popped). `loop_depth == 0` is
+                // `Stmt::Break`/`Stmt::Continue`'s ONLY gate (K0229) -- so a
+                // closure literal defined INSIDE a `while`/`for` loop
+                // inherited the ENCLOSING loop's nonzero depth, letting a
+                // bare `break`/`continue` written directly in the closure's
+                // OWN body (no loop of its own) pass type-checking. This is
+                // UNSOUND, not just over-strict like PR-it947's `ret` gap:
+                // confirmed LIVE that `kupl check` accepted a `while`
+                // loop containing `let f = fn() { break }; f()` -- and at
+                // RUNTIME (interp.rs), `call_value`'s closure-call boundary
+                // only intercepts `Flow::Return`, so the leaked
+                // `Flow::Break`/`Continue` propagates up to whatever REAL
+                // loop happens to be executing in the caller's frame:
+                // `break` silently truncated the loop after 1 of 3
+                // iterations (no error, no diagnostic); `continue` produced
+                // a genuine INFINITE LOOP (confirmed live under a strict
+                // `perl alarm`-bounded timeout, spamming the same iteration
+                // forever since `i = i + 1` is skipped). A CROSS-ENGINE
+                // DIVERGENCE too: `kupl run --vm`/`kupl native` already
+                // correctly reject the identical program with K0229,
+                // because `compile.rs`'s OWN independent `ExprKind::Lambda`
+                // case gives each closure a brand-new `FnCompiler` with its
+                // own empty loop stack -- interp.rs has no analogous
+                // structural backstop and relies solely on check.rs, making
+                // it the only engine actually vulnerable at runtime.
+                // `in_handler` had the SAME unreset-scope shape but is only
+                // OVER-strict (PR-it947's class, not unsound): a closure
+                // defined inside a component handler inherited
+                // `in_handler=true`, wrongly rejecting `?` used inside the
+                // closure's own body with K0237 even though the `?` only
+                // early-returns the closure's own frame -- confirmed live
+                // by comparing an identical `?`-using helper hoisted to a
+                // top-level function (accepted) vs. inlined as a closure
+                // inside the handler (wrongly rejected). Both fixed with the
+                // SAME save-fresh/restore pattern PR-it947 established.
                 let outer_ret = std::mem::replace(&mut ctx.ret, self.uni.fresh());
+                let outer_loop_depth = std::mem::replace(&mut ctx.loop_depth, 0);
+                let outer_in_handler = std::mem::replace(&mut ctx.in_handler, false);
                 let bt = self.check_block(body, ctx);
                 let closure_ret = ctx.ret.clone();
                 self.check_assign(&closure_ret, &bt, body.span, "closure return value");
                 ctx.ret = outer_ret;
+                ctx.loop_depth = outer_loop_depth;
+                ctx.in_handler = outer_in_handler;
                 ctx.scopes.pop();
                 Ty::Fun(ptys, Box::new(bt))
             }
@@ -4437,6 +4482,104 @@ mod generic_tests {
             "a closure returning Str on one path and Int on another must still be a genuine \
              type error: {:?}",
             errors(genuine_mismatch)
+        );
+    }
+
+    /// A REAL, SEVERE bug found+fixed (production-hardening PR-it948, a
+    /// sibling gap in the SAME shared-`ctx` shape PR-it947 fixed for `ret`,
+    /// found via a deliberate follow-up audit of `Ctx`'s OTHER fields):
+    /// `loop_depth` was ALSO never reset for a closure's own scope -- unlike
+    /// `ret`, this is UNSOUND, not just over-strict: a closure literal
+    /// defined INSIDE a `while`/`for` loop inherited the enclosing loop's
+    /// nonzero depth, letting a bare `break`/`continue` written directly in
+    /// the closure's OWN body (no loop of its own) pass type-checking, even
+    /// though `Stmt::Break`/`Continue`'s ONLY gate is `loop_depth == 0`.
+    /// Confirmed LIVE (before this fix) that this let genuinely broken
+    /// programs compile and run: `break` inside such a closure silently
+    /// truncated the enclosing loop early (no error at all), and
+    /// `continue` produced a genuine INFINITE LOOP at runtime on interp.rs
+    /// (confirmed under a strict `perl alarm`-bounded timeout) -- both
+    /// because `call_value`'s closure-call boundary only intercepts
+    /// `Flow::Return`, letting a leaked `Flow::Break`/`Continue` propagate
+    /// to whatever REAL loop happens to be executing in the caller's
+    /// frame. This was ALSO a genuine cross-engine divergence: `kupl run
+    /// --vm`/`kupl native` already correctly rejected the identical
+    /// program with K0229, since `compile.rs`'s own independent
+    /// `ExprKind::Lambda` case gives each closure a brand-new `FnCompiler`
+    /// with its own empty loop stack -- only `check.rs` (the SHARED gate
+    /// every engine's `compile()` relies on) and interp.rs (which has no
+    /// structural backstop of its own) were actually vulnerable.
+    #[test]
+    fn break_and_continue_inside_a_closure_check_against_the_closures_own_loop_depth() {
+        // The exact unsoundness repro: a closure defined inside a `while`
+        // loop, containing a bare `break` in its OWN body (no loop of its
+        // own) -- must be REJECTED, matching the already-correct behavior
+        // for a bare `break`/`continue` with NO enclosing loop at all.
+        let break_in_closure = "fun main() uses io {\n    \
+                                 var i = 0\n    while i < 3 {\n        \
+                                 print(\"iter {i}\")\n        \
+                                 let f = fn() { break }\n        f()\n        \
+                                 i = i + 1\n    }\n    print(\"done\")\n}\n";
+        assert!(
+            errors(break_in_closure).iter().any(|d| d.code == "K0229"),
+            "`break` inside a closure's own body (no loop of its OWN) must be rejected, even \
+             when the closure is LEXICALLY defined inside an enclosing loop -- a closure body \
+             is a separate call frame, not an extension of the enclosing loop: {:?}",
+            errors(break_in_closure)
+        );
+        let continue_in_closure = "fun main() uses io {\n    \
+                                    var i = 0\n    while i < 3 {\n        \
+                                    print(\"iter {i}\")\n        \
+                                    let f = fn() { continue }\n        f()\n        \
+                                    i = i + 1\n    }\n    print(\"done\")\n}\n";
+        assert!(
+            errors(continue_in_closure).iter().any(|d| d.code == "K0229"),
+            "`continue` inside a closure's own body must be rejected the same way -- the \
+             pre-fix bug let this compile into a genuine infinite loop at runtime: {:?}",
+            errors(continue_in_closure)
+        );
+        // A closure with its OWN genuine loop and break must still compile
+        // and correctly reset loop_depth back to 0 on exit, not leak a
+        // nonzero depth into ITS OWN trailing statements or the caller.
+        let own_loop = "fun main() uses io {\n    \
+                         let f = fn() {\n        var i = 0\n        \
+                         while i < 5 {\n            if i == 2 { break }\n            \
+                         i = i + 1\n        }\n        i\n    }\n    print(f())\n}\n";
+        assert!(
+            errors(own_loop).is_empty(),
+            "a closure with its OWN loop must still be able to break out of THAT loop: {:?}",
+            errors(own_loop)
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it948, the SAME
+    /// unreset-`ctx`-field shape as this file's `loop_depth` fix just
+    /// above, but over-strict rather than unsound -- same severity class
+    /// as PR-it947's `ret` gap): `in_handler` was ALSO never reset for a
+    /// closure's own scope, so a closure literal defined directly inside a
+    /// component handler (where `in_handler == true` gates K0237, "`?` is
+    /// not allowed in handlers") inherited that flag, wrongly rejecting `?`
+    /// used inside the closure's OWN body even though the `?` only early-
+    /// returns the closure's own frame, never the handler's. Confirmed live
+    /// by comparing an identical `?`-using helper hoisted to a top-level
+    /// function (already correctly accepted, K0237's own error message
+    /// recommends exactly this workaround) against the same logic inlined
+    /// as a closure inside the handler (was wrongly rejected).
+    #[test]
+    fn qmark_inside_a_closure_inside_a_component_handler_checks_against_the_closures_own_scope() {
+        let src = "component Worker {\n    intent \"worker\"\n    in raw: Str\n    \
+                   out parsed: Int\n    on raw(s) {\n        \
+                   let helper = fn(x: Str) {\n            Ok(x.parse_int().ok_or(\"bad\")?)\n        }\n        \
+                   match helper(s) {\n            \
+                   Ok(n) => { emit parsed(n) }\n            \
+                   Err(_) => { emit parsed(-1) }\n        }\n    }\n}\n\
+                   app Main {\n    intent \"m\"\n    let w = Worker()\n}\n";
+        assert!(
+            errors(src).is_empty(),
+            "`?` inside a closure's own body, even when the closure is LEXICALLY defined \
+             inside a component handler, must check against the CLOSURE's own scope, not the \
+             enclosing handler's `in_handler` restriction: {:?}",
+            errors(src)
         );
     }
 
