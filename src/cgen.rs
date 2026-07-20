@@ -6075,14 +6075,28 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 for (int64_t i = 0; i < l->len; i++) acc += l->items[i].as.f32v;
                 return k_f32(acc);
             }
+            /* A REAL bug found+fixed (production-hardening PR-it943, the
+               SAME class as every `+`/`-`/`*`/`/` operator call site above
+               (k_add/k_sub/k_mul/k_div, each already calling
+               k_big_check_size/k_rat_check_size after computing) -- but this
+               loop's own accumulator called k_big_add/k_rat_add directly,
+               bypassing that check entirely. `[a, a, a].sum()` (three
+               copies of an individually-legal, near-cap BigInt) silently
+               built a result past the documented cap while the equivalent
+               `a + a + a` cleanly panicked -- confirmed live, and this gap
+               exists independently on native, NOT inherited from interp/vm
+               (native's own reimplementation never called the check here
+               either). Checked after EACH accumulation step (fail-fast,
+               matching k_big_pow's own precedent), not just once at the
+               end. */
             if (l->len > 0 && l->items[0].tag == K_BIGINT) {
                 KBig* acc = k_big_from_i64(0);
-                for (int64_t i = 0; i < l->len; i++) acc = k_big_add(k_big_v(acc), l->items[i]);
+                for (int64_t i = 0; i < l->len; i++) { acc = k_big_add(k_big_v(acc), l->items[i]); k_big_check_size(acc, "BigInt"); }
                 return k_big_v(acc);
             }
             if (l->len > 0 && l->items[0].tag == K_RATIONAL) {
                 KRat* acc = k_rat_norm(k_big_from_i64(0), k_big_from_i64(1));
-                for (int64_t i = 0; i < l->len; i++) acc = k_rat_add(k_rat_v(acc), l->items[i]);
+                for (int64_t i = 0; i < l->len; i++) { acc = k_rat_add(k_rat_v(acc), l->items[i]); k_rat_check_size(acc); }
                 return k_rat_v(acc);
             }
             int64_t si = 0; double sf = 0; int isf = 0;
@@ -6321,14 +6335,16 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 for (int64_t i = 0; i < l->len; i++) acc *= l->items[i].as.f32v;
                 return k_f32(acc);
             }
+            /* Same PR-it943 fix as `sum`'s BigInt/Rational arms above -- see
+               that comment for the full rationale. */
             if (l->len > 0 && l->items[0].tag == K_BIGINT) {
                 KBig* acc = k_big_from_i64(1);
-                for (int64_t i = 0; i < l->len; i++) acc = k_big_mul(k_big_v(acc), l->items[i]);
+                for (int64_t i = 0; i < l->len; i++) { acc = k_big_mul(k_big_v(acc), l->items[i]); k_big_check_size(acc, "BigInt"); }
                 return k_big_v(acc);
             }
             if (l->len > 0 && l->items[0].tag == K_RATIONAL) {
                 KRat* acc = k_rat_norm(k_big_from_i64(1), k_big_from_i64(1));
-                for (int64_t i = 0; i < l->len; i++) acc = k_rat_mul(k_rat_v(acc), l->items[i]);
+                for (int64_t i = 0; i < l->len; i++) { acc = k_rat_mul(k_rat_v(acc), l->items[i]); k_rat_check_size(acc); }
                 return k_rat_v(acc);
             }
             int64_t pi = 1; double pf = 1; int isf = 0;
@@ -12212,6 +12228,39 @@ fun main() uses io {
         let eq_check = "fun main() uses io {\n    let s = \"9\".repeat(1000)\n    \
                         print(\"{rat(big(s), 3) == rat(big(s), 3)}\")\n}\n";
         assert_eq!(native_main_stdout(eq_check, "rateq").trim(), "true");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it943, the SAME
+    /// class as PR-it639's operator-boundary fix): `k_add`/`k_sub`/`k_mul`/
+    /// `k_div` each call `k_big_check_size`/`k_rat_check_size` after
+    /// computing, but `List.sum()`/`.product()`'s own BigInt/Rational
+    /// accumulator loops called `k_big_add`/`k_big_mul`/`k_rat_add`/
+    /// `k_rat_mul` DIRECTLY, bypassing that check entirely -- confirmed
+    /// live BEFORE this fix that `[a, a, a].product()` (three copies of an
+    /// individually-legal, near-cap BigInt) silently produced a result 3x
+    /// past the documented cap on native, exactly matching interp/KVM's own
+    /// (also pre-fix) identical gap -- this is an INDEPENDENT gap in
+    /// native's own reimplementation, not merely inherited: native never
+    /// called the check here either, confirmed by direct code read.
+    #[test]
+    fn native_bigint_sum_and_product_reject_growth_past_the_cap() {
+        assert_panic_wording_matches(
+            "fun main() uses io {\n    let a = big(\"9\".repeat(180000))\n    \
+             let xs = [a, a, a]\n    print(\"{xs.product()}\")\n}\n",
+            "bigsumprodcap1",
+        );
+        assert_panic_wording_matches(
+            "fun main() uses io {\n    let a = big(\"9\".repeat(180000))\n    \
+             let xs = [a, a]\n    print(\"{xs.sum()}\")\n}\n",
+            "bigsumprodcap2",
+        );
+        if !cc_available() {
+            return;
+        }
+        // ordinary, legitimate sum/product is completely unaffected.
+        let ok = "fun main() uses io {\n    let xs = [big(2), big(3), big(4)]\n    \
+                  print(\"{xs.sum()},{xs.product()}\")\n}\n";
+        assert_eq!(native_main_stdout(ok, "bigsumprodok").trim(), "9,24");
     }
 
     /// Rational ACCUMULATION with running GCD-reduction (it231): a harmonic-series loop adds 1/i each

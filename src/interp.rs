@@ -2315,11 +2315,33 @@ pub fn shared_method(
                     }
                     Ok(Value::F32(acc))
                 }
+                // A REAL bug found+fixed (production-hardening PR-it943, the
+                // SAME class as PR-it639's `raw_binary_op` fix, found via a
+                // targeted audit of every OTHER caller of BigInt/Rational's
+                // add/sub/mul after PR-it942's fix to those exact functions):
+                // `raw_binary_op` checks `exceeds_max_size()` after EVERY
+                // `+`/`-`/`*`/`/`, but this loop's own accumulator calls the
+                // SAME uncapped `add` building block directly, bypassing that
+                // check entirely -- `[a, a, a].sum()` (three copies of an
+                // individually-legal, near-cap BigInt) silently built a
+                // result 3x past the documented cap while the equivalent
+                // `a + a + a` cleanly panicked. Checked HERE, after each
+                // accumulation step (fail-fast, matching `BigInt::pow`'s own
+                // precedent), not just once at the end, so a single wildly
+                // out-of-range item can't force one huge intermediate
+                // allocation before the check ever runs.
                 Value::BigInt(_) => {
                     let mut acc = crate::bigint::BigInt::zero();
                     for item in items.iter() {
                         let Value::BigInt(b) = item else { unreachable!() };
                         acc = acc.add(b);
+                        if acc.exceeds_max_size() {
+                            return Err(format!(
+                                "BigInt arithmetic result would be too large to compute (limit ~{} limbs, roughly {} decimal digits)",
+                                crate::bigint::MAX_BIGINT_LIMBS,
+                                crate::bigint::MAX_BIGINT_LIMBS * 9
+                            ));
+                        }
                     }
                     Ok(Value::BigInt(Rc::new(acc)))
                 }
@@ -2328,6 +2350,13 @@ pub fn shared_method(
                     for item in items.iter() {
                         let Value::Rational(r) = item else { unreachable!() };
                         acc = acc.add(r)?;
+                        if acc.exceeds_max_size() {
+                            return Err(format!(
+                                "Rational arithmetic result would be too large to compute (limit ~{} limbs, roughly {} decimal digits)",
+                                crate::bigint::MAX_BIGINT_LIMBS,
+                                crate::bigint::MAX_BIGINT_LIMBS * 9
+                            ));
+                        }
                     }
                     Ok(Value::Rational(Rc::new(acc)))
                 }
@@ -2642,11 +2671,20 @@ pub fn shared_method(
                     }
                     Ok(Value::F32(acc))
                 }
+                // Same PR-it943 fix as `sum`'s BigInt/Rational arms above --
+                // see that comment for the full rationale.
                 Value::BigInt(_) => {
                     let mut acc = crate::bigint::BigInt::from_i64(1);
                     for item in items.iter() {
                         let Value::BigInt(b) = item else { unreachable!() };
                         acc = acc.mul(b);
+                        if acc.exceeds_max_size() {
+                            return Err(format!(
+                                "BigInt arithmetic result would be too large to compute (limit ~{} limbs, roughly {} decimal digits)",
+                                crate::bigint::MAX_BIGINT_LIMBS,
+                                crate::bigint::MAX_BIGINT_LIMBS * 9
+                            ));
+                        }
                     }
                     Ok(Value::BigInt(Rc::new(acc)))
                 }
@@ -2655,6 +2693,13 @@ pub fn shared_method(
                     for item in items.iter() {
                         let Value::Rational(r) = item else { unreachable!() };
                         acc = acc.mul(r)?;
+                        if acc.exceeds_max_size() {
+                            return Err(format!(
+                                "Rational arithmetic result would be too large to compute (limit ~{} limbs, roughly {} decimal digits)",
+                                crate::bigint::MAX_BIGINT_LIMBS,
+                                crate::bigint::MAX_BIGINT_LIMBS * 9
+                            ));
+                        }
                     }
                     Ok(Value::Rational(Rc::new(acc)))
                 }

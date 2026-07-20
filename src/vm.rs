@@ -2386,6 +2386,43 @@ mod tests {
         );
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it943, the SAME
+    /// class as PR-it639's `raw_binary_op` fix, found via a targeted audit
+    /// of every OTHER caller of BigInt/Rational's add/mul after PR-it942's
+    /// fix to those exact functions): `List.sum()`/`List.product()` call
+    /// the SAME uncapped `BigInt`/`Rational` `add`/`mul` building blocks
+    /// `raw_binary_op` does for `+`/`*`, but never applied the
+    /// `exceeds_max_size()` check `raw_binary_op` applies after EVERY
+    /// operator call -- so `[a, a, a].product()` (three copies of an
+    /// individually-legal, near-cap BigInt) silently built a result 3x past
+    /// the documented cap while the equivalent `a * a * a` cleanly
+    /// panicked. Confirmed live before this fix on interp/KVM AND native
+    /// independently (native's own reimplementation had the identical gap,
+    /// not inherited from interp/KVM -- see
+    /// `native_bigint_sum_and_product_reject_growth_past_the_cap`, cgen.rs).
+    #[test]
+    fn diff_bigint_sum_and_product_reject_growth_past_the_cap() {
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let a = big(\"9\".repeat(180000))\n    \
+                 let xs = [a, a, a]\n    \"{xs.product()}\" }\n"
+            ),
+            "panic: BigInt arithmetic result would be too large to compute (limit ~20000 limbs, roughly 180000 decimal digits)"
+        );
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let a = big(\"9\".repeat(180000))\n    \
+                 let xs = [a, a]\n    \"{xs.sum()}\" }\n"
+            ),
+            "panic: BigInt arithmetic result would be too large to compute (limit ~20000 limbs, roughly 180000 decimal digits)"
+        );
+        // ordinary, legitimate sum/product is completely unaffected.
+        assert_eq!(
+            differential("fun probe() -> Str { let xs = [big(2), big(3), big(4)]\n    \"{xs.sum()},{xs.product()}\" }\n"),
+            "9,24"
+        );
+    }
+
     /// `Str.repeat`'s size check (`s.len().saturating_mul(n as usize) >
     /// 100_000_000`) is already overflow-safe on interp/KVM (`saturating_mul`
     /// can never wrap) -- this locks that CORRECT, already-shared behavior
