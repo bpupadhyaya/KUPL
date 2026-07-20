@@ -323,7 +323,7 @@ pub fn try_par_filter(
 /// least `THRESHOLD` fully-portable elements and the callback is a named pure
 /// function. Returns the portable elements + the function name, or `None` to
 /// fall back to the sequential path.
-fn gate(recv: &Value, args: &[Value], image: &ProgramImage) -> Option<(Vec<PortableValue>, String)> {
+fn gate(recv: &Value, args: &[Value], image: &Arc<ProgramImage>) -> Option<(Vec<PortableValue>, String)> {
     let Value::List(items) = recv else { return None };
     if items.len() < THRESHOLD {
         return None;
@@ -335,6 +335,79 @@ fn gate(recv: &Value, args: &[Value], image: &ProgramImage) -> Option<(Vec<Porta
     let mut portable: Vec<PortableValue> = Vec::with_capacity(items.len());
     for it in items.iter() {
         portable.push(to_portable(it)?); // any non-portable element → sequential
+    }
+    // A REAL bug found+fixed (production-hardening PR-it922, an Explore
+    // survey finding, independently re-verified live before implementing):
+    // this function already falls back to the sequential path when an
+    // INPUT element isn't portable (the loop above), but had NO equivalent
+    // check for the callback's own OUTPUT -- `eval_one` (below) treats a
+    // non-portable RESULT as a hard error instead of a fallback, which
+    // `try_par_map`/`try_par_filter` then propagate as an uncaught panic.
+    // `check.rs` leaves a `par_map` callback's return type as a fully
+    // unconstrained fresh type variable, so `List[fn(Int) -> Int]` (a list
+    // of CLOSURES, non-portable across a thread boundary) is perfectly
+    // valid, well-typed KUPL -- and `effects.rs` classifies a function that
+    // merely BUILDS and returns a closure as pure, the same purity class
+    // `pure_funs` already requires here. Live-confirmed BEFORE this fix: a
+    // 300-element `xs.par_map(make_adder)` (`make_adder`'s own return type
+    // is `fn(Int) -> Int`) PANICKED with "parallel callback returned a
+    // non-portable value" -- while the IDENTICAL program with a 200-element
+    // list (below `THRESHOLD`, so the sequential path runs instead),
+    // `xs.map(make_adder)` (never gated at all), and `kupl native` (which
+    // always runs `par_map` sequentially, no real threading in cgen.rs) all
+    // completed successfully -- a genuine, purely SIZE/ENGINE-dependent
+    // crash on valid input, driven entirely by an internal performance-
+    // tuning constant with no business being semantically visible. Fixed
+    // by test-calling the callback ONCE, sequentially, on the FIRST
+    // portable input element here, mirroring the input-side fallback this
+    // function already does -- safe because `pure_funs` already guarantees
+    // no observable side effects from calling it an extra time, and because
+    // KUPL's static typing guarantees ONE fixed return type for the whole
+    // list, so the first element's own portability is representative of
+    // every other element's. Fall back to `None` (sequential) ONLY when the
+    // trial call SUCCEEDS but produces a non-portable value -- that is the
+    // one condition this fix exists to catch. A trial call that PANICS for
+    // any OTHER reason (a genuine runtime error the callback would raise on
+    // ANY engine/path) must NOT be treated the same way and must NOT
+    // prevent the real parallel dispatch below -- REAL, live-confirmed
+    // BEFORE this exact refinement, via this file's OWN pre-existing
+    // `diff_par_map_pure_fn_deep_recursion_does_not_crash_the_process` test
+    // (vm.rs): that test's callback deliberately recurses close to
+    // `MAX_CALL_DEPTH` specifically to prove a REAL worker thread's 2GiB
+    // stack (`par_eval`, PR-it729) safely absorbs it before the depth guard
+    // cleanly fires -- an earlier draft of this fix treated ANY trial-call
+    // panic (including a legitimate, EXPECTED depth-guard panic) as "not
+    // portable", falling back to sequential evaluation on the CALLING
+    // thread's ordinary (non-2GiB) stack, which then genuinely crashed the
+    // WHOLE PROCESS with an uncatchable native stack overflow -- worse than
+    // the very bug this fix exists to close. The trial call itself also
+    // MUST run on a thread with `par_eval`'s own 2GiB stack size, not the
+    // caller's own thread, for the identical reason.
+    if let Some(first) = portable.first() {
+        let first = first.clone();
+        let image_clone = Arc::clone(image);
+        let fname_clone = fname.clone();
+        let trial = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(move || {
+                let mut interp = crate::interp::Interp::new_bare(image_clone.worker_db());
+                let f = Value::Fun(Rc::new(fname_clone));
+                // `Some(true)`/`Some(false)`: the call genuinely SUCCEEDED,
+                // reporting whether the result is portable. `None`: the
+                // call itself panicked/errored -- INCONCLUSIVE about
+                // portability, must not be conflated with `Some(false)`.
+                match interp.call_value(f, vec![from_portable(&first)], Span::default()) {
+                    Ok(v) => Some(to_portable(&v).is_some()),
+                    Err(_) => None,
+                }
+            })
+            .and_then(|h| h.join().map_err(|_| std::io::Error::other("trial thread panicked")));
+        // Only a CONFIRMED non-portable result blocks the parallel path;
+        // a spawn/join failure or an inconclusive (panicked) trial falls
+        // through to the real dispatch below, unaffected.
+        if let Ok(Some(false)) = trial {
+            return None;
+        }
     }
     Some((portable, fname))
 }
@@ -868,6 +941,50 @@ mod tests {
         let out = out.unwrap_or_else(|| panic!("kupl run par_map/par_filter happy path hung"));
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(stdout.trim(), "true|true|500|72", "stdout={stdout:?} stderr={:?}", String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it922, an Explore
+    /// survey finding): see `gate`'s own doc comment (immediately above its
+    /// output-portability trial call) for the full writeup. This test locks
+    /// in that a `par_map` callback whose return type is NON-portable (a
+    /// closure, here) no longer panics on a large (real-thread-path) list --
+    /// matching the SAME program's already-correct behavior below
+    /// `THRESHOLD` (the sequential path, never gated at all).
+    #[test]
+    fn par_map_with_a_non_portable_callback_output_falls_back_to_sequential_instead_of_panicking() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let src = "fun make_adder(x: Int) -> fn(Int) -> Int {\n    fn(y: Int) { x + y }\n}\n\n\
+                   fun main() uses io {\n    \
+                   var xs: List[Int] = []\n    var i = 0\n    while i < 300 {\n        \
+                   xs = xs.push(i)\n        i = i + 1\n    }\n    \
+                   let fns = xs.par_map(make_adder)\n    \
+                   let f10 = fns.get(10).unwrap_or(fn(y: Int) { -1 })\n    \
+                   print(\"{fns.len()} {f10(1)}\")\n}\n";
+        let dir = std::env::temp_dir().join(format!("kupl-parallel-nonportable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nonportable.kupl");
+        std::fs::write(&path, src).unwrap();
+        let child = std::process::Command::new(&bin)
+            .arg("run")
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.unwrap_or_else(|| panic!("kupl run par_map non-portable-output test hung"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.trim(),
+            "300 11",
+            "must succeed with the correct closures (element 10 adds 10, so (…)(1) == 11), not panic: \
+             stdout={stdout:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
