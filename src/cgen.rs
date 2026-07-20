@@ -3514,12 +3514,27 @@ static KValue k_exec(KValue prog, KValue arglist) {
     (void)!read(xp[0], &exec_errno, sizeof exec_errno);
     close(xp[0]);
     if (exec_errno != 0) {
-        char m[300];
-        snprintf(m, sizeof m, "cannot run %s: %s (os error %d)", program, strerror(exec_errno), exec_errno);
+        /* A REAL cross-engine divergence found+fixed (production-hardening
+           PR-it937, the SAME fixed-buffer-truncation shape as PR-it936's
+           k_ai_err fix): `program` is the raw, unbounded, user-controlled
+           `exec()` argument -- `char m[300]` truncated the message once
+           `program` alone approached ~280 bytes, silently DROPPING the
+           trailing "%s (os error %d)" suffix entirely. Unlike a panic, this
+           truncated buffer is wrapped DIRECTLY into a genuine `Err(Str)`
+           VALUE a KUPL program observes (pattern-matches/logs/compares) --
+           silent VALUE corruption, not just truncated diagnostic text.
+           Confirmed live via a 400-char nonexistent program name: interp/vm
+           (mirrors ai.rs::interp.rs's own unbounded `format!("cannot run
+           {program}: {e}")`) report the full 451-char message, native cut
+           it to 299 chars with the OS-error detail missing entirely. Now a
+           growable `KBuf`, matching interp/vm exactly (same `kb_printf`
+           helper PR-it936 added). */
+        KBuf mbuf = {0, 0, 0};
+        kb_printf(&mbuf, "cannot run %s: %s (os error %d)", program, strerror(exec_errno), exec_errno);
         /* drain the pipes so the child doesn't block, then reap it */
         char d[4096]; while (read(outp[0], d, sizeof d) > 0) {} while (read(errp[0], d, sizeof d) > 0) {}
         close(outp[0]); close(errp[0]); int st; waitpid(pid, &st, 0);
-        return k_err(k_str(k_strdup(m)));
+        return k_err(k_str(mbuf.buf ? mbuf.buf : ""));
     }
     KBuf out = { 0, 0, 0 }, er = { 0, 0, 0 };
     k_drain_two_pipes(outp[0], errp[0], &out, &er);
@@ -9208,6 +9223,41 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let ok = "fun main() uses io {\n    \
                   match exec(\"echo\", [\"hi\"]) { Ok(s) => print(\"ok:{s.trim()}\"), Err(e) => print(\"err:{e}\") }\n}\n";
         assert_eq!(native_main_stdout(ok, "execok").trim(), "ok:hi");
+    }
+
+    /// A REAL cross-engine divergence found+fixed (production-hardening
+    /// PR-it937, the SAME fixed-buffer-truncation shape as PR-it936's
+    /// `k_ai_err` fix): `k_exec`'s "cannot run" `Err(Str)` message used to be
+    /// built into a fixed `char m[300]` via `snprintf` -- once the (fully
+    /// user-controlled, unbounded) `program` argument alone approached ~280
+    /// bytes, the message silently truncated, dropping the trailing
+    /// `": <os error text> (os error N)"` suffix entirely. Unlike a panic,
+    /// this is a genuine `Err(Str)` VALUE a KUPL program can observe
+    /// (pattern-match/log/compare) -- silent VALUE corruption, not just
+    /// truncated diagnostic text. Confirmed live via a 400-char nonexistent
+    /// program name: interp/vm reported the full 451-char message, native
+    /// (pre-fix) cut it to 299 chars with the OS-error detail missing
+    /// entirely.
+    #[test]
+    fn native_exec_error_message_is_not_truncated_by_a_fixed_size_buffer() {
+        if !cc_available() {
+            return;
+        }
+        let longname = "x".repeat(400);
+        let src = format!(
+            "fun main() uses io {{\n    \
+             let longname = \"x\".repeat(400)\n    \
+             match exec(longname, []) {{ Ok(_) => print(\"ok\"), Err(e) => print(\"{{e.len()}}|{{e}}\") }}\n}}\n"
+        );
+        let expected = format!("cannot run {longname}: No such file or directory (os error 2)");
+        let expected_len = expected.chars().count();
+        assert_eq!(
+            native_main_stdout(&src, "execlongname").trim(),
+            format!("{expected_len}|{expected}"),
+            "the Err(Str) VALUE must carry the FULL, untruncated message -- the old \
+             fixed-size char m[300] buffer used to silently drop the OS-error suffix \
+             once `program` alone approached ~280 bytes"
+        );
     }
 
     /// A REAL BUG found+fixed (PR-it577), the STDERR twin of `native_exec_matches_interp`'s
