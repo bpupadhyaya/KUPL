@@ -1859,6 +1859,55 @@ mod tests {
     }
 
     #[test]
+    fn diff_env_hybrid_index_preserves_shadowing_semantics_across_the_threshold() {
+        // A REAL performance bug found+fixed (production-hardening PR-it929,
+        // a close-read survey finding following directly on PR-it928's own
+        // repl.rs investigation): `value.rs::Env` scanned its `vars: Vec`
+        // linearly on every `get`/`set`/`define`, deliberately documented as
+        // fine for the common case (a handful of variables per scope) -- but
+        // `interp.rs::exec_block` creates exactly ONE child scope for an
+        // entire block containing any `Let`, so many DISTINCT-named
+        // sequential `let`s in one block (e.g. a large generated data file)
+        // all land in the SAME scope's `vars`, making lookups O(n) and the
+        // whole block O(n^2). Live-confirmed before the fix: 20,000
+        // sequential `let`s took ~0.2s, 60,000 took ~2.4s (release build).
+        // Fixed with a lazily-built `HashMap<Box<str>, usize>` index,
+        // built only once a scope's `vars` exceeds `ENV_INDEX_THRESHOLD`
+        // (32) -- re-measured post-fix: 60,000 lets in ~0.03s.
+        //
+        // This test pins the CORRECTNESS side of that fix: shadowing/re-let
+        // semantics must be byte-identical whether or not the index is
+        // active. 40 distinct `let`s (> ENV_INDEX_THRESHOLD, so the index
+        // IS built partway through), then a re-`let` of an EARLY name
+        // (defined before the index existed, backfilled into it) AFTER the
+        // index is already active -- must still find and overwrite it, not
+        // silently create a shadow copy or miss it entirely.
+        let mut src = String::from("fun probe() -> Str {\n");
+        for i in 0..40 {
+            src.push_str(&format!("    let v{i} = {i}\n"));
+        }
+        src.push_str("    let v5 = 999\n"); // re-let, index already active
+        src.push_str("    \"{v0}|{v5}|{v39}\"\n");
+        src.push_str("}\n");
+        assert_eq!(differential(&src), "0|999|39");
+
+        // Nested-scope shadowing must ALSO stay correct once the OUTER
+        // scope alone is large enough to have its own index active.
+        let mut src2 = String::from("fun probe() -> Str {\n");
+        for i in 0..40 {
+            src2.push_str(&format!("    let w{i} = {i}\n"));
+        }
+        src2.push_str("    var out = \"\"\n");
+        src2.push_str("    if true {\n");
+        src2.push_str("        let w0 = 777\n"); // shadows outer w0 in a child scope
+        src2.push_str("        out = \"{w0}\"\n");
+        src2.push_str("    }\n");
+        src2.push_str("    \"{out}|{w0}\"\n"); // outer w0 must be UNCHANGED
+        src2.push_str("}\n");
+        assert_eq!(differential(&src2), "777|0");
+    }
+
+    #[test]
     fn diff_list_self_push() {
         // `xs = xs.push(x)` pushes in place when xs is uniquely owned, but preserves
         // value semantics: an aliased list (and a mid-build snapshot) is never

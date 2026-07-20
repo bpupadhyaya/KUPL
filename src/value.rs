@@ -1,6 +1,7 @@
 //! Runtime values and environments.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -1030,40 +1031,105 @@ impl fmt::Debug for Value {
 /// a `String` key — and it allocates far less per call (no hash table per scope).
 /// Binding order is not observable (the env is only get/set/define, never
 /// iterated for output), so this cannot affect byte-identity.
+///
+/// A REAL bug found+fixed (production-hardening PR-it929, a close-read
+/// survey finding following directly on it928's own repl.rs investigation):
+/// `exec_block` (interp.rs) creates exactly ONE child scope for an entire
+/// block containing any `Let`, so many DISTINCT-named sequential `let`s in
+/// one block (e.g. a large generated data/constants file) all land in the
+/// SAME `EnvInner.vars` — the linear scan this doc comment's own rationale
+/// assumes stays cheap (\"a handful of variables\") then costs O(n) PER
+/// LOOKUP, O(n^2) total across the block. Live-confirmed: 20,000 sequential
+/// `let`s took ~0.2s, 60,000 took ~2.4s (release build) -- growth matching
+/// O(n^2) almost exactly. Since `define`'s own overwrite-in-place semantics
+/// already guarantee at most ONE entry per name within a single scope (a
+/// re-`let` of the same name never creates a duplicate — see `define`
+/// below), the small-scope rationale above is preserved by adding a
+/// LAZILY-built index that only kicks in once a scope genuinely grows large
+/// (`ENV_INDEX_THRESHOLD`) — a tiny scope (the overwhelming common case:
+/// function params + a few locals) pays ZERO extra cost, identical to
+/// before this fix; only a scope that's ALREADY paying the linear-scan cost
+/// gets the O(1) index built for it, backfilled once from its existing
+/// entries. Binding ORDER remains unobservable exactly as this doc comment
+/// already established, so this cannot affect byte-identity either.
 #[derive(Clone)]
 pub struct Env(Rc<RefCell<EnvInner>>);
 
+/// How large a single scope's `vars` must grow before `EnvInner` builds a
+/// name -> index lookup table alongside it (production-hardening PR-it929).
+/// Deliberately generous: real scopes (function params + a few locals) never
+/// come close, so this never fires for the documented common case; it only
+/// exists to cap the linear-scan cost for the rare but real large-block
+/// shape (many distinct sequential `let`s in one block).
+const ENV_INDEX_THRESHOLD: usize = 32;
+
 struct EnvInner {
     vars: Vec<(Box<str>, Value)>,
+    /// Lazily-built once `vars.len()` exceeds `ENV_INDEX_THRESHOLD` (see
+    /// `Env`'s own doc comment for the full rationale) — `None` for the
+    /// overwhelming common case of a small scope.
+    index: Option<HashMap<Box<str>, usize>>,
     parent: Option<Env>,
+}
+
+impl EnvInner {
+    /// Find `name`'s index into THIS scope's own `vars` (never walks
+    /// `parent`) — via the lazily-built `index` once present, or the
+    /// original linear reverse scan otherwise. Every `Env` method that
+    /// looks up/mutates a LOCAL binding goes through this single helper, so
+    /// the index only needs to be kept correct in one place (`define`,
+    /// where entries are added — nothing else adds or removes a `vars`
+    /// entry within one scope).
+    fn find_local(&self, name: &str) -> Option<usize> {
+        if let Some(idx) = &self.index {
+            idx.get(name).copied()
+        } else {
+            // Scan newest-first so a shadowing binding wins (matches lexical
+            // scope) -- though `define`'s own overwrite-in-place semantics
+            // mean there is never more than one match per name in practice.
+            self.vars.iter().rposition(|(k, _)| &**k == name)
+        }
+    }
 }
 
 impl Env {
     pub fn new() -> Env {
-        Env(Rc::new(RefCell::new(EnvInner { vars: Vec::new(), parent: None })))
+        Env(Rc::new(RefCell::new(EnvInner { vars: Vec::new(), index: None, parent: None })))
     }
     pub fn child(&self) -> Env {
         Env(Rc::new(RefCell::new(EnvInner {
             vars: Vec::new(),
+            index: None,
             parent: Some(self.clone()),
         })))
     }
     pub fn define(&self, name: &str, value: Value) {
         let mut inner = self.0.borrow_mut();
         // Re-`let` in the same scope overwrites (HashMap-insert semantics).
-        if let Some(slot) = inner.vars.iter_mut().find(|(k, _)| &**k == name) {
-            slot.1 = value;
+        if let Some(i) = inner.find_local(name) {
+            inner.vars[i].1 = value;
+            return;
+        }
+        let i = inner.vars.len();
+        if inner.index.is_some() {
+            let boxed_name: Box<str> = name.into();
+            inner.vars.push((boxed_name.clone(), value));
+            inner.index.as_mut().unwrap().insert(boxed_name, i);
         } else {
             inner.vars.push((name.into(), value));
+            if inner.vars.len() > ENV_INDEX_THRESHOLD {
+                let mut idx = HashMap::with_capacity(inner.vars.len() * 2);
+                for (j, (k, _)) in inner.vars.iter().enumerate() {
+                    idx.insert(k.clone(), j);
+                }
+                inner.index = Some(idx);
+            }
         }
     }
     pub fn get(&self, name: &str) -> Option<Value> {
         let inner = self.0.borrow();
-        // Scan newest-first so a shadowing binding wins (matches lexical scope).
-        for (k, v) in inner.vars.iter().rev() {
-            if &**k == name {
-                return Some(v.clone());
-            }
+        if let Some(i) = inner.find_local(name) {
+            return Some(inner.vars[i].1.clone());
         }
         match &inner.parent {
             Some(p) => p.get(name),
@@ -1079,8 +1145,8 @@ impl Env {
     /// concatenate to a NUL-free UTF-8 string, so K0008 still holds.
     pub fn append_str_in_place(&self, name: &str, suffix: &str) -> bool {
         let mut inner = self.0.borrow_mut();
-        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
-            if let Value::Str(rc) = &mut slot.1 {
+        if let Some(i) = inner.find_local(name) {
+            if let Value::Str(rc) = &mut inner.vars[i].1 {
                 if let Some(s) = Rc::get_mut(rc) {
                     s.push_str(suffix);
                     return true;
@@ -1104,8 +1170,8 @@ impl Env {
     /// is never mutated). Turns an O(n^2) build loop into O(n).
     pub fn push_list_in_place(&self, name: &str, item: Value) -> Option<Value> {
         let mut inner = self.0.borrow_mut();
-        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
-            if let Value::List(rc) = &mut slot.1 {
+        if let Some(i) = inner.find_local(name) {
+            if let Value::List(rc) = &mut inner.vars[i].1 {
                 if let Some(v) = Rc::get_mut(rc) {
                     v.push(item);
                     return None;
@@ -1129,8 +1195,8 @@ impl Env {
     /// exactly like `.insert` (same overwrite semantics, same insertion order).
     pub fn insert_map_in_place(&self, name: &str, key: Value, val: Value) -> Option<(Value, Value)> {
         let mut inner = self.0.borrow_mut();
-        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
-            if let Value::Map(rc) = &mut slot.1 {
+        if let Some(i) = inner.find_local(name) {
+            if let Value::Map(rc) = &mut inner.vars[i].1 {
                 if let Some(pairs) = Rc::get_mut(rc) {
                     // `value_key_eq`, not plain `==` (PR-it692, a direct follow-up gap
                     // in PR-it691's NaN-key-identity fix): this fast path is a
@@ -1161,8 +1227,8 @@ impl Env {
     /// dedup). None on success, Some(v) to fall back.
     pub fn insert_set_in_place(&self, name: &str, v: Value) -> Option<Value> {
         let mut inner = self.0.borrow_mut();
-        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
-            if let Value::Set(rc) = &mut slot.1 {
+        if let Some(i) = inner.find_local(name) {
+            if let Value::Set(rc) = &mut inner.vars[i].1 {
                 if let Some(items) = Rc::get_mut(rc) {
                     // value_key_eq, not plain `==` -- see insert_map_in_place above (PR-it692).
                     if !items.iter().any(|x| value_key_eq(x, &v)) {
@@ -1185,8 +1251,8 @@ impl Env {
     /// Assign to an existing binding (walks up the chain). Returns false if unbound.
     pub fn set(&self, name: &str, value: Value) -> bool {
         let mut inner = self.0.borrow_mut();
-        if let Some(slot) = inner.vars.iter_mut().rev().find(|(k, _)| &**k == name) {
-            slot.1 = value;
+        if let Some(i) = inner.find_local(name) {
+            inner.vars[i].1 = value;
             return true;
         }
         match inner.parent.clone() {
