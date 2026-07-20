@@ -620,11 +620,29 @@ fn param_str(p: &crate::ast::Param) -> String {
     s
 }
 
-/// Render a function declaration's signature (`fun name(params) -> ret uses effects`),
-/// shared by top-level functions and component methods (exposed or private) so hover
-/// shows the identical format regardless of where the function lives.
+/// Render a function declaration's signature (`fun name[T](params) -> ret uses
+/// effects`), shared by top-level functions and component methods (exposed or
+/// private) so hover shows the identical format regardless of where the
+/// function lives.
+///
+/// Production-hardening PR-it957 (survey #109's close-read of lsp.rs's
+/// signature-rendering surface, the SAME bug shape as PR-it675's `Param.
+/// default` fix immediately above, just for `FunDecl.type_params` instead):
+/// this used to omit a generic function's own `[T]` type-parameter list
+/// entirely, even though `fmt.rs::fmt_fun` (this project's own canonical
+/// source of truth for how KUPL source re-prints) already renders it
+/// correctly. Live-confirmed BEFORE this fix: hovering `fun identity[T](x:
+/// T) -> T` (its own declaration OR a call site) showed `fun identity(x: T)
+/// -> T` -- actively misleading, not merely incomplete, since with `[T]`
+/// gone, `T` reads as an ordinary, apparently-undefined type name rather
+/// than a declared generic parameter.
 fn fun_sig_str(f: &crate::ast::FunDecl) -> String {
     use crate::fmt::ty_str;
+    let tp = if f.type_params.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", f.type_params.join(", "))
+    };
     let params: Vec<String> = f.params.iter().map(param_str).collect();
     let ret = f.ret.as_ref().map(|r| format!(" -> {}", ty_str(r))).unwrap_or_default();
     let eff = if f.effects.is_empty() {
@@ -633,7 +651,7 @@ fn fun_sig_str(f: &crate::ast::FunDecl) -> String {
         format!(" uses {}", f.effects.join(", "))
     };
     let kw = if f.ai.is_some() { "ai fun" } else { "fun" };
-    format!("{kw} {}({}){ret}{eff}", f.name, params.join(", "))
+    format!("{kw} {}{tp}({}){ret}{eff}", f.name, params.join(", "))
 }
 
 /// Render a contract's body-less method signature (`expose fun name(params) ->
@@ -674,7 +692,15 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
                         }
                     })
                     .collect();
-                return Some(format!("type {} = {}", t.name, variants.join(" | ")));
+                // Production-hardening PR-it957 -- the SAME `type_params`
+                // gap as `fun_sig_str`'s own fix above, for generic TYPES
+                // (`type Box[T] = ...`) rather than functions.
+                let tp = if t.type_params.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", t.type_params.join(", "))
+                };
+                return Some(format!("type {}{tp} = {}", t.name, variants.join(" | ")));
             }
             Item::Component(c) if c.name == name => {
                 let head = if c.is_app { "app" } else { "component" };
@@ -4571,6 +4597,64 @@ mod tests {
         let (label, params) = signature_help_info(&program, "greet").expect("signature help");
         assert!(label.contains("= \"World\"") && label.contains("= false"), "label: {label}");
         assert_eq!(params, vec!["name: Str = \"World\"", "loud: Bool = false"]);
+    }
+
+    /// A REAL, LIVE-CONFIRMED hover/completion/documentSymbol content-quality
+    /// bug (production-hardening PR-it957, found via survey #109's close-read
+    /// of lsp.rs's signature-rendering surface) -- the SAME bug SHAPE as
+    /// PR-it675 immediately above (`Param.default` silently dropped from
+    /// every LSP signature renderer), just for a DIFFERENT field:
+    /// `ast::FunDecl.type_params`/`ast::TypeDecl.type_params` (`fun
+    /// identity[T](x: T) -> T`, `type Box[T] = Value(v: T)`). `fmt.rs`'s
+    /// canonical formatter (this project's own designated source of truth
+    /// for how KUPL source re-prints, confirmed via its own
+    /// `fmt_preserves_generic_type_params` regression test) renders
+    /// `type_params` correctly -- but `lsp.rs::fun_sig_str` and
+    /// `item_signature`'s `Item::Type` arm never read `type_params` at all,
+    /// silently dropping every generic function's/type's OWN `[T]`
+    /// parameter list from hover, completion detail, documentSymbol detail,
+    /// and signatureHelp (all four route through these SAME two helpers).
+    /// This is actively misleading, not merely incomplete: with `[T]`
+    /// gone, `T` reads as an ordinary, apparently-undefined type name
+    /// rather than a declared generic parameter. `ast::FunSig` (a contract
+    /// method's body-less signature) has NO `type_params` field at all
+    /// (confirmed via its own struct definition) -- contracts cannot
+    /// syntactically declare generic methods, so `contract_sig_str` is
+    /// structurally immune and needs no analogous fix.
+    #[test]
+    fn hover_and_document_symbol_show_generic_type_params() {
+        let src = "fun identity[T](x: T) -> T {\n    x\n}\n\
+                   type Box[T] = Value(v: T)\n\
+                   type Pair[A, B] = Pair(first: A, second: B)\n\
+                   fun main() -> Int {\n    let r = identity(1)\n    r\n}\n";
+
+        let fun_line = src.lines().position(|l| l.starts_with("fun identity")).unwrap();
+        let fun_ch = src.lines().nth(fun_line).unwrap().find("identity").unwrap() + 1;
+        let h = resolve_hover(src, fun_line, fun_ch).expect("hover on identity");
+        assert!(
+            h.contains("fun identity[T](x: T) -> T"),
+            "hover on a generic function's OWN declaration must show its `[T]` type params: {h}"
+        );
+
+        // hover at the CALL site must show the same full signature, not just
+        // the un-parameterized shape.
+        let call_line = src.lines().position(|l| l.contains("identity(1)")).unwrap();
+        let call_ch = src.lines().nth(call_line).unwrap().find("identity").unwrap() + 1;
+        let h2 = resolve_hover(src, call_line, call_ch).expect("hover on identity call site");
+        assert!(h2.contains("fun identity[T](x: T) -> T"), "hover at call site: {h2}");
+
+        // a single-type-param generic ADT constructor.
+        let box_line = src.lines().position(|l| l.starts_with("type Box")).unwrap();
+        let h3 = resolve_hover(src, box_line, 6).expect("hover on Box");
+        assert!(h3.contains("type Box[T] = Value(v: T)"), "hover on generic type: {h3}");
+
+        // a multi-type-param generic ADT.
+        let pair_line = src.lines().position(|l| l.starts_with("type Pair")).unwrap();
+        let h4 = resolve_hover(src, pair_line, 6).expect("hover on Pair");
+        assert!(
+            h4.contains("type Pair[A, B] = Pair(first: A, second: B)"),
+            "hover on multi-param generic type: {h4}"
+        );
     }
 
     #[test]
