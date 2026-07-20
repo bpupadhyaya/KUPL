@@ -4062,7 +4062,26 @@ static void k_ai_dump_json_into(KBuf* b, KValue j) {
     if (!strcmp(v, "JBool")) { kb_puts(b, k_json_field0(j).as.b ? "true" : "false"); return; }
     if (!strcmp(v, "JNum")) {
         double n = k_json_field0(j).as.f;
-        if (isfinite(n) && n == floor(n) && n >= -9223372036854775808.0 && n < 9223372036854775808.0) {
+        /* A REAL bug found+fixed (production-hardening PR-it909, survey #66):
+           `k_json_num` (the STRICT RFC-8259 writer, used by `.to_json()`/
+           `k_json_stringify`) deliberately PANICS on a non-finite number
+           (PR-it634's own fix, since real JSON has no NaN/Infinity
+           representation) -- but THIS function mirrors `ai.rs::dump_json`,
+           which is only used to echo a mock/model tool-call's own content
+           back into an internal conversation transcript, not to emit
+           spec-compliant JSON. `dump_json`'s `Json::Num` arm has NO
+           finiteness guard at all -- its non-integer-fast-path fallback is
+           bare Rust `format!("{n}")` (f64's `Display` impl), which for
+           NaN/Infinity/-Infinity produces the literal text "NaN"/"inf"/
+           "-inf", not an error. Calling the strict `k_json_num` here for a
+           non-finite value crashed the WHOLE program with an unrelated-
+           looking "cannot serialize a non-finite number" panic where interp/
+           vm return cleanly (e.g. `"inf"` for an ai fun's `-> Str`) --
+           confirmed live via `KUPL_AI_MOCK_<NAME>='[{"final": 1e400}]'` on
+           an `ai fun ... tools [t]`. */
+        if (!isfinite(n)) {
+            kb_puts(b, isnan(n) ? "NaN" : (n > 0 ? "inf" : "-inf"));
+        } else if (n == floor(n) && n >= -9223372036854775808.0 && n < 9223372036854775808.0) {
             char t[32]; snprintf(t, sizeof t, "%lld", (long long)n); kb_puts(b, t);
         } else {
             k_json_num(b, n);
@@ -4372,7 +4391,17 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
     } else {
         KValue j = k_json_field0(parsed);
         if (strcmp(k_json_var(j), "JArr")) { /* bare value => single final */
-            final_text = !strcmp(k_json_var(j), "JStr") ? k_json_field0(j).as.s : k_json_stringify(j).as.s;
+            /* A REAL bug found+fixed (production-hardening PR-it909): this
+               used `k_json_stringify`, the STRICT RFC-8259 writer that
+               panics on a non-finite number -- but a bare (non-array) mock
+               value is treated as a single `{"final": <value>}` round
+               (mirrors ai.rs's own mock-script wrapping, `Ok(other) =>
+               vec![Json::Obj(vec![("final".into(), other)])]`, which THEN
+               goes through `MockProvider::round`'s `dump_json` conversion,
+               NOT the strict writer). `k_ai_dump_json` is the correct
+               mirror of `dump_json` (see its own doc comment for the
+               non-finite-number fix this same iteration). */
+            final_text = !strcmp(k_json_var(j), "JStr") ? k_json_field0(j).as.s : k_ai_dump_json(j);
         } else {
             KList* rounds = k_json_field0(j).as.list;
             long limit = rounds->len < 8 ? (long)rounds->len : 8;
@@ -4382,7 +4411,10 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                 KMap* m = k_json_field0(r).as.map;
                 KValue fin;
                 if (k_map_field(m, "final", &fin)) {
-                    final_text = !strcmp(k_json_var(fin), "JStr") ? fin.as.ctor->fields[0].as.s : k_json_stringify(fin).as.s;
+                    /* Same fix as the bare-value case above (PR-it909): use
+                       `k_ai_dump_json` (mirrors `dump_json`), not the
+                       strict, non-finite-panicking `k_json_stringify`. */
+                    final_text = !strcmp(k_json_var(fin), "JStr") ? fin.as.ctor->fields[0].as.s : k_ai_dump_json(fin);
                     break;
                 }
                 KValue tools_arr;
@@ -4390,6 +4422,24 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                     /* {"tools": [...]}: several simultaneous tool calls in the
                        SAME round (mirrors ai.rs's MockProvider, it524). */
                     KList* items = k_json_field0(tools_arr).as.list;
+                    /* A REAL bug found+fixed (production-hardening PR-it909,
+                       survey #66): `ai.rs::run_tool_loop` explicitly rejects
+                       an EMPTY `Reply::Tools(reqs)` ("provider asked to use
+                       zero tools") -- a `"tools": []` scripted round can
+                       produce exactly this via `MockProvider::round`. This
+                       loop simply didn't execute for `items->len == 0`, with
+                       no error set, so the round silently advanced to the
+                       NEXT scripted round instead of erroring -- confirmed
+                       live: `KUPL_AI_MOCK_<NAME>='[{"tools": []},
+                       {"final": "hi"}]'` correctly panics with "provider
+                       asked to use zero tools" on interp/vm, but native
+                       silently printed "hi" (worse than a crash-vs-clean-
+                       error mismatch -- native swallowed a genuine protocol
+                       violation and returned an unrelated round's answer). */
+                    if (items->len == 0) {
+                        snprintf(k_ai_err, sizeof k_ai_err, "provider asked to use zero tools");
+                        k_ai_ok = 0; return k_unit();
+                    }
                     for (long ti = 0; ti < items->len; ti++) {
                         KValue item = items->items[ti];
                         if (strcmp(k_json_var(item), "JObj")) {
@@ -16578,6 +16628,85 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         assert_eq!(String::from_utf8_lossy(&out.stdout), "Err(\"division by zero\")\n");
         let _ = std::fs::remove_file(&cp);
         let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it909, survey #66): a
+    /// tool-mock script's `{"final": <non-string JSON value>}` round used
+    /// `k_json_stringify` (the STRICT RFC-8259 writer, which deliberately
+    /// panics on a non-finite number per PR-it634) instead of `k_ai_dump_json`
+    /// (mirrors `ai.rs::dump_json`, used ONLY to echo a mock/model's own
+    /// content into an internal transcript, which formats a non-finite
+    /// number as bare "inf"/"-inf"/"NaN" text, matching `MockProvider::
+    /// round`'s `other => dump_json(other)` exactly). `k_ai_dump_json`
+    /// itself ALSO independently delegated its own JNum fallback to the
+    /// same strict writer, so fixing only the call site would not have been
+    /// enough. Confirmed live BEFORE this fix: interp/vm printed `"inf"`
+    /// cleanly for `KUPL_AI_MOCK_<NAME>='[{"final": 1e400}]'` on an `ai fun
+    /// ... tools [...] -> Str`; native crashed with an unrelated-looking
+    /// "cannot serialize a non-finite number (NaN/Infinity) to JSON" panic,
+    /// entirely OUTSIDE `k_ai_call`'s own "ai `name`: " wrapping.
+    #[test]
+    fn native_ai_fun_non_finite_final_round_value_matches_interp_instead_of_crashing() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun helper_b9(x: Int) -> Int { x }\n\
+                   ai fun call_b9(x: Int) -> Str tools [helper_b9] { intent \"x\" }\n\
+                   fun main() uses io { print(call_b9(1)) }\n";
+        let out = native_main_stdout_env(
+            src,
+            "ainonfinite",
+            &[("KUPL_AI_MOCK_CALL_B9", "[{\"final\": 1e400}]")],
+        );
+        assert_eq!(out, "inf\n");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it909, survey #66,
+    /// the SAME survey/iteration as the non-finite-final fix above but a
+    /// structurally DIFFERENT bug): `ai.rs::run_tool_loop` explicitly
+    /// rejects an EMPTY `Reply::Tools(reqs)` with `"provider asked to use
+    /// zero tools"` -- a scripted `{"tools": []}` round produces exactly
+    /// this via `MockProvider::round`. Native's equivalent loop over the
+    /// (empty) `tools` array simply never executed, with NO error set, so
+    /// the round silently advanced to the NEXT scripted round instead of
+    /// erroring -- worse than a crash/error-message mismatch, since native
+    /// swallowed a genuine protocol violation and returned an UNRELATED
+    /// round's own final answer with a clean exit(0), not even a crash.
+    /// Confirmed live BEFORE this fix: interp/vm panicked with `"ai
+    /// \`call_a9\`: provider asked to use zero tools"` for
+    /// `KUPL_AI_MOCK_<NAME>='[{"tools": []}, {"final": "hi"}]'`; native
+    /// printed the bare `"hi"` and exited cleanly.
+    #[test]
+    fn native_ai_fun_empty_tools_round_matches_interp_instead_of_silently_advancing() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun helper_a9(x: Int) -> Int { x }\n\
+                   ai fun call_a9(x: Int) -> Str tools [helper_a9] { intent \"x\" }\n\
+                   fun main() uses io { print(call_a9(1)) }\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aiemptytools-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_CALL_A9", "[{\"tools\": []}, {\"final\": \"hi\"}]")
+            .output()
+            .expect("binary runs");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        assert!(!out.status.success(), "an empty `tools` round must panic, not silently advance: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.trim(),
+            "panic: ai `call_a9`: provider asked to use zero tools",
+            "native must match interp/vm's zero-tools rejection: {stderr:?}"
+        );
     }
 
     /// Direct cross-component expose calls compile to native and dispatch to the
