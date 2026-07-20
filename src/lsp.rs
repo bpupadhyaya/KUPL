@@ -661,31 +661,44 @@ fn fun_sig_str(f: &crate::ast::FunDecl) -> String {
     // INSIDE the body block and which hover deliberately does NOT show for
     // the same reason it doesn't show an ordinary function's body.
     //
-    // The SAME sweep also found `FunDecl.is_pub` looks dropped the same
-    // way, but is NOT a fix candidate here: `is_pub` is genuinely
-    // OVERLOADED -- `parser.rs`'s `Tok::KwExpose` arm parses an exposed
-    // component method via `self.parse_fun(true)`, forcing `is_pub: true`
-    // regardless of the SURFACE syntax (`expose fun`, never `pub fun`).
-    // `fmt.rs::fmt_component` knows this and explicitly zeroes `is_pub` on
-    // a CLONE before rendering an exposed method, with its own comment
-    // "exposes are implicitly public -- never print `pub`", then prepends
-    // a literal `expose ` prefix instead. `fun_sig_str` has no equivalent
-    // "which list did this come from" context (many call sites chain
-    // `c.exposes.iter().chain(&c.funs)` together deliberately, for lookup
-    // purposes), so naively rendering `pub ` whenever `is_pub` is true
-    // would show WRONG, actively misleading text for every exposed
-    // component method (`pub fun greet` for source that says `expose fun
-    // greet`) -- confirmed by a pre-existing test regressing exactly this
-    // way when first attempted. Deferring a correct fix (threading
-    // exposed-vs-private context through every `fun_sig_str` call site) as
-    // a separate, more carefully-scoped future iteration rather than
-    // risking a wrong-in-a-different-way fix under this one.
     let kw = if f.ai.is_some() { "ai fun" } else { "fun" };
     let tools = match &f.ai {
         Some(ai) if !ai.tools.is_empty() => format!(" tools [{}]", ai.tools.join(", ")),
         _ => String::new(),
     };
-    format!("{kw} {}{tp}({}){ret}{eff}{tools}", f.name, params.join(", "))
+    // Production-hardening PR-it960: `is_pub` was the LAST field PR-it958's
+    // parity sweep found dropped, deferred at the time because it's
+    // genuinely OVERLOADED -- `parser.rs`'s `Tok::KwExpose` arm parses an
+    // exposed component method via `self.parse_fun(true)`, forcing
+    // `is_pub: true` regardless of the SURFACE syntax (`expose fun`, never
+    // `pub fun`). Rendering `pub ` unconditionally whenever `is_pub` is
+    // true would show WRONG text for every exposed method (confirmed to
+    // genuinely regress a pre-existing test when first attempted at
+    // PR-it958). Now fixed correctly: `fun_sig_str` itself renders `pub `
+    // whenever `is_pub` is true (correct for a top-level `pub fun` AND a
+    // component's own PRIVATE `pub fun` in `c.funs`, both of which parse
+    // `is_pub` directly from a literal `pub` keyword, per `parser.rs`'s
+    // `Tok::KwPub | Tok::KwFun | Tok::KwAsync` arm) -- every call site that
+    // specifically handles an EXPOSED method now routes through the new
+    // `exposed_fun_sig_str` below instead, which clones-and-zeroes
+    // `is_pub` first, mirroring `fmt.rs::fmt_component`'s own established
+    // "exposes are implicitly public -- never print `pub`" technique
+    // exactly.
+    let pub_prefix = if f.is_pub { "pub " } else { "" };
+    format!("{pub_prefix}{kw} {}{tp}({}){ret}{eff}{tools}", f.name, params.join(", "))
+}
+
+/// `fun_sig_str` for a component method known to come from `c.exposes`
+/// (never `c.funs`) -- see `fun_sig_str`'s own PR-it960 doc comment for
+/// why this needs to exist as a SEPARATE helper rather than just calling
+/// `fun_sig_str` directly: an exposed method's `is_pub` is `true` as an
+/// internal encoding of "publicly accessible", not because its surface
+/// syntax says `pub` (it says `expose`), so rendering it through
+/// `fun_sig_str` unmodified would show a wrong `pub fun` prefix.
+fn exposed_fun_sig_str(f: &crate::ast::FunDecl) -> String {
+    let mut plain = f.clone();
+    plain.is_pub = false;
+    fun_sig_str(&plain)
 }
 
 /// Render a contract's body-less method signature (`expose fun name(params) ->
@@ -773,7 +786,16 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
         // TOP-LEVEL items; component methods live nested inside Item::Component's
         // `exposes`/`funs` lists (PR-it513).
         if let Item::Component(c) = item {
-            if let Some(f) = c.exposes.iter().chain(&c.funs).find(|f| f.name == name) {
+            // Production-hardening PR-it960: search `c.exposes` and
+            // `c.funs` SEPARATELY (not chained) so an exposed method
+            // renders via `exposed_fun_sig_str` (never shows `pub`) while
+            // a private method renders via `fun_sig_str` (correctly shows
+            // `pub` if it has that keyword) -- see `fun_sig_str`'s own doc
+            // comment for the full rationale.
+            if let Some(f) = c.exposes.iter().find(|f| f.name == name) {
+                return Some(format!("{}\n// method of component {}", exposed_fun_sig_str(f), c.name));
+            }
+            if let Some(f) = c.funs.iter().find(|f| f.name == name) {
                 return Some(format!("{}\n// method of component {}", fun_sig_str(f), c.name));
             }
         }
@@ -857,7 +879,12 @@ fn signature_help_info(program: &crate::ast::Program, name: &str) -> Option<(Str
         match item {
             Item::Fun(f) if f.name == name => return Some((fun_sig_str(f), params_of(&f.params))),
             Item::Component(c) => {
-                if let Some(f) = c.exposes.iter().chain(&c.funs).find(|f| f.name == name) {
+                // Production-hardening PR-it960: search separately, same
+                // rationale as `item_signature`'s own analogous fix.
+                if let Some(f) = c.exposes.iter().find(|f| f.name == name) {
+                    return Some((exposed_fun_sig_str(f), params_of(&f.params)));
+                }
+                if let Some(f) = c.funs.iter().find(|f| f.name == name) {
                     return Some((fun_sig_str(f), params_of(&f.params)));
                 }
             }
@@ -1915,7 +1942,14 @@ fn item_completions(program: &crate::ast::Program) -> Vec<(String, u8, String)> 
                 // for hover/go-to-definition (PR-it513); extend the same nested search
                 // here so typing `n` or `greet` inside a component body autocompletes
                 // (PR-it514).
-                for f in c.exposes.iter().chain(&c.funs) {
+                // Production-hardening PR-it960: split into two loops so an
+                // exposed method's completion detail renders via
+                // `exposed_fun_sig_str` (never shows `pub`), same
+                // rationale as `item_signature`'s own analogous fix.
+                for f in &c.exposes {
+                    out.push((f.name.clone(), 3, exposed_fun_sig_str(f))); // 3 = Function
+                }
+                for f in &c.funs {
                     out.push((f.name.clone(), 3, fun_sig_str(f))); // 3 = Function
                 }
                 for s in &c.state {
@@ -2133,11 +2167,12 @@ fn item_symbol(text: &str, item: &crate::ast::Item, line_index: &LineIndex) -> S
                     .iter()
                     .map(|ch| symbol_json(&ch.name, 8, &lsp_range(line_index, text, ch.span), &ch.component, &[])),
             );
-            children.extend(
-                c.exposes
-                    .iter()
-                    .map(|f| symbol_json(&f.name, 6, &lsp_range(line_index, text, f.span), &fun_sig_str(f), &[])),
-            );
+            children.extend(c.exposes.iter().map(|f| {
+                // Production-hardening PR-it960: `exposed_fun_sig_str`,
+                // not `fun_sig_str` -- same rationale as the analogous
+                // fix in `item_signature` above.
+                symbol_json(&f.name, 6, &lsp_range(line_index, text, f.span), &exposed_fun_sig_str(f), &[])
+            }));
             children.extend(
                 c.funs
                     .iter()
@@ -4724,29 +4759,66 @@ mod tests {
         assert!(!h2.contains("tools"), "must not show an empty tools list: {h2}");
     }
 
-    /// The deferred half of the SAME PR-it958 field-by-field parity sweep
-    /// above: `FunDecl.is_pub` looks equally "silently dropped" from
-    /// `fun_sig_str`, but is genuinely NOT a fix candidate -- `is_pub` is
-    /// OVERLOADED. `parser.rs`'s `Tok::KwExpose` arm parses an exposed
+    /// A REAL, LIVE-CONFIRMED hover content-quality bug (production-
+    /// hardening PR-it960, the deferred half of PR-it958's field-by-field
+    /// parity sweep, now correctly fixed): `FunDecl.is_pub` was silently
+    /// dropped from `fun_sig_str` entirely, hiding a genuine `pub`
+    /// declaration from hover/completion/documentSymbol/signatureHelp for
+    /// BOTH a top-level `pub fun` and a component's own PRIVATE `pub fun`
+    /// (`c.funs`, distinct from `c.exposes`). `is_pub` is OVERLOADED,
+    /// though: `parser.rs`'s `Tok::KwExpose` arm parses an exposed
     /// component method via `self.parse_fun(true)`, forcing `is_pub: true`
-    /// regardless of surface syntax (`expose fun`, never `pub fun`).
+    /// regardless of surface syntax (`expose fun`, never `pub fun`) --
     /// `fmt.rs::fmt_component` already knows this (see its own "exposes are
     /// implicitly public -- never print `pub`" comment) and zeroes
-    /// `is_pub` on a clone before rendering, prepending a literal `expose `
-    /// prefix instead. This test locks in the CURRENT, CORRECT boundary
-    /// (hover on an exposed method shows `expose fun`, not `pub fun`) as a
-    /// permanent regression test, so a future attempt at this exact fix
-    /// starts from a verified baseline instead of re-discovering the
-    /// footgun from scratch.
+    /// `is_pub` on a clone before rendering. A first attempt at fixing this
+    /// (PR-it958) blindly rendered `pub ` whenever `is_pub` was true,
+    /// genuinely regressing a pre-existing test by showing `pub fun get`
+    /// for source that says `expose fun get` -- reverted, and correctly
+    /// fixed here by routing every call site that specifically handles a
+    /// `c.exposes` method through a new `exposed_fun_sig_str` helper
+    /// (clones-and-zeroes `is_pub`, mirroring `fmt.rs`'s own technique
+    /// exactly), while `fun_sig_str` itself now safely renders `pub `
+    /// whenever `is_pub` is true for every OTHER caller (top-level funs,
+    /// and a component's own `c.funs`-list private methods).
     #[test]
-    fn hover_on_an_exposed_component_method_shows_expose_not_pub() {
-        let src = "component Store {\n    intent \"s\"\n    \
+    fn hover_shows_pub_for_top_level_and_private_component_funs_but_never_for_exposed_ones() {
+        let src = "pub fun greet(name: Str) -> Str {\n    name\n}\n\
+                   component Store {\n    intent \"s\"\n    \
+                   pub fun helper() -> Int {\n        1\n    }\n    \
                    expose fun get(k: Str) -> Int {\n        1\n    }\n}\n";
-        let line = src.lines().position(|l| l.contains("expose fun get")).unwrap();
-        let ch = src.lines().nth(line).unwrap().find("get").unwrap() + 1;
-        let h = resolve_hover(src, line, ch).expect("hover on Store.get");
-        assert!(!h.contains("pub fun"), "an exposed method must never show `pub fun`: {h}");
-        assert!(h.contains("fun get(k: Str) -> Int"), "{h}");
+
+        let top_line = src.lines().position(|l| l.starts_with("pub fun greet")).unwrap();
+        let top_ch = src.lines().nth(top_line).unwrap().find("greet").unwrap() + 1;
+        let h1 = resolve_hover(src, top_line, top_ch).expect("hover on greet");
+        assert!(h1.contains("pub fun greet(name: Str) -> Str"), "top-level pub fun: {h1}");
+
+        let priv_line = src.lines().position(|l| l.contains("pub fun helper")).unwrap();
+        let priv_ch = src.lines().nth(priv_line).unwrap().find("helper").unwrap() + 1;
+        let h2 = resolve_hover(src, priv_line, priv_ch).expect("hover on Store.helper");
+        assert!(
+            h2.contains("pub fun helper() -> Int"),
+            "a component's own PRIVATE `pub fun` must show `pub`: {h2}"
+        );
+
+        let exposed_line = src.lines().position(|l| l.contains("expose fun get")).unwrap();
+        let exposed_ch = src.lines().nth(exposed_line).unwrap().find("get").unwrap() + 1;
+        let h3 = resolve_hover(src, exposed_line, exposed_ch).expect("hover on Store.get");
+        assert!(!h3.contains("pub fun"), "an exposed method must never show `pub fun`: {h3}");
+        assert!(h3.contains("fun get(k: Str) -> Int"), "{h3}");
+
+        // The SAME distinction must hold for completion detail and
+        // documentSymbol detail, which route through the SAME two
+        // renderers via SEPARATE call sites.
+        let items = completions(src);
+        let helper = items.iter().find(|(l, _, _)| l == "helper").expect("helper completion");
+        assert!(helper.2.contains("pub fun helper"), "completion detail: {helper:?}");
+        let get = items.iter().find(|(l, _, _)| l == "get").expect("get completion");
+        assert!(!get.2.contains("pub"), "completion detail must not show pub for exposed: {get:?}");
+
+        let syms = document_symbols(src).expect("parses cleanly");
+        assert!(syms.contains("\"detail\":\"pub fun helper() -> Int\""), "{syms}");
+        assert!(syms.contains("\"detail\":\"fun get(k: Str) -> Int\""), "{syms}");
     }
 
     #[test]
