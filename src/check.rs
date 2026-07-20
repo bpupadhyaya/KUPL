@@ -2376,7 +2376,30 @@ impl Checker {
                     ctx.scopes.insert(&p.name, ty.clone(), false);
                     ptys.push(ty);
                 }
+                // A REAL bug found+fixed (production-hardening PR-it947): this
+                // used to check the closure's body against the SAME `ctx` the
+                // caller passed in, whose `ret` field still held the ENCLOSING
+                // NAMED FUNCTION's return type -- so `?`/`return` inside a
+                // closure were validated against, e.g., `fun main() uses io`'s
+                // `Unit` return type instead of the closure's own (correctly
+                // inferable) return type, a false rejection of ordinary,
+                // idiomatic code (a validation/helper closure using `?`
+                // defined inside `main`, the single most common shape). Fixed
+                // by giving the closure its OWN fresh `ret` unification
+                // variable (mirroring `check_fun`'s own `Ctx` construction for
+                // a real function), unifying it with the closure body's own
+                // trailing-expression type after checking, then restoring the
+                // OUTER `ret` so `?`/`return` immediately after the closure
+                // literal (in the enclosing function) still see the correct
+                // type. This is purely a static checker fix -- KUPL erases
+                // types at runtime, so all three engines already agreed at
+                // runtime; the checker was simply over-rejecting valid
+                // programs before they ever reached any engine.
+                let outer_ret = std::mem::replace(&mut ctx.ret, self.uni.fresh());
                 let bt = self.check_block(body, ctx);
+                let closure_ret = ctx.ret.clone();
+                self.check_assign(&closure_ret, &bt, body.span, "closure return value");
+                ctx.ret = outer_ret;
                 ctx.scopes.pop();
                 Ty::Fun(ptys, Box::new(bt))
             }
@@ -4336,6 +4359,84 @@ mod generic_tests {
             errors(mismatch2).iter().any(|d| d.code == "K0238" && d.message.starts_with("`?` on a Result requires")),
             "the Result branch must lead with the same \"on a Result\" clause the Option branch uses: {:?}",
             errors(mismatch2)
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it947, found via a
+    /// breadth-first fuzzing-style survey rather than a manual close-read):
+    /// `?`/`return` inside a closure literal (`ExprKind::Lambda`) used to be
+    /// checked against the SAME `ctx` the caller passed in, whose `ret`
+    /// field still held the ENCLOSING NAMED FUNCTION's return type -- so a
+    /// perfectly ordinary validation/helper closure using `?`, defined
+    /// inside `fun main() uses io { ... }` (a `Unit`-returning function, the
+    /// single most common shape), was falsely rejected with K0238 even
+    /// though the closure's OWN body obviously returns a `Result`. This was
+    /// a pure static over-restriction, not a runtime bug: KUPL erases types
+    /// at runtime, so once the checker itself was no longer blocking the
+    /// program from reaching any engine, all three (interp/KVM/native) were
+    /// already in agreement (live-confirmed via `kupl run`/`kupl run --vm`/
+    /// `kupl native` all producing identical output on this exact repro).
+    /// Fixed by giving each closure its own
+    /// fresh `ret` unification variable (mirroring `check_fun`'s own `Ctx`
+    /// construction for a real function), unified against the closure
+    /// body's own trailing-expression type, then restoring the outer `ret`
+    /// afterward.
+    #[test]
+    fn qmark_and_return_inside_a_closure_check_against_the_closures_own_return_type() {
+        // The exact false-rejection repro: `?` on a Result inside a closure
+        // defined in a `Unit`-returning `main`.
+        let qmark_in_closure = "fun parse_pair(s: Str) -> Result[Int, Str] {\n    \
+                                 s.parse_int().ok_or(\"not a number\")\n}\n\
+                                 fun main() uses io {\n    \
+                                 let safe_sum = fn(a, b) {\n        \
+                                 let x = parse_pair(a)?\n        \
+                                 let y = parse_pair(b)?\n        \
+                                 Ok(x + y)\n    }\n    \
+                                 print(safe_sum(\"3\", \"4\"))\n}\n";
+        assert!(
+            errors(qmark_in_closure).is_empty(),
+            "`?` inside a closure must check against the CLOSURE's own return type, not the \
+             enclosing function's: {:?}",
+            errors(qmark_in_closure)
+        );
+        // `return` inside a closure, same shape.
+        let return_in_closure = "fun main() uses io {\n    \
+                                  let classify = fn(n) {\n        \
+                                  if n < 0 {\n            return \"negative\"\n        }\n        \
+                                  \"non-negative\"\n    }\n    \
+                                  print(classify(-5))\n    print(classify(5))\n}\n";
+        assert!(
+            errors(return_in_closure).is_empty(),
+            "`return` inside a closure must check against the CLOSURE's own return type: {:?}",
+            errors(return_in_closure)
+        );
+        // The outer function's OWN `?`/return type must be UNAFFECTED by a
+        // closure defined earlier in its body -- confirms `ctx.ret` is
+        // correctly RESTORED after checking the closure, not leaked.
+        let restore_after_closure = "fun outer(s: Str) -> Result[Int, Str] {\n    \
+                                      let inner = fn(x) {\n        \
+                                      if x < 0 { return \"neg\" }\n        \"ok\"\n    }\n    \
+                                      let _ = inner(-1)\n    \
+                                      let n = s.parse_int().ok_or(\"bad\")?\n    Ok(n * 2)\n}\n\
+                                      fun main() uses io { print(outer(\"21\")) }\n";
+        assert!(
+            errors(restore_after_closure).is_empty(),
+            "the outer function's own `?` must still see its OWN return type after a closure \
+             with a DIFFERENT return type is defined earlier in the body: {:?}",
+            errors(restore_after_closure)
+        );
+        // A GENUINE type mismatch inside a closure must still be rejected --
+        // confirms this fix didn't just make closure return-checking a
+        // no-op.
+        let genuine_mismatch = "fun main() uses io {\n    \
+                                 let bad = fn(x) {\n        \
+                                 if x < 0 {\n            return \"a string\"\n        }\n        \
+                                 42\n    }\n    print(bad(1))\n}\n";
+        assert!(
+            errors(genuine_mismatch).iter().any(|d| d.code == "K0200"),
+            "a closure returning Str on one path and Int on another must still be a genuine \
+             type error: {:?}",
+            errors(genuine_mismatch)
         );
     }
 
