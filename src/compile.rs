@@ -797,6 +797,26 @@ impl<'s> FnCompiler<'s> {
                     }
                     return None;
                 }
+                // Production-hardening PR-it952 (survey #106): this arm's own
+                // message text used to be echoed by LANGUAGE-REFERENCE.md/
+                // DIAGNOSTICS.md as a documented "known intentional VM/native
+                // limit" -- but it is provably unreachable today. Every free
+                // variable an `ExprKind::Lambda` closes over is bound via
+                // `lc.bind_local(n)` before its body compiles (see the Lambda
+                // arm above), so `self.lookup(name)` always finds a captured
+                // name as a local and returns via the branch at line ~759,
+                // long before control reaches here -- confirmed live
+                // (`total += x` inside a closure over `var total` compiles
+                // clean with no K0803 on `kupl check`/`kupl run --vm`/`kupl
+                // native`, matching the by-value, call-local capture
+                // semantics interp.rs's own PR-it76 comment already
+                // documents as deliberate and cross-engine-consistent).
+                // Retained as a defense-in-depth fallback (should the capture
+                // -binding mechanism above ever change) rather than removed,
+                // but the docs now describe the CURRENT behavior instead of
+                // this dead path; see this file's `Stmt::Assign` non-`Ident`
+                // sibling arm above for the K0803 case that IS still
+                // reachable in principle.
                 self.err(
                     "K0803",
                     format!("cannot assign to `{name}` on KVM (captured variable)"),

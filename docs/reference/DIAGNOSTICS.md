@@ -152,7 +152,7 @@ Severity: **E** = error, **W** = warning.
 | Code | Sev | Meaning |
 |---|---|---|
 | K0801 | E | function too large for KVM v0 (more than 256 registers) |
-| K0803 | E | cannot assign to a lambda-captured variable on the KVM |
+| K0803 | E | unsupported assignment target on the KVM (internal safety net; the checker rejects any assignment target this could fire for before compilation reaches the KVM) |
 | K0804 | E | `forall` runs only under `kupl test` (interpreter); not compiled to the KVM |
 | K0805 | E | component has too many props + state fields + children for KVM v0 (more than 256 total) |
 | K0806 | E | chunk has too many distinct constants for KVM v0 (more than 65536) |

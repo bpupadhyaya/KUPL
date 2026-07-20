@@ -742,9 +742,14 @@ let b = Cache(store: LoudStore())              // …or another — same consume
 | Native (C) | `kupl native` | `fun main` programs, components (incl. `wire`/`supervise`/timers), and `ai fun` (incl. `tools`) |
 
 The interpreter defines the semantics; the VM and native backend are held to
-it by differential tests. Known intentional VM/native limits: assignment to a
-lambda-captured outer `var` is a compile error on the KVM (K0803) — captures
-are by value; component state accessed from lambdas is live on all engines.
+it by differential tests. Closures capture free locals by value on every
+engine: assigning to a captured outer `var` from inside the closure mutates
+only that call's own snapshot (discarded on return), never the outer
+binding — a "counter" closure like `fn() { n = n + 1\n    n }` always returns
+the same value on every call, and an outer mutation made after the closure
+was created is never observed inside it. Component state accessed from
+lambdas is live on all engines (state is re-snapshotted per closure creation,
+not per call).
 
 ## 12. Grammar
 
