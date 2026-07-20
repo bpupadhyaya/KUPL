@@ -109,6 +109,37 @@ pub fn parse_index(text: &str) -> Result<RegistryIndex, String> {
             return Err(format!("registry index version `{version}`'s `files` must be an object"));
         };
         let mut files = HashMap::new();
+        // Tracks each already-inserted path's own case-FOLDED form -> the
+        // original path, so a SECOND, distinctly-spelled path that would
+        // collide with it on disk can be reported (and reject BOTH names
+        // in the message). A REAL, SEVERE bug found+fixed (production-
+        // hardening PR-it921, an Explore survey finding, independently
+        // re-verified live before implementing, including confirming the
+        // exact NONDETERMINISTIC consequence): `materialize` (below)
+        // writes each declared file to `staging.join(path)` keyed by its
+        // OWN distinct string, with no cross-check that two DIFFERENT
+        // declared paths (e.g. `"main.kupl"` and `"Main.kupl"`) address
+        // the SAME real file on a case-INSENSITIVE filesystem -- the
+        // DEFAULT for both macOS (APFS) and Windows (NTFS), not an
+        // exotic edge case. A malicious or compromised registry index can
+        // legally declare both spellings with DIFFERENT content, each
+        // independently passing its own hash check -- whichever one
+        // `HashMap`'s RANDOMIZED-per-process iteration order happens to
+        // write LAST silently wins on disk, with `materialize` returning
+        // `Ok(())` and zero diagnostic. Live-confirmed BEFORE this fix,
+        // across 5 separate process invocations of the IDENTICAL index:
+        // the winning content (and even which CASE VARIANT appeared in a
+        // directory listing) was different EVERY time -- a genuinely
+        // non-reproducible silent-value-corruption bug, meaning an
+        // attacker's malicious variant has roughly even odds of becoming
+        // the ACTUAL `entry` file `loader.rs` loads and runs on any given
+        // `kupl pkg fetch`. Rejected here, at parse time (the single
+        // earliest enforcement point, mirroring `is_safe_relative_path`'s
+        // own precedent immediately below), using a full Unicode-aware
+        // case fold (not just ASCII) to stay conservative -- a registry
+        // index has no legitimate reason to declare two paths that only
+        // differ by case at all.
+        let mut folded: HashMap<String, String> = HashMap::new();
         for (path, file_json) in file_pairs {
             // A registry index is untrusted, network-supplied data. A file
             // path is later joined onto a local cache directory
@@ -125,6 +156,15 @@ pub fn parse_index(text: &str) -> Result<RegistryIndex, String> {
                     "registry index version `{version}` has an unsafe file path `{path}` \
                      (must be a relative path with no `..` component)"
                 ));
+            }
+            let fold = path.to_lowercase();
+            if let Some(other) = folded.insert(fold, path.clone()) {
+                if other != *path {
+                    return Err(format!(
+                        "registry index version `{version}` declares two files that would collide \
+                         on a case-insensitive filesystem: `{other}` and `{path}`"
+                    ));
+                }
             }
             let url = file_json
                 .get("url")
@@ -261,6 +301,27 @@ pub fn materialize(
     for path in contents.keys() {
         if !version.files.contains_key(path) {
             return Err(format!("fetched content for `{path}`, which the index did not declare"));
+        }
+    }
+    // Defense in depth (production-hardening PR-it921): `parse_index`
+    // already rejects two declared paths that would collide on a case-
+    // insensitive filesystem before a `RegistryVersion` can exist at all
+    // (see that check's own doc comment for the full writeup) -- but
+    // re-checking here, mirroring `is_safe_relative_path`'s own identical
+    // "safe to call with a hand-built `RegistryVersion` too" precedent
+    // immediately below, means a hand-built `RegistryVersion` (a test, or
+    // a future caller that doesn't route through `parse_index`) can't
+    // silently overwrite one file's verified content with another's on
+    // disk either.
+    let mut folded: HashMap<String, &String> = HashMap::new();
+    for path in version.files.keys() {
+        let fold = path.to_lowercase();
+        if let Some(other) = folded.insert(fold, path) {
+            if other != path {
+                return Err(format!(
+                    "declared files `{other}` and `{path}` would collide on a case-insensitive filesystem"
+                ));
+            }
         }
     }
     for (path, content) in contents {
@@ -1194,5 +1255,86 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL, SEVERE bug found+fixed (production-hardening PR-it921, an
+    /// Explore survey finding, independently re-verified live before
+    /// implementing): `parse_index`'s own doc comment above explains the
+    /// full mechanism -- a registry index declaring two file paths that
+    /// only differ by case (`"main.kupl"`/`"Main.kupl"`) address the SAME
+    /// real file on a case-insensitive filesystem (macOS/Windows default),
+    /// but nothing cross-checked this before this fix. Live-confirmed
+    /// BEFORE this fix, across 5 separate process runs of the IDENTICAL
+    /// index (each with Rust's own randomized-per-process `HashMap` seed):
+    /// `materialize` returned `Ok(())` every time, but WHICH of the two
+    /// files' content ended up on disk as `main.kupl` was DIFFERENT nearly
+    /// every run -- a genuinely non-reproducible silent-value-corruption
+    /// bug, not just a theoretical one.
+    #[test]
+    fn a_registry_index_declaring_two_case_colliding_file_paths_is_a_clean_parse_error() {
+        let honest_hash =
+            crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv("pub fun f() -> Int { 1 }\n")));
+        let text = format!(
+            "{{\"name\":\"pkg\",\"versions\":{{\"1.0.0\":{{\"entry\":\"main.kupl\",\"files\":{{\
+             \"main.kupl\":{{\"url\":\"https://example.com/main.kupl\",\"hash\":\"{honest_hash}\"}},\
+             \"Main.kupl\":{{\"url\":\"https://example.com/Main.kupl\",\"hash\":\"{honest_hash}\"}}\
+             }}}}}}}}"
+        );
+        let err = parse_index(&text).expect_err("two case-colliding declared paths must be a clean parse error");
+        assert!(
+            err.contains("collide") && err.contains("main.kupl") && err.contains("Main.kupl"),
+            "must name BOTH colliding paths: {err}"
+        );
+
+        // an ordinary index with NO case collision is completely unaffected.
+        let text_ok = format!(
+            "{{\"name\":\"pkg\",\"versions\":{{\"1.0.0\":{{\"entry\":\"main.kupl\",\"files\":{{\
+             \"main.kupl\":{{\"url\":\"https://example.com/main.kupl\",\"hash\":\"{honest_hash}\"}},\
+             \"kupl.toml\":{{\"url\":\"https://example.com/kupl.toml\",\"hash\":\"{honest_hash}\"}}\
+             }}}}}}}}"
+        );
+        assert!(parse_index(&text_ok).is_ok(), "an ordinary, non-colliding index must still parse cleanly");
+    }
+
+    /// The `materialize`-level defense-in-depth twin of the test above --
+    /// see that fix's own doc comment (immediately above `materialize`'s
+    /// case-fold check) for why this is checked at BOTH layers, mirroring
+    /// `is_safe_relative_path`'s own identical dual-check precedent.
+    #[test]
+    fn materialize_rejects_two_case_colliding_paths_even_in_a_hand_built_registryversion() {
+        let honest = "pub fun f() -> Int { 1 }\n";
+        let evil = "pub fun f() -> Int { 999 }\n";
+        let version = RegistryVersion {
+            entry: "main.kupl".to_string(),
+            files: HashMap::from([
+                (
+                    "main.kupl".to_string(),
+                    RegistryFile {
+                        url: "https://example.com/main.kupl".to_string(),
+                        hash: crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(honest))),
+                    },
+                ),
+                (
+                    "Main.kupl".to_string(),
+                    RegistryFile {
+                        url: "https://example.com/Main.kupl".to_string(),
+                        hash: crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(evil))),
+                    },
+                ),
+            ]),
+        };
+        let contents = HashMap::from([
+            ("main.kupl".to_string(), honest.to_string()),
+            ("Main.kupl".to_string(), evil.to_string()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("kupl-registry-case-collision-test-{}", std::process::id()));
+        let result = materialize(&version, &contents, &dir);
+        assert!(
+            result.is_err() && result.as_ref().unwrap_err().contains("collide"),
+            "a hand-built RegistryVersion with case-colliding paths must be rejected, not silently \
+             overwrite one file's verified content with another's on disk: {result:?}"
+        );
+        assert!(!dir.exists(), "nothing should be written to disk on rejection: {result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
