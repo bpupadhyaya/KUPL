@@ -616,9 +616,14 @@ impl<'m> Vm<'m> {
             // RESULT of computing a register index -- but every op that
             // gathers a contiguous run of registers (`Op::Call`/`CallComp`/
             // `CallBuiltin`/`CallValue`/`Method`/`MakeList`/`MakeCtor`/
-            // `MakeClosure`/`MakeInstance`, 9 call sites) used to compute
-            // that index via plain, UNCHECKED `Reg` (`u8`) addition,
-            // `start + i`, before this macro ever got a chance to bounds-
+            // `MakeClosure`/`MakeInstance`/the `ai fun` call arm's own
+            // `chunk.ncaps + i` param-gathering loop/`Method`'s own
+            // Map-insert fast path's `start + 1`, 11 call sites total, TWO
+            // found only on a deliberate second grep sweep for the same
+            // dangerous SHAPE rather than the exact literal substring
+            // `start + i`) used to compute that index via plain, UNCHECKED
+            // `Reg` (`u8`) addition, `start + i`, before this macro ever got
+            // a chance to bounds-
             // check anything. `kx.rs::decode()` never cross-validates
             // `start`/`argc`/`len`/`ncaps` against each other (documented
             // repeatedly above and throughout this file's existing
@@ -647,8 +652,9 @@ impl<'m> Vm<'m> {
             // computation (a static-analysis use, not this runtime
             // execution loop) -- the safe pattern already existed in this
             // codebase but was never applied here. Fixed by widening EVERY
-            // one of these 9 call sites' own `start + i` to `start as u16 +
-            // i as u16` before ever reaching this macro -- `usize`
+            // one of these 11 call sites' own `start + i` (or the
+            // equivalent `chunk.ncaps + i` / `start + 1`) to `u16`
+            // arithmetic before ever reaching this macro -- `usize`
             // arithmetic (this macro's own `base + $r as usize`) can never
             // wrap for any value a `u16` addition could produce, so the
             // existing `self.stack.get(...)` bounds check now correctly
@@ -825,7 +831,7 @@ impl<'m> Vm<'m> {
                     };
                     let intent_str = reg!(intent).to_string();
                     let args: Vec<Value> =
-                        (0..chunk.nparams).map(|i| Ok(reg!(chunk.ncaps + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                        (0..chunk.nparams).map(|i| Ok(reg!(chunk.ncaps as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     match crate::ai::ai_call(meta, &intent_str, &args, self) {
                         Ok(v) => set!(dst, v),
                         Err(msg) => return Err(VmError { msg, span }),
@@ -1142,7 +1148,7 @@ impl<'m> Vm<'m> {
                         && self.stack.get(base + recv as usize).is_some_and(|v| matches!(v, Value::Map(_)))
                     {
                         let key = reg!(start);
-                        let val = reg!(start + 1);
+                        let val = reg!(start as u16 + 1u16);
                         if let Some(Value::Map(rc)) = self.stack.get_mut(base + recv as usize) {
                             let pairs = match Rc::get_mut(rc) {
                                 Some(p) => p,
@@ -20373,5 +20379,67 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
             .call_named("main", vec![])
             .expect_err("a start+offset overflow must be a clean VmError, not a panic or silent wraparound");
         assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it920): a SECOND
+    /// sibling site to the `MakeList` one above, found only on a deliberate
+    /// follow-up grep for the same dangerous SHAPE (`Reg`/`u8` addition
+    /// before `reg!`'s own bounds check) rather than the exact literal
+    /// substring `start + i` -- `Op::CallAi`'s own argument-gathering loop
+    /// uses `chunk.ncaps + i` (the CURRENT chunk's own capture count plus a
+    /// loop index over its own parameter count), the identical unchecked-
+    /// `u8`-addition shape. Confirmed live BEFORE this fix: an `ai fun`
+    /// with 2 parameters, corrupted so its own chunk's `ncaps` field is
+    /// 255 (mirroring a hand-crafted `.kx` file's `decode()` never cross-
+    /// validating `ncaps` against `nparams`), reaches the SAME overflow
+    /// class as `MakeList`'s.
+    #[test]
+    fn an_ai_fun_calls_own_ncaps_plus_offset_overflow_is_a_clean_error_not_a_panic() {
+        let src = "ai fun nat_x(a: Str, b: Str) -> Str {\n    intent \"X.\"\n}\n\
+                   fun main() uses io {\n    print(nat_x(\"p\", \"q\"))\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let idx = module.funs["nat_x"];
+        assert_eq!(
+            module.chunks[idx as usize].nparams, 2,
+            "the test needs `nat_x` to genuinely take 2 params, so `ncaps + i` can reach i=1"
+        );
+
+        // `nregs` must be LARGE ENOUGH that `push_frame`'s OWN parameter-
+        // placement check (`base + chunk.ncaps as usize + i`, already-safe
+        // `usize` arithmetic, vm.rs ~line 503) does NOT itself reject this
+        // scenario for an unrelated reason (an out-of-range index) BEFORE
+        // ever reaching `Op::CallAi`'s own `chunk.ncaps + i` -- if `nregs`
+        // is too small (e.g. exactly 256, the naive first guess), the
+        // frame never gets pushed at all and this test would pass even
+        // WITHOUT the fix at line ~828, silently testing nothing. 260 is
+        // comfortably large enough that push_frame succeeds (255 + 1 = 256
+        // < 260, both `a` and `b`'s registers are legitimately valid) --
+        // with `nregs` this large, the CORRECT (post-fix) outcome is a
+        // clean SUCCESS (`Op::CallAi` reading the exact same registers
+        // `push_frame` already placed `a`/`b` into), not an error; the
+        // observable pre-fix bug at THIS site is specifically an uncaught
+        // Rust panic in a debug build (confirmed live: "attempt to add
+        // with overflow" at this exact line, BEFORE this fix, using this
+        // exact `nregs`/`ncaps` combination) -- a release build's silent
+        // wraparound has no OBSERVABLE consequence via this specific mock
+        // ai-fun path (the mock response text doesn't depend on which
+        // register its own args happened to be misread from), unlike
+        // `MakeList`'s own test above where the wrong VALUE is directly
+        // visible in the constructed list. This test's real assertion is
+        // therefore "does not panic and completes with a genuinely correct
+        // result", not "must error".
+        module.chunks[idx as usize].nregs = 260;
+        module.chunks[idx as usize].ncaps = 255;
+        let mut vm = Vm::new(&module);
+        std::env::set_var("KUPL_AI_MOCK_NAT_X", "hi");
+        let result = vm
+            .call_named(
+                "nat_x",
+                vec![crate::value::Value::str("p".to_string()), crate::value::Value::str("q".to_string())],
+            )
+            .expect("must complete correctly (not panic, not spuriously error)");
+        assert_eq!(result.to_string(), "hi");
     }
 }
