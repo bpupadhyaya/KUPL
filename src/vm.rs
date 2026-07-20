@@ -19312,6 +19312,24 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         );
     }
 
+    /// A coverage-closing verification (production-hardening PR-it964, no
+    /// bug found -- follow-up confirmatory check queued by PR-it963's own
+    /// NEXT-note): a zero-ROW table (`[]`, no rows at all) is structurally
+    /// DIFFERENT from PR-it963's zero-FIELD-row case (`[[], ["a"]]`, a row
+    /// present but with no fields) -- CSV's own grammar has no trouble
+    /// representing "no rows" at all (it's simply the empty string), unlike
+    /// "a row with zero fields," which is genuinely unrepresentable. Locks
+    /// in that this ALREADY-legal shape stays correct and round-trips
+    /// cleanly, unaffected by PR-it963's new zero-FIELD-row rejection.
+    #[test]
+    fn diff_csv_empty_table_round_trips_cleanly() {
+        assert_eq!(
+            differential("fun probe() -> Bool {\n    let rows: List[List[Str]] = []\n    \
+                          csv_stringify(rows) == \"\" && csv_parse(csv_stringify(rows)) == rows\n}\n"),
+            "true"
+        );
+    }
+
     #[test]
     fn diff_numeric_formatting_it24() {
         // Int radix formatting (lowercase, sign on the magnitude)
