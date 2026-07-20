@@ -2023,6 +2023,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, SEVERE bug found+fixed (production-hardening PR-it915, survey
+    /// #71): a named argument at a method-call site (`recv.method(b: 1, a:
+    /// 2)`) used to be silently discarded at the PARSER level and executed
+    /// POSITIONALLY in WRITTEN order on every engine -- confirmed live
+    /// BEFORE this fix: `acct.transfer(to: 1, from: 2)` against `expose fun
+    /// transfer(from: Int, to: Int)` was accepted by `kupl check` with ZERO
+    /// diagnostics and executed as `transfer(1, 2)`, silently swapping the
+    /// two same-typed arguments -- a genuine SILENT VALUE-CORRUPTION bug.
+    /// `check.rs`'s own
+    /// `a_named_argument_on_a_genuine_method_call_is_a_clean_k0241_not_
+    /// silently_swapped` test covers the compile-time K0241 rejection
+    /// itself; THIS test covers the actual RUNTIME OUTPUT for the
+    /// unambiguous positional form (per this codebase's established "a
+    /// silent-wrong-value bug needs a test checking ACTUAL RUNTIME OUTPUT,
+    /// not just diagnostics" discipline) plus the CLI-level rejection of the
+    /// dangerous named form.
+    #[test]
+    fn a_named_argument_swap_on_a_method_call_no_longer_silently_executes_reversed() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-methodcall-named-arg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let component = "component Account {\n    intent \"a\"\n    \
+                          expose fun transfer(from: Int, to: Int) uses io -> Bool {\n        \
+                          print(\"from={from} to={to}\")\n        true\n    }\n}\n";
+
+        // the dangerous named form must be a clean compile-time rejection,
+        // never a silent execution
+        let named_src = dir.join("named.kupl");
+        std::fs::write(
+            &named_src,
+            format!(
+                "{component}fun main() uses io {{\n    let acct = Account()\n    \
+                 print(acct.transfer(to: 1, from: 2))\n}}\n"
+            ),
+        )
+        .unwrap();
+        let named_out = std::process::Command::new(&bin)
+            .args(["check", named_src.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert!(!named_out.status.success(), "a named-arg method call must be rejected, not silently accepted");
+        let named_stderr = String::from_utf8_lossy(&named_out.stderr);
+        assert!(
+            named_stderr.contains("K0241"),
+            "must be rejected with K0241, not a different or missing diagnostic: {named_stderr:?}"
+        );
+
+        // the equivalent positional form must run cleanly and produce the
+        // ACTUAL, unambiguous runtime value -- not just compile
+        let pos_src = dir.join("positional.kupl");
+        std::fs::write(
+            &pos_src,
+            format!(
+                "{component}fun main() uses io {{\n    let acct = Account()\n    \
+                 print(acct.transfer(2, 1))\n}}\n"
+            ),
+        )
+        .unwrap();
+        let pos_out = std::process::Command::new(&bin)
+            .args(["run", pos_src.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert!(pos_out.status.success(), "{pos_out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&pos_out.stdout),
+            "from=2 to=1\ntrue\n",
+            "the positional call must bind from=2, to=1 exactly as written -- no argument reordering"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL text-consistency bug found+fixed (production-hardening
     /// PR-it783, the same survey's finding 2, independently re-verified
     /// live before implementing): a PLAIN (non-`forall`) failed `expect`'s

@@ -1678,11 +1678,31 @@ impl Parser {
                     let (name, nspan) = self.expect_ident()?;
                     if self.at(&Tok::LParen) {
                         self.bump();
-                        let args = self
-                            .parse_args()?
-                            .into_iter()
-                            .map(|a| a.value)
-                            .collect();
+                        // A REAL, SEVERE bug found+fixed (production-hardening
+                        // PR-it915, survey #71): this site used to silently
+                        // DISCARD every argument's own `name` here
+                        // (`.map(|a| a.value)`), with NO diagnostic anywhere
+                        // downstream -- so `recv.method(b: 1, a: 2)` was
+                        // accepted by `kupl check` and then executed
+                        // POSITIONALLY in WRITTEN order on every engine,
+                        // silently reversing the caller's evident intent
+                        // whenever two same-typed parameters were swapped, a
+                        // genuine SILENT VALUE-CORRUPTION bug. Now keeps the
+                        // full `Arg` (name + value) so downstream passes that
+                        // know the difference between "this is a genuine
+                        // method call on a value" and "this dotted call is
+                        // actually a cross-package qualified constructor
+                        // call" (only `resolve.rs`, via its own dependency-
+                        // alias table, can tell -- the parser cannot) can
+                        // handle each correctly: `resolve.rs`'s `is_dep`
+                        // rewrite now preserves names into the resulting
+                        // `Call` node (a genuine cross-package constructor
+                        // call keeps full named-arg support, matching a
+                        // same-package constructor call); `check.rs`'s
+                        // `infer_method` rejects a named argument on a
+                        // GENUINE method call with K0241, mirroring
+                        // `ExprKind::Call`'s own identical existing check.
+                        let args = self.parse_args()?;
                         let end = self.expect(Tok::RParen)?;
                         let span = expr.span.merge(end);
                         expr = Expr { kind: ExprKind::MethodCall { recv: Box::new(expr), name, args }, span };

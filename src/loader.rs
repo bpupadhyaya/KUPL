@@ -1249,6 +1249,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL, latent bug found+fixed ALONGSIDE PR-it915's main fix
+    /// (production-hardening PR-it915, survey #71): `resolve.rs`'s
+    /// dependency-qualified-call rewrite (`alias.Ctor(args)` ->
+    /// `alias$Ctor(args)`, the SAME rewrite `cross_package_component_names_
+    /// are_demangled_in_ctor_and_wire_diagnostics` above exercises) used to
+    /// unconditionally discard every argument's own NAME when rebuilding the
+    /// resulting `Call` node -- so a cross-package qualified constructor
+    /// call using named args (`dep.Widget(shade: 42)`, exactly like an
+    /// ordinary same-package constructor call `Widget(shade: 42)` already
+    /// correctly supports) was silently reinterpreted POSITIONALLY. For a
+    /// single-prop component this happened to still work by coincidence
+    /// (only one possible position), but for a multi-prop component with
+    /// args written out of declaration order, this would have silently
+    /// bound the WRONG prop -- the exact same silent-corruption shape
+    /// PR-it915's main method-call fix closes, just reached via the
+    /// cross-package constructor path instead. Confirmed the fix restores
+    /// correct behavior for BOTH a same-order and an intentionally
+    /// OUT-OF-ORDER named-arg construction.
+    #[test]
+    fn cross_package_named_arg_constructor_call_binds_props_by_name_not_position() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let base = std::env::temp_dir().join(format!("kupl-crosspkg-named-ctor-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "pub component Point {\n    intent \"p\"\n    prop x: Int\n    prop y: Int\n    \
+             expose fun show() uses io {\n        print(\"x={x} y={y}\")\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            // props written OUT OF declaration order (y before x) -- only
+            // correct if bound by NAME, not by written position
+            "use dep\n\nfun main() uses io {\n    let p = dep.Point(y: 20, x: 10)\n    p.show()\n}\n",
+        )
+        .unwrap();
+
+        let out = std::process::Command::new(&bin)
+            .args(["run", app.join("main.kupl").to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "x=10 y=20\n",
+            "y: 20, x: 10 must bind y=20 and x=10 by NAME, not swap them by written position"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it684): `resolve.rs`'s
     /// `Rewriter::component` visited a component's `props`/`state` field
     /// DECLARATIONS (types, default/init expressions) but never bound their

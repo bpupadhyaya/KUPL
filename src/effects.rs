@@ -732,7 +732,7 @@ fn walk_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         ExprKind::MethodCall { recv, args, .. } => {
             walk_expr(recv, f);
             for a in args {
-                walk_expr(a, f);
+                walk_expr(&a.value, f);
             }
         }
         ExprKind::Field { recv, .. } => walk_expr(recv, f),

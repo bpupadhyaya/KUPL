@@ -253,7 +253,7 @@ fn expr_references_name(e: &Expr, names: &HashSet<&str>) -> bool {
             expr_references_name(callee, names) || args.iter().any(|a| expr_references_name(&a.value, names))
         }
         ExprKind::MethodCall { recv, args, .. } => {
-            expr_references_name(recv, names) || args.iter().any(|a| expr_references_name(a, names))
+            expr_references_name(recv, names) || args.iter().any(|a| expr_references_name(&a.value, names))
         }
         ExprKind::Field { recv, .. } => expr_references_name(recv, names),
         ExprKind::Binary { lhs, rhs, .. } => expr_references_name(lhs, names) || expr_references_name(rhs, names),
@@ -2136,7 +2136,41 @@ impl Checker {
             }
             ExprKind::Ident(name) => self.infer_ident(name, expr.span, ctx),
             ExprKind::Call { callee, args } => self.infer_call(callee, args, expr.span, ctx),
-            ExprKind::MethodCall { recv, name, args } => self.infer_method(recv, name, args, expr.span, ctx),
+            ExprKind::MethodCall { recv, name, args } => {
+                // A REAL, SEVERE bug found+fixed (production-hardening
+                // PR-it915, survey #71): a named argument at a method-call
+                // site (`recv.method(b: 1, a: 2)`) used to be silently
+                // discarded and reinterpreted POSITIONALLY at the AST level
+                // (parser.rs), with NO diagnostic anywhere -- executing with
+                // arguments in WRITTEN order, silently corrupting the call
+                // whenever two same-typed parameters were swapped. The
+                // sibling "general callable" arm of `ExprKind::Call` (below,
+                // in `infer_call`) already rejects this exact shape with
+                // K0241 -- mirrored here now that `MethodCall`'s own `args`
+                // field (ast.rs) carries full `Arg` (name + value) instead
+                // of a bare `Expr`. By the time this arm runs, `resolve.rs`'s
+                // dependency-qualified rewrite (`is_dep(recv)`) has ALREADY
+                // turned a cross-package qualified CONSTRUCTOR call
+                // (`dep.Widget(shade: 1)`, which legitimately supports named
+                // args, matching a same-package constructor call) into an
+                // `ExprKind::Call` -- so every `MethodCall` node reaching
+                // this arm is guaranteed to be a genuine method call on a
+                // receiver VALUE, safe to reject unconditionally.
+                for a in args {
+                    if let Some(n) = &a.name {
+                        self.err(
+                            "K0241",
+                            format!(
+                                "`{n}:` is a named argument, but named arguments are only allowed for constructors and props here -- call positionally instead: `{}`",
+                                crate::fmt::expr_str(&a.value, 0)
+                            ),
+                            a.value.span,
+                        );
+                    }
+                }
+                let arg_values: Vec<Expr> = args.iter().map(|a| a.value.clone()).collect();
+                self.infer_method(recv, name, &arg_values, expr.span, ctx)
+            }
             ExprKind::Field { recv, name } => {
                 let rt = self.infer_expr(recv, ctx);
                 match self.uni.apply(&rt) {
@@ -4539,6 +4573,59 @@ mod generic_tests {
         assert!(
             crate::run::compile("fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() {\n    print(add(a: 1, b: 2))\n}\n").is_ok(),
             "direct named call must compile cleanly through the real pipeline (resolve_call_args rewrites it to positional form)"
+        );
+    }
+
+    /// A REAL, SEVERE bug found+fixed (production-hardening PR-it915, survey
+    /// #71): a named argument at a METHOD-CALL site (`recv.method(b: 1, a:
+    /// 2)`, as opposed to a plain function call, which `k0241_names_the_
+    /// argument_and_the_positional_fix` above already covers) used to be
+    /// silently discarded at the PARSER level (`ExprKind::MethodCall`'s
+    /// `args` field used to be `Vec<Expr>`, with no room to carry a name at
+    /// all) and reinterpreted POSITIONALLY in WRITTEN order on every engine
+    /// -- confirmed live BEFORE this fix: `acct.transfer(to: 1, from: 2)`
+    /// against `expose fun transfer(from: Int, to: Int)` was accepted by
+    /// `kupl check` and executed as `transfer(1, 2)`, silently swapping the
+    /// two same-typed arguments with zero diagnostic anywhere -- a genuine
+    /// SILENT VALUE-CORRUPTION bug, this campaign's second-most-severe
+    /// tracked category. Reachable through ANY method call, not just a
+    /// `fulfills`-contract-typed one (this test covers a PLAIN component
+    /// method; the contract-typed case is structurally identical, both
+    /// funnel through the same `infer_method` call site).
+    #[test]
+    fn a_named_argument_on_a_genuine_method_call_is_a_clean_k0241_not_silently_swapped() {
+        let src = "component Account {\n    intent \"a\"\n    \
+                    expose fun transfer(from: Int, to: Int) uses io -> Bool {\n        \
+                    print(\"from={from} to={to}\")\n        true\n    }\n}\n\
+                    fun main() uses io {\n    let acct = Account()\n    \
+                    print(acct.transfer(to: 1, from: 2))\n}\n";
+        let e = errors(src);
+        assert!(
+            e.iter().any(|d| d.code == "K0241" && d.message.contains("`to:` is a named argument")),
+            "a named argument on a method call must be rejected with K0241, not silently reordered: {e:?}"
+        );
+        assert!(
+            e.iter().any(|d| d.code == "K0241" && d.message.contains("`from:` is a named argument")),
+            "K0241 should report EACH named argument separately on a method call too: {e:?}"
+        );
+        // The positional equivalent must still compile cleanly -- this fix
+        // must not disturb ordinary, unambiguous method calls. (Actual
+        // RUNTIME output for the positional form is separately verified via
+        // a subprocess in run.rs's own
+        // `a_named_argument_swap_on_a_method_call_no_longer_silently_
+        // executes_reversed` test, matching this codebase's established
+        // "a silent-wrong-value bug needs a test checking ACTUAL RUNTIME
+        // OUTPUT, not just diagnostics" discipline.)
+        assert!(
+            crate::run::compile(
+                "component Account {\n    intent \"a\"\n    \
+                 expose fun transfer(from: Int, to: Int) uses io -> Bool {\n        \
+                 print(\"from={from} to={to}\")\n        true\n    }\n}\n\
+                 fun main() uses io {\n    let acct = Account()\n    \
+                 print(acct.transfer(2, 1))\n}\n"
+            )
+            .is_ok(),
+            "positional method call must still compile cleanly"
         );
     }
 

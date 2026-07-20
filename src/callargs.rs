@@ -391,7 +391,7 @@ impl Resolver<'_> {
             ExprKind::MethodCall { recv, args, .. } => {
                 self.expr(recv);
                 for a in args {
-                    self.expr(a);
+                    self.expr(&mut a.value);
                 }
             }
             ExprKind::Field { recv, .. } => self.expr(recv),

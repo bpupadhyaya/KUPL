@@ -639,7 +639,13 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
         }
         ExprKind::MethodCall { recv, name, args } => {
             let r = expr_str(recv, P_UNARY + 1);
-            let a: Vec<String> = args.iter().map(|x| expr_str(x, 0)).collect();
+            let a: Vec<String> = args
+                .iter()
+                .map(|arg| match &arg.name {
+                    Some(n) => format!("{n}: {}", expr_str(&arg.value, 0)),
+                    None => expr_str(&arg.value, 0),
+                })
+                .collect();
             (format!("{r}.{name}({})", a.join(", ")), ATOM)
         }
         ExprKind::Field { recv, name } => {

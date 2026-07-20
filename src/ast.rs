@@ -312,7 +312,7 @@ pub enum ExprKind {
     MethodCall {
         recv: Box<Expr>,
         name: String,
-        args: Vec<Expr>,
+        args: Vec<Arg>,
     },
     Field {
         recv: Box<Expr>,

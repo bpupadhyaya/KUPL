@@ -468,7 +468,7 @@ impl Rewriter<'_> {
             ExprKind::MethodCall { recv, args, .. } => {
                 self.expr(recv);
                 for a in args {
-                    self.expr(a);
+                    self.expr(&mut a.value);
                 }
             }
             ExprKind::Field { recv, .. } => self.expr(recv),
@@ -599,6 +599,22 @@ impl Rewriter<'_> {
         match &e.kind {
             // `alias.method(args)` -> `resolved$method(args)` (or bare `method(args)`
             // when `resolved` is root's empty prefix).
+            //
+            // A REAL, latent bug found+fixed ALONGSIDE the main PR-it915 fix
+            // (production-hardening PR-it915, survey #71): this rewrite used
+            // to unconditionally discard each argument's own name
+            // (`Arg { name: None, value }`) when reconstructing the `Call`
+            // node -- `dep.Widget(shade: 1)` is a cross-package QUALIFIED
+            // CONSTRUCTOR call (this rewrite exists specifically to turn it
+            // into `dep$Widget(...)`, an ordinary constructor call), which
+            // legitimately supports named args exactly like a same-package
+            // `Widget(shade: 1)` does -- but named-arg info never survived
+            // this far even BEFORE `MethodCall.args` widened to `Vec<Arg>`
+            // (PR-it915), since the parser itself used to discard it first.
+            // Now that `args` already carries names correctly, simply
+            // preserving them here restores full named-arg support for
+            // cross-package constructor calls, matching the same-package
+            // case.
             ExprKind::MethodCall { recv, name, args } if is_dep(recv) => {
                 let ExprKind::Ident(a) = &recv.kind else { return None };
                 let resolved = self.deps.get(a).map(String::as_str).unwrap_or(a);
@@ -607,7 +623,7 @@ impl Rewriter<'_> {
                         kind: ExprKind::Ident(qualify(resolved, name)),
                         span: recv.span,
                     }),
-                    args: args.iter().cloned().map(|value| Arg { name: None, value }).collect(),
+                    args: args.clone(),
                 })
             }
             // `alias.name` used as a value / callee -> `resolved$name` (or bare `name`).

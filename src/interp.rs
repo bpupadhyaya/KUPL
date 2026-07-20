@@ -647,7 +647,7 @@ impl Interp {
                             && args.len() == 1
                             && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
                         {
-                            let item = self.eval(&args[0], env)?;
+                            let item = self.eval(&args[0].value, env)?;
                             match env.push_list_in_place(tname, item) {
                                 None => return Ok(Value::Unit),
                                 Some(item) => {
@@ -677,8 +677,8 @@ impl Interp {
                             && args.len() == 2
                             && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
                         {
-                            let key = self.eval(&args[0], env)?;
-                            let val = self.eval(&args[1], env)?;
+                            let key = self.eval(&args[0].value, env)?;
+                            let val = self.eval(&args[1].value, env)?;
                             match env.insert_map_in_place(tname, key, val) {
                                 None => return Ok(Value::Unit),
                                 Some((key, val)) => {
@@ -707,7 +707,7 @@ impl Interp {
                             && args.len() == 1
                             && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
                         {
-                            let v = self.eval(&args[0], env)?;
+                            let v = self.eval(&args[0].value, env)?;
                             match env.insert_set_in_place(tname, v) {
                                 None => return Ok(Value::Unit),
                                 Some(v) => {
@@ -1092,7 +1092,7 @@ impl Interp {
                 let r = self.eval(recv, env)?;
                 let mut avs = Vec::with_capacity(args.len());
                 for a in args {
-                    avs.push(self.eval(a, env)?);
+                    avs.push(self.eval(&a.value, env)?);
                 }
                 self.eval_method(r, name, avs, expr.span)
             }

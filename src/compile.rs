@@ -738,7 +738,7 @@ impl<'s> FnCompiler<'s> {
                                     && ((m == "push" && args.len() == 1)
                                         || (m == "insert" && (args.len() == 1 || args.len() == 2)))
                                 {
-                                    let exprs: Vec<Expr> = args.clone();
+                                    let exprs: Vec<Expr> = args.iter().map(|a| a.value.clone()).collect();
                                     let start = self.consecutive(&exprs, *span);
                                     let name_idx = self.const_idx(Value::str(m.to_string()), *span);
                                     self.emit(
@@ -1002,7 +1002,7 @@ impl<'s> FnCompiler<'s> {
             ExprKind::Call { callee, args } => self.call(callee, args, span),
             ExprKind::MethodCall { recv, name, args } => {
                 let r = self.expr(recv);
-                let exprs: Vec<Expr> = args.clone();
+                let exprs: Vec<Expr> = args.iter().map(|a| a.value.clone()).collect();
                 let start = self.consecutive(&exprs, span);
                 let name_idx = self.const_idx(Value::str(name.clone()), span);
                 let dst = self.alloc(span);
@@ -1626,7 +1626,7 @@ fn free_vars_expr(e: &Expr, bound: &HashSet<String>, free: &mut BTreeSet<String>
         ExprKind::MethodCall { recv, args, .. } => {
             free_vars_expr(recv, bound, free);
             for a in args {
-                free_vars_expr(a, bound, free);
+                free_vars_expr(&a.value, bound, free);
             }
         }
         ExprKind::Field { recv, .. } => free_vars_expr(recv, bound, free),

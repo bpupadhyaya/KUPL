@@ -846,7 +846,7 @@ fn find_enclosing_call(program: &crate::ast::Program, offset: usize) -> Option<(
                 _ => None,
             },
             ExprKind::MethodCall { name, args, .. } => {
-                Some((name.clone(), active_param_index(args.iter().map(|a| a.span), offset)))
+                Some((name.clone(), active_param_index(args.iter().map(|a| a.value.span), offset)))
             }
             _ => None,
         };
@@ -1374,7 +1374,7 @@ fn expr_binds_name(expr: &crate::ast::Expr, name: &str) -> bool {
             expr_binds_name(callee, name) || args.iter().any(|a| expr_binds_name(&a.value, name))
         }
         ExprKind::MethodCall { recv, args, .. } => {
-            expr_binds_name(recv, name) || args.iter().any(|e| expr_binds_name(e, name))
+            expr_binds_name(recv, name) || args.iter().any(|a| expr_binds_name(&a.value, name))
         }
         ExprKind::Field { recv, .. } => expr_binds_name(recv, name),
         ExprKind::Binary { lhs, rhs, .. } => expr_binds_name(lhs, name) || expr_binds_name(rhs, name),
