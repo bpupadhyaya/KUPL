@@ -589,6 +589,44 @@ fn collect_expr(
         _ => (None, false, false),
     };
     let Some(name) = call_name else { return };
+    // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    // PR-it933, a close-read survey finding): a function-typed PARAMETER
+    // of the enclosing function must ALWAYS shadow a same-named builtin/
+    // component-local/top-level function for a PLAIN call -- matching
+    // this codebase's established "a local binding shadowing a top-level
+    // name must be respected" principle (PR-it894/it915/it931), extended
+    // here to effects.rs's OWN call-resolution for the first time. This
+    // MUST be checked before resolving against builtins/funs below (moved
+    // here from its own former home inside the `is_plain_call || ...`
+    // block further down, which only ran AFTER an early `return` on a
+    // successful builtin/funs resolution -- so it could never actually
+    // fire whenever the parameter's name happened to collide with an
+    // existing function, exactly the one case it exists to catch).
+    // Live-confirmed: `fun log(x: Int) -> Int { x }` alongside `pub fun
+    // apply(log: fn(Int) -> Int, x: Int) -> Int { log(x) }` -- `kupl
+    // check` reported ZERO diagnostics (no K0303) for `apply`'s call
+    // through its OWN "log" parameter, silently misattributed as calling
+    // the unrelated global `log` (a pure function) instead, while an
+    // identical control case using a non-colliding parameter name (`cb`)
+    // correctly emitted K0303. `pure_funs()` (the real-OS-thread `par_map`/
+    // `par_filter` safety gate) also misclassified `apply` as pure in
+    // isolation. This finding's PRACTICAL severity is bounded (not a
+    // proven data race): any actually-impure closure passed through the
+    // parameter is independently still caught by this file's OWN
+    // conservative bare-Ident-reference tracking (PR-it569, immediately
+    // above) wherever it's referenced by name in the reachable call
+    // graph, and `parallel.rs::PortableValue` has no closure/function
+    // variant at all (any function VALUE anywhere in a par_map/par_filter
+    // payload already forces the sequential fallback) -- but relying on
+    // two independently-existing protections to compose correctly by
+    // accident is fragile, and effects.rs's OWN classification for this
+    // shape was simply wrong regardless of what currently happens to
+    // absorb the consequence.
+    if is_plain_call && fn_typed_params.contains(name) {
+        *unresolved = true;
+        *plain_call_unresolved = true;
+        return;
+    }
     let builtin = builtin_effects(name);
     let mut resolved = builtin.is_some();
     if let Some(e) = builtin {
@@ -643,8 +681,8 @@ fn collect_expr(
     if is_plain_call || (is_method_call && component_method_names.contains(name)) {
         *unresolved = true;
         // `plain_call_unresolved` is DELIBERATELY narrower than `unresolved`
-        // above -- set ONLY for a plain call whose name is one of the
-        // ENCLOSING function's own declared function-typed parameters
+        // above -- it's ONLY ever set for a plain call whose name is one of
+        // the ENCLOSING function's own declared function-typed parameters
         // (`fun outer(f: fn() -> Int) { f() }`), NEVER for the method-call/
         // component-instance case, and NEVER for an unresolved plain call to
         // anything else (production-hardening PR-it750 v2). This is exactly
@@ -668,10 +706,15 @@ fn collect_expr(
         // BROADER `unresolved` flag it still consumes unchanged (it wants
         // the strictest possible bar for the real-OS-thread fast path it
         // gates, per its own doc comment) -- this narrowing applies ONLY to
-        // the new, K0301/K0302-facing `plain_call_unresolved` flag.
-        if is_plain_call && fn_typed_params.contains(name) {
-            *plain_call_unresolved = true;
-        }
+        // `plain_call_unresolved`.
+        //
+        // The actual `fn_typed_params.contains(name)` check that sets
+        // `plain_call_unresolved` now lives EARLIER in this function
+        // (production-hardening PR-it933) -- it must run BEFORE the
+        // component/top-level function resolution above, since a call
+        // through a parameter that happens to collide with an existing
+        // function's name would otherwise resolve successfully there and
+        // return before ever reaching this point.
     }
 }
 
@@ -1210,6 +1253,57 @@ mod tests {
         assert!(
             !private_hof.iter().any(|d| d.code == "K0303"),
             "a private function calling its own function-typed parameter must not warn K0303: {private_hof:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_typed_parameter_shadowing_an_existing_function_still_warns_k0303_and_is_unresolved() {
+        // A REAL, live-confirmed bug found+fixed (production-hardening
+        // PR-it933, a close-read survey finding): when a function-typed
+        // parameter's NAME happens to collide with an existing top-level
+        // function, `collect_expr` used to resolve the call against that
+        // UNRELATED function FIRST (returning early before ever reaching
+        // the `fn_typed_params` check below it), silently misattributing
+        // the call's effects to the collision partner's own effects
+        // instead of correctly flagging it as unresolved. Confirmed live
+        // BEFORE this fix: `fun log(x: Int) -> Int { x }` alongside `pub
+        // fun apply(log: fn(Int) -> Int, x: Int) -> Int { log(x) }`
+        // compiled with ZERO diagnostics (no K0303), while an identical
+        // non-colliding control (parameter named `cb` instead of `log`)
+        // correctly warned -- and `pure_funs()` (the real-OS-thread
+        // `par_map`/`par_filter` safety gate) misclassified `apply` as
+        // pure in isolation.
+        let colliding = diags_for(
+            "fun log(x: Int) -> Int {\n    x\n}\n\
+             pub fun apply(log: fn(Int) -> Int, x: Int) -> Int {\n    log(x)\n}\n",
+        );
+        assert!(
+            colliding.iter().any(|d| d.code == "K0303"),
+            "a call through a parameter whose name collides with an existing function must \
+             still warn K0303: {colliding:?}"
+        );
+
+        // the non-colliding control case must ALSO still warn, confirming
+        // the ordinary (already-correct) case is unaffected by the fix.
+        let control = diags_for(
+            "fun log(x: Int) -> Int {\n    x\n}\n\
+             pub fun apply(cb: fn(Int) -> Int, x: Int) -> Int {\n    cb(x)\n}\n",
+        );
+        assert!(control.iter().any(|d| d.code == "K0303"), "{control:?}");
+
+        // directly exercise `pure_funs()` itself -- the actual safety gate
+        // `par_map`/`par_filter`'s real-thread fast path relies on -- to
+        // confirm `apply` is no longer wrongly admitted as pure.
+        let (p, d) = parser::parse(
+            "fun log(x: Int) -> Int {\n    x\n}\n\
+             pub fun apply(log: fn(Int) -> Int, x: Int) -> Int {\n    log(x)\n}\n",
+        );
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let pure = super::pure_funs(&p);
+        assert!(
+            !pure.contains("apply"),
+            "apply must NOT be classified pure -- it calls through a parameter that collides \
+             with an unrelated global function name: {pure:?}"
         );
     }
 }
