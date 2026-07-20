@@ -535,7 +535,39 @@ impl<'a> Lexer<'a> {
                     // `self.pos - 1` is the byte just before the closing `}`. At
                     // EOF the loop never advances, so clamp to `expr_start` to keep
                     // the range non-inverted (a degenerate `{` at end-of-input).
-                    let end = self.pos.saturating_sub(1).max(expr_start);
+                    //
+                    // A REAL bug found+fixed (production-hardening PR-it924, a
+                    // two-phase self-scoping survey finding): when the loop exits
+                    // via true EOF (the `None` arm above, `self.pos` unmoved from
+                    // wherever the last successfully-consumed byte left it) rather
+                    // than a real closing `}`, `self.pos - 1` can land STRICTLY
+                    // INSIDE a multi-byte UTF-8 character if the source is
+                    // truncated mid-character (e.g. `"{π` with no closing brace) --
+                    // this inner byte-at-a-time scan (unlike the outer plain-text
+                    // scan just below, which explicitly reassembles a full
+                    // character before pushing it) has no character-boundary
+                    // awareness at all, so a raw byte offset landing mid-character
+                    // is entirely possible. `self.src[expr_start..end]` (a `&str`
+                    // slice) then panics ("byte index N is not a char boundary")
+                    // instead of the intended clean K0007 diagnostic already
+                    // pushed above. (The `Some(b'\n')` exit arm can NEVER hit this:
+                    // `\n` is ASCII and can only ever appear between UTF-8
+                    // characters, never as a continuation byte, so `self.pos`
+                    // there is always already a valid boundary.) Live-confirmed:
+                    // `kupl check` on a file containing `"{` followed by a raw
+                    // 2-byte UTF-8 character (e.g. `π`) and nothing else crashed
+                    // with "internal compiler error [src/lexer.rs:539]" (exit
+                    // 101) instead of K0007 (exit 1), identically via `check`,
+                    // `run`, and `native` (this lexer is shared front-end code).
+                    // Fixed by rounding `end` DOWN to the nearest valid char
+                    // boundary at or before the naive clamp -- `expr_start` is
+                    // itself always a valid boundary (right after the single-byte
+                    // `{` that opened this interpolation), so the loop below is
+                    // guaranteed to terminate.
+                    let mut end = self.pos.saturating_sub(1).max(expr_start);
+                    while end > expr_start && !self.src.is_char_boundary(end) {
+                        end -= 1;
+                    }
                     let raw = self.src[expr_start..end].to_string();
                     parts.push(StrPart::Expr(raw, expr_start as u32));
                 }
@@ -982,6 +1014,23 @@ mod tests {
         }
         // the reduced trigger emits a clean unterminated-interpolation diagnostic
         let (_t, diags) = lex("\"{");
+        assert!(diags.iter().any(|d| d.code == "K0007"), "expected K0007, got {diags:?}");
+    }
+
+    #[test]
+    fn unterminated_interpolation_at_eof_mid_multibyte_char_does_not_panic() {
+        // regression: PR-it924, the SAME class of bug as
+        // `unterminated_interpolation_at_eof_does_not_panic` above (an unclosed
+        // `{` at EOF forcing an invalid byte range for `self.src[expr_start..end]`)
+        // but for a case that fix's own ASCII-only fixtures never exercised: the
+        // interpolation's raw content is truncated by true EOF strictly INSIDE a
+        // multi-byte UTF-8 character, so the naive `self.pos - 1` clamp lands on
+        // a non-char-boundary index instead of just an inverted range.
+        // none of these may panic (the point of the test is reaching this line)
+        for src in ["\"{π", "\"{日本語", "\"{a日", "\"{😀", "\"{a\u{1F600}"] {
+            let _ = lex(src);
+        }
+        let (_t, diags) = lex("\"{π");
         assert!(diags.iter().any(|d| d.code == "K0007"), "expected K0007, got {diags:?}");
     }
 
