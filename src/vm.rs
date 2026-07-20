@@ -610,6 +610,50 @@ impl<'m> Vm<'m> {
             // `.kx` is documented as a distributable compiled-module format,
             // so this is genuinely untrusted input, not just "can't happen
             // to a well-formed file we produced ourselves."
+            // A REAL bug found+fixed (production-hardening PR-it920, an
+            // Explore survey finding, independently re-verified live before
+            // implementing): `reg!`'s own bounds check only runs on the
+            // RESULT of computing a register index -- but every op that
+            // gathers a contiguous run of registers (`Op::Call`/`CallComp`/
+            // `CallBuiltin`/`CallValue`/`Method`/`MakeList`/`MakeCtor`/
+            // `MakeClosure`/`MakeInstance`, 9 call sites) used to compute
+            // that index via plain, UNCHECKED `Reg` (`u8`) addition,
+            // `start + i`, before this macro ever got a chance to bounds-
+            // check anything. `kx.rs::decode()` never cross-validates
+            // `start`/`argc`/`len`/`ncaps` against each other (documented
+            // repeatedly above and throughout this file's existing
+            // corrupt-`.kx` hardening) -- a corrupted `.kx` file can set
+            // `start` and `argc`/`len` independently such that `start + i`
+            // exceeds `u8::MAX`. This is a DISTINCT mechanism from the
+            // "final register index too large" class this file's existing
+            // tests cover (PR-it686's own test only proves this macro's
+            // OWN bounds check catches a too-large index from LEGITIMATE
+            // compiler output; it never considers a `start` value from a
+            // hand-crafted file). Confirmed live BEFORE this fix: a
+            // `MakeList` op with `start = 255, len = 2` on a chunk whose
+            // `nregs` was corrupted to 256 (wide enough that register 255
+            // alone isn't rejected outright) made a DEBUG build PANIC with
+            // "attempt to add with overflow" (an uncaught crash, not this
+            // module's own established "corrupt .kx module: ..." clean
+            // error every sibling site was already fixed to produce) and a
+            // RELEASE build (this crate's `Cargo.toml` has no `overflow-
+            // checks` override, so it's off by default in release) SILENTLY
+            // WRAP `255u8 + 1u8` to `0`, building `[reg[255], reg[0]]`
+            // instead of erroring -- silent wrong output with zero
+            // diagnostic, this campaign's second-highest severity tier
+            // below outright data loss. `bytecode.rs`'s own `aliasing_regs`/
+            // `reg_traces_to_a_parameter` helpers already widen via
+            // `start.saturating_add(*argc)` for an analogous range
+            // computation (a static-analysis use, not this runtime
+            // execution loop) -- the safe pattern already existed in this
+            // codebase but was never applied here. Fixed by widening EVERY
+            // one of these 9 call sites' own `start + i` to `start as u16 +
+            // i as u16` before ever reaching this macro -- `usize`
+            // arithmetic (this macro's own `base + $r as usize`) can never
+            // wrap for any value a `u16` addition could produce, so the
+            // existing `self.stack.get(...)` bounds check now correctly
+            // catches a genuinely out-of-range index instead of the
+            // addition itself silently misbehaving first.
             macro_rules! reg {
                 ($r:expr) => {
                     match self.stack.get(base + $r as usize) {
@@ -758,7 +802,7 @@ impl<'m> Vm<'m> {
                 },
                 Op::Call { dst, fun, start, argc } => {
                     let args: Vec<Value> =
-                        (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                        (0..argc).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     self.push_frame(fun, &args, dst, None).map_err(|mut e| {
                         e.span = span;
                         e
@@ -766,7 +810,7 @@ impl<'m> Vm<'m> {
                 }
                 Op::CallComp { dst, fun, start, argc } => {
                     let args: Vec<Value> =
-                        (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                        (0..argc).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     self.push_frame(fun, &args, dst, cur_inst).map_err(|mut e| {
                         e.span = span;
                         e
@@ -807,7 +851,7 @@ impl<'m> Vm<'m> {
                             });
                         }
                     }
-                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     match which {
                         BUILTIN_PRINT => {
                             println!("{}", args[0]);
@@ -1031,7 +1075,7 @@ impl<'m> Vm<'m> {
                 }
                 Op::CallValue { dst, f, start, argc } => {
                     let callee = reg!(f);
-                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     match callee {
                         Value::Fun(ref name) => {
                             let Some(&idx) = self.module.funs.get(name.as_str()) else {
@@ -1141,7 +1185,7 @@ impl<'m> Vm<'m> {
                         continue;
                     }
                     let r = reg!(recv);
-                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                    let args: Vec<Value> = (0..argc).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     // expose call on a component instance
                     if let Value::Component(id) = r {
                         let meta = &self.module.components[self.instances[id].comp as usize];
@@ -1232,7 +1276,7 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::MakeList { dst, start, len } => {
-                    let items: Vec<Value> = (0..len).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                    let items: Vec<Value> = (0..len).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     set!(dst, Value::List(Rc::new(items)));
                 }
                 Op::MakeCtor { dst, ctor, start, len } => {
@@ -1244,7 +1288,7 @@ impl<'m> Vm<'m> {
                         msg: "corrupt .kx module: ctor index out of range".into(),
                         span,
                     })?;
-                    let fields: Vec<Value> = (0..len).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                    let fields: Vec<Value> = (0..len).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     set!(
                         dst,
                         Value::Ctor {
@@ -1360,7 +1404,7 @@ impl<'m> Vm<'m> {
                     set!(dst, Value::Bool(is));
                 }
                 Op::MakeClosure { dst, proto, start, ncaps } => {
-                    let caps: Vec<Value> = (0..ncaps).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                    let caps: Vec<Value> = (0..ncaps).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     set!(dst, Value::VmClosure(proto, Rc::new(caps), cur_inst));
                 }
                 Op::MakeRange { dst, lo, hi, inclusive } => {
@@ -1472,7 +1516,7 @@ impl<'m> Vm<'m> {
                     }
                 }
                 Op::MakeInstance { dst, comp, start, argc, policy } => {
-                    let props: Vec<Value> = (0..argc).map(|i| Ok(reg!(start + i))).collect::<Result<Vec<Value>, VmError>>()?;
+                    let props: Vec<Value> = (0..argc).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     let id = self.instantiate(comp, props).map_err(|mut e| {
                         if e.span == Span::default() {
                             e.span = span;
@@ -20279,5 +20323,55 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
             .expect("module compiles");
         assert!(crate::cgen::emit_c(&module).is_ok(), "native should compile ai funs now");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it920, an Explore
+    /// survey finding): see the `reg!` macro's own doc comment above for the
+    /// full writeup of WHY this class of bug exists (unchecked `Reg`/`u8`
+    /// addition in a register-run-gathering op's own index computation,
+    /// distinct from the register-index-out-of-range class this file's
+    /// OTHER corrupt-`.kx` tests already cover). This test locks in the
+    /// `Op::MakeList` reachability path specifically -- a corrupted `.kx`
+    /// file whose `start`/`len` would overflow `u8` on the SAME chunk whose
+    /// `nregs` was ALSO corrupted wide enough that `start` alone isn't
+    /// rejected outright, mirroring this file's own established `nregs`/
+    /// `nslots` corrupted-field test idiom exactly (build a legitimate
+    /// module, then directly mutate ONE field the way a hand-crafted `.kx`
+    /// file's `decode()` would hand the VM, since `decode()` never cross-
+    /// validates these fields against each other).
+    #[test]
+    fn a_register_run_whose_start_plus_offset_overflows_u8_is_a_clean_error_not_a_panic_or_silent_wraparound() {
+        let src = "fun main() uses io { let xs = [1, 2]\n print(xs) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let idx = module.funs["main"];
+
+        // a legitimate module still runs correctly (sanity check).
+        let mut vm = Vm::new(&module);
+        assert!(vm.call_named("main", vec![]).is_ok());
+
+        // corrupt `nregs` wide enough that a `start` of 255 isn't rejected
+        // by itself, then corrupt the `MakeList` op's own `start`/`len` so
+        // that `start + i` (`255 + 1`) overflows `u8` on the SECOND
+        // register of the run -- exactly what a hand-edited/corrupted `.kx`
+        // file's `decode()` would hand the VM, since `decode()` never
+        // cross-checks these fields against each other.
+        module.chunks[idx as usize].nregs = 256;
+        let mut found = false;
+        for op in module.chunks[idx as usize].code.iter_mut() {
+            if let crate::bytecode::Op::MakeList { start, len, .. } = op {
+                *start = 255;
+                *len = 2;
+                found = true;
+            }
+        }
+        assert!(found, "the test needs `main` to genuinely contain a MakeList op");
+
+        let mut vm = Vm::new(&module);
+        let err = vm
+            .call_named("main", vec![])
+            .expect_err("a start+offset overflow must be a clean VmError, not a panic or silent wraparound");
+        assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
     }
 }
