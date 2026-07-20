@@ -95,23 +95,43 @@ impl Rational {
         self.num.exceeds_max_size() || self.den.exceeds_max_size()
     }
 
-    pub fn add(&self, o: &Rational) -> Rational {
+    /// A REAL bug found+fixed (production-hardening PR-it942): this used to
+    /// `.unwrap()` `Rational::new`'s `Result` -- but `new` can legitimately
+    /// return `Err` (PR-it718's `MAX_GCD_INPUT_LIMBS` guard, see its own doc
+    /// comment above), so two ordinary, individually-under-cap `Rational`s
+    /// whose cross-multiplication pushes BOTH the resulting numerator AND
+    /// denominator past the limb cap turned this `Err` into a raw Rust
+    /// panic -- a bogus "internal compiler error... this is a bug in KUPL,
+    /// not your program" on interp/vm, actively misleading since the input
+    /// IS ordinary (if extreme) user code, fully reachable through `kupl
+    /// check`. Confirmed live via repeated squaring of a `rat(big(...),
+    /// big(...))` built from two ~450-digit coprime repdigit strings (5
+    /// iterations of `r = r * r`): interp/vm crashed with the bogus ICE
+    /// message (no KUPL source span); native's independently-reimplemented
+    /// `k_rat_mul` was ALREADY correct (calls `k_panic` directly, no
+    /// Rust-style Result/unwrap indirection to lose), producing the clean,
+    /// intended "Rational construction would require a GCD reduction too
+    /// large to compute..." panic instead -- a genuine three-engine
+    /// divergence, with native the one that was already right. Fixed by
+    /// propagating the `Result` like `div`/`recip` already correctly do,
+    /// instead of unwrapping it.
+    pub fn add(&self, o: &Rational) -> Result<Rational, String> {
         // a/b + c/d = (a*d + c*b) / (b*d)
         let n = self.num.mul(&o.den).add(&o.num.mul(&self.den));
-        Rational::new(n, self.den.mul(&o.den)).unwrap()
+        Rational::new(n, self.den.mul(&o.den))
     }
 
-    pub fn sub(&self, o: &Rational) -> Rational {
+    pub fn sub(&self, o: &Rational) -> Result<Rational, String> {
         let n = self.num.mul(&o.den).sub(&o.num.mul(&self.den));
-        Rational::new(n, self.den.mul(&o.den)).unwrap()
+        Rational::new(n, self.den.mul(&o.den))
     }
 
     pub fn negate(&self) -> Rational {
         Rational { num: self.num.negate(), den: self.den.clone() }
     }
 
-    pub fn mul(&self, o: &Rational) -> Rational {
-        Rational::new(self.num.mul(&o.num), self.den.mul(&o.den)).unwrap()
+    pub fn mul(&self, o: &Rational) -> Result<Rational, String> {
+        Rational::new(self.num.mul(&o.num), self.den.mul(&o.den))
     }
 
     /// `Err` if `o` is zero.
@@ -239,8 +259,8 @@ mod tests {
     fn reduces_and_arithmetic() {
         assert_eq!(r(2, 4), r(1, 2)); // reduction
         assert_eq!(r(1, -2), r(-1, 2)); // sign normalization
-        assert_eq!(r(1, 3).add(&r(1, 6)), r(1, 2)); // 1/3 + 1/6 = 1/2
-        assert_eq!(r(1, 3).mul(&r(3, 1)), r(1, 1)); // 1/3 * 3 = 1
+        assert_eq!(r(1, 3).add(&r(1, 6)).unwrap(), r(1, 2)); // 1/3 + 1/6 = 1/2
+        assert_eq!(r(1, 3).mul(&r(3, 1)).unwrap(), r(1, 1)); // 1/3 * 3 = 1
         assert_eq!(r(1, 3).div(&r(1, 2)).unwrap(), r(2, 3)); // (1/3)/(1/2) = 2/3
         assert_eq!(r(3, 7).recip().unwrap(), r(7, 3));
         assert_eq!(r(1, 1).to_string(), "1"); // integer prints bare

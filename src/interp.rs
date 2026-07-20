@@ -1964,9 +1964,9 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
                 ));
             }
             let result = match op {
-                Add => a.add(b),
-                Sub => a.sub(b),
-                Mul => a.mul(b),
+                Add => a.add(b)?,
+                Sub => a.sub(b)?,
+                Mul => a.mul(b)?,
                 Div => a.div(b)?,
                 Lt => return Ok(Value::Bool(a.cmp(b) == Ordering::Less)),
                 Le => return Ok(Value::Bool(a.cmp(b) != Ordering::Greater)),
@@ -2327,7 +2327,7 @@ pub fn shared_method(
                     let mut acc = crate::rational::Rational::from_ints(0, 1).unwrap();
                     for item in items.iter() {
                         let Value::Rational(r) = item else { unreachable!() };
-                        acc = acc.add(r);
+                        acc = acc.add(r)?;
                     }
                     Ok(Value::Rational(Rc::new(acc)))
                 }
@@ -2654,7 +2654,7 @@ pub fn shared_method(
                     let mut acc = crate::rational::Rational::from_ints(1, 1).unwrap();
                     for item in items.iter() {
                         let Value::Rational(r) = item else { unreachable!() };
-                        acc = acc.mul(r);
+                        acc = acc.mul(r)?;
                     }
                     Ok(Value::Rational(Rc::new(acc)))
                 }

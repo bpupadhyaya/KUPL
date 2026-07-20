@@ -2338,6 +2338,54 @@ mod tests {
         assert_eq!(differential("fun probe() -> Str { \"{rat(1, 3) < rat(1, 2)}\" }\n"), "true");
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it942, a DIFFERENT
+    /// reachability path than PR-it718's own test above): that test
+    /// constructs a Rational DIRECTLY from two already-too-large operands
+    /// (`rat(big(s), big(s))`), hitting `Rational::new`'s own early guard.
+    /// This test instead starts from an ORDINARY, individually-under-cap
+    /// Rational and repeatedly squares it -- `add`/`sub`/`mul` cross-
+    /// multiply numerator/denominator INTERNALLY before calling
+    /// `Rational::new`, so a legitimate-looking `*`/`+`/`-` chain can walk
+    /// both components past the cap the SAME way `BigInt::mul` can walk a
+    /// BigInt past ITS cap (PR-it639) -- but `add`/`sub`/`mul` used to
+    /// `.unwrap()` `Rational::new`'s `Result` instead of propagating it
+    /// (unlike `div`/`recip`, which already correctly did), turning this
+    /// `Err` into a raw Rust panic: a bogus "internal compiler error...
+    /// this is a bug in KUPL, not your program" on interp/KVM, even though
+    /// the input is ordinary (if extreme) user code. Confirmed LIVE before
+    /// this fix; native's independently-reimplemented `k_rat_mul`/`k_rat_add`
+    /// were ALREADY correct (call `k_panic` directly, no Rust-style
+    /// Result/unwrap indirection to lose) -- this is one of the rare cases
+    /// where native was already right and interp/KVM were the ones wrong.
+    #[test]
+    fn diff_rational_add_sub_mul_reject_growth_past_the_gcd_cap_instead_of_panicking_raw() {
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let x = big(\"7\".repeat(450))\n    let y = big(\"3\".repeat(451))\n    \
+                 var r = rat(x, y)\n    var i = 0\n    while i < 5 { r = r * r\n        i = i + 1 }\n    \
+                 \"{r}\" }\n"
+            ),
+            "panic: Rational construction would require a GCD reduction too large to compute \
+             (limit ~100 limbs, roughly 900 decimal digits, when BOTH operands exceed it)"
+        );
+        // the same growth via `+` (not just `*`) is equally rejected, not
+        // just multiplication -- `add`/`sub` share the identical shape.
+        assert_eq!(
+            differential(
+                "fun probe() -> Str { let x = big(\"7\".repeat(450))\n    let y = big(\"3\".repeat(451))\n    \
+                 var r = rat(x, y)\n    var i = 0\n    while i < 5 { r = r + r\n        i = i + 1 }\n    \
+                 \"{r}\" }\n"
+            ),
+            "panic: Rational construction would require a GCD reduction too large to compute \
+             (limit ~100 limbs, roughly 900 decimal digits, when BOTH operands exceed it)"
+        );
+        // ordinary, legitimate Rational arithmetic is completely unaffected.
+        assert_eq!(
+            differential("fun probe() -> Str { \"{rat(1, 3) + rat(1, 6)}\" }\n"),
+            "1/2"
+        );
+    }
+
     /// `Str.repeat`'s size check (`s.len().saturating_mul(n as usize) >
     /// 100_000_000`) is already overflow-safe on interp/KVM (`saturating_mul`
     /// can never wrap) -- this locks that CORRECT, already-shared behavior
