@@ -1908,6 +1908,63 @@ mod tests {
     }
 
     #[test]
+    fn diff_a_local_binding_shadowing_a_type_ctor_name_is_never_confused_with_it() {
+        // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+        // PR-it931, a close-read survey finding, following the exact
+        // shape of PR-it894/it915's own "a local binding shadowing a top-
+        // level name must be respected" fixes for plain function calls):
+        // `interp.rs`'s "user constructor" dispatch had NO shadowing check
+        // at all (every OTHER dispatch branch in the same match already
+        // checked `env.get(name).is_none()`), unlike `compile.rs`'s own
+        // analogous ctor-dispatch (already correctly shadowing-aware,
+        // `ctor_idx.get(name).filter(...)`), so the VM and native paths
+        // already agreed with each other but DISAGREED with the
+        // interpreter (this campaign's own reference engine) whenever a
+        // local binding shadowed a constructor's own name. `kupl check`
+        // reported ZERO diagnostics for this -- a genuine silent VALUE
+        // divergence on a well-typed program, not a diagnostic gap.
+        assert_eq!(
+            differential(
+                "type Pair = Pair(a: Int, b: Int)\n\
+                 fun weird(a: Int, b: Int) -> Pair {\n    Pair(a: b, b: a)\n}\n\
+                 fun probe() -> Str {\n    let Pair = weird\n    let p = Pair(1, 2)\n    \"{p.a},{p.b}\"\n}\n"
+            ),
+            "2,1"
+        );
+        // control: without the shadowing `let`, `Pair(1, 2)` still
+        // constructs the type directly, unaffected by the fix.
+        assert_eq!(
+            differential(
+                "type Pair = Pair(a: Int, b: Int)\n\
+                 fun probe() -> Str {\n    let p = Pair(1, 2)\n    \"{p.a},{p.b}\"\n}\n"
+            ),
+            "1,2"
+        );
+    }
+
+    #[test]
+    fn diff_a_local_binding_shadowing_a_component_name_is_never_confused_with_it() {
+        // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+        // PR-it931, the sibling of the ctor-shadowing fix above, same root
+        // cause: `interp.rs`'s "component construction" dispatch also had
+        // no shadowing check, unlike `compile.rs`'s own `instance_expr`
+        // caller-side guard). This one is strictly worse than the ctor
+        // case: the interpreter would silently INSTANTIATE a real
+        // component (with whatever side effects its own lifecycle carries)
+        // instead of calling the shadowing function the user's code
+        // actually named.
+        assert_eq!(
+            differential(
+                "component Widget {\n    intent \"w\"\n    prop label: Str\n    \
+                 expose fun describe() -> Str {\n        \"widget:{label}\"\n    }\n}\n\
+                 fun makeFake(label: Str) -> Str {\n    \"fake:{label}\"\n}\n\
+                 fun probe() -> Str {\n    let Widget = makeFake\n    Widget(\"hi\")\n}\n"
+            ),
+            "fake:hi"
+        );
+    }
+
+    #[test]
     fn diff_list_self_push() {
         // `xs = xs.push(x)` pushes in place when xs is uniquely owned, but preserves
         // value semantics: an aliased list (and a mid-build snapshot) is never

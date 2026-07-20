@@ -2888,20 +2888,43 @@ impl Checker {
                 _ => {}
             }
             // user constructor
-            if let Some((tyname, fields)) = self.checked.ctors.get(name).cloned() {
-                let (field_tys, result) = self.instantiate_ctor(&tyname, &fields);
-                let inst: Vec<(String, Ty)> = fields
-                    .iter()
-                    .map(|(n, _)| n.clone())
-                    .zip(field_tys)
-                    .collect();
-                self.check_named_args(name, &inst, args, span, ctx);
-                return result;
-            }
-            // component construction (props checked in the caller's own scope)
-            if let Some(sig) = self.checked.components.get(name).cloned() {
-                self.check_ctor_args(name, &sig, args, span, ctx);
-                return Ty::Component(name.clone());
+            //
+            // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+            // PR-it931, alongside the identical gap in interp.rs's own
+            // dispatch — see that file's own doc comment for the full live
+            // repro): this branch had no check for whether `name` is
+            // shadowed by a local binding or a same-named top-level fun,
+            // unlike `compile.rs`'s own analogous ctor-dispatch (already
+            // correctly shadowing-aware) — meaning `kupl check` silently
+            // type-checked a shadowed constructor call as if it always
+            // constructed the type, REGARDLESS of what the shadowing local
+            // binding's own type actually was. Left unfixed, fixing ONLY
+            // interp.rs's runtime dispatch (to correctly defer to the
+            // shadowing binding) would have created a NEW, worse problem:
+            // a program `kupl check` calls well-typed as producing type
+            // `T` (the constructor's own type) that actually evaluates, at
+            // runtime, to a value of a COMPLETELY DIFFERENT type (whatever
+            // the shadowing binding's own call returns) — a type-checker/
+            // runtime mismatch, not just a value divergence. Fixed with the
+            // SAME guard added to interp.rs and already present in
+            // `compile.rs`.
+            if !self.checked.funs.contains_key(name) && ctx.scopes.get(name).is_none() {
+                if let Some((tyname, fields)) = self.checked.ctors.get(name).cloned() {
+                    let (field_tys, result) = self.instantiate_ctor(&tyname, &fields);
+                    let inst: Vec<(String, Ty)> = fields
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .zip(field_tys)
+                        .collect();
+                    self.check_named_args(name, &inst, args, span, ctx);
+                    return result;
+                }
+                // component construction (props checked in the caller's own
+                // scope) — same shadowing gap, same PR-it931 fix.
+                if let Some(sig) = self.checked.components.get(name).cloned() {
+                    self.check_ctor_args(name, &sig, args, span, ctx);
+                    return Ty::Component(name.clone());
+                }
             }
         }
         // general callable

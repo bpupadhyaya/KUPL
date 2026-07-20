@@ -1574,28 +1574,70 @@ impl Interp {
                 }
             }
             // user constructor
-            if let Some((tyname, field_names)) = self.db.ctors.get(name).cloned() {
-                let mut fields = vec![Value::Unit; field_names.len()];
-                for (i, a) in args.iter().enumerate() {
-                    let v = self.eval(&a.value, env)?;
-                    let idx = match &a.name {
-                        Some(n) => field_names.iter().position(|f| f == n).ok_or_else(|| {
-                            Self::panic_flow(format!("`{name}` has no field `{n}`"), a.value.span)
-                        })?,
-                        None => i,
-                    };
-                    if idx < fields.len() {
-                        fields[idx] = v;
+            //
+            // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+            // PR-it931, a close-read survey finding): unlike EVERY other
+            // dispatch branch in this match (component-local fun above,
+            // top-level fun below), this branch had NO check for whether
+            // `name` is shadowed by a local binding or a same-named top-
+            // level fun — `compile.rs`'s own analogous ctor-dispatch
+            // ALREADY guards against exactly this (`ctor_idx.get(name).
+            // filter(...)`, checking `!fun_names.contains(name) &&
+            // self.lookup(name).is_none()`), so the VM and native paths
+            // (both driven by `compile.rs`'s bytecode) already correctly
+            // deferred to the shadowing binding — only the tree-walking
+            // interpreter (this campaign's OWN reference engine) got it
+            // wrong. Live-confirmed: `type Pair = Pair(a: Int, b: Int)`
+            // alongside `fun weird(a: Int, b: Int) -> Pair { Pair(a: b, b:
+            // a) }` and `let Pair = weird; let p = Pair(1, 2)` — `kupl
+            // check` reports ZERO diagnostics, `kupl run` printed `1,2`
+            // (silently ignoring the shadow, always constructing) while
+            // `kupl run --vm` and `kupl native` both correctly printed
+            // `2,1` (calling the shadowing `weird`) — a genuine silent
+            // cross-engine VALUE divergence on a well-typed program, not
+            // just a diagnostic-text difference. Fixed by adding the SAME
+            // guard `compile.rs` already has, matching this file's OWN
+            // sibling checks immediately above/below.
+            if !self.db.funs.contains_key(name) && env.get(name).is_none() {
+                if let Some((tyname, field_names)) = self.db.ctors.get(name).cloned() {
+                    let mut fields = vec![Value::Unit; field_names.len()];
+                    for (i, a) in args.iter().enumerate() {
+                        let v = self.eval(&a.value, env)?;
+                        let idx = match &a.name {
+                            Some(n) => field_names.iter().position(|f| f == n).ok_or_else(|| {
+                                Self::panic_flow(format!("`{name}` has no field `{n}`"), a.value.span)
+                            })?,
+                            None => i,
+                        };
+                        if idx < fields.len() {
+                            fields[idx] = v;
+                        }
                     }
+                    return Ok(Value::Ctor {
+                        ty: Rc::new(tyname),
+                        variant: Rc::new(name.to_string()),
+                        fields: Rc::new(fields),
+                    });
                 }
-                return Ok(Value::Ctor {
-                    ty: Rc::new(tyname),
-                    variant: Rc::new(name.to_string()),
-                    fields: Rc::new(fields),
-                });
             }
-            // component construction
-            if self.db.components.contains_key(name) {
+            // component construction (same shadowing gap as the ctor branch
+            // above, same PR-it931 fix, same fix shape: `compile.rs`'s own
+            // `instance_expr` caller-side guard already checks `self.lookup
+            // (name).is_none()` before treating a name as a component to
+            // construct). Live-confirmed with a component `Widget` shadowed
+            // by `let Widget = makeFake` (an ordinary Str -> Str function):
+            // `kupl run` printed `<component #0>` (silently instantiated a
+            // REAL Widget component, with whatever side effects its own
+            // lifecycle handlers carry, ignoring the shadow entirely) while
+            // `kupl run --vm` correctly printed `fake:hi` (calling the
+            // shadowing function) — the interpreter path is strictly worse
+            // here than the constructor case, since it can trigger real
+            // component instantiation side effects the user's code never
+            // intended.
+            if !self.db.funs.contains_key(name)
+                && env.get(name).is_none()
+                && self.db.components.contains_key(name)
+            {
                 let comp_name = name.clone();
                 let mut avs = Vec::new();
                 for a in args {
