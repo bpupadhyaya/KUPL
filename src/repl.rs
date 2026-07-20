@@ -166,11 +166,32 @@ fn is_item(src: &str) -> bool {
     // component, so a re-typed law should ADD another law rather than
     // REPLACE the prior same-named one the way the dedup-by-name logic does
     // for those.
-    let first = src.split_whitespace().next().unwrap_or("");
-    matches!(
+    let mut words = src.split_whitespace();
+    let first = words.next().unwrap_or("");
+    if matches!(
         first,
         "fun" | "type" | "component" | "app" | "pub" | "async" | "contract" | "use" | "module" | "law"
-    )
+    ) {
+        return true;
+    }
+    // A REAL bug found+fixed (production-hardening PR-it935): `ai` is ALSO a
+    // soft keyword, mirroring `law` above, but with a narrower shape --
+    // `parser::parse_item` only special-cases it directly before `fun`
+    // (`ai fun name(...) { intent "..." }`, `ast::Item::Fun` via
+    // `parse_ai_fun`), so unlike `law`'s unconditional single-token match,
+    // this must ALSO peek the second token before claiming the line as an
+    // item -- otherwise an ordinary statement/expression that happens to
+    // start with a variable literally named `ai` (e.g. `ai + 1`, a bare
+    // `ai`, or `ai.summarize()`) would be wrongly misrouted here instead of
+    // to the statement/expression path below. Pre-fix, a bare `ai fun ...`
+    // typed at the REPL prompt (no `pub` prefix -- `pub ai fun ...` was
+    // already safe, since `is_pub` is consumed by the parser BEFORE this
+    // check, routing it through the existing `"pub"` arm above) fell through
+    // to `parser::parse_stmt_fragment`, which can't parse it, producing a
+    // misleading `K0102: expected end of statement, found 'fun'` and
+    // silently losing the declaration (`:defs` stayed empty) -- live-
+    // confirmed.
+    first == "ai" && words.next() == Some("fun")
 }
 
 /// A REAL bug found+fixed (production-hardening PR-it768): this used to be
@@ -460,6 +481,23 @@ mod tests {
         // this match arm before, so it fell through to statement-fragment
         // parsing and produced a misleading K0102 error instead of "defined.".
         assert!(is_item("law \"ok\" { expect 1 == 1 }"));
+        // a bare `ai fun ...` is a real item too (PR-it935): missing from
+        // this match arm before, so it fell through to statement-fragment
+        // parsing and produced a misleading K0102 error instead of "defined.",
+        // silently losing the declaration (`:defs` stayed empty).
+        assert!(is_item("ai fun summarize(text: Str) -> Str { intent \"x\" }"));
+        // `ai` is a soft keyword only directly before `fun` -- unlike `law`'s
+        // unconditional single-token match, an ordinary statement/expression
+        // that happens to start with a variable literally named `ai` must
+        // still correctly route to the statement/expression path, not be
+        // misrouted here.
+        assert!(!is_item("ai + 1"));
+        assert!(!is_item("ai"));
+        assert!(!is_item("ai.summarize()"));
+        // `pub ai fun ...` was already safe pre-fix: `is_pub` is consumed by
+        // the parser BEFORE the `ai`-soft-keyword check, so it already
+        // routed through the existing `"pub"` arm.
+        assert!(is_item("pub ai fun summarize(text: Str) -> Str { intent \"x\" }"));
         // statements and expressions are not items (they run against current state)
         assert!(!is_item("let x = 1"));
         assert!(!is_item("2 + 3"));
