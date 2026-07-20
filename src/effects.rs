@@ -74,6 +74,43 @@ fn component_method_names(program: &Program) -> HashSet<&str> {
     names
 }
 
+/// Every type/ADT constructor name declared ANYWHERE in the program
+/// (including the prelude's `Json` variants, since `run.rs::inject_prelude`
+/// prepends prelude items to `program.items` before effects analysis runs),
+/// PLUS `Option`/`Result`'s own `Some`/`None`/`Ok`/`Err` -- unlike `Json`,
+/// these are compiler-intrinsic type names (see `check.rs`'s own hardcoded
+/// `["Some", "None", "Ok", "Err"]` list, e.g. around its `builtins`/pattern-
+/// exhaustiveness handling) with NO corresponding `Item::Type` AST node at
+/// all, so a plain scan of `program.items` alone would miss the single most
+/// common constructor pair in idiomatic KUPL code. Used by `collect_expr` to
+/// recognize a plain call to a constructor as fully resolved with NO effect
+/// and NO call-graph edge, rather than falling through to "unresolved"
+/// (production-hardening PR-it953). Unlike `construct_key`'s synthetic per-
+/// component node, a constructor needs no such node: `check.rs`'s K0275
+/// rejects a default value on ANY constructor field ("defaults only apply
+/// to `fun` parameters, not `{Type}`'s fields"), confirmed live -- so every
+/// field value at a constructor call site is always an explicit, ordinary
+/// argument expression, already walked as an ordinary sub-expression of the
+/// same `Call` node by `walk_expr`/`walk_block`, with nothing this function
+/// needs to chase down separately (unlike a component's state/prop
+/// initializers, which CAN be omitted and filled from a default, per
+/// `construct_key`'s own doc comment). Constructing a value is also,
+/// unconditionally, side-effect-free in KUPL -- it never touches the
+/// runtime's shared instance registry the way constructing a COMPONENT
+/// does (`construct_key`'s own `*unresolved = true` requirement) -- so this
+/// resolution is unconditionally safe for `pure_funs()` too.
+fn type_ctor_names(program: &Program) -> HashSet<&str> {
+    let mut names: HashSet<&str> = ["Some", "None", "Ok", "Err"].into_iter().collect();
+    for item in &program.items {
+        if let Item::Type(t) = item {
+            for v in &t.variants {
+                names.insert(v.name.as_str());
+            }
+        }
+    }
+    names
+}
+
 /// The names of `decl`'s parameters whose declared type is a function type
 /// (`fn(...) -> ...`) -- used by `collect_expr` to scope the K0303 "call
 /// through an unverifiable function value" warning EXACTLY to a call through
@@ -151,6 +188,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
             _ => None,
         })
         .collect();
+    let ctor_names = type_ctor_names(program);
 
     // ---- direct effects + call edges per function ----
     let mut direct: HashMap<String, EffectSet> = HashMap::new();
@@ -197,6 +235,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                         &funs,
                         &method_names,
                         &component_names,
+                        &ctor_names,
                         &fn_params,
                         &mut eff,
                         &mut calls,
@@ -260,6 +299,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                     &funs,
                     &method_names,
                     &component_names,
+                    &ctor_names,
                     &fn_params,
                     &mut eff,
                     &mut calls,
@@ -275,6 +315,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                 &funs,
                 &method_names,
                 &component_names,
+                &ctor_names,
                 &fn_params,
                 &mut eff,
                 &mut calls,
@@ -306,6 +347,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                     &funs,
                     &method_names,
                     &component_names,
+                    &ctor_names,
                     &HashSet::new(),
                     &mut eff,
                     &mut calls,
@@ -323,6 +365,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                         &funs,
                         &method_names,
                         &component_names,
+                        &ctor_names,
                         &HashSet::new(),
                         &mut eff,
                         &mut calls,
@@ -491,6 +534,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
             _ => None,
         })
         .collect();
+    let ctor_names = type_ctor_names(program);
 
     let mut direct: HashMap<String, EffectSet> = HashMap::new();
     let mut direct_unresolved: HashMap<String, bool> = HashMap::new();
@@ -525,6 +569,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                         &funs,
                         &method_names,
                         &component_names,
+                        &ctor_names,
                         &fn_params,
                         &mut eff,
                         &mut calls,
@@ -541,6 +586,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                 &funs,
                 &method_names,
                 &component_names,
+                &ctor_names,
                 &fn_params,
                 &mut eff,
                 &mut calls,
@@ -569,6 +615,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                     &funs,
                     &method_names,
                     &component_names,
+                    &ctor_names,
                     &HashSet::new(),
                     &mut eff,
                     &mut calls,
@@ -586,6 +633,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                         &funs,
                         &method_names,
                         &component_names,
+                        &ctor_names,
                         &HashSet::new(),
                         &mut eff,
                         &mut calls,
@@ -698,6 +746,7 @@ fn collect_expr(
     funs: &HashMap<String, impl Sized>,
     component_method_names: &HashSet<&str>,
     component_names: &HashSet<&str>,
+    ctor_names: &HashSet<&str>,
     fn_typed_params: &HashSet<&str>,
     eff: &mut EffectSet,
     calls: &mut Vec<String>,
@@ -822,6 +871,15 @@ fn collect_expr(
         calls.push(construct_key(name));
         resolved = true;
         *unresolved = true;
+    }
+    // A plain call to a known type/ADT constructor (`Some(x)`, `Wrap(f)`, any
+    // user `type` variant) -- see `type_ctor_names`'s own doc comment
+    // (production-hardening PR-it953) for why this needs no call-graph edge
+    // and no `*unresolved`/`*plain_call_unresolved` marking at all: every
+    // field value is an ordinary argument expression already walked
+    // separately, and construction itself is unconditionally effect-free.
+    if !resolved && is_plain_call && ctor_names.contains(name) {
+        resolved = true;
     }
     if resolved {
         return;
@@ -1358,6 +1416,97 @@ mod tests {
         assert!(d.is_empty(), "parse diags: {d:?}");
         let pure = super::pure_funs(&p);
         assert!(!pure.contains("apply"), "apply must NOT be classified pure: {pure:?}");
+        assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
+    }
+
+    /// A REAL performance gap found+fixed (production-hardening PR-it953,
+    /// found while independently re-verifying survey #107's investigation
+    /// into `par_map`/`par_filter` thread-safety): `collect_expr` never
+    /// resolved a plain call to a known type/ADT constructor name at all
+    /// (`Item::Type(_) => {}` in both `check_effects`/`infer_effects`'s own
+    /// per-item loops), so constructing ANY value -- a user ADT, or even
+    /// `Some(x)`/`Ok(x)` -- fell through to the generic "unresolved plain
+    /// call" branch, unconditionally marking `unresolved = true`. This
+    /// never caused a missed diagnostic (K0301 doesn't act on the broader
+    /// `unresolved` flag at all -- effects nested in a constructor's own
+    /// ARGUMENTS were always correctly walked and attributed as separate
+    /// sub-expressions regardless), but it DID mean `pure_funs()` -- which
+    /// gates the real-OS-thread `par_map`/`par_filter` fast path -- wrongly
+    /// excluded essentially any function using `Option`/`Result` or a
+    /// custom ADT, even when otherwise trivially pure. Live-confirmed
+    /// BEFORE this fix via a CPU-bound timing probe (a 100k-iteration spin
+    /// loop over 2000 list elements): a plain pure callback ran at ~1650%
+    /// CPU (real 16x thread parallelism engaged) while the IDENTICAL
+    /// workload wrapped in `Some(...).unwrap_or(...)` ran at 99% CPU
+    /// (sequential fallback) -- confirmed identically for both a
+    /// user-defined ADT constructor and `Some`/`Ok`. Distinguished from a
+    /// genuine safety concern (this file's own `construct_key` precedent
+    /// for COMPONENT construction, which unconditionally marks
+    /// `unresolved` because it touches the runtime's shared instance
+    /// registry): constructing an ordinary data value has no such shared
+    /// state, and `check.rs`'s K0275 ("constructor field cannot have a
+    /// default value") independently guarantees no OMITTED-and-defaulted
+    /// field can hide an unwalked expression the way a component's
+    /// state/prop defaults could (PR-it951) -- confirmed live via
+    /// `kupl check` rejecting `type Widget = Widget(n: Int = 5)` outright.
+    #[test]
+    fn pure_funs_includes_a_function_that_only_constructs_option_or_a_user_adt() {
+        let (p, d) = crate::parser::parse(
+            "type Wrap = Wrap(v: Int)\n\
+             fun pure_double(x: Int) -> Int { x * 2 }\n\
+             fun wraps_user_adt(x: Int) -> Int {\n    let w = Wrap(pure_double(x))\n    \
+             match w {\n        Wrap(v) => v\n    }\n}\n\
+             fun wraps_option(x: Int) -> Int {\n    Some(pure_double(x)).unwrap_or(0)\n}\n",
+        );
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let pure = super::pure_funs(&p);
+        assert!(
+            pure.contains("wraps_user_adt"),
+            "a function that only constructs a user ADT around an otherwise-pure call must be \
+             classified pure, unlocking the real-thread par_map/par_filter fast path: {pure:?}"
+        );
+        assert!(
+            pure.contains("wraps_option"),
+            "a function that only constructs Some(...) around an otherwise-pure call must be \
+             classified pure: {pure:?}"
+        );
+    }
+
+    /// The negative-control sibling of the test above: an effect genuinely
+    /// nested INSIDE a constructor's own argument must still be correctly
+    /// attributed and both fail `pure_funs()` and require `uses io` under
+    /// K0301 -- confirming the new ctor-resolution branch only short-
+    /// circuits the constructor call ITSELF, never the sub-expressions
+    /// `walk_expr`/`walk_block` already walk independently.
+    #[test]
+    fn effect_nested_inside_a_constructor_argument_is_still_attributed() {
+        let d = diags_for(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    1\n}\n\
+             pub fun wrapper() -> Option[Int] {\n    Some(noisy())\n}\n",
+        );
+        assert!(
+            d.iter().any(|d| d.code == "K0301"),
+            "an effectful call nested inside Some(...)'s own argument must still require \
+             `uses io`: {d:?}"
+        );
+        let ok = diags_for(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    1\n}\n\
+             pub fun wrapper() uses io -> Option[Int] {\n    Some(noisy())\n}\n",
+        );
+        assert!(ok.is_empty(), "correctly declared `uses io` must check clean: {ok:?}");
+
+        let (p, d2) = crate::parser::parse(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    1\n}\n\
+             fun wrapper() -> Option[Int] {\n    Some(noisy())\n}\n\
+             fun pure_double(x: Int) -> Int { x * 2 }\n",
+        );
+        assert!(d2.is_empty(), "parse diags: {d2:?}");
+        let pure = super::pure_funs(&p);
+        assert!(
+            !pure.contains("wrapper"),
+            "a function whose Some(...) argument is genuinely effectful must NOT be classified \
+             pure: {pure:?}"
+        );
         assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
     }
 
