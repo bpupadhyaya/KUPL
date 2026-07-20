@@ -28,6 +28,34 @@ fn fun_key(component: Option<&str>, name: &str) -> String {
     }
 }
 
+/// A REAL bug found+fixed (production-hardening PR-it951, found via a
+/// breadth-first fuzzing-style survey): a component's `state`/`prop` field
+/// initializers (`state n: Int = EXPR`, `prop n: Int = EXPR`) are evaluated
+/// on EVERY construction (`Component()`) -- a real, unconditional execution
+/// path -- but were never walked by `check_effects`/`infer_effects` at all
+/// (unlike a plain function's parameter defaults, PR-it629's own fix).
+/// Confirmed live BEFORE this fix: `component Sink { state n: Int =
+/// noisy() }` (where `noisy` calls `print`) let a `pub fun` that only
+/// CONSTRUCTS a `Sink` (`let s = Sink()`, no method call at all) compile
+/// with NO `uses io` requirement, and `kupl run`/`kupl run --vm`/native all
+/// genuinely printed the undeclared side effect identically. This is
+/// DIFFERENT from the already-documented, deliberately-out-of-scope
+/// "component-instance method call" limitation (`collect_expr`'s own doc
+/// comment below, PR-it707): a bare `Sink()` construction call names the
+/// component directly, by a LEXICALLY RESOLVABLE identifier right there in
+/// the AST -- no type information about a variable's instance type is
+/// needed, unlike `s.method()`. Fixed by giving each component a synthetic
+/// "constructor" node in the SAME call-graph `direct`/`edges` maps every
+/// real function already uses, keyed by this function (guaranteed to never
+/// collide with a real `fun_key` -- a bare function key is always a plain
+/// identifier with no `#`, and a component-method key always contains a
+/// literal `.`), and having `collect_expr` resolve a plain call to a known
+/// component name into a call edge to that synthetic node, mirroring how it
+/// already resolves a plain call to a component-local/top-level function.
+fn construct_key(component: &str) -> String {
+    format!("{component}#new")
+}
+
 /// Every component method name (exposed or private) declared ANYWHERE in the
 /// program, unqualified -- used by `collect_expr` to tell a genuine (if
 /// unresolvable without type info) component-instance method call apart from
@@ -115,6 +143,14 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
     }
 
     let method_names = component_method_names(program);
+    let component_names: HashSet<&str> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Component(c) => Some(c.name.as_str()),
+            _ => None,
+        })
+        .collect();
 
     // ---- direct effects + call edges per function ----
     let mut direct: HashMap<String, EffectSet> = HashMap::new();
@@ -160,6 +196,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                         info.component,
                         &funs,
                         &method_names,
+                        &component_names,
                         &fn_params,
                         &mut eff,
                         &mut calls,
@@ -222,6 +259,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                     info.component,
                     &funs,
                     &method_names,
+                    &component_names,
                     &fn_params,
                     &mut eff,
                     &mut calls,
@@ -236,6 +274,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                 info.component,
                 &funs,
                 &method_names,
+                &component_names,
                 &fn_params,
                 &mut eff,
                 &mut calls,
@@ -247,6 +286,55 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
         plain_call_unresolved.insert(key.clone(), plain_call);
         direct.insert(key.clone(), eff);
         edges.insert(key.clone(), calls);
+    }
+
+    // A synthetic "constructor" node per component, walking `state`/`prop`
+    // initializers -- see `construct_key`'s own doc comment (production-
+    // hardening PR-it951) for the full rationale. Fed into the SAME
+    // `direct`/`edges` maps and fixpoint below as any real function.
+    for item in &program.items {
+        let Item::Component(c) = item else { continue };
+        let mut eff = EffectSet::new();
+        let mut calls = Vec::new();
+        let mut unresolved = false;
+        let mut plain_call = false;
+        for s in &c.state {
+            walk_expr(&s.init, &mut |expr| {
+                collect_expr(
+                    expr,
+                    Some(c.name.as_str()),
+                    &funs,
+                    &method_names,
+                    &component_names,
+                    &HashSet::new(),
+                    &mut eff,
+                    &mut calls,
+                    &mut unresolved,
+                    &mut plain_call,
+                );
+            });
+        }
+        for p in &c.props {
+            if let Some(d) = &p.default {
+                walk_expr(d, &mut |expr| {
+                    collect_expr(
+                        expr,
+                        Some(c.name.as_str()),
+                        &funs,
+                        &method_names,
+                        &component_names,
+                        &HashSet::new(),
+                        &mut eff,
+                        &mut calls,
+                        &mut unresolved,
+                        &mut plain_call,
+                    );
+                });
+            }
+        }
+        let key = construct_key(&c.name);
+        direct.insert(key.clone(), eff);
+        edges.insert(key, calls);
     }
 
     // ---- fixpoint: propagate effects along call edges ----
@@ -395,6 +483,14 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
     }
 
     let method_names = component_method_names(program);
+    let component_names: HashSet<&str> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Component(c) => Some(c.name.as_str()),
+            _ => None,
+        })
+        .collect();
 
     let mut direct: HashMap<String, EffectSet> = HashMap::new();
     let mut direct_unresolved: HashMap<String, bool> = HashMap::new();
@@ -428,6 +524,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                         *component,
                         &funs,
                         &method_names,
+                        &component_names,
                         &fn_params,
                         &mut eff,
                         &mut calls,
@@ -443,6 +540,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                 *component,
                 &funs,
                 &method_names,
+                &component_names,
                 &fn_params,
                 &mut eff,
                 &mut calls,
@@ -453,6 +551,54 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
         direct.insert(key.clone(), eff);
         direct_unresolved.insert(key.clone(), unresolved);
         edges.insert(key.clone(), calls);
+    }
+
+    // Same synthetic "constructor" node per component as `check_effects` --
+    // see `construct_key`'s own doc comment (production-hardening PR-it951).
+    for item in &program.items {
+        let Item::Component(c) = item else { continue };
+        let mut eff = EffectSet::new();
+        let mut calls = Vec::new();
+        let mut unresolved = false;
+        let mut plain_call_unresolved = false;
+        for s in &c.state {
+            walk_expr(&s.init, &mut |expr| {
+                collect_expr(
+                    expr,
+                    Some(c.name.as_str()),
+                    &funs,
+                    &method_names,
+                    &component_names,
+                    &HashSet::new(),
+                    &mut eff,
+                    &mut calls,
+                    &mut unresolved,
+                    &mut plain_call_unresolved,
+                );
+            });
+        }
+        for p in &c.props {
+            if let Some(d) = &p.default {
+                walk_expr(d, &mut |expr| {
+                    collect_expr(
+                        expr,
+                        Some(c.name.as_str()),
+                        &funs,
+                        &method_names,
+                        &component_names,
+                        &HashSet::new(),
+                        &mut eff,
+                        &mut calls,
+                        &mut unresolved,
+                        &mut plain_call_unresolved,
+                    );
+                });
+            }
+        }
+        let key = construct_key(&c.name);
+        direct.insert(key.clone(), eff);
+        direct_unresolved.insert(key.clone(), unresolved);
+        edges.insert(key, calls);
     }
 
     let mut inferred = direct;
@@ -551,6 +697,7 @@ fn collect_expr(
     component: Option<&str>,
     funs: &HashMap<String, impl Sized>,
     component_method_names: &HashSet<&str>,
+    component_names: &HashSet<&str>,
     fn_typed_params: &HashSet<&str>,
     eff: &mut EffectSet,
     calls: &mut Vec<String>,
@@ -644,6 +791,37 @@ fn collect_expr(
     if funs.contains_key(&global) {
         calls.push(global);
         resolved = true;
+    }
+    // A component-construction call (`Sink()`) -- resolved AFTER function
+    // names (mirroring interp.rs/check.rs's own established priority order
+    // for this exact ambiguity, PR-it931), since a plain call's name is
+    // unambiguous once it's a real function; only otherwise-unresolved names
+    // are checked against known component names. See `construct_key`'s own
+    // doc comment (production-hardening PR-it951) for why this differs from
+    // the deliberately-out-of-scope component-INSTANCE method-call case.
+    //
+    // Pushes the call-graph edge (so `check_effects`/K0301 correctly sees
+    // whatever the state/prop initializers actually do) AND unconditionally
+    // marks `unresolved` -- construction ITSELF (allocating a fresh
+    // instance, registering it in the runtime's shared instance registry)
+    // is an effect on shared interpreter/runtime state independent of
+    // whatever the initializers compute, so `pure_funs()` (which gates the
+    // real-OS-thread `par_map`/`par_filter` fast path) must keep excluding
+    // ANY function that constructs a component, even one whose state/prop
+    // initializers happen to be trivially pure (`state n: Int = 0`) --
+    // otherwise this fix would have traded a missing-diagnostic bug for a
+    // genuine thread-safety regression (two real threads concurrently
+    // constructing instances via a wrongly-"pure"-classified function).
+    // `plain_call_unresolved` (the narrower K0303 warning) is deliberately
+    // NOT set here -- a construction call is not a call through an
+    // unverifiable function-typed VALUE, it's an unambiguous, resolvable
+    // component name, matching this file's own established precedent
+    // (see `fn_typed_param_names`'s doc comment) that K0303 should not
+    // fire on ordinary `Counter()`-style construction.
+    if !resolved && is_plain_call && component_names.contains(name) {
+        calls.push(construct_key(name));
+        resolved = true;
+        *unresolved = true;
     }
     if resolved {
         return;
@@ -1058,6 +1236,101 @@ mod tests {
         assert!(d.is_empty(), "parse diags: {d:?}");
         let pure = super::pure_funs(&p);
         assert!(!pure.contains("wrapper"), "wrapper must NOT be classified pure: {pure:?}");
+        assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it951, found via a
+    /// breadth-first fuzzing-style survey): a component's `state`/`prop`
+    /// field initializers are evaluated on EVERY construction, a real,
+    /// unconditional execution path -- but were never walked by
+    /// `check_effects` at all (unlike a plain function's parameter
+    /// defaults, PR-it629). Confirmed live BEFORE this fix: a `pub fun`
+    /// that only CONSTRUCTS a component with an effectful `state`
+    /// initializer (no method call needed at all) compiled with NO `uses
+    /// io` requirement, and `kupl run`/`kupl run --vm`/native all genuinely
+    /// printed the undeclared side effect identically. This is DIFFERENT
+    /// from PR-it707's already-documented, deliberately-out-of-scope
+    /// "component-instance method call" limitation: a bare `Sink()`
+    /// construction call names the component directly, by a LEXICALLY
+    /// RESOLVABLE identifier right there in the AST -- no type information
+    /// about a variable's instance type is needed.
+    #[test]
+    fn effectful_component_state_and_prop_initializers_require_a_declared_effect_on_construction() {
+        // state field initializer
+        let d = diags_for(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    42\n}\n\
+             component Sink {\n    intent \"s\"\n    state n: Int = noisy()\n    \
+             expose fun get() -> Int { n }\n}\n\
+             pub fun make_and_get() -> Int {\n    let s = Sink()\n    s.get()\n}\n",
+        );
+        assert!(
+            d.iter().any(|d| d.code == "K0301"),
+            "a pub fun constructing a component with an effectful state initializer must \
+             require `uses io`: {d:?}"
+        );
+        // prop default value, same shape
+        let d2 = diags_for(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    42\n}\n\
+             component Sink {\n    intent \"s\"\n    prop n: Int = noisy()\n    \
+             expose fun get() -> Int { n }\n}\n\
+             pub fun make_and_get() -> Int {\n    let s = Sink()\n    s.get()\n}\n",
+        );
+        assert!(
+            d2.iter().any(|d| d.code == "K0301"),
+            "a pub fun constructing a component with an effectful prop DEFAULT must \
+             require `uses io`: {d2:?}"
+        );
+        // bare construction alone (no method call at all) must ALSO trigger it.
+        let d3 = diags_for(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    42\n}\n\
+             component Sink {\n    intent \"s\"\n    state n: Int = noisy()\n}\n\
+             pub fun just_construct() {\n    let s = Sink()\n}\n",
+        );
+        assert!(
+            d3.iter().any(|d| d.code == "K0301"),
+            "bare construction alone (no method call) must still require `uses io`: {d3:?}"
+        );
+        // once correctly declared, no diagnostic at all.
+        let ok = diags_for(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    42\n}\n\
+             component Sink {\n    intent \"s\"\n    state n: Int = noisy()\n    \
+             expose fun get() -> Int { n }\n}\n\
+             pub fun make_and_get() uses io -> Int {\n    let s = Sink()\n    s.get()\n}\n",
+        );
+        assert!(ok.is_empty(), "correctly declared `uses io` must check clean: {ok:?}");
+    }
+
+    /// A REAL safety consideration caught DURING this same fix (production-
+    /// hardening PR-it951): the naive version of the fix above (just adding
+    /// a call-graph edge for construction) would have let `pure_funs()`
+    /// wrongly classify a function that constructs a component with a
+    /// GENUINELY PURE state initializer (e.g. `state n: Int = 0`, no calls
+    /// at all) as pure -- but construction ITSELF (allocating a fresh
+    /// instance, registering it in the runtime's shared instance registry)
+    /// is an effect on shared interpreter/runtime state independent of
+    /// whatever the initializers compute, matching this file's OWN
+    /// established precedent (PR-it707, the test above) that ANY function
+    /// constructing a component must stay conservatively excluded from the
+    /// real-OS-thread `par_map`/`par_filter` fast path. Fixed by
+    /// unconditionally marking `unresolved` at a construction call site (in
+    /// ADDITION to pushing the call-graph edge K0301 needs), independent of
+    /// whether the initializer itself is provably pure.
+    #[test]
+    fn pure_funs_excludes_a_function_that_constructs_a_component_even_with_a_trivially_pure_state_initializer() {
+        let (p, d) = crate::parser::parse(
+            "component Trivial {\n    intent \"t\"\n    state n: Int = 0\n    \
+             expose fun get() -> Int { n }\n}\n\
+             fun wrapper(x: Int) -> Int {\n    let t = Trivial()\n    x * 2\n}\n\
+             fun pure_double(x: Int) -> Int { x * 2 }\n",
+        );
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let pure = super::pure_funs(&p);
+        assert!(
+            !pure.contains("wrapper"),
+            "a function that merely CONSTRUCTS a component -- even one with a trivially pure \
+             state initializer -- must NOT be classified pure, since construction itself \
+             touches the runtime's shared instance registry: {pure:?}"
+        );
         assert!(pure.contains("pure_double"), "a genuinely pure function must stay pure: {pure:?}");
     }
 
