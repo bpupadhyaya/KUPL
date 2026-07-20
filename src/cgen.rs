@@ -4528,18 +4528,35 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                                    would silently execute again. Name them in the error so a
                                    caller knows not to blindly retry, instead of discarding
                                    that fact -- mirrors ai.rs's Rust-side message exactly. */
-                                char names[192] = {0};
-                                size_t off = 0;
-                                for (long pj = 0; pj < ti && off < sizeof names; pj++) {
+                                /* A REAL cross-engine divergence found+fixed (production-
+                                   hardening PR-it938, the THIRD instance of the SAME
+                                   fixed-buffer-truncation shape as PR-it936's k_ai_err fix
+                                   and PR-it937's k_exec fix, found via a deliberate
+                                   sibling-path sweep): `names` used to be a fixed
+                                   `char[192]`, silently DROPPING any already-run tool
+                                   names past ~190 bytes (mirrors ai.rs::run_tool_loop's own
+                                   unbounded `ran.join(", ")` -- confirmed live: a round of
+                                   40 successful "noop" tool calls before a 41st failing
+                                   call produced the full 357-char message on interp/vm, but
+                                   native cut the tool-name list off mid-list, ending in a
+                                   trailing ", " with only 32 of the 40 names, for a 310-char
+                                   total). This buffer feeds `k_ai_err_buf` (see its own
+                                   doc comment), which for a `wraps_result` ai fun becomes a
+                                   genuine `Err(Str)` VALUE a KUPL program observes -- silent
+                                   VALUE corruption, not just truncated diagnostic text. Now
+                                   a growable `KBuf`, matching ai.rs exactly -- no loop guard
+                                   needed once it's unbounded. */
+                                KBuf namesbuf = {0, 0, 0};
+                                for (long pj = 0; pj < ti; pj++) {
                                     const char* pname = k_ai_tool_name_of(k_json_field0(items->items[pj]).as.map);
-                                    int n = snprintf(names + off, sizeof(names) - off, "%s%s", pj ? ", " : "", pname);
-                                    if (n > 0) off += (size_t)n;
+                                    if (pj) kb_puts(&namesbuf, ", ");
+                                    kb_puts(&namesbuf, pname);
                                 }
                                 char* orig = k_strdup(k_ai_err);
                                 kb_reset(&k_ai_err_buf);
                                 kb_printf(&k_ai_err_buf,
                                          "%s (this tool failed after %ld other tool call(s) in the same round already ran: %s)",
-                                         orig, ti, names);
+                                         orig, ti, namesbuf.buf ? namesbuf.buf : "");
                             }
                             return k_unit();
                         }
@@ -16572,6 +16589,56 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         );
         let _ = std::fs::remove_file(&cp);
         let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A REAL cross-engine divergence found+fixed (production-hardening
+    /// PR-it938, the THIRD instance of the SAME fixed-buffer-truncation
+    /// shape as PR-it936's `k_ai_err` fix and PR-it937's `k_exec` fix, found
+    /// via a deliberate sibling-path sweep): the PR-it770 "already ran"
+    /// already-run-tool-names list (tested with a SINGLE name in
+    /// `native_ai_multi_tool_round` above) was built into a fixed
+    /// `char[192]` -- once enough already-run tool names accumulated past
+    /// ~190 bytes, the list silently truncated mid-name with no indication
+    /// anything was dropped, unlike ai.rs's own unbounded
+    /// `ran.join(", ")`. Confirmed live via 40 successful `noop` tool calls
+    /// before a 41st, deliberately-unknown-named call fails: interp/vm
+    /// report the full 357-char message (all 40 names), native (pre-fix)
+    /// cut it to 310 chars, ending mid-list in a trailing `", "` with only
+    /// 32 names. Since this list feeds `k_ai_err_buf` (PR-it936), which a
+    /// `wraps_result` ai fun wraps directly into a genuine `Err(Str)` VALUE,
+    /// this is silent VALUE corruption, not just truncated diagnostic text.
+    #[test]
+    fn native_ai_tool_round_names_a_long_list_of_already_run_tools_without_truncation() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun noop(x: Int) -> Int { x }\n\
+                   ai fun runner() -> Result[Str, Str] tools [noop] { intent \"run tools\" }\n\
+                   fun main() uses io {\n    \
+                   match runner() {\n        \
+                   Ok(v) => print(\"ok:{v}\")\n        \
+                   Err(e) => print(\"{e.len()}|{e}\")\n    \
+                   }\n}\n";
+        let calls: Vec<String> = (0..40)
+            .map(|i| format!("{{\"tool\":\"noop\",\"input\":{{\"x\":{i}}}}}"))
+            .collect();
+        let mock = format!(
+            "[{{\"tools\":[{},{{\"tool\":\"unknown_tool\",\"input\":{{}}}}]}}]",
+            calls.join(",")
+        );
+        let names = std::iter::repeat("noop").take(40).collect::<Vec<_>>().join(", ");
+        let expected = format!(
+            "model called unknown tool `unknown_tool` (this tool failed after 40 other \
+             tool call(s) in the same round already ran: {names})"
+        );
+        let expected_len = expected.chars().count();
+        let out = native_main_stdout_env(src, "aitoolnames", &[("KUPL_AI_MOCK_RUNNER", &mock)]);
+        assert_eq!(
+            out.trim(),
+            format!("{expected_len}|{expected}"),
+            "the Err(Str) VALUE must carry ALL 40 already-run tool names, not truncate \
+             mid-list (the old fixed-size char names[192] buffer used to do exactly that)"
+        );
     }
 
     /// A REAL cross-engine byte-identity divergence found+fixed (production-
