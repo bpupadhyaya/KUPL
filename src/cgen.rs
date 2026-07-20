@@ -5659,7 +5659,36 @@ static KValue k_parse_iso(KValue sv) {
     if (!dash2) return k_err(k_str(errbuf));
     *dash2 = 0; char* dstr = dash2 + 1;
     char* end; int ok;
-    y = k_strtol_checked(p, &end, &ok);   if (!ok || *end) return k_err(k_str(errbuf));  if (neg) y = -y;
+    /* A REAL cross-engine bug (production-hardening PR-it959, the SAME
+       "empty numeral substring parses as 0 instead of failing" shape the
+       `d`/`ss` fields below already guard against with their own
+       `dstr[0]==0`/`sstr[0]==0` checks) -- but never extended to `y`,
+       `hh`, or `mi`. `k_strtol_checked` wraps plain C `strtol`, which
+       (unlike Rust's `str::parse::<i64>()`, used uniformly for EVERY field
+       by `time.rs::parse_iso`, the shared interp/vm implementation) treats
+       an EMPTY string as a successful parse of `0` rather than an error --
+       `end` is left equal to the input pointer, so `*end` is the string's
+       own NUL terminator, which reads as falsy and slips straight past the
+       `!ok || *end` check with no complaint. `mo` (month) happens to be
+       accidentally protected already: a doubled dash (`"2001--15"`) makes
+       `mstr` empty, `mo` parses to `0`, and the very next line's own
+       `mo < 1` range check catches it downstream. `y`/`hh`/`mi` have no
+       such accidental catch (`0` is a legitimate year, hour, and minute),
+       so a doubled leading dash on the YEAR (`"--03-15"`, from e.g.
+       string-concatenation building a negative-year date) or a doubled `:`
+       on the HOUR/MINUTE (`"...T:30:00"`, `"...T05::00"`) silently
+       fabricates a bogus year-0000/midnight-hour/on-the-hour timestamp on
+       native, where interp/vm correctly return `Err`. Confirmed live
+       BEFORE this fix, all three shapes: native alone returned `Ok` with a
+       plausible-but-wrong timestamp while `kupl run`/`kupl run --vm`
+       agreed on `Err "invalid ISO-8601 timestamp: ..."` for the identical
+       input on all three. Fixed by mirroring `d`/`ss`'s own established
+       `[0] == 0` empty-substring guard onto `y` (checked on `p`, the
+       substring AFTER any leading `-` sign has already been consumed by
+       `p++` above -- a well-formed negative year like `"-0007-03-15"`
+       still starts with a real digit at that point, confirmed live to
+       stay unaffected) and onto `hh`/`mi`. */
+    y = k_strtol_checked(p, &end, &ok);   if (!ok || *end || p[0] == 0) return k_err(k_str(errbuf));  if (neg) y = -y;
     mo = k_strtol_checked(mstr, &end, &ok); if (!ok || *end) return k_err(k_str(errbuf));
     d = k_strtol_checked(dstr, &end, &ok);  if (!ok || *end || dstr[0] == 0) return k_err(k_str(errbuf));
     /* reject an impossible day-of-month (leap-year aware), matching time::parse_iso */
@@ -5673,8 +5702,8 @@ static KValue k_parse_iso(KValue sv) {
         char* c2 = strchr(mstr2, ':');
         if (!c2) return k_err(k_str(errbuf));
         *c2 = 0; char* sstr = c2 + 1;
-        hh = k_strtol_checked(time, &end, &ok);  if (!ok || *end) return k_err(k_str(errbuf));
-        mi = k_strtol_checked(mstr2, &end, &ok); if (!ok || *end) return k_err(k_str(errbuf));
+        hh = k_strtol_checked(time, &end, &ok);  if (!ok || *end || time[0] == 0) return k_err(k_str(errbuf));
+        mi = k_strtol_checked(mstr2, &end, &ok); if (!ok || *end || mstr2[0] == 0) return k_err(k_str(errbuf));
         ss = k_strtol_checked(sstr, &end, &ok);  if (!ok || *end || sstr[0] == 0) return k_err(k_str(errbuf));
         if (hh < 0 || hh > 23 || mi < 0 || mi > 59 || ss < 0 || ss > 60) return k_err(k_str(errbuf));
     }
@@ -10379,6 +10408,49 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "isooverflow").trim(),
             "false|false|false|false|false|false|true|true"
+        );
+    }
+
+    /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
+    /// PR-it959, found via a background survey's close-read of `k_parse_iso`
+    /// noticing the `d`/`ss` fields have an explicit `[0] == 0` empty-
+    /// substring guard that `y`/`hh`/`mi` lack): `k_strtol_checked` wraps
+    /// plain C `strtol`, which treats an EMPTY string as a successful parse
+    /// of `0` rather than an error, unlike Rust's `str::parse::<i64>()`
+    /// (used uniformly for every field by `time.rs::parse_iso`, the shared
+    /// interp/vm implementation, which always rejects an empty numeral
+    /// cleanly). `mo` (month) is accidentally protected already -- a
+    /// doubled dash makes `mstr` empty, `mo` parses to `0`, and the very
+    /// next line's own `mo < 1` range check catches it downstream -- but
+    /// `y`/`hh`/`mi` have no such accidental catch, since `0` is a
+    /// legitimate year, hour, and minute. Confirmed live BEFORE this fix:
+    /// a doubled leading dash on the year (`"--03-15"`, e.g. from string-
+    /// concatenation building a negative-year date) or a doubled `:` on the
+    /// hour/minute (`"...T:30:00"`, `"...T05::00"`) silently fabricated a
+    /// bogus year-0000/midnight-hour/on-the-hour timestamp on native
+    /// (`Ok`), while `kupl run`/`kupl run --vm` correctly agreed on `Err`
+    /// for the identical input -- a genuine 3-way cross-engine divergence,
+    /// not just a shared wrong answer. Fixed by mirroring `d`/`ss`'s own
+    /// established `[0] == 0` empty-substring guard onto `y`/`hh`/`mi`.
+    /// The well-formed negative-year shape (`"-0007-03-15"`) and
+    /// legitimate zero-valued fields (`"0000-01-01"`, `"...T00:00:00"`)
+    /// are confirmed to stay unaffected, live-verified across all three
+    /// engines before this fix was finalized.
+    #[test]
+    fn native_parse_iso_rejects_a_doubled_separator_that_would_empty_a_numeral_field() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{parse_iso(\"--03-15\").is_ok()}|\
+                   {parse_iso(\"2001-01-01T:30:00\").is_ok()}|\
+                   {parse_iso(\"2001-01-01T05::00\").is_ok()}|\
+                   {parse_iso(\"-0007-03-15\").is_ok()}|\
+                   {parse_iso(\"0000-01-01\").is_ok()}|\
+                   {parse_iso(\"2001-01-01T00:00:00\").is_ok()}\")\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "isoemptynumeral").trim(),
+            "false|false|false|true|true|true"
         );
     }
 
