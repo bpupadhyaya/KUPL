@@ -1271,6 +1271,18 @@ impl Env {
         }
     }
 
+    /// Like `bound_instance_ids`, but scans only THIS scope's own direct
+    /// bindings -- no walk up `parent`. Used to inspect a component
+    /// instance's own internal env (whose `parent` is always `self.globals`,
+    /// see `Interp::instantiate`) without pulling in unrelated global
+    /// bindings.
+    pub fn own_bound_instance_ids(&self, out: &mut std::collections::HashSet<usize>) {
+        let inner = self.0.borrow();
+        for (_, v) in &inner.vars {
+            Self::collect_instance_ids(v, out);
+        }
+    }
+
     /// Iterative work-list walk (see `bound_instance_ids`'s own doc comment
     /// for why iterative, not recursive) collecting every component-
     /// instance id reachable from `root`, including one nested inside a

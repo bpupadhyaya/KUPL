@@ -2322,6 +2322,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL fourth reachability path to the SAME forall phantom-
+    /// counterexample bug class (production-hardening PR-it906, after
+    /// PR-it903/PR-it904/PR-it905's direct/nested/captured-value paths --
+    /// independently re-verified live before implementing, and confirmed
+    /// still reproducing with all three prior fixes already applied). A
+    /// bound component instance's own CHILD instance is never itself a
+    /// value reachable from the outer scope's own bindings -- `Value::
+    /// Component(id)` is just an opaque instance id -- so when a property
+    /// depends on state that lives in a delegated-to CHILD (reached only
+    /// via `parent.exposedFun()` calling `child.exposedFun()` internally;
+    /// `ExprKind::Field` has no `Value::Component` case at all, so children
+    /// cannot be read back out as a bare field), the child's state
+    /// silently accumulated across cases with no reset, still producing a
+    /// false counterexample. Fixed by transitively walking each found
+    /// instance's OWN internal env (where `instantiate` binds children,
+    /// see `Env::own_bound_instance_ids`'s own doc comment) via a
+    /// fixed-point work-list, so a grandchild delegated to by a child
+    /// delegated to by the bound parent is reset too. This test locks in
+    /// both the direct-child and transitive-grandchild shapes.
+    #[test]
+    fn forall_resets_a_child_instances_state_reached_only_through_parent_delegation() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-forall-child-delegation-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_law = |src: &str| -> String {
+            let file = dir.join(format!("case-{}.kupl", src.len()));
+            std::fs::write(&file, src).unwrap();
+            let out = std::process::Command::new(&bin).args(["test", file.to_str().unwrap()]).output().expect("kupl runs");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // state held by a direct child, reached only via delegation
+        let child_stdout = run_law(
+            "component Child {\n    intent \"child counter\"\n    state count: Int = 0\n    \
+             expose fun bump() -> Int { count = count + 1\n        count }\n}\n\n\
+             component Parent {\n    intent \"delegates to a child\"\n    let c = Child()\n    \
+             expose fun bumpChild() -> Int { c.bump() }\n}\n\n\
+             law \"child state resets across forall cases\" {\n    let p = Parent()\n    \
+             forall k: Int {\n        let r = p.bumpChild()\n        expect r == 1\n    }\n}\n\nfun main() {}\n",
+        );
+        assert!(
+            child_stdout.contains("1 passed, 0 failed"),
+            "a child instance's state reached only through parent delegation must also be reset per case: {child_stdout:?}"
+        );
+
+        // state held by a grandchild, reached via two levels of delegation
+        let grandchild_stdout = run_law(
+            "component GrandChild {\n    intent \"innermost counter\"\n    state count: Int = 0\n    \
+             expose fun bump() -> Int { count = count + 1\n        count }\n}\n\n\
+             component Child {\n    intent \"middle delegator\"\n    let g = GrandChild()\n    \
+             expose fun bump() -> Int { g.bump() }\n}\n\n\
+             component Parent {\n    intent \"top delegator\"\n    let c = Child()\n    \
+             expose fun bumpChild() -> Int { c.bump() }\n}\n\n\
+             law \"grandchild state resets across forall cases too\" {\n    let p = Parent()\n    \
+             forall k: Int {\n        let r = p.bumpChild()\n        expect r == 1\n    }\n}\n\nfun main() {}\n",
+        );
+        assert!(
+            grandchild_stdout.contains("1 passed, 0 failed"),
+            "a grandchild instance's state reached via two levels of parent delegation must also be reset per case: {grandchild_stdout:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL text-consistency bug found+fixed (production-hardening
     /// PR-it783, the same finding as `plain_and_forall_expect_failures_...`
     /// above, but at a DIFFERENT site with no shared code path: a component

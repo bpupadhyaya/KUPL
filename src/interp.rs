@@ -976,6 +976,27 @@ impl Interp {
     ) -> Result<Option<String>, Flow> {
         let mut instance_ids = std::collections::HashSet::new();
         env.bound_instance_ids(&mut instance_ids);
+        // Transitively pull in children: a bound instance's own children
+        // live as ordinary values in ITS OWN internal env (`instantiate`'s
+        // `env.define(&child.name, v)`), not in the value graph reachable
+        // from the outer `env` at all -- a plain `Value::Component(id)` is
+        // just an opaque instance id, so a parent bound here whose STATE is
+        // held by a child instead (delegated to via `child.exposedFun()`)
+        // needs that child's own env walked too, and so on for
+        // grandchildren (production-hardening PR-it906 -- the fourth
+        // distinct reachability path to this bug class, after PR-it903/
+        // it904/it905's direct/nested/captured paths).
+        let mut frontier: Vec<usize> = instance_ids.iter().copied().collect();
+        while let Some(id) = frontier.pop() {
+            let child_env = self.instances[id].env.clone();
+            let mut found = std::collections::HashSet::new();
+            child_env.own_bound_instance_ids(&mut found);
+            for cid in found {
+                if instance_ids.insert(cid) {
+                    frontier.push(cid);
+                }
+            }
+        }
         for id in instance_ids {
             self.reset_instance_state(id)?;
         }
