@@ -303,11 +303,73 @@ impl Rewriter<'_> {
         // component's own not-yet-constructed state), matching how a
         // constructor's own field defaults can't reference sibling fields.
         self.push();
+        // A REAL bug found+fixed (production-hardening PR-it961, survey
+        // #111's close-read of resolve.rs, the SAME "unbound name shadowed
+        // by an in-scope binding this pass doesn't know about" bug family
+        // as the props/state fix immediately above (PR-it684): an OUT
+        // port's bare name is ALSO read as an ordinary local variable
+        // inside an `example { ... expect PORT == ... }` block --
+        // `run.rs::run_example`/`check.rs::check_example` both bind it to
+        // the port's last-emitted value, a real, documented language
+        // feature -- but `c.ports` was never bound into `self.scope` here,
+        // only its TYPE was walked (`self.ty(&mut p.ty)` above). If this
+        // SAME package also happens to define a top-level `fun`/`type`/
+        // constructor/`component`/`contract` with the identical bare name
+        // as a port (legal: ports are a different namespace), `self.name`
+        // fell through to the rename map and silently mangled the port
+        // reference to `pkg$name` instead -- confirmed live via a
+        // `component Gauge { out Go: Signal ... example { expect Go ==
+        // Stop } }` alongside a colliding `type Signal = Go | Stop` in the
+        // SAME dependency package: `kupl check` reported zero diagnostics,
+        // but `kupl test` on a consuming package showed `FAIL dep$Gauge
+        // example: \`dep$Go == dep$Stop\` was not satisfied` -- the
+        // diagnostic text itself proving the port reference was wrongly
+        // rewritten to the colliding constructor, permanently severing the
+        // assertion from the port's actual emitted value (silent value
+        // corruption, not the "loud unresolved-name error" this file's own
+        // top-of-file doc comment claims is the worst case). The
+        // byte-identical component compiled standalone (no package
+        // involved, so `isolate` never mangles it) passes cleanly,
+        // isolating the bug to cross-package mangling specifically. Bound
+        // unconditionally for BOTH `in` and `out` ports, matching props/
+        // state's own unconditional-binding style, even though only an
+        // OUT port's name is currently known to be read as a bare
+        // expression (an `in` port's name in `send NAME(...)` is parsed as
+        // a plain string field, never an `Expr` this pass walks at all) --
+        // binding a name that happens to go unread is always harmless.
+        for p in &c.ports {
+            self.bind(&p.name);
+        }
         for p in &c.props {
             self.bind(&p.name);
         }
         for s in &c.state {
             self.bind(&s.name);
+        }
+        // A SIBLING instance of the SAME PR-it961 bug shape as ports above,
+        // found by auditing every other component-local binding source per
+        // this campaign's own "audit every analogous site" convention: a
+        // CHILD's own instance name (`let helper = Widget()`) is likewise
+        // read as a bare local identifier -- `helper.value()` inside a
+        // handler/method/example body -- but was never bound into
+        // `self.scope` either, only `ch.component` (the TYPE being
+        // constructed) got rewritten. Confirmed live via a child instance
+        // named `helper` alongside a colliding top-level `fun helper()` in
+        // the SAME dependency package: `helper.value()` resolved to the
+        // MANGLED top-level function instead of the child instance,
+        // failing with `K0249: fn() -> Int has no method 'value'` on a
+        // consuming package (a LOUD error in this specific repro, since a
+        // function value has no such method -- but the SAME underlying
+        // mis-binding could just as easily manifest as SILENT corruption
+        // if the colliding top-level entity happened to have a
+        // method-compatible shape, exactly like the ports case above).
+        // Bound in its own loop, before children's constructor `args` are
+        // walked, matching props/state's own "bind everything first, walk
+        // usages after" ordering (harmless even for a child referencing
+        // itself in its own args, a case check.rs's real type-checker
+        // rejects anyway -- this pass only decides local-vs-mangled).
+        for ch in &c.children {
+            self.bind(&ch.name);
         }
         for ch in &mut c.children {
             if let Some(m) = self.name(&ch.component) {

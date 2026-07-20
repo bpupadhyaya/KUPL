@@ -1565,6 +1565,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it961,
+    /// survey #111's close-read of resolve.rs, independently re-verified
+    /// live with a FRESH multi-package repro before implementing). ANOTHER
+    /// sibling gap to the state-field collision test above, for a
+    /// DIFFERENT component-local binding source: `resolve.rs`'s
+    /// `Rewriter::component` walked a component's `ports`' TYPES but never
+    /// bound their NAMES into scope, even though an OUT port's bare name is
+    /// read as an ordinary local variable inside an `example { ... expect
+    /// PORT == ... }` block (`run.rs`/`check.rs` both bind it to the port's
+    /// last-emitted value, a real, documented language feature). If the
+    /// SAME dependency package ALSO happens to define a top-level
+    /// fun/type/constructor/component/contract with the identical bare
+    /// name as a port, the mangling pass silently rewrote the port
+    /// reference to that unrelated top-level definition's mangled name
+    /// instead -- with ZERO diagnostics from `kupl check`, DIRECTLY
+    /// CONTRADICTING this file's own top-of-file doc comment claim that "a
+    /// missed rewrite surfaces as a loud unresolved-name error, never
+    /// silent divergence." Live-confirmed BEFORE this fix via a component
+    /// `Gauge { out Go: Signal ... example { expect Go == Stop } }`
+    /// alongside a colliding `type Signal = Go | Stop` in the SAME
+    /// dependency package: `kupl check` reported zero errors, but `kupl
+    /// test` on a consuming package showed `FAIL dep$Gauge example:
+    /// \`dep$Go == dep$Stop\` was not satisfied` -- the diagnostic text
+    /// itself proving the port reference `Go` was wrongly rewritten to the
+    /// colliding constructor `Go`, permanently severing the assertion from
+    /// the port's actual emitted value (`Stop`) regardless of what the
+    /// component does at runtime. The byte-identical component compiled
+    /// standalone (no package involved, so `isolate` never runs at all)
+    /// passed cleanly, isolating the bug to cross-package mangling
+    /// specifically.
+    #[test]
+    fn component_out_port_name_colliding_with_a_top_level_constructor_is_not_mangled() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let base = std::env::temp_dir().join(format!("kupl-port-collision-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "type Signal = Go | Stop\n\n\
+             pub component Gauge {\n    \
+             intent \"an out port colliding with a top-level constructor by name\"\n    \
+             out Go: Signal\n    \
+             on start {\n        emit Go(Stop)\n    }\n    \
+             example {\n        expect Go == Stop\n    }\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun main() uses io {\n    let g = dep.Gauge()\n    print(\"ok\")\n}\n",
+        )
+        .unwrap();
+
+        let out = std::process::Command::new(&bin)
+            .args(["test", app.join("main.kupl").to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("1 passed, 0 failed"),
+            "an out port's bare name colliding with an unrelated top-level constructor in the \
+             SAME package must not be mistaken for it: {stdout:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A SIBLING gap to the out-port test immediately above, found by
+    /// auditing every OTHER component-local binding source in `resolve.rs`
+    /// (production-hardening PR-it961, the SAME iteration): a CHILD's own
+    /// instance name (`let helper = Widget()`) is likewise read as a bare
+    /// local identifier (`helper.value()`) inside a handler/method body,
+    /// but was never bound into scope either -- only `ch.component` (the
+    /// TYPE being constructed) got rewritten. Live-confirmed BEFORE this
+    /// fix via a child instance named `helper` alongside a colliding
+    /// top-level `fun helper()` in the SAME dependency package:
+    /// `helper.value()` resolved to the MANGLED top-level function instead
+    /// of the child instance, failing with `K0249: fn() -> Int has no
+    /// method 'value'` on a consuming package (a LOUD error in this
+    /// specific repro shape, since a function value has no such method --
+    /// but the SAME underlying mis-binding could just as easily manifest
+    /// as SILENT corruption if the colliding top-level entity happened to
+    /// have a method-compatible shape, exactly like the port case above).
+    /// The byte-identical component compiled standalone passed cleanly,
+    /// isolating the bug to cross-package mangling specifically.
+    #[test]
+    fn component_child_instance_name_colliding_with_a_top_level_fun_is_not_mangled() {
+        let base = std::env::temp_dir().join(format!("kupl-child-collision-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "component Widget {\n    \
+             intent \"returns a fixed number\"\n    \
+             expose fun value() -> Int {\n        111\n    }\n\
+             }\n\n\
+             fun helper() -> Int {\n    999\n}\n\n\
+             pub component Parent {\n    \
+             intent \"a child instance name colliding with a top-level fun by name\"\n    \
+             let helper = Widget()\n    \
+             expose fun get() -> Int {\n        helper.value()\n    }\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun probe() -> Int {\n    dep.Parent().get()\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = super::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with its dep dependency");
+        let (checked, diags) = crate::check::check(&program);
+        assert!(
+            diags.iter().all(|d| d.severity != crate::diag::Severity::Error),
+            "a child instance's bare name colliding with an unrelated top-level fun in the SAME \
+             package must not be mistaken for it: {diags:?}"
+        );
+        let db = crate::interp::ProgramDb::build(&program, &checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let probe = crate::value::Value::Fun(std::rc::Rc::new("probe".to_string()));
+        let result = match interp.call_value(probe, vec![], crate::diag::Span::default()) {
+            Ok(v) => v,
+            Err(_) => panic!("probe() should run cleanly"),
+        };
+        assert_eq!(
+            result.to_string(),
+            "111",
+            "must resolve to the CHILD INSTANCE's own method, not the unrelated top-level fun's \
+             mangled name"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it775, an Explore
     /// survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
     /// live before implementing): `resolve.rs`'s `Rewriter::pattern` only
