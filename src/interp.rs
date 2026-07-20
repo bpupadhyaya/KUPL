@@ -4558,8 +4558,28 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 /// Find a `Content-Length` header in a raw request head and return its value,
 /// capped at `MAX_BODY_SIZE`. Missing/unparsable/negative -> 0 (no body).
+///
+/// A REAL cross-engine divergence found+fixed (production-hardening
+/// PR-it918, deferred at it902): this used to split on the literal
+/// `"\r\n"` line terminator -- for a request whose header lines are
+/// separated by a BARE `\n` (still ending in the required literal
+/// `\r\n\r\n` terminator overall) this treats the WHOLE multi-line
+/// bare-LF header block as a SINGLE "line" with no internal `\r\n` to
+/// split on, so `split_once(':')` matches the FIRST colon in the blob
+/// rather than the actual `Content-Length` header. `cgen.rs`'s native
+/// mirror (`k_content_length`, PR-it901) already scans line-by-line on a
+/// bare `\n` boundary -- converging onto that SAME boundary here (rather
+/// than porting this function's exact semantics into C, the ORIGINAL
+/// larger fix it902 judged not worth it) is a minimal, low-risk change:
+/// a trailing `\r` left in an ordinary `\r\n`-terminated line's `value`
+/// half is already stripped by the existing `.trim()` call below (`\r`
+/// is ASCII whitespace), so this does not disturb the normal case at
+/// all. Confirmed live before this fix: `POST /echo HTTP/1.1\nHost:
+/// x\nContent-Length: 11\n\r\n\r\nhello world` (bare-LF header lines,
+/// literal `\r\n\r\n` terminator) returned an EMPTY body on interp/vm
+/// while native correctly returned `hello world`.
 fn parse_content_length(head: &str) -> usize {
-    for line in head.split("\r\n") {
+    for line in head.split('\n') {
         if let Some((name, value)) = line.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
                 if let Ok(n) = value.trim().parse::<usize>() {
@@ -5061,10 +5081,36 @@ fn builtin_method(
 #[cfg(test)]
 mod server_tests {
     use super::{
-        http_response, parse_request_line, serve_http, serve_http_with_read_timeout, Interp, ProgramDb, Value,
+        http_response, parse_content_length, parse_request_line, serve_http, serve_http_with_read_timeout, Interp,
+        ProgramDb, Value,
     };
     use std::io::{Read, Write};
     use std::net::TcpStream;
+
+    /// A REAL cross-engine divergence found+fixed (production-hardening
+    /// PR-it918, deferred at it902): `parse_content_length` used to split
+    /// strictly on `"\r\n"`, so a request whose header lines are separated
+    /// by a bare `\n` (still ending in the required literal `\r\n\r\n`
+    /// terminator overall) was treated as ONE single "line" with no
+    /// internal `\r\n` to split on -- `split_once(':')` then matched the
+    /// FIRST colon in the whole blob (the one in `Host:`, not
+    /// `Content-Length:`), silently missing the real header. Now split on
+    /// a bare `\n`, matching `cgen.rs`'s native `k_content_length`
+    /// (PR-it901) exactly. Also confirms the ORDINARY `\r\n`-terminated
+    /// case (the overwhelming common case) is completely unaffected --
+    /// a trailing `\r` left in the value half of an ordinary line is
+    /// already stripped by the pre-existing `.trim()` call.
+    #[test]
+    fn parse_content_length_finds_the_header_even_with_bare_lf_line_boundaries() {
+        let mixed = "POST /echo HTTP/1.1\nHost: x\nContent-Length: 11\n\r\n";
+        assert_eq!(parse_content_length(mixed), 11, "bare-LF header lines must still find Content-Length");
+
+        let ordinary = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\n";
+        assert_eq!(parse_content_length(ordinary), 11, "ordinary \\r\\n-terminated headers must be unaffected");
+
+        let none = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(parse_content_length(none), 0, "no Content-Length header still means no body");
+    }
 
     /// Send one GET and return the response body (everything after the headers).
     fn get_body(port: u16, path: &str) -> String {
