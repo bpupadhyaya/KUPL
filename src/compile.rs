@@ -797,29 +797,37 @@ impl<'s> FnCompiler<'s> {
                     }
                     return None;
                 }
-                // Production-hardening PR-it952 (survey #106): this arm's own
-                // message text used to be echoed by LANGUAGE-REFERENCE.md/
-                // DIAGNOSTICS.md as a documented "known intentional VM/native
-                // limit" -- but it is provably unreachable today. Every free
-                // variable an `ExprKind::Lambda` closes over is bound via
-                // `lc.bind_local(n)` before its body compiles (see the Lambda
-                // arm above), so `self.lookup(name)` always finds a captured
-                // name as a local and returns via the branch at line ~759,
-                // long before control reaches here -- confirmed live
-                // (`total += x` inside a closure over `var total` compiles
-                // clean with no K0803 on `kupl check`/`kupl run --vm`/`kupl
+                // Production-hardening PR-it952 (survey #106) traced this
+                // arm's OWN message text ("cannot assign to a lambda-
+                // captured variable") to a stale doc claim: it is provably
+                // unreachable today. Every free variable an `ExprKind::
+                // Lambda` closes over is bound via `lc.bind_local(n)` before
+                // its body compiles (see the Lambda arm above), so
+                // `self.lookup(name)` always finds a captured name as a
+                // local and returns via the branch at line ~759, long
+                // before control reaches here -- confirmed live (`total +=
+                // x` inside a closure over `var total` compiles clean with
+                // no diagnostic on `kupl check`/`kupl run --vm`/`kupl
                 // native`, matching the by-value, call-local capture
                 // semantics interp.rs's own PR-it76 comment already
                 // documents as deliberate and cross-engine-consistent).
-                // Retained as a defense-in-depth fallback (should the capture
-                // -binding mechanism above ever change) rather than removed,
-                // but the docs now describe the CURRENT behavior instead of
-                // this dead path; see this file's `Stmt::Assign` non-`Ident`
-                // sibling arm above for the K0803 case that IS still
-                // reachable in principle.
+                // Retained as a defense-in-depth fallback (should the
+                // capture-binding mechanism above ever change) rather than
+                // removed. Production-hardening PR-it953 gave this arm its
+                // OWN diagnostic code, K0802 (previously an unused gap in
+                // the K08xx range, confirmed via a full-codebase grep):
+                // this arm and the non-`Ident`-target sibling arm above
+                // (K0803, "unsupported assignment target on KVM") both used
+                // to share the SAME code for two genuinely unrelated
+                // messages, a real violation of DIAGNOSTICS.md's own stated
+                // "codes are never reused with a different meaning"
+                // invariant -- the SAME invariant PR-it670 previously fixed
+                // for K0008/K0010. Both arms remain provably unreachable in
+                // current practice; only the code-collision itself needed
+                // fixing, not the arms' own defense-in-depth existence.
                 self.err(
-                    "K0803",
-                    format!("cannot assign to `{name}` on KVM (captured variable)"),
+                    "K0802",
+                    format!("unknown assignment target `{name}` on KVM"),
                     *span,
                 );
                 None
