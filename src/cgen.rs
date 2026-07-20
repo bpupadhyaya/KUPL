@@ -755,6 +755,7 @@ const RUNTIME: &str = r#"/* KUPL native runtime v0 (generated — do not edit) *
 #include <arpa/inet.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 
 typedef struct KValue KValue;
 /* `cap` tracks allocated (not just used) slots in `items`, so a self-rebind
@@ -1749,6 +1750,23 @@ static void kb_puts(KBuf* b, const char* s) {
     kb_grow(b, n);
     memcpy(b->buf + b->len, s, n);
     b->len += n; b->buf[b->len] = 0;
+}
+static void kb_reset(KBuf* b) { b->len = 0; if (b->buf) b->buf[0] = 0; }
+/* Appends a printf-formatted message, growing `b` to fit -- unlike a fixed
+   stack buffer + snprintf, this never truncates. Measures the needed length
+   with a first vsnprintf(NULL, 0, ...) pass (a standard, portable C99 idiom),
+   then writes for real into the grown buffer. */
+static void kb_printf(KBuf* b, const char* fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) { va_end(ap2); return; }
+    kb_grow(b, (size_t)n);
+    vsnprintf(b->buf + b->len, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)n;
 }
 
 static void k_fmt_float(KBuf* b, double f) {
@@ -3998,7 +4016,35 @@ typedef struct { const char* name; const char* mock_key; const KAiShape* shape; 
 extern const KAiFun AI_FUNS[];
 
 static int k_ai_ok = 1;
-static char k_ai_err[256];
+/* A REAL cross-engine divergence found+fixed (production-hardening PR-it936):
+   this used to be a fixed `char[256]`, silently TRUNCATING any AI-shape-
+   mismatch/JSON-parse-error message longer than 255 bytes -- unlike ai.rs's
+   own unbounded Rust `String` equivalent (`format!("expected {}, model
+   returned {}", ...)`, ai.rs:396). Confirmed live via a mock response long
+   enough to overflow it: interp/vm report the full untruncated message,
+   native cut it off mid-content with NO indication of truncation. Worse than
+   a diagnostic-text-only divergence: a `wraps_result` (`-> Result[T, Str]`)
+   ai fun's shape-mismatch error becomes a genuine `Err(Str)` VALUE built
+   DIRECTLY from this buffer (`k_ai_call`'s `k_err(k_str(k_strdup(k_ai_err)))`
+   below, no panic involved) -- a KUPL program can pattern-match, compare, or
+   print that Err payload, so a truncated buffer is silent VALUE corruption,
+   not just truncated crash output. Confirmed live truncation can also land
+   mid-UTF-8-multibyte-character (a large model response padded with a
+   repeated multi-byte character): native's own UTF-8 validation catches the
+   resulting invalid tail and substitutes U+FFFD rather than corrupting
+   memory or crashing, but the STRING CONTENT still diverges from interp/vm's
+   full, valid text either way. Now a growable `KBuf` (same mechanism as
+   `k_show`'s own buffer), matching ai.rs's unbounded `String` exactly --
+   `k_ai_err` reads as a NUL-terminated `const char*` via the macro below;
+   every write site resets it (`kb_reset`) then appends via `kb_printf`
+   instead of `snprintf`-ing into a fixed buffer. This intentionally does
+   NOT touch `k_panic_buf`'s own separate, pre-existing, campaign-wide 1024-
+   byte cap (src/cgen.rs's general panic-message mechanism, shared by every
+   OTHER panic in the runtime, not just ai-fun ones) -- out of scope here;
+   the plain-panic (non-`wraps_result`) path below is still ultimately
+   bounded by that shared, unrelated mechanism, same as it always was. */
+static KBuf k_ai_err_buf;
+#define k_ai_err (k_ai_err_buf.buf ? k_ai_err_buf.buf : "")
 static const char* k_json_var(KValue j) { return j.tag == K_CTOR ? CTORS[j.as.ctor->ctor].variant : "?"; }
 static KValue k_json_field0(KValue j) { return j.as.ctor->fields[0]; }
 
@@ -4129,10 +4175,11 @@ static KValue k_ai_from_json(const KAiShape* s, KValue j) {
                 if (isfinite(n) && n == floor(n)
                     && n >= -9223372036854775808.0 && n < 9223372036854775808.0)
                     return k_int((int64_t)n);
+                kb_reset(&k_ai_err_buf);
                 if (isfinite(n) && n == floor(n))
-                    snprintf(k_ai_err, sizeof k_ai_err, "expected an integer, model returned %.0f", n);
+                    kb_printf(&k_ai_err_buf, "expected an integer, model returned %.0f", n);
                 else
-                    snprintf(k_ai_err, sizeof k_ai_err, "expected an integer, model returned a fraction");
+                    kb_puts(&k_ai_err_buf, "expected an integer, model returned a fraction");
                 k_ai_ok = 0; return k_unit();
             }
             break;
@@ -4160,7 +4207,7 @@ static KValue k_ai_from_json(const KAiShape* s, KValue j) {
                     int found = 0; KValue fj = k_unit();
                     for (int64_t k = 0; k < m->len; k++)
                         if (!strcmp(m->keys[k].as.s, s->fnames[i])) { fj = m->vals[k]; found = 1; break; }
-                    if (!found) { snprintf(k_ai_err, sizeof k_ai_err, "model response is missing field `%s`", s->fnames[i]); k_ai_ok = 0; return k_unit(); }
+                    if (!found) { kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "model response is missing field `%s`", s->fnames[i]); k_ai_ok = 0; return k_unit(); }
                     vals[i] = k_ai_from_json(s->fshapes[i], fj);
                     if (!k_ai_ok) return k_unit();
                 }
@@ -4181,7 +4228,8 @@ static KValue k_ai_from_json(const KAiShape* s, KValue j) {
        `shape_name`/`dump_json` exactly (see their own doc comments). */
     char* want = k_ai_shape_name(s);
     char* got = k_ai_dump_json(j);
-    snprintf(k_ai_err, sizeof k_ai_err, "expected %s, model returned %s", want, got);
+    kb_reset(&k_ai_err_buf);
+    kb_printf(&k_ai_err_buf, "expected %s, model returned %s", want, got);
     k_ai_ok = 0; return k_unit();
 }
 
@@ -4257,7 +4305,8 @@ static KValue k_ai_convert(const KAiShape* shape, const char* text) {
            NUL-byte-rejection pattern (k_url_decode, HTTP response bodies,
            command output, file reads). */
         if (memchr(text + a, 0, (size_t)n)) {
-            snprintf(k_ai_err, sizeof k_ai_err, "model response contains a NUL byte, not allowed in a KUPL Str (K0008)");
+            kb_reset(&k_ai_err_buf);
+            kb_puts(&k_ai_err_buf, "model response contains a NUL byte, not allowed in a KUPL Str (K0008)");
             k_ai_ok = 0; return k_unit();
         }
         char* c = (char*)k_alloc(n + 1); memcpy(c, text + a, n); c[n] = 0; return k_str(c);
@@ -4273,7 +4322,8 @@ static KValue k_ai_convert(const KAiShape* shape, const char* text) {
            the reason NOR the payload -- a real information loss, not just a
            wording difference). */
         const char* reason = k_json_field0(parsed).as.s;
-        snprintf(k_ai_err, sizeof k_ai_err, "model response is not valid JSON (%s): %s", reason, payload);
+        kb_reset(&k_ai_err_buf);
+        kb_printf(&k_ai_err_buf, "model response is not valid JSON (%s): %s", reason, payload);
         k_ai_ok = 0; return k_unit();
     }
     KValue json = k_json_field0(parsed);
@@ -4286,10 +4336,10 @@ static KValue k_ai_convert(const KAiShape* shape, const char* text) {
     KValue v = k_ai_from_json(shape, inner);
     if (k_ai_ok) return v;
     /* retry against the whole object (mirrors convert's or_else) */
-    char first[256]; snprintf(first, sizeof first, "%s", k_ai_err);
+    char* first = k_strdup(k_ai_err);
     k_ai_ok = 1;
     KValue v2 = k_ai_from_json(shape, json);
-    if (!k_ai_ok) snprintf(k_ai_err, sizeof k_ai_err, "%s", first);
+    if (!k_ai_ok) { kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, first); }
     return v2;
 }
 
@@ -4323,19 +4373,20 @@ static const char* k_ai_tool_name_of(KMap* m) {
 static int k_ai_call_one_tool(const KAiFun* f, KMap* m) {
     KValue tn;
     if (!k_map_field(m, "tool", &tn) || strcmp(k_json_var(tn), "JStr")) {
-        snprintf(k_ai_err, sizeof k_ai_err, "mock round must be `{\"tool\": ...}` or `{\"final\": ...}`");
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, "mock round must be `{\"tool\": ...}` or `{\"final\": ...}`");
         k_ai_ok = 0; return 0;
     }
     const char* name = tn.as.ctor->fields[0].as.s;
     const KAiTool* t = 0;
     for (int k = 0; k < f->ntools; k++) if (!strcmp(f->tools[k].name, name)) { t = &f->tools[k]; break; }
-    if (!t) { snprintf(k_ai_err, sizeof k_ai_err, "model called unknown tool `%s`", name); k_ai_ok = 0; return 0; }
+    if (!t) { kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "model called unknown tool `%s`", name); k_ai_ok = 0; return 0; }
     KValue input; int has_input = k_map_field(m, "input", &input);
     KMap* im = (has_input && !strcmp(k_json_var(input), "JObj")) ? k_json_field0(input).as.map : 0;
     KValue* targs = (KValue*)k_alloc(sizeof(KValue) * (t->nparams < 1 ? 1 : t->nparams));
     for (int p = 0; p < t->nparams; p++) {
         KValue pj;
-        if (!im || !k_map_field(im, t->pnames[p], &pj)) { snprintf(k_ai_err, sizeof k_ai_err, "tool `%s` is missing argument `%s`", name, t->pnames[p]); k_ai_ok = 0; return 0; }
+        if (!im || !k_map_field(im, t->pnames[p], &pj)) { kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "tool `%s` is missing argument `%s`", name, t->pnames[p]); k_ai_ok = 0; return 0; }
         targs[p] = k_ai_from_json(t->pshapes[p], pj);
         if (!k_ai_ok) return 0;
     }
@@ -4367,7 +4418,8 @@ static int k_ai_call_one_tool(const KAiFun* f, KMap* m) {
         k_pad = prev_pad;
     } else {
         k_pad = prev_pad; k_cur_inst = saved_cur_inst; k_depth = saved_depth;
-        snprintf(k_ai_err, sizeof k_ai_err, "%s", k_panic_buf);
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, k_panic_buf);
         k_ai_ok = 0;
         return 0;
     }
@@ -4407,7 +4459,7 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
             long limit = rounds->len < 8 ? (long)rounds->len : 8;
             for (long i = 0; i < limit; i++) {
                 KValue r = rounds->items[i];
-                if (strcmp(k_json_var(r), "JObj")) { snprintf(k_ai_err, sizeof k_ai_err, "mock round must be `{\"tool\": ...}` or `{\"final\": ...}`"); k_ai_ok = 0; return k_unit(); }
+                if (strcmp(k_json_var(r), "JObj")) { kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "mock round must be `{\"tool\": ...}` or `{\"final\": ...}`"); k_ai_ok = 0; return k_unit(); }
                 KMap* m = k_json_field0(r).as.map;
                 KValue fin;
                 if (k_map_field(m, "final", &fin)) {
@@ -4437,13 +4489,15 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                        error mismatch -- native swallowed a genuine protocol
                        violation and returned an unrelated round's answer). */
                     if (items->len == 0) {
-                        snprintf(k_ai_err, sizeof k_ai_err, "provider asked to use zero tools");
+                        kb_reset(&k_ai_err_buf);
+                        kb_puts(&k_ai_err_buf, "provider asked to use zero tools");
                         k_ai_ok = 0; return k_unit();
                     }
                     for (long ti = 0; ti < items->len; ti++) {
                         KValue item = items->items[ti];
                         if (strcmp(k_json_var(item), "JObj")) {
-                            snprintf(k_ai_err, sizeof k_ai_err, "mock round: each entry in `tools` must have a `tool` name");
+                            kb_reset(&k_ai_err_buf);
+                            kb_puts(&k_ai_err_buf, "mock round: each entry in `tools` must have a `tool` name");
                             k_ai_ok = 0; return k_unit();
                         }
                         if (!k_ai_call_one_tool(f, k_json_field0(item).as.map)) {
@@ -4466,8 +4520,9 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                                     int n = snprintf(names + off, sizeof(names) - off, "%s%s", pj ? ", " : "", pname);
                                     if (n > 0) off += (size_t)n;
                                 }
-                                char orig[256]; snprintf(orig, sizeof orig, "%s", k_ai_err);
-                                snprintf(k_ai_err, sizeof k_ai_err,
+                                char* orig = k_strdup(k_ai_err);
+                                kb_reset(&k_ai_err_buf);
+                                kb_printf(&k_ai_err_buf,
                                          "%s (this tool failed after %ld other tool call(s) in the same round already ran: %s)",
                                          orig, ti, names);
                             }
@@ -4482,8 +4537,9 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                 /* Match the interpreter/KVM: a script of >= 8 rounds is stopped by the
                    MAX_TOOL_ROUNDS cap (the loop ran the full limit), while a shorter one
                    genuinely exhausts the scripted rounds. */
-                if (rounds->len >= 8) snprintf(k_ai_err, sizeof k_ai_err, "tool loop exceeded 8 rounds without a final answer");
-                else snprintf(k_ai_err, sizeof k_ai_err, "mock provider ran out of scripted rounds");
+                kb_reset(&k_ai_err_buf);
+                if (rounds->len >= 8) kb_puts(&k_ai_err_buf, "tool loop exceeded 8 rounds without a final answer");
+                else kb_puts(&k_ai_err_buf, "mock provider ran out of scripted rounds");
                 k_ai_ok = 0; return k_unit();
             }
         }
@@ -4511,10 +4567,14 @@ static KValue k_ai_call(int info) {
        k_panic(b) triggers the CALLER's tool_pad setjmp handler, which
        stores the raw panic text into k_ai_err unwrapped, then THAT level's
        OWN k_ai_call wraps it again with ITS name) -- so the message
-       accumulated one "ai `name`: " prefix per recursion level here too,
-       just bounded (truncated, not unbounded) by k_ai_err/b's fixed
-       buffer sizes rather than growing to interp/vm's pre-fix ~65KB.
-       Confirmed live: interp/vm (post-fix) report the single-wrapped
+       accumulated one "ai `name`: " prefix per recursion level here too --
+       at the time of this fix, bounded (truncated, not unbounded) by
+       k_ai_err/b's then-fixed buffer sizes rather than growing to
+       interp/vm's pre-fix ~65KB (k_ai_err/b later became dynamically
+       growable at PR-it936, but the skip-re-wrap check below is what
+       ACTUALLY prevents the accumulation -- still needed independent of
+       buffer size, since interp/vm's OWN fix is the identical skip, not a
+       size bound). Confirmed live: interp/vm (post-fix) report the single-wrapped
        "ai `call_a`: stack overflow (10000 frames)", but native reported a
        276-byte message of ~20 repeated "ai `call_a`: " prefixes before
        truncating -- a real cross-engine byte-identity divergence this fix
@@ -4523,7 +4583,7 @@ static KValue k_ai_call(int info) {
        prefix unambiguously means "already wrapped by a deeper k_ai_call
        frame" -- skip re-wrapping in that case. */
     if (!strncmp(k_ai_err, "ai `", 4)) { k_panic(k_ai_err); return k_unit(); }
-    char b[320]; snprintf(b, sizeof b, "ai `%s`: %s", f->name, k_ai_err); k_panic(b); return k_unit();
+    KBuf wrapped = {0}; kb_printf(&wrapped, "ai `%s`: %s", f->name, k_ai_err); k_panic(wrapped.buf); return k_unit();
 }
 
 /* ---- regex (mirrors src/regex.rs, which matches over Unicode scalars via
@@ -8605,9 +8665,12 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
     /// call chain re-enters `k_ai_call` at every nested level on the way
     /// back up the unwind, and (before this fix) each level's OWN
     /// `k_ai_call` re-wrapped the SAME error with another `"ai \`name\`: "`
-    /// prefix -- bounded/truncated by `k_ai_err`/`b`'s fixed buffer sizes
-    /// (unlike interp/vm's unbounded Rust `String`, which grew to ~65KB
-    /// before the SAME sibling bug was fixed there), but still a genuine
+    /// prefix -- at the time of this fix, bounded/truncated by `k_ai_err`/
+    /// `b`'s then-fixed buffer sizes (unlike interp/vm's unbounded Rust
+    /// `String`, which grew to ~65KB before the SAME sibling bug was fixed
+    /// there; `k_ai_err`/`b` later became dynamically growable too, at
+    /// PR-it936, but the skip-re-wrap fix below is what actually prevents
+    /// the accumulation, independent of buffer size), but still a genuine
     /// cross-engine byte-identity divergence: interp/vm (post-fix) report
     /// the single-wrapped `"ai \`call_a\`: stack overflow (10000 frames)"`,
     /// but native (pre-fix) reported a ~276-byte message of roughly 20
@@ -8649,6 +8712,102 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             stderr.trim(),
             "panic: ai `call_a7`: stack overflow (10000 frames)",
             "native must match interp/vm's SINGLE-wrapped message, not one prefix per recursion level: {stderr:?}"
+        );
+    }
+
+    /// A REAL cross-engine divergence found+fixed (production-hardening
+    /// PR-it936): `k_ai_err` -- the buffer `k_ai_convert`/`k_ai_from_json`
+    /// build every AI-shape-mismatch/JSON-parse-error message into -- used
+    /// to be a fixed `char[256]`, silently TRUNCATING any message longer
+    /// than 255 bytes, unlike ai.rs's own unbounded Rust `String`
+    /// (`format!("expected {}, model returned {}", ...)`, ai.rs:396).
+    /// Confirmed live via a 391-byte JSON-array mock response on a plain
+    /// (non-`wraps_result`) `ai fun`: interp/vm panicked with the FULL
+    /// message, native cut it off mid-number with no indication of
+    /// truncation. Now a growable `KBuf`, matching ai.rs exactly.
+    #[test]
+    fn native_ai_fun_panic_message_is_not_truncated_by_a_fixed_size_buffer() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun classify(text: Str) -> Int {\n    intent \"x\"\n}\n\
+                   fun main() uses io {\n    print(classify(\"x\"))\n}\n";
+        // A JSON array long enough to overflow the OLD 256-byte fixed buffer
+        // once echoed back inside "expected Int, model returned " -- the
+        // WHOLE array, including its final element, must survive intact.
+        let items: Vec<String> = (0..100).map(|i| i.to_string()).collect();
+        let mock = format!("[{}]", items.join(","));
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aitrunc-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_CLASSIFY", &mock)
+            .output()
+            .expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("expected Int, model returned {mock}")),
+            "the FULL untruncated mock response must appear in the panic message, \
+             not cut off mid-content (the old 256-byte k_ai_err buffer used to \
+             truncate this): {stderr:?}"
+        );
+    }
+
+    /// A REAL cross-engine divergence found+fixed (production-hardening
+    /// PR-it936, the SAME fixed-buffer-truncation bug as the sibling test
+    /// above, but reached through the `wraps_result` (`-> Result[T, Str]`)
+    /// path instead of a panic): `k_ai_call`'s
+    /// `k_err(k_str(k_strdup(k_ai_err)))` built a genuine `Err(Str)` VALUE
+    /// directly from the (formerly fixed-size) buffer -- a KUPL program can
+    /// pattern-match/print/compare that value, so truncation there was
+    /// silent VALUE corruption, not just truncated crash output. Also
+    /// confirmed live that truncation could land mid-UTF-8-multibyte-
+    /// character (a large response padded with a repeated multi-byte
+    /// character): native's own UTF-8 validation substituted U+FFFD rather
+    /// than crashing or corrupting memory, but the STRING CONTENT still
+    /// diverged from interp/vm's full, valid text either way. Now
+    /// byte-identical to interp/vm (the exact char count -- 3 chars/euro
+    /// sign literal, wrapped in a 3-char JSON `["..."]` envelope, times 300
+    /// repetitions, plus the "expected Int, model returned " prefix --
+    /// pins the full content, not just "didn't crash").
+    #[test]
+    fn native_ai_fun_result_err_value_is_not_truncated_or_utf8_corrupted() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun classify(text: Str) -> Result[Int, Str] {\n    intent \"x\"\n}\n\
+                   fun main() uses io {\n    \
+                   match classify(\"x\") {\n        \
+                   Ok(v) => print(\"ok\")\n        \
+                   Err(e) => print(\"{e.len()}|{e}\")\n    \
+                   }\n}\n";
+        // 300 repeated 3-byte UTF-8 characters ('€', U+20AC) inside a JSON
+        // string -- long enough that the old 256-byte buffer's truncation
+        // point landed mid-character for the overwhelming majority of
+        // possible prefix lengths (confirmed live: it did).
+        let euro_run = "\u{20AC}".repeat(300);
+        let mock = format!("[\"{euro_run}\"]");
+        let expected_msg = format!("expected Int, model returned {mock}");
+        let expected_len = expected_msg.chars().count();
+        let out = native_main_stdout_env(src, "aireserr", &[("KUPL_AI_MOCK_CLASSIFY", &mock)]);
+        assert_eq!(
+            out.trim(),
+            format!("{expected_len}|{expected_msg}"),
+            "the Err(Str) VALUE must carry the FULL, byte-identical, valid-UTF-8 \
+             message -- not truncated, and not corrupted with a mid-character U+FFFD \
+             replacement (both observed with the old fixed-size k_ai_err buffer)"
         );
     }
 
