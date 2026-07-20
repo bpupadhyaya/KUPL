@@ -650,8 +650,42 @@ fn fun_sig_str(f: &crate::ast::FunDecl) -> String {
     } else {
         format!(" uses {}", f.effects.join(", "))
     };
+    // Production-hardening PR-it958: a systematic field-by-field parity
+    // check against `fmt.rs::fmt_fun` (prompted by the SAME bug shape
+    // biting twice already, PR-it675/it957) found another silently-dropped
+    // field: `AiDecl.tools`. Live-confirmed BEFORE this fix: hovering `ai
+    // fun summarize(...) tools [helper]` showed `ai fun summarize(...)`,
+    // no `tools [...]` -- despite `fmt.rs` rendering it as part of the
+    // single-line declaration header, BEFORE the body's opening brace,
+    // structurally distinct from `intent`/`model`, which `fmt.rs` renders
+    // INSIDE the body block and which hover deliberately does NOT show for
+    // the same reason it doesn't show an ordinary function's body.
+    //
+    // The SAME sweep also found `FunDecl.is_pub` looks dropped the same
+    // way, but is NOT a fix candidate here: `is_pub` is genuinely
+    // OVERLOADED -- `parser.rs`'s `Tok::KwExpose` arm parses an exposed
+    // component method via `self.parse_fun(true)`, forcing `is_pub: true`
+    // regardless of the SURFACE syntax (`expose fun`, never `pub fun`).
+    // `fmt.rs::fmt_component` knows this and explicitly zeroes `is_pub` on
+    // a CLONE before rendering an exposed method, with its own comment
+    // "exposes are implicitly public -- never print `pub`", then prepends
+    // a literal `expose ` prefix instead. `fun_sig_str` has no equivalent
+    // "which list did this come from" context (many call sites chain
+    // `c.exposes.iter().chain(&c.funs)` together deliberately, for lookup
+    // purposes), so naively rendering `pub ` whenever `is_pub` is true
+    // would show WRONG, actively misleading text for every exposed
+    // component method (`pub fun greet` for source that says `expose fun
+    // greet`) -- confirmed by a pre-existing test regressing exactly this
+    // way when first attempted. Deferring a correct fix (threading
+    // exposed-vs-private context through every `fun_sig_str` call site) as
+    // a separate, more carefully-scoped future iteration rather than
+    // risking a wrong-in-a-different-way fix under this one.
     let kw = if f.ai.is_some() { "ai fun" } else { "fun" };
-    format!("{kw} {}{tp}({}){ret}{eff}", f.name, params.join(", "))
+    let tools = match &f.ai {
+        Some(ai) if !ai.tools.is_empty() => format!(" tools [{}]", ai.tools.join(", ")),
+        _ => String::new(),
+    };
+    format!("{kw} {}{tp}({}){ret}{eff}{tools}", f.name, params.join(", "))
 }
 
 /// Render a contract's body-less method signature (`expose fun name(params) ->
@@ -4655,6 +4689,64 @@ mod tests {
             h4.contains("type Pair[A, B] = Pair(first: A, second: B)"),
             "hover on multi-param generic type: {h4}"
         );
+    }
+
+    /// A REAL, LIVE-CONFIRMED instance of the SAME "fmt.rs renders it,
+    /// lsp.rs's renderer silently drops it" bug shape as PR-it675/it957
+    /// (production-hardening PR-it958, found via a systematic field-by-
+    /// field parity check against `fmt.rs::fmt_fun` prompted by the shape
+    /// biting twice already): `AiDecl.tools` was silently dropped from
+    /// `fun_sig_str`, even though `fmt.rs` renders it as part of a
+    /// function's single-line declaration header, BEFORE the body's
+    /// opening brace -- structurally distinct from `intent`/`model`, which
+    /// `fmt.rs` renders INSIDE the body block and which hover deliberately
+    /// does NOT show, for the same reason it doesn't show an ordinary
+    /// function's body. Live-confirmed BEFORE this fix: hovering `ai fun
+    /// summarize(...) tools [helper]` showed `ai fun summarize(...)`, no
+    /// `tools [...]`.
+    #[test]
+    fn hover_shows_an_ai_funs_tools_list() {
+        let src = "ai fun summarize(text: Str) -> Str tools [helper] {\n    \
+                   intent \"Summarize {text}\"\n}\nfun helper(x: Str) -> Str { x }\n";
+        let line = src.lines().position(|l| l.starts_with("ai fun summarize")).unwrap();
+        let ch = src.lines().nth(line).unwrap().find("summarize").unwrap() + 1;
+        let h = resolve_hover(src, line, ch).expect("hover on ai fun summarize");
+        assert!(
+            h.contains("ai fun summarize(text: Str) -> Str tools [helper]"),
+            "hover on an ai fun must show its `tools [...]` list: {h}"
+        );
+
+        // an `ai fun` with NO `tools` clause must render unchanged (no
+        // spurious trailing ` tools []`).
+        let src2 = "ai fun greet(text: Str) -> Str {\n    intent \"Greet {text}\"\n}\n";
+        let h2 = resolve_hover(src2, 0, 7).expect("hover on ai fun greet");
+        assert!(h2.contains("ai fun greet(text: Str) -> Str"), "{h2}");
+        assert!(!h2.contains("tools"), "must not show an empty tools list: {h2}");
+    }
+
+    /// The deferred half of the SAME PR-it958 field-by-field parity sweep
+    /// above: `FunDecl.is_pub` looks equally "silently dropped" from
+    /// `fun_sig_str`, but is genuinely NOT a fix candidate -- `is_pub` is
+    /// OVERLOADED. `parser.rs`'s `Tok::KwExpose` arm parses an exposed
+    /// component method via `self.parse_fun(true)`, forcing `is_pub: true`
+    /// regardless of surface syntax (`expose fun`, never `pub fun`).
+    /// `fmt.rs::fmt_component` already knows this (see its own "exposes are
+    /// implicitly public -- never print `pub`" comment) and zeroes
+    /// `is_pub` on a clone before rendering, prepending a literal `expose `
+    /// prefix instead. This test locks in the CURRENT, CORRECT boundary
+    /// (hover on an exposed method shows `expose fun`, not `pub fun`) as a
+    /// permanent regression test, so a future attempt at this exact fix
+    /// starts from a verified baseline instead of re-discovering the
+    /// footgun from scratch.
+    #[test]
+    fn hover_on_an_exposed_component_method_shows_expose_not_pub() {
+        let src = "component Store {\n    intent \"s\"\n    \
+                   expose fun get(k: Str) -> Int {\n        1\n    }\n}\n";
+        let line = src.lines().position(|l| l.contains("expose fun get")).unwrap();
+        let ch = src.lines().nth(line).unwrap().find("get").unwrap() + 1;
+        let h = resolve_hover(src, line, ch).expect("hover on Store.get");
+        assert!(!h.contains("pub fun"), "an exposed method must never show `pub fun`: {h}");
+        assert!(h.contains("fun get(k: Str) -> Int"), "{h}");
     }
 
     #[test]
