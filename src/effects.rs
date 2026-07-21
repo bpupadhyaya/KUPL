@@ -818,7 +818,37 @@ fn collect_expr(
     // accident is fragile, and effects.rs's OWN classification for this
     // shape was simply wrong regardless of what currently happens to
     // absorb the consequence.
-    if is_plain_call && fn_typed_params.contains(name) {
+    // A REAL, live-confirmed HIGH-severity soundness hole found+fixed
+    // (production-hardening PR-it993, an Explore survey finding): this used
+    // to require `is_plain_call` too -- so a function-typed parameter
+    // referenced ONLY as a bare VALUE (forwarded to another call, e.g.
+    // `xs.map(f)` or `helper(f)`, rather than invoked directly as `f()`)
+    // never matched here at all. Unlike an ordinary bare-Ident reference to
+    // a REAL function name (the `is_plain_call`-independent it569 heuristic
+    // just above, which only fires when the referenced NAME happens to
+    // collide with a genuine `funs` entry), a reference to one of THIS
+    // function's own declared function-typed PARAMETERS can NEVER collide
+    // with a real function this way -- its value is whatever the CALLER
+    // happened to pass, unknowable here regardless of how it's used -- so
+    // requiring `is_plain_call` bought no safety, it just left every
+    // forwarding shape silently unclassified. Live-confirmed BEFORE this
+    // fix, via a full three-function call chain with NO `uses` declaration
+    // anywhere except the actual `print`-calling leaf: `fun noisy(x: Int)
+    // uses io -> Int { print("{x}") x } pub fun bridge1(xs: List[Int], f:
+    // fn(Int) -> Int) -> List[Int] { bridge2(xs, f) } fun bridge2(xs:
+    // List[Int], f: fn(Int) -> Int) -> List[Int] { xs.map(f) } fun main() {
+    // bridge1([1, 2, 3], noisy) }` -- `kupl check` reported "ok" (zero
+    // diagnostics, not even the K0303 warning) and `kupl run` printed
+    // `1`/`2`/`3`, genuinely executing undeclared `io` all the way up to
+    // `main` itself. Fixed by dropping the `is_plain_call` requirement: ANY
+    // reference to an enclosing function-typed parameter -- called directly
+    // OR merely passed along as a value -- is equally a "laundering risk"
+    // this pass cannot verify, matching K0303's own message ("calls a value
+    // of function type -- its effects cannot be verified"), which already
+    // reads correctly for the forwarding case too (a function that hands an
+    // unverifiable callback to something else still cannot have its own
+    // effects verified).
+    if fn_typed_params.contains(name) {
         *unresolved = true;
         *plain_call_unresolved = true;
         return;
@@ -1675,6 +1705,58 @@ mod tests {
         assert!(
             !private_hof.iter().any(|d| d.code == "K0303"),
             "a private function calling its own function-typed parameter must not warn K0303: {private_hof:?}"
+        );
+    }
+
+    #[test]
+    fn forwarding_a_function_typed_parameter_as_a_value_warns_k0303_not_just_calling_it_directly() {
+        // A REAL, live-confirmed HIGH-severity soundness hole found+fixed
+        // (production-hardening PR-it993, an Explore survey finding, ONE
+        // HOP past PR-it750's own fix above): that fix only ever matched a
+        // function-typed parameter used as a PLAIN CALL's OWN callee
+        // (`f()`) -- a parameter merely PASSED as a value to something else
+        // (`xs.map(f)`, or forwarded into another function's own parameter,
+        // `helper(f)`) was invisible to `collect_expr` entirely, not even
+        // triggering the file's OWN "bare Ident reference" over-attribution
+        // heuristic (which only fires when the referenced NAME happens to
+        // collide with a REAL function -- a parameter's value is whatever
+        // the CALLER passed, so its own name can never collide that way).
+        // Confirmed live BEFORE this fix, via a full THREE-FUNCTION call
+        // chain with `uses io` declared ONLY on the actual `print`-calling
+        // leaf: `fun noisy(x: Int) uses io -> Int { print("{x}") x } pub
+        // fun bridge1(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+        // bridge2(xs, f) } fun bridge2(xs: List[Int], f: fn(Int) -> Int) ->
+        // List[Int] { xs.map(f) } fun main() { bridge1([1, 2, 3], noisy) }`
+        // -- `kupl check` reported "ok" (ZERO diagnostics, not even K0303)
+        // and `kupl run` genuinely printed `1`/`2`/`3`, executing undeclared
+        // `io` all the way up through `bridge1` to `main` itself with no
+        // signal anywhere in the compile.
+        let forwarded_to_method_call = diags_for(
+            "pub fun run_with(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {\n    xs.map(f)\n}\n",
+        );
+        assert!(
+            forwarded_to_method_call.iter().any(|d| d.code == "K0303"),
+            "a function-typed parameter forwarded to .map() must warn K0303, not compile silently: \
+             {forwarded_to_method_call:?}"
+        );
+        let forwarded_to_another_fun = diags_for(
+            "fun helper(f: fn() -> Int) -> Int {\n    f()\n}\n\
+             pub fun outer(f: fn() -> Int) -> Int {\n    helper(f)\n}\n",
+        );
+        assert!(
+            forwarded_to_another_fun.iter().any(|d| d.code == "K0303" && d.message.contains("outer")),
+            "a function-typed parameter forwarded to another function must warn K0303 on the \
+             FORWARDING function, not compile silently: {forwarded_to_another_fun:?}"
+        );
+        // The genuinely pure control case (no function-typed parameter
+        // involved at all) must stay completely clean -- this fix must not
+        // become an over-broad "any List[T] method warns" regression.
+        let genuinely_pure = diags_for(
+            "pub fun double_all(xs: List[Int]) -> List[Int] {\n    xs.map(fn(x) { x * 2 })\n}\n",
+        );
+        assert!(
+            !genuinely_pure.iter().any(|d| d.code == "K0303"),
+            "a plain lambda with no function-typed PARAMETER forwarding must not warn K0303: {genuinely_pure:?}"
         );
     }
 
