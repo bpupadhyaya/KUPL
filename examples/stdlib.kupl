@@ -46,6 +46,12 @@ fun main() {
     print("unique     = {dups.unique()}")
     print("product    = {[1, 2, 3, 4].product()}")
 
+    // rotate_left/rotate_right shift the whole List circularly (not a sort) —
+    // a negative shift rotates the other way, so rotate_left(-n) == rotate_right(n).
+    let seq = [1, 2, 3, 4, 5]
+    print("rotate_left  = {seq.rotate_left(2)}")
+    print("rotate_right = {seq.rotate_right(2)}")
+
     // rfind / replace_first / split_once
     let path = "a.b.c.d"
     print("rfind      = {path.rfind(".")}")
@@ -61,6 +67,8 @@ fun main() {
     expect "g".parse_radix(16) == None
     expect dups.unique() == [3, 1, 2, 4]
     expect [1, 2, 3, 4].product() == 24
+    expect seq.rotate_left(2) == [3, 4, 5, 1, 2]
+    expect seq.rotate_left(-1) == seq.rotate_right(1)
 
     print("all stdlib expectations hold")
 }
