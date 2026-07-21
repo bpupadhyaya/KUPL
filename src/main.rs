@@ -451,6 +451,26 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
             eprintln!("error: -o requires a value");
             return 2;
         }
+        // A REAL, LIVE-CONFIRMED silent-wrong-behavior bug found+fixed
+        // (production-hardening PR-it999, the SECOND finding from the same
+        // main.rs CLI-dispatch survey that produced PR-it998's kx-fast-path
+        // fix): `args.iter().position(...)` always returns the FIRST `-o`
+        // occurrence -- a REPEATED `-o` was silently discarded with ZERO
+        // diagnostic. Live-confirmed BEFORE this fix: `kupl build foo.kupl
+        // -o first.kx -o second.kx` silently produced ONLY `first.kx`,
+        // `second.kx` never created, exit 0, no error or warning anywhere.
+        // Rejected cleanly instead, matching this file's OWN established
+        // convention of rejecting ambiguous/duplicate input rather than
+        // silently picking one (e.g. `fmt`'s `--write`+`--check` rejection,
+        // `find_path_arg`'s single-positional-path enforcement, PR-it864's
+        // extra-positional-argument rejection) -- `args[i + 2..]` (past the
+        // first `-o` AND its already-consumed value) is always a valid
+        // slice here since `args.get(i + 1)` was just confirmed `Some`
+        // above, so `i + 2 <= args.len()`.
+        if args[i + 2..].iter().any(|a| a == "-o") {
+            eprintln!("error: -o specified more than once");
+            return 2;
+        }
     }
     let out = o_pos
         .and_then(|i| args.get(i + 1))
@@ -1224,6 +1244,50 @@ mod tests {
         let code3 = build_module(&[p.clone()], &p, false);
         assert_eq!(code3, 0, "omitting -o entirely must still default normally");
         assert!(default_out.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-wrong-behavior bug found+fixed
+    /// (production-hardening PR-it999, the SECOND finding from the same
+    /// main.rs CLI-dispatch survey that produced PR-it998's kx-fast-path
+    /// fix): `args.iter().position(...)` always returns the FIRST `-o`
+    /// occurrence -- a REPEATED `-o` was silently discarded with ZERO
+    /// diagnostic. Live-confirmed BEFORE this fix: `kupl build foo.kupl -o
+    /// first.kx -o second.kx` silently produced ONLY `first.kx`, exit 0,
+    /// `second.kx` never created, no error/warning anywhere. Rejected
+    /// cleanly instead, matching this file's own established convention of
+    /// rejecting ambiguous/duplicate input rather than silently picking
+    /// one. The IDENTICAL shape also existed in `run::native`'s own `-o`
+    /// extraction, fixed together.
+    #[test]
+    fn a_repeated_o_flag_is_a_clean_error_not_a_silent_first_occurrence_win() {
+        let dir = std::env::temp_dir().join(format!("kupl-dup-oflag-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+        let source = dir.join("foo.kupl");
+        std::fs::write(&source, src).unwrap();
+        let p = source.to_str().unwrap().to_string();
+
+        let first = dir.join("first.kx");
+        let second = dir.join("second.kx");
+        let args = vec![
+            "build".to_string(),
+            p.clone(),
+            "-o".to_string(),
+            first.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            second.to_str().unwrap().to_string(),
+        ];
+        let code = build_module(&args, &p, false);
+        assert_eq!(code, 2, "a repeated -o must be a clean usage error");
+        assert!(!first.exists(), "neither -o value must be silently used");
+        assert!(!second.exists(), "neither -o value must be silently used");
+
+        // sanity: a single `-o <value>` still works normally (no regression).
+        let args2 = vec!["build".to_string(), p.clone(), "-o".to_string(), first.to_str().unwrap().to_string()];
+        let code2 = build_module(&args2, &p, false);
+        assert_eq!(code2, 0, "a single -o value must still work");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

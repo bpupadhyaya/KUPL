@@ -1095,6 +1095,17 @@ pub fn native(path: &str, args: &[String]) -> i32 {
             eprintln!("error: -o requires a value");
             return 2;
         }
+        // A REAL, LIVE-CONFIRMED silent-wrong-behavior bug found+fixed
+        // (production-hardening PR-it999): the sibling site to
+        // `main.rs::build_module`'s identical fix (see that site's own
+        // doc comment for the full writeup) -- `position(...)` always
+        // returns the FIRST `-o`, silently discarding a repeated one with
+        // zero diagnostic. `args[i + 2..]` is always a valid slice here
+        // since `args.get(i + 1)` was just confirmed `Some` above.
+        if args[i + 2..].iter().any(|a| a == "-o") {
+            eprintln!("error: -o specified more than once");
+            return 2;
+        }
     }
     let out = o_pos
         .and_then(|i| args.get(i + 1))
@@ -1621,6 +1632,39 @@ mod tests {
             "PRE-EXISTING-DATA",
             "the default output path must NOT be silently overwritten"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-wrong-behavior bug found+fixed
+    /// (production-hardening PR-it999, the sibling site to
+    /// `main.rs::build_module`'s identical fix -- see that site's own doc
+    /// comment for the full writeup): `position(...)` always returns the
+    /// FIRST `-o`, silently discarding a repeated one with zero diagnostic.
+    /// Live-confirmed BEFORE this fix: `kupl native foo.kupl -o first -o
+    /// second` silently produced ONLY `first`, exit 0, `second` never
+    /// created.
+    #[test]
+    fn a_repeated_o_flag_is_a_clean_error_not_a_silent_first_occurrence_win() {
+        let dir = std::env::temp_dir().join(format!("kupl-native-dup-oflag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+        let source = dir.join("foo.kupl");
+        std::fs::write(&source, src).unwrap();
+        let p = source.to_str().unwrap().to_string();
+
+        let first = dir.join("first");
+        let second = dir.join("second");
+        let args = vec![
+            "-o".to_string(),
+            first.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            second.to_str().unwrap().to_string(),
+        ];
+        let code = super::native(&p, &args);
+        assert_eq!(code, 2, "a repeated -o must be a clean usage error");
+        assert!(!first.exists(), "neither -o value must be silently used");
+        assert!(!second.exists(), "neither -o value must be silently used");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
