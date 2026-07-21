@@ -2058,7 +2058,26 @@ impl Checker {
                             if *op != AssignOp::Set {
                                 let rt = self.uni.apply(&ty);
                                 let rt = self.default_numeric(rt);
-                                if !rt.is_numeric() {
+                                // A REAL, live-confirmed FALSE REJECTION found+fixed
+                                // (production-hardening PR-it996, found by the SAME
+                                // check.rs Explore survey as PR-it994/PR-it995): `+=`
+                                // on a `Str` variable was wrongly rejected here even
+                                // though it's valid, executable code -- `interp.rs`
+                                // desugars `AssignOp::Add` into the exact same
+                                // `BinOp::Add` an ordinary `s = s + "b"` uses (and
+                                // `compile.rs` desugars it into the same `Op::Add`
+                                // used for KVM/native), and `Str + Str` concatenation
+                                // is already legal there. Live-confirmed before this
+                                // fix: `s += "b"` on `var s: Str` failed `kupl check`
+                                // with this exact K0222, while the plain equivalent
+                                // `s = s + "b"` compiled and ran cleanly (printing the
+                                // correct concatenation) on ALL THREE runnable
+                                // engines (interp/KVM/native). `-=`/`*=`/`/=` have NO
+                                // such `Str`-supporting desugar target and stay
+                                // rejected -- this narrowly exempts ONLY the
+                                // `Str`+`Add` combination, not `Str` from the whole
+                                // check.
+                                if !rt.is_numeric() && !(rt == Ty::Str && *op == AssignOp::Add) {
                                     self.err("K0222", format!("`{}=` needs a numeric variable, `{name}` is {rt}", op_sym(*op)), *span);
                                 }
                             }
@@ -5384,6 +5403,33 @@ mod generic_tests {
         assert!(on_let.iter().any(|d| d.code == "K0221" && d.message.contains(fix)), "let: {on_let:?}");
         // Valid `var` reassignment (including `+=`) still type-checks.
         assert!(errors("fun main() { var x = 5\n    x = 6\n    x += 10 }\n").is_empty());
+    }
+
+    /// A REAL, live-confirmed FALSE REJECTION found+fixed (production-
+    /// hardening PR-it996, found by the SAME check.rs Explore survey as
+    /// PR-it994/PR-it995): `+=` on a `Str` variable was wrongly rejected --
+    /// `interp.rs` desugars `AssignOp::Add` into the exact same `BinOp::Add`
+    /// an ordinary `s = s + "b"` uses (and `compile.rs` desugars it into the
+    /// same `Op::Add` used for KVM/native), and `Str + Str` concatenation is
+    /// already legal there, so this was purely an over-strict checker gate,
+    /// not an unsound one. `-=`/`*=`/`/=` have no such `Str`-supporting
+    /// desugar target and stay rejected -- only `Str`+`Add` is exempted.
+    #[test]
+    fn str_plus_equals_is_accepted_other_compound_ops_on_str_still_rejected() {
+        assert!(errors("fun main() { var s: Str = \"a\"\n    s += \"b\" }\n").is_empty());
+        for op in ["-=", "*=", "/="] {
+            let e = errors(&format!("fun main() {{ var s: Str = \"a\"\n    s {op} \"b\" }}\n"));
+            assert!(
+                e.iter().any(|d| d.code == "K0222" && d.message.contains("is Str")),
+                "{op}: {e:?}"
+            );
+        }
+        // Non-numeric, non-Str types (e.g. Bool) are still rejected for `+=` too --
+        // this fix narrowly exempts ONLY `Str`+`Add`, not every non-numeric type.
+        let bad = errors("fun main() { var b: Bool = true\n    b += true }\n");
+        assert!(bad.iter().any(|d| d.code == "K0222" && d.message.contains("is Bool")), "{bad:?}");
+        // The pre-existing numeric `+=` behavior is unaffected.
+        assert!(errors("fun main() { var x = 5\n    x += 10 }\n").is_empty());
     }
 
     #[test]
