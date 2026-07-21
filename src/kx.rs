@@ -1,8 +1,9 @@
 //! `.kx` — the KVM module binary format (encode/decode), and the bundle
 //! trailer used by `kupl bundle` to produce self-contained executables.
 //!
-//! Layout: magic "KUPLKX01", then chunks, ctors, fun table, ctor field names,
-//! components. All integers little-endian; strings are u32 length + UTF-8.
+//! Layout: magic "KUPLKX02" (`KX_MAGIC` below), then chunks, ctors, fun
+//! table, ctor field names, components. All integers little-endian; strings
+//! are u32 length + UTF-8.
 
 use std::collections::HashMap;
 use std::rc::Rc;

@@ -36,7 +36,7 @@ Commands: `:help` `:defs` `:quit`.
 ## Compiling & packaging
 
 ### `kupl build <file.kupl> [-o out.kx]`
-Ahead-of-time compile to a `.kx` bytecode module (magic `KUPLKX01`).
+Ahead-of-time compile to a `.kx` bytecode module (magic `KUPLKX02`).
 Default output: `<file>.kx`. Artifacts are small (a todo app ≈ 1.5 KB).
 
 ### `kupl bundle <file.kupl> [-o app]`
