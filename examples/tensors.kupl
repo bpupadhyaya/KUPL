@@ -12,6 +12,7 @@ fun main() {
 
     print("xs        = {xs}")
     print("weights   = {weights}")
+    print("len       = {xs.len()}")
     print("sum       = {xs.sum()}, mean = {xs.mean()}")
     print("min..max  = {xs.min()} .. {xs.max()}")
 
@@ -31,6 +32,7 @@ fun main() {
     print("as list   = {combo.to_list().first()}")
 
     expect zeros(3).sum() == 0.0
+    expect xs.len() == 8
     expect xs.get(5) == 5.0
     expect (xs + xs) == xs.scale(2.0)
     print("all tensor expectations hold")
