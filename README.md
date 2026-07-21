@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 216 tests, includes interpreter-vs-VM differential suite
+cargo test                   # 1,448 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -297,7 +297,7 @@ language, every example verified against the toolchain).
 - [`docs/reference/LANGUAGE-REFERENCE.md`](docs/reference/LANGUAGE-REFERENCE.md) — the language reference manual (as implemented): lexical structure, types, expressions, statements, functions & effects, components, contracts, supervision, semantics
 - [`docs/reference/STDLIB.md`](docs/reference/STDLIB.md) — built-in functions, constructors, and every method on List/Str/Int/Float/Option/Result/Tensor
 - [`docs/reference/CLI.md`](docs/reference/CLI.md) — every `kupl` command, flags, exit codes, artifact formats
-- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (104 diagnostics, grouped by phase)
+- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (124 diagnostics, grouped by phase)
 - [`docs/PRODUCTION.md`](docs/PRODUCTION.md) — running KUPL in production: security model, resource limits, threat model (it is **not** a sandbox), operations, and an honest list of known limitations
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — an honest audit of KUPL vs Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift, and Kotlin (as-implemented vs designed)
 
@@ -310,11 +310,13 @@ language, every example verified against the toolchain).
 
 ## Status & roadmap
 
-**v1.0-alpha** (2026-07): the founding vision is implemented end to end —
-~29,100 lines of dependency-free Rust, 216 tests, all engines differentially
-verified. Next arc (per `docs/design/TOOLCHAIN.md`): KIR (typed SSA) with GPU
-lowering (Metal first), components + per-component GC in the native backend,
-timers (`on every`), the package registry, LSP hover/completion, and
+**v1.0-alpha**: the founding vision is implemented end to end — ~90,900 lines
+of dependency-free Rust, 1,448 tests, all engines differentially verified.
+The package registry (`kupl pkg tree/lock/fetch`) and LSP hover/completion
+are already implemented. Next arc (per `docs/design/TOOLCHAIN.md`): KIR
+(typed SSA) with GPU lowering (Metal first), a genuine per-component
+generational GC in the native backend (native already supports components,
+supervision, and timers — this arc is specifically about the GC), and
 self-hosting. The pre-2026 Scala/Java scaffold lives in `attic/`.
 
 ## License
