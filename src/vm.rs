@@ -2093,6 +2093,66 @@ mod tests {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1001, a close-read survey of interp.rs's own eval/
+    /// exec_block loop): all four self-referential assignment fast paths
+    /// (`x = x + rhs`, `xs = xs.push(...)`, `m = m.insert(...)`, `s =
+    /// s.insert(...)`) used to evaluate the RHS/args BEFORE reading the
+    /// target's own value -- so an RHS/arg whose evaluation has a side
+    /// effect that reassigns the SAME target (e.g. via a component method
+    /// that mutates its own state) silently combined with the POST-side-
+    /// effect value instead of the value the target held at the START of
+    /// the statement. interp.rs was the SOLE odd-one-out among all four
+    /// engines (vm.rs/cgen.rs/kx were all already correct), invisible to
+    /// every prior "matches interp.rs" differential test -- including the
+    /// two siblings just above -- since those only ever catch divergence
+    /// FROM interp.rs, never interp.rs itself being wrong. Fixed by
+    /// capturing the target's value BEFORE evaluating the RHS/args in all
+    /// four fast paths.
+    #[test]
+    fn diff_self_referential_assignment_uses_the_pre_rhs_value_not_a_post_side_effect_one() {
+        // Str: `count = count + bump()` where `bump()` mutates `count` itself.
+        assert_eq!(
+            differential(
+                "component C1001a {\n    state count: Int = 0\n    \
+                 fun bump() -> Int {\n        count = count + 1\n        count\n    }\n    \
+                 expose fun run_it() -> Int {\n        count = count + bump()\n        count\n    }\n}\n\
+                 fun probe() -> Int { C1001a().run_it() }\n"
+            ),
+            "1"
+        );
+        // List: `xs = xs.push(mutate_and_get())` where the arg mutates `xs` itself.
+        assert_eq!(
+            differential(
+                "component C1001b {\n    state xs: List[Int] = []\n    \
+                 fun mutate_and_get() -> Int {\n        xs = xs.push(999)\n        1\n    }\n    \
+                 expose fun run_it() -> List[Int] {\n        xs = xs.push(mutate_and_get())\n        xs\n    }\n}\n\
+                 fun probe() -> Str { \"{C1001b().run_it()}\" }\n"
+            ),
+            "[1]"
+        );
+        // Map: `m = m.insert(\"a\", mutate_and_get())` where the arg mutates `m` itself.
+        assert_eq!(
+            differential(
+                "component C1001c {\n    state m: Map[Str, Int] = Map()\n    \
+                 fun mutate_and_get() -> Int {\n        m = m.insert(\"z\", 999)\n        1\n    }\n    \
+                 expose fun run_it() -> Map[Str, Int] {\n        m = m.insert(\"a\", mutate_and_get())\n        m\n    }\n}\n\
+                 fun probe() -> Str { \"{C1001c().run_it()}\" }\n"
+            ),
+            "Map{\"a\": 1}"
+        );
+        // Set: `s = s.insert(mutate_and_get())` where the arg mutates `s` itself.
+        assert_eq!(
+            differential(
+                "component C1001d {\n    state s: Set[Int] = Set([])\n    \
+                 fun mutate_and_get() -> Int {\n        s = s.insert(999)\n        1\n    }\n    \
+                 expose fun run_it() -> Set[Int] {\n        s = s.insert(mutate_and_get())\n        s\n    }\n}\n\
+                 fun probe() -> Str { \"{C1001d().run_it()}\" }\n"
+            ),
+            "Set{1}"
+        );
+    }
+
     #[test]
     fn self_add_overflow_panic_span_matches_across_engines() {
         // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it852, the
@@ -3721,6 +3781,22 @@ fun probe() -> Str { "{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD
         // the LCS an AI writes for diff tools, version-control merges, and DNA/sequence alignment; a backend
         // whose match-extend, max-branch, or base case was off would misreport the shared length. Pairs with
         // edit distance to cover both canonical two-string DPs (min-cost transform vs max-length overlap).
+        //
+        // A REAL test-harness-only bug found+fixed (production-hardening
+        // PR-it1001, discovered while re-verifying "cargo test green" after
+        // that SAME iteration's interp.rs fix): this test's UN-memoized,
+        // exponentially-branching `lcsRec` recursion was ALREADY marginal
+        // against the DEFAULT 2MB debug test-thread stack -- interp.rs's
+        // `exec_stmt` grew a handful of new locals as part of that
+        // iteration's self-referential-assignment fix, marginally
+        // enlarging its own per-call stack frame, enough to
+        // deterministically overflow this budget too (the SAME downstream
+        // effect already fixed for `diff_is_prime_trial_division` and
+        // `diff_longest_bitonic_subsequence` above -- see either's own doc
+        // comment, or PR-it860's original precedent, for the full
+        // writeup). Fixed the same way: wrap the test body in a dedicated
+        // larger-stack thread rather than shrinking the workload.
+        let body = || {
         let src = r#"fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
 fun lcsRec(a: List[Str], b: List[Str]) -> Int {
     if a.len() == 0 { 0 }
@@ -3750,6 +3826,8 @@ fun probe() -> Str {
             differential(src),
             "abcbdab=4|same=3|none=0|empty=0|agg=4"
         );
+        };
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(body).unwrap().join().unwrap();
     }
 
     #[test]
@@ -4443,6 +4521,22 @@ fun probe() -> Str {
         // agree. This is the "list the primes up to n" an AI writes for factoring, number theory, or a primality
         // table; the sieve and the individual test agreeing catches an off-by-one in either. A non-sort lock
         // certifying the Sieve of Eratosthenes cross-checked against trial-division primality.
+        //
+        // A REAL test-harness-only bug found+fixed (production-hardening
+        // PR-it1001, discovered while re-verifying "cargo test green" after
+        // that SAME iteration's interp.rs fix): this test's recursive
+        // `rangeIncl`/`sieve`/`noDiv` calls were ALREADY marginal against
+        // the DEFAULT 2MB debug test-thread stack -- interp.rs's
+        // `exec_stmt` grew a handful of new locals as part of that
+        // iteration's self-referential-assignment fix, marginally
+        // enlarging its own per-call stack frame, enough to
+        // deterministically overflow this budget too (the SAME downstream
+        // effect already fixed for several other tests above -- see any of
+        // their own doc comments, or PR-it860's original precedent, for
+        // the full writeup). Fixed the same way: wrap the test body in a
+        // dedicated larger-stack thread rather than shrinking the
+        // workload.
+        let body = || {
         let src = r#"fun rangeIncl(lo: Int, hi: Int) -> List[Int] {
     if lo > hi { [] } else { [[lo], rangeIncl(lo + 1, hi)].flatten() }
 }
@@ -4473,6 +4567,8 @@ fun probe() -> Str {
             differential(src),
             "p20=2,3,5,7,11,13,17,19|p10=2,3,5,7|cnt=8|cross=true|prime91=false|sum20=77"
         );
+        };
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(body).unwrap().join().unwrap();
     }
 
     #[test]
@@ -10490,6 +10586,23 @@ fun probe() -> Str {
         // DP an AI writes for peak-shaped run detection and mountain-array problems; a backend whose two-pass
         // combine, strictness, or peak-subtraction was off would over- or under-count. Extends the single-seq
         // LIS shape to a two-direction peak-combining DP.
+        //
+        // A REAL test-harness-only bug found+fixed (production-hardening
+        // PR-it1001, discovered while re-verifying "cargo test green"
+        // after that SAME iteration's interp.rs fix): this test's own
+        // nested/recursive `lisEndAt`/`ldsStartAt`/`rangeN` calls were
+        // ALREADY marginal against the DEFAULT 2MB debug test-thread stack
+        // -- interp.rs's `exec_stmt` grew a handful of new locals as part
+        // of that iteration's self-referential-assignment fix (see
+        // `Stmt::Assign`'s doc comment), marginally enlarging its own
+        // per-call stack frame, enough to deterministically overflow this
+        // budget too (the SAME downstream effect already fixed once for
+        // `diff_is_prime_trial_division` above, and originally established
+        // at PR-it860 for `diff_roman_numeral_encode_decode_bidirectional`
+        // -- see either's own doc comment for the full precedent). Fixed
+        // the same way: wrap the test body in a dedicated larger-stack
+        // thread rather than shrinking the workload.
+        let body = || {
         let src = r#"fun rangeN(n: Int) -> List[Int] {
     if n <= 0 { [] } else { [rangeN(n - 1), [n - 1]].flatten() }
 }
@@ -10530,6 +10643,8 @@ fun probe() -> Str {
 }
 "#;
         assert_eq!(differential(src), "a=6|b=5|c=5|inc=4|one=1");
+        };
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(body).unwrap().join().unwrap();
     }
 
     #[test]
@@ -12044,7 +12159,28 @@ fun probe() -> Str {
         // is correctly composite: 91 "looks prime" but 7*13=91, and the sqrt bound still finds 7 (7*7=49<=91).
         // A backend that used d>=n instead of d*d>n would still be correct but slow; one whose % or bound was
         // off would misclassify 91 or 97. This is the primality test an AI writes constantly.
-        let src = r#"fun divides(n: Int, d: Int) -> Bool {
+        //
+        // A REAL test-harness-only bug found+fixed (production-hardening
+        // PR-it1001, discovered as a side effect of this SAME iteration's
+        // own "cargo test green" verification): this test's own comment
+        // above claims magnitudes were kept modest to stay within "the 2MB
+        // DEBUG test-thread stack" -- but interp.rs's `exec_stmt` grew a
+        // handful of new locals as part of THIS iteration's self-
+        // referential-assignment fix (see `Stmt::Assign`'s doc comment),
+        // marginally enlarging its own per-call stack frame -- enough to
+        // deterministically overflow this ALREADY-marginal budget (4/4
+        // isolated runs, `signal: 6, SIGABRT`). The identical shape was
+        // already fixed once before for a DIFFERENT test at PR-it860 (see
+        // `diff_roman_numeral_encode_decode_bidirectional`'s own doc
+        // comment a few tests above): a bare `#[test]`-spawned thread gets
+        // the OS/std DEFAULT stack with no wrapping, unlike `main.rs`'s
+        // actual CLI entry points (which deliberately run on an explicit
+        // large-stack thread precisely to avoid this class of gap) --
+        // fixed the SAME way, wrapping the test body in
+        // `std::thread::Builder::new().stack_size(..).spawn(..)` rather
+        // than trying to shrink the workload further.
+        let body = || {
+            let src = r#"fun divides(n: Int, d: Int) -> Bool {
     if d * d > n { false }
     else {
         if n % d == 0 { true }
@@ -12065,10 +12201,12 @@ fun probe() -> Str {
     "primes={primes}|is97={p97}|is91={p91}"
 }
 "#;
-        assert_eq!(
-            differential(src),
-            "primes=[2, 3, 5, 7, 11, 13, 17, 19]|is97=true|is91=false"
-        );
+            assert_eq!(
+                differential(src),
+                "primes=[2, 3, 5, 7, 11, 13, 17, 19]|is97=true|is91=false"
+            );
+        };
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(body).unwrap().join().unwrap();
     }
 
     #[test]

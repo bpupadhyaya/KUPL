@@ -616,18 +616,71 @@ impl Interp {
                         (&target.kind, &value.kind)
                     {
                         if matches!(&lhs.kind, ExprKind::Ident(l) if l == tname) {
+                            // A REAL, LIVE-CONFIRMED silent-wrong-value bug found+
+                            // fixed (production-hardening PR-it1001, a close-read
+                            // survey of this loop): this (and its three siblings
+                            // below, `push`/Map-`insert`/Set-`insert`) used to
+                            // evaluate `rhs`/the method args BEFORE reading
+                            // `tname`'s own value -- so a `rhs` whose evaluation
+                            // has a side effect that reassigns `tname` ITSELF
+                            // (e.g. `count = count + bump()` where `bump()`
+                            // mutates `count`) silently combined with the
+                            // POST-side-effect value instead of the value `tname`
+                            // held at the START of the statement -- backwards
+                            // from `ExprKind::Binary`'s own lhs-before-rhs order
+                            // used everywhere ELSE in this file, and from what
+                            // vm.rs/cgen.rs/kx all actually do for the identical
+                            // shape. Live-confirmed: a component method `count =
+                            // count + bump()` (`bump()` sets `count = 1`) printed
+                            // `2` on `kupl run` but `1` (correct) on `kupl run
+                            // --vm`/`kupl native` -- interp.rs was the SOLE
+                            // odd-one-out among all four engines, invisible to
+                            // every "matches interp.rs" differential test this
+                            // campaign has ever run, since those only catch
+                            // divergence FROM interp.rs, never interp.rs itself
+                            // being wrong relative to the language's own intended
+                            // left-to-right semantics. Fixed by capturing
+                            // `tname`'s value BEFORE evaluating `rhs`, then
+                            // checking -- via `Rc::as_ptr` IDENTITY, not a full
+                            // value compare -- whether `rhs`'s evaluation
+                            // reassigned `tname` out from under us. If not (the
+                            // overwhelming common case), the snapshot is dropped
+                            // before attempting the in-place append/push/insert
+                            // so it doesn't spuriously defeat that fast path's OWN
+                            // uniqueness check (preserving its O(n), not O(n^2),
+                            // build-loop guarantee); if `tname` WAS reassigned
+                            // mid-`rhs`, the in-place path is skipped entirely and
+                            // the ORIGINAL pre-`rhs` snapshot is combined with the
+                            // already-evaluated result instead, matching standard
+                            // left-to-right assignment semantics.
+                            let before = env.get(tname).ok_or_else(|| {
+                                Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                            })?;
+                            let before_ptr =
+                                if let Value::Str(rc) = &before { Some(Rc::as_ptr(rc)) } else { None };
                             let rv = self.eval(rhs, env)?;
-                            if let Value::Str(rs) = &rv {
-                                if env.append_str_in_place(tname, rs) {
+                            let unchanged = before_ptr.is_some()
+                                && matches!(env.get(tname), Some(Value::Str(ref rc)) if Some(Rc::as_ptr(rc)) == before_ptr);
+                            if unchanged {
+                                if let Value::Str(rs) = &rv {
+                                    drop(before);
+                                    if env.append_str_in_place(tname, rs) {
+                                        return Ok(Value::Unit);
+                                    }
+                                    let lv = env.get(tname).ok_or_else(|| {
+                                        Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                                    })?;
+                                    let nv = self.binary_or_overload(BinOp::Add, lv, rv, value.span)?;
+                                    if !env.set(tname, nv) {
+                                        return Err(Self::panic_flow(
+                                            format!("unknown variable `{tname}`"),
+                                            *span,
+                                        ));
+                                    }
                                     return Ok(Value::Unit);
                                 }
                             }
-                            // Shared string or non-Str: fall back to a normal concat
-                            // using the already-evaluated rhs (don't re-eval — effects).
-                            let lv = env.get(tname).ok_or_else(|| {
-                                Self::panic_flow(format!("unknown variable `{tname}`"), *span)
-                            })?;
-                            let nv = self.binary_or_overload(BinOp::Add, lv, rv, value.span)?;
+                            let nv = self.binary_or_overload(BinOp::Add, before, rv, value.span)?;
                             if !env.set(tname, nv) {
                                 return Err(Self::panic_flow(
                                     format!("unknown variable `{tname}`"),
@@ -647,27 +700,49 @@ impl Interp {
                             && args.len() == 1
                             && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
                         {
+                            // PR-it1001 (see the Str self-append fast path above
+                            // for the full writeup): capture `tname` BEFORE
+                            // evaluating the arg, in case the arg's evaluation
+                            // reassigns `tname` itself as a side effect.
+                            let before = env.get(tname).ok_or_else(|| {
+                                Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                            })?;
+                            let before_ptr =
+                                if let Value::List(rc) = &before { Some(Rc::as_ptr(rc)) } else { None };
                             let item = self.eval(&args[0].value, env)?;
-                            match env.push_list_in_place(tname, item) {
-                                None => return Ok(Value::Unit),
-                                Some(item) => {
-                                    // shared list or non-List receiver: fall back to
-                                    // the normal push via the usual method dispatch,
-                                    // reusing the already-evaluated arg (no re-eval).
-                                    let recv_val = env.get(tname).ok_or_else(|| {
-                                        Self::panic_flow(format!("unknown variable `{tname}`"), *span)
-                                    })?;
-                                    let nv =
-                                        self.eval_method(recv_val, "push", vec![item], value.span)?;
-                                    if !env.set(tname, nv) {
-                                        return Err(Self::panic_flow(
-                                            format!("unknown variable `{tname}`"),
-                                            *span,
-                                        ));
+                            let unchanged = before_ptr.is_some()
+                                && matches!(env.get(tname), Some(Value::List(ref rc)) if Some(Rc::as_ptr(rc)) == before_ptr);
+                            if unchanged {
+                                drop(before);
+                                match env.push_list_in_place(tname, item) {
+                                    None => return Ok(Value::Unit),
+                                    Some(item) => {
+                                        // shared list or non-List receiver: fall back to
+                                        // the normal push via the usual method dispatch,
+                                        // reusing the already-evaluated arg (no re-eval).
+                                        let recv_val = env.get(tname).ok_or_else(|| {
+                                            Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                                        })?;
+                                        let nv =
+                                            self.eval_method(recv_val, "push", vec![item], value.span)?;
+                                        if !env.set(tname, nv) {
+                                            return Err(Self::panic_flow(
+                                                format!("unknown variable `{tname}`"),
+                                                *span,
+                                            ));
+                                        }
+                                        return Ok(Value::Unit);
                                     }
-                                    return Ok(Value::Unit);
                                 }
                             }
+                            let nv = self.eval_method(before, "push", vec![item], value.span)?;
+                            if !env.set(tname, nv) {
+                                return Err(Self::panic_flow(
+                                    format!("unknown variable `{tname}`"),
+                                    *span,
+                                ));
+                            }
+                            return Ok(Value::Unit);
                         }
                         // Fast path for `m = m.insert(k, v)` (Map self-insert): update
                         // in place when `m` is a uniquely-owned Map, avoiding the O(n)
@@ -685,29 +760,51 @@ impl Interp {
                             && args.len() == 2
                             && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
                         {
+                            // PR-it1001 (see the Str self-append fast path above
+                            // for the full writeup): capture `tname` BEFORE
+                            // evaluating either arg, in case an arg's evaluation
+                            // reassigns `tname` itself as a side effect.
+                            let before = env.get(tname).ok_or_else(|| {
+                                Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                            })?;
+                            let before_ptr =
+                                if let Value::Map(rc) = &before { Some(Rc::as_ptr(rc)) } else { None };
                             let key = self.eval(&args[0].value, env)?;
                             let val = self.eval(&args[1].value, env)?;
-                            match env.insert_map_in_place(tname, key, val) {
-                                None => return Ok(Value::Unit),
-                                Some((key, val)) => {
-                                    let recv_val = env.get(tname).ok_or_else(|| {
-                                        Self::panic_flow(format!("unknown variable `{tname}`"), *span)
-                                    })?;
-                                    let nv = self.eval_method(
-                                        recv_val,
-                                        "insert",
-                                        vec![key, val],
-                                        value.span,
-                                    )?;
-                                    if !env.set(tname, nv) {
-                                        return Err(Self::panic_flow(
-                                            format!("unknown variable `{tname}`"),
-                                            *span,
-                                        ));
+                            let unchanged = before_ptr.is_some()
+                                && matches!(env.get(tname), Some(Value::Map(ref rc)) if Some(Rc::as_ptr(rc)) == before_ptr);
+                            if unchanged {
+                                drop(before);
+                                match env.insert_map_in_place(tname, key, val) {
+                                    None => return Ok(Value::Unit),
+                                    Some((key, val)) => {
+                                        let recv_val = env.get(tname).ok_or_else(|| {
+                                            Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                                        })?;
+                                        let nv = self.eval_method(
+                                            recv_val,
+                                            "insert",
+                                            vec![key, val],
+                                            value.span,
+                                        )?;
+                                        if !env.set(tname, nv) {
+                                            return Err(Self::panic_flow(
+                                                format!("unknown variable `{tname}`"),
+                                                *span,
+                                            ));
+                                        }
+                                        return Ok(Value::Unit);
                                     }
-                                    return Ok(Value::Unit);
                                 }
                             }
+                            let nv = self.eval_method(before, "insert", vec![key, val], value.span)?;
+                            if !env.set(tname, nv) {
+                                return Err(Self::panic_flow(
+                                    format!("unknown variable `{tname}`"),
+                                    *span,
+                                ));
+                            }
+                            return Ok(Value::Unit);
                         }
                         // Fast path for `s = s.insert(v)` (Set self-insert, 1 arg):
                         // same in-place uniqueness optimization, avoiding the per-call
@@ -720,23 +817,46 @@ impl Interp {
                             && args.len() == 1
                             && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
                         {
+                            // PR-it1001 (see the Str self-append fast path above
+                            // for the full writeup): capture `tname` BEFORE
+                            // evaluating the arg, in case the arg's evaluation
+                            // reassigns `tname` itself as a side effect.
+                            let before = env.get(tname).ok_or_else(|| {
+                                Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                            })?;
+                            let before_ptr =
+                                if let Value::Set(rc) = &before { Some(Rc::as_ptr(rc)) } else { None };
                             let v = self.eval(&args[0].value, env)?;
-                            match env.insert_set_in_place(tname, v) {
-                                None => return Ok(Value::Unit),
-                                Some(v) => {
-                                    let recv_val = env.get(tname).ok_or_else(|| {
-                                        Self::panic_flow(format!("unknown variable `{tname}`"), *span)
-                                    })?;
-                                    let nv = self.eval_method(recv_val, "insert", vec![v], value.span)?;
-                                    if !env.set(tname, nv) {
-                                        return Err(Self::panic_flow(
-                                            format!("unknown variable `{tname}`"),
-                                            *span,
-                                        ));
+                            let unchanged = before_ptr.is_some()
+                                && matches!(env.get(tname), Some(Value::Set(ref rc)) if Some(Rc::as_ptr(rc)) == before_ptr);
+                            if unchanged {
+                                drop(before);
+                                match env.insert_set_in_place(tname, v) {
+                                    None => return Ok(Value::Unit),
+                                    Some(v) => {
+                                        let recv_val = env.get(tname).ok_or_else(|| {
+                                            Self::panic_flow(format!("unknown variable `{tname}`"), *span)
+                                        })?;
+                                        let nv =
+                                            self.eval_method(recv_val, "insert", vec![v], value.span)?;
+                                        if !env.set(tname, nv) {
+                                            return Err(Self::panic_flow(
+                                                format!("unknown variable `{tname}`"),
+                                                *span,
+                                            ));
+                                        }
+                                        return Ok(Value::Unit);
                                     }
-                                    return Ok(Value::Unit);
                                 }
                             }
+                            let nv = self.eval_method(before, "insert", vec![v], value.span)?;
+                            if !env.set(tname, nv) {
+                                return Err(Self::panic_flow(
+                                    format!("unknown variable `{tname}`"),
+                                    *span,
+                                ));
+                            }
+                            return Ok(Value::Unit);
                         }
                     }
                 }
