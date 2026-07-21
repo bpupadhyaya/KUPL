@@ -2,7 +2,19 @@ use std::process::ExitCode;
 
 use kupl::{repl, run};
 
-const USAGE: &str = "KUPL — K Universal Programming Language (v0.2)
+// SOUNDNESS FIX (production-hardening PR-it974): this banner used to hardcode
+// a literal "(v0.2)" -- stale since Cargo.toml (and `kupl version`/`kupl
+// --version`, which reads `env!("CARGO_PKG_VERSION")` at line ~349) moved on
+// to "1.0.0-alpha" long ago, so `kupl --help`/a bare `kupl`/any usage error
+// showed a DIFFERENT, wrong version than `kupl version` itself -- an internal
+// inconsistency in the shipped binary's own output, not just a docs staleness
+// issue. Built via `concat!` + `env!("CARGO_PKG_VERSION")` (both compile-time,
+// so USAGE stays a plain `&'static str` -- no other call site needs to change)
+// so this can never drift out of sync with the crate's own version again.
+const USAGE: &str = concat!(
+    "KUPL — K Universal Programming Language (v",
+    env!("CARGO_PKG_VERSION"),
+    ")
 
 Usage:
   kupl run <file.kupl> [--vm]       Run the app / `fun main` (--vm: on the KVM bytecode VM)
@@ -25,7 +37,8 @@ Usage:
   kupl repl                         Start an interactive session
   kupl lsp                          Start the Language Server (stdio, for editors)
   kupl version                      Print version
-";
+"
+);
 
 fn main() -> ExitCode {
     // Production safety net: a bug in the compiler should never dump a raw Rust
@@ -645,6 +658,23 @@ fn with_file(args: &[String], f: impl Fn(&str, &str) -> i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{build_module, find_path_arg, valid_project_name, with_file, USAGE};
+
+    /// A REAL bug found+fixed (production-hardening PR-it974): `USAGE`'s
+    /// banner used to hardcode a literal "(v0.2)", stale since the crate's
+    /// own version moved on -- `kupl --help`/a bare `kupl`/any usage error
+    /// showed a DIFFERENT version than `kupl version` (which reads
+    /// `env!("CARGO_PKG_VERSION")`), an internal inconsistency in the
+    /// shipped binary's own output, live-confirmed before fixing. Locks in
+    /// that the banner always matches the crate's actual version, built via
+    /// the SAME `env!("CARGO_PKG_VERSION")` `kupl version` itself uses, so
+    /// this can never silently drift out of sync again.
+    #[test]
+    fn usage_banner_version_matches_the_crate_version() {
+        assert!(
+            USAGE.contains(&format!("(v{})", env!("CARGO_PKG_VERSION"))),
+            "USAGE's banner must report the crate's ACTUAL version, not a stale hardcoded one: {USAGE:?}"
+        );
+    }
 
     /// A REAL discoverability gap (PR-it669): `kupl pkg tree|lock|fetch
     /// <file.kupl>` is a fully implemented, tested subcommand (dispatched in
