@@ -440,27 +440,79 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 /// `vec![0u8; content_length]` allocation).
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 
+/// Reads one `Content-Length`-framed JSON-RPC message off `stdin`. `None`
+/// covers BOTH a clean EOF (the client closed the connection -- ordinary,
+/// silent shutdown) and a genuine framing-level failure (a malformed
+/// `Content-Length`, a body shorter than declared, a low-level IO error, or
+/// non-UTF-8 body bytes) -- `serve()`'s `while let Some(body) = ...` loop
+/// can't tell these apart, so a framing failure ends the whole session
+/// exactly as quietly as a normal shutdown.
+///
+/// A REAL, live-confirmed silent-failure bug found+fixed (production-
+/// hardening PR-it989, a finding deferred from PR-it987's own Explore
+/// survey): unlike the JSON-CONTENT parse path a few lines below in
+/// `serve()`'s own loop (already hardened at PR-it620/it755 to send a clean
+/// `-32700`/`-32600` JSON-RPC error rather than stay silent), NOTHING here
+/// reported a framing-level failure at all -- confirmed live via a real
+/// `kupl lsp` subprocess: an unparseable `Content-Length` value
+/// (`Content-Length: abc\r\n\r\n{}`), a body shorter than declared
+/// (`Content-Length: 1000\r\n\r\n{"short":true}` with stdin then closing),
+/// and non-UTF-8 body bytes (valid `Content-Length: 3` framing a raw
+/// `\xff\xfe\xfd`) ALL made `kupl lsp` exit 0 with ZERO bytes on stdout and
+/// ZERO bytes on stderr -- indistinguishable from a client that disconnected
+/// cleanly. Once a framing-level failure happens, the stream position is no
+/// longer trustworthy (unlike a malformed JSON *body*, correctly delimited
+/// by `Content-Length`, where the position stays reliable for the NEXT
+/// message) -- there's no safe way to resynchronize and keep serving, so
+/// this deliberately does NOT attempt to send a JSON-RPC error response or
+/// continue the loop (a response over a possibly-desynced stream could
+/// itself be misread by the client). The narrower, safe fix: log exactly
+/// which failure occurred to stderr -- many LSP clients capture and surface
+/// server stderr in an "Output" panel, so this turns a silently dead server
+/// into a diagnosed one, without redesigning the read/serve loop's shape.
 fn read_message(stdin: &mut impl BufRead) -> Option<String> {
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
-        if stdin.read_line(&mut line).ok()? == 0 {
-            return None; // EOF
+        match stdin.read_line(&mut line) {
+            Ok(0) => return None, // clean EOF -- ordinary shutdown, stay silent
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("kupl lsp: stdin read error, closing: {e}");
+                return None;
+            }
         }
         let line = line.trim_end();
         if line.is_empty() {
             break;
         }
         if let Some(v) = line.strip_prefix("Content-Length:") {
-            content_length = v.trim().parse().ok()?;
+            content_length = match v.trim().parse() {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("kupl lsp: malformed Content-Length {v:?}, closing: {e}");
+                    return None;
+                }
+            };
         }
     }
     if content_length > MAX_MESSAGE_LEN {
-        return None; // refuse absurd frame sizes rather than pre-allocate them
+        // refuse absurd frame sizes rather than pre-allocate them
+        eprintln!("kupl lsp: Content-Length {content_length} exceeds the {MAX_MESSAGE_LEN}-byte cap, closing");
+        return None;
     }
     let mut buf = vec![0u8; content_length];
-    stdin.read_exact(&mut buf).ok()?;
-    String::from_utf8(buf).ok()
+    if let Err(e) = stdin.read_exact(&mut buf) {
+        eprintln!("kupl lsp: body shorter than its declared Content-Length ({content_length}), closing: {e}");
+        return None;
+    }
+    match String::from_utf8(buf) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("kupl lsp: message body is not valid UTF-8, closing: {e}");
+            None
+        }
+    }
 }
 
 fn send(out: &mut impl Write, body: &str) {
@@ -4706,6 +4758,73 @@ mod tests {
             let _ = tx.send(child.wait_with_output());
         });
         rx.recv_timeout(timeout).ok().and_then(Result::ok)
+    }
+
+    /// A REAL, live-confirmed silent-failure bug found+fixed (production-
+    /// hardening PR-it989, deferred from PR-it987's own Explore survey): see
+    /// `read_message`'s own doc comment for the full analysis. Sends raw,
+    /// deliberately malformed low-level framing (not wrapped through the
+    /// usual `Content-Length: {len}\r\n\r\n{body}` helper the other tests in
+    /// this file use, since the framing itself is what's under test) for
+    /// each of the three failure shapes, plus a genuine clean-EOF control,
+    /// and checks stderr -- BEFORE this fix, `kupl lsp` exited 0 with ZERO
+    /// bytes on stdout AND ZERO bytes on stderr for all three malformed
+    /// shapes, indistinguishable from the clean-EOF case.
+    #[test]
+    fn malformed_low_level_framing_is_logged_not_silently_swallowed() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let run = |input: &[u8]| -> (String, String) {
+            let mut child = std::process::Command::new(&bin)
+                .arg("lsp")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("kupl lsp spawns");
+            let mut stdin = child.stdin.take().unwrap();
+            let input = input.to_vec();
+            let writer = std::thread::spawn(move || {
+                use std::io::Write as _;
+                let _ = stdin.write_all(&input);
+                // drop stdin here so the child sees EOF if it's still reading
+            });
+            let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(10));
+            let _ = writer.join();
+            let out = out.expect("kupl lsp hung on malformed framing");
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        let (stdout, stderr) = run(b"Content-Length: abc\r\n\r\n{}");
+        assert!(stdout.is_empty(), "a malformed Content-Length value must not produce a JSON-RPC response: {stdout:?}");
+        assert!(
+            stderr.contains("malformed Content-Length"),
+            "a malformed Content-Length value must be logged to stderr, not silently swallowed: {stderr:?}"
+        );
+
+        let (stdout, stderr) = run(b"Content-Length: 1000\r\n\r\n{\"short\":true}");
+        assert!(stdout.is_empty(), "a truncated body must not produce a JSON-RPC response: {stdout:?}");
+        assert!(
+            stderr.contains("shorter than its declared Content-Length"),
+            "a truncated body must be logged to stderr, not silently swallowed: {stderr:?}"
+        );
+
+        let (stdout, stderr) = run(b"Content-Length: 3\r\n\r\n\xff\xfe\xfd");
+        assert!(stdout.is_empty(), "a non-UTF-8 body must not produce a JSON-RPC response: {stdout:?}");
+        assert!(
+            stderr.contains("not valid UTF-8"),
+            "a non-UTF-8 body must be logged to stderr, not silently swallowed: {stderr:?}"
+        );
+
+        // control: a genuine clean EOF (no input at all) must stay completely
+        // silent -- this fix must not turn an ordinary shutdown into noise.
+        let (stdout, stderr) = run(b"");
+        assert!(stdout.is_empty() && stderr.is_empty(), "a clean EOF must stay silent: stdout={stdout:?} stderr={stderr:?}");
     }
 
     #[test]
