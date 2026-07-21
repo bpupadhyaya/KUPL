@@ -1,0 +1,42 @@
+// HTTP server — answer real requests with a KUPL function.
+//
+//   http_serve(port: Int, handler) -> Result[Unit, Str]
+//     handler: fn(method: Str, path: Str, body: Str) -> Str
+//
+// `http_serve` binds the port and answers requests one at a time, calling
+// `handler` for each and sending back whatever Str it returns as the
+// response body. It carries the `io.net` effect (same as `http_get`/
+// `http_post` in examples/http.kupl, which cover the CLIENT side of HTTP).
+//
+// The server blocks forever once started — a real, if minimal, HTTP
+// server is supposed to keep running until you stop it (Ctrl-C). So this
+// example only starts it when explicitly asked; a plain `kupl run`/
+// `kupl check` never blocks:
+//   kupl run examples/http_server.kupl -- --serve
+//   curl http://127.0.0.1:38999/                     (in another terminal)
+//   curl http://127.0.0.1:38999/echo -d "hello"
+//   curl http://127.0.0.1:38999/nope
+//
+// Compiles to a native binary too, identically:
+//   kupl native examples/http_server.kupl -o server && ./server --serve
+
+fun handle(method: Str, path: Str, body: Str) -> Str {
+    match path {
+        "/" => "hello from KUPL\n"
+        "/echo" => "you sent: {body}\n"
+        _ => "not found: {method} {path}\n"
+    }
+}
+
+fun main() uses io, io.env, io.net {
+    let a = args()
+    if !a.contains("--serve") {
+        print("usage: kupl run examples/http_server.kupl -- --serve")
+        return
+    }
+    print("listening on http://127.0.0.1:38999 (Ctrl-C to stop)")
+    match http_serve(38999, handle) {
+        Ok(_) => print("server stopped")
+        Err(e) => print("server error: {e}")
+    }
+}
