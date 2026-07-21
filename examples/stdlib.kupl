@@ -57,6 +57,25 @@ fun main() {
     print("window     = {[1, 2, 3, 4].window(2)}")
     print("chunk      = {[1, 2, 3, 4, 5].chunk(2)}")
 
+    // dedup collapses only CONSECUTIVE duplicates (unlike unique's GLOBAL
+    // dedup, a repeat can reappear later if it isn't adjacent to the last one).
+    let runs = [1, 1, 2, 2, 3, 1]
+    print("dedup      = {runs.dedup()}")
+    print("unique     = {runs.unique()}")
+
+    // init: every element but the LAST (the converse of tail, which drops the FIRST)
+    print("init       = {[1, 2, 3, 4, 5].init()}")
+
+    // intersperse inserts a separator between each adjacent pair; a singleton
+    // (or empty) List is returned unchanged, since there's no "between" to fill.
+    print("intersperse= {[1, 2, 3].intersperse(0)}")
+    print("intersperse1={[1].intersperse(0)}")
+
+    // scan is like fold, but keeps every INTERMEDIATE result (not just the
+    // final one) — one output element per input element, the initial value
+    // itself is NOT included.
+    print("scan       = {[1, 2, 3].scan(0, fn acc, n { acc + n })}")
+
     // rfind / replace_first / split_once
     let path = "a.b.c.d"
     print("rfind      = {path.rfind(".")}")
@@ -76,6 +95,12 @@ fun main() {
     expect seq.rotate_left(-1) == seq.rotate_right(1)
     expect [1, 2, 3, 4].window(2) == [[1, 2], [2, 3], [3, 4]]
     expect [1, 2, 3, 4, 5].chunk(2) == [[1, 2], [3, 4], [5]]
+    expect runs.dedup() == [1, 2, 3, 1]
+    expect runs.unique() == [1, 2, 3]
+    expect [1, 2, 3, 4, 5].init() == [1, 2, 3, 4]
+    expect [1, 2, 3].intersperse(0) == [1, 0, 2, 0, 3]
+    expect [1].intersperse(0) == [1]
+    expect [1, 2, 3].scan(0, fn acc, n { acc + n }) == [1, 3, 6]
 
     print("all stdlib expectations hold")
 }
