@@ -4,6 +4,13 @@
 // with a suffix (`255u8`, `1000i16`, `0xFFu8`). Arithmetic is checked — overflow
 // panics, just like the default Int (i64). Mixing widths is a type error; convert
 // explicitly with `.to_u8()`…`.to_u64()` / `.to_i8()`… and `.to_int()`.
+//
+// When you WANT overflow to wrap or clamp instead of panic (checksums,
+// audio/pixel processing, network protocol fields), each width also has
+// `.wrapping_add`/`.wrapping_sub`/`.wrapping_mul` (mod-2^bits wraparound)
+// and `.saturating_add`/`.saturating_sub`/`.saturating_mul` (clamp to the
+// width's own min/max) — both operands must share the same width, same as
+// the checked operators.
 
 // A byte with an explicit width.
 fun clamp_byte(n: Int) -> u8 {
@@ -36,4 +43,17 @@ fun main() uses io {
 
     // overflow is a panic, not a silent wrap — uncomment to see:
     //   print(200u8 + 100u8)   // panic: integer overflow in addition
+
+    // wrapping/saturating: a checksum byte that's meant to roll over, vs.
+    // a brightness level that should clamp instead of wrapping back to black.
+    let almost_full: u8 = 250u8
+    print(almost_full.wrapping_add(10u8))    // 4   (250 + 10 = 260, wraps mod 256)
+    print(almost_full.saturating_add(10u8))  // 255 (clamps at u8::MAX)
+
+    let low: i8 = 0i8 - 120i8
+    print(low.wrapping_sub(20i8))    // 116  (wraps around through i8::MIN)
+    print(low.saturating_sub(20i8))  // -128 (clamps at i8::MIN)
+
+    print((200u8).wrapping_mul(2u8))    // 144 (400 mod 256)
+    print((200u8).saturating_mul(2u8))  // 255 (clamps at u8::MAX)
 }
