@@ -41,6 +41,11 @@ fun main() {
     print("partition  = {nums.partition(fn n { n % 2 == 0 })}")
     expect nums.sort_by(fn n { n }) == nums.sort()
 
+    // unique (dedup, keeping first-occurrence order — not sorted) / product
+    let dups = [3, 1, 2, 3, 1, 4]
+    print("unique     = {dups.unique()}")
+    print("product    = {[1, 2, 3, 4].product()}")
+
     // rfind / replace_first / split_once
     let path = "a.b.c.d"
     print("rfind      = {path.rfind(".")}")
@@ -54,6 +59,8 @@ fun main() {
     expect "hi".center(6, "*") == "**hi**"
     expect "ff".parse_radix(16) == Some(255)
     expect "g".parse_radix(16) == None
+    expect dups.unique() == [3, 1, 2, 4]
+    expect [1, 2, 3, 4].product() == 24
 
     print("all stdlib expectations hold")
 }
