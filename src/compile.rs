@@ -855,7 +855,50 @@ impl<'s> FnCompiler<'s> {
                 None
             }
             Stmt::For { var, iter, body, span } => {
-                let it = self.expr(iter);
+                // A REAL, LIVE-CONFIRMED SILENT-VALUE-DIVERGENCE bug found+
+                // fixed (production-hardening PR-it997, a close-read survey
+                // of vm.rs's run() dispatch loop): `self.expr(iter)` for a
+                // bare `Ident` referring to a mutable `var` (`ExprKind::
+                // Ident`'s `self.lookup(name)` arm) returns that VARIABLE'S
+                // OWN register directly, not a copy -- so `for x in r { ... }`
+                // aliased `it` with `r`'s own live register. `Op::IterLen`
+                // computes the loop's length ONCE from the register's value
+                // at that point, but `Op::IterGet` re-reads THE SAME
+                // register on every iteration -- so if the loop body
+                // reassigns `r` (`r = 5..8`), every SUBSEQUENT iteration
+                // silently pulled values from the NEW range/list instead of
+                // the one actually being iterated, with ZERO diagnostic.
+                // `interp.rs`'s `Stmt::For` (line ~794) has NO such bug: it
+                // evaluates `iter` into an OWNED, independent `Value` up
+                // front (`self.eval(iter, env)?`), fully decoupled from any
+                // later reassignment of `r` in `env`. Live-confirmed on ALL
+                // THREE runnable engines: `var r = 100..103\n for x in r {
+                // ... if <first iter> { r = 5..8 } }` printed the correct
+                // `100/101/102` on `kupl run`, but `100/6/7` (WRONG values,
+                // from the reassigned range) on BOTH `kupl run --vm` AND a
+                // `kupl native` binary -- since `compile.rs` is the SHARED
+                // emitter driving both. (A range whose reassigned `lo` bound
+                // combined with the ORIGINAL loop's counter could also
+                // overflow `i64` in `Op::IterGet`'s `a + i` -- separately
+                // hardened with `checked_add`/`__builtin_add_overflow` in
+                // vm.rs/cgen.rs as defense-in-depth, but that only turns an
+                // overflow into a clean error; it does NOT fix the silent-
+                // wrong-VALUE case a non-overflowing reassignment causes,
+                // which only THIS fix addresses.) FIXED at the root: snapshot
+                // `iter`'s value into a FRESH register via the existing
+                // `Op::Move` op (this file's own established "materialize an
+                // owned copy" mechanism, used pervasively elsewhere in this
+                // same compiler) immediately after evaluating it -- mirroring
+                // `interp.rs`'s own once-captured-by-value semantics exactly,
+                // and fixing BOTH `Range` and `List` iteration identically
+                // (both read `iter`'s register on every `IterGet` call, so
+                // both were equally affected). Unconditional (not just for
+                // the `Ident`-aliasing case) since an always-fresh snapshot
+                // is simpler and strictly safe for every other `iter` shape
+                // too, at the cost of one extra register + `Move` op.
+                let it_raw = self.expr(iter);
+                let it = self.alloc(*span);
+                self.emit(Op::Move(it, it_raw), *span);
                 let len = self.alloc(*span);
                 self.emit(Op::IterLen(len, it), *span);
                 let i = self.const_reg(Value::Int(0), *span);

@@ -2726,9 +2726,31 @@ static KValue k_iter_len(KValue v) {
     k_panic("`for` needs a Range or List"); return k_unit();
 }
 
+/* A REAL bug found+fixed (production-hardening PR-it997), the C mirror of
+   vm.rs's Op::IterGet fix (see that arm's own doc comment for the full
+   analysis): this computed `lo + idx.as.i` in plain, unchecked int64_t.
+   Live-confirmed REACHABLE via `kupl native` before this iteration's
+   companion fix in compile.rs::Stmt::For (which snapshots `iter` into a
+   fresh register instead of aliasing a mutable `var`'s own register) --
+   run.rs::native rejects `.kx` input outright, but always compiles fresh
+   from checked `.kupl` source, and BEFORE the compile.rs fix a loop body
+   reassigning its OWN `var` mid-iteration silently changed what this
+   function read on later iterations, defeating compile.rs's intended
+   0<=i<len invariant from perfectly valid source (not just via a
+   corrupted `.kx` module). With that companion fix in place, this
+   specific overflow is no longer reachable via `kupl native` (the
+   invariant genuinely holds again) -- kept anyway for engine-symmetry/
+   anti-drift with vm.rs, matching this codebase's own established "fix
+   both engines identically" precedent from PR-it846's IterLen fix, and as
+   a defense-in-depth backstop should compile.rs's invariant ever be
+   violated by a future change. */
 static KValue k_iter_get(KValue v, KValue idx) {
     if (idx.tag != K_INT) k_panic("iterator index must be Int");
-    if (v.tag == K_RANGE) return k_int(v.as.range.lo + idx.as.i);
+    if (v.tag == K_RANGE) {
+        int64_t r;
+        if (__builtin_add_overflow(v.as.range.lo, idx.as.i, &r)) k_panic("corrupt .kx module: iterator index out of range");
+        return k_int(r);
+    }
     if (v.tag == K_LIST) {
         if (idx.as.i < 0 || idx.as.i >= v.as.list->len) k_panic("list index out of range");
         return v.as.list->items[idx.as.i];

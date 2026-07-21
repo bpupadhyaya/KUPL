@@ -1518,7 +1518,52 @@ impl<'m> Vm<'m> {
                         _ => return Err(VmError { msg: "iterator index must be Int".into(), span }),
                     };
                     match reg!(iter) {
-                        Value::Range(a, _, _) => set!(dst, Value::Int(a + i)),
+                        // A REAL bug found+fixed (production-hardening
+                        // PR-it997, a close-read survey of this loop): the
+                        // untouched sibling of `Op::IterLen`'s ALREADY-FIXED
+                        // overflow (PR-it846, see that arm's own doc comment
+                        // above) -- this computed `a + i` in plain, unchecked
+                        // `i64` arithmetic. For ANY loop `compile.rs` (the
+                        // sole emitter of this op, line ~869) actually
+                        // compiles, the loop invariant `0 <= i < len` (where
+                        // `len` is `IterLen`'s now-correctly-clamped result,
+                        // computed from the SAME snapshotted `iter` register
+                        // this op reads) guarantees `a + i` always fits in
+                        // `i64` -- so with `compile.rs::Stmt::For`'s OWN
+                        // PR-it997 companion fix in place (which snapshots
+                        // `iter` into a fresh register via `Op::Move`, fixing
+                        // a SEPARATE, much higher-severity silent-value-
+                        // divergence bug where a loop body reassigning its
+                        // OWN `var` mid-iteration silently changed what
+                        // `IterGet` read on later iterations -- see that
+                        // fix's own doc comment for the full live-confirmed
+                        // repro, which affected BOTH this file and cgen.rs
+                        // identically, reachable from perfectly valid
+                        // source), this specific overflow is NOT reachable
+                        // from any valid, check.rs-accepted `.kupl` source.
+                        // It remains reachable via a hand-crafted or
+                        // corrupted `.kx` module loaded through `kupl run
+                        // some.kx` (`kx.rs::decode()` performs zero semantic
+                        // cross-validation between an `IterGet`'s `idx`
+                        // register and the `iter` it pairs with) -- the SAME
+                        // established threat model as every other "corrupt
+                        // .kx module" guard in this loop. Uses `checked_add`
+                        // and this file's own established clean-error
+                        // convention rather than silently clamping (unlike
+                        // `IterLen`'s length, which has natural saturating
+                        // semantics, `a + i` here IS the actual value handed
+                        // to the running program -- clamping would silently
+                        // substitute a WRONG value instead of surfacing the
+                        // corruption).
+                        Value::Range(a, _, _) => match a.checked_add(i) {
+                            Some(v) => set!(dst, Value::Int(v)),
+                            None => {
+                                return Err(VmError {
+                                    msg: "corrupt .kx module: iterator index out of range".into(),
+                                    span,
+                                })
+                            }
+                        },
                         Value::List(ref items) => match items.get(i as usize) {
                             Some(v) => set!(dst, v.clone()),
                             None => return Err(VmError { msg: "list index out of range".into(), span }),
@@ -20818,6 +20863,111 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
             .call_named("main", vec![])
             .expect_err("a start+offset overflow must be a clean VmError, not a panic or silent wraparound");
         assert!(err.msg.contains("corrupt .kx module"), "{}", err.msg);
+    }
+
+    /// A REAL, LIVE-CONFIRMED SILENT-VALUE-DIVERGENCE bug found+fixed
+    /// (production-hardening PR-it997, a close-read survey of this loop):
+    /// see `compile.rs::Stmt::For`'s own doc comment for the full root-
+    /// cause writeup. `for x in r { ... }` aliased the compiled `it`
+    /// register directly with `r`'s own live register (`self.expr(iter)`'s
+    /// `Ident` arm returns a variable's OWN register, not a copy) -- so a
+    /// loop body reassigning `r` silently changed what `Op::IterGet` read
+    /// on every SUBSEQUENT iteration, while `Op::IterLen`'s already-
+    /// computed length (from the ORIGINAL value) kept the loop running for
+    /// the ORIGINAL iteration count. `interp.rs` was unaffected (captures
+    /// `iter` as an owned, independent `Value` up front), so this was a
+    /// genuine cross-engine divergence reachable from perfectly valid,
+    /// check.rs-accepted `.kupl` source -- confirmed identically on `kupl
+    /// native` too, since `compile.rs` drives both. Fixed at the root by
+    /// snapshotting `iter` into a fresh register via `Op::Move` before
+    /// either `IterLen` or `IterGet` ever reads it.
+    #[test]
+    fn diff_reassigning_a_for_loops_own_iterator_variable_mid_loop_does_not_affect_the_ongoing_iteration() {
+        // A benign same-shape reassignment: without the fix, the VM/native
+        // silently pulled values from the REASSIGNED range on later
+        // iterations (`100, 6, 7`) instead of the correct `100, 101, 102`.
+        let benign = "fun probe() -> Str {\n    \
+                      var r = 100..103\n    var i = 0\n    var out = \"\"\n    \
+                      for x in r {\n        i = i + 1\n        out = \"{out}{x},\"\n        \
+                      if i == 1 { r = 5..8 }\n    }\n    out\n}\n";
+        assert_eq!(differential(benign), "100,101,102,");
+        // A reassignment to a range whose bounds WOULD overflow `Op::IterGet`'s
+        // `a + i` if the (buggy) aliasing let it leak into a later iteration --
+        // with the fix, the loop is fully decoupled from the reassignment, so
+        // this runs cleanly on both engines exactly like the benign case above.
+        let extreme = "fun probe() -> Str {\n    \
+                       var r = 100..102\n    var i = 0\n    var out = \"\"\n    \
+                       for x in r {\n        i = i + 1\n        out = \"{out}{x},\"\n        \
+                       if i == 1 { r = 9223372036854775807..9223372036854775807 }\n    }\n    out\n}\n";
+        assert_eq!(differential(extreme), "100,101,");
+        // Reassigning a `List`-backed iterator variable mid-loop is the same
+        // root cause (both `Op::IterLen`/`Op::IterGet` read the SAME aliased
+        // register regardless of Range vs List) -- covered here too, since
+        // the fix is unconditional over `iter`'s shape.
+        let list = "fun probe() -> Str {\n    \
+                    var r = [10, 20, 30]\n    var i = 0\n    var out = \"\"\n    \
+                    for x in r {\n        i = i + 1\n        out = \"{out}{x},\"\n        \
+                    if i == 1 { r = [40, 50, 60] }\n    }\n    out\n}\n";
+        assert_eq!(differential(list), "10,20,30,");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it997, a close-read
+    /// survey of this loop): see `Op::IterGet`'s own doc comment above for
+    /// the full writeup. With the sibling fix above (`compile.rs::Stmt::
+    /// For` now snapshotting `iter` into a never-again-written register)
+    /// in place, `Op::IterLen`'s `len` and `Op::IterGet`'s `a` always
+    /// derive from that SAME stable value, so this overflow is NOT
+    /// reachable from any valid, check.rs-accepted `.kupl` source. It
+    /// remains reachable via a hand-crafted/corrupted `.kx` module,
+    /// simulated here the same way this file's OTHER corrupt-`.kx` tests
+    /// do (mutate a compiled Op's own operand directly, mirroring the
+    /// `MakeList` test above): redirect `Op::IterGet`'s `idx` operand to
+    /// read from the loop's `+1` increment register instead of its own
+    /// counter register, after corrupting THAT register's constant to
+    /// `i64::MAX` -- exactly what a hand-edited `.kx` file's `decode()`
+    /// would hand the VM, since `decode()` never cross-validates an op's
+    /// operand register against what it's actually supposed to reference.
+    #[test]
+    fn a_for_loop_iterator_index_that_overflows_the_range_addition_is_a_clean_error_not_a_panic_or_silent_wraparound() {
+        let src = "fun main() { for i in 100..102 { } }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let idx = module.funs["main"];
+
+        // a legitimate module still runs correctly (sanity check).
+        let mut vm = Vm::new(&module);
+        assert!(vm.call_named("main", vec![]).is_ok());
+
+        let chunk = &mut module.chunks[idx as usize];
+        let mut one_reg = None;
+        for op in chunk.code.iter() {
+            if let crate::bytecode::Op::Const(dst, cidx) = op {
+                if chunk.consts.get(*cidx as usize) == Some(&Value::Int(1)) {
+                    one_reg = Some(*dst);
+                }
+            }
+        }
+        let one_reg = one_reg.expect("the test needs `main`'s for-loop to genuinely have a `1` increment constant");
+        for c in chunk.consts.iter_mut() {
+            if *c == Value::Int(1) {
+                *c = Value::Int(i64::MAX);
+            }
+        }
+        let mut found = false;
+        for op in chunk.code.iter_mut() {
+            if let crate::bytecode::Op::IterGet { idx, .. } = op {
+                *idx = one_reg;
+                found = true;
+            }
+        }
+        assert!(found, "the test needs `main` to genuinely contain an IterGet op");
+
+        let mut vm = Vm::new(&module);
+        let err = vm
+            .call_named("main", vec![])
+            .expect_err("an overflowing `a + i` must be a clean VmError, not a panic or silent wraparound");
+        assert!(err.msg.contains("corrupt .kx module: iterator index out of range"), "{}", err.msg);
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it920): a SECOND
