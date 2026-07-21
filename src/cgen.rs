@@ -14189,6 +14189,125 @@ fun main() uses io {
         }
     }
 
+    /// A cross-engine fuzz pass against `rational.rs`'s exact-fraction
+    /// arithmetic (`add`/`sub`/`mul`/`div`, built on `BigInt`'s
+    /// cross-multiplication + GCD reduction) vs `cgen.rs`'s independent C
+    /// reimplementation (`k_rat_add`/`k_rat_sub`/`k_rat_mul`/`k_rat_div`,
+    /// `k_rat_norm`'s own GCD-based reduction and sign normalization),
+    /// production-hardening PR-it1009 -- the SAME cross-engine gap PR-it1008
+    /// just closed for bare `BigInt`, now extended to `Rational`: PR-it1000's
+    /// own close-read of this exact region was a HAND-PICKED edge-case audit
+    /// (pow boundary exactness, GCD-heuristic threshold, `to_f64`'s
+    /// individually-oversized-but-close-ratio case), not broad random
+    /// generation -- genuinely fresh territory for THIS fuzz technique,
+    /// mirroring the SAME PR-it628-vs-PR-it1008 distinction just resolved
+    /// for BigInt. Generates random `(n, d)` machine-`Int` pairs (small
+    /// enough that cross-multiplication during `add`/`sub`/`div` can never
+    /// approach `MAX_BIGINT_LIMBS`'s cap, so every generated case is
+    /// expected to succeed on both sides) with `d` forced non-zero, paired
+    /// with one of `+`/`-`/`*`/`/` -- the SECOND operand's numerator is also
+    /// forced non-zero when `/` is chosen, since `rat(n, d)` itself already
+    /// panics on `d == 0` (an ordinary, already-covered construction-time
+    /// error, not this fuzz test's own concern) but a non-zero-denominator
+    /// Rational can still legitimately BE zero (`rat(0, 5)`), which IS a
+    /// legal divisor to reject at DIVISION time specifically. Checks that
+    /// `rat(n1, d1) OP rat(n2, d2)`'s canonical `n/d` (or bare `n` when
+    /// `d == 1`) string matches EXACTLY between native and the identical
+    /// chain computed directly via `crate::rational::Rational::from_ints`/
+    /// `.add`/`.sub`/`.mul`/`.div`/`Display` (the same functions interp/vm
+    /// call). Before trusting a clean first-run report, applied the it885/
+    /// it886/it887/it1007/it1008 discipline -- including it1008's OWN
+    /// lesson about verifying an injection lands in a code path the test
+    /// actually exercises: deliberately injected a real, narrow divergence
+    /// into native's `k_rat_norm` (changed the sign-normalization check
+    /// `if (den->neg)` to `if (num->neg)`, a plausible one-character
+    /// regression that would misfire sign normalization specifically when
+    /// only the numerator, not the denominator, is negative) and confirmed
+    /// the SAME fuzz test caught it, before reverting (confirmed via
+    /// `diff -a` against a pre-injection backup that ONLY the intended line
+    /// differed) and re-confirming a clean result on the real code. Found
+    /// ZERO disagreements on the real code -- a genuinely broader coverage
+    /// mechanism now locked in permanently, not a bug fix.
+    #[test]
+    fn fuzz_random_rational_arithmetic_matches_the_canonical_rust_implementation_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+            fn range(&mut self, lo: i64, hi: i64) -> i64 {
+                lo + self.below((hi - lo) as u64) as i64
+            }
+            fn nonzero_range(&mut self, lo: i64, hi: i64) -> i64 {
+                loop {
+                    let v = self.range(lo, hi);
+                    if v != 0 {
+                        return v;
+                    }
+                }
+            }
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let (op_sym, op_idx) = match rng.below(4) {
+                0 => ("+", 0),
+                1 => ("-", 1),
+                2 => ("*", 2),
+                _ => ("/", 3),
+            };
+            let n1 = rng.range(-1000, 1000);
+            let d1 = rng.nonzero_range(-100, 100);
+            let n2 = if op_idx == 3 { rng.nonzero_range(-1000, 1000) } else { rng.range(-1000, 1000) };
+            let d2 = rng.nonzero_range(-100, 100);
+            let r1 = crate::rational::Rational::from_ints(n1, d1).expect("in-range Int construction");
+            let r2 = crate::rational::Rational::from_ints(n2, d2).expect("in-range Int construction");
+            let result = match op_idx {
+                0 => r1.add(&r2),
+                1 => r1.sub(&r2),
+                2 => r1.mul(&r2),
+                _ => r1.div(&r2),
+            }
+            .expect("small operands can never exceed the BigInt size cap");
+            let expected = result.to_string();
+            let src =
+                format!("fun main() uses io {{\n    print(rat({n1}, {d1}) {op_sym} rat({n2}, {d2}))\n}}\n");
+            let raw = native_main_stdout(&src, &format!("ratfuzz{seed}"));
+            // strip exactly ONE trailing newline (print's own terminator) --
+            // not a blanket .trim(), per PR-it883's lesson.
+            let actual = raw.strip_suffix('\n').unwrap_or(&raw);
+            if actual != expected {
+                mismatches.push(format!(
+                    "seed={seed} n1={n1} d1={d1} op={op_sym} n2={n2} d2={d2} expected={expected:?} actual={actual:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native Rational add/sub/mul/div diverges from the canonical Rust implementation on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it627), mirroring the
     /// SAME fix in `rational.rs`'s `Rational::to_f64`: native's
     /// `k_rat_to_f64` converted `num` and `den` to `double` SEPARATELY via
