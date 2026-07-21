@@ -47,20 +47,47 @@ struct Checker {
 /// Lexical scope stack for body checking.
 struct Scopes {
     stack: Vec<HashMap<String, (Ty, bool)>>,
+    /// Parallel scope stack for `let`-bound aliases of a top-level
+    /// polymorphic function (production-hardening PR-it969): `let f1 =
+    /// generic_fn` where `generic_fn` has type parameters. Kept SEPARATE
+    /// from `stack`'s concrete `Ty` bindings rather than freezing `f1`'s
+    /// type at whatever its first use infers -- a plain top-level generic
+    /// function already re-instantiates fresh type variables per CALL SITE
+    /// (`infer_ident`'s `self.checked.funs` fallback), but a `let`-bound
+    /// alias used to short-circuit through `stack` first, freezing a
+    /// single concrete instantiation and rejecting a second call at a
+    /// different type (K0200) -- confirmed live, PR-it965. Always the SAME
+    /// length as `stack`, kept in lockstep by `push`/`pop`.
+    fun_aliases: Vec<HashMap<String, String>>,
 }
 
 impl Scopes {
     fn new() -> Self {
-        Scopes { stack: vec![HashMap::new()] }
+        Scopes { stack: vec![HashMap::new()], fun_aliases: vec![HashMap::new()] }
     }
     fn push(&mut self) {
         self.stack.push(HashMap::new());
+        self.fun_aliases.push(HashMap::new());
     }
     fn pop(&mut self) {
         self.stack.pop();
+        self.fun_aliases.pop();
     }
     fn insert(&mut self, name: &str, ty: Ty, mutable: bool) {
         self.stack.last_mut().unwrap().insert(name.to_string(), (ty, mutable));
+        // A concrete binding always overrides/clears any fun-alias of the
+        // SAME name at this exact scope level (e.g. `let f1 = apply` later
+        // shadowed by an inner `let f1 = 5`).
+        self.fun_aliases.last_mut().unwrap().remove(name);
+    }
+    /// Bind `name` as an alias for the top-level polymorphic function
+    /// `target`, instead of a concrete `Ty` -- see the `fun_aliases` field
+    /// doc comment. Immutable only (`Stmt::Let`'s own call site only invokes
+    /// this for `let`, never `var` -- a reassignable binding freezing to a
+    /// SPECIFIC later-assigned value is the ordinary, correct behavior).
+    fn insert_fun_alias(&mut self, name: &str, target: &str) {
+        self.fun_aliases.last_mut().unwrap().insert(name.to_string(), target.to_string());
+        self.stack.last_mut().unwrap().remove(name);
     }
     fn get(&self, name: &str) -> Option<(Ty, bool)> {
         for scope in self.stack.iter().rev() {
@@ -70,9 +97,29 @@ impl Scopes {
         }
         None
     }
+    /// The top-level function `name` currently aliases, if any -- walks
+    /// scope levels innermost-first exactly like `get`, so a concrete
+    /// binding of `name` at an INNER level correctly shadows an alias of
+    /// the same name from an OUTER level (both stacks are indexed
+    /// together, not `fun_aliases` alone, to stay correct even if that
+    /// invariant were ever violated by a future caller).
+    fn get_fun_alias(&self, name: &str) -> Option<String> {
+        for (concrete, aliases) in self.stack.iter().zip(self.fun_aliases.iter()).rev() {
+            if concrete.contains_key(name) {
+                return None;
+            }
+            if let Some(target) = aliases.get(name) {
+                return Some(target.clone());
+            }
+        }
+        None
+    }
     /// All in-scope binding names (for "did you mean" suggestions).
     fn names(&self) -> impl Iterator<Item = &str> {
-        self.stack.iter().flat_map(|s| s.keys().map(String::as_str))
+        self.stack
+            .iter()
+            .flat_map(|s| s.keys().map(String::as_str))
+            .chain(self.fun_aliases.iter().flat_map(|s| s.keys().map(String::as_str)))
     }
 }
 
@@ -1861,6 +1908,34 @@ impl Checker {
     fn check_stmt(&mut self, stmt: &Stmt, ctx: &mut Ctx) -> Ty {
         match stmt {
             Stmt::Let { name, ty, init, mutable, span } => {
+                // Alias detection (production-hardening PR-it969): `let f1 =
+                // generic_fn` where `init` is a BARE reference to an
+                // existing top-level POLYMORPHIC function (or a transitive
+                // alias of one), with no explicit type annotation (an
+                // annotation is an intentional monomorphizing constraint,
+                // left untouched) and immutable (`var` freezing to a later
+                // reassignment is ordinary, correct behavior). See
+                // `Scopes::fun_aliases`'s own doc comment for the bug this
+                // closes.
+                if ty.is_none() && !*mutable {
+                    if let ExprKind::Ident(fname) = &init.kind {
+                        // `fname` must genuinely refer to the top-level decl,
+                        // not a local/param that happens to share its name
+                        // (the SAME shadowing-awareness PR-it931 already
+                        // established for constructor-call dispatch just
+                        // below `infer_call`'s own doc comment).
+                        if ctx.scopes.get(fname).is_none() {
+                            let target = match self.checked.funs.get(fname) {
+                                Some((_, _, qvars)) if !qvars.is_empty() => Some(fname.clone()),
+                                _ => ctx.scopes.get_fun_alias(fname),
+                            };
+                            if let Some(target) = target {
+                                ctx.scopes.insert_fun_alias(name, &target);
+                                return Ty::Unit;
+                            }
+                        }
+                    }
+                }
                 let init_ty = self.infer_expr(init, ctx);
                 let final_ty = match ty {
                     Some(t) => {
@@ -2635,6 +2710,18 @@ impl Checker {
     }
 
     fn infer_ident(&mut self, name: &str, span: Span, ctx: &mut Ctx) -> Ty {
+        // A `let`-bound alias of a top-level polymorphic function
+        // (production-hardening PR-it969) re-instantiates fresh type
+        // variables on EVERY use, exactly like a direct reference to the
+        // top-level function itself below -- see `Scopes::fun_aliases`'s
+        // own doc comment for why this can't just fall through to the
+        // plain `ctx.scopes.get` below.
+        if let Some(target) = ctx.scopes.get_fun_alias(name) {
+            if let Some((params, ret, qvars)) = self.checked.funs.get(&target).cloned() {
+                let (params, ret) = self.instantiate_scheme(&params, &ret, &qvars);
+                return Ty::Fun(params, Box::new(ret));
+            }
+        }
         if let Some((ty, _)) = ctx.scopes.get(name) {
             return ty;
         }
@@ -6356,6 +6443,69 @@ mod generic_tests {
             .iter()
             .all(|d| d.code != "K0282"),
             "an ordinary non-generic component method must never trigger K0282"
+        );
+    }
+
+    #[test]
+    fn let_bound_alias_of_a_generic_function_stays_polymorphic() {
+        // A REAL bug found+fixed (production-hardening PR-it969, closing the
+        // gap re-characterized and deferred at PR-it965): direct top-level
+        // calls to a generic function (`apply(f, x)`) already re-instantiate
+        // fresh type variables per call site (`infer_ident`'s
+        // `self.checked.funs` fallback) -- but `let f1 = apply` used to fall
+        // through `Stmt::Let`'s ordinary path, which EAGERLY instantiated
+        // `apply`'s scheme ONCE and froze the result as `f1`'s permanent
+        // type in `ctx.scopes`. Calling `f1` a SECOND time at a different
+        // type then failed with a spurious K0200, even though the runtime
+        // (types are fully erased after checking) was ALWAYS correct --
+        // confirmed live before this fix. This is a check.rs-only bug; no
+        // engine besides the type checker itself is involved.
+        let src = "fun apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\n\
+                   fun main() uses io {\n\
+                   \x20   let f1 = apply\n\
+                   \x20   let a = f1(fn n { n - 1 }, 100)\n\
+                   \x20   let b = f1(fn s { s + \"?\" }, \"ab\")\n\
+                   \x20   print(\"{a} {b}\")\n\
+                   }\n";
+        assert!(errors(src).is_empty(), "a let-bound alias of a generic fun must stay polymorphic: {:?}", errors(src));
+
+        // Chained aliasing (`let f2 = f1`) must ALSO stay polymorphic --
+        // transitively resolving through to the ultimate top-level scheme.
+        let chained = "fun apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\n\
+                        fun main() uses io {\n\
+                        \x20   let f1 = apply\n\
+                        \x20   let f2 = f1\n\
+                        \x20   let a = f2(fn n { n - 1 }, 100)\n\
+                        \x20   let b = f2(fn s { s + \"?\" }, \"ab\")\n\
+                        \x20   print(\"{a} {b}\")\n\
+                        }\n";
+        assert!(errors(chained).is_empty(), "a chained alias must ALSO stay polymorphic: {:?}", errors(chained));
+
+        // Shadowing: a local binding that merely shares its NAME with a
+        // top-level generic function (not an alias of it at all) must be
+        // completely unaffected -- no false-positive aliasing.
+        let shadow = "fun apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\n\
+                       fun make_apply() -> Int { 5 }\n\
+                       fun main() uses io {\n\
+                       \x20   let apply = make_apply()\n\
+                       \x20   print(\"{apply}\")\n\
+                       }\n";
+        assert!(errors(shadow).is_empty(), "shadowing a generic fun's name must not spuriously alias it: {:?}", errors(shadow));
+
+        // `var` (not `let`) must NOT alias -- a reassignable binding
+        // freezing to whatever type its first use infers is the ordinary,
+        // INTENTIONAL, unchanged behavior (this fix is `let`-only).
+        let var_mono = "fun apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\n\
+                         fun main() uses io {\n\
+                         \x20   var f1 = apply\n\
+                         \x20   let a = f1(fn n { n - 1 }, 100)\n\
+                         \x20   let b = f1(fn s { s + \"?\" }, \"ab\")\n\
+                         \x20   print(\"{a} {b}\")\n\
+                         }\n";
+        assert!(
+            errors(var_mono).iter().any(|d| d.code == "K0200"),
+            "a `var`-bound alias must stay monomorphic (K0200 on the second, differently-typed call): {:?}",
+            errors(var_mono)
         );
     }
 }
