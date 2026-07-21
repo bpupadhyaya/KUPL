@@ -143,10 +143,25 @@ contract* — pick the engine and idiom that fit the workload:
   so the same loop is **O(n²)** — e.g. pushing 100 000 elements one at a time takes
   milliseconds on `run`/`--vm` but seconds compiled. A value shared by another binding
   falls back to copying on every engine (value semantics are always preserved).
-- **Guidance.** For large accumulation on the native backend, prefer a single bulk pass
-  — `.map` / `.filter` / `.fold` / `.flat_map` over a source collection, or `.join` to
-  assemble a string — each of which allocates once and is O(n) on all four engines.
-  Reserve element-at-a-time `push`/`+` loops for small n or the interp/KVM engines.
+- **`Map`/`Set` in-loop `.insert()` is a narrower case — it stays O(n²) even on the
+  interpreter and KVM.** `m = m.insert(k, v)` / `s = s.insert(v)` have the same
+  uniquely-owned in-place fast path as `Str`/`List` above, but — unlike append/push —
+  `.insert()` must also check whether the key/value is already present, and that
+  duplicate check is an O(n) linear scan of the map/set on **every** call. The fast
+  path removes the per-call clone (so allocation cost is amortized O(1), not O(n)) but
+  **not** the scan, so an n-iteration build loop remains O(n²) **time** on every
+  engine, not just native — e.g. inserting into a `Map` one entry at a time took
+  0.4s/6.4s for n=5,000/20,000 (~15.5x time for 4x size) on `run`, matching O(n²)
+  almost exactly. `Set` has an escape hatch — `Set(list)` bulk-constructs in genuine
+  O(n log n) — but `Map` currently has no analogous bulk constructor, so there is no
+  way to build a large `Map` other than accepting O(n²).
+- **Guidance.** For large `Str`/`List` accumulation on the native backend, or any
+  large `Map`/`Set` accumulation on every backend, prefer a single bulk pass — `.map` /
+  `.filter` / `.fold` / `.flat_map` over a source collection, or `.join` to assemble a
+  string, or `Set(list)` to bulk-build a Set — each of which allocates (and, for
+  `Set(list)`, deduplicates) once and is O(n) or O(n log n) on all four engines.
+  Reserve element-at-a-time `push`/`+`/`Set.insert` loops for small n or the interp/KVM
+  engines, and element-at-a-time `Map.insert` loops for small n on every engine.
 
 ---
 

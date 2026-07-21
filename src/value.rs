@@ -1189,10 +1189,29 @@ impl Env {
     }
 
     /// `m = m.insert(k, v)` in place when `m` is a uniquely-owned Map — updates or
-    /// appends the pair without cloning the whole assoc-list, turning an O(n^2)
-    /// map-building loop into O(n) allocations. Returns None on success, or
-    /// Some((k, v)) to fall back (shared map / not found / other shape). Behaves
-    /// exactly like `.insert` (same overwrite semantics, same insertion order).
+    /// appends the pair without cloning the whole assoc-list. Returns None on
+    /// success, or Some((k, v)) to fall back (shared map / not found / other
+    /// shape). Behaves exactly like `.insert` (same overwrite semantics, same
+    /// insertion order).
+    ///
+    /// CORRECTED (production-hardening PR-it983, a live-benchmarked finding):
+    /// unlike its `append_str_in_place`/`push_list_in_place` siblings just above
+    /// (genuinely O(n) TOTAL for an n-iteration build loop, since Str append/List
+    /// push need no duplicate check), this does NOT make an `m = m.insert(...)`
+    /// loop O(n) overall — `pairs.iter_mut().find(...)` below is an O(n) LINEAR
+    /// SCAN for the duplicate-key check, paid on EVERY call, so an n-iteration
+    /// build loop remains O(n^2) TIME even with this fast path; only the
+    /// PER-CALL ALLOCATION cost drops from O(n) (a full assoc-list clone) to
+    /// amortized O(1) (`Vec::push`). Live-confirmed: a `for i in 0..n { m =
+    /// m.insert(i, i) }` loop took 0.41s/6.37s for n=5,000/20,000 (~15.5x time
+    /// for 4x size, matching O(n^2) almost exactly) on this SAME fast path.
+    /// `Map` has no bulk constructor (unlike `Set(list)`, which already gets a
+    /// genuine O(n log n) fast path via `set_from_list`/PR-it826) to route
+    /// around this, so there is currently no way to build a large `Map` other
+    /// than accepting O(n^2). A real fix needs a persistent hash/sorted index
+    /// alongside the insertion-order `Vec` (or a new `Map(list)` bulk
+    /// constructor mirroring `Set(list)`'s) — out of scope for this comment
+    /// fix; see dotfiles PR-it983 for the full investigation.
     pub fn insert_map_in_place(&self, name: &str, key: Value, val: Value) -> Option<(Value, Value)> {
         let mut inner = self.0.borrow_mut();
         if let Some(i) = inner.find_local(name) {
@@ -1225,6 +1244,14 @@ impl Env {
     /// `s = s.insert(v)` in place when `s` is a uniquely-owned Set — the Set-build
     /// analogue of `insert_map_in_place` (a Set is an insertion-ordered `Vec` with
     /// dedup). None on success, Some(v) to fall back.
+    ///
+    /// Shares `insert_map_in_place`'s SAME O(n^2)-not-O(n) correction (PR-it983):
+    /// `items.iter().any(...)` below is an O(n) dedup scan paid per call, so an
+    /// `s = s.insert(v)` build loop remains O(n^2) TIME despite this fast path
+    /// (only the per-call clone/allocation cost is avoided). Unlike Map, `Set`
+    /// DOES have a genuine O(n log n) bulk-construction escape hatch —
+    /// `Set(list)` / `set_from_list` (PR-it826) — so prefer building a `List`
+    /// first and converting once, rather than an incremental insert loop.
     pub fn insert_set_in_place(&self, name: &str, v: Value) -> Option<Value> {
         let mut inner = self.0.borrow_mut();
         if let Some(i) = inner.find_local(name) {

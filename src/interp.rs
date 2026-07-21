@@ -670,9 +670,17 @@ impl Interp {
                             }
                         }
                         // Fast path for `m = m.insert(k, v)` (Map self-insert): update
-                        // in place when `m` is a uniquely-owned Map — turns the O(n^2)
-                        // map-building loop into O(n) allocations. (2 args => Map
+                        // in place when `m` is a uniquely-owned Map, avoiding the O(n)
+                        // clone `.insert` would otherwise pay per call. (2 args => Map
                         // insert; Set insert takes 1 arg, so it never matches here.)
+                        // NOTE (production-hardening PR-it983): this does NOT make the
+                        // build loop O(n) overall like its Str/List siblings above --
+                        // `insert_map_in_place`'s own duplicate-key scan is still O(n)
+                        // per call, so an n-iteration loop remains O(n^2) TIME; only
+                        // the per-call ALLOCATION drops from O(n) to O(1) amortized.
+                        // See value.rs::insert_map_in_place's doc comment for the full,
+                        // live-benchmarked correction (this comment previously implied
+                        // full O(n), unchallenged since the fast path's original PR-it91).
                         if name == "insert"
                             && args.len() == 2
                             && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)
@@ -702,7 +710,12 @@ impl Interp {
                             }
                         }
                         // Fast path for `s = s.insert(v)` (Set self-insert, 1 arg):
-                        // same in-place uniqueness optimization — O(n^2) set build -> O(n).
+                        // same in-place uniqueness optimization, avoiding the per-call
+                        // clone -- but (production-hardening PR-it983) the dedup scan
+                        // in `insert_set_in_place` is still O(n) per call, so this does
+                        // NOT make the build loop O(n) overall, unlike Str/List above;
+                        // prefer `Set(list)` (a genuine O(n log n) bulk path, PR-it826)
+                        // over an incremental insert loop when building a large Set.
                         if name == "insert"
                             && args.len() == 1
                             && matches!(&recv.kind, ExprKind::Ident(r) if r == tname)

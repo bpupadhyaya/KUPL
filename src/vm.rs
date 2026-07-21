@@ -1141,7 +1141,14 @@ impl<'m> Vm<'m> {
                         continue;
                     }
                     // Self-insert fast path (`m = m.insert(k, v)`): same in-place
-                    // update of a uniquely-owned Map — O(n^2) build loop -> O(n).
+                    // update of a uniquely-owned Map, avoiding the per-call clone.
+                    // NOTE (production-hardening PR-it983): the duplicate-key scan
+                    // just below is still O(n) per call, so this does NOT make the
+                    // build loop O(n) overall (unlike the List/Str fast paths above)
+                    // -- an n-iteration loop remains O(n^2) TIME, just without the
+                    // extra per-call clone/realloc cost. See value.rs's
+                    // `insert_map_in_place` doc comment for the live-benchmarked
+                    // correction of this comment's original (PR-it91) claim.
                     if method == "insert"
                         && argc == 2
                         && dst == recv
@@ -1168,7 +1175,11 @@ impl<'m> Vm<'m> {
                         continue;
                     }
                     // Self-insert fast path (`s = s.insert(v)`, 1 arg): in-place dedup
-                    // append on a uniquely-owned Set — O(n^2) build loop -> O(n).
+                    // append on a uniquely-owned Set, avoiding the per-call clone.
+                    // NOTE (production-hardening PR-it983): the dedup scan just below
+                    // is still O(n) per call, so this does NOT make the build loop
+                    // O(n) overall (unlike List/Str above) -- prefer `Set(list)` (a
+                    // genuine O(n log n) bulk path, PR-it826) for a large Set.
                     if method == "insert"
                         && argc == 1
                         && dst == recv
@@ -17750,8 +17761,9 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
 
     #[test]
     fn diff_map_self_insert_in_place_preserves_aliasing() {
-        // The `m = m.insert(k, v)` in-place fast path (PR-it91, O(n^2)->O(n) map
-        // build) must only fire when the Map is uniquely owned. An aliased map must
+        // The `m = m.insert(k, v)` in-place fast path (PR-it91; avoids a per-call
+        // clone, though the loop remains O(n^2) overall -- PR-it983) must only
+        // fire when the Map is uniquely owned. An aliased map must
         // be untouched — value semantics. Here `alias` shares m before the insert,
         // so it stays len 1 while m grows to 2, on both interp and KVM.
         let src = "fun probe() -> Str {\n    var m = Map().insert(\"a\", 1)\n    let alias = m\n    \
@@ -17766,7 +17778,8 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
 
     #[test]
     fn diff_set_self_insert_in_place_preserves_aliasing_and_dedup() {
-        // `s = s.insert(v)` in-place (PR-it92, O(n^2)->O(n) set build) fires only on a
+        // `s = s.insert(v)` in-place (PR-it92; avoids a per-call clone, though the
+        // loop remains O(n^2) overall -- PR-it983) fires only on a
         // uniquely-owned Set. An aliased set is untouched, dedup still holds (inserting
         // a present element is a no-op), insertion order is preserved. interp == KVM.
         let src = "fun probe() -> Str {\n    var s: Set[Int] = Set().insert(1).insert(2)\n    \
