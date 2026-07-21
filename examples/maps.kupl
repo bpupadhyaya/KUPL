@@ -1,7 +1,12 @@
-// Map transformations — filter and fold over key/value entries.
+// Map transformations — filter/fold over entries, plus lookup/combine.
 //
-//   Map.filter(fn(K, V) -> Bool) -> Map[K, V]   keep matching entries
-//   Map.fold(init, fn(Acc, K, V) -> Acc) -> Acc  reduce over entries
+//   Map.filter(fn(K, V) -> Bool) -> Map[K, V]     keep matching entries
+//   Map.fold(init, fn(Acc, K, V) -> Acc) -> Acc    reduce over entries
+//   Map.contains_key(K) -> Bool                    membership check
+//   Map.remove(K) -> Map[K, V]                      a copy without that key
+//   Map.map_values(fn(V) -> V2) -> Map[K, V2]       transform every value
+//   Map.merge(Map[K, V]) -> Map[K, V]               combine two Maps —
+//     on a shared key, the ARGUMENT's value wins (like `a with` for records)
 //
 // Entries are visited in insertion order, so results are deterministic.
 
@@ -22,6 +27,18 @@ fun main() uses io {
     print("total = {total}")
     let receipt = prices.fold("", fn acc, item, cost { "{acc}{item}:{cost} " })
     print("receipt = {receipt}")
+
+    // contains_key / remove — membership check and immutable deletion
+    print("has caviar = {prices.contains_key("caviar")}")
+    print("has eggs   = {prices.contains_key("eggs")}")
+    print("no caviar  = {prices.remove("caviar").keys()}")
+
+    // map_values / merge — transform every value, or combine two Maps
+    let doubled = prices.map_values(fn cost { cost * 2 })
+    print("doubled    = {doubled.values()}")
+    let sale = Map().insert("apple", 2).insert("eggs", 5)
+    print("merged     = {prices.merge(sale).keys()}")
+    print("apple sale = {prices.merge(sale).get("apple")}")
 }
 
 law "Map filter and fold" {
@@ -30,4 +47,10 @@ law "Map filter and fold" {
     expect m.filter(fn k, v { k == "a" }) == Map().insert("a", 1)
     expect m.fold(0, fn acc, k, v { acc + v }) == 6
     expect m.fold("", fn acc, k, v { acc + k }) == "abc"
+    expect m.contains_key("a")
+    expect !m.contains_key("z")
+    expect m.remove("b") == Map().insert("a", 1).insert("c", 3)
+    expect m.map_values(fn v { v * 10 }) == Map().insert("a", 10).insert("b", 20).insert("c", 30)
+    expect m.merge(Map().insert("a", 100).insert("d", 4)) ==
+        Map().insert("a", 100).insert("b", 2).insert("c", 3).insert("d", 4)
 }
