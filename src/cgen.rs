@@ -14959,6 +14959,121 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "bigunicodetrim"), "123\n-456\n789\n");
     }
 
+    /// A cross-engine fuzz pass against `bigint.rs`'s arbitrary-precision
+    /// arithmetic (`add`/`sub`/`mul`) vs `cgen.rs`'s own SEPARATE,
+    /// genuinely substantial multi-limb C reimplementation (`k_big_add`/
+    /// `k_big_sub`/`k_big_mul`, with their own limb-carry/borrow magnitude
+    /// helpers `k_big_add_mag`/`k_big_mul_small`/`k_big_sub_mag`),
+    /// production-hardening PR-it1008. `bigint.rs`'s OWN internal
+    /// correctness was already property-fuzzed against Python's arbitrary-
+    /// precision ints as an oracle at PR-it628 (0 mismatches) -- but that
+    /// only validated the RUST side in isolation, never `cgen.rs`'s
+    /// independent native C reimplementation, exactly the cross-engine gap
+    /// every OTHER fuzz test in this file targets (following the SAME
+    /// xorshift64* convention established for CSV/regex/JSON/query-strings/
+    /// date math). Generates random large decimal-digit strings (1-24
+    /// digits, random sign, well under `MAX_BIGINT_LIMBS`'s cap so no
+    /// generated case can hit the separate "too large to compute" error
+    /// path) paired with one of `+`/`-`/`*`, and checks that the result's
+    /// canonical decimal string matches EXACTLY between native and the
+    /// identical chain computed directly via `crate::bigint::BigInt::
+    /// from_str`/`.add`/`.sub`/`.mul`/`Display` (the same functions
+    /// interp/vm call). Before trusting a clean first-run report, applied
+    /// the it885/it886/it887/it1007 discipline: deliberately injected a
+    /// real, narrow divergence into native's `k_big_mul`'s own inline
+    /// schoolbook double-loop carry logic (changed the output limb's `%
+    /// KBIG_BASE` to `% (KBIG_BASE - 1)`, a plausible one-character
+    /// regression, leaving the SEPARATE carry computation, `cur /
+    /// KBIG_BASE`, untouched -- exactly the kind of subtle, easy-to-miss
+    /// inconsistency a real edit could introduce). First attempted this in
+    /// the WRONG function (`k_big_mul_small`, a plausible-looking but
+    /// actually-unrelated helper) and the fuzz test correctly stayed
+    /// clean -- confirming `k_big_mul` doesn't call `k_big_mul_small` at
+    /// all (it has its own fully independent inline carry logic), a useful
+    /// reminder to verify an injected bug is actually EXERCISED by the
+    /// code path under test, not just plausible-sounding. Re-injected into
+    /// the CORRECT location and confirmed the SAME fuzz test caught it (22
+    /// of the 80 seeds -- exactly the ones whose randomly-chosen operator
+    /// was `*`, i.e. every single multiplication case, none missed), before
+    /// reverting (confirmed via `diff -a` against a pre-injection backup
+    /// that ONLY the intended line differed) and re-confirming a clean
+    /// result on the real code. Found ZERO disagreements on the real code
+    /// -- a genuinely broader coverage mechanism now locked in
+    /// permanently, not a bug fix.
+    #[test]
+    fn fuzz_random_bigint_arithmetic_matches_the_canonical_rust_implementation_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+        }
+        fn fuzz_gen_digits(rng: &mut FuzzRng) -> String {
+            let len = 1 + rng.below(24) as usize;
+            let mut s = String::new();
+            if rng.below(2) == 0 {
+                s.push('-');
+            }
+            for _ in 0..len {
+                s.push((b'0' + rng.below(10) as u8) as char);
+            }
+            s
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let a = fuzz_gen_digits(&mut rng);
+            let b = fuzz_gen_digits(&mut rng);
+            let (op_sym, op_idx) = match rng.below(3) {
+                0 => ("+", 0),
+                1 => ("-", 1),
+                _ => ("*", 2),
+            };
+            let big_a = crate::bigint::BigInt::from_str(&a).expect("generated digits parse");
+            let big_b = crate::bigint::BigInt::from_str(&b).expect("generated digits parse");
+            let result = match op_idx {
+                0 => big_a.add(&big_b),
+                1 => big_a.sub(&big_b),
+                _ => big_a.mul(&big_b),
+            };
+            let expected = result.to_string();
+            let src = format!("fun main() uses io {{\n    print(big(\"{a}\") {op_sym} big(\"{b}\"))\n}}\n");
+            let raw = native_main_stdout(&src, &format!("bigintfuzz{seed}"));
+            // strip exactly ONE trailing newline (print's own terminator) --
+            // not a blanket .trim(), per PR-it883's lesson.
+            let actual = raw.strip_suffix('\n').unwrap_or(&raw);
+            if actual != expected {
+                mismatches.push(format!(
+                    "seed={seed} a={a} op={op_sym} b={b} expected={expected:?} actual={actual:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native BigInt add/sub/mul diverges from the canonical Rust implementation on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
     /// PR-it663, the SAME bug class as it662's BigInt.from_str finding, this
     /// time on a far more commonly-used surface): `Str.trim()` used to share
