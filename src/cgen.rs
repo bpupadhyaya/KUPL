@@ -18553,4 +18553,138 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
             "native: the string workload took {elapsed:?}, expected well under {NATIVE_BOUND:?} -- possible performance regression"
         );
     }
+
+    /// A FOURTH performance-regression GUARD, production-hardening
+    /// PR-it1014 -- PR-it1011/it1012/it1013's guards exercise recursive
+    /// call dispatch, plain arithmetic/loop dispatch, and string/method
+    /// dispatch respectively; this one exercises the COMPONENT RUNTIME
+    /// specifically (instantiation + `expose fun` call dispatch + state
+    /// get/set) -- never covered by ANY existing guard, and central to
+    /// KUPL's OWN "AI-first, component-oriented" identity. `native`'s own
+    /// `wiring.kupl` example notes the declarative `app`/`wire`/`emit`
+    /// model is interp/VM-only -- but confirmed LIVE before designing
+    /// this test that a component instantiated DIRECTLY inside a plain
+    /// `fun main()` (no `app`, just `let c = Counter()` + `c.bump(n)`
+    /// expose-fun calls, matching this file's OWN established
+    /// `native_expose_calls` test's pattern) compiles and runs
+    /// identically on ALL THREE engines. Instantiates a FRESH component
+    /// instance on every iteration (rather than reusing one instance
+    /// repeatedly, which PR-it1012's own loop guard already effectively
+    /// covers via plain variable mutation) specifically to stress
+    /// INSTANTIATION dispatch, not just method-call dispatch on an
+    /// already-live instance. Same wide-margin philosophy throughout:
+    /// empirically measured baseline FIRST (debug `kupl` CLI, the SAME
+    /// unoptimized profile `cargo test` itself builds under) before
+    /// picking bounds -- 20,000 iterations of `Counter()` construction +
+    /// one `expose fun` call each took ~0.076s (interp) / ~0.047s (VM) /
+    /// negligible (native). Bounds here are 10s (interp/VM, >100x margin)
+    /// and 5s (native) -- generous enough to never flake, tight enough to
+    /// catch a genuine order-of-magnitude-or-worse regression. Times ONLY
+    /// execution (never compile/build time). Asserts the CORRECT result
+    /// (`sum_{i=0}^{n-1} i = n(n-1)/2`, independently verified via the
+    /// closed-form formula, not just trusted from one engine) on every
+    /// engine. No recursion at all (a `while` loop), so no `std::thread::
+    /// Builder` stack-size wrapping needed -- confirmed live before
+    /// finalizing (this test's own first, unwrapped run completed
+    /// cleanly, no stack overflow).
+    #[test]
+    fn perf_guard_a_moderate_component_instantiation_workload_completes_well_within_a_generous_time_bound_on_every_engine(
+    ) {
+        const N: i64 = 20_000;
+        // sum_{i=0}^{n-1} i = n*(n-1)/2, independently verified via the
+        // closed-form formula, not just trusted from one engine.
+        let expected_sum: i128 = {
+            let n = N as i128;
+            n * (n - 1) / 2
+        };
+        const INTERP_VM_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+        const NATIVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let work_src = format!(
+            "component Counter1014 {{\n    \
+             intent \"perf guard\"\n    \
+             state total: Int = 0\n    \
+             expose fun bump(n: Int) -> Int {{\n        total = total + n\n        total\n    }}\n}}\n\
+             fun work() -> Int {{\n    \
+             var sum = 0\n    var i = 0\n    \
+             while i < {N} {{\n        \
+             let c = Counter1014()\n        \
+             sum = sum + c.bump(i)\n        \
+             i = i + 1\n    }}\n    \
+             sum\n}}\n"
+        );
+
+        // interp
+        let interp_src = format!("{work_src}fun main() -> Int {{ work() }}\n");
+        let compiled = crate::run::compile(&interp_src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let start = std::time::Instant::now();
+        let result = interp
+            .call_value(f, vec![], crate::diag::Span::default())
+            .unwrap_or_else(|_| panic!("interp: the component workload must not panic"));
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            crate::value::Value::Int(expected_sum as i64),
+            "interp: wrong sum result"
+        );
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "interp: the component workload took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // VM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = crate::vm::Vm::new(&module);
+        let start = std::time::Instant::now();
+        let result = vm
+            .call_named("main", vec![])
+            .unwrap_or_else(|e| panic!("vm: the component workload must not error: {}", e.msg));
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            crate::value::Value::Int(expected_sum as i64),
+            "vm: wrong sum result"
+        );
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "vm: the component workload took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // native
+        if !cc_available() {
+            return;
+        }
+        let native_src = format!("{work_src}fun main() uses io {{\n    print(work())\n}}\n");
+        let compiled = crate::run::compile(&native_src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base =
+            std::env::temp_dir().join(format!("kupl-cgen-compperfguard-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            expected_sum.to_string(),
+            "native: wrong sum result"
+        );
+        assert!(
+            elapsed < NATIVE_BOUND,
+            "native: the component workload took {elapsed:?}, expected well under {NATIVE_BOUND:?} -- possible performance regression"
+        );
+    }
 }
