@@ -21143,6 +21143,66 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
         assert_eq!(differential(list), "10,20,30,");
     }
 
+    /// A REAL, LIVE-CONFIRMED SILENT-WRONG-BRANCH bug found+fixed
+    /// (production-hardening PR-it1003, a close-read survey of
+    /// `compile.rs`'s pattern-lowering region): see
+    /// `compile.rs::ExprKind::Match`'s own doc comment for the full
+    /// root-cause writeup. This is the SAME aliasing shape as PR-it997's
+    /// `Stmt::For::iter` bug above, but for a match's scrutinee: a bare
+    /// `Ident` scrutinee's `self.expr(scrutinee)` returns the variable's
+    /// OWN live register (via `self.lookup`), not a snapshot. A KUPL
+    /// guard is an ordinary `Expr`, and the grammar allows a bare `{
+    /// ... }` to parse as a `BlockExpr` containing a full `Stmt::Assign`
+    /// -- so a guard can legally reassign the scrutinee variable itself.
+    /// When such a guard evaluates false, control falls through to the
+    /// NEXT arm's pattern match, which re-reads the scrutinee register --
+    /// now holding the REASSIGNED value instead of the value the match
+    /// started with, silently taking the wrong branch with zero
+    /// diagnostic. `interp.rs` was unaffected (evaluates the scrutinee
+    /// into an owned, independent `Value` up front), so this was a
+    /// genuine cross-engine divergence reachable from perfectly valid,
+    /// check.rs-accepted `.kupl` source -- confirmed identically on
+    /// `kupl native` too, since `compile.rs` drives both. Fixed at the
+    /// root the same way as PR-it997: snapshotting the scrutinee into a
+    /// fresh register via `Op::Move` before any arm's pattern ever reads
+    /// it.
+    #[test]
+    fn diff_reassigning_a_matchs_own_scrutinee_variable_inside_a_guard_does_not_affect_which_arm_is_taken(
+    ) {
+        // Int-literal-pattern shape: without the fix, the VM/native fell
+        // through to arm 2 (reading the MUTATED scrutinee `2`) instead of
+        // the wildcard arm, silently picking "two-wrong".
+        let int_literal = "fun probe() -> Str {\n    \
+                           var x = 1\n    var out = \"\"\n    \
+                           match x {\n        \
+                           1 if { x = 2\n false } => { out = \"one\" }\n        \
+                           2 => { out = \"two-wrong\" }\n        \
+                           _ => { out = \"other\" }\n    \
+                           }\n    out\n}\n";
+        assert_eq!(differential(int_literal), "other");
+        // Ctor-pattern shape: without the fix, the VM/native fell through
+        // to the `None` arm (reading the MUTATED scrutinee) instead of
+        // re-matching `Some(1)` against the second arm, silently picking
+        // "none" instead of the wrapped value "1".
+        let ctor = "fun probe() -> Str {\n    \
+                    var x = Some(1)\n    var out = \"\"\n    \
+                    match x {\n        \
+                    Some(n) if { x = None\n false } => { out = \"first\" }\n        \
+                    Some(m) => { out = \"{m}\" }\n        \
+                    None => { out = \"none\" }\n    \
+                    }\n    out\n}\n";
+        assert_eq!(differential(ctor), "1");
+        // Control: a guard that does NOT mutate the scrutinee still works
+        // correctly (no regression to ordinary guard behavior).
+        let benign_guard = "fun probe() -> Str {\n    \
+                            var x = 5\n    var out = \"\"\n    \
+                            match x {\n        \
+                            n if n > 0 => { out = \"positive\" }\n        \
+                            _ => { out = \"other\" }\n    \
+                            }\n    out\n}\n";
+        assert_eq!(differential(benign_guard), "positive");
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it997, a close-read
     /// survey of this loop): see `Op::IterGet`'s own doc comment above for
     /// the full writeup. With the sibling fix above (`compile.rs::Stmt::

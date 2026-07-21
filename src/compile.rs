@@ -1163,7 +1163,44 @@ impl<'s> FnCompiler<'s> {
                 dst
             }
             ExprKind::Match { scrutinee, arms } => {
-                let s = self.expr(scrutinee);
+                // A REAL, LIVE-CONFIRMED SILENT-WRONG-BRANCH bug found+fixed
+                // (production-hardening PR-it1003, a close-read survey of
+                // this file's `fn pattern`/register-lifecycle machinery,
+                // explicitly dispatched because PR-it997 found the SAME
+                // aliasing shape one call site over, in `Stmt::For`'s
+                // `iter`): `self.expr(scrutinee)` for a bare `Ident`
+                // referring to a mutable `var` returns that VARIABLE'S OWN
+                // register directly, not a copy -- so `match x { ... }`
+                // aliased `s` with `x`'s own live register. A guard is an
+                // ordinary `Expr`, and KUPL's grammar lets a bare `{ ... }`
+                // parse as a block expression, so a guard can legally
+                // contain a full assignment statement that mutates `x`
+                // itself (`1 if { x = 2; false } => ...`). When such a
+                // guard evaluates false, control falls through to the NEXT
+                // arm's `self.pattern(...)` call, which re-reads `s` --
+                // now the MUTATED value, not the scrutinee's value at the
+                // start of the match -- with ZERO diagnostic. `interp.rs`'s
+                // `Stmt::Match`/`eval` (its own scrutinee handling) has NO
+                // such bug: it evaluates the scrutinee into an OWNED,
+                // independent `Value` once, up front, fully decoupled from
+                // any later reassignment of `x` in `env`. Live-confirmed on
+                // ALL THREE runnable engines: `var x = 1\n match x { 1 if {
+                // x = 2\n false } => print("one")\n 2 => print("two-wrong")
+                // \n _ => print("other") }` printed the correct `other` on
+                // `kupl run`, but `two-wrong` on BOTH `kupl run --vm` AND a
+                // `kupl native` binary -- since `compile.rs` is the SHARED
+                // emitter driving both. FIXED the SAME way PR-it997 fixed
+                // its own sibling aliasing bug: snapshot the scrutinee's
+                // value into a FRESH register via the existing `Op::Move`
+                // op immediately after evaluating it, mirroring interp.rs's
+                // own once-captured-by-value semantics exactly. `fn
+                // pattern`'s own recursive matching (nested constructors,
+                // Or-alternatives, At-bindings) was independently confirmed
+                // sound -- this aliasing was confined to the scrutinee
+                // register itself, not `fn pattern`'s own logic.
+                let s_raw = self.expr(scrutinee);
+                let s = self.alloc(span);
+                self.emit(Op::Move(s, s_raw), span);
                 let dst = self.alloc(span);
                 let mut end_jumps = Vec::new();
                 for arm in arms {
