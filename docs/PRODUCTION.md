@@ -154,16 +154,25 @@ contract* — pick the engine and idiom that fit the workload:
 
 Being honest about what is not yet production-grade:
 
-- **No package registry or ecosystem.** There is no dependency manager, no published
-  library index, and no third-party packages. Programs use the (substantial, zero-
-  dependency) standard library and local multi-file modules only.
+- **No hosted package registry yet.** `kupl.toml` has a real dependency manager
+  (`[dependencies]`, `kupl pkg tree`/`lock`/`fetch`, hash-verified atomic fetches) and
+  local **path** dependencies (qualified access, version pinning, locking) work today
+  — but there is no live server at the default registry URL, no published library
+  index, and no third-party packages yet: a version-pinned (non-path) dependency
+  fails with a clean network error until a registry is hosted. Programs use the
+  (substantial, zero-dependency) standard library, local multi-file modules, and
+  local path dependencies.
 - **The real-provider AI path is mock-tested, not battle-tested.** The `anthropic`,
   `openai`, and `ollama` providers are implemented, but the test suite exercises the
   **mock** provider. Real-network behavior (timeouts, retries, rate limits, partial
   responses) has not been hardened. Treat live AI calls as experimental; pin them
   behind the mock in CI.
-- **Single-threaded execution.** The runtime is single-threaded; `par` expresses
-  concurrency structurally but does not deliver OS-thread parallelism.
+- **Mostly single-threaded execution.** `par_map`/`par_filter` DO spawn real OS
+  threads (`std::thread::spawn`) when the callback is a pure top-level function and
+  the list is large (≥ 256 elements) — otherwise, and for everything else, execution
+  is sequential. The structured `par { … }` fork-join block itself, `par_each`, and
+  a component instance's own handler dispatch all remain single-threaded (a
+  multi-threaded scheduler for those is a later, semantics-preserving step).
 - **No incremental or persistent compilation cache.** Each invocation recompiles;
   there is no build cache or daemon.
 - **Alpha stability.** The language and `.kx` binary format are versioned (a `.kx`
