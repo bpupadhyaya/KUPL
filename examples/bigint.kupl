@@ -46,6 +46,7 @@ fun main() uses io {
     print("n % 7   = {n % big(7)}")
     print("2^256   = {big(2).pow(256)}")
     print("abs/sign: {big(-42).abs()} {big(-42).sign()}")
+    print("is_negative: {big(-42).is_negative()} {big(42).is_negative()} {big(0).is_negative()}")
 }
 
 law "BigInt arithmetic is exact" {
@@ -54,6 +55,9 @@ law "BigInt arithmetic is exact" {
     expect big(999999999) + big(1) == big("1000000000")
     expect big("-5") + big(3) == big("-2")
     expect big(2).pow(10) == big("1024")
+    expect big(-42).is_negative() == true
+    expect big(42).is_negative() == false
+    expect big(0).is_negative() == false
     expect big(17) % big(5) == big("2")
     expect (big(100) / big(7)) * big(7) + big(100) % big(7) == big("100")
 }
