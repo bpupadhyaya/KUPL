@@ -20645,6 +20645,33 @@ fun main() {\n    let xs = [OnlyA(), OnlyB()]\n    let _ = xs\n}\n";
         let src = "ai fun bad(q: Str) -> Str tools [nope] {\n    intent \"x\"\n}\n";
         let (_, diags) = crate::check::check(&crate::parser::parse(src).0);
         assert!(diags.iter().any(|d| d.code == "K0272"), "{diags:?}");
+        assert!(
+            diags.iter().any(|d| d.code == "K0272" && d.message.contains("which is not defined")),
+            "a genuinely nonexistent tool name must say NOT DEFINED: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn ai_fun_tool_that_is_itself_an_ai_fun_gets_an_accurate_message() {
+        // A REAL diagnostic-wording bug found+fixed (production-hardening
+        // PR-it971, survey #117): a tool name that DOES name a real top-
+        // level function -- just one that's itself an `ai fun`, ineligible
+        // as a tool -- used to get the IDENTICAL "which is not a top-level
+        // function" text as a genuinely nonexistent tool name, even though
+        // the tool function very much IS a top-level function. Every OTHER
+        // K0272 sub-message (generic, missing return type, param/return
+        // shape) already names its own real cause; this was the one
+        // exception. Must now be distinguishable from the nonexistent-name
+        // case (see `ai_fun_unknown_tool_is_rejected` just above).
+        let src = "ai fun helper(x: Int) -> Int tools [] {\n    intent \"h\"\n}\n\
+                   ai fun classify(x: Int) -> Str tools [helper] {\n    intent \"c\"\n}\n";
+        let (_, diags) = crate::check::check(&crate::parser::parse(src).0);
+        let d = diags.iter().find(|d| d.code == "K0272").expect("K0272 must fire");
+        assert!(
+            d.message.contains("itself an `ai fun`") && !d.message.contains("which is not a top-level function"),
+            "must accurately say the tool is itself an ai fun, not falsely say it's not a top-level function: {}",
+            d.message
+        );
     }
 
     #[test]

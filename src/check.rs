@@ -988,20 +988,46 @@ impl Checker {
     ) -> Vec<crate::ai::ToolMeta> {
         let mut out = Vec::new();
         for tool_name in &ai.tools {
-            let decl = program.items.iter().find_map(|it| match it {
-                Item::Fun(f) if &f.name == tool_name && f.ai.is_none() => Some(f),
+            // A REAL diagnostic-wording bug found+fixed (production-hardening
+            // PR-it971, survey #117): this single lookup used to collapse
+            // TWO genuinely different situations into one message -- a
+            // `tool_name` that names no top-level function AT ALL, and one
+            // that DOES name a real top-level function which is itself an
+            // `ai fun` (excluded from tool eligibility, since a tool must be
+            // a plain, synchronous, structured-output-shaped function). Both
+            // got the identical "which is not a top-level function" text,
+            // even though the second case's tool function very much IS a
+            // top-level function -- just not an eligible KIND of one. Every
+            // sibling K0272 sub-message below (generic, missing return type,
+            // param/return shape errors) names its OWN real cause; this was
+            // the only one that didn't. Confirmed live: `ai fun helper() ...`
+            // listed as a tool by another `ai fun` produced the SAME message
+            // text as a genuinely nonexistent tool name.
+            let found = program.items.iter().find_map(|it| match it {
+                Item::Fun(f) if &f.name == tool_name => Some(f),
                 _ => None,
             });
-            let Some(decl) = decl else {
-                self.err(
-                    "K0272",
-                    format!(
-                        "`ai fun {}` lists tool `{tool_name}`, which is not a top-level function",
-                        owner.name
-                    ),
-                    owner.span,
-                );
-                continue;
+            let decl = match found {
+                Some(f) if f.ai.is_none() => f,
+                Some(_) => {
+                    self.err(
+                        "K0272",
+                        format!(
+                            "`ai fun {}` lists tool `{tool_name}`, but it is itself an `ai fun` — tools must be plain functions, not other `ai fun`s",
+                            owner.name
+                        ),
+                        owner.span,
+                    );
+                    continue;
+                }
+                None => {
+                    self.err(
+                        "K0272",
+                        format!("`ai fun {}` lists tool `{tool_name}`, which is not defined", owner.name),
+                        owner.span,
+                    );
+                    continue;
+                }
             };
             if !decl.type_params.is_empty() {
                 self.err(
