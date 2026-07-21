@@ -18317,4 +18317,127 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         };
         std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(body).unwrap().join().unwrap();
     }
+
+    /// A SECOND performance-regression GUARD, production-hardening
+    /// PR-it1012 -- PR-it1011's own `fib(24)` guard exercises RECURSIVE
+    /// function-call dispatch specifically; this one exercises a
+    /// STRUCTURALLY DIFFERENT hot path (a plain `while` loop with
+    /// variable mutation and arithmetic, no function calls at all beyond
+    /// `main` itself), so a Big-O-class regression confined to ONE
+    /// dispatch shape (e.g. loop-condition re-evaluation, `Op::Add`/
+    /// `Op::Mul` dispatch, or variable-store/-load) wouldn't necessarily
+    /// be caught by the recursive guard alone. Same wide-margin
+    /// philosophy as PR-it1011 throughout: empirically measured baseline
+    /// FIRST (debug `kupl` CLI, the SAME unoptimized profile `cargo test`
+    /// itself builds under) before picking bounds -- 500,000 iterations
+    /// of `sum = sum + i * i; i = i + 1` took ~0.28s (interp) / ~0.26s
+    /// (VM) / negligible (native, `-O2`, process-spawn-dominated).
+    /// Bounds here are 10s (interp/VM, >35x margin) and 5s (native, a
+    /// vast margin given near-zero actual compute time) -- generous
+    /// enough to never flake, tight enough to catch a genuine order-of-
+    /// magnitude-or-worse regression. Times ONLY execution (never
+    /// compile/build time). Asserts the CORRECT result (the closed-form
+    /// sum of squares 0^2+1^2+...+499999^2, independently verified via
+    /// the well-known `n(n-1)(2n-1)/6` formula for `n=500000` BEFORE
+    /// writing this test, not just trusted from a single engine's own
+    /// output) on every engine, not just the timing bound -- a pure
+    /// timing check with no correctness assertion could pass vacuously
+    /// on a silently-wrong computation. This loop's own depth is
+    /// constant (no recursion at all), so -- UNLIKE PR-it1011's `fib`
+    /// guard -- no `std::thread::Builder` stack-size wrapping is needed
+    /// here; confirmed live before finalizing (this test's own first,
+    /// unwrapped run completed cleanly, no stack overflow).
+    #[test]
+    fn perf_guard_a_moderate_loop_heavy_workload_completes_well_within_a_generous_time_bound_on_every_engine(
+    ) {
+        const N: i64 = 500_000;
+        // sum_{i=0}^{n-1} i^2 = (n-1)*n*(2n-1)/6, independently verified
+        // via the closed-form formula, not just trusted from one engine.
+        let expected_sum: i128 = {
+            let n = N as i128;
+            (n - 1) * n * (2 * n - 1) / 6
+        };
+        const INTERP_VM_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+        const NATIVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let loop_src = format!(
+            "fun work() -> Int {{\n    \
+             var sum = 0\n    var i = 0\n    \
+             while i < {N} {{\n        sum = sum + i * i\n        i = i + 1\n    }}\n    \
+             sum\n}}\n"
+        );
+
+        // interp
+        let interp_src = format!("{loop_src}fun main() -> Int {{ work() }}\n");
+        let compiled = crate::run::compile(&interp_src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let start = std::time::Instant::now();
+        let result = interp
+            .call_value(f, vec![], crate::diag::Span::default())
+            .unwrap_or_else(|_| panic!("interp: the loop workload must not panic"));
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            crate::value::Value::Int(expected_sum as i64),
+            "interp: wrong sum-of-squares result"
+        );
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "interp: the loop workload took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // VM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = crate::vm::Vm::new(&module);
+        let start = std::time::Instant::now();
+        let result = vm
+            .call_named("main", vec![])
+            .unwrap_or_else(|e| panic!("vm: the loop workload must not error: {}", e.msg));
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            crate::value::Value::Int(expected_sum as i64),
+            "vm: wrong sum-of-squares result"
+        );
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "vm: the loop workload took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // native
+        if !cc_available() {
+            return;
+        }
+        let native_src = format!("{loop_src}fun main() uses io {{\n    print(work())\n}}\n");
+        let compiled = crate::run::compile(&native_src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base =
+            std::env::temp_dir().join(format!("kupl-cgen-loopperfguard-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            expected_sum.to_string(),
+            "native: wrong sum-of-squares result"
+        );
+        assert!(
+            elapsed < NATIVE_BOUND,
+            "native: the loop workload took {elapsed:?}, expected well under {NATIVE_BOUND:?} -- possible performance regression"
+        );
+    }
 }

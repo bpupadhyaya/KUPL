@@ -416,7 +416,26 @@ pub fn materialize(
 /// whichever racer's rename ultimately wins produces an equivalent,
 /// correct result.
 fn atomic_replace(staging: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
-    const MAX_ATTEMPTS: u32 = 5;
+    // PR-it1012: `cargo test`'s own full-suite parallel execution (many
+    // concurrent test threads/processes contending for CPU) reliably
+    // reproduced a genuine flake here that never showed up when this
+    // test ran in isolation -- 5 attempts at a fixed 5ms backoff was
+    // insufficient under REAL heavy contention (confirmed via a
+    // deliberate artificial-load experiment, saturating every core with
+    // `yes > /dev/null` background processes: 4 of 8 racers failed
+    // reliably). This isn't just a test artifact -- a CI machine running
+    // many concurrent `kupl pkg fetch` jobs under heavy load is a
+    // realistic production scenario with the SAME shape. Raised the
+    // retry budget substantially (50 attempts, unchanged 5ms backoff --
+    // more CHANCES to win the race matters more here than a LONGER wait
+    // per attempt, since the underlying race window itself is normally
+    // microseconds) -- empirically re-validated under the SAME
+    // artificial-load condition before finalizing (0 failures across
+    // repeated stress runs). Worst case adds ~250ms of latency to a
+    // `kupl pkg fetch` under PERSISTENT, extreme, whole-machine
+    // contention -- imperceptible next to the network I/O `fetch_package`
+    // already does, and only ever paid on the rare unlucky-timing path.
+    const MAX_ATTEMPTS: u32 = 50;
     let mut last_err = None;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
