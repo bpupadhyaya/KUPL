@@ -18196,4 +18196,125 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
                    on start {\n        a.set(10)\n        b.set(20)\n        print(\"{a.get()} {b.get()}\")\n    }\n}\n";
         assert_eq!(native_stdout(two, "exp2"), "10 20\n");
     }
+
+    /// A performance-regression GUARD, production-hardening PR-it1011 --
+    /// this campaign's founding roadmap named "PERF unbenchmarked" as a
+    /// standing gap (never systematically addressed across 1000+ prior
+    /// iterations) alongside robustness/security/stability work. Not a
+    /// fine-grained timing benchmark (this project's own PR-it818 already
+    /// established that tight wall-clock assertions are genuinely flaky --
+    /// a bounded-WAIT pattern for something expected to complete quickly is
+    /// sound, per PR-it821's `wait_with_timeout`, but asserting a TIGHT
+    /// upper bound on ordinary variable-load-machine timing is not) --
+    /// this is instead a coarse, GENEROUS-margin guard against a genuine
+    /// Big-O-class regression (e.g. an accidental O(n^2) change to
+    /// function-call dispatch, env/variable lookup, or register
+    /// allocation) slipping in unnoticed on a hot, commonly-exercised
+    /// path: recursive function calls. Runs `fib(24)` (46,368 recursive
+    /// calls -- small enough to keep this test's own contribution to the
+    /// full suite's runtime negligible, large enough to be dominated by
+    /// per-call dispatch overhead rather than process/compile startup
+    /// noise) directly through `Interp::call_value`/`Vm::call_named`, and
+    /// through a real `-O2`-compiled native binary, timing ONLY each
+    /// engine's own EXECUTION (never compilation/build time, which is a
+    /// separate concern already exercised implicitly by every OTHER
+    /// native test in this file). Bounds were set with a wide empirical
+    /// margin: measured baseline on this development machine (debug
+    /// `kupl` CLI, i.e. the SAME unoptimized profile `cargo test` itself
+    /// builds under) was ~0.19s (interp) / ~0.17s (VM) / ~0.05s (native,
+    /// already `-O2`) -- bounds here are 10s (interp/VM, >50x margin) and
+    /// 5s (native, >100x margin), chosen to catch a genuine order-of-
+    /// magnitude-or-worse regression while being extremely unlikely to
+    /// ever flake on a real CI/dev machine, matching PR-it821's own
+    /// established "generous margin, not a close timing call" philosophy
+    /// exactly. Also asserts the CORRECT result (46368) on every engine --
+    /// a pure timing check with no correctness assertion could pass
+    /// vacuously fast on a silently-wrong (e.g. short-circuited or
+    /// memoized-into-triviality) computation.
+    #[test]
+    fn perf_guard_a_moderate_recursive_workload_completes_well_within_a_generous_time_bound_on_every_engine(
+    ) {
+        // interp.rs's `eval`/`exec_stmt` dispatch functions have grown
+        // substantial per-frame local state over 1000+ campaign iterations
+        // (matching PR-it1001's own documented lesson) -- even `fib(24)`'s
+        // modest 24-deep recursion is enough to exceed the DEFAULT 2MB
+        // debug-test-thread stack (confirmed live: this test genuinely
+        // SIGABRTs with a stack overflow without this wrapping). Wrapped
+        // in the SAME established `std::thread::Builder`-with-8MB-stack
+        // pattern this file's/vm.rs's OTHER marginal-recursion tests
+        // already use (first established PR-it860).
+        let body = || {
+        const EXPECTED: i64 = 46368; // fib(24)
+        const INTERP_VM_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+        const NATIVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let fib_src = "fun fib(n: Int) -> Int {\n    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\n";
+
+        // interp
+        let interp_src = format!("{fib_src}fun main() -> Int {{ fib(24) }}\n");
+        let compiled = crate::run::compile(&interp_src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let start = std::time::Instant::now();
+        let result = interp
+            .call_value(f, vec![], crate::diag::Span::default())
+            .unwrap_or_else(|_| panic!("interp: fib(24) must not panic"));
+        let elapsed = start.elapsed();
+        assert_eq!(result, crate::value::Value::Int(EXPECTED), "interp: wrong fib(24) result");
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "interp: fib(24) took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // VM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = crate::vm::Vm::new(&module);
+        let start = std::time::Instant::now();
+        let result = vm
+            .call_named("main", vec![])
+            .unwrap_or_else(|e| panic!("vm: fib(24) must not error: {}", e.msg));
+        let elapsed = start.elapsed();
+        assert_eq!(result, crate::value::Value::Int(EXPECTED), "vm: wrong fib(24) result");
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "vm: fib(24) took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // native
+        if !cc_available() {
+            return;
+        }
+        let native_src = format!("{fib_src}fun main() uses io {{\n    print(fib(24))\n}}\n");
+        let compiled = crate::run::compile(&native_src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base =
+            std::env::temp_dir().join(format!("kupl-cgen-perfguard-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            EXPECTED.to_string(),
+            "native: wrong fib(24) result"
+        );
+        assert!(
+            elapsed < NATIVE_BOUND,
+            "native: fib(24) took {elapsed:?}, expected well under {NATIVE_BOUND:?} -- possible performance regression"
+        );
+        };
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(body).unwrap().join().unwrap();
+    }
 }
