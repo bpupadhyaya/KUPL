@@ -712,8 +712,36 @@ pub fn add_lhs_escapes(chunk: &Chunk, add_idx: usize) -> bool {
 /// chunk. See `method_recv_escapes`'s doc comment for the two-window
 /// soundness argument (loop body vs whole prefix) this implements.
 fn reg_escapes(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool {
+    // A REAL, live-confirmed silent value-corruption bug found+fixed
+    // (production-hardening PR-it985), the SIXTH instance of the escape-
+    // analysis-completeness family opened at it615, and the SECOND caused by
+    // a WINDOW-SCOPE bug (after PR-it984's `reg_traces_to_a_parameter` fix,
+    // same shape, sibling function): when `op_idx` is inside a loop, this
+    // used to scan ONLY the loop body (`(lo, hi + 1)`) -- correct for
+    // catching an alias created (or re-created) WITHIN the loop itself,
+    // live on the NEXT iteration, but blind to an alias created in the
+    // PREFIX, before the loop, which is exactly as live at the loop's FIRST
+    // iteration as one created inside it. Live-confirmed: `var t = "abcde"; t
+    // = t + "f"; t = t + "g"; var getter = fn { t }; for i in 0..n { t = t +
+    // "x" } "{getter()}|{t}"` -- interp/KVM correctly returned the closure's
+    // VALUE-SEMANTICS SNAPSHOT taken at `MakeClosure` time ("abcdefg",
+    // unaffected by the loop), but native's fast path (wrongly proven "safe"
+    // by this narrowed window, which never saw the pre-loop `MakeClosure`
+    // capturing `t`) mutated `t`'s buffer in place, corrupting the closure's
+    // captured value too ("abcdefgxx", matching `t`'s post-loop value
+    // instead of the snapshot). The straight-line (no loop) sibling shape,
+    // and a loop preceded by a plain `Move`-based alias (`var backup = t`),
+    // were already correctly handled before this fix -- this gap is
+    // SPECIFIC to the loop-narrowed window, same root cause as PR-it984,
+    // just reached through a different alias-creating op (`MakeClosure`
+    // rather than `Move`/`GetField`/`IterGet`). Fixed identically to
+    // PR-it984: widen the loop-case window to include the full prefix `[0,
+    // ..)` in addition to (not instead of) the loop body, so a pre-loop
+    // alias-creating op is never invisible again, while still catching the
+    // ORIGINAL loop-wraparound case (an alias created late in one iteration,
+    // live before the op on the NEXT iteration) this narrowing was for.
     let (start, end) = match enclosing_loop_range(chunk, op_idx) {
-        Some((lo, hi)) => (lo, hi + 1),
+        Some((_, hi)) => (0, hi + 1),
         None => (0, op_idx),
     };
     chunk

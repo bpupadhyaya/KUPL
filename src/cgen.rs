@@ -8446,6 +8446,60 @@ mod tests {
     }
 
     /// A REAL, live-confirmed silent value-corruption bug found+fixed
+    /// (production-hardening PR-it985), the SIXTH instance of the escape-
+    /// analysis-completeness family, and the SECOND caused by a WINDOW-SCOPE
+    /// bug (sibling of the `reg_traces_to_a_parameter` fix just above,
+    /// PR-it984, same root cause reached through `reg_escapes` instead):
+    /// `reg_escapes` ALSO narrowed its scan to just the loop body when the
+    /// self-rebind op is inside a loop, missing an alias-creating op (here,
+    /// a `MakeClosure` capturing the variable) in the PREFIX before the
+    /// loop. `var t = "abcde"; t = t + "f"; t = t + "g"` (priming capacity so
+    /// the loop's own appends fit WITHOUT reallocating -- appending to a
+    /// FRESH literal always reallocates on the first append since `k_str`
+    /// sets `cap == len` exactly, which would coincidentally mask this bug)
+    /// then `var getter = fn { t }` (captures `t` BY VALUE at this point,
+    /// per KUPL's value semantics) then a loop appending more to `t` -- the
+    /// closure's captured snapshot must stay `"abcdefg"` regardless of the
+    /// loop. interp/KVM correctly returned the snapshot; native's fast path
+    /// (wrongly proven safe, since the narrowed window never saw the
+    /// pre-loop `MakeClosure`) mutated `t`'s buffer in place, corrupting the
+    /// closure's own captured value too. Confirmed the same gap for List/Map/
+    /// Set (all fixed by the SAME single-function change, matching PR-it984's
+    /// pattern of one shared root cause across all four container types).
+    /// Fixed identically to PR-it984: widen the loop-case window to the full
+    /// prefix, in addition to the loop body.
+    #[test]
+    fn native_self_rebind_through_a_closure_capture_alias_before_a_loop_does_not_corrupt_the_captured_value() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun grow_str(n: Int) -> Str {\n    \
+                   var t = \"abcde\"\n    t = t + \"f\"\n    t = t + \"g\"\n    \
+                   var getter = fn { t }\n    for i in 0..n { t = t + \"x\" }\n    \
+                   \"{getter()}|{t}\"\n}\n\
+                   fun grow_list(n: Int) -> Str {\n    \
+                   var xs: List[Int] = [1, 2, 3, 4, 5]\n    xs = xs.push(6)\n    xs = xs.push(7)\n    \
+                   var getter = fn { xs }\n    for i in 0..n { xs = xs.push(i) }\n    \
+                   \"{getter()}|{xs}\"\n}\n\
+                   fun grow_map(n: Int) -> Str {\n    \
+                   var m: Map[Int, Int] = Map()\n    m = m.insert(1, 1)\n    m = m.insert(2, 2)\n    \
+                   var getter = fn { m }\n    for i in 0..n { m = m.insert(100 + i, i) }\n    \
+                   \"{getter().len()}|{m.len()}\"\n}\n\
+                   fun grow_set(n: Int) -> Str {\n    \
+                   var s: Set[Int] = Set()\n    s = s.insert(1)\n    s = s.insert(2)\n    \
+                   var getter = fn { s }\n    for i in 0..n { s = s.insert(100 + i) }\n    \
+                   \"{getter().len()}|{s.len()}\"\n}\n\
+                   fun main() uses io {\n    \
+                   print(\"{grow_str(2)}|{grow_list(2)}|{grow_map(2)}|{grow_set(2)}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_closure_capture_before_loop");
+        assert_eq!(
+            out.trim(),
+            "abcdefg|abcdefgxx|[1, 2, 3, 4, 5, 6, 7]|[1, 2, 3, 4, 5, 6, 7, 0, 1]|2|4|2|4",
+            "native must not corrupt a closure's pre-loop captured value via a LOOP-based internal self-rebind"
+        );
+    }
+
+    /// A REAL, live-confirmed silent value-corruption bug found+fixed
     /// (production-hardening PR-it819), ONE HOP past PR-it615's parameter-
     /// alias fix above: `reg_traces_to_a_parameter` (bytecode.rs) only
     /// followed `Op::Move` edges, so `fun mutate(b: Box) -> List[Int] { var
