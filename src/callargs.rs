@@ -550,9 +550,21 @@ fn resolve_one(fun_name: &str, params: &[Param], e: &mut Expr, diags: &mut Vec<D
             None => match &p.default {
                 Some(d) => out.push(Arg { name: None, value: d.clone() }),
                 None => {
+                    // A REAL diagnostic-wording gap found+fixed (production-
+                    // hardening PR-it972): unlike check.rs's K0242 (which
+                    // genuinely can't name the callee -- that path handles
+                    // ANY callable expression, e.g. `get_fn()(1, 2)`, not
+                    // just a named function), `resolve_one` -- and this
+                    // K0274 site specifically -- only ever runs for a DIRECT
+                    // call to a top-level named `fun` (this file's own
+                    // top-of-file doc comment), so `fun_name` is ALWAYS a
+                    // real, known, meaningful name here, exactly like its
+                    // sibling K0273 just above (`` `{fun_name}` has no
+                    // parameter named `{n}` ``) -- which already includes
+                    // it. This message used to omit it entirely.
                     diags.push(Diag::error(
                         "K0274",
-                        format!("missing argument for parameter `{}`", p.name),
+                        format!("`{fun_name}` is missing an argument for parameter `{}`", p.name),
                         span,
                     ));
                     // placeholder so the arg list stays the right length
@@ -610,6 +622,26 @@ mod tests {
         // A correct named call still type-checks cleanly.
         let ok_src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() uses io {\n    print(\"{add(a: 1, b: 2)}\")\n}\n";
         assert!(errors(ok_src).is_empty());
+    }
+
+    #[test]
+    fn k0274_missing_argument_names_the_function() {
+        // A REAL diagnostic-wording gap found+fixed (production-hardening
+        // PR-it972): K0274 ("missing argument for parameter") used to omit
+        // the function name entirely, unlike its sibling K0273 (unknown
+        // named argument) just above, which already names it -- both fire
+        // from the exact same named/default-argument resolution pass, which
+        // ONLY ever runs for a direct call to a top-level named `fun` (this
+        // file's own top-of-file doc comment), so the function name is
+        // ALWAYS known and meaningful at this site (unlike check.rs's
+        // separate, differently-scoped K0242, which genuinely can't name an
+        // arbitrary callable expression).
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() uses io {\n    print(\"{add(b: 5)}\")\n}\n";
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|d| d.code == "K0274" && d.message.contains("`add`") && d.message.contains("parameter `a`")),
+            "a missing named argument must name BOTH the function and the missing parameter: {errs:?}"
+        );
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it769): `resolve_call_args`'s
