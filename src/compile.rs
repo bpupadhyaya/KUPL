@@ -1148,7 +1148,25 @@ impl<'s> FnCompiler<'s> {
                     self.patch_jump(short);
                     return dst;
                 }
-                let a = self.expr(lhs);
+                // PR-it1005 (see `consecutive()`'s own doc comment for the
+                // full writeup of this bug class -- same family, a NEW
+                // instance found via a systematic sweep of the rest of
+                // `fn expr`/`fn call` after PR-it1004's six sibling fixes):
+                // `a` is evaluated here, THEN `b` below (which can legally
+                // reassign whatever mutable variable a bare-`Ident` `lhs`
+                // aliases), and only THEN does `Op::Add`/etc. read `a`.
+                // Live-confirmed: for `var x = 5`, `x + { x = 99; 1 }`
+                // printed the correct `6` on `kupl run` but `100` (99 + 1,
+                // silently using the MUTATED `x`) on BOTH `kupl run --vm`
+                // and `kupl native`. Fixed the same way as every sibling
+                // site: snapshot `a` into a fresh register via `Op::Move`
+                // BEFORE evaluating `rhs`. (The short-circuit `And`/`Or`
+                // case just above is UNAFFECTED: its `l` is moved into the
+                // already-fresh `dst` immediately, before `rhs` is ever
+                // evaluated.)
+                let a_raw = self.expr(lhs);
+                let a = self.alloc(span);
+                self.emit(Op::Move(a, a_raw), span);
                 let b = self.expr(rhs);
                 let dst = self.alloc(span);
                 let op = match op {
@@ -1340,7 +1358,32 @@ impl<'s> FnCompiler<'s> {
                 dst
             }
             ExprKind::With { recv, updates } => {
-                let mut cur = self.expr(recv);
+                // PR-it1005 (see `consecutive()`'s own doc comment for the
+                // full writeup of this bug class -- same family, a NEW
+                // instance found via a systematic sweep of the rest of
+                // `fn expr`/`fn call`): `recv` is evaluated here, THEN the
+                // FIRST update's `value` below (which can legally reassign
+                // whatever mutable variable a bare-`Ident` `recv` aliases),
+                // and only THEN does the first `Op::WithField` read `cur`.
+                // Live-confirmed: for `type P = P(x: Int, y: Int)` and `var
+                // p = P(x: 1, y: 2)`, `p with x: { p = P(x: 99, y: 99); 5 }`
+                // printed the correct `5,2` on `kupl run` but `5,99`
+                // (silently reading `p`'s MUTATED `y` field) on BOTH `kupl
+                // run --vm` and `kupl native`. Fixed the same way as every
+                // sibling site: snapshot `recv` into a fresh register via
+                // `Op::Move` immediately after evaluating it. (This is
+                // ONLY needed for `recv`'s initial read -- every SUBSEQUENT
+                // `cur` is already the fresh `dst` register a prior
+                // `Op::WithField` call itself allocated, never aliased to
+                // any user variable, so it can never go stale this way.
+                // PR-it896 separately confirmed `Op::WithField` itself
+                // never mutates `obj` in place -- a different question
+                // from this one, which is about `cur`'s register going
+                // stale BEFORE `Op::WithField` ever runs, not about what
+                // `Op::WithField` does once it does.)
+                let recv_raw = self.expr(recv);
+                let mut cur = self.alloc(span);
+                self.emit(Op::Move(cur, recv_raw), span);
                 for (field, value) in updates {
                     let v = self.expr(value);
                     let name_idx = self.const_idx(Value::str(field.clone()), span);

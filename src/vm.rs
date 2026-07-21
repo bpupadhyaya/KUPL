@@ -21275,6 +21275,52 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
         assert_eq!(differential(ctor_field), "5,1");
     }
 
+    /// A REAL, LIVE-CONFIRMED SILENT-VALUE-CORRUPTION bug FAMILY found+fixed
+    /// (production-hardening PR-it1005, a SYSTEMATIC sweep of the rest of
+    /// `compile.rs`'s `fn expr`/`fn call` region for MORE instances of the
+    /// SAME bug class PR-it1004 found six of): TWO more distinct call sites
+    /// shared the identical shape (see the test just above and
+    /// `compile.rs::consecutive`'s own doc comment for the full root-cause
+    /// writeup) -- `ExprKind::Binary`'s non-short-circuit `lhs`/`rhs`
+    /// evaluation, and `ExprKind::With`'s `recv`. Both fixed the SAME way:
+    /// snapshot into a fresh register via `Op::Move` immediately after
+    /// evaluating, before any subsequent sub-expression can run.
+    #[test]
+    fn diff_a_binary_operators_rhs_or_a_with_exprs_first_update_value_mutating_the_earlier_bare_ident_operands_own_variable_does_not_corrupt_the_earlier_value(
+    ) {
+        // `ExprKind::Binary`'s non-short-circuit `lhs`, held across `rhs`'s
+        // evaluation.
+        let binary_lhs = "fun probe() -> Str {\n    \
+                          var x = 5\n    \
+                          let r = x + { x = 99\n 1 }\n    \
+                          \"{r}\"\n}\n";
+        assert_eq!(differential(binary_lhs), "6");
+        // Control: a genuinely commutative case with NO mutation is
+        // unaffected (no regression to ordinary binary-op behavior).
+        let binary_control = "fun probe() -> Str {\n    \
+                              var a = 3\n    var b = 4\n    \
+                              let r = a * b - 2\n    \
+                              \"{r}\"\n}\n";
+        assert_eq!(differential(binary_control), "10");
+        // `ExprKind::With`'s `recv`, held across the FIRST update's `value`
+        // evaluation.
+        let with_recv = "type P1005 = P1005(x: Int, y: Int)\n\
+                         fun probe() -> Str {\n    \
+                         var p = P1005(x: 1, y: 2)\n    \
+                         let q = p with x: { p = P1005(x: 99, y: 99)\n 5 }\n    \
+                         \"{q.x},{q.y}\"\n}\n";
+        assert_eq!(differential(with_recv), "5,2");
+        // Control: a multi-update `with` with no mutation is unaffected --
+        // `cur` correctly threads through each `Op::WithField`'s own fresh
+        // `dst`, unaffected by the initial `recv` snapshot.
+        let with_control = "type P1005b = P1005b(x: Int, y: Int, z: Int)\n\
+                            fun probe() -> Str {\n    \
+                            var p = P1005b(x: 1, y: 2, z: 3)\n    \
+                            let q = p with x: 10, y: 20\n    \
+                            \"{q.x},{q.y},{q.z}\"\n}\n";
+        assert_eq!(differential(with_control), "10,20,3");
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it997, a close-read
     /// survey of this loop): see `Op::IterGet`'s own doc comment above for
     /// the full writeup. With the sibling fix above (`compile.rs::Stmt::
