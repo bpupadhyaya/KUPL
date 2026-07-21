@@ -1537,6 +1537,90 @@ mod tests {
         assert!(out.status.success(), "the REPL process itself must exit cleanly via :quit, not abort: {out:?}");
     }
 
+    /// A REAL, live-confirmed silent-state-corruption bug found+fixed
+    /// (production-hardening PR-it992, an Explore survey finding): see
+    /// `repl.rs`'s own `defs_items` doc comment for the full root-cause
+    /// analysis. `;` lexes to the same `Newline` statement-terminator token
+    /// the parser uses, so `type A = X(v: Int); type B = Y(v: Int)` on ONE
+    /// REPL line is legal KUPL that used to be tracked as ONE entry keyed by
+    /// BOTH `A` and `B`. Later redefining `A` ALONE (with a wider shape)
+    /// used to silently delete the WHOLE original entry -- including `type
+    /// B`, never touched -- because the redefinition-by-name filter matched
+    /// on ANY shared key. `type B`'s constructor `Y` then vanished from the
+    /// session with zero error, and a later `Y(...)` panicked `unknown
+    /// name`. Also confirms the ANALOGOUS fix works for redefining the
+    /// MIDDLE item of a THREE-item single-line submission (`A`/`B`/`C`,
+    /// redefine `B`), and that a genuinely single-item redefinition (the
+    /// ORIGINAL, most common shape this whole mechanism exists for) still
+    /// works unchanged.
+    #[test]
+    fn redefining_one_item_from_a_multi_item_repl_line_does_not_delete_its_untouched_siblings() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "type A992 = X992(v: Int); type B992 = Y992(v: Int)\n\
+                      Y992(v: 5)\n\
+                      type A992 = X992(v: Int, w: Int)\n\
+                      Y992(v: 5)\n\
+                      type P992 = Q992(v: Int); type R992 = S992(v: Int); type T992 = U992(v: Int)\n\
+                      Q992(v: 1)\n\
+                      S992(v: 2)\n\
+                      U992(v: 3)\n\
+                      type R992 = S992(v: Int, w: Int)\n\
+                      Q992(v: 1)\n\
+                      S992(v: 2, w: 9)\n\
+                      U992(v: 3)\n\
+                      fun add992(a: Int, b: Int) -> Int { a + b }\n\
+                      add992(2, 3)\n\
+                      fun add992(a: Int, b: Int) -> Int { a + b + 100 }\n\
+                      add992(2, 3)\n\
+                      :quit\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = format!("{stdout}{stderr}");
+        assert!(!combined.contains("panicked at"), "kupl repl panicked: {combined}");
+        assert!(
+            !stderr.contains("unknown name"),
+            "an untouched sibling item must survive redefining ANOTHER item from the same original \
+             multi-item submission: {stderr}"
+        );
+        assert!(stdout.contains("Y992(5)"), "B992's constructor must still work before A992 is redefined: {stdout}");
+        assert!(
+            stdout.matches("Y992(5)").count() == 2,
+            "B992's constructor must STILL work identically after redefining unrelated A992: {stdout}"
+        );
+        assert!(
+            stdout.contains("S992(2, 9)"),
+            "the middle item (R992/S992) must pick up its OWN redefinition: {stdout}"
+        );
+        assert!(
+            stdout.matches("Q992(1)").count() == 2 && stdout.matches("U992(3)").count() == 2,
+            "the first and last items of a three-item submission must survive redefining the MIDDLE one: {stdout}"
+        );
+        assert!(stdout.contains("kupl> 5\n"), "add992(2,3) must be 5 before its own redefinition: {stdout}");
+        assert!(
+            stdout.contains("kupl> 105\n"),
+            "add992(2,3) must be 105 after its own (single-item) redefinition: {stdout}"
+        );
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it763, the second
     /// finding from the same survey that produced PR-it762's lockfile
     /// field-escaping fix): `kupl pkg tree`'s drift check only ever asked

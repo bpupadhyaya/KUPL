@@ -14,19 +14,44 @@ Commands: :help  :defs  :quit";
 pub fn repl() -> i32 {
     println!("{BANNER}");
     let stdin = io::stdin();
-    // Each entry is (the (kind, name) pairs this input declares, its source
-    // text). Kept as separate units rather than one flat string so a
-    // re-typed `fun`/`type`/`component`/`contract` can REPLACE its prior
-    // declaration instead of appending a same-named duplicate (production-
-    // hardening PR-it703): before this, only components could be
-    // "redefined" in the REPL, and only because `check.rs` had no
-    // duplicate-component-name check at all (a real bug, now fixed with
-    // K0278) -- redefining a `fun`/`type`/`contract` already correctly
-    // errored (K0203/K0201/K0260) on the accidental last-write-wins
-    // concatenation this REPL used to do. Replacing by name makes
-    // redefinition an intentional, consistent operation for every item
-    // kind, rather than a side effect of one item kind's checker gap.
-    let mut defs_items: Vec<(Vec<(&'static str, String)>, String)> = Vec::new();
+    // Each entry is (this ITEM's own (kind, name) key, its OWN source text).
+    // Kept as separate units rather than one flat string so a re-typed
+    // `fun`/`type`/`component`/`contract` can REPLACE its prior declaration
+    // instead of appending a same-named duplicate (production-hardening
+    // PR-it703): before this, only components could be "redefined" in the
+    // REPL, and only because `check.rs` had no duplicate-component-name
+    // check at all (a real bug, now fixed with K0278) -- redefining a
+    // `fun`/`type`/`contract` already correctly errored (K0203/K0201/K0260)
+    // on the accidental last-write-wins concatenation this REPL used to do.
+    // Replacing by name makes redefinition an intentional, consistent
+    // operation for every item kind, rather than a side effect of one item
+    // kind's checker gap. `key` is `None` for a `law` (matching this same
+    // exemption below: duplicate top-level law names are legitimately
+    // allowed, so a re-typed law always ADDS rather than REPLACES).
+    //
+    // A REAL, live-confirmed silent-STATE-corruption bug found+fixed
+    // (production-hardening PR-it992, an Explore survey finding): this used
+    // to track keys per-SUBMISSION (one entry held EVERY key a single REPL
+    // input declared, sharing ONE text blob) rather than per-ITEM. `;`
+    // lexes to the SAME `Newline` statement-terminator token the parser
+    // uses (`lexer.rs:788`), so `type A = X(v: Int); type B = Y(v: Int)` on
+    // ONE line is legal KUPL and produced ONE entry with `keys = [(type,A),
+    // (type,B)]`. Later redefining ONLY `A` computed `new_keys = [(type,A)]`,
+    // and the retain-filter `!keys.iter().any(|k| new_keys.contains(k))`
+    // dropped the WHOLE original entry -- including `type B`, which was
+    // NEVER touched -- because it merely shared ONE key with the new
+    // submission. The recompile then succeeded trivially (the remaining
+    // source doesn't need `B`), so `"defined."` printed with ZERO error,
+    // and `type B`/its constructor `Y` silently vanished from the session:
+    // `:defs` stopped listing them, and a later `Y(...)` panicked `unknown
+    // name`. Live-confirmed via a real `kupl repl` subprocess BEFORE this
+    // fix. Fixed by tracking ONE key per entry (splitting a multi-item
+    // submission into one entry per item, each sliced from its OWN span
+    // via `sdiff::item_span` through the NEXT item's span start -- or the
+    // end of input for the last item -- so any separator/whitespace
+    // between items naturally stays attached to the PRECEDING item's own
+    // text, needing no new parsing/formatting logic).
+    let mut defs_items: Vec<(Option<(&'static str, String)>, String)> = Vec::new();
     let mut interp = Interp::new(ProgramDb::build(&Default::default(), &Default::default()));
 
     let mut buffer = String::new();
@@ -83,34 +108,62 @@ pub fn repl() -> i32 {
         let trimmed = input.trim();
 
         if is_item(trimmed) {
-            // This input's own top-level (kind, name) pairs, parsed in
-            // isolation -- purely syntactic, so it doesn't need the rest of
-            // `defs_items` to resolve. Any prior entry sharing a key gets
-            // dropped before re-concatenating, so a re-typed declaration
-            // REPLACES rather than duplicates it. If parsing `input` alone
-            // fails, fall back to appending unchanged; `run::compile` below
-            // still reports the real error either way.
-            let new_keys: Vec<(&'static str, String)> = parser::parse(&input)
-                .0
-                .items
-                .iter()
-                .filter(|it| !matches!(it, crate::ast::Item::Law(_)))
-                .map(|it| (crate::sdiff::kind_tag(it), crate::sdiff::item_name(it).to_string()))
-                .collect();
-            let entry_text = format!("{input}\n");
+            // This input's own top-level items, parsed in isolation --
+            // purely syntactic, so it doesn't need the rest of `defs_items`
+            // to resolve. Each item becomes its OWN (key, text) entry --
+            // see the `defs_items` doc comment above (PR-it992) for why
+            // per-ITEM tracking, not per-SUBMISSION, is required. A key
+            // collision with an OLD entry drops JUST that old entry, so a
+            // re-typed declaration REPLACES rather than duplicates it,
+            // without disturbing any UNRELATED item that merely happened to
+            // share this input's original submission. If parsing `input`
+            // alone fails (no items at all), fall back to one unkeyed entry
+            // for the WHOLE input, exactly as before this fix -- it can't
+            // collide with (or displace) anything, but still participates
+            // in `candidate` so `run::compile` below reports the real error.
+            let parsed_items = parser::parse(&input).0.items;
+            let new_entries: Vec<(Option<(&'static str, String)>, String)> = if parsed_items.is_empty() {
+                vec![(None, format!("{input}\n"))]
+            } else {
+                parsed_items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, it)| {
+                        let key = if matches!(it, crate::ast::Item::Law(_)) {
+                            None
+                        } else {
+                            Some((crate::sdiff::kind_tag(it), crate::sdiff::item_name(it).to_string()))
+                        };
+                        let start = crate::sdiff::item_span(it).start as usize;
+                        let end = parsed_items
+                            .get(i + 1)
+                            .map(|next| crate::sdiff::item_span(next).start as usize)
+                            .unwrap_or(input.len());
+                        let mut text = input[start..end].to_string();
+                        if !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        (key, text)
+                    })
+                    .collect()
+            };
+            let new_keys: Vec<&(&'static str, String)> =
+                new_entries.iter().filter_map(|(k, _)| k.as_ref()).collect();
             let mut candidate = String::new();
-            for (keys, text) in &defs_items {
-                if !keys.iter().any(|k| new_keys.contains(k)) {
+            for (key, text) in &defs_items {
+                if key.as_ref().is_none_or(|k| !new_keys.contains(&k)) {
                     candidate.push_str(text);
                 }
             }
-            candidate.push_str(&entry_text);
+            for (_, text) in &new_entries {
+                candidate.push_str(text);
+            }
             // Try committing the new definition against everything defined so far.
             match run::compile(&candidate) {
                 Ok(compiled) => {
                     run::print_diags(&compiled.warnings, &candidate, "<repl>");
-                    defs_items.retain(|(keys, _)| !keys.iter().any(|k| new_keys.contains(k)));
-                    defs_items.push((new_keys, entry_text));
+                    defs_items.retain(|(key, _)| key.as_ref().is_none_or(|k| !new_keys.contains(&k)));
+                    defs_items.extend(new_entries);
                     let db = ProgramDb::build(&compiled.program, &compiled.checked);
                     // Keep live values/instances; swap in the new definitions.
                     let old = std::mem::replace(&mut interp, Interp::new(db));

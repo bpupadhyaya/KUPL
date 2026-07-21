@@ -206,6 +206,20 @@ pub(crate) fn kind_tag(item: &Item) -> &'static str {
     }
 }
 
+/// This item's own span in the source it was parsed from -- `pub(crate)`:
+/// used by `repl.rs` (production-hardening PR-it992) to slice a multi-item
+/// single input into its OWN individually-tracked per-item source text,
+/// mirroring `item_name`/`kind_tag`'s exact per-variant match shape.
+pub(crate) fn item_span(item: &Item) -> crate::diag::Span {
+    match item {
+        Item::Fun(f) => f.span,
+        Item::Type(t) => t.span,
+        Item::Component(c) => c.span,
+        Item::Contract(ct) => ct.span,
+        Item::Law(l) => l.span,
+    }
+}
+
 fn kind(item: &Item) -> &'static str {
     match item {
         Item::Fun(_) => "fun      ",
