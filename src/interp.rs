@@ -1898,10 +1898,41 @@ impl Interp {
             // FUTURE call/message, matching Erlang-style supervision (a
             // crashed synchronous call surfaces to the caller AND restarts
             // the supervised process).
+            let mut should_drain = result.is_ok();
             if let Err(Flow::Panic { ref msg, .. }) = result {
                 if self.instances[id].restart_on_failure {
                     self.restart(id, msg)?;
+                    should_drain = true;
                 }
+            }
+            // A REAL, live-confirmed silent-wrong-answer bug found+fixed
+            // (production-hardening PR-it991, an Explore survey finding):
+            // every OTHER path that can enqueue a message via `emit`
+            // (`start_all`'s lifecycle dispatch, `advance`'s timer dispatch,
+            // `send`) calls `self.drain()` afterward -- but an ORDINARY
+            // exposed-method call reachable here never did, even though
+            // `emit` is legal inside ANY component method, not just an `on`
+            // handler (`check.rs` only requires `emit` be "inside a
+            // component," confirmed via a direct read). A component whose
+            // exposed method emits (e.g. an explicit `poke()`-style trigger
+            // on a wired producer) silently queued the message and NEVER
+            // delivered it -- the wired sibling's own handler never fired,
+            // so its state stayed at its OLD value with zero error anywhere.
+            // Live-confirmed on ALL THREE engines (interp/KVM/native all
+            // share this bug identically, not a cross-engine divergence):
+            // a `Trigger` component's `expose fun press() { emit fired(7) }`
+            // wired to a `Counter`'s `in bump: Int` / `on bump(n) { total =
+            // total + n }` left `Counter.read()` at `0` instead of `7` after
+            // `trigger.press()` on every engine. Draining on the SAME
+            // success/restarted-panic conditions `should_drain` already
+            // tracks above mirrors the established `advance()` precedent
+            // exactly (drain after a restarted panic too, so any messages
+            // queued before the panic still reach their destination; skip
+            // draining only when the panic propagates un-restarted, since
+            // the caller receives an `Err` and the program is unwinding
+            // regardless).
+            if should_drain {
+                self.drain()?;
             }
             return result;
         }

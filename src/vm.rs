@@ -1222,10 +1222,28 @@ impl<'m> Vm<'m> {
                         // no value to synthesize for a still-in-flight expression),
                         // but the child is also restarted so it is ready for any
                         // FUTURE call/message.
+                        let mut should_drain = result.is_ok();
                         if let Err(ref e) = result {
                             if self.instances[id].restart_on_failure {
                                 self.restart(id, &e.msg)?;
+                                should_drain = true;
                             }
+                        }
+                        // A REAL, live-confirmed silent-wrong-answer bug found+fixed
+                        // (production-hardening PR-it991, mirroring interp.rs::
+                        // eval_method's identical fix -- an Explore survey finding):
+                        // every OTHER path that can enqueue a message via `emit`
+                        // (`start_all`, `advance`'s timer dispatch, `send`) calls
+                        // `self.drain()` afterward, but an ORDINARY exposed-method
+                        // call reachable here never did, even though `emit` is legal
+                        // inside ANY component method, not just an `on` handler. A
+                        // component whose exposed method emits (e.g. an explicit
+                        // `poke()`-style trigger on a wired producer) silently
+                        // queued the message and never delivered it. Draining on the
+                        // SAME success/restarted-error conditions `should_drain`
+                        // already tracks mirrors `advance()`'s own precedent exactly.
+                        if should_drain {
+                            self.drain()?;
                         }
                         let v = result.map_err(|mut e| {
                             if e.span == Span::default() {
@@ -18776,6 +18794,58 @@ component Relay967 {
         assert_eq!(
             i_after, "0",
             "restart must reset n back to 0 -- a stale/un-reset n would show 2"
+        );
+    }
+
+    #[test]
+    fn diff_an_ordinary_exposed_method_call_that_emits_actually_delivers_the_message() {
+        // A REAL, live-confirmed silent-wrong-answer bug found+fixed
+        // (production-hardening PR-it991, an Explore survey finding): every
+        // OTHER path that can enqueue a message via `emit` (`start_all`'s
+        // lifecycle dispatch, `advance`'s timer dispatch, `send`) calls
+        // `drain()` afterward -- but an ORDINARY exposed-method call (as
+        // opposed to a port/timer-triggered handler, the ONLY shape the
+        // sibling PR-it967 test just above exercises) never did, even
+        // though `emit` is legal inside ANY component method, not just an
+        // `on` handler (confirmed via check.rs::Stmt::Emit's own check,
+        // which only requires `ctx.component`, no handler-specific gate).
+        // Confirmed live BEFORE this fix on ALL THREE engines (interp/KVM/
+        // native all shared this bug identically -- not a cross-engine
+        // divergence): `Trigger.press()` (`expose fun press() { emit
+        // fired(7) }`) wired to `Counter`'s `in bump: Int` / `on bump(n) {
+        // total = total + n }` left `Counter.read()` at `0` instead of `7`
+        // after `t.press()`, on every engine, with zero error anywhere.
+        let src = "\
+component Counter991 {
+    intent \"c\"
+    state total: Int = 0
+    in bump: Int
+    on bump(n) { total = total + n }
+    expose fun read() -> Int { total }
+}
+component Trigger991 {
+    intent \"t\"
+    out fired: Int
+    expose fun press() { emit fired(7) }
+}
+component Rig991 {
+    intent \"r\"
+    let t = Trigger991()
+    let c = Counter991()
+    wire t.fired -> c.bump
+    expose fun poke() { t.press() }
+    expose fun peek() -> Int { c.read() }
+}
+fun probe() -> Str {
+    let r = Rig991()
+    r.poke()
+    \"{r.peek()}\"
+}
+";
+        assert_eq!(
+            differential(src),
+            "7",
+            "an exposed method's `emit` must actually reach its wired sibling, not sit undelivered in the queue"
         );
     }
 

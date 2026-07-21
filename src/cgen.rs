@@ -5812,6 +5812,7 @@ static KValue k_shuffle(KValue seed, KValue lst) {
 }
 
 static KValue k_expose_call(KValue recv, const char* name, KValue* args, int argc);
+static void k_drain(void);
 /* UFCS: a top-level function reachable via method-call syntax `x.f(args)` */
 typedef struct { const char* name; int fnid; } KUfcs;
 extern const KUfcs UFCS_FUNS[];
@@ -7775,6 +7776,19 @@ static KValue k_expose_call(KValue recv, const char* name, KValue* args, int arg
                 int saved = k_cur_inst; k_cur_inst = id;
                 KValue r = CHUNKS[cm->exposes[i].chunk](0, args);
                 k_cur_inst = saved;
+                /* A REAL, live-confirmed silent-wrong-answer bug found+fixed
+                   (production-hardening PR-it991, mirroring interp.rs::
+                   eval_method / vm.rs's identical fix, same iteration -- an
+                   Explore survey finding): every OTHER path that can enqueue
+                   a message via `emit` (k_dispatch's handler dispatch, the
+                   app's own start/timer drain) calls k_drain() afterward,
+                   but an ORDINARY exposed-method call reachable here never
+                   did, even though `emit` is legal inside ANY component
+                   method, not just an `on` handler. A component whose
+                   exposed method emits (e.g. an explicit `poke()`-style
+                   trigger on a wired producer) silently queued the message
+                   and never delivered it. */
+                k_drain();
                 return r;
             }
             jmp_buf pad; jmp_buf* prev = k_pad; k_pad = &pad;
@@ -7783,6 +7797,7 @@ static KValue k_expose_call(KValue recv, const char* name, KValue* args, int arg
             if (setjmp(pad) == 0) {
                 KValue r = CHUNKS[cm->exposes[i].chunk](0, args);
                 k_cur_inst = saved; k_pad = prev;
+                k_drain(); /* see the sibling call's own comment above */
                 return r;
             } else {
                 char msg[1024];
@@ -7790,6 +7805,11 @@ static KValue k_expose_call(KValue recv, const char* name, KValue* args, int arg
                 msg[sizeof(msg) - 1] = 0;
                 k_cur_inst = saved; k_pad = prev; k_depth = saved_depth;
                 k_restart(id, msg);
+                /* drain whatever was queued BEFORE the panic too, mirroring
+                   interp.rs/vm.rs's `should_drain` on a restarted panic --
+                   the child is freshly restarted and ready, so messages it
+                   already emitted should still reach their destination. */
+                k_drain();
                 k_panic(msg);
             }
         }
@@ -9169,6 +9189,38 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
                    app Main {\n    let src = Source()\n    let sink = Sink()\n    \
                    wire src.total -> sink.total\n    wire src.frac -> sink.frac\n}\n";
         assert_eq!(native_stdout(wire_src, "compnumwire"), "total = 84\nfrac = 3/2\n");
+    }
+
+    /// A REAL, live-confirmed silent-wrong-answer bug found+fixed (production-
+    /// hardening PR-it991, mirroring the identical interp.rs/vm.rs fixes --
+    /// an Explore survey finding): `k_expose_call` (an ORDINARY exposed-method
+    /// call, as opposed to a port/timer-triggered handler dispatched via
+    /// `k_dispatch`, which already calls `k_drain()`) never drained the
+    /// message queue after running the called chunk, even though `emit` is
+    /// legal inside ANY component method, not just an `on` handler. A
+    /// component whose exposed method emits (`Trigger991.press()` below)
+    /// silently queued the message and never delivered it to its wired
+    /// sibling -- confirmed live BEFORE this fix: `peek()` printed `0`
+    /// instead of `7` on `kupl native` (matching the SAME bug independently
+    /// confirmed on interp/KVM, not a cross-engine divergence -- all three
+    /// engines shared this bug identically).
+    #[test]
+    fn native_an_ordinary_exposed_method_call_that_emits_actually_delivers_the_message() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Counter991 {\n    state total: Int = 0\n    in bump: Int\n    \
+                   on bump(n) { total = total + n }\n    expose fun read() -> Int { total }\n}\n\
+                   component Trigger991 {\n    out fired: Int\n    expose fun press() { emit fired(7) }\n}\n\
+                   component Rig991 {\n    let t = Trigger991()\n    let c = Counter991()\n    \
+                   wire t.fired -> c.bump\n    expose fun poke() { t.press() }\n    \
+                   expose fun peek() -> Int { c.read() }\n}\n\
+                   app Main991 {\n    let r = Rig991()\n    on start {\n        r.poke()\n        print(\"{r.peek()}\")\n    }\n}\n";
+        assert_eq!(
+            native_stdout(src, "exposeemit991"),
+            "7\n",
+            "an exposed method's `emit` must actually reach its wired sibling on native too, not sit undelivered in the queue"
+        );
     }
 
     /// Float.fmt (it73) compiles to native and matches the interpreter's manual
