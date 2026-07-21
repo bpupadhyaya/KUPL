@@ -1369,6 +1369,21 @@ static int k_big_cmp(KValue av, KValue bv) {
     return sa < 0 ? -m : m;
 }
 /* the `big` builtin: from an Int or a decimal Str */
+/* A REAL bug found+fixed (production-hardening PR-it1000, a close-read
+   survey of cgen.rs's BigInt/Rational builtins): `k_big_builtin`'s and
+   `k_rat_to_big`'s (below) own type-mismatch panics dropped the offending
+   type name entirely, unlike `interp.rs`'s `big_builtin`/`rat_builtin`
+   (`format!("`big` needs an Int or a Str, found {}", other.type_name())`).
+   Reachable from valid, check.rs-accepted `.kupl` source: `check.rs`'s
+   `("big", 1)`/`("rat", 2)` signature entries never `unify` their argument
+   against `Int`/`Str`/`BigInt`, so a mistyped argument (e.g. `big(true)`)
+   passes type-checking and only fails at THIS runtime panic. Live-confirmed
+   before this fix: `kupl run`/`kupl run --vm` said `` `big` needs an Int or
+   a Str, found Bool `` while `kupl native` said only `` `big` needs an Int
+   or a Str `` -- a genuine cross-engine wording divergence. Forward-declare
+   `k_type_name` (defined below, at its own established position) since
+   both call sites here precede that definition. */
+static const char* k_type_name(KValue v);
 static KValue k_big_builtin(KValue v) {
     if (v.tag == K_INT) return k_big_v(k_big_from_i64(v.as.i));
     if (v.tag == K_BIGINT) return v;
@@ -1400,7 +1415,12 @@ static KValue k_big_builtin(KValue v) {
         }
         return k_big_v(b);
     }
-    k_panic("`big` needs an Int or a Str"); return k_unit();
+    {
+        char m[80];
+        snprintf(m, sizeof m, "`big` needs an Int or a Str, found %s", k_type_name(v));
+        k_panic(m);
+    }
+    return k_unit();
 }
 
 /* ---- Rational: exact fractions over KBig, a C mirror of src/rational.rs.
@@ -1452,7 +1472,12 @@ static KRat* k_rat_norm(KBig* num, KBig* den) {
 static KBig* k_rat_to_big(KValue v) {
     if (v.tag == K_INT) return k_big_from_i64(v.as.i);
     if (v.tag == K_BIGINT) return v.as.big;
-    k_panic("`rat` needs Int or BigInt"); return 0;
+    {
+        char m[80];
+        snprintf(m, sizeof m, "`rat` needs Int or BigInt, found %s", k_type_name(v));
+        k_panic(m);
+    }
+    return 0;
 }
 static KValue k_rat_builtin(KValue n, KValue d) {
     return k_rat_v(k_rat_norm(k_rat_to_big(n), k_rat_to_big(d)));
@@ -12539,6 +12564,25 @@ fun main() uses io {
         let eq_check = "fun main() uses io {\n    let s = \"9\".repeat(1000)\n    \
                         print(\"{rat(big(s), 3) == rat(big(s), 3)}\")\n}\n";
         assert_eq!(native_main_stdout(eq_check, "rateq").trim(), "true");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1000, a close-read
+    /// survey of cgen.rs's BigInt/Rational builtins): `k_big_builtin`'s and
+    /// `k_rat_to_big`'s type-mismatch panics dropped the offending type
+    /// name entirely, unlike `interp.rs`'s `big_builtin`/`rat_builtin`
+    /// (`"...found {}", other.type_name()`). Reachable from valid,
+    /// check.rs-accepted source: `check.rs`'s `("big", 1)`/`("rat", 2)`
+    /// signature entries never `unify` their argument against `Int`/`Str`/
+    /// `BigInt`, so a mistyped argument only fails at THIS runtime panic.
+    /// Live-confirmed before this fix: interp/KVM said `` `big` needs an
+    /// Int or a Str, found Bool `` while native said only `` `big` needs
+    /// an Int or a Str ``. Fixed by reusing the existing `k_type_name`
+    /// helper (a forward declaration was needed since both call sites
+    /// precede its own definition).
+    #[test]
+    fn native_big_and_rat_type_mismatch_panic_names_the_offending_type() {
+        assert_panic_wording_matches("fun main() uses io {\n    print(big(true))\n}\n", "bigwording");
+        assert_panic_wording_matches("fun main() uses io {\n    print(rat(true, 3))\n}\n", "ratwording");
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it943, the SAME
