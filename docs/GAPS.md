@@ -259,8 +259,8 @@ completion (3). Everything stays byte-identical across engines.
       return type drives structured output (JSON Schema derived from the
       type); `Result[T, Str]` captures failures; implicit `ai` effect;
       provider-agnostic runtime (anthropic / openai-compatible / ollama /
-      deterministic mock via `KUPL_AI_MOCK*`); interpreter + KVM + `.kx`
-      (native rejects with a clear error)
+      deterministic mock via `KUPL_AI_MOCK*`); every engine including native
+      (see the `◐` entry below — only a real-provider network call defers)
 - [x] **Tool use** — `ai fun … tools [f, g]` exposes top-level KUPL functions
       to the model; the runtime drives the model↔tool loop (JSON ↔ typed
       values), bounded, scriptable via the mock provider for tests. Real
@@ -340,13 +340,15 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 - [◐] **Native components + KIR** (audit #2) — as of it36-37, `kupl native`
       compiles COMPONENT apps to machine code: instance state, `on start`/port
       handlers, child components, `wire`s, `emit`, the message-queue/drain loop, virtual-clock
-      timers, and `supervise` restart-on-failure (a C mirror of vm.rs, incl. a
-      setjmp/longjmp panic landing pad). counter/todo/timers/native-counter
-      native stdout == `kupl run`. Remaining: cross-component expose calls,
-      The only remaining piece is the OPTIONAL typed SSA IR / KIR (KValue
-      unboxing for raw-register numeric loops — a performance, not correctness,
-      arc; deliberately deferred). Effectful builtins (ai/json/sized/f32) inside
-      native components defer as they do for `fun main`.
+      timers, `supervise` restart-on-failure (a C mirror of vm.rs, incl. a
+      setjmp/longjmp panic landing pad), and cross-component `expose` calls
+      (confirmed live: a parent calling a child's exposed method compiles and
+      runs byte-identical to `kupl run`). counter/todo/timers/native-counter
+      native stdout == `kupl run`. The only remaining piece is the OPTIONAL
+      typed SSA IR / KIR (KValue unboxing for raw-register numeric loops — a
+      performance, not correctness, arc; deliberately deferred). Effectful
+      builtins (ai/json/sized/f32) inside native components defer as they do
+      for `fun main`.
 - [ ] KIR `kernel fun` + `at(gpu)` placement; Metal lowering first
 - [◐] Sized numerics (i8…u64, f32), Byte/Char, BigInt/Decimal (audit #3) —
       sized ints i8…u64 fully landed across ALL engines: checked/wrapping/
@@ -366,8 +368,11 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 
 ## Tier 4 — ecosystem
 
-- [ ] Package registry + `kupl pkg publish` with enforced API compat
-- [ ] LSP: hover, completion, go-to-definition (diagnostics ship today)
+- [ ] Package registry + `kupl pkg publish` with enforced API compat (client
+      side — `kupl pkg tree`/`lock`/`fetch`, hash-verified atomic fetches, local
+      path dependencies — already landed; no live server is hosted yet)
+- [x] LSP: hover, completion, go-to-definition — DONE (it44; see the
+      "Final stretch" entry above, which this line used to stale-duplicate).
 - [ ] `kupl patch` (component-granular edits); conformance suite numbering
 - [ ] WASM target; cross-compilation story
 
