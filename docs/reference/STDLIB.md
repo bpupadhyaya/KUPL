@@ -184,6 +184,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.contains(v)` | `(T) -> Bool` | structural equality |
 | `.push(v)` | `(T) -> List[T]` | returns a **new** list (lists are immutable) |
 | `.fold(init, f)` | `(A, fn(A, T) -> A) -> A` | left fold |
+| `.scan(init, f)` | `(A, fn(A, T) -> A) -> List[A]` | like `.fold`, but returns every intermediate accumulator (one per element, not the initial value) |
 | `.any(f)` / `.all(f)` | `(fn(T) -> Bool) -> Bool` | short-circuiting |
 | `.sort()` | `-> List[T]` | Int/Float/Str elements; stable ascending |
 | `.take(n)` / `.drop(n)` | `(Int) -> List[T]` | clamped to list bounds |
@@ -194,7 +195,8 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.join(sep)` | `(Str) -> Str` | elements rendered with Display |
 | `.is_empty()` | `-> Bool` | |
 | `.concat(other)` | `(List[T]) -> List[T]` | appends another list |
-| `.unique()` | `-> List[T]` | drops later duplicates, preserves order |
+| `.unique()` | `-> List[T]` | drops later duplicates anywhere in the list, preserves order |
+| `.dedup()` | `-> List[T]` | collapses only **consecutive** duplicate runs (Unix `uniq`-style) — a value can reappear later if not adjacent to its prior occurrence, unlike `.unique()` |
 | `.init()` / `.tail()` | `-> List[T]` | all but the last / all but the first |
 | `.product()` | `-> T` | Int or Float lists; Int overflow panics |
 | `.min()` / `.max()` | `-> Option[T]` | Int/Float/Str elements; `None` if empty |
@@ -218,6 +220,8 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.contains(s)` | `(Str) -> Bool` | |
 | `.starts_with(s)` | `(Str) -> Bool` | |
 | `.to_upper()` / `.to_lower()` | `-> Str` | **ASCII-only** case mapping; non-ASCII characters pass through unchanged (identical on all engines) |
+| `.capitalize()` | `-> Str` | first character uppercased, the rest lowercased (ASCII-only); empty stays empty |
+| `.swapcase()` | `-> Str` | swaps the case of every ASCII letter; every other character is unchanged |
 | `.trim()` / `.trim_start()` / `.trim_end()` | `-> Str` | strip ASCII whitespace (` \t\n\r`) at both ends / the start / the end |
 | `.split(sep)` | `(Str) -> List[Str]` | non-empty separator |
 | `.ends_with(s)` | `(Str) -> Bool` | |
@@ -226,6 +230,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.repeat(n)` | `(Int) -> Str` | n ≥ 0 |
 | `.parse_int()` | `-> Option[Int]` | `None` on any malformed input |
 | `.parse_float()` | `-> Option[Float]` | |
+| `.parse_radix(base)` | `(Int) -> Option[Int]` | base `2..=36` (else panics, matching `.to_radix()`); optional `+`/`-` sign, no `0x` prefix or whitespace; `None` on malformed input |
 | `.is_empty()` | `-> Bool` | |
 | `.reverse()` | `-> Str` | by characters, not bytes |
 | `.lines()` | `-> List[Str]` | splits on `\n`, strips a trailing `\r`; no trailing empty line |
@@ -236,6 +241,7 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.count(sub)` | `(Str) -> Int` | non-overlapping occurrences (non-empty `sub`) |
 | `.slice(start, end)` | `(Int, Int) -> Str` | substring by character index, clamped |
 | `.pad_left(width, fill)` / `.pad_right(width, fill)` | `(Int, Str) -> Str` | pad to `width` chars with the first char of `fill` |
+| `.center(width, fill)` | `(Int, Str) -> Str` | center within `width` chars using the first char of `fill`; an odd remainder goes on the right |
 
 `+` concatenates two Str values; `"…{expr}…"` interpolation renders any value.
 
@@ -246,15 +252,22 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.to_str()` | `-> Str` | |
 | `.to_float()` | `-> Float` | |
 | `.abs()` | `-> Int` | `Int.min.abs()` panics |
+| `.abs_diff(other)` | `(Int) -> Int` | `\|self - other\|`, computed without intermediate overflow; overflow panics only if the RESULT exceeds `i64::MAX` |
 | `.min(other)` / `.max(other)` | `(Int) -> Int` | |
 | `.pow(exp)` | `(Int) -> Int` | `exp ≥ 0`; overflow panics |
 | `.gcd(other)` | `(Int) -> Int` | greatest common divisor (non-negative) |
+| `.lcm(other)` | `(Int) -> Int` | least common multiple (non-negative); `lcm(0, _) = 0`; overflow panics |
+| `.div_euclid(other)` / `.rem_euclid(other)` | `(Int) -> Int` | Euclidean division: the remainder is always non-negative (unlike `%`); panics on a zero divisor or `i64::MIN / -1` overflow |
 | `.clamp(lo, hi)` | `(Int, Int) -> Int` | `lo ≤ hi` required |
 | `.sign()` | `-> Int` | `-1` / `0` / `1` |
 | `.is_even()` / `.is_odd()` | `-> Bool` | |
+| `.factorial()` | `-> Int` | `0! = 1! = 1`; negative panics; overflow (past `20!`) panics |
+| `.digits()` | `-> List[Int]` | base-10 digits of `\|self\|`, most-significant first; `0 -> [0]` |
 | `.to_i8()` … `.to_i64()` / `.to_u8()` … `.to_u64()` | `-> i8`…`u64` | checked narrowing; panics if out of range |
 | `.band(x)` / `.bor(x)` / `.bxor(x)` | `(Int) -> Int` | bitwise and / or / xor |
 | `.bnot()` | `-> Int` | bitwise complement (`~`) |
+| `.count_ones()` | `-> Int` | population count of the 64-bit two's-complement pattern (`(-1).count_ones() = 64`) |
+| `.leading_zeros()` / `.trailing_zeros()` | `-> Int` | leading/trailing zero bits of the 64-bit pattern; both are `64` for `0` |
 | `.shl(n)` | `(Int) -> Int` | left shift; `n` in `0..=63` (else panics) |
 | `.to_hex()` / `.to_binary()` / `.to_octal()` | `-> Str` | lowercase, no prefix; negatives get a leading `-` |
 | `.to_radix(base)` | `(Int) -> Str` | base `2..=36` (else panics) |
@@ -299,14 +312,18 @@ to `f32` with `Float.to_f32()`.
 | `.to_int()` | `-> Int` | truncates toward zero; **saturating** — out-of-range floats clamp to `i64::MIN`/`i64::MAX`, `NaN` → `0` (identical on every engine) |
 | `.abs()` / `.sqrt()` | `-> Float` | |
 | `.floor()` / `.ceil()` / `.round()` | `-> Float` | |
+| `.trunc()` / `.fract()` | `-> Float` | integer part toward zero / the remaining fractional part |
 | `.min(other)` / `.max(other)` / `.pow(exp)` | `(Float) -> Float` | |
 | `.log()` / `.log10()` / `.exp()` | `-> Float` | natural log / base-10 log / e^x |
 | `.sin()` / `.cos()` / `.tan()` | `-> Float` | radians |
+| `.to_degrees()` / `.to_radians()` | `-> Float` | angle unit conversion |
 | `.clamp(lo, hi)` | `(Float, Float) -> Float` | `lo ≤ hi` required |
 | `.sign()` | `-> Float` | `1.0` / `-1.0` / preserves `0.0`, `-0.0`, `NaN` |
 | `.is_nan()` / `.is_infinite()` | `-> Bool` | |
 | `.log2()` / `.cbrt()` | `-> Float` | base-2 log / cube root |
 | `.atan2(x)` / `.hypot(x)` | `(Float) -> Float` | `atan2(self, x)` / `sqrt(self²+x²)` |
+| `.copysign(x)` | `(Float) -> Float` | magnitude of `self` with the sign of `x` |
+| `.mul_add(a, b)` | `(Float, Float) -> Float` | fused multiply-add, `self * a + b` with a single rounding (more accurate than `self*a+b`, can differ in the last bit) |
 | `.format(decimals)` | `(Int) -> Str` | fixed-point, rounded; `decimals` in `0..=100` |
 
 ### Option[T]
@@ -371,6 +388,7 @@ Insertion-ordered; equality is order-insensitive.
 | `.len()` | `-> Int` | |
 | `.is_empty()` | `-> Bool` | |
 | `.is_subset(other)` | `(Set[T]) -> Bool` | every element is in `other` |
+| `.is_superset(other)` | `(Set[T]) -> Bool` | every element of `other` is in self |
 
 ### Json
 
