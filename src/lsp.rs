@@ -2755,7 +2755,32 @@ pub fn serve() -> i32 {
                 // protocol violation (buffer left untouched, matching this
                 // handler's existing no-op behavior for any other
                 // malformed/missing field) instead of corrupting state.
-                let is_full_replacement = change.is_some_and(|c| c.get("range").is_none());
+                //
+                // A REAL, live-confirmed gap found+fixed (production-
+                // hardening PR-it990, deferred from PR-it987's own Explore
+                // survey): the check above only ever treated an ABSENT
+                // `range` key as "no range" -- `Json::get` (this file's own
+                // tiny hand-rolled JSON parser) returns `Some(&Json::Null)`,
+                // NOT `None`, for a key whose VALUE is JSON `null`, so a
+                // client whose serializer always emits every optional field
+                // (using `null` rather than omitting the key) sends a
+                // perfectly legitimate full-sync `didChange` shaped as
+                // `{"range": null, "text": "..."}` -- which this check
+                // wrongly classified as an incremental edit and silently
+                // DROPPED, the identical failure mode this whole guard
+                // exists to PREVENT, just reached via a different JSON
+                // shape for "no range" than the one originally handled.
+                // Live-confirmed BEFORE this fix: `didOpen` with valid
+                // content, then a `didChange` with an EXPLICIT `"range":
+                // null` and a syntax-error replacement, produced NO second
+                // `publishDiagnostics` notification at all -- proving the
+                // update never applied. A GENUINE incremental edit (a real
+                // `range` object with start/end coordinates) is UNAFFECTED
+                // by this fix -- `Some(&Json::Obj(_))` matches neither arm
+                // below, so `is_full_replacement` still correctly evaluates
+                // to `false` for it, preserving PR-it754's original intent.
+                let is_full_replacement =
+                    change.is_some_and(|c| matches!(c.get("range"), None | Some(Json::Null)));
                 if let (Some(uri), Some(text)) = (uri, text) {
                     if is_full_replacement {
                         if let Some(path) = uri_to_path(uri) {
@@ -4584,6 +4609,81 @@ mod tests {
             symbol_reply.contains("example_function_marker_it754"),
             "the original document must survive an incremental-style didChange intact -- \
              the buffer was corrupted down to just the malformed edit's fragment: {symbol_reply}"
+        );
+    }
+
+    /// A REAL, live-confirmed gap found+fixed (production-hardening
+    /// PR-it990, deferred from PR-it987's own Explore survey): see
+    /// `is_full_replacement`'s own doc comment above for the full analysis.
+    /// A `didChange` carrying an EXPLICIT `"range": null` (as opposed to
+    /// omitting the key entirely) is a legitimate full-sync update -- some
+    /// client serializers always emit every optional field, using `null`
+    /// for "absent" -- and must be APPLIED, unlike a genuine incremental
+    /// edit (a real `range` object), which must still be REJECTED exactly
+    /// as `an_incremental_style_didchange_does_not_corrupt_the_full_sync_
+    /// document_buffer` above already confirms. Uses the SAME
+    /// `documentSymbol`-after-`didChange` observable signal that test uses.
+    #[test]
+    fn a_didchange_with_an_explicit_null_range_is_applied_as_a_full_sync_update() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let old_src = "fun old_marker_it990() -> Int {\n    1\n}\n";
+        let did_open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///nullrange_it990.kupl","text":{old_src:?}}}}}}}"#
+        );
+        // an EXPLICIT "range": null, full-document replacement text -- what
+        // a client whose serializer always emits every optional field would
+        // send for a textDocumentSync:1 full-sync update.
+        let new_src = "fun new_marker_it990() -> Int {\n    2\n}\n";
+        let null_range_change = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"file:///nullrange_it990.kupl","version":2}},"contentChanges":[{{"range":null,"text":{new_src:?}}}]}}}}"#
+        );
+        let symbol_req = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///nullrange_it990.kupl"}}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init.to_string(), did_open, null_range_change, symbol_req.to_string()] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung after a null-range didChange");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+
+        let bodies: Vec<&str> = stdout
+            .split("Content-Length:")
+            .filter(|s| !s.trim().is_empty())
+            .map(|chunk| chunk.split("\r\n\r\n").nth(1).unwrap_or("").trim())
+            .collect();
+        let symbol_reply = bodies
+            .iter()
+            .find(|b| b.contains("\"id\":2"))
+            .expect("server must still answer the documentSymbol request after a null-range didChange");
+        assert!(
+            symbol_reply.contains("new_marker_it990"),
+            "a didChange with an explicit \"range\": null must be applied as a full-sync update: {symbol_reply}"
+        );
+        assert!(
+            !symbol_reply.contains("old_marker_it990"),
+            "the OLD content must not survive a null-range didChange that was correctly applied: {symbol_reply}"
         );
     }
 
