@@ -119,12 +119,29 @@ fn run_cli() -> ExitCode {
         .collect();
     let json = args.iter().any(|a| a == "--json");
     let vm = args.iter().any(|a| a == "--vm");
-    let kx_path = args
-        .iter()
-        .skip(1)
-        .find(|a| !a.starts_with("--"))
-        .filter(|p| p.ends_with(".kx"))
-        .cloned();
+    // A REAL, LIVE-CONFIRMED silent-wrong-behavior bug found+fixed
+    // (production-hardening PR-it998, a close-read survey of this file's
+    // CLI dispatch): this used to scan for the FIRST non-`--`-prefixed
+    // token itself (`args.iter().skip(1).find(...)`), completely bypassing
+    // `find_path_arg`'s hardened single-positional-argument enforcement --
+    // so `kupl run report.kx realprog.kupl` silently ran `report.kx` and
+    // NEVER even looked at `realprog.kupl` (no "unexpected extra argument"
+    // rejection, unlike every OTHER subcommand's PR-it864/PR-it697/PR-it798
+    // precedent for this exact bug class), and `kupl run -- report.kx`
+    // silently ran `report.kx` too, violating the `--`-separator contract
+    // ("everything after `--` belongs to the program, not kupl") that
+    // `find_path_arg` and `interp::program_args` both otherwise honor.
+    // Routing through `find_path_arg` (the SAME helper every other
+    // file-taking subcommand already uses) fixes both: a genuine second
+    // positional argument is now cleanly rejected, and a token after `--`
+    // is never considered a candidate path.
+    let kx_path = match args.first().map(String::as_str) {
+        Some("run") => match find_path_arg(&args) {
+            Ok(path) if path.ends_with(".kx") => Some(path.to_string()),
+            _ => None,
+        },
+        _ => None,
+    };
     let code = match (args.first().map(String::as_str), kx_path) {
         (Some("run"), Some(path)) => match std::fs::read(&path) {
             Ok(bytes) => match kupl::kx::decode(&bytes) {
@@ -1257,6 +1274,63 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "hi");
         let dis = run(&["dis", kx.to_str().unwrap()]);
         assert_eq!(dis.status.code(), Some(0), "{dis:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-wrong-behavior bug found+fixed
+    /// (production-hardening PR-it998, a close-read survey of this file's
+    /// CLI dispatch): `kupl run`'s direct `.kx` fast path used to find its
+    /// path argument via a bare `args.iter().skip(1).find(|a|
+    /// !a.starts_with("--"))` scan, completely bypassing `find_path_arg`'s
+    /// hardened single-positional-argument enforcement -- so a genuinely
+    /// unexpected SECOND positional argument was silently ignored (the SAME
+    /// bug class `find_path_arg`'s own PR-it697/PR-it864/PR-it798 fixes
+    /// already closed for every OTHER subcommand), and a token AFTER a
+    /// literal `--` separator was still treated as a candidate path,
+    /// violating the documented "everything after `--` belongs to the
+    /// PROGRAM" contract. Live-confirmed BEFORE this fix: `kupl run
+    /// report.kx realprog.kupl` silently ran ONLY `report.kx`, never even
+    /// examining `realprog.kupl`; `kupl run -- report.kx` also silently ran
+    /// `report.kx`. Fixed by routing the `.kx` detection through
+    /// `find_path_arg` (the SAME helper every other file-taking subcommand
+    /// already uses) instead of a separate, cruder scan.
+    #[test]
+    fn kx_fast_path_rejects_an_extra_argument_and_honors_the_separator_like_every_sibling_subcommand() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-kx-fast-path-extra-arg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("report998.kupl");
+        std::fs::write(&src, "fun main() uses io {\n    print(\"report\")\n}\n").unwrap();
+        let kx = dir.join("report998.kx");
+        let other = dir.join("realprog998.kupl");
+        std::fs::write(&other, "fun main() uses io {\n    print(\"realprog\")\n}\n").unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let built = run(&["build", src.to_str().unwrap(), "-o", kx.to_str().unwrap()]);
+        assert_eq!(built.status.code(), Some(0), "{built:?}");
+
+        // a genuine second positional argument must be cleanly rejected, not silently dropped.
+        let extra = run(&["run", kx.to_str().unwrap(), other.to_str().unwrap()]);
+        assert_eq!(extra.status.code(), Some(2), "{extra:?}");
+        assert!(
+            String::from_utf8_lossy(&extra.stderr).contains("unexpected extra argument"),
+            "{extra:?}"
+        );
+
+        // a token after `--` belongs to the program, not to kupl -- never a candidate path.
+        let sep = run(&["run", "--", kx.to_str().unwrap()]);
+        assert_eq!(sep.status.code(), Some(2), "{sep:?}");
+        assert!(String::from_utf8_lossy(&sep.stderr).contains("missing <file.kupl> argument"), "{sep:?}");
+
+        // the ordinary, single-argument `.kx` fast path is unaffected.
+        let ok = run(&["run", kx.to_str().unwrap()]);
+        assert_eq!(ok.status.code(), Some(0), "{ok:?}");
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "report");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
