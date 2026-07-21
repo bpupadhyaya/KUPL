@@ -298,11 +298,59 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             // SHOULD get their own lifecycle is a separate, larger design
             // question left for a future iteration; today all three engines
             // must simply agree, and now they do.
+            //
+            // A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed
+            // (production-hardening PR-it1002, a close-read survey of
+            // vm.rs's component-lifecycle machinery, which found the
+            // IDENTICAL bug there too -- see `vm.rs::run_app`'s own doc
+            // comment for the full writeup): this used to call
+            // `k_instantiate({app_idx}, 0, 0)` unconditionally, leaving
+            // EVERY app prop (even ones with an explicit default) as
+            // `k_unit()` -- unlike every OTHER instantiation site, which
+            // resolves prop defaults via a compiled `Call` to the default
+            // chunk BEFORE `Op::MakeInstance`/`k_instantiate` ever runs.
+            // Live-confirmed: `app Foo { prop x: Int = 5  on start {
+            // print(x) } }` printed `5` on `kupl run`/`kupl run --vm` but
+            // `()` on a `kupl native` binary. Unlike vm.rs's fix (a RUNTIME
+            // check, since `kupl run --vm` re-interprets the SAME module
+            // on every invocation), native's own execution model is a
+            // single, fixed binary compiled once from one fixed AST -- so
+            // an app with a genuinely REQUIRED (no-default) prop is a
+            // program that can NEVER successfully run, fully determined at
+            // COMPILE time. Refusing to build at all (returning an `Err`
+            // from `emit_c`, this file's own established pattern -- see
+            // the `Entry` match's own "needs a `fun main()` or an `app`"
+            // refusal above) is therefore the earliest, cleanest possible
+            // catch point, with the SAME message `run.rs::run_program`'s
+            // own pre-check uses.
+            let app_props = &module.components[app_idx].props;
+            let missing: Vec<&str> =
+                app_props.iter().filter(|(_, d)| d.is_none()).map(|(n, _)| n.as_str()).collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "app `{}` requires props ({}) — v0.1 apps must be self-contained",
+                    module.components[app_idx].name,
+                    missing.join(", ")
+                ));
+            }
+            let nprops = app_props.len();
+            let mut props_setup = String::new();
+            let props_arg = if nprops == 0 {
+                "0, 0".to_string()
+            } else {
+                let _ = writeln!(props_setup, "    KValue k_app_props[{nprops}];");
+                for (i, (_, default_chunk)) in app_props.iter().enumerate() {
+                    let chunk = default_chunk.expect("filtered out missing defaults above");
+                    let _ = writeln!(props_setup, "    k_app_props[{i}] = fun_{chunk}(0, 0);");
+                }
+                format!("k_app_props, {nprops}")
+            };
             let _ = writeln!(
                 out,
                 "\nint main(int argc, char** argv) {{\n    signal(SIGPIPE, SIG_IGN);\n    setvbuf(stdout, NULL, _IOLBF, 0);\n    k_argc = argc; k_argv = argv;\n    \
-                 k_print_unwired = 1;\n    \
-                 k_instantiate({app_idx}, 0, 0);\n    \
+                 k_print_unwired = 1;\n\
+                 {props_setup}    \
+                 k_instantiate({app_idx}, {props_arg});\n    \
                  int k_n0 = k_ninsts;\n    \
                  for (int id = 0; id < k_n0; id++) {{ k_run_lifecycle(id, \"@start\"); k_arm_timers(id); }}\n    \
                  k_drain();\n    \
@@ -8265,6 +8313,76 @@ mod tests {
 
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1002), the C mirror of `vm.rs::run_app`'s identical fix
+    /// (see that function's own doc comment for the full writeup): `main()`
+    /// used to call `k_instantiate(app_idx, 0, 0)` unconditionally, leaving
+    /// EVERY app prop (even ones with an explicit default) as `k_unit()`.
+    /// Live-confirmed: `app Foo { prop x: Int = 5  on start { print(x) } }`
+    /// printed `5` on `kupl run`/`kupl run --vm` but `()` on a `kupl native`
+    /// binary. Unlike `vm.rs`'s RUNTIME check (the same module is
+    /// re-interpreted on every `kupl run --vm` invocation), native compiles
+    /// ONE fixed binary from ONE fixed AST, so a genuinely REQUIRED
+    /// (no-default) prop is a program that can NEVER successfully run --
+    /// fully determined at COMPILE time. Refuses to build at all instead
+    /// (an `emit_c` `Err`, matching `run.rs::run_program`'s own pre-check
+    /// wording exactly), the earliest possible catch point.
+    #[test]
+    fn native_run_app_resolves_prop_defaults_and_cleanly_refuses_a_missing_required_prop() {
+        if !cc_available() {
+            return;
+        }
+        // a prop WITH a default must be resolved, not left as k_unit().
+        let src = "app Foo1002 {\n    intent \"f\"\n    prop x: Int = 5\n    on start { print(x) }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-appprop1002-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+
+        // MULTIPLE props with defaults must all resolve, in declaration order.
+        let src2 = "app Multi1002 {\n    intent \"m\"\n    prop a: Int = 1\n    prop b: Str = \"hi\"\n    \
+                    on start { print(\"{a} {b}\") }\n}\n";
+        let compiled2 = crate::run::compile(src2).expect("compiles");
+        let module2 = crate::compile::compile_module(&compiled2.program, &compiled2.checked)
+            .expect("module compiles");
+        let c2 = super::emit_c(&module2).expect("emit_c succeeds");
+        let base2 = std::env::temp_dir().join(format!("kupl-cgen-appprop1002b-{}", std::process::id()));
+        let cpath2 = base2.with_extension("c");
+        let bin2 = base2.with_extension("out");
+        std::fs::write(&cpath2, &c2).unwrap();
+        let status2 = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin2.to_str().unwrap(), cpath2.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status2.success(), "generated C must compile");
+        let out2 = std::process::Command::new(&bin2).output().expect("binary runs");
+        assert_eq!(String::from_utf8_lossy(&out2.stdout), "1 hi\n");
+        let _ = std::fs::remove_file(&cpath2);
+        let _ = std::fs::remove_file(&bin2);
+
+        // a prop with NO default at all must be a CLEAN COMPILE-TIME refusal,
+        // not a silently-built binary that fills it in with k_unit().
+        let src3 = "app Bar1002 {\n    intent \"b\"\n    prop x: Int\n    on start { print(x) }\n}\n";
+        let compiled3 = crate::run::compile(src3).expect("compiles");
+        let module3 = crate::compile::compile_module(&compiled3.program, &compiled3.checked)
+            .expect("module compiles");
+        let err = super::emit_c(&module3).expect_err("a missing required prop must refuse to build");
+        assert_eq!(err, "app `Bar1002` requires props (x) — v0.1 apps must be self-contained", "{err}");
     }
 
     /// A security-audit finding (production-hardening sweep, PR-it614): `emit_c`

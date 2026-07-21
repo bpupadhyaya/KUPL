@@ -201,7 +201,49 @@ impl<'m> Vm<'m> {
         let Some(&idx) = self.module.component_names.get(app) else {
             return Err(VmError { msg: format!("no component `{app}`"), span: Span::default() });
         };
-        self.instantiate(idx, Vec::new())?;
+        // A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed
+        // (production-hardening PR-it1002, a close-read survey of this
+        // file's component-lifecycle machinery): every OTHER instantiation
+        // path resolves prop defaults at COMPILE time -- `compile.rs::
+        // instance_expr` splices a `Call` to each unsupplied prop's default
+        // chunk into the caller's own Op stream before emitting
+        // `Op::MakeInstance` (see `instantiate`'s own doc comment below,
+        // "args arrive complete") -- but an app's OWN top-level
+        // instantiation, right here, NEVER goes through that path: it used
+        // to call `self.instantiate(idx, Vec::new())` directly, leaving
+        // EVERY prop (even one with an explicit default) as `Value::Unit`.
+        // Live-confirmed: `app Foo { prop x: Int = 5  on start { print(x) }
+        // }` printed `5` on `kupl run` but `()` on `kupl run --vm`/`kupl
+        // native`; and an app with a genuinely REQUIRED (no-default) prop
+        // -- which `kupl run`/`run.rs::run_program`'s own pre-check cleanly
+        // refuses to run at all ("app `Foo` requires props (...) -- v0.1
+        // apps must be self-contained") -- silently ran anyway with
+        // `x = Unit` on the VM. Fixed by resolving every prop's value here:
+        // calling its default chunk (mirroring `Interp::instantiate`'s own
+        // `self.eval(&prop.default, ...)`) when present, or refusing
+        // cleanly (mirroring `run.rs::run_program`'s own pre-check --
+        // IDENTICAL wording, IDENTICAL exit-0-not-panic behavior) when a
+        // prop has no default at all.
+        let meta = self.module.components.get(idx as usize).ok_or_else(|| VmError {
+            msg: "corrupt .kx module: component index out of range".into(),
+            span: Span::default(),
+        })?;
+        let props_meta = meta.props.clone();
+        let missing: Vec<String> =
+            props_meta.iter().filter(|(_, d)| d.is_none()).map(|(n, _)| n.clone()).collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "error: app `{app}` requires props ({}) — v0.1 apps must be self-contained",
+                missing.join(", ")
+            );
+            return Ok(());
+        }
+        let mut props = Vec::with_capacity(props_meta.len());
+        for (_, default_chunk) in &props_meta {
+            let chunk = default_chunk.expect("filtered out missing defaults above");
+            props.push(self.call_chunk_nested(chunk, Vec::new(), None)?);
+        }
+        self.instantiate(idx, props)?;
         for id in 0..self.instances.len() {
             self.run_lifecycle(id, "@start")?;
             self.arm_timers(id);
@@ -18902,6 +18944,58 @@ component Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver 
             .expect("module compiles");
         let mut vm = Vm::new(&module);
         assert!(vm.run_app("Main6").is_ok(), "KVM supervision must catch the ai-fun tool panic too");
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1002, a close-read survey of this file's component-
+    /// lifecycle machinery): every OTHER instantiation path resolves prop
+    /// defaults at compile time (`compile.rs::instance_expr`) before
+    /// `Op::MakeInstance` ever runs, but `run_app`'s own top-level
+    /// instantiation never went through that path -- it called
+    /// `self.instantiate(idx, Vec::new())` directly, leaving EVERY app prop
+    /// (even ones with an explicit default) as `Value::Unit`, and silently
+    /// proceeding even when a prop had NO default at all (unlike `kupl run`/
+    /// `run.rs::run_program`'s own clean pre-check refusal). Live-confirmed:
+    /// `app Foo { prop x: Int = 5  on start { print(x) } }` printed `5` on
+    /// `kupl run` but `()` on `kupl run --vm`/`kupl native`.
+    #[test]
+    fn run_app_resolves_prop_defaults_and_cleanly_refuses_a_missing_required_prop() {
+        // a prop WITH a default must be resolved, not left as Unit.
+        let src = "app Foo1002 {\n    intent \"f\"\n    prop x: Int = 5\n    expose fun get_x() -> Int { x }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        assert!(vm.run_app("Foo1002").is_ok());
+        assert_eq!(vm.call_expose(0, "get_x", vec![]).unwrap(), Value::Int(5));
+
+        // MULTIPLE props with defaults must all resolve, in declaration order.
+        let src2 = "app Multi1002 {\n    intent \"m\"\n    prop a: Int = 1\n    prop b: Str = \"hi\"\n    \
+                    expose fun get() -> Str { \"{a} {b}\" }\n}\n";
+        let compiled2 = crate::run::compile(src2).expect("compiles");
+        let module2 = crate::compile::compile_module(&compiled2.program, &compiled2.checked)
+            .expect("module compiles");
+        let mut vm2 = Vm::new(&module2);
+        assert!(vm2.run_app("Multi1002").is_ok());
+        assert_eq!(vm2.call_expose(0, "get", vec![]).unwrap(), Value::str("1 hi"));
+
+        // a prop with NO default at all must be a CLEAN refusal (matching
+        // `run.rs::run_program`'s own pre-check: Ok, a printed error, and
+        // NO instance ever created), not a panic and not a silent Unit fill-in.
+        let src3 = "app Bar1002 {\n    intent \"b\"\n    prop x: Int\n    expose fun get_x() -> Int { x }\n}\n";
+        let compiled3 = crate::run::compile(src3).expect("compiles");
+        let module3 = crate::compile::compile_module(&compiled3.program, &compiled3.checked)
+            .expect("module compiles");
+        let mut vm3 = Vm::new(&module3);
+        assert!(
+            vm3.run_app("Bar1002").is_ok(),
+            "a missing required prop must be a CLEAN refusal (Ok, printed error), not a panic"
+        );
+        assert_eq!(
+            vm3.instances.len(),
+            0,
+            "instantiation must be skipped entirely when a required prop is missing"
+        );
     }
 
     #[test]
