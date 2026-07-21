@@ -573,23 +573,44 @@ fn is_ident(c: char) -> bool {
 }
 
 /// Whether `s` is syntactically valid as a KUPL identifier -- non-empty,
-/// every character passes `is_ident`, and the FIRST character additionally
-/// isn't a digit (matching `lexer.rs::lex_ident`'s own dispatch condition,
+/// every character passes `is_ident`, the FIRST character additionally isn't
+/// a digit (matching `lexer.rs::lex_ident`'s own dispatch condition,
 /// `b'A'..=b'Z' | b'a'..=b'z' | b'_' | byte >= 0x80` -- a leading digit
-/// routes to `lex_number` instead). A REAL bug found+fixed (production-
-/// hardening PR-it767): `textDocument/rename`'s `newName` was accepted
-/// VERBATIM with ZERO validation before being embedded into an outgoing
-/// `WorkspaceEdit` -- every mainstream LSP client applies a rename edit
-/// immediately and unconditionally, so an invalid `newName` silently
-/// corrupted previously-working source with no error surfaced anywhere.
-/// Live-confirmed BEFORE this fix via a raw LSP session: renaming to
-/// `"123 bad-name!"` (not an identifier at all) and to `""` (empty) both
-/// returned well-formed, "successful"-looking `WorkspaceEdit`s that would
-/// produce invalid syntax (or delete the identifier entirely) if applied.
+/// routes to `lex_number` instead), and `s` isn't one of KUPL's ~39 reserved
+/// keywords. A REAL bug found+fixed (production-hardening PR-it767):
+/// `textDocument/rename`'s `newName` was accepted VERBATIM with ZERO
+/// validation before being embedded into an outgoing `WorkspaceEdit` --
+/// every mainstream LSP client applies a rename edit immediately and
+/// unconditionally, so an invalid `newName` silently corrupted previously-
+/// working source with no error surfaced anywhere. Live-confirmed BEFORE
+/// that fix via a raw LSP session: renaming to `"123 bad-name!"` (not an
+/// identifier at all) and to `""` (empty) both returned well-formed,
+/// "successful"-looking `WorkspaceEdit`s that would produce invalid syntax
+/// (or delete the identifier entirely) if applied.
+///
+/// The keyword check is a SEPARATE, later gap (production-hardening
+/// PR-it988, an Explore survey finding on the SAME `textDocument/rename`
+/// handler): PR-it767's fix above only ever checked the CHARACTER SET, never
+/// whether the result names one of KUPL's own reserved words -- every
+/// keyword (`if`, `match`, `fun`, `let`, ...) passes the character-set check
+/// cleanly (all alphabetic, non-digit-leading), so a rename to any of them
+/// slipped through with zero validation, the identical failure mode PR-it767
+/// fixed for punctuation/digit-leading names, just for the keyword case.
+/// Live-confirmed BEFORE this fix via the SAME raw-LSP-session technique:
+/// renaming `fun helper` to `"if"` returned a well-formed, non-null
+/// `WorkspaceEdit` covering both the declaration and the call site; applying
+/// it produces `fun if() -> Int { 1 }`, which fails to parse (`if` lexes as
+/// `Tok::KwIf`, not an identifier) -- silently corrupting working source
+/// with no warning, same severity class as the original bug. Reuses
+/// `token::keyword` (the SAME reserved-word table the lexer itself checks
+/// FIRST before falling back to an ordinary identifier, `lexer.rs::
+/// lex_ident`) rather than hand-duplicating the ~39-word list here.
 fn is_valid_new_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
-        Some(c) if is_ident(c) && !c.is_ascii_digit() => chars.all(is_ident),
+        Some(c) if is_ident(c) && !c.is_ascii_digit() => {
+            chars.all(is_ident) && crate::token::keyword(s).is_none()
+        }
         _ => false,
     }
 }
@@ -4958,6 +4979,12 @@ mod tests {
         for bad in ["", "123 bad-name!", "9lives", "bad-name", "has space", "!", "a.b"] {
             assert!(!is_valid_new_identifier(bad), "must reject {bad:?} as a new identifier");
         }
+        // rejected: KUPL reserved keywords (production-hardening PR-it988) --
+        // every one of these passes the character-set check cleanly, so this
+        // is a genuinely separate condition, not covered by the loop above.
+        for kw in ["if", "match", "fun", "let", "component", "true", "false"] {
+            assert!(!is_valid_new_identifier(kw), "must reject reserved keyword {kw:?} as a new identifier");
+        }
         // accepted: ordinary ASCII, underscore-led, non-ASCII (café/日本 -- KUPL
         // explicitly supports these as real identifiers, matching `lexer.rs::
         // lex_ident`'s own `byte >= 0x80` dispatch condition)
@@ -5102,6 +5129,69 @@ mod tests {
         assert!(
             stdout.contains(r#""id":4,"result":{"changes""#),
             "renaming to a genuinely free name must still work: {stdout}"
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it988, an Explore
+    /// survey finding): `is_valid_new_identifier` (see its own doc comment)
+    /// only checked `newName`'s CHARACTER SET, never whether the result
+    /// names one of KUPL's own reserved keywords -- `"if"`/`"match"`/
+    /// `"fun"`/etc. all pass the character-set check cleanly, so
+    /// `textDocument/rename` used to return a well-formed, non-null
+    /// `WorkspaceEdit` renaming a function to a keyword; applying it
+    /// silently corrupts working source into unparseable code. Also checks
+    /// a rename to a genuinely free (non-keyword) name still works, so the
+    /// fix isn't over-broad.
+    #[test]
+    fn rename_to_a_reserved_keyword_returns_null_not_a_corrupting_edit() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let src = "fun helper() -> Int {\n    1\n}\n\nfun main() {\n    print(helper())\n}\n";
+        let did_open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///rename_keyword_it988.kupl","text":{src:?}}}}}}}"#
+        );
+        let rename_if = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_keyword_it988.kupl"},"position":{"line":0,"character":4},"newName":"if"}}"#;
+        let rename_match = r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_keyword_it988.kupl"},"position":{"line":0,"character":4},"newName":"match"}}"#;
+        let rename_ok = r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_keyword_it988.kupl"},"position":{"line":0,"character":4},"newName":"compute"}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init.to_string(), did_open, rename_if.to_string(), rename_match.to_string(), rename_ok.to_string()] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung on a rename request");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":2,"result":null"#),
+            "renaming to the keyword `if` must return null, not a corrupting edit: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":3,"result":null"#),
+            "renaming to the keyword `match` must return null, not a corrupting edit: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":4,"result":{"changes""#),
+            "renaming to a genuinely free, non-keyword name must still work: {stdout}"
         );
     }
 
