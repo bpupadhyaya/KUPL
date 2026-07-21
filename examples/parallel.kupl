@@ -45,6 +45,11 @@ fun main() uses io, ai {
 
     // par_filter and par_each round out the parallel List API:
     print([1, 2, 3, 4, 5, 6].par_filter(fn n { n % 2 == 0 }))
+
+    // par_each fans work out like par_map, but for SIDE EFFECTS: it calls
+    // the function once per item (in order, deterministically) and returns
+    // Unit rather than collecting a List of results.
+    [1, 2, 3].par_each(fn n { print("squared: {n * n}") })
 }
 
 ai fun classify(review: Str) -> Str {
