@@ -153,6 +153,19 @@ Writes/updates `kupl.lock` next to the project's `kupl.toml`, recording each
 dependency's resolved path, version, and a content hash for reproducibility.
 Locks are written only by this command — never during `run`/`build`/`test`.
 
+### `kupl pkg fetch <file.kupl>`
+Downloads every **registry-only** dependency (a `version`-pinned entry with no
+local `path =`) into the local cache (`~/.kupl/registry-cache/<name>/<version>/`):
+fetches the index at `{registry_url}/<name>.json`, resolves the pinned
+version, downloads every file it lists, and verifies each one's hash before
+writing anything to disk. A per-dependency failure is reported and fetching
+continues with the rest (not aborted early); the exit code reflects whether
+*any* dependency failed. v1 always re-fetches and re-verifies — there is no
+cache-skip, even if the version is already materialized. No live registry is
+deployed at the default URL yet, so fetching a real registry-only dependency
+currently fails with a clean network error, exactly like any other
+unreachable host, until one is hosted.
+
 ### `kupl version`
 Prints the toolchain version.
 
