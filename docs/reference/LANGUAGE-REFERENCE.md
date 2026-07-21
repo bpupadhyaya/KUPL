@@ -277,10 +277,19 @@ fun add(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x + b.x, y: a.y + b.y) }
 
 `==` and `!=` are **structural** on all values (they compare fields/variants
 directly), so they are not overloadable and need no definition. Using an
-operator on a user type with no matching function is a type error (K0234/K0235)
-that names the exact function to define. Built-in numeric and string operators
-are unaffected — only user-typed operands take this path. See
-`examples/operators.kupl`.
+arithmetic operator (`+ - * /`) on a user type with no matching function is a
+type error (K0235) that names the exact function to define. Using a
+comparison operator (`< <= > >=`) on a user type with a matching `fun lt`/
+`fun le`/`fun gt`/`fun ge` works the same way — but `.sort()`/`.min()`/
+`.max()` have no such overload path at all: they only accept Int/Float/Str/
+other numeric elements, regardless of whether a comparison overload is
+defined for the element type, so a list of any other type needs an explicit
+key function instead (`.sort_by(f)`/`.min_by(f)`/`.max_by(f)`). Both cases
+raise K0234, which names the built-in orderable types directly rather than a
+specific function, since that wording covers both the missing-overload case
+and the no-overload-path case with one accurate message. Built-in numeric and
+string operators are unaffected — only user-typed operands take this path.
+See `examples/operators.kupl`.
 
 ### 4.1 Concurrency — `par` (structured fork-join)
 
@@ -331,8 +340,9 @@ both the interpreter and the KVM); otherwise they evaluate sequentially. Because
 the clock, randomness, or shared state — and results are written back by input
 index — the output is byte-for-byte identical regardless of how many threads
 ran it. `par_each` applies the function for its effects and returns `()`. All
-run identically on the interpreter, KVM, and native backends. (Widening the
-thread path to `par_filter`/`par_each`/`par{}` and the KVM is in progress.)
+run identically on the interpreter, KVM, and native backends. (`par_each` and
+structured `par{}` remain sequential — their own fork-join scheduler is a
+later, semantics-preserving step.)
 
 ### Patterns
 
@@ -446,8 +456,10 @@ the documented wire form `{"value": <payload>}` or the bare payload; markdown
 code fences are stripped. `KUPL_AI_MODEL` overrides the default model for any
 provider; a `model "…"` clause in the function wins over both.
 
-`ai fun`s run on the interpreter, the KVM, and inside `.kx`/bundles. The
-native backend rejects programs containing them with a clear error (planned).
+`ai fun`s run on every engine, including the native backend (incl. `tools`) —
+only a real-provider **network** call defers to `bundle` at runtime; the
+deterministic `KUPL_AI_MOCK*` path, including the tool loop, compiles
+completely. See §11's Execution modes table.
 
 ### 6.2 Tool use (`ai fun … tools [f, g]`)
 
@@ -613,9 +625,10 @@ component Ticker {
 - `kupl run` advances the clock **automatically but bounded** (up to 100 timer
   firings) so an app with a recurring timer yields finite, deterministic output
   rather than running forever.
-- Timers run identically on the interpreter and the KVM (differentially
-  tested). Like all component features, they require `kupl run`/`--vm`/`bundle`
-  — the native backend does not compile components. See `examples/timers.kupl`.
+- Timers run identically on the interpreter, the KVM, and the native backend
+  (differentially tested — the native backend compiles the full component
+  model, including `wire`/`supervise`/timers; see §11's Execution modes
+  table). See `examples/timers.kupl`.
 
 ## 8. Contracts and laws
 
