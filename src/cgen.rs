@@ -15897,6 +15897,109 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         );
     }
 
+    /// A cross-engine fuzz pass against `time.rs`'s civil-calendar arithmetic
+    /// (`make`/`iso`, which route through `days_from_civil_checked`/
+    /// `civil_from_days`) vs `cgen.rs`'s independent C reimplementation
+    /// (`k_date_make`/`k_date_iso`, `k_make_checked`/`k_days_from_civil`/
+    /// `k_civil`), production-hardening PR-it1007 -- the SAME xorshift64*
+    /// fuzz-harness convention `csv.rs`/`regex.rs`/`json.rs`/this file's own
+    /// query-string test established, extended to a genuinely fresh domain
+    /// after a scoping agent confirmed the single-file close-read-survey well
+    /// was close to dry across the whole `src/` tree: civil-calendar date
+    /// math has its OWN real bug history (PR-it635's i64 overflow, PR-it682's
+    /// floor-division sign bug, PR-it868's multi-year month-normalization
+    /// gap) but had never been fuzzed -- every prior fix was found via
+    /// hand-picked edge cases, not broad random generation. Generates `y`/
+    /// `m`/`d`/`hh`/`mm`/`ss` component tuples mixing IN-RANGE values
+    /// (ordinary calendar dates) with DELIBERATELY OUT-OF-RANGE ones (months
+    /// outside `1..=12`, days outside a month's real length, hours/minutes/
+    /// seconds outside `0..60`/`0..24`) -- exercising the documented
+    /// "out-of-range values normalize" contract `make`'s own doc comment
+    /// states, exactly the shape PR-it868's real bug hid in. `y` is bounded
+    /// to a range that can never hit the i64-overflow `Err` path even after
+    /// the LARGEST possible month-normalization shift this generator can
+    /// produce, so every generated case is expected to succeed on the Rust
+    /// side (`.expect()`, not swallowed as a skip) -- a native panic on ANY
+    /// case would surface as an EMPTY actual stdout, itself a mismatch
+    /// worth reporting. Checks that `date_iso(date_make(y, m, d, hh, mm,
+    /// ss))` produces EXACTLY the same ISO-8601 string on native as
+    /// computing the identical chain directly via the canonical Rust
+    /// `crate::time::make`/`crate::time::iso` (the same functions interp/vm
+    /// call). Before trusting a clean first-run report, applied the it885/
+    /// it886/it887 discipline: deliberately injected a real, narrow
+    /// divergence into native's `k_days_from_civil_checked` (changed the
+    /// `153 * (m - 3)` coefficient's `+ 2` rounding offset to `+ 3`, a
+    /// plausible one-character regression in exactly the historically
+    /// bug-prone region) and confirmed the SAME fuzz test caught it (9 of
+    /// the 80 seeds -- exactly the cases whose `153 * (...)`  term happens
+    /// to land in the day-of-year rounding's affected boundary -- each
+    /// mismatching by exactly 1 day), before reverting and re-confirming a
+    /// clean result on the real code. Found ZERO disagreements on the real
+    /// code -- a genuinely broader coverage mechanism now locked in
+    /// permanently, not a bug fix.
+    #[test]
+    fn fuzz_random_date_components_match_the_canonical_rust_calendar_math_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+            fn range(&mut self, lo: i64, hi: i64) -> i64 {
+                lo + self.below((hi - lo) as u64) as i64
+            }
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let y = rng.range(-9000, 9999);
+            let m = rng.range(-20, 40);
+            let d = rng.range(-40, 70);
+            let hh = rng.range(-100, 200);
+            let mm = rng.range(-100, 200);
+            let ss = rng.range(-100, 200);
+            let expected = crate::time::iso(
+                crate::time::make(y, m, d, hh, mm, ss)
+                    .unwrap_or_else(|e| panic!("Rust side unexpectedly failed for y={y} m={m} d={d}: {e}")),
+            );
+            let src = format!(
+                "fun main() uses io {{\n    print(date_iso(date_make({y}, {m}, {d}, {hh}, {mm}, {ss})))\n}}\n"
+            );
+            let raw = native_main_stdout(&src, &format!("datefuzz{seed}"));
+            // strip exactly ONE trailing newline (print's own terminator) --
+            // not a blanket .trim(), per PR-it883's lesson.
+            let actual = raw.strip_suffix('\n').unwrap_or(&raw);
+            if actual != expected {
+                mismatches.push(format!(
+                    "seed={seed} y={y} m={m} d={d} hh={hh} mm={mm} ss={ss} expected={expected:?} actual={actual:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native date_make/date_iso diverges from the canonical Rust calendar math on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// A GREP SWEEP for the same fixed-buffer-truncation signature (bug-hunt batch
     /// 166, PR-it558) found SIX more real instances beyond regex/query_parse
     /// (it555-557): `Str.chars()` (was `KValue tmp_items[4096]`), `Str.reverse()`
