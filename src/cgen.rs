@@ -7751,16 +7751,47 @@ static void k_state_set(int slot, KValue v) { k_insts[k_cur_inst].slots[slot] = 
 
 /* call an expose on a component instance: run its chunk with THAT instance
    current (so its state ops hit the right slots) — mirrors vm.rs Op::Method. */
+/* SOUNDNESS FIX (production-hardening PR-it967, mirroring interp.rs::eval_method
+   and vm.rs's Op::Method fix, same iteration): an ordinary exposed-method call
+   on a supervised child (`parent.exposed()` calling `w.method()` internally, as
+   opposed to a port/timer-triggered handler panic already caught by k_dispatch)
+   used to bypass supervision entirely -- the chunk was invoked directly with no
+   setjmp pad, so a panic longjmped straight past this function to whatever
+   OUTER pad was active (or exit(101) if none), identical to an unsupervised
+   panic, contradicting docs/design/LANGUAGE.md's documented semantics ("panic
+   unwinds the current component instance only; supervision decides restart").
+   Now: for a supervised child, set up a landing pad exactly like k_dispatch's;
+   on a caught panic, restart the child (so it's ready for any FUTURE call/
+   message) and THEN re-raise the SAME panic message to the caller of THIS
+   call, since -- unlike k_dispatch's fire-and-forget handler dispatch -- this
+   call's caller is waiting on a return value and there is none to synthesize. */
 static KValue k_expose_call(KValue recv, const char* name, KValue* args, int argc) {
     (void)argc;
     int id = (int)recv.as.i;
     const KCompMeta* cm = &COMPS[k_insts[id].comp];
     for (int i = 0; i < cm->nexposes; i++) {
         if (!strcmp(cm->exposes[i].name, name)) {
+            if (!k_insts[id].restart_on_failure) {
+                int saved = k_cur_inst; k_cur_inst = id;
+                KValue r = CHUNKS[cm->exposes[i].chunk](0, args);
+                k_cur_inst = saved;
+                return r;
+            }
+            jmp_buf pad; jmp_buf* prev = k_pad; k_pad = &pad;
             int saved = k_cur_inst; k_cur_inst = id;
-            KValue r = CHUNKS[cm->exposes[i].chunk](0, args);
-            k_cur_inst = saved;
-            return r;
+            int64_t saved_depth = k_depth;
+            if (setjmp(pad) == 0) {
+                KValue r = CHUNKS[cm->exposes[i].chunk](0, args);
+                k_cur_inst = saved; k_pad = prev;
+                return r;
+            } else {
+                char msg[1024];
+                strncpy(msg, k_panic_buf, sizeof(msg) - 1);
+                msg[sizeof(msg) - 1] = 0;
+                k_cur_inst = saved; k_pad = prev; k_depth = saved_depth;
+                k_restart(id, msg);
+                k_panic(msg);
+            }
         }
     }
     fprintf(stderr, "panic: component `%s` does not expose `%s`\n", cm->name, name);

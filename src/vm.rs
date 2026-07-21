@@ -1201,14 +1201,27 @@ impl<'m> Vm<'m> {
                                 span,
                             });
                         };
-                        let v = self
-                            .call_chunk_nested(expose_chunk, args, Some(id))
-                            .map_err(|mut e| {
-                                if e.span == Span::default() {
-                                    e.span = span;
-                                }
-                                e
-                            })?;
+                        let result = self.call_chunk_nested(expose_chunk, args, Some(id));
+                        // SOUNDNESS FIX (production-hardening PR-it967, mirroring
+                        // interp.rs::eval_method's identical fix): an ordinary
+                        // exposed-method call on a supervised child used to bypass
+                        // supervision entirely on a panic -- only drain()/advance()'s
+                        // handler dispatch ever checked restart_on_failure. The panic
+                        // still propagates to the caller of this call below (there is
+                        // no value to synthesize for a still-in-flight expression),
+                        // but the child is also restarted so it is ready for any
+                        // FUTURE call/message.
+                        if let Err(ref e) = result {
+                            if self.instances[id].restart_on_failure {
+                                self.restart(id, &e.msg)?;
+                            }
+                        }
+                        let v = result.map_err(|mut e| {
+                            if e.span == Span::default() {
+                                e.span = span;
+                            }
+                            e
+                        })?;
                         set!(dst, v);
                         continue;
                     }
@@ -18675,6 +18688,82 @@ component Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver 
             .expect("module compiles");
         let mut vm = Vm::new(&module);
         assert!(vm.run_app("Main6").is_ok(), "KVM supervision must catch the ai-fun tool panic too");
+    }
+
+    #[test]
+    fn diff_direct_call_panic_on_supervised_child_restarts_and_resets_its_state() {
+        // A REAL cross-engine bug found+fixed (production-hardening PR-it967): a
+        // panic from an ORDINARY exposed-method call on a supervised child (as
+        // opposed to a port/timer-triggered handler panic -- the ONLY shape
+        // every prior supervise test, including
+        // diff_ai_fun_tool_panic_inside_wire_handler_triggers_supervised_restart
+        // just above, ever exercised) used to bypass supervision ENTIRELY: the
+        // panic propagated straight past the component boundary and crashed
+        // with the exact same shape (exit 101, no "[supervise]" message at all)
+        // as an unsupervised panic -- silently ignoring `supervise ... restart
+        // on_failure` for this entire invocation shape. Confirmed live via a
+        // real CLI run BEFORE fixing, across all three engines (interp/vm/
+        // native). Fixed in interp.rs::eval_method, vm.rs's Op::Method handler,
+        // and cgen.rs::k_expose_call (mirroring k_dispatch's setjmp/pad
+        // pattern): the panic still propagates to the CALLER of the crashing
+        // call (there's no value to synthesize for a still-in-flight
+        // expression, unlike drain/advance's fire-and-forget handler dispatch)
+        // -- but the child is now ALSO restarted, so its state is correctly
+        // reset for any FUTURE call.
+        let src = "\
+component Worker967 {
+    intent \"w\"
+    state n: Int = 0
+    expose fun bump() { n += 1 }
+    expose fun boom() { n = 1 / 0 }
+    expose fun read() -> Int { n }
+}
+component Relay967 {
+    intent \"r\"
+    let w = Worker967()
+    supervise w restart on_failure
+    expose fun bump_w() { w.bump() }
+    expose fun crash_w() { w.boom() }
+    expose fun read_w() -> Int { w.read() }
+}
+";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        let iid = match it.instantiate("Relay967", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(id)) => id,
+            _ => panic!("interp instantiate failed"),
+        };
+        let call_i = |it: &mut Interp, name: &str| {
+            let f = Value::Bound(iid, std::rc::Rc::new(name.to_string()));
+            it.call_value(f, vec![], crate::diag::Span::default())
+        };
+        assert!(call_i(&mut it, "bump_w").is_ok(), "bump 1");
+        assert!(call_i(&mut it, "bump_w").is_ok(), "bump 2");
+        assert!(call_i(&mut it, "crash_w").is_err(), "the panic must still surface to the direct caller");
+        let i_after = match call_i(&mut it, "read_w") {
+            Ok(v) => v.to_string(),
+            Err(_) => panic!("read after restart failed"),
+        };
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let vid = vm.instantiate_named("Relay967", vec![]).expect("KVM instantiate failed");
+        vm.call_expose(vid, "bump_w", vec![]).expect("bump 1");
+        vm.call_expose(vid, "bump_w", vec![]).expect("bump 2");
+        let v_crash = vm.call_expose(vid, "crash_w", vec![]);
+        assert!(v_crash.is_err(), "KVM: the panic must still surface to the direct caller");
+        let v_after = vm.call_expose(vid, "read_w", vec![]).expect("read after restart").to_string();
+
+        assert_eq!(i_after, v_after, "interpreter and KVM disagree on post-restart state");
+        assert_eq!(
+            i_after, "0",
+            "restart must reset n back to 0 -- a stale/un-reset n would show 2"
+        );
     }
 
     #[test]

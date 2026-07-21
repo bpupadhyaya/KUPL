@@ -1868,6 +1868,28 @@ impl Interp {
             let saved = self.current.replace(id);
             let result = self.call_fun(&decl.clone(), args, &instance_env, span);
             self.current = saved;
+            // SOUNDNESS FIX (production-hardening PR-it967): a panic from an
+            // ORDINARY exposed-method call on a supervised child (as opposed
+            // to a port/timer-triggered handler panic, already handled by
+            // `drain()`/`advance()`) used to bypass supervision entirely --
+            // propagating straight past the component boundary to crash the
+            // WHOLE PROGRAM with the exact same exit code/diagnostic as an
+            // unsupervised panic, contradicting this language's own
+            // documented semantics ("panic unwinds the current component
+            // instance only; supervision decides restart," docs/design/
+            // LANGUAGE.md). The panic itself STILL propagates to the caller
+            // of this call (there is no sensible value to synthesize for a
+            // still-in-flight expression, unlike drain/advance's fire-and-
+            // forget handler dispatch) -- but the child is now ALSO
+            // restarted so it is back in a clean, usable state for any
+            // FUTURE call/message, matching Erlang-style supervision (a
+            // crashed synchronous call surfaces to the caller AND restarts
+            // the supervised process).
+            if let Err(Flow::Panic { ref msg, .. }) = result {
+                if self.instances[id].restart_on_failure {
+                    self.restart(id, msg)?;
+                }
+            }
             return result;
         }
         // UFCS: if there's no built-in method, fall back to a top-level function
