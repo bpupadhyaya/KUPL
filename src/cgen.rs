@@ -18440,4 +18440,117 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
             "native: the loop workload took {elapsed:?}, expected well under {NATIVE_BOUND:?} -- possible performance regression"
         );
     }
+
+    /// A THIRD performance-regression GUARD, production-hardening
+    /// PR-it1012's follow-up (PR-it1013) -- PR-it1011's `fib(24)` guard
+    /// exercises RECURSIVE call dispatch; PR-it1012's loop guard exercises
+    /// plain arithmetic/variable-mutation dispatch; this one exercises a
+    /// STRUCTURALLY DIFFERENT hot path again: STRING construction
+    /// (concatenation via `+`, `to_str`) and STRING METHOD dispatch
+    /// (`.contains`) inside a loop -- the by-name method-lookup/dispatch
+    /// machinery (`Op::Method` on native, the `(Value::Str(_), name)`
+    /// match arms on interp) is a genuinely different code path than
+    /// either PR-it1011's or PR-it1012's guards exercise, so a regression
+    /// confined to string/method dispatch specifically wouldn't
+    /// necessarily be caught by either. Same wide-margin philosophy
+    /// throughout: empirically measured baseline FIRST (debug `kupl` CLI,
+    /// the SAME unoptimized profile `cargo test` itself builds under)
+    /// before picking bounds -- 50,000 iterations of building `"hello
+    /// world " + to_str(i)` and checking `.contains("hello")` took ~0.09s
+    /// (interp) / ~0.11s (VM) / negligible (native, `-O2`, process-spawn-
+    /// dominated). Bounds here are 10s (interp/VM, >90x margin) and 5s
+    /// (native) -- generous enough to never flake, tight enough to catch
+    /// a genuine order-of-magnitude-or-worse regression. Times ONLY
+    /// execution (never compile/build time). Asserts the CORRECT result
+    /// (`count == N`, since every generated string always starts with the
+    /// literal `"hello world "` and therefore always contains `"hello"` --
+    /// independently verified live via `kupl check`/`kupl run` before
+    /// writing this test, not just assumed) on every engine, not just the
+    /// timing bound. No recursion at all (a `while` loop, like PR-it1012's
+    /// guard), so no `std::thread::Builder` stack-size wrapping is needed
+    /// here either -- confirmed live before finalizing (this test's own
+    /// first, unwrapped run completed cleanly, no stack overflow).
+    #[test]
+    fn perf_guard_a_moderate_string_manipulation_workload_completes_well_within_a_generous_time_bound_on_every_engine(
+    ) {
+        const N: i64 = 50_000;
+        const EXPECTED: i64 = N; // every generated string contains "hello"
+        const INTERP_VM_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+        const NATIVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let work_src = format!(
+            "fun work() -> Int {{\n    \
+             var count = 0\n    var i = 0\n    \
+             while i < {N} {{\n        \
+             let s = \"hello world \" + to_str(i)\n        \
+             if s.contains(\"hello\") {{\n            count = count + 1\n        }}\n        \
+             i = i + 1\n    }}\n    \
+             count\n}}\n"
+        );
+
+        // interp
+        let interp_src = format!("{work_src}fun main() -> Int {{ work() }}\n");
+        let compiled = crate::run::compile(&interp_src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let start = std::time::Instant::now();
+        let result = interp
+            .call_value(f, vec![], crate::diag::Span::default())
+            .unwrap_or_else(|_| panic!("interp: the string workload must not panic"));
+        let elapsed = start.elapsed();
+        assert_eq!(result, crate::value::Value::Int(EXPECTED), "interp: wrong count result");
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "interp: the string workload took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // VM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = crate::vm::Vm::new(&module);
+        let start = std::time::Instant::now();
+        let result = vm
+            .call_named("main", vec![])
+            .unwrap_or_else(|e| panic!("vm: the string workload must not error: {}", e.msg));
+        let elapsed = start.elapsed();
+        assert_eq!(result, crate::value::Value::Int(EXPECTED), "vm: wrong count result");
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "vm: the string workload took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // native
+        if !cc_available() {
+            return;
+        }
+        let native_src = format!("{work_src}fun main() uses io {{\n    print(work())\n}}\n");
+        let compiled = crate::run::compile(&native_src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base =
+            std::env::temp_dir().join(format!("kupl-cgen-strperfguard-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            EXPECTED.to_string(),
+            "native: wrong count result"
+        );
+        assert!(
+            elapsed < NATIVE_BOUND,
+            "native: the string workload took {elapsed:?}, expected well under {NATIVE_BOUND:?} -- possible performance regression"
+        );
+    }
 }
