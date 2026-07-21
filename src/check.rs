@@ -1586,6 +1586,32 @@ impl Checker {
             };
             for prop in &c.props {
                 let ty = self.resolve_ty(&prop.ty);
+                // A REAL, live-confirmed HIGH-severity soundness hole
+                // found+fixed (production-hardening PR-it994, an Explore
+                // survey finding): a prop's DEFAULT VALUE was never
+                // type-checked against the prop's own declared type --
+                // unlike `state` immediately below, whose init IS checked
+                // via `infer_expr`/`check_assign` (and unlike a
+                // CONSTRUCTION-SITE argument for this same prop, which
+                // check_ctor_args' ordinary argument-checking already
+                // covers). A default is only substituted when a
+                // CONSTRUCTION call OMITS this prop, so the mismatch never
+                // surfaces at that call site either -- the checker simply
+                // never looked at `prop.default` anywhere at all. Live-
+                // confirmed on ALL FOUR ENGINES identically before this
+                // fix: `component Gauge { prop level: Int = "not a
+                // number"  expose fun read() -> Int { level } }` compiled
+                // with `kupl check` reporting "ok" (zero diagnostics), yet
+                // `kupl run`/`kupl run --vm`/`kupl native` all panicked
+                // `invalid operand types: Str and Int` the moment the
+                // (never-checked) `Str` default was used as an `Int` --
+                // the exact class of bug this checker exists to prevent:
+                // a program `kupl check` accepts that crashes at runtime
+                // because a promised type was never actually verified.
+                if let Some(default) = &prop.default {
+                    let default_ty = self.infer_expr(default, &mut ctx);
+                    self.check_assign(&ty, &default_ty, default.span, &format!("prop `{}`'s default value", prop.name));
+                }
                 ctx.scopes.insert(&prop.name, ty, false);
             }
             for s in &c.state {
@@ -6138,6 +6164,34 @@ mod generic_tests {
         // an ordinary component with distinctly-named props is unaffected.
         assert!(
             errors("component Ok {\n    intent \"ok\"\n    prop a: Int\n    prop b: Int\n    expose fun sum() -> Int { a + b }\n}\nfun main() {}\n")
+                .is_empty()
+        );
+    }
+
+    /// A REAL, live-confirmed HIGH-severity soundness hole (production-
+    /// hardening PR-it994): a prop's DEFAULT VALUE was never type-checked
+    /// against the prop's own declared type -- `kupl check` reported "ok"
+    /// for `prop level: Int = "not a number"`, yet `kupl run`/`kupl run
+    /// --vm`/`kupl native` all panicked identically the moment the never-
+    /// checked `Str` default was used as an `Int`. Now rejected at check
+    /// time, mirroring the sibling `state` init check two lines below it in
+    /// `check_component`.
+    #[test]
+    fn component_prop_default_value_is_type_checked_against_its_declared_type() {
+        let bad = errors("component Gauge {\n    intent \"g\"\n    prop level: Int = \"not a number\"\n    expose fun read() -> Int { level }\n}\nfun main() {}\n");
+        assert!(
+            bad.iter().any(|d| d.code == "K0200" && d.message.contains("prop `level`'s default value")),
+            "{bad:?}"
+        );
+        // a default typed against a DIFFERENT declared type is still rejected the same way.
+        let bad2 = errors("component Gauge2 {\n    intent \"g\"\n    prop label: Str = 5\n    expose fun read() -> Str { label }\n}\nfun main() {}\n");
+        assert!(
+            bad2.iter().any(|d| d.code == "K0200" && d.message.contains("prop `label`'s default value")),
+            "{bad2:?}"
+        );
+        // a correctly-typed default -- and a prop with no default at all -- are unaffected.
+        assert!(
+            errors("component Ok {\n    intent \"ok\"\n    prop level: Int = 42\n    prop other: Int\n    expose fun sum() -> Int { level + other }\n}\nfun main() {}\n")
                 .is_empty()
         );
     }
