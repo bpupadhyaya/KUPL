@@ -12367,6 +12367,174 @@ fun main() uses io {
         );
     }
 
+    /// A cross-engine fuzz pass against `value.rs`'s `IntW` wrapping/
+    /// saturating arithmetic (`wrap`/`saturate`/`wrapping_mul`/
+    /// `saturating_mul`) vs `cgen.rs`'s independent C reimplementation
+    /// (`k_iw_wrap`/`k_iw_sat`/`k_iw_saturating_mul`), production-hardening
+    /// PR-it1010 -- a quick inventory of cgen.rs's remaining `k_*` functions
+    /// (after BigInt/Rational/date math were all fuzz-covered at PR-it1007/
+    /// it1008/it1009) surfaced this as a strong candidate: 8 distinct
+    /// widths (`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`) times 6
+    /// arithmetic methods (`wrapping_add`/`sub`/`mul`, `saturating_add`/
+    /// `sub`/`mul`), with REAL documented prior bug history in exactly this
+    /// region (PR-it671's `saturating_mul` sign-flip bug for near-extreme
+    /// `u64`/`i64` operands) -- genuine complexity, never broadly fuzzed
+    /// (only hand-picked extreme-value cases, e.g.
+    /// `diff_sized_int_mul_near_u64_i64_extremes_does_not_crash_it671`
+    /// above, which compares interp-vs-VM, not native). Generates a random
+    /// width and two random operands EXCLUDING each width's exact minimum
+    /// (a signed minimum's bare literal, e.g. `-128i8`, cannot be written
+    /// directly -- `128i8` alone overflows `i8`'s positive range before
+    /// the unary minus ever applies, matching this file's own established
+    /// `(0i64 - 9223372036854775807i64) - 1i64`-style workaround
+    /// elsewhere; simply excluding it keeps the generator's own KUPL
+    /// source simple and safe, at the cost of that ONE already-hand-
+    /// tested boundary value), biased toward the min+1/max extremes where
+    /// PR-it671's bug actually lived, paired with one of the SIX
+    /// arithmetic methods. Checks that native's result matches EXACTLY
+    /// what the canonical `crate::value::IntW`'s own `wrap`/`saturate`/
+    /// `wrapping_mul`/`saturating_mul` methods compute (the same ones
+    /// interp/vm call). Before trusting a clean first-run report, applied
+    /// the it885/it886/it887/it1007/it1008/it1009 discipline -- including
+    /// it1008's OWN lesson about verifying an injection lands in an
+    /// EXERCISED code path: deliberately injected a real, narrow
+    /// divergence into native's `k_iw_saturating_mul` (changed
+    /// `k_i128_mul_overflows`'s overflow-sign check `(a < 0) != (b < 0)`
+    /// to `(a < 0) == (b < 0)`, inverting exactly which extreme an
+    /// overflowing product saturates toward -- the SAME sign-flip bug
+    /// SHAPE PR-it671 originally fixed). The FIRST run against this
+    /// injection stayed clean -- a genuine false negative caught by
+    /// applying the it1008 discipline rather than trusting it: a
+    /// __int128-level overflow inside `saturating_mul` is ONLY reachable
+    /// when BOTH operands' magnitudes approach `u64::MAX` specifically
+    /// (`i64::MAX` alone is too small -- `i64::MAX^2` stays well under
+    /// `2^127`, since i64's range is HALF of u64's in magnitude), and
+    /// uniformly-random width selection across all 8 widths made hitting
+    /// that narrow condition genuinely rare across only 80 seeds -- the
+    /// SAME class of harness-under-coverage gap PR-it885's own regex
+    /// fuzzer hit on ITS first attempt. Re-tuned the generator to bias
+    /// 3-in-8 toward `u64` specifically, forcing both operands within 5
+    /// of `u64::MAX` whenever it's chosen (mirroring PR-it885's own fix:
+    /// widen the generator's weighting toward the historically-relevant
+    /// shape, don't just widen the seed count blindly), and confirmed the
+    /// SAME fuzz test now caught the injected bug reliably (7 of 80
+    /// seeds, every one a genuine `u64` `saturating_mul` overflow,
+    /// consistently saturating to the WRONG extreme, `0` instead of
+    /// `u64::MAX`, matching the doc comment's own predicted failure mode
+    /// exactly). Reverted (confirmed via `diff -a` against a pre-injection
+    /// backup showing ZERO remaining diff) and
+    /// re-confirming a clean result on the real code. Found ZERO
+    /// disagreements on the real code -- a genuinely broader coverage
+    /// mechanism now locked in permanently, not a bug fix.
+    #[test]
+    fn fuzz_random_sized_int_wrapping_and_saturating_arithmetic_matches_the_canonical_rust_implementation_on_native(
+    ) {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    self.next() % n
+                }
+            }
+        }
+        let widths: [(crate::value::IntW, &str); 8] = [
+            (crate::value::IntW::I8, "i8"),
+            (crate::value::IntW::I16, "i16"),
+            (crate::value::IntW::I32, "i32"),
+            (crate::value::IntW::I64, "i64"),
+            (crate::value::IntW::U8, "u8"),
+            (crate::value::IntW::U16, "u16"),
+            (crate::value::IntW::U32, "u32"),
+            (crate::value::IntW::U64, "u64"),
+        ];
+        // Generate an operand in `[min+1, max]`, biased toward the extreme
+        // ends (where wrapping/saturating semantics actually diverge from
+        // ordinary arithmetic) roughly half the time.
+        fn fuzz_gen_operand(rng: &mut FuzzRng, w: crate::value::IntW) -> i128 {
+            let (lo, hi) = (w.min() + 1, w.max());
+            if rng.below(2) == 0 {
+                let span = (hi - lo).min(5) as u64;
+                if rng.below(2) == 0 {
+                    lo + rng.below(span + 1) as i128
+                } else {
+                    hi - rng.below(span + 1) as i128
+                }
+            } else {
+                lo + (rng.below((hi - lo) as u64 + 1)) as i128
+            }
+        }
+        let methods = ["wrapping_add", "wrapping_sub", "wrapping_mul", "saturating_add", "saturating_sub", "saturating_mul"];
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            // A genuine __int128-level overflow inside `k_iw_saturating_mul`
+            // (the exact PR-it671 bug shape) is ONLY reachable when BOTH
+            // operands' magnitudes approach `u64::MAX` -- `i64::MAX` alone is
+            // too small (`i64::MAX^2` is well under `2^127`, since i64's
+            // range is HALF of u64's in magnitude). Uniformly random width
+            // selection made this genuinely rare across 80 seeds (an
+            // EMPIRICALLY-CAUGHT false negative during this fuzz test's own
+            // development, mirroring PR-it885's harness-tuning precedent) --
+            // biased 3-in-8 toward `u64` specifically, WITH both operands
+            // forced near its max, so multiplication reliably overflows.
+            let (w, suffix) = if rng.below(8) < 3 {
+                widths[7] // u64
+            } else {
+                widths[rng.below(widths.len() as u64) as usize]
+            };
+            let (a, b) = if w == crate::value::IntW::U64 {
+                let hi = w.max();
+                (hi - rng.below(6) as i128, hi - rng.below(6) as i128)
+            } else {
+                (fuzz_gen_operand(&mut rng, w), fuzz_gen_operand(&mut rng, w))
+            };
+            let m = methods[rng.below(methods.len() as u64) as usize];
+            let expected = match m {
+                "wrapping_add" => w.wrap(a + b),
+                "wrapping_sub" => w.wrap(a - b),
+                "wrapping_mul" => w.wrapping_mul(a, b),
+                "saturating_add" => w.saturate(a + b),
+                "saturating_sub" => w.saturate(a - b),
+                _ => w.saturating_mul(a, b),
+            };
+            let src = format!(
+                "fun main() uses io {{\n    print(({a}{suffix}).{m}({b}{suffix}))\n}}\n"
+            );
+            let raw = native_main_stdout(&src, &format!("sizedfuzz{seed}"));
+            // strip exactly ONE trailing newline (print's own terminator) --
+            // not a blanket .trim(), per PR-it883's lesson.
+            let actual = raw.strip_suffix('\n').unwrap_or(&raw);
+            let expected_str = expected.to_string();
+            if actual != expected_str {
+                mismatches.push(format!(
+                    "seed={seed} width={suffix} a={a} method={m} b={b} expected={expected_str:?} actual={actual:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native SizedInt wrapping/saturating arithmetic diverges from the canonical Rust implementation on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// Native sized-int bitwise ops mask results to the operand WIDTH, matching interp/KVM —
     /// C promotes u8/i8 to int, so bnot/shl must re-narrow or high bits would leak (PR-it155).
     #[test]
