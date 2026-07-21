@@ -358,7 +358,7 @@ unambiguous "better than everyone" claim, and it is real today.
 
 Punches above its age: a canonical formatter (spec-level), **semantic diff**
 (`kupl diff` compares by meaning, classifying interface-vs-implementation
-changes), **structured diagnostics** (104 stable K-codes with spans and a JSON
+changes), **structured diagnostics** (124 stable K-codes with spans and a JSON
 mode built for editors and AI agents), a zero-dependency LSP server, component
 manifests for visual tools, `kupl context` for LLM prompt-packing, and
 property-based testing built in. This is Rust-cargo-quality ambition delivered
@@ -465,26 +465,38 @@ for a language this approachable.
 
 **Where it clearly trails today, in priority order:**
 
-1. **Concurrency / parallelism** — the constructs exist (`par`, `par_map`) but
-   execute **sequentially**; a real multi-threaded scheduler and async I/O are
-   □ [design]. Go, Rust, Kotlin, Swift, and the JVM all win decisively. Still the
+1. **General concurrency** — `par_map`/`par_filter` over a pure function on a
+   large list DO execute on real OS threads (see "Concurrency / parallelism"
+   above); what's still sequential is everything else: structured `par { … }`
+   branches, `par_each`, general async I/O, coroutines, and a work-stealing
+   scheduler for arbitrary tasks (all □ [design]). Go, Rust, Kotlin, Swift, and
+   the JVM all still win decisively on *general-purpose* concurrency. Still the
    top gap for the "universal, capable of any software" claim.
-2. **Performance on components** — native codegen doesn't cover components yet
-   (□ KIR + native components). Real apps run at VM speed.
+2. **Numeric-loop performance** — the whole component model and the entire
+   language already compile to native machine code at native speed (see
+   "Runtime performance" above); what remains is the *optional* typed SSA IR
+   (KIR) that would unbox the 16-byte tagged `KValue` for raw-register
+   arithmetic in tight monomorphic numeric loops — a performance refinement,
+   not a correctness or coverage gap.
 3. **Ecosystem & maturity** — no third-party packages, no users. (The *standard*
    library is now broad — that part of the it10 gap is closed.) Only a registry
    plus adoption fixes the rest.
-4. **Hardware universality & sized numerics** — GPU kernels, `at()` placement,
-   full sized numerics (i8…u64, f32), and the system/hardware tiers are
-   □ [design] (bitwise ops + hex/binary literals landed as a first slice).
+4. **Hardware & systems universality** — GPU kernels, `at()` device placement,
+   and the systems/ownership tier (`low`/`asm`) are □ [design]. (Sized numerics
+   — `i8…u64`, `f32` — are NOT part of this gap: they already fully landed
+   across every engine including native, checked/wrapping/saturating
+   arithmetic and all; see "What changed since the it20 refresh" above.)
 
 **Roadmap implication (drives it22+):** the criteria where KUPL scores lowest
 and which are most load-bearing for the founding thesis are, in order:
-**(a) real concurrency/parallelism** on the actor model (async I/O + a
-work-stealing/multi-threaded scheduler behind the existing `par`/`par_map`
-seam, with the virtual clock preserved for tests); **(b) native components +
-KIR** to make components fast; **(c) full sized numerics** (i8…u64, f32) for
-systems and binary work; **(d) the GPU/kernel and system tiers** and a package
-**registry**. The it14–20 arc closed the everyday-capability and stdlib gaps;
-what remains are the hard performance/concurrency and ecosystem items. See
+**(a) general concurrency** beyond the existing `par_map`/`par_filter` real-
+thread seam (async I/O + a work-stealing/multi-threaded scheduler for `par{}`
+branches and arbitrary tasks, with the virtual clock preserved for tests);
+**(b) KIR** (KValue unboxing) for tight numeric-loop performance, now that
+native components/the whole language already compile natively; **(c) the
+GPU/kernel and systems tiers** and a hosted package **registry**. The it14–20
+arc closed the everyday-capability and stdlib gaps; the it27–40 arcs closed
+sized numerics, real-thread data parallelism, and native components; what
+remains are general concurrency, numeric-loop unboxing, hardware tiers, and
+ecosystem. See
 [`GAPS.md`](GAPS.md) for the tracked roadmap.
