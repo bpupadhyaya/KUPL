@@ -1028,6 +1028,19 @@ mod tests {
         assert!(!ks.contains(&Tok::Newline) || ks.iter().filter(|t| **t == Tok::Newline).count() == 1);
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it966): a newline
+    /// right after `..`, `..=`, `!`, or `@` used to terminate the statement
+    /// like a closing delimiter, even though every other operator already
+    /// suppressed it. Each of these should lex identically to its same-line
+    /// form -- no stray `Newline` token between the operator and its operand.
+    #[test]
+    fn newline_suppression_after_range_bang_and_at() {
+        assert_eq!(kinds("0 ..\n5"), kinds("0 .. 5"));
+        assert_eq!(kinds("0 ..=\n5"), kinds("0 ..= 5"));
+        assert_eq!(kinds("!\ntrue"), kinds("! true"));
+        assert_eq!(kinds("whole @\nCircle"), kinds("whole @ Circle"));
+    }
+
     #[test]
     fn string_interpolation() {
         let (toks, diags) = lex("\"hi {name}!\"");

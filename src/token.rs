@@ -201,6 +201,10 @@ impl Tok {
                 | Tok::PipeGt
                 | Tok::LParen
                 | Tok::LBracket
+                | Tok::DotDot
+                | Tok::DotDotEq
+                | Tok::Bang
+                | Tok::At
                 | Tok::Newline
         )
     }
@@ -354,5 +358,24 @@ mod tests {
         // right after `)` or `5` really does end the statement.
         assert!(!Tok::RParen.suppresses_newline());
         assert!(!Tok::Int(5).suppresses_newline());
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it966, from survey
+    /// #114's token.rs close-read): `DotDot`/`DotDotEq`/`Bang`/`At` were
+    /// simply never added to this list, even though `lexer.rs`'s own doc
+    /// comment promises newlines are insignificant "after a token that
+    /// implies continuation (operator, comma, dot, open bracket)" -- every
+    /// OTHER operator (including every other unary/binary op) was already
+    /// listed. This silently rejected ordinary, validly-formatted source
+    /// that split a range (`0 ..\n    5`), a negation (`!\n    true`), or an
+    /// `@`-pattern binding (`whole @\n    Circle(_) => ...`) across a line,
+    /// with a spurious "expected an expression/pattern, found end of line"
+    /// parse error identical across all four engines (shared front-end).
+    #[test]
+    fn suppresses_newline_covers_range_bang_and_at() {
+        assert!(Tok::DotDot.suppresses_newline());
+        assert!(Tok::DotDotEq.suppresses_newline());
+        assert!(Tok::Bang.suppresses_newline());
+        assert!(Tok::At.suppresses_newline());
     }
 }
