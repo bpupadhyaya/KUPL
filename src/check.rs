@@ -1455,6 +1455,38 @@ impl Checker {
         ctx.scopes.push();
         for p in &f.params {
             let ty = self.resolve_ty(&p.ty);
+            // A REAL, live-confirmed completeness gap found+fixed
+            // (production-hardening PR-it995, a sibling of PR-it994's
+            // component-prop-default fix, found by the SAME check.rs Explore
+            // survey): a top-level `fun` parameter's default value was never
+            // type-checked against the parameter's own declared type at the
+            // DECLARATION site -- `check_default_params_dont_reference_
+            // sibling_params` above only checks for a sibling-parameter-name
+            // reference (K0280), and neither this loop nor `collect()`'s
+            // `Item::Fun` arm ever called `infer_expr`/`check_assign` on
+            // `p.default`. Only reachable for TOP-LEVEL `fun` params
+            // (`component.is_none()`) -- component/contract/ctor/`ai fun`
+            // param defaults are ALREADY rejected entirely by
+            // `reject_param_defaults` (K0275) before this would ever matter,
+            // mirroring the sibling check's own scoping above. Lower
+            // severity than PR-it994's prop case: `callargs::resolve_call_
+            // args` runs before `check::check` (run.rs) and splices a
+            // defaulted param's raw expression into any DIRECT call site
+            // that omits it, so the mismatch IS caught as soon as any call
+            // in the checked program actually omits that arg -- the gap
+            // only survives when the default is never spliced anywhere
+            // (every call always supplies that arg explicitly, or the
+            // function goes unused), so it cannot itself cause a runtime
+            // divergence for reachable code. Still a genuine "checker
+            // accepts a declaration it shouldn't" hole, fixed the same
+            // structural way as PR-it994: mirroring `check_component`'s
+            // existing `state`/`prop` default checks.
+            if component.is_none() {
+                if let Some(default) = &p.default {
+                    let default_ty = self.infer_expr(default, &mut ctx);
+                    self.check_assign(&ty, &default_ty, default.span, &format!("parameter `{}`'s default value", p.name));
+                }
+            }
             ctx.scopes.insert(&p.name, ty, false);
         }
         if let Some(ai) = &f.ai {
@@ -6193,6 +6225,46 @@ mod generic_tests {
         assert!(
             errors("component Ok {\n    intent \"ok\"\n    prop level: Int = 42\n    prop other: Int\n    expose fun sum() -> Int { level + other }\n}\nfun main() {}\n")
                 .is_empty()
+        );
+    }
+
+    /// A REAL, live-confirmed completeness gap (production-hardening
+    /// PR-it995, a sibling of PR-it994's component-prop-default fix, found
+    /// by the SAME check.rs Explore survey): a top-level `fun` parameter's
+    /// default value was never type-checked against its OWN declared
+    /// parameter type at the declaration site -- only caught later, and only
+    /// when SOME call site actually omits that argument, via
+    /// `callargs::resolve_call_args` splicing the default into the call
+    /// (see `default_value_referencing_a_sibling_parameter_is_rejected_at_
+    /// check_time` above for that unrelated, already-covered mechanism).
+    /// Live-confirmed: `fun greet(name: Str, times: Int = "oops") -> Str
+    /// { name.repeat(times) }` with every call site supplying `times`
+    /// explicitly type-checked clean despite the `Str`/`Int` mismatch.
+    #[test]
+    fn fun_parameter_default_value_is_type_checked_against_its_declared_type() {
+        let bad = errors("fun greet(name: Str, times: Int = \"oops\") -> Str { name.repeat(times) }\nfun main() { print(greet(\"hi\", 3)) }\n");
+        assert!(
+            bad.iter().any(|d| d.code == "K0200" && d.message.contains("parameter `times`'s default value")),
+            "{bad:?}"
+        );
+        // a default typed against a DIFFERENT declared parameter type is still rejected the same way.
+        // (`n` comes first here, with NO default, so this stays K0267-ordering-valid --
+        // trailing-default order matters, since K0267 is emitted by callargs.rs, a
+        // SEPARATE pass this bare `errors()`/`check()` helper doesn't run, and an
+        // ordering violation would otherwise mask this test's own K0200 on the real CLI.)
+        let bad2 = errors("fun tag(n: Int, label: Str = 5) -> Int { n }\nfun main() { print(tag(1, \"x\")) }\n");
+        assert!(
+            bad2.iter().any(|d| d.code == "K0200" && d.message.contains("parameter `label`'s default value")),
+            "{bad2:?}"
+        );
+        // a correctly-typed default -- and a parameter with no default at all -- are unaffected.
+        // (Both call args supplied explicitly here: `errors()` calls `check()`
+        // directly, without `callargs::resolve_call_args`'s default-splicing
+        // pass, so a call OMITTING a defaulted arg is a separate concern
+        // covered instead by `crate::run::compile` in the sibling K0280 test
+        // above -- not what this test is verifying.)
+        assert!(
+            errors("fun greet(name: Str, times: Int = 3) -> Str { name.repeat(times) }\nfun main() { print(greet(\"hi\", 5)) }\n").is_empty()
         );
     }
 
