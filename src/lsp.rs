@@ -386,24 +386,52 @@ fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> 
 
 // ---------------- LSP server ----------------
 
+/// Percent-decode a `file://` URI's path component (RFC 3986 -- unlike a query
+/// string, `+` here is a literal PLUS SIGN, not a space, so this deliberately
+/// does NOT reuse `url::url_decode`'s form-encoding convention).
+///
+/// A REAL, live-confirmed CRASH found+fixed (production-hardening PR-it987, an
+/// Explore survey finding): the previous version worked byte-by-byte directly
+/// on `raw: &str`, doing `out.push(v as char)` per decoded byte (mapping each
+/// raw BYTE straight to its own Unicode codepoint -- wrong for any byte >= 0x80
+/// that's actually part of a multi-byte UTF-8 sequence, silently reassembling a
+/// percent-encoded multi-byte character like `%E6%97%A5` -- exactly what
+/// `path_to_uri` emits for `日` -- into 3-character mojibake instead of the
+/// original character) AND sliced `raw[i+1..i+3]` BY BYTE RANGE for the hex
+/// digits, which panics whenever that 2-byte window isn't on a char boundary --
+/// reachable by ANY workspace file whose name has a literal `%` immediately
+/// followed by a multi-byte character (most CJK characters, most emoji), since
+/// a client's `file://` URI need not itself be percent-encoded at that byte.
+/// Live-confirmed: `uri_to_path("file:///tmp/100%完了.kupl")` panicked with
+/// "byte index N is not a char boundary" -- reachable from `initialize`'s
+/// `rootUri`, `didOpen`, or any request naming such a file, killing the whole
+/// LSP session. Fixed by working entirely on `&[u8]` (byte slicing never
+/// panics regardless of UTF-8 boundaries) and decoding the WHOLE accumulated
+/// byte sequence as UTF-8 ONCE at the end, exactly mirroring `url::url_decode`'s
+/// already-correct technique -- a malformed `%XX` (including one that lands
+/// mid-character) falls through to treating `%` as a literal byte, matching
+/// the previous LENIENT behavior; a final byte sequence that isn't valid UTF-8
+/// returns `None` (a clean "no such document") instead of corrupting data.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let raw = uri.strip_prefix("file://")?;
-    // minimal percent-decoding (spaces etc.)
-    let mut out = String::new();
     let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
-                out.push(v as char);
+            if let Some(v) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(v);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    Some(PathBuf::from(out))
+    String::from_utf8(out).ok().map(PathBuf::from)
 }
 
 /// Upper bound on a single JSON-RPC message body. Generous for real source files,
@@ -2992,6 +3020,33 @@ fn render_id(id: &Json) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// production-hardening PR-it987: a literal `%` immediately followed by a
+    /// multi-byte character (CJK, emoji) used to panic (`byte index N is not
+    /// a char boundary`) instead of returning a clean path -- see
+    /// `uri_to_path`'s own doc comment for the full analysis. Must not panic,
+    /// and must decode to the literal filename (the `%` is not a valid hex
+    /// escape here, so it's kept as-is, matching the function's established
+    /// lenient fallback for any malformed `%XX`).
+    #[test]
+    fn uri_to_path_does_not_panic_on_percent_before_a_multibyte_char() {
+        let got = uri_to_path("file:///tmp/100%完了.kupl");
+        assert_eq!(got, Some(PathBuf::from("/tmp/100%完了.kupl")));
+        let got = uri_to_path("file:///tmp/50%_🎉.kupl");
+        assert_eq!(got, Some(PathBuf::from("/tmp/50%_🎉.kupl")));
+    }
+
+    /// production-hardening PR-it987: a genuinely percent-encoded multi-byte
+    /// character (exactly what `path_to_uri` emits for a non-ASCII path, e.g.
+    /// `日` -> `%E6%97%A5`) must round-trip back to the ORIGINAL character,
+    /// not per-byte mojibake (the previous `out.push(v as char)` treated each
+    /// decoded byte as its own Unicode scalar value instead of re-decoding
+    /// the accumulated bytes as UTF-8).
+    #[test]
+    fn uri_to_path_correctly_reassembles_a_percent_encoded_multibyte_character() {
+        let uri = path_to_uri(std::path::Path::new("/tmp/日本語.kupl"));
+        assert_eq!(uri_to_path(&uri), Some(PathBuf::from("/tmp/日本語.kupl")));
+    }
 
     // a small multi-item program for the language-feature tests
     const PROG: &str = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
