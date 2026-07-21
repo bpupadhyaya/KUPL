@@ -21203,6 +21203,78 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
         assert_eq!(differential(benign_guard), "positive");
     }
 
+    /// A REAL, LIVE-CONFIRMED SILENT-VALUE-CORRUPTION bug FAMILY found+fixed
+    /// (production-hardening PR-it1004, a close-read survey of
+    /// `compile.rs`'s `fn expr`/`fn call` region, immediately adjacent to
+    /// PR-it1003's already-fixed `fn pattern`): see
+    /// `compile.rs::consecutive`'s own doc comment for the full root-cause
+    /// writeup. SIX distinct call sites (`consecutive()` itself,
+    /// `ExprKind::MethodCall`'s `recv`, the indirect-call `callee`,
+    /// `ExprKind::Range`'s `lo`, `instance_expr`'s per-prop-arg loop, and
+    /// `order_ctor_args`'s per-field-arg loop) all shared the SAME bug
+    /// shape: an early `self.expr()` result (a raw register, aliasing a
+    /// mutable variable's OWN register for a bare `Ident` operand) held
+    /// across a LATER sibling expression's evaluation that can legally
+    /// reassign that same variable (a `{ x = ...; ... }` block-expr, valid
+    /// KUPL syntax anywhere an `Expr` is expected), silently corrupting the
+    /// earlier operand's value once a deferred op finally reads the
+    /// now-stale register. `interp.rs` is unaffected on every one of these
+    /// shapes (every operand is evaluated into an OWNED, independent
+    /// `Value` the moment it's reached, never re-read from a shared
+    /// mutable slot). All SIX fixed the SAME way: snapshot into a fresh
+    /// register via `Op::Move` immediately after evaluating, before any
+    /// subsequent sibling expression can run.
+    #[test]
+    fn diff_a_later_sibling_expression_mutating_an_earlier_bare_ident_operands_own_variable_does_not_corrupt_the_earlier_value(
+    ) {
+        // `consecutive()` itself: a plain List literal's sibling elements.
+        let list_literal = "fun probe() -> Str {\n    \
+                            var x = 5\n    \
+                            let lst = [x, { x = 99\n 1 }]\n    \
+                            let a = lst.get(0).unwrap_or(0)\n    \
+                            let b = lst.get(1).unwrap_or(0)\n    \
+                            \"{a},{b}\"\n}\n";
+        assert_eq!(differential(list_literal), "5,1");
+        // `ExprKind::MethodCall`'s `recv`, held across arg evaluation.
+        let method_recv = "fun probe() -> Str {\n    \
+                           var x = [1, 2, 3]\n    \
+                           let found = x.contains({ x = [9, 9, 9]\n 2 })\n    \
+                           \"{found}\"\n}\n";
+        assert_eq!(differential(method_recv), "true");
+        // Indirect call's callee, held across arg evaluation.
+        let call_value = "fun addOne(n: Int) -> Int { n + 1 }\n\
+                          fun addTen(n: Int) -> Int { n + 10 }\n\
+                          fun probe() -> Str {\n    \
+                          var f = addOne\n    \
+                          let r = f({ f = addTen\n 5 })\n    \
+                          \"{r}\"\n}\n";
+        assert_eq!(differential(call_value), "6");
+        // `ExprKind::Range`'s `lo`, held across `hi` evaluation.
+        let range_lo = "fun probe() -> Str {\n    \
+                        var x = 1\n    var out = \"\"\n    \
+                        for i in x..{ x = 100\n 5 } {\n        out = \"{out}{i},\"\n    \
+                        }\n    out\n}\n";
+        assert_eq!(differential(range_lo), "1,2,3,4,");
+        // `instance_expr`'s per-prop-arg loop (component construction).
+        let component_prop = "component Widget1004 {\n    \
+                              intent \"test\"\n    \
+                              prop a: Int\n    prop b: Int\n    \
+                              expose fun show() -> Str { \"{a},{b}\" }\n\
+                              }\n\
+                              fun probe() -> Str {\n    \
+                              var x = 5\n    \
+                              let w = Widget1004(a: x, b: { x = 99\n 1 })\n    \
+                              w.show()\n}\n";
+        assert_eq!(differential(component_prop), "5,1");
+        // `order_ctor_args`'s per-field-arg loop (user constructor).
+        let ctor_field = "type Pair1004 = Pair1004(a: Int, b: Int)\n\
+                          fun probe() -> Str {\n    \
+                          var x = 5\n    \
+                          let p = Pair1004(a: x, b: { x = 99\n 1 })\n    \
+                          \"{p.a},{p.b}\"\n}\n";
+        assert_eq!(differential(ctor_field), "5,1");
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it997, a close-read
     /// survey of this loop): see `Op::IterGet`'s own doc comment above for
     /// the full writeup. With the sibling fix above (`compile.rs::Stmt::

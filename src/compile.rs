@@ -501,13 +501,27 @@ impl<'s> FnCompiler<'s> {
         // `Widget(b: panic("B"), a: panic("A"))` for a component with
         // `prop a: Int` declared before `prop b: Int` panicked "B" on
         // `kupl run` but "A" on `kupl run --vm`/`kupl native`.
+        // PR-it1004 (see `consecutive()`'s own doc comment for the full
+        // writeup of this bug class): each supplied arg used to be
+        // evaluated via a bare `self.expr(&a.value)` with no snapshot, so a
+        // LATER sibling arg's evaluation (e.g. a `{ x = ...; ... }` block)
+        // could reassign a variable an EARLIER arg's bare-`Ident` value
+        // aliased, silently corrupting that earlier prop's value once the
+        // deferred `Move`-into-consecutive-block loop below finally reads
+        // it. Live-confirmed: `Widget(a: x, b: { x = 99; 1 })` for `var x =
+        // 5` printed the correct `5,1` on `kupl run` but `99,1` on BOTH
+        // `kupl run --vm` and `kupl native`. Fixed the same way as every
+        // sibling site: snapshot each arg into a fresh register via
+        // `Op::Move` immediately after evaluating it.
         let mut supplied: Vec<Option<Reg>> = vec![None; props.len()];
         for (i, a) in args.iter().enumerate() {
             let idx = match &a.name {
                 Some(n) => props.iter().position(|(pn, _)| pn == n).unwrap_or(i),
                 None => i,
             };
-            let r = self.expr(&a.value);
+            let raw = self.expr(&a.value);
+            let r = self.alloc(span);
+            self.emit(Op::Move(r, raw), span);
             if idx < supplied.len() {
                 supplied[idx] = Some(r);
             }
@@ -1040,7 +1054,21 @@ impl<'s> FnCompiler<'s> {
                 dst
             }
             ExprKind::Range { lo, hi, inclusive } => {
-                let l = self.expr(lo);
+                // PR-it1004 (see `consecutive()`'s own doc comment for the
+                // full writeup of this bug class): `lo` is evaluated here,
+                // THEN `hi` below (which can legally reassign whatever
+                // mutable variable a bare-`Ident` `lo` aliases). Only `lo`
+                // needs snapshotting: nothing runs between `hi`'s own
+                // evaluation and `Op::MakeRange` reading it, so `hi` is
+                // never held stale. Live-confirmed: for `var x = 1`, `for i
+                // in x..{ x = 100; 5 } { ... }` printed the correct
+                // `1,2,3,4,` on `kupl run` but an EMPTY loop body (`lo`
+                // silently became the mutated `100`, an invalid/empty
+                // `100..5` range) on BOTH `kupl run --vm` and `kupl
+                // native`.
+                let l_raw = self.expr(lo);
+                let l = self.alloc(span);
+                self.emit(Op::Move(l, l_raw), span);
                 let h = self.expr(hi);
                 let dst = self.alloc(span);
                 self.emit(Op::MakeRange { dst, lo: l, hi: h, inclusive: *inclusive }, span);
@@ -1072,7 +1100,23 @@ impl<'s> FnCompiler<'s> {
             }
             ExprKind::Call { callee, args } => self.call(callee, args, span),
             ExprKind::MethodCall { recv, name, args } => {
-                let r = self.expr(recv);
+                // PR-it1004 (see `consecutive()`'s own doc comment for the
+                // full writeup of this bug class): `recv` is evaluated here,
+                // THEN the args are evaluated below (which can legally
+                // reassign whatever mutable variable a bare-`Ident` `recv`
+                // aliases, e.g. `x.contains({ x = [9,9,9]; 2 })`), and only
+                // THEN does `Op::Method` read the `recv` register --
+                // silently observing the args' mutation instead of the
+                // receiver's value at the moment it was evaluated.
+                // Live-confirmed: for `var x = [1,2,3]`, `x.contains({ x =
+                // [9,9,9]; 2 })` printed the correct `true` on `kupl run`
+                // but `false` on BOTH `kupl run --vm` and `kupl native`.
+                // Fixed the same way as every sibling site: snapshot `recv`
+                // into a fresh register via `Op::Move` BEFORE evaluating
+                // any argument.
+                let r_raw = self.expr(recv);
+                let r = self.alloc(span);
+                self.emit(Op::Move(r, r_raw), span);
                 let exprs: Vec<Expr> = args.iter().map(|a| a.value.clone()).collect();
                 let start = self.consecutive(&exprs, span);
                 let name_idx = self.const_idx(Value::str(name.clone()), span);
@@ -1338,8 +1382,56 @@ impl<'s> FnCompiler<'s> {
 
     /// Compile expressions into freshly-allocated CONSECUTIVE registers;
     /// returns the first register.
+    ///
+    /// A REAL, LIVE-CONFIRMED SILENT-VALUE-CORRUPTION bug family found+fixed
+    /// (production-hardening PR-it1004, a close-read survey of `fn expr`/
+    /// `fn call`, the region adjacent to PR-it1003's already-fixed `fn
+    /// pattern`): the OLD version of this function evaluated EVERY sibling
+    /// expression FIRST (`exprs.iter().map(|e| self.expr(e)).collect()`),
+    /// collecting whatever RAW registers each returned, and only THEN
+    /// looped back over those raw registers to `Op::Move` each into a
+    /// truly-consecutive final block. A bare-`Ident` expression's
+    /// `self.expr()` returns that variable's OWN live register directly
+    /// (via `self.lookup`), not a snapshot -- so if `exprs[i]` is a bare
+    /// mutable-var reference and a LATER sibling `exprs[j]` (`j > i`, e.g. a
+    /// `{ x = newval; ... }` block-expr argument, perfectly legal KUPL
+    /// syntax) reassigns that SAME variable before the deferred `Move`
+    /// loop runs, `exprs[i]`'s `Move` reads the MUTATED value instead of
+    /// the value at the moment `exprs[i]` was evaluated -- silently
+    /// corrupting one argument's value based on an unrelated LATER
+    /// argument's own side effect, with zero diagnostic. `interp.rs`
+    /// evaluates each argument into an OWNED, independent `Value` at the
+    /// moment it's reached (see `eval_call`'s `for a in args { avs.push
+    /// (self.eval(&a.value, env)?); }`), fully decoupled from any later
+    /// sibling's mutation, so this was a genuine cross-engine divergence on
+    /// perfectly valid, check.rs-accepted source. Live-confirmed (component
+    /// prop construction, which mirrors this exact two-phase shape in its
+    /// own hand-rolled sibling `instance_expr`): `Widget(a: x, b: { x = 99;
+    /// 1 })` for `var x = 5` printed the correct `5,1` on `kupl run` but
+    /// `99,1` on BOTH `kupl run --vm` and `kupl native` -- confirmed
+    /// identically across all THREE callers of this pattern (see the sibling
+    /// fixes to `instance_expr`/`order_ctor_args` below, and to
+    /// `ExprKind::MethodCall`'s `recv`/the indirect-call `callee`/
+    /// `ExprKind::Range`'s `lo`, all fixed alongside this one as the SAME
+    /// bug class). FIXED by snapshotting each sibling's raw register into
+    /// its OWN fresh, dedicated register via `Op::Move` IMMEDIATELY after
+    /// evaluating it -- decoupling it from the source variable BEFORE the
+    /// next sibling expression ever runs -- and THEN, unchanged, moving
+    /// those now-decoupled snapshots into the final truly-consecutive block
+    /// callers rely on (`start`/`len`/`argc` contiguity). This costs one
+    /// extra `Op::Move` per element versus the old code, negligible next to
+    /// correctness, and mirrors the same "immediate snapshot via `Op::Move`"
+    /// pattern already established at PR-it997/PR-it1003.
     fn consecutive(&mut self, exprs: &[Expr], span: Span) -> Reg {
-        let temps: Vec<Reg> = exprs.iter().map(|e| self.expr(e)).collect();
+        let temps: Vec<Reg> = exprs
+            .iter()
+            .map(|e| {
+                let raw = self.expr(e);
+                let snap = self.alloc(span);
+                self.emit(Op::Move(snap, raw), span);
+                snap
+            })
+            .collect();
         let start = self.next as Reg;
         for t in temps {
             let r = self.alloc(span);
@@ -1470,7 +1562,23 @@ impl<'s> FnCompiler<'s> {
             }
         }
         // indirect call
-        let f = self.expr(callee);
+        //
+        // PR-it1004 (see `consecutive()`'s own doc comment for the full
+        // writeup of this bug class): `callee` is evaluated here, THEN the
+        // args below (which can legally reassign whatever mutable variable
+        // a bare-`Ident` `callee` aliases -- reached whenever `callee` is a
+        // local var/param holding a `Fun` value, since every special-cased
+        // branch above this point requires `self.lookup(name).is_none()`
+        // and therefore falls through to here for a shadowing local).
+        // Live-confirmed: for `var f = addOne`, `f({ f = addTen; 5 })`
+        // printed the correct `6` (calling the ORIGINAL `addOne`) on `kupl
+        // run` but `15` (calling the REASSIGNED `addTen`) on BOTH `kupl run
+        // --vm` and `kupl native`. Fixed the same way as every sibling
+        // site: snapshot `callee` into a fresh register via `Op::Move`
+        // BEFORE evaluating any argument.
+        let f_raw = self.expr(callee);
+        let f = self.alloc(span);
+        self.emit(Op::Move(f, f_raw), span);
         let exprs: Vec<Expr> = args.iter().map(|a| a.value.clone()).collect();
         let start = self.consecutive(&exprs, span);
         let dst = self.alloc(span);
@@ -1523,13 +1631,22 @@ impl<'s> FnCompiler<'s> {
         // field names come from Checked via ctor order captured at module build;
         // for builtin ctors and positional calls this is the identity.
         let field_names = self.shared.ctor_fields.get(variant).cloned().unwrap_or_default();
+        // PR-it1004 (see `consecutive()`'s own doc comment for the full
+        // writeup of this bug class, and `instance_expr`'s sibling fix
+        // immediately above for the identical shape): snapshot each arg
+        // into a fresh register via `Op::Move` immediately after
+        // evaluating it, so a LATER sibling arg's evaluation can never
+        // silently corrupt an EARLIER arg's already-read value once the
+        // deferred `Move`-into-consecutive-block loop below runs.
         let mut ordered: Vec<Option<Reg>> = vec![None; args.len()];
         for (i, a) in args.iter().enumerate() {
             let idx = match &a.name {
                 Some(n) => field_names.iter().position(|f| f == n).unwrap_or(i),
                 None => i,
             };
-            let r = self.expr(&a.value);
+            let raw = self.expr(&a.value);
+            let r = self.alloc(span);
+            self.emit(Op::Move(r, raw), span);
             if idx < ordered.len() {
                 ordered[idx] = Some(r);
             }
