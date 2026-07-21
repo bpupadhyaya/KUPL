@@ -307,6 +307,27 @@ fn aliasing_regs(op: &Op) -> Vec<Reg> {
         Op::MakeList { start, len, .. } | Op::MakeCtor { start, len, .. } => {
             (*start..start.saturating_add(*len)).collect()
         }
+        // A REAL static-analysis gap found+fixed (production-hardening
+        // PR-it968, the EIGHTH instance of the escape-analysis-completeness
+        // family first opened at it615): `Op::MakeInstance` (component
+        // construction) had no arm here at all, falling into the `_ =>
+        // vec![]` catch-all, unlike its sibling `MakeList`/`MakeCtor` arm
+        // just above, which already treats their own `start..start+len`
+        // staging window as aliasing. Currently masked in practice ONLY by
+        // `compile.rs::instance_expr`'s own convention of unconditionally
+        // re-staging every prop value through a fresh `Op::Move` before
+        // emitting `MakeInstance` -- the Move's OWN arm already flags the
+        // ORIGINAL register, so no currently-compiler-generated
+        // `MakeInstance` is unsafe -- but that is a fragile CONVENTION, not
+        // a structural guarantee (unlike `reg_traces_to_a_parameter`/`go`'s
+        // own separate, K0233-based argument at PR-it847 for why THAT
+        // function doesn't need a `MakeInstance` arm: an external
+        // `w.prop_name`/`GetFieldNamed` read is rejected at type-check
+        // time, but a component's OWN exposed methods CAN read a prop's
+        // value back out internally, e.g. `expose fun get() -> T { prop }`
+        // -- a different bytecode mechanism than `GetFieldNamed`, so that
+        // argument does not transfer to this function).
+        Op::MakeInstance { start, argc, .. } => (*start..start.saturating_add(*argc)).collect(),
         Op::MakeClosure { start, ncaps, .. } => (*start..start.saturating_add(*ncaps)).collect(),
         Op::WithField { value, .. } => vec![*value],
         Op::StateSet(_slot, src) => vec![*src],
@@ -784,6 +805,23 @@ mod escape_tests {
         let c = chunk(vec![
             Op::MakeList { dst: 0, start: 0, len: 0 },
             Op::MakeList { dst: 1, start: 0, len: 1 }, // [xs] embeds it
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn embedding_in_a_new_component_instance_before_push_escapes() {
+        // production-hardening PR-it968: a hand-built chunk bypassing
+        // compile.rs::instance_expr's own Move-staging convention (which
+        // masks this in every currently-compiler-generated MakeInstance --
+        // see aliasing_regs's own doc comment on its new MakeInstance arm)
+        // -- `xs` passed DIRECTLY into MakeInstance's prop window, with no
+        // intervening Move, then self-pushed. Must be flagged as escaping,
+        // mirroring the sibling MakeList/MakeCtor test just above.
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::MakeInstance { dst: 1, comp: 0, start: 0, argc: 1, policy: 0 }, // Widget(items: xs) embeds it
             self_push(0),
         ]);
         assert!(method_recv_escapes(&c, 2));
