@@ -8388,6 +8388,64 @@ mod tests {
     }
 
     /// A REAL, live-confirmed silent value-corruption bug found+fixed
+    /// (production-hardening PR-it984), ANOTHER hop past PR-it615/it819/it820's
+    /// parameter-alias fixes above -- all FOUR self-rebind fast paths
+    /// (Str append, List push, Map insert, Set insert) share the SAME
+    /// `reg_traces_to_a_parameter` (bytecode.rs) proof, and that proof had a
+    /// gap specific to LOOPS: when the self-rebind op is inside a `for`/
+    /// `while` loop, it used to narrow its scan to JUST the loop body (`(lo,
+    /// hi + 1)`, mirroring `reg_escapes`'s own loop-body window) -- sound for
+    /// `reg_escapes`'s different question ("was ANOTHER alias created"), but
+    /// NOT sound here: the very `Move` that establishes `var t = s`'s
+    /// aliasing with a parameter `s` sits in the PREFIX, before the loop, so
+    /// the narrowed window never saw it, and wrongly proved "safe" for every
+    /// one of the FOUR self-rebind ops below when a loop is involved --
+    /// unlike their already-tested straight-line-code siblings above (single
+    /// append/push/insert, no loop), which the pre-fix window handled
+    /// correctly. Confirmed live BEFORE fixing: each of these four,
+    /// `var t = <param>; for i in 0..3 { t = t.<op>(...) }`, corrupted the
+    /// CALLER's own value on native alone (interp/KVM, which use a dynamic
+    /// `Rc::get_mut`-based uniqueness check instead of this static proof,
+    /// were unaffected) -- e.g. the Str case leaked a stray "x" into the
+    /// caller's own string. Fixed by widening the loop-case window to
+    /// `(0, hi + 1)` (full prefix, in addition to the loop body) rather than
+    /// `(lo, hi + 1)` (loop body only) -- still resolves the ORIGINAL
+    /// loop-wraparound case (a defining write textually AFTER the self-
+    /// rebind op within the same loop body, live on the NEXT iteration),
+    /// while now also seeing a pre-loop `Move`/`GetField`/`IterGet` that
+    /// seeds the register's value entering the loop's first iteration.
+    #[test]
+    fn native_self_rebind_through_a_parameter_alias_inside_a_loop_does_not_corrupt_the_callers_value() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun grow_str(s: Str) -> Str {\n    \
+                   var t = s\n    for i in 0..3 { t = t + \"x\" }\n    t\n}\n\
+                   fun grow_list(xs: List[Int]) -> List[Int] {\n    \
+                   var ys = xs\n    for i in 0..3 { ys = ys.push(i) }\n    ys\n}\n\
+                   fun grow_map(m: Map[Int, Int]) -> Map[Int, Int] {\n    \
+                   var m2 = m\n    for i in 0..3 { m2 = m2.insert(i, i) }\n    m2\n}\n\
+                   fun grow_set(s: Set[Int]) -> Set[Int] {\n    \
+                   var s2 = s\n    for i in 0..3 { s2 = s2.insert(i) }\n    s2\n}\n\
+                   fun main() uses io {\n    \
+                   var a = \"ab\"\n    a = a + \"c\"\n    \
+                   var asnap = grow_str(a)\n    a = a + \"d\"\n    \
+                   var xs: List[Int] = [1, 2]\n    xs = xs.push(3)\n    \
+                   var xsnap = grow_list(xs)\n    xs = xs.push(4)\n    \
+                   var m: Map[Int, Int] = Map()\n    m = m.insert(1, 10)\n    \
+                   var msnap = grow_map(m)\n    m = m.insert(2, 20)\n    \
+                   var s: Set[Int] = Set()\n    s = s.insert(1)\n    \
+                   var ssnap = grow_set(s)\n    s = s.insert(2)\n    \
+                   print(\"{a}|{asnap}|{xs}|{xsnap}|{m.len()}|{msnap.len()}|{s.len()}|{ssnap.len()}\")\n}\n";
+        let out = native_main_stdout(src, "self_rebind_param_alias_in_loop");
+        assert_eq!(
+            out.trim(),
+            "abcd|abcxxx|[1, 2, 3, 4]|[1, 2, 3, 0, 1, 2]|2|3|2|3",
+            "native must not corrupt the caller's `a`/`xs`/`m`/`s` via a LOOP-based internal self-rebind"
+        );
+    }
+
+    /// A REAL, live-confirmed silent value-corruption bug found+fixed
     /// (production-hardening PR-it819), ONE HOP past PR-it615's parameter-
     /// alias fix above: `reg_traces_to_a_parameter` (bytecode.rs) only
     /// followed `Op::Move` edges, so `fun mutate(b: Box) -> List[Int] { var

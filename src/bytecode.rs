@@ -409,8 +409,35 @@ pub fn reg_traces_to_a_parameter(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool
         if depth as usize > chunk.nregs as usize {
             return true;
         }
+        // A REAL, live-confirmed silent value-corruption bug found+fixed
+        // (production-hardening PR-it984): when `op_idx` is inside a loop,
+        // this used to narrow the scan to JUST the loop body (`(lo, hi + 1)`,
+        // mirroring `reg_escapes`'s own loop-body window) -- sound for
+        // `reg_escapes`'s question ("was ANOTHER alias created that could
+        // touch `reg`"), since a fresh alias formed anywhere else is
+        // irrelevant to whether THIS loop's mutation is safe. But this
+        // function asks a DIFFERENT question -- "does `reg`'s CURRENT value
+        // trace back to a parameter/capture" -- and the very `Move`/
+        // `GetField`/`IterGet` edge that establishes that aliasing is, for
+        // the single most common shape (`var t = s; for ... { t = t + x }`),
+        // textually BEFORE the loop, in the prefix the loop-only window
+        // never sees. Live-confirmed: `fun f(s: Str) -> Str { var t = s; for
+        // i in 0..3 { t = t + "x" } t }` called as `f(a)` where `a` is a live
+        // caller variable used again afterward -- interp/KVM correctly kept
+        // `a` unmutated, but native's fast path (wrongly proven "safe" by
+        // this narrowed window, which never saw `var t = s`) mutated `t`'s
+        // buffer in place on the very FIRST loop iteration, silently
+        // corrupting `a` too (`a` observed a stray leaked "x" appended by
+        // the callee). Fixed by always including the full prefix `[0, ..)`,
+        // in addition to (not instead of) the loop's own body -- still
+        // bounded (never scans past the loop's own end), still resolves the
+        // ORIGINAL loop-wraparound case `enclosing_loop_range` was chosen
+        // for (a defining write textually AFTER `op_idx` within the same
+        // loop body, live on the NEXT iteration), while now also correctly
+        // seeing a pre-loop `Move`/`GetField`/`IterGet` that seeds the
+        // register's value entering the loop's first iteration.
         let (start, end) = match enclosing_loop_range(chunk, op_idx) {
-            Some((lo, hi)) => (lo, hi + 1),
+            Some((_, hi)) => (0, hi + 1),
             None => (0, op_idx),
         };
         for (i, op) in chunk.code.iter().enumerate().take(end).skip(start) {
