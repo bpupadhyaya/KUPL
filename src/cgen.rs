@@ -15443,6 +15443,122 @@ fun main() uses io {
         );
     }
 
+    /// A SIBLING fuzz domain to PR-it1028's List fuzzer (production-hardening
+    /// PR-it1029): `Set.union`/`.intersect`/`.difference`/`.symmetric_difference`.
+    /// `.union` in particular has REAL prior bug history of its own (PR-it828's
+    /// O(n^2)-latency fix, part of the same "naive O(n^2) collection algorithm"
+    /// bug class as `.intersect`/`.difference` (PR-it829) and `.unique()`
+    /// (PR-it825)). Each expected value is computed by an INDEPENDENTLY-written
+    /// Rust function matching interp.rs's OWN documented ORDER contract for
+    /// each operation (union: self's items in order, then other's new items in
+    /// other's order; intersect/difference: self's items filtered by (non-)
+    /// membership in other, self's order; symmetric_difference: self-only items
+    /// in self's order, then other-only items in other's order) -- NOT by
+    /// calling into interp.rs, so a shared interp/cgen bug would still be
+    /// caught, the same evidentiary strength as PR-it1028's own List fuzzer.
+    #[test]
+    fn fuzz_random_set_union_intersect_difference_and_symmetric_difference_match_the_canonical_rust_implementation_on_native(
+    ) {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 { 0 } else { self.next() % n }
+            }
+        }
+        fn dedup_preserve_order(values: &[i64]) -> Vec<i64> {
+            let mut out = Vec::new();
+            for &v in values {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+            out
+        }
+        fn fmt_list(v: &[i64]) -> String {
+            format!("[{}]", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+        }
+        // Independently-written reference implementations of each op's own
+        // documented ORDER contract (not copied from interp.rs's fast-path
+        // sort/binary-search machinery -- a plain linear scan is enough to be
+        // an independent oracle here).
+        fn ref_union(a: &[i64], b: &[i64]) -> Vec<i64> {
+            let mut out = a.to_vec();
+            for &x in b {
+                if !a.contains(&x) {
+                    out.push(x);
+                }
+            }
+            out
+        }
+        fn ref_intersect(a: &[i64], b: &[i64]) -> Vec<i64> {
+            a.iter().filter(|x| b.contains(x)).copied().collect()
+        }
+        fn ref_difference(a: &[i64], b: &[i64]) -> Vec<i64> {
+            a.iter().filter(|x| !b.contains(x)).copied().collect()
+        }
+        fn ref_symmetric_difference(a: &[i64], b: &[i64]) -> Vec<i64> {
+            let mut out: Vec<i64> = a.iter().filter(|x| !b.contains(x)).copied().collect();
+            out.extend(b.iter().filter(|x| !a.contains(x)).copied());
+            out
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let a_len = 1 + rng.below(15) as usize;
+            let b_len = 1 + rng.below(15) as usize;
+            // A narrow, OVERLAPPING value range (0..20 for both sides)
+            // guarantees a genuine mix of shared and disjoint elements,
+            // exercising every branch of union/intersect/difference/
+            // symmetric_difference rather than degenerate all-disjoint sets.
+            let a: Vec<i64> = dedup_preserve_order(&(0..a_len).map(|_| rng.below(20) as i64).collect::<Vec<_>>());
+            let b: Vec<i64> = dedup_preserve_order(&(0..b_len).map(|_| rng.below(20) as i64).collect::<Vec<_>>());
+
+            let expected_union = ref_union(&a, &b);
+            let expected_intersect = ref_intersect(&a, &b);
+            let expected_difference = ref_difference(&a, &b);
+            let expected_symdiff = ref_symmetric_difference(&a, &b);
+
+            let a_src = a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+            let b_src = b.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+            let src = format!(
+                "fun main() uses io {{\n    let a = Set([{a_src}])\n    let b = Set([{b_src}])\n    print(a.union(b).to_list())\n    print(a.intersect(b).to_list())\n    print(a.difference(b).to_list())\n    print(a.symmetric_difference(b).to_list())\n}}\n"
+            );
+            let raw = native_main_stdout(&src, &format!("setfuzz{seed}"));
+            let expected = format!(
+                "{}\n{}\n{}\n{}\n",
+                fmt_list(&expected_union),
+                fmt_list(&expected_intersect),
+                fmt_list(&expected_difference),
+                fmt_list(&expected_symdiff)
+            );
+            if raw != expected {
+                mismatches.push(format!(
+                    "seed={seed} a={a:?} b={b:?} expected={expected:?} actual={raw:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native Set union/intersect/difference/symmetric_difference diverges from the canonical Rust implementation on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
     /// PR-it663, the SAME bug class as it662's BigInt.from_str finding, this
     /// time on a far more commonly-used surface): `Str.trim()` used to share
