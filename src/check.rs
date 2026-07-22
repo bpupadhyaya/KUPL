@@ -2867,6 +2867,59 @@ impl Checker {
 
     fn infer_call(&mut self, callee: &Expr, args: &[Arg], span: Span, ctx: &mut Ctx) -> Ty {
         if let ExprKind::Ident(name) = &callee.kind {
+            // A REAL, live-confirmed silent-value-corruption bug found+fixed
+            // (production-hardening PR-it1039, a close-read survey finding,
+            // independently re-verified live before implementing): the
+            // giant builtin-dispatch match right below reads every argument
+            // PURELY BY POSITION (`args[0].value`, `args[1].value`, ...) and
+            // never once inspects `Arg::name` -- but `parser.rs::parse_args`
+            // accepts `name: expr` syntax on EVERY call, builtins included,
+            // with no restriction. So `write_file(contents: "X", path: "Y")`
+            // parsed fine, type-checked with ZERO diagnostics, and at
+            // runtime silently used "X" as the PATH and "Y" as the
+            // CONTENTS -- the exact same "silently reordered/mismatched
+            // named argument" bug class PR-it915 already closed for named
+            // METHOD-call arguments, just on the free-function builtin
+            // table instead. Live-confirmed: `write_file(contents: "PAYLOAD-
+            // DATA", path: "<real target>")` created a file literally named
+            // `PAYLOAD-DATA` (a bare relative filename, since that was the
+            // POSITIONAL first argument) whose CONTENTS were the intended
+            // target path string -- silently writing wrong data to the
+            // wrong location with no error anywhere, a genuine data-
+            // integrity hazard for a file-writing builtin. Unlike ctor/
+            // component calls (which DO legitimately support named args,
+            // matched by name via `check_named_args`/`check_ctor_args`
+            // below) and user-defined function calls (already correctly
+            // rejected via the "general callable" arm further down), the
+            // builtin table has no name-awareness at all, so this rejects
+            // named args here too -- mirroring the EXACT same K0241
+            // diagnostic and wording the general-callable path already
+            // uses, applied at the one place upstream of every arm in the
+            // match below, rather than touching each of its ~90 individual
+            // arms. Gated on the SAME "not a user fun, not in local scope,
+            // not a ctor, not a component" predicate the code below already
+            // establishes for its own ctor/component special-case (so a
+            // local binding that shadows a builtin name -- e.g. `let
+            // write_file = fn(a, b) { .. }` -- correctly defers to the
+            // general-callable path instead of double-reporting).
+            if !self.checked.funs.contains_key(name)
+                && ctx.scopes.get(name).is_none()
+                && !self.checked.ctors.contains_key(name)
+                && !self.checked.components.contains_key(name)
+            {
+                for a in args {
+                    if let Some(n) = &a.name {
+                        self.err(
+                            "K0241",
+                            format!(
+                                "`{n}:` is a named argument, but named arguments are only allowed for constructors and props here -- call positionally instead: `{}`",
+                                crate::fmt::expr_str(&a.value, 0)
+                            ),
+                            a.value.span,
+                        );
+                    }
+                }
+            }
             // builtins
             match (name.as_str(), args.len()) {
                 ("print", 1) => {
@@ -5083,6 +5136,47 @@ mod generic_tests {
             )
             .is_ok(),
             "positional method call must still compile cleanly"
+        );
+    }
+
+    #[test]
+    fn a_named_argument_on_a_builtin_free_function_call_is_a_clean_k0241_not_silently_swapped() {
+        // production-hardening PR-it1039: the exact PR-it915 bug shape
+        // (silent named-argument reordering), but on the builtin-dispatch
+        // table in `infer_call` instead of a genuine method call.
+        let e = errors("fun main() uses io.fs {\n    let _ = write_file(contents: \"c\", path: \"p\")\n}\n");
+        assert!(
+            e.iter().any(|d| d.code == "K0241" && d.message.contains("`contents:` is a named argument")),
+            "a named argument on a builtin call must be rejected with K0241, not silently reordered: {e:?}"
+        );
+        assert!(
+            e.iter().any(|d| d.code == "K0241" && d.message.contains("`path:` is a named argument")),
+            "K0241 should report EACH named argument separately on a builtin call too: {e:?}"
+        );
+        // the positional equivalent must still compile cleanly
+        assert!(
+            crate::run::compile("fun main() uses io.fs {\n    let _ = write_file(\"p\", \"c\")\n}\n").is_ok(),
+            "positional builtin call must still compile cleanly"
+        );
+        // ctor/component named args (a LEGITIMATE use of the same syntax) must be unaffected
+        assert!(
+            crate::run::compile(
+                "type Point = { x: Int, y: Int }\nfun main() uses io {\n    let p = Point(y: 2, x: 1)\n    print(p.x)\n}\n"
+            )
+            .is_ok(),
+            "constructor named args are a legitimate, distinct case and must still work"
+        );
+        // a local closure with a NON-colliding name, called with named args,
+        // must be rejected via the ordinary "general callable" K0241 path
+        // exactly once per argument -- this fix's own exclusion condition
+        // (skip the new check when `ctx.scopes.get(name)` is Some) must not
+        // cause a DOUBLE K0241 report by also matching some unrelated
+        // builtin-table arm.
+        let local = errors("fun main() uses io {\n    let onlyLocal = fn(a, b) { a + b }\n    let _ = onlyLocal(a: 1, b: 2)\n}\n");
+        assert_eq!(
+            local.iter().filter(|d| d.code == "K0241").count(),
+            2,
+            "a local closure's named args must be rejected exactly once per argument via the general-callable path, not doubled: {local:?}"
         );
     }
 

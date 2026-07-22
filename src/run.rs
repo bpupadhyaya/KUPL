@@ -2142,6 +2142,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, LIVE-CONFIRMED silent-value-corruption bug found+fixed
+    /// (production-hardening PR-it1039, a close-read survey finding,
+    /// independently re-verified live before implementing): the SAME
+    /// PR-it915 bug shape (silent named-argument reordering), but on
+    /// `check.rs::infer_call`'s builtin-dispatch table instead of a genuine
+    /// method call -- every multi-arg builtin (`write_file`, `append_file`,
+    /// `re_replace`, `http_post`, ...) read its arguments PURELY BY
+    /// POSITION and never inspected `Arg::name`, so `write_file(contents:
+    /// "X", path: "Y")` compiled with ZERO diagnostics and, at runtime,
+    /// silently wrote a file literally named "X" (the positional-first
+    /// argument) with "Y" as its CONTENTS -- exactly backwards from what the
+    /// labels say, with no error anywhere. This test drives the REAL
+    /// compiled binary end-to-end (not just `check.rs`'s own unit test,
+    /// which only confirms the diagnostic) and inspects the actual
+    /// filesystem effect.
+    #[test]
+    fn a_named_argument_swap_on_a_builtin_call_no_longer_silently_writes_the_wrong_file() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-builtin-named-arg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+
+        // the dangerous named form must be a clean compile-time rejection,
+        // never a silent execution that writes the wrong file
+        let named_src = dir.join("named.kupl");
+        std::fs::write(
+            &named_src,
+            format!(
+                "fun main() uses io.fs {{\n    let _ = write_file(contents: \"PAYLOAD\", path: \"{}\")\n}}\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        let named_out = std::process::Command::new(&bin)
+            .args(["check", named_src.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert!(!named_out.status.success(), "a named-arg builtin call must be rejected, not silently accepted");
+        let named_stderr = String::from_utf8_lossy(&named_out.stderr);
+        assert!(
+            named_stderr.contains("K0241"),
+            "must be rejected with K0241, not a different or missing diagnostic: {named_stderr:?}"
+        );
+        assert!(!target.exists(), "the target file must never have been written at all -- the call was rejected before execution");
+
+        // the equivalent positional form must run cleanly and write the
+        // ACTUAL, unambiguous content to the ACTUAL, unambiguous path
+        let pos_src = dir.join("positional.kupl");
+        std::fs::write(
+            &pos_src,
+            format!(
+                "fun main() uses io.fs {{\n    let _ = write_file(\"{}\", \"PAYLOAD\")\n}}\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        let pos_out = std::process::Command::new(&bin)
+            .args(["run", pos_src.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert!(pos_out.status.success(), "{pos_out:?}");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("positional call must have written the target file"),
+            "PAYLOAD",
+            "the positional call must write exactly the intended content to the intended path -- no argument reordering"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL text-consistency bug found+fixed (production-hardening
     /// PR-it783, the same survey's finding 2, independently re-verified
     /// live before implementing): a PLAIN (non-`forall`) failed `expect`'s
