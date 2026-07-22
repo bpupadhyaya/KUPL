@@ -254,7 +254,19 @@ fn interface_of(item: &Item) -> String {
             if let Some(r) = &f.ret {
                 s.push_str(&format!(" -> {}", ty_str(r)));
             }
-            s.push_str(&format!(" uses[{}]", f.effects.join(",")));
+            // A REAL false-positive bug found+fixed (production-hardening
+            // PR-it1043, the SAME class PR-it646 fixed for `fulfills`/
+            // `ports`/`exposes`): a `uses` effect budget is checked via SET
+            // membership everywhere it's consumed (`check.rs`'s
+            // `effects.iter().any(|budget| covers_effect(budget, e))`, line
+            // ~1302), never by position or declaration order -- so `fun f()
+            // uses io, net { .. }` reordered to `uses net, io`, with nothing
+            // else changed, previously flagged `[INTERFACE — breaking]` on a
+            // function with no actual caller-visible change. Sorted before
+            // joining, same fix shape as PR-it646.
+            let mut effects = f.effects.clone();
+            effects.sort();
+            s.push_str(&format!(" uses[{}]", effects.join(",")));
             if let Some(ai) = &f.ai {
                 // A REAL bug found+fixed (production-hardening PR-it864, an
                 // Explore survey finding, independently re-verified live
@@ -352,7 +364,12 @@ fn interface_of(item: &Item) -> String {
                     s.push_str(&format!("{},", param_fingerprint(p)));
                 }
                 s.push_str(&format!(")->{}", f.ret.as_ref().map(ty_str).unwrap_or_else(|| "Unit".into())));
-                s.push_str(&format!(" uses[{}]", f.effects.join(",")));
+                // Same PR-it1043 fix as `Item::Fun`'s own effects above --
+                // a component expose's `uses` budget is equally set-checked,
+                // equally order-insensitive.
+                let mut effects = f.effects.clone();
+                effects.sort();
+                s.push_str(&format!(" uses[{}]", effects.join(",")));
             }
         }
         Item::Contract(ct) => {
@@ -379,7 +396,12 @@ fn interface_of(item: &Item) -> String {
                 // This was the one sig-interface site missing `uses[...]`, so a
                 // contract-only effect change was misclassified as "implementation
                 // only" instead of "[INTERFACE — breaking]" (PR-it580).
-                s.push_str(&format!(" uses[{}]", sig.effects.join(",")));
+                // Same PR-it1043 fix as the two `uses` sites above -- a
+                // contract sig's own effect budget is equally order-
+                // insensitive (checked via `.any()`, never by position).
+                let mut effects = sig.effects.clone();
+                effects.sort();
+                s.push_str(&format!(" uses[{}]", effects.join(",")));
             }
             let mut laws: Vec<&crate::ast::Law> = ct.laws.iter().collect();
             laws.sort_by_key(|law| &law.name);
@@ -916,6 +938,39 @@ mod tests {
             &format!("{contracts}component C fulfills A, B {{\n    expose fun f() -> Int {{ 1 }}\n    expose fun g() -> Int {{ 2 }}\n}}\n"),
         );
         assert_eq!(lines, vec!["interface C"]);
+    }
+
+    /// A REAL false-positive bug found+fixed (production-hardening PR-it1043,
+    /// the SAME class as `PR-it646`'s `fulfills`/`ports`/`exposes` fix,
+    /// independently re-verified live before implementing): a `uses` effect
+    /// budget is checked via SET membership everywhere it's consumed
+    /// (`check.rs`'s `effects.iter().any(|budget| covers_effect(budget, e))`),
+    /// never by declaration order -- but all THREE `interface_of` sites that
+    /// render `uses[...]` (a top-level `fun`, a component's own `expose fun`,
+    /// and a contract's `sig`) used bare `.join(",")` with no sorting, so
+    /// reordering a multi-effect `uses` clause with no other change was
+    /// wrongly flagged `[INTERFACE — breaking]`. Covers all three sites, plus
+    /// a sanity check that a GENUINE effect addition still correctly reports.
+    #[test]
+    fn uses_effects_reorder_is_not_interface() {
+        let (lines, _) = diff_lines("fun f() uses io, net {\n    1\n}\n", "fun f() uses net, io {\n    1\n}\n");
+        assert_eq!(lines, vec!["impl f"], "reordering a fun's `uses` effects must be implementation-only");
+
+        let (lines, _) = diff_lines(
+            "component C {\n    expose fun f() uses io, net -> Int {\n        1\n    }\n}\n",
+            "component C {\n    expose fun f() uses net, io -> Int {\n        1\n    }\n}\n",
+        );
+        assert_eq!(lines, vec!["impl C"], "reordering a component expose's `uses` effects must be implementation-only");
+
+        let (lines, _) = diff_lines(
+            "contract Store {\n    intent \"kv\"\n    expose fun get() uses io, net -> Int\n}\n",
+            "contract Store {\n    intent \"kv\"\n    expose fun get() uses net, io -> Int\n}\n",
+        );
+        assert_eq!(lines, vec!["impl Store"], "reordering a contract sig's `uses` effects must be implementation-only");
+
+        // sanity: a GENUINE effect addition (not just reordered) still reports breaking.
+        let (lines, _) = diff_lines("fun f() uses io, net {\n    1\n}\n", "fun f() uses io, net, fs {\n    1\n}\n");
+        assert_eq!(lines, vec!["interface f"], "an actual new effect must still be flagged breaking");
     }
 
     /// Same false-positive shape as the component test above, for `Item::Contract`'s
