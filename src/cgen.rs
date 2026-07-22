@@ -9257,6 +9257,25 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
     }
 
     /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1057): native shares compile.rs's compiled bytecode
+    /// with the VM, so compile.rs's own general `+=`/`-=`/`*=`/`/=` path fix
+    /// (see `vm.rs::diff_compound_assign_operators_use_the_pre_rhs_value_
+    /// not_a_post_side_effect_one` for the full writeup, including
+    /// interp.rs's own separate, analogous fix in `exec_stmt`) benefits
+    /// native identically -- confirmed live BEFORE this fix: this exact
+    /// program printed `100` on `kupl native`, matching `kupl run --vm`'s
+    /// own wrong output, both diverging from `kupl run`'s correct `6`.
+    #[test]
+    fn native_compound_assign_operators_use_the_pre_rhs_value_not_a_post_side_effect_one() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   var x = 5\n    x += { x = 99\n        1 }\n    print(\"{x}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "compoundassign"), "6\n");
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
     /// hardening PR-it1053): the `is_some`/`is_none`/`is_ok`/`is_err`/
     /// `unwrap_or` checks in this native runtime's own `K_CTOR` method
     /// dispatch used to match ANY constructor value unconditionally

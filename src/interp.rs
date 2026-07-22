@@ -860,16 +860,41 @@ impl Interp {
                         }
                     }
                 }
-                let rhs = self.eval(value, env)?;
                 let ExprKind::Ident(name) = &target.kind else {
                     return Err(Self::panic_flow("unsupported assignment target", *span));
                 };
+                // A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed
+                // (production-hardening PR-it1057, found via a background
+                // close-read survey of interp.rs's own exec_stmt): this used
+                // to evaluate `value` (the RHS) BEFORE reading `name`'s
+                // "old" value for `+=`/`-=`/`*=`/`/=` -- the exact bug
+                // shape the fast-path block above (PR-it1001/PR-it1052) and
+                // `check.rs`'s own K0222 doc comment (PR-it996, which
+                // EXPLICITLY states `AssignOp::Add` "desugars into the exact
+                // SAME `BinOp::Add` an ordinary `s = s + \"b\"` uses")
+                // already establish as this codebase's OWN intended
+                // semantics -- but that fast path only recognizes the
+                // DESUGARED `x = x + e` AST shape (gated on `*op ==
+                // AssignOp::Set`), never the SUGARED `x += e` form, which
+                // falls straight through to this general path instead.
+                // Live-confirmed BEFORE this fix: `var x = 5; x += { x = 99
+                // \n 1 }; print(x)` printed `100` (99 + 1, silently using
+                // the MUTATED x) instead of the correct `6` (5 + 1, matching
+                // what the ALREADY-fixed `x = x + { x = 99 \n 1 }` sibling
+                // shape correctly produces) -- on BOTH interp and vm (this
+                // is engine-CONSISTENT, not a cross-engine divergence,
+                // exactly the "engine-agreeing-but-wrong-relative-to-the-
+                // language's-own-documented-semantics" blind spot PR-it1001
+                // itself was originally found to close). Fixed by reading
+                // `old` BEFORE evaluating `value`, mirroring the fast path's
+                // own established snapshot-before-rhs discipline.
                 let new_value = if *op == AssignOp::Set {
-                    rhs
+                    self.eval(value, env)?
                 } else {
                     let old = env.get(name).ok_or_else(|| {
                         Self::panic_flow(format!("unknown variable `{name}`"), *span)
                     })?;
+                    let rhs = self.eval(value, env)?;
                     let bin = match op {
                         AssignOp::Add => BinOp::Add,
                         AssignOp::Sub => BinOp::Sub,

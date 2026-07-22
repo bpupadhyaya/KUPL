@@ -2243,6 +2243,75 @@ mod tests {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1057, found via a background close-read survey of
+    /// interp.rs's own `exec_stmt`): UNLIKE the DESUGARED `x = x + e` shape
+    /// (the sibling test just above, PR-it1052), the SUGARED compound-
+    /// assignment operators (`+=`/`-=`/`*=`/`/=`) had their OWN, separate
+    /// bug of the identical shape, in BOTH interp.rs's general `Stmt::
+    /// Assign` path AND compile.rs's own general path (feeding both the VM
+    /// and native, which share compile.rs's compiled bytecode) -- `value`
+    /// was read/compiled BEFORE the target's own "old" value, so a `value`
+    /// whose evaluation reassigns the target itself (a directly-nested
+    /// block/if/match/loop expression) silently combined with the POST-
+    /// side-effect value. `check.rs`'s own K0222 doc comment (PR-it996)
+    /// explicitly states `+=` "desugars into the exact SAME `BinOp::Add` an
+    /// ordinary `s = s + \"b\"` uses" -- the codebase's OWN documented
+    /// intent that these two forms behave identically, which this bug
+    /// violated. Live-confirmed BEFORE this fix, in the specific two-step
+    /// order this bug was found and fixed: `kupl run` alone (interp.rs)
+    /// FIRST printed the wrong `100` for `var x = 5; x += { x = 99; 1 };
+    /// print(x)` -- fixing JUST interp.rs's `exec_stmt` then made `kupl
+    /// run --vm` the SOLE remaining odd-one-out (still `100`), revealing
+    /// compile.rs's own separate, analogous bug in the SAME statement kind
+    /// (its general `+=` path, and the component-state-slot variant of the
+    /// SAME path) -- both needed fixing for all three engines to agree on
+    /// the correct `6`.
+    #[test]
+    fn diff_compound_assign_operators_use_the_pre_rhs_value_not_a_post_side_effect_one() {
+        // `+=`, `-=`, `*=`, `/=` on a local var, each with a directly-nested
+        // self-reassignment inside the RHS.
+        assert_eq!(
+            differential("fun probe() -> Int {\n    var x = 5\n    x += { x = 99\n        1 }\n    x\n}\n"),
+            "6"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    var x = 10\n    x -= { x = 100\n        1 }\n    x\n}\n"),
+            "9"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    var x = 3\n    x *= { x = 100\n        2 }\n    x\n}\n"),
+            "6"
+        );
+        assert_eq!(
+            differential("fun probe() -> Int {\n    var x = 20\n    x /= { x = 100\n        2 }\n    x\n}\n"),
+            "10"
+        );
+        // `+=` on a component STATE field, mirroring PR-it1001's own
+        // `count = count + bump()` repro shape but for the sugared form
+        // that fix never covered.
+        assert_eq!(
+            differential(
+                "component C1057 {\n    state count: Int = 0\n    \
+                 fun bump() -> Int {\n        count = 1\n        count\n    }\n    \
+                 expose fun run_it() -> Int {\n        count += bump()\n        count\n    }\n}\n\
+                 fun probe() -> Int { C1057().run_it() }\n"
+            ),
+            "1"
+        );
+        // Sanity: the ORDINARY case (no self-reassignment) is completely
+        // unaffected, including inside a loop (the common accumulator shape
+        // this fast path exists to keep O(n) for).
+        assert_eq!(differential("fun probe() -> Int {\n    var x = 5\n    x += 3\n    x\n}\n"), "8");
+        assert_eq!(
+            differential(
+                "fun probe() -> Int {\n    var f = 0\n    var i = 0\n    \
+                 while i < 5 {\n        f += i\n        i += 1\n    }\n    f\n}\n"
+            ),
+            "10"
+        );
+    }
+
     #[test]
     fn self_add_overflow_panic_span_matches_across_engines() {
         // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it852, the

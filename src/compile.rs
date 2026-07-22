@@ -840,25 +840,60 @@ impl<'s> FnCompiler<'s> {
                         }
                     }
                 }
-                let rhs = self.expr(value);
                 let ExprKind::Ident(name) = &target.kind else {
                     self.err("K0803", "unsupported assignment target on KVM", *span);
                     return None;
                 };
+                // A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed
+                // (production-hardening PR-it1057, the SAME bug class as the
+                // self-mutating fast path above (PR-it1052) and interp.rs's
+                // own sibling fix in `exec_stmt` for its general `+=`/`-=`/
+                // `*=`/`/=` path -- see that fix's own doc comment for the
+                // full writeup): `value` used to be compiled BEFORE reading
+                // `name`'s own "old" value/register for `+=`/`-=`/`*=`/`/=`,
+                // so a `value` whose evaluation reassigns `name` itself (a
+                // directly-nested block/if/match/loop expression) silently
+                // combined with the POST-side-effect value. Live-confirmed
+                // BEFORE this fix: `var x = 5; x += { x = 99 \n 1 };
+                // print(x)` printed `100` on `kupl run --vm` -- AFTER
+                // interp.rs's own PR-it1057 fix, this was a genuine, NEW
+                // cross-engine divergence (interp correctly printed `6`) --
+                // matching `check.rs`'s own K0222 doc comment (PR-it996),
+                // which explicitly states `+=` "desugars into the exact
+                // SAME `BinOp::Add` an ordinary `s = s + \"b\"` uses".
                 if let Some(local) = self.lookup(name) {
                     match op {
                         AssignOp::Set => {
+                            let rhs = self.expr(value);
                             self.emit(Op::Move(local, rhs), *span);
                         }
                         other => {
-                            let bin = match other {
-                                AssignOp::Add => Op::Add(local, local, rhs),
-                                AssignOp::Sub => Op::Sub(local, local, rhs),
-                                AssignOp::Mul => Op::Mul(local, local, rhs),
-                                AssignOp::Div => Op::Div(local, local, rhs),
+                            let bin_op = |dst: Reg, a: Reg, b: Reg| match other {
+                                AssignOp::Add => Op::Add(dst, a, b),
+                                AssignOp::Sub => Op::Sub(dst, a, b),
+                                AssignOp::Mul => Op::Mul(dst, a, b),
+                                AssignOp::Div => Op::Div(dst, a, b),
                                 AssignOp::Set => unreachable!(),
                             };
-                            self.emit(bin, *span);
+                            if assigns_to_in_expr(name, value) {
+                                // `value` might reassign `name` itself --
+                                // snapshot BEFORE evaluating, matching the
+                                // self-mutating fast path's own established
+                                // technique: an unconditional fresh `dst`
+                                // would ALWAYS give up the `dst == a` in-
+                                // place-mutation trigger, silently
+                                // reintroducing the O(n^2) blowup the fast
+                                // path above exists to prevent, even in the
+                                // COMMON no-side-effect case -- so only pay
+                                // that cost in this rare, provably-unsafe one.
+                                let snapshot = self.alloc(*span);
+                                self.emit(Op::Move(snapshot, local), *span);
+                                let rhs = self.expr(value);
+                                self.emit(bin_op(local, snapshot, rhs), *span);
+                            } else {
+                                let rhs = self.expr(value);
+                                self.emit(bin_op(local, local, rhs), *span);
+                            }
                         }
                     }
                     return None;
@@ -868,11 +903,19 @@ impl<'s> FnCompiler<'s> {
                 if let Some(slot) = slot {
                     match op {
                         AssignOp::Set => {
+                            let rhs = self.expr(value);
                             self.emit(Op::StateSet(slot, rhs), *span);
                         }
                         other => {
+                            // `t` is a fresh scratch register with no aliasing
+                            // concern (unlike `local` above, it's never
+                            // independently observable elsewhere), so simply
+                            // reading it BEFORE evaluating `value` -- rather
+                            // than a static `assigns_to_in_expr` check -- is
+                            // unconditionally sufficient here.
                             let t = self.alloc(*span);
                             self.emit(Op::StateGet(t, slot), *span);
+                            let rhs = self.expr(value);
                             let bin = match other {
                                 AssignOp::Add => Op::Add(t, t, rhs),
                                 AssignOp::Sub => Op::Sub(t, t, rhs),
