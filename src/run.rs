@@ -431,7 +431,29 @@ fn report_panic_map(msg: &str, span: Span, map: &crate::loader::SourceMap) {
 pub fn load_compile(path: &str) -> Result<(Compiled, crate::loader::SourceMap), i32> {
     let (mut program, map) = match crate::loader::load(path) {
         Ok(ok) => ok,
-        Err((diags, map)) => {
+        Err((mut diags, map)) => {
+            // A REAL, LIVE-CONFIRMED diagnostic-ordering inconsistency found+
+            // fixed (production-hardening PR-it1055, found via the same
+            // background close-read survey as PR-it1054's own `native()` data-
+            // loss fix): unlike `check_cmd`'s structurally identical branch
+            // just below (which DOES call `sort_diags` here), this branch
+            // printed `loader::load`'s error diagnostics AS-IS. `loader::
+            // load_with` processes a single file's multiple `use` targets via
+            // a LIFO `queue.pop()` stack (each file's own `use` targets are
+            // `push`ed in source order, so `pop()` retrieves the LAST-pushed
+            // one first) -- so two-plus `use` errors originating from the SAME
+            // file are appended to `diags` in REVERSE of their source order.
+            // Live-confirmed BEFORE this fix: a file with `use a` then `use b`
+            // (neither existing) printed `use a` first via `kupl check`
+            // (which sorts) but `use b` first via `kupl run`/every OTHER
+            // loader-consuming subcommand routed through THIS function
+            // (`run_program`, `run_program_vm`, `native`, `disassemble`,
+            // `emit_context`, `emit_manifest`) -- a genuine, deterministic (not
+            // flaky) inconsistency on the IDENTICAL broken input, violating
+            // `sort_diags`'s own stated contract ("deterministic, top-to-
+            // bottom order"). Fixed by sorting here too, mirroring `check_cmd`
+            // exactly.
+            sort_diags(&mut diags);
             print_diags_map(&diags, &map);
             return Err(1);
         }
@@ -3387,6 +3409,55 @@ mod tests {
             let keys: Vec<(u32, &str)> = v.iter().map(|d| (d.span.start, d.code)).collect();
             assert_eq!(keys, vec![(0, "K0302"), (5, "K0100"), (5, "K0101"), (20, "K0302")]);
         }
+    }
+
+    /// A REAL, LIVE-CONFIRMED diagnostic-ordering inconsistency found+fixed
+    /// (production-hardening PR-it1055, found via a background close-read
+    /// survey of run.rs): `load_compile`'s own loader-error branch (feeding
+    /// `run_program`/`run_program_vm`/`native`/`disassemble`/`emit_context`/
+    /// `emit_manifest` -- i.e. every loader-consuming subcommand EXCEPT
+    /// `check_cmd`) used to print `loader::load`'s error diagnostics as-is,
+    /// without calling `sort_diags` first, unlike `check_cmd`'s structurally
+    /// identical branch. `loader::load_with` processes a single file's
+    /// multiple `use` targets via a LIFO `queue.pop()` stack (each file's own
+    /// `use` targets are pushed in source order, so `pop()` retrieves the
+    /// LAST-pushed one first), so two-plus `use` errors from the SAME file
+    /// were appended in REVERSE source order. Live-confirmed BEFORE this fix:
+    /// a file with `use a` then `use b` (neither existing) printed `use a`
+    /// first via `kupl check` but `use b` first via `kupl run` -- a genuine,
+    /// deterministic inconsistency on the IDENTICAL broken input. Fixed by
+    /// sorting here too. Spawns a real subprocess (matching this file's own
+    /// established convention for asserting on printed CLI output) since
+    /// `load_compile` prints diagnostics itself rather than returning them.
+    #[test]
+    fn kupl_run_and_kupl_check_report_multiple_missing_use_targets_in_the_same_order() {
+        let dir = std::env::temp_dir().join(format!("kupl-diag-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "use a\nuse b\nfun main() uses io {\n    print(\"hi\")\n}\n";
+        let path = dir.join("main.kupl");
+        std::fs::write(&path, src).unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let run_out = std::process::Command::new(&bin)
+            .args(["run", path.to_str().unwrap()])
+            .output()
+            .expect("kupl run runs");
+        let check_out = std::process::Command::new(&bin)
+            .args(["check", path.to_str().unwrap()])
+            .output()
+            .expect("kupl check runs");
+        let run_stderr = String::from_utf8_lossy(&run_out.stderr);
+        let check_stderr = String::from_utf8_lossy(&check_out.stderr);
+        let a_pos = run_stderr.find("use a").expect("run's stderr must mention `use a`");
+        let b_pos = run_stderr.find("use b").expect("run's stderr must mention `use b`");
+        assert!(a_pos < b_pos, "kupl run must report `use a` before `use b` (source order): {run_stderr:?}");
+        let a_pos = check_stderr.find("use a").expect("check's stderr must mention `use a`");
+        let b_pos = check_stderr.find("use b").expect("check's stderr must mention `use b`");
+        assert!(a_pos < b_pos, "kupl check must report `use a` before `use b` (source order): {check_stderr:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A follow-up to the loader.rs fix (production-hardening PR-it625): a
