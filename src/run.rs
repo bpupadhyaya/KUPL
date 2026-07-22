@@ -1119,6 +1119,37 @@ pub fn native(path: &str, args: &[String]) -> i32 {
         return 1;
     }
     let c_path = format!("{out}.c");
+    // A REAL, LIVE-CONFIRMED data-loss bug found+fixed (production-hardening
+    // PR-it1054, found via a background close-read survey of this file): the
+    // check just above only ever guards `out` (the FINAL executable path)
+    // against colliding with the source file -- but the FIRST thing this
+    // function actually writes to disk is `c_path`, a DIFFERENT path
+    // whenever `out` doesn't already end in `.c`. A KUPL source file named
+    // `prog.c` (an entirely ordinary, already-tested naming choice --
+    // `.kupl` is never required, see `native_refuses_to_overwrite_an_
+    // extensionless_source_file`) compiled via the completely natural,
+    // C-toolchain-muscle-memory invocation `kupl native prog.c -o prog`
+    // passes the `out`-vs-source check cleanly (`prog` != `prog.c`), but
+    // `c_path` ("prog.c") is EXACTLY the source file -- so the very next
+    // line used to silently overwrite the user's own KUPL source with
+    // generated C, then (unless `--keep-c`) DELETE that file entirely as
+    // ordinary post-compile cleanup a few lines below, leaving nothing
+    // recoverable at all -- exit code 0, a "native executable: prog"
+    // SUCCESS message, no warning anywhere. This is exactly the worst case
+    // this function's own `output_would_overwrite_source` doc comment
+    // already predicts ("for `native`, the intermediate `.c` is also
+    // deleted on success unless `--keep-c`, leaving nothing recoverable at
+    // all") -- the doc comment described the risk precisely, but the
+    // original PR-it781 fix only ever applied the guard to `out`, never to
+    // this SEPARATE intermediate path. Fixed by applying the exact same
+    // guard to `c_path` too.
+    if output_would_overwrite_source(&c_path, path) {
+        eprintln!(
+            "error: refusing to overwrite the source file {path} -- the intermediate C output path \
+             {c_path} resolves to the same file (use -o to choose a different output path)"
+        );
+        return 1;
+    }
     if let Err(e) = std::fs::write(&c_path, &c_src) {
         eprintln!("error: cannot write {c_path}: {e}");
         return 1;
@@ -1599,6 +1630,50 @@ mod tests {
         assert_eq!(code, 1, "must refuse rather than overwrite the source");
         let after = std::fs::read_to_string(&bare).unwrap();
         assert_eq!(after, src, "the source file's content must be completely untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CRITICAL, LIVE-CONFIRMED data-loss bug found+fixed (production-
+    /// hardening PR-it1054, found via a background close-read survey of this
+    /// file, deliberately steered away from the `out`-vs-source case just
+    /// above -- which this test's own PR-it781 precedent already fixed --
+    /// looking instead for what that fix DIDN'T cover): the `out`-vs-source
+    /// guard above never protected the INTERMEDIATE `c_path` ("{out}.c")
+    /// against colliding with the source. A KUPL source file named `prog.c`
+    /// (an entirely ordinary naming choice -- `.kupl` is never required, see
+    /// the sibling test above) compiled via `kupl native prog.c -o prog` --
+    /// the exact command shape anyone with C-toolchain muscle memory (`cc
+    /// prog.c -o prog`) would type -- passed the `out`-vs-source check
+    /// cleanly (`prog` != `prog.c`), but `c_path` ("prog.c") was EXACTLY the
+    /// source file: `std::fs::write(&c_path, ...)` silently overwrote the
+    /// user's own KUPL source with generated C, then (without `--keep-c`)
+    /// this function's own post-compile cleanup DELETED that file entirely
+    /// a few lines later -- exit code 0, a "native executable: prog" SUCCESS
+    /// message, nothing recoverable at all. Live-confirmed BEFORE this fix
+    /// with a REAL end-to-end CLI invocation (not just this in-process
+    /// test): `prog.c`'s original KUPL source content was gone completely
+    /// (not merely overwritten -- `cat prog.c` reported "No such file or
+    /// directory" after the compiled `prog` binary correctly ran and printed
+    /// "hi"). Fixed by applying the SAME `output_would_overwrite_source`
+    /// guard to `c_path`, not just `out`.
+    #[test]
+    fn native_refuses_to_overwrite_a_dot_c_named_source_file_via_the_intermediate_c_output() {
+        let dir = std::env::temp_dir().join(format!("kupl-native-cclobber-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+        let source_path = dir.join("prog.c");
+        std::fs::write(&source_path, src).unwrap();
+        let p = source_path.to_str().unwrap().to_string();
+        let out_path = dir.join("prog");
+        let code = super::native(&p, &["-o".to_string(), out_path.to_str().unwrap().to_string()]);
+        assert_eq!(code, 1, "must refuse rather than overwrite the source via the intermediate .c path");
+        let after = std::fs::read_to_string(&source_path).unwrap();
+        assert_eq!(after, src, "the source file's content must be completely untouched");
+        assert!(
+            !out_path.exists(),
+            "must not have produced an executable either, having refused before compiling"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
