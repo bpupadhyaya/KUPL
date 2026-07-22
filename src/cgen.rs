@@ -15633,6 +15633,87 @@ fun main() uses io {
         );
     }
 
+    /// A FOURTH sibling fuzz domain (production-hardening PR-it1034), covering
+    /// the last of this campaign's six original O(n^2)-latency collection-
+    /// algorithm bug sites without dedicated fuzz coverage: `List.group_by`
+    /// (`interp.rs`'s own fast-path/fallback split, PR-it827's original fix).
+    /// `group_by`'s documented contract: returns a `Map[K, List[V]]`, keys in
+    /// FIRST-SEEN order, each group's elements in original list order. The
+    /// expected value is computed by an INDEPENDENTLY-written Rust reference
+    /// (a plain `Vec<(i64, Vec<i64>)>` insertion-ordered accumulator, NOT
+    /// copied from interp.rs's own sort-based fast path), using a FIXED,
+    /// simple key function (`n % 3`) reproducible identically in Rust, so a
+    /// bug shared between interp.rs and cgen.rs's own C reimplementation
+    /// would still be caught -- the same evidentiary strength as PR-it1028/
+    /// it1029/it1030's own fuzzers.
+    #[test]
+    fn fuzz_random_list_group_by_matches_the_canonical_rust_implementation_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 { 0 } else { self.next() % n }
+            }
+        }
+        fn fmt_list(v: &[i64]) -> String {
+            format!("[{}]", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let len = 2 + rng.below(25) as usize;
+            // A narrow value range (0..9) over a mod-3 key guarantees every
+            // one of the 3 possible groups is genuinely exercised across the
+            // 80 seeds, not just degenerate single-group/all-distinct cases.
+            let values: Vec<i64> = (0..len).map(|_| rng.below(9) as i64).collect();
+            let list_src = values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+
+            // Independently-written first-seen-order grouping reference --
+            // NOT interp.rs's own sort-based fast path.
+            let mut groups: Vec<(i64, Vec<i64>)> = Vec::new();
+            for &v in &values {
+                let key = v % 3;
+                match groups.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, bucket)) => bucket.push(v),
+                    None => groups.push((key, vec![v])),
+                }
+            }
+            let expected = format!(
+                "Map{{{}}}\n",
+                groups.iter().map(|(k, vs)| format!("{k}: {}", fmt_list(vs))).collect::<Vec<_>>().join(", ")
+            );
+
+            let src = format!(
+                "fun main() uses io {{\n    print([{list_src}].group_by(fn n {{ n % 3 }}))\n}}\n"
+            );
+            let raw = native_main_stdout(&src, &format!("groupbyfuzz{seed}"));
+            if raw != expected {
+                mismatches.push(format!(
+                    "seed={seed} values={values:?} expected={expected:?} actual={raw:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native List.group_by diverges from the canonical Rust implementation on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
     /// PR-it663, the SAME bug class as it662's BigInt.from_str finding, this
     /// time on a far more commonly-used surface): `Str.trim()` used to share
