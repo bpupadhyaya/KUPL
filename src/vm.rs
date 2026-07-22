@@ -17018,6 +17018,67 @@ fun probe() -> Str {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1053, found via a background close-read survey of
+    /// `interp.rs::shared_method` -- the SAME function `Op::Method` routes
+    /// through on the VM, so a bug here affects interp AND vm IDENTICALLY,
+    /// making it invisible to ordinary interp-vs-vm differential testing on
+    /// its own; independently re-verified via a fresh live repro against the
+    /// user's OWN intended semantics before trusting the survey, and ALSO
+    /// confirmed identical on `kupl native`, whose cgen.rs mirror had the
+    /// SAME unguarded shape, fixed alongside this): `is_some`/`is_none`/
+    /// `is_ok`/`is_err`/`unwrap_or` -- UNLIKE every other Option/Result
+    /// combinator (`map`/`and_then`/`filter`/`ok_or`/`map_err`/`ok`, all
+    /// already correctly variant-guarded, see `diff_option_result_
+    /// combinators` just above) -- used to match ANY `Ctor` value
+    /// unconditionally, silently intercepting a user-defined UFCS function
+    /// of the SAME name on a completely unrelated ADT before it ever got a
+    /// chance to run (`shared_method` always returned `Ok(...)` for these
+    /// five, so `eval_method`/`Op::Method`'s "fall back to UFCS on `has no
+    /// method`" gate never fired). `check.rs`'s own `infer_method` only
+    /// assigns the builtin signature for `Ty::Option`/`Ty::Result`, so the
+    /// type checker itself believes the user's function will run for any
+    /// OTHER ADT. Confirmed BEFORE this fix: `Rect(2.0, 3.0).unwrap_or(99.0)`
+    /// -- with a user `fun unwrap_or(s: Shape, default: Float) -> Float`
+    /// computing `w * h` -- printed `99.0` (the untouched default,
+    /// discarding the receiver) instead of the correct `6.0` on `kupl run`,
+    /// `kupl run --vm`, AND `kupl native` alike.
+    #[test]
+    fn diff_ufcs_shadow_of_unguarded_option_result_combinators_on_a_user_adt() {
+        let src = r#"type Shape = Circle(r: Float) | Rect(w: Float, h: Float)
+fun unwrap_or(s: Shape, default: Float) -> Float {
+    match s {
+        Circle(r) => r
+        Rect(w, h) => w * h
+    }
+}
+fun is_some(s: Shape) -> Bool {
+    match s {
+        Circle(_) => true
+        Rect(_, _) => false
+    }
+}
+fun probe() -> Str {
+    let a = Rect(2.0, 3.0).unwrap_or(99.0)
+    let b = Circle(1.0).unwrap_or(99.0)
+    let c = Rect(2.0, 3.0).is_some()
+    let d = Circle(1.0).is_some()
+    // real Option/Result behavior must stay completely unaffected
+    let e = Some(5).unwrap_or(0)
+    let n: Option[Int] = None
+    let f = n.unwrap_or(0)
+    let g = Some(5).is_some()
+    let h = n.is_none()
+    let ok: Result[Int, Str] = Ok(3)
+    let er: Result[Int, Str] = Err("e")
+    let i = ok.is_ok()
+    let j = er.is_err()
+    "{a}|{b}|{c}|{d}|{e}|{f}|{g}|{h}|{i}|{j}"
+}
+"#;
+        assert_eq!(differential(src), "6.0|1.0|false|true|5|0|true|true|true|true");
+    }
+
     #[test]
     fn diff_json_nested_roundtrip_and_key_order() {
         // JSON serialize/parse of nested structures is byte-identical on interp/KVM: JObj keys

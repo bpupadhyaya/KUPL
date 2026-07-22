@@ -4170,11 +4170,59 @@ pub fn shared_method(
         (Value::Tensor(d), "to_list") => Ok(Value::List(Rc::new(
             d.iter().map(|x| Value::Float(*x)).collect(),
         ))),
-        (Value::Ctor { variant, .. }, "is_some") => Ok(Value::Bool(variant.as_str() == "Some")),
-        (Value::Ctor { variant, .. }, "is_none") => Ok(Value::Bool(variant.as_str() == "None")),
-        (Value::Ctor { variant, .. }, "is_ok") => Ok(Value::Bool(variant.as_str() == "Ok")),
-        (Value::Ctor { variant, .. }, "is_err") => Ok(Value::Bool(variant.as_str() == "Err")),
-        (Value::Ctor { variant, fields, .. }, "unwrap_or") => {
+        // A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+        // hardening PR-it1053, found via a background close-read survey of this
+        // whole function): these five arms -- UNLIKE every other Option/Result
+        // combinator immediately below them -- were NOT variant-guarded, so they
+        // matched ANY `Value::Ctor` unconditionally, silently intercepting a
+        // user-defined UFCS function of the same name on a completely unrelated
+        // ADT (e.g. a user's own `unwrap_or(shape: Shape, default: Float) ->
+        // Float`) before it ever got a chance to run. `eval_method`/vm.rs's
+        // `Op::Method` only fall back to a user's UFCS function when this whole
+        // function returns an `Err` containing "has no method" -- these arms
+        // always returned `Ok(...)`, so the user's real function was NEVER
+        // called, silently replaced by nonsensical built-in behavior (`is_some`/
+        // `is_none`/`is_ok`/`is_err` always `false` unless a user variant
+        // happens to be literally named "Some"/"None"/"Ok"/"Err"; `unwrap_or`
+        // always just returns its own `default` argument unchanged, discarding
+        // the receiver entirely). `check.rs`'s own `infer_method` only assigns a
+        // builtin signature to these names for `Ty::Option`/`Ty::Result`
+        // (confirmed via a live `kupl check` pass) -- for any OTHER ADT it
+        // legitimately resolves to a matching top-level UFCS function, so the
+        // type checker itself believed the user's function would run. Live-
+        // confirmed identically on ALL THREE engines (interp/vm share this exact
+        // function; native's cgen.rs has the SAME unguarded shape in its own
+        // independently-written C mirror, fixed alongside this): `type Shape =
+        // Circle(r: Float) | Rect(w: Float, h: Float)` with a user `fun
+        // unwrap_or(s: Shape, default: Float) -> Float { match s { Circle(r) =>
+        // r, Rect(w, h) => w * h } }`, calling `Rect(2.0, 3.0).unwrap_or(99.0)`
+        // printed `99.0` (the untouched default) instead of the user's own
+        // correct `6.0` (`w * h`) on `kupl run`, `kupl run --vm`, AND `kupl
+        // native` alike. Fixed by adding the SAME variant guard every sibling
+        // arm below already uses.
+        (Value::Ctor { variant, .. }, "is_some")
+            if matches!(variant.as_str(), "Some" | "None" | "Ok" | "Err") =>
+        {
+            Ok(Value::Bool(variant.as_str() == "Some"))
+        }
+        (Value::Ctor { variant, .. }, "is_none")
+            if matches!(variant.as_str(), "Some" | "None" | "Ok" | "Err") =>
+        {
+            Ok(Value::Bool(variant.as_str() == "None"))
+        }
+        (Value::Ctor { variant, .. }, "is_ok")
+            if matches!(variant.as_str(), "Some" | "None" | "Ok" | "Err") =>
+        {
+            Ok(Value::Bool(variant.as_str() == "Ok"))
+        }
+        (Value::Ctor { variant, .. }, "is_err")
+            if matches!(variant.as_str(), "Some" | "None" | "Ok" | "Err") =>
+        {
+            Ok(Value::Bool(variant.as_str() == "Err"))
+        }
+        (Value::Ctor { variant, fields, .. }, "unwrap_or")
+            if matches!(variant.as_str(), "Some" | "None" | "Ok" | "Err") =>
+        {
             let default = args.into_iter().next().ok_or("`unwrap_or` needs a default")?;
             match variant.as_str() {
                 "Some" | "Ok" => Ok(fields.first().cloned().unwrap_or(Value::Unit)),

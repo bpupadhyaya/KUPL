@@ -7768,12 +7768,28 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         }
     }
     if (recv.tag == K_CTOR) {
-        if (!strcmp(name, "is_some")) return k_bool(k_ctor_variant_is(recv, "Some"));
-        if (!strcmp(name, "is_none")) return k_bool(k_ctor_variant_is(recv, "None"));
-        if (!strcmp(name, "is_ok")) return k_bool(k_ctor_variant_is(recv, "Ok"));
-        if (!strcmp(name, "is_err")) return k_bool(k_ctor_variant_is(recv, "Err"));
-        if (!strcmp(name, "unwrap_or")) {
-            if (k_ctor_variant_is(recv, "Some") || k_ctor_variant_is(recv, "Ok"))
+        /* A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+           hardening PR-it1053): these five checks -- UNLIKE the guarded
+           Option/Result combinator block just below -- used to match ANY
+           K_CTOR value unconditionally, silently intercepting a user-defined
+           UFCS function of the same name on a completely unrelated ADT before
+           it ever got a chance to run (the SAME gap independently found in
+           interp.rs's own `shared_method`, this native runtime's own mirror --
+           see that fix's own doc comment for the full live repro and
+           reachability trace). Guarded the same way the block below already
+           is: only match when the receiver is actually an Option/Result
+           variant, otherwise fall through to the UFCS lookup. */
+        int _rv_some = k_ctor_variant_is(recv, "Some");
+        int _rv_none = k_ctor_variant_is(recv, "None");
+        int _rv_ok = k_ctor_variant_is(recv, "Ok");
+        int _rv_err = k_ctor_variant_is(recv, "Err");
+        int _rv_opt_or_res = _rv_some || _rv_none || _rv_ok || _rv_err;
+        if (!strcmp(name, "is_some") && _rv_opt_or_res) return k_bool(_rv_some);
+        if (!strcmp(name, "is_none") && _rv_opt_or_res) return k_bool(_rv_none);
+        if (!strcmp(name, "is_ok") && _rv_opt_or_res) return k_bool(_rv_ok);
+        if (!strcmp(name, "is_err") && _rv_opt_or_res) return k_bool(_rv_err);
+        if (!strcmp(name, "unwrap_or") && _rv_opt_or_res) {
+            if (_rv_some || _rv_ok)
                 return recv.as.ctor->nfields ? recv.as.ctor->fields[0] : k_unit();
             return args[0];
         }
@@ -9238,6 +9254,30 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
                    var x = 5\n    x = x + { x = 99\n        1 }\n    print(\"{x}\")\n    \
                    var xs = [1, 2, 3]\n    xs = xs.push({ xs = [9, 9]\n        5 })\n    print(\"{xs}\")\n}\n";
         assert_eq!(native_main_stdout(src, "selfmutfastpath"), "6\n[1, 2, 3, 5]\n");
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1053): the `is_some`/`is_none`/`is_ok`/`is_err`/
+    /// `unwrap_or` checks in this native runtime's own `K_CTOR` method
+    /// dispatch used to match ANY constructor value unconditionally
+    /// (unlike the already-guarded Option/Result combinator block right
+    /// below them), silently intercepting a user-defined UFCS function of
+    /// the same name on an unrelated ADT -- the SAME gap independently
+    /// found in `interp.rs::shared_method` (see that fix's own doc comment
+    /// for the full writeup and live repro). Confirmed BEFORE this fix:
+    /// this exact program printed `99.0` (discarding the receiver) instead
+    /// of the user's own correct `6.0`.
+    #[test]
+    fn native_ufcs_shadow_of_unguarded_option_result_combinators_on_a_user_adt() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Shape = Circle(r: Float) | Rect(w: Float, h: Float)\n\
+                   fun unwrap_or(s: Shape, default: Float) -> Float {\n    \
+                   match s {\n        Circle(r) => r\n        Rect(w, h) => w * h\n    }\n}\n\
+                   fun main() uses io {\n    print(\"{Rect(2.0, 3.0).unwrap_or(99.0)}\")\n    \
+                   print(\"{Some(5).unwrap_or(0)}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "ufcsshadow"), "6.0\n5\n");
     }
 
     /// A REAL cross-engine divergence found+fixed (production-hardening
