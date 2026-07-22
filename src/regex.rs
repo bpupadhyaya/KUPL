@@ -521,99 +521,152 @@ impl Regex {
 
     /// Try to match starting exactly at `pos`; return the end index of the
     /// longest greedy match, honoring `$`.
+    ///
+    /// A REAL, LIVE-CONFIRMED HIGH-severity bug found+fixed (production-
+    /// hardening PR-it1067, a background close-read survey finding): every
+    /// matcher function below used to return a single `Option<usize>` --
+    /// ONE committed answer, with no way for a caller to ask "that answer
+    /// didn't work out downstream, give me the NEXT possibility instead."
+    /// This meant a `(...)` group committed to the FIRST alternative/
+    /// internal split that matched ANYTHING at all, even when a DIFFERENT
+    /// internal split was the only one that let the REST of the pattern
+    /// (or, here, the `$` anchor) succeed -- silently producing a false
+    /// negative instead of trying the next possibility, exactly the same
+    /// defect this function's OWN `$`-anchor check had one level up: if
+    /// `match_seq` returned an `end` that didn't satisfy `anchored_end`,
+    /// the WHOLE alternative was abandoned instead of asking `match_seq`
+    /// for a shorter/different match that might satisfy it. Live-confirmed
+    /// BEFORE this fix: `re_match("^(a|ab)c$", "abc")` returned `false`
+    /// (Python's `re`, the correctness oracle, returns `True`) -- `(a|ab)`
+    /// tried alternative `a` first, matched it (1 char), committed to that
+    /// answer, and the trailing literal `c` then failed against `"bc"`'s
+    /// own second char `b` -- with no way to backtrack into trying `ab`
+    /// instead. Reordering the alternatives (`(ab|a)`) "fixed" the SAME
+    /// semantic pattern by accident, proving the bug was genuinely a
+    /// missing-backtracking defect, not a narrower one-off. Fixed by
+    /// converting the ENTIRE matcher to continuation-passing style (CPS):
+    /// every match function now takes a `cont: &dyn Fn(usize) ->
+    /// Option<usize>` representing "try to match everything AFTER this
+    /// point, starting from this position" -- so a group's own internal
+    /// quantifier/alternation backtracking loops now retry against the
+    /// SAME downstream continuation the group was originally called with,
+    /// not just their own immediate `rest` slice. This single change ALSO
+    /// fixes the identical defect in the `$`-anchor check above: it's now
+    /// folded into the top-level continuation passed into `match_seq`, so
+    /// an anchor failure downstream correctly triggers backtracking into
+    /// an earlier group/quantifier's OWN alternative choices, exactly like
+    /// any other continuation failure would.
     fn match_here(&self, chars: &[char], pos: usize) -> Option<usize> {
+        let anchor_ok = |end: usize| -> Option<usize> {
+            if !self.anchored_end || end == chars.len() {
+                Some(end)
+            } else {
+                None
+            }
+        };
         for alt in &self.alts {
-            if let Some(end) = match_seq(alt, chars, pos) {
-                if !self.anchored_end || end == chars.len() {
-                    return Some(end);
-                }
+            if let Some(end) = match_seq(alt, chars, pos, &anchor_ok) {
+                return Some(end);
             }
         }
         None
     }
 }
 
-/// Match a sequence of pieces starting at `pos`, returning the end index.
-fn match_seq(pieces: &[Piece], chars: &[char], pos: usize) -> Option<usize> {
+/// Match a sequence of pieces starting at `pos`, then `cont` (everything
+/// after this sequence -- the rest of an enclosing sequence, or the
+/// top-level `$`-anchor check). Returns the final overall end index `cont`
+/// itself settles on, threading backtracking all the way through.
+fn match_seq(pieces: &[Piece], chars: &[char], pos: usize, cont: &dyn Fn(usize) -> Option<usize>) -> Option<usize> {
     // Every recursive descent passes through here; charge a step so a pathological
     // backtracking blow-up unwinds at the budget instead of hanging (see tick()).
     if !tick() {
         return None;
     }
     match pieces.split_first() {
-        None => Some(pos),
-        Some((first, rest)) => match_piece(first, rest, chars, pos),
+        None => cont(pos),
+        Some((first, rest)) => match_piece(first, rest, chars, pos, cont),
     }
 }
 
-/// Match `piece` then `rest`, with backtracking over greedy quantifiers.
-fn match_piece(piece: &Piece, rest: &[Piece], chars: &[char], pos: usize) -> Option<usize> {
+/// Match `piece`, then `rest`, then `cont` -- with full backtracking over
+/// greedy quantifiers AND over any group alternative/internal split whose
+/// own downstream match (via `cont`) doesn't pan out.
+fn match_piece(piece: &Piece, rest: &[Piece], chars: &[char], pos: usize, cont: &dyn Fn(usize) -> Option<usize>) -> Option<usize> {
+    let rest_cont = |np: usize| match_seq(rest, chars, np, cont);
     match piece.quant {
-        Quant::One => {
-            let np = atom_match(&piece.atom, chars, pos)?;
-            match_seq(rest, chars, np)
-        }
+        Quant::One => atom_match(&piece.atom, chars, pos, &rest_cont),
         Quant::ZeroOrOne => {
             // greedy: try consuming one first, then zero
-            if let Some(np) = atom_match(&piece.atom, chars, pos) {
-                if let Some(end) = match_seq(rest, chars, np) {
-                    return Some(end);
-                }
+            if let Some(end) = atom_match(&piece.atom, chars, pos, &rest_cont) {
+                return Some(end);
             }
-            match_seq(rest, chars, pos)
+            rest_cont(pos)
         }
-        Quant::ZeroOrMore | Quant::OneOrMore => {
-            // collect greedily, then backtrack
-            let mut ends = vec![pos];
-            let mut cur = pos;
-            while let Some(np) = atom_match(&piece.atom, chars, cur) {
-                if np == cur {
-                    break; // guard against zero-width infinite loop
-                }
-                cur = np;
-                ends.push(cur);
-            }
-            let min = if piece.quant == Quant::OneOrMore { 1 } else { 0 };
-            // try the longest run first (greedy), backtrack toward `min`
-            for k in (min..ends.len()).rev() {
-                if let Some(end) = match_seq(rest, chars, ends[k]) {
-                    return Some(end);
-                }
-            }
-            None
-        }
+        Quant::ZeroOrMore => match_star(&piece.atom, chars, pos, &rest_cont),
+        Quant::OneOrMore => match_plus(&piece.atom, chars, pos, &rest_cont),
     }
 }
 
-/// Match a single atom at `pos`; return the position after it, or None.
-fn atom_match(atom: &Atom, chars: &[char], pos: usize) -> Option<usize> {
+/// Match `atom` zero or more times (greedy, backtracking toward fewer
+/// repetitions), then `cont`. Recurses so each repetition attempt gets the
+/// FULL downstream continuation, not just "the next repetition" -- letting
+/// a group nested inside a `*`/`+` backtrack its own internal choices too.
+fn match_star(atom: &Atom, chars: &[char], pos: usize, cont: &dyn Fn(usize) -> Option<usize>) -> Option<usize> {
+    // Try consuming one MORE repetition (greedy), recursing before falling
+    // back to `cont` so the longest run is explored first. The zero-width
+    // guard (`np == pos`) prevents infinite recursion on an atom (only ever
+    // possible via a `Group` alternative that itself matches empty) that
+    // consumes no input -- treated as "no further repetitions help", not a
+    // hard failure, since the outer `cont(pos)` fallback below covers it.
+    if let Some(end) = atom_match(atom, chars, pos, &|np| if np == pos { None } else { match_star(atom, chars, np, cont) }) {
+        return Some(end);
+    }
+    cont(pos)
+}
+
+/// Match `atom` one or more times (mandatory first repetition, then
+/// behaves exactly like `match_star` for any further ones), then `cont`.
+fn match_plus(atom: &Atom, chars: &[char], pos: usize, cont: &dyn Fn(usize) -> Option<usize>) -> Option<usize> {
+    atom_match(atom, chars, pos, &|np| if np == pos { None } else { match_star(atom, chars, np, cont) })
+}
+
+/// Match a single atom at `pos`, then `cont`. Returns the final overall end
+/// index, not just the position immediately after this one atom -- for a
+/// simple atom (always exactly one character wide) this is just `cont(pos +
+/// 1)`; for a `Group`, EVERY alternative is tried against the SAME `cont`,
+/// so a later downstream failure correctly causes the group to try its next
+/// alternative (or, within one alternative, its own internal quantifier
+/// backtracking) rather than committing to the first internally-successful
+/// choice.
+fn atom_match(atom: &Atom, chars: &[char], pos: usize, cont: &dyn Fn(usize) -> Option<usize>) -> Option<usize> {
     match atom {
         Atom::Any => {
             if pos < chars.len() {
-                Some(pos + 1)
+                cont(pos + 1)
             } else {
                 None
             }
         }
         Atom::Char(c) => {
             if chars.get(pos) == Some(c) {
-                Some(pos + 1)
+                cont(pos + 1)
             } else {
                 None
             }
         }
         Atom::Class { negated, ranges } => {
-            let ch = *chars.get(pos)?;
+            let Some(&ch) = chars.get(pos) else { return None };
             let inside = ranges.iter().any(|&(lo, hi)| ch >= lo && ch <= hi);
             if inside != *negated {
-                Some(pos + 1)
+                cont(pos + 1)
             } else {
                 None
             }
         }
         Atom::Group(alts) => {
             for alt in alts {
-                if let Some(end) = match_seq(alt, chars, pos) {
+                if let Some(end) = match_seq(alt, chars, pos, cont) {
                     return Some(end);
                 }
             }
@@ -741,6 +794,44 @@ mod tests {
         assert!(m("^(ab)+$", "ababab"));
         assert!(!m("^(ab)+$", "aba"));
         assert!(m("^a(b|c)*d$", "abcbcd"));
+    }
+
+    /// A REAL, LIVE-CONFIRMED HIGH-severity bug found+fixed (production-
+    /// hardening PR-it1067, a background close-read survey finding): see
+    /// `match_here`'s own doc comment for the full writeup. A `(...)` group
+    /// used to commit to the FIRST alternative/internal split that matched
+    /// ANYTHING at all, with no way to backtrack into a DIFFERENT split if
+    /// the rest of the pattern (or the `$` anchor) subsequently failed --
+    /// a silent false negative, not a panic or hang. Live-confirmed BEFORE
+    /// this fix (cross-checked against Python's `re` as the correctness
+    /// oracle): `re_match("^(a|ab)c$", "abc")` returned `false` (should be
+    /// `true`) -- `(a|ab)` tried `a` first, matched it, committed, and the
+    /// trailing literal `c` then failed against `"bc"`'s own `b`.
+    /// Reordering the alternatives (`(ab|a)c`) "fixed" the identical
+    /// semantic pattern purely by accident, proving this was genuinely a
+    /// missing-backtracking defect, not a narrower one-off.
+    #[test]
+    fn a_group_backtracks_into_a_different_alternative_or_internal_quantifier_split_when_the_first_one_leaves_the_rest_of_the_pattern_unmatchable(
+    ) {
+        assert!(m("^(a|ab)c$", "abc"), "the shorter alternative `a` must be abandoned in favor of `ab`");
+        assert!(m("^(ab|a)c$", "abc"), "the SAME pattern with alternatives reordered must ALSO match");
+        assert!(m("^(a+)ab$", "aaab"), "a quantified atom inside a group must backtrack its own repeat count");
+        assert!(m("^(cat|catering)s?$", "caterings"), "a longer alternative must be tried when a shorter one fails downstream");
+        // the identical defect, one level up: a `$`-anchor failure must
+        // also trigger backtracking into an earlier group's own choices.
+        assert!(m("^(a|aa)$", "aa"), "the `$` anchor failing on the first alternative must trigger backtracking too");
+        // `find`/`find_all`/`replace` (not just a full-string `match`) must
+        // benefit from the same fix, since they share the same matcher.
+        assert_eq!(f("(a|ab)c", "xabcx"), Some("abc".to_string()));
+        assert_eq!(f("(a+)ab", "xxaaabxx"), Some("aaab".to_string()));
+        assert_eq!(
+            compile("(a|ab)c").unwrap().find_all("abc xabcx"),
+            vec!["abc".to_string(), "abc".to_string()]
+        );
+        assert_eq!(compile("(a|ab)c").unwrap().replace_all("abc", "Z"), "Z");
+        // sanity: an ordinary, already-correct group match is unaffected.
+        assert!(m("^(cat|dog)$", "cat"));
+        assert!(!m("^(cat|dog)$", "cow"));
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it725, found via a

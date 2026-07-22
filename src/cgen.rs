@@ -5083,77 +5083,155 @@ static KRegex k_re_compile(const char* pat) {
     return re;
 }
 
-/* matcher — recursive, mirrors regex.rs match_here/seq/piece/atom exactly */
-static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, int* out);
-static int kre_atom_match(KReAtom* a, const unsigned char* t, int tlen, int pos, int* np) {
+/* matcher — continuation-passing style (CPS), mirrors regex.rs match_here/seq/
+   piece/atom/star/plus exactly.
+   A REAL, LIVE-CONFIRMED HIGH-severity cross-engine bug found+fixed
+   (production-hardening PR-it1067, mirroring regex.rs's own identical fix --
+   see that file's `match_here` doc comment for the FULL rationale of the
+   original defect). This engine used to return a single `int`/`*out` "the
+   one committed answer" from every matcher function, exactly like
+   regex.rs's OWN pre-fix shape -- so a `(...)` group committed to the FIRST
+   alternative/internal split that matched ANYTHING at all, with no way to
+   backtrack into a DIFFERENT split if the rest of the pattern (or the `$`
+   anchor) subsequently failed. Confirmed live: fixing regex.rs alone (the
+   "canonical" oracle this file's own `fuzz_random_regex_patterns_and_
+   subjects_match_the_canonical_rust_engine_on_native` test compares
+   against) immediately unmasked this SAME bug here as a fresh cross-engine
+   DIVERGENCE the very next full test run -- e.g. pattern
+   `([a-c]?(\w*c*[a-c])*|\d*[^a-c]*)+` against `"d.01B"`: regex.rs (fixed)
+   correctly matches the whole subject, this native engine (pre-this-fix)
+   matched nothing. Fixed the SAME way regex.rs was: every matcher function
+   now takes a `const KReCont*` continuation (a function pointer + a `void*`
+   context struct -- C's usual substitute for Rust's `&dyn Fn`) representing
+   "try to match everything AFTER this point"; a group's own internal
+   backtracking loops now retry against the SAME downstream continuation
+   they were called with, not just their own immediate `rest` slice. This
+   ALSO folds the `$`-anchor check into the top-level continuation passed
+   into the first `kre_match_seq` call, fixing the identical defect one
+   level up (an anchor failure now correctly triggers backtracking into an
+   earlier group/quantifier's own choices too). */
+typedef struct KReCont {
+    int (*fn)(const struct KReCont* self, int pos, int* out);
+    void* ctx;
+} KReCont;
+
+static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out);
+static int kre_match_piece(KRePiece* first, KRePiece* rest, int nrest, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out);
+static int kre_match_star(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out);
+
+/* Match a single atom at `pos`, then `cont` -- for a simple (always exactly
+   one CHARACTER wide) atom this is just `cont->fn(cont, pos + width, out)`;
+   for a `Group`, EVERY alternative is tried against the SAME `cont`, so a
+   later downstream failure correctly causes the group to try its next
+   alternative (or its own internal quantifier backtracking) instead of
+   committing to the first internally-successful choice. */
+static int kre_atom_match(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
     switch (a->kind) {
         /* `.` matches any single CHARACTER — advance a full UTF-8 codepoint, not
            one byte, so it mirrors the interpreter (which matches over chars) and
            never returns an invalid-UTF-8 byte fragment. */
-        case 0: if (pos < tlen) { *np = pos + k_utf8_len(t[pos]); return 1; } return 0;
+        case 0: if (pos < tlen) { return cont->fn(cont, pos + k_utf8_len(t[pos]), out); } return 0;
         case 1: {
             if (pos >= tlen) return 0;
             int clen; long cp = kre_utf8_cp(t, tlen, pos, &clen);
-            if (cp == a->ch) { *np = pos + clen; return 1; } return 0;
+            if (cp == a->ch) { return cont->fn(cont, pos + clen, out); } return 0;
         }
         case 2: {
             if (pos >= tlen) return 0;
             int clen; long cp = kre_utf8_cp(t, tlen, pos, &clen); int inside = 0;
             for (int i = 0; i < a->nranges; i++) if (cp >= a->ranges[i].lo && cp <= a->ranges[i].hi) { inside = 1; break; }
-            if (inside != a->negated) { *np = pos + clen; return 1; } return 0;
+            if (inside != a->negated) { return cont->fn(cont, pos + clen, out); } return 0;
         }
         default: { /* group */
             for (int i = 0; i < a->group.n; i++) {
-                int e; if (kre_match_seq(a->group.a[i].p, a->group.a[i].n, t, tlen, pos, &e)) { *np = e; return 1; }
+                if (kre_match_seq(a->group.a[i].p, a->group.a[i].n, t, tlen, pos, cont, out)) return 1;
             }
             return 0;
         }
     }
 }
-static int kre_match_piece(KRePiece* first, KRePiece* rest, int nrest, const unsigned char* t, int tlen, int pos, int* out) {
+
+/* Continuation context for `match rest of the enclosing sequence, then the
+   OUTER continuation` -- used by `kre_match_piece` for every quantifier
+   shape below. */
+typedef struct { KRePiece* rest; int nrest; const unsigned char* t; int tlen; const KReCont* outer; } KReSeqCtx;
+static int kre_seq_cont_fn(const KReCont* k, int pos, int* out) {
+    KReSeqCtx* c = (KReSeqCtx*)k->ctx;
+    return kre_match_seq(c->rest, c->nrest, c->t, c->tlen, pos, c->outer, out);
+}
+
+/* Continuation context for `match_star`'s own recursive-repetition step:
+   after `atom` matches once more (from `base_pos` to `np`), either bail out
+   on a zero-width match (guard against infinite recursion -- only possible
+   via a `Group` alternative that itself matches empty) or recurse into
+   `match_star` again from the new position. */
+typedef struct { KReAtom* a; const unsigned char* t; int tlen; int base_pos; const KReCont* outer; } KReStarCtx;
+static int kre_star_next_cont_fn(const KReCont* k, int np, int* out) {
+    KReStarCtx* c = (KReStarCtx*)k->ctx;
+    if (np == c->base_pos) return 0;
+    return kre_match_star(c->a, c->t, c->tlen, np, c->outer, out);
+}
+
+/* Match `atom` zero or more times (greedy, backtracking toward fewer
+   repetitions), then `cont`. Recurses so each repetition attempt gets the
+   FULL downstream continuation, not just "the next repetition" -- letting a
+   group nested inside a `*`/`+` backtrack its own internal choices too. */
+static int kre_match_star(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
+    KReStarCtx sctx = { a, t, tlen, pos, cont };
+    KReCont inner = { kre_star_next_cont_fn, &sctx };
+    if (kre_atom_match(a, t, tlen, pos, &inner, out)) return 1;
+    return cont->fn(cont, pos, out);
+}
+
+/* Match `atom` one or more times (mandatory first repetition, then behaves
+   exactly like `kre_match_star` for any further ones), then `cont`. */
+static int kre_match_plus(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
+    KReStarCtx sctx = { a, t, tlen, pos, cont };
+    KReCont inner = { kre_star_next_cont_fn, &sctx };
+    return kre_atom_match(a, t, tlen, pos, &inner, out);
+}
+
+static int kre_match_piece(KRePiece* first, KRePiece* rest, int nrest, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
     KReAtom* a = first->atom;
-    if (first->quant == 0) {
-        int np; if (!kre_atom_match(a, t, tlen, pos, &np)) return 0;
-        return kre_match_seq(rest, nrest, t, tlen, np, out);
+    KReSeqCtx sctx = { rest, nrest, t, tlen, cont };
+    KReCont rest_cont = { kre_seq_cont_fn, &sctx };
+    if (first->quant == 0) {   /* exactly one */
+        return kre_atom_match(a, t, tlen, pos, &rest_cont, out);
     }
     if (first->quant == 3) {   /* ? greedy: one then zero */
-        int np;
-        if (kre_atom_match(a, t, tlen, pos, &np)) { if (kre_match_seq(rest, nrest, t, tlen, np, out)) return 1; }
-        return kre_match_seq(rest, nrest, t, tlen, pos, out);
+        if (kre_atom_match(a, t, tlen, pos, &rest_cont, out)) return 1;
+        return rest_cont.fn(&rest_cont, pos, out);
     }
-    /* * or + : collect greedy ends, then backtrack toward min */
-    int cap = 16, cnt = 0; int* ends = (int*)malloc(sizeof(int) * cap); ends[cnt++] = pos;
-    int cur = pos, np;
-    while (kre_atom_match(a, t, tlen, cur, &np)) {
-        if (np == cur) break;   /* zero-width guard */
-        cur = np;
-        if (cnt == cap) { cap *= 2; ends = (int*)realloc(ends, sizeof(int) * cap); }
-        ends[cnt++] = cur;
+    if (first->quant == 1) {   /* * */
+        return kre_match_star(a, t, tlen, pos, &rest_cont, out);
     }
-    int min = (first->quant == 2) ? 1 : 0;
-    for (int k = cnt - 1; k >= min; k--) {
-        if (kre_match_seq(rest, nrest, t, tlen, ends[k], out)) { free(ends); return 1; }
-    }
-    free(ends);
-    return 0;
+    return kre_match_plus(a, t, tlen, pos, &rest_cont, out);   /* quant == 2: + */
 }
 /* backtracking-step budget — mirrors src/regex.rs MATCH_BUDGET (10_000_000). A
    pathological pattern/input (e.g. `a*a*a*a*c` over a long non-matching string)
    would otherwise hang exponentially (ReDoS); instead it panics cleanly with the
    same message the interpreter raises. Reset at each top-level match op. */
 static long kre_steps = 0;
-static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, int* out) {
+static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
     if (--kre_steps < 0)
         k_panic("regex match budget exceeded (pattern too complex for the input)");
-    if (n == 0) { *out = pos; return 1; }
-    return kre_match_piece(&pieces[0], pieces + 1, n - 1, t, tlen, pos, out);
+    if (n == 0) { return cont->fn(cont, pos, out); }
+    return kre_match_piece(&pieces[0], pieces + 1, n - 1, t, tlen, pos, cont, out);
 }
 /* try to match starting exactly at pos; returns end index or -1 (honors $) */
+typedef struct { int aend; int tlen; } KReAnchorCtx;
+static int kre_anchor_cont_fn(const KReCont* k, int pos, int* out) {
+    KReAnchorCtx* c = (KReAnchorCtx*)k->ctx;
+    if (!c->aend || pos == c->tlen) { *out = pos; return 1; }
+    return 0;
+}
 static int k_re_match_here(KRegex* re, const unsigned char* t, int tlen, int pos) {
+    KReAnchorCtx actx = { re->aend, tlen };
+    KReCont acont = { kre_anchor_cont_fn, &actx };
     for (int i = 0; i < re->alts.n; i++) {
         int end;
-        if (kre_match_seq(re->alts.a[i].p, re->alts.a[i].n, t, tlen, pos, &end)) {
-            if (!re->aend || end == tlen) return end;
+        if (kre_match_seq(re->alts.a[i].p, re->alts.a[i].n, t, tlen, pos, &acont, &end)) {
+            return end;
         }
     }
     return -1;
@@ -13845,7 +13923,11 @@ fun main() uses io {
     /// the first 8192 with no error/panic at all. Confirmed via a real 3-engine CLI probe
     /// first. Fixed by making `items` a growable heap buffer (`k_alloc`/`realloc`, freed
     /// after `k_list` copies it), the SAME doubling pattern the file already uses elsewhere
-    /// (`kre_class`'s `REPUSH` macro, `kre_match_piece`'s `ends` array).
+    /// (`kre_class`'s `REPUSH` macro). (`kre_match_piece`'s own former `ends` array, cited
+    /// here at the time of this fix, no longer exists post-PR-it1067's continuation-passing
+    /// rewrite of the matcher -- this doc comment's own historical citation is now stale,
+    /// left as-is except for this parenthetical rather than rewritten, since the doubling-
+    /// buffer PATTERN this comment documents is unaffected by that later, unrelated fix.)
     #[test]
     fn native_re_find_all_is_not_truncated_past_8192_matches() {
         if !cc_available() {
