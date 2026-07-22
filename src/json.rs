@@ -390,6 +390,26 @@ fn format_num(n: f64) -> Result<String, String> {
     if !n.is_finite() {
         return Err("cannot serialize a non-finite number (NaN/Infinity) to JSON".into());
     }
+    // A REAL bug found+fixed (production-hardening PR-it1066, a background
+    // close-read survey finding): `n as i64` has no representation for
+    // negative zero (the sign bit is simply discarded by the cast), so
+    // `-0.0` -- which satisfies both `fract() == 0.0` and `abs() < 1e15`,
+    // taking the SAME integer-cast branch below as any other whole number
+    // -- silently printed `"0"` instead of `"-0"`. This codebase treats
+    // `-0.0` textual-sign fidelity as an actively-enforced invariant
+    // elsewhere (`vm.rs`'s own float `Display`/formatting differential
+    // tests lock in `-0.0` sign preservation) -- this was the one place in
+    // THIS file that silently dropped it. Live-confirmed BEFORE this fix:
+    // `json_stringify(json_parse("-0")..)` produced `"0"`, breaking the
+    // round-trip; ordinary negative integers (`-1`, `-1000000000000000`)
+    // were unaffected -- the bug is narrowly scoped to exactly `-0.0`. The
+    // `else` branch below (`n.to_string()`, used for non-integral/large
+    // values) already correctly emits `"-0"` for `-0.0` -- Rust's own
+    // `f64::to_string()` preserves the sign -- so route negative zero
+    // through an explicit early return instead of the lossy `as i64` cast.
+    if n == 0.0 && n.is_sign_negative() {
+        return Ok("-0".to_string());
+    }
     if n.fract() == 0.0 && n.abs() < 1e15 {
         Ok(format!("{}", n as i64))
     } else {
@@ -504,6 +524,22 @@ mod tests {
     #[test]
     fn integral_floats_have_no_decimal() {
         assert_eq!(roundtrip("[1, 2.0, 2.5]"), "[1,2,2.5]");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1066, a background
+    /// close-read survey finding): see `format_num`'s own doc comment for
+    /// the full writeup. `n as i64` has no representation for negative
+    /// zero, so `-0.0` used to silently lose its sign and round-trip to
+    /// `"0"` instead of `"-0"` -- confirmed narrowly scoped to exactly
+    /// `-0.0` (an ordinary negative integer round-trips fine).
+    #[test]
+    fn negative_zero_round_trips_with_its_sign_preserved() {
+        assert_eq!(roundtrip("-0"), "-0");
+        assert_eq!(roundtrip("-0.0"), "-0");
+        // sanity: positive zero and ordinary negative integers are unaffected.
+        assert_eq!(roundtrip("0"), "0");
+        assert_eq!(roundtrip("-1"), "-1");
+        assert_eq!(roundtrip("-1000000000000000"), "-1000000000000000");
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it634): `1e400` is a
