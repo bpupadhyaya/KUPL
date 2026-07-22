@@ -189,9 +189,26 @@ fn run_cli() -> ExitCode {
                 2
             }
         },
-        Some("new") => match args.get(1) {
-            Some(name) => scaffold_project(name),
-            None => {
+        // A REAL bug found+fixed (production-hardening PR-it1062, a background
+        // close-read survey finding): the SAME "unexpected extra argument
+        // silently dropped" shape PR-it864 already closed for `diff`/`context`
+        // just above -- `new` took its single positional argument via a raw
+        // `args.get(1)`, never checking `args.get(2)` at all, so a genuinely
+        // unexpected SECOND positional argument (a plausible typo, or a
+        // leftover argument from a copy-pasted/mis-templated command, e.g. a
+        // script doing `kupl new "$name" "$stray_var"`) was silently IGNORED
+        // with zero diagnostic, scaffolding the project from just the first
+        // argument. Live-confirmed BEFORE this fix: `kupl new demo
+        // unexpected_second_arg unexpected_third_arg` created `demo/` cleanly,
+        // exit 0, with the extra arguments never examined or mentioned
+        // anywhere -- a CI-invisibility risk, matching PR-it864's own framing.
+        Some("new") => match (args.get(1), args.get(2)) {
+            (Some(name), None) => scaffold_project(name),
+            (Some(_), Some(extra)) => {
+                eprintln!("error: unexpected extra argument `{extra}`");
+                2
+            }
+            (None, _) => {
                 eprintln!("usage: kupl new <project-name>");
                 2
             }
@@ -1096,6 +1113,41 @@ mod tests {
         assert_eq!(d_ok.status.code(), Some(1), "a real semantic change must still report exit 1: {d_ok:?}");
         let c_ok = run(&["context", a.to_str().unwrap(), "main"]);
         assert_eq!(c_ok.status.code(), Some(0), "{c_ok:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1062, a background
+    /// close-read survey finding): the SAME "unexpected extra argument
+    /// silently dropped" shape the test above locks in for `diff`/`context`
+    /// (PR-it864) also applied to `new`, which took its single positional
+    /// argument via a raw `args.get(1)`, never checking `args.get(2)` at
+    /// all. Live-confirmed BEFORE this fix: `kupl new demo extra_arg`
+    /// created `demo/` cleanly, exit 0, `extra_arg` never examined.
+    #[test]
+    fn new_rejects_a_genuine_extra_argument_instead_of_silently_dropping_it() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-new-extra-arg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str], cwd: &std::path::Path| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).current_dir(cwd).output().expect("kupl runs")
+        };
+
+        let n = run(&["new", "demo", "extra_arg"], &dir);
+        assert_eq!(n.status.code(), Some(2), "{n:?}");
+        assert!(
+            String::from_utf8_lossy(&n.stderr).contains("unexpected extra argument `extra_arg`"),
+            "{n:?}"
+        );
+        assert!(!dir.join("demo").exists(), "a rejected `new` invocation must not create the project dir");
+
+        // sanity: the ordinary single-argument form is entirely unaffected.
+        let n_ok = run(&["new", "demo"], &dir);
+        assert_eq!(n_ok.status.code(), Some(0), "{n_ok:?}");
+        assert!(dir.join("demo").join("kupl.toml").exists(), "a valid `new` invocation must still scaffold the project");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
