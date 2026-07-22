@@ -19040,4 +19040,129 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
             "native: the component workload took {elapsed:?}, expected well under {NATIVE_BOUND:?} -- possible performance regression"
         );
     }
+
+    /// A FIFTH performance-regression GUARD, production-hardening PR-it1035
+    /// -- PR-it1011/it1012/it1013/it1014's guards exercise recursive call
+    /// dispatch, plain arithmetic/loop dispatch, string/method dispatch, and
+    /// component instantiation respectively; this one exercises `Map`/`Set`
+    /// insert-then-lookup dispatch specifically, never covered by ANY
+    /// existing guard. UNLIKE the other four, this workload is NOT a flat
+    /// dispatch-cost check -- `Map.insert`/`Set.insert` are each documented
+    /// (interp.rs's own match arms) as an O(n) clone-then-linear-scan per
+    /// call, so building an N-entry Map/Set via N sequential `.insert()`
+    /// calls is genuinely O(n^2) BY DESIGN (immutable, small-collection-
+    /// oriented semantics, not a bug -- there is no incremental fast path
+    /// the way `.unique()`/`.union()`/`group_by()` have for their own ONE-
+    /// SHOT batch conversions, since each `.insert()` here is a genuinely
+    /// separate call with no way to know how many more are coming). This
+    /// guard exists specifically to give a FUTURE refactor of `Map`/`Set`'s
+    /// internal representation a documented, tested baseline for the
+    /// CURRENT quadratic cost, so a future change that makes it WORSE (not
+    /// just "still quadratic") is caught. Empirically measured baseline
+    /// FIRST (debug `kupl` CLI, the SAME unoptimized profile `cargo test`
+    /// itself builds under) before picking N/bounds: 1,000 sequential Map
+    /// inserts + 1,000 sequential Set inserts + 2,000 lookups (`.contains_"
+    /// "key`/`.contains`) took ~0.23s (interp) / ~0.23s (VM) / ~0.14s
+    /// (native) -- N deliberately kept smaller than the OTHER four guards'
+    /// own N (2,000 was tried first and already took ~0.9s, confirming the
+    /// genuine O(n^2) cost live before picking the final, faster N). Bounds
+    /// here are 10s (interp/VM, >40x margin) and 5s (native, >30x margin),
+    /// matching the SAME wide-margin philosophy as the other four guards.
+    /// Times ONLY execution (never compile/build time). Asserts the CORRECT
+    /// result (`2*N`, since every one of the N keys/elements is present in
+    /// both `m` and `s` by construction) on every engine, independently
+    /// hand-computed, not just trusted from one engine. No recursion at all
+    /// (plain `while` loops), so no `std::thread::Builder` stack-size
+    /// wrapping needed -- confirmed live before finalizing.
+    #[test]
+    fn perf_guard_a_moderate_map_and_set_insert_then_lookup_workload_completes_well_within_a_generous_time_bound_on_every_engine(
+    ) {
+        const N: i64 = 1_000;
+        let expected: i64 = 2 * N;
+        const INTERP_VM_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+        const NATIVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let work_src = format!(
+            "fun work() -> Int {{\n    \
+             var m = Map()\n    var i = 0\n    \
+             while i < {N} {{\n        \
+             m = m.insert(i, i * 2)\n        \
+             i = i + 1\n    }}\n    \
+             var s = Set()\n    i = 0\n    \
+             while i < {N} {{\n        \
+             s = s.insert(i)\n        \
+             i = i + 1\n    }}\n    \
+             var total = 0\n    i = 0\n    \
+             while i < {N} {{\n        \
+             if m.contains_key(i) {{\n            total = total + 1\n        }}\n        \
+             if s.contains(i) {{\n            total = total + 1\n        }}\n        \
+             i = i + 1\n    }}\n    \
+             total\n}}\n"
+        );
+
+        // interp
+        let interp_src = format!("{work_src}fun main() -> Int {{ work() }}\n");
+        let compiled = crate::run::compile(&interp_src).expect("program compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = crate::interp::Interp::new(db);
+        let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+        let start = std::time::Instant::now();
+        let result = interp
+            .call_value(f, vec![], crate::diag::Span::default())
+            .unwrap_or_else(|_| panic!("interp: the Map/Set workload must not panic"));
+        let elapsed = start.elapsed();
+        assert_eq!(result, crate::value::Value::Int(expected), "interp: wrong total result");
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "interp: the Map/Set workload took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // VM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = crate::vm::Vm::new(&module);
+        let start = std::time::Instant::now();
+        let result = vm
+            .call_named("main", vec![])
+            .unwrap_or_else(|e| panic!("vm: the Map/Set workload must not error: {}", e.msg));
+        let elapsed = start.elapsed();
+        assert_eq!(result, crate::value::Value::Int(expected), "vm: wrong total result");
+        assert!(
+            elapsed < INTERP_VM_BOUND,
+            "vm: the Map/Set workload took {elapsed:?}, expected well under {INTERP_VM_BOUND:?} -- possible performance regression"
+        );
+
+        // native
+        if !cc_available() {
+            return;
+        }
+        let native_src = format!("{work_src}fun main() uses io {{\n    print(work())\n}}\n");
+        let compiled = crate::run::compile(&native_src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base =
+            std::env::temp_dir().join(format!("kupl-cgen-mapsetperfguard-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            expected.to_string(),
+            "native: wrong total result"
+        );
+        assert!(
+            elapsed < NATIVE_BOUND,
+            "native: the Map/Set workload took {elapsed:?}, expected well under {NATIVE_BOUND:?} -- possible performance regression"
+        );
+    }
 }
