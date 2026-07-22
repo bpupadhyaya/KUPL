@@ -620,8 +620,31 @@ fn offset_at(text: &str, line: usize, character: usize) -> usize {
     off.min(text.len())
 }
 
+/// Whether `c` continues a KUPL identifier -- MUST match `lexer.rs::lex_ident`'s
+/// own continuation rule (`b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80`)
+/// byte-for-byte, or `ident_at`/`ident_under` disagree with the real lexer
+/// about where an identifier token ends. A REAL bug found+fixed (production-
+/// hardening PR-it1031): the lexer treats ANY non-ASCII byte as an identifier
+/// continuation character (deliberately permissive, to support e.g. `café`/
+/// `日本` identifiers), but this previously used `char::is_alphanumeric()`,
+/// which is FALSE for non-ASCII characters outside Unicode's alphabetic/
+/// numeric categories (symbols, punctuation, a stray non-breaking space
+/// U+00A0 pasted adjacent to a name, etc.) -- so an identifier like `a°b`
+/// (accepted by the lexer as ONE token, and by a program that compiles
+/// successfully end-to-end) got incorrectly split at `°` by `ident_at`'s
+/// backward/forward scan, silently truncating it to `"a"`. Every downstream
+/// consumer (`resolve_hover`, `resolve_definition`, `resolve_signature_help`,
+/// `resolve_document_highlight`, and `textDocument/rename`) then searched for
+/// an item named `"a"`, found nothing, and returned an empty/`None` result --
+/// for rename specifically, a well-formed but SILENTLY EMPTY `WorkspaceEdit`
+/// that looks successful to the client but renames nothing, the same "quiet
+/// failure of a mutating operation" class PR-it754/PR-it990 treated as high
+/// severity for `didChange`. Live-confirmed BEFORE this fix: `resolve_hover`/
+/// `resolve_definition` returned `None` at the exact byte offset of a valid
+/// `fun a°b() -> Int { 1 }` declaration, while `occurrences(text, "a°b")`
+/// (the identifier's REAL, lexer-assigned name) found it correctly.
 fn is_ident(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()
 }
 
 /// Whether `s` is syntactically valid as a KUPL identifier -- non-empty,
@@ -3144,6 +3167,90 @@ mod tests {
     fn uri_to_path_correctly_reassembles_a_percent_encoded_multibyte_character() {
         let uri = path_to_uri(std::path::Path::new("/tmp/日本語.kupl"));
         assert_eq!(uri_to_path(&uri), Some(PathBuf::from("/tmp/日本語.kupl")));
+    }
+
+    /// A REAL, live-confirmed silent-failure bug found+fixed (production-
+    /// hardening PR-it1031, an Explore survey finding on `is_ident`'s own
+    /// definition): see `is_ident`'s own doc comment for the full analysis.
+    /// `a°b` (`°` = U+00B0, a non-ASCII SYMBOL, not an alphabetic/numeric
+    /// character) lexes as ONE identifier token and compiles as a real,
+    /// valid program -- but `is_ident`'s old `char::is_alphanumeric()` check
+    /// incorrectly split it at `°`, so `ident_at` extracted the truncated,
+    /// nonexistent name `"a"` instead of the real `"a°b"`, and every
+    /// consumer (`resolve_hover`/`resolve_definition`) silently returned
+    /// `None` at a position squarely inside a valid declaration.
+    #[test]
+    fn hover_and_definition_find_an_identifier_containing_a_non_ascii_symbol_character() {
+        let src = "fun a\u{b0}b() -> Int { 1 }\nfun main() { print(a\u{b0}b()) }\n";
+        // The lexer really does treat this as ONE identifier token, and the
+        // program compiles -- this is a real, valid program, not adversarial
+        // malformed input.
+        let (toks, _diags) = crate::lexer::lex(src);
+        assert!(
+            toks.iter().any(|t| matches!(&t.tok, crate::token::Tok::Ident(s) if s == "a\u{b0}b")),
+            "expected the lexer to produce one Ident(\"a°b\") token: {toks:?}"
+        );
+        assert!(crate::run::compile(src).is_ok(), "expected this program to compile");
+        // Hover/definition at the declaration's own name (line 0, col 4) must
+        // find the FULL identifier, not silently fail.
+        assert_eq!(resolve_hover(src, 0, 4), Some("```kupl\nfun a\u{b0}b() -> Int\n```".to_string()));
+        assert_eq!(resolve_definition(src, 0, 4), Some((0, 4, 0, 7)));
+        // occurrences() under the REAL name finds both the declaration and
+        // the call site; the OLD truncated name resolves to nothing.
+        assert_eq!(occurrences(src, "a\u{b0}b"), vec![(0, 4, 0, 7), (1, 19, 1, 22)]);
+        assert_eq!(occurrences(src, "a"), Vec::<(usize, usize, usize, usize)>::new());
+    }
+
+    /// Sibling to the unit test above, exercising the FULL `textDocument/
+    /// rename` JSON-RPC handler (spawning the real `kupl lsp` subprocess,
+    /// matching PR-it767's/PR-it787's own established harness) -- this is
+    /// the MORE severe sub-case PR-it1031's own fix addresses: before the
+    /// fix, this returned a well-formed, non-null `{"changes":{}}` edit that
+    /// LOOKS successful to an LSP client but silently renames nothing.
+    #[test]
+    fn rename_finds_and_renames_an_identifier_containing_a_non_ascii_symbol_character() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let src = "fun a\u{b0}b() -> Int { 1 }\nfun main() { print(a\u{b0}b()) }\n";
+        let did_open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///rename_nonascii_symbol_it1031.kupl","text":{src:?}}}}}}}"#
+        );
+        let rename = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_nonascii_symbol_it1031.kupl"},"position":{"line":0,"character":4},"newName":"renamed"}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init.to_string(), did_open, rename.to_string()] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung on a rename request");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+        // Both the declaration AND the call site must be covered by the edit
+        // -- an empty `{"changes":{}}` (the pre-fix behavior) would also
+        // contain the substring `"changes":{` and slip past a weaker check.
+        assert!(
+            stdout.matches("renamed").count() >= 2,
+            "rename must replace both the declaration and the call site, not silently do nothing: {stdout}"
+        );
     }
 
     // a small multi-item program for the language-feature tests
