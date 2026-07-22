@@ -272,6 +272,47 @@ impl Module {
 fn aliasing_regs(op: &Op) -> Vec<Reg> {
     match op {
         Op::Move(_dst, src) => vec![*src],
+        // A REAL, LIVE-CONFIRMED silent value-corruption bug found+fixed
+        // (production-hardening PR-it1045, the NINTH instance of the
+        // escape-analysis-completeness family opened at it615, found via a
+        // close-read survey scoped to this exact function): `Add`/`Sub`/
+        // `Mul`/`Div`/`Rem`/`Lt`/`Le`/`Gt`/`Ge` were entirely absent from
+        // this match, exactly the SAME gap PR-it811 fixed for `Method` --
+        // whenever an operand is a `Ctor` (a user record type), native's
+        // `k_add`/`k_sub`/`k_mul`/`k_div`/`k_rem`/`k_cmp` (cgen.rs) fall back
+        // to `k_op_overload`, a PLAIN CALL into the user's own operator-
+        // overload function (`fun add(a: T, b: T) -> T { .. }`), whose
+        // return value is used with ZERO cloning -- exactly like
+        // `Str.replace_first` returning its receiver unchanged (PR-it811),
+        // a user overload can just as easily return one of ITS OWN
+        // arguments (or a field extracted from one) verbatim, e.g. `fun
+        // add(a: Box, b: Box) -> Str { a.s }`. Since none of these nine
+        // variants were tracked, this passthrough alias was invisible to
+        // the self-rebind safety net entirely. Live-confirmed: `type Box =
+        // Box(s: Str)` with `fun add(a: Box, b: Box) -> Str { a.s }`,
+        // building a string `s` via repeated self-append, wrapping it in
+        // `box1 = Box(s: s)`, then `var f = box1 + box2; f = f + "d"` --
+        // interp/VM correctly printed `abc/abc/abcd` (`s`/`box1.s`
+        // untouched, `f` independent), but `kupl native` printed
+        // `abcd/abcd/abcd` -- the overloaded `+`'s returned string
+        // (`box1.s`, sharing `s`'s own buffer) was silently mutated in
+        // place by the later `f = f + "d"` self-append, corrupting `s` and
+        // `box1.s` too. Only `Eq`/`Ne` (deliberately non-overloadable,
+        // always structural) and `Neg`/`Not` (no `k_op_overload` call at
+        // all) are genuinely safe and correctly remain uncovered. Both
+        // operand registers are treated as escaping, matching `Method`'s
+        // own conservative treatment of its receiver AND argument
+        // registers just below -- an overload could plausibly return
+        // either operand unchanged.
+        Op::Add(_dst, a, b)
+        | Op::Sub(_dst, a, b)
+        | Op::Mul(_dst, a, b)
+        | Op::Div(_dst, a, b)
+        | Op::Rem(_dst, a, b)
+        | Op::Lt(_dst, a, b)
+        | Op::Le(_dst, a, b)
+        | Op::Gt(_dst, a, b)
+        | Op::Ge(_dst, a, b) => vec![*a, *b],
         Op::Call { start, argc, .. }
         | Op::CallComp { start, argc, .. }
         | Op::CallBuiltin { start, argc, .. }
@@ -846,6 +887,37 @@ mod escape_tests {
     }
 
     #[test]
+    fn arithmetic_op_reading_an_operand_before_push_escapes() {
+        // production-hardening PR-it1045, the SAME class as
+        // `method_call_reading_the_receiver_before_push_escapes` immediately
+        // above, for `Add`/`Sub`/`Mul`/`Div`/`Rem`/`Lt`/`Le`/`Gt`/`Ge`
+        // instead of `Method`: whenever an operand is a `Ctor`, native's
+        // `k_add`/etc. (cgen.rs) dispatch to a user-defined operator overload
+        // via a PLAIN CALL with no cloning -- exactly like `Str.
+        // replace_first` can return its receiver unchanged, an overload can
+        // return one of ITS OWN operands (or a field of one) unchanged. Live-
+        // confirmed before this fix: `type Box = Box(s: Str)` with `fun
+        // add(a: Box, b: Box) -> Str { a.s }`, `var f = box1 + box2; f = f +
+        // "d"` corrupted `box1.s`'s own shared buffer on `kupl native` only.
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::Add(1, 0, 0), // register 0 read as BOTH operands of an Add
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+
+        // the same shape via a comparison op (Lt/Le/Gt/Ge share ONE match
+        // arm with the arithmetic ops -- check.rs::infer_call lets a `lt`/
+        // `le`/`gt`/`ge` overload return any type, not just Bool).
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::Lt(1, 0, 0), // register 0 read as BOTH operands of an Lt
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
     fn closure_capture_before_push_escapes() {
         let c = chunk(vec![
             Op::MakeList { dst: 0, start: 0, len: 0 },
@@ -1025,6 +1097,21 @@ mod escape_tests {
         let c = chunk(vec![
             Op::Const(0, 0),
             Op::Method { dst: 1, recv: 0, name: PUSH, start: 2, argc: 0 }, // s read as a receiver
+            Op::Const(2, 1),
+            self_add(0, 2),
+        ]);
+        assert!(add_lhs_escapes(&c, 3));
+    }
+
+    #[test]
+    fn arithmetic_op_reading_an_operand_before_self_add_escapes() {
+        // production-hardening PR-it1045, the Add-side counterpart of
+        // `arithmetic_op_reading_an_operand_before_push_escapes` -- see that
+        // test's comment for the concrete operator-overload aliasing this
+        // closes.
+        let c = chunk(vec![
+            Op::Const(0, 0),
+            Op::Sub(1, 0, 0), // register 0 read as BOTH operands of a Sub
             Op::Const(2, 1),
             self_add(0, 2),
         ]);
