@@ -266,7 +266,35 @@ fn split_outside_quotes(s: &str, delim: char) -> Vec<&str> {
 fn parse_string(v: &str) -> Option<String> {
     let v = v.trim();
     if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
-        Some(v[1..v.len() - 1].to_string())
+        let inner = &v[1..v.len() - 1];
+        // A REAL bug found+fixed (production-hardening PR-it1064, a
+        // background close-read survey finding): this format has NO escape
+        // mechanism at all (see this file's own top-of-file doc comment:
+        // "NOT a general TOML parser") -- `strip_comment`/
+        // `split_outside_quotes` (the naive `in_str` toggle-on-every-`"`
+        // technique they share) compute field/value boundaries assuming
+        // every value contains ZERO embedded `"` characters. When a value
+        // DOES contain one (e.g. a user's attempt at `\"` escaping, which
+        // this format silently does not support), the toggle desyncs for
+        // the REST of the line -- a subsequent field-separating comma gets
+        // wrongly swallowed as "inside a string", MERGING two inline-table
+        // fields into one and silently DROPPING whichever field never got
+        // its own key/value recognized. Live-confirmed BEFORE this fix:
+        // `web = { version = "a\"b", path = "c" }` parsed successfully to
+        // `Dep { path: None, version: Some("a\\\"b\", path = \"c") }` --
+        // `path` silently vanished and `version` ended up holding a
+        // corrupted blob containing the literal, unparsed text of the
+        // swallowed `path` field. Any value this function would otherwise
+        // extract that STILL contains an embedded `"` is therefore always
+        // a symptom of this exact desync having already happened earlier
+        // on the line -- never a legitimately encodable value -- so reject
+        // it here, at the single point every string value in this file
+        // flows through, converting the silent corruption into a clean
+        // parse error instead.
+        if inner.contains('"') {
+            return None;
+        }
+        Some(inner.to_string())
     } else {
         None
     }
@@ -690,6 +718,41 @@ mod tests {
         assert_eq!(
             m2.deps,
             vec![Dep { name: "web".into(), path: Some("a,b".into()), version: Some("1.2.0".into()) }]
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1064, a background
+    /// close-read survey finding): see `parse_string`'s own doc comment for
+    /// the full writeup. This format has no escape mechanism at all, so a
+    /// value containing an embedded `"` (e.g. a user's own attempt at `\"`
+    /// escaping) desyncs `split_outside_quotes`'s naive in-string toggle for
+    /// the REST of the line -- silently merging two inline-table fields and
+    /// dropping one entirely. Live-confirmed BEFORE this fix:
+    /// `web = { version = "a\"b", path = "c" }` parsed SUCCESSFULLY to
+    /// `Dep { path: None, version: Some("a\\\"b\", path = \"c") }` -- `path`
+    /// silently vanished and `version` held a corrupted blob containing the
+    /// literal, unparsed text of the swallowed `path` field.
+    #[test]
+    fn an_embedded_quote_inside_a_dependency_string_value_is_a_clean_error_not_silent_field_corruption() {
+        let err = parse("[dependencies]\nweb = { version = \"a\\\"b\", path = \"c\" }\n")
+            .expect_err("an embedded quote must be a clean error, not silent field-swallowing");
+        assert!(err.contains("expected a string value"), "{err}");
+
+        // the reverse field order must be caught identically.
+        let err2 = parse("[dependencies]\nweb = { path = \"a\\\"b\", version = \"1.0\" }\n")
+            .expect_err("an embedded quote must be a clean error regardless of field order");
+        assert!(err2.contains("expected a string value"), "{err2}");
+
+        // the bare-string shorthand form must be caught too, not just inline tables.
+        let err3 = parse("[dependencies]\nweb = \"a\\\"b\"\n")
+            .expect_err("an embedded quote in the bare-string shorthand must be a clean error");
+        assert!(err3.contains("expected a string or"), "{err3}");
+
+        // sanity: an ordinary, well-formed manifest is completely unaffected.
+        let m = parse("[dependencies]\nweb = { version = \"1.2.0\", path = \"c\" }\n").unwrap();
+        assert_eq!(
+            m.deps,
+            vec![Dep { name: "web".into(), path: Some("c".into()), version: Some("1.2.0".into()) }]
         );
     }
 }
