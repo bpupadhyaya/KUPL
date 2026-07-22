@@ -79,7 +79,7 @@ pub fn isolate(
         .map(|(mut item, prefix)| {
             let rename = renames.get(&prefix).cloned().unwrap_or_default();
             let deps = pkg_deps.get(&prefix).unwrap_or(&empty);
-            let mut r = Rewriter { rename: &rename, deps, scope: Vec::new() };
+            let mut r = Rewriter { rename: &rename, deps, scope: Vec::new(), tyvars: HashSet::new() };
             r.item(&mut item);
             item
         })
@@ -107,6 +107,14 @@ struct Rewriter<'a> {
     /// dependency's OWN resolved mangling prefix.
     deps: &'a HashMap<String, String>,
     scope: Vec<HashSet<String>>,
+    /// The CURRENT fun/type item's own `type_params` (`fun f[T](...)`/`type
+    /// Box[T]`), checked by `ty()` before falling through to the rename map
+    /// -- see `ty()`'s own doc comment for the bug this closes (production-
+    /// hardening PR-it1041). Not a stack: `type_params` only ever appear on
+    /// a single top-level `fun`/`type` item (never nested -- component
+    /// methods can't be generic, matching `check.rs::tyvars`'s own
+    /// clear-and-repopulate-per-item convention rather than a scope stack).
+    tyvars: HashSet<String>,
 }
 
 impl Rewriter<'_> {
@@ -140,6 +148,26 @@ impl Rewriter<'_> {
                 if let Some(m) = self.rename.get(&t.name) {
                     t.name = m.clone();
                 }
+                // A REAL, LIVE-CONFIRMED false-rejection bug found+fixed
+                // (production-hardening PR-it1041, the SAME close-read
+                // survey's secondary finding at PR-it1040): a generic
+                // type's own `type_params` (`type Box[T] = Box(v: T)`) were
+                // never tracked here, unlike `check.rs::resolve_ty`'s
+                // correct `self.tyvars`-first check -- so a variant field's
+                // bare reference to its OWN type parameter (`v: T`) was
+                // mangled to match an UNRELATED top-level `type` of the
+                // identical bare name in the SAME package, if one existed,
+                // even though the type parameter and the top-level type are
+                // in entirely different scopes. Unlike this file's other
+                // four fixed bugs (PR-it684/it841/it842/it961/it1040, all
+                // SILENT value corruption), this one is always LOUD -- type
+                // parameters are checked but fully erased at runtime, so
+                // the ONLY possible outcome is a K0200 type-mismatch
+                // rejection of otherwise-valid generic code purely due to
+                // an unrelated top-level name collision, never a runtime
+                // divergence. See `ty()`'s own doc comment for the exact
+                // mechanism.
+                self.tyvars = t.type_params.iter().cloned().collect();
                 for va in &mut t.variants {
                     if let Some(m) = self.rename.get(&va.name) {
                         va.name = m.clone();
@@ -148,6 +176,7 @@ impl Rewriter<'_> {
                         self.ty(&mut field.ty);
                     }
                 }
+                self.tyvars.clear();
             }
             Item::Component(c) => self.component(c),
             Item::Contract(c) => self.contract(c),
@@ -214,6 +243,14 @@ impl Rewriter<'_> {
     }
 
     fn fun_body(&mut self, f: &mut FunDecl) {
+        // See PR-it1041's own doc comment on the `Item::Type` arm above for
+        // the bug this closes -- the SAME gap, for a generic FUN's own
+        // `type_params` (`fun f[T](x: T) -> T { ... }`) instead of a
+        // generic type's. Kept active through the WHOLE function (params,
+        // ret, AND body below), matching `check.rs::check_fun`'s own
+        // `self.tyvars` lifetime -- a local `let x: T = ...` inside the
+        // body can reference the function's own type parameter too.
+        self.tyvars = f.type_params.iter().cloned().collect();
         for p in &mut f.params {
             self.ty(&mut p.ty);
             // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
@@ -266,6 +303,7 @@ impl Rewriter<'_> {
         }
         self.block(&mut f.body);
         self.pop();
+        self.tyvars.clear();
     }
 
     fn component(&mut self, c: &mut ComponentDecl) {
@@ -467,9 +505,37 @@ impl Rewriter<'_> {
         }
     }
 
+    /// A REAL, LIVE-CONFIRMED false-rejection bug found+fixed (production-
+    /// hardening PR-it1041, a close-read survey finding, independently
+    /// re-verified live before implementing): unlike `check.rs::resolve_ty`
+    /// (which checks `self.tyvars.contains_key(n)` FIRST, before any other
+    /// name resolution), this function used to mangle `TyExprKind::Name(n)`
+    /// purely by checking `self.rename` -- with zero notion of "is `n`
+    /// currently an in-scope type parameter of the enclosing generic
+    /// `fun`/`type`." So a generic `fun`/`type`'s own bare type-parameter
+    /// reference (`fun identity[T](x: T) -> T { x }`'s `x: T`/`-> T`) was
+    /// silently mangled to match an UNRELATED top-level `type` of the
+    /// identical bare name in the SAME dependency package, if one existed
+    /// (legal: a type parameter and a top-level type are different scopes
+    /// entirely) -- turning perfectly valid generic code into a K0200 type
+    /// mismatch purely due to an unrelated top-level name collision.
+    /// Live-confirmed BEFORE this fix: `pub fun identity[T](x: T) -> T { x
+    /// }` alongside an unrelated `type T = Alpha | Beta` in the SAME
+    /// dependency package failed as a consumed dependency with `K0200:
+    /// type mismatch in argument 1: expected T, found Int` (`T` here being
+    /// the MANGLED top-level type, not the type parameter) -- the
+    /// byte-identical function compiled and ran fine standalone (no
+    /// package involved) and as a dependency with no colliding `type T`
+    /// present, isolating the bug to cross-package mangling specifically.
+    /// `self.tyvars` is populated by `fun_body`/the `Item::Type` arm above,
+    /// from each generic item's own `type_params` -- see their own doc
+    /// comments for the exact lifetime.
     fn ty(&mut self, t: &mut TyExpr) {
         match &mut t.kind {
             TyExprKind::Name(n) => {
+                if self.tyvars.contains(n.as_str()) {
+                    return;
+                }
                 if let Some(m) = self.rename.get(n) {
                     *n = m.clone();
                 }

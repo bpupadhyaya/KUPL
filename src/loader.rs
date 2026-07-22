@@ -1854,6 +1854,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL, LIVE-CONFIRMED false-rejection bug found+fixed (production-
+    /// hardening PR-it1041, the SAME survey's secondary finding from the
+    /// PR-it1040 iteration, independently re-verified live before
+    /// implementing). Unlike this file's other bugs of this general shape
+    /// (all silent VALUE corruption), this one is always LOUD: a generic
+    /// `fun`/`type`'s own bare type-parameter reference was never checked
+    /// against `resolve.rs`'s `self.tyvars` before falling through to the
+    /// rename map, so `fun identity[T](x: T) -> T { x }` alongside an
+    /// UNRELATED top-level `type T = Alpha | Beta` in the SAME dependency
+    /// package -- legal, since a type parameter and a top-level type are
+    /// different scopes -- got its `x: T`/`-> T` silently mangled to match
+    /// the colliding top-level type instead, turning perfectly valid
+    /// generic code into a K0200 type-mismatch when consumed as a
+    /// dependency. Covers BOTH shapes found by the survey: a generic `fun`
+    /// and a generic record `type`, each with an analogous collision.
+    #[test]
+    fn generic_type_parameter_colliding_with_a_top_level_type_is_not_mangled() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let base = std::env::temp_dir().join(format!("kupl-typeparam-collision-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+
+        // shape 1: a generic FUN's own type parameter
+        std::fs::write(
+            dep.join("main.kupl"),
+            "type T = Alpha | Beta\n\npub fun identity[T](x: T) -> T {\n    x\n}\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use dep\n\nfun main() uses io {\n    print(dep.identity(42))\n}\n").unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["run", app.join("main.kupl").to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "42\n",
+            "a generic fun's own type parameter colliding with an unrelated top-level type in the \
+             SAME package must not be mistaken for it"
+        );
+
+        // shape 2: a generic record TYPE's own type parameter
+        std::fs::write(dep.join("main.kupl"), "type T = Alpha | Beta\n\npub type Box[T] = Box(v: T)\n").unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun main() uses io {\n    let b = dep.Box(v: 42)\n    print(b.v)\n}\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["run", app.join("main.kupl").to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "42\n",
+            "a generic type's own type parameter colliding with an unrelated top-level type in the \
+             SAME package must not be mistaken for it"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it775, an Explore
     /// survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
     /// live before implementing): `resolve.rs`'s `Rewriter::pattern` only
