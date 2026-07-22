@@ -246,51 +246,107 @@ fn value_to_json(shape: &AiShape, v: &Value) -> String {
 
 /// Serialize a parsed [`Json`] value back to a compact JSON string (used to
 /// echo assistant tool_use content and tool inputs into the message history).
+///
+/// A DEFENSIVE static-analysis completeness fix (production-hardening
+/// PR-it1048, closing the queued follow-up from PR-it1047's own codebase-wide
+/// survey): this used to recurse natively via Rust's own call stack into
+/// `Json::Arr`/`Json::Obj` children (`items.iter().map(dump_json)`) -- the
+/// SAME "unbounded native-recursion stack overflow" bug class this codebase
+/// has already fixed SIX times elsewhere (`Value::drop`/`eq`/`Display`/
+/// `approx_byte_size`/`value_key_eq` in value.rs, `to_portable`/
+/// `from_portable` in parallel.rs), and the EXACT sibling gap `json.rs`'s own
+/// `write_value` was fixed for at PR-it803/it806, specifically because "a
+/// Json value can be built directly via KUPL's own JArr/JObj constructors,
+/// bypassing json_parse's MAX_JSON_DEPTH" (that fix's own doc comment).
+/// UNLIKE those six prior instances, this ONE was not currently live-
+/// reachable at overflow depth: `lsp::parse_json` -- the ONLY parser that
+/// ever produces a `Json` value of this specific type -- already reuses
+/// `json::MAX_JSON_DEPTH` (500 levels) for its own recursion-depth guard,
+/// hard-capping any value this function could ever be called on today, far
+/// too shallow to overflow a native stack. Fixed anyway for CONSISTENCY with
+/// every sibling JSON-serialization path, which already made this exact
+/// choice, and as a pre-emptive hardening against a future change (a raised
+/// depth cap, or a new caller feeding a directly-constructed `Json` value
+/// bypassing the parser) silently reintroducing a bug class this codebase has
+/// otherwise fully eliminated. Mirrors `json.rs::write_value`'s own exact
+/// technique: an explicit heap-allocated work-stack of tagged `Item`s (a
+/// literal string chunk to append, an owned computed string, or a `&Json` to
+/// expand), bounding native call-stack depth to O(1) regardless of the
+/// value's own nesting depth, with unbounded ITERATION count instead.
 fn dump_json(j: &Json) -> String {
-    match j {
-        Json::Null => "null".into(),
-        Json::Bool(b) => b.to_string(),
-        Json::Num(n) => {
-            // PRODUCTION-HARDENING (PR-it773): `as i64` on a float outside i64's
-            // range doesn't error or wrap -- it SATURATES to exactly i64::MAX/MIN
-            // (Rust's documented float-to-int cast behavior since the 2018
-            // edition). `dump_json` is used to echo a model's OWN tool-call
-            // content back into conversation history for the next round
-            // (AnthropicProvider::round/OpenAiProvider::round below) -- so a
-            // large integer tool argument (a Snowflake-style ID, a large hash)
-            // that happens to exceed i64's range would silently become the
-            // FIXED sentinel 9223372036854775807/-9223372036854775808 in what
-            // the model believes is its own prior message, with no error
-            // anywhere. `i64::MAX as f64` is exactly 2^63 (i64::MAX itself,
-            // 2^63-1, isn't representable in f64) -- a STRICT `<` upper bound
-            // is required, since `n == i64::MAX as f64` itself still saturates
-            // on cast (confirmed empirically: `(i64::MAX as f64) as i64 ==
-            // i64::MAX`, NOT the actual value 2^63 that f64 held). `i64::MIN as
-            // f64` IS exact (a negative power of two), so `>=` is safe there.
-            // Outside this range, fall back to the SAME float-formatted string
-            // already used for genuinely fractional numbers below -- lossy at
-            // f64 precision like any large JSON number, but round-trips to
-            // SOME value derived from what was actually sent, not a sentinel
-            // that discards the input's magnitude entirely.
-            if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n < i64::MAX as f64 {
-                format!("{}", *n as i64)
-            } else {
-                format!("{n}")
-            }
-        }
-        Json::Str(s) => format!("\"{}\"", json_escape(s)),
-        Json::Arr(items) => {
-            let parts: Vec<String> = items.iter().map(dump_json).collect();
-            format!("[{}]", parts.join(","))
-        }
-        Json::Obj(pairs) => {
-            let parts: Vec<String> = pairs
-                .iter()
-                .map(|(k, v)| format!("\"{}\":{}", json_escape(k), dump_json(v)))
-                .collect();
-            format!("{{{}}}", parts.join(","))
+    enum Item<'a> {
+        Lit(&'static str),
+        Owned(String),
+        Val(&'a Json),
+    }
+    let mut out = String::new();
+    let mut stack: Vec<Item> = vec![Item::Val(j)];
+    while let Some(item) = stack.pop() {
+        match item {
+            Item::Lit(s) => out.push_str(s),
+            Item::Owned(s) => out.push_str(&s),
+            Item::Val(j) => match j {
+                Json::Null => out.push_str("null"),
+                Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                Json::Num(n) => {
+                    // PRODUCTION-HARDENING (PR-it773): `as i64` on a float outside i64's
+                    // range doesn't error or wrap -- it SATURATES to exactly i64::MAX/MIN
+                    // (Rust's documented float-to-int cast behavior since the 2018
+                    // edition). `dump_json` is used to echo a model's OWN tool-call
+                    // content back into conversation history for the next round
+                    // (AnthropicProvider::round/OpenAiProvider::round below) -- so a
+                    // large integer tool argument (a Snowflake-style ID, a large hash)
+                    // that happens to exceed i64's range would silently become the
+                    // FIXED sentinel 9223372036854775807/-9223372036854775808 in what
+                    // the model believes is its own prior message, with no error
+                    // anywhere. `i64::MAX as f64` is exactly 2^63 (i64::MAX itself,
+                    // 2^63-1, isn't representable in f64) -- a STRICT `<` upper bound
+                    // is required, since `n == i64::MAX as f64` itself still saturates
+                    // on cast (confirmed empirically: `(i64::MAX as f64) as i64 ==
+                    // i64::MAX`, NOT the actual value 2^63 that f64 held). `i64::MIN as
+                    // f64` IS exact (a negative power of two), so `>=` is safe there.
+                    // Outside this range, fall back to the SAME float-formatted string
+                    // already used for genuinely fractional numbers below -- lossy at
+                    // f64 precision like any large JSON number, but round-trips to
+                    // SOME value derived from what was actually sent, not a sentinel
+                    // that discards the input's magnitude entirely.
+                    if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n < i64::MAX as f64 {
+                        out.push_str(&format!("{}", *n as i64));
+                    } else {
+                        out.push_str(&format!("{n}"));
+                    }
+                }
+                Json::Str(s) => {
+                    out.push('"');
+                    out.push_str(&json_escape(s));
+                    out.push('"');
+                }
+                Json::Arr(items) => {
+                    out.push('[');
+                    stack.push(Item::Lit("]"));
+                    for (i, item) in items.iter().enumerate().rev() {
+                        stack.push(Item::Val(item));
+                        if i > 0 {
+                            stack.push(Item::Lit(","));
+                        }
+                    }
+                }
+                Json::Obj(pairs) => {
+                    out.push('{');
+                    stack.push(Item::Lit("}"));
+                    for (i, (k, v)) in pairs.iter().enumerate().rev() {
+                        stack.push(Item::Val(v));
+                        stack.push(Item::Lit(":"));
+                        stack.push(Item::Owned(format!("\"{}\"", json_escape(k))));
+                        if i > 0 {
+                            stack.push(Item::Lit(","));
+                        }
+                    }
+                }
+            },
         }
     }
+    out
 }
 
 /// Convert parsed JSON to a KUPL value guided by the shape.
@@ -1000,9 +1056,16 @@ fn tool_response(
         // so interp and native agree — malformed/garbage mock text becomes the raw
         // final answer on both.
         let strict = crate::json::parse(&script).is_ok();
-        let rounds = match parse_json(&script) {
-            Ok(Json::Arr(a)) if strict => a,
-            Ok(other) if strict => vec![Json::Obj(vec![("final".into(), other)])],
+        // `Json` now has a custom `Drop` impl (production-hardening PR-it1048),
+        // which disallows moving a field out of an owned `Json` via pattern
+        // matching -- swap the value out through a `&mut` binding instead
+        // (`mem::take`/`mem::replace`), rather than moving it.
+        let mut parsed = parse_json(&script);
+        let rounds = match &mut parsed {
+            Ok(Json::Arr(a)) if strict => std::mem::take(a),
+            Ok(other) if strict => {
+                vec![Json::Obj(vec![("final".into(), std::mem::replace(other, Json::Null))])]
+            }
             _ => vec![Json::Obj(vec![("final".into(), Json::Str(script.clone()))])],
         };
         let mut p = MockProvider { rounds, idx: 0 };
@@ -1320,6 +1383,44 @@ mod tests {
         // ordinary in-range/fractional numbers are completely unaffected.
         assert_eq!(dump_json(&Json::Num(42.0)), "42");
         assert_eq!(dump_json(&Json::Num(3.14)), "3.14");
+    }
+
+    /// PRODUCTION-HARDENING (PR-it1048): `dump_json` used to recurse natively
+    /// via Rust's own call stack into `Json::Arr`/`Json::Obj` children -- the
+    /// SAME "unbounded native-recursion stack overflow" bug class this
+    /// codebase has already fixed six times elsewhere (see `value.rs`'s
+    /// `Drop`/`PartialEq`/`Display`/`approx_byte_size`/`value_key_eq`, and
+    /// `parallel.rs`'s `to_portable`/`from_portable`). A `Json` value built
+    /// DIRECTLY in Rust (as this test does, bypassing `lsp::parse_json`'s own
+    /// `MAX_JSON_DEPTH` recursion-depth guard entirely) is not subject to any
+    /// depth cap -- so an ordinary `while`-loop-grown chain, however deep,
+    /// must not overflow the native stack. 2 million levels comfortably
+    /// exceeds any real native stack's own frame budget for a per-level
+    /// stack frame (confirmed separately: the OLD recursive implementation
+    /// reliably aborted with a native stack overflow around ~100k-200k
+    /// levels on this machine's default thread stack size).
+    #[test]
+    fn dump_json_does_not_stack_overflow_on_a_deeply_nested_value_built_directly_in_rust() {
+        let depth = 2_000_000;
+        let mut j = Json::Num(1.0);
+        for _ in 0..depth {
+            j = Json::Arr(vec![j]);
+        }
+        let s = dump_json(&j);
+        assert_eq!(s.len(), depth * 2 + 1, "expected `depth` opening + `depth` closing brackets around a single \"1\"");
+        assert!(s.starts_with(&"[".repeat(10)));
+        assert!(s.ends_with(&"]".repeat(10)));
+        assert!(s.contains("1"));
+
+        // same shape via Json::Obj (a single-key object nested `depth` levels
+        // deep), exercising the Obj arm's own work-stack pushes.
+        let mut j = Json::Num(1.0);
+        for _ in 0..depth {
+            j = Json::Obj(vec![("k".into(), j)]);
+        }
+        let s = dump_json(&j);
+        assert!(s.starts_with(&"{\"k\":".repeat(3)));
+        assert!(s.ends_with(&"}".repeat(10)));
     }
 
     #[test]

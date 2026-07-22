@@ -50,6 +50,43 @@ impl Json {
     }
 }
 
+// PRODUCTION-HARDENING (PR-it1048): a SECOND, independent instance of the
+// "unbounded native-recursion stack overflow" bug class found while writing
+// a deep-nesting regression test for `ai.rs::dump_json`'s own iterative
+// rewrite (see that function's doc comment) -- the test's own `Json` value,
+// built directly in Rust (bypassing `parse_json`'s `MAX_JSON_DEPTH` guard,
+// same threat model), overflowed the native stack not in `dump_json` itself
+// but in the compiler-GENERATED recursive drop glue when the value went out
+// of scope: `Json` derives no custom `Drop`, so freeing a `Json::Arr`/`Obj`
+// recurses natively into each child's own drop, exactly the same pattern
+// already fixed for `Value` in `value.rs` at PR-it799. Confirmed live via a
+// standalone `rustc`-compiled repro before this fix: building then dropping
+// a 2 000 000-deep `Json::Arr` chain aborted with a native stack overflow.
+// Fixed with the SAME technique as `Value`'s own `Drop` impl -- an explicit
+// `Vec<Json>` work-list, draining a container's owned children into it and
+// finishing teardown in a `while` loop instead of via recursive calls,
+// bounding native call-stack depth to O(1) regardless of nesting depth.
+// Simpler than `Value`'s version: `Json`'s `Arr`/`Obj` fields are plain owned
+// `Vec`s (no `Rc` sharing to check via `Rc::get_mut`), so every child can
+// always be drained unconditionally.
+fn collect_json_children(j: &mut Json, stack: &mut Vec<Json>) {
+    match j {
+        Json::Arr(items) => stack.extend(items.drain(..)),
+        Json::Obj(pairs) => stack.extend(pairs.drain(..).map(|(_, v)| v)),
+        _ => {}
+    }
+}
+
+impl Drop for Json {
+    fn drop(&mut self) {
+        let mut stack: Vec<Json> = Vec::new();
+        collect_json_children(self, &mut stack);
+        while let Some(mut child) = stack.pop() {
+            collect_json_children(&mut child, &mut stack);
+        }
+    }
+}
+
 pub fn parse_json(src: &str) -> Result<Json, String> {
     let bytes = src.as_bytes();
     let mut pos = 0usize;
@@ -165,8 +202,13 @@ fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> 
             }
             loop {
                 skip_ws(b, pos);
-                let key = match parse_value(b, pos, depth)? {
-                    Json::Str(s) => s,
+                // `Json` now has a custom `Drop` impl (production-hardening
+                // PR-it1048), which disallows moving a field out of an owned
+                // `Json` via pattern matching -- swap the string out through a
+                // `&mut` binding instead (`mem::take`), rather than moving it.
+                let mut key_val = parse_value(b, pos, depth)?;
+                let key = match &mut key_val {
+                    Json::Str(s) => std::mem::take(s),
                     _ => return Err("object key must be a string".into()),
                 };
                 skip_ws(b, pos);
