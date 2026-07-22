@@ -384,7 +384,43 @@ fn interface_of(item: &Item) -> String {
             let mut laws: Vec<&crate::ast::Law> = ct.laws.iter().collect();
             laws.sort_by_key(|law| &law.name);
             for law in laws {
-                s.push_str(&format!(" law:{}", law.name));
+                // A REAL, LIVE-CONFIRMED misclassification bug found+fixed
+                // (production-hardening PR-it1042, a close-read survey
+                // finding, independently re-verified live before
+                // implementing): only `law.name` was ever fingerprinted here
+                // -- `law.body` (the actual `forall`/`expect` assertion
+                // EVERY fulfilling component's `kupl test` run must satisfy)
+                // was invisible to `interface_of`, so strengthening or
+                // weakening a law's own assertion (same name, same contract
+                // signature, different body) was classified `[implementation
+                // only]` -- the SAME severity class as PR-it580 (a contract's
+                // effect budget silently not flagged as breaking), just for
+                // a law's own enforced guarantee instead. Live-confirmed: a
+                // `contract Store` with `law "..." { forall k: Str { expect
+                // get(k) >= 0 } }` strengthened to `expect get(k) > 100`,
+                // alongside an UNCHANGED fulfilling `component ZeroStore`
+                // (`expose fun get(k: Str) -> Int { 0 }`) -- `kupl test`
+                // genuinely went from `1 passed, 0 failed` to `FAIL ... `get
+                // (k) > 100` was not satisfied`` purely due to the contract
+                // update, yet `kupl diff` reported `changed contract Store
+                // [implementation only]` on both files, both of which
+                // `kupl check` cleanly. A package author trusting that
+                // verdict to bump `Store`'s version as a non-breaking patch
+                // would silently break every downstream fulfiller's test
+                // suite. Fixed by folding the law's own canonical body text
+                // into its fingerprint, reusing `canonical()`'s own exact
+                // "wrap in a synthetic single-item Program, run it through
+                // the formatter" technique (`Law` is the SAME struct used by
+                // both `Item::Law` and `ContractDecl.laws`, so this needs no
+                // new machinery) -- `interface_of`'s result is ONLY ever
+                // compared for string equality, never displayed, so
+                // embedding the body's full (possibly multi-line) rendered
+                // text here is safe.
+                let body_text = crate::fmt::format_program(&crate::ast::Program {
+                    items: vec![crate::ast::Item::Law(law.clone())],
+                    uses: Vec::new(),
+                });
+                s.push_str(&format!(" law:{}[{body_text}]", law.name));
             }
         }
         // a top-level law has no public interface (it is a test, not surface)
@@ -712,6 +748,40 @@ mod tests {
             "contract Store {\n    intent \"kv\"\n    expose fun get(key: Str) -> Int\n}\n",
         );
         assert_eq!(lines, vec!["interface Store"]);
+    }
+
+    /// A REAL, LIVE-CONFIRMED misclassification bug found+fixed (production-
+    /// hardening PR-it1042, a close-read survey finding, independently
+    /// re-verified live before implementing -- see `interface_of`'s own doc
+    /// comment on the `Item::Contract` branch for the full writeup). Only
+    /// `law.name` was ever fingerprinted -- `law.body` (the actual
+    /// `forall`/`expect` assertion every fulfilling component's `kupl test`
+    /// run must satisfy) was invisible, so strengthening/weakening a law's
+    /// own assertion, same name, same contract signature, was classified
+    /// "[implementation only]" -- the SAME severity class as PR-it580 (a
+    /// contract's effect budget silently not flagged as breaking), just for
+    /// a law's own enforced guarantee instead of its effect budget.
+    #[test]
+    fn contract_law_body_change_is_interface() {
+        let (lines, _) = diff_lines(
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n    \
+             law \"non-negative\" {\n        forall k: Str {\n            expect get(k) >= 0\n        }\n    }\n}\n",
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n    \
+             law \"non-negative\" {\n        forall k: Str {\n            expect get(k) > 100\n        }\n    }\n}\n",
+        );
+        assert_eq!(lines, vec!["interface Store"], "strengthening a law's own assertion is a breaking change to the contract");
+
+        // an UNRELATED body-only change to the contract's own `intent` string
+        // (display-only, not part of the enforced guarantee) must NOT be
+        // conflated with a genuine law-body change -- sanity-checks the fix
+        // is scoped to `law.body` specifically, not over-broadly triggered.
+        let (lines, _) = diff_lines(
+            "contract Store {\n    intent \"kv\"\n    expose fun get(k: Str) -> Int\n    \
+             law \"non-negative\" {\n        forall k: Str {\n            expect get(k) >= 0\n        }\n    }\n}\n",
+            "contract Store {\n    intent \"kv store\"\n    expose fun get(k: Str) -> Int\n    \
+             law \"non-negative\" {\n        forall k: Str {\n            expect get(k) >= 0\n        }\n    }\n}\n",
+        );
+        assert_eq!(lines, vec!["impl Store"], "an intent-string-only change must remain implementation-only");
     }
 
     /// A REAL BUG found+fixed (production-hardening PR-it643): the SAME sig-
