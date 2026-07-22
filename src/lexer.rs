@@ -886,6 +886,47 @@ mod tests {
         assert!(d("70000u16").contains("`u32` holds it"), "u16 overflow suggests u32");
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it1059, a background
+    /// close-read survey finding): `IntW::widen_to_fit` only ever searched
+    /// the SAME signedness family as the declared width, so a signed literal
+    /// (e.g. `i8`) whose value exceeds `i64::MAX` but fits `u64` exactly used
+    /// to fall through to the generic "too large for any fixed-width
+    /// integer; use the default `Int`" hint -- both claims false, since
+    /// `u64` holds the value and the bare unsuffixed literal ALSO overflows
+    /// `Int`'s own 64-bit range (K0004). Live-confirmed BEFORE this fix via
+    /// `18446744073709551615i8`.
+    #[test]
+    fn sized_overflow_beyond_every_signed_width_still_suggests_a_holding_unsigned_one() {
+        let d = |src: &str| {
+            lex(src)
+                .1
+                .into_iter()
+                .find(|d| d.code == "K0009")
+                .expect("K0009")
+                .message
+        };
+        // 18446744073709551615 (u64::MAX) overflows every signed width (i64::MAX is
+        // smaller) but fits u64 exactly -- must suggest u64, not "too large for any
+        // fixed-width integer".
+        let m = d("18446744073709551615i8");
+        assert!(m.contains("out of range for `i8`"), "shows i8 range: {m}");
+        assert!(
+            m.contains("`u64` holds it") && m.contains("0..18446744073709551615"),
+            "suggests u64 instead of falsely claiming no fixed width holds it: {m}"
+        );
+        assert!(
+            !m.contains("too large for any fixed-width integer"),
+            "must not show the generic hint when u64 genuinely holds the value: {m}"
+        );
+        // A value truly beyond every fixed width (including u64) must still show the
+        // generic hint -- confirms the fallback doesn't over-fire.
+        let m2 = d("999999999999999999999i8");
+        assert!(
+            m2.contains("too large for any fixed-width integer"),
+            "a value beyond u64::MAX too must keep the generic hint: {m2}"
+        );
+    }
+
     #[test]
     fn suffixed_overflow_never_silently_drops_the_declared_width() {
         // Two REAL bugs found+fixed (PR-it604, a lexer.rs sweep mirroring check.rs/

@@ -48,18 +48,45 @@ impl IntW {
     }
     /// The narrowest built-in width whose range holds `v`, for suggesting a fix
     /// when a literal overflows its declared width. Prefers the same signedness
-    /// family, but falls back to the signed widths when `v` is negative (no
-    /// unsigned width can hold a negative). Returns `None` when `v` is larger
-    /// than every fixed width (only reachable above the u64 / below the i64 range).
+    /// family (or the signed widths when `v` is negative, since no unsigned
+    /// width can hold a negative) but, if nothing in that preferred family
+    /// holds `v`, ALSO tries the other family before giving up — a REAL bug
+    /// found+fixed (production-hardening PR-it1059, a background close-read
+    /// survey finding): a non-negative `v` in `(i64::MAX, u64::MAX]` overflows
+    /// every SIGNED width, but previously this only ever searched the signed
+    /// family for a signed `self` (e.g. an `i8`-suffixed literal), returning
+    /// `None` and producing a K0009 hint claiming the value is "too large for
+    /// any fixed-width integer" even though `u64` holds it exactly. Live-
+    /// confirmed BEFORE this fix: `let a = 18446744073709551615i8` reported
+    /// "too large for any fixed-width integer; use the default `Int`" — both
+    /// claims false, since `u64` fits it exactly and the bare unsuffixed
+    /// literal ALSO fails (K0004, exceeds `Int`'s 64-bit range). Only a
+    /// negative `v` can never fit any unsigned width, so the fallback is
+    /// skipped in that case (unreachable from `lexer.rs`'s own caller today,
+    /// since a numeric literal's digits are always non-negative — negation is
+    /// a separate unary operator — but `widen_to_fit` is kept correct as a
+    /// general `IntW` method regardless of caller). Returns `None` only when
+    /// `v` truly fits no fixed width at all (`v > u64::MAX` or `v < i64::MIN`).
     pub fn widen_to_fit(self, v: i128) -> Option<IntW> {
         let signed = [IntW::I8, IntW::I16, IntW::I32, IntW::I64];
         let unsigned = [IntW::U8, IntW::U16, IntW::U32, IntW::U64];
-        let order: &[IntW] = if self.is_signed() || v < 0 {
-            &signed
+        let (primary, fallback): (&[IntW], &[IntW]) = if self.is_signed() || v < 0 {
+            (&signed, &unsigned)
         } else {
-            &unsigned
+            (&unsigned, &signed)
         };
-        order.iter().copied().find(|w| w.check_range(v))
+        primary
+            .iter()
+            .copied()
+            .find(|w| w.check_range(v))
+            .or_else(|| {
+                if v < 0 {
+                    // No unsigned width can ever hold a negative value.
+                    None
+                } else {
+                    fallback.iter().copied().find(|w| w.check_range(v))
+                }
+            })
     }
     /// Width in bits.
     pub fn bits(self) -> u32 {
