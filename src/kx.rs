@@ -1139,6 +1139,104 @@ mod tests {
         assert_eq!(module, decoded, "a .kx round-trip must be byte-for-byte structurally identical");
     }
 
+    /// The sibling structural round-trip test above only exercises whatever
+    /// `Op` variants the compiler happens to emit for ONE hand-written KUPL
+    /// program -- it can never guarantee EVERY one of `Op`'s 43 variants is
+    /// covered (production-hardening PR-it1032, closing a candidate PR-it831's
+    /// own follow-up agent explicitly flagged as NOT yet done: "did NOT
+    /// exhaustively re-verify every Op variant's own encode/decode symmetry").
+    /// This test instead hand-constructs ONE instance of literally every `Op`
+    /// variant directly (bypassing the compiler entirely), each with DISTINCT
+    /// field values (no value reused across two positions within the same
+    /// variant, and u16 index fields deliberately larger than u8 register
+    /// fields) so a field-ORDER bug in `encode_op`/`decode_op` -- e.g. writing
+    /// `start` where `argc` belongs, or reading a `u16` where a `u8` was
+    /// written -- cannot hide behind two fields happening to share a value.
+    /// Also covers BOTH branches of `Op`'s two variant-internal enums:
+    /// `MakeRange`'s `inclusive: bool` (both `true`/`false`) and `EmitOp`'s
+    /// `payload: Option<Reg>` (both `Some`/`None`).
+    #[test]
+    fn kx_roundtrip_preserves_every_op_variant_with_distinct_field_values() {
+        use crate::bytecode::{Chunk, Module, Op};
+        let code = vec![
+            Op::Const(1, 1001),
+            Op::Move(2, 3),
+            Op::Add(4, 5, 6),
+            Op::Sub(7, 8, 9),
+            Op::Mul(10, 11, 12),
+            Op::Div(13, 14, 15),
+            Op::Rem(16, 17, 18),
+            Op::Eq(19, 20, 21),
+            Op::Ne(22, 23, 24),
+            Op::Lt(25, 26, 27),
+            Op::Le(28, 29, 30),
+            Op::Gt(31, 32, 33),
+            Op::Ge(34, 35, 36),
+            Op::Neg(37, 38),
+            Op::Not(39, 40),
+            Op::Jump(100_001),
+            Op::JumpIfFalse(41, 100_002),
+            Op::JumpIfTrue(42, 100_003),
+            Op::Call { dst: 43, fun: 1002, start: 44, argc: 45 },
+            Op::CallComp { dst: 46, fun: 1003, start: 47, argc: 48 },
+            Op::CallBuiltin { dst: 49, which: 50, start: 51, argc: 52 },
+            Op::CallValue { dst: 53, f: 54, start: 55, argc: 56 },
+            Op::Method { dst: 57, recv: 58, name: 1004, start: 59, argc: 60 },
+            Op::Ret(61),
+            Op::MakeList { dst: 62, start: 63, len: 64 },
+            Op::MakeCtor { dst: 65, ctor: 1005, start: 66, len: 67 },
+            Op::GetField { dst: 68, obj: 69, idx: 70 },
+            Op::GetFieldNamed { dst: 71, obj: 72, name: 1006 },
+            Op::WithField { dst: 73, obj: 74, name: 1007, value: 75 },
+            Op::TagIs { dst: 76, obj: 77, ctor: 1008 },
+            Op::MakeClosure { dst: 78, proto: 1009, start: 79, ncaps: 80 },
+            Op::MakeRange { dst: 81, lo: 82, hi: 83, inclusive: true },
+            Op::MakeRange { dst: 84, lo: 85, hi: 86, inclusive: false },
+            Op::IterLen(87, 88),
+            Op::IterGet { dst: 89, iter: 90, idx: 91 },
+            Op::ToStr(92, 93),
+            Op::Concat(94, 95, 96),
+            Op::StateGet(97, 98),
+            Op::StateSet(99, 100),
+            Op::MakeInstance { dst: 101, comp: 1010, start: 102, argc: 103, policy: 104 },
+            Op::WireOp { from: 105, out_port: 1011, to: 106, in_port: 1012 },
+            Op::EmitOp { port: 1013, payload: Some(107) },
+            Op::EmitOp { port: 1014, payload: None },
+            Op::Panic(1015),
+            Op::CallAi { dst: 108, info: 1016, intent: 109 },
+        ];
+        let n = code.len();
+        let spans: Vec<crate::diag::Span> =
+            (0..n).map(|i| crate::diag::Span::new(i as u32, (i + 1) as u32)).collect();
+        let module = Module {
+            chunks: vec![Chunk {
+                name: "op_coverage".to_string(),
+                ncaps: 0,
+                nparams: 0,
+                nregs: 200,
+                consts: vec![],
+                code,
+                spans,
+            }],
+            ..Default::default()
+        };
+        let bytes = super::encode(&module);
+        let decoded = super::decode(&bytes).expect("decodes");
+        assert_eq!(
+            module, decoded,
+            "every Op variant, with distinct per-field values, must survive an encode/decode round trip"
+        );
+        // Sanity: confirm this test really did cover every DISTINCT variant
+        // (45 entries total -- 43 variants plus one extra `MakeRange`/`EmitOp`
+        // each, to cover both branches of their own internal `bool`/`Option`),
+        // so a FUTURE new Op added to the enum without a corresponding entry
+        // here fails loudly instead of silently going unfuzzed.
+        let distinct: std::collections::HashSet<_> =
+            decoded.chunks[0].code.iter().map(std::mem::discriminant).collect();
+        assert_eq!(n, 45, "expected 43 Op variants + 2 extra branch-coverage entries (MakeRange, EmitOp)");
+        assert_eq!(distinct.len(), 43, "Op has 43 DISTINCT variants as of PR-it1032 -- if this fails, a variant was ADDED or REMOVED; update this test's own `code` list to match");
+    }
+
     #[test]
     fn corrupt_kx_is_rejected_not_a_crash() {
         // A tampered/untrusted .kx must decode to a clean Err — never a panic, an
