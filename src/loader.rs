@@ -167,9 +167,33 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
                             // now also refuses to WRITE a colliding cache entry in the first
                             // place -- see `fetch_package_with`'s own new check) instead of
                             // silently running the wrong code.
-                            let identity_confirmed = crate::manifest::read(&cached_manifest)
-                                .map(|cm| cm.name == dep.name)
-                                .unwrap_or(false);
+                            // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+                            // PR-it1060, a background close-read survey finding re-examining
+                            // this SAME check from a different angle): verifying only the
+                            // cached manifest's NAME left the VERSION component of `cached`
+                            // unchecked -- `cached.join("kupl.toml")` above resolves via the
+                            // OS's own case-insensitive path lookup even when the on-disk
+                            // directory's actual name differs from `v` only by case (e.g. a
+                            // directory materialized as `1.0.0-RC` is found and trusted when
+                            // `dep.version` is `1.0.0-rc`), so a project could silently reuse
+                            // a cache entry that was never actually fetched under the version
+                            // string it declared. Mirrors `registry.rs::fetch_package_with`'s
+                            // own matching WRITE-side fix for the same bug class (guarding the
+                            // exact-case existence of the per-package subdirectory's version
+                            // entry) by requiring an EXACT (case-sensitive) directory-name
+                            // match for `v` before trusting `identity_confirmed` at all.
+                            let version_dir_matches =
+                                std::fs::read_dir(crate::registry::cache_dir().join(&dep.name))
+                                    .map(|entries| {
+                                        entries
+                                            .flatten()
+                                            .any(|e| e.file_name().to_string_lossy() == *v)
+                                    })
+                                    .unwrap_or(false);
+                            let identity_confirmed = version_dir_matches
+                                && crate::manifest::read(&cached_manifest)
+                                    .map(|cm| cm.name == dep.name)
+                                    .unwrap_or(false);
                             if identity_confirmed {
                                 deps.insert(dep.name.clone(), (cached, Some(v.clone())));
                             } else {
@@ -905,6 +929,62 @@ mod tests {
             deps.iter().any(|(n, v)| n == "lib" && v == "1.0.0"),
             "expected `lib` to still be registry_only (not silently resolved via the \
              case-colliding `Lib` cache entry), got {deps:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1060, a background close-read survey finding re-examining the
+    /// name-level case-collision test above from a different angle): that
+    /// test's OWN fix only re-verifies the cached manifest's NAME, never
+    /// the VERSION component of `cached` -- `cached.join("kupl.toml")`
+    /// resolves via the OS's own case-insensitive path lookup even when
+    /// the on-disk directory's actual name differs from the declared
+    /// version only by case. Confirmed live BEFORE this fix: a project
+    /// declaring `json2 = { version = "1.0.0-rc" }`, with only a
+    /// differently-cased `1.0.0-RC` ever actually fetched, silently
+    /// resolved `json2` as already-fetched from that mismatched-version
+    /// directory -- no error, no re-fetch prompt. Fixed by requiring an
+    /// EXACT (case-sensitive) directory-name match for the declared
+    /// version before trusting `identity_confirmed` at all. Uses the SAME
+    /// `$HOME`-override technique as the test above (safe for the same
+    /// reason documented there).
+    #[test]
+    fn pkg_ctx_refuses_to_reuse_a_version_case_colliding_cached_registry_dependency() {
+        let fake_home = std::env::temp_dir().join(format!("kupl-pkgctx-version-case-collide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        let cached = fake_home.join(".kupl").join("registry-cache").join("json2").join("1.0.0-RC");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(cached.join("kupl.toml"), "[project]\nname = \"json2\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(cached.join("main.kupl"), "pub fun greet() -> Str { \"from-1.0.0-RC\" }\n").unwrap();
+
+        let proj = fake_home.join("projc");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("kupl.toml"),
+            "[project]\nname = \"projc\"\nentry = \"main.kupl\"\n\n[dependencies]\njson2 = { version = \"1.0.0-rc\" }\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("main.kupl"), "use json2\n\nfun main() uses io {\n    print(json2.greet())\n}\n")
+            .unwrap();
+
+        let real_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &fake_home);
+        let deps = super::registry_only_deps(proj.join("main.kupl").to_str().unwrap());
+        match real_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        // `json2` must still be reported as NOT-yet-fetched (registry_only) --
+        // never silently satisfied from the version-case-colliding `1.0.0-RC`
+        // cache entry.
+        let deps = deps.expect("registry_only_deps must not error");
+        assert!(
+            deps.iter().any(|(n, v)| n == "json2" && v == "1.0.0-rc"),
+            "expected `json2` to still be registry_only (not silently resolved via the \
+             version-case-colliding `1.0.0-RC` cache entry), got {deps:?}"
         );
 
         let _ = std::fs::remove_dir_all(&fake_home);

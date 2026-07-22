@@ -614,6 +614,42 @@ fn fetch_package_with(
             }
         }
     }
+    // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it1060,
+    // a background close-read survey finding re-examining PR-it930's own
+    // name-level case-collision fix immediately above from a DIFFERENT
+    // angle): that check only scans `cache_dir`'s TOP-LEVEL entries (package
+    // NAMES) for a case-insensitive collision -- it never scans
+    // `cache_dir.join(name)`'s own children for a collision on the VERSION
+    // component. `version`, exactly like `name` above, is caller-supplied
+    // (a local `kupl.toml` version-pin string, untrusted). On a case-
+    // insensitive filesystem, fetching `1.0.0-rc` after `1.0.0-RC` is
+    // already cached resolves `atomic_replace`'s destination to the SAME
+    // on-disk directory (confirmed live via matching inode numbers), so
+    // `materialize` silently overwrites the original, already-hash-
+    // verified version's content with the new, differently-cased version's
+    // content -- no error, no diagnostic. Worse, `loader.rs::pkg_ctx`'s own
+    // "already fetched" check (PR-it930's read-side defense) only re-
+    // verifies the cached manifest's NAME, never the version, so this also
+    // lets a project silently load a cached directory that was never
+    // fetched under the version string it actually declared (see that
+    // function's own matching PR-it1060 fix for the read-side half of this
+    // same bug class). Guarded the SAME way as the name-level check above,
+    // scanning the per-package subdirectory instead of `cache_dir` itself.
+    if let Ok(entries) = std::fs::read_dir(cache_dir.join(name)) {
+        let version_fold = version.to_lowercase();
+        for entry in entries.flatten() {
+            let existing = entry.file_name();
+            let existing = existing.to_string_lossy();
+            if existing.as_ref() != version && existing.to_lowercase() == version_fold {
+                return Err(format!(
+                    "package version `{version}` for `{name}` collides with the already-\
+                     cached version `{existing}` on a case-insensitive filesystem — \
+                     refusing to fetch (this would silently overwrite an already-cached \
+                     version's cache entry)"
+                ));
+            }
+        }
+    }
     let index_url = format!("{}/{name}.json", registry_url.trim_end_matches('/'));
     let index_text =
         fetch(&index_url).map_err(|e| format!("cannot fetch registry index for `{name}`: {e}"))?;
@@ -1377,6 +1413,41 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(existing.join("main.kupl")).unwrap(),
             "pub fun greet() -> Str { \"original-Lib-content\" }\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1060, a background
+    /// close-read survey finding re-examining the case-collision test above
+    /// from a different angle): that test only covers a collision on the
+    /// package NAME -- this proves the analogous collision on the VERSION
+    /// component of the SAME package is caught too. Confirmed live BEFORE
+    /// this fix: fetching `1.0.0-rc` after `1.0.0-RC` was already cached
+    /// silently overwrote the original version's content (same on-disk
+    /// directory on a case-insensitive filesystem), with `Ok(())` returned
+    /// and no diagnostic at all.
+    #[test]
+    fn fetch_package_with_refuses_to_overwrite_a_case_colliding_cached_version() {
+        let dir = std::env::temp_dir()
+            .join(format!("kupl-registry-fetch-version-case-collide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let existing = dir.join("json2").join("1.0.0-RC");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("kupl.toml"), "[project]\nname = \"json2\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(existing.join("main.kupl"), "pub fun greet() -> Str { \"original-1.0.0-RC-content\" }\n").unwrap();
+
+        let (_hash, urls) =
+            mock_index_and_files("json2", "1.0.0-rc", "pub fun greet() -> Str { \"unrelated-1.0.0-rc-content\" }\n");
+        let err = fetch_package_with(mock_fetcher(urls), "https://registry.example.com", "json2", "1.0.0-rc", &dir)
+            .unwrap_err();
+        assert!(err.contains("collides"), "{err}");
+        assert!(err.contains("1.0.0-RC"), "{err}");
+
+        // the pre-existing `1.0.0-RC` cache entry must be completely untouched.
+        assert_eq!(
+            std::fs::read_to_string(existing.join("main.kupl")).unwrap(),
+            "pub fun greet() -> Str { \"original-1.0.0-RC-content\" }\n"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
