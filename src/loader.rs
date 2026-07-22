@@ -351,6 +351,45 @@ pub struct ResolvedDep {
 /// `Result<_, String>` error convention -- both `pkg_tree`/`pkg_lock`
 /// (run.rs) already propagate any `Err` from this function as `eprintln!
 /// ("error: {e}"); return 1;`, so no caller-side change is needed.
+/// Every same-package file transitively reachable from `entry_file` via
+/// `use <sibling>`, mirroring `load_with`'s own same-package `use`-
+/// resolution branch (the `else` arm a few hundred lines below this one)
+/// but WITHOUT its diagnostics/mangling machinery -- this only needs to
+/// enumerate files for drift-hashing, not compile them. A cross-package
+/// `use <dep-name>` (any `use` whose first segment matches one of the
+/// dependency's OWN declared dependencies or registry-only entries) is
+/// deliberately NOT followed -- that nested dependency's own drift is
+/// tracked independently, via its own `ResolvedDep` entry, not folded into
+/// this one. Returns (path, source) pairs sorted by path so the combined
+/// hash below is deterministic regardless of `use`-traversal order.
+fn same_package_files(dep_dir: &Path, entry_file: &Path) -> Vec<(PathBuf, String)> {
+    let dep_ctx = pkg_ctx(dep_dir, false, "");
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut queue: Vec<PathBuf> = vec![entry_file.to_path_buf()];
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    while let Some(path) = queue.pop() {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !seen.insert(canonical) {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else { continue };
+        let (file_program, _) = parser::parse_with_base(&src, 0);
+        for (use_path, _) in &file_program.uses {
+            let first = use_path.split('.').next().unwrap_or(use_path);
+            if dep_ctx.deps.contains_key(first) || dep_ctx.registry_only.contains_key(first) {
+                continue;
+            }
+            let rel: PathBuf = use_path.split('.').collect();
+            let mut fs_path = dep_ctx.root.join(rel);
+            fs_path.set_extension("kupl");
+            queue.push(fs_path);
+        }
+        out.push((path, src));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
     let entry_path = PathBuf::from(entry);
     if let Err(e) = std::fs::read_to_string(&entry_path) {
@@ -374,9 +413,25 @@ pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
             }
         }
         let entry_file = dep_dir.join(&m.entry);
-        let src = std::fs::read_to_string(&entry_file)
-            .map_err(|e| format!("dependency `{name}` entry {}: {e}", entry_file.display()))?;
-        let hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(&src)));
+        if let Err(e) = std::fs::read_to_string(&entry_file) {
+            return Err(format!("dependency `{name}` entry {}: {e}", entry_file.display()));
+        }
+        // A REAL, live-confirmed silent drift-detection bug found+fixed
+        // (production-hardening PR-it1037): this hash used to cover ONLY
+        // `entry_file`'s own source -- a multi-file dependency (an ordinary,
+        // first-class case: the entry `use`s a sibling module) could have
+        // that sibling file edited, genuinely changing the dependency's
+        // compiled behavior, while `kupl.lock`'s hash -- and therefore `kupl
+        // pkg tree`'s `[drift]` marker -- stayed completely unchanged,
+        // silently claiming "no drift" when the locked snapshot no longer
+        // matched. Now hashes EVERY same-package file transitively
+        // reachable from the entry via `use`, not just the entry itself.
+        let mut combined = String::new();
+        for (_, src) in same_package_files(dep_dir, &entry_file) {
+            combined.push_str(&src);
+            combined.push('\u{0}');
+        }
+        let hash = crate::encoding::hex_encode(&format!("{}", crate::encoding::hash_fnv(&combined)));
         out.push(ResolvedDep {
             name: name.clone(),
             path: dep_dir.display().to_string(),
@@ -2212,6 +2267,74 @@ mod tests {
         std::fs::write(math.join("main.kupl"), "pub fun add(a: Int, b: Int) -> Int {\n    a + b + 1\n}\n").unwrap();
         let deps2 = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).unwrap();
         assert_ne!(deps2[0].hash, deps[0].hash, "editing the dep changes its hash");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it1037,
+    /// a background close-read survey finding, independently re-verified via
+    /// a fresh, self-authored end-to-end repro before implementing --
+    /// `resolve_deps`'s own combined-hash doc comment has the full writeup).
+    /// `resolve_deps`'s drift hash used to cover ONLY a dependency's `entry`
+    /// file -- an ordinary multi-file dependency (its entry `use`s a sibling
+    /// helper module, a first-class, unremarkable case this SAME loader
+    /// otherwise fully supports) could have ONLY that sibling edited,
+    /// genuinely changing the dependency's compiled behavior, while the
+    /// drift hash stayed completely unchanged, making `kupl pkg tree`'s
+    /// `[drift]` marker silently claim "no drift" when the locked snapshot
+    /// no longer matched -- reachable through ordinary project structure,
+    /// not an adversarial one. This test locks a TWO-file dependency, edits
+    /// ONLY its non-entry sibling file, and asserts the hash DOES change
+    /// (unlike before this fix, where it would not) -- while a separate,
+    /// unrelated third-party file elsewhere on disk changing nothing about
+    /// the dependency's OWN files must NOT perturb the hash either.
+    #[test]
+    fn resolve_deps_hash_detects_drift_from_editing_a_non_entry_sibling_file_of_a_multi_file_dependency() {
+        let base = std::env::temp_dir().join(format!("kupl-multifile-drift-test-{}", std::process::id()));
+        let math = base.join("math");
+        let app = base.join("app");
+        std::fs::create_dir_all(&math).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(math.join("kupl.toml"), "[project]\nname = \"math\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(math.join("main.kupl"), "use helper\n\npub fun compute() -> Int {\n    value()\n}\n").unwrap();
+        std::fs::write(math.join("helper.kupl"), "pub fun value() -> Int {\n    1\n}\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = { path = \"../math\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use math\n\nfun main() uses io {\n    print(math.compute())\n}\n").unwrap();
+
+        assert_eq!(
+            super::load(app.join("main.kupl").to_str().unwrap()).is_ok(),
+            true,
+            "the two-file dependency must load and compile cleanly"
+        );
+
+        let deps = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).unwrap();
+        assert_eq!(deps.len(), 1);
+
+        // editing ONLY the sibling (non-entry) file must change the hash --
+        // this is the exact gap PR-it1037 closes; before the fix, this
+        // `assert_ne!` failed (the hash was identical, entry-only).
+        std::fs::write(math.join("helper.kupl"), "pub fun value() -> Int {\n    999\n}\n").unwrap();
+        let deps2 = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).unwrap();
+        assert_ne!(
+            deps2[0].hash, deps[0].hash,
+            "editing a dependency's non-entry sibling file must be detected as drift, not silently ignored"
+        );
+
+        // a THIRD, unrelated file elsewhere on disk (not part of the math
+        // package at all) must NOT affect the hash -- confirms the walk is
+        // scoped to the dependency's own `use` graph, not e.g. every file in
+        // the directory tree.
+        let unrelated = base.join("unrelated.kupl");
+        std::fs::write(&unrelated, "pub fun noop() -> Int {\n    0\n}\n").unwrap();
+        let deps3 = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).unwrap();
+        assert_eq!(
+            deps3[0].hash, deps2[0].hash,
+            "an unrelated file outside the dependency's own use-graph must not perturb its drift hash"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
