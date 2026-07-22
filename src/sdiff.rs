@@ -876,6 +876,46 @@ mod tests {
         assert!(lines.is_empty() && !changed, "identical ai fun declarations must report no change: {lines:?}");
     }
 
+    /// A DELIBERATE, investigated-and-confirmed-correct DESIGN CHOICE
+    /// (production-hardening PR-it1044, investigated as a queued follow-up
+    /// from PR-it1043's own `uses`-effects reorder fix -- NOT a bug, this
+    /// test exists to LOCK IN the current behavior and prevent a future
+    /// well-meaning "fix" from silently introducing a real false-negative
+    /// regression). Unlike a `fun`'s `uses` effect budget (fixed PR-it1043 --
+    /// checked via SET membership in `check.rs`, provably order-insensitive)
+    /// or `fulfills`/`ports`/`exposes` (fixed PR-it646 -- looked up BY NAME
+    /// everywhere consumed), an `ai fun`'s `tools` list's declaration order
+    /// is NOT provably safe to ignore: `check.rs::ai_tool_metas` builds
+    /// `ToolMeta`s in `ai.tools`' own iteration order, and BOTH
+    /// `ai.rs::anthropic_tools_json`/`openai_tools_json` render that SAME
+    /// order, unchanged, directly into the `tools` array of the actual
+    /// request sent to the model. Whether presentation order influences a
+    /// specific LLM provider's own tool-selection behavior is NOT something
+    /// this codebase controls or can statically prove either way (unlike the
+    /// effects case, which had a clear, deterministic proof of order-
+    /// insensitivity in `check.rs`'s own consumption code) -- so treating a
+    /// tools-reorder as a potential interface change is the conservative,
+    /// correct choice for a tool whose entire 17+-bug history is about
+    /// eliminating FALSE NEGATIVES (a real behavioral change silently
+    /// passing as non-breaking), not false positives. If a future iteration
+    /// re-investigates this and finds concrete evidence tool order is
+    /// genuinely irrelevant to every supported provider, revisit this test
+    /// (and `ai.tools.join(",")`'s own lack of sorting) together.
+    #[test]
+    fn ai_fun_tools_reorder_is_interface_by_deliberate_design_not_a_bug() {
+        let (lines, _) = diff_lines(
+            "fun toolA(x: Int) -> Int {\n    x + 1\n}\nfun toolB(x: Int) -> Int {\n    x - 1\n}\n\
+             ai fun classify(n: Int) -> Int tools [toolA, toolB] {\n    intent \"pick a tool for {n}\"\n}\n",
+            "fun toolA(x: Int) -> Int {\n    x + 1\n}\nfun toolB(x: Int) -> Int {\n    x - 1\n}\n\
+             ai fun classify(n: Int) -> Int tools [toolB, toolA] {\n    intent \"pick a tool for {n}\"\n}\n",
+        );
+        assert_eq!(
+            lines,
+            vec!["interface classify"],
+            "reordering an ai fun's `tools` list is DELIBERATELY still interface-breaking -- see this test's own doc comment before changing this"
+        );
+    }
+
     #[test]
     fn reordering_items_is_not_a_semantic_change() {
         // The diff is keyed by item name, so swapping the order of two functions is
