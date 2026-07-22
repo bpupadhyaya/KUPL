@@ -9218,6 +9218,28 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1052): native shares compile.rs's compiled bytecode
+    /// with the VM (`kupl native` compiles the SAME `Module`/`Chunk`/`Op`
+    /// sequence `compile_module` emits for `kupl run --vm`), so the fast-
+    /// path fix in `compile.rs`'s `Stmt::Assign` handling (see
+    /// `vm.rs::diff_self_mutating_fast_path_local_var_uses_the_pre_rhs_
+    /// value_not_a_post_side_effect_one` for the full writeup) benefits
+    /// native identically -- confirmed live BEFORE this fix: this exact
+    /// program printed `100`/`[9, 9, 5]` on `kupl native`, matching `kupl
+    /// run --vm`'s own wrong output, both diverging from `kupl run`'s
+    /// correct `6`/`[1, 2, 3, 5]`.
+    #[test]
+    fn native_self_mutating_fast_path_local_var_uses_the_pre_rhs_value_not_a_post_side_effect_one() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   var x = 5\n    x = x + { x = 99\n        1 }\n    print(\"{x}\")\n    \
+                   var xs = [1, 2, 3]\n    xs = xs.push({ xs = [9, 9]\n        5 })\n    print(\"{xs}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "selfmutfastpath"), "6\n[1, 2, 3, 5]\n");
+    }
+
     /// A REAL cross-engine divergence found+fixed (production-hardening
     /// PR-it936): `k_ai_err` -- the buffer `k_ai_convert`/`k_ai_from_json`
     /// build every AI-shape-mismatch/JSON-parse-error message into -- used

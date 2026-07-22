@@ -736,8 +736,82 @@ impl<'s> FnCompiler<'s> {
                 if *op == AssignOp::Set {
                     if let ExprKind::Ident(name) = &target.kind {
                         if let Some(local) = self.lookup(name) {
+                            // A REAL, LIVE-CONFIRMED silent-wrong-value bug found+
+                            // fixed (production-hardening PR-it1052, found via a
+                            // background close-read survey of this file's own
+                            // register-allocation machinery): this fast path (and
+                            // its `push`/`insert` sibling below) used to compile
+                            // `rhs`/the method args BEFORE reading `name`'s own
+                            // register -- so an `rhs` whose evaluation has a side
+                            // effect that reassigns `name` ITSELF (via a nested
+                            // block/if/match/loop expression directly inside the
+                            // RHS -- e.g. `x = x + { x = 99; 1 }`) silently combined
+                            // with the POST-side-effect value instead of the value
+                            // `name` held at the START of the statement. This is the
+                            // EXACT bug shape already fixed for `ExprKind::Binary`'s
+                            // GENERAL case (PR-it1005, see that fix's own doc
+                            // comment) and for `interp.rs`'s OWN analogous fast path
+                            // (PR-it1001) -- but neither fix covered THIS
+                            // `Stmt::Assign` fast-path block, since it's a separate
+                            // code path entered BEFORE `ExprKind::Binary`/the general
+                            // assignment path is ever reached. Live-confirmed on
+                            // BOTH `kupl run --vm` AND `kupl native` (which share
+                            // this SAME compiled bytecode): `var x = 5; x = x + { x
+                            // = 99; 1 }; print(x)` printed the correct `6` on `kupl
+                            // run` but `100` (99 + 1, silently using the MUTATED x)
+                            // on the VM and native; `var x = [1,2,3]; x =
+                            // x.push({x=[9,9];5})` printed `[1, 2, 3, 5]` on `kupl
+                            // run` but `[9, 9, 5]` on the VM and native.
+                            //
+                            // UNLIKE `ExprKind::Binary`'s general-case fix (which
+                            // snapshots `lhs` into a FRESH register, unconditionally
+                            // giving up this fast path's own `dst == a` in-place-
+                            // mutation trigger -- acceptable there since that path
+                            // never had the mutation optimization to begin with),
+                            // this fast path's ENTIRE PURPOSE is the `dst == a`
+                            // uniqueness-checked in-place mutation (turning an O(n^2)
+                            // build loop into O(n), guarded by cross-engine perf
+                            // tests) -- a naive snapshot-and-restore would keep the
+                            // snapshot register ALIVE right up to the mutating op,
+                            // permanently defeating `Rc::get_mut`'s uniqueness check
+                            // (refcount 2, not 1) even in the overwhelmingly common
+                            // case where `rhs` has NO side effect at all, silently
+                            // reintroducing the O(n^2) blowup this fast path exists
+                            // to prevent. `interp.rs`'s OWN fix avoids this via a
+                            // RUNTIME snapshot-drop-then-check-uniqueness technique
+                            // (see its own PR-it1001 doc comment) that has no direct
+                            // bytecode equivalent without a new opcode understood by
+                            // BOTH vm.rs and cgen.rs (a substantially larger, riskier
+                            // change for a narrow edge case). Fixed instead with a
+                            // STATIC, WHOLE-SUBTREE conservative check
+                            // (`assigns_to_in_expr`, mirroring this file's own
+                            // `free_vars_expr`/`free_vars_stmt`/`free_vars_block`
+                            // traversal shape): only take this fast path when `rhs`/
+                            // the method's args PROVABLY cannot reassign `name`
+                            // anywhere within their own directly-compiled subtree.
+                            // This is SOUND (never MISSES a real hazard) because
+                            // KUPL closures capture by VALUE, not by reference --
+                            // live-confirmed via `var x = 5; let f = fn { x = 99 };
+                            // f(); print(x)` printing `5` (unchanged) on both interp
+                            // and vm -- so a called function/closure can NEVER
+                            // indirectly reassign a caller's own local `var`; the
+                            // ONLY way to trigger this bug is a DIRECTLY-NESTED,
+                            // inline construct (block/if/match/loop) inside the RHS
+                            // itself, which `assigns_to_in_expr` walks exhaustively
+                            // (deliberately ALSO recursing into lambda bodies anyway,
+                            // a purely conservative widening costing nothing but an
+                            // occasional missed optimization in a contrived case,
+                            // mirroring this codebase's own established "more
+                            // flagged, never fewer" precedent from `bytecode.rs`'s
+                            // sibling `aliasing_regs` fixes). When the check fires
+                            // (rare), this falls through to the general path below,
+                            // which is already correct (just without the in-place
+                            // mutation optimization) — exactly matching interp.rs's
+                            // own slow-path behavior for the same rare shape.
                             if let ExprKind::Binary { op: BinOp::Add, lhs, rhs } = &value.kind {
-                                if matches!(&lhs.kind, ExprKind::Ident(n) if n == name) {
+                                if matches!(&lhs.kind, ExprKind::Ident(n) if n == name)
+                                    && !assigns_to_in_expr(name, rhs)
+                                {
                                     let b = self.expr(rhs);
                                     self.emit(Op::Add(local, local, b), value.span);
                                     return None;
@@ -751,6 +825,7 @@ impl<'s> FnCompiler<'s> {
                                 if self_recv
                                     && ((m == "push" && args.len() == 1)
                                         || (m == "insert" && (args.len() == 1 || args.len() == 2)))
+                                    && !args.iter().any(|a| assigns_to_in_expr(name, &a.value))
                                 {
                                     let exprs: Vec<Expr> = args.iter().map(|a| a.value.clone()).collect();
                                     let start = self.consecutive(&exprs, *span);
@@ -1968,6 +2043,77 @@ fn bind_pattern_names(p: &Pattern, bound: &mut HashSet<String>) {
             bind_pattern_names(inner, bound);
         }
         _ => {}
+    }
+}
+
+/// Conservative static check for the `Stmt::Assign` self-mutating fast path
+/// above (production-hardening PR-it1052): does `e`'s own subtree contain an
+/// assignment (`Stmt::Assign`, any `AssignOp`) whose target is the bare
+/// identifier `name`, at ANY nesting depth (nested blocks/if/match/loops,
+/// and — deliberately, as a PURELY CONSERVATIVE widening even though it's
+/// not strictly necessary, see the fast path's own doc comment — lambda
+/// bodies too)? Mirrors `free_vars_expr`'s own traversal shape exactly, just
+/// answering a different question (is `name` ever an ASSIGNMENT TARGET
+/// here, not merely referenced).
+fn assigns_to_in_expr(name: &str, e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Str(pieces) => pieces.iter().any(|p| match p {
+            StrPiece::Expr(inner) => assigns_to_in_expr(name, inner),
+            StrPiece::Text(_) => false,
+        }),
+        ExprKind::List(items) => items.iter().any(|i| assigns_to_in_expr(name, i)),
+        ExprKind::Call { callee, args } => {
+            assigns_to_in_expr(name, callee) || args.iter().any(|a| assigns_to_in_expr(name, &a.value))
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            assigns_to_in_expr(name, recv) || args.iter().any(|a| assigns_to_in_expr(name, &a.value))
+        }
+        ExprKind::Field { recv, .. } => assigns_to_in_expr(name, recv),
+        ExprKind::Binary { lhs, rhs, .. } => assigns_to_in_expr(name, lhs) || assigns_to_in_expr(name, rhs),
+        ExprKind::Unary { operand, .. } => assigns_to_in_expr(name, operand),
+        ExprKind::If { cond, then_block, else_block } => {
+            assigns_to_in_expr(name, cond)
+                || assigns_to_in_block(name, then_block)
+                || else_block.as_ref().is_some_and(|el| assigns_to_in_expr(name, el))
+        }
+        ExprKind::BlockExpr(b) => assigns_to_in_block(name, b),
+        ExprKind::Match { scrutinee, arms } => {
+            assigns_to_in_expr(name, scrutinee)
+                || arms.iter().any(|arm| {
+                    arm.guard.as_ref().is_some_and(|g| assigns_to_in_expr(name, g))
+                        || assigns_to_in_expr(name, &arm.body)
+                })
+        }
+        ExprKind::Lambda { body, .. } => assigns_to_in_block(name, body),
+        ExprKind::Range { lo, hi, .. } => assigns_to_in_expr(name, lo) || assigns_to_in_expr(name, hi),
+        ExprKind::With { recv, updates } => {
+            assigns_to_in_expr(name, recv) || updates.iter().any(|(_, v)| assigns_to_in_expr(name, v))
+        }
+        ExprKind::Try(inner) | ExprKind::Await(inner) => assigns_to_in_expr(name, inner),
+        ExprKind::Par(branches) => branches.iter().any(|b| assigns_to_in_expr(name, b)),
+        _ => false,
+    }
+}
+
+fn assigns_to_in_block(name: &str, b: &Block) -> bool {
+    b.stmts.iter().any(|s| assigns_to_in_stmt(name, s))
+}
+
+fn assigns_to_in_stmt(name: &str, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Let { init, .. } => assigns_to_in_expr(name, init),
+        Stmt::Assign { target, value, .. } => {
+            matches!(&target.kind, ExprKind::Ident(n) if n == name) || assigns_to_in_expr(name, value)
+        }
+        Stmt::Expr(e) | Stmt::Expect(e, _) => assigns_to_in_expr(name, e),
+        Stmt::Forall { body, .. } => assigns_to_in_block(name, body),
+        Stmt::Return(Some(e), _) => assigns_to_in_expr(name, e),
+        Stmt::Return(None, _) => false,
+        Stmt::While { cond, body, .. } => assigns_to_in_expr(name, cond) || assigns_to_in_block(name, body),
+        Stmt::For { iter, body, .. } => assigns_to_in_expr(name, iter) || assigns_to_in_block(name, body),
+        Stmt::Emit { arg: Some(e), .. } => assigns_to_in_expr(name, e),
+        Stmt::Emit { arg: None, .. } => false,
+        Stmt::Break(_) | Stmt::Continue(_) => false,
     }
 }
 

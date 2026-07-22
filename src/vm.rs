@@ -2195,6 +2195,54 @@ mod tests {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED silent-wrong-value bug found+fixed (production-
+    /// hardening PR-it1052, found via a background close-read survey of
+    /// compile.rs's own register-allocation machinery): UNLIKE the sibling
+    /// test just above (which exercises this bug shape via a COMPONENT
+    /// STATE field mutated through a nested FUNCTION CALL, already fixed by
+    /// PR-it1001), this covers the SAME shape for a plain LOCAL variable
+    /// (`var`) mutated through a directly-nested block/method-arg
+    /// expression -- `compile.rs`'s `Stmt::Assign` self-mutating fast path
+    /// (`x = x + e`, `x = x.push(e)`/`x = m.insert(...)`) used to compile
+    /// `e` BEFORE reading `x`'s own register, so a directly-nested
+    /// reassignment of `x` inside `e` (not reachable via a function call,
+    /// since KUPL closures capture by value -- only a directly-inline
+    /// block/if/match/loop expression) silently combined with the POST-
+    /// side-effect value instead of the value `x` held at the START of the
+    /// statement. Live-confirmed BEFORE this fix: `kupl run` printed `6`/
+    /// `[1, 2, 3, 5]` (correct) but `kupl run --vm` AND `kupl native`
+    /// (which share this SAME compiled bytecode) both printed `100`/
+    /// `[9, 9, 5]`.
+    #[test]
+    fn diff_self_mutating_fast_path_local_var_uses_the_pre_rhs_value_not_a_post_side_effect_one() {
+        // `x = x + { x = 99; 1 }` -- Add fast path.
+        assert_eq!(
+            differential("fun probe() -> Int {\n    var x = 5\n    x = x + { x = 99\n        1 }\n    x\n}\n"),
+            "6"
+        );
+        // `x = x.push({ x = [9, 9]; 5 })` -- Method (push) fast path.
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    var x = [1, 2, 3]\n    x = x.push({ x = [9, 9]\n        5 })\n    \"{x}\"\n}\n"
+            ),
+            "[1, 2, 3, 5]"
+        );
+        // `m = m.insert("a", { m = Map(); 5 })` -- Method (insert) fast path.
+        assert_eq!(
+            differential(
+                "fun probe() -> Str {\n    var m = Map().insert(\"z\", 1)\n    m = m.insert(\"a\", { m = Map()\n        5 })\n    \"{m}\"\n}\n"
+            ),
+            "Map{\"z\": 1, \"a\": 5}"
+        );
+        // Sanity: the ORDINARY case (no self-reassignment in the RHS) is
+        // completely unaffected -- the fast path still triggers normally.
+        assert_eq!(differential("fun probe() -> Int {\n    var x = 5\n    x = x + 1\n    x\n}\n"), "6");
+        assert_eq!(
+            differential("fun probe() -> Str {\n    var x = [1]\n    x = x.push(2)\n    \"{x}\"\n}\n"),
+            "[1, 2]"
+        );
+    }
+
     #[test]
     fn self_add_overflow_panic_span_matches_across_engines() {
         // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it852, the
