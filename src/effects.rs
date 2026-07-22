@@ -375,6 +375,50 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                 });
             }
         }
+        // A REAL, LIVE-CONFIRMED soundness hole found+fixed (production-
+        // hardening PR-it1058, found via a background close-read survey of
+        // this whole file): this synthetic constructor node used to walk
+        // ONLY `state`/`prop` initializers -- `c.children`'s own
+        // construction-argument expressions (`let child = Component(args)`)
+        // were never walked at all, even though `interp.rs`'s own
+        // `instantiate` (the SAME real, unconditional execution path
+        // PR-it951's own doc comment establishes as the correct standard
+        // for this synthetic node) evaluates every `child.args[i].value`
+        // on EVERY construction of the parent, and `compile.rs` compiles
+        // them into the component's own init chunk identically. Live-
+        // confirmed BEFORE this fix: `component Wrapper { let s =
+        // Sink(noisy()) }` where `noisy()` calls `print(...)` -- a `pub
+        // fun make_wrapper() { let w = Wrapper() }` (NO `uses io`
+        // declared) passed `kupl check` cleanly, and `kupl run` genuinely
+        // printed the output -- an undeclared `io` effect crossing a
+        // function boundary the checker exists to police. The SAME gap
+        // also silently let `pure_funs()` (used by `parallel.rs`'s real-
+        // OS-thread `par_map`/`par_filter` fast path) wrongly classify
+        // such a function as pure, and produced a false-positive "declares
+        // `uses io` but never uses it" (K0302) warning for a developer who
+        // responsibly DID declare it -- punishing correct code, the same
+        // pattern PR-it750's own comment documents for a different vector.
+        // Fixed by walking `c.children`'s own argument expressions too,
+        // mirroring the EXACT `state`/`props` pattern above.
+        for ch in &c.children {
+            for a in &ch.args {
+                walk_expr(&a.value, &mut |expr| {
+                    collect_expr(
+                        expr,
+                        Some(c.name.as_str()),
+                        &funs,
+                        &method_names,
+                        &component_names,
+                        &ctor_names,
+                        &HashSet::new(),
+                        &mut eff,
+                        &mut calls,
+                        &mut unresolved,
+                        &mut plain_call,
+                    );
+                });
+            }
+        }
         let key = construct_key(&c.name);
         direct.insert(key.clone(), eff);
         edges.insert(key, calls);
@@ -627,6 +671,28 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
         for p in &c.props {
             if let Some(d) = &p.default {
                 walk_expr(d, &mut |expr| {
+                    collect_expr(
+                        expr,
+                        Some(c.name.as_str()),
+                        &funs,
+                        &method_names,
+                        &component_names,
+                        &ctor_names,
+                        &HashSet::new(),
+                        &mut eff,
+                        &mut calls,
+                        &mut unresolved,
+                        &mut plain_call_unresolved,
+                    );
+                });
+            }
+        }
+        // Same `children` construction-argument gap as `check_effects`'s own
+        // mirror above -- see that fix's own doc comment for the full
+        // writeup (production-hardening PR-it1058).
+        for ch in &c.children {
+            for a in &ch.args {
+                walk_expr(&a.value, &mut |expr| {
                     collect_expr(
                         expr,
                         Some(c.name.as_str()),
@@ -1386,6 +1452,47 @@ mod tests {
              pub fun make_and_get() uses io -> Int {\n    let s = Sink()\n    s.get()\n}\n",
         );
         assert!(ok.is_empty(), "correctly declared `uses io` must check clean: {ok:?}");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1058, found via a
+    /// background close-read survey of this whole file): the SAME synthetic
+    /// constructor node PR-it951 fixed above for `state`/`prop` initializers
+    /// never walked a `ChildDecl`'s own construction-ARGUMENT expressions
+    /// (`let child = Component(args)`) -- a real, unconditional execution
+    /// path (`interp.rs::instantiate` evaluates every `child.args[i].value`
+    /// on every construction of the parent; `compile.rs` compiles them into
+    /// the parent's own init chunk identically). Confirmed live BEFORE this
+    /// fix: `pub fun make_wrapper() { let w = Wrapper() }` (where `Wrapper`
+    /// has `let s = Sink(noisy())` and `noisy` calls `print`) checked clean
+    /// with NO `uses io` requirement, and `kupl run` genuinely printed the
+    /// undeclared side effect. The same gap also produced a false-positive
+    /// K0302 ("declares `uses io` but never uses it") for a caller who
+    /// responsibly DID declare it up front.
+    #[test]
+    fn effectful_component_child_construction_arguments_require_a_declared_effect_on_construction() {
+        let d = diags_for(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    42\n}\n\
+             component Sink {\n    intent \"s\"\n    prop n: Int\n    \
+             expose fun get() -> Int { n }\n}\n\
+             component Wrapper {\n    intent \"w\"\n    let s = Sink(noisy())\n}\n\
+             pub fun make_wrapper() {\n    let w = Wrapper()\n}\n",
+        );
+        assert!(
+            d.iter().any(|d| d.code == "K0301"),
+            "a pub fun constructing a component whose child's own construction \
+             argument is effectful must require `uses io`: {d:?}"
+        );
+        // once correctly declared, no diagnostic at all -- including no
+        // false-positive K0302 "declared but unused" (the second symptom
+        // this same fix resolves).
+        let ok = diags_for(
+            "fun noisy() -> Int {\n    print(\"boom\")\n    42\n}\n\
+             component Sink {\n    intent \"s\"\n    prop n: Int\n    \
+             expose fun get() -> Int { n }\n}\n\
+             component Wrapper {\n    intent \"w\"\n    let s = Sink(noisy())\n}\n\
+             pub fun make_wrapper() uses io {\n    let w = Wrapper()\n}\n",
+        );
+        assert!(ok.is_empty(), "correctly declared `uses io` must check clean, with no K0302: {ok:?}");
     }
 
     /// A REAL safety consideration caught DURING this same fix (production-
