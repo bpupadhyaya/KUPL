@@ -371,6 +371,29 @@ fn aliasing_regs(op: &Op) -> Vec<Reg> {
         Op::MakeInstance { start, argc, .. } => (*start..start.saturating_add(*argc)).collect(),
         Op::MakeClosure { start, ncaps, .. } => (*start..start.saturating_add(*ncaps)).collect(),
         Op::WithField { value, .. } => vec![*value],
+        // A defensive static-analysis completeness fix (production-hardening
+        // PR-it1046, the SAME shape as `MakeInstance`'s own PR-it968 arm just
+        // above -- see its doc comment for the general pattern this mirrors):
+        // `Op::GetField`/`Op::GetFieldNamed` had no arm here either, unlike
+        // their OWN treatment in the sibling function `reg_traces_to_a_
+        // parameter` (PR-it819's `go()` arm, which already recurses into
+        // `obj` when tracing whether a register's value originates from a
+        // parameter/capture). `k_field`/`k_field_named` (cgen.rs) copy a
+        // field's `KValue` out of `obj` with NO clone/refcount bump -- the
+        // exact same unrefcounted-shallow-copy hazard PR-it819's own doc
+        // comment documents -- so a value read out of a LOCAL (not just a
+        // parameter) register via `GetField`/`GetFieldNamed` is JUST as
+        // aliased to `obj` as a direct `Move` would be. NO live KUPL-source
+        // repro currently reaches this gap (a background survey spent 8
+        // hand-traced/compiled attempts and was always incidentally blocked
+        // by an unrelated existing safety net or `reg_traces_to_a_
+        // parameter`'s own conservative cycle-detection depth-guard) -- but
+        // that masking is the SAME kind of fragile CONVENTION, not a
+        // structural guarantee, that `MakeInstance`'s own doc comment
+        // describes for its analogous gap. Fixed defensively, matching that
+        // precedent, rather than waiting for a live repro to eventually find
+        // a path around the incidental masking.
+        Op::GetField { obj, .. } | Op::GetFieldNamed { obj, .. } => vec![*obj],
         Op::StateSet(_slot, src) => vec![*src],
         Op::EmitOp { payload: Some(r), .. } => vec![*r],
         _ => vec![],
@@ -959,6 +982,34 @@ mod escape_tests {
         let c = chunk(vec![
             Op::MakeList { dst: 0, start: 0, len: 0 },
             Op::WithField { dst: 1, obj: 2, name: 0, value: 0 },
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+    }
+
+    #[test]
+    fn get_field_reading_an_object_before_push_escapes() {
+        // production-hardening PR-it1046, a DEFENSIVE completeness fix in
+        // the SAME shape as `embedding_in_a_new_component_instance_before_
+        // push_escapes` (PR-it968) immediately above -- see `aliasing_regs`'s
+        // own doc comment on its new `GetField`/`GetFieldNamed` arm for the
+        // full writeup (no live KUPL-source repro currently reaches this
+        // gap, masked by an unrelated existing safety net, but the fix is
+        // structurally required the same way `MakeInstance`'s was). `xs`
+        // (register 0) read as the OBJECT of a field access, then
+        // self-pushed -- must be flagged as escaping, since `k_field`
+        // (cgen.rs) copies the field's value out of `xs` with no clone.
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::GetField { dst: 1, obj: 0, idx: 0 }, // reads xs as the field's object
+            self_push(0),
+        ]);
+        assert!(method_recv_escapes(&c, 2));
+
+        // the same shape for the named-field variant.
+        let c = chunk(vec![
+            Op::MakeList { dst: 0, start: 0, len: 0 },
+            Op::GetFieldNamed { dst: 1, obj: 0, name: 0 },
             self_push(0),
         ]);
         assert!(method_recv_escapes(&c, 2));
