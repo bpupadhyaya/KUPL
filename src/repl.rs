@@ -223,9 +223,28 @@ fn is_item(src: &str) -> bool {
     let first = words.next().unwrap_or("");
     if matches!(
         first,
-        "fun" | "type" | "component" | "app" | "pub" | "async" | "contract" | "use" | "module" | "law"
+        "fun" | "type" | "component" | "app" | "pub" | "async" | "contract" | "use" | "module"
     ) {
         return true;
+    }
+    // A REAL bug found+fixed (production-hardening PR-it1063, a background
+    // close-read survey finding): `law` is a SOFT keyword too, exactly like
+    // `ai` immediately below -- it's lexed as a plain `Tok::Ident("law")`
+    // (`parser.rs:378`), not a hard lexer keyword, so matching it
+    // unconditionally on the first word alone (as this branch used to,
+    // before PR-it1063) wrongly misroutes an ORDINARY statement/expression
+    // that happens to start with a variable literally named `law` (a bare
+    // `law`, `law + 1`, `law.foo()`) into the item-declaration path, which
+    // then fails with a confusing `K0115: 'law' expects a name string`
+    // parse error instead of evaluating the expression -- live-confirmed
+    // BEFORE this fix via `let law = 42` followed by a bare `law` at the
+    // REPL prompt. `parser::parse_item` (parser.rs:378-393) requires the
+    // token immediately after `law` to be a STRING LITERAL (the law's own
+    // name) before treating it as a law declaration, so mirror that here:
+    // peek the second word and require it to look like a string literal
+    // (starts with `"`) before claiming the line as an item.
+    if first == "law" {
+        return words.next().is_some_and(|w| w.starts_with('"'));
     }
     // A REAL bug found+fixed (production-hardening PR-it935): `ai` is ALSO a
     // soft keyword, mirroring `law` above, but with a narrower shape --
@@ -534,6 +553,17 @@ mod tests {
         // this match arm before, so it fell through to statement-fragment
         // parsing and produced a misleading K0102 error instead of "defined.".
         assert!(is_item("law \"ok\" { expect 1 == 1 }"));
+        // `law` is a soft keyword too (PR-it1063, a background close-read
+        // survey finding): like `ai` below, it must ALSO peek the second
+        // token before claiming the line as an item -- an ordinary
+        // statement/expression that happens to start with a variable
+        // literally named `law` must still correctly route to the
+        // statement/expression path, not be misrouted into item parsing
+        // (which used to produce a misleading K0115 "expects a name
+        // string" error instead of evaluating the expression).
+        assert!(!is_item("law + 1"));
+        assert!(!is_item("law"));
+        assert!(!is_item("law.foo()"));
         // a bare `ai fun ...` is a real item too (PR-it935): missing from
         // this match arm before, so it fell through to statement-fragment
         // parsing and produced a misleading K0102 error instead of "defined.",
