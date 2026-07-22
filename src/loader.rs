@@ -1775,6 +1775,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A FIFTH instance of this exact bug shape, found by continuing the
+    /// SAME "audit every component/contract-local binding source in
+    /// `resolve.rs`" convention as the two tests above (production-
+    /// hardening PR-it1040, a close-read survey finding, independently
+    /// re-verified live with a FRESH multi-package repro before
+    /// implementing). A contract's `sig`s declare abstract method NAMES a
+    /// law body calls bare (`get("x")`) -- `run.rs::run_example` and
+    /// `check.rs::check_contract` both bind each `sig.name` fresh into
+    /// scope before executing/checking a law's body, a real, documented
+    /// dynamic-dispatch mechanism -- but `resolve.rs::Rewriter::contract`
+    /// had no equivalent binding anywhere, so a law body's reference to its
+    /// OWN contract's abstract method fell through to the rename map
+    /// whenever the SAME package also defined an unrelated top-level `fun`
+    /// of the identical bare name, silently rewriting the law's call to the
+    /// WRONG function. Live-confirmed BEFORE this fix: `contract Greeter {
+    /// expose fun greet(name: Str) -> Str; law "..." { expect greet("world")
+    /// == "dep-hello world" } }` alongside an unrelated top-level `pub fun
+    /// greet(name: Str) -> Str { "ROOT-COLLISION-" + name }` in the SAME
+    /// dependency package: `kupl check` reported zero errors on both the
+    /// dependency standalone AND as a consumed dependency, but `kupl test`
+    /// on the consuming package failed with `` `dep$greet("world") ==
+    /// "dep-hello world"` was not satisfied `` -- the diagnostic's OWN text
+    /// proving the law's `greet` call was silently rewritten to the mangled
+    /// top-level function instead of staying bound to the contract's
+    /// abstract method. The byte-identical contract/component compiled
+    /// standalone passed cleanly, isolating the bug to cross-package
+    /// mangling specifically.
+    #[test]
+    fn contract_sig_name_colliding_with_a_top_level_fun_is_not_mangled_inside_a_law_body() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let base = std::env::temp_dir().join(format!("kupl-contract-sig-collision-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "contract Greeter {\n    \
+             expose fun greet(name: Str) -> Str\n    \
+             law \"greets correctly\" {\n        \
+             expect greet(\"world\") == \"dep-hello world\"\n    \
+             }\n\
+             }\n\n\
+             pub component GreeterImpl fulfills Greeter {\n    \
+             intent \"a contract sig name colliding with a top-level fun by name\"\n    \
+             expose fun greet(name: Str) -> Str {\n        \
+             \"dep-hello \" + name\n    \
+             }\n\
+             }\n\n\
+             pub fun greet(name: Str) -> Str {\n    \
+             \"ROOT-COLLISION-\" + name\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use dep\n\nfun main() uses io {\n    print(\"loaded\")\n}\n").unwrap();
+
+        let out = std::process::Command::new(&bin)
+            .args(["test", app.join("main.kupl").to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("1 passed, 0 failed"),
+            "a contract sig's bare name colliding with an unrelated top-level fun in the SAME \
+             package must not be mistaken for it: {stdout:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it775, an Explore
     /// survey finding, agentId ad3c3f6ee2f0cd891, independently re-verified
     /// live before implementing): `resolve.rs`'s `Rewriter::pattern` only

@@ -427,8 +427,41 @@ impl Rewriter<'_> {
                 self.ty(r);
             }
         }
+        // A REAL, LIVE-CONFIRMED silent-value-corruption bug found+fixed
+        // (production-hardening PR-it1040, a close-read survey finding,
+        // independently re-verified live before implementing): a FIFTH
+        // instance of this file's own recurring bug shape (PR-it684/it841/
+        // it842/it961) -- `c.sigs`' abstract method NAMES are a genuine,
+        // dynamically-dispatched binding a law body calls bare (`get("x")`,
+        // matching `run.rs::run_example`'s own `env.define(&sig.name, ...)`
+        // and `check.rs::check_contract`'s own `ctx.scopes.insert(name,
+        // ...)`, both of which bind each `sig.name` fresh per law before
+        // executing/checking its body) -- but this pass had NO equivalent
+        // binding anywhere, so a law body's reference to its OWN contract's
+        // abstract method fell through to the rename map whenever the SAME
+        // package also happened to define an unrelated top-level `fun` of
+        // the identical bare name, silently rewriting the law's call to the
+        // WRONG function while `run.rs`/`check.rs` kept binding (and
+        // therefore expecting) the bare, unmangled name -- a guaranteed
+        // mismatch. Live-confirmed: `contract Greeter { expose fun
+        // greet(name: Str) -> Str; law "..." { expect greet("world") ==
+        // "dep-hello world" } }` alongside an UNRELATED root-level `pub fun
+        // greet(name: Str) -> Str { "ROOT-COLLISION-" + name }` in the SAME
+        // dependency package compiled the dependency standalone AND as a
+        // consumed dependency with ZERO diagnostics either way (`kupl
+        // check`), yet the consuming package's `kupl test` failed with
+        // `` `dep$greet("world") == "dep-hello world"` was not satisfied ``
+        // -- the diagnostic's OWN text proving the law's `greet` call was
+        // silently rewritten to the mangled top-level function instead of
+        // staying bound to the contract's abstract method. Fixed by
+        // binding every `sig.name` into THIS law's own pushed scope before
+        // walking its body, mirroring `run.rs`/`check.rs`'s identical
+        // per-law binding pattern exactly.
         for law in &mut c.laws {
             self.push();
+            for sig in &c.sigs {
+                self.bind(&sig.name);
+            }
             self.block(&mut law.body);
             self.pop();
         }
