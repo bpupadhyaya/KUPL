@@ -302,6 +302,33 @@ fn parse_string(v: &str) -> Option<String> {
 
 fn parse_dep(name: &str, value: &str, line: usize) -> Result<Dep, String> {
     let name = name.to_string();
+    // A REAL bug found+fixed (production-hardening PR-it1065, a background
+    // close-read survey finding): the name-safety check below (originally
+    // added at PR-it919, citing this exact file's own "a module's own
+    // stated threat model is worth re-applying to EVERY value that flows
+    // into the same dangerous operation" principle) used to sit AFTER the
+    // bare-string-shorthand branch's own early `return`, so it only ever
+    // gated the inline-table (`{ path = "..", version = ".." }`) form --
+    // the bare-string shorthand (`name = "../path"`) skipped it entirely.
+    // Live-confirmed BEFORE this fix: `/etc/passwd = "vendor/util"` parsed
+    // SUCCESSFULLY (no manifest error at all), while the IDENTICAL name
+    // via `../../etc = { path = "vendor/util" }` was correctly REJECTED at
+    // parse time with a clean "must be a plain relative name" error -- the
+    // exact same inconsistency this file's own PR-it747 already flagged
+    // and fixed once for duplicate-name detection across both syntax
+    // forms. `dep.name` is not currently filesystem-joined anywhere for a
+    // PATH-style dependency (`loader.rs`'s `resolve_deps` only joins
+    // `dep.path`, using `dep.name` purely as a `HashMap` key) -- confirmed
+    // directly by reading `loader.rs` before this fix, so no CURRENT
+    // exploit chain existed through this specific gap -- but the
+    // validation itself should not depend on which of two equivalent
+    // syntax forms a dependency happens to use. Moved here, before EITHER
+    // branch, so both forms are validated identically.
+    if !crate::registry::is_safe_relative_path(&name) {
+        return Err(format!(
+            "line {line}: dependency name `{name}` must be a plain relative name, not an absolute path or contain `..`"
+        ));
+    }
     // bare-string shorthand: `name = "../path"`
     if let Some(s) = parse_string(value) {
         return Ok(Dep { name, path: Some(s), version: None });
@@ -374,34 +401,21 @@ fn parse_dep(name: &str, value: &str, line: usize) -> Result<Dep, String> {
     // dangerous operation" -- a lead never actually followed up here). A
     // version-only dependency (`{ version = ".." }`, no `path`) resolves via
     // `loader.rs::pkg_ctx`'s `registry::cache_dir().join(&dep.name).join(v)`
-    // -- but neither `name` (this manifest's OWN `[dependencies]` KEY,
-    // taken verbatim with zero validation) nor `version` had any path-
-    // safety check, and `PathBuf::join` silently DISCARDS its left-hand
-    // base entirely when the joined argument is itself absolute (the SAME
-    // well-known footgun `entry`'s own PR-it766 fix already treats as
-    // security-relevant). Live-confirmed BEFORE this fix: a manifest with
-    // `[dependencies]` key set to an absolute path to an unrelated local
-    // project directory and `version = "."` (a no-op path segment,
-    // ALSO correctly rejected by `is_safe_relative_path` below, not just
-    // `..`/absolute paths) made `kupl pkg tree` silently read and report
-    // that ARBITRARY directory's own `kupl.toml` as if it were a
-    // legitimately cache-resolved dependency -- and per `pkg_ctx`'s own
-    // doc comment, this SAME `deps` map also feeds ordinary `use`-
-    // resolution/compilation, not just reporting commands, so a
-    // sufficiently-crafted manifest could cause an unrelated local
-    // directory's code to be silently compiled and run as a dependency.
-    // Rejected here, at the SAME "single earliest enforcement point"
-    // `is_safe_relative_path`'s own doc comment establishes for `path`/
-    // `url` in registry.rs, mirroring `entry`'s own precedent exactly --
-    // for BOTH `path`- and `version`-style dependencies uniformly (a
-    // dependency's own NAME should never plausibly need to look like an
-    // absolute path or contain `..`/bare `.` components, regardless of
-    // which resolution mechanism it uses).
-    if !crate::registry::is_safe_relative_path(&name) {
-        return Err(format!(
-            "line {line}: dependency name `{name}` must be a plain relative name, not an absolute path or contain `..`"
-        ));
-    }
+    // -- but `version` had no path-safety check, and `PathBuf::join`
+    // silently DISCARDS its left-hand base entirely when the joined
+    // argument is itself absolute (the SAME well-known footgun `entry`'s
+    // own PR-it766 fix already treats as security-relevant). Live-
+    // confirmed BEFORE this fix: a manifest with `version = "."` (a no-op
+    // path segment, ALSO correctly rejected below, not just `..`/absolute
+    // paths) made `kupl pkg tree` silently read and report an unrelated
+    // directory's own `kupl.toml` as if it were a legitimately cache-
+    // resolved dependency. Rejected here, at the SAME "single earliest
+    // enforcement point" `is_safe_relative_path`'s own doc comment
+    // establishes for `path`/`url` in registry.rs, mirroring `entry`'s own
+    // precedent exactly. (The `name` check this comment originally also
+    // covered here now lives at the TOP of this function instead, applying
+    // uniformly to both the bare-string and inline-table syntax forms --
+    // see PR-it1065's own doc comment there for why.)
     if let Some(v) = &version {
         if !crate::registry::is_safe_relative_path(v) {
             return Err(format!(
@@ -493,6 +507,49 @@ mod tests {
         assert!(
             ok.is_ok(),
             "an ordinary relative/absolute PATH dependency and an ordinary VERSION string must still parse cleanly: {ok:?}"
+        );
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1065, a background
+    /// close-read survey finding): the test above locks in the NAME check
+    /// for the inline-table (`{ version = ".." }`) syntax form -- this test
+    /// proves the IDENTICAL check now applies to the bare-string shorthand
+    /// form too (`name = "../path"`), which used to skip it entirely via
+    /// an early `return` before the check ever ran. Live-confirmed BEFORE
+    /// this fix: `/etc/passwd = "vendor/util"` parsed SUCCESSFULLY (no
+    /// manifest error), while the identical name via
+    /// `../../etc = { path = "vendor/util" }` was already correctly
+    /// rejected -- a genuine inconsistency between two equivalent syntax
+    /// forms.
+    #[test]
+    fn a_path_style_dependencys_absolute_or_escaping_name_is_a_clean_parse_error_via_the_bare_string_shorthand_too() {
+        let abs_name = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\n/etc/passwd = \"vendor/util\"\n",
+        )
+        .expect_err("an absolute dependency NAME must be a clean parse error via the bare-string shorthand form too");
+        assert!(abs_name.contains("must be a plain relative name"), "{abs_name}");
+
+        let dotdot_name = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\n../../etc = \"vendor/util\"\n",
+        )
+        .expect_err("a `..`-containing dependency NAME must be a clean parse error via the bare-string shorthand form too");
+        assert!(dotdot_name.contains("must be a plain relative name"), "{dotdot_name}");
+
+        // both syntax forms must now reject the SAME unsafe name IDENTICALLY.
+        let inline_table = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\n/etc/passwd = { path = \"vendor/util\" }\n",
+        )
+        .expect_err("the inline-table form must still reject the same unsafe name");
+        assert_eq!(
+            abs_name, inline_table,
+            "the bare-string and inline-table forms must reject the identical unsafe name with the identical error"
+        );
+
+        // ordinary, legitimate bare-string-shorthand dependencies are unaffected.
+        let ok = parse("[project]\nname = \"app\"\n\n[dependencies]\nutil = \"vendor/util\"\n").unwrap();
+        assert_eq!(
+            ok.deps,
+            vec![Dep { name: "util".into(), path: Some("vendor/util".into()), version: None }]
         );
     }
 
