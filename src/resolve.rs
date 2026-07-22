@@ -50,6 +50,38 @@ pub fn demangle_for_display(name: &str) -> &str {
     name.rsplit('$').next().unwrap_or(name)
 }
 
+/// The complement of `demangle_for_display`: the package prefix a mangled
+/// `pkg$name` came from, or `""` for a root-package (never-mangled) name.
+///
+/// A REAL, LIVE-CONFIRMED schema-completeness gap found+fixed (production-
+/// hardening PR-it1056, an investigation queued from PR-it1054's own run.rs
+/// survey): `run.rs::manifest_json` demangles every cross-package component/
+/// contract name for DISPLAY (this module's own `demangle_for_display`,
+/// PR-it628's precedent) -- but since `isolate()`'s own mangling is
+/// PER-PACKAGE-PREFIXED (this module's own doc comment: "two same-named
+/// types from different packages must stay distinguishable"), TWO DIFFERENT
+/// dependency packages can each legitimately declare a component with the
+/// IDENTICAL bare name (e.g. both declaring `Widget`), and the manifest's
+/// OWN JSON schema had no field anywhere to tell them apart post-demangling.
+/// Live-confirmed BEFORE this fix: a real two-dependency project (`dep_a`
+/// and `dep_b`, each `pub component Widget { ... }` with genuinely different
+/// props/intent) produced a manifest with TWO entries both `"name":
+/// "Widget"` -- completely indistinguishable to a consumer (the manifest's
+/// own stated audience is external "visual tools"), which could silently
+/// pick/overwrite the wrong one if keying by name. Used to add a `"package"`
+/// field to each top-level component entry (and to each `children[]`
+/// entry's own referenced component) -- an ADDITIVE, non-breaking JSON
+/// schema change (a new key on an existing object), not applied to
+/// `fulfills` (a bare string array, not yet converted to an object -- a
+/// larger, separately-scoped follow-up, since contracts are a genuinely
+/// distinct namespace from components with their own characteristics).
+pub fn package_prefix(name: &str) -> &str {
+    match name.rfind('$') {
+        Some(idx) => &name[..idx],
+        None => "",
+    }
+}
+
 /// Rewrite a program's items so cross-package names are globally unique.
 /// `tagged` is `(item, package-prefix)` in load order (prefix "" = root, never
 /// mangled); `pkg_deps` maps a package prefix to the ALIASES it may reference

@@ -843,9 +843,19 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
         // check.rs/types.rs/value.rs). `ports`/`props`/`state`/`exposes`/
         // `children[].name`/`supervises[].child` are all LOCAL names, never
         // mangled, and need no such treatment.
+        //
+        // `"package"` (production-hardening PR-it1056): TWO DIFFERENT
+        // dependency packages can legitimately declare a same-named
+        // component (`isolate()`'s own mangling is per-package-prefixed, so
+        // `dep_a$Widget`/`dep_b$Widget` coexist without colliding
+        // internally) -- demangling BOTH down to bare `"Widget"` with no
+        // other distinguishing field made them indistinguishable to a
+        // manifest consumer. `""` for a root-package (never-mangled)
+        // component, matching `package_prefix`'s own doc comment.
         out.push_str(&format!(
-            "{{\"name\":\"{}\",\"kind\":\"{}\",\"intent\":\"{}\"",
+            "{{\"name\":\"{}\",\"package\":\"{}\",\"kind\":\"{}\",\"intent\":\"{}\"",
             esc(crate::resolve::demangle_for_display(&c.name)),
+            esc(crate::resolve::package_prefix(&c.name)),
             if c.is_app { "app" } else { "component" },
             esc(c.intent.as_deref().unwrap_or("")),
         ));
@@ -959,10 +969,17 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             .children
             .iter()
             .map(|ch| {
+                // `"component_package"` (production-hardening PR-it1056, see
+                // this component entry's own `"package"` field above for the
+                // full writeup): a child instantiation's own `component`
+                // name is demangled the SAME way, so it needs the SAME
+                // disambiguating field when two dependencies declare a
+                // same-named component.
                 format!(
-                    "{{\"name\":\"{}\",\"component\":\"{}\"}}",
+                    "{{\"name\":\"{}\",\"component\":\"{}\",\"component_package\":\"{}\"}}",
                     esc(&ch.name),
-                    esc(crate::resolve::demangle_for_display(&ch.component))
+                    esc(crate::resolve::demangle_for_display(&ch.component)),
+                    esc(crate::resolve::package_prefix(&ch.component))
                 )
             })
             .collect();
@@ -2062,6 +2079,84 @@ mod tests {
             props[0].get("type").and_then(|t| t.str()),
             Some("Color"),
             "a prop typed with the dependency's OWN type must report the bare name, not `dep$Color`"
+        );
+        assert_eq!(
+            comp.get("package").and_then(|p| p.str()),
+            Some("dep"),
+            "a dependency component's own package prefix must be reported"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL, LIVE-CONFIRMED schema-completeness gap found+fixed (production-
+    /// hardening PR-it1056, an investigation queued from PR-it1054's own
+    /// run.rs survey): TWO DIFFERENT dependency packages can legitimately
+    /// declare a component with the IDENTICAL bare name (`isolate()`'s own
+    /// mangling is per-package-prefixed, so `dep_a$Widget`/`dep_b$Widget`
+    /// coexist without colliding internally, confirmed by reading
+    /// `resolve::isolate` directly before writing this test), and
+    /// `manifest_json` demangled BOTH down to the same bare `"Widget"` with
+    /// no other field to distinguish them. Live-confirmed BEFORE this fix
+    /// via a real two-dependency project (`dep_a`/`dep_b`, each declaring a
+    /// genuinely different `Widget`): the manifest's `components` array had
+    /// two entries, both `"name":"Widget"`, indistinguishable to a consumer.
+    /// This test locks in the fix (a new `"package"` field) using the SAME
+    /// project-construction pattern as the single-dependency test above.
+    #[test]
+    fn manifest_distinguishes_two_same_named_components_from_different_dependencies() {
+        let base = std::env::temp_dir().join(format!("kupl-manifest-collision-test-{}", std::process::id()));
+        let dep_a = base.join("dep_a");
+        let dep_b = base.join("dep_b");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep_a).unwrap();
+        std::fs::create_dir_all(&dep_b).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep_a.join("kupl.toml"), "[project]\nname = \"dep_a\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep_a.join("main.kupl"),
+            "pub component Widget {\n    intent \"widget from dep_a\"\n    prop x: Int\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dep_b.join("kupl.toml"), "[project]\nname = \"dep_b\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep_b.join("main.kupl"),
+            "pub component Widget {\n    intent \"widget from dep_b\"\n    prop y: Str\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n\
+             [dependencies]\ndep_a = { path = \"../dep_a\" }\ndep_b = { path = \"../dep_b\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep_a\nuse dep_b\n\nfun main() uses io {\n    \
+             let a = dep_a.Widget(x: 1)\n    let b = dep_b.Widget(y: \"hi\")\n    print(a)\n    print(b)\n}\n",
+        )
+        .unwrap();
+
+        let (program, _map) = crate::loader::load(app.join("main.kupl").to_str().unwrap())
+            .map_err(|(d, _)| format!("{d:?}"))
+            .expect("app loads with both dependencies");
+        let json = super::manifest_json(&program);
+        assert!(!json.contains('$'), "no `pkg$Name` mangling artifact should ever reach the manifest: {json}");
+        let v = crate::lsp::parse_json(&json).expect("manifest must be valid JSON");
+        let comps = match v.get("components") {
+            Some(crate::lsp::Json::Arr(a)) => a.clone(),
+            other => panic!("components must be an array: {other:?}"),
+        };
+        assert_eq!(comps.len(), 2, "both same-named components must be present, not deduplicated/dropped");
+        for c in &comps {
+            assert_eq!(c.get("name").and_then(|n| n.str()), Some("Widget"));
+        }
+        let packages: std::collections::BTreeSet<&str> =
+            comps.iter().filter_map(|c| c.get("package").and_then(|p| p.str())).collect();
+        assert_eq!(
+            packages,
+            std::collections::BTreeSet::from(["dep_a", "dep_b"]),
+            "the two same-named components must be distinguishable by their own package field: {json}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
