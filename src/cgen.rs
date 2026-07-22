@@ -4266,58 +4266,102 @@ static void k_ai_dump_str_escaped(KBuf* b, const char* s) {
    `k_json_num` (already fuzz-confirmed at PR-it722 to match Rust's
    `f64::to_string()` byte-for-byte, including the shortest-round-tripping-
    decimal algorithm for large whole numbers) is the correct mirror. */
+/* Iterative (production-hardening PR-it1049, closing the queued native-side
+   follow-up from PR-it1048's own Rust-side `ai.rs::dump_json` fix): used to
+   recurse via `k_ai_dump_json_into` calling itself for each `JArr` item /
+   `JObj` value, so a `Json` value built ITERATIVELY on the KUPL/Rust side and
+   echoed through a mock/model tool-call round-trip deep enough could
+   segfault natively -- the EXACT same bug class, and the EXACT same fix
+   shape, as `k_json_write`'s own PR-it806 iterative rewrite just above in
+   this file (both walk the SAME `JNull`/`JBool`/`JNum`/`JStr`/`JArr`/`JObj`
+   `KValue`-`Ctor` representation, reusing that fix's own `KJsonItem`
+   work-stack type). Deliberately NOT unified into a single function: this
+   one preserves `k_ai_dump_json_into`'s OWN distinct `JNum`/`JStr` formatting
+   (the PR-it909 non-finite-number fallback, the full-i64-range integer fast
+   path, and `k_ai_dump_str_escaped`'s own `\b`/`\f`-unescaped convention) --
+   see this function's own history above for why those differ from
+   `k_json_write`'s stricter RFC-8259 formatting. */
 static void k_ai_dump_json_into(KBuf* b, KValue j) {
-    const char* v = k_json_var(j);
-    if (!strcmp(v, "JNull")) { kb_puts(b, "null"); return; }
-    if (!strcmp(v, "JBool")) { kb_puts(b, k_json_field0(j).as.b ? "true" : "false"); return; }
-    if (!strcmp(v, "JNum")) {
-        double n = k_json_field0(j).as.f;
-        /* A REAL bug found+fixed (production-hardening PR-it909, survey #66):
-           `k_json_num` (the STRICT RFC-8259 writer, used by `.to_json()`/
-           `k_json_stringify`) deliberately PANICS on a non-finite number
-           (PR-it634's own fix, since real JSON has no NaN/Infinity
-           representation) -- but THIS function mirrors `ai.rs::dump_json`,
-           which is only used to echo a mock/model tool-call's own content
-           back into an internal conversation transcript, not to emit
-           spec-compliant JSON. `dump_json`'s `Json::Num` arm has NO
-           finiteness guard at all -- its non-integer-fast-path fallback is
-           bare Rust `format!("{n}")` (f64's `Display` impl), which for
-           NaN/Infinity/-Infinity produces the literal text "NaN"/"inf"/
-           "-inf", not an error. Calling the strict `k_json_num` here for a
-           non-finite value crashed the WHOLE program with an unrelated-
-           looking "cannot serialize a non-finite number" panic where interp/
-           vm return cleanly (e.g. `"inf"` for an ai fun's `-> Str`) --
-           confirmed live via `KUPL_AI_MOCK_<NAME>='[{"final": 1e400}]'` on
-           an `ai fun ... tools [t]`. */
-        if (!isfinite(n)) {
-            kb_puts(b, isnan(n) ? "NaN" : (n > 0 ? "inf" : "-inf"));
-        } else if (n == floor(n) && n >= -9223372036854775808.0 && n < 9223372036854775808.0) {
-            char t[32]; snprintf(t, sizeof t, "%lld", (long long)n); kb_puts(b, t);
-        } else {
-            k_json_num(b, n);
+    int cap = 16, n = 0;
+    KJsonItem* stack = (KJsonItem*)k_alloc(sizeof(KJsonItem) * cap);
+    stack[n].kind = 1; stack[n].v = j; n++;
+    while (n > 0) {
+        KJsonItem item = stack[--n];
+        if (item.kind == 0) {
+            kb_puts(b, item.lit);
+            if (item.owned) free((void*)item.lit);
+            continue;
         }
-        return;
-    }
-    if (!strcmp(v, "JStr")) { k_ai_dump_str_escaped(b, k_json_field0(j).as.s); return; }
-    if (!strcmp(v, "JArr")) {
-        kb_puts(b, "[");
-        KList* items = k_json_field0(j).as.list;
-        for (int64_t i = 0; i < items->len; i++) { if (i) kb_puts(b, ","); k_ai_dump_json_into(b, items->items[i]); }
-        kb_puts(b, "]");
-        return;
-    }
-    if (!strcmp(v, "JObj")) {
-        kb_puts(b, "{");
-        KMap* m = k_json_field0(j).as.map;
-        for (int64_t i = 0; i < m->len; i++) {
-            if (i) kb_puts(b, ",");
-            k_ai_dump_str_escaped(b, m->keys[i].as.s);
-            kb_puts(b, ":");
-            k_ai_dump_json_into(b, m->vals[i]);
+        KValue x = item.v;
+        const char* v = k_json_var(x);
+        if (!strcmp(v, "JNull")) {
+            kb_puts(b, "null");
+        } else if (!strcmp(v, "JBool")) {
+            kb_puts(b, k_json_field0(x).as.b ? "true" : "false");
+        } else if (!strcmp(v, "JNum")) {
+            double num = k_json_field0(x).as.f;
+            /* A REAL bug found+fixed (production-hardening PR-it909, survey
+               #66): `k_json_num` (the STRICT RFC-8259 writer, used by
+               `.to_json()`/`k_json_stringify`) deliberately PANICS on a
+               non-finite number (PR-it634's own fix, since real JSON has no
+               NaN/Infinity representation) -- but THIS function mirrors
+               `ai.rs::dump_json`, which is only used to echo a mock/model
+               tool-call's own content back into an internal conversation
+               transcript, not to emit spec-compliant JSON. `dump_json`'s
+               `Json::Num` arm has NO finiteness guard at all -- its non-
+               integer-fast-path fallback is bare Rust `format!("{n}")` (f64's
+               `Display` impl), which for NaN/Infinity/-Infinity produces the
+               literal text "NaN"/"inf"/"-inf", not an error. Calling the
+               strict `k_json_num` here for a non-finite value crashed the
+               WHOLE program with an unrelated-looking "cannot serialize a
+               non-finite number" panic where interp/vm return cleanly (e.g.
+               `"inf"` for an ai fun's `-> Str`) -- confirmed live via
+               `KUPL_AI_MOCK_<NAME>='[{"final": 1e400}]'` on an `ai fun ...
+               tools [t]`. */
+            if (!isfinite(num)) {
+                kb_puts(b, isnan(num) ? "NaN" : (num > 0 ? "inf" : "-inf"));
+            } else if (num == floor(num) && num >= -9223372036854775808.0 && num < 9223372036854775808.0) {
+                char t[32]; snprintf(t, sizeof t, "%lld", (long long)num); kb_puts(b, t);
+            } else {
+                k_json_num(b, num);
+            }
+        } else if (!strcmp(v, "JStr")) {
+            k_ai_dump_str_escaped(b, k_json_field0(x).as.s);
+        } else if (!strcmp(v, "JArr")) {
+            kb_puts(b, "[");
+            KList* items = k_json_field0(x).as.list;
+            if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+            stack[n].kind = 0; stack[n].lit = "]"; stack[n].owned = 0; n++;
+            for (int64_t i = items->len - 1; i >= 0; i--) {
+                if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                stack[n].kind = 1; stack[n].v = items->items[i]; n++;
+                if (i > 0) {
+                    if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                    stack[n].kind = 0; stack[n].lit = ","; stack[n].owned = 0; n++;
+                }
+            }
+        } else if (!strcmp(v, "JObj")) {
+            kb_puts(b, "{");
+            KMap* m = k_json_field0(x).as.map;
+            if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+            stack[n].kind = 0; stack[n].lit = "}"; stack[n].owned = 0; n++;
+            for (int64_t i = m->len - 1; i >= 0; i--) {
+                if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                stack[n].kind = 1; stack[n].v = m->vals[i]; n++;
+                if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = ":"; stack[n].owned = 0; n++;
+                KBuf kb2 = { 0, 0, 0 };
+                k_ai_dump_str_escaped(&kb2, m->keys[i].as.s);
+                if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                stack[n].kind = 0; stack[n].lit = kb2.buf; stack[n].owned = 1; n++;
+                if (i > 0) {
+                    if (n == cap) { cap *= 2; stack = (KJsonItem*)realloc(stack, sizeof(KJsonItem) * cap); }
+                    stack[n].kind = 0; stack[n].lit = ","; stack[n].owned = 0; n++;
+                }
+            }
         }
-        kb_puts(b, "}");
-        return;
     }
+    free(stack);
 }
 static char* k_ai_dump_json(KValue j) {
     KBuf b = { 0, 0, 0 };
@@ -9553,6 +9597,53 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         // `null` for an `Int` target hits the GENERIC fallback (not the
         // dedicated Int-vs-fraction branch, which only fires for Json::Num).
         assert_eq!(run("KUPL_AI_MOCK_I", "null", "i"), "panic: ai `i`: expected Int, model returned null");
+    }
+
+    /// PRODUCTION-HARDENING (PR-it1049): `k_ai_dump_json_into` (the native
+    /// mirror of `ai.rs::dump_json`, fixed on the Rust side at PR-it1048) is
+    /// rewritten here to use the SAME iterative `KJsonItem` work-stack
+    /// technique as its sibling `k_json_write` (PR-it806), instead of
+    /// recursing natively into `JArr`/`JObj` children. Both `lsp::parse_json`
+    /// AND native's own `k_json_parse` cap recursion depth at
+    /// `MAX_JSON_DEPTH` (500) -- the ONLY way a `Json` value reaches
+    /// `dump_json`/`k_ai_dump_json_into` at all is via one of those two
+    /// parsers, so a value nested anywhere NEAR that cap is the realistic
+    /// worst case this rewrite must handle correctly (unlike the Rust-side
+    /// test, which could construct a value directly bypassing the parser
+    /// entirely to prove millions-deep safety; native has no equivalent
+    /// in-process construction path, so this test instead proves BYTE-EXACT
+    /// correctness at the deepest depth genuinely reachable through any real
+    /// KUPL-source call). Depth 400 is comfortably under the 500 cap (margin
+    /// against any off-by-one in exactly where "depth" starts counting) while
+    /// still exercising hundreds of work-stack push/pop cycles per array
+    /// boundary -- the OLD recursive version and the NEW iterative version
+    /// must produce byte-identical output for this to pass, since the
+    /// asserted string is a plain, compact, no-whitespace round-trip of the
+    /// input.
+    #[test]
+    fn native_ai_dump_json_matches_a_json_value_nested_near_the_max_parse_depth() {
+        if !cc_available() {
+            return;
+        }
+        let depth = 400;
+        let deep = "[".repeat(depth) + &"]".repeat(depth);
+        let src = "ai fun i(t: Str) -> Int { intent \"i {t}\" }\n\
+                   fun main() uses io { print(\"{i(\"x\")}\") }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("emit_c");
+        let base =
+            std::env::temp_dir().join(format!("kupl-aidumpdeep-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin).env("KUPL_AI_MOCK_I", &deep).output().unwrap();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        assert_eq!(stderr, format!("panic: ai `i`: expected Int, model returned {deep}"));
     }
 
     /// Native read_file rejects a NUL / invalid-UTF-8 file like the interpreter
