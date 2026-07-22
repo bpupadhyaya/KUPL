@@ -15559,6 +15559,80 @@ fun main() uses io {
         );
     }
 
+    /// A THIRD sibling fuzz domain (production-hardening PR-it1030), closing a
+    /// gap PR-it1029's own NEXT-note flagged in ITS OWN Set fuzzer: that test
+    /// deduplicates its `a`/`b` element lists in RUST before generating the
+    /// `Set([...])` KUPL source, so the raw List handed to `Set(...)` NEVER
+    /// actually contains a duplicate -- meaning `set_from_list`'s own dedup
+    /// fast path (`k_set_from` in cgen.rs, the SAME O(n^2)-latency bug class
+    /// PR-it826 originally fixed here) was genuinely never fuzzed with real
+    /// duplicate input. This test closes exactly that gap: the generated List
+    /// literal is fed to `Set(...)` WITH duplicates still present, letting the
+    /// native constructor itself do the deduplication. The expected value is
+    /// an independently-written first-occurrence-preserving Rust dedup scan
+    /// (identical CONTRACT to `.unique()`'s, since only plain `Int` values are
+    /// used here -- no NaN-collapsing-vs-preserving distinction applies).
+    #[test]
+    fn fuzz_random_set_construction_deduplicates_like_the_canonical_rust_implementation_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 { 0 } else { self.next() % n }
+            }
+        }
+        fn fmt_list(v: &[i64]) -> String {
+            format!("[{}]", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let len = 2 + rng.below(25) as usize;
+            // A narrow value range (0..8) guarantees the generated List
+            // itself contains genuine duplicates -- the whole point of this
+            // test, unlike PR-it1029's Set fuzzer which pre-dedupes.
+            let values: Vec<i64> = (0..len).map(|_| rng.below(8) as i64).collect();
+            let list_src = values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+
+            let mut expected = Vec::new();
+            for &v in &values {
+                if !expected.contains(&v) {
+                    expected.push(v);
+                }
+            }
+
+            let src = format!(
+                "fun main() uses io {{\n    print(Set([{list_src}]).to_list())\n}}\n"
+            );
+            let raw = native_main_stdout(&src, &format!("setfromlistfuzz{seed}"));
+            let expected_str = format!("{}\n", fmt_list(&expected));
+            if raw != expected_str {
+                mismatches.push(format!(
+                    "seed={seed} values={values:?} expected={expected_str:?} actual={raw:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native Set(...) construction diverges from the canonical Rust implementation on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
     /// PR-it663, the SAME bug class as it662's BigInt.from_str finding, this
     /// time on a far more commonly-used surface): `Str.trim()` used to share
