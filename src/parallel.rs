@@ -282,7 +282,19 @@ pub fn try_par_map(
     for r in par_eval(&portable, &fname, image) {
         match r {
             Ok(pv) => out.push(from_portable(&pv)),
-            Err(e) => return Some(Err(e)),
+            Err(EvalOutcome::Panic(msg)) => return Some(Err(msg)),
+            // A REAL bug found+fixed (production-hardening PR-it1061): see
+            // `EvalOutcome`'s own doc comment for the full writeup -- this
+            // is NOT a real error, so return `None` (the SAME "fall back to
+            // sequential" signal `gate` itself returns) rather than
+            // `Some(Err(..))`, letting `interp.rs::builtin_method` re-run
+            // the WHOLE call through the ordinary, always-correct
+            // sequential `shared_method` path. Safe to discard whatever
+            // parallel work already happened: every element's callback is
+            // PURE (a `gate`-enforced precondition), so redundantly
+            // re-evaluating it sequentially produces the identical result
+            // with no observable difference.
+            Err(EvalOutcome::NonPortableResult) => return None,
         }
     }
     Some(Ok(Value::List(Rc::new(out))))
@@ -309,7 +321,15 @@ pub fn try_par_filter(
             // false OR any non-Bool: excluded, exactly as the sequential
             // `if let Value::Bool(true) = …` does (it never errors on non-Bool).
             Ok(_) => {}
-            Err(e) => return Some(Err(e)),
+            Err(EvalOutcome::Panic(msg)) => return Some(Err(msg)),
+            // See `try_par_map`'s own matching arm / `EvalOutcome`'s doc
+            // comment (production-hardening PR-it1061) -- not a real error,
+            // fall back to sequential. `par_filter`'s own predicate must
+            // return `Bool` (always portable), so this arm is not
+            // reachable in practice today, but is handled identically to
+            // `try_par_map` for defense-in-depth/future-proofing rather
+            // than relying on that being permanently true.
+            Err(EvalOutcome::NonPortableResult) => return None,
         }
     }
     Some(Ok(Value::List(Rc::new(out))))
@@ -461,13 +481,13 @@ fn par_eval(
     portable: &[PortableValue],
     fname: &str,
     image: &Arc<ProgramImage>,
-) -> Vec<Result<PortableValue, String>> {
+) -> Vec<Result<PortableValue, EvalOutcome>> {
     let n = portable.len();
     let workers =
         std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).clamp(1, n.max(1));
     let chunk = n.div_ceil(workers);
 
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<Result<PortableValue, String>>)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<Result<PortableValue, EvalOutcome>>)>();
     let mut num_spawned = 0usize;
     for w in 0..workers {
         let start = w * chunk;
@@ -538,7 +558,7 @@ fn par_eval(
                 // whatever is present, and `try_par_map`/`try_par_filter`
                 // (this function's own callers) already stop at the first
                 // `Err` they see regardless of how many elements follow it.
-                let mut results: Vec<Result<PortableValue, String>> =
+                let mut results: Vec<Result<PortableValue, EvalOutcome>> =
                     Vec::with_capacity(owned_slice.len());
                 for p in &owned_slice {
                     let r = eval_one(&mut interp, &fname, p);
@@ -559,7 +579,7 @@ fn par_eval(
     }
     drop(tx); // our own extra sender; each worker holds its own clone
 
-    let mut slots: Vec<Option<Vec<Result<PortableValue, String>>>> = vec![None; num_spawned];
+    let mut slots: Vec<Option<Vec<Result<PortableValue, EvalOutcome>>>> = vec![None; num_spawned];
     let mut received = 0usize;
     while received < num_spawned {
         match rx.recv() {
@@ -594,18 +614,44 @@ fn par_eval(
     out
 }
 
+/// The two ways `eval_one` can fail to produce a `PortableValue`, kept
+/// DISTINCT (production-hardening PR-it1061, a background close-read survey
+/// finding): a `Panic` is a genuine runtime error the sequential path would
+/// ALSO raise at this exact element -- it must surface identically to the
+/// user. `NonPortableResult` is NOT a real error at all, just this fast
+/// path's own inability to carry a closure/component/etc. across a thread
+/// boundary -- conflating the two (as a single `Err(String)` used to) made
+/// `try_par_map`/`try_par_filter` treat BOTH the same way: an uncaught
+/// panic. See `gate`'s own doc comment for why a single trial call on
+/// element 0 cannot rule this out upfront: a container/ADT return type
+/// (`Option[fn(Int) -> Int]`, `List[fn(Int) -> Int]`) can be portable for
+/// SOME input values and non-portable for others, purely as a function of
+/// runtime data, not the static type -- so a LATER element can still turn
+/// out non-portable even after the trial call on element 0 passed. Live-
+/// confirmed BEFORE this fix: a 300-element `xs.par_map(pick)` where `pick`
+/// returns `None` for `x == 0` (portable) and `Some(closure)` otherwise
+/// (non-portable) genuinely PANICKED with "parallel callback returned a
+/// non-portable value" -- a purely SIZE-driven crash on valid, well-typed
+/// KUPL, the exact class of bug PR-it922 already fixed for the UNIFORM
+/// case (every element sharing the same portability), left open here for
+/// the DATA-DEPENDENT case.
+#[derive(Clone)]
+enum EvalOutcome {
+    Panic(String),
+    NonPortableResult,
+}
+
 /// Evaluate the pure function on one element (thread-local `Value`s only).
 fn eval_one(
     interp: &mut crate::interp::Interp,
     fname: &str,
     arg: &PortableValue,
-) -> Result<PortableValue, String> {
+) -> Result<PortableValue, EvalOutcome> {
     let f = Value::Fun(Rc::new(fname.to_string()));
     match interp.call_value(f, vec![from_portable(arg)], Span::default()) {
-        Ok(v) => to_portable(&v)
-            .ok_or_else(|| "parallel callback returned a non-portable value".to_string()),
-        Err(crate::interp::Flow::Panic { msg, .. }) => Err(msg),
-        Err(_) => Err("invalid control flow in parallel callback".to_string()),
+        Ok(v) => to_portable(&v).ok_or(EvalOutcome::NonPortableResult),
+        Err(crate::interp::Flow::Panic { msg, .. }) => Err(EvalOutcome::Panic(msg)),
+        Err(_) => Err(EvalOutcome::Panic("invalid control flow in parallel callback".to_string())),
     }
 }
 
@@ -983,6 +1029,60 @@ mod tests {
             "300 11",
             "must succeed with the correct closures (element 10 adds 10, so (…)(1) == 11), not panic: \
              stdout={stdout:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1061, a background
+    /// close-read survey finding): see `EvalOutcome`'s own doc comment for
+    /// the full writeup. Unlike the PR-it922 test above (every element's
+    /// output shares the SAME portability, since `make_adder` always
+    /// returns a closure), this test's callback returns a DATA-DEPENDENT
+    /// mix -- portable (`None`) for element 0, non-portable (`Some(closure)`)
+    /// for every other element -- so `gate`'s single-element trial call
+    /// (which only probes element 0) cannot catch this upfront, and the
+    /// gap only surfaces once a LATER element's own non-portable result
+    /// reaches `eval_one`. Confirmed live BEFORE this fix: `kupl run`
+    /// genuinely panicked with "parallel callback returned a non-portable
+    /// value" on exactly this program at 300 elements.
+    #[test]
+    fn par_map_with_a_data_dependent_non_portable_output_falls_back_to_sequential_instead_of_panicking() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let src = "fun pick(x: Int) -> Option[fn(Int) -> Int] {\n    \
+                   if x == 0 { None } else { Some(fn(y: Int) { x + y }) }\n}\n\n\
+                   fun main() uses io {\n    \
+                   var xs: List[Int] = []\n    var i = 0\n    while i < 300 {\n        \
+                   xs = xs.push(i)\n        i = i + 1\n    }\n    \
+                   let ys = xs.par_map(pick)\n    \
+                   let idx0_is_none = ys.get(0).unwrap_or(None) == None\n    \
+                   let f10 = ys.get(10).unwrap_or(None)\n    \
+                   match f10 {\n        \
+                   Some(f) => print(\"{ys.len()} {idx0_is_none} {f(1)}\"),\n        \
+                   None => print(\"UNEXPECTED_NONE\"),\n    }\n}\n";
+        let dir = std::env::temp_dir().join(format!("kupl-parallel-nonportable-data-dependent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nonportable-data-dependent.kupl");
+        std::fs::write(&path, src).unwrap();
+        let child = std::process::Command::new(&bin)
+            .arg("run")
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out =
+            out.unwrap_or_else(|| panic!("kupl run par_map data-dependent-non-portable-output test hung"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.trim(),
+            "300 true 11",
+            "must succeed with the correct closures (element 0 is None, element 10 adds \
+             10, so f(1) == 11), not panic: stdout={stdout:?} stderr={:?}",
             String::from_utf8_lossy(&out.stderr)
         );
         let _ = std::fs::remove_dir_all(&dir);
