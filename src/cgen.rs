@@ -15361,6 +15361,88 @@ fun main() uses io {
         );
     }
 
+    /// A NEW fuzz domain (production-hardening PR-it1028), the first to target
+    /// List collection methods rather than a numeric/text type. `.unique()` and
+    /// `.dedup()` in particular have real prior bug history in this exact area
+    /// (PR-it825's O(n^2)-latency fix for `.unique()`, part of a broader pattern
+    /// of at least six similar collection-algorithm latency bugs this campaign
+    /// has found and fixed: `Int.pow` it814, `List.sort` it818, `List.unique`
+    /// it825, `set_from_list` it826, `group_by` it827, `Set.union` it828).
+    /// Each expected value is computed by an INDEPENDENTLY-written Rust
+    /// computation (plain `Vec::sort`/`Vec::dedup`/a hand-written first-
+    /// occurrence scan), not by calling into interp.rs at all, so a shared bug
+    /// between interp.rs and cgen.rs's own C reimplementation would still be
+    /// caught -- the same evidentiary strength as the existing numeric fuzzers.
+    #[test]
+    fn fuzz_random_list_sort_unique_and_dedup_match_the_canonical_rust_implementation_on_native() {
+        if !cc_available() {
+            return;
+        }
+        struct FuzzRng(u64);
+        impl FuzzRng {
+            fn new(seed: u64) -> Self {
+                FuzzRng(if seed == 0 { 1 } else { seed })
+            }
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 { 0 } else { self.next() % n }
+            }
+        }
+        fn fmt_list(v: &[i64]) -> String {
+            format!("[{}]", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+        }
+        let mut mismatches = Vec::new();
+        for seed in 1..=80u64 {
+            let mut rng = FuzzRng::new(seed);
+            let len = 1 + rng.below(20) as usize;
+            // A narrow value range (0..10) guarantees plenty of duplicates,
+            // exercising unique/dedup's actual dedup logic rather than a
+            // list that's already all-distinct.
+            let values: Vec<i64> = (0..len).map(|_| rng.below(10) as i64).collect();
+            let list_src = values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+
+            let mut sorted = values.clone();
+            sorted.sort();
+            let mut unique = Vec::new();
+            for &v in &values {
+                if !unique.contains(&v) {
+                    unique.push(v);
+                }
+            }
+            let mut deduped = values.clone();
+            deduped.dedup(); // Rust's own consecutive-only dedup matches KUPL's `.dedup()` exactly
+
+            let src = format!(
+                "fun main() uses io {{\n    let xs = [{list_src}]\n    print(xs.sort())\n    print(xs.unique())\n    print(xs.dedup())\n}}\n"
+            );
+            let raw = native_main_stdout(&src, &format!("listfuzz{seed}"));
+            let expected = format!(
+                "{}\n{}\n{}\n",
+                fmt_list(&sorted),
+                fmt_list(&unique),
+                fmt_list(&deduped)
+            );
+            if raw != expected {
+                mismatches.push(format!(
+                    "seed={seed} values={values:?} expected={expected:?} actual={raw:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "native List sort/unique/dedup diverges from the canonical Rust implementation on {} generated cases:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
     /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
     /// PR-it663, the SAME bug class as it662's BigInt.from_str finding, this
     /// time on a far more commonly-used surface): `Str.trim()` used to share
