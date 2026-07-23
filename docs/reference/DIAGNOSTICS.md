@@ -131,6 +131,9 @@ Severity: **E** = error, **W** = warning.
 | K0278 | E | component is defined more than once |
 | K0279 | W | a fulfilling method calls a value of function type — its effects cannot be verified against the contract's effect budget |
 | K0280 | E | a parameter's default value references another parameter of the same function — defaults are evaluated at the call site, not the function's own scope |
+| K0281 | E | a generic function's own type parameter is narrowed/specialized inside its own body — a generic function must treat its type parameters abstractly |
+| K0282 | E | component method declares type parameters — component methods do not yet support generics (only top-level `fun`s can be generic) |
+| K0283 | E | prop is declared more than once |
 | K0284 | E | method is declared more than once in a contract |
 | K0285 | E | the same `wire` connection is declared more than once — each emitted value would be delivered twice |
 | K0286 | E | the same child is `supervise`d more than once — a `restart on_failure` declaration silently wins over a later `restart never` |
@@ -142,6 +145,7 @@ Severity: **E** = error, **W** = warning.
 | K0300 | W | component has no `intent` |
 | K0301 | E | public function does not declare its effects (`add uses …`) |
 | K0302 | W | declared effect is never used |
+| K0303 | W | function calls a value of function type — its effects cannot be verified; declare `uses` for any effect it may perform |
 
 ## K04xx — Loader (multi-file)
 
@@ -149,6 +153,7 @@ Severity: **E** = error, **W** = warning.
 |---|---|---|
 | K0400 | E | cannot read module file referenced by `use` |
 | K0401 | E | dependency version mismatch (`requires 1.2.0 but found 0.9.0`) |
+| K0402 | E | command needs `.kupl` source, not an already-compiled `.kx` module |
 
 ## K08xx — KVM backend limits
 
