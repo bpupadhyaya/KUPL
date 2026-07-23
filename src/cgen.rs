@@ -4490,6 +4490,23 @@ static void k_ai_dump_json_into(KBuf* b, KValue j) {
                tools [t]`. */
             if (!isfinite(num)) {
                 kb_puts(b, isnan(num) ? "NaN" : (num > 0 ? "inf" : "-inf"));
+            } else if (num == 0.0 && signbit(num)) {
+                /* A REAL, live-confirmed cross-engine byte divergence
+                   found+fixed (production-hardening PR-it1094): this mirrors
+                   ai.rs::dump_json's own Json::Num arm, which used to have
+                   the SAME `as i64`-discards-the-sign-of-negative-zero bug
+                   already fixed elsewhere in this codebase (json.rs's
+                   format_num PR-it1066, this file's OWN k_json_num
+                   PR-it1083) -- deliberately left unfixed here at PR-it1083
+                   because at the time BOTH engines agreed (the Rust
+                   reference had the identical bug). Now that ai.rs::
+                   dump_json's own Json::Num arm is fixed (PR-it1094) to
+                   correctly emit "-0", leaving this C mirror unfixed would
+                   have flipped a previously-agreeing pair into a NEW
+                   divergence rather than closing one -- so this follow-up
+                   fix is required, not optional, per this campaign's own
+                   "check whether a second site is now safe to fix" discipline. */
+                kb_puts(b, "-0");
             } else if (num == floor(num) && num >= -9223372036854775808.0 && num < 9223372036854775808.0) {
                 char t[32]; snprintf(t, sizeof t, "%lld", (long long)num); kb_puts(b, t);
             } else {
@@ -10089,6 +10106,41 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let _ = std::fs::remove_file(&bin);
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         assert_eq!(stderr, format!("panic: ai `i`: expected Int, model returned {deep}"));
+    }
+
+    /// A REAL, live-confirmed cross-engine byte divergence found+fixed
+    /// (production-hardening PR-it1094): `k_ai_dump_json_into` (the native
+    /// mirror of `ai.rs::dump_json`) had the SAME `(long long)num`-discards-
+    /// the-sign-of-negative-zero bug already fixed for `k_json_num`
+    /// (PR-it1083) -- deliberately left unfixed at that time because the
+    /// Rust reference (`ai.rs::dump_json`) had the identical bug, so all
+    /// engines agreed. Now that `dump_json` is fixed (PR-it1094) to
+    /// correctly emit "-0", this C mirror needed its OWN matching follow-up
+    /// fix to avoid introducing a NEW divergence. Exercised via the same
+    /// mock-mismatch mechanism as the sibling tests above: a `List[Int]`
+    /// target mocked with a bare JSON number (`-0.0`) mismatches and the
+    /// panic message echoes the model's own value via `k_ai_dump_json_into`.
+    #[test]
+    fn native_ai_dump_json_preserves_the_sign_of_negative_zero() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun li(t: Str) -> List[Int] { intent \"li {t}\" }\n\
+                   fun main() uses io { print(\"{li(\"x\")}\") }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-ainegzero-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let out = std::process::Command::new(&bin).env("KUPL_AI_MOCK_LI", "-0.0").output().unwrap();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        assert_eq!(stderr, "panic: ai `li`: expected List[Int], model returned -0");
     }
 
     /// Native read_file rejects a NUL / invalid-UTF-8 file like the interpreter

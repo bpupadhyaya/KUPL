@@ -310,7 +310,25 @@ fn dump_json(j: &Json) -> String {
                     // f64 precision like any large JSON number, but round-trips to
                     // SOME value derived from what was actually sent, not a sentinel
                     // that discards the input's magnitude entirely.
-                    if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n < i64::MAX as f64 {
+                    // A REAL bug found+fixed (production-hardening PR-it1094):
+                    // `*n as i64` has no representation for negative zero (the
+                    // sign bit is simply discarded by the cast), so `-0.0` --
+                    // which satisfies the whole-number branch's own guard just
+                    // like any other integer-valued float -- silently echoed
+                    // "0" instead of "-0" back into the model's own tool-call
+                    // history. json.rs::format_num's sibling PR-it1066 fix
+                    // (and cgen.rs's own matching PR-it1083 fix for
+                    // k_json_num) already established that this codebase
+                    // treats -0.0 textual-sign fidelity as an actively-
+                    // enforced round-trip invariant; this was the one
+                    // remaining place that dropped it. The `else` branch
+                    // below already correctly emits "-0" for -0.0 (Rust's own
+                    // f64 Display preserves the sign) -- routed through an
+                    // explicit early check instead of the lossy `as i64` cast,
+                    // matching format_num's exact fix shape.
+                    if *n == 0.0 && n.is_sign_negative() {
+                        out.push_str("-0");
+                    } else if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n < i64::MAX as f64 {
                         out.push_str(&format!("{}", *n as i64));
                     } else {
                         out.push_str(&format!("{n}"));
@@ -1383,6 +1401,26 @@ mod tests {
         // ordinary in-range/fractional numbers are completely unaffected.
         assert_eq!(dump_json(&Json::Num(42.0)), "42");
         assert_eq!(dump_json(&Json::Num(3.14)), "3.14");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1094): `*n as i64`
+    /// has no representation for negative zero (the sign bit is simply
+    /// discarded by the cast), so `-0.0` -- which satisfies the whole-number
+    /// fast path's own guard just like any other integer-valued float --
+    /// silently echoed "0" instead of "-0" back into the model's own tool-
+    /// call history. json.rs::format_num's sibling PR-it1066 fix (and this
+    /// codebase's own matching cgen.rs::k_json_num PR-it1083 fix) already
+    /// established -0.0 textual-sign fidelity as an actively-enforced round-
+    /// trip invariant; this was the one remaining unfixed instance.
+    #[test]
+    fn dump_json_preserves_the_sign_of_negative_zero() {
+        assert_eq!(dump_json(&Json::Num(-0.0)), "-0");
+        assert_eq!(dump_json(&Json::Num(0.0)), "0");
+        // an ordinary negative whole number is unaffected (only exactly
+        // -0.0 hit the sign-dropping cast).
+        assert_eq!(dump_json(&Json::Num(-1.0)), "-1");
+        // -0.0 nested inside an array/object round-trips correctly too.
+        assert_eq!(dump_json(&Json::Arr(vec![Json::Num(-0.0), Json::Num(1.0)])), "[-0,1]");
     }
 
     /// PRODUCTION-HARDENING (PR-it1048): `dump_json` used to recurse natively
