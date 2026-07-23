@@ -3871,7 +3871,27 @@ static int k_rmrf(const char* path) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
             char child[4096]; snprintf(child, sizeof child, "%s/%s", path, e->d_name);
             struct stat st;
-            if (!stat(child, &st) && S_ISDIR(st.st_mode)) k_rmrf(child);
+            /* A REAL, live-confirmed DESTRUCTIVE-DATA-LOSS bug (production-
+               hardening PR-it1092): `stat` FOLLOWS symlinks, so a symlink
+               inside the tree being removed that points to an EXTERNAL
+               directory made `remove_dir` recurse into (and delete the
+               CONTENTS of) that external directory -- files completely
+               outside the path the caller asked to remove. Rust's own
+               std::fs::remove_dir_all (interp.rs's reference) is explicitly
+               documented to NOT follow symlinks, instead removing the
+               symlink itself as a plain file. Live-confirmed: a directory
+               containing a symlink to a sibling directory holding
+               `precious.txt` -- `kupl run`'s remove_dir left `precious.txt`
+               untouched (only the symlink itself was removed), but `kupl
+               native`'s remove_dir followed the symlink, deleted
+               `precious.txt`, and only then failed (the symlink path itself
+               can't be `rmdir`'d) with "Directory not empty" -- the data
+               loss had ALREADY happened before the surfaced error. Fixed by
+               using `lstat` (does NOT follow symlinks) instead of `stat` --
+               a symlink now correctly reports as non-directory regardless
+               of what it points to, so it falls to the `unlink` branch just
+               like Rust's own lstat-based check. */
+            if (!lstat(child, &st) && S_ISDIR(st.st_mode)) k_rmrf(child);
             else unlink(child);
         }
         closedir(d);
@@ -3881,6 +3901,21 @@ static int k_rmrf(const char* path) {
 static KValue k_remove_dir(KValue path) {
     /* k_rmrf mirrors interp's fs::remove_dir_all (recursive); the final rmdir sets
        errno (ENOTDIR on a file, ENOENT on missing) so the message matches interp. */
+    /* The SAME symlink hazard k_rmrf's own lstat fix (PR-it1092) closes for
+       NESTED entries also applies to the TOP-LEVEL argument itself: k_rmrf
+       unconditionally opendir()s its argument, and opendir ALWAYS follows a
+       symlink -- so `remove_dir("a_symlink_to_a_dir")` would recurse into
+       (and delete the CONTENTS of) the symlink's TARGET, then merely fail to
+       rmdir the symlink path itself at the very end, by which point the
+       damage was already done. Rust's own remove_dir_all on a top-level
+       symlink argument simply unlinks the symlink and returns Ok, never
+       touching the target -- live-confirmed on interp.rs. Checked here,
+       BEFORE any recursion, via lstat (which does NOT follow the symlink). */
+    struct stat top_lst;
+    if (lstat(path.as.s, &top_lst) == 0 && S_ISLNK(top_lst.st_mode)) {
+        if (unlink(path.as.s) != 0) return k_os_error();
+        return k_ok(k_unit());
+    }
     if (k_rmrf(path.as.s) != 0) return k_os_error();
     return k_ok(k_unit());
 }
@@ -10099,6 +10134,70 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             native_main_stdout(src, "paths").trim(),
             "/b|b|a/\n||noslash\na/b||a/b\n.gz||.|"
         );
+    }
+
+    /// A REAL, live-confirmed DESTRUCTIVE-DATA-LOSS bug found+fixed
+    /// (production-hardening PR-it1092): `k_rmrf` (native's `remove_dir`)
+    /// used `stat` (follows symlinks) to decide whether to recurse into an
+    /// entry, so a symlink NESTED inside the tree being removed -- pointing
+    /// to an EXTERNAL directory -- made native recurse into and delete the
+    /// CONTENTS of that external directory, files completely outside the
+    /// path the caller asked to remove. A SEPARATE, related gap: the
+    /// TOP-LEVEL path argument being a symlink was also followed (via
+    /// `opendir`, which always follows the final path component), deleting
+    /// the target's contents even though only the symlink itself should be
+    /// removed. Rust's own `std::fs::remove_dir_all` (interp.rs's reference)
+    /// is explicitly documented to never follow symlinks in either
+    /// position -- confirmed live on interp.rs before fixing native to
+    /// match, using `lstat` for nested entries and an explicit top-level
+    /// `lstat`+`unlink` check in `k_remove_dir`.
+    #[test]
+    fn native_remove_dir_does_not_follow_symlinks_out_of_the_tree() {
+        if !cc_available() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("kupl-rmrf-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Case 1: a symlink NESTED inside the removed tree, pointing to a
+        // SIBLING directory outside it.
+        let outside = base.join("outside");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("precious.txt"), "keep me").unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+        std::os::unix::fs::symlink(&outside, victim.join("link_to_outside")).unwrap();
+        let prog1 = format!(
+            "fun main() uses io {{ match remove_dir(\"{}\") {{ Ok(_) => print(\"ok\"), Err(e) => print(\"err:{{e}}\") }} }}\n",
+            victim.display()
+        );
+        assert_eq!(native_main_stdout(&prog1, "rmrfsym1").trim(), "ok");
+        assert!(!victim.exists(), "victim itself should be removed");
+        assert!(
+            outside.join("precious.txt").exists(),
+            "a file OUTSIDE the removed tree, reachable only via a nested symlink, must survive"
+        );
+
+        // Case 2: the TOP-LEVEL argument to `remove_dir` is ITSELF a symlink
+        // to a directory -- only the symlink should be removed, the target's
+        // contents must survive untouched.
+        let real_target = base.join("real_target");
+        let top_symlink = base.join("top_symlink");
+        std::fs::create_dir_all(&real_target).unwrap();
+        std::fs::write(real_target.join("keepme.txt"), "keep me too").unwrap();
+        std::os::unix::fs::symlink(&real_target, &top_symlink).unwrap();
+        let prog2 = format!(
+            "fun main() uses io {{ match remove_dir(\"{}\") {{ Ok(_) => print(\"ok\"), Err(e) => print(\"err:{{e}}\") }} }}\n",
+            top_symlink.display()
+        );
+        assert_eq!(native_main_stdout(&prog2, "rmrfsym2").trim(), "ok");
+        assert!(!top_symlink.exists(), "the top-level symlink itself should be removed");
+        assert!(
+            real_target.join("keepme.txt").exists(),
+            "the symlink's TARGET directory's contents must survive when the symlink itself is the remove_dir argument"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Native seeded RNG (xorshift64*) produces the identical sequence to the
