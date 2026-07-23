@@ -300,7 +300,29 @@ impl Resolver<'_> {
     /// `intent` functionally replaces `body` for an ai fun (production-
     /// hardening PR-it840's own finding: `f.body` is always a
     /// parser-synthesized empty block for one).
+    ///
+    /// A REAL bug found+fixed (production-hardening PR-it1068): a
+    /// parameter's OWN default value (`Param.default`, only legal on a
+    /// top-level `fun` -- component-method/ai-fun params and
+    /// constructor/variant fields all reject a default outright via
+    /// check.rs's K0275) was never walked here, the same missing-`Expr`-
+    /// field gap as the `PropDecl.default` case in the `Item::Component`
+    /// arm above, just on a different AST node. Live-confirmed before this
+    /// fix: `fun f(a: Int, b: Int = g(y: 1, x: 10))` against `fun g(x: Int,
+    /// y: Int)` spuriously rejected the named call inside the default with
+    /// K0241, even though `f` was never called anywhere. Resolved BEFORE
+    /// this function's own params are bound, mirroring `PropDecl.default`'s
+    /// identical before-the-frame placement above -- a default is spliced
+    /// into the CALLER's own scope at each call site (never this
+    /// function's own param scope, per this file's own top doc comment), so
+    /// a call target here must never be treated as shadowed by one of this
+    /// function's OWN sibling parameter names.
     fn fun_body(&mut self, f: &mut FunDecl) {
+        for p in &mut f.params {
+            if let Some(d) = &mut p.default {
+                self.expr(d);
+            }
+        }
         self.push();
         for p in &f.params {
             self.bind(&p.name);
@@ -720,6 +742,48 @@ mod tests {
         assert!(
             errors(default).is_empty(),
             "a default-param call inside an ai fun's intent must resolve like it does everywhere else: {:?}",
+            errors(default)
+        );
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1068, an Explore survey finding, agentId a4c21ee677f4e8991,
+    /// independently re-verified live before implementing): `fun_body`
+    /// (used for every top-level `fun` and component method) bound each
+    /// parameter's NAME into scope but never walked that parameter's own
+    /// `default` expression -- unlike the sibling `PropDecl.default` case
+    /// (`Item::Component`'s arm, fixed at PR-it839), which already does.
+    /// So a named-argument or trailing-default-relying call written INSIDE
+    /// a `fun` parameter's own default value was silently rejected with a
+    /// misleading K0241/K0242, even though the identical call compiles
+    /// cleanly everywhere else -- and this misfires purely from the
+    /// function's OWN DECLARATION, with no call to it required anywhere in
+    /// the program. The FIFTH instance of this file's "an Expr-bearing
+    /// field missing from the item walker" class (after PR-it769's
+    /// `examples`/`laws`, PR-it839's `props[i].default`/`children[i].args`,
+    /// PR-it840's `ai.intent_expr`). Component-method/`ai fun` params and
+    /// constructor/variant fields all reject a default outright via
+    /// check.rs's K0275, so a plain top-level `fun`'s own parameter default
+    /// is the ONLY reachable location for this specific gap.
+    #[test]
+    fn default_params_and_named_args_resolve_inside_another_funs_own_parameter_default() {
+        // named arguments, inside a parameter's own default value.
+        let named = "fun g(x: Int, y: Int) -> Int {\n    x - y\n}\n\
+                      fun f(a: Int, b: Int = g(y: 1, x: 10)) -> Int {\n    a + b\n}\n\
+                      fun main() uses io {\n    print(\"{f(0)}\")\n}\n";
+        assert!(
+            errors(named).is_empty(),
+            "a named-argument call inside a fun parameter's own default must resolve like it does everywhere else: {:?}",
+            errors(named)
+        );
+
+        // a trailing default, inside a parameter's own default value.
+        let default = "fun add(a: Int, b: Int = 5) -> Int {\n    a + b\n}\n\
+                        fun f(a: Int, b: Int = add(10)) -> Int {\n    a + b\n}\n\
+                        fun main() uses io {\n    print(\"{f(1)}\")\n}\n";
+        assert!(
+            errors(default).is_empty(),
+            "a default-param call inside a fun parameter's own default must resolve like it does everywhere else: {:?}",
             errors(default)
         );
     }
