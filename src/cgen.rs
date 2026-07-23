@@ -5864,8 +5864,30 @@ static KValue k_date_iso(KValue tv) {
    success (`*end` unchanged) -- `time::parse_iso`'s year field has no subsequent
    range check the way month/day/hour/min/sec incidentally do, so an absurdly large
    year string (e.g. 20+ digits) used to silently parse as a clamped epoch on native
-   instead of the `Err` interp.rs/vm.rs correctly return. */
+   instead of the `Err` interp.rs/vm.rs correctly return.
+   A REAL cross-engine bug found+fixed (production-hardening PR-it1071, an Explore
+   survey finding, independently re-verified live before implementing): plain
+   `strtol` also silently SKIPS leading whitespace, unlike Rust's `str::parse::
+   <i64>()` (used uniformly for every numeral field by `time.rs::parse_iso`, the
+   shared interp/vm implementation), which strictly rejects ANY embedded
+   whitespace. None of `k_parse_iso`'s six call sites' own guards below catch
+   this -- the `*end` check passes since the parse genuinely succeeded, and the
+   `[0]==0` empty-substring guards (PR-it959) only catch a truly EMPTY field, not
+   one that's merely whitespace-prefixed. Live-confirmed before this fix:
+   `parse_iso("2024-01-01T 1:02:03")` (a space-prefixed hour field, landing
+   after the `T`/space date-time separator has already been consumed, so this
+   later space is just part of the hour digit string) returned `Ok(1704070923)`
+   on native alone, while interp/vm agreed on `Err "invalid ISO-8601
+   timestamp..."` for the identical input. This is the SAME `strtol`/`strtoll`
+   leading-whitespace hazard this file already guards against for the unrelated
+   `parse_int`/`parse_radix` builtins (see their own `c0==' '||c0=='\t'||...`
+   checks below) -- that guard was never applied here. Fixed by adding the
+   IDENTICAL character-class check directly in this shared helper (used by ALL
+   SIX of `k_parse_iso`'s numeral fields: year/month/day/hour/minute/second),
+   rather than patching each call site individually. */
 static long k_strtol_checked(const char* s, char** end, int* ok) {
+    char c0 = s[0];
+    if (c0==' '||c0=='\t'||c0=='\n'||c0=='\r'||c0=='\v'||c0=='\f') { *ok = 0; *end = (char*)s; return 0; }
     errno = 0;
     long v = strtol(s, end, 10);
     *ok = (errno != ERANGE);
@@ -11125,6 +11147,56 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "isoemptynumeral").trim(),
             "false|false|false|true|true|true"
+        );
+    }
+
+    /// A REAL cross-engine DIVERGENCE found+fixed (production-hardening
+    /// PR-it1071, an Explore survey finding, independently re-verified live
+    /// before implementing): `k_strtol_checked` wraps plain C `strtol`,
+    /// which silently SKIPS leading whitespace, unlike Rust's `str::parse::
+    /// <i64>()` (used uniformly for every numeral field by
+    /// `time.rs::parse_iso`, the shared interp/vm implementation), which
+    /// strictly rejects ANY embedded whitespace. None of `k_parse_iso`'s six
+    /// call sites' own guards caught this -- the `*end` check passes since
+    /// the parse genuinely succeeds, and the `[0]==0` empty-substring guards
+    /// (PR-it959, the test just above) only catch a truly EMPTY field, not
+    /// one that's merely whitespace-prefixed. A space landing AFTER the
+    /// `T`/space date-time separator has already been consumed (so it's
+    /// just part of an hour/minute/second digit string, not the separator
+    /// itself) or a tab/CR/etc. anywhere within a field (never treated
+    /// specially by the separator-detection loop, which only recognizes
+    /// literal `T`/space) both silently fabricated a plausible-but-wrong
+    /// timestamp on native, where interp/vm correctly returned `Err`. This
+    /// is the SAME `strtol`/`strtoll` leading-whitespace hazard this file
+    /// already guards against for the unrelated `parse_int`/`parse_radix`
+    /// builtins -- that guard was never applied to `k_strtol_checked`.
+    /// Fixed by adding the identical character-class check directly in the
+    /// shared helper, covering all six numeral fields (year/month/day/
+    /// hour/minute/second) with one change. The legitimate WHOLE-STRING
+    /// Unicode-aware trim (`k_utf8_trim_range`, PR-it666, tested just below)
+    /// is unaffected -- confirmed a leading tab before the entire timestamp
+    /// still correctly parses (trimmed away before field-splitting even
+    /// starts), only an internal, per-field leading whitespace character is
+    /// newly rejected.
+    #[test]
+    fn native_parse_iso_rejects_whitespace_prefixed_numeral_fields_strtol_would_silently_skip() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{parse_iso(\"2024-01-01T 1:02:03\").is_ok()}|\
+                   {parse_iso(\"2024-\\t1-01T00:00:00\").is_ok()}|\
+                   {parse_iso(\"2024-01-\\t1T00:00:00\").is_ok()}|\
+                   {parse_iso(\"\\t2024-01-01T00:00:00\").is_ok()}|\
+                   {parse_iso(\"2024-01-01T00:00:00\").is_ok()}\")\n}\n";
+        // BEFORE the fix, native printed "true|true|true|true|true" for the
+        // first three (whitespace-prefixed field, silently accepted) while
+        // interp/vm printed "false|false|false|true|true" (rejected, except
+        // the legitimate whole-string leading tab, which both correctly
+        // accept via the separate whole-string trim).
+        assert_eq!(
+            native_main_stdout(src, "isowsnumeral").trim(),
+            "false|false|false|true|true"
         );
     }
 
