@@ -238,10 +238,75 @@ pub(crate) fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>)
 /// top-level type, not types nested inside a variant's fields -- is left
 /// unchanged by this fix).
 fn inhabited_named_types(types: &HashMap<String, TypeSig>) -> HashSet<String> {
-    fn field_is_finite(ty: &Ty, inhabited: &HashSet<String>) -> bool {
+    /// Whether `ty`, after stripping any number of `List`/`Option` layers,
+    /// names EXACTLY `current` -- deliberately narrow (a direct self-
+    /// reference mediated entirely through `List`/`Option`, not a general
+    /// mutual-recursion-through-wrapping analysis, which would need full
+    /// graph/SCC reasoning to prove safe and isn't needed for any case this
+    /// campaign has found).
+    fn unwraps_to(ty: &Ty, current: &str) -> bool {
+        match ty {
+            Ty::Named(n, _) => n == current,
+            Ty::List(inner) | Ty::Option(inner) => unwraps_to(inner, current),
+            _ => false,
+        }
+    }
+    // A REAL bug found+fixed (production-hardening PR-it1072, an Explore
+    // survey finding, independently re-verified live before implementing):
+    // `field_is_finite`'s `List`/`Option` case used to recurse into the
+    // element type's OWN independent inhabitedness unconditionally --
+    // correct for `type Foo = Bar(xs: List[Stream])` (Stream a DIFFERENT
+    // type with a genuinely unconditional direct self-reference and no
+    // base case, per the doc comment above), but WRONG for a type whose
+    // ONLY path back to itself is `List[Self]`/`Option[Self]`, e.g. an
+    // idiomatic rose tree `type Tree = Node(value: Int, children:
+    // List[Tree])` or a linked list `type LinkedList = Cons(head: Int,
+    // tail: Option[LinkedList])` -- both were rejected with a factually
+    // wrong K0276 "no FINITE property-test generator... no value could
+    // ever be constructed" error (`Node(0, [])` is trivially valid),
+    // because `field_is_finite(List[Tree], {})` circularly required Tree
+    // to already be in `inhabited` before Tree could ever enter it, an
+    // unresolvable chicken-and-egg loop for the LEAST-fixed-point
+    // computation below. `prop::generate`'s `List`/`Option` arms cap
+    // UNCONDITIONALLY at `depth >= 4`, regardless of whether the element
+    // type has a nullary variant (unlike `gen_named`'s own depth check,
+    // which only applies when a nullary variant exists) -- so for a type
+    // whose self-reference is ALWAYS mediated by `List`/`Option`, EVERY
+    // lap back through the cycle necessarily re-enters that SAME
+    // List/Option node, and since depth strictly increases each lap, the
+    // cap is guaranteed to fire within a small bounded number of levels --
+    // fundamentally different from a DIRECT (unwrapped) self-reference
+    // like `Stream`'s, whose own field never passes through any
+    // List/Option node at all, so it has NO structural termination
+    // guarantee (`gen_named`'s depth check can never fire, since it
+    // requires a nullary variant Stream doesn't have). Confirmed live
+    // (BOTH before and after this fix): `type Tree = Node(value: Int,
+    // children: List[Tree])` and `type LinkedList = Cons(head: Int, tail:
+    // Option[LinkedList])` were both rejected by `kupl check` before this
+    // fix; a standalone probe calling `prop::generate` DIRECTLY (bypassing
+    // this checker gate entirely) generated 100 cases of each cleanly with
+    // no crash at bounded depth (~4-5 levels) both before AND after,
+    // proving the checker was the ONLY thing wrong, not the generator.
+    // Fixed by ALSO accepting a `List`/`Option` field as finite when its
+    // element type unwraps to the SAME type currently being tested for
+    // `inhabited` membership -- this does NOT weaken the existing
+    // Foo/Stream protection at all (Stream != Foo, so `unwraps_to` is
+    // false there, leaving that case's behavior byte-for-byte unchanged),
+    // and does NOT accept a type with an ADDITIONAL, genuinely-hazardous
+    // DIRECT (unwrapped) self-reference alongside a safe wrapped one
+    // (e.g. `Node(children: List[Tree], parent: Tree)`) either -- the
+    // `parent: Tree` field's own `field_is_finite` check is completely
+    // unaffected by this fix (still requires Tree to already be
+    // independently inhabited, which it isn't while being computed for
+    // the first time), so that variant still correctly fails to be
+    // all-fields-finite and Tree still correctly stays rejected in that
+    // hypothetical mixed shape -- confirmed live before finalizing.
+    fn field_is_finite(ty: &Ty, inhabited: &HashSet<String>, current: &str) -> bool {
         match ty {
             Ty::Named(n, _) => inhabited.contains(n),
-            Ty::List(inner) | Ty::Option(inner) => field_is_finite(inner, inhabited),
+            Ty::List(inner) | Ty::Option(inner) => {
+                unwraps_to(inner, current) || field_is_finite(inner, inhabited, current)
+            }
             _ => true,
         }
     }
@@ -252,8 +317,10 @@ fn inhabited_named_types(types: &HashMap<String, TypeSig>) -> HashSet<String> {
             if inhabited.contains(name) {
                 continue;
             }
-            let has_finite_variant =
-                sig.variants.iter().any(|v| v.fields.iter().all(|(_, fty)| field_is_finite(fty, &inhabited)));
+            let has_finite_variant = sig
+                .variants
+                .iter()
+                .any(|v| v.fields.iter().all(|(_, fty)| field_is_finite(fty, &inhabited, name)));
             if has_finite_variant {
                 inhabited.insert(name.clone());
                 changed = true;
@@ -5843,6 +5910,63 @@ mod generic_tests {
             "type Tree = Leaf | Node(l: Tree, r: Tree)\ntype Forest = Bar(xs: List[Tree])\nlaw \"x\" { forall f: Forest { expect true } }\n"
         )
         .is_empty());
+    }
+
+    /// A REAL false-positive bug found+fixed (production-hardening
+    /// PR-it1072, an Explore survey finding, independently re-verified live
+    /// before implementing): a type whose ONLY path back to itself is
+    /// `List[Self]`/`Option[Self]` (no OTHER, unrelated type mediating the
+    /// wrap, unlike PR-it727's `Foo = Bar(xs: List[Stream])`) was rejected
+    /// with a factually WRONG "no FINITE property-test generator... no
+    /// value could ever be constructed" error, even though `Node(0, [])`
+    /// and `Cons(0, None)` are trivially valid finite values of these
+    /// types. Root cause: `field_is_finite`'s `List`/`Option` case
+    /// circularly required the SAME type to already be in `inhabited`
+    /// before it could ever enter it -- an unresolvable chicken-and-egg
+    /// loop for the least-fixed-point computation, even though
+    /// `prop::generate`'s `List`/`Option` arms cap UNCONDITIONALLY at
+    /// `depth >= 4` regardless of the element type's own base-case
+    /// situation, so a self-reference mediated entirely through
+    /// `List`/`Option` structurally always terminates. Confirmed live
+    /// BEFORE this fix (`kupl check` rejected both; a standalone probe
+    /// calling `prop::generate` directly, bypassing this checker gate,
+    /// generated 100 cases of each cleanly with no crash) and AFTER this
+    /// fix (`kupl test` runs the `forall` to completion, including a
+    /// falsifiable property that correctly exercises the shrinker down to
+    /// a minimal counterexample like `Node(-1, [])`).
+    #[test]
+    fn forall_binder_over_a_type_self_referential_only_through_list_or_option_is_accepted() {
+        // a rose tree: self-reference mediated entirely through List[Self].
+        assert!(errors(
+            "type Tree = Node(value: Int, children: List[Tree])\nlaw \"x\" { forall t: Tree { expect true } }\n"
+        )
+        .is_empty());
+        // a linked list: self-reference mediated entirely through Option[Self].
+        assert!(errors(
+            "type LinkedList = Cons(head: Int, tail: Option[LinkedList])\nlaw \"x\" { forall xs: LinkedList { expect true } }\n"
+        )
+        .is_empty());
+        // the PR-it727 Foo/Stream case (a DIFFERENT type mediating the wrap,
+        // with its OWN unconditional direct self-reference) must STILL be
+        // rejected -- this fix must not weaken that existing protection.
+        let list_err = errors(
+            "type Stream = Cons(head: Int, tail: Stream)\ntype Foo = Bar(xs: List[Stream])\nlaw \"x\" { forall f: Foo { expect true } }\n",
+        );
+        assert!(
+            list_err.iter().any(|d| d.code == "K0276" && d.message.contains("no FINITE property-test generator")),
+            "{list_err:?}"
+        );
+        // a type with an ADDITIONAL, genuinely-hazardous DIRECT (unwrapped)
+        // self-reference alongside a safe List-wrapped one must ALSO stay
+        // rejected -- the wrapped field being safe must not let a sibling
+        // direct field's own unconditional recursion slip through.
+        let mixed_err = errors(
+            "type MixedTree = Node(value: Int, children: List[MixedTree], parent: MixedTree)\nlaw \"x\" { forall t: MixedTree { expect true } }\n",
+        );
+        assert!(
+            mixed_err.iter().any(|d| d.code == "K0276" && d.message.contains("no FINITE property-test generator")),
+            "{mixed_err:?}"
+        );
     }
 
     #[test]
