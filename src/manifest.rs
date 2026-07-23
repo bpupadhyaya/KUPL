@@ -323,8 +323,13 @@ fn parse_dep(name: &str, value: &str, line: usize) -> Result<Dep, String> {
     // exploit chain existed through this specific gap -- but the
     // validation itself should not depend on which of two equivalent
     // syntax forms a dependency happens to use. Moved here, before EITHER
-    // branch, so both forms are validated identically.
-    if !crate::registry::is_safe_relative_path(&name) {
+    // branch, so both forms are validated identically. Uses the STRICTER
+    // single-component variant (production-hardening PR-it1096): a
+    // dependency name has no legitimate reason to be nested, unlike a
+    // registry file path -- see that function's own doc comment for the
+    // destructive cache-corruption bug a multi-component name/version
+    // caused.
+    if !crate::registry::is_safe_relative_path_single_component(&name) {
         return Err(format!(
             "line {line}: dependency name `{name}` must be a plain relative name, not an absolute path or contain `..`"
         ));
@@ -417,7 +422,12 @@ fn parse_dep(name: &str, value: &str, line: usize) -> Result<Dep, String> {
     // uniformly to both the bare-string and inline-table syntax forms --
     // see PR-it1065's own doc comment there for why.)
     if let Some(v) = &version {
-        if !crate::registry::is_safe_relative_path(v) {
+        // STRICTER single-component variant (production-hardening PR-it1096):
+        // a version has no legitimate reason to be nested, unlike a registry
+        // file path -- see is_safe_relative_path_single_component's own doc
+        // comment for the destructive cache-corruption bug a multi-component
+        // version caused.
+        if !crate::registry::is_safe_relative_path_single_component(v) {
             return Err(format!(
                 "line {line}: dependency `{name}`'s version `{v}` must be a plain relative value, not an absolute path or contain `..`"
             ));
@@ -508,6 +518,50 @@ mod tests {
             ok.is_ok(),
             "an ordinary relative/absolute PATH dependency and an ordinary VERSION string must still parse cleanly: {ok:?}"
         );
+    }
+
+    /// A REAL, live-confirmed DESTRUCTIVE cache-corruption bug found+fixed
+    /// (production-hardening PR-it1096, a two-phase self-scoping survey
+    /// finding): the test above locks in `..`/absolute rejection, but
+    /// `is_safe_relative_path` ALSO accepted a perfectly ordinary-looking
+    /// MULTI-COMPONENT name/version like `"beta/preview"` -- no traversal,
+    /// no absolute path, just a nested value. `registry.rs::fetch_package_with`'s
+    /// `dest = cache_dir.join(name).join(version)` builds an ordinary
+    /// intermediate directory for each component, indistinguishable on disk
+    /// from a genuine top-level version -- so a LATER, entirely ordinary
+    /// fetch of a plain sibling version equal to that ancestor path segment
+    /// (`version = "beta"`) silently DESTROYED the entire previously-
+    /// fetched, already-hash-verified `"beta/preview"` version's directory
+    /// tree via `atomic_replace`'s own unconditional `remove_dir_all`, with
+    /// zero diagnostic (see `registry.rs`'s own
+    /// `is_safe_relative_path_single_component` doc comment for the full
+    /// write-up and a live repro). Now rejected at manifest-PARSE time,
+    /// the earliest possible enforcement point, for both `name` and
+    /// `version`.
+    #[test]
+    fn a_multi_component_dependency_name_or_version_is_a_clean_parse_error() {
+        let nested_name = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\nns/widgets = { version = \"1.0\" }\n",
+        );
+        assert!(
+            nested_name.is_err() && nested_name.unwrap_err().contains("must be a plain relative name"),
+            "a multi-component dependency NAME must be a clean parse error"
+        );
+
+        let nested_version = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\nwidgets = { version = \"beta/preview\" }\n",
+        );
+        assert!(
+            nested_version.is_err() && nested_version.unwrap_err().contains("must be a plain relative value"),
+            "a multi-component dependency VERSION must be a clean parse error"
+        );
+
+        // an ordinary, single-component name/version (including one with
+        // dots/dashes, just no `/`) is completely unaffected.
+        let ok = parse(
+            "[project]\nname = \"app\"\n\n[dependencies]\nwidgets = { version = \"1.0.0-rc\" }\n",
+        );
+        assert!(ok.is_ok(), "{ok:?}");
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it1065, a background

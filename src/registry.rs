@@ -251,6 +251,47 @@ pub(crate) fn is_safe_relative_path(path: &str) -> bool {
     p.components().all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
+/// Like `is_safe_relative_path`, but additionally rejects a value with MORE
+/// THAN ONE path component -- for a dependency's `name`/`version`, which
+/// have no legitimate reason to be nested, unlike a registry FILE path
+/// (`is_safe_relative_path`'s other class of caller, `parse_index`/
+/// `materialize` below, which legitimately needs multi-component paths like
+/// `"src/main.kupl"`).
+///
+/// A REAL, live-confirmed DESTRUCTIVE cache-corruption bug found+fixed
+/// (production-hardening PR-it1096, a two-phase self-scoping survey
+/// finding): `is_safe_relative_path`'s own multi-component allowance,
+/// needed for file paths, was reused UNCHANGED for `name`/`version` too --
+/// so a multi-component version like `"beta/preview"` passed cleanly.
+/// `fetch_package_with`'s `dest = cache_dir.join(name).join(version)`
+/// builds an ORDINARY intermediate directory (`cache_dir/name/beta/`) for
+/// each path component of a nested version -- indistinguishable on disk
+/// from a genuine top-level version directory. A LATER, entirely ordinary
+/// fetch of a plain SIBLING version that happens to equal that ancestor
+/// path segment (`version = "beta"`) passes the existing version-collision
+/// guard cleanly (that guard only compares `cache_dir/name`'s own DIRECT
+/// children against the exact `version` string -- `"beta"` legitimately
+/// matches its own intermediate directory entry, since to that guard this
+/// looks like an ordinary same-version re-fetch, not an ancestor
+/// collision), then `atomic_replace`'s own unconditional
+/// `remove_dir_all(dest)` silently DELETES THE ENTIRE `beta/` SUBTREE --
+/// including the previously-fetched, already-hash-verified `beta/preview/`
+/// version -- before writing the new `beta` version's own content. Live-
+/// confirmed: fetching `widgets` version `"beta/preview"`, then `widgets`
+/// version `"beta"`, returns `Ok` for the second fetch (no diagnostic at
+/// all) while completely destroying `beta/preview/`'s own directory. No
+/// traversal or case-folding trick is needed -- an entirely benign
+/// manifest/registry using a plain "channel-style" versioning convention
+/// (`"1.0"` vs `"1.0/rc1"`) reaches this on an ORDINARY re-fetch, since
+/// this module's own design deliberately never cache-skips. Since
+/// `cache_dir` is a single GLOBAL, per-user directory shared across every
+/// project on the machine (PR-it930's own established threat model), this
+/// can silently corrupt an entirely unrelated project's own cached
+/// dependency the moment either project's `kupl pkg fetch` runs again.
+pub(crate) fn is_safe_relative_path_single_component(path: &str) -> bool {
+    is_safe_relative_path(path) && std::path::Path::new(path).components().count() == 1
+}
+
 /// Whether `url` is safe to hand to `curl_get`: an `http://` or `https://`
 /// URL, and nothing else. A registry index is untrusted, network-supplied
 /// data -- a file's `url` is later passed DIRECTLY to `curl` (`curl_get`,
@@ -576,11 +617,16 @@ fn fetch_package_with(
     // file write anywhere the current user can write, entirely outside the
     // intended cache directory. Reuses the SAME `is_safe_relative_path`
     // helper `parse_index`/`materialize` already use for the analogous
-    // registry-file-path threat (production-hardening PR-it683).
-    if !is_safe_relative_path(name) {
+    // registry-file-path threat (production-hardening PR-it683). Uses the
+    // STRICTER single-component variant (production-hardening PR-it1096) --
+    // unlike a registry file path, a name/version has no legitimate reason
+    // to be nested, and a multi-component value here caused a genuine
+    // destructive cache-corruption bug (see that function's own doc
+    // comment for the full writeup).
+    if !is_safe_relative_path_single_component(name) {
         return Err(format!("unsafe package name `{name}`"));
     }
-    if !is_safe_relative_path(version) {
+    if !is_safe_relative_path_single_component(version) {
         return Err(format!("unsafe package version `{version}`"));
     }
     // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it930,
@@ -1449,6 +1495,52 @@ mod tests {
             std::fs::read_to_string(existing.join("main.kupl")).unwrap(),
             "pub fun greet() -> Str { \"original-1.0.0-RC-content\" }\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, live-confirmed DESTRUCTIVE cache-corruption bug found+fixed
+    /// (production-hardening PR-it1096, a two-phase self-scoping survey
+    /// finding): `is_safe_relative_path`'s own multi-component allowance
+    /// (needed for registry FILE paths) was reused unchanged for `name`/
+    /// `version` too, so a nested version like `"beta/preview"` was
+    /// accepted. Confirmed live BEFORE this fix, via a standalone probe
+    /// mirroring this exact test: fetching `widgets` version
+    /// `"beta/preview"`, then ORDINARILY re-fetching `widgets` version
+    /// `"beta"` (a plain sibling value, no traversal or case tricks)
+    /// returned `Ok` for the second fetch with ZERO diagnostic, while
+    /// `atomic_replace`'s own unconditional `remove_dir_all(dest)` silently
+    /// destroyed the ENTIRE previously-fetched, already-hash-verified
+    /// `beta/preview` version's directory tree -- `dest` for `version =
+    /// "beta"` (`cache_dir/widgets/beta`) is the ANCESTOR of `dest` for
+    /// `version = "beta/preview"` (`cache_dir/widgets/beta/preview`), and
+    /// the existing version-collision guard (PR-it1060) only ever compares
+    /// EXACT sibling entries, never detecting an ancestor/descendant
+    /// relationship. Now rejected outright at the FIRST (nested) fetch,
+    /// since `is_safe_relative_path_single_component` rejects any
+    /// multi-component name/version before either fetch can ever reach the
+    /// filesystem.
+    #[test]
+    fn fetch_package_with_rejects_a_multi_component_version_that_could_ancestor_collide() {
+        let dir = std::env::temp_dir().join(format!("kupl-registry-nested-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (_h1, urls1) = mock_index_and_files("widgets", "beta/preview", "pub fun v() -> Str { \"preview-content\" }\n");
+        let err = fetch_package_with(mock_fetcher(urls1), "https://registry.example.com", "widgets", "beta/preview", &dir)
+            .unwrap_err();
+        assert!(err.contains("unsafe package version"), "{err}");
+        assert!(!dir.exists(), "nothing should be written when the version itself is rejected");
+
+        // a multi-component NAME is rejected the same way.
+        let (_h2, urls2) = mock_index_and_files("ns/widgets", "1.0.0", "pub fun v() -> Str { \"x\" }\n");
+        let err2 = fetch_package_with(mock_fetcher(urls2), "https://registry.example.com", "ns/widgets", "1.0.0", &dir)
+            .unwrap_err();
+        assert!(err2.contains("unsafe package name"), "{err2}");
+
+        // an ORDINARY, single-component name/version is completely unaffected.
+        let (_h3, urls3) = mock_index_and_files("widgets", "1.0.0", "pub fun v() -> Str { \"ok-content\" }\n");
+        let ok = fetch_package_with(mock_fetcher(urls3), "https://registry.example.com", "widgets", "1.0.0", &dir);
+        assert!(ok.is_ok(), "{ok:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
