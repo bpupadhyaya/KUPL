@@ -740,7 +740,9 @@ let b = Cache(store: LoudStore())              // …or another — same consume
   `-`, `*`, negation, `abs`, `sum`). `Int / 0` and `Int % 0` panic.
 - `Float` follows IEEE-754; division by zero yields `inf`/`nan` (no panic).
 - `==`/`!=` are structural for every type; `<` `<=` `>` `>=` are defined for
-  Int, Float, and Str (lexicographic by bytes).
+  every numeric type (`Int`, the sized integers `i8`/`i16`/`i32`/`i64`/`u8`/
+  `u16`/`u32`/`u64`, `Float`, `f32`, `BigInt`, `Rational`) and `Str`
+  (lexicographic by bytes) — not just `Int`, `Float`, and `Str`.
 - Display of floats uses the shortest representation that round-trips
   (`3.5`, `0.30000000000000004`); whole floats show one decimal (`12.0`).
   All engines — including native machine code — format identically.
