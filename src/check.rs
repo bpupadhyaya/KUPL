@@ -1837,6 +1837,26 @@ impl Checker {
                 self.unify(&a, &b, wire.span, "wire (out port must match in port)");
             }
         }
+        // A REAL, live-confirmed silent-behavior bug (production-hardening
+        // PR-it1090), a direct sibling of PR-it1089's duplicate-wire fix:
+        // unlike every OTHER collection in this function that rejects a
+        // duplicate declaration of the same target (children K0207, `on`
+        // handlers K0209, wires K0285), two `supervise` declarations for the
+        // SAME child had no check at all. Worse than a harmless redundancy:
+        // `instantiate` (interp.rs) resolves a child's supervision via
+        // `comp.supervises.iter().any(|s| s.child == child.name && s.policy
+        // == RestartOnFailure)` -- an `.any()` over ALL declarations for that
+        // child, so the mere PRESENCE of one `restart on_failure` entry wins
+        // unconditionally, regardless of how many contradicting `restart
+        // never` entries also exist or where they're positioned. Live-
+        // confirmed: `supervise x restart on_failure` followed by `supervise
+        // x restart never` for the SAME child still restarts `x` on panic --
+        // the textually-LAST declaration (which a reasonable reader would
+        // expect to govern, matching ordinary reassignment intuition
+        // elsewhere in the language) is silently ignored. Confirmed
+        // identical on interp/vm/native (a missing diagnostic, not a cross-
+        // engine divergence), with `kupl check` reporting a clean "ok".
+        let mut seen_supervised: HashSet<&str> = HashSet::new();
         for s in &c.supervises {
             if !child_types.contains_key(&s.child) {
                 // Did-you-mean, matching K0213's `wire`-child lookup (the SAME
@@ -1847,6 +1867,16 @@ impl Checker {
                     msg.push_str(&format!(" — did you mean `{sug}`?"));
                 }
                 self.err("K0265", msg, s.span);
+            } else if !seen_supervised.insert(s.child.as_str()) {
+                self.err(
+                    "K0286",
+                    format!(
+                        "child `{}` is supervised more than once — if ANY declaration says `restart \
+                         on_failure` it wins regardless of order, silently ignoring a later `restart never`",
+                        s.child
+                    ),
+                    s.span,
+                );
             }
         }
 
@@ -6813,6 +6843,44 @@ mod generic_tests {
              wire src.result -> snk.got\n    wire src.result -> snk2.got\n}}\n"
         );
         assert!(!errors(&fanout).iter().any(|d| d.code == "K0285"), "{:?}", errors(&fanout));
+    }
+
+    /// A REAL, live-confirmed silent-behavior bug (production-hardening
+    /// PR-it1090), a direct sibling of PR-it1089's duplicate-wire fix: two
+    /// `supervise` declarations for the SAME child had no duplicate check.
+    /// interp.rs's own `instantiate` resolves supervision via `.any(|s| ...
+    /// s.policy == RestartOnFailure)` over ALL declarations for that child,
+    /// so the mere PRESENCE of one `restart on_failure` entry wins
+    /// unconditionally, regardless of a later, textually-final `restart
+    /// never` -- confirmed live (identically on interp/vm/native) that a
+    /// panicking child still restarts even when `restart never` is the LAST
+    /// declaration written for it.
+    #[test]
+    fn duplicate_supervise_declarations_are_rejected() {
+        let src = |extra_supervise: &str| {
+            format!(
+                "component Flaky {{\n    intent \"f\"\n    in go: Int\n    on go(n) {{ let v = 100 / n }}\n}}\n\
+                 app Main {{\n    intent \"m\"\n    let flaky = Flaky()\n    \
+                 supervise flaky restart on_failure\n{extra_supervise}}}\n"
+            )
+        };
+        let dup = errors(&src("    supervise flaky restart never\n"));
+        assert!(
+            dup.iter().any(|d| d.code == "K0286" && d.message.contains("child `flaky`") && d.message.contains("more than once")),
+            "{dup:?}"
+        );
+        // an EXACT duplicate (same policy repeated) is flagged the same way.
+        let exact_dup = errors(&src("    supervise flaky restart on_failure\n"));
+        assert!(exact_dup.iter().any(|d| d.code == "K0286"), "{exact_dup:?}");
+        // an ordinary component with a single supervise declaration (the common
+        // case) is unaffected.
+        assert!(errors(&src("")).is_empty(), "{:?}", errors(&src("")));
+
+        // supervising two DIFFERENT children is not a duplicate -- must not be flagged.
+        let two_children = "component Flaky {\n    intent \"f\"\n    in go: Int\n    on go(n) { let v = 100 / n }\n}\n\
+             app Main {\n    intent \"m\"\n    let a = Flaky()\n    let b = Flaky()\n    \
+             supervise a restart on_failure\n    supervise b restart on_failure\n}\n";
+        assert!(!errors(two_children).iter().any(|d| d.code == "K0286"), "{:?}", errors(two_children));
     }
 
     /// A REAL, live-confirmed HIGH-severity soundness hole (production-
