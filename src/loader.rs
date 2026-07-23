@@ -417,7 +417,40 @@ pub struct ResolvedDep {
 /// tracked independently, via its own `ResolvedDep` entry, not folded into
 /// this one. Returns (path, source) pairs sorted by path so the combined
 /// hash below is deterministic regardless of `use`-traversal order.
-fn same_package_files(dep_dir: &Path, entry_file: &Path) -> Vec<(PathBuf, String)> {
+/// A REAL, LIVE-CONFIRMED silent-value-corruption bug found+fixed
+/// (production-hardening PR-it1101, a two-phase self-scoping survey finding
+/// via the "cross-file interaction never audited together" angle: this
+/// function's own write-side counterpart, `registry.rs::atomic_replace`,
+/// has a `remove_dir_all(dest)` then `rename(staging, dest)` sequence with
+/// an inherent window where `dest` doesn't exist on disk at all -- exactly
+/// the kind of transient absence a concurrent reader on a SHARED,
+/// per-user registry cache, or simply a file removed/moved for any other
+/// reason, can observe). This function's own doc comment already noted it
+/// mirrors `load_with`'s same-package `use`-resolution branch "WITHOUT its
+/// diagnostics" -- but `load_with` (`loader.rs:717-727`) treats an
+/// unreadable module file as a hard `K0400` error, while this function used
+/// `let Ok(src) = std::fs::read_to_string(&path) else { continue };`,
+/// silently DROPPING that file from the walk instead. For `resolve_deps`'s
+/// own purpose (drift-hashing a dependency's entire `use` graph for
+/// `kupl.lock`, PR-it1037), this is not a harmless simplification: a
+/// transiently-unreadable SIBLING file (the entry file itself already has
+/// its own separate, correctly-erroring check one call site up) silently
+/// produces a hash covering FEWER files than the dependency actually has --
+/// neither the hash the dependency had before nor the hash it has after
+/// whatever transient condition caused the read to fail, an internally
+/// inconsistent value written straight into `kupl.lock` with exit code 0
+/// and zero diagnostic. `kupl pkg tree`/`pkg lock` on the SAME, completely
+/// untouched dependency later reports a spurious `[drift]` false positive
+/// against that torn hash -- the exact failure mode the drift feature
+/// exists to prevent. Live-confirmed via a standalone probe (no race timing
+/// needed -- the defect is deterministic once a sibling file is
+/// unreadable, regardless of why): `resolve_deps` returned `Ok` with a
+/// DIFFERENT hash immediately after deleting a `use`d sibling file, with no
+/// error at all. Fixed by returning `Result` and propagating a clean error
+/// (mirroring `load_with`'s own `K0400` wording) instead of silently
+/// skipping, exactly like the entry-file check already does one call site
+/// up.
+fn same_package_files(dep_dir: &Path, entry_file: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     let dep_ctx = pkg_ctx(dep_dir, false, "");
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: Vec<PathBuf> = vec![entry_file.to_path_buf()];
@@ -427,7 +460,8 @@ fn same_package_files(dep_dir: &Path, entry_file: &Path) -> Vec<(PathBuf, String
         if !seen.insert(canonical) {
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(&path) else { continue };
+        let src = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read module file {}: {e}", path.display()))?;
         let (file_program, _) = parser::parse_with_base(&src, 0);
         for (use_path, _) in &file_program.uses {
             let first = use_path.split('.').next().unwrap_or(use_path);
@@ -442,7 +476,7 @@ fn same_package_files(dep_dir: &Path, entry_file: &Path) -> Vec<(PathBuf, String
         out.push((path, src));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    Ok(out)
 }
 
 pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
@@ -482,7 +516,7 @@ pub fn resolve_deps(entry: &str) -> Result<Vec<ResolvedDep>, String> {
         // matched. Now hashes EVERY same-package file transitively
         // reachable from the entry via `use`, not just the entry itself.
         let mut combined = String::new();
-        for (_, src) in same_package_files(dep_dir, &entry_file) {
+        for (_, src) in same_package_files(dep_dir, &entry_file).map_err(|e| format!("dependency `{name}`: {e}"))? {
             combined.push_str(&src);
             combined.push('\u{0}');
         }
@@ -2643,6 +2677,59 @@ mod tests {
             deps3[0].hash, deps2[0].hash,
             "an unrelated file outside the dependency's own use-graph must not perturb its drift hash"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL, LIVE-CONFIRMED silent-value-corruption bug found+fixed
+    /// (production-hardening PR-it1101) -- see `same_package_files`'s own
+    /// doc comment for the full writeup. Confirmed live BEFORE this fix: a
+    /// standalone probe deleting `helper.kupl` between two `resolve_deps`
+    /// calls got `Ok` both times, with the SECOND call's hash silently
+    /// different from the first (computed from `main.kupl` alone) -- no
+    /// error, no diagnostic, an internally inconsistent hash that would be
+    /// written straight into `kupl.lock`.
+    #[test]
+    fn resolve_deps_errors_instead_of_silently_hashing_around_a_missing_sibling_file() {
+        let base = std::env::temp_dir().join(format!("kupl-missing-sibling-{}", std::process::id()));
+        let math = base.join("math");
+        let app = base.join("app");
+        std::fs::create_dir_all(&math).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(math.join("kupl.toml"), "[project]\nname = \"math\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(math.join("main.kupl"), "use helper\n\npub fun compute() -> Int {\n    value()\n}\n").unwrap();
+        std::fs::write(math.join("helper.kupl"), "pub fun value() -> Int {\n    1\n}\n").unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\nmath = { path = \"../math\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.kupl"), "use math\n\nfun main() uses io {\n    print(math.compute())\n}\n").unwrap();
+
+        let deps = super::resolve_deps(app.join("main.kupl").to_str().unwrap()).unwrap();
+        assert_eq!(deps.len(), 1);
+        let hash_before = deps[0].hash.clone();
+
+        // A sibling file (reached only via `use`, not the dependency's own
+        // entry) disappears -- standing in for the registry-cache race
+        // (`registry.rs::atomic_replace`'s `remove_dir_all`-then-`rename`
+        // window) this defect was originally found through, but constructed
+        // directly/deterministically since the fix itself doesn't depend on
+        // WHY the file vanished, only on whether a read failure is ever
+        // silently swallowed.
+        std::fs::remove_file(math.join("helper.kupl")).unwrap();
+
+        match super::resolve_deps(app.join("main.kupl").to_str().unwrap()) {
+            Err(e) => {
+                assert!(e.contains("math"), "must name the dependency: {e}");
+                assert!(e.contains("helper.kupl"), "must name the unreadable file: {e}");
+            }
+            Ok(deps2) => panic!(
+                "a missing sibling file must be a clean error, not a silently-computed alternate \
+                 hash (before: {hash_before:?}, silently-recomputed-after: {:?})",
+                deps2[0].hash
+            ),
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
