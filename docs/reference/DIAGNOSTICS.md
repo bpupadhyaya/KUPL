@@ -131,6 +131,7 @@ Severity: **E** = error, **W** = warning.
 | K0278 | E | component is defined more than once |
 | K0279 | W | a fulfilling method calls a value of function type — its effects cannot be verified against the contract's effect budget |
 | K0280 | E | a parameter's default value references another parameter of the same function — defaults are evaluated at the call site, not the function's own scope |
+| K0284 | E | method is declared more than once in a contract |
 
 ## K03xx — Effects & style
 

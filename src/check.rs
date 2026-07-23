@@ -931,7 +931,32 @@ impl Checker {
                 }
                 Item::Contract(ct) => {
                     let mut sig = ContractSig::default();
+                    // A REAL diagnostic gap, matching the same sibling checks
+                    // already present just above for every other same-file
+                    // collection (props K0283, component methods K0277,
+                    // component names K0278): `sig.sigs` is a `HashMap`, so
+                    // two `expose fun`s with the SAME name inside one
+                    // contract silently collapsed to whichever was declared
+                    // LAST, with zero diagnostic on the contract itself. Since
+                    // both this HashMap (used by `check_contract`'s own
+                    // law-body scope and by `check_fulfills`'s signature
+                    // check) and the LATER `expose fun` win, a fulfilling
+                    // component correctly implementing an EARLIER-declared
+                    // (and thus dropped) signature got a misleading K0263
+                    // blaming it for "not matching" the surviving, unrelated
+                    // signature, while a component matching only the LAST
+                    // signature passed clean even though the contract itself
+                    // is unsatisfiable (the same method name can't mean two
+                    // different signatures at once) (PR-it1087).
+                    let mut sig_names: HashSet<&str> = HashSet::new();
                     for s in &ct.sigs {
+                        if !sig_names.insert(s.name.as_str()) {
+                            self.err(
+                                "K0284",
+                                format!("method `{}` is declared more than once in contract `{}`", s.name, ct.name),
+                                s.span,
+                            );
+                        }
                         self.reject_param_defaults(&s.params, &format!("contract `{}`'s method `{}`'s parameters", ct.name, s.name));
                         let params: Vec<Ty> = s.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
                         let ret = s.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit);
@@ -6558,6 +6583,48 @@ mod generic_tests {
         assert!(
             fulfills_hole.iter().any(|d| d.code == "K0277" && d.message.contains("method `act`")),
             "{fulfills_hole:?}"
+        );
+    }
+
+    /// A REAL diagnostic gap (production-hardening PR-it1087): unlike its
+    /// sibling `check_bodies` collections in the same file (component
+    /// methods K0277, component names K0278, component props K0283), a
+    /// contract's OWN `expose fun` signatures had NO duplicate-name check --
+    /// `sig.sigs` is a `HashMap`, so two same-named signatures silently
+    /// collapsed to whichever was declared LAST, with zero diagnostic on the
+    /// contract itself. Confirmed live before this fix that this is a
+    /// genuine ACCEPT-vs-REJECT gap, not merely cosmetic: a component
+    /// correctly implementing the FIRST (dropped) signature got a
+    /// misleading K0263 blaming it for not matching the surviving, unrelated
+    /// LAST signature, while a component matching ONLY the last signature
+    /// passed `kupl check` clean even though the contract itself is
+    /// unsatisfiable (the same method name can't mean two different
+    /// signatures at once).
+    #[test]
+    fn duplicate_contract_method_names_are_rejected() {
+        let dup = errors(
+            "contract Store {\n    intent \"store\"\n    expose fun get(k: Str) -> Int\n    expose fun get(k: Int) -> Str\n}\nfun main() {}\n",
+        );
+        assert!(
+            dup.iter().any(|d| d.code == "K0284" && d.message.contains("method `get`") && d.message.contains("contract `Store`")),
+            "{dup:?}"
+        );
+        // A component matching only the LAST declared signature used to pass
+        // `kupl check` clean -- must now still be rejected via K0284 on the
+        // contract itself, even with no K0263 to piggyback on.
+        let last_wins = errors(
+            "contract Store {\n    intent \"store\"\n    expose fun get(k: Str) -> Int\n    expose fun get(k: Int) -> Str\n}\ncomponent C fulfills Store {\n    intent \"c\"\n    expose fun get(k: Int) -> Str { \"x\" }\n}\nfun main() {}\n",
+        );
+        assert!(last_wins.iter().any(|d| d.code == "K0284"), "{last_wins:?}");
+        // an ordinary contract with distinctly-named signatures is unaffected.
+        assert!(
+            errors("contract Store {\n    intent \"store\"\n    expose fun get(k: Str) -> Int\n    expose fun put(k: Str, v: Int) -> Bool\n}\nfun main() {}\n")
+                .is_empty()
+        );
+        // duplicate names across TWO DIFFERENT contracts is not a duplicate at all.
+        assert!(
+            errors("contract A {\n    intent \"a\"\n    expose fun get(k: Str) -> Int\n}\ncontract B {\n    intent \"b\"\n    expose fun get(k: Str) -> Int\n}\nfun main() {}\n")
+                .is_empty()
         );
     }
 
