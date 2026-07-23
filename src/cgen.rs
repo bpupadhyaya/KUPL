@@ -2931,6 +2931,20 @@ static void k_json_num(KBuf* b, double n) {
        across all three engines rather than silently diverging into
        "native emits corrupt text, interp/KVM don't." */
     if (!isfinite(n)) k_panic("cannot serialize a non-finite number (NaN/Infinity) to JSON");
+    /* A REAL, live-confirmed cross-engine byte divergence found+fixed
+       (production-hardening PR-it1083, mirroring json.rs::format_num's own
+       PR-it1066 fix): `(long long)n` has no representation for negative
+       zero -- the sign bit is simply discarded by the cast -- so `-0.0`
+       (which satisfies `n == floor(n) && fabs(n) < 1e15` just like any
+       other whole number) silently printed "0" instead of "-0" here, even
+       though json.rs's own reference formatter was ALREADY fixed for this
+       exact case. Live-confirmed before this fix: `json_stringify(JNum((0.0
+       - 5.0) * 0.0))` printed "-0" on `kupl run`/`kupl run --vm` but "0" on
+       `kupl native` -- a silent, narrowly-scoped-to-exactly--0.0 divergence
+       (ordinary negative wholes like -1.0 were unaffected). Route negative
+       zero through an explicit early return, matching json.rs's own fix
+       shape exactly. */
+    if (n == 0.0 && signbit(n)) { kb_puts(b, "-0"); return; }
     if (n == floor(n) && fabs(n) < 1e15) {
         char t[32]; snprintf(t, sizeof t, "%lld", (long long)n); kb_puts(b, t);
     } else if (n == floor(n)) {
@@ -10576,6 +10590,28 @@ fun main() uses io {
             native_main_stdout(src, "jnum").trim(),
             "100000000000000000000|0.30000000000000004|42|0.00001"
         );
+    }
+
+    /// A REAL, live-confirmed cross-engine byte divergence found+fixed
+    /// (production-hardening PR-it1083, a background survey finding,
+    /// mirroring json.rs::format_num's own PR-it1066 fix): `k_json_num`'s
+    /// `(long long)n` cast has no representation for negative zero -- the
+    /// sign bit is simply discarded -- so `-0.0` (which satisfies
+    /// `n == floor(n) && fabs(n) < 1e15` just like any other whole number)
+    /// silently printed "0" instead of "-0", even though json.rs's own
+    /// reference formatter was ALREADY fixed for this exact case at
+    /// PR-it1066. Live-confirmed before this fix: `json_stringify(JNum((0.0
+    /// - 5.0) * 0.0))` printed "-0" on `kupl run`/`kupl run --vm` but "0"
+    /// on `kupl native` -- narrowly scoped to exactly -0.0 (ordinary
+    /// negative wholes like -1.0 were unaffected, and remain correct here).
+    #[test]
+    fn native_json_number_negative_zero_preserves_its_sign() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{json_stringify(JNum((0.0 - 5.0) * 0.0))}|{json_stringify(JNum(0.0))}|{json_stringify(JNum(0.0 - 1.0))}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "jnumnegzero").trim(), "-0|0|-1");
     }
 
     /// A REAL, FUZZ-CONFIRMED cross-engine byte divergence found+fixed
