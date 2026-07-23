@@ -238,10 +238,27 @@ impl<'m> Vm<'m> {
             );
             return Ok(());
         }
+        // PR-it1077 (see compile.rs::compile_module's phase A and
+        // instance_expr's own doc comments for the full writeup): a prop's
+        // default chunk is now compiled with one parameter per EARLIER
+        // sibling prop (so a default referencing an earlier prop by name,
+        // `prop b: Int = a + 1`, resolves correctly) -- this SEPARATE
+        // top-level app instantiation path (PR-it1002's own fix) calls each
+        // default chunk directly rather than going through instance_expr's
+        // compiled Call sequence, so it must ALSO thread the already-
+        // computed sibling values through, in the SAME declaration order,
+        // or every default chunk with 1+ parameters gets called with too
+        // few arguments. Confirmed live before this fix: an app with 2+
+        // props (even ones whose defaults don't actually REFERENCE an
+        // earlier prop, since every default chunk unconditionally gets one
+        // parameter per prior prop regardless of whether it's used) failed
+        // `run_app` outright once instance_expr's own sibling-threading fix
+        // landed, since this loop still called every chunk with zero args.
         let mut props = Vec::with_capacity(props_meta.len());
         for (_, default_chunk) in &props_meta {
             let chunk = default_chunk.expect("filtered out missing defaults above");
-            props.push(self.call_chunk_nested(chunk, Vec::new(), None)?);
+            let v = self.call_chunk_nested(chunk, props.clone(), None)?;
+            props.push(v);
         }
         self.instantiate(idx, props)?;
         for id in 0..self.instances.len() {
@@ -16259,6 +16276,76 @@ fun probe() -> Str {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED cross-engine ACCEPT-vs-REJECT divergence
+    /// found+fixed (production-hardening PR-it1077, an Explore survey
+    /// finding of a genuinely uncovered compile.rs region, independently
+    /// re-verified live before implementing): a prop's default expression
+    /// referencing an EARLIER sibling prop by name (`prop b: Int = a + 1`)
+    /// is a genuinely legal, intentional feature -- `check.rs::
+    /// check_component` and `interp.rs::instantiate` both progressively
+    /// bind each prop's name before checking/evaluating the NEXT prop's
+    /// default -- but `compile.rs`'s phase-A default-chunk compiler used to
+    /// compile every default as a ZERO-parameter chunk with no locals bound
+    /// at all, so `Ident("a")` inside `b`'s default failed every lookup and
+    /// emitted a bogus `K0240: unknown name`. This was not silent
+    /// corruption but a LOUD divergence: `kupl check` accepted the source
+    /// and `kupl run` (interp) printed the correct value, while `kupl run
+    /// --vm`/`kupl native` failed to even COMPILE the program. Live-
+    /// confirmed before this fix: `component Gauge { prop a: Int; prop b:
+    /// Int = a + 1; expose fun sum() -> Int { a + b } }` instantiated as
+    /// `Gauge(a: 1)` printed `3` on `kupl run` but errored `K0240: unknown
+    /// name \`a\` (KVM)` on `kupl run --vm`/`kupl native`. Fixed by
+    /// compiling each default chunk with one parameter per earlier sibling
+    /// prop and threading each already-computed value through as a call
+    /// argument at `instance_expr` (this test) AND at the SEPARATE
+    /// `Vm::run_app`/native-app-bootstrap paths (see those tests' own doc
+    /// comments for that sibling fix, found only via `differential()`'s own
+    /// `.expect("module must compile")` catching THIS regular-instantiation
+    /// path while `run_app_resolves_prop_defaults_and_cleanly_refuses_a_
+    /// missing_required_prop` caught the SEPARATE app-bootstrap path).
+    #[test]
+    fn diff_prop_default_referencing_an_earlier_sibling_prop_resolves_correctly() {
+        // a single sibling reference.
+        assert_eq!(
+            differential(
+                "component Gauge {\n    intent \"g\"\n    prop a: Int\n    prop b: Int = a + 1\n    \
+                 expose fun sum() -> Int { a + b }\n}\n\
+                 fun probe() -> Int { Gauge(a: 1).sum() }\n"
+            ),
+            "3"
+        );
+        // a chain of THREE props, each referencing everything before it.
+        assert_eq!(
+            differential(
+                "component Chain {\n    intent \"c\"\n    prop a: Int\n    prop b: Int = a + 1\n    \
+                 prop c: Int = a + b\n    expose fun sum() -> Int { a + b + c }\n}\n\
+                 fun probe() -> Int { Chain(a: 10).sum() }\n"
+            ),
+            "42"
+        );
+        // a default referencing MULTIPLE earlier props at once (not just the
+        // immediately-preceding one).
+        assert_eq!(
+            differential(
+                "component MultiRef {\n    intent \"m\"\n    prop x: Int\n    prop y: Int\n    \
+                 prop z: Int = x + y\n    expose fun sum() -> Int { x + y + z }\n}\n\
+                 fun probe() -> Int { MultiRef(x: 3, y: 4).sum() }\n"
+            ),
+            "14"
+        );
+        // an explicitly-SUPPLIED value for an earlier prop must be what a
+        // later default sees, not a re-evaluation of that prop's own
+        // (unused, since it was overridden) default expression.
+        assert_eq!(
+            differential(
+                "component Chain2 {\n    intent \"c\"\n    prop a: Int\n    prop b: Int = a + 1\n    \
+                 prop c: Int = a + b\n    expose fun sum() -> Int { a + b + c }\n}\n\
+                 fun probe() -> Int { Chain2(a: 10, b: 100).sum() }\n"
+            ),
+            "220"
+        );
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it840),
     /// found by a DELIBERATE, EXHAUSTIVE audit of every Expr-bearing AST field
     /// against `callargs.rs`'s item walker (prompted by PR-it839 being the
@@ -19156,6 +19243,22 @@ component Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver 
         let mut vm2 = Vm::new(&module2);
         assert!(vm2.run_app("Multi1002").is_ok());
         assert_eq!(vm2.call_expose(0, "get", vec![]).unwrap(), Value::str("1 hi"));
+
+        // A REAL bug found+fixed (production-hardening PR-it1077): this
+        // SEPARATE app-bootstrap path (unlike ordinary `Widget(...)`
+        // instantiation via `instance_expr`) calls each prop's default
+        // chunk directly rather than through compiled Call bytecode, so it
+        // needed its OWN fix to thread already-computed sibling prop
+        // values through -- a default referencing an EARLIER sibling prop
+        // by name (`prop b: Int = a + 1`) must resolve correctly here too.
+        let src2b = "app Sibling1077 {\n    intent \"s\"\n    prop a: Int = 5\n    prop b: Int = a + 1\n    \
+                     expose fun get() -> Str { \"{a} {b}\" }\n}\n";
+        let compiled2b = crate::run::compile(src2b).expect("compiles");
+        let module2b = crate::compile::compile_module(&compiled2b.program, &compiled2b.checked)
+            .expect("module compiles");
+        let mut vm2b = Vm::new(&module2b);
+        assert!(vm2b.run_app("Sibling1077").is_ok());
+        assert_eq!(vm2b.call_expose(0, "get", vec![]).unwrap(), Value::str("5 6"));
 
         // a prop with NO default at all must be a CLEAN refusal (matching
         // `run.rs::run_program`'s own pre-check: Ok, a printed error, and

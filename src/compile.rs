@@ -98,17 +98,52 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
     }
 
     // phase A: prop default chunks + prop tables (needed by any construction site)
+    //
+    // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it1077,
+    // an Explore survey finding, independently re-verified live before
+    // implementing): a prop's default expression referencing an EARLIER
+    // sibling prop by name (`prop a: Int` then `prop b: Int = a + 1`) is a
+    // genuinely legal, intentional KUPL feature -- `check.rs::check_component`
+    // and `interp.rs::instantiate` BOTH progressively bind each prop's name
+    // into scope before checking/evaluating the NEXT prop's default, so a
+    // later default can see an earlier prop's value -- but this compiler
+    // used to compile every default chunk as a zero-parameter function with
+    // `fc.comp` left `None` and NO locals bound at all, so `Ident("a")`
+    // inside `b`'s default failed every lookup and emitted a bogus
+    // `K0240: unknown name` -- a LOUD, cross-engine ACCEPT-vs-REJECT
+    // divergence (not silent corruption): `kupl check` accepted the source
+    // and `kupl run` (interp) printed the correct value, but `kupl run --vm`
+    // and `kupl native` both failed to even COMPILE the program. Confirmed
+    // live before this fix: `component Gauge { prop a: Int; prop b: Int = a
+    // + 1; expose fun sum() -> Int { a + b } }` instantiated as `Gauge(a:
+    // 1)` printed `3` on `kupl run` but errored `K0240: unknown name \`a\`
+    // (KVM)` on both `kupl run --vm` and `kupl native`. Fixed by compiling
+    // each prop's default chunk with ONE PARAMETER PER EARLIER SIBLING PROP
+    // (bound in declaration order, mirroring check.rs's/interp.rs's own
+    // progressive-scope semantics), and threading each already-computed
+    // sibling value through as a call argument at the two sites that invoke
+    // a default chunk (`instance_expr` below).
     for c in &comps {
         let mut props = Vec::new();
+        let mut prior_names: Vec<String> = Vec::new();
         for p in &c.props {
             let default = p.default.as_ref().map(|d| {
-                let mut fc = FnCompiler::new(&mut shared, &format!("{}::default::{}", c.name, p.name), 0, 0);
+                let mut fc = FnCompiler::new(
+                    &mut shared,
+                    &format!("{}::default::{}", c.name, p.name),
+                    0,
+                    prior_names.len() as u8,
+                );
+                for name in &prior_names {
+                    fc.bind_local(name);
+                }
                 let r = fc.expr(d);
                 fc.emit(Op::Ret(r), p.span);
                 let chunk = fc.finish();
                 shared.push_chunk(chunk, p.span)
             });
             props.push((p.name.clone(), default));
+            prior_names.push(p.name.clone());
         }
         shared.comp_props.insert(c.name.clone(), props);
     }
@@ -526,15 +561,33 @@ impl<'s> FnCompiler<'s> {
                 supplied[idx] = Some(r);
             }
         }
-        let temps: Vec<Reg> = props
-            .iter()
-            .zip(supplied)
-            .map(|((pname, default), s)| match s {
+        // PR-it1077 (see phase A's own doc comment in `compile_module` for the
+        // full writeup): a prop's default chunk is now compiled with one
+        // parameter per EARLIER sibling prop, so a default referencing an
+        // earlier prop by name (`prop b: Int = a + 1`) resolves correctly --
+        // this requires threading each already-computed sibling value through
+        // as a call argument here, in the SAME declaration order the default
+        // chunk's own parameters were bound in. Uses the same "gather into a
+        // fresh, guaranteed-consecutive register range via `Op::Move`" shape
+        // as `consecutive()`'s own second pass and this function's own final
+        // `MakeInstance`-argument gather just below -- safe here without a
+        // FIRST decoupling pass (unlike `consecutive()`, which protects raw
+        // expressions with side effects) since every value in `temps` is
+        // already a stable, previously-computed register, not a fresh
+        // evaluation that could be mutated by a later sibling.
+        let mut temps: Vec<Reg> = Vec::with_capacity(props.len());
+        for ((pname, default), s) in props.iter().zip(supplied) {
+            let t = match s {
                 Some(r) => r,
                 None => match default {
                     Some(chunk) => {
+                        let start = self.next as Reg;
+                        for &prior in &temps {
+                            let r = self.alloc(span);
+                            self.emit(Op::Move(r, prior), span);
+                        }
                         let dst = self.alloc(span);
-                        self.emit(Op::Call { dst, fun: *chunk, start: 0, argc: 0 }, span);
+                        self.emit(Op::Call { dst, fun: *chunk, start, argc: temps.len() as u8 }, span);
                         dst
                     }
                     None => {
@@ -546,8 +599,9 @@ impl<'s> FnCompiler<'s> {
                         self.const_reg(Value::Unit, span)
                     }
                 },
-            })
-            .collect();
+            };
+            temps.push(t);
+        }
         let start = self.next as Reg;
         for t in temps {
             let r = self.alloc(span);

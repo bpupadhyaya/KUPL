@@ -339,9 +339,24 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
                 "0, 0".to_string()
             } else {
                 let _ = writeln!(props_setup, "    KValue k_app_props[{nprops}];");
+                // PR-it1077 (see compile.rs::compile_module's phase A and
+                // instance_expr's own doc comments for the full writeup): a
+                // prop's default chunk is now compiled with one parameter
+                // per EARLIER sibling prop (so a default referencing an
+                // earlier prop by name, `prop b: Int = a + 1`, resolves
+                // correctly) -- this native app-bootstrap path must ALSO
+                // pass the already-computed sibling values as `args`,
+                // mirroring the SAME `fun_{fun}(0, &regs[start])` calling
+                // convention every other Call site in this file already
+                // uses. `k_app_props` is filled in declaration order, so by
+                // the time prop `i`'s default runs, `k_app_props[0..i]`
+                // already holds exactly the values its own compiled body
+                // expects at `args[0..i]` -- passing the array itself
+                // (which decays to a pointer to its own first element)
+                // needs no extra bookkeeping.
                 for (i, (_, default_chunk)) in app_props.iter().enumerate() {
                     let chunk = default_chunk.expect("filtered out missing defaults above");
-                    let _ = writeln!(props_setup, "    k_app_props[{i}] = fun_{chunk}(0, 0);");
+                    let _ = writeln!(props_setup, "    k_app_props[{i}] = fun_{chunk}(0, k_app_props);");
                 }
                 format!("k_app_props, {nprops}")
             };
@@ -8588,6 +8603,38 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out2.stdout), "1 hi\n");
         let _ = std::fs::remove_file(&cpath2);
         let _ = std::fs::remove_file(&bin2);
+
+        // A REAL bug found+fixed (production-hardening PR-it1077): this
+        // native app-bootstrap codegen calls each prop's default chunk via
+        // a hand-written C call (`fun_{chunk}(0, ...)`), completely
+        // separate from the ordinary `instance_expr`-emitted Call bytecode
+        // -- so it needed its OWN fix to pass the already-computed sibling
+        // prop values as the callee's `args` pointer. Unlike the "Multi1002"
+        // case just above (whose `b`'s default `"hi"` never actually reads
+        // its own nominal `args[0]`, so the pre-fix bug was silently
+        // unobservable there even under `-O2`), THIS case's `b`'s default
+        // (`a + 1`) genuinely dereferences `args[0]`, so it's a real,
+        // load-bearing check that the fix passes the right pointer, not
+        // just that the generated C compiles and runs at all.
+        let src2c = "app Sibling1077 {\n    intent \"s\"\n    prop a: Int = 5\n    prop b: Int = a + 1\n    \
+                     on start { print(\"{a} {b}\") }\n}\n";
+        let compiled2c = crate::run::compile(src2c).expect("compiles");
+        let module2c = crate::compile::compile_module(&compiled2c.program, &compiled2c.checked)
+            .expect("module compiles");
+        let c2c = super::emit_c(&module2c).expect("emit_c succeeds");
+        let base2c = std::env::temp_dir().join(format!("kupl-cgen-appprop1077-{}", std::process::id()));
+        let cpath2c = base2c.with_extension("c");
+        let bin2c = base2c.with_extension("out");
+        std::fs::write(&cpath2c, &c2c).unwrap();
+        let status2c = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin2c.to_str().unwrap(), cpath2c.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status2c.success(), "generated C must compile");
+        let out2c = std::process::Command::new(&bin2c).output().expect("binary runs");
+        assert_eq!(String::from_utf8_lossy(&out2c.stdout), "5 6\n");
+        let _ = std::fs::remove_file(&cpath2c);
+        let _ = std::fs::remove_file(&bin2c);
 
         // a prop with NO default at all must be a CLEAN COMPILE-TIME refusal,
         // not a silently-built binary that fills it in with k_unit().
