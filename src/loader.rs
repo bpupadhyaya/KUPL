@@ -656,9 +656,32 @@ pub fn lock_text(deps: &[ResolvedDep]) -> String {
 }
 
 /// Write `path`'s new content atomically: to a sibling temp file first,
-/// then `rename` it into place (production-hardening PR-it1102, a
-/// two-phase self-scoping survey finding via the cross-file-interaction
-/// angle, following up on this file's own PR-it1101 registry.rs/loader.rs
+/// then `rename` it into place. On EITHER the write or the rename failing,
+/// the tmp file is removed before the error propagates (production-
+/// hardening PR-it1116, a two-phase self-scoping survey finding: auditing
+/// this function's OWN prior fix, PR-it1102/1103, for the same "leaves an
+/// orphaned artifact behind on failure, never cleaned up" gap class
+/// `CacheLock` had at PR-it1100/1115). Unlike `registry.rs::materialize`,
+/// whose own staging directory is explicitly cleaned up on every one of
+/// its own failure paths (`let _ = std::fs::remove_dir_all(&staging);`),
+/// this function's own first version propagated a write or rename failure
+/// via a bare `?` with no cleanup at all -- live-confirmed real: a rename
+/// failure (reproduced via a target path that's a directory rather than a
+/// file, `std::io::ErrorKind::IsADirectory` -- standing in for the wider
+/// class of rename failures, e.g. a disk-full condition mid-write leaving
+/// a truncated tmp file, or a permissions error) left the `.tmp-{pid}`
+/// file sitting next to the real target on disk, in the user's OWN project
+/// directory (visible in `git status`/file listings, since `pkg_lock`'s
+/// and `fmt --write`'s own targets, `kupl.lock` and a `.kupl` source file,
+/// both live inside the project, unlike `CacheLock`'s hidden OS-temp-dir
+/// lock file) -- lower severity than that bug (nothing is BLOCKED, the
+/// real target file is correctly left untouched, only litter accumulates),
+/// but the same underlying "new machinery never audited against this
+/// codebase's own established cleanup-on-failure precedent" class.
+///
+/// This function itself was originally added at production-hardening
+/// PR-it1102, a two-phase self-scoping survey finding via the cross-file-
+/// interaction angle, following up on this file's own PR-it1101 registry.rs/loader.rs
 /// pairing with a SECOND instance of the same shape, originally found via
 /// `kupl.lock`: `run.rs::pkg_lock` (write) and `run.rs::pkg_tree` (read,
 /// via `lock_hashes` above) were each independently correct in isolation,
@@ -703,8 +726,15 @@ pub fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
         path.file_name().and_then(|n| n.to_str()).unwrap_or("kupl-atomic-write"),
         std::process::id()
     ));
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+    if let Err(e) = std::fs::write(&tmp, text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Parse a `kupl.lock` into (name -> hash) for drift comparison.
@@ -3214,5 +3244,39 @@ mod tests {
         assert!(saw_old || saw_new, "the read loop should have observed the file at least once");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1116) -- see `write_atomically`'s own doc comment for the full
+    /// writeup. This proves the FIX: when the final `rename` step fails
+    /// (here forced via a target path that's a directory rather than a
+    /// file, `ErrorKind::IsADirectory` -- standing in for the wider class
+    /// of rename failures, e.g. disk-full or a permissions error), the
+    /// `.tmp-{pid}` staging file must NOT be left behind -- unlike the
+    /// original version, confirmed live (a standalone probe, not kept as a
+    /// permanent test) to leak exactly this file in exactly this scenario.
+    #[test]
+    fn write_atomically_cleans_up_its_own_tmp_file_when_the_rename_step_fails() {
+        let base = std::env::temp_dir().join(format!("kupl-atomic-write-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("kupl.lock");
+        // The target is a DIRECTORY, not a file -- `rename(tmp, target)`
+        // must fail with IsADirectory, exactly the failure this test
+        // exercises (a stand-in for any rename failure, not a claim that a
+        // directory literally named `kupl.lock` is the realistic case).
+        std::fs::create_dir_all(&target).unwrap();
+
+        let err = super::write_atomically(&target, "new content").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{err:?}");
+
+        let tmp = base.join(format!("kupl.lock.tmp-{}", std::process::id()));
+        assert!(
+            !tmp.exists(),
+            "write_atomically must clean up its own tmp file when the rename step fails, not leave {} behind",
+            tmp.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
