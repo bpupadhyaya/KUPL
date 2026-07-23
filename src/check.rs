@@ -1802,7 +1802,35 @@ impl Checker {
             self.bind_component_env(c, &mut cctx);
             self.check_ctor_args(&child.component, &sig, &child.args, child.span, &mut cctx);
         }
+        // A REAL, live-confirmed silent-behavior bug (production-hardening
+        // PR-it1089): unlike every sibling collection in this same function
+        // (children K0207, `on` handlers K0209, props K0283, methods K0277),
+        // `c.wires` had NO duplicate-declaration check at all -- and unlike
+        // those siblings, where a duplicate is merely a confusing redundancy,
+        // a duplicate `wire` is a genuine RUNTIME divergence: `instantiate`
+        // (interp.rs) pushes one `(dst, to_port)` entry onto the source
+        // instance's `wires` map PER wire declaration, with no dedup, and
+        // `emit` iterates every entry to enqueue a message -- so declaring
+        // the identical `wire a.out -> b.in` twice (an easy copy-paste/merge-
+        // conflict mistake) delivers every emitted value TWICE, running the
+        // target handler twice per emit. Live-confirmed identically on ALL
+        // THREE runnable engines (interp/vm/native all double-fire the same
+        // way, so this is a missing diagnostic, not a cross-engine
+        // divergence) with `kupl check` reporting a clean "ok", zero
+        // diagnostics, for a program that silently double-executes a
+        // handler's side effects on every message.
+        let mut seen_wires: HashSet<(&str, &str, &str, &str)> = HashSet::new();
         for wire in &c.wires {
+            if !seen_wires.insert((wire.from.0.as_str(), wire.from.1.as_str(), wire.to.0.as_str(), wire.to.1.as_str())) {
+                self.err(
+                    "K0285",
+                    format!(
+                        "wire `{}.{}` -> `{}.{}` is declared more than once — each emitted value would be delivered twice",
+                        wire.from.0, wire.from.1, wire.to.0, wire.to.1
+                    ),
+                    wire.span,
+                );
+            }
             let from_ty = self.wire_port_ty(&child_types, &wire.from, true, wire.span);
             let to_ty = self.wire_port_ty(&child_types, &wire.to, false, wire.span);
             if let (Some(a), Some(b)) = (from_ty, to_ty) {
@@ -6739,6 +6767,52 @@ mod generic_tests {
             errors("component Ok {\n    intent \"ok\"\n    prop a: Int\n    prop b: Int\n    expose fun sum() -> Int { a + b }\n}\nfun main() {}\n")
                 .is_empty()
         );
+    }
+
+    /// A REAL, live-confirmed SILENT-BEHAVIOR bug (production-hardening
+    /// PR-it1089): unlike every sibling collection in `check_component`
+    /// (children K0207, `on` handlers K0209, props K0283, methods K0277),
+    /// `c.wires` had NO duplicate-declaration check -- and unlike those
+    /// siblings, a duplicate wire is not merely redundant: `emit` (shared by
+    /// interp/vm/native) iterates every registered `(dst, to_port)` entry
+    /// for a source port and enqueues one message PER entry, so declaring
+    /// the identical `wire a.out -> b.in` twice makes every emitted value
+    /// deliver TWICE, running the target handler twice per emit. Confirmed
+    /// live before this fix that `kupl check` reported a clean "ok" and
+    /// `kupl run`/`kupl run --vm`/`kupl native` all silently double-fired the
+    /// target handler identically (a missing diagnostic, not a cross-engine
+    /// divergence).
+    #[test]
+    fn duplicate_wire_declarations_are_rejected() {
+        let src = |extra_wire: &str| {
+            format!(
+                "component Source {{\n    intent \"s\"\n    out result: Int\n    on start {{ emit result(1) }}\n}}\n\
+                 component Sink {{\n    intent \"k\"\n    in got: Int\n    on got(v) {{ }}\n}}\n\
+                 app Main {{\n    intent \"m\"\n    let src = Source()\n    let snk = Sink()\n    \
+                 wire src.result -> snk.got\n{extra_wire}}}\n"
+            )
+        };
+        let dup = errors(&src("    wire src.result -> snk.got\n"));
+        assert!(
+            dup.iter().any(|d| d.code == "K0285"
+                && d.message.contains("src.result")
+                && d.message.contains("snk.got")
+                && d.message.contains("declared more than once")),
+            "{dup:?}"
+        );
+        // an ordinary component with a single wire (the common case) is unaffected.
+        assert!(errors(&src("")).is_empty(), "{:?}", errors(&src("")));
+
+        // fan-out (the SAME source port wired to a DIFFERENT target) is legitimate,
+        // not a duplicate -- must not be flagged.
+        let fanout = format!(
+            "component Source {{\n    intent \"s\"\n    out result: Int\n    on start {{ emit result(1) }}\n}}\n\
+             component Sink {{\n    intent \"k\"\n    in got: Int\n    on got(v) {{ }}\n}}\n\
+             component Sink2 {{\n    intent \"k2\"\n    in got: Int\n    on got(v) {{ }}\n}}\n\
+             app Main {{\n    intent \"m\"\n    let src = Source()\n    let snk = Sink()\n    let snk2 = Sink2()\n    \
+             wire src.result -> snk.got\n    wire src.result -> snk2.got\n}}\n"
+        );
+        assert!(!errors(&fanout).iter().any(|d| d.code == "K0285"), "{:?}", errors(&fanout));
     }
 
     /// A REAL, live-confirmed HIGH-severity soundness hole (production-
