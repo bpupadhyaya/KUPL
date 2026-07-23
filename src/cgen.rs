@@ -3979,7 +3979,28 @@ static long k_content_length(const char* head, long head_len) {
         while (j < head_len && (head[j] == ' ' || head[j] == '\t')) j++;
         long start = j;
         while (j < head_len && head[j] >= '0' && head[j] <= '9') j++;
-        if (j == start) return 0;
+        if (j == start) continue;
+        /* Production-hardening PR-it1086: `interp::parse_content_length`
+           requires the WHOLE trimmed header value to parse as a number
+           (`value.trim().parse::<usize>()`) -- any trailing non-digit
+           content after the digits (trailing whitespace/CR aside) makes
+           the ENTIRE value unparsable, in which case Rust's `for line in
+           head.split('\n')` loop simply moves on to check for a LATER
+           header of the same name, never returning early. The old code
+           here only ever consumed a leading run of digits and unconditionally
+           `return`ed on ANY match (whether the value ended cleanly, had
+           trailing garbage, or overflowed) -- so `Content-Length: 11x`
+           silently accepted `11` (never checking for trailing garbage) and
+           a first unparsable/overflowing `Content-Length` header
+           permanently shadowed a later, valid one, both live-confirmed
+           cross-engine divergences. Skip trailing whitespace/CR the same
+           way `.trim()` would, then require the value to end at the line
+           boundary (`\n` or end of buffer) before accepting the digits;
+           `continue` (not `return`) on ANY failure so a later header can
+           still be found, matching Rust's per-line `continue`-on-`Err`. */
+        long vend = j;
+        while (vend < head_len && (head[vend] == ' ' || head[vend] == '\t' || head[vend] == '\r')) vend++;
+        if (vend < head_len && head[vend] != '\n') continue;
         uint64_t v = 0;
         int overflowed = 0;
         for (long k = start; k < j; k++) {
@@ -3987,7 +4008,7 @@ static long k_content_length(const char* head, long head_len) {
             if (v > (UINT64_MAX - d) / 10) { overflowed = 1; break; }
             v = v * 10 + d;
         }
-        if (overflowed) return 0;
+        if (overflowed) continue;
         return v > (uint64_t)K_MAX_HTTP_BODY ? K_MAX_HTTP_BODY : (long)v;
     }
     return 0;
@@ -4207,8 +4228,39 @@ static KValue k_http_serve(KValue port, KValue handler) {
             status, strlen(body));
         kb_write(&resp, hdr, hn);
         kb_write(&resp, body, (long)strlen(body));
+        /* A REAL, SEVERE availability bug found+fixed (production-hardening
+           PR-it1086), the SAME single-stalled-connection-wedges-the-whole-
+           server class as it559/it577/it623/it624 above -- all four fixed
+           the READ side of this exact function; the response WRITE side had
+           NO timeout of any kind, a plain blocking `write()` loop that could
+           block forever. A client that sends a valid request and then simply
+           never reads the response (or reads it slowly enough to keep the
+           TCP send buffer full without ever fully stalling a single
+           `write()` call -- the exact "trickle" shape it624 already fixed on
+           the read side) wedges the single-threaded accept loop exactly as
+           effectively as a stalled READ does. Live-confirmed before this
+           fix: a client that connected, sent a request, and deliberately
+           never read the response left `write()` blocked (state `S`, zero
+           bytes written) for the entire observation window, unblocking only
+           once the client process exited and its socket was torn down --
+           mirroring interp::serve_http's identical, separately-fixed gap
+           (its own PR-it867). Fixed with the IDENTICAL two-layer defense
+           already used for reads: a per-write timeout (mirroring it623)
+           PLUS a total elapsed-time deadline checked every loop iteration
+           (mirroring it624), rather than relying on SO_SNDTIMEO alone -- a
+           single SO_SNDTIMEO bounds only each individual `write()` syscall,
+           which resets on every partial write exactly like the per-read
+           timeout did before it624, so it alone would NOT close the trickle
+           variant. */
+        struct timeval sndtimeo = { 30, 0 };
+        setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &sndtimeo, sizeof sndtimeo);
+        time_t write_deadline = time(0) + 30;
         long off = 0;
-        while (off < resp.len) { ssize_t w = write(conn, resp.buf + off, resp.len - off); if (w <= 0) break; off += w; }
+        while (off < resp.len && time(0) < write_deadline) {
+            ssize_t w = write(conn, resp.buf + off, resp.len - off);
+            if (w <= 0) break;
+            off += w;
+        }
         close(conn);
     }
 }
@@ -15294,6 +15346,85 @@ fun main() uses io {
         result.unwrap();
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it1086, a
+    /// background survey finding, independently re-verified live before implementing):
+    /// two distinct divergences from `interp::parse_content_length`, both stemming from
+    /// `k_content_length` only ever consuming a leading run of digits and unconditionally
+    /// `return`ing on ANY match, rather than requiring the digit run to consume the WHOLE
+    /// trimmed header value (matching `value.trim().parse::<usize>()`'s all-or-nothing
+    /// semantics) and `continue`ing to a later same-named header on failure (matching
+    /// Rust's `for line in head.split('\n')` loop, which only ever `return`s on success).
+    /// (1) `Content-Length: 11x` (trailing non-digit garbage after otherwise-valid
+    /// digits) was silently accepted as `11` instead of being treated as unparsable (0,
+    /// no body) like interp/vm. (2) a first `Content-Length` header with an unparsable
+    /// value permanently shadowed a LATER, valid `Content-Length` header on the same
+    /// request -- interp/vm keep scanning and use the later, valid one; native stopped
+    /// at the first failure and never looked further. Live-confirmed before this fix:
+    /// `Content-Length: 11x\r\n\r\nhello world` yielded body `"hello world"` on native but
+    /// `""` on interp/vm; `Content-Length: abc\r\nContent-Length: 5\r\n\r\nlater` yielded
+    /// body `""` on native but `"later"` on interp/vm.
+    #[test]
+    fn native_http_serve_content_length_trailing_garbage_and_later_header_fallback() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun h(m: Str, p: Str, b: Str) -> Str { \"{m} {p} [{b}]\" }\n\
+                   fun main() uses io { let _ = http_serve(38132, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srv-cltrail-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let mut stream = None;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38132u16)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let result = (|| {
+            // trailing garbage after otherwise-valid digits must make the whole value
+            // unparsable, not silently truncate to the leading digit prefix.
+            let mut s1 = stream.ok_or("server should be listening")?;
+            s1.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s1.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11x\r\n\r\nhello world")
+                .map_err(|e| e.to_string())?;
+            let mut resp1 = String::new();
+            let _ = s1.read_to_string(&mut resp1);
+            if !resp1.ends_with("POST /echo []") {
+                return Err(format!(
+                    "trailing garbage after the digits must make Content-Length unparsable: {resp1}"
+                ));
+            }
+            // a first, unparsable Content-Length header must not shadow a later, valid one.
+            let mut s2 = std::net::TcpStream::connect(("127.0.0.1", 38132u16)).map_err(|e| e.to_string())?;
+            s2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            s2.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\nContent-Length: 5\r\n\r\nlater")
+                .map_err(|e| e.to_string())?;
+            let mut resp2 = String::new();
+            let _ = s2.read_to_string(&mut resp2);
+            if !resp2.ends_with("POST /echo [later]") {
+                return Err(format!(
+                    "a later, valid Content-Length header must still be found after an earlier \
+                     unparsable one: {resp2}"
+                ));
+            }
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
     /// A REAL BUG found+fixed (bug-hunt batch 167, PR-it559, found via an Explore-agent
     /// survey of tensors [exhausted, clean] vs HTTP [this]): native's `k_http_serve` had
     /// NO panic-catching landing pad around the handler call, unlike interp.rs's
@@ -15582,6 +15713,104 @@ fun main() uses io {
             }
             let resp = recovered
                 .ok_or("server should recover and serve a fresh request after the stalled one times out")?;
+            if !resp.ends_with("GET /world") {
+                return Err(format!("bad recovered response: {resp}"));
+            }
+            drop(stalled);
+            Ok::<(), String>(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        result.unwrap();
+    }
+
+    /// A REAL, SEVERE availability bug found+fixed (production-hardening
+    /// PR-it1086, a background survey finding, independently re-verified
+    /// live before implementing): the SAME single-stalled-connection-
+    /// wedges-the-whole-server class as it559/it577/it623/it624 above --
+    /// all four fixed the READ side of `k_http_serve`; the response WRITE
+    /// side (`while (off < resp.len) { write(...); ... }`) had NO timeout
+    /// of any kind, unlike interp::serve_http's own separately-fixed write
+    /// side (PR-it867). A client that sends a complete, valid request and
+    /// then simply never reads the (deliberately large) response wedges the
+    /// single-threaded accept loop exactly as effectively as a stalled READ
+    /// does, since a blocking `write()` to a full TCP send buffer never
+    /// returns. Live-confirmed before this fix (via a standalone extraction
+    /// of the exact write-loop shape): the server's `write()` blocked in
+    /// state `S` with zero bytes written for the ENTIRE observation window,
+    /// unblocking only once the stalled client's own process exited.
+    /// Mirrors `native_http_serve_recovers_from_a_stalled_slow_client`'s
+    /// (it623) exact structure and `native_http_serve_survives_a_client_
+    /// that_disconnects_before_reading_a_large_response`'s (it791) `grow`-
+    /// doubling technique for a response large enough to reliably fill the
+    /// kernel socket send buffer -- unlike that it791 test (which DROPS the
+    /// connection, testing SIGPIPE recovery), THIS test deliberately KEEPS
+    /// the stalled connection OPEN without ever reading from it, the
+    /// distinct trigger mechanism only a genuine write-side timeout closes.
+    #[test]
+    fn native_http_serve_recovers_from_a_client_that_never_reads_the_response() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let src = "fun grow(s: Str) -> Str {\n    \
+                   var out: Str = s\n    var i = 0\n    \
+                   while i < 22 {\n        out = out + out\n        i = i + 1\n    }\n    \
+                   out\n}\n\
+                   fun h(m: Str, p: Str, b: Str) -> Str {\n    \
+                   if p == \"/big\" { grow(\"y\") } else { \"{m} {p}\" }\n}\n\
+                   fun main() uses io { let _ = http_serve(38128, h) }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("http_serve compiles to C");
+        assert!(c.contains("SO_SNDTIMEO"), "the fix must emit a write-timeout setsockopt call");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-srvwrite-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
+        let connect = || {
+            for _ in 0..300 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", 38128u16)) {
+                    return Some(s);
+                }
+            }
+            None
+        };
+        let result = (|| {
+            // connection 1: a COMPLETE request for the large response, held
+            // open WITHOUT ever reading anything back. Before the fix, the
+            // native server's write() would block on this forever and
+            // connection 2 below would never even be accepted.
+            let mut stalled = connect().ok_or("server should be listening")?;
+            stalled.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .map_err(|e| e.to_string())?;
+            // connection 2: retried for up to ~35s (past the real 30s
+            // SO_SNDTIMEO production value) -- proves the server recovers
+            // and serves a fresh, small request rather than staying wedged.
+            let mut recovered = None;
+            for _ in 0..875 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", 38128u16)) {
+                    s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                    if s.write_all(b"GET /world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").is_err() {
+                        continue;
+                    }
+                    let mut resp = String::new();
+                    let _ = s.read_to_string(&mut resp);
+                    if resp.contains("HTTP/1.1 200 OK") {
+                        recovered = Some(resp);
+                        break;
+                    }
+                }
+            }
+            let resp = recovered
+                .ok_or("server should recover after the stalled connection's write deadline expires")?;
             if !resp.ends_with("GET /world") {
                 return Err(format!("bad recovered response: {resp}"));
             }
