@@ -644,6 +644,22 @@ struct CacheLock {
 
 impl CacheLock {
     fn acquire(cache_dir: &std::path::Path) -> std::io::Result<CacheLock> {
+        Self::acquire_with_stale_after(cache_dir, std::time::Duration::from_secs(300))
+    }
+
+    /// `acquire`, but with an injectable staleness threshold -- lets a test
+    /// force the staleness-recovery path deterministically in milliseconds
+    /// rather than waiting out the real, production `stale_after` (5
+    /// minutes), mirroring `parallel.rs::par_eval_with_stack_size`'s own
+    /// established pattern (production-hardening PR-it1098) for making an
+    /// otherwise-impractical-to-test time/resource threshold testable
+    /// without touching real production behavior: `acquire` above always
+    /// calls this with the real constant, so production behavior is
+    /// provably unchanged.
+    fn acquire_with_stale_after(
+        cache_dir: &std::path::Path,
+        stale_after: std::time::Duration,
+    ) -> std::io::Result<CacheLock> {
         // The lock file lives in the OS temp directory (always present),
         // deterministically named from `cache_dir`'s own path, rather than
         // inside `cache_dir` itself. `cache_dir` may not exist yet (this
@@ -657,6 +673,43 @@ impl CacheLock {
         // first and broke exactly those five tests).
         let key = crate::encoding::hash_fnv(&cache_dir.display().to_string());
         let path = std::env::temp_dir().join(format!("kupl-registry-cache-{key:x}.lock"));
+        // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+        // PR-it1115, a two-phase self-scoping survey finding auditing this
+        // struct's OWN new code -- added at PR-it1100 -- against a threat
+        // its own doc comment already named but never actually handled):
+        // this lock originally had NO staleness recovery, and its failure
+        // path never revealed `path` itself, only `cache_dir` (see the call
+        // site below). If the process holding the lock is killed
+        // UNGRACEFULLY (SIGKILL, an OOM-kill, a CI job's own hard timeout --
+        // exactly the "two CI jobs" threat model this struct's own doc
+        // comment names as the primary reason to exist), `Drop::drop` never
+        // runs (Rust destructors don't run on a hard kill) and the lock file
+        // is orphaned FOREVER. Live-confirmed before this fix: hand-creating
+        // a stale lock file at the exact computed path, then running a real
+        // `kupl pkg fetch` against a real project, reliably reproduced a
+        // ~10s-delayed failure with `error: cannot acquire registry cache
+        // lock in <cache_dir>: File exists (os error 17)` -- a message that
+        // names the wrong path entirely (the cache DIRECTORY, not the lock
+        // FILE actually blocking it) -- and EVERY SUBSEQUENT invocation, for
+        // ANY package, on that machine, failed identically the same way
+        // until the orphaned file was found (by reconstructing its hashed
+        // name by hand) and manually deleted. Fixed with a self-healing
+        // staleness check mirroring `atomic_replace`'s own existing
+        // crash-recovery precedent (`materialize`'s own stale-staging-
+        // directory cleanup, this file's `let _ = std::fs::remove_dir_all(
+        // &staging); // a stale leftover from a prior crash, if any`): a
+        // lock file whose own mtime is older than `stale_after` is presumed
+        // orphaned and is stolen (removed, so the next attempt can recreate
+        // it) rather than waited out for the full budget. A time-based
+        // heuristic, not a PID-liveness check, deliberately: this codebase
+        // is zero-dependency with no `libc`/unsafe FFI for a portable
+        // "is this PID still alive" syscall, and a generous, minutes-long
+        // threshold (far longer than any real fetch's network I/O + hash
+        // verification + write should ever legitimately take) costs nothing
+        // in the common case while still recovering automatically instead
+        // of wedging forever. The lock path is now ALSO folded into the
+        // returned error's own message (see below), so even a genuine
+        // (non-stale) contention timeout is self-service-debuggable.
         // 2000 attempts * 5ms = 10s worst-case wait before giving up --
         // generous next to the network I/O a real fetch already does, but
         // still bounded so a crashed process that left a stale lock file
@@ -670,12 +723,24 @@ impl CacheLock {
             }
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(_file) => return Ok(CacheLock { path }),
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if meta.modified().is_ok_and(|m| m.elapsed().is_ok_and(|age| age > stale_after)) {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                    last_err = Some(e);
+                }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out waiting for registry cache lock")
-        }))
+        Err(last_err
+            .map(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+            .unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("timed out waiting for {}", path.display()),
+                )
+            }))
     }
 }
 
@@ -840,6 +905,44 @@ mod tests {
         let dir = super::cache_dir();
         assert_eq!(dir.file_name().unwrap(), "registry-cache");
         assert_eq!(dir.parent().unwrap().file_name().unwrap(), ".kupl");
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1115) -- see `CacheLock::acquire_with_stale_after`'s own doc
+    /// comment for the full writeup. This proves the FIX: a lock file older
+    /// than the (injectable, here tiny) staleness threshold is stolen and
+    /// removed rather than being waited out for the full attempt budget --
+    /// a real, orphaned lock file (standing in for one left behind by a
+    /// process killed before its own `Drop` could run) does NOT permanently
+    /// block every future `CacheLock::acquire` call the way it did before
+    /// this fix.
+    #[test]
+    fn cache_lock_steals_a_stale_lock_file_instead_of_waiting_out_the_full_budget() {
+        let cache_dir = std::env::temp_dir().join(format!("kupl-cachelock-stale-{}", std::process::id()));
+        let key = crate::encoding::hash_fnv(&cache_dir.display().to_string());
+        let lock_path = std::env::temp_dir().join(format!("kupl-registry-cache-{key:x}.lock"));
+        let _ = std::fs::remove_file(&lock_path);
+
+        // Hand-create an orphaned lock file -- standing in for one left by a
+        // process that was killed before `Drop::drop` could remove it.
+        std::fs::write(&lock_path, b"orphaned").unwrap();
+        // Let it age past a deliberately tiny staleness threshold -- fast
+        // and deterministic, unlike the real 300s production value.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let start = std::time::Instant::now();
+        let guard = CacheLock::acquire_with_stale_after(&cache_dir, std::time::Duration::from_millis(20))
+            .expect("a stale lock must be stolen, not waited out");
+        let elapsed = start.elapsed();
+        // Self-healing within a couple of retry cycles (each 5ms), nowhere
+        // near the real 10s (2000-attempt) budget -- proves the stale file
+        // was actively stolen, not that this just got lucky waiting it out.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "stealing a stale lock took {elapsed:?} -- looks like it fell through to the full wait budget instead"
+        );
+        drop(guard);
+        let _ = std::fs::remove_file(&lock_path);
     }
 
     fn sample_index() -> &'static str {
