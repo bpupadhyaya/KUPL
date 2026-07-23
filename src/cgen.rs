@@ -4888,13 +4888,47 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                         kb_puts(&k_ai_err_buf, "provider asked to use zero tools");
                         k_ai_ok = 0; return k_unit();
                     }
+                    /* A REAL, live-confirmed cross-engine bug found+fixed
+                       (production-hardening PR-it1118, a two-phase self-scoping
+                       survey finding): `ai.rs::MockProvider::round` validates
+                       EVERY entry's own `"tool"` name FIRST, building the whole
+                       `reqs` vec, before `run_tool_loop` ever calls
+                       `execute_tool` (a REAL side effect) on any of them --
+                       a malformed entry anywhere in a `"tools"` array rejects
+                       the ENTIRE round atomically, with ZERO tools run. This
+                       loop used to validate each entry's `"tool"` field
+                       INTERLEAVED with actually EXECUTING it via
+                       `k_ai_call_one_tool` (which calls the real KUPL function,
+                       side effects and all) -- so a well-formed EARLIER entry
+                       already ran for real before a LATER malformed entry was
+                       even inspected. Confirmed live: a two-entry `"tools"`
+                       round with a valid tool at index 0 (writes a marker
+                       file) followed by `{"bogus":"entry"}` at index 1 panics
+                       on interp/vm with the marker file NEVER written, but
+                       native wrote the file AND emitted the WRONG error
+                       ("mock round must be `{\"tool\": ...}` or `{\"final\":
+                       ...}`" instead of "mock round: each entry in `tools`
+                       must have a `tool` name") while falsely claiming "this
+                       tool failed after 1 other tool call(s) in the same
+                       round already ran" -- a claim that can never be true on
+                       interp/vm for this failure mode, since nothing runs at
+                       all. Fixed by pre-validating every entry's own `"tool"`
+                       field (mirrors `k_ai_call_one_tool`'s own `"tool"`-field
+                       check, without the side-effecting call) BEFORE the
+                       execution loop below runs anything. */
                     for (long ti = 0; ti < items->len; ti++) {
                         KValue item = items->items[ti];
-                        if (strcmp(k_json_var(item), "JObj")) {
+                        KValue tn;
+                        if (strcmp(k_json_var(item), "JObj")
+                            || !k_map_field(k_json_field0(item).as.map, "tool", &tn)
+                            || strcmp(k_json_var(tn), "JStr")) {
                             kb_reset(&k_ai_err_buf);
                             kb_puts(&k_ai_err_buf, "mock round: each entry in `tools` must have a `tool` name");
                             k_ai_ok = 0; return k_unit();
                         }
+                    }
+                    for (long ti = 0; ti < items->len; ti++) {
+                        KValue item = items->items[ti];
                         if (!k_ai_call_one_tool(f, k_json_field0(item).as.map)) {
                             if (ti > 0) {
                                 /* PRODUCTION-HARDENING (PR-it770): mirrors ai.rs::run_tool_loop's
@@ -19589,6 +19623,76 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
             stderr.trim(),
             "panic: ai `call_a9`: provider asked to use zero tools",
             "native must match interp/vm's zero-tools rejection: {stderr:?}"
+        );
+    }
+
+    /// A REAL, live-confirmed cross-engine bug found+fixed (production-
+    /// hardening PR-it1118, a two-phase self-scoping survey finding):
+    /// `ai.rs::MockProvider::round` validates EVERY entry's own `"tool"`
+    /// name FIRST, building the whole `reqs` vec, before `run_tool_loop`
+    /// ever calls `execute_tool` (a REAL side effect) on any of them -- a
+    /// malformed entry ANYWHERE in a `"tools"` array rejects the entire
+    /// round atomically, with ZERO tools run. `cgen.rs`'s own mirror used
+    /// to validate each entry's `"tool"` field INTERLEAVED with actually
+    /// EXECUTING it, so a well-formed EARLIER entry already ran for real
+    /// (writing a file, in this repro) before a LATER malformed entry was
+    /// even inspected. Confirmed live BEFORE fixing: this exact program
+    /// panics on interp/vm with the marker file NEVER written, but native
+    /// wrote the file AND emitted the WRONG error message ("mock round
+    /// must be `{\"tool\": ...}` or `{\"final\": ...}`" instead of "mock
+    /// round: each entry in `tools` must have a `tool` name") while
+    /// falsely claiming "this tool failed after 1 other tool call(s) in
+    /// the same round already ran" -- a claim that can never be true on
+    /// interp/vm for this failure mode, since nothing runs at all.
+    #[test]
+    fn native_ai_tools_array_malformed_entry_runs_no_tool_before_erroring() {
+        if !cc_available() {
+            return;
+        }
+        let marker = std::env::temp_dir()
+            .join(format!("kupl-cgen-aitoolsmalformed-marker-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let src = format!(
+            "fun mark_c9(path: Str) uses io.fs -> Str {{\n    \
+                let _ = write_file(path, \"ran\")\n    \"ok\"\n}}\n\
+             ai fun call_c9(q: Str) -> Str tools [mark_c9] {{ intent \"x\" }}\n\
+             fun main() uses io, ai {{ print(call_c9(\"go\")) }}\n"
+        );
+        let compiled = crate::run::compile(&src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aitoolsmalformed-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mock = format!(
+            "[{{\"tools\":[{{\"tool\":\"mark_c9\",\"input\":{{\"path\":\"{}\"}}}},{{\"bogus\":\"entry\"}}]}}]",
+            marker.to_str().unwrap().replace('\\', "\\\\")
+        );
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_CALL_C9", &mock)
+            .output()
+            .expect("binary runs");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        let marker_ran = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!out.status.success(), "a malformed `tools` array entry must panic: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.trim(),
+            "panic: ai `call_c9`: mock round: each entry in `tools` must have a `tool` name",
+            "native must match interp/vm's exact rejection message, with no \"already ran\" \
+             suffix (nothing may have run yet): {stderr:?}"
+        );
+        assert!(
+            !marker_ran,
+            "the well-formed EARLIER tool call must NOT have run its real side effect \
+             before the LATER malformed entry was validated -- matches interp/vm, which \
+             reject the whole round atomically before executing anything"
         );
     }
 
