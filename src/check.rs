@@ -4326,6 +4326,47 @@ impl Checker {
                 }
             }
             PatternKind::At { name, inner } => {
+                // A REAL, LIVE-CONFIRMED cross-engine SILENT VALUE-CORRUPTION
+                // bug found+fixed (production-hardening PR-it1117, a
+                // two-phase self-scoping survey finding): if `name` is ALSO
+                // bound somewhere inside `inner` (e.g. `x @ Circle(x)`, the
+                // same identifier reused by a nested field pattern), the two
+                // execution engines pick OPPOSITE "last write wins"
+                // semantics for which binding survives, with NO diagnostic
+                // anywhere to catch it: `interp.rs::match_pattern`'s `At` arm
+                // matches `inner` (defining ITS bindings) BEFORE `env.define`
+                // -ing the outer name, so the OUTER (whole-value) binding
+                // wins; `compile.rs::pattern`'s `At` arm emits the outer
+                // `bind_local` BEFORE compiling `inner`, and `lookup` resolves
+                // to the MOST RECENTLY pushed scope entry, so the INNER
+                // (field-value) binding wins there instead -- meaning VM and
+                // native (both driven by `compile.rs`'s bytecode) silently
+                // disagree with the interpreter on an ordinary, statically-
+                // accepted program with zero crash on either side. Live-
+                // confirmed: `type Shape = Circle(r: Int) | Square(s: Int)`,
+                // `match sh { x @ Circle(x) => x, _ => 0 }` on `Circle(5)` --
+                // `kupl check` passes cleanly, `kupl run` prints `Circle(5)`
+                // (the WHOLE value, wrong per the function's own `-> Int`
+                // return type), `kupl run --vm`/`kupl native` both print `5`.
+                // This mirrors the EXISTING K0258 precedent immediately
+                // above (an or-pattern alternative cannot bind variables) --
+                // the analogous "ambiguous self-shadowing bind" shape was
+                // simply never extended to this case. Fixed by rejecting the
+                // ambiguity at the SOURCE rather than trying to make the two
+                // engines agree on an evaluation order: a name bound by an
+                // `@`-binder can never ALSO be bound anywhere inside its own
+                // `inner` subtree.
+                if pattern_rebinds_name(inner, name) {
+                    self.err(
+                        "K0287",
+                        format!(
+                            "`{name}` is bound both by this `@` pattern and by a nested sub-pattern -- \
+                             pick a different name for one of them (this would silently bind to \
+                             different values on different engines)"
+                        ),
+                        pat.span,
+                    );
+                }
                 let ty = self.uni.apply(expected);
                 ctx.scopes.insert(name, ty, false);
                 self.check_pattern(inner, expected, ctx);
@@ -4774,6 +4815,23 @@ fn pattern_binds_var(p: &Pattern) -> bool {
         PatternKind::Bind(_) | PatternKind::At { .. } => true,
         PatternKind::Ctor { args, .. } => args.iter().any(pattern_binds_var),
         PatternKind::Or(alts) => alts.iter().any(pattern_binds_var),
+        _ => false,
+    }
+}
+
+/// Whether `p` (or anything nested inside it) binds `name` -- used by the
+/// `At` pattern's own K0287 check (production-hardening PR-it1117) to
+/// reject `name @ inner` when `inner` ALSO binds `name` somewhere within
+/// itself (directly via `Bind`, via a nested `@`, or through a `Ctor`
+/// field/`Or` alternative), which the two execution engines resolve with
+/// OPPOSITE "last write wins" semantics -- see that check's own doc comment
+/// for the full writeup.
+fn pattern_rebinds_name(p: &Pattern, name: &str) -> bool {
+    match &p.kind {
+        PatternKind::Bind(n) => n == name,
+        PatternKind::At { name: n, inner } => n == name || pattern_rebinds_name(inner, name),
+        PatternKind::Ctor { args, .. } => args.iter().any(|a| pattern_rebinds_name(a, name)),
+        PatternKind::Or(alts) => alts.iter().any(|a| pattern_rebinds_name(a, name)),
         _ => false,
     }
 }
@@ -5892,6 +5950,55 @@ mod generic_tests {
         // positional `5` to the one remaining unclaimed prop, `w`.
         let out_of_order = errors(&format!("{comp}fun main() {{ let _ = Widget(h: 6, 5) }}\n"));
         assert!(out_of_order.is_empty(), "out_of_order: {out_of_order:?}");
+    }
+
+    /// A REAL, LIVE-CONFIRMED cross-engine silent-value-corruption bug
+    /// found+fixed (production-hardening PR-it1117) -- see K0287's own doc
+    /// comment (`check_pattern`'s `PatternKind::At` arm) for the full
+    /// writeup. Confirmed live BEFORE this fix, via the real CLI across all
+    /// three runnable engines: `type Shape = Circle(r: Int) | Square(s: Int)`
+    /// with `match sh { x @ Circle(x) => x, _ => 0 }` passed `kupl check`
+    /// cleanly, then `kupl run` printed `Circle(5)` (the whole matched
+    /// value) while `kupl run --vm` and `kupl native` both printed `5` (the
+    /// field alone) for the identical input `Circle(5)`.
+    #[test]
+    fn at_pattern_rebinding_its_own_name_in_a_nested_subpattern_is_rejected_at_check_time() {
+        let src = "type Shape = Circle(r: Int) | Square(s: Int)\n\
+                    fun describe(sh: Shape) -> Int {\n    \
+                        match sh {\n        \
+                            x @ Circle(x) => x\n        \
+                            _ => 0\n    \
+                        }\n}\n";
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|d| d.code == "K0287" && d.message.contains('x')),
+            "x @ Circle(x) must be rejected as K0287: {errs:?}"
+        );
+
+        // The SAME shape nested deeper (inside an Or-alternative's own Ctor
+        // args) must also be caught, not just the top-level case.
+        let nested = "type Shape = Circle(r: Int) | Square(s: Int)\n\
+                       fun describe(sh: Shape) -> Int {\n    \
+                           match sh {\n        \
+                               Circle(y @ Square(y)) => 0\n        \
+                               _ => 0\n    \
+                           }\n}\n";
+        let nested_errs = errors(nested);
+        assert!(
+            nested_errs.iter().any(|d| d.code == "K0287"),
+            "a nested self-rebinding At-pattern must also be K0287: {nested_errs:?}"
+        );
+
+        // A legitimate `@`-pattern using TWO DISTINCT names must still
+        // type-check cleanly -- this fix must not reject ordinary,
+        // unambiguous `@` bindings.
+        let ok = "type Shape = Circle(r: Int) | Square(s: Int)\n\
+                  fun describe(sh: Shape) -> Int {\n    \
+                      match sh {\n        \
+                          whole @ Circle(r) => r\n        \
+                          _ => 0\n    \
+                      }\n}\n";
+        assert!(errors(ok).is_empty(), "a legitimate distinct-name @ pattern must not be rejected: {:?}", errors(ok));
     }
 
     #[test]

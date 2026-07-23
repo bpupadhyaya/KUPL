@@ -137,6 +137,7 @@ Severity: **E** = error, **W** = warning.
 | K0284 | E | method is declared more than once in a contract |
 | K0285 | E | the same `wire` connection is declared more than once — each emitted value would be delivered twice |
 | K0286 | E | the same child is `supervise`d more than once — a `restart on_failure` declaration silently wins over a later `restart never` |
+| K0287 | E | an `@` pattern's own name is also bound by a nested sub-pattern — the interpreter and the VM/native compiler disagree on which binding wins |
 
 ## K03xx — Effects & style
 
