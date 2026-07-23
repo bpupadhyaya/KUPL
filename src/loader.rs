@@ -256,7 +256,38 @@ impl SourceMap {
             .iter()
             .rev()
             .find(|f| span.start >= f.base)?;
-        Some((file, Span::new(span.start - file.base, span.end - file.base)))
+        // A REAL defense-in-depth gap found+fixed (production-hardening
+        // PR-it1097, a two-phase self-scoping survey finding): plain `-`
+        // here panics with "attempt to subtract with overflow" (debug
+        // builds) if `span.end < file.base` -- reachable for a REVERSED
+        // span (`end < start`) whose `start` resolves into a non-first
+        // file (`file.base > 0`) in a multi-file program. `diag::render`
+        // was already hardened against exactly this "reversed span"
+        // shape at PR-it655 (clamping `end` to be `>= start` before any
+        // arithmetic, with its own dedicated regression test,
+        // `a_reversed_span_does_not_panic_and_still_renders`) -- but this
+        // sibling function, which BOTH `render` and `to_json` below share,
+        // never received the matching treatment. No current code path is
+        // known to actually construct a reversed span (every `Span::new`
+        // outside the parser/lexer passes an already-valid AST-node span,
+        // and `Span::merge` always yields a non-reversed span from
+        // non-reversed inputs) -- but `Span::new` itself performs no
+        // validation, exactly the same "should never happen in practice,
+        // but must degrade gracefully rather than panic" situation
+        // `diag::render`'s own doc comment describes. `saturating_sub`
+        // (rather than a `.min`/`.max` clamp before subtracting) is
+        // sufficient here since `file.base` is always the CORRECT file's
+        // own base (found via the `find` above) -- a reversed span's
+        // `end` just clamps to 0 relative to this file, matching
+        // `diag::render`'s own "degrades to 0 chars instead of panicking"
+        // behavior downstream.
+        Some((
+            file,
+            Span::new(
+                span.start.saturating_sub(file.base),
+                span.end.saturating_sub(file.base),
+            ),
+        ))
     }
 
     /// Render a diagnostic against the owning file.
@@ -1034,6 +1065,50 @@ mod tests {
         assert!(rendered.contains("util.kupl"), "diag should point at util.kupl:\n{rendered}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL defense-in-depth gap found+fixed (production-hardening
+    /// PR-it1097, a two-phase self-scoping survey finding): `locate`'s own
+    /// `span.start - file.base`/`span.end - file.base` used plain `-`, no
+    /// guard -- for a REVERSED span (`end < start`) whose `start` resolves
+    /// into a non-first file (`file.base > 0`) in a multi-file program,
+    /// `span.end - file.base` underflowed a `u32`, panicking ("attempt to
+    /// subtract with overflow") in a debug build -- taking down `render`
+    /// AND `to_json` (both share `locate`), i.e. essentially any
+    /// diagnostic-reporting invocation (`kupl run`/`check`/`test`/`native`)
+    /// for a multi-file program. `diag::render` was already hardened
+    /// against exactly this "reversed span" shape at PR-it655 (its own
+    /// `a_reversed_span_does_not_panic_and_still_renders` test) -- this is
+    /// the sibling case that fix never reached, since `locate`'s own
+    /// arithmetic runs BEFORE `diag::render` ever gets a chance to clamp
+    /// anything. Live-confirmed BEFORE this fix: a hand-built two-file
+    /// `SourceMap` with a `Diag` whose span starts inside the SECOND file
+    /// (`base > 0`) but has `end < start` panicked at exactly
+    /// `loader.rs:259` with the underflow message. No current code path is
+    /// known to construct a reversed span (every `Span::new` outside the
+    /// parser/lexer passes an already-valid AST-node span, and
+    /// `Span::merge` always yields a non-reversed span from non-reversed
+    /// inputs) -- this is the same "should never happen in practice, but
+    /// must degrade gracefully, not panic" posture `diag::render`'s own
+    /// doc comment already establishes, applied to its sibling.
+    #[test]
+    fn locate_does_not_panic_on_a_reversed_span_into_a_non_first_file() {
+        let mut map = super::SourceMap { files: vec![], concat: String::new() };
+        map.concat.push_str("fun a() {}\n");
+        map.files.push(super::SourceFile { path: "a.kupl".into(), src: "fun a() {}\n".into(), base: 0 });
+        let base2 = map.concat.len() as u32;
+        map.concat.push_str("fun b() {}\n");
+        map.files.push(super::SourceFile { path: "b.kupl".into(), src: "fun b() {}\n".into(), base: base2 });
+
+        // span.start resolves into file "b" (base2), span.end (2) is BEFORE
+        // base2 -- reversed AND pre-file2, the exact shape that used to
+        // underflow.
+        let d = crate::diag::Diag::error("K0000", "test", crate::diag::Span::new(base2 + 3, 2));
+        let rendered = map.render(&d);
+        assert!(rendered.contains("b.kupl"), "should still resolve to the correct file: {rendered}");
+
+        let json = map.to_json(&[d]);
+        assert!(json.contains("b.kupl"), "to_json should also degrade gracefully, not panic: {json}");
     }
 
     #[test]
