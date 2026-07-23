@@ -3484,8 +3484,20 @@ static KValue k_csv_parse(KValue s) {
             if (ncols == row_cap) { row_cap *= 2; row = (KValue*)realloc(row, sizeof(KValue) * row_cap); }
             row[ncols++] = k_str(kb_take(&field));
             field = (KBuf){ 0, 0, 0 }; field_was_quoted = 0; i++;
-        } else if (c == '\n' || c == '\r') {
-            if (c == '\r' && i + 1 < n && in[i + 1] == '\n') i++;
+        } else if (c == '\n' || (c == '\r' && i + 1 < n && in[i + 1] == '\n')) {
+            /* A REAL cross-engine bug found+fixed (production-hardening
+               PR-it1073, mirrors the SAME fix in csv.rs::parse): this arm
+               used to fire for ANY '\r', whether or not followed by '\n' --
+               but the shared grammar (csv.rs's own top doc comment) is
+               "records separated by \n or \r\n", NOT a lone \r on its own.
+               A bare \r not part of a \r\n pair was silently treated as a
+               record terminator, splitting one logical row into two and
+               discarding the \r byte entirely, identically to the Rust
+               bug. Fixed the same way: require the \r to actually be
+               followed by \n to count as a terminator; a \r that isn't is
+               now ordinary literal field content via the final `else`
+               arm below. */
+            if (c == '\r') i++;
             if (ncols == row_cap) { row_cap *= 2; row = (KValue*)realloc(row, sizeof(KValue) * row_cap); }
             row[ncols++] = k_str(kb_take(&field));
             field = (KBuf){ 0, 0, 0 };
@@ -13719,6 +13731,30 @@ fun main() uses io {
                    print(csv_parse(\"\\\"\\\"\"))\n    \
                    print(csv_parse(\"a\\n\\\"\\\"\"))\n}\n";
         assert_eq!(native_main_stdout(src, "csvlonefield").trim(), "[[\"\"]]\n[[\"a\"], [\"\"]]");
+    }
+
+    /// A REAL cross-engine bug found+fixed (production-hardening PR-it1073,
+    /// mirrors the SAME fix in csv.rs::parse): `k_csv_parse` used to treat
+    /// ANY `\r`, whether or not followed by `\n`, as a record terminator --
+    /// contradicting the shared grammar ("records separated by `\n` or
+    /// `\r\n`"). A bare `\r` not part of a `\r\n` pair silently split one
+    /// logical row into two and discarded the `\r` byte entirely. Fixed by
+    /// requiring the `\r` to actually be followed by `\n` to count as a
+    /// terminator; a `\r` that isn't is now ordinary literal field content.
+    #[test]
+    fn native_csv_bare_cr_not_followed_by_lf_is_literal_field_content_not_a_terminator() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(csv_parse(\"a,b\\rc,d\\n\"))\n    \
+                   print(csv_parse(\"a\\r\\rb\\n\"))\n    \
+                   print(csv_parse(\"a,b\\r\"))\n    \
+                   print(csv_parse(\"a,b\\r\\nc,d\\n\"))\n}\n";
+        assert_eq!(
+            native_main_stdout(src, "csvbarecr").trim(),
+            "[[\"a\", \"b\rc\", \"d\"]]\n[[\"a\r\rb\"]]\n[[\"a\", \"b\r\"]]\n[[\"a\", \"b\"], [\"c\", \"d\"]]"
+        );
     }
 
     /// A REAL silent-data-loss bug (PR-it883, matching the fix + fuzz-found

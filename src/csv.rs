@@ -66,10 +66,35 @@ pub fn parse(input: &str) -> Vec<Vec<String>> {
             row.push(std::mem::take(&mut field));
             field_was_quoted = false;
             i += 1;
-        } else if c == '\n' || c == '\r' {
-            // end of record (handle CRLF as one terminator)
-            if c == '\r' && i + 1 < n && chars[i + 1] == '\n' {
-                i += 1;
+        } else if c == '\n' || (c == '\r' && i + 1 < n && chars[i + 1] == '\n') {
+            // end of record. A REAL bug found+fixed (production-hardening
+            // PR-it1073, an Explore survey finding, independently re-
+            // verified live before implementing): this arm used to fire
+            // for ANY `\r`, whether or not it was followed by `\n` -- but
+            // this file's own top doc comment states the grammar
+            // precisely: "records separated by `\n` or `\r\n`", NOT a lone
+            // `\r` on its own. A bare `\r` not part of a `\r\n` pair (e.g.
+            // stray/old-Mac-style data embedded in an otherwise ordinary
+            // field) was silently treated as a record terminator, splitting
+            // one logical row into two and discarding the `\r` byte
+            // entirely -- e.g. `parse("a,b\rc,d\n")` produced two rows,
+            // `[["a","b"],["c","d"]]`, instead of the one row the
+            // documented grammar implies, `[["a","b\rc","d"]]`. Confirmed
+            // live before this fix, identically on interp/vm/native
+            // (cgen.rs's `k_csv_parse` has the SAME bug, PR-it1073's
+            // second half). Unreachable via this library's OWN
+            // `stringify`/`csv_stringify` output (`write_field` always
+            // quotes a field containing `\r`, so no KUPL-generated CSV can
+            // ever contain a raw, unquoted `\r`), but a real gap when
+            // PARSING externally-sourced CSV. Fixed by requiring the `\r`
+            // to actually be followed by `\n` to count as a (CRLF)
+            // terminator; a `\r` that isn't is now ordinary literal field
+            // content, falling through to the final `else` arm below --
+            // matching how a `\r` appearing INSIDE a quoted field already
+            // correctly behaves (that loop, above, only ever special-cases
+            // `"`, so a bare `\r` there was never affected by this bug).
+            if c == '\r' {
+                i += 1; // consume the `\n` half of the CRLF pair too
             }
             row.push(std::mem::take(&mut field));
             rows.push(std::mem::take(&mut row));
@@ -272,6 +297,40 @@ mod tests {
         // a genuine leading quote (field.is_empty() at the time it's seen)
         // still opens quoted-field parsing as normal.
         assert_eq!(p("\"a,b\",c"), vec![vec!["a,b", "c"]]);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1073, an Explore
+    /// survey finding, independently re-verified live before implementing,
+    /// including its equivalent in `cgen.rs`'s `k_csv_parse`): this file's
+    /// own top doc comment states the grammar precisely -- "records
+    /// separated by `\n` or `\r\n`" -- but the parser used to treat ANY
+    /// `\r`, whether or not followed by `\n`, as a record terminator. A
+    /// bare `\r` not part of a `\r\n` pair (stray or old-Mac-style data
+    /// embedded in an otherwise ordinary field) was silently treated as
+    /// ending the record, splitting one logical row into two and
+    /// discarding the `\r` byte entirely -- contradicting the documented
+    /// grammar. Unreachable via this library's OWN `stringify` output
+    /// (`write_field` always quotes a field containing `\r`), but a real
+    /// gap when parsing externally-sourced CSV. Fixed by requiring a `\r`
+    /// to actually be followed by `\n` to count as a terminator; a `\r`
+    /// that isn't is now ordinary literal field content, matching how a
+    /// `\r` INSIDE a quoted field was already correctly handled.
+    #[test]
+    fn a_bare_cr_not_followed_by_lf_is_literal_field_content_not_a_terminator() {
+        // the bug's reproducer: a lone \r used to split one row into two
+        // and silently drop the \r itself.
+        assert_eq!(p("a,b\rc,d\n"), vec![vec!["a", "b\rc", "d"]]);
+        // consecutive bare CRs are ALSO literal, not multiple terminators.
+        assert_eq!(p("a\r\rb\n"), vec![vec!["a\r\rb"]]);
+        // a bare CR at the very end of input (no trailing char at all) is
+        // still literal content, not a terminator with an empty flush.
+        assert_eq!(p("a,b\r"), vec![vec!["a", "b\r"]]);
+        // a genuine CRLF pair still correctly ends a record as ONE
+        // terminator, consuming both bytes -- this fix must not regress it.
+        assert_eq!(p("a,b\r\nc,d\n"), vec![vec!["a", "b"], vec!["c", "d"]]);
+        // round-trips cleanly through this library's own stringify/parse.
+        let original = vec![vec!["a".to_string(), "b\rc".to_string(), "d".to_string()]];
+        assert_eq!(p(&stringify(&original)), original);
     }
 
     #[test]
