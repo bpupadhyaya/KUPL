@@ -488,10 +488,15 @@ every doc tooltip (`intent`) is literally this source code.
    composition sugar? (Leaning: a `render` block that is itself just component
    construction — no separate template language.) **→ full proposal in `UI.md`
    (pure `render` projection, typed view tree, renderer adapters); pending review.**
-2. `Int` default: 64-bit checked vs BigInt-by-default (Python-style)? Leaning i64
-   checked; BigInt in std.
+2. `Int` default: 64-bit checked vs BigInt-by-default (Python-style)? **RESOLVED
+   (matches the original leaning): `Int` is 64-bit checked; arbitrary-precision
+   arithmetic is the separate, opt-in `BigInt` std type (`big(...)`).**
 3. Effect granularity: is `db.read`/`db.write` the right grain, or user-definable
-   effect hierarchies from day one?
+   effect hierarchies from day one? **RESOLVED: a fixed, hierarchical set of
+   built-in effect names — `io` with sub-effects `io.fs`/`io.net`/`io.env`/
+   `io.proc`/`io.time`, plus `ai` — where `uses io` covers every `io.*`
+   sub-effect and `uses io.fs` etc. narrows to one. Not a `db`-style
+   per-resource split, and not user-definable/extensible from user code.**
 4. Hot-swap semantics for `state` migration on component upgrade (Erlang's
    `code_change` equivalent) — needed for visual live-editing (contract item C6,
    see `VISUAL-TOOLS-CONTRACT.md`).
