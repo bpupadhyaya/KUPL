@@ -734,7 +734,7 @@ pub fn pkg_lock(path: &str) -> i32 {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("kupl.lock");
-    match std::fs::write(&lock_path, crate::loader::lock_text(&deps)) {
+    match crate::loader::write_lock_atomically(&lock_path, &crate::loader::lock_text(&deps)) {
         Ok(()) => {
             println!("wrote {} ({} dependencies)", lock_path.display(), deps.len());
             if !registry_only.is_empty() {
