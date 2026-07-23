@@ -297,7 +297,7 @@ completion (3). Everything stays byte-identical across engines.
       handlers on a virtual clock advanced explicitly (`advance 5s` example
       step; `kupl run` auto-advances bounded). Deterministic, byte-identical on
       interpreter + KVM. Durations `ms`/`s`/`m`/`h`. (`examples/timers.kupl`)
-- [ ] **Hot-swap state migration** (design open Q4; Builder live-editing hook)
+- [ ] **Hot-swap state migration** (design open Q4; visual live-editing hook, see `VISUAL-TOOLS-CONTRACT.md`)
 
 ## Tier 3 — audit-driven priorities (next arc)
 
@@ -355,7 +355,10 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       saturating arithmetic, width-aware bitwise, full conversion matrix
       (it27-29), and native codegen via a boxed __int128 KValue (it40). f32 runs
       on ALL engines incl. native (it28/it42, shortest-round-trip display). Bitwise Int methods + literals (it17); numeric formatting +
-      math (it24). Byte/Char, BigInt/Decimal still to do.
+      math (it24). **BigInt (`big(...)`) and Rational (`rat(...)`) have since
+      shipped too** — arbitrary-precision arithmetic and exact fractions, both
+      byte-identical on every engine including native (see `STDLIB.md`).
+      Byte/Char and a base-10 `Decimal` type are still to do.
 - [x] Broader standard library (audit #3, it12) — ~40 methods across all core
       types, all engines byte-identical incl. native. List (is_empty/concat/
       unique/init/tail/product/min/max/flatten/count/flat_map/window/chunk); Str
@@ -380,6 +383,6 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 
 1. UI trees → `docs/design/UI.md` (render = component construction). **Designed.**
 2. Int default → **decided & shipped:** i64 checked, overflow panics.
-3. Effect granularity → shipped hierarchical effects (`db` covers `db.read`).
+3. Effect granularity → shipped hierarchical effects (`io` covers `io.fs`/`io.net`/`io.env`/`io.proc`/`io.time`; plus `ai`).
 4. Hot-swap state migration → supervision restart hook shipped; migration TBD.
 5. Package identity → `kupl.toml` shipped; registry governance TBD.
