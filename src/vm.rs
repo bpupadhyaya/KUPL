@@ -183,8 +183,18 @@ impl<'m> Vm<'m> {
             return Err(VmError { msg: format!("no function `{name}`"), span: Span::default() });
         };
         let depth = self.frames.len();
-        self.push_frame(idx, &args, 0, None)?;
-        self.run(depth)
+        let stack_len = self.stack.len();
+        // same unwind-on-any-failure discipline as `call_chunk_nested`/
+        // `call_value_nested` (PR-it1078) -- currently inert since every
+        // production call site discards the `Vm` after one call, but a
+        // future re-entrant/persistent caller (REPL, embedding) must not
+        // inherit a silently-leaked frame/stack on error.
+        let result = self.push_frame(idx, &args, 0, None).and_then(|()| self.run(depth));
+        if result.is_err() {
+            self.frames.truncate(depth);
+            self.stack.truncate(stack_len);
+        }
+        result
     }
 
     /// Re-entrantly call a top-level function by name (used by the ai tool host).
@@ -514,16 +524,17 @@ impl<'m> Vm<'m> {
     ) -> Result<Value, VmError> {
         let depth = self.frames.len();
         let stack_len = self.stack.len();
-        self.push_frame(chunk, &args, 0, inst)?;
-        match self.run(depth) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                // unwind so supervision restarts leave the VM consistent
-                self.frames.truncate(depth);
-                self.stack.truncate(stack_len);
-                Err(e)
-            }
+        // unwind on ANY failure, not just a `run` failure -- `push_frame`
+        // itself can fail after already growing `self.stack` (corrupt-file
+        // register-out-of-range, or the 10_000-frame cap), so the truncate
+        // must cover its `?` too, not just wrap `self.run` (PR-it1078).
+        let result = self.push_frame(chunk, &args, 0, inst).and_then(|()| self.run(depth));
+        if result.is_err() {
+            // unwind so supervision restarts leave the VM consistent
+            self.frames.truncate(depth);
+            self.stack.truncate(stack_len);
         }
+        result
     }
 
     /// `Err` (a clean `VmError`, never a panic) on an out-of-range `idx` --
@@ -603,22 +614,34 @@ impl<'m> Vm<'m> {
         Ok(())
     }
 
-    /// Call a callable value re-entrantly (used by Method callbacks).
+    /// Call a callable value re-entrantly (used by Method callbacks and
+    /// `http_serve`'s per-request handler invocation).
     fn call_value_nested(&mut self, f: Value, args: Vec<Value>) -> Result<Value, String> {
         let depth = self.frames.len();
-        match f {
-            Value::Fun(ref name) => {
-                let Some(&idx) = self.module.funs.get(name.as_str()) else {
-                    return Err(format!("no function `{name}`"));
-                };
-                self.push_frame(idx, &args, 0, None).map_err(|e| e.msg)?;
-            }
+        let stack_len = self.stack.len();
+        // Every error path here must unwind `frames`/`stack` back to the
+        // pre-call snapshot: an `http_serve` handler that errors is caught
+        // by `interp::serve_http`'s own accept loop and turned into a plain
+        // HTTP 500 (it never propagates further up the call stack), so a
+        // leaked frame/stack slots here are NEVER cleaned up by any outer
+        // caller -- left unfixed, enough panicking requests permanently
+        // wedge the server once the 10_000-frame cap is hit (PR-it1078).
+        let push_result: Result<(), String> = match f {
+            Value::Fun(ref name) => match self.module.funs.get(name.as_str()) {
+                Some(&idx) => self.push_frame(idx, &args, 0, None).map_err(|e| e.msg),
+                None => Err(format!("no function `{name}`")),
+            },
             Value::VmClosure(proto, ref caps, origin_inst) => {
-                self.push_closure_frame(proto, caps, &args, 0, origin_inst).map_err(|e| e.msg)?;
+                self.push_closure_frame(proto, caps, &args, 0, origin_inst).map_err(|e| e.msg)
             }
-            other => return Err(format!("{} is not callable", other.type_name())),
+            other => Err(format!("{} is not callable", other.type_name())),
+        };
+        let result = push_result.and_then(|()| self.run(depth).map_err(|e| e.msg));
+        if result.is_err() {
+            self.frames.truncate(depth);
+            self.stack.truncate(stack_len);
         }
-        self.run(depth).map_err(|e| e.msg)
+        result
     }
 
     /// Execute until the frame stack returns to `stop_depth`; the final `Ret`
@@ -3136,6 +3159,81 @@ mod tests {
         let _ = s2.read_to_string(&mut resp2);
         assert!(resp2.contains("HTTP/1.1 200 OK"), "resp2: {resp2}");
         assert!(resp2.ends_with("ok /ok"), "resp2: {resp2}");
+    }
+
+    /// PR-it1078: `call_value_nested` must unwind `frames`/`stack` back to
+    /// their pre-call length on error, not just leave the growth in place.
+    /// Before the fix, each erroring call leaked exactly 1 frame and
+    /// `nregs` stack slots forever (proven live: 20 calls grew `frames` by
+    /// exactly 20 and `stack` by exactly 80, with zero cleanup) -- over
+    /// `http_serve`, enough panicking requests eventually hit the
+    /// 10_000-frame cap and permanently wedge the server for every
+    /// subsequent request, panicking or not.
+    #[test]
+    fn vm_call_value_nested_does_not_leak_frames_on_error() {
+        let src = "fun boom() -> Int { 1 / 0 }\nfun main() uses io { }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let mut vm = Vm::new(&module);
+        let f = Value::Fun(std::rc::Rc::new("boom".to_string()));
+        let frames_before = vm.frames.len();
+        let stack_before = vm.stack.len();
+        for _ in 0..20 {
+            let result = vm.call_value_nested(f.clone(), vec![]);
+            assert!(result.is_err(), "boom() must error with division by zero");
+        }
+        assert_eq!(vm.frames.len(), frames_before, "frames must not leak across erroring calls");
+        assert_eq!(vm.stack.len(), stack_before, "stack must not leak across erroring calls");
+    }
+
+    /// PR-it1078: `call_chunk_nested`'s own truncate-on-error had a narrower
+    /// gap too -- its `self.push_frame(...)?` returned early via `?` on a
+    /// `push_frame`-LEVEL failure, bypassing the truncate block entirely
+    /// (only a `self.run`-level failure was ever cleaned up). `push_frame`
+    /// itself can fail AFTER already growing `self.stack`: hitting its own
+    /// 10_000-frame cap happens right after the stack resize. Drive that
+    /// exact path directly (bypassing 10_000 levels of real recursion) by
+    /// pre-filling `frames` to the cap, then confirm the fix truncates the
+    /// stack growth back down instead of leaking it.
+    #[test]
+    fn vm_call_chunk_nested_does_not_leak_stack_when_push_frame_itself_fails() {
+        let src = "fun f() -> Int { 1 }\nfun main() uses io { }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let mut vm = Vm::new(&module);
+        let idx = *module.funs.get("f").unwrap();
+        for _ in 0..10_000 {
+            vm.frames.push(Frame { chunk: idx, ip: 0, base: 0, dst: 0, inst: None });
+        }
+        let frames_before = vm.frames.len();
+        let stack_before = vm.stack.len();
+        let result = vm.call_chunk_nested(idx, vec![], None);
+        assert!(result.is_err(), "must hit the 10_000-frame cap");
+        assert_eq!(vm.frames.len(), frames_before, "frames must not grow past the cap");
+        assert_eq!(vm.stack.len(), stack_before, "stack must not leak when push_frame itself fails");
+    }
+
+    /// PR-it1078: `call_named` had the identical missing-truncation gap as
+    /// `call_chunk_nested`/`call_value_nested`, currently inert only because
+    /// every production call site discards its `Vm` after one call -- fixed
+    /// symmetrically so a future re-entrant/persistent caller doesn't
+    /// inherit a silent leak.
+    #[test]
+    fn vm_call_named_does_not_leak_frames_when_push_frame_itself_fails() {
+        let src = "fun f() -> Int { 1 }\nfun main() uses io { }\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let mut vm = Vm::new(&module);
+        let idx = *module.funs.get("f").unwrap();
+        for _ in 0..10_000 {
+            vm.frames.push(Frame { chunk: idx, ip: 0, base: 0, dst: 0, inst: None });
+        }
+        let frames_before = vm.frames.len();
+        let stack_before = vm.stack.len();
+        let result = vm.call_named("f", vec![]);
+        assert!(result.is_err(), "must hit the 10_000-frame cap");
+        assert_eq!(vm.frames.len(), frames_before, "frames must not grow past the cap");
+        assert_eq!(vm.stack.len(), stack_before, "stack must not leak when push_frame itself fails");
     }
 
     #[test]
