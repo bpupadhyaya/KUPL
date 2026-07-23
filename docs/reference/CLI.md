@@ -84,6 +84,11 @@ THE canonical format — zero configuration, idempotent, fixed member order
 inside components. Prints to stdout, or rewrites in place with `--write`.
 Formats the named file only (per-file by design).
 
+### `kupl fmt <file.kupl> --check`
+Exits nonzero if the file isn't already canonical — a CI gate (matches the
+`rustfmt --check`/`prettier --check` convention). Never writes the file.
+Mutually exclusive with `--write`.
+
 ### `kupl diff <old.kupl> <new.kupl>`
 **Semantic** comparison: items are compared by canonical form, so formatting
 and comments never register. Changes are classified
