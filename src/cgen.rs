@@ -4956,6 +4956,20 @@ static long kre_range_endpoint(KReP* p) {
         p->pos++;
         int e = kre_peek(p);
         if (e < 0) { kre_fail(p, "dangling `\\` in class"); return 0; }
+        if ((unsigned char)e >= 0x80) {
+            /* a multi-byte escaped literal used as a range endpoint, e.g.
+               `[a-\é]` -- decode the whole codepoint rather than consuming
+               just its lead byte, mirroring kre_atom's own PR-it555 fix for
+               the identical shape outside a class (production-hardening
+               PR-it1084: `kre_peek` only ever returns a single byte, so the
+               unconditional `p->pos++`+`(unsigned char)e` fallback below
+               silently truncated any multi-byte escaped range endpoint to
+               its lead byte, leaving the continuation byte(s) to be
+               mis-parsed as a spurious SECOND class member). */
+            int elen; long ecp = kre_utf8_cp(p->s, p->len, p->pos, &elen);
+            p->pos += elen;
+            return ecp;
+        }
         p->pos++;
         switch (e) {
             case 'd': kre_fail(p, "`\\d` cannot be used as a character-class range endpoint"); return 0;
@@ -5004,6 +5018,23 @@ static void kre_class(KReP* p, KReAtom* a) {
             p->pos++;
             int e = kre_peek(p);
             if (e < 0) { kre_fail(p, "dangling `\\` in class"); return; }
+            if ((unsigned char)e >= 0x80) {
+                /* a multi-byte escaped literal inside a class, e.g. `[\é]`
+                   -- decode the whole codepoint rather than consuming just
+                   its lead byte, mirroring kre_atom's own PR-it555 fix for
+                   the identical shape outside a class (production-hardening
+                   PR-it1084, the same gap kre_range_endpoint's own sibling
+                   fix just above closes). Left unfixed, `p->pos++` below
+                   would silently truncate the codepoint to its lead byte
+                   AND leave the continuation byte(s) in the input stream,
+                   where the NEXT loop iteration re-decodes them as a
+                   spurious, unrelated extra class member. */
+                int elen; long ecp = kre_utf8_cp(p->s, p->len, p->pos, &elen);
+                p->pos += elen;
+                kre_finish_class_member(p, a, &cap, ecp);
+                if (p->err) return;
+                continue;
+            }
             p->pos++;
             /* `\D`/`\W`/`\S` (negated predefined classes) are refused here,
                matching regex.rs exactly (production-hardening PR-it658) --
@@ -17837,6 +17868,41 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
             stderr.contains(expected),
             "native must match interp's wording exactly: {stderr:?}"
         );
+    }
+
+    /// A REAL, live-confirmed cross-engine byte divergence found+fixed
+    /// (production-hardening PR-it1084, a background survey finding): an
+    /// ESCAPED MULTI-BYTE literal inside a character class (`[\é]`) or used
+    /// as a range endpoint (`[a-\é]`) used to be mis-decoded by both
+    /// `kre_class` and `kre_range_endpoint` -- both only ever read a single
+    /// byte via `kre_peek` for an escaped class member/endpoint (unlike
+    /// `kre_atom`'s own sibling escape-handling, which was ALREADY fixed at
+    /// PR-it555 to detect a lead byte `>= 0x80` and decode the whole
+    /// codepoint via `kre_utf8_cp`) -- so `\é`'s lead byte (0xC3) was stored
+    /// as a bogus "codepoint" and its continuation byte (0xA9) was left in
+    /// the input stream, silently mis-parsed as a SECOND, unrelated,
+    /// spurious class member on the very next loop iteration. Live-
+    /// confirmed before this fix: `re_match("[\\é]", "é")` printed `true`
+    /// on `kupl run`/`kupl run --vm` but `false` on `kupl native` (the
+    /// pattern's own literal character no longer matched itself), while
+    /// `re_match("[\\é]", "Ã")` printed `false` on interp/VM but `true` on
+    /// native (spuriously matching the coincidental lead-byte value
+    /// instead); `re_match("[a-\\é]", "é")` (using `\é` as a RANGE
+    /// endpoint) printed `true` on interp/VM but `false` on native (the
+    /// range's upper bound was silently truncated from U+00E9 to the lead
+    /// byte's own numeric value 0xC3, excluding the pattern's own intended
+    /// endpoint). Did TWO separate revert-and-verify passes (one per fixed
+    /// function), each reproducing its own exact predicted mismatch.
+    #[test]
+    fn native_regex_escaped_multi_byte_literal_inside_a_class_or_as_a_range_endpoint_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(re_match(\"[\\\\é]\", \"é\"))\n    \
+                   print(re_match(\"[\\\\é]\", \"Ã\"))\n    \
+                   print(re_match(\"[a-\\\\é]\", \"é\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "reescclass").trim(), "true\nfalse\ntrue");
     }
 
     /// A REAL cross-engine bug (PR-it596, found via the SAME panic-wording sweep
