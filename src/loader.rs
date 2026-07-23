@@ -655,42 +655,52 @@ pub fn lock_text(deps: &[ResolvedDep]) -> String {
     s
 }
 
-/// Write `kupl.lock`'s new content atomically: to a sibling temp file
-/// first, then `rename` it into place (production-hardening PR-it1102, a
+/// Write `path`'s new content atomically: to a sibling temp file first,
+/// then `rename` it into place (production-hardening PR-it1102, a
 /// two-phase self-scoping survey finding via the cross-file-interaction
 /// angle, following up on this file's own PR-it1101 registry.rs/loader.rs
-/// pairing with a SECOND, smaller instance of the same shape: `run.rs::
-/// pkg_lock` (write) and `run.rs::pkg_tree` (read, via `lock_hashes` above)
-/// were each independently correct in isolation, but `pkg_lock` used a
-/// plain `std::fs::write(&lock_path, ...)` -- which opens with `O_TRUNC`
-/// (truncating `kupl.lock` to EMPTY immediately) and only THEN writes the
-/// new content, two separate steps with no atomicity between them. A
-/// concurrent `kupl pkg tree` (a different terminal, or two CI jobs sharing
-/// the same checkout) reading `kupl.lock` during that window sees a
-/// TRUNCATED (usually empty) file -- `lock_hashes` above already treats a
-/// malformed/empty lockfile gracefully (no panic), but the practical effect
-/// is every dependency spuriously reported as `[new, not yet locked]`
-/// instead of its real drift status: a misleading, though self-correcting
-/// (kupl.lock's own FINAL content is never affected, since `pkg_lock`
-/// recomputes fresh from source rather than merging with the old lock file)
-/// CLI-output bug. Live-confirmed the underlying mechanism directly: a
-/// standalone probe mirroring `std::fs::write`'s own create-then-write_all
-/// shape (with an injected delay to reliably widen the normally
-/// microscopic window) observed the file transiently EMPTY on 15 of ~40
-/// concurrent reads during the write. Fixed the same way
-/// `registry.rs::atomic_replace` already fixes the analogous directory-
-/// level case (production-hardening PR-it700/1006): write to a `.tmp-{pid}`
-/// sibling file first, then `rename` it over the real destination --
-/// `rename` atomically replacing an existing destination FILE (unlike a
-/// directory rename, no `remove_dir_all`/retry loop is needed here) is a
-/// single OS-level operation, so a concurrent reader of `path` can only
-/// ever observe the complete OLD content or the complete NEW content, never
-/// an in-between state, regardless of how long the temp-file write itself
-/// takes.
-pub fn write_lock_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+/// pairing with a SECOND instance of the same shape, originally found via
+/// `kupl.lock`: `run.rs::pkg_lock` (write) and `run.rs::pkg_tree` (read,
+/// via `lock_hashes` above) were each independently correct in isolation,
+/// but `pkg_lock` used a plain `std::fs::write(&lock_path, ...)` -- which
+/// opens with `O_TRUNC` (truncating the file to EMPTY immediately) and only
+/// THEN writes the new content, two separate steps with no atomicity
+/// between them. A concurrent `kupl pkg tree` (a different terminal, or two
+/// CI jobs sharing the same checkout) reading `kupl.lock` during that
+/// window sees a TRUNCATED (usually empty) file -- `lock_hashes` above
+/// already treats a malformed/empty lockfile gracefully (no panic), but the
+/// practical effect is every dependency spuriously reported as `[new, not
+/// yet locked]` instead of its real drift status: a misleading, though
+/// self-correcting (kupl.lock's own FINAL content is never affected, since
+/// `pkg_lock` recomputes fresh from source rather than merging with the old
+/// lock file) CLI-output bug. Live-confirmed the underlying mechanism
+/// directly: a standalone probe mirroring `std::fs::write`'s own
+/// create-then-write_all shape (with an injected delay to reliably widen
+/// the normally microscopic window) observed the file transiently EMPTY on
+/// 15 of ~40 concurrent reads during the write. A THIRD instance of the
+/// identical shape (production-hardening PR-it1103) was found in the same
+/// iteration this function was generalized: `main.rs`'s `kupl fmt --write`
+/// (already separately hardened, PR-it837/889, against writing INVALID
+/// formatter output -- but not against a concurrent reader observing a
+/// TORN write of otherwise-valid output) overwrites the user's own
+/// `.kupl` source file in place via the identical `std::fs::write` shape --
+/// a source file is read far more often, by far more concurrent tools
+/// (editors, an LSP, a file-watcher-triggered `kupl run`/`check`/`test`) than
+/// `kupl.lock` ever is, making "format on save" while a separate watcher
+/// re-runs `kupl check` on save a realistic, common workflow this defends.
+/// Fixed the same way `registry.rs::atomic_replace` already fixes the
+/// analogous directory-level case (production-hardening PR-it700/1006):
+/// write to a `.tmp-{pid}` sibling file first, then `rename` it over the
+/// real destination -- `rename` atomically replacing an existing
+/// destination FILE (unlike a directory rename, no `remove_dir_all`/retry
+/// loop is needed here) is a single OS-level operation, so a concurrent
+/// reader of `path` can only ever observe the complete OLD content or the
+/// complete NEW content, never an in-between state, regardless of how long
+/// the temp-file write itself takes.
+pub fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_file_name(format!(
         "{}.tmp-{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("kupl.lock"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("kupl-atomic-write"),
         std::process::id()
     ));
     std::fs::write(&tmp, text)?;
@@ -3159,22 +3169,22 @@ mod tests {
     }
 
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
-    /// PR-it1102) -- see `write_lock_atomically`'s own doc comment for the
-    /// full writeup. This proves the FIX: a concurrent reader spinning
-    /// during a real `write_lock_atomically` call must NEVER observe a
-    /// torn/empty file, only ever the complete old content or the complete
-    /// new content -- unlike the plain `std::fs::write` this replaced,
-    /// which a standalone probe (during this iteration's own live
+    /// PR-it1102, generalized at PR-it1103) -- see `write_atomically`'s own
+    /// doc comment for the full writeup. This proves the FIX: a concurrent
+    /// reader spinning during a real `write_atomically` call must NEVER
+    /// observe a torn/empty file, only ever the complete old content or the
+    /// complete new content -- unlike the plain `std::fs::write` this
+    /// replaced, which a standalone probe (during PR-it1102's own live
     /// verification, not kept as a permanent test) confirmed DOES expose a
     /// real torn-read window.
     #[test]
-    fn write_lock_atomically_never_exposes_a_torn_read_to_a_concurrent_reader() {
-        let path = std::env::temp_dir().join(format!("kupl-atomic-lock-write-{}", std::process::id()));
+    fn write_atomically_never_exposes_a_torn_read_to_a_concurrent_reader() {
+        let path = std::env::temp_dir().join(format!("kupl-atomic-write-{}", std::process::id()));
         std::fs::write(&path, "OLD-CONTENT-1234567890").unwrap();
 
         let path_w = path.clone();
         let writer = std::thread::spawn(move || {
-            super::write_lock_atomically(&path_w, "NEW-CONTENT-ABCDEFGHIJ").unwrap();
+            super::write_atomically(&path_w, "NEW-CONTENT-ABCDEFGHIJ").unwrap();
         });
 
         let mut saw_old = false;

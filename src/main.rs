@@ -337,7 +337,13 @@ fn run_cli() -> ExitCode {
                     );
                     return 1;
                 }
-                if let Err(e) = std::fs::write(file, &formatted) {
+                // Atomic write (production-hardening PR-it1103): see
+                // `loader::write_atomically`'s own doc comment -- a plain
+                // `std::fs::write` here could expose a torn/empty read of
+                // the user's own source file to a concurrent reader (an
+                // editor, an LSP, a file-watcher-triggered `kupl run`/
+                // `check`), a realistic "format on save" workflow.
+                if let Err(e) = kupl::loader::write_atomically(std::path::Path::new(file), &formatted) {
                     eprintln!("error: cannot write {file}: {e}");
                     return 1;
                 }
