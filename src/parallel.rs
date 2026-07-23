@@ -482,6 +482,23 @@ fn par_eval(
     fname: &str,
     image: &Arc<ProgramImage>,
 ) -> Vec<Result<PortableValue, EvalOutcome>> {
+    par_eval_with_stack_size(portable, fname, image, WORKER_STACK_SIZE)
+}
+
+/// Same 2GiB stack sizing as `gate`'s own trial thread (PR-it729) -- a pure
+/// function recursing near `MAX_CALL_DEPTH` must hit the clean guard panic,
+/// not a real native stack overflow. Named (production-hardening PR-it1098)
+/// so `par_eval_with_stack_size`'s own `stack_size` parameter can be
+/// overridden ONLY by a test forcing a deterministic spawn failure, without
+/// touching this constant or production behavior at all.
+const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024 * 1024;
+
+fn par_eval_with_stack_size(
+    portable: &[PortableValue],
+    fname: &str,
+    image: &Arc<ProgramImage>,
+    stack_size: usize,
+) -> Vec<Result<PortableValue, EvalOutcome>> {
     let n = portable.len();
     let workers =
         std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).clamp(1, n.max(1));
@@ -504,8 +521,51 @@ fn par_eval(
         // fix, still required for the SAME reason (a pure function
         // recursing near MAX_CALL_DEPTH must hit the clean guard panic, not
         // a real native stack overflow).
-        std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024 * 1024)
+        // A REAL, live-confirmed bug found+fixed (production-hardening
+        // PR-it1098, a two-phase self-scoping survey finding, resolving a
+        // deferred lead from this file's own CLOSED-VEINS INDEX entry
+        // flagging `par_eval`'s spawn call as "unverifiable on macOS"):
+        // `thread::Builder::spawn` is a genuinely fallible OS call --
+        // that's why it returns `io::Result` -- and `gate`'s own identical
+        // trial-thread spawn (above) is already correctly guarded, its own
+        // doc comment stating "a spawn/join failure... falls through to the
+        // real dispatch below, unaffected." This sibling spawn was left
+        // completely unguarded via `.expect(...)`, panicking with a raw
+        // Rust-level panic (never converted to KUPL's own clean
+        // `Flow::Panic`/"panic: ..." diagnostic, since nothing between here
+        // and `main.rs`'s generic top-level panic hook catches it) --
+        // surfacing as a factually WRONG "internal compiler error" for
+        // transient OS resource exhaustion, not an actual KUPL program bug.
+        // `workers = available_parallelism()` (uncapped by memory
+        // awareness) each reserving a 2GiB stack makes this a realistic
+        // failure mode under a constrained address-space limit (a
+        // container memory cgroup, `ulimit -v`, a hardened
+        // `vm.overcommit_memory=2` host) on a many-core CI/production
+        // machine -- well before physical RAM is close to exhausted, since
+        // `pthread_create` with an explicit large stack size needs the
+        // address-space range to exist. Live-confirmed by forcing a
+        // deterministic spawn failure (an absurd stack_size in a scratch
+        // build) rather than relying on fragile ulimit tuning: the OLD code
+        // panicked with the raw `.expect()` message and exited 101 via
+        // main.rs's generic "internal compiler error" path; since cgen.rs
+        // never spawns real threads for `par_map`/`par_filter` at all
+        // (dispatches through the same code as sequential `map`/`filter`),
+        // this was ALSO a genuine cross-engine divergence: `kupl native`
+        // would succeed on the identical program under the identical
+        // resource constraint while `kupl run`/`kupl run --vm` crashed.
+        // Fixed by reusing the EXISTING "not a real error, fall back to
+        // sequential" signal this file already established for the
+        // analogous per-ELEMENT case (`EvalOutcome::NonPortableResult`,
+        // PR-it1061) -- `try_par_map`/`try_par_filter` already stop at the
+        // FIRST such marker and return `None`, letting
+        // `interp.rs::builtin_method` re-run the WHOLE call through the
+        // ordinary, always-correct sequential path, safe because every
+        // already-spawned (detached, never joined) worker thread's own
+        // eventual `tx.send` is silently ignored once `rx` is dropped here,
+        // exactly like this function's own existing "ignore a send
+        // failure" handling one comment block above.
+        let spawned = std::thread::Builder::new()
+            .stack_size(stack_size)
             .spawn(move || {
                 let mut interp = crate::interp::Interp::new_bare(image.worker_db());
                 // A REAL, LIVE-CONFIRMED HANG bug found+fixed (production-
@@ -573,9 +633,11 @@ fn par_eval(
                 // and dropped `rx` -- this worker's own result is simply
                 // discarded, exactly as intended.
                 let _ = tx.send((w, results));
-            })
-            .expect("spawn par_map/par_filter worker thread");
-        num_spawned += 1;
+            });
+        match spawned {
+            Ok(_handle) => num_spawned += 1,
+            Err(_) => return vec![Err(EvalOutcome::NonPortableResult)],
+        }
     }
     drop(tx); // our own extra sender; each worker holds its own clone
 
@@ -665,6 +727,45 @@ mod tests {
     fn portable_is_send_sync() {
         assert_send_sync::<PortableValue>();
         assert_send_sync::<Arc<ProgramImage>>();
+    }
+
+    /// A REAL, live-confirmed bug found+fixed (production-hardening
+    /// PR-it1098, a two-phase self-scoping survey finding): `par_eval`'s own
+    /// `thread::Builder::spawn` call used to be unguarded (`.expect(...)`),
+    /// panicking with a raw Rust-level panic -- surfacing as a factually
+    /// WRONG "internal compiler error" -- on a genuinely fallible OS call,
+    /// unlike `gate`'s own identical trial-thread spawn, already correctly
+    /// guarded (its own doc comment: "a spawn/join failure... falls through
+    /// to the real dispatch below, unaffected"). Live-confirmed BEFORE this
+    /// fix by temporarily forcing `par_eval`'s own real, hardcoded 2GiB
+    /// production stack size to an absurd value in a scratch build: the OLD
+    /// code panicked with the exact predicted `.expect()` message and
+    /// exited via `main.rs`'s generic top-level panic hook; since `cgen.rs`
+    /// never spawns real threads for `par_map`/`par_filter` at all, this was
+    /// ALSO a genuine cross-engine divergence (native would succeed on the
+    /// identical program under the identical resource constraint). This
+    /// test exercises the EXACT SAME production code path
+    /// (`par_eval_with_stack_size`, the function `par_eval` itself calls
+    /// with the real `WORKER_STACK_SIZE` constant) with a `stack_size` far
+    /// beyond any real system's virtual address space -- deterministic and
+    /// fully portable, since `thread::Builder::spawn` must fail here on
+    /// every real machine, without ever touching the real 2GiB production
+    /// constant or requiring fragile `ulimit` tuning.
+    #[test]
+    fn par_eval_spawn_failure_falls_back_instead_of_panicking() {
+        let src = "fun dbl(n: Int) -> Int {\n    n * 2\n}\nfun main() {}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+        let image = ProgramImage::from_db(&db);
+        let portable: Vec<PortableValue> = (0..10).map(PortableValue::Int).collect();
+
+        let results = par_eval_with_stack_size(&portable, "dbl", &image, 1usize << 62);
+        assert_eq!(results.len(), 1, "a spawn failure signals fallback via a single marker element");
+        assert!(
+            matches!(results[0], Err(EvalOutcome::NonPortableResult)),
+            "a spawn failure must signal graceful fallback (the SAME signal used for a non-portable \
+             callback result, PR-it1061), not panic"
+        );
     }
 
     #[test]
