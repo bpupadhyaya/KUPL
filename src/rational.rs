@@ -201,13 +201,40 @@ impl Rational {
     /// before touching any code. Fixed with a fast path (direct
     /// parse-and-divide, unchanged, for the common case where both operands
     /// fit `f64` on their own) and a slow path taken only when at least one
-    /// side overflows: scale `num` by a fixed power of ten via EXACT BigInt
-    /// arithmetic before dividing, so the RATIO's precision survives even
-    /// though the individual operands don't fit in `f64`. A ratio that is
-    /// genuinely astronomically large or small (not just individually
-    /// oversized) still correctly reduces to `±inf` or `0.0` through this
-    /// same path, since the scaled quotient itself then overflows or
-    /// underflows on its own.
+    /// side overflows.
+    ///
+    /// A SECOND REAL bug found+fixed (production-hardening PR-it1070, an
+    /// Explore survey finding, independently re-verified live before
+    /// implementing): the original PR-it627 slow path scaled by a FIXED
+    /// `10^30` and then divided the resulting decimal string's `f64` by a
+    /// literal `10f64.powi(30)` -- correct only when the true ratio's
+    /// magnitude happens to land within about 30 orders of magnitude of 1.
+    /// For a ratio genuinely near (but not beyond) `f64`'s actual exponent
+    /// boundaries -- e.g. `num=1, den=10^320+1` (true value ~1e-320, a
+    /// perfectly valid subnormal) or `num=(10^400+7)*10^290+1,
+    /// den=10^400+7` (true value ~1e290, comfortably finite) -- the fixed
+    /// `10^30` scale is nowhere near enough to bring the SCALED quotient
+    /// into a safely-representable range, so it silently rounds to `0.0` or
+    /// `inf` respectively, even though the true value is neither. Live-
+    /// confirmed before this fix: both cases above returned the wrong
+    /// value identically on `kupl run`, `kupl run --vm`, AND `kupl native`
+    /// (cgen.rs's `k_rat_to_f64` has the IDENTICAL fixed-scale defect),
+    /// while genuinely-out-of-range ratios (`10^400/1`, `1/10^400`) and the
+    /// original near-1 case both still correctly returned `inf`/`0.0`/`1.0`.
+    /// Fixed by computing a DYNAMIC scale from `num`/`den`'s own decimal
+    /// digit counts (already computed as strings above, for free) so the
+    /// scaled integer quotient always has a comfortable, roughly-constant
+    /// number of significant digits regardless of how far apart `num` and
+    /// `den`'s magnitudes are -- then, instead of dividing by a literal
+    /// `f64` power of ten (which can itself independently overflow or
+    /// underflow even when the true ratio wouldn't), the quotient's digits
+    /// are combined with the correct decimal EXPONENT into a scientific-
+    /// notation string and handed to Rust's own correctly-rounded
+    /// `f64::from_str`, which applies the full valid exponent range in one
+    /// exact step. A digit-count gap so extreme that even a generous safety
+    /// margin puts it unambiguously beyond `f64`'s range (~10^308 max,
+    /// ~10^-324 smallest subnormal) is detected and returned directly,
+    /// without ever needing to build a huge power-of-ten `BigInt`.
     pub fn to_f64(&self) -> f64 {
         let n_dec = self.num.to_decimal();
         let d_dec = self.den.to_decimal();
@@ -216,14 +243,46 @@ impl Rational {
                 return n / d;
             }
         }
-        const SCALE_DIGITS: u32 = 30;
-        // 10^30 is 4 limbs -- nowhere near BigInt::pow's MAX_POW_RESULT_LIMBS
-        // sanity cap (a constant, never caller-controlled).
-        let scale = BigInt::from_i64(10).pow(SCALE_DIGITS as u64).expect("10^30 is far under the pow size cap");
-        let scaled_num = self.num.mul(&scale);
-        let (q, _) = scaled_num.divmod(&self.den).unwrap();
-        let approx = q.to_decimal().parse::<f64>().unwrap_or(f64::INFINITY);
-        approx / 10f64.powi(SCALE_DIGITS as i32)
+        if self.num.is_zero() {
+            return 0.0;
+        }
+        let neg = self.num.is_negative();
+        let num_abs = self.num.abs();
+        let num_digits = num_abs.to_decimal().len() as i64;
+        let den_digits = self.den.to_decimal().len() as i64;
+        // log10(num/den) is within +-1 of (num_digits - den_digits); a wide
+        // safety margin beyond f64's actual exponent range means the ratio
+        // is UNAMBIGUOUSLY out of range here.
+        let approx_exp = num_digits - den_digits;
+        if approx_exp > 320 {
+            return if neg { f64::NEG_INFINITY } else { f64::INFINITY };
+        }
+        if approx_exp < -330 {
+            return 0.0;
+        }
+        // The true ratio's magnitude is within a few hundred orders of
+        // f64's representable range either way, so `scale` below is always
+        // small (well under a thousand) even though num/den individually
+        // can be up to MAX_BIGINT_LIMBS-sized -- safe to `pow` unconditionally.
+        const EXTRA_DIGITS: i64 = 25;
+        let scale = den_digits - num_digits + EXTRA_DIGITS;
+        let q_dec = if scale >= 0 {
+            let factor = BigInt::from_i64(10).pow(scale as u64).expect("bounded scale");
+            num_abs.mul(&factor).divmod(&self.den).unwrap().0.to_decimal()
+        } else {
+            let factor = BigInt::from_i64(10).pow((-scale) as u64).expect("bounded scale");
+            num_abs.divmod(&self.den.mul(&factor)).unwrap().0.to_decimal()
+        };
+        if q_dec == "0" {
+            return 0.0;
+        }
+        // `q_dec` is an unsigned decimal-integer string; its true value is
+        // `q_dec * 10^-scale`.
+        let qd = q_dec.len() as i64;
+        let exp = (qd - 1) - scale;
+        let mantissa = if qd > 1 { format!("{}.{}", &q_dec[..1], &q_dec[1..]) } else { q_dec };
+        let sci = format!("{}{}e{}", if neg { "-" } else { "" }, mantissa, exp);
+        sci.parse::<f64>().unwrap_or(if neg { f64::NEG_INFINITY } else { f64::INFINITY })
     }
 }
 
@@ -309,5 +368,43 @@ mod tests {
         // the ordinary, small-number fast path is unaffected by the fix.
         assert_eq!(r(1, 4).to_f64(), 0.25);
         assert_eq!(r(10, 1).to_f64(), 10.0);
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1070, an Explore survey finding, independently re-verified
+    /// live before implementing): the PR-it627 fix above scaled by a FIXED
+    /// `10^30` regardless of how far the true ratio's magnitude sits from
+    /// f64's actual overflow/underflow boundaries, so a ratio genuinely
+    /// NEAR (but not beyond) those boundaries -- not just individually
+    /// oversized like the near-1 case above -- silently rounded to `0.0`
+    /// or `inf` instead of its true finite/representable value. Live-
+    /// confirmed via `kupl run`/`run --vm`/`native` before this fix: both
+    /// cases below returned the wrong value identically on all three
+    /// engines (cgen.rs's `k_rat_to_f64` has the identical fixed-scale
+    /// defect).
+    #[test]
+    fn to_f64_uses_a_dynamic_scale_not_a_fixed_one_so_near_boundary_ratios_are_not_silently_rounded_to_zero_or_inf() {
+        // num=1, den=10^320+1: true value ~1e-320, a valid representable
+        // subnormal -- the old fixed 10^30 scale left it far too small to
+        // survive the scaled integer division, silently giving 0.0.
+        let d1 = BigInt::from_i64(10).pow(320).unwrap().add(&BigInt::from_i64(1));
+        let case1 = Rational::new(BigInt::from_i64(1), d1.clone()).unwrap();
+        let f1 = case1.to_f64();
+        assert!(f1 > 0.0 && f1.is_finite(), "expected a tiny nonzero subnormal, got {f1}");
+        assert!((f1 - 1e-320).abs() / 1e-320 < 1e-6, "expected ~1e-320, got {f1}");
+
+        // num=(10^400+7)*10^290+1, den=10^400+7: true value ~1e290,
+        // comfortably finite -- the old fixed scale pushed the scaled
+        // quotient itself past f64::MAX, silently giving inf.
+        let ten_400_7 = BigInt::from_i64(10).pow(400).unwrap().add(&BigInt::from_i64(7));
+        let n2 = ten_400_7.mul(&BigInt::from_i64(10).pow(290).unwrap()).add(&BigInt::from_i64(1));
+        let case2 = Rational::new(n2, ten_400_7).unwrap();
+        let f2 = case2.to_f64();
+        assert!(f2.is_finite(), "expected a finite value ~1e290, got {f2}");
+        assert!((f2 - 1e290).abs() / 1e290 < 1e-6, "expected ~1e290, got {f2}");
+
+        // a negative numerator must carry its sign through the new path too.
+        let neg_case = Rational::new(BigInt::from_i64(1).negate(), d1).unwrap();
+        assert!(neg_case.to_f64() < 0.0, "sign must survive the dynamic-scale path");
     }
 }

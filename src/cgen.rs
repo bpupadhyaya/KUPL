@@ -1606,16 +1606,58 @@ static double k_rat_to_f64(KRat* r) {
        to f64 SEPARATELY and dividing is wrong when BOTH overflow f64's
        range individually but their RATIO doesn't -- e.g. two ~400-digit
        coprime BigInts differing by 2 each parse as +inf, giving inf/inf =
-       NaN instead of the true value ~1.0. Scale num by a fixed power of ten
-       via EXACT BigInt arithmetic before dividing, so precision survives
-       even though the individual operands don't fit f64. A genuinely
-       astronomical ratio still correctly reduces to +-inf or 0.0, since the
-       scaled quotient itself then overflows/underflows on its own. */
-    KBig* scale = k_big_pow(k_big_v(k_big_from_i64(10)), 30);
-    KBig* scaled_num = k_big_mul(k_big_v(r->num), k_big_v(scale));
-    KBig* q = k_big_divmod(k_big_v(scaled_num), k_big_v(r->den), 0);
-    double approx = strtod(k_big_to_decimal(q), 0);
-    return approx / pow(10.0, 30.0);
+       NaN instead of the true value ~1.0. */
+    if (r->num->n == 0) return 0.0;
+    /* A SECOND REAL bug found+fixed (production-hardening PR-it1070,
+       mirroring the SAME fix in rational.rs's Rational::to_f64): the
+       original PR-it627 fix scaled by a FIXED 10^30 and divided the
+       resulting decimal string's double by a literal pow(10.0, 30.0) --
+       correct only when the true ratio's magnitude happens to land within
+       about 30 orders of magnitude of 1. A ratio genuinely NEAR (but not
+       beyond) f64's actual exponent boundaries -- e.g. num=1,
+       den=10^320+1 (true value ~1e-320, a valid subnormal) -- silently
+       rounded to 0.0 or inf instead of its true finite/representable
+       value, identically to rational.rs's own pre-fix bug. Fixed the same
+       way: compute a DYNAMIC scale from num/den's own decimal digit
+       counts, then combine the scaled integer quotient's digits with the
+       correct decimal exponent into a scientific-notation string and let
+       strtod's own correctly-rounded parser apply the exponent directly --
+       this handles the full valid double exponent range in one exact
+       step, unlike dividing by a literal pow() result (which can itself
+       independently overflow or underflow). */
+    int neg = r->num->neg;
+    KBig* num_abs = k_big_abs(r->num);
+    char* num_dec = k_big_to_decimal(num_abs);
+    char* den_dec = k_big_to_decimal(r->den);
+    int64_t num_digits = (int64_t)strlen(num_dec);
+    int64_t den_digits = (int64_t)strlen(den_dec);
+    int64_t approx_exp = num_digits - den_digits;
+    if (approx_exp > 320) return neg ? -INFINITY : INFINITY;
+    if (approx_exp < -330) return 0.0;
+    int64_t extra_digits = 25;
+    int64_t scale = den_digits - num_digits + extra_digits;
+    KBig* q;
+    if (scale >= 0) {
+        KBig* factor = k_big_pow(k_big_v(k_big_from_i64(10)), scale);
+        KBig* scaled = k_big_mul(k_big_v(num_abs), k_big_v(factor));
+        q = k_big_divmod(k_big_v(scaled), k_big_v(r->den), 0);
+    } else {
+        KBig* factor = k_big_pow(k_big_v(k_big_from_i64(10)), -scale);
+        KBig* scaled_den = k_big_mul(k_big_v(r->den), k_big_v(factor));
+        q = k_big_divmod(k_big_v(num_abs), k_big_v(scaled_den), 0);
+    }
+    char* q_dec = k_big_to_decimal(q);
+    if (strcmp(q_dec, "0") == 0) return 0.0;
+    int64_t qd = (int64_t)strlen(q_dec);
+    int64_t exp = (qd - 1) - scale;
+    size_t buflen = strlen(q_dec) + 32;
+    char* sci = (char*)k_alloc(buflen);
+    if (qd > 1) {
+        snprintf(sci, buflen, "%s%c.%se%lld", neg ? "-" : "", q_dec[0], q_dec + 1, (long long)exp);
+    } else {
+        snprintf(sci, buflen, "%s%se%lld", neg ? "-" : "", q_dec, (long long)exp);
+    }
+    return strtod(sci, 0);
 }
 
 static KValue k_fun(int32_t idx) { KValue x; x.tag = K_FUN;   x.as.fun = idx; return x; }
@@ -14751,6 +14793,40 @@ fun main() uses io {
                    print(rat(1, 4).to_float())\n}\n";
         if cc_available() {
             assert_eq!(native_main_stdout(src, "rational_f64"), "1.0\ninf\n0.0\n0.25\n");
+        }
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1070, mirroring the SAME fix in `rational.rs`'s
+    /// `Rational::to_f64`): the PR-it627 fix above scaled by a FIXED
+    /// `10^30`, correct only when the true ratio's magnitude happens to
+    /// land within about 30 orders of magnitude of 1. A ratio genuinely
+    /// near (but not beyond) `f64`'s actual exponent boundaries -- e.g.
+    /// `num=1, den=10^320+1` (true value ~1e-320, a valid subnormal) --
+    /// silently rounded to `0.0`/`inf` instead of its true finite value,
+    /// identically on interp/vm/native (all three share this same fixed-
+    /// scale defect pre-fix). Fixed the same way as the Rust side: a
+    /// DYNAMIC scale derived from num/den's own decimal digit counts, then
+    /// `strtod` applies the correct exponent directly via a scientific-
+    /// notation string instead of a literal `pow()` division.
+    #[test]
+    fn native_rational_to_float_uses_a_dynamic_scale_not_a_fixed_one_so_near_boundary_ratios_are_not_silently_rounded_to_zero_or_inf() {
+        let src = "fun main() uses io {\n    \
+                   let d1 = big(10).pow(320) + big(1)\n    \
+                   print(rat(big(1), d1).to_float())\n    \
+                   let d2 = big(10).pow(400) + big(7)\n    \
+                   let n2 = d2 * big(10).pow(290) + big(1)\n    \
+                   print(rat(n2, d2).to_float())\n\
+                   }\n";
+        if cc_available() {
+            let raw = native_main_stdout(src, "rational_f64_dynscale");
+            let mut lines = raw.lines();
+            let case1: f64 = lines.next().unwrap().parse().expect("valid float");
+            let case2: f64 = lines.next().unwrap().parse().expect("valid float");
+            assert!(case1 > 0.0 && case1.is_finite(), "expected a tiny nonzero subnormal, got {case1}");
+            assert!((case1 - 1e-320).abs() / 1e-320 < 1e-6, "expected ~1e-320, got {case1}");
+            assert!(case2.is_finite(), "expected a finite value ~1e290, got {case2}");
+            assert!((case2 - 1e290).abs() / 1e290 < 1e-6, "expected ~1e290, got {case2}");
         }
     }
 
