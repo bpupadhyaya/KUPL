@@ -327,6 +327,8 @@ to `f32` with `Float.to_f32()`.
 | `.copysign(x)` | `(Float) -> Float` | magnitude of `self` with the sign of `x` |
 | `.mul_add(a, b)` | `(Float, Float) -> Float` | fused multiply-add, `self * a + b` with a single rounding (more accurate than `self*a+b`, can differ in the last bit) |
 | `.format(decimals)` | `(Int) -> Str` | fixed-point, rounded; `decimals` in `0..=100` |
+| `.fmt(decimals)` | `(Int) -> Str` | fixed-point, **rounding half away from zero** (`2.5.fmt(0)` → `"3"`, vs. `.format`'s `"2"`); `decimals` clamped to `0..=18`; non-finite inputs render as `nan`/`inf`/`-inf` |
+| `.to_f32()` | `-> f32` | narrows to the single-precision sized float type |
 
 ### Option[T]
 
