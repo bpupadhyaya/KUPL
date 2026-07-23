@@ -16510,6 +16510,43 @@ fun probe() -> Str {
         assert!(compiled.is_err(), "positional-colliding-with-named-on-the-same-slot must still be rejected");
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it1080,
+    /// a background survey finding, independently live-verified before
+    /// fixing): `check.rs`'s compound-assignment (`+=`/`-=`/`*=`/`/=`)
+    /// applicability check never consulted operator overloading, unlike the
+    /// ordinary `BinOp::Add|Sub|Mul|Div` arm in `infer_expr` (which calls
+    /// `operator_overload` before falling back to its numeric/Str-only
+    /// diagnostic) -- `v += Vec2(...)` for a `Vec2` type with a user `add`
+    /// overload used to be wrongly rejected at check time with `K0222 `+=`
+    /// needs a numeric variable, `v` is Vec2`, even though `interp.rs`
+    /// desugars `AssignOp::Add` into the exact same `BinOp::Add` an ordinary
+    /// `v = v + Vec2(...)` uses (already accepted, and already dispatching
+    /// to the overload via `binary_or_overload`), and `compile.rs` compiles
+    /// both shapes to the identical `Op::Add` shared by VM+native. This is a
+    /// SINGLE-SITE fix confined to `check.rs`'s own `Stmt::Assign` handling
+    /// -- unlike PR-it1079's own six-site fix, `interp.rs`'s/`compile.rs`'s
+    /// RUNTIME/COMPILED sides were ALREADY correct (both already desugar
+    /// every compound-assignment op into the identical shared `BinOp`/`Op`
+    /// their own ordinary-assignment sibling uses), so only the STATIC
+    /// checker itself needed to learn to accept what the engines already
+    /// executed correctly.
+    #[test]
+    fn diff_compound_assign_consults_operator_overloading() {
+        let overloads = "type Vec2 = { x: Int, y: Int }\n\
+            fun add(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x + b.x, y: a.y + b.y) }\n\
+            fun sub(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x - b.x, y: a.y - b.y) }\n\
+            fun mul(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x * b.x, y: a.y * b.y) }\n\
+            fun div(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x / b.x, y: a.y / b.y) }\n";
+        assert_eq!(
+            differential(&format!(
+                "{overloads}fun probe() -> Str {{\n    var v = Vec2(x: 10, y: 20)\n    \
+                 v += Vec2(x: 1, y: 2)\n    v -= Vec2(x: 1, y: 2)\n    \
+                 v *= Vec2(x: 2, y: 2)\n    v /= Vec2(x: 2, y: 2)\n    \"{{v.x}} {{v.y}}\"\n}}\n"
+            )),
+            "10 20"
+        );
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it840),
     /// found by a DELIBERATE, EXHAUSTIVE audit of every Expr-bearing AST field
     /// against `callargs.rs`'s item walker (prompted by PR-it839 being the

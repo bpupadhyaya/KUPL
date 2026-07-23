@@ -2156,28 +2156,61 @@ impl Checker {
                             self.check_assign(&ty, &value_ty, *span, &format!("assignment to `{name}`"));
                             if *op != AssignOp::Set {
                                 let rt = self.uni.apply(&ty);
-                                let rt = self.default_numeric(rt);
                                 // A REAL, live-confirmed FALSE REJECTION found+fixed
-                                // (production-hardening PR-it996, found by the SAME
-                                // check.rs Explore survey as PR-it994/PR-it995): `+=`
-                                // on a `Str` variable was wrongly rejected here even
-                                // though it's valid, executable code -- `interp.rs`
-                                // desugars `AssignOp::Add` into the exact same
-                                // `BinOp::Add` an ordinary `s = s + "b"` uses (and
-                                // `compile.rs` desugars it into the same `Op::Add`
-                                // used for KVM/native), and `Str + Str` concatenation
-                                // is already legal there. Live-confirmed before this
-                                // fix: `s += "b"` on `var s: Str` failed `kupl check`
-                                // with this exact K0222, while the plain equivalent
-                                // `s = s + "b"` compiled and ran cleanly (printing the
-                                // correct concatenation) on ALL THREE runnable
-                                // engines (interp/KVM/native). `-=`/`*=`/`/=` have NO
-                                // such `Str`-supporting desugar target and stay
-                                // rejected -- this narrowly exempts ONLY the
-                                // `Str`+`Add` combination, not `Str` from the whole
-                                // check.
-                                if !rt.is_numeric() && !(rt == Ty::Str && *op == AssignOp::Add) {
-                                    self.err("K0222", format!("`{}=` needs a numeric variable, `{name}` is {rt}", op_sym(*op)), *span);
+                                // (production-hardening PR-it1080, found by a
+                                // check.rs close-read survey): this compound-
+                                // assignment applicability check never consulted
+                                // operator overloading, unlike the ordinary
+                                // `BinOp::Add|Sub|Mul|Div` arm in `infer_expr`
+                                // (which calls `operator_overload` before falling
+                                // back to the numeric/Str-only diagnostic below) --
+                                // `interp.rs` desugars `AssignOp::Add/Sub/Mul/Div`
+                                // into the EXACT SAME `BinOp` an ordinary
+                                // `v = v + e` uses, routed through the identical
+                                // `binary_or_overload` that already dispatches to
+                                // a user's `add`/`sub`/`mul`/`div` overload
+                                // function for a `Value::Ctor` (and `compile.rs`
+                                // compiles both shapes to the identical `Op::Add`
+                                // etc., shared by KVM/native). Live-confirmed
+                                // before this fix: `v += Vec2(x: 3, y: 4)` on `var
+                                // v: Vec2` (with a user `fun add(a: Vec2, b: Vec2)
+                                // -> Vec2` overload) failed `kupl check` with this
+                                // exact K0222, while the plain equivalent `v = v +
+                                // Vec2(x: 3, y: 4)` compiled and ran cleanly on ALL
+                                // FOUR engines.
+                                let bin_op = match op {
+                                    AssignOp::Add => BinOp::Add,
+                                    AssignOp::Sub => BinOp::Sub,
+                                    AssignOp::Mul => BinOp::Mul,
+                                    AssignOp::Div => BinOp::Div,
+                                    AssignOp::Set => unreachable!(),
+                                };
+                                if let Some(ret) = self.operator_overload(bin_op, &rt, *span) {
+                                    self.check_assign(&ty, &ret, *span, &format!("assignment to `{name}`"));
+                                } else {
+                                    let rt = self.default_numeric(rt);
+                                    // A REAL, live-confirmed FALSE REJECTION found+fixed
+                                    // (production-hardening PR-it996, found by the SAME
+                                    // check.rs Explore survey as PR-it994/PR-it995): `+=`
+                                    // on a `Str` variable was wrongly rejected here even
+                                    // though it's valid, executable code -- `interp.rs`
+                                    // desugars `AssignOp::Add` into the exact same
+                                    // `BinOp::Add` an ordinary `s = s + "b"` uses (and
+                                    // `compile.rs` desugars it into the same `Op::Add`
+                                    // used for KVM/native), and `Str + Str` concatenation
+                                    // is already legal there. Live-confirmed before this
+                                    // fix: `s += "b"` on `var s: Str` failed `kupl check`
+                                    // with this exact K0222, while the plain equivalent
+                                    // `s = s + "b"` compiled and ran cleanly (printing the
+                                    // correct concatenation) on ALL THREE runnable
+                                    // engines (interp/KVM/native). `-=`/`*=`/`/=` have NO
+                                    // such `Str`-supporting desugar target and stay
+                                    // rejected -- this narrowly exempts ONLY the
+                                    // `Str`+`Add` combination, not `Str` from the whole
+                                    // check.
+                                    if !rt.is_numeric() && !(rt == Ty::Str && *op == AssignOp::Add) {
+                                        self.err("K0222", format!("`{}=` needs a numeric variable, `{name}` is {rt}", op_sym(*op)), *span);
+                                    }
                                 }
                             }
                         }
@@ -5638,6 +5671,46 @@ mod generic_tests {
         assert!(bad.iter().any(|d| d.code == "K0222" && d.message.contains("is Bool")), "{bad:?}");
         // The pre-existing numeric `+=` behavior is unaffected.
         assert!(errors("fun main() { var x = 5\n    x += 10 }\n").is_empty());
+    }
+
+    /// A REAL, live-confirmed FALSE REJECTION found+fixed (production-hardening
+    /// PR-it1080, a background survey finding): the sibling gap to PR-it996's
+    /// own `Str += ` fix, but for OPERATOR OVERLOADING -- `x += y` never
+    /// consulted `operator_overload` the way the ordinary `x = x + y` binary
+    /// arm does, so a user-defined type with a `fun add(a: T, b: T) -> T`
+    /// overload was wrongly rejected by every compound-assignment operator
+    /// with a matching overload function.
+    #[test]
+    fn compound_assign_consults_operator_overloading_same_as_ordinary_binary_ops() {
+        let overloads = "type Vec2 = { x: Int, y: Int }\n\
+            fun add(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x + b.x, y: a.y + b.y) }\n\
+            fun sub(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x - b.x, y: a.y - b.y) }\n\
+            fun mul(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x * b.x, y: a.y * b.y) }\n\
+            fun div(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x / b.x, y: a.y / b.y) }\n";
+        for op in ["+=", "-=", "*=", "/="] {
+            let e = errors(&format!(
+                "{overloads}fun main() {{ var v = Vec2(x: 1, y: 2)\n    v {op} Vec2(x: 3, y: 4) }}\n"
+            ));
+            assert!(e.is_empty(), "{op}: {e:?}");
+        }
+        // A type with NO matching overload function is still correctly rejected.
+        let no_overload = errors(
+            "type Vec2 = { x: Int, y: Int }\n\
+             fun main() { var v = Vec2(x: 1, y: 2)\n    v += Vec2(x: 3, y: 4) }\n",
+        );
+        assert!(
+            no_overload.iter().any(|d| d.code == "K0222" && d.message.contains("is Vec2")),
+            "{no_overload:?}"
+        );
+        // An overload whose return type doesn't match the assignment target is a clean
+        // type-mismatch error, not silently accepted.
+        let mismatched = errors(
+            "type Vec2 = { x: Int, y: Int }\n\
+             fun add(a: Vec2, b: Vec2) -> Str { \"nope\" }\n\
+             fun main() { var v = Vec2(x: 1, y: 2)\n    v += Vec2(x: 3, y: 4) }\n",
+        );
+        assert!(!mismatched.is_empty(), "expected a type-mismatch error: {mismatched:?}");
+        assert!(mismatched.iter().all(|d| d.code != "K0222"), "should not be K0222: {mismatched:?}");
     }
 
     #[test]
