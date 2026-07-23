@@ -211,6 +211,8 @@ match `Ok`/`Err` structurally rather than on the text.
 | `.group_by(f)` | `(fn(T) -> K) -> Map[K, List[T]]` | bucket elements by a key; keys in first-seen order, each bucket in input order |
 | `.position(f)` | `(fn(T) -> Bool) -> Option[Int]` | index of the first element matching the predicate |
 | `.partition(f)` | `(fn(T) -> Bool) -> List[List[T]]` | `[matching, non-matching]`, order preserved |
+| `.rotate_left(n)` / `.rotate_right(n)` | `(Int) -> List[T]` | cyclic shift; `n` moves the first/last `n` elements to the other end (`n` taken modulo length, negative allowed); an empty list is unchanged |
+| `.intersperse(sep)` | `(T) -> List[T]` | insert `sep` between each pair of adjacent elements (`[1,2,3].intersperse(0)` → `[1,0,2,0,3]`); empty and singleton lists are unchanged |
 
 ### Str
 
