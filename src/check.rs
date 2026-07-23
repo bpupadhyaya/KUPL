@@ -1354,6 +1354,30 @@ impl Checker {
             for (fname, (params, ret, effects)) in &contract.sigs {
                 match comp_sig.exposes.get(fname) {
                     None => {
+                        // A REAL usability gap (production-hardening PR-it1088):
+                        // when the missing method is declared as a PRIVATE (non-
+                        // `expose`) method under the EXACT same name -- the single
+                        // most common way to trip this error, simply forgetting
+                        // the `expose` keyword -- the did-you-mean below (which
+                        // only searches ALREADY-exposed names) finds nothing to
+                        // suggest, since an exact match isn't a "close" match. A
+                        // component with zero OTHER exposed methods got a bare
+                        // "does not expose `get`" with no hint at all, even
+                        // though the exact fix (add `expose`) was sitting right
+                        // there in `c.funs`. Checked first, before falling back
+                        // to the typo-suggestion path below.
+                        if let Some(priv_decl) = c.funs.iter().find(|f| f.name == *fname) {
+                            self.err(
+                                "K0262",
+                                format!(
+                                    "`{}` fulfills `{contract_name}` but does not expose `{fname}` \
+                                     — it's declared as a private method; add `expose` to fulfill the contract",
+                                    c.name
+                                ),
+                                priv_decl.span,
+                            );
+                            continue;
+                        }
                         // Did-you-mean, matching K0261's courtesy right above (a typo'd
                         // `fulfills` contract name) -- a typo'd EXPOSED METHOD name landed
                         // here bare: `expose fun gett(...)` for a contract requiring `get`
@@ -5164,6 +5188,58 @@ mod generic_tests {
         assert!(
             none.iter().any(|d| d.code == "K0262" && !d.message.contains("did you mean")),
             "unrelated exposed name should stay bare: {none:?}"
+        );
+    }
+
+    /// A REAL usability gap found+fixed (production-hardening PR-it1088): the
+    /// did-you-mean fix directly above (K0262, PR-it581) only ever searches
+    /// the component's ALREADY-exposed methods for a close typo match -- so
+    /// the single most common trigger for this whole error, simply forgetting
+    /// the `expose` keyword on a method whose name EXACTLY matches what the
+    /// contract requires, got no hint at all (an exact match isn't a "close"
+    /// one, and a component with zero other exposed methods has nothing for
+    /// `suggest` to find). Fixed by checking the component's PRIVATE methods
+    /// for an exact name match FIRST, giving a specific, actionable message
+    /// pointing at the private declaration itself rather than the whole
+    /// component header.
+    #[test]
+    fn k0262_hints_when_the_missing_method_is_declared_private_not_exposed() {
+        let priv_only = errors(
+            "contract Store {\n    intent \"s\"\n    expose fun get(k: Str) -> Int\n}\n\
+             component MemStore fulfills Store {\n    intent \"m\"\n    fun get(k: Str) -> Int {\n        0\n    }\n}\n",
+        );
+        assert!(
+            priv_only.iter().any(|d| d.code == "K0262"
+                && d.message.contains("does not expose `get`")
+                && d.message.contains("declared as a private method")
+                && d.message.contains("add `expose`")),
+            "an exact-name private method should get the specific private-method hint: {priv_only:?}"
+        );
+
+        // A component that's ALSO missing the method as a private method (truly
+        // absent, or only present under an unrelated name) must still fall back
+        // to the ordinary bare/did-you-mean K0262 behavior, unaffected by this fix.
+        let truly_missing = errors(
+            "contract Store {\n    intent \"s\"\n    expose fun get(k: Str) -> Int\n}\n\
+             component MemStore fulfills Store {\n    intent \"m\"\n    expose fun other() -> Int {\n        0\n    }\n}\n",
+        );
+        assert!(
+            truly_missing.iter().any(|d| d.code == "K0262"
+                && d.message.contains("does not expose `get`")
+                && !d.message.contains("declared as a private method")
+                && !d.message.contains("did you mean")),
+            "truly missing (no private OR exposed near-match) should stay the plain bare message: {truly_missing:?}"
+        );
+
+        // The private-method hint must not fire when the private method exists
+        // under a DIFFERENT name -- only an EXACT name match is actionable here.
+        let unrelated_private = errors(
+            "contract Store {\n    intent \"s\"\n    expose fun get(k: Str) -> Int\n}\n\
+             component MemStore fulfills Store {\n    intent \"m\"\n    fun helper() -> Int {\n        0\n    }\n}\n",
+        );
+        assert!(
+            unrelated_private.iter().any(|d| d.code == "K0262" && !d.message.contains("declared as a private method")),
+            "an unrelated private method name must not trigger the hint: {unrelated_private:?}"
         );
     }
 
