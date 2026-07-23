@@ -549,10 +549,31 @@ impl<'s> FnCompiler<'s> {
         // sibling site: snapshot each arg into a fresh register via
         // `Op::Move` immediately after evaluating it.
         let mut supplied: Vec<Option<Reg>> = vec![None; props.len()];
-        for (i, a) in args.iter().enumerate() {
+        // `next_positional` is a cursor into `props`, in declaration order,
+        // for resolving positional args. Production-hardening PR-it1079: a
+        // positional arg used to resolve via its own RAW index `i` in
+        // `args`, which is only correct when every named arg's own list
+        // position happens to align with its target prop's declared index
+        // -- a named arg for a LATER prop appearing BEFORE a positional one
+        // broke this (the positional's raw index landed back on the prop
+        // just claimed by name, silently overwriting it here while leaving
+        // the prop actually meant unset). Fixed by advancing the cursor
+        // past any prop slot an EARLIER arg (name or position) already
+        // claimed, mirroring `check.rs::check_ctor_args`'s own identical
+        // fix (which this function must stay behaviorally consistent with)
+        // and `interp.rs::instantiate`'s own (the source-of-truth engine).
+        let mut next_positional = 0usize;
+        for a in args.iter() {
             let idx = match &a.name {
-                Some(n) => props.iter().position(|(pn, _)| pn == n).unwrap_or(i),
-                None => i,
+                Some(n) => props.iter().position(|(pn, _)| pn == n).unwrap_or(usize::MAX),
+                None => {
+                    while next_positional < props.len() && supplied[next_positional].is_some() {
+                        next_positional += 1;
+                    }
+                    let idx = next_positional;
+                    next_positional += 1;
+                    idx
+                }
             };
             let raw = self.expr(&a.value);
             let r = self.alloc(span);
@@ -1854,10 +1875,27 @@ impl<'s> FnCompiler<'s> {
         // silently corrupt an EARLIER arg's already-read value once the
         // deferred `Move`-into-consecutive-block loop below runs.
         let mut ordered: Vec<Option<Reg>> = vec![None; args.len()];
-        for (i, a) in args.iter().enumerate() {
+        // Same cursor fix as `instance_expr`'s own, immediately above
+        // (production-hardening PR-it1079): a positional arg used to
+        // resolve via its own RAW index `i`, only correct when every named
+        // arg's own list position aligns with its target field's declared
+        // index. Fixed by advancing a cursor past any field slot an
+        // EARLIER arg (name or position) already claimed, mirroring
+        // `check.rs::check_named_args`'s own identical fix and
+        // `interp.rs`'s ctor-construction branch (the source-of-truth
+        // engine).
+        let mut next_positional = 0usize;
+        for a in args.iter() {
             let idx = match &a.name {
-                Some(n) => field_names.iter().position(|f| f == n).unwrap_or(i),
-                None => i,
+                Some(n) => field_names.iter().position(|f| f == n).unwrap_or(usize::MAX),
+                None => {
+                    while next_positional < ordered.len() && ordered[next_positional].is_some() {
+                        next_positional += 1;
+                    }
+                    let idx = next_positional;
+                    next_positional += 1;
+                    idx
+                }
             };
             let raw = self.expr(&a.value);
             let r = self.alloc(span);

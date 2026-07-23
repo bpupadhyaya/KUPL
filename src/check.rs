@@ -1933,10 +1933,42 @@ impl Checker {
         // function, never as a lookup key.
         let comp_name = crate::resolve::demangle_for_display(comp_name);
         let mut supplied: HashSet<String> = HashSet::new();
-        for (i, arg) in args.iter().enumerate() {
+        // `next_positional` tracks a cursor into `sig.props`, in declaration
+        // order, for resolving positional arguments. Production-hardening
+        // PR-it1079: it used to be the argument's own RAW index in `args`
+        // (`sig.props.get(i)`), which is only correct when every named
+        // argument's own list position happens to equal its target prop's
+        // declared index. A named argument for a LATER prop appearing
+        // BEFORE a positional one broke this: the positional argument's raw
+        // index landed back on the prop just claimed by name, misreporting
+        // a phantom K0215 "duplicate" on that prop and a phantom K0216
+        // "missing required prop" on the prop actually left unsupplied.
+        // Fixed by advancing the cursor past any prop ALREADY claimed by an
+        // earlier-processed argument (name or position) instead of using
+        // the argument's own raw list index -- this leaves every
+        // ALREADY-tested case unchanged (a positional argument followed
+        // later by a named argument for the SAME slot it just claimed is
+        // still correctly flagged as a duplicate, since nothing has claimed
+        // that slot yet when the positional argument is processed) while
+        // correctly resolving the previously-misdiagnosed case. Must be
+        // mirrored exactly in `interp.rs::instantiate` (runtime) and
+        // `compile.rs::instance_expr` (compiled, feeding VM+native) --
+        // otherwise this function would newly ACCEPT a call that those
+        // engines still resolve incorrectly or reject.
+        let mut next_positional = 0usize;
+        for arg in args.iter() {
             let target = match &arg.name {
                 Some(n) => sig.props.iter().find(|(pn, _, _)| pn == n).cloned(),
-                None => sig.props.get(i).cloned(),
+                None => {
+                    while next_positional < sig.props.len()
+                        && supplied.contains(&sig.props[next_positional].0)
+                    {
+                        next_positional += 1;
+                    }
+                    let t = sig.props.get(next_positional).cloned();
+                    next_positional += 1;
+                    t
+                }
             };
             let arg_ty = self.infer_expr(&arg.value, ctx);
             match target {
@@ -3436,7 +3468,15 @@ impl Checker {
         // overwriting (interp) or crashing at runtime (KVM) — a duplicate can even mask a missing
         // field when the argument count happens to match (PR-it213).
         let mut supplied: HashSet<String> = HashSet::new();
-        for (i, arg) in args.iter().enumerate() {
+        // Same cursor fix as `check_ctor_args`'s own (PR-it1079): a positional
+        // argument fills the next field NOT YET claimed by an earlier
+        // argument in this call, not simply `fields[i]` by its own raw list
+        // index -- otherwise a named argument for a LATER field appearing
+        // BEFORE a positional one misreports a phantom duplicate/missing
+        // pair. Must mirror `interp.rs`'s ctor-construction branch (runtime)
+        // and `compile.rs::order_ctor_args` (compiled).
+        let mut next_positional = 0usize;
+        for arg in args.iter() {
             let target = match &arg.name {
                 Some(n) => {
                     if fields.iter().any(|(fname, _)| fname == n) && !supplied.insert(n.clone()) {
@@ -3445,14 +3485,21 @@ impl Checker {
                     fields.iter().find(|(fname, _)| fname == n).cloned()
                 }
                 None => {
-                    // A positional argument fills field `i`; record it so a later named arg for the
-                    // same field (or vice versa) is caught as a duplicate (PR-it214).
-                    if let Some((fname, _)) = fields.get(i) {
+                    while next_positional < fields.len()
+                        && supplied.contains(&fields[next_positional].0)
+                    {
+                        next_positional += 1;
+                    }
+                    // A positional argument fills field `next_positional`; record it so a later
+                    // named arg for the same field (or vice versa) is caught as a duplicate (PR-it214).
+                    let target = fields.get(next_positional).cloned();
+                    if let Some((fname, _)) = &target {
                         if !supplied.insert(fname.clone()) {
                             self.err("K0244", format!("duplicate field `{fname}` in `{ctor}`"), arg.value.span);
                         }
                     }
-                    fields.get(i).cloned()
+                    next_positional += 1;
+                    target
                 }
             };
             let at = self.infer_expr(&arg.value, ctx);
@@ -5605,6 +5652,14 @@ mod generic_tests {
         assert!(mix.iter().any(|d| d.code == "K0215" && d.message.contains("duplicate prop `w`")), "mix: {mix:?}");
         // Valid constructions — named, positional, and mixed on distinct props — still type-check.
         assert!(errors(&format!("{comp}fun main() {{ let _ = Widget(w: 5, h: 6)\n    let _ = Widget(5, 6)\n    let _ = Widget(5, h: 6) }}\n")).is_empty());
+        // Production-hardening PR-it1079: a NAMED argument for a LATER prop appearing BEFORE a
+        // positional one used to misreport a phantom duplicate on the named prop AND a phantom
+        // missing-required-prop on a completely different, unrelated prop -- `sig.props.get(i)`
+        // resolved a positional arg by its own RAW index in the arg list, not by which prop
+        // slots were still unclaimed. `Widget(h: 6, 5)` now correctly accepts, binding the
+        // positional `5` to the one remaining unclaimed prop, `w`.
+        let out_of_order = errors(&format!("{comp}fun main() {{ let _ = Widget(h: 6, 5) }}\n"));
+        assert!(out_of_order.is_empty(), "out_of_order: {out_of_order:?}");
     }
 
     #[test]
@@ -5628,6 +5683,12 @@ mod generic_tests {
         assert!(errors("type P = { x: Int, y: Int }\nfun main() { let _ = P(x: 1, y: 2)\n    let _ = P(y: 20, x: 10) }\n").is_empty());
         assert!(errors("type Box[T] = Box(v: T)\nfun main() { let _ = Box(v: 5) }\n").is_empty());
         assert!(errors("type T = { a: Int, b: Int, c: Int }\nfun main() { let _ = T(1, 2, c: 3)\n    let _ = T(1, b: 2, c: 3) }\n").is_empty());
+        // Production-hardening PR-it1079 (sibling of the component-prop fix immediately above):
+        // a named arg for a LATER field appearing BEFORE a positional one used to misreport a
+        // phantom duplicate/missing pair here too -- `fields.get(i)` resolved a positional arg by
+        // raw list index, not by which field slots were still unclaimed.
+        let out_of_order = errors("type T = { a: Int, b: Int, c: Int }\nfun main() { let _ = T(b: 2, 1, 3) }\n");
+        assert!(out_of_order.is_empty(), "out_of_order: {out_of_order:?}");
         // Too FEW all-named args now names the missing field(s) in the arity K0243 (PR-it484).
         let mf = errors("type T = { a: Int, b: Int, c: Int }\nfun main() { let _ = T(a: 1, c: 3) }\n");
         assert!(

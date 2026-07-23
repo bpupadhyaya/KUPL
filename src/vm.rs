@@ -16444,6 +16444,72 @@ fun probe() -> Str {
         );
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1079, a background survey finding scoped to six previously-
+    /// unsurveyed check.rs functions, independently live-verified before
+    /// fixing): a component-instantiation positional argument used to
+    /// resolve to its own RAW index in the argument list (`sig.props.get(i)`
+    /// in `check.rs::check_ctor_args`, `*j == i` in `interp.rs::instantiate`,
+    /// and `idx = i` in `compile.rs::instance_expr`) rather than "the next
+    /// prop not yet claimed by an earlier argument" -- correct only when
+    /// every named argument's own list position happens to align with its
+    /// target prop's declared index. A named argument for a LATER prop
+    /// appearing BEFORE a positional one broke this: `Widget(h: 6, 5)` for
+    /// `prop w: Int; prop h: Int` used to be REJECTED at check time with a
+    /// phantom `K0215 duplicate prop \`h\`` (the positional arg's raw index 1
+    /// landed back on `h`, just claimed by name) plus a phantom `K0216
+    /// missing required prop \`w\`` (never touched by either argument) --
+    /// live-confirmed BOTH diagnostics fired on the actual `kupl check`
+    /// binary before this fix. A partial fix (check.rs only) would have been
+    /// actively WORSE: it would newly ACCEPT this shape while interp.rs's
+    /// `.find()`-based resolution still panicked "missing required prop w"
+    /// at runtime, and compile.rs's own last-write-wins array logic still
+    /// silently mis-assigned `h=5` (overwriting the correct `h=6`) while
+    /// ALSO failing to ever set `w`, feeding both the VM and native engines
+    /// a corrupt result -- three independently-maintained call sites
+    /// (`check.rs::check_ctor_args`, `interp.rs::instantiate`,
+    /// `compile.rs::instance_expr`) needed the identical cursor-based fix,
+    /// mirroring PR-it1077's own precedent of a shared bug spanning multiple
+    /// independent engines. The identical root cause and fix shape was ALSO
+    /// found and fixed in the sibling record/ADT-constructor path
+    /// (`check.rs::check_named_args`, `interp.rs`'s ctor-construction
+    /// branch, `compile.rs::order_ctor_args`) -- see
+    /// `duplicate_record_field_is_rejected_at_check_time`'s own extended
+    /// `out_of_order` case in check.rs's test module for that diagnostic-
+    /// level coverage; this test proves VALUE correctness end to end on the
+    /// component-prop side across BOTH engines this `differential()` helper
+    /// exercises (a separate native-binary check further below covers the
+    /// THIRD engine).
+    #[test]
+    fn diff_component_prop_out_of_order_named_then_positional_resolves_to_the_next_unclaimed_prop() {
+        assert_eq!(
+            differential(
+                "component Widget {\n    intent \"t\"\n    prop w: Int\n    prop h: Int\n    \
+                 expose fun both() -> Str { \"{w} {h}\" }\n}\n\
+                 fun probe() -> Str { Widget(h: 6, 5).both() }\n"
+            ),
+            "5 6"
+        );
+        // three props, with the named argument for the LAST prop appearing first --
+        // the two positional arguments must fill the two remaining props in order.
+        assert_eq!(
+            differential(
+                "component Triple {\n    intent \"t\"\n    prop a: Int\n    prop b: Int\n    prop c: Int\n    \
+                 expose fun all() -> Str { \"{a} {b} {c}\" }\n}\n\
+                 fun probe() -> Str { Triple(c: 30, 1, 2).all() }\n"
+            ),
+            "1 2 30"
+        );
+        // the pre-existing "positional colliding with a named prop on the same slot"
+        // shape (PR-it215) must still be rejected at check time -- unaffected by this fix.
+        let compiled = crate::run::compile(
+            "component Widget2 {\n    intent \"t\"\n    prop w: Int\n    prop h: Int\n    \
+             expose fun both() -> Str { \"{w} {h}\" }\n}\n\
+             fun probe() -> Str { Widget2(5, w: 6).both() }\n",
+        );
+        assert!(compiled.is_err(), "positional-colliding-with-named-on-the-same-slot must still be rejected");
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it840),
     /// found by a DELIBERATE, EXHAUSTIVE audit of every Expr-bearing AST field
     /// against `callargs.rs`'s item walker (prompted by PR-it839 being the

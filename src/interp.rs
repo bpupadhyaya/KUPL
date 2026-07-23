@@ -225,17 +225,43 @@ impl Interp {
         };
         let env = self.globals.child();
 
-        // props: by name or position, else default
+        // props: by name or position, else default. Production-hardening
+        // PR-it1079: a positional arg used to resolve via `*j == i` (its own
+        // raw index in `args` equal to the prop's own declared index `i`),
+        // which is only correct when every named arg's own list position
+        // happens to align with its target prop's declared index -- a named
+        // arg for a LATER prop appearing BEFORE a positional one broke this
+        // (the positional's raw index landed on the prop just claimed by
+        // name, so NEITHER that prop NOR the one actually meant ever got a
+        // match, panicking "missing required prop" for the WRONG prop).
+        // Fixed with the same cursor algorithm as `check.rs::check_ctor_args`
+        // (which this function must stay consistent with, now that check.rs
+        // accepts a call shape this function must resolve identically):
+        // resolve every arg's target prop index in ONE pass up front,
+        // advancing a cursor past any prop slot an EARLIER arg (name or
+        // position) already claimed, then read each prop's slot below.
+        let mut supplied_by_idx: Vec<Option<Value>> = vec![None; comp.props.len()];
+        let mut next_positional = 0usize;
+        for (name, v) in args {
+            let idx = match name {
+                Some(n) => comp.props.iter().position(|p| &p.name == n),
+                None => {
+                    while next_positional < comp.props.len()
+                        && supplied_by_idx[next_positional].is_some()
+                    {
+                        next_positional += 1;
+                    }
+                    let idx = (next_positional < comp.props.len()).then_some(next_positional);
+                    next_positional += 1;
+                    idx
+                }
+            };
+            if let Some(idx) = idx {
+                supplied_by_idx[idx] = Some(v.clone());
+            }
+        }
         for (i, prop) in comp.props.iter().enumerate() {
-            let supplied = args
-                .iter()
-                .enumerate()
-                .find(|(j, (name, _))| match name {
-                    Some(n) => n == &prop.name,
-                    None => *j == i,
-                })
-                .map(|(_, (_, v))| v.clone());
-            let value = match (supplied, &prop.default) {
+            let value = match (supplied_by_idx[i].take(), &prop.default) {
                 (Some(v), _) => v,
                 (None, Some(d)) => self.eval(d, &env)?,
                 (None, None) => {
@@ -1795,16 +1821,33 @@ impl Interp {
             if !self.db.funs.contains_key(name) && env.get(name).is_none() {
                 if let Some((tyname, field_names)) = self.db.ctors.get(name).cloned() {
                     let mut fields = vec![Value::Unit; field_names.len()];
-                    for (i, a) in args.iter().enumerate() {
+                    // Same cursor fix as `check.rs::check_named_args`'s own
+                    // (PR-it1079): a positional arg fills the next field NOT
+                    // YET claimed by an earlier arg in THIS call (name or
+                    // position), not simply `field_names[i]` by its own raw
+                    // list index -- preserves source-order evaluation
+                    // (PR-it1004's own concern) since the cursor only
+                    // depends on args already processed in this same pass.
+                    let mut supplied = vec![false; field_names.len()];
+                    let mut next_positional = 0usize;
+                    for a in args.iter() {
                         let v = self.eval(&a.value, env)?;
                         let idx = match &a.name {
                             Some(n) => field_names.iter().position(|f| f == n).ok_or_else(|| {
                                 Self::panic_flow(format!("`{name}` has no field `{n}`"), a.value.span)
                             })?,
-                            None => i,
+                            None => {
+                                while next_positional < field_names.len() && supplied[next_positional] {
+                                    next_positional += 1;
+                                }
+                                let idx = next_positional;
+                                next_positional += 1;
+                                idx
+                            }
                         };
                         if idx < fields.len() {
                             fields[idx] = v;
+                            supplied[idx] = true;
                         }
                     }
                     return Ok(Value::Ctor {
