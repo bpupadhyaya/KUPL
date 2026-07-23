@@ -358,7 +358,7 @@ unambiguous "better than everyone" claim, and it is real today.
 
 Punches above its age: a canonical formatter (spec-level), **semantic diff**
 (`kupl diff` compares by meaning, classifying interface-vs-implementation
-changes), **structured diagnostics** (124 stable K-codes with spans and a JSON
+changes), **structured diagnostics** (132 stable K-codes with spans and a JSON
 mode built for editors and AI agents), a zero-dependency LSP server, component
 manifests for visual tools, `kupl context` for LLM prompt-packing, and
 property-based testing built in. This is Rust-cargo-quality ambition delivered
