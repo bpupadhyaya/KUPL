@@ -766,6 +766,9 @@ not per call).
 
 ## 12. Grammar
 
-The implemented grammar is LL(2); the authoritative EBNF sketch is in
+The implemented grammar is predominantly LL(2), with one narrow exception:
+disambiguating a continued `with` record-update chain from its end
+(`x with a: 1, b: 2` vs. `f(x with a: 1, other)`) needs a 3rd lookahead
+token (`parser.rs::parse_with`). The authoritative EBNF sketch is in
 [`../design/LANGUAGE.md` §9](../design/LANGUAGE.md). The invariant
 `parse(fmt(program)) == program` is enforced by round-trip tests.
