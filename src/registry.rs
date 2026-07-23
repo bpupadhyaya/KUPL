@@ -588,12 +588,112 @@ pub fn fetch_package(
     fetch_package_with(curl_get, registry_url, name, version, cache_dir)
 }
 
+/// A simple, dependency-free, cross-PROCESS advisory lock over the whole
+/// registry cache directory, held for `fetch_package_with`'s entire
+/// critical section (production-hardening PR-it1100).
+///
+/// A REAL, LIVE-CONFIRMED DESTRUCTIVE cache-corruption bug found+fixed: this
+/// module's own two case-collision guards (PR-it930's name-level check,
+/// PR-it1060's version-level check, both at the top of `fetch_package_with`
+/// below) only defend against a collision with a package ALREADY on disk at
+/// scan time — they never close the window between that scan and
+/// `materialize`'s own eventual write. Two CONCURRENT `kupl pkg fetch`
+/// processes fetching two DIFFERENT, case-colliding names (e.g. `Lib` and
+/// `lib`) for the FIRST time can each pass their own independent scan
+/// (neither is cached yet), then race to materialize into what is, on a
+/// case-insensitive filesystem (the default on macOS/Windows), the SAME
+/// physical directory — structurally distinct from `atomic_replace`'s own
+/// already-fixed same-name/same-version race (PR-it1006), which is safe
+/// specifically because both racers there always hold IDENTICAL,
+/// hash-verified content for the exact same package; here the two racers
+/// hold GENUINELY DIFFERENT content for two DIFFERENT packages that merely
+/// happen to case-collide. Live-confirmed via a real two-thread repro
+/// (mirroring PR-it1006's own "real threads standing in for real processes"
+/// technique) injecting a small unconditional delay into each racer's mock
+/// "network" fetch to widen the window: reliably reproducible across every
+/// repeated run (4 of 4), the dominant failure mode being the WORST case --
+/// both `fetch_package_with` calls return `Ok`, with zero diagnostic, while
+/// one package's on-disk content is silently destroyed by the other's;
+/// occasionally instead an unrelated, confusing `No such file or directory`
+/// I/O error surfaces from `atomic_replace`'s own rename target vanishing
+/// mid-flight. FIXED by acquiring this lock before either case-collision
+/// scan runs and holding it through `materialize`'s own final write,
+/// serializing every `fetch_package_with` call against this cache
+/// directory (across processes, since the lock is a real file on disk) --
+/// this doesn't just narrow the race window, it eliminates it entirely: a
+/// second racer's OWN scan now correctly runs strictly after the first
+/// racer's write has either landed or failed, so the EXISTING collision
+/// guards work exactly as already designed and tested, no new detection
+/// logic needed. `kupl pkg fetch` is not a throughput-sensitive hot path
+/// (`run.rs::pkg_fetch_with` already fetches every dependency strictly
+/// SEQUENTIALLY within one process, confirmed via that function's own
+/// source), so full serialization costs nothing in the common case and only
+/// ever adds latency, never contention, for the realistic concurrent-
+/// process scenario this defends (e.g. two CI jobs or two terminals sharing
+/// one `$HOME` cache). Implemented via `OpenOptions::create_new` on a lock
+/// file in the OS temp directory, deterministically named from `cache_dir`
+/// itself (see `acquire`'s own doc comment for why NOT inside `cache_dir`)
+/// -- atomic at the OS level (only one creator can ever win), polled with a
+/// short backoff since this codebase is deliberately zero-dependency and
+/// has no blocking-flock primitive available; released by removing the
+/// lock file when the guard drops (including on an early `?`/panic-unwind
+/// return, via `Drop`).
+struct CacheLock {
+    path: std::path::PathBuf,
+}
+
+impl CacheLock {
+    fn acquire(cache_dir: &std::path::Path) -> std::io::Result<CacheLock> {
+        // The lock file lives in the OS temp directory (always present),
+        // deterministically named from `cache_dir`'s own path, rather than
+        // inside `cache_dir` itself. `cache_dir` may not exist yet (this
+        // race is most likely on a brand-new machine's very first `kupl pkg
+        // fetch`), and several existing tests deliberately assert NOTHING
+        // is written to `cache_dir` at all when a fetch is cleanly rejected
+        // before ever reaching `materialize` (an unsafe name/version, a
+        // resolve failure, a hash mismatch) -- eagerly creating `cache_dir`
+        // just to host a lock file would silently break that "no footprint
+        // on a clean rejection" contract (confirmed live: this was tried
+        // first and broke exactly those five tests).
+        let key = crate::encoding::hash_fnv(&cache_dir.display().to_string());
+        let path = std::env::temp_dir().join(format!("kupl-registry-cache-{key:x}.lock"));
+        // 2000 attempts * 5ms = 10s worst-case wait before giving up --
+        // generous next to the network I/O a real fetch already does, but
+        // still bounded so a crashed process that left a stale lock file
+        // behind can't wedge every future `kupl pkg fetch` forever silently;
+        // a stuck lock surfaces as a clear timeout error instead.
+        const MAX_ATTEMPTS: u32 = 2000;
+        let mut last_err = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_file) => return Ok(CacheLock { path }),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out waiting for registry cache lock")
+        }))
+    }
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// `fetch_package`, but the transport is injectable — lets a test exercise
 /// the full fetch-index/resolve-version/fetch-files/materialize pipeline
 /// with a canned, in-memory fetcher instead of live curl/network access
 /// (only `fetch_package` above uses real curl; tests call this directly),
 /// mirroring `interp.rs`'s `serve_http`/`serve_http_with_read_timeout` test-
-/// injection pattern (production-hardening PR-it623).
+/// injection pattern (production-hardening PR-it623). Acquires `CacheLock`
+/// (production-hardening PR-it1100) for its ENTIRE body, serializing every
+/// call against this `cache_dir` -- see that struct's own doc comment for
+/// the destructive cross-name race this closes.
 fn fetch_package_with(
     fetch: impl Fn(&str) -> Result<String, String>,
     registry_url: &str,
@@ -601,6 +701,13 @@ fn fetch_package_with(
     version: &str,
     cache_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf, String> {
+    // Held for the REST of this function (production-hardening PR-it1100) --
+    // see `CacheLock`'s own doc comment for the destructive cross-name race
+    // this closes. Acquired before EITHER case-collision scan below runs,
+    // so a second racer's own scan is guaranteed to see whatever the first
+    // racer already wrote (or didn't), never an in-between state.
+    let _lock = CacheLock::acquire(cache_dir)
+        .map_err(|e| format!("cannot acquire registry cache lock in {}: {e}", cache_dir.display()))?;
     // `name`/`version` are NOT registry-supplied like a `RegistryVersion`'s
     // file paths (already guarded by `is_safe_relative_path` in
     // `parse_index`) -- they come from the CALLER, ultimately traced back to
@@ -1494,6 +1601,57 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(existing.join("main.kupl")).unwrap(),
             "pub fun greet() -> Str { \"original-1.0.0-RC-content\" }\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_package_with_serializes_racing_fetches_for_case_colliding_names_instead_of_silently_corrupting_one(
+    ) {
+        use std::sync::{Arc, Barrier};
+        let dir = std::env::temp_dir().join(format!("kupl-registry-cross-name-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (_hash_a, urls_a) = mock_index_and_files("Lib", "1.0.0", "package-A-content\n");
+        let (_hash_b, urls_b) = mock_index_and_files("lib", "1.0.0", "package-B-content\n");
+
+        let fetch_a = move |url: &str| -> Result<String, String> {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            urls_a.get(url).cloned().ok_or_else(|| format!("mock: no canned response for {url}"))
+        };
+        let fetch_b = move |url: &str| -> Result<String, String> {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            urls_b.get(url).cloned().ok_or_else(|| format!("mock: no canned response for {url}"))
+        };
+
+        let start = Arc::new(Barrier::new(2));
+        let start_a = Arc::clone(&start);
+        let start_b = Arc::clone(&start);
+        let dir_a = dir.clone();
+        let dir_b = dir.clone();
+        let handle_a = std::thread::spawn(move || {
+            start_a.wait();
+            fetch_package_with(fetch_a, "https://registry.example.com", "Lib", "1.0.0", &dir_a)
+        });
+        let handle_b = std::thread::spawn(move || {
+            start_b.wait();
+            fetch_package_with(fetch_b, "https://registry.example.com", "lib", "1.0.0", &dir_b)
+        });
+        let result_a = handle_a.join().unwrap();
+        let result_b = handle_b.join().unwrap();
+
+        let results = [&result_a, &result_b];
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one of two case-colliding racers may win, never both, never neither: {result_a:?} / {result_b:?}"
+        );
+        let err = results.iter().find_map(|r| r.as_ref().err()).unwrap();
+        assert!(
+            err.contains("collides with the already-cached package"),
+            "the loser must get the SAME clean collision error a non-racing second fetch already gets, \
+             not a corrupted silent success or an unrelated I/O error: {err}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
