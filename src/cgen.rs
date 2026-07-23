@@ -7514,7 +7514,21 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
         if (!strcmp(name, "shl") || !strcmp(name, "shr") || !strcmp(name, "ushr")) {
             int64_t n = args[0].as.i;
             if (n < 0 || n > 63) k_panic("shift amount must be in 0..=63");
-            if (!strcmp(name, "shl")) return k_int(recv.as.i << n);
+            /* `<<` on a NEGATIVE signed operand is undefined behavior per the C
+               standard (C11 6.5.7p4 only defines it for a non-negative left
+               operand) -- unlike Rust's own `<<` on i64, which is a plain,
+               fully-defined bit-pattern shift regardless of sign (matching
+               `interp.rs`'s own `(Value::Int(v), "shl") => ... v << n`).
+               Production-hardening PR-it1081: cast to unsigned first (an
+               unsigned left-shift is always well-defined, discarding overflow
+               bits) then reinterpret back -- produces the IDENTICAL bit
+               pattern gcc/clang already emit for the signed form in practice
+               (confirmed live: no observed value change), but removes a
+               genuine UB landmine a more aggressive optimizer/LTO/a different
+               compiler could exploit, mirroring this same function's own
+               SizedInt shl path (line ~6355), which already masks to
+               non-negative before shifting (`(a & mask) << sh`). */
+            if (!strcmp(name, "shl")) return k_int((int64_t)((uint64_t)recv.as.i << n));
             if (!strcmp(name, "ushr")) return k_int((int64_t)((uint64_t)recv.as.i >> n));
             return k_int(recv.as.i >> n);                               /* shr (arithmetic) */
         }
@@ -12968,6 +12982,28 @@ fun main() uses io {
         let src = "fun main() uses io {\n    let neg = (0i8 - 8i8)\n    \
                    print(\"{(0u8).bnot()}|{(255u8).shl(1)}|{(1u16).shl(15)}|{(12u8).band(10u8)}|{neg.shr(1)}|{neg.bnot()}\")\n}\n";
         assert_eq!(native_main_stdout(src, "sizedbit").trim(), "255|254|32768|8|-4|7");
+    }
+
+    /// Production-hardening PR-it1081: plain (non-`SizedInt`) `Int.shl` on a NEGATIVE
+    /// receiver used to compile to a bare C `recv.as.i << n` -- undefined behavior per the
+    /// C standard (C11 6.5.7p4 only defines `<<` for a non-negative left operand), unlike
+    /// `interp.rs`'s own Rust `v << n` on `i64`, which is a fully-defined bit-pattern shift
+    /// regardless of sign. Confirmed via a standalone UBSan build of the ACTUAL generated
+    /// C (`kupl native --keep-c`) that gcc/clang's OBSERVED result already matched the
+    /// correct interp/VM value on this project's own toolchain (so this was never a live
+    /// wrong-VALUE bug in practice), but UBSan still flagged the shift itself as UB before
+    /// this fix and is clean after -- fixed by casting to `uint64_t` first (an unsigned
+    /// left-shift is always well-defined), mirroring the SizedInt `shl` path's own
+    /// already-established `(a & mask) << sh` non-negative-first pattern a few thousand
+    /// lines above in the same `k_method` function.
+    #[test]
+    fn native_int_shl_on_a_negative_receiver_is_well_defined_not_c_ub() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   print(\"{(0 - 1).shl(1)}|{(0 - 100).shl(5)}|{(-9223372036854775807 - 1).shl(3)}\")\n}\n";
+        assert_eq!(native_main_stdout(src, "intshlneg").trim(), "-2|-3200|0");
     }
 
     /// Native unary `-` matches interp/KVM for EVERY numeric type, not just Int/Float
