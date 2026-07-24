@@ -141,6 +141,28 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
 
     // Names the target references, resolved to item names.
     let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // A REAL, live-confirmed silent-output-corruption bug found+fixed
+    // (production-hardening PR-it1155, a fresh Explore survey finding): this
+    // self-exclusion check used to compare `owner` against `name` -- the RAW
+    // CLI argument as the caller typed it -- but `name` only equals the
+    // target's ACTUAL internal name when `target` was resolved via the
+    // exact-match branch above. When resolved via the demangle FALLBACK
+    // (PR-it780's own fix, e.g. asking for a dependency item by its bare
+    // name `fact` instead of its mangled `dep$fact`), `name` ("fact") never
+    // equals the target's real internal name ("dep$fact"), so `owner !=
+    // name` was ALWAYS true even when `owner` genuinely WAS the target
+    // itself -- a self-referential item (direct recursion, or a recursive
+    // ADT) fabricated a bogus dependency on itself and printed its own
+    // source TWICE. Live-confirmed BEFORE this fix: `kupl context
+    // app/main.kupl fact` (where `dep::fact` calls itself recursively)
+    // printed the identical `fun fact(...)` body once as the target and
+    // again under `--- direct dependencies ---`, while the exact-mangled
+    // form (`kupl context app/main.kupl 'dep$fact'`) correctly omitted it --
+    // isolating the fallback branch as the cause. Fixed by comparing against
+    // `item_name(target)` (the target's OWN real internal name, correct
+    // regardless of which branch resolved it) instead of the raw `name`
+    // argument.
+    let target_name = item_name(target);
     let mut note = |n: &str| {
         // constructor names resolve to their owning type
         let owner = compiled
@@ -149,7 +171,7 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
             .get(n)
             .map(|(ty, _)| ty.as_str())
             .unwrap_or(n);
-        if owner != name && items.iter().any(|(i, _)| *i == owner) {
+        if owner != target_name && items.iter().any(|(i, _)| *i == owner) {
             referenced.insert(owner.to_string());
         }
     };
@@ -3264,6 +3286,96 @@ mod tests {
             .output()
             .expect("kupl context runs");
         assert!(exact.status.success(), "the exact mangled name must still resolve: {:?}", exact);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A REAL, live-confirmed silent-output-corruption bug found+fixed
+    /// (production-hardening PR-it1155, a fresh Explore survey finding, the
+    /// sibling case to the demangle-resolution test above): the self-
+    /// exclusion check inside `emit_context`'s `note` closure used to
+    /// compare against the RAW CLI argument string rather than the target
+    /// item's OWN actual internal name -- correct when resolved via the
+    /// EXACT-match branch (where they're always equal), but wrong whenever
+    /// resolved via the demangle FALLBACK, since a dependency item's bare
+    /// name (e.g. `fact`) never equals its real mangled name (`dep$fact`).
+    /// A self-referential item reached this way -- direct recursion, or a
+    /// recursive ADT -- fabricated a bogus dependency on ITSELF and printed
+    /// its own source a second time under `--- direct dependencies ---`.
+    /// Live-confirmed BEFORE this fix, for BOTH a self-recursive `fun` and a
+    /// self-recursive `type`; the exact-mangled-name form was unaffected
+    /// (proving the fallback branch specifically was the cause).
+    #[test]
+    fn emit_context_does_not_fabricate_a_self_dependency_for_a_recursive_item_resolved_via_demangling() {
+        let base = std::env::temp_dir().join(format!("kupl-ctx-self-recursive-demangle-test-{}", std::process::id()));
+        let dep = base.join("dep");
+        let app = base.join("app");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(
+            dep.join("main.kupl"),
+            "pub fun fact(n: Int) -> Int { if n <= 1 { 1 } else { n * fact(n - 1) } }\n\
+             pub type Tree = Leaf | Node(l: Tree, v: Int, r: Tree)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("main.kupl"),
+            "use dep\n\nfun main() uses io {\n    print(\"{dep.fact(5)}\")\n}\n",
+        )
+        .unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // no debug binary built yet -- nothing to test
+        }
+        let main = app.join("main.kupl");
+
+        let fun_out = std::process::Command::new(&bin)
+            .args(["context", main.to_str().unwrap(), "fact"])
+            .output()
+            .expect("kupl context runs");
+        assert!(fun_out.status.success(), "{fun_out:?}");
+        let fun_stdout = String::from_utf8_lossy(&fun_out.stdout);
+        assert_eq!(
+            fun_stdout.matches("fun fact(n: Int) -> Int").count(),
+            1,
+            "a self-recursive fun's own body must be printed exactly ONCE, not duplicated as a bogus \
+             self-dependency: {fun_stdout:?}"
+        );
+        assert!(
+            !fun_stdout.contains("--- direct dependencies ---"),
+            "a fun with no REAL dependencies (only itself) must not fabricate a dependencies section: {fun_stdout:?}"
+        );
+
+        let type_out = std::process::Command::new(&bin)
+            .args(["context", main.to_str().unwrap(), "Tree"])
+            .output()
+            .expect("kupl context runs");
+        assert!(type_out.status.success(), "{type_out:?}");
+        let type_stdout = String::from_utf8_lossy(&type_out.stdout);
+        assert_eq!(
+            type_stdout.matches("type Tree =").count(),
+            1,
+            "a self-recursive type's own body must be printed exactly ONCE, not duplicated as a bogus \
+             self-dependency: {type_stdout:?}"
+        );
+        assert!(!type_stdout.contains("--- direct dependencies ---"), "{type_stdout:?}");
+
+        // control: the exact mangled form was never affected by this bug --
+        // must keep behaving identically (still no bogus self-dependency).
+        let exact_out = std::process::Command::new(&bin)
+            .args(["context", main.to_str().unwrap(), "dep$fact"])
+            .output()
+            .expect("kupl context runs");
+        assert!(exact_out.status.success(), "{exact_out:?}");
+        let exact_stdout = String::from_utf8_lossy(&exact_out.stdout);
+        assert_eq!(exact_stdout.matches("fun fact(n: Int) -> Int").count(), 1, "{exact_stdout:?}");
 
         let _ = std::fs::remove_dir_all(&base);
     }
