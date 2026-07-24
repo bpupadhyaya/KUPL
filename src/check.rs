@@ -1566,7 +1566,7 @@ impl Checker {
             loop_depth: 0,
         };
         if let Some(c) = component {
-            self.bind_component_env(c, &mut ctx);
+            self.bind_component_env(c, &mut ctx, None);
         }
         ctx.scopes.push();
         for p in &f.params {
@@ -1691,7 +1691,45 @@ impl Checker {
     }
 
     /// Put props (immutable) and state (mutable) in scope.
-    fn bind_component_env(&mut self, c: &ComponentDecl, ctx: &mut Ctx) {
+    ///
+    /// `child_limit`: when checking a CHILD's own constructor arguments, this
+    /// is `Some(i)` (that child's own index in `c.children`) so only EARLIER
+    /// siblings are visible -- `None` (every other call site: a component's
+    /// own `fun`/`expose fun` bodies and `on` handler bodies, which only ever
+    /// run AFTER the whole instance, including every child, already exists)
+    /// puts every child in scope unconditionally, as before.
+    ///
+    /// A REAL, live-confirmed silent cross-engine divergence found+fixed
+    /// (production-hardening PR-it1134, an Explore-agent survey finding):
+    /// unlike `props`/`state` immediately above (whose types this SAME
+    /// function inserts one at a time, in `c.props`/`c.state`'s own
+    /// declaration order, so a later prop/state entry naturally cannot see an
+    /// even-later one -- matching interp.rs::instantiate's own sequential
+    /// evaluation exactly), the children arm below used to insert EVERY
+    /// child from `c.children` unconditionally, regardless of which child's
+    /// own constructor arguments were currently being checked. So `let a =
+    /// Consumer(w: b); let b = Worker()` (a child referencing a LATER
+    /// sibling by name) type-checked cleanly, even though
+    /// `interp.rs::instantiate` constructs children ONE AT A TIME, in
+    /// declaration order, `env.define`-ing each one only after its own
+    /// `instantiate` call returns (interp.rs:293-313) -- `b` genuinely does
+    /// not exist yet at the moment `a`'s own constructor arguments are
+    /// evaluated. Live-confirmed BEFORE this fix, across all three engines:
+    /// interp correctly PANICS `unknown name \`b\`` (its plain `Env` lookup
+    /// has nothing else to fall back to), but `vm.rs`/`kupl native` -- whose
+    /// compiled bytecode resolves every same-named local to a fixed
+    /// component-instance SLOT via `Op::StateGet` regardless of whether that
+    /// slot has been written yet (both `vm.rs::instantiate` and
+    /// `cgen.rs::k_instantiate` zero-initialize every slot to `Unit`/
+    /// `k_unit()` up front) -- SILENTLY construct `a` with its `w` prop
+    /// holding `Unit` instead of the intended `Worker` instance, no
+    /// diagnostic at all: a program that only ever calls `a`'s OTHER
+    /// methods (never touching the corrupted `w` prop) runs to completion
+    /// and exits 0 on `kupl run --vm`/`kupl native`, while the reference
+    /// engine (`kupl run`) correctly refuses to even start it. Fixed by
+    /// threading the current child's own index through as `child_limit`,
+    /// mirroring props/state's own sequential-visibility pattern exactly.
+    fn bind_component_env(&mut self, c: &ComponentDecl, ctx: &mut Ctx, child_limit: Option<usize>) {
         for prop in &c.props {
             let ty = self.resolve_ty(&prop.ty);
             ctx.scopes.insert(&prop.name, ty, false);
@@ -1707,8 +1745,12 @@ impl Checker {
             };
             ctx.scopes.insert(&s.name, ty, true);
         }
-        // children in scope as component refs
-        for child in &c.children {
+        // children in scope as component refs -- only those declared BEFORE
+        // `child_limit` (see this function's own doc comment above).
+        for (i, child) in c.children.iter().enumerate() {
+            if child_limit.is_some_and(|limit| i >= limit) {
+                continue;
+            }
             if self.checked.components.contains_key(&child.component) {
                 ctx.scopes.insert(&child.name, Ty::Component(child.component.clone()), false);
             }
@@ -1776,7 +1818,7 @@ impl Checker {
 
         // children & wires
         let mut child_types: HashMap<String, String> = HashMap::new();
-        for child in &c.children {
+        for (child_idx, child) in c.children.iter().enumerate() {
             if child_types.contains_key(&child.name) {
                 self.err("K0207", format!("child `{}` declared twice", child.name), child.span);
             }
@@ -1799,7 +1841,7 @@ impl Checker {
                 in_handler: false,
                 loop_depth: 0,
             };
-            self.bind_component_env(c, &mut cctx);
+            self.bind_component_env(c, &mut cctx, Some(child_idx));
             self.check_ctor_args(&child.component, &sig, &child.args, child.span, &mut cctx);
         }
         // A REAL, live-confirmed silent-behavior bug (production-hardening
@@ -1891,7 +1933,7 @@ impl Checker {
                 in_handler: true,
                 loop_depth: 0,
             };
-            self.bind_component_env(c, &mut ctx);
+            self.bind_component_env(c, &mut ctx, None);
             ctx.scopes.push();
             match &h.trigger {
                 Trigger::Start | Trigger::Stop => {
@@ -6444,6 +6486,52 @@ mod generic_tests {
         );
         // A correct child-component reference still type-checks cleanly.
         assert!(errors("component Widget {\n    intent \"w\"\n}\ncomponent Main {\n    intent \"m\"\n    let w = Widget()\n}\n").is_empty());
+    }
+
+    /// A REAL, live-confirmed silent cross-engine divergence found+fixed
+    /// (production-hardening PR-it1134, an Explore-agent survey finding):
+    /// unlike props/state (whose ordering was already correctly enforced),
+    /// a child's own constructor arguments could reference a LATER-declared
+    /// sibling child, since `bind_component_env` used to insert every child
+    /// into scope unconditionally, regardless of which child was currently
+    /// being checked. `interp.rs::instantiate` constructs children one at a
+    /// time, in declaration order, so a later sibling genuinely doesn't
+    /// exist yet -- `kupl run` correctly panicked `unknown name`, but
+    /// `kupl run --vm`/`kupl native` (whose compiled bytecode resolves
+    /// every same-named local to a fixed, zero-initialized slot regardless
+    /// of write-order) silently resolved the forward reference to `Unit`
+    /// instead, with NO diagnostic at all -- a program that never actually
+    /// dispatches through the corrupted field ran to completion and exited
+    /// cleanly on those two engines while the reference engine refused to
+    /// even start it.
+    #[test]
+    fn a_child_referencing_a_later_declared_sibling_child_is_a_clean_check_time_error() {
+        let src = "component Worker {\n    intent \"w\"\n    expose fun ping() -> Int { 42 }\n}\n\
+                    component Consumer {\n    intent \"c\"\n    prop w: Worker\n    expose fun go() -> Int { w.ping() }\n}\n\
+                    app Main {\n    intent \"m\"\n    let a = Consumer(w: b)\n    let b = Worker()\n    on start { print(a.go()) }\n}\n";
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|d| d.code == "K0240" && d.message.contains("unknown name `b`")),
+            "a child referencing a later-declared sibling by name must be a clean K0240, not silently accepted: {errs:?}"
+        );
+
+        // sanity: referencing an EARLIER-declared sibling child remains legal
+        // (this is the ordinary, idiomatic dependency-injection pattern, and
+        // must be completely unaffected by this fix).
+        let ok_earlier = "component Worker {\n    intent \"w\"\n    expose fun ping() -> Int { 42 }\n}\n\
+                           component Consumer {\n    intent \"c\"\n    prop w: Worker\n    expose fun go() -> Int { w.ping() }\n}\n\
+                           app Main {\n    intent \"m\"\n    let b = Worker()\n    let a = Consumer(w: b)\n    on start { print(a.go()) }\n}\n";
+        assert!(errors(ok_earlier).is_empty(), "referencing an earlier-declared sibling child must remain legal");
+
+        // sanity: an exposed method's OWN body (which only ever runs after
+        // every child in the instance already exists) must still see every
+        // child regardless of textual declaration order -- this fix is
+        // specifically about a CHILD'S OWN construction arguments, not
+        // ordinary method bodies.
+        let method_sees_all = "component Worker {\n    intent \"w\"\n    expose fun ping() -> Int { 99 }\n}\n\
+                                component Holder {\n    intent \"h\"\n    expose fun useLater() -> Int { later.ping() }\n    let later = Worker()\n}\n\
+                                app Main {\n    intent \"m\"\n    let h = Holder()\n    on start { print(h.useLater()) }\n}\n";
+        assert!(errors(method_sees_all).is_empty(), "a method body must see every child regardless of textual order: {:?}", errors(method_sees_all));
     }
 
     #[test]
