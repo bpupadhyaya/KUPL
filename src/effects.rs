@@ -326,7 +326,8 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                 );
             });
         }
-        let resolved_methods = local_component_bindings(&info.decl.body, &component_names);
+        let resolved_methods =
+            local_component_bindings(&info.decl.body, &info.decl.params, &component_names);
         walk_block(&info.decl.body, &mut |expr| {
             collect_expr(
                 expr,
@@ -647,7 +648,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                 });
             }
         }
-        let resolved_methods = local_component_bindings(&decl.body, &component_names);
+        let resolved_methods = local_component_bindings(&decl.body, &decl.params, &component_names);
         walk_block(&decl.body, &mut |expr| {
             collect_expr(
                 expr,
@@ -906,9 +907,41 @@ fn pattern_bound_names(p: &Pattern, names: &mut Vec<String>) {
 /// name. `collect_expr` itself double-checks any resolution this pass
 /// produces against `funs` before trusting it (see its own call site) --
 /// a second, independent safety net.
-fn local_component_bindings(block: &Block, component_names: &HashSet<&str>) -> HashMap<usize, String> {
+///
+/// UPDATE (production-hardening PR-it1130): also seeds the OUTERMOST scope
+/// with `params` whose own DECLARED type is a plain, literal component name
+/// (`fun helper(b: Bot) { b.ask() }`) -- exactly as syntactically provable
+/// as the `let`-bound case (no cross-function inference needed, the type is
+/// right there in the signature), matching PR-it1128's own design's
+/// explicitly-flagged "natural future extension". A parameter is ALWAYS
+/// immutable in KUPL (`check.rs` inserts every parameter into scope with
+/// `mutable: false`, confirmed via direct source read before implementing
+/// this) -- so a well-typed program can never reassign one via
+/// `Stmt::Assign` at all, but this pass's own reassignment-invalidation
+/// logic above still applies unconditionally regardless (defensive: a
+/// syntactically-valid-but-not-yet-type-checked program could still
+/// contain such an assignment, and the SAME shadow-marker machinery
+/// already handles it correctly with no special-casing needed). A
+/// parameter typed as a GENERIC wrapping a component (`Option[Bot]`,
+/// `List[Bot]`) or a type PARAMETER (`fun f[T](x: T)`) is correctly, safely
+/// NOT tracked -- `TyExprKind::Name` only matches a bare, literal type
+/// name, never a `Generic`, and a type parameter's own name essentially
+/// never collides with a real component name.
+fn local_component_bindings(
+    block: &Block,
+    params: &[Param],
+    component_names: &HashSet<&str>,
+) -> HashMap<usize, String> {
     let mut resolved = HashMap::new();
-    let mut scopes: Vec<LocalScope> = vec![LocalScope::new()];
+    let mut outer = LocalScope::new();
+    for p in params {
+        if let TyExprKind::Name(tn) = &p.ty.kind {
+            if component_names.contains(tn.as_str()) {
+                outer.insert(p.name.clone(), Some(tn.clone()));
+            }
+        }
+    }
+    let mut scopes: Vec<LocalScope> = vec![outer];
     scan_block_for_bindings(block, component_names, &mut scopes, &mut resolved);
     resolved
 }
@@ -1629,6 +1662,64 @@ mod tests {
         assert!(
             !d.iter().any(|d| d.code == "K0301"),
             "documents the residual, deliberately-conservative gap for reassigned locals: {d:?}"
+        );
+    }
+
+    /// A component-typed function PARAMETER (`fun helper(b: Bot) { b.ask() }`)
+    /// is resolvable exactly as precisely as a direct `let`-bound instance --
+    /// production-hardening PR-it1130, extending PR-it1129's own fix per
+    /// PR-it1128's own design's explicitly-flagged "natural future
+    /// extension" (a parameter's own DECLARED type is as syntactically
+    /// provable as a `let`'s own direct `ComponentName(...)` initializer, no
+    /// cross-function inference needed).
+    #[test]
+    fn a_component_typed_parameter_calling_an_effectful_method_is_now_caught() {
+        let d = diags_for(
+            "component Bot {\n    intent \"io\"\n    expose fun ask() uses io {\n        print(\"x\")\n    }\n}\n\
+             pub fun helper(b: Bot) {\n    b.ask()\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K0301"), "PR-it1130's own fix must catch this case: {d:?}");
+    }
+
+    /// A LOCAL `let` binding must correctly SHADOW a component-typed
+    /// parameter of the SAME name, resolving to the INNER, shadowing
+    /// component instead of the outer parameter -- discriminating test
+    /// (same technique as PR-it1129's own `Bot`/`Quiet` shadow test): if
+    /// the parameter's OWN tracked type wrongly survived the shadow, this
+    /// would spuriously require `uses io` even though the REAL `b.ask()`
+    /// call resolves to the local `Quiet` (pure).
+    #[test]
+    fn a_local_let_shadows_a_component_typed_parameter_of_the_same_name() {
+        let d = diags_for(
+            "component Bot {\n    intent \"io\"\n    expose fun ask() uses io {\n        print(\"x\")\n    }\n}\n\
+             component Quiet {\n    intent \"pure\"\n    expose fun ask() -> Int {\n        42\n    }\n}\n\
+             pub fun helper(b: Bot) -> Int {\n    let b = Quiet()\n    b.ask()\n}\n",
+        );
+        assert!(
+            d.is_empty(),
+            "must resolve to the INNER `Quiet` local, not the shadowed `Bot` parameter: {d:?}"
+        );
+    }
+
+    /// A parameter typed as a GENERIC wrapping a component (`Option[Bot]`)
+    /// -- as opposed to a bare, literal component name -- is correctly,
+    /// safely NOT tracked (`TyExprKind::Name` never matches a `Generic`
+    /// variant); the wrapped instance, once unwrapped via a match-arm
+    /// pattern, is ALSO not tracked (pattern-bound names are only ever
+    /// shadow-markers, never resolved) -- both fall back to the existing,
+    /// pre-fix conservative "unresolved" handling, a residual gap
+    /// documented at `docs/PRODUCTION.md`'s own "Known gap" callout, not a
+    /// bug. Exists mainly as a no-crash smoke test for `TyExprKind::Generic`
+    /// (a param type shape `local_component_bindings` must never panic on).
+    #[test]
+    fn a_generic_wrapped_component_parameter_is_not_tracked_but_does_not_crash() {
+        let d = diags_for(
+            "component Bot {\n    intent \"io\"\n    expose fun ask() uses io {\n        print(\"x\")\n    }\n}\n\
+             pub fun helper(b: Option[Bot]) {\n    match b {\n        Some(inst) => inst.ask()\n        None => ()\n    }\n}\n",
+        );
+        assert!(
+            !d.iter().any(|d| d.code == "K0301"),
+            "documents the residual, deliberately-conservative gap for a generic-wrapped param: {d:?}"
         );
     }
 
