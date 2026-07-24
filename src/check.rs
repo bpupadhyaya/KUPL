@@ -355,6 +355,38 @@ fn common_method_alias(name: &str) -> Option<&'static str> {
 /// erring toward over-matching is safe (worst case: a rare, genuinely-safe
 /// shadowed usage gets rejected too, not a correctness risk) and far
 /// simpler than tracking scopes correctly through every expression form.
+/// True if `e` reads a name in `names` as a genuine FREE reference -- i.e.
+/// not a name a nested binding (a lambda parameter, a match-arm pattern, a
+/// `for`/`forall` loop variable, or an earlier `let` in the same block)
+/// re-binds and thereby shadows first.
+///
+/// A REAL false-positive bug found+fixed (production-hardening PR-it1137,
+/// an Explore-agent survey finding, independently re-verified live before
+/// implementing): this function (and its siblings `block_references_name`/
+/// `stmt_references_name`) used to be a pure TEXTUAL "does this identifier
+/// name appear anywhere in the subtree" scanner, with no notion of local
+/// shadowing at all -- unlike `effects.rs`'s own analogous `LocalScope`
+/// walk (PR-it1129), which explicitly tracks shadow markers while
+/// traversing. `check_default_params_dont_reference_sibling_params`'s own
+/// K0280 check (below) uses this scanner to reject a parameter default
+/// that references ANOTHER parameter of the same function BY NAME, since a
+/// default is spliced into the CALLER's scope, not the callee's -- but a
+/// default whose only occurrence of a sibling's name is a FRESH, shadowing
+/// binding (e.g. a lambda's own parameter) is completely safe: the inner
+/// name is bound anew every time the lambda runs, never looked up from the
+/// splice site at all. Live-confirmed BEFORE this fix: `fun f(a: Int, b:
+/// fn(Int) -> Int = fn a { a + 1 }) -> Int { b(0) }` -- `kupl check`
+/// rejected this with a spurious K0280 pointing at the lambda default,
+/// even though the IDENTICAL program with the lambda's own parameter
+/// renamed to anything else (`fn x { x + 1 }`) compiled and ran correctly
+/// (`f(5)` prints `1`), proving the rejected version was equally safe and
+/// the ONLY difference was a coincidental name collision the checker
+/// couldn't see past. Fixed by narrowing `names` at every binding site
+/// this function's own AST walk passes through, mirroring the general
+/// shape (though not the exact machinery) of `effects.rs`'s own
+/// shadow-tracking, restricted to what K0280's callers can ever construct
+/// (a parameter default expression -- never itself a component, so no
+/// component-instance-method resolution is needed here).
 fn expr_references_name(e: &Expr, names: &HashSet<&str>) -> bool {
     match &e.kind {
         ExprKind::Ident(n) => names.contains(n.as_str()),
@@ -381,11 +413,17 @@ fn expr_references_name(e: &Expr, names: &HashSet<&str>) -> bool {
         ExprKind::Match { scrutinee, arms } => {
             expr_references_name(scrutinee, names)
                 || arms.iter().any(|arm| {
-                    arm.guard.as_ref().is_some_and(|g| expr_references_name(g, names))
-                        || expr_references_name(&arm.body, names)
+                    let inner: HashSet<&str> =
+                        names.iter().copied().filter(|n| !pattern_rebinds_name(&arm.pattern, n)).collect();
+                    arm.guard.as_ref().is_some_and(|g| expr_references_name(g, &inner))
+                        || expr_references_name(&arm.body, &inner)
                 })
         }
-        ExprKind::Lambda { body, .. } => block_references_name(body, names),
+        ExprKind::Lambda { params, body } => {
+            let inner: HashSet<&str> =
+                names.iter().copied().filter(|n| !params.iter().any(|p| p.name.as_str() == *n)).collect();
+            block_references_name(body, &inner)
+        }
         ExprKind::Range { lo, hi, .. } => expr_references_name(lo, names) || expr_references_name(hi, names),
         ExprKind::With { recv, updates } => {
             expr_references_name(recv, names) || updates.iter().any(|(_, v)| expr_references_name(v, names))
@@ -396,7 +434,19 @@ fn expr_references_name(e: &Expr, names: &HashSet<&str>) -> bool {
 }
 
 fn block_references_name(b: &Block, names: &HashSet<&str>) -> bool {
-    b.stmts.iter().any(|s| stmt_references_name(s, names))
+    let mut current: HashSet<&str> = names.clone();
+    for s in &b.stmts {
+        if stmt_references_name(s, &current) {
+            return true;
+        }
+        // A `let` shadows this name for every LATER statement in the same
+        // block (its own init expression, checked just above, still runs
+        // in the OUTER scope, so it isn't shadowed for itself).
+        if let Stmt::Let { name, .. } = s {
+            current.remove(name.as_str());
+        }
+    }
+    false
 }
 
 fn stmt_references_name(s: &Stmt, names: &HashSet<&str>) -> bool {
@@ -406,10 +456,17 @@ fn stmt_references_name(s: &Stmt, names: &HashSet<&str>) -> bool {
         Stmt::Expr(e) => expr_references_name(e, names),
         Stmt::Return(Some(e), _) => expr_references_name(e, names),
         Stmt::While { cond, body, .. } => expr_references_name(cond, names) || block_references_name(body, names),
-        Stmt::For { iter, body, .. } => expr_references_name(iter, names) || block_references_name(body, names),
+        Stmt::For { var, iter, body, .. } => {
+            // `iter` still runs in the OUTER scope, before `var` exists.
+            let inner: HashSet<&str> = names.iter().copied().filter(|n| *n != var.as_str()).collect();
+            expr_references_name(iter, names) || block_references_name(body, &inner)
+        }
         Stmt::Emit { arg: Some(e), .. } => expr_references_name(e, names),
         Stmt::Expect(e, _) => expr_references_name(e, names),
-        Stmt::Forall { body, .. } => block_references_name(body, names),
+        Stmt::Forall { vars, body, .. } => {
+            let inner: HashSet<&str> = names.iter().copied().filter(|n| !vars.iter().any(|(vn, _)| vn == n)).collect();
+            block_references_name(body, &inner)
+        }
         _ => false,
     }
 }
@@ -6180,6 +6237,77 @@ mod generic_tests {
             )
             .is_ok(),
             "a default referencing only globals/constants must compile cleanly"
+        );
+    }
+
+    /// A REAL false-positive bug found+fixed (production-hardening PR-it1137,
+    /// an Explore-agent survey finding): K0280's own name-reference scanner
+    /// (`expr_references_name`/`block_references_name`/`stmt_references_name`)
+    /// used to be a pure textual scan with no notion of local shadowing --
+    /// see those functions' own doc comment for the full writeup and the
+    /// live-confirmed repro. This locks in the fix across every binding
+    /// shape the scanner walks through.
+    #[test]
+    fn a_default_referencing_a_sibling_name_shadowed_by_a_nested_binding_is_accepted() {
+        // a lambda parameter shadowing the sibling name is safe.
+        assert!(
+            errors("fun f(a: Int, b: fn(Int) -> Int = fn a { a + 1 }) -> Int { b(0) }\nfun main() {}\n").is_empty(),
+            "a lambda's own parameter shadows the outer sibling name"
+        );
+        // ...but a lambda that DOESN'T shadow (different param name) and still
+        // references the sibling is correctly rejected -- the fix narrows the
+        // check, it doesn't disable it.
+        assert!(
+            errors("fun f(a: Int, b: fn(Int) -> Int = fn x { x + a }) -> Int { b(0) }\nfun main() {}\n")
+                .iter()
+                .any(|d| d.code == "K0280"),
+            "an unshadowed reference inside a lambda body must still be rejected"
+        );
+        // a match-arm bind pattern shadowing the sibling name is safe...
+        assert!(
+            errors(
+                "fun f(a: Int, b: Int = match Some(9) {\n    Some(a) => a\n    None => 0\n}) -> Int { b }\nfun main() {}\n"
+            )
+            .is_empty(),
+            "a match-arm pattern binding shadows the outer sibling name"
+        );
+        // ...but the match SCRUTINEE itself runs before any arm's pattern
+        // binds anything, so a scrutinee that references the sibling by name
+        // is still correctly rejected.
+        assert!(
+            errors("fun f(a: Int, b: Int = match a {\n    x => x + 1\n}) -> Int { b }\nfun main() {}\n")
+                .iter()
+                .any(|d| d.code == "K0280"),
+            "the match scrutinee itself is not yet inside any arm's shadow"
+        );
+        // a `for` loop variable shadowing the sibling name is safe -- but its
+        // OWN `iter` expression still runs in the outer (unshadowed) scope.
+        assert!(
+            errors(
+                "fun f(a: Int, b: Int = {\n    var s = 0\n    for a in 0..3 {\n        s = s + a\n    }\n    s\n}) -> Int { b }\nfun main() {}\n"
+            )
+            .is_empty(),
+            "a for-loop variable shadows the outer sibling name inside its own body"
+        );
+        // a `let` shadows the sibling name for LATER statements in the same
+        // block, but NOT for its own init expression.
+        assert!(
+            errors("fun f(a: Int, b: Int = {\n    let a = 99\n    a + 1\n}) -> Int { b }\nfun main() {}\n").is_empty(),
+            "a let binding shadows the outer sibling name for later statements"
+        );
+        assert!(
+            errors("fun f(a: Int, b: Int = {\n    let a = a + 1\n    a\n}) -> Int { b }\nfun main() {}\n")
+                .iter()
+                .any(|d| d.code == "K0280"),
+            "a let's own init expression is not yet shadowed by its own binding"
+        );
+        // partial shadow: two sibling names, only one shadowed -- the OTHER
+        // must still be caught.
+        assert!(
+            errors("fun f(a: Int, c: Int, b: fn(Int) -> Int = fn a { a + c }) -> Int { b(0) }\nfun main() {}\n")
+                .iter()
+                .any(|d| d.code == "K0280"),
+            "shadowing one sibling name must not mask a genuine reference to a DIFFERENT one"
         );
     }
 
