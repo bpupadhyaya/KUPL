@@ -1560,8 +1560,29 @@ fn run_example(
     let Value::Component(id) = v else {
         return Ok(Some("could not instantiate component".into()));
     };
+    // snapshot right where `on start` fires -- `stop_all` below must deliver
+    // `on stop` to this SAME range, mirroring `run_program`'s own PR-it1144
+    // pattern exactly (see `Interp::stop_all`'s own doc comment for the full
+    // writeup of why this must not just re-read `interp.instances.len()`
+    // later).
+    let started = interp.instances.len();
     interp.start_all()?;
 
+    // A REAL, live-confirmed asymmetry found+fixed (production-hardening
+    // PR-it1145, a direct follow-up to PR-it1144's own on-stop fix, which
+    // deliberately scoped this function OUT to keep that iteration tightly
+    // bounded): an example's `expect` failure used to `return` immediately
+    // from the MIDDLE of this function, skipping `on stop` entirely -- but
+    // an unmet `expect` is a normal, non-crashing test outcome (the program
+    // ran to completion; it just failed an ASSERTION about its own output),
+    // not a panic, so unlike a genuine panic (which correctly still skips
+    // `on stop`, propagated via `?` below), it should get the SAME graceful
+    // shutdown a passing example already does. Restructured to record the
+    // failure and `break` out of the step loop instead of returning early,
+    // so `stop_all` below always runs for both outcomes -- only a genuine
+    // `Flow::Panic`/`?`-propagated error (which never reaches this point at
+    // all) still skips it, exactly matching `run_program`'s own semantics.
+    let mut failure: Option<String> = None;
     for step in &example.steps {
         match step {
             ExampleStep::Send { port, arg, .. } => {
@@ -1608,7 +1629,8 @@ fn run_example(
                     // uses (interp.rs), so this now matches every OTHER
                     // "was not satisfied" site in the codebase.
                     let text = crate::fmt::expr_str(expr, 0);
-                    return Ok(Some(format!("`{text}` was not satisfied")));
+                    failure = Some(format!("`{text}` was not satisfied"));
+                    break;
                 }
             }
             ExampleStep::Advance { ms, .. } => {
@@ -1616,7 +1638,8 @@ fn run_example(
             }
         }
     }
-    Ok(None)
+    interp.stop_all(started)?;
+    Ok(failure)
 }
 
 #[cfg(test)]
@@ -3713,4 +3736,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, live-confirmed asymmetry found+fixed (production-hardening
+    /// PR-it1145, a direct follow-up to PR-it1144's own `on stop` fix, which
+    /// deliberately scoped `run_example` OUT to keep that iteration tightly
+    /// bounded): `on stop` now fires for BOTH a passing and a FAILING
+    /// example (an unmet `expect` is a normal test outcome, not a panic --
+    /// see `run_example`'s own doc comment), but still correctly does NOT
+    /// fire when an example's step panics outright.
+    #[test]
+    fn kupl_test_delivers_on_stop_for_passing_and_failing_examples_but_not_after_a_panic() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-it1145-example-on-stop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_test = |file: &std::path::Path| -> std::process::Output {
+            std::process::Command::new(&bin).args(["test", file.to_str().unwrap()]).output().unwrap()
+        };
+
+        // one passing example, one failing (unmet `expect`) example -- BOTH
+        // must print their own start/stop pair.
+        let both = dir.join("pass_and_fail.kupl");
+        std::fs::write(
+            &both,
+            "component Counter {\n    out result: Int\n    state n: Int = 0\n    \
+             on start { print(\"counter started\") }\n    on stop { print(\"counter stopped\") }\n    \
+             in ping: Event\n    on ping {\n        n = n + 1\n        emit result(n)\n    }\n\n    \
+             example {\n        send ping\n        expect result == 1\n    }\n\n    \
+             example {\n        send ping\n        expect result == 99\n    }\n}\n",
+        )
+        .unwrap();
+        let out = run_test(&both);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.matches("counter started").count(),
+            2,
+            "both the passing AND the failing example must deliver on-start: {stdout:?}"
+        );
+        assert_eq!(
+            stdout.matches("counter stopped").count(),
+            2,
+            "both the passing AND the failing example must deliver on-stop, including the FAILING one: {stdout:?}"
+        );
+        assert!(stdout.contains("1 passed, 1 failed"), "{stdout:?}");
+
+        // a panicking example must NOT deliver on-stop.
+        let panics = dir.join("panics.kupl");
+        std::fs::write(
+            &panics,
+            "component Boom {\n    in ping: Event\n    on ping { panic(\"boom\") }\n    \
+             on stop { print(\"must never print\") }\n\n    example {\n        send ping\n        expect true\n    }\n}\n",
+        )
+        .unwrap();
+        let out2 = run_test(&panics);
+        let stdout2 = String::from_utf8_lossy(&out2.stdout);
+        assert!(!stdout2.contains("must never print"), "{stdout2:?}");
+        assert!(stdout2.contains("0 passed, 1 failed"), "{stdout2:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
