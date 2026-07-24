@@ -254,6 +254,9 @@ fn fmt_contract(out: &mut String, ct: &ContractDecl) {
                     out.push_str(", ");
                 }
                 out.push_str(&format!("{}: {}", p.name, ty_str(&p.ty)));
+                if let Some(d) = &p.default {
+                    out.push_str(&format!(" = {}", expr_str(d, 0)));
+                }
             }
             out.push(')');
             if !s.effects.is_empty() {
@@ -1022,6 +1025,22 @@ mod tests {
     fn fmt_preserves_default_params() {
         // regression: fmt used to drop `= "hi"` default values.
         roundtrip("fun greet(name: Str, greeting: Str = \"hi\") -> Str {\n    greeting\n}\n");
+    }
+
+    #[test]
+    fn fmt_preserves_default_params_in_contract_sig() {
+        // regression (production-hardening PR-it1141): `fmt_contract`'s hand-rolled
+        // signature loop was a separate implementation from `fmt_fun`'s and never
+        // printed `p.default`, so a `= EXPR` on a contract `expose fun` signature
+        // silently vanished -- `roundtrip()` alone can't catch this (the data is
+        // already gone by the first format pass, so f1==f2 trivially), so assert
+        // the literal default text actually survives formatting.
+        let src = "contract Store {\n intent \"keyed storage\"\n expose fun get(k: Str, fallback: Str = \"missing\") -> Str\n law \"l\" { expect 1 == 1 }\n}\n";
+        let (p1, d1) = parser::parse(src);
+        assert!(d1.is_empty(), "input diags: {d1:?}");
+        let f1 = super::format_program(&p1);
+        assert!(f1.contains("= \"missing\""), "default value was dropped:\n{f1}");
+        roundtrip(src);
     }
 
     #[test]
