@@ -268,6 +268,32 @@ fn run_cli() -> ExitCode {
                     "note: `kupl fmt` does not yet preserve comments — they are dropped from the formatted output"
                 );
             }
+            // PRODUCTION-HARDENING (PR-it1142): the `run::compile`-gated
+            // "internal formatter bug" refusal below (PR-it837/889) never
+            // distinguished "formatting introduced NEW invalidity" (a genuine
+            // formatter bug, worth refusing and blaming the formatter) from
+            // "the SOURCE was already checker-invalid before formatting even
+            // ran" (an ordinary, extremely common state -- e.g. mid-edit code
+            // during format-on-save -- NOT a formatter bug). Live-confirmed
+            // before this fix: `kupl fmt` on ANY file with a pre-existing
+            // checker error (even a trivial, unrelated K0200 type mismatch)
+            // unconditionally refused with "please report this as a KUPL
+            // bug", making the plain-print path entirely unusable on
+            // work-in-progress code. Fixed by recompiling the ORIGINAL `src`
+            // too and comparing the resulting diagnostic CODE sets (not full
+            // messages/spans, which shift with reformatting): if every code
+            // the formatted output fails on was ALREADY present before
+            // formatting, nothing NEW was introduced, so the formatter isn't
+            // at fault. `--write` still refuses either way (a mutating,
+            // persistent action -- an already-invalid file staying invalid
+            // after a pure reformat isn't dangerous, but this keeps its
+            // existing conservative guarantee unchanged and only corrects
+            // the message); the plain-print path, which is non-destructive,
+            // now succeeds when nothing new was introduced.
+            let src_error_codes: std::collections::HashSet<&'static str> = match kupl::run::compile(src) {
+                Ok(_) => std::collections::HashSet::new(),
+                Err(errs) => errs.iter().map(|d| d.code).collect(),
+            };
             let write = args.iter().any(|a| a == "--write");
             let check = args.iter().any(|a| a == "--check");
             // PRODUCTION-HARDENING (PR-it774): `kupl fmt --check` was entirely
@@ -331,10 +357,16 @@ fn run_cli() -> ExitCode {
                 // programs with the same AST render identically") implies
                 // round-tripping, which this enforces defensively rather than
                 // trusting silently.
-                if let Err(_compile_errors) = kupl::run::compile(&formatted) {
-                    eprintln!(
-                        "error: internal formatter bug producing invalid output for {file} -- refusing to overwrite the file (original left untouched; please report this as a KUPL bug)"
-                    );
+                if let Err(compile_errors) = kupl::run::compile(&formatted) {
+                    if compile_errors.iter().any(|d| !src_error_codes.contains(d.code)) {
+                        eprintln!(
+                            "error: internal formatter bug producing invalid output for {file} -- refusing to overwrite the file (original left untouched; please report this as a KUPL bug)"
+                        );
+                    } else {
+                        eprintln!(
+                            "error: {file} already has pre-existing check error(s) before formatting -- refusing to overwrite until they are fixed (run `kupl check {file}` for details)"
+                        );
+                    }
                     return 1;
                 }
                 // Atomic write (production-hardening PR-it1103): see
@@ -370,11 +402,20 @@ fn run_cli() -> ExitCode {
                 // recompile the freshly-formatted text through the full
                 // pipeline and refuse to print it if it doesn't come back
                 // clean.
-                if let Err(_compile_errors) = kupl::run::compile(&formatted) {
+                if let Err(compile_errors) = kupl::run::compile(&formatted) {
+                    if compile_errors.iter().any(|d| !src_error_codes.contains(d.code)) {
+                        eprintln!(
+                            "error: internal formatter bug producing invalid output for {file} -- refusing to print it (please report this as a KUPL bug)"
+                        );
+                        return 1;
+                    }
+                    // The pre-existing error(s) predate formatting (same
+                    // codes as `src` itself) -- printing doesn't destroy
+                    // anything, so unlike `--write` there's no reason to
+                    // withhold the (equally, but not newly, invalid) text.
                     eprintln!(
-                        "error: internal formatter bug producing invalid output for {file} -- refusing to print it (please report this as a KUPL bug)"
+                        "note: {file} already has pre-existing check error(s) before formatting -- printing the reformatted text anyway (run `kupl check {file}` for details)"
                     );
-                    return 1;
                 }
                 print!("{formatted}");
             }
@@ -950,6 +991,102 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&printed.stderr).contains("refusing to print"),
             "{printed:?}"
+        );
+        assert!(printed.stdout.is_empty(), "must not print anything on stdout when refusing: {printed:?}");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A REAL, live-confirmed UX bug found+fixed (production-hardening
+    /// PR-it1142): the `run::compile`-gated "internal formatter bug"
+    /// refusal PR-it837/889 added never distinguished "formatting
+    /// introduced NEW invalidity" from "the source was ALREADY
+    /// checker-invalid before formatting even ran" -- confirmed live before
+    /// this fix, `kupl fmt` refused to print ANYTHING for a file with even
+    /// a completely ordinary, unrelated, pre-existing type error (ordinary
+    /// mid-edit code, e.g. during format-on-save), always blaming "an
+    /// internal formatter bug" that didn't exist. Fixed by comparing the
+    /// formatted output's diagnostic CODE set against the ORIGINAL source's
+    /// own diagnostic code set: when formatting introduces nothing new, the
+    /// plain-print path (non-destructive) now succeeds with an accurate
+    /// `note:`, while `--write` (a mutating, persistent action) still
+    /// refuses for safety, but with corrected wording that no longer
+    /// blames the formatter.
+    #[test]
+    fn fmt_plain_print_succeeds_on_pre_existing_check_errors_but_write_still_refuses() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let tmp = std::env::temp_dir().join(format!("kupl_it1142_fmt_preexisting_{}.kupl", std::process::id()));
+        let original = b"fun bad() -> Int {\n    \"not an int\"\n}\n".to_vec();
+        std::fs::write(&tmp, &original).unwrap();
+
+        // sanity: the ORIGINAL file already fails `kupl check` (K0200), unrelated to formatting.
+        let checked = run(&["check", tmp.to_str().unwrap()]);
+        assert_eq!(checked.status.code(), Some(1), "sanity: original must already be checker-invalid: {checked:?}");
+
+        let printed = run(&["fmt", tmp.to_str().unwrap()]);
+        assert_eq!(printed.status.code(), Some(0), "plain-print must succeed on faithfully-preserved pre-existing errors: {printed:?}");
+        assert!(
+            String::from_utf8_lossy(&printed.stderr).contains("pre-existing check error"),
+            "must explain this is a pre-existing error, not blame the formatter: {printed:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&printed.stderr).contains("internal formatter bug"),
+            "must NOT claim a formatter bug for a faithfully-preserved pre-existing error: {printed:?}"
+        );
+        assert!(String::from_utf8_lossy(&printed.stdout).contains("not an int"), "{printed:?}");
+
+        let written = run(&["fmt", tmp.to_str().unwrap(), "--write"]);
+        assert_eq!(written.status.code(), Some(1), "--write must still refuse, unchanged safety guarantee: {written:?}");
+        assert!(
+            String::from_utf8_lossy(&written.stderr).contains("pre-existing check error"),
+            "must explain this is a pre-existing error, not blame the formatter: {written:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&written.stderr).contains("internal formatter bug"),
+            "must NOT claim a formatter bug for a faithfully-preserved pre-existing error: {written:?}"
+        );
+        assert_eq!(std::fs::read(&tmp).unwrap(), original, "--write must leave the file byte-for-byte untouched");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The discriminating adversarial pair to the test immediately above:
+    /// when formatting a file that ALREADY has one pre-existing check error
+    /// ALSO introduces a genuinely DIFFERENT, NEW one (here, PR-it837's own
+    /// overflowing-float-literal bug, layered into the same file), the
+    /// PR-it1142 fix above must still correctly refuse and blame the
+    /// formatter — the new-vs-pre-existing code-set comparison must not
+    /// become a blanket "any pre-existing error excuses everything" hole.
+    #[test]
+    fn fmt_still_refuses_when_a_pre_existing_error_is_joined_by_a_genuinely_new_one() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let tmp = std::env::temp_dir().join(format!("kupl_it1142_fmt_mixed_{}.kupl", std::process::id()));
+        let original = b"fun bad() -> Int {\n    \"not an int\"\n}\nfun main() uses io {\n    let x: Float = 1e400\n    print(\"{x}\")\n}\n".to_vec();
+        std::fs::write(&tmp, &original).unwrap();
+
+        // sanity: the ORIGINAL file has exactly the one, pre-existing K0200 error --
+        // the float overflow is silently accepted with no diagnostic until formatted.
+        let checked = run(&["check", tmp.to_str().unwrap()]);
+        assert_eq!(checked.status.code(), Some(1), "{checked:?}");
+        assert_eq!(String::from_utf8_lossy(&checked.stderr).matches("error[").count(), 1, "{checked:?}");
+
+        let printed = run(&["fmt", tmp.to_str().unwrap()]);
+        assert_eq!(printed.status.code(), Some(1), "must still refuse: formatting introduces a genuinely NEW error: {printed:?}");
+        assert!(
+            String::from_utf8_lossy(&printed.stderr).contains("internal formatter bug"),
+            "a genuinely new formatter-introduced error must still be blamed on the formatter: {printed:?}"
         );
         assert!(printed.stdout.is_empty(), "must not print anything on stdout when refusing: {printed:?}");
 
