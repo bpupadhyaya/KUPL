@@ -1550,6 +1550,82 @@ fn shadow_zones(program: &crate::ast::Program, name: &str) -> Vec<crate::diag::S
     zones
 }
 
+/// Whether `name` matches one of `c`'s own `state`/`prop`/`child` field
+/// names -- used ONLY by `local_binding_scope_for_rename`/
+/// `shadow_zones_for_rename` below, NEVER by `local_binding_scope`/
+/// `shadow_zones` themselves (see those two functions' own callers:
+/// `resolve_hover`/`resolve_signature_help`/`resolve_definition` must NOT
+/// treat a field reference as "locally bound with nothing further to show" --
+/// they need to fall through to `item_signature`/`item_definition`'s own
+/// dedicated, already-working field-aware resolvers, established at
+/// PR-it871/PR-it872/PR-it873).
+fn component_field_named(c: &crate::ast::ComponentDecl, name: &str) -> bool {
+    c.props.iter().any(|p| p.name == name)
+        || c.state.iter().any(|s| s.name == name)
+        || c.children.iter().any(|ch| ch.name == name)
+}
+
+/// Like `local_binding_scope`, but additionally treats a component's own
+/// `state`/`prop`/`child` field names as bound throughout the WHOLE
+/// component -- for RENAME/OCCURRENCE SCOPING ONLY (`scoped_occurrences`'s
+/// same-file half, and the symmetric top-level-collision check in the
+/// `textDocument/rename` handler), never for hover/definition/signature-help
+/// (see `component_field_named`'s own doc comment for why those must keep
+/// using the plain, non-field-aware `local_binding_scope`).
+///
+/// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it1138,
+/// an Explore-agent survey finding, the FIFTH sibling instance of the
+/// "hardcoded binding-kind list forgot an entry" shape already fixed for
+/// let/for/forall/lambda-param/match-pattern bindings (PR-it704/it739/it836)
+/// and for law bodies (PR-it855)): `check.rs::bind_component_env` inserts a
+/// component's own `state`/`prop`/`child` field names into the SAME kind of
+/// scope a local `let` occupies, shadowing an unrelated same-named
+/// top-level `fun`/`type`/`component` inside EVERY one of that component's
+/// own method/handler bodies -- but `block_binds_name`/`expr_binds_name`
+/// never recognized these, since a field is referenced as a bare `Ident`
+/// inside a method body, not a syntactic binding SITE within that method's
+/// own block (which is exactly what those two functions correctly check for
+/// their OWN, narrower purpose). Live-confirmed BEFORE this fix: `fun
+/// helper() -> Int { 1 } fun caller() -> Int { helper() } component C {
+/// state helper: Int = 2  expose fun get() -> Int { helper } }` -- renaming
+/// EITHER the top-level `fun helper` OR the state field returned the
+/// IDENTICAL four locations merged together, so renaming either one would
+/// silently corrupt the other. A field is visible throughout the WHOLE
+/// component (every method that references it), so the returned scope is
+/// the component's own span, a strict superset of any single method's span
+/// -- checked BEFORE falling back to the plain, per-method-only version.
+fn local_binding_scope_for_rename(
+    program: &crate::ast::Program,
+    offset: usize,
+    name: &str,
+) -> Option<crate::diag::Span> {
+    use crate::ast::Item;
+    let in_span = |span: crate::diag::Span| (span.start as usize) <= offset && offset <= (span.end as usize);
+    for item in &program.items {
+        if let Item::Component(c) = item {
+            if in_span(c.span) && component_field_named(c, name) {
+                return Some(c.span);
+            }
+        }
+    }
+    local_binding_scope(program, offset, name)
+}
+
+/// The `shadow_zones` counterpart to `local_binding_scope_for_rename` --
+/// see that function's own doc comment for the full writeup.
+fn shadow_zones_for_rename(program: &crate::ast::Program, name: &str) -> Vec<crate::diag::Span> {
+    use crate::ast::Item;
+    let mut zones = shadow_zones(program, name);
+    for item in &program.items {
+        if let Item::Component(c) = item {
+            if component_field_named(c, name) {
+                zones.push(c.span);
+            }
+        }
+    }
+    zones
+}
+
 /// Whether `name` is already declared as a TOP-LEVEL item (a `fun`, a `type`
 /// or one of its variant/constructor names, a `component`, or a `contract`)
 /// somewhere in `program` -- a `law`'s own name is a string literal, not an
@@ -1913,7 +1989,7 @@ pub fn occurrences_cross_file(
         // corrupting `other()`'s logic exactly like it704/it739's own
         // "corrupting a completely unrelated file" severity framing.
         let (other_program, _diags) = crate::parser::parse(&other_text);
-        let other_zones = shadow_zones(&other_program, name);
+        let other_zones = shadow_zones_for_rename(&other_program, name);
         let other_line_index = LineIndex::build(&other_text);
         let other_line_range = |span: crate::diag::Span| {
             let start_line = other_line_index.resolve_line(other_text.len(), span.start);
@@ -1943,7 +2019,7 @@ fn scoped_occurrences(
     name: &str,
     offset: usize,
 ) -> (Vec<(usize, usize, usize, usize)>, Option<crate::diag::Span>) {
-    let local_scope = local_binding_scope(program, offset, name);
+    let local_scope = local_binding_scope_for_rename(program, offset, name);
     // Built ONCE (production-hardening PR-it836, found auditing lsp.rs
     // further after the SAME class of bug it835 fixed): the OLD
     // `crate::diag::line_col(text, ...)` call here is O(L) per call, and
@@ -1970,7 +2046,7 @@ fn scoped_occurrences(
         (start_line - 1)..=(end_line - 1)
     };
     let other_shadow_zones: Vec<crate::diag::Span> =
-        if local_scope.is_none() { shadow_zones(program, name) } else { Vec::new() };
+        if local_scope.is_none() { shadow_zones_for_rename(program, name) } else { Vec::new() };
     let occ = occurrences(text, name)
         .into_iter()
         .filter(|(l0, ..)| match local_scope {
@@ -3050,10 +3126,15 @@ pub fn serve() -> i32 {
                     // `name` itself is NOT locally bound (a top-level rename target) --
                     // a local shadowing a top-level name is ordinary, legal scoping,
                     // not a collision (see `top_level_item_named`'s own doc comment for
-                    // why this is deliberately SAME-FILE-only, not cross-file).
+                    // why this is deliberately SAME-FILE-only, not cross-file). Uses the
+                    // field-aware `local_binding_scope_for_rename` (production-hardening
+                    // PR-it1138) so renaming a component's own state/prop/child field to
+                    // a name that happens to match an unrelated top-level item is
+                    // correctly treated as the SAME kind of ordinary shadowing, not a
+                    // false-positive collision warning.
                     if new_name != name {
                         let (program, _diags) = crate::parser::parse(&text);
-                        if local_binding_scope(&program, off, &name).is_none()
+                        if local_binding_scope_for_rename(&program, off, &name).is_none()
                             && top_level_item_named(&program, new_name)
                         {
                             return None;
@@ -4235,6 +4316,71 @@ mod tests {
         let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers);
         assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
         assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it1138, an
+    /// Explore-agent survey finding, the FIFTH sibling instance of the "hardcoded
+    /// binding-kind list forgot an entry" shape already fixed for let/for/forall/
+    /// lambda-param/match-pattern bindings (PR-it704/it739/it836) and for law
+    /// bodies (PR-it855)) -- see `local_binding_scope`'s own `Item::Component` doc
+    /// comment for the full writeup. Live-confirmed BEFORE this fix: renaming
+    /// EITHER the top-level `fun helper` OR the component's own `state helper`
+    /// field returned the IDENTICAL four locations merged together (both the
+    /// unrelated fun's decl+call AND the component's own decl+use) -- so renaming
+    /// either one would silently corrupt the other.
+    #[test]
+    fn component_state_field_shadowing_an_unrelated_top_level_declaration_is_scoped_separately() {
+        let src = "fun helper() -> Int { 1 }\nfun caller() -> Int { helper() }\ncomponent C {\n    intent \"c\"\n    state helper: Int = 2\n    expose fun get() -> Int {\n        helper\n    }\n}\n";
+        let dir = std::path::Path::new("/fake/lsp-it1138-state");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+
+        // Renaming the TOP-LEVEL `fun helper` must find ONLY its own decl + its
+        // one call site in `caller()` -- NOT the component's own unrelated `state
+        // helper` field reference inside `get()`.
+        let fun_off = src.find("fun helper").unwrap() + 4;
+        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers);
+        assert_eq!(fun_locs.len(), 2, "fun decl + its one call site, NOT the state field: {fun_locs:?}");
+        assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
+
+        // Renaming the component's own `state helper` field must find ONLY its own
+        // decl + its one use inside `get()` -- NOT the unrelated top-level `fun
+        // helper` decl or its call site in `caller()`.
+        let state_off = src.find("helper: Int").unwrap();
+        let state_locs = occurrences_cross_file(src, "helper", state_off, dir, &empty_buffers);
+        assert_eq!(state_locs.len(), 2, "state decl + its one use, NOT the unrelated fun: {state_locs:?}");
+        assert!(state_locs.iter().all(|(_, l0, ..)| *l0 == 4 || *l0 == 6), "{state_locs:?}");
+    }
+
+    /// Sibling of the test above (PR-it1138), covering `prop` and `child` --
+    /// `component_field_named` checks all three field kinds identically. Also
+    /// confirms the field's OWN scope spans the WHOLE component (every method
+    /// that references it, not just the one nearest the cursor).
+    #[test]
+    fn component_prop_and_child_fields_shadowing_an_unrelated_top_level_declaration_are_scoped_separately() {
+        let dir = std::path::Path::new("/fake/lsp-it1138-prop-child");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+
+        // `prop` case, plus TWO methods both referencing the shadowed prop --
+        // renaming the prop must reach BOTH uses, not just the one nearest the cursor.
+        let prop_src = "fun widget() -> Int { 1 }\nfun caller() -> Int { widget() }\ncomponent C {\n    intent \"c\"\n    prop widget: Int\n    expose fun a() -> Int {\n        widget\n    }\n    expose fun b() -> Int {\n        widget + 1\n    }\n}\n";
+        let prop_off = prop_src.find("widget: Int").unwrap();
+        let prop_locs = occurrences_cross_file(prop_src, "widget", prop_off, dir, &empty_buffers);
+        assert_eq!(prop_locs.len(), 3, "prop decl + BOTH its uses across two methods: {prop_locs:?}");
+        assert!(prop_locs.iter().all(|(_, l0, ..)| *l0 == 4 || *l0 == 6 || *l0 == 9), "{prop_locs:?}");
+        // the reverse direction: renaming the unrelated top-level fun must not
+        // reach into EITHER method that shadows it via the prop.
+        let fun_off = prop_src.find("fun widget").unwrap() + 4;
+        let fun_locs = occurrences_cross_file(prop_src, "widget", fun_off, dir, &empty_buffers);
+        assert_eq!(fun_locs.len(), 2, "fun decl + its one call site, NOT either shadowed use: {fun_locs:?}");
+
+        // `child` case (the method call's own name `poke` is deliberately DIFFERENT
+        // from the child's own name `ping`, so `occurrences`'s plain token scan --
+        // unrelated to this fix -- doesn't ALSO match the method-name token).
+        let child_src = "component Worker {\n    intent \"w\"\n    expose fun poke() -> Int { 1 }\n}\nfun ping() -> Int { 2 }\nfun caller() -> Int { ping() }\ncomponent C {\n    intent \"c\"\n    let ping = Worker()\n    expose fun go() -> Int {\n        ping.poke()\n    }\n}\n";
+        let child_off = child_src.find("let ping").unwrap() + 4;
+        let child_locs = occurrences_cross_file(child_src, "ping", child_off, dir, &empty_buffers);
+        assert_eq!(child_locs.len(), 2, "child decl + its one use inside go(): {child_locs:?}");
+        assert!(child_locs.iter().all(|(_, l0, ..)| *l0 == 8 || *l0 == 10), "{child_locs:?}");
     }
 
     /// A REAL bug (production-hardening PR-it742): unlike the cross-file rename/
