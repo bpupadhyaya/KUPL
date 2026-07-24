@@ -1210,25 +1210,120 @@ fn extract_uses_names(message: &str) -> Option<String> {
 /// where a fresh `uses X` clause should be inserted (`fun name(params) uses
 /// X -> ret { ... }`). Paren-depth-tracked so a default-value expression
 /// containing its own parens (`x: Int = f(1)`) doesn't confuse the match.
+///
+/// A REAL, live-confirmed silent-CORRUPTION-and-non-functional-fix bug
+/// found+fixed (production-hardening PR-it1158, a fresh open-ended Explore
+/// survey finding, the SIBLING to PR-it1157's own `find_uses_clause_range`
+/// fix -- that fix touched the "widen an EXISTING `uses` clause" branch of
+/// the SAME `textDocument/codeAction` handler; this function backs the
+/// OTHER branch, "add a FRESH `uses` clause when there is none yet", and
+/// had the IDENTICAL naive-scanning flaw PR-it1157 hadn't touched here):
+/// this used to be a plain byte-level `(`/`)` counter with ZERO string or
+/// comment awareness. A `)` character inside a parameter's own DEFAULT
+/// STRING VALUE (e.g. `name: Str = ")"`, an entirely ordinary literal) or
+/// inside a `/* ... */` comment between the parens was counted as a REAL
+/// paren, prematurely zeroing `depth` and returning an insertion point that
+/// landed INSIDE that string/comment. Live-confirmed BEFORE this fix, via
+/// the real `kupl lsp` subprocess: the "Add `uses io`" quick-fix on `pub
+/// fun greet(name: Str = ")") -> Unit { print(name) }` inserted `" uses
+/// io"` INSIDE the string literal, silently changing the default value
+/// from `")"` to `") uses io"` -- and, since the insertion never actually
+/// reached the real position after the true closing `)`, the K0301
+/// diagnostic the fix claims to resolve was STILL PRESENT afterward
+/// (re-confirmed via `kupl check` on the "fixed" file) -- a one-click
+/// editor action that is simultaneously destructive AND non-functional.
+/// Fixed by adapting `repl.rs::braces_balanced`'s own already-hardened
+/// string/interpolation/comment-tracking algorithm (PR-it779/PR-it870's
+/// escaped-backslash and nested-interpolation-string fixes) to track PAREN
+/// depth specifically and return a byte offset instead of a bool: skips
+/// `//` line comments, NESTABLE `/* */` block comments, and string literals
+/// (with `\`-pair escaping and NESTED-interpolation-string awareness --
+/// `"{f("(")}"`'s own inner `(` and `"` must never affect the OUTER paren
+/// count) as opaque spans, so only parens that are GENUINELY part of the
+/// parameter-list syntax are ever counted.
 fn insertion_point_after_params(text: &str, fun_span: crate::diag::Span) -> Option<usize> {
     let start = fun_span.start as usize;
-    let bytes = text.as_bytes();
     let open_rel = text.get(start..)?.find('(')?;
-    let mut i = start + open_rel;
-    let mut depth = 0i32;
-    loop {
-        match bytes.get(i)? {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
+    let open_at = start + open_rel;
+    let mut paren_depth: i64 = 0;
+    let mut in_str = false;
+    let mut comment_depth: u32 = 0;
+    let mut chars = text.get(open_at..)?.char_indices().peekable();
+    while let Some((rel_i, ch)) = chars.next() {
+        if in_str {
+            match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_str = false,
+                '{' if chars.peek().map(|(_, c)| *c) == Some('{') => {
+                    chars.next();
+                }
+                '{' => {
+                    let mut interp_depth: u32 = 1;
+                    while interp_depth > 0 {
+                        match chars.next() {
+                            None => return None, // unterminated -- no valid insertion point
+                            Some((_, '{')) => interp_depth += 1,
+                            Some((_, '}')) => interp_depth -= 1,
+                            Some((_, '"')) => loop {
+                                match chars.next() {
+                                    None => return None,
+                                    Some((_, '\\')) => {
+                                        chars.next();
+                                    }
+                                    Some((_, '"')) => break,
+                                    _ => {}
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek().map(|(_, c)| *c) == Some('/') {
+            for (_, c) in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek().map(|(_, c)| *c) == Some('*') {
+            chars.next();
+            comment_depth += 1;
+            while comment_depth > 0 {
+                match chars.next() {
+                    None => return None,
+                    Some((_, '/')) if chars.peek().map(|(_, c)| *c) == Some('*') => {
+                        chars.next();
+                        comment_depth += 1;
+                    }
+                    Some((_, '*')) if chars.peek().map(|(_, c)| *c) == Some('/') => {
+                        chars.next();
+                        comment_depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    return Some(open_at + rel_i + ch.len_utf8());
                 }
             }
             _ => {}
         }
-        i += 1;
     }
+    None
 }
 
 /// Locate an existing `uses X, Y` clause right after a function's parameter
@@ -3605,6 +3700,106 @@ mod tests {
             !diags.iter().any(|d| d.code == "K0301"),
             "the fix must actually resolve K0301: {fixed:?} -> {diags:?}"
         );
+    }
+
+    /// A REAL, live-confirmed silent-CORRUPTION-and-non-functional-fix bug
+    /// found+fixed (production-hardening PR-it1158, a fresh open-ended
+    /// Explore survey finding, the sibling to PR-it1157's own
+    /// `find_uses_clause_range` fix): `insertion_point_after_params` (the
+    /// helper this "Add `uses X`" branch relies on, for a function with NO
+    /// existing `uses` clause) used to be a naive `(`/`)` byte counter with
+    /// no string awareness. A `)` inside a parameter's own DEFAULT STRING
+    /// VALUE (`name: Str = ")"`, an entirely ordinary literal) was counted
+    /// as a real paren, so the insertion point landed INSIDE that string.
+    /// Live-confirmed BEFORE this fix via a real `kupl lsp` subprocess: the
+    /// "Add `uses io`" quick-fix on this exact source inserted `" uses
+    /// io"` inside the string literal, silently changing the default value
+    /// from `")"` to `") uses io"` -- and since the insertion point never
+    /// reached the TRUE closing `)`, K0301 was STILL PRESENT afterward
+    /// (re-confirmed via `kupl check` on the "fixed" file): a one-click
+    /// quick-fix that is simultaneously destructive AND non-functional.
+    #[test]
+    fn code_action_adding_a_uses_clause_does_not_corrupt_a_default_string_value_containing_a_paren() {
+        let src = "pub fun greet(name: Str = \")\") -> Unit {\n    print(name)\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (title, start, end, new_text) = &actions[0];
+        assert_eq!(title, "Add `uses io`");
+        assert_eq!(start, end, "K0301's fresh-clause fix is a zero-width insertion");
+        let mut fixed = src.to_string();
+        fixed.insert_str(*start, new_text);
+        // The discriminating assertion: the default value's own literal
+        // text must survive completely intact, and the insertion must
+        // genuinely land AFTER the parameter list's true closing paren,
+        // not inside the string.
+        assert!(
+            fixed.contains("name: Str = \")\") uses io"),
+            "the default value `\")\"` must survive intact and the clause must land after the real `)`: {fixed:?}"
+        );
+        assert!(!fixed.contains(") uses io\")"), "must NOT insert inside the string literal: {fixed:?}");
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(
+            !diags.iter().any(|d| d.code == "K0301"),
+            "the fix must ACTUALLY resolve K0301, not just look successful: {fixed:?} -> {diags:?}"
+        );
+    }
+
+    /// Sibling to the test above: a `)` inside a `/* ... */` comment between
+    /// the parameter list's parens must be skipped the same way a `)`
+    /// inside a string literal is.
+    #[test]
+    fn code_action_adding_a_uses_clause_does_not_corrupt_a_comment_containing_a_paren() {
+        let src = "pub fun greet(name: Str /* default ) placeholder */) -> Unit {\n    print(name)\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (_, start, end, new_text) = &actions[0];
+        assert_eq!(start, end);
+        let mut fixed = src.to_string();
+        fixed.insert_str(*start, new_text);
+        assert!(
+            fixed.contains("placeholder */) uses io -> Unit"),
+            "the comment must survive intact and the clause must land after the real `)`: {fixed:?}"
+        );
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(!diags.iter().any(|d| d.code == "K0301"), "{fixed:?} -> {diags:?}");
+    }
+
+    /// A THIRD sibling case, covering the trickiest ambiguity this class of
+    /// bug can hit: a NESTED string literal inside a `{ .. }` interpolation
+    /// expression within the default value's own OUTER string (mirroring
+    /// `repl.rs::braces_balanced`'s own PR-it870 regression case,
+    /// `"{f("(")}"`) -- both the nested string's own quotes AND its own
+    /// paren must be skipped as part of the SAME opaque string span, or a
+    /// naive quote-toggle would misread the nested `"` as the outer
+    /// string's own close, letting the nested `(`/`)` leak into the real
+    /// paren count.
+    #[test]
+    fn code_action_adding_a_uses_clause_does_not_corrupt_a_nested_interpolation_string() {
+        let src = "fun f(s: Str) -> Str { s }\npub fun greet(name: Str = \"{f(\")\")}\") -> Unit {\n    print(name)\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (_, start, end, new_text) = &actions[0];
+        assert_eq!(start, end);
+        let mut fixed = src.to_string();
+        fixed.insert_str(*start, new_text);
+        assert!(
+            fixed.contains("\"{f(\")\")}\") uses io -> Unit"),
+            "the nested interpolation string must survive intact and the clause must land after the real `)`: {fixed:?}"
+        );
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(!diags.iter().any(|d| d.code == "K0301"), "{fixed:?} -> {diags:?}");
     }
 
     #[test]
