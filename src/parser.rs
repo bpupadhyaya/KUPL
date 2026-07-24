@@ -1623,6 +1623,30 @@ impl Parser {
                 self.depth -= 1;
                 let operand = operand?;
                 let span = span.merge(operand.span);
+                // A REAL bug found+fixed (production-hardening PR-it1146):
+                // `lexer.rs::emit_sized` now WIDENS its own range check to
+                // also accept a signed width's exact "one past max"
+                // magnitude (e.g. `128i8`, one past i8's own max of 127),
+                // deferring the final validity call to here -- fold it
+                // directly into its correctly-negated, already-in-range
+                // value instead of wrapping it in a generic `Unary{Neg,
+                // ...}` node, so `-128i8` produces an ordinary `SizedInt(
+                // -128, I8)` literal, exactly like every other in-range
+                // sized-int literal, rather than an intermediate
+                // out-of-range `SizedInt(128, I8)` node that no downstream
+                // consumer (interp.rs/compile.rs's own direct `Value::
+                // SizedInt` construction from the AST value, with no range
+                // re-check of its own) has ever needed to tolerate. A BARE,
+                // un-negated instance of this same boundary magnitude falls
+                // through unchanged here (this arm only ever fires for a
+                // DIRECT `Tok::Minus`-then-literal shape) and is instead
+                // caught by a new deferred check in
+                // `check.rs::infer_expr`'s own `ExprKind::SizedInt` arm.
+                if let ExprKind::SizedInt(v, w) = operand.kind {
+                    if w.is_signed() && v == -w.min() {
+                        return Ok(Expr { kind: ExprKind::SizedInt(-v, w), span });
+                    }
+                }
                 Ok(Expr { kind: ExprKind::Unary { op: UnOp::Neg, operand: Box::new(operand) }, span })
             }
             Tok::Bang => {
@@ -2310,6 +2334,80 @@ mod tests {
         let (p, diags) = parse(src);
         assert!(diags.is_empty(), "diags: {diags:#?}");
         p
+    }
+
+    fn main_body_inits(p: &Program) -> Vec<Expr> {
+        p.items
+            .iter()
+            .find_map(|i| match i {
+                Item::Fun(f) if f.name == "main" => Some(f.body.stmts.clone()),
+                _ => None,
+            })
+            .expect("fun main")
+            .into_iter()
+            .filter_map(|s| match s {
+                Stmt::Let { init, .. } => Some(init),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A REAL, live-confirmed false-positive-rejection bug found+fixed
+    /// (production-hardening PR-it1146): a signed width's own MIN value
+    /// (`-128i8`, `-32768i16`, `-2147483648i32`, `-9223372036854775808i64`)
+    /// used to be REJECTED outright, since `lexer.rs::emit_sized` range-
+    /// checked the bare (pre-negation) magnitude, which is exactly one past
+    /// the width's own max. `lexer.rs` now WIDENS acceptance for this exact
+    /// boundary magnitude, deferring the final call to here: this arm folds
+    /// `Neg` applied directly to it into the correctly-negated literal, so
+    /// the AST never carries an intermediate, out-of-range `SizedInt` node
+    /// for the ordinary, most-natural way to spell a signed width's
+    /// minimum -- locks in the exact fold shape (a bare `SizedInt`, NOT a
+    /// `Unary { op: Neg, .. }` wrapper) for every signed width.
+    #[test]
+    fn unary_neg_folds_a_signed_widths_own_min_literal_into_a_single_sized_int_node() {
+        use crate::value::IntW;
+        let p = ok(
+            "fun main() {\n    let a: i8 = -128i8\n    let b: i16 = -32768i16\n    \
+             let c: i32 = -2147483648i32\n    let d: i64 = -9223372036854775808i64\n}\n",
+        );
+        let inits = main_body_inits(&p);
+        assert_eq!(inits.len(), 4);
+        assert!(
+            matches!(inits[0].kind, ExprKind::SizedInt(-128, IntW::I8)),
+            "{:?}",
+            inits[0].kind
+        );
+        assert!(
+            matches!(inits[1].kind, ExprKind::SizedInt(-32768, IntW::I16)),
+            "{:?}",
+            inits[1].kind
+        );
+        assert!(
+            matches!(inits[2].kind, ExprKind::SizedInt(-2147483648, IntW::I32)),
+            "{:?}",
+            inits[2].kind
+        );
+        assert!(
+            matches!(inits[3].kind, ExprKind::SizedInt(-9223372036854775808, IntW::I64)),
+            "{:?}",
+            inits[3].kind
+        );
+
+        // discriminating pair: the fold is gated on `w.is_signed()` --
+        // `-w.min()` is `0` for an UNSIGNED width (whose own `min()` is
+        // always `0`), so without that guard `-0u8` would coincidentally
+        // match the same numeric condition. Confirm it stays a generic
+        // `Unary { Neg, .. }` node (the value is identical either way, 0,
+        // but the AST SHAPE must be unaffected for unsigned widths, which
+        // this fix has no business touching at all).
+        let p2 = ok("fun main() {\n    let e: u8 = -0u8\n}\n");
+        let inits2 = main_body_inits(&p2);
+        assert!(
+            matches!(&inits2[0].kind, ExprKind::Unary { op: UnOp::Neg, .. }),
+            "an unsigned width's negated zero must not be folded: {:?}",
+            inits2[0].kind
+        );
     }
 
     #[test]

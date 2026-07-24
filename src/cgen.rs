@@ -550,7 +550,29 @@ fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
             // value fits its width (≤64 bits); build the __int128 from an i64/u64
             let (v, w) = (b.0, b.1);
             if w.is_signed() {
-                format!("k_sized((__int128)(long long){}LL, {})", v, w.tag())
+                // A REAL (if low-severity) gap found+fixed (production-
+                // hardening PR-it1146, a direct follow-on to the SAME
+                // iteration's own lexer fix that made `-9223372036854775808i64`
+                // reachable as source for the first time -- previously
+                // `emit_sized` rejected it at lex time, so this branch could
+                // never see an i64::MIN-valued SizedInt at all): the bare
+                // `-9223372036854775808LL` form is NOT valid as a single
+                // token in C for the exact same reason `Value::Int`'s own
+                // i64::MIN case (right above) was already fixed at PR-it851
+                // -- the unsuffixed magnitude doesn't fit `long long`, so
+                // `cc` parses it as an implicitly-unsigned literal before
+                // negating (functionally correct, confirmed live via
+                // matching interp/VM/native output, but `cc -Wall` warns
+                // `-Wimplicitly-unsigned-literal`). Mirrors `Value::Int`'s
+                // own fix exactly: an unambiguous `ULL` literal cast to
+                // `long long`. `i8`/`i16`/`i32`'s own MIN values are all
+                // comfortably representable as an ordinary `long long`
+                // literal (64-bit), so only the `i64` width needs this.
+                if w == crate::value::IntW::I64 && v == i64::MIN as i128 {
+                    format!("k_sized((__int128)(long long)9223372036854775808ULL, {})", w.tag())
+                } else {
+                    format!("k_sized((__int128)(long long){}LL, {})", v, w.tag())
+                }
             } else {
                 format!("k_sized((__int128)(unsigned long long){}ULL, {})", v, w.tag())
             }
@@ -8862,6 +8884,49 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             "parent started\nchild started\nparent stopped\nchild stopped\n"
         );
+
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A REAL (if low-severity) gap found+fixed (production-hardening
+    /// PR-it1146, a direct follow-on to the SAME iteration's own lexer/
+    /// parser fix that made `-9223372036854775808i64` reachable as source
+    /// for the first time): `const_expr`'s `Value::SizedInt` branch used to
+    /// emit a bare `-9223372036854775808LL` C literal for `i64::MIN`, which
+    /// is not valid as a single token in C (the unsuffixed magnitude
+    /// doesn't fit `long long`) -- `cc` accepted it anyway via an
+    /// implementation-defined implicitly-unsigned-literal interpretation
+    /// (functionally correct, confirmed live, but noisy:
+    /// `-Wimplicitly-unsigned-literal`) -- mirroring the SAME class of gap
+    /// `Value::Int`'s own i64::MIN case already had fixed at PR-it851.
+    /// Locks in BOTH the correct runtime value AND a warning-free compile.
+    #[test]
+    fn native_i64_min_sized_int_literal_compiles_without_a_compiler_warning() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    let a: i64 = -9223372036854775808i64\n    print(a)\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+
+        let base = std::env::temp_dir().join(format!("kupl-cgen-i64min-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let compile_out = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .output()
+            .expect("cc runs");
+        assert!(compile_out.status.success(), "generated C must compile: {compile_out:?}");
+        assert!(
+            String::from_utf8_lossy(&compile_out.stderr).is_empty(),
+            "must compile with ZERO warnings, not just successfully: {compile_out:?}"
+        );
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "-9223372036854775808\n");
 
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);

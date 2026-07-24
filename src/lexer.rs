@@ -363,8 +363,34 @@ impl<'a> Lexer<'a> {
     }
 
     /// Emit a sized-int token, range-checking at lex time (K0009 on overflow).
+    ///
+    /// A REAL, live-confirmed false-positive-rejection bug found+fixed
+    /// (production-hardening PR-it1146, an Explore-agent survey finding,
+    /// independently re-verified live before implementing): a numeric
+    /// literal's digits are always lexed as a non-negative magnitude --
+    /// `-` is a separate token, applied later by the parser as a `Neg`
+    /// unary operator -- so writing a signed width's own MIN value the
+    /// single most natural way (`-128i8`, `-32768i16`, `-2147483648i32`,
+    /// `-9223372036854775808i64`) used to be REJECTED here, since the bare
+    /// magnitude (128, 32768, ...) is exactly one past `w.max()`, even
+    /// though negating it lands exactly on `w.min()`. Confirmed live: NO
+    /// literal syntax at all could ever reach a sized width's MIN before
+    /// this fix (unlike unsuffixed `Int`, which has an awkward-but-
+    /// discoverable `0x8000000000000000` hex-bit-pattern workaround, PR-
+    /// it851 -- unmodified here) -- the only prior way was
+    /// `(<max>).wrapping_add(1)`. Fixed by WIDENING acceptance here to also
+    /// allow the exact "one past max" magnitude for a signed width,
+    /// deferring the final validity determination: `parser.rs::parse_unary`
+    /// now folds `Neg` directly applied to this exact boundary magnitude
+    /// into the correctly-negated literal (so `-128i8` produces an
+    /// ordinary, already-in-range `SizedInt(-128, I8)` node, never letting
+    /// an out-of-range magnitude escape into the rest of the pipeline); a
+    /// BARE, un-negated instance of this same magnitude (e.g. a literal
+    /// `128i8` on its own, genuinely still invalid) is instead caught by a
+    /// new deferred check in `check.rs::infer_expr`, mirroring this
+    /// function's own K0009 wording exactly.
     fn emit_sized(&mut self, v: i128, w: crate::value::IntW, start: usize) {
-        if w.check_range(v) {
+        if w.check_range(v) || (w.is_signed() && v == -w.min()) {
             self.push(Tok::SizedInt(v, w), start);
         } else {
             let hint = match w.widen_to_fit(v) {
@@ -904,6 +930,40 @@ mod tests {
         assert_eq!(toks, vec![Tok::Int(123), Tok::Ident("index".into()), Tok::Newline, Tok::Eof]);
     }
 
+    /// A REAL, live-confirmed false-positive-rejection bug found+fixed
+    /// (production-hardening PR-it1146): a signed width's own MIN value's
+    /// bare magnitude (e.g. `128i8`, one past `i8::MAX`) used to be
+    /// rejected right here at lex time -- see `emit_sized`'s own doc
+    /// comment for the full writeup -- meaning `-128i8` (the single most
+    /// natural way to spell `i8::MIN`) could never be written at all.
+    /// Locks in that this exact boundary magnitude now lexes CLEANLY
+    /// (no diagnostic, a real token) for every signed width, deferring the
+    /// final validity call to the parser (a directly-negated instance) or
+    /// the checker (a bare, un-negated instance, covered by check.rs's own
+    /// dedicated test) -- while anything genuinely beyond the boundary
+    /// (checked here via the width immediately below JUST for I64, since
+    /// there is no wider signed width to compare against) still correctly
+    /// fails to lex at all.
+    #[test]
+    fn sized_int_boundary_magnitude_lexes_cleanly_deferring_to_the_parser_or_checker() {
+        use crate::value::IntW;
+        for (src, magnitude, width) in [
+            ("128i8", 128i128, IntW::I8),
+            ("32768i16", 32768i128, IntW::I16),
+            ("2147483648i32", 2147483648i128, IntW::I32),
+            ("9223372036854775808i64", 9223372036854775808i128, IntW::I64),
+        ] {
+            let (toks, diags) = lex(src);
+            assert!(diags.is_empty(), "{src} must lex with zero diagnostics: {diags:?}");
+            let kinds: Vec<Tok> = toks.into_iter().map(|t| t.tok).collect();
+            assert_eq!(kinds, vec![Tok::SizedInt(magnitude, width), Tok::Newline, Tok::Eof], "{src}");
+        }
+        // sanity: this widening is exact, not a general loosening -- one
+        // magnitude further (a genuine overflow) still correctly fails.
+        let (_, diags) = lex("129i8");
+        assert!(diags.iter().any(|d| d.code == "K0009"), "129i8 must still be rejected: {diags:?}");
+    }
+
     #[test]
     fn sized_overflow_suggests_a_wider_width() {
         // K0009 for an over-wide literal should not just say "out of range"; it should show
@@ -920,8 +980,14 @@ mod tests {
         let m = d("256u8");
         assert!(m.contains("out of range for `u8`") && m.contains("0..255"), "shows u8 range: {m}");
         assert!(m.contains("`u16` holds it") && m.contains("0..65535"), "suggests u16: {m}");
-        // 128 overflows i8 (-128..127) -> suggest i16 (same signedness family).
-        let s = d("128i8");
+        // 200 overflows i8 (-128..127) -> suggest i16 (same signedness family).
+        // NOTE: NOT 128i8 -- since PR-it1146, that exact boundary magnitude
+        // (i8::MIN's own, one past i8::MAX) is deliberately no longer
+        // rejected at LEX time at all (see `emit_sized`'s own doc comment
+        // and `sized_int_boundary_magnitude_lexes_cleanly_deferring_to_the_
+        // parser_or_checker` below) -- it's covered by a dedicated K0009
+        // test in check.rs instead now.
+        let s = d("200i8");
         assert!(s.contains("`i16` holds it"), "signed literal suggests i16: {s}");
         // 70000 overflows u16 -> suggest u32.
         assert!(d("70000u16").contains("`u32` holds it"), "u16 overflow suggests u32");

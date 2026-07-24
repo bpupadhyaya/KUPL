@@ -2631,7 +2631,45 @@ impl Checker {
     fn infer_expr(&mut self, expr: &Expr, ctx: &mut Ctx) -> Ty {
         match &expr.kind {
             ExprKind::Int(_) => Ty::Int,
-            ExprKind::SizedInt(_, w) => Ty::IntW(*w),
+            ExprKind::SizedInt(v, w) => {
+                // A REAL bug found+fixed (production-hardening PR-it1146):
+                // `lexer.rs::emit_sized` now WIDENS its own range check to
+                // also accept a signed width's exact "one past max"
+                // magnitude, deferring to `parser.rs::parse_unary`'s own
+                // fold (a DIRECTLY negated instance, e.g. `-128i8`, is
+                // folded there into an ordinary, already-in-range literal
+                // and never reaches this arm with an out-of-range value at
+                // all) -- a BARE, un-negated instance of that same boundary
+                // magnitude (e.g. a literal `128i8` on its own, genuinely
+                // still invalid) falls through unchanged and must be caught
+                // HERE instead, mirroring `emit_sized`'s own K0009 wording
+                // exactly so the diagnostic is identical regardless of
+                // which stage ends up emitting it.
+                if !w.check_range(*v) {
+                    let hint = match w.widen_to_fit(*v) {
+                        Some(wider) if wider != *w => format!(
+                            " — `{}` holds it (its range is {}..{})",
+                            wider.name(),
+                            wider.min(),
+                            wider.max()
+                        ),
+                        _ => " — too large for any fixed-width integer; use the default `Int` \
+                              or a `big(...)` BigInt"
+                            .to_string(),
+                    };
+                    self.err(
+                        "K0009",
+                        format!(
+                            "literal `{v}` out of range for `{}` (its range is {}..{}){hint}",
+                            w.name(),
+                            w.min(),
+                            w.max()
+                        ),
+                        expr.span,
+                    );
+                }
+                Ty::IntW(*w)
+            }
             ExprKind::F32(_) => Ty::F32,
             ExprKind::Float(_) => Ty::Float,
             ExprKind::Bool(_) => Ty::Bool,
@@ -7721,6 +7759,46 @@ mod generic_tests {
             errors(var_mono).iter().any(|d| d.code == "K0200"),
             "a `var`-bound alias must stay monomorphic (K0200 on the second, differently-typed call): {:?}",
             errors(var_mono)
+        );
+    }
+
+    /// A REAL, live-confirmed false-positive-rejection bug found+fixed
+    /// (production-hardening PR-it1146): `lexer.rs::emit_sized` now WIDENS
+    /// its own range check to also accept a signed width's exact "one past
+    /// max" magnitude (e.g. `128i8`, `i8::MIN`'s own magnitude), deferring
+    /// the final validity call -- a DIRECTLY negated instance
+    /// (`-128i8`) is folded by `parser.rs::parse_unary` into an ordinary,
+    /// already-in-range literal and never reaches here at all (see
+    /// `fun main() { let a: i8 = -128i8 }` compiling cleanly below); a
+    /// BARE, un-negated instance of that same magnitude is instead caught
+    /// HERE, mirroring `emit_sized`'s own K0009 wording exactly.
+    #[test]
+    fn sized_int_boundary_magnitude_is_accepted_when_negated_but_rejected_bare() {
+        let negated = "fun main() {\n    let a: i8 = -128i8\n    let b: i16 = -32768i16\n    \
+                        let c: i32 = -2147483648i32\n    let d: i64 = -9223372036854775808i64\n}\n";
+        assert!(
+            errors(negated).is_empty(),
+            "every signed width's own MIN literal must compile cleanly: {:?}",
+            errors(negated)
+        );
+
+        let bare = "fun main() {\n    let a: i8 = 128i8\n}\n";
+        let errs = errors(bare);
+        let e = errs.iter().find(|d| d.code == "K0009").expect("bare 128i8 must be K0009");
+        assert!(
+            e.message.contains("out of range for `i8`") && e.message.contains("-128..127"),
+            "{}",
+            e.message
+        );
+
+        // discriminating pair: a genuinely out-of-range value (beyond the
+        // boundary magnitude, not just the boundary itself) must still be
+        // rejected too -- this class of check isn't newly broadened.
+        let too_large = "fun main() {\n    let a: i8 = 200i8\n}\n";
+        assert!(
+            errors(too_large).iter().any(|d| d.code == "K0009"),
+            "a genuinely too-large sized-int literal must still be rejected: {:?}",
+            errors(too_large)
         );
     }
 }
