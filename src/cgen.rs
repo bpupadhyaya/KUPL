@@ -370,6 +370,8 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
                  for (int id = 0; id < k_n0; id++) {{ k_run_lifecycle(id, \"@start\"); k_arm_timers(id); }}\n    \
                  k_drain();\n    \
                  k_run_timers(100);\n    \
+                 for (int id = 0; id < k_n0; id++) {{ k_run_lifecycle(id, \"@stop\"); }}\n    \
+                 k_drain();\n    \
                  return 0;\n}}"
             );
         }
@@ -8819,6 +8821,47 @@ mod tests {
         assert!(status.success(), "generated C must compile");
         let out = std::process::Command::new(&bin).output().expect("binary runs");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "n=42\n");
+
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A REAL, live-confirmed dead-code bug found+fixed (production-hardening
+    /// PR-it1144 -- see `interp.rs::Interp::stop_all`'s own doc comment for
+    /// the full writeup): `on stop` was parsed/checked/compiled on every
+    /// engine but NO call site anywhere ever actually triggered it. This
+    /// file's own generated `main()` template (the app-bootstrap path
+    /// shared by every native app) now also fires `@stop` for every
+    /// instance that received `@start`, in the SAME creation order, right
+    /// before the process exits -- independently verified here (not just
+    /// assumed consistent with the VM fix) since native's C codegen is its
+    /// own separate code path from `compile.rs`/`vm.rs`.
+    #[test]
+    fn native_app_with_a_child_fires_on_stop_for_both_in_creation_order() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Child {\n    on start { print(\"child started\") }\n    on stop { print(\"child stopped\") }\n}\n\
+                    app Parent {\n    let c = Child()\n    on start { print(\"parent started\") }\n    on stop { print(\"parent stopped\") }\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+
+        let base = std::env::temp_dir().join(format!("kupl-cgen-onstop-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "parent started\nchild started\nparent stopped\nchild stopped\n"
+        );
 
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);

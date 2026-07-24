@@ -494,7 +494,7 @@ pub fn run_program(path: &str) -> i32 {
     let mut interp = Interp::new(db);
     interp.print_unwired = true;
 
-    let outcome: Result<(), Flow> = (|| {
+    let outcome: Result<usize, Flow> = (|| {
         match app {
             Some(name) => {
                 let required: Vec<String> = interp
@@ -514,27 +514,38 @@ pub fn run_program(path: &str) -> i32 {
                         "error: app `{name}` requires props ({}) — v0.1 apps must be self-contained",
                         required.join(", ")
                     );
-                    return Ok(());
+                    return Ok(0);
                 }
                 interp.instantiate(&name, &[], Span::default())?;
+                // snapshot right where `start_all` fires `on start` -- `stop_all`
+                // (below) must deliver `on stop` to this SAME range, not
+                // whatever `interp.instances.len()` happens to be by the time the
+                // program finishes (see `Interp::stop_all`'s own doc comment).
+                let started = interp.instances.len();
                 interp.start_all()?;
                 // fire timers deterministically (bounded, so recurring timers
                 // yield finite output under `kupl run`)
                 interp.run_timers(100)?;
-                Ok(())
+                Ok(started)
             }
             None => {
                 if interp.db.funs.contains_key("main") {
                     let f = Value::Fun(std::rc::Rc::new("main".to_string()));
                     interp.call_value(f, vec![], Span::default())?;
-                    Ok(())
+                    Ok(0)
                 } else {
                     eprintln!("error: no `app` or `fun main()` found in {file}");
-                    Ok(())
+                    Ok(0)
                 }
             }
         }
     })();
+    // Deliver `on stop` only on a successful run (a panicking program doesn't
+    // get a graceful shutdown either, matching this codebase's other
+    // Drop-adjacent conventions) -- see `Interp::stop_all`'s own doc comment
+    // for why `started` (not `interp.instances.len()` at this later point) is
+    // the correct range.
+    let outcome = outcome.and_then(|started| interp.stop_all(started));
 
     match outcome {
         Ok(()) => 0,

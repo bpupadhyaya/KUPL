@@ -271,12 +271,22 @@ impl<'m> Vm<'m> {
             props.push(v);
         }
         self.instantiate(idx, props)?;
-        for id in 0..self.instances.len() {
+        // snapshot right where `on start` fires -- the closing `on stop` loop
+        // below must deliver to this SAME range, mirroring `on start`'s own
+        // creation-order semantics exactly (see interp.rs::Interp::stop_all's
+        // own doc comment for the full production-hardening PR-it1144 writeup
+        // of why this must not just re-read `self.instances.len()` later).
+        let started = self.instances.len();
+        for id in 0..started {
             self.run_lifecycle(id, "@start")?;
             self.arm_timers(id);
         }
         self.drain()?;
         self.run_timers(100)?;
+        for id in 0..started {
+            self.run_lifecycle(id, "@stop")?;
+        }
+        self.drain()?;
         Ok(())
     }
 

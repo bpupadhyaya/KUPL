@@ -339,6 +339,46 @@ impl Interp {
         Ok(())
     }
 
+    /// Deliver `on stop` to the first `upto` instances (creation order), the
+    /// SAME range `start_all` fired `on start` for.
+    ///
+    /// A REAL, live-confirmed dead-code bug found+fixed (production-
+    /// hardening PR-it1144, an Explore-agent survey side-finding,
+    /// independently re-verified live before implementing): `Trigger::Stop`
+    /// is fully parsed (parser.rs), type-checked (check.rs), round-trip
+    /// formatted (fmt.rs), and compiled (compile.rs/cgen.rs all emit real
+    /// code for it, and `run_lifecycle` here has ALWAYS correctly matched
+    /// against it) -- but before this fix, NO call site anywhere in the
+    /// crate ever actually PASSED `Trigger::Stop` to `run_lifecycle`, on any
+    /// of the three engines. `on stop` was consequently silent, permanent
+    /// dead code on every engine: a documented language construct
+    /// (docs/design/LANGUAGE.md, docs/reference/LANGUAGE-REFERENCE.md) that
+    /// parsed and checked cleanly but could never fire, with zero
+    /// diagnostic. Neither doc ever specifies exactly WHEN `on stop` should
+    /// fire (unlike `on start`'s own explicit "`kupl run` ... delivers `on
+    /// start` to every instance in creation order, then drains the queue to
+    /// quiescence"), so this closes the gap with the one unambiguous,
+    /// already-existing lifecycle boundary in the current design: the
+    /// natural end of a `kupl run`/`kupl run --vm`/`kupl native` program's
+    /// own execution, mirroring `on start`'s own delivery exactly (creation
+    /// order, only for instances that were part of the original started
+    /// batch) rather than firing for every instance that merely happens to
+    /// still exist by then -- a component instantiated ad-hoc from ordinary
+    /// code (e.g. `examples/agent_component.kupl`'s `let bot = Assistant()`
+    /// inside `fun main()`, entirely outside any `app`'s own declarative
+    /// child list) never receives `on start` either today, so symmetry
+    /// requires it not receive `on stop` either. `upto` is the caller's own
+    /// snapshot of `self.instances.len()` taken right where `start_all` was
+    /// called, so this only ever touches exactly the instances that were
+    /// actually started.
+    pub fn stop_all(&mut self, upto: usize) -> Result<(), Flow> {
+        for id in 0..upto.min(self.instances.len()) {
+            self.run_lifecycle(id, &Trigger::Stop)?;
+        }
+        self.drain()?;
+        Ok(())
+    }
+
     /// Arm the instance's timers relative to the current virtual time.
     fn arm_timers(&mut self, id: usize) {
         let comp = self.instances[id].comp.clone();

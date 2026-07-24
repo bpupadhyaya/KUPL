@@ -2177,6 +2177,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, live-confirmed dead-code bug found+fixed (production-hardening
+    /// PR-it1144, an Explore-agent survey side-finding, independently
+    /// re-verified live before implementing -- see `interp.rs::Interp::
+    /// stop_all`'s own doc comment for the full writeup): `on stop` handlers
+    /// are a documented language construct (parsed, type-checked, and
+    /// compiled on all three engines) that, before this fix, NO call site
+    /// anywhere in the crate ever actually triggered -- `on stop` was
+    /// permanently, silently dead code, identically on every engine. Fixed
+    /// by delivering `on stop` at the natural end of a `kupl run`/`kupl run
+    /// --vm` program (mirroring `on start`'s own creation-order delivery
+    /// exactly, INCLUDING descendants), but only on a successful run, not
+    /// after a panic. Locks in BOTH the fix itself and its cross-engine
+    /// byte-identity -- `run --vm`'s handling lives entirely inside
+    /// `vm.rs::Vm::run_app`, structurally different from `run.rs::
+    /// run_program`'s interp-side split between the closure and the
+    /// trailing `stop_all` call, so this genuinely exercises two independent
+    /// code paths, not one shared helper.
+    #[test]
+    fn on_stop_fires_symmetrically_with_on_start_for_an_app_and_its_children_but_not_after_a_panic() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-it1144-on-stop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_both = |file: &std::path::Path| -> (std::process::Output, std::process::Output) {
+            let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+            (interp, vm)
+        };
+
+        // an app with a child: `on stop` must fire for BOTH, in the SAME
+        // creation order `on start` already uses.
+        let both = dir.join("parent_child.kupl");
+        std::fs::write(
+            &both,
+            "component Child {\n    on start { print(\"child started\") }\n    on stop { print(\"child stopped\") }\n}\n\
+             app Parent {\n    let c = Child()\n    on start { print(\"parent started\") }\n    on stop { print(\"parent stopped\") }\n}\n",
+        )
+        .unwrap();
+        let (i1, v1) = run_both(&both);
+        let expected = b"parent started\nchild started\nparent stopped\nchild stopped\n".to_vec();
+        assert_eq!(i1.stdout, expected, "{i1:?}");
+        assert_eq!(v1.stdout, expected, "must be byte-identical to the interpreter: {v1:?}");
+        assert_eq!(i1.status.code(), Some(0));
+        assert_eq!(v1.status.code(), Some(0));
+
+        // a component instantiated AD-HOC from a plain `fun main()` (outside
+        // any `app`'s own declarative child list, e.g.
+        // `examples/agent_component.kupl`'s own `let bot = Assistant()`
+        // shape) never receives `on start` today either -- `on stop` must
+        // stay symmetric and NOT fire for it, not just fire universally for
+        // every instance that happens to still exist by program end.
+        let adhoc = dir.join("adhoc.kupl");
+        std::fs::write(
+            &adhoc,
+            "component Widget {\n    on start { print(\"widget started\") }\n    on stop { print(\"widget stopped\") }\n    expose fun ping() -> Str { \"pong\" }\n}\n\
+             fun main() uses io {\n    let w = Widget()\n    print(w.ping())\n}\n",
+        )
+        .unwrap();
+        let (i2, v2) = run_both(&adhoc);
+        assert_eq!(i2.stdout, b"pong\n", "{i2:?}");
+        assert_eq!(v2.stdout, b"pong\n", "{v2:?}");
+
+        // a panicking `on start` must NOT trigger `on stop` -- a crashed
+        // program doesn't get a graceful shutdown.
+        let panics = dir.join("panics.kupl");
+        std::fs::write(
+            &panics,
+            "app Boom {\n    on start { panic(\"boom\") }\n    on stop { print(\"must never print\") }\n}\n",
+        )
+        .unwrap();
+        let (i3, v3) = run_both(&panics);
+        assert_eq!(i3.status.code(), Some(101), "{i3:?}");
+        assert_eq!(v3.status.code(), Some(101), "{v3:?}");
+        assert!(!String::from_utf8_lossy(&i3.stdout).contains("must never print"), "{i3:?}");
+        assert!(!String::from_utf8_lossy(&v3.stdout).contains("must never print"), "{v3:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it894,
     /// an Explore survey finding, agentId a7ba91a6862653340, independently
     /// re-verified live before implementing -- see `callargs.rs`'s own doc
