@@ -1804,7 +1804,35 @@ impl Checker {
                 }
                 ctx.scopes.insert(&prop.name, ty, false);
             }
+            // A REAL correctness footgun found+fixed (production-hardening
+            // PR-it1135, a systematic sweep of every ComponentDecl field for
+            // the exact "sibling collection has a duplicate-name check but
+            // this one doesn't" shape already found and fixed for ports
+            // (K0204), props (K0283), children (K0207), wires (K0285), and
+            // supervise clauses (K0286)): `state` was the one remaining
+            // collection with NO duplicate-name check at all -- this loop's
+            // own `ctx.scopes.insert(&s.name, ...)` silently overwrites an
+            // earlier same-named entry, exactly like `Scopes`'s underlying
+            // HashMap-based storage always does on a repeated key. Live-
+            // confirmed BEFORE this fix: `component Counter { state n: Int
+            // = 1  state n: Int = 2  expose fun get() -> Int { n } }`
+            // compiled with `kupl check` reporting "ok" (zero diagnostics),
+            // and `kupl run`/`kupl run --vm`/`kupl native` all silently
+            // printed `2` (the SECOND declaration winning, consistently
+            // across every engine -- `interp.rs::instantiate`'s own
+            // `env.define(&s.name, v)` has the identical last-wins shape) --
+            // a plausible copy-paste mistake (declaring `state n` twice
+            // instead of `state count`/`state total`) silently discards the
+            // FIRST declaration's own init expression's side effects (if
+            // any) and its own declared type, with no hint anything is
+            // wrong, exactly the class of confusing-but-consistent footgun
+            // K0207/K0283/K0285/K0286 already reject for their own sibling
+            // collections.
+            let mut seen_state: HashSet<String> = HashSet::new();
             for s in &c.state {
+                if !seen_state.insert(s.name.clone()) {
+                    self.err("K0288", format!("state `{}` declared twice", s.name), s.span);
+                }
                 let init_ty = self.infer_expr(&s.init, &mut ctx);
                 if let Some(t) = &s.ty {
                     let ann = self.resolve_ty(t);
@@ -6990,6 +7018,35 @@ mod generic_tests {
         // an ordinary component with distinctly-named props is unaffected.
         assert!(
             errors("component Ok {\n    intent \"ok\"\n    prop a: Int\n    prop b: Int\n    expose fun sum() -> Int { a + b }\n}\nfun main() {}\n")
+                .is_empty()
+        );
+    }
+
+    /// A REAL correctness footgun found+fixed (production-hardening
+    /// PR-it1135, a systematic sweep of every `ComponentDecl` field for the
+    /// SAME "sibling collection has a duplicate-name check but this one
+    /// doesn't" shape already found for ports (K0204), props (K0283),
+    /// children (K0207), wires (K0285), and supervise clauses (K0286)):
+    /// `state` was the one remaining collection with NO duplicate-name check
+    /// -- `ctx.scopes.insert(&s.name, ...)` silently overwrote an earlier
+    /// same-named entry, matching `interp.rs::instantiate`'s own identical
+    /// `env.define` last-wins shape (consistent across all three runnable
+    /// engines, not a cross-engine divergence -- but still a plausible
+    /// copy-paste mistake, e.g. declaring `state n` twice instead of `state
+    /// count`, that silently discards the first declaration with zero hint).
+    #[test]
+    fn duplicate_component_state_names_are_rejected() {
+        let dup = errors("component C {\n    intent \"dup\"\n    state n: Int = 1\n    state n: Int = 2\n    expose fun get() -> Int { n }\n}\nfun main() {}\n");
+        assert!(
+            dup.iter().any(|d| d.code == "K0288" && d.message.contains("state `n`") && d.message.contains("declared twice")),
+            "{dup:?}"
+        );
+        // a state field duplicated against a DIFFERENT type is still rejected the same way.
+        let dup_diff_ty = errors("component C {\n    intent \"dup\"\n    state n: Int = 1\n    state n: Str = \"x\"\n    expose fun get() -> Str { n }\n}\nfun main() {}\n");
+        assert!(dup_diff_ty.iter().any(|d| d.code == "K0288" && d.message.contains("state `n`")), "{dup_diff_ty:?}");
+        // an ordinary component with distinctly-named state fields is unaffected.
+        assert!(
+            errors("component Ok {\n    intent \"ok\"\n    state a: Int = 0\n    state b: Int = 0\n    expose fun sum() -> Int { a + b }\n}\nfun main() {}\n")
                 .is_empty()
         );
     }
