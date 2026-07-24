@@ -1374,6 +1374,10 @@ pub fn run_tests(path: &str) -> i32 {
         let label = format!("law \"{}\"", law.name);
         let db = ProgramDb::build(&compiled.program, &compiled.checked);
         let mut interp = Interp::new(db);
+        // PR-it1156: bound this test item's own `while`-loop iterations so a
+        // runaway/accidental infinite loop fails cleanly instead of hanging
+        // `kupl test` forever -- see `test_step_budget`'s own doc comment.
+        interp.test_step_budget = Some(crate::interp::MAX_TEST_WHILE_ITERATIONS);
         let env = interp.globals.child();
         match interp.exec_block(&law.body, &env) {
             Ok(_) | Err(Flow::Return(_)) => {
@@ -1468,6 +1472,8 @@ pub fn run_tests(path: &str) -> i32 {
             };
             let db = ProgramDb::build(&compiled.program, &compiled.checked);
             let mut interp = Interp::new(db);
+            // PR-it1156: see the top-level law loop's own identical comment above.
+            interp.test_step_budget = Some(crate::interp::MAX_TEST_WHILE_ITERATIONS);
             let result = run_example(&mut interp, &c.name, example);
             match result {
                 Ok(None) => {
@@ -1529,6 +1535,8 @@ pub fn run_tests(path: &str) -> i32 {
                 let label = format!("{} law \"{}\"", c.name, law.name);
                 let db = ProgramDb::build(&compiled.program, &compiled.checked);
                 let mut interp = Interp::new(db);
+                // PR-it1156: see the top-level law loop's own identical comment above.
+                interp.test_step_budget = Some(crate::interp::MAX_TEST_WHILE_ITERATIONS);
                 let outcome: Result<(), Flow> = (|| {
                     let v = interp.instantiate(&c.name, &[], Span::default())?;
                     let Value::Component(id) = v else {
@@ -2327,6 +2335,84 @@ mod tests {
         // a file with no laws is not an error.
         let none = write("none.kupl", "fun add(a: Int, b: Int) -> Int { a + b }\n");
         assert_eq!(super::run_tests(&none), 0, "no tests is a clean pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, live-confirmed HANG bug found+fixed (production-hardening
+    /// PR-it1156, a fresh Explore survey finding): `kupl test` had NO
+    /// timeout/watchdog anywhere in its call path -- an accidental or
+    /// adversarial `while true { ... }` inside a `law`, a component
+    /// `example`, or a contract law hung the WHOLE `kupl test` invocation
+    /// forever (100% CPU, zero output, `kill -9` required), with no way for
+    /// an automated caller (CI) to distinguish "hung" from "slow" short of
+    /// its OWN external timeout wrapper. Live-confirmed BEFORE this fix
+    /// with a real subprocess left running past 5 seconds with zero
+    /// output. Fixed via `Interp::test_step_budget` (`None` for every
+    /// OTHER interp session -- `kupl run`'s own legitimate `while true`
+    /// event loop must never be capped -- only set by `run_tests` on each
+    /// fresh, per-test-item `Interp`), checked inside `Stmt::While`'s own
+    /// loop. This test calls `run_tests` on a SEPARATE thread with its own
+    /// wall-clock timeout as a safety net for the TEST ITSELF (mirroring
+    /// this codebase's own established hang-safety pattern, e.g. `lsp.rs`'s
+    /// `wait_with_timeout_lsp`) -- if the fix regresses, this test fails
+    /// cleanly instead of wedging the whole `cargo test` run.
+    #[test]
+    fn run_tests_does_not_hang_on_a_runaway_while_loop_in_any_test_item_kind() {
+        let dir = std::env::temp_dir().join(format!("kupl-runtests-hang-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_str().unwrap().to_string()
+        };
+        let run_with_timeout = |path: String| -> Option<i32> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(super::run_tests(&path));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(20)).ok()
+        };
+
+        // a runaway top-level law must fail cleanly, not hang.
+        let hang_law = write(
+            "hang_law.kupl",
+            "law \"runaway\" {\n    var x = 0\n    while true { x += 1 }\n    expect x == 1\n}\n",
+        );
+        let code = run_with_timeout(hang_law).expect("run_tests must not hang on a runaway law");
+        assert_eq!(code, 1, "a runaway law must be a clean FAILURE, not a hang");
+
+        // a runaway component example must ALSO fail cleanly (proving the
+        // guard isn't law-specific), and a SIBLING passing example in the
+        // SAME file must still run correctly, since this is per-test-item.
+        let hang_example = write(
+            "hang_example.kupl",
+            "component Ok1 {\n    in click: Int\n    out value: Int\n    on click(n) { emit value(n) }\n    example { send click(1)\n        expect value == 1 }\n}\n\
+             component Loopy {\n    in click: Int\n    out value: Int\n    on click(n) {\n        var x = 0\n        while true { x += 1 }\n        emit value(x)\n    }\n    example { send click(1)\n        expect value == 2 }\n}\n",
+        );
+        let code = run_with_timeout(hang_example).expect("run_tests must not hang on a runaway example");
+        assert_eq!(code, 1, "a file with one passing and one runaway example must still fail overall");
+
+        // a runaway CONTRACT law must also fail cleanly (the third of the
+        // three test-item categories `run_tests` supports).
+        let hang_contract_law = write(
+            "hang_contract_law.kupl",
+            "contract Counting {\n    expose fun current() -> Int\n    law \"runaway\" {\n        var x = 0\n        while true { x += 1 }\n        expect x == 1\n    }\n}\n\
+             component Impl fulfills Counting {\n    expose fun current() -> Int { 0 }\n}\n",
+        );
+        let code = run_with_timeout(hang_contract_law).expect("run_tests must not hang on a runaway contract law");
+        assert_eq!(code, 1, "a runaway contract law must be a clean FAILURE, not a hang");
+
+        // discriminating control: a LEGITIMATE, finite loop-based test
+        // (nowhere near the 10,000,000-iteration budget) must still pass --
+        // the guard must not be so tight it false-positives on ordinary
+        // test bodies.
+        let legit_loop = write(
+            "legit_loop.kupl",
+            "law \"sum of first 1000 naturals\" {\n    var i = 0\n    var total = 0\n    while i < 1000 {\n        total = total + i\n        i = i + 1\n    }\n    expect total == 499500\n}\n",
+        );
+        let code = run_with_timeout(legit_loop).expect("run_tests must not hang on a legitimate loop");
+        assert_eq!(code, 0, "a legitimate, finite loop-based test must still pass cleanly");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

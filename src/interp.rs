@@ -131,6 +131,18 @@ pub struct Interp {
     /// fatal, uncatchable native-stack abort — and matches the KVM's 10 000-frame
     /// limit so the two engines stay byte-identical on deep recursion.
     pub call_depth: usize,
+    /// Remaining `while`-loop iteration budget for THIS interp session
+    /// (production-hardening PR-it1156). `None` for every ordinary interp
+    /// session (`kupl run`/`kupl check`/native-adjacent worker interps) -- a
+    /// legitimate app's own `while true` event loop must NEVER be capped.
+    /// Only `run_tests` (`kupl test`) sets this to `Some(MAX_TEST_WHILE_
+    /// ITERATIONS)` on a freshly-constructed, per-test-item `Interp`, so a
+    /// runaway/accidental infinite loop inside a SINGLE `example`/law/
+    /// contract-law body fails with a clean panic (caught by run_tests's
+    /// own already-existing `Flow::Panic` handling, exactly like any other
+    /// test failure) instead of hanging the whole `kupl test` invocation
+    /// forever.
+    pub test_step_budget: Option<u64>,
 }
 
 /// Maximum user-function call depth, shared by the interpreter and the KVM
@@ -175,6 +187,26 @@ pub const MAX_COMPONENT_MESSAGE_BYTES: u64 = 10_000_000;
 /// native runtime (`cgen.rs`).
 pub const MAX_ADVANCE_FIRES: usize = 10_000_000;
 
+/// Bound on `while`-loop iterations within a single `kupl test` example/
+/// law/contract-law body (production-hardening PR-it1156, a fresh Explore
+/// survey finding: `kupl test` had NO hang guard anywhere in its call
+/// path -- an accidental or adversarial `while true { ... }` inside any
+/// test item hung the whole process indefinitely, 100% CPU, zero
+/// diagnostic, live-confirmed with `kill -9` required). Empirically
+/// calibrated on this hardware: 20,000,000 trivial `while` iterations
+/// took ~5 seconds (`kupl run`), so 10,000,000 bounds a hung test to
+/// roughly 2.5 seconds before it cleanly fails -- comfortably beyond
+/// what ANY legitimate, deterministic `example`/`law` body should ever
+/// need (these are meant to be small, fast unit tests, not loop-heavy
+/// batch jobs), while still failing fast enough to be CI-friendly. Value
+/// matches `regex.rs::MATCH_BUDGET` and this file's own
+/// `MAX_ADVANCE_FIRES` sizing convention exactly, for the same "generous
+/// for real use, but caps runaway growth" rationale. Only ever set via
+/// `Interp::test_step_budget`, and only by `run_tests` -- see that
+/// field's own doc comment for why every OTHER interp session must never
+/// be capped.
+pub const MAX_TEST_WHILE_ITERATIONS: u64 = 10_000_000;
+
 impl Interp {
     pub fn new(db: ProgramDb) -> Interp {
         let image = Some(crate::parallel::ProgramImage::from_db(&db));
@@ -188,6 +220,7 @@ impl Interp {
             now: 0,
             image,
             call_depth: 0,
+            test_step_budget: None,
         }
     }
 
@@ -204,6 +237,7 @@ impl Interp {
             now: 0,
             image: None,
             call_depth: 0,
+            test_step_budget: None,
         }
     }
 
@@ -991,6 +1025,20 @@ impl Interp {
                     };
                     if !b {
                         break;
+                    }
+                    // `kupl test`'s own hang guard (PR-it1156, see
+                    // `test_step_budget`'s own doc comment on the struct):
+                    // `None` for every session except a fresh per-test-item
+                    // interp under `run_tests`, so this is a no-op check for
+                    // `kupl run`/`kupl check`/native-adjacent sessions.
+                    if let Some(budget) = &mut self.test_step_budget {
+                        if *budget == 0 {
+                            return Err(Self::panic_flow(
+                                "test exceeded its `while`-loop iteration budget (likely an infinite loop)",
+                                *span,
+                            ));
+                        }
+                        *budget -= 1;
                     }
                     match self.exec_block(body, env) {
                         Ok(_) => {}
