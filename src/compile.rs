@@ -1288,6 +1288,52 @@ impl<'s> FnCompiler<'s> {
                         return dst;
                     }
                 }
+                // A REAL, live-confirmed cross-engine CAPABILITY gap found
+                // (production-hardening PR-it1143, an Explore-agent survey
+                // finding via the under-examined-helper-function technique,
+                // independently re-verified live before implementing):
+                // `check.rs::bind_component_env` binds every component
+                // function (private + exposed) into scope as an ordinary
+                // function-typed VALUE ("component functions ... callable
+                // from any body"), and `interp.rs::eval_ident` correctly
+                // resolves a bare reference to one as `Value::Bound(id,
+                // name)` -- so `kupl check` accepts, and `kupl run` correctly
+                // executes, a component method referenced as a first-class
+                // value (e.g. `xs.map(double)` where `double` is the
+                // component's own `fun`). But THIS arm's checklist above was
+                // only ever extended for TOP-LEVEL functions as values
+                // (`fun_names` -> `Value::Fun`), never for component-local
+                // ones -- so on the VM/native engines (which share this one
+                // compile step) the exact same well-typed program falls
+                // through to the generic "unknown name" fallback below,
+                // hard-failing to even compile with a confusing message that
+                // makes it look like a typo rather than an unsupported
+                // pattern. Properly supporting this would need a new runtime
+                // value representation (the current instance id isn't known
+                // until the enclosing frame executes) plus VM dispatch and
+                // native codegen support for invoking it later -- real
+                // future work, not a one-line fix. In the meantime, this at
+                // least turns a misleading "unknown name" into an accurate,
+                // actionable diagnostic that names the actual limitation and
+                // suggests the two concrete workarounds that already work
+                // identically on every engine today (call it directly, or
+                // wrap it in a lambda).
+                if let Some(ctx) = &self.comp {
+                    if ctx.funs.contains_key(name.as_str()) {
+                        self.err(
+                            "K0289",
+                            format!(
+                                "`{name}` is one of this component's own functions -- referencing it \
+                                 as a value (not calling it directly) is not yet supported on the \
+                                 VM/native engines, only the interpreter -- call it directly instead \
+                                 (e.g. `{name}(x)`), or wrap it in a lambda if you need to pass it as \
+                                 a value (e.g. `fn x -> {name}(x)`)"
+                            ),
+                            span,
+                        );
+                        return self.const_reg(Value::Unit, span);
+                    }
+                }
                 self.err("K0240", format!("unknown name `{name}` (KVM)"), span);
                 self.const_reg(Value::Unit, span)
             }
@@ -2379,5 +2425,48 @@ mod tests {
         assert!(!shared2.too_many_chunks);
         assert!(shared2.diags.is_empty());
         assert_eq!(shared2.module.chunks.len(), 1000);
+    }
+
+    /// A REAL, live-confirmed cross-engine CAPABILITY gap found+fixed
+    /// (production-hardening PR-it1143): `check.rs` accepts a component's own
+    /// function referenced as a first-class value (e.g. `xs.map(double)`
+    /// where `double` is the component's own `fun`), and `interp.rs` runs it
+    /// correctly -- but `ExprKind::Ident`'s value-resolution checklist here
+    /// was only ever extended for TOP-LEVEL functions (`fun_names` ->
+    /// `Value::Fun`), never component-local ones, so `compile_module` (shared
+    /// by the VM and native) used to fall through to the generic, misleading
+    /// "unknown name" K0240. Locks in the clearer K0289 diagnostic instead,
+    /// alongside a discriminating pair proving K0240 still fires for an
+    /// actually-unknown name and is untouched for the top-level-fun-as-value
+    /// case that already worked.
+    #[test]
+    fn component_local_fun_referenced_as_a_value_gets_a_clear_k0289_not_a_confusing_k0240() {
+        let src = "component Doubler {\n\
+                    out result: List[Int]\n\
+                    fun double(x: Int) -> Int { x * 2 }\n\
+                    on start { emit result([1, 2, 3].map(double)) }\n\
+                    }\n\
+                    app Main { let d = Doubler() }\n";
+        let compiled = crate::run::compile(src).expect("check.rs must accept this program");
+        let err = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect_err("VM/native compilation must still refuse this pattern");
+        assert!(err.iter().any(|d| d.code == "K0289"), "expected K0289, got: {err:?}");
+        assert!(!err.iter().any(|d| d.code == "K0240"), "must NOT also emit the generic K0240: {err:?}");
+
+        // discriminating pair (1): a genuinely unknown name is UNAFFECTED, still K0240.
+        let unknown_src = "fun main() uses io {\n    print(\"{totally_bogus_name}\")\n}\n";
+        let (program, diags) = crate::parser::parse(unknown_src);
+        let mut checked_diags = diags;
+        let (_checked, more) = crate::check::check(&program);
+        checked_diags.extend(more);
+        assert!(checked_diags.iter().any(|d| d.code == "K0240"), "sanity: must fail check with K0240: {checked_diags:?}");
+
+        // discriminating pair (2): a TOP-LEVEL fun referenced as a value is UNAFFECTED,
+        // compiles cleanly on the VM (this is the case `fun_names` already handles).
+        let top_level_src = "fun sq(x: Int) -> Int { x * x }\n\
+                              fun main() uses io {\n    print(\"{[1, 2, 3].map(sq)}\")\n}\n";
+        let compiled2 = crate::run::compile(top_level_src).expect("must check cleanly");
+        crate::compile::compile_module(&compiled2.program, &compiled2.checked)
+            .expect("a top-level fun referenced as a value must still compile cleanly on the VM");
     }
 }

@@ -139,6 +139,7 @@ Severity: **E** = error, **W** = warning.
 | K0286 | E | the same child is `supervise`d more than once — a `restart on_failure` declaration silently wins over a later `restart never` |
 | K0287 | E | an `@` pattern's own name is also bound by a nested sub-pattern — the interpreter and the VM/native compiler disagree on which binding wins |
 | K0288 | E | state field is declared more than once — the first declaration is silently discarded |
+| K0289 | E | a component's own function is referenced as a value (not called directly) — supported on the interpreter only, not yet on the VM/native engines |
 
 ## K03xx — Effects & style
 
