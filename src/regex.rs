@@ -608,27 +608,154 @@ fn match_piece(piece: &Piece, rest: &[Piece], chars: &[char], pos: usize, cont: 
     }
 }
 
+// A REAL, LIVE-CONFIRMED stack-overflow CRASH bug found+fixed (production-
+// hardening PR-it1148, an Explore-agent survey finding, independently
+// re-verified live before implementing): PR-it1067's own continuation-
+// passing rewrite (needed to fix groups not backtracking their internal
+// alternative choice) made `match_star`/`match_plus` recurse into
+// THEMSELVES once per matched repetition, via `atom_match`'s own
+// continuation -- so native stack depth became O(the length of the
+// greedy run), unbounded and proportional to ordinary INPUT length, not
+// pattern complexity (unlike every other recursion hazard in this
+// codebase, e.g. this file's own `Parser::atom`'s `(` arm, all capped via
+// an explicit depth guard). The existing `MATCH_BUDGET`/`tick()` step
+// counter -- this file's only other safety net, designed for ReDoS-style
+// pathological BACKTRACKING blowup -- never protected against this: the
+// star/plus repetition recursion never went through `match_seq` (the only
+// place that calls `tick()`) at all, so by the time the 10-million-step
+// budget would fire, the stack had already overflowed. Live-confirmed
+// BEFORE this fix: `re_match("^a*$", "a".repeat(4_000_000))` -- an
+// entirely ordinary, non-adversarial, LINEAR (no ReDoS shape) match --
+// aborted the whole process with an uncatchable Rust stack-overflow abort
+// on `kupl run`/`kupl run --vm` (~4M chars); `kupl native` (no enlarged
+// thread stack, unlike `main.rs`'s own 2GiB worker thread) SEGFAULTED at
+// a dramatically smaller, everyday input size (~90,000 chars -- an
+// ordinary "validate/search a moderately sized text" use case).
+//
+// Fixed with a hybrid: for a SIMPLE atom (`Any`/`Char`/`Class` -- always
+// consumes EXACTLY one character with no internal choice of its own, the
+// atom kind `a*`/`.+`/`[0-9]+`/etc. all use, and the OVERWHELMING majority
+// of real-world quantified atoms), `match_repeat_simple` below is a
+// STRAIGHT ITERATIVE greedy-scan-then-backtrack -- provably EXACTLY
+// equivalent to the recursive algorithm for this atom class (there is
+// only ever ONE possible per-repetition ending position, so "try the
+// longest run first, then progressively shorter ones" needs no search
+// tree at all), with native stack usage independent of input length. A
+// `Group` atom (which CAN have multiple internal alternative endings per
+// repetition -- exactly the shape PR-it1067's own fix was about) keeps
+// the original recursive/CPS structure, unchanged in behavior, but now
+// under an explicit depth guard (`match_star_group`, mirroring this
+// file's own `Parser::depth`-capped-at-`json::MAX_JSON_DEPTH` precedent
+// EXACTLY, including reusing its own proven-safe 500 limit -- an initial
+// attempt at a more generous 5,000 was live-caught by this file's OWN new
+// test suite: `cargo test`'s own per-test thread uses a smaller default
+// stack than `main.rs`'s deliberately-enlarged CLI worker thread, and
+// 5,000 levels of this closure-heavy continuation-passing recursion
+// still overflowed IT, confirming 500 is the right order of magnitude,
+// not just a round number) so a pathologically deep repeated-group match
+// cleanly reports the existing "regex match budget exceeded" error
+// instead of crashing -- generous enough that no ordinary grouped
+// pattern (e.g. `(ab)*` repeated a few hundred times) ever approaches it.
+const MAX_GROUP_REPEAT_DEPTH: usize = 500;
+
 /// Match `atom` zero or more times (greedy, backtracking toward fewer
-/// repetitions), then `cont`. Recurses so each repetition attempt gets the
-/// FULL downstream continuation, not just "the next repetition" -- letting
-/// a group nested inside a `*`/`+` backtrack its own internal choices too.
+/// repetitions), then `cont`.
 fn match_star(atom: &Atom, chars: &[char], pos: usize, cont: &dyn Fn(usize) -> Option<usize>) -> Option<usize> {
-    // Try consuming one MORE repetition (greedy), recursing before falling
-    // back to `cont` so the longest run is explored first. The zero-width
-    // guard (`np == pos`) prevents infinite recursion on an atom (only ever
-    // possible via a `Group` alternative that itself matches empty) that
-    // consumes no input -- treated as "no further repetitions help", not a
-    // hard failure, since the outer `cont(pos)` fallback below covers it.
-    if let Some(end) = atom_match(atom, chars, pos, &|np| if np == pos { None } else { match_star(atom, chars, np, cont) }) {
-        return Some(end);
+    match atom {
+        Atom::Group(_) => match_star_group(atom, chars, pos, cont, 0),
+        _ => match_repeat_simple(atom, chars, pos, cont, 0),
     }
-    cont(pos)
 }
 
 /// Match `atom` one or more times (mandatory first repetition, then
 /// behaves exactly like `match_star` for any further ones), then `cont`.
 fn match_plus(atom: &Atom, chars: &[char], pos: usize, cont: &dyn Fn(usize) -> Option<usize>) -> Option<usize> {
-    atom_match(atom, chars, pos, &|np| if np == pos { None } else { match_star(atom, chars, np, cont) })
+    match atom {
+        Atom::Group(_) => {
+            atom_match(atom, chars, pos, &|np| if np == pos { None } else { match_star_group(atom, chars, np, cont, 0) })
+        }
+        _ => match_repeat_simple(atom, chars, pos, cont, 1),
+    }
+}
+
+/// The ORIGINAL recursive/CPS repetition matcher, kept for `Group` atoms
+/// only (see the doc comment above `MAX_GROUP_REPEAT_DEPTH` for why this
+/// class still needs full backtracking search rather than the iterative
+/// fast path). `depth` counts repetitions consumed so far in THIS
+/// star/plus chain; once it hits `MAX_GROUP_REPEAT_DEPTH`, unwind cleanly
+/// (via the existing `budget_exceeded()` signal) instead of recursing
+/// further toward a native stack overflow.
+fn match_star_group(atom: &Atom, chars: &[char], pos: usize, cont: &dyn Fn(usize) -> Option<usize>, depth: usize) -> Option<usize> {
+    if depth >= MAX_GROUP_REPEAT_DEPTH {
+        BUDGET_HIT.with(|h| h.set(true));
+        return None;
+    }
+    // Try consuming one MORE repetition (greedy), recursing before falling
+    // back to `cont` so the longest run is explored first. The zero-width
+    // guard (`np == pos`) prevents infinite recursion on a `Group`
+    // alternative that itself matches empty -- treated as "no further
+    // repetitions help", not a hard failure, since the outer `cont(pos)`
+    // fallback below covers it.
+    if let Some(end) =
+        atom_match(atom, chars, pos, &|np| if np == pos { None } else { match_star_group(atom, chars, np, cont, depth + 1) })
+    {
+        return Some(end);
+    }
+    cont(pos)
+}
+
+/// Whether a SIMPLE (non-`Group`) atom matches the character at `pos`.
+fn atom_matches_one_char_simple(atom: &Atom, chars: &[char], pos: usize) -> bool {
+    match atom {
+        Atom::Any => pos < chars.len(),
+        Atom::Char(c) => chars.get(pos) == Some(c),
+        Atom::Class { negated, ranges } => match chars.get(pos) {
+            Some(&ch) => ranges.iter().any(|&(lo, hi)| ch >= lo && ch <= hi) != *negated,
+            None => false,
+        },
+        Atom::Group(_) => unreachable!("match_repeat_simple is never called with a Group atom"),
+    }
+}
+
+/// Iterative greedy-then-backtrack repetition matcher for a SIMPLE atom
+/// (`min_reps` is 0 for `*`, 1 for `+`). First scans forward as far as
+/// possible (every reachable position is trivially known, since a simple
+/// atom always consumes exactly one character with no branching choice),
+/// then walks backward from the longest match, trying `cont` at each
+/// length -- the SAME "prefer longest, backtrack toward fewer" greedy
+/// semantics `match_star_group` implements recursively, but with native
+/// stack usage independent of how many repetitions are found.
+fn match_repeat_simple(
+    atom: &Atom,
+    chars: &[char],
+    pos: usize,
+    cont: &dyn Fn(usize) -> Option<usize>,
+    min_reps: usize,
+) -> Option<usize> {
+    let mut end = pos;
+    while end < chars.len() && atom_matches_one_char_simple(atom, chars, end) {
+        if !tick() {
+            return None;
+        }
+        end += 1;
+    }
+    let floor = pos + min_reps;
+    if end < floor {
+        return None;
+    }
+    let mut p = end;
+    loop {
+        if !tick() {
+            return None;
+        }
+        if let Some(r) = cont(p) {
+            return Some(r);
+        }
+        if p == floor {
+            return None;
+        }
+        p -= 1;
+    }
 }
 
 /// Match a single atom at `pos`, then `cont`. Returns the final overall end
@@ -887,6 +1014,70 @@ mod tests {
         let shallow = "(".repeat(10) + "a" + &")".repeat(10);
         assert!(compile(&shallow).is_ok());
         assert!(m(&shallow, "a"));
+    }
+
+    /// A REAL, LIVE-CONFIRMED stack-overflow CRASH bug found+fixed
+    /// (production-hardening PR-it1148, an Explore-agent survey finding,
+    /// independently re-verified live before implementing): PR-it1067's
+    /// own continuation-passing rewrite (needed to fix groups not
+    /// backtracking their internal alternative choice, see the test right
+    /// above this one's own sibling test
+    /// `a_group_backtracks_into_a_different_alternative_or_internal_
+    /// quantifier_split_when_the_first_one_leaves_the_rest_of_the_pattern_
+    /// unmatchable`) made `match_star`/`match_plus` recurse into
+    /// THEMSELVES once per matched repetition -- native stack depth
+    /// became O(the length of the greedy run), unbounded and proportional
+    /// to ordinary INPUT length, not pattern complexity. Live-confirmed
+    /// BEFORE this fix: `re_match("^a*$", "a".repeat(4_000_000))` -- an
+    /// entirely ordinary, non-adversarial, LINEAR (no ReDoS shape) match
+    /// -- aborted the whole process with an uncatchable stack-overflow
+    /// abort. This test's own size (well under that crash threshold on
+    /// `main.rs`'s own CLI, which spawns an enlarged worker thread) is
+    /// still comfortably enough to crash under a PLAIN `cargo test`
+    /// thread's own default (unenlarged) stack, so it genuinely
+    /// regression-guards the fix without needing a multi-million-char
+    /// string that would slow the suite down.
+    #[test]
+    fn a_long_greedy_run_of_a_simple_atom_does_not_stack_overflow() {
+        let big: String = "a".repeat(300_000);
+        assert!(m("^a*$", &big), "an ordinary, non-adversarial long match must succeed, not crash");
+        assert!(m("^a+$", &big));
+        // backtracking still works correctly at this size: a trailing `b`
+        // the greedy `a*` must give back one position for.
+        let big_b = format!("{big}b");
+        assert!(m("^a*b$", &big_b), "greedy a* must still backtrack to let the trailing b match");
+        // a genuine non-match (no amount of backtracking helps) must
+        // cleanly return false, not crash either.
+        assert!(!m("^a*b$", &big), "a string with no trailing b must cleanly fail to match, not crash");
+        // re_find_all over a large subject (a totally ordinary "extract
+        // runs from a big text" use, no anchors at all) reproduces the
+        // exact same crash shape live-confirmed against `re_find_all`
+        // before this fix.
+        let re = compile("a+").unwrap();
+        assert_eq!(re.find_all(&big_b), vec![big.clone()]);
+    }
+
+    /// The `Group`-atom sibling of the test immediately above: a `Group`
+    /// atom (unlike a simple `Any`/`Char`/`Class` one) keeps the ORIGINAL
+    /// recursive/CPS repetition matcher (needed to preserve PR-it1067's
+    /// own group-backtracking fix, see `match_star_group`'s own doc
+    /// comment), so it remains stack-depth-limited -- but now under an
+    /// explicit `MAX_GROUP_REPEAT_DEPTH` guard, so a pathologically deep
+    /// repeated-group match cleanly reports the budget-exceeded signal
+    /// instead of crashing, mirroring `deeply_nested_groups_are_a_clean_
+    /// error_not_a_stack_overflow`'s own established pattern one level
+    /// down (PATTERN nesting depth there; repetition COUNT here).
+    #[test]
+    fn a_deeply_repeated_group_is_a_clean_budget_error_not_a_stack_overflow() {
+        let re = compile("(ab)*").unwrap();
+        let too_many = "ab".repeat(super::MAX_GROUP_REPEAT_DEPTH + 1);
+        let _ = re.is_match(&too_many); // must return quickly, not crash
+        assert!(super::budget_exceeded(), "expected the group-repeat depth guard to trip");
+
+        // comfortably within the cap: still matches correctly.
+        let few = "ab".repeat(100);
+        assert!(re.is_match(&few));
+        assert!(!super::budget_exceeded());
     }
 
     #[test]

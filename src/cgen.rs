@@ -5460,6 +5460,15 @@ typedef struct KReCont {
 static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out);
 static int kre_match_piece(KRePiece* first, KRePiece* rest, int nrest, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out);
 static int kre_match_star(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out);
+static int kre_match_star_group(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out, int depth);
+/* backtracking-step budget — mirrors src/regex.rs MATCH_BUDGET (10_000_000). A
+   pathological pattern/input (e.g. `a*a*a*a*c` over a long non-matching string)
+   would otherwise hang exponentially (ReDoS); instead it panics cleanly with the
+   same message the interpreter raises. Reset at each top-level match op. Declared
+   here (rather than just before its own first use, `kre_match_seq`, as before
+   PR-it1148) since `kre_match_repeat_simple`/`kre_match_star_group` -- both
+   defined earlier in this file now -- also need it. */
+static long kre_steps = 0;
 
 /* Match a single atom at `pos`, then `cont` -- for a simple (always exactly
    one CHARACTER wide) atom this is just `cont->fn(cont, pos + width, out)`;
@@ -5502,35 +5511,146 @@ static int kre_seq_cont_fn(const KReCont* k, int pos, int* out) {
     return kre_match_seq(c->rest, c->nrest, c->t, c->tlen, pos, c->outer, out);
 }
 
-/* Continuation context for `match_star`'s own recursive-repetition step:
-   after `atom` matches once more (from `base_pos` to `np`), either bail out
-   on a zero-width match (guard against infinite recursion -- only possible
-   via a `Group` alternative that itself matches empty) or recurse into
-   `match_star` again from the new position. */
-typedef struct { KReAtom* a; const unsigned char* t; int tlen; int base_pos; const KReCont* outer; } KReStarCtx;
+/* A REAL, LIVE-CONFIRMED stack-overflow/SEGFAULT CRASH bug found+fixed
+   (production-hardening PR-it1148 -- see regex.rs's own doc comment above
+   `MAX_GROUP_REPEAT_DEPTH` for the full writeup): the SAME PR-it1067
+   continuation-passing rewrite that fixed groups not backtracking their
+   internal alternative choice ALSO made `kre_match_star`/`kre_match_plus`
+   recurse into THEMSELVES once per matched repetition -- native stack
+   depth O(the length of the greedy run), unbounded and proportional to
+   ordinary INPUT length. This native engine has it WORSE than interp/VM:
+   it runs on the OS's ordinary default thread stack (no enlarged worker
+   thread, unlike `main.rs`'s own CLI), so it SEGFAULTS at a dramatically
+   smaller, everyday input size (~90,000 chars for `re_match("^a*$", ...)`
+   -- confirmed live) than interp/VM's own multi-million-character crash
+   threshold. Fixed with the IDENTICAL hybrid regex.rs itself now uses: a
+   SIMPLE atom (kind 0/1/2 -- Any/Char/Class, always exactly one character
+   wide with no internal choice) now uses `kre_match_repeat_simple` below,
+   an ITERATIVE greedy-scan-then-backtrack using a growable heap array
+   (mirroring this SAME file's own `k_re_find_all`'s established growable-
+   array convention) instead of native-stack recursion -- provably exactly
+   equivalent for this atom class, since there's only ever one possible
+   per-repetition ending position. A `Group` atom (kind 3, which CAN have
+   multiple internal alternative endings per repetition -- exactly the
+   shape PR-it1067's own fix was about) keeps the original recursive/CPS
+   structure, unchanged in behavior, but now under an explicit depth guard
+   (mirroring this file's own `K_MAX_JSON_DEPTH` precedent) so a
+   pathologically deep repeated-group match cleanly panics with the
+   existing "regex match budget exceeded" message instead of crashing. */
+/* mirrors regex.rs's own MAX_GROUP_REPEAT_DEPTH exactly (500, matching
+   K_MAX_JSON_DEPTH's own already-proven-safe value) -- an initial attempt
+   at 5,000 was live-caught by regex.rs's own new test suite overflowing
+   its stack under cargo test's smaller default thread, so 500 (verified
+   live here too, on native's own OS-default-stack process) is the right
+   order of magnitude for a closure/struct-heavy CPS recursion, not the
+   ~90,000 the SIMPLE, lightweight per-character recursion this same fix
+   replaced could tolerate. */
+#define KRE_MAX_GROUP_REPEAT_DEPTH 500
+
+/* Whether SIMPLE atom `a` (kind 0/1/2, never Group) matches at BYTE offset
+   `pos`; `*outlen` receives how many bytes the matched character took
+   (UTF-8 is variable-width, unlike regex.rs's own char-indexed `&[char]`,
+   so unlike that side's fixed "+1 per repetition" this must track actual
+   byte offsets). */
+static int kre_atom_matches_one_simple(KReAtom* a, const unsigned char* t, int tlen, int pos, int* outlen) {
+    if (pos >= tlen) return 0;
+    switch (a->kind) {
+        case 0: *outlen = k_utf8_len(t[pos]); return 1;
+        case 1: {
+            int clen; long cp = kre_utf8_cp(t, tlen, pos, &clen);
+            if (cp == a->ch) { *outlen = clen; return 1; }
+            return 0;
+        }
+        case 2: {
+            int clen; long cp = kre_utf8_cp(t, tlen, pos, &clen);
+            int inside = 0;
+            for (int i = 0; i < a->nranges; i++) if (cp >= a->ranges[i].lo && cp <= a->ranges[i].hi) { inside = 1; break; }
+            if (inside != a->negated) { *outlen = clen; return 1; }
+            return 0;
+        }
+        default: return 0; /* unreachable: never called with a Group atom */
+    }
+}
+
+/* Iterative greedy-then-backtrack repetition matcher for a SIMPLE atom
+   (`min_reps` 0 for `*`, 1 for `+`). First scans forward collecting every
+   reachable BYTE-offset endpoint into a growable array (variable-width
+   UTF-8 steps mean these can't be recomputed from a plain count, unlike
+   regex.rs's own char-indexed fast path), then walks backward from the
+   longest match, trying `cont` at each length -- the SAME "prefer
+   longest, backtrack toward fewer" greedy semantics the original
+   recursive form implements, but with native stack usage independent of
+   how many repetitions are found. */
+static int kre_match_repeat_simple(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out, int min_reps) {
+    int cap = 64;
+    int* ends = (int*)k_alloc(sizeof(int) * cap);
+    int n = 0;
+    ends[n++] = pos;
+    int cur = pos;
+    for (;;) {
+        if (--kre_steps < 0) { free(ends); k_panic("regex match budget exceeded (pattern too complex for the input)"); }
+        int clen;
+        if (!kre_atom_matches_one_simple(a, t, tlen, cur, &clen)) break;
+        cur += clen;
+        if (n == cap) { cap *= 2; ends = (int*)realloc(ends, sizeof(int) * cap); }
+        ends[n++] = cur;
+    }
+    int result = 0;
+    for (int i = n - 1; i >= min_reps; i--) {
+        if (--kre_steps < 0) { free(ends); k_panic("regex match budget exceeded (pattern too complex for the input)"); }
+        if (cont->fn(cont, ends[i], out)) { result = 1; break; }
+    }
+    free(ends);
+    return result;
+}
+
+/* Continuation context for `kre_match_star_group`'s own recursive-
+   repetition step (Group atoms only): after `atom` matches once more (from
+   `base_pos` to `np`), either bail out on a zero-width match (guard
+   against infinite recursion -- only possible via a `Group` alternative
+   that itself matches empty) or recurse into `kre_match_star_group` again
+   from the new position, one `depth` deeper. */
+typedef struct { KReAtom* a; const unsigned char* t; int tlen; int base_pos; const KReCont* outer; int depth; } KReStarCtx;
 static int kre_star_next_cont_fn(const KReCont* k, int np, int* out) {
     KReStarCtx* c = (KReStarCtx*)k->ctx;
     if (np == c->base_pos) return 0;
-    return kre_match_star(c->a, c->t, c->tlen, np, c->outer, out);
+    return kre_match_star_group(c->a, c->t, c->tlen, np, c->outer, out, c->depth + 1);
 }
 
-/* Match `atom` zero or more times (greedy, backtracking toward fewer
-   repetitions), then `cont`. Recurses so each repetition attempt gets the
-   FULL downstream continuation, not just "the next repetition" -- letting a
-   group nested inside a `*`/`+` backtrack its own internal choices too. */
-static int kre_match_star(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
-    KReStarCtx sctx = { a, t, tlen, pos, cont };
+/* The ORIGINAL recursive/CPS repetition matcher, kept for `Group` atoms
+   only -- see the doc comment above `KRE_MAX_GROUP_REPEAT_DEPTH` for why
+   this class still needs full backtracking search rather than the
+   iterative fast path `kre_match_repeat_simple` uses. `depth` counts
+   repetitions consumed so far in THIS star/plus chain; once it hits
+   `KRE_MAX_GROUP_REPEAT_DEPTH`, panic cleanly (the SAME "regex match
+   budget exceeded" message the step-budget check already uses) instead of
+   recursing further toward a native stack overflow. */
+static int kre_match_star_group(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out, int depth) {
+    if (depth >= KRE_MAX_GROUP_REPEAT_DEPTH) {
+        k_panic("regex match budget exceeded (pattern too complex for the input)");
+    }
+    KReStarCtx sctx = { a, t, tlen, pos, cont, depth };
     KReCont inner = { kre_star_next_cont_fn, &sctx };
     if (kre_atom_match(a, t, tlen, pos, &inner, out)) return 1;
     return cont->fn(cont, pos, out);
 }
 
+/* Match `atom` zero or more times (greedy, backtracking toward fewer
+   repetitions), then `cont`. */
+static int kre_match_star(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
+    if (a->kind == 3) return kre_match_star_group(a, t, tlen, pos, cont, out, 0);
+    return kre_match_repeat_simple(a, t, tlen, pos, cont, out, 0);
+}
+
 /* Match `atom` one or more times (mandatory first repetition, then behaves
    exactly like `kre_match_star` for any further ones), then `cont`. */
 static int kre_match_plus(KReAtom* a, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
-    KReStarCtx sctx = { a, t, tlen, pos, cont };
-    KReCont inner = { kre_star_next_cont_fn, &sctx };
-    return kre_atom_match(a, t, tlen, pos, &inner, out);
+    if (a->kind == 3) {
+        KReStarCtx sctx = { a, t, tlen, pos, cont, 0 };
+        KReCont inner = { kre_star_next_cont_fn, &sctx };
+        return kre_atom_match(a, t, tlen, pos, &inner, out);
+    }
+    return kre_match_repeat_simple(a, t, tlen, pos, cont, out, 1);
 }
 
 static int kre_match_piece(KRePiece* first, KRePiece* rest, int nrest, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
@@ -5549,11 +5669,6 @@ static int kre_match_piece(KRePiece* first, KRePiece* rest, int nrest, const uns
     }
     return kre_match_plus(a, t, tlen, pos, &rest_cont, out);   /* quant == 2: + */
 }
-/* backtracking-step budget — mirrors src/regex.rs MATCH_BUDGET (10_000_000). A
-   pathological pattern/input (e.g. `a*a*a*a*c` over a long non-matching string)
-   would otherwise hang exponentially (ReDoS); instead it panics cleanly with the
-   same message the interpreter raises. Reset at each top-level match op. */
-static long kre_steps = 0;
 static int kre_match_seq(KRePiece* pieces, int n, const unsigned char* t, int tlen, int pos, const KReCont* cont, int* out) {
     if (--kre_steps < 0)
         k_panic("regex match budget exceeded (pattern too complex for the input)");
@@ -14535,6 +14650,52 @@ fun main() uses io {
         assert_eq!(
             native_main_stdout(src, "regex").trim(),
             "[\"1\", \"22\", \"333\"]\na#b#c\nSome(\"日\")\nSome(\"a日本z\")"
+        );
+    }
+
+    /// A REAL, LIVE-CONFIRMED SEGFAULT crash bug found+fixed (production-
+    /// hardening PR-it1148, the native mirror of regex.rs's identical fix
+    /// -- see `kre_match_repeat_simple`'s own doc comment for the full
+    /// writeup): PR-it1067's continuation-passing rewrite made
+    /// `kre_match_star`/`kre_match_plus` recurse into THEMSELVES once per
+    /// matched repetition, so native stack depth grew O(the length of the
+    /// greedy run) -- unlike interp/VM (which run on `main.rs`'s own
+    /// deliberately-enlarged worker thread and only crashed around
+    /// several MILLION characters), this native engine runs on the OS's
+    /// ordinary default thread stack and SEGFAULTED at a dramatically
+    /// smaller, everyday input size (live-confirmed BEFORE this fix:
+    /// `re_match("^a*$", "a".repeat(90_000))` crashed; 80,000 chars still
+    /// succeeded). This test's own size is comfortably past that old
+    /// crash threshold, independently verifying native's OWN separate C
+    /// implementation, not just assuming it's fixed because regex.rs is.
+    #[test]
+    fn native_regex_long_greedy_run_does_not_crash() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    \
+                   let s = \"a\".repeat(200000)\n    \
+                   print(re_match(\"^a*$\", s))\n    \
+                   let sb = s + \"b\"\n    \
+                   print(re_match(\"^a*b$\", sb))\n    \
+                   print(re_match(\"^a*b$\", s))\n}\n";
+        assert_eq!(native_main_stdout(src, "regexlonggreedy").trim(), "true\ntrue\nfalse");
+    }
+
+    /// The `Group`-atom sibling of the test immediately above (native
+    /// mirror of regex.rs's own `a_deeply_repeated_group_is_a_clean_
+    /// budget_error_not_a_stack_overflow`): a `Group` atom keeps the
+    /// original recursive structure under an explicit depth guard
+    /// (`KRE_MAX_GROUP_REPEAT_DEPTH`, mirroring regex.rs's own
+    /// `MAX_GROUP_REPEAT_DEPTH`), so a pathologically deep repeated-group
+    /// match cleanly panics -- with the SAME message as the interpreter,
+    /// since both engines' depth guards are set to the identical limit --
+    /// instead of crashing.
+    #[test]
+    fn native_regex_deeply_repeated_group_panics_cleanly_not_a_crash() {
+        assert_panic_wording_matches(
+            "fun main() uses io {\n    let s = \"ab\".repeat(2000)\n    print(re_match(\"(ab)*\", s))\n}\n",
+            "regexgroupdepth",
         );
     }
 
