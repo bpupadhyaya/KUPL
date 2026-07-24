@@ -371,10 +371,10 @@ fn dump_json(j: &Json) -> String {
 pub fn value_from_json(shape: &AiShape, json: &Json) -> Result<Value, String> {
     match (shape, json) {
         // A REAL bug found+fixed (production-hardening PR-it690): unlike
-        // `json.rs`'s OWN parser (which rejects a ` ` escape at parse
+        // `json.rs`'s OWN parser (which rejects a `\u0000` escape at parse
         // time -- "not allowed in a KUPL Str, K0008") and ~15 other input
         // boundaries across this codebase, this module parses a model's JSON
-        // response with `lsp::parse_json`, which decodes ` ` to a
+        // response with `lsp::parse_json`, which decodes `\u0000` to a
         // literal NUL character with NO such guard -- so a model response
         // (or a misbehaving/malicious provider) could construct a
         // `Value::Str` violating KUPL's own "Str is NUL-free UTF-8 text"
@@ -712,7 +712,7 @@ fn convert(meta: &AiFunMeta, text: &str) -> Result<Value, String> {
     if meta.shape == AiShape::Str {
         // Same "Str is NUL-free" concern as `value_from_json`'s `AiShape::
         // Str` arm above (PR-it690), for the RAW-TEXT fast path (no JSON
-        // parsing at all here, so no ` `-escape angle -- a literal NUL
+        // parsing at all here, so no `\u0000`-escape angle -- a literal NUL
         // byte anywhere in the model's raw response text reaches this point
         // completely unchecked).
         if text.contains('\0') {
@@ -1253,7 +1253,7 @@ mod tests {
     /// A REAL bug found+fixed (production-hardening PR-it690): unlike
     /// `json.rs`'s own parser and ~15 other input boundaries, neither
     /// `convert`'s raw-text fast path (`-> Str` ai funs) nor
-    /// `value_from_json`'s `AiShape::Str` arm (used for a JSON ` `
+    /// `value_from_json`'s `AiShape::Str` arm (used for a JSON `\u0000`
     /// escape, decoded by `lsp::parse_json` with no NUL guard) rejected a
     /// NUL byte reaching a `Value::Str` -- violating KUPL's "Str is
     /// NUL-free" invariant via a path structurally unreachable from any
@@ -1275,7 +1275,7 @@ mod tests {
         assert!(err.contains("NUL"), "{err}");
 
         // JSON-shape path (`value_from_json`'s `AiShape::Str` arm), reached
-        // via a ` ` escape that `lsp::parse_json` decodes to a literal
+        // via a `\u0000` escape that `lsp::parse_json` decodes to a literal
         // NUL with no guard of its own.
         let json = crate::lsp::parse_json("{\"value\": \"hi\\u0000there\"}").unwrap();
         let inner = json.get("value").unwrap();
