@@ -1268,10 +1268,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL sibling-consistency bug found+fixed (production-hardening
+    /// PR-it1147, an Explore-agent survey finding, independently re-
+    /// verified live before implementing) -- the SAME class PR-it594 fixed
+    /// for `kupl fmt`'s own `with_file`: `kupl diff` used to report a
+    /// missing/unreadable/unparseable INPUT file as exit 2, the SAME code
+    /// as a genuine command-line USAGE error (missing/extra argument,
+    /// locked in by the test immediately above), while every other file-
+    /// taking subcommand (run/check/native/test/build/bundle/dis/manifest/
+    /// context) reports the identical "can't read/parse this file"
+    /// condition as a load failure, exit 1. Fixed in `sdiff.rs::
+    /// semantic_diff`'s own load-failure branch.
+    #[test]
+    fn diff_reports_a_bad_input_file_as_a_load_failure_not_a_bare_usage_error() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-it1147-diff-load-failure-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+        let real = dir.join("real.kupl");
+        std::fs::write(&real, "fun main() uses io {\n    print(\"hi\")\n}\n").unwrap();
+        let missing = dir.join("does-not-exist.kupl");
+        let unparseable = dir.join("bad.kupl");
+        std::fs::write(&unparseable, "fun main( {\n    print(\n").unwrap();
+
+        for bad in [&missing, &unparseable] {
+            let d = run(&["diff", bad.to_str().unwrap(), real.to_str().unwrap()]);
+            assert_eq!(
+                d.status.code(),
+                Some(1),
+                "a bad input file must be a load failure (exit 1), not a usage error (exit 2): {d:?}"
+            );
+            let d2 = run(&["diff", real.to_str().unwrap(), bad.to_str().unwrap()]);
+            assert_eq!(d2.status.code(), Some(1), "{d2:?}");
+        }
+
+        // the genuinely-malformed-INVOCATION cases are a DIFFERENT
+        // situation (main.rs's own dispatch arm, unaffected by this fix)
+        // and must stay exit 2.
+        let no_args = run(&["diff"]);
+        assert_eq!(no_args.status.code(), Some(2), "{no_args:?}");
+        let extra_arg = run(&["diff", real.to_str().unwrap(), real.to_str().unwrap(), "extra"]);
+        assert_eq!(extra_arg.status.code(), Some(2), "{extra_arg:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it1062, a background
     /// close-read survey finding): the SAME "unexpected extra argument
-    /// silently dropped" shape the test above locks in for `diff`/`context`
-    /// (PR-it864) also applied to `new`, which took its single positional
+    /// silently dropped" shape `diff_and_context_reject_a_genuine_extra_
+    /// argument_instead_of_silently_dropping_it` locks in for `diff`/
+    /// `context` (PR-it864) also applied to `new`, which took its single positional
     /// argument via a raw `args.get(1)`, never checking `args.get(2)` at
     /// all. Live-confirmed BEFORE this fix: `kupl new demo extra_arg`
     /// created `demo/` cleanly, exit 0, `extra_arg` never examined.

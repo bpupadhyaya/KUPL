@@ -4,7 +4,12 @@
 //! comments, and layout never register as changes. Changes are classified:
 //!   - interface: signature/ports/props/exposes/fulfills changed (breaking)
 //!   - implementation: only bodies/state/wiring changed (non-breaking)
-//! Exit code 0 = semantically identical, 1 = changes found.
+//! Exit code 0 = semantically identical, 1 = changes found OR either input
+//! failed to load (missing/unreadable file, parse error, duplicate item
+//! name) -- mirrors `kupl fmt --check`'s own established convention of
+//! reusing exit 1 for "this isn't in a fully clean state," rather than a
+//! genuine command-line usage error (exit 2, e.g. a missing/extra
+//! argument).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,7 +45,32 @@ pub fn semantic_diff(old_path: &str, new_path: &str) -> i32 {
     let (old_items, old_uses, ok_a) = load_items(old_path);
     let (new_items, new_uses, ok_b) = load_items(new_path);
     if !ok_a || !ok_b {
-        return 2;
+        // A REAL bug found+fixed (production-hardening PR-it1147, an
+        // Explore-agent survey finding, independently re-verified live
+        // before implementing): this used to return 2 (the "malformed
+        // command line" class), conflating a genuine USAGE error (missing/
+        // extra argument -- main.rs's own `diff` dispatch arm, unaffected
+        // by this fix) with a bad INPUT (one of the two files is missing,
+        // unreadable, fails to parse, or has a duplicate item name). Every
+        // OTHER file-taking subcommand in this binary (`run`/`check`/`dis`/
+        // `native`/`manifest`/`test`/`build`/`bundle`/`context`, all routed
+        // through `with_path`/`load_compile`) treats this exact condition
+        // as a load failure, exit 1 -- established and locked in by
+        // PR-it594's own `with_file_reports_missing_entry_as_a_load_
+        // failure_not_a_bare_usage_error` test. Live-confirmed before this
+        // fix: `kupl check missing.kupl` exits 1, but `kupl diff missing.
+        // kupl real.kupl` exited 2 for the IDENTICAL underlying condition
+        // -- a script/CI job branching on exit code (a pattern this
+        // project's own conventions actively encourage, e.g. `fmt --check`)
+        // could never distinguish "you typed the diff command wrong" from
+        // "one of the two files you pointed at doesn't exist" for `diff`
+        // alone, unlike every sibling subcommand. `sdiff.rs`'s own
+        // load_items/semantic_diff pairing was simply never routed through
+        // the K0400 convention the rest of the CLI converged on, and slipped
+        // past both PR-it594's original sweep (main.rs::with_file only) and
+        // PR-it864's later one (diff's own EXTRA-argument handling only,
+        // still correctly exit 2, unaffected here).
+        return 1;
     }
 
     let mut changes = 0usize;
@@ -650,10 +680,12 @@ mod tests {
         assert_eq!(errt, ("type", "Config".to_string()), "{errt:?}");
 
         // end to end via `semantic_diff` (the REAL CLI entry point): a
-        // same-kind duplicate must make the WHOLE FILE un-diffable (exit 2,
-        // the SAME code an unparseable file already returns), not silently
-        // report "semantically identical" while a real change to one of the
-        // colliding declarations goes completely unreported.
+        // same-kind duplicate must make the WHOLE FILE un-diffable (exit 1
+        // -- a LOAD failure, the SAME code an unparseable/missing file
+        // already returns since PR-it1147's own sibling-consistency fix,
+        // not a usage error), not silently report "semantically identical"
+        // while a real change to one of the colliding declarations goes
+        // completely unreported.
         let dir = std::env::temp_dir().join(format!("kupl-sdiff-dup-it757-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let old_path = dir.join("old.kupl");
@@ -671,8 +703,8 @@ mod tests {
         .unwrap();
         let code = super::semantic_diff(old_path.to_str().unwrap(), new_path.to_str().unwrap());
         assert_eq!(
-            code, 2,
-            "a same-kind duplicate must make the file un-diffable (exit 2), not silently report success"
+            code, 1,
+            "a same-kind duplicate must make the file un-diffable (exit 1, a load failure), not silently report success"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
