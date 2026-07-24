@@ -4905,6 +4905,31 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
                     final_text = !strcmp(k_json_var(fin), "JStr") ? fin.as.ctor->fields[0].as.s : k_ai_dump_json(fin);
                     break;
                 }
+                /* A REAL, live-confirmed cross-engine divergence found+fixed
+                   (production-hardening PR-it1140, an Explore-agent survey
+                   finding): `ai.rs::MockProvider::round` checks fields in
+                   `"final"` -> `"tool"` (singular) -> `"tools"` (plural)
+                   order -- for a scripted round malformed enough to contain
+                   BOTH `"tool"` and `"tools"` simultaneously, `"tool"` wins
+                   and `"tools"` is never even inspected. This function used
+                   to check `"tools"` FIRST (below), falling through to
+                   `"tool"` only in the `else` branch -- the OPPOSITE
+                   priority. Live-confirmed BEFORE this fix: a round `{
+                   "tool": "tool_a", ..., "tools": [{"tool": "tool_b", ...}]
+                   }` ran `tool_a` (a distinguishable side effect, writing
+                   its own marker file) on `kupl run`/`kupl run --vm`, but
+                   `kupl native` ran `tool_b` instead -- a genuine, silent,
+                   different-side-effect divergence, not just a wording
+                   mismatch. Fixed by checking the singular `"tool"` field
+                   FIRST, matching `ai.rs`'s own priority exactly; every
+                   other case (only `"tool"`, only `"tools"`, or neither)
+                   is completely unaffected, since each already reached the
+                   identical `k_ai_call_one_tool` call either way. */
+                KValue single_tool;
+                if (k_map_field(m, "tool", &single_tool) && !strcmp(k_json_var(single_tool), "JStr")) {
+                    if (!k_ai_call_one_tool(f, m)) return k_unit();
+                    continue;
+                }
                 KValue tools_arr;
                 if (k_map_field(m, "tools", &tools_arr) && !strcmp(k_json_var(tools_arr), "JArr")) {
                     /* {"tools": [...]}: several simultaneous tool calls in the
@@ -19771,6 +19796,60 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
              before the LATER malformed entry was validated -- matches interp/vm, which \
              reject the whole round atomically before executing anything"
         );
+    }
+
+    /// A REAL, live-confirmed cross-engine divergence found+fixed (production-
+    /// hardening PR-it1140, an Explore-agent survey finding): `ai.rs::
+    /// MockProvider::round` checks a scripted round's fields in `"final"` ->
+    /// `"tool"` (singular) -> `"tools"` (plural) order -- for a round
+    /// malformed enough to contain BOTH `"tool"` and `"tools"` simultaneously,
+    /// `"tool"` wins and `"tools"` is never even inspected. `cgen.rs`'s own
+    /// mirror used to check `"tools"` FIRST, the OPPOSITE priority. Live-
+    /// confirmed BEFORE this fix: a round with BOTH fields present ran the
+    /// `"tool"`-named function (a distinguishable side effect, writing its
+    /// own marker file) on `kupl run`/`kupl run --vm`, but `kupl native` ran
+    /// the DIFFERENT function named inside `"tools"` instead -- a genuine,
+    /// silent, different-side-effect divergence.
+    #[test]
+    fn native_ai_mock_round_with_both_tool_and_tools_prefers_the_singular_tool_field() {
+        if !cc_available() {
+            return;
+        }
+        let marker_a = std::env::temp_dir().join(format!("kupl-cgen-aitoolpriority-a-{}.txt", std::process::id()));
+        let marker_b = std::env::temp_dir().join(format!("kupl-cgen-aitoolpriority-b-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker_a);
+        let _ = std::fs::remove_file(&marker_b);
+        let src = "fun mark_a() uses io.fs -> Str {\n    let _ = write_file(\"MARKER_A\", \"ran\")\n    \"ok\"\n}\n\
+                   fun mark_b() uses io.fs -> Str {\n    let _ = write_file(\"MARKER_B\", \"ran\")\n    \"ok\"\n}\n\
+                   ai fun assist_d0(q: Str) -> Str tools [mark_a, mark_b] { intent \"x\" }\n\
+                   fun main() uses io, ai { print(assist_d0(\"go\")) }\n"
+            .replace("MARKER_A", &marker_a.to_str().unwrap().replace('\\', "\\\\"))
+            .replace("MARKER_B", &marker_b.to_str().unwrap().replace('\\', "\\\\"));
+        let compiled = crate::run::compile(&src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-aitoolpriority-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let mock = "[{\"tool\":\"mark_a\",\"input\":{},\"tools\":[{\"tool\":\"mark_b\",\"input\":{}}]},{\"final\":\"done\"}]";
+        let out = std::process::Command::new(&bin)
+            .env("KUPL_AI_MOCK_ASSIST_D0", mock)
+            .output()
+            .expect("binary runs");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+        let a_ran = marker_a.exists();
+        let b_ran = marker_b.exists();
+        let _ = std::fs::remove_file(&marker_a);
+        let _ = std::fs::remove_file(&marker_b);
+        assert!(out.status.success(), "the round must resolve cleanly, not panic: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+        assert!(a_ran, "the singular `\"tool\": \"mark_a\"` field must win, matching ai.rs's own priority");
+        assert!(!b_ran, "`\"tools\"` must NOT be inspected when `\"tool\"` is also present");
     }
 
     /// Direct cross-component expose calls compile to native and dispatch to the
