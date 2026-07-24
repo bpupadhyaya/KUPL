@@ -1200,7 +1200,23 @@ pub fn native(path: &str, args: &[String]) -> i32 {
         );
         return 1;
     }
-    if let Err(e) = std::fs::write(&c_path, &c_src) {
+    // A REAL bug found+fixed (production-hardening PR-it1151, a fresh
+    // Explore survey's finding): this was a plain, non-atomic
+    // `std::fs::write`, exposing `c_path` to a concurrent reader (an editor,
+    // `clang-tidy`/`clangd`, a `tail -f`, or a rebuild loop under
+    // `--keep-c`) as transiently truncated or empty during the write --
+    // exactly the "torn read" class `loader::write_atomically`'s own doc
+    // comment documents and live-confirms (its own probe observed a
+    // transient 0-length file at just 474 bytes; this write is FAR larger,
+    // so the exposure window is wider, not narrower). Every OTHER
+    // persistent-artifact write in this codebase already migrated to
+    // `write_atomically` to close exactly this bug class: `build_module`'s
+    // `.kx`/bundled-executable write, `kupl fmt --write`'s formatted-source
+    // write, and `pkg_lock`'s lockfile write -- `c_path` here was simply
+    // missed, a straightforward fifth instance of an already-fixed pattern
+    // in the very same file. `--keep-c` documents this path as intended for
+    // exactly the kind of external inspection a torn read would corrupt.
+    if let Err(e) = crate::loader::write_atomically(std::path::Path::new(&c_path), &c_src) {
         eprintln!("error: cannot write {c_path}: {e}");
         return 1;
     }
@@ -1813,6 +1829,54 @@ mod tests {
         assert_eq!(code, 2, "a repeated -o must be a clean usage error");
         assert!(!first.exists(), "neither -o value must be silently used");
         assert!(!second.exists(), "neither -o value must be silently used");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1151, a fresh
+    /// Explore survey's finding, the sibling site to `main.rs::build_module`'s
+    /// PR-it1132 fix -- see that site's own doc comment and
+    /// `build_module_rebuild_overwrites_atomically_and_leaves_no_tmp_sibling`
+    /// for the full torn-read writeup and `write_atomically`'s own dedicated
+    /// concurrency proof): `native`'s intermediate `c_path` write used to go
+    /// through plain `std::fs::write`, exposing any concurrent reader
+    /// (`--keep-c`'s whole documented purpose is to leave this file around
+    /// for exactly that) to a torn/empty read during a rebuild onto a
+    /// pre-existing `c_path`. This is an end-to-end sanity check, not a
+    /// repeat of the concurrency proof: `--keep-c` across two rebuilds onto
+    /// the SAME `c_path` produces the correct new content each time and
+    /// leaves no `.tmp-*` sibling behind.
+    #[test]
+    fn native_rebuild_with_keep_c_overwrites_c_path_atomically_and_leaves_no_tmp_sibling() {
+        let dir = std::env::temp_dir().join(format!("kupl-it1151-native-rebuild-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("app.kupl");
+        let out = dir.join("app");
+        let c_path = dir.join("app.c");
+        let args = || vec!["-o".to_string(), out.to_str().unwrap().to_string(), "--keep-c".to_string()];
+
+        std::fs::write(&source, "fun main() uses io {\n    print(\"v1\")\n}\n").unwrap();
+        let code = super::native(source.to_str().unwrap(), &args());
+        assert_eq!(code, 0, "first native build must succeed");
+        let first_c = std::fs::read_to_string(&c_path).expect("--keep-c must leave the C source behind");
+        assert!(first_c.contains("v1"), "first C source must reflect the first program body");
+
+        // Rebuild in place -- the pre-existing-c_path case this fix targets.
+        std::fs::write(&source, "fun main() uses io {\n    print(\"v2, a longer body to change the byte count\")\n}\n").unwrap();
+        let code2 = super::native(source.to_str().unwrap(), &args());
+        assert_eq!(code2, 0, "rebuild onto a pre-existing c_path must succeed");
+        let second_c = std::fs::read_to_string(&c_path).expect("--keep-c must leave the rebuilt C source behind");
+        assert!(second_c.contains("v2"), "the rebuild must actually produce different (updated) C source");
+        assert_ne!(first_c, second_c);
+
+        // No `.tmp-{pid}` sibling left behind by the atomic-write machinery.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .tmp-* sibling should survive a successful rebuild: {leftovers:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
