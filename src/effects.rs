@@ -12,15 +12,22 @@
 //!
 //! Limitation (documented): effects of calls through closures/variables are not
 //! tracked in v0.2 — that needs effect types in `fn(...)`, planned with KIR.
-//! The SAME limitation also applies to a component INSTANCE method call
-//! (`s.method()`, as opposed to `s.method()`'s own DECLARATION, which is
-//! checked normally) -- this pass has no per-local-variable type information,
-//! so a `pub`/`expose` function whose only use of an effect flows through a
-//! constructed instance's own method call is NOT required to declare it (a
-//! DELIBERATE tradeoff, not an oversight — see `collect_expr`'s own doc
-//! comment, production-hardening PR-it707, and the regression test
-//! `check_effects_does_not_catch_a_pub_fun_whose_only_io_flows_through_a_component_instance_method`,
-//! PR-it1124, which locks in and explains this exact gap with a live repro).
+//! The SAME limitation applies, NARROWER since production-hardening
+//! PR-it1129, to a component INSTANCE method call (`s.method()`, as
+//! opposed to `s.method()`'s own DECLARATION, which is checked normally):
+//! this pass has no per-local-variable TYPE information in general, but
+//! `local_component_bindings` (a separate, additive pre-pass) DOES resolve
+//! the common, direct `let x = ComponentName(...)` shape precisely, so a
+//! `pub`/`expose` function whose only use of an effect flows through THAT
+//! shape IS now required to declare it. The gap remains for anything more
+//! indirect — a component behind a typed function PARAMETER, stored in a
+//! record field/prop, returned from another function, or reassigned mid-
+//! function — a DELIBERATE tradeoff for those remaining cases, not an
+//! oversight (see `collect_expr`'s own doc comment, production-hardening
+//! PR-it707, and `local_component_bindings`'s own doc comment, PR-it1129,
+//! for the full conservative-by-construction design; the regression tests
+//! beginning with `check_effects_now_catches_a_pub_fun_whose_only_io_flows_through_a_directly_constructed_component_instance`
+//! lock in both what is now caught and what still isn't).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -246,6 +253,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                         &component_names,
                         &ctor_names,
                         &fn_params,
+                        &HashMap::new(),
                         &mut eff,
                         &mut calls,
                         &mut unresolved,
@@ -310,6 +318,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                     &component_names,
                     &ctor_names,
                     &fn_params,
+                    &HashMap::new(),
                     &mut eff,
                     &mut calls,
                     &mut unresolved,
@@ -317,6 +326,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                 );
             });
         }
+        let resolved_methods = local_component_bindings(&info.decl.body, &component_names);
         walk_block(&info.decl.body, &mut |expr| {
             collect_expr(
                 expr,
@@ -326,6 +336,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                 &component_names,
                 &ctor_names,
                 &fn_params,
+                &resolved_methods,
                 &mut eff,
                 &mut calls,
                 &mut unresolved,
@@ -358,6 +369,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                     &component_names,
                     &ctor_names,
                     &HashSet::new(),
+                    &HashMap::new(),
                     &mut eff,
                     &mut calls,
                     &mut unresolved,
@@ -376,6 +388,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                         &component_names,
                         &ctor_names,
                         &HashSet::new(),
+                        &HashMap::new(),
                         &mut eff,
                         &mut calls,
                         &mut unresolved,
@@ -420,6 +433,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                         &component_names,
                         &ctor_names,
                         &HashSet::new(),
+                        &HashMap::new(),
                         &mut eff,
                         &mut calls,
                         &mut unresolved,
@@ -624,6 +638,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                         &component_names,
                         &ctor_names,
                         &fn_params,
+                        &HashMap::new(),
                         &mut eff,
                         &mut calls,
                         &mut unresolved,
@@ -632,6 +647,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                 });
             }
         }
+        let resolved_methods = local_component_bindings(&decl.body, &component_names);
         walk_block(&decl.body, &mut |expr| {
             collect_expr(
                 expr,
@@ -641,6 +657,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                 &component_names,
                 &ctor_names,
                 &fn_params,
+                &resolved_methods,
                 &mut eff,
                 &mut calls,
                 &mut unresolved,
@@ -670,6 +687,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                     &component_names,
                     &ctor_names,
                     &HashSet::new(),
+                    &HashMap::new(),
                     &mut eff,
                     &mut calls,
                     &mut unresolved,
@@ -688,6 +706,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                         &component_names,
                         &ctor_names,
                         &HashSet::new(),
+                        &HashMap::new(),
                         &mut eff,
                         &mut calls,
                         &mut unresolved,
@@ -710,6 +729,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                         &component_names,
                         &ctor_names,
                         &HashSet::new(),
+                        &HashMap::new(),
                         &mut eff,
                         &mut calls,
                         &mut unresolved,
@@ -815,6 +835,261 @@ fn builtin_effects(name: &str) -> Option<&'static str> {
     }
 }
 
+/// One lexical scope's own locally-known component-or-shadowed bindings,
+/// for `local_component_bindings`'s own scope-stack (production-hardening
+/// PR-it1129). `Some(name)` records a local variable as a tracked instance
+/// of component `name`; `None` records that the variable is LOCALLY bound
+/// to something else entirely (a shadow marker) -- present specifically so
+/// a lookup for that name correctly STOPS at this scope level instead of
+/// falling through to an OUTER, now-irrelevant tracked entry for the same
+/// name (e.g. `let b = Bot()  match x { Some(b) => b.foo()  _ => () }` --
+/// the match arm's OWN pattern-bound `b` must shadow the outer `Bot`
+/// instance, not inherit it).
+type LocalScope = HashMap<String, Option<String>>;
+
+fn lookup_local_component<'a>(scopes: &'a [LocalScope], name: &str) -> Option<&'a str> {
+    for scope in scopes.iter().rev() {
+        if let Some(entry) = scope.get(name) {
+            return entry.as_deref();
+        }
+    }
+    None
+}
+
+/// Every name `p` binds, mirroring `compile.rs::bind_pattern_names` (kept
+/// as a separate, self-contained copy rather than a cross-module `pub` --
+/// this file's own established convention, e.g. `pure_funs`/`collect_expr`
+/// never reach into compile.rs either).
+fn pattern_bound_names(p: &Pattern, names: &mut Vec<String>) {
+    match &p.kind {
+        PatternKind::Bind(n) => names.push(n.clone()),
+        PatternKind::Ctor { args, .. } => {
+            for a in args {
+                pattern_bound_names(a, names);
+            }
+        }
+        PatternKind::At { name, inner } => {
+            names.push(name.clone());
+            pattern_bound_names(inner, names);
+        }
+        _ => {}
+    }
+}
+
+/// Tracks LOCAL, syntactically-direct `let x = ComponentName(...)` bindings
+/// (and their invalidation on reassignment/shadowing) within `block`'s own
+/// lexical scopes, resolving each `x.method()` call site it can prove sound
+/// -- production-hardening PR-it1129, implementing PR-it1128's own design
+/// to close (for this common, direct-construction shape) the gap PR-it1124
+/// found and documented: a component INSTANCE method call was entirely
+/// invisible to effect inference, so a `pub fun` could perform real,
+/// undeclared `io` (or any other effect) as long as it flowed through
+/// `let b = Bot()  b.ask()` rather than a directly-named call.
+///
+/// Deliberately conservative: only the DIRECT `let x = ComponentName(...)`
+/// shape is tracked -- no cross-function type inference, no tracking
+/// through an intermediate value or a component stored in a record field/
+/// prop/returned from another function, no tracking of typed function
+/// PARAMETERS (a natural future extension, left out here to keep this
+/// fix's own first version narrowly scoped). Anything more complex than
+/// the narrow shape simply isn't recorded, falling back to `collect_expr`'s
+/// own existing "unresolved" handling exactly as before this fix -- a
+/// missed resolution is always safe (matches pre-fix behavior exactly).
+/// This pass can never record a WRONG resolution: `x`'s own tracked
+/// component is unconditionally invalidated (via a `None` shadow marker,
+/// not merely removed -- see `LocalScope`'s own doc comment for why a
+/// marker is required, not just absence) the moment `x`'s name is
+/// reassigned (`Stmt::Assign`, legal ONLY for a bare `Ident` target --
+/// K0223 already rejects any other assignment-target shape, so this is
+/// exhaustive) or shadowed by an inner `let`, loop variable, `forall`
+/// variable, lambda parameter, or match-arm pattern binding of the same
+/// name. `collect_expr` itself double-checks any resolution this pass
+/// produces against `funs` before trusting it (see its own call site) --
+/// a second, independent safety net.
+fn local_component_bindings(block: &Block, component_names: &HashSet<&str>) -> HashMap<usize, String> {
+    let mut resolved = HashMap::new();
+    let mut scopes: Vec<LocalScope> = vec![LocalScope::new()];
+    scan_block_for_bindings(block, component_names, &mut scopes, &mut resolved);
+    resolved
+}
+
+fn scan_block_for_bindings(
+    block: &Block,
+    component_names: &HashSet<&str>,
+    scopes: &mut Vec<LocalScope>,
+    resolved: &mut HashMap<usize, String>,
+) {
+    scopes.push(LocalScope::new());
+    for stmt in &block.stmts {
+        scan_stmt_for_bindings(stmt, component_names, scopes, resolved);
+    }
+    scopes.pop();
+}
+
+fn scan_stmt_for_bindings(
+    stmt: &Stmt,
+    component_names: &HashSet<&str>,
+    scopes: &mut Vec<LocalScope>,
+    resolved: &mut HashMap<usize, String>,
+) {
+    match stmt {
+        Stmt::Let { name, init, .. } => {
+            scan_expr_for_bindings(init, component_names, scopes, resolved);
+            // ALWAYS insert an entry for `name` at the current scope --
+            // either the tracked component (a direct `ComponentName(...)`
+            // call) or an explicit shadow marker (`None`) otherwise, so a
+            // non-component `let` correctly blocks an outer tracked entry
+            // of the same name too (`let b = Bot()  { let b = 5  b.foo() }`
+            // must NOT resolve `b.foo()` against `Bot`).
+            let component = match &init.kind {
+                ExprKind::Call { callee, .. } => match &callee.kind {
+                    ExprKind::Ident(cn) if component_names.contains(cn.as_str()) => Some(cn.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            scopes.last_mut().expect("at least one scope").insert(name.clone(), component);
+        }
+        Stmt::Assign { target, value, .. } => {
+            scan_expr_for_bindings(value, component_names, scopes, resolved);
+            if let ExprKind::Ident(name) = &target.kind {
+                for scope in scopes.iter_mut().rev() {
+                    if scope.contains_key(name.as_str()) {
+                        scope.insert(name.clone(), None);
+                        break;
+                    }
+                }
+            }
+        }
+        Stmt::Expr(e) => scan_expr_for_bindings(e, component_names, scopes, resolved),
+        Stmt::Return(Some(e), _) => scan_expr_for_bindings(e, component_names, scopes, resolved),
+        Stmt::Return(None, _) => {}
+        Stmt::While { cond, body, .. } => {
+            scan_expr_for_bindings(cond, component_names, scopes, resolved);
+            scan_block_for_bindings(body, component_names, scopes, resolved);
+        }
+        Stmt::For { var, iter, body, .. } => {
+            scan_expr_for_bindings(iter, component_names, scopes, resolved);
+            scopes.push(LocalScope::new());
+            scopes.last_mut().expect("just pushed").insert(var.clone(), None);
+            for s in &body.stmts {
+                scan_stmt_for_bindings(s, component_names, scopes, resolved);
+            }
+            scopes.pop();
+        }
+        Stmt::Emit { arg: Some(e), .. } => scan_expr_for_bindings(e, component_names, scopes, resolved),
+        Stmt::Emit { arg: None, .. } => {}
+        Stmt::Expect(e, _) => scan_expr_for_bindings(e, component_names, scopes, resolved),
+        Stmt::Forall { vars, body, .. } => {
+            scopes.push(LocalScope::new());
+            for (name, _) in vars {
+                scopes.last_mut().expect("just pushed").insert(name.clone(), None);
+            }
+            for s in &body.stmts {
+                scan_stmt_for_bindings(s, component_names, scopes, resolved);
+            }
+            scopes.pop();
+        }
+        Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+fn scan_expr_for_bindings(
+    expr: &Expr,
+    component_names: &HashSet<&str>,
+    scopes: &mut Vec<LocalScope>,
+    resolved: &mut HashMap<usize, String>,
+) {
+    match &expr.kind {
+        ExprKind::Str(pieces) => {
+            for p in pieces {
+                if let StrPiece::Expr(e) = p {
+                    scan_expr_for_bindings(e, component_names, scopes, resolved);
+                }
+            }
+        }
+        ExprKind::List(items) => {
+            for i in items {
+                scan_expr_for_bindings(i, component_names, scopes, resolved);
+            }
+        }
+        ExprKind::Call { callee, args } => {
+            scan_expr_for_bindings(callee, component_names, scopes, resolved);
+            for a in args {
+                scan_expr_for_bindings(&a.value, component_names, scopes, resolved);
+            }
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            scan_expr_for_bindings(recv, component_names, scopes, resolved);
+            for a in args {
+                scan_expr_for_bindings(&a.value, component_names, scopes, resolved);
+            }
+            if let ExprKind::Ident(name) = &recv.kind {
+                if let Some(cn) = lookup_local_component(scopes, name) {
+                    resolved.insert(expr as *const Expr as usize, cn.to_string());
+                }
+            }
+        }
+        ExprKind::Field { recv, .. } => scan_expr_for_bindings(recv, component_names, scopes, resolved),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            scan_expr_for_bindings(lhs, component_names, scopes, resolved);
+            scan_expr_for_bindings(rhs, component_names, scopes, resolved);
+        }
+        ExprKind::Unary { operand, .. } => scan_expr_for_bindings(operand, component_names, scopes, resolved),
+        ExprKind::If { cond, then_block, else_block } => {
+            scan_expr_for_bindings(cond, component_names, scopes, resolved);
+            scan_block_for_bindings(then_block, component_names, scopes, resolved);
+            if let Some(e) = else_block {
+                scan_expr_for_bindings(e, component_names, scopes, resolved);
+            }
+        }
+        ExprKind::BlockExpr(b) => scan_block_for_bindings(b, component_names, scopes, resolved),
+        ExprKind::Match { scrutinee, arms } => {
+            scan_expr_for_bindings(scrutinee, component_names, scopes, resolved);
+            for arm in arms {
+                scopes.push(LocalScope::new());
+                let mut names = Vec::new();
+                pattern_bound_names(&arm.pattern, &mut names);
+                for n in names {
+                    scopes.last_mut().expect("just pushed").insert(n, None);
+                }
+                if let Some(g) = &arm.guard {
+                    scan_expr_for_bindings(g, component_names, scopes, resolved);
+                }
+                scan_expr_for_bindings(&arm.body, component_names, scopes, resolved);
+                scopes.pop();
+            }
+        }
+        ExprKind::Lambda { params, body } => {
+            scopes.push(LocalScope::new());
+            for p in params {
+                scopes.last_mut().expect("just pushed").insert(p.name.clone(), None);
+            }
+            for s in &body.stmts {
+                scan_stmt_for_bindings(s, component_names, scopes, resolved);
+            }
+            scopes.pop();
+        }
+        ExprKind::Range { lo, hi, .. } => {
+            scan_expr_for_bindings(lo, component_names, scopes, resolved);
+            scan_expr_for_bindings(hi, component_names, scopes, resolved);
+        }
+        ExprKind::With { recv, updates } => {
+            scan_expr_for_bindings(recv, component_names, scopes, resolved);
+            for (_, v) in updates {
+                scan_expr_for_bindings(v, component_names, scopes, resolved);
+            }
+        }
+        ExprKind::Try(e) | ExprKind::Await(e) => scan_expr_for_bindings(e, component_names, scopes, resolved),
+        ExprKind::Par(branches) => {
+            for b in branches {
+                scan_expr_for_bindings(b, component_names, scopes, resolved);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_expr(
     expr: &Expr,
     component: Option<&str>,
@@ -823,6 +1098,7 @@ fn collect_expr(
     component_names: &HashSet<&str>,
     ctor_names: &HashSet<&str>,
     fn_typed_params: &HashSet<&str>,
+    resolved_methods: &HashMap<usize, String>,
     eff: &mut EffectSet,
     calls: &mut Vec<String>,
     unresolved: &mut bool,
@@ -860,6 +1136,34 @@ fn collect_expr(
         _ => (None, false, false),
     };
     let Some(name) = call_name else { return };
+    // A REAL fix (production-hardening PR-it1129, implementing PR-it1128's
+    // own design): if `local_component_bindings`'s own pre-pass determined
+    // THIS SPECIFIC method-call expression's receiver is a locally,
+    // syntactically KNOWN component instance (a direct `let x =
+    // ComponentName(...)` binding, never reassigned/shadowed since),
+    // resolve it PRECISELY to that component's own method -- exactly as if
+    // the caller had written `ComponentName().method()` directly -- instead
+    // of falling into the broad "unresolved" bucket below. This is the ONE
+    // case PR-it707's own "would create diagnostic noise" concern does NOT
+    // apply to: unlike a BLANKET "any unresolved method call might have
+    // effects" flag (which WOULD over-fire on ordinary, ambiguous method
+    // calls), this resolution only ever fires for a target this pass can
+    // PROVE, syntactically, is correct -- see `local_component_bindings`'s
+    // own doc comment for the full conservative-by-construction design.
+    // Double-checks `funs.contains_key` before trusting the pre-pass's own
+    // resolution (falls through to the existing unresolved handling if the
+    // resolved component doesn't actually have this method -- e.g. a
+    // genuine typo `check.rs` would separately reject) -- a second,
+    // independent safety net, never trusts the pre-pass blindly.
+    if is_method_call {
+        if let Some(component_name) = resolved_methods.get(&(expr as *const Expr as usize)) {
+            let key = fun_key(Some(component_name), name);
+            if funs.contains_key(&key) {
+                calls.push(key);
+                return;
+            }
+        }
+    }
     // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
     // PR-it933, a close-read survey finding): a function-typed PARAMETER
     // of the enclosing function must ALWAYS shadow a same-named builtin/
@@ -1202,59 +1506,129 @@ mod tests {
         assert!(d.iter().any(|d| d.code == "K0301"), "{d:?}");
     }
 
-    /// A REAL, LIVE-CONFIRMED soundness gap in `check_effects`'s own K0301
-    /// enforcement (production-hardening PR-it1124, a broad exploratory
-    /// survey finding, documenting rather than fixing): `collect_expr`'s own
-    /// `unresolved` flag for a component-instance method call (`s.method()`)
-    /// is DELIBERATELY excluded from the shared `EffectSet` that `check_effects`
-    /// consults (see `collect_expr`'s own doc comment on the
-    /// `is_method_call && component_method_names.contains(name)` branch,
-    /// PR-it707) -- `pure_funs()` (which gates the real-OS-thread `par_map`/
-    /// `par_filter` fast path, PR-it707/it951) correctly treats this as
-    /// "unresolved, may have effects" and excludes such a function from the
-    /// pure set, but `check_effects`'s own K0301/K0302 diagnostics NEVER see
-    /// that flag at all -- a DELIBERATE tradeoff (the comment explains:
-    /// flagging every unresolved method-call would force every ordinary
-    /// function that legitimately constructs a component to declare effects
-    /// it may not have, "trading one crash for a much bigger diagnostic-
-    /// noise regression"). The PRACTICAL consequence, confirmed live with the
-    /// exact program below (`kupl check` reports `ok`, `kupl run` prints
-    /// "bot speaking"): a `pub fun` (here `sneaky`) that performs REAL I/O
-    /// exclusively through a component instance's own exposed method call
-    /// needs NO `uses io` declaration anywhere in its own signature -- and a
-    /// caller further up the chain that DOES declare `uses io` (here `main`,
-    /// in an earlier version of this exact repro) gets a MISLEADING K0302
-    /// "declared but unused" warning, actively encouraging a user to REMOVE
-    /// the one correct declaration in the chain. This is a genuine soundness
-    /// hole in KUPL's own stated effect-boundary-explicitness guarantee ("pub
-    /// functions and expose functions MUST declare every effect they use"),
-    /// though NOT a runtime-confinement bypass (`docs/PRODUCTION.md`'s own
-    /// Threat Model section already correctly states the effect system is a
-    /// compile-time discipline, not a sandbox). A full fix would need
-    /// per-local-variable type tracking through `effects.rs`'s own AST
-    /// walker (`walk_block`/`walk_stmt`/`walk_expr`, `effects.rs:1054-1164`)
-    /// -- which is CURRENTLY a flat, scope-unaware visitor (a single
-    /// `FnMut(&Expr)` callback with no notion of a `let`-bound variable's
-    /// name at all, let alone its type) -- a nontrivial, genuinely risky
-    /// rearchitecture of a file with an unusually dense history of subtle
-    /// bugs (PR-it569/584/629/706/707/750/933/951/953/993 among others), NOT
-    /// attempted here. This test LOCKS IN the current, deliberate,
-    /// documented behavior (asserting NO K0301 fires) so a future change to
-    /// this area is a conscious, visible decision rather than an accidental
-    /// side effect -- see `docs/PRODUCTION.md`'s own "Effects" section
-    /// (updated this same iteration) for the user-facing disclosure.
+    /// A REAL soundness gap in `check_effects`'s own K0301 enforcement,
+    /// found+FIXED for the common case (production-hardening PR-it1124
+    /// documented it; PR-it1129 fixes it, implementing PR-it1128's own
+    /// design): `collect_expr`'s own `unresolved` flag for a component-
+    /// instance method call (`s.method()`) is DELIBERATELY excluded from
+    /// the shared `EffectSet` that `check_effects` consults (see
+    /// `collect_expr`'s own doc comment on the `is_method_call &&
+    /// component_method_names.contains(name)` branch, PR-it707) -- a
+    /// DELIBERATE tradeoff, since flagging every unresolved method-call
+    /// would force every ordinary function that legitimately constructs a
+    /// component to declare effects it may not have. FIXED (for the common,
+    /// direct-construction shape) by `local_component_bindings` (PR-it1129):
+    /// a separate, additive pre-pass tracks the NARROW `let x =
+    /// ComponentName(...)` shape via a lexical scope-stack, resolving
+    /// `x.method()` PRECISELY to that component's own method instead of the
+    /// blanket "unresolved" bucket -- see that function's own doc comment
+    /// for the full conservative-by-construction design (a missed
+    /// resolution is always safe; a WRONG resolution is structurally
+    /// impossible, since `x`'s tracked component is unconditionally
+    /// invalidated by reassignment or ANY shadowing, including a nested
+    /// `let`, loop/`forall` variable, lambda parameter, or match-arm
+    /// pattern binding of the same name). Confirmed live with the exact
+    /// program below: `kupl check` now correctly reports K0301 for
+    /// `sneaky`, and `kupl run` (once `uses io` is added) prints "bot
+    /// speaking" as expected. This does NOT close the gap for every shape
+    /// -- a component instance behind a typed function PARAMETER, stored in
+    /// a record field/prop, returned from another function, or reassigned
+    /// mid-function is still unresolved and STILL not required to declare
+    /// its effects (see the sibling tests below for each of these residual
+    /// cases, each asserting the CURRENT, still-conservative behavior) --
+    /// `docs/PRODUCTION.md`'s own "Known gap" callout (updated this same
+    /// iteration) is narrowed accordingly rather than removed.
     #[test]
-    fn check_effects_does_not_catch_a_pub_fun_whose_only_io_flows_through_a_component_instance_method() {
+    fn check_effects_now_catches_a_pub_fun_whose_only_io_flows_through_a_directly_constructed_component_instance() {
         let d = diags_for(
             "component Bot {\n    intent \"does IO when asked\"\n    \
              expose fun ask() uses io {\n        print(\"bot speaking\")\n    }\n}\n\
              pub fun sneaky() {\n    let b = Bot()\n    b.ask()\n}\n",
         );
         assert!(
+            d.iter().any(|d| d.code == "K0301"),
+            "PR-it1129's own fix must now catch this case: {d:?}"
+        );
+    }
+
+    /// A legitimate `let`-bound component instance calling a PURE method
+    /// must NOT be spuriously flagged -- `local_component_bindings`'s own
+    /// resolution must be PRECISE (attributing exactly the resolved
+    /// method's own effects), not a blanket "any component method might
+    /// have effects" over-approximation, which would reintroduce PR-it707's
+    /// own diagnostic-noise regression for the common case.
+    #[test]
+    fn a_directly_constructed_component_instance_calling_a_pure_method_is_not_flagged() {
+        let d = diags_for(
+            "component Quiet {\n    intent \"pure\"\n    \
+             expose fun ask() -> Int {\n        42\n    }\n}\n\
+             pub fun quiet_caller() -> Int {\n    let q = Quiet()\n    q.ask()\n}\n",
+        );
+        assert!(d.is_empty(), "a pure method call must not be spuriously flagged: {d:?}");
+    }
+
+    /// Shadowing a tracked component binding with a DIFFERENT component (a
+    /// nested `let` of the same name) must correctly switch the resolution
+    /// to the INNER, shadowing component -- not the outer one. Uses two
+    /// components with a same-named method but DIFFERENT effects (`Bot.ask`
+    /// performs `io`, `Quiet.ask` is pure) so a WRONG resolution (still
+    /// attributing the outer `Bot`) would be directly observable as a
+    /// spurious K0301.
+    #[test]
+    fn shadowing_a_tracked_component_binding_resolves_to_the_inner_shadowing_component() {
+        let d = diags_for(
+            "component Bot {\n    intent \"io\"\n    expose fun ask() uses io {\n        print(\"x\")\n    }\n}\n\
+             component Quiet {\n    intent \"pure\"\n    expose fun ask() -> Int {\n        42\n    }\n}\n\
+             pub fun shadow_case() -> Int {\n    let b = Bot()\n    let b = Quiet()\n    b.ask()\n}\n",
+        );
+        assert!(
+            d.is_empty(),
+            "must resolve to the INNER `Quiet` binding (pure), not the shadowed outer `Bot`: {d:?}"
+        );
+    }
+
+    /// A match arm's own PATTERN-bound name must shadow an outer tracked
+    /// component binding of the same name -- `local_component_bindings`
+    /// must seed each arm's own pushed scope with every name the arm's
+    /// pattern binds (mirroring `compile.rs::bind_pattern_names`), not just
+    /// track `let`/`for`/lambda-parameter bindings. Without this, `b.ask()`
+    /// inside the arm would wrongly resolve against the OUTER `Bot`
+    /// (io-effectful) instead of correctly falling back to unresolved for
+    /// the pattern-bound `Quiet` (this test doesn't need `Quiet` to
+    /// resolve — just that `Bot` is NOT wrongly attributed).
+    #[test]
+    fn a_match_arm_pattern_binding_shadows_an_outer_tracked_component_of_the_same_name() {
+        let d = diags_for(
+            "component Bot {\n    intent \"io\"\n    expose fun ask() uses io {\n        print(\"x\")\n    }\n}\n\
+             component Quiet {\n    intent \"pure\"\n    expose fun ask() -> Int {\n        42\n    }\n}\n\
+             pub fun match_shadow_case(x: Option[Quiet]) -> Int {\n    let b = Bot()\n    \
+             match x {\n        Some(b) => b.ask()\n        None => 0\n    }\n}\n",
+        );
+        assert!(
+            d.is_empty(),
+            "the pattern-bound `b` (Quiet) must shadow the outer `b` (Bot): {d:?}"
+        );
+    }
+
+    /// Reassigning a tracked local (`var b = Bot()  b = Bot()`) must
+    /// unconditionally drop tracking -- even though both assignments
+    /// happen to construct the SAME component type, `Stmt::Assign`
+    /// invalidates the binding regardless (a deliberately conservative
+    /// choice: re-tracking would need to re-verify the RHS is ALSO a
+    /// direct `ComponentName(...)` call at the assignment site, adding
+    /// complexity for a rarer pattern than the basic `let`-and-use shape
+    /// this fix targets). This test locks in that the residual gap
+    /// (reassigned locals stay unresolved, matching pre-PR-it1129
+    /// behavior) is exactly as documented, not silently wider or narrower.
+    #[test]
+    fn reassigning_a_tracked_local_drops_tracking_even_to_the_same_component_type() {
+        let d = diags_for(
+            "component Bot {\n    intent \"io\"\n    expose fun ask() uses io {\n        print(\"x\")\n    }\n}\n\
+             pub fun reassign_case() {\n    var b = Bot()\n    b = Bot()\n    b.ask()\n}\n",
+        );
+        assert!(
             !d.iter().any(|d| d.code == "K0301"),
-            "documents the CURRENT, deliberate gap: `sneaky` performs undeclared `io` \
-             through `b.ask()` with zero K0301 -- if this now fails, the gap has been \
-             fixed (update this test + PRODUCTION.md's Effects section to match): {d:?}"
+            "documents the residual, deliberately-conservative gap for reassigned locals: {d:?}"
         );
     }
 

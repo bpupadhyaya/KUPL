@@ -62,19 +62,22 @@ component's own construction). The two effects are:
 - **`ai`** — calling an `ai fun` (the `ai` keyword is itself the boundary
   declaration; a `pub fun` that calls one must declare `uses ai`).
 
-**Known gap:** propagation does **not** follow a call through a *component instance's*
-own exposed method (`s.method()`, where `s` was constructed elsewhere in the same
-function) — the checker has no per-local-variable type information to resolve which
-component's method is being called. A `pub fun` whose only use of an effect flows
-through such a call needs no `uses` declaration at all, and a caller further up the
-chain that correctly declares the effect anyway will see a misleading "declared but
-unused" warning. This is a deliberate tradeoff (see `effects.rs`'s own top-of-file
-doc comment and production-hardening PR-it707/PR-it1124), not an oversight: naively
-flagging every unresolved method call would force ordinary component-constructing code
-to over-declare effects it may not have. It does **not** weaken the threat model below
-— the effect system was never a runtime sandbox — but it does mean an *absence* of a
-`uses` declaration is not proof a function performs no side effects when component
-instances are involved.
+**Known gap (narrowed):** propagation through a *component instance's* own exposed
+method (`s.method()`) is precise for the common case — `let s = SomeComponent()`
+immediately followed by using `s` in the same function — but does **not** follow the
+call when `s` arrives more indirectly: behind a typed function parameter, stored in a
+record field or component prop, returned from another function, or reassigned after
+its initial `let`. In those remaining cases the checker has no type information to
+resolve which component's method is being called, so a `pub fun` whose only use of an
+effect flows through one of them needs no `uses` declaration at all, and a caller
+further up the chain that correctly declares the effect anyway will see a misleading
+"declared but unused" warning. This is a deliberate tradeoff (see `effects.rs`'s own
+top-of-file doc comment and production-hardening PR-it707/PR-it1124/PR-it1129), not an
+oversight: naively flagging every unresolved method call would force ordinary
+component-constructing code to over-declare effects it may not have. It does **not**
+weaken the threat model below — the effect system was never a runtime sandbox — but it
+does mean an *absence* of a `uses` declaration is not proof a function performs no side
+effects when component instances are involved in one of these remaining indirect ways.
 
 ### Threat model — read this before running untrusted code
 
