@@ -4687,7 +4687,7 @@ static KValue k_ai_convert(const KAiShape* shape, const char* text) {
         long n = z - a;
         /* A REAL cross-engine gap found+fixed (production-hardening
            PR-it690): this raw-text path (no JSON parsing at all, so it
-           never goes through kjp_string's own   guard, PR-it575)
+           never goes through kjp_string's own `\u0000` guard, PR-it575)
            reaches k_str() below unchecked -- and k_str()'s sole length
            source is C's strlen(), which stops at the first NUL byte. A
            model response containing an embedded NUL wouldn't just violate
@@ -4717,6 +4717,47 @@ static KValue k_ai_convert(const KAiShape* shape, const char* text) {
            the reason NOR the payload -- a real information loss, not just a
            wording difference). */
         const char* reason = k_json_field0(parsed).as.s;
+        /* A REAL, live-confirmed cross-engine Err(Str)-VALUE divergence found
+           +fixed (production-hardening PR-it1119, continuing the ai.rs<->
+           cgen.rs mirror close-read that found PR-it1118's bug): this parser
+           (`k_json_parse`, matching `json.rs`'s own strict semantics, needed
+           for the stdlib `Json.parse` builtin's own correctness) rejects a
+           `\u0000` escape AT PARSE TIME, anywhere in the document -- but
+           `ai.rs::convert` uses a DIFFERENT, permissive parser
+           (`lsp::parse_json`) that decodes it into a literal NUL character
+           instead of failing, deferring the reject to `value_from_json`'s own
+           SHAPE-SCOPED `Str`-field check, which emits "model response
+           contains a NUL byte, not allowed in a KUPL Str (K0008)" -- a
+           DIFFERENT string than this generic "not valid JSON (...): payload"
+           wrapping. For a `wraps_result` ai fun this Err(Str) text is a real,
+           program-observable VALUE, and this project's own standing
+           invariant is full diagnostic-message byte-identity across engines
+           (see `k_ai_from_json`'s own shape-mismatch wording fix, PR-it793,
+           for the identical precedent). Detect this SPECIFIC parser reason
+           and reformat to match ai.rs's wording exactly.
+           NOT fully fixed by this: when the \u0000-containing text sits in
+           a field the declared shape never actually reads (e.g. an unused
+           extra JSON key), ai.rs's permissive-parse-then-shape-scoped-check
+           architecture lets interp/vm SUCCEED cleanly, while native still
+           fails here regardless of relevance -- confirmed live:
+           `KUPL_AI_MOCK_<NAME>='{"value":{"name":"ok","extra":"a\u0000b"}}'`
+           on an `ai fun -> { name: Str }` shape succeeds with `{name: "ok"}`
+           on interp/vm (the unused `extra` field is never inspected) but
+           still panics here on native. This parser can't safely be made
+           fully permissive about \u0000 instead: native's `Str`
+           representation is C-string/NUL-terminated (`k_str()`'s SOLE length
+           source is `strlen()`, see the `-> Str` fast path above, PR-it690),
+           so embedding a genuine NUL byte during parsing would silently
+           truncate it downstream -- the exact corruption class PR-it575
+           already fixed for the "field IS actually used" case. Closing this
+           fully would need native's `Str` to carry an explicit length rather
+           than relying on NUL-termination -- a structural representation
+           change, out of scope for a single, safely-reversible fix. */
+        if (!strcmp(reason, "\\u0000 escape decodes to a NUL byte, not allowed in a KUPL Str (K0008)")) {
+            kb_reset(&k_ai_err_buf);
+            kb_puts(&k_ai_err_buf, "model response contains a NUL byte, not allowed in a KUPL Str (K0008)");
+            k_ai_ok = 0; return k_unit();
+        }
         kb_reset(&k_ai_err_buf);
         kb_printf(&k_ai_err_buf, "model response is not valid JSON (%s): %s", reason, payload);
         k_ai_ok = 0; return k_unit();
@@ -10796,7 +10837,7 @@ fun main() uses io {
         assert!(out.starts_with("\u{FFFD}A|ERR:invalid \\u escape"), "{out:?}");
     }
 
-    /// A REAL BUG found+fixed (PR-it575): a JSON ` ` escape decodes to a NUL byte,
+    /// A REAL BUG found+fixed (PR-it575): a JSON `\u0000` escape decodes to a NUL byte,
     /// which KUPL strings must never contain (K0008, enforced everywhere else — the
     /// lexer, base64/hex decode, url_decode). `json.rs`'s `\u` handling never checked
     /// for this, so interp/vm happily produced a genuinely NUL-containing `Str` value;
@@ -13938,6 +13979,42 @@ fun main() uses io {
         let out = native_main_stdout_env(src, "aimalformedjson", &[("KUPL_AI_MOCK_CLASSIFY", "positive")]);
         assert!(out.starts_with("err: model response is not valid JSON ("), "{out:?}");
         assert!(out.trim_end().ends_with("): positive"), "{out:?}");
+    }
+
+    /// A REAL, live-confirmed cross-engine Err(Str)-VALUE divergence found+fixed
+    /// (production-hardening PR-it1119) -- see `k_ai_convert`'s own doc comment
+    /// (the NUL-escape reason check right before its generic "not valid JSON"
+    /// wrapping) for the full writeup. Unlike the PREVIOUS test's own generic
+    /// "two independently-written parsers phrase failures differently" case
+    /// (explicitly NOT fixable, per that test's own doc comment), THIS specific
+    /// case is fixable: on interp/vm, `ai.rs::convert`'s permissive parser
+    /// (`lsp::parse_json`) SUCCEEDS the parse and instead fails downstream, in
+    /// `value_from_json`'s own shape-scoped `Str`-field check, with "model
+    /// response contains a NUL byte, not allowed in a KUPL Str (K0008)" -- NOT
+    /// via the generic "not valid JSON (...): payload" wrapping at all. Native's
+    /// `k_json_parse` (matching `json.rs`'s stricter semantics) instead fails
+    /// the parse itself for the identical reason, so this ONE specific reason
+    /// string is reformatted to match exactly.
+    #[test]
+    fn native_ai_nul_escape_in_a_used_field_matches_interps_specific_wording() {
+        if !cc_available() {
+            return;
+        }
+        let src = "type Sentiment = { label: Str }\n\
+                   ai fun classify(review: Str) -> Result[Sentiment, Str] { intent \"x\" }\n\
+                   fun main() uses io {\n    match classify(\"x\") {\n        \
+                   Ok(s) => print(\"ok\"),\n        Err(e) => print(\"err: {e}\"),\n    }\n}\n";
+        let out = native_main_stdout_env(
+            src,
+            "ainulwording",
+            &[("KUPL_AI_MOCK_CLASSIFY", "{\"value\":{\"label\":\"a\\u0000b\"}}")],
+        );
+        assert_eq!(
+            out.trim(),
+            "err: model response contains a NUL byte, not allowed in a KUPL Str (K0008)",
+            "must match ai.rs::value_from_json's own wording exactly, not the generic \
+             \"not valid JSON (...): payload\" wrapping: {out:?}"
+        );
     }
 
     /// Native `expect` failure names the failing expression (via the KVM module's
