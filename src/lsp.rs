@@ -2774,6 +2774,13 @@ pub fn serve() -> i32 {
     // -- unset until `initialize` supplies `rootUri` (`rootPath` as a fallback
     // for older clients); `workspace/symbol` is a safe no-op ("[]") without it.
     let mut workspace_root: Option<PathBuf> = None;
+    // A REAL bug found+fixed (production-hardening PR-it1153, a fresh
+    // Explore survey's finding, the LSP protocol surface's own first full
+    // deep-dive this campaign): `shutdown`/`exit` had NO state tracking at
+    // all, violating two explicit LSP spec requirements. See the
+    // `shutdown`/`exit` match arms and the pre-dispatch check below for the
+    // fix.
+    let mut shutdown_received = false;
 
     while let Some(body) = read_message(&mut stdin) {
         // A robustness-audit finding (production-hardening PR-it620): a
@@ -2826,6 +2833,30 @@ pub fn serve() -> i32 {
         let method = msg.get("method").and_then(Json::str).unwrap_or("");
         let id = msg.get("id");
 
+        // The LSP spec: "If a server receives a request after a shutdown
+        // request, it should error with InvalidRequest." Live-confirmed
+        // BEFORE this fix: `initialize` -> `shutdown` -> a SECOND
+        // `initialize` got back the full normal capabilities result again,
+        // not an `InvalidRequest` (-32600) -- a client relying on that
+        // error to detect a misbehaving/already-terminating server would
+        // instead see it accept new work. `exit` is exempted from this
+        // check since it's the one method REQUIRED to still be handled
+        // (indeed, differently -- see below) after `shutdown`. A
+        // notification (no `id`) simply has no response to withhold,
+        // matching ordinary JSON-RPC notification semantics.
+        if shutdown_received && method != "exit" {
+            if let Some(id) = id {
+                let id = render_id(id);
+                send(
+                    &mut stdout,
+                    &format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32600,\"message\":\"Invalid Request: the server has already received shutdown\"}}}}"
+                    ),
+                );
+            }
+            continue;
+        }
+
         match method {
             "initialize" => {
                 let id = id.map(render_id).unwrap_or_else(|| "null".into());
@@ -2849,10 +2880,17 @@ pub fn serve() -> i32 {
                 );
             }
             "shutdown" => {
+                shutdown_received = true;
                 let id = id.map(render_id).unwrap_or_else(|| "null".into());
                 send(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":null}}"));
             }
-            "exit" => return 0,
+            // The LSP spec: "exit should exit with code 0 if shutdown was
+            // received before; otherwise with error code 1." Live-confirmed
+            // BEFORE this fix: `initialize` -> `exit` (no `shutdown` at all)
+            // exited 0 unconditionally -- a supervisor/test harness relying
+            // on this exit code to distinguish a graceful shutdown from an
+            // abrupt one would misclassify every such termination as clean.
+            "exit" => return if shutdown_received { 0 } else { 1 },
             "textDocument/didOpen" => {
                 let doc = msg.get("params").and_then(|p| p.get("textDocument"));
                 if let (Some(uri), Some(text)) = (
@@ -6256,5 +6294,115 @@ mod tests {
         assert!(matches.contains("\"name\":\"real\""), "{matches}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn run_lsp_it1153(bodies: &[String]) -> Option<std::process::Output> {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return None;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let bodies = bodies.to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in bodies {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        out
+    }
+
+    /// A REAL LSP spec-conformance bug found+fixed (production-hardening
+    /// PR-it1153, a fresh Explore survey's finding -- the `kupl lsp`
+    /// protocol surface's own first full deep-dive this campaign): the spec
+    /// requires `exit` to "exit with code 0 if shutdown was received before;
+    /// otherwise with error code 1", but `serve()` tracked NO shutdown state
+    /// at all and unconditionally returned 0. Live-confirmed BEFORE this
+    /// fix: `initialize` -> `exit` (no `shutdown` at all) exited 0 -- a
+    /// supervisor/test harness relying on this exit code to distinguish a
+    /// graceful shutdown from an abrupt one would misclassify every such
+    /// termination as clean.
+    #[test]
+    fn exit_without_a_prior_shutdown_exits_with_code_1_not_0() {
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string();
+        let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#.to_string();
+        let Some(out) = run_lsp_it1153(&[init, exit]) else { return };
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "exit without a prior shutdown must exit with code 1 per the LSP spec: {out:?}"
+        );
+    }
+
+    /// Control/regression companion to the test above: the NORMAL,
+    /// spec-compliant sequence (`shutdown` actually received before `exit`)
+    /// must still exit 0, confirming the fix didn't just flip the default.
+    #[test]
+    fn exit_after_a_prior_shutdown_still_exits_with_code_0() {
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string();
+        let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":{}}"#.to_string();
+        let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#.to_string();
+        let Some(out) = run_lsp_it1153(&[init, shutdown, exit]) else { return };
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "exit after a real prior shutdown must still exit with code 0: {out:?}"
+        );
+    }
+
+    /// The other half of PR-it1153's own fix: the LSP spec also requires
+    /// "If a server receives a request after a shutdown request, it should
+    /// error with InvalidRequest." Live-confirmed BEFORE this fix: a SECOND
+    /// `initialize` sent after `shutdown` got back the full normal
+    /// capabilities result again (a well-formed, successful-looking
+    /// response), not an `InvalidRequest` (-32600) error -- a client
+    /// relying on that error to detect a server that's already tearing
+    /// down would instead see it silently accept new work.
+    #[test]
+    fn a_request_sent_after_shutdown_is_rejected_as_invalid_request() {
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string();
+        let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":{}}"#.to_string();
+        let init_again = r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}"#.to_string();
+        let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#.to_string();
+        let Some(out) = run_lsp_it1153(&[init, shutdown, init_again, exit]) else { return };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("\"id\":3,\"result\""),
+            "a request after shutdown must NOT be processed as if the server were still alive: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"id\":3") && stdout.contains("-32600") && stdout.contains("Invalid Request"),
+            "a request after shutdown must get a JSON-RPC InvalidRequest (-32600) error: {stdout}"
+        );
+        assert_eq!(out.status.code(), Some(0), "exit after shutdown must still exit 0: {out:?}");
+    }
+
+    /// Discriminating pair to the test above: a NOTIFICATION (no `id`) sent
+    /// after `shutdown` has no response to withhold in the first place
+    /// (ordinary JSON-RPC notification semantics) -- it must be silently
+    /// dropped, not crash or hang the server, and must not disturb the
+    /// pending `exit`'s own correct behavior.
+    #[test]
+    fn a_notification_sent_after_shutdown_is_silently_dropped_not_a_crash() {
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string();
+        let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":{}}"#.to_string();
+        let did_open_after_shutdown = r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///it1153_after_shutdown.kupl","text":"fun main() { }\n"}}}"#.to_string();
+        let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#.to_string();
+        let Some(out) = run_lsp_it1153(&[init, shutdown, did_open_after_shutdown, exit]) else { return };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+        assert_eq!(out.status.code(), Some(0), "exit after shutdown must still exit 0 even after a stray notification: {out:?}");
     }
 }
