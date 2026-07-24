@@ -294,6 +294,35 @@ fn parse_string(v: &str) -> Option<String> {
         if inner.contains('"') {
             return None;
         }
+        // A REAL, live-confirmed correctness footgun found+fixed
+        // (production-hardening PR-it1133, closing a low-severity
+        // observation deferred at PR-it1065): leading/trailing whitespace
+        // inside a quoted value used to be preserved verbatim, not trimmed
+        // or rejected. For a dependency `version`, this passed
+        // `is_safe_relative_path_single_component`'s own check unchanged
+        // (a whitespace-padded string is still one "Normal" path component
+        // on both Unix and Windows) and flowed straight into
+        // `loader.rs::pkg_ctx`'s `registry::cache_dir().join(name).join(v)`
+        // -- live-confirmed BEFORE this fix: `version = " 1.2.0"` made `kupl
+        // pkg tree` print `widgets @  1.2.0  (registry — not yet supported,
+        // unresolved)` (the doubled space the only visible clue), and would
+        // have gone on to build a registry-cache directory literally named
+        // " 1.2.0" had the fetch itself succeeded, silently splitting what a
+        // user thinks of as one version across two on-disk directory names
+        // that no longer round-trip through an ordinary string comparison.
+        // Not a security bypass (no traversal/absolute-path escape --
+        // `is_safe_relative_path_single_component` already rejects those),
+        // just a value silently NOT meaning what it visually appears to
+        // mean. Rejected here, at the same single point every string value
+        // in this file already flows through (mirroring PR-it1064's own
+        // embedded-quote rejection immediately above), rather than silently
+        // trimming: a leading/trailing space is essentially never
+        // intentional in a `name`/`version`/`path`/`entry` value, so a clean
+        // parse error is more useful than a silent, invisible normalization
+        // a user would have no way to notice.
+        if inner != inner.trim() {
+            return None;
+        }
         Some(inner.to_string())
     } else {
         None
@@ -865,5 +894,47 @@ mod tests {
             m.deps,
             vec![Dep { name: "web".into(), path: Some("c".into()), version: Some("1.2.0".into()) }]
         );
+    }
+
+    /// A REAL, live-confirmed correctness footgun found+fixed (production-
+    /// hardening PR-it1133, closing a low-severity observation deferred at
+    /// PR-it1065): leading/trailing whitespace inside a quoted value used to
+    /// be preserved verbatim rather than trimmed or rejected. Live-confirmed
+    /// BEFORE this fix: `version = " 1.2.0"` passed `parse_dep` cleanly and
+    /// made `kupl pkg tree` print `widgets @  1.2.0  (registry — not yet
+    /// supported, unresolved)` with a doubled space as the only visible
+    /// clue -- see `parse_string`'s own doc comment for the full writeup.
+    #[test]
+    fn leading_or_trailing_whitespace_inside_a_quoted_value_is_a_clean_error_not_silently_preserved() {
+        // a dependency version, inline-table form (the exact live repro).
+        let err = parse("[dependencies]\nwidgets = { version = \" 1.2.0\" }\n")
+            .expect_err("a leading-space version must be a clean error, not silently preserved");
+        assert!(err.contains("expected a string value"), "{err}");
+
+        // trailing whitespace, and a dependency path, inline-table form.
+        let err2 = parse("[dependencies]\nwidgets = { path = \"vendor/w \" }\n")
+            .expect_err("trailing whitespace in a path must be a clean error too");
+        assert!(err2.contains("expected a string value"), "{err2}");
+
+        // the bare-string shorthand path form must be caught too.
+        let err3 = parse("[dependencies]\nwidgets = \" vendor/w\"\n")
+            .expect_err("leading whitespace in the bare-string shorthand must be a clean error");
+        assert!(err3.contains("expected a string or"), "{err3}");
+
+        // [project] fields flow through the SAME parse_string, so name/
+        // version/entry are covered by the same single fix point too.
+        let err4 = parse("[project]\nname = \"app\"\nversion = \" 0.1.0\"\nentry = \"main.kupl\"\n")
+            .expect_err("a leading-space [project] version must be a clean error");
+        assert!(err4.contains("expected a string"), "{err4}");
+
+        // sanity: INTERNAL whitespace (not leading/trailing) is untouched --
+        // this fix is specifically about the visually-invisible boundary
+        // case, not a blanket rejection of any string containing a space.
+        let m = parse("[project]\nname = \"my app\"\nversion = \"0.1.0\"\nentry = \"main.kupl\"\n").unwrap();
+        assert_eq!(m.name, "my app");
+
+        // sanity: an ordinary, well-formed dependency manifest is unaffected.
+        let m2 = parse("[dependencies]\nwidgets = { version = \"1.2.0\" }\n").unwrap();
+        assert_eq!(m2.deps, vec![Dep { name: "widgets".into(), path: None, version: Some("1.2.0".into()) }]);
     }
 }
