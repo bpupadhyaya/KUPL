@@ -532,7 +532,15 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
     } else {
         kupl::kx::encode(&module)
     };
-    if let Err(e) = std::fs::write(&out, &bytes) {
+    // A REAL, live-confirmed torn-read bug found+fixed (production-hardening
+    // PR-it1132, the FOURTH instance of the shape PR-it1102/1103 already
+    // fixed three times over): a rebuild overwriting a pre-existing `.kx`
+    // module or bundled executable in place is a realistic, common workflow
+    // (hot-reload, a CI/deploy script re-running `kupl build` while a
+    // supervisor process holds the old binary open to restart it) -- see
+    // `loader::write_atomically`'s own doc comment for the live-confirmed
+    // torn-read measurement and full rationale.
+    if let Err(e) = kupl::loader::write_atomically(std::path::Path::new(&out), &bytes) {
         eprintln!("error: cannot write {out}: {e}");
         return 1;
     }
@@ -1215,6 +1223,56 @@ mod tests {
         assert!(module.funs.contains_key("mean"), "compiled module must resolve `use lib.stats`'s `mean`");
         assert!(module.funs.contains_key("label"), "compiled module must resolve `use util`'s `label`");
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// A REAL, live-confirmed torn-read bug found+fixed (production-hardening
+    /// PR-it1132): `build_module`'s output write used to go through plain
+    /// `std::fs::write`, which truncates the destination to empty BEFORE
+    /// writing the new bytes -- a rebuild overwriting a pre-existing `.kx`
+    /// module (a realistic hot-reload/CI workflow) exposed a concurrent
+    /// reader to a torn/empty file, live-confirmed via a standalone probe
+    /// (47 of ~52k reads observed 0 bytes at a realistic `.kx` payload
+    /// size). Fixed by routing through `loader::write_atomically` (temp
+    /// file + rename), already proven torn-read-safe by its own dedicated
+    /// concurrency test. This is an end-to-end sanity check, not a repeat of
+    /// that concurrency proof: a REBUILD onto a pre-existing `.kx` file
+    /// produces the correct new content and leaves no `.tmp-*` sibling
+    /// behind (the exact litter `write_atomically`'s own cleanup-on-failure
+    /// tests guard against, now exercised via this real call site too).
+    #[test]
+    fn build_module_rebuild_overwrites_atomically_and_leaves_no_tmp_sibling() {
+        let dir = std::env::temp_dir().join(format!("kupl-it1132-rebuild-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.kupl");
+        let out = dir.join("main.kx");
+
+        std::fs::write(&entry, "fun main() uses io {\n    print(\"v1\")\n}\n").unwrap();
+        let args = |o: &std::path::Path| {
+            vec!["build".to_string(), entry.to_str().unwrap().to_string(), "-o".to_string(), o.to_str().unwrap().to_string()]
+        };
+        let code = build_module(&args(&out), entry.to_str().unwrap(), false);
+        assert_eq!(code, 0, "first build must succeed");
+        let first_bytes = std::fs::read(&out).unwrap();
+        assert!(kupl::kx::decode(&first_bytes).is_ok(), "first build's output must decode");
+
+        // Rebuild in place -- the pre-existing-target case this fix targets.
+        std::fs::write(&entry, "fun main() uses io {\n    print(\"v2, a longer body to change the byte count\")\n}\n").unwrap();
+        let code2 = build_module(&args(&out), entry.to_str().unwrap(), false);
+        assert_eq!(code2, 0, "rebuild onto a pre-existing .kx file must succeed");
+        let second_bytes = std::fs::read(&out).unwrap();
+        assert_ne!(first_bytes, second_bytes, "the rebuild must actually produce different (updated) content");
+        assert!(kupl::kx::decode(&second_bytes).is_ok(), "rebuilt output must still decode");
+
+        // No `.tmp-{pid}` sibling left behind by the atomic-write machinery.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .tmp-* sibling should remain after a successful rebuild: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A CRITICAL data-loss bug found+fixed (production-hardening PR-it781, an

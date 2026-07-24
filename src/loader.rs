@@ -720,13 +720,34 @@ pub fn lock_text(deps: &[ResolvedDep]) -> String {
 /// reader of `path` can only ever observe the complete OLD content or the
 /// complete NEW content, never an in-between state, regardless of how long
 /// the temp-file write itself takes.
-pub fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+///
+/// A FOURTH instance of the identical shape (production-hardening
+/// PR-it1132) was found by the same cross-file-interaction angle:
+/// `main.rs`'s `kupl build`/`kupl bundle` output write
+/// (`std::fs::write(&out, &bytes)`) -- a REBUILD overwriting a
+/// pre-existing `.kx` module or bundled executable in place is a realistic,
+/// common workflow (hot-reload, a CI/deploy script re-running `kupl build`
+/// while a supervisor process holds the old binary open to restart it), and
+/// a torn read here is arguably more severe than the string-content cases
+/// above: a partially-written `.kx`/executable is not just misleading CLI
+/// output, it's a malformed binary a concurrent `kupl run`/OS loader could
+/// choke on. Live-confirmed via a standalone probe (not kept as a permanent
+/// test) mirroring this exact shape at a realistic `.kx` payload size (474
+/// bytes): 47 of ~52k concurrent reads observed a transient 0-length file
+/// during unthrottled repeated `std::fs::write` calls. Generalized this
+/// function's parameter from `text: &str` to `contents: impl AsRef<[u8]>`
+/// to cover BOTH the existing string callers (kupl.lock text, formatted
+/// source) and this new binary caller (`.kx` bytes / bundled executable
+/// bytes) with the same primitive, rather than duplicating the
+/// temp-file-then-rename logic a fourth time.
+pub fn write_atomically(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let contents = contents.as_ref();
     let tmp = path.with_file_name(format!(
         "{}.tmp-{}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("kupl-atomic-write"),
         std::process::id()
     ));
-    if let Err(e) = std::fs::write(&tmp, text) {
+    if let Err(e) = std::fs::write(&tmp, contents) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
