@@ -107,6 +107,33 @@ pub fn repl() -> i32 {
         let input = std::mem::take(&mut buffer);
         let trimmed = input.trim();
 
+        // A REAL bug found+fixed (production-hardening PR-it1150, a fresh
+        // Explore survey's finding): a submission consisting ONLY of a `//`
+        // or `/* .. */` comment (e.g. a doc-comment line typed on its own,
+        // immediately before pasting the function it documents) is
+        // completely valid, inert KUPL syntax everywhere else -- a whole
+        // source file containing nothing but a comment passes `kupl check`
+        // cleanly -- but here it fell through both the item-declaration path
+        // (`is_item` looks at `split_whitespace().next()`, which for
+        // `"// note"` yields the literal token `"//"`, matching no keyword)
+        // and straight into `parser::parse_stmt_fragment`, which correctly
+        // reports "expected an expression, found end of file" for its own
+        // (comment-stripped, now-empty) input -- the right diagnosis for
+        // THAT function given empty input, but the wrong path to have
+        // reached from a comment. Confirmed live before this fix:
+        // `printf '// a helper\n:quit\n' | kupl repl` printed a spurious
+        // `error[K0110]: expected an expression, found end of file` instead
+        // of silently accepting the comment, exactly like a blank line
+        // already does two branches above. Fixed by treating a submission
+        // that is comment-and-whitespace-only as the SAME no-op a blank
+        // line already is, checked here (after `braces_balanced` has
+        // already confirmed any block comment is fully closed, not
+        // mid-continuation) rather than in the `buffer.is_empty()` dispatch
+        // above, since a comment can itself span multiple lines.
+        if is_comment_and_whitespace_only(trimmed) {
+            continue;
+        }
+
         if is_item(trimmed) {
             // This input's own top-level items, parsed in isolation --
             // purely syntactic, so it doesn't need the rest of `defs_items`
@@ -422,9 +449,55 @@ fn braces_balanced(src: &str) -> bool {
     depth <= 0 && comment_depth == 0
 }
 
+// True if `src` contains only whitespace and `//`/`/* .. */` comments (no
+// real code token) -- see the PR-it1150 doc comment at this function's own
+// call site for why a comment-only REPL submission needs this check. Mirrors
+// `braces_balanced`'s own comment-skipping algorithm (including nestable
+// block comments) but doesn't need string-literal awareness: encountering a
+// `"` (or any other non-whitespace, non-comment character) is ALREADY real
+// content, so this returns `false` immediately rather than needing to track
+// where the string ends.
+fn is_comment_and_whitespace_only(src: &str) -> bool {
+    let mut chars = src.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next(); // consume the '*'
+            let mut comment_depth: u32 = 1;
+            while comment_depth > 0 {
+                match chars.next() {
+                    None => break, // unterminated; braces_balanced already gates this case
+                    Some('/') if chars.peek() == Some(&'*') => {
+                        chars.next();
+                        comment_depth += 1;
+                    }
+                    Some('*') if chars.peek() == Some(&'/') => {
+                        chars.next();
+                        comment_depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{braces_balanced, is_item};
+    use super::{braces_balanced, is_comment_and_whitespace_only, is_item};
 
     #[test]
     fn braces_balanced_drives_multiline_reads() {
@@ -485,6 +558,32 @@ mod tests {
         // treating everything after a `/` as inert.
         assert!(!braces_balanced("fun f() -> Int { // trailing comment on an open line"));
         assert!(!braces_balanced("foo(1, 2"));
+    }
+
+    #[test]
+    fn is_comment_and_whitespace_only_detects_the_no_op_case_and_rejects_real_code() {
+        // the actual PR-it1150 repro shapes: no-op.
+        assert!(is_comment_and_whitespace_only("// a helper"));
+        assert!(is_comment_and_whitespace_only("/* a block comment */"));
+        // blank / whitespace-only is also (vacuously) comment-and-whitespace-only.
+        assert!(is_comment_and_whitespace_only(""));
+        assert!(is_comment_and_whitespace_only("   \n\t  "));
+        // multiple comments, and comments spanning several lines, are still a no-op.
+        assert!(is_comment_and_whitespace_only("// one\n// two\n"));
+        assert!(is_comment_and_whitespace_only("/* start\ncontinues */\n// trailing too"));
+        // NESTED block comments, mirroring `braces_balanced`'s own nestable algorithm.
+        assert!(is_comment_and_whitespace_only("/* outer /* inner */ still outer */"));
+        // the discriminating pair: real code, with or without an accompanying
+        // comment, must NOT be treated as a no-op -- this fix must not
+        // over-correct into silently swallowing genuine input.
+        assert!(!is_comment_and_whitespace_only("1 + 1"));
+        assert!(!is_comment_and_whitespace_only("// note\n1 + 1"));
+        assert!(!is_comment_and_whitespace_only("fun f() -> Int { 1 }"));
+        // a string literal that merely CONTAINS comment-like text is real
+        // code, not a comment, even though it starts with `"` rather than a
+        // recognizable keyword -- encountering the `"` itself is enough to
+        // disqualify it, with no need to track where the string ends.
+        assert!(!is_comment_and_whitespace_only("\"// not actually a comment\""));
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it779, a long-abandoned
@@ -787,6 +886,54 @@ mod tests {
             stdout.matches("law \"one\"").count(),
             2,
             ":defs must list BOTH identically-named laws, not dedupe them by name: {stdout}"
+        );
+        assert!(out.status.success(), ":quit must exit cleanly: {out:?}");
+    }
+
+    /// End-to-end companion to
+    /// `is_comment_and_whitespace_only_detects_the_no_op_case_and_rejects_real_code`
+    /// above: spawns the REAL `kupl repl` process to confirm a comment-only
+    /// submission (both `//` and `/* .. */` forms) is a silent no-op, not a
+    /// spurious `K0110`. Live-confirmed BEFORE this fix: `printf '// a
+    /// helper\n:quit\n' | kupl repl` printed `error[K0110]: expected an
+    /// expression, found end of file` for the comment line.
+    #[test]
+    fn a_comment_only_submission_is_a_silent_no_op_not_a_parse_error() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "// a helper\n/* another one */\nprint(\"hi\")\n:quit\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung on a comment-only submission").expect("wait_with_output succeeds");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("K0110"),
+            "a comment-only submission must be a silent no-op, not a parse error: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("hi"),
+            "print(\"hi\") must still actually run after the comment-only lines: {stdout}"
         );
         assert!(out.status.success(), ":quit must exit cleanly: {out:?}");
     }
