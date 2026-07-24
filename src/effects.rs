@@ -12,6 +12,15 @@
 //!
 //! Limitation (documented): effects of calls through closures/variables are not
 //! tracked in v0.2 — that needs effect types in `fn(...)`, planned with KIR.
+//! The SAME limitation also applies to a component INSTANCE method call
+//! (`s.method()`, as opposed to `s.method()`'s own DECLARATION, which is
+//! checked normally) -- this pass has no per-local-variable type information,
+//! so a `pub`/`expose` function whose only use of an effect flows through a
+//! constructed instance's own method call is NOT required to declare it (a
+//! DELIBERATE tradeoff, not an oversight — see `collect_expr`'s own doc
+//! comment, production-hardening PR-it707, and the regression test
+//! `check_effects_does_not_catch_a_pub_fun_whose_only_io_flows_through_a_component_instance_method`,
+//! PR-it1124, which locks in and explains this exact gap with a live repro).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -1191,6 +1200,62 @@ mod tests {
             "fun helper() {\n    print(\"hi\")\n}\npub fun outer() {\n    helper()\n}\n",
         );
         assert!(d.iter().any(|d| d.code == "K0301"), "{d:?}");
+    }
+
+    /// A REAL, LIVE-CONFIRMED soundness gap in `check_effects`'s own K0301
+    /// enforcement (production-hardening PR-it1124, a broad exploratory
+    /// survey finding, documenting rather than fixing): `collect_expr`'s own
+    /// `unresolved` flag for a component-instance method call (`s.method()`)
+    /// is DELIBERATELY excluded from the shared `EffectSet` that `check_effects`
+    /// consults (see `collect_expr`'s own doc comment on the
+    /// `is_method_call && component_method_names.contains(name)` branch,
+    /// PR-it707) -- `pure_funs()` (which gates the real-OS-thread `par_map`/
+    /// `par_filter` fast path, PR-it707/it951) correctly treats this as
+    /// "unresolved, may have effects" and excludes such a function from the
+    /// pure set, but `check_effects`'s own K0301/K0302 diagnostics NEVER see
+    /// that flag at all -- a DELIBERATE tradeoff (the comment explains:
+    /// flagging every unresolved method-call would force every ordinary
+    /// function that legitimately constructs a component to declare effects
+    /// it may not have, "trading one crash for a much bigger diagnostic-
+    /// noise regression"). The PRACTICAL consequence, confirmed live with the
+    /// exact program below (`kupl check` reports `ok`, `kupl run` prints
+    /// "bot speaking"): a `pub fun` (here `sneaky`) that performs REAL I/O
+    /// exclusively through a component instance's own exposed method call
+    /// needs NO `uses io` declaration anywhere in its own signature -- and a
+    /// caller further up the chain that DOES declare `uses io` (here `main`,
+    /// in an earlier version of this exact repro) gets a MISLEADING K0302
+    /// "declared but unused" warning, actively encouraging a user to REMOVE
+    /// the one correct declaration in the chain. This is a genuine soundness
+    /// hole in KUPL's own stated effect-boundary-explicitness guarantee ("pub
+    /// functions and expose functions MUST declare every effect they use"),
+    /// though NOT a runtime-confinement bypass (`docs/PRODUCTION.md`'s own
+    /// Threat Model section already correctly states the effect system is a
+    /// compile-time discipline, not a sandbox). A full fix would need
+    /// per-local-variable type tracking through `effects.rs`'s own AST
+    /// walker (`walk_block`/`walk_stmt`/`walk_expr`, `effects.rs:1054-1164`)
+    /// -- which is CURRENTLY a flat, scope-unaware visitor (a single
+    /// `FnMut(&Expr)` callback with no notion of a `let`-bound variable's
+    /// name at all, let alone its type) -- a nontrivial, genuinely risky
+    /// rearchitecture of a file with an unusually dense history of subtle
+    /// bugs (PR-it569/584/629/706/707/750/933/951/953/993 among others), NOT
+    /// attempted here. This test LOCKS IN the current, deliberate,
+    /// documented behavior (asserting NO K0301 fires) so a future change to
+    /// this area is a conscious, visible decision rather than an accidental
+    /// side effect -- see `docs/PRODUCTION.md`'s own "Effects" section
+    /// (updated this same iteration) for the user-facing disclosure.
+    #[test]
+    fn check_effects_does_not_catch_a_pub_fun_whose_only_io_flows_through_a_component_instance_method() {
+        let d = diags_for(
+            "component Bot {\n    intent \"does IO when asked\"\n    \
+             expose fun ask() uses io {\n        print(\"bot speaking\")\n    }\n}\n\
+             pub fun sneaky() {\n    let b = Bot()\n    b.ask()\n}\n",
+        );
+        assert!(
+            !d.iter().any(|d| d.code == "K0301"),
+            "documents the CURRENT, deliberate gap: `sneaky` performs undeclared `io` \
+             through `b.ask()` with zero K0301 -- if this now fails, the gap has been \
+             fixed (update this test + PRODUCTION.md's Effects section to match): {d:?}"
+        );
     }
 
     #[test]

@@ -53,13 +53,28 @@ fuzzed over hundreds of malformed inputs; they emit diagnostics, never panics.
 ### Effects
 
 KUPL has a **static** effect discipline. A function that performs side effects must
-declare them with `uses`, and the checker enforces that callers propagate the
-declaration. The two effects are:
+declare them with `uses`, and the checker propagates the declaration requirement
+through ordinary function calls (private helpers, top-level `pub` functions, and a
+component's own construction). The two effects are:
 
 - **`io`** — any interaction with the outside world through the standard builtins
   (`print`, `eprint`, reading args, `exec`, `now`, file/stdin/HTTP operations).
 - **`ai`** — calling an `ai fun` (the `ai` keyword is itself the boundary
   declaration; a `pub fun` that calls one must declare `uses ai`).
+
+**Known gap:** propagation does **not** follow a call through a *component instance's*
+own exposed method (`s.method()`, where `s` was constructed elsewhere in the same
+function) — the checker has no per-local-variable type information to resolve which
+component's method is being called. A `pub fun` whose only use of an effect flows
+through such a call needs no `uses` declaration at all, and a caller further up the
+chain that correctly declares the effect anyway will see a misleading "declared but
+unused" warning. This is a deliberate tradeoff (see `effects.rs`'s own top-of-file
+doc comment and production-hardening PR-it707/PR-it1124), not an oversight: naively
+flagging every unresolved method call would force ordinary component-constructing code
+to over-declare effects it may not have. It does **not** weaken the threat model below
+— the effect system was never a runtime sandbox — but it does mean an *absence* of a
+`uses` declaration is not proof a function performs no side effects when component
+instances are involved.
 
 ### Threat model — read this before running untrusted code
 
