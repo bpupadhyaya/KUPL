@@ -1237,10 +1237,7 @@ fn insertion_point_after_params(text: &str, fun_span: crate::diag::Span) -> Opti
 /// Returns `(range_start, range_end, effect_names)` where `range_start` is
 /// right after `)` and `range_end` is right before the `->`/`{` that follows
 /// -- i.e. the exact span that must be replaced to add, remove, or drop the
-/// whole clause. `None` if the function has no `uses` clause at all (effect
-/// names, unlike arbitrary identifiers, never contain `-` or `{`, so scanning
-/// for the first occurrence of either safely finds the clause's end without
-/// needing to parse the return type).
+/// whole clause. `None` if the function has no `uses` clause at all.
 fn find_uses_clause_range(text: &str, fun_span: crate::diag::Span) -> Option<(usize, usize, Vec<String>)> {
     let after_params = insertion_point_after_params(text, fun_span)?;
     let rest = text.get(after_params..)?;
@@ -1255,10 +1252,82 @@ fn find_uses_clause_range(text: &str, fun_span: crate::diag::Span) -> Option<(us
     }
     let clause_start = after_params;
     let inner_start = after_params + kw_rel + 4;
-    let end_rel = after_kw.find(['-', '{'])?;
+    // A REAL, live-confirmed silent-CORRUPTION bug found+fixed (production-
+    // hardening PR-it1157, a fresh open-ended Explore survey finding): this
+    // used to be a naive `after_kw.find(['-', '{'])`, on the theory (this
+    // comment's own OLD text) that "effect names never contain `-` or `{`,
+    // so scanning for the first occurrence of either safely finds the
+    // clause's end" -- true of the effect NAMES themselves, but false of
+    // the raw SOURCE TEXT being scanned, which can legally contain an
+    // inline `/* ... */` block comment between the `uses` clause and the
+    // `->`/`{` that follows (e.g. `uses io /* needs ai - added */ -> Str`,
+    // an entirely ordinary developer annotation). A hyphen or brace INSIDE
+    // such a comment (routine: "needs review - ai added", em/en-dashes,
+    // etc.) made the old scan stop mid-comment, so the K0301 "Widen `uses`
+    // clause" quick-fix's own edit range ended INSIDE the comment --
+    // applying that edit exactly as a real LSP client would (verified via
+    // the actual `kupl lsp` subprocess) turned valid, correctly-diagnosed
+    // source into `uses io, ai - added */ -> Str {`, which `kupl check`
+    // then rejects with K0100 ("expected `{`, found `-`") -- a one-click,
+    // editor-offered "fix" that silently corrupts the user's own file into
+    // something that no longer parses at all. Fixed by scanning char-by-
+    // char, tracking `/* ... */` NESTING depth exactly like `lexer.rs`'s
+    // own comment algorithm (block comments are nestable in this
+    // language), and only matching `-`/`{` OUTSIDE any comment. As a side
+    // benefit, this also fixes a related false-negative in the K0302
+    // "Remove unused `uses`" branch just below: the SAME naive scan
+    // previously produced a comment-polluted, bogus `effects` list for a
+    // clause containing a comment (e.g. one fake entry `"io /* needs ai"`
+    // instead of a clean `"io"`), which never matched a real effect name,
+    // so that branch silently declined to offer a fix instead of
+    // corrupting anything -- fixed incidentally, not the primary bug, but
+    // confirmed correct behavior now that `effects` is parsed cleanly too --
+    // built from a COMMENT-STRIPPED copy of the clause text (`stripped`
+    // below), not the raw substring, using the SAME nesting-depth scan that
+    // finds `end_rel`: `segment_start` tracks the start of the current
+    // outside-any-comment run, appended to `stripped` right before entering
+    // the OUTERMOST `/* */` (nested opens/closes only adjust `depth`, never
+    // touch `stripped`) and right after that outermost comment closes.
+    let mut end_rel = None;
+    let mut depth: u32 = 0;
+    let bytes = after_kw.as_bytes();
+    let mut i = 0;
+    let mut stripped = String::new();
+    let mut segment_start = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            if depth == 0 {
+                stripped.push_str(&after_kw[segment_start..i]);
+            }
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if depth > 0 {
+            if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    segment_start = i;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'-' || bytes[i] == b'{' {
+            end_rel = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let end_rel = end_rel?;
+    // `depth == 0` is guaranteed here -- `end_rel` is only ever set inside
+    // the `depth == 0` branch above.
+    stripped.push_str(&after_kw[segment_start..end_rel]);
     let clause_end = inner_start + end_rel;
     let effects: Vec<String> =
-        text[inner_start..clause_end].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        stripped.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     Some((clause_start, clause_end, effects))
 }
 
@@ -3575,6 +3644,104 @@ mod tests {
             !diags.iter().any(|d| d.code == "K0301"),
             "the fix must actually resolve K0301: {fixed:?} -> {diags:?}"
         );
+    }
+
+    /// A REAL, live-confirmed silent-CORRUPTION bug found+fixed (production-
+    /// hardening PR-it1157, a fresh open-ended Explore survey finding, the
+    /// primary sub-case): `find_uses_clause_range`'s OLD `.find(['-', '{'])`
+    /// scan didn't skip over an inline `/* ... */` block comment between an
+    /// existing `uses` clause and the `->`/`{` that follows -- a hyphen or
+    /// brace INSIDE such a comment (an entirely ordinary developer
+    /// annotation, e.g. "needs ai - added") made the scan stop mid-comment,
+    /// so the widen fix's edit range ended INSIDE the comment. Live-
+    /// confirmed BEFORE this fix via a real `kupl lsp` subprocess: applying
+    /// this exact fix (as any editor would) turned valid, correctly-
+    /// diagnosed source into `uses io, ai - added */ -> Str {`, which `kupl
+    /// check` then rejected with K0100 ("expected `{`, found `-`") -- a
+    /// one-click quick-fix silently corrupting the user's own file into
+    /// something that no longer parses.
+    #[test]
+    fn code_action_widening_a_uses_clause_does_not_corrupt_a_trailing_block_comment_containing_a_hyphen() {
+        let src = "ai fun helper() -> Str {\n    intent \"say hi\"\n}\n\
+                   pub fun outer(x: Int) uses io /* needs ai - added */ -> Str {\n    print(to_str(x))\n    helper()\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (title, start, end, new_text) = &actions[0];
+        assert_eq!(title, "Widen `uses` clause to add `ai`");
+        let mut fixed = src.to_string();
+        fixed.replace_range(*start..*end, new_text);
+        // The discriminating assertion: the fix must produce genuinely
+        // PARSEABLE source, not just "no K0301 left" (a K0100 parse error
+        // wouldn't even reach the effects checker to report K0301 at all).
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "the fix must not corrupt the source into something that fails to parse: {fixed:?} -> {diags:?}"
+        );
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(!diags.iter().any(|d| d.code == "K0301"), "{fixed:?} -> {diags:?}");
+        assert!(fixed.contains("uses io, ai"), "{fixed:?}");
+        // the comment itself, and the return arrow/body, must both survive intact.
+        assert!(fixed.contains("-> Str {"), "the return arrow must survive intact: {fixed:?}");
+    }
+
+    /// Sibling to the test above, covering a NESTED block comment (this
+    /// language's own comments nest, matching `lexer.rs`) containing BOTH a
+    /// hyphen and a brace inside the nested portion -- the fix's own
+    /// comment-skipping scan must track nesting DEPTH, not just detect the
+    /// first `*/` naively, or a `/* outer /* inner */ still outer */` would
+    /// stop after the INNER close instead of the true outer one.
+    #[test]
+    fn code_action_widening_a_uses_clause_does_not_corrupt_a_nested_block_comment() {
+        let src = "ai fun helper() -> Str {\n    intent \"say hi\"\n}\n\
+                   pub fun outer(x: Int) uses io /* outer /* nested - {} */ still outer */ -> Str {\n    print(to_str(x))\n    helper()\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (_, start, end, new_text) = &actions[0];
+        let mut fixed = src.to_string();
+        fixed.replace_range(*start..*end, new_text);
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "a nested block comment must not defeat the fix's own nesting tracking: {fixed:?} -> {diags:?}"
+        );
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(!diags.iter().any(|d| d.code == "K0301"), "{fixed:?} -> {diags:?}");
+    }
+
+    /// The related side-benefit half of PR-it1157's own fix: `find_uses_
+    /// clause_range`'s `effects` list (used by K0302's "Remove unused
+    /// `uses`" branch to confirm the target effect is actually present) is
+    /// built from the SAME comment-containing raw text -- before this fix,
+    /// a trailing comment polluted that list with leftover comment text
+    /// (e.g. one bogus entry `"io /* leftover - comment"` instead of a
+    /// clean `"io"`), which never matched the target effect name, so K0302
+    /// silently declined to offer ANY fix at all (a false negative, not a
+    /// corruption -- confirmed as the less-severe half of this same root
+    /// cause). Fixed incidentally by extracting `effects` from a comment-
+    /// STRIPPED copy of the clause text.
+    #[test]
+    fn code_action_removes_an_unused_uses_clause_even_with_a_trailing_block_comment() {
+        let src = "pub fun outer(x: Int) uses io /* leftover - comment */ -> Str {\n    to_str(x)\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "a comment in the clause must not suppress the K0302 fix: {actions:?}");
+        let (title, start, end, new_text) = &actions[0];
+        assert_eq!(title, "Remove unused `uses io`");
+        let mut fixed = src.to_string();
+        fixed.replace_range(*start..*end, new_text);
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        assert!(!diags.iter().any(|d| d.severity == Severity::Error), "{fixed:?} -> {diags:?}");
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(!diags.iter().any(|d| d.code == "K0301" || d.code == "K0302"), "{fixed:?} -> {diags:?}");
     }
 
     #[test]
