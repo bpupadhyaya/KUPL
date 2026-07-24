@@ -1798,15 +1798,15 @@ fn shadow_zones_for_rename(program: &crate::ast::Program, name: &str) -> Vec<cra
 /// closing a gap carried forward since PR-it767/it780) to detect a genuine
 /// collision BEFORE generating a rename edit that would otherwise silently
 /// produce a duplicate top-level definition -- e.g. renaming `fun helper`
-/// to `main` when `fun main` already exists in the SAME file. Deliberately
-/// scoped to SAME-FILE top-level items only, not cross-file: a top-level
-/// item in a DIFFERENT (`use`d) file lives in that file's own mangled
-/// package namespace (`resolve.rs`'s `pkg$name` scheme) and is only ever
-/// reachable via a qualified `pkg.name`, never a bare identifier, so it
-/// cannot actually collide with a bare rename in THIS file. Also
-/// deliberately does NOT check local bindings (function params/`let`s) --
-/// a local legitimately shadowing a top-level name is ordinary, legal
-/// scoping, not a collision.
+/// to `main` when `fun main` already exists in the SAME file. `program` is
+/// whatever file the caller passes -- as of PR-it1159, the rename handler
+/// calls this BOTH for the current file AND for every file reached via
+/// `used_file_paths`, since an UNALIASED `use lib` imports `lib`'s own
+/// top-level names as bare identifiers (a genuine cross-file collision
+/// hazard -- see the rename handler's own PR-it1159 doc comment for the
+/// full writeup). Also deliberately does NOT check local bindings (function
+/// params/`let`s) -- a local legitimately shadowing a top-level name is
+/// ordinary, legal scoping, not a collision.
 fn top_level_item_named(program: &crate::ast::Program, name: &str) -> bool {
     use crate::ast::Item;
     program.items.iter().any(|item| match item {
@@ -3327,19 +3327,57 @@ pub fn serve() -> i32 {
                     // zero warning about before applying the edit. Only checked when
                     // `name` itself is NOT locally bound (a top-level rename target) --
                     // a local shadowing a top-level name is ordinary, legal scoping,
-                    // not a collision (see `top_level_item_named`'s own doc comment for
-                    // why this is deliberately SAME-FILE-only, not cross-file). Uses the
-                    // field-aware `local_binding_scope_for_rename` (production-hardening
-                    // PR-it1138) so renaming a component's own state/prop/child field to
-                    // a name that happens to match an unrelated top-level item is
-                    // correctly treated as the SAME kind of ordinary shadowing, not a
-                    // false-positive collision warning.
+                    // not a collision. Uses the field-aware `local_binding_scope_for_
+                    // rename` (production-hardening PR-it1138) so renaming a
+                    // component's own state/prop/child field to a name that happens to
+                    // match an unrelated top-level item is correctly treated as the
+                    // SAME kind of ordinary shadowing, not a false-positive collision
+                    // warning.
+                    //
+                    // A REAL, live-confirmed silent-CORRUPTION bug found+fixed
+                    // (production-hardening PR-it1159, a fresh open-ended Explore
+                    // survey finding): `top_level_item_named`'s own OLD doc comment
+                    // claimed this collision check was deliberately SAME-FILE-only,
+                    // reasoning that "a top-level item in a DIFFERENT (`use`d) file...
+                    // is only ever reachable via a qualified `pkg.name`, never a bare
+                    // identifier, so it cannot actually collide" -- factually WRONG for
+                    // an UNALIASED `use lib` (no `as` clause), which imports `lib`'s
+                    // own top-level names as BARE identifiers directly, exactly as this
+                    // repo's own `examples/multifile/main.kupl` demonstrates (`use
+                    // lib.stats` then a bare `mean(xs)` call). `occurrences_cross_file`
+                    // just below (PR-it518) DOES rename into every file reached via
+                    // `used_file_paths`, so the collision guard's own scope was
+                    // narrower than the mutation's actual reach. Live-confirmed BEFORE
+                    // this fix, via a real `kupl lsp` subprocess: with `lib.kupl`
+                    // declaring both `fun mean` and `fun total`, and `main.kupl`
+                    // (`use lib`) calling bare `mean(xs)`, renaming `mean` -> `total`
+                    // from the CALL SITE in `main.kupl` returned a non-null
+                    // `WorkspaceEdit` spanning BOTH files with ZERO collision warning;
+                    // applying it exactly as an editor would left `lib.kupl` with TWO
+                    // functions named `total` (K0203 "defined more than once") plus a
+                    // downstream K0200 type-mismatch in `main.kupl`. Fixed by ALSO
+                    // checking `new_name` against every file `used_file_paths` reaches
+                    // from the current file -- the exact same file set
+                    // `occurrences_cross_file` itself mutates, no more and no less (a
+                    // rename triggered from a DECLARATION site, rather than a call
+                    // site, does NOT currently reach into caller files at all -- a
+                    // separate, pre-existing reach limitation, not touched by this fix
+                    // -- so no symmetric check is needed in that direction).
                     if new_name != name {
                         let (program, _diags) = crate::parser::parse(&text);
-                        if local_binding_scope_for_rename(&program, off, &name).is_none()
-                            && top_level_item_named(&program, new_name)
-                        {
-                            return None;
+                        if local_binding_scope_for_rename(&program, off, &name).is_none() {
+                            let collides_locally = top_level_item_named(&program, new_name);
+                            let collides_cross_file = used_file_paths(&program, &dir).iter().any(|fs_path| {
+                                text_at_path(fs_path, &buffers)
+                                    .map(|other_text| {
+                                        let (other_program, _diags) = crate::parser::parse(&other_text);
+                                        top_level_item_named(&other_program, new_name)
+                                    })
+                                    .unwrap_or(false)
+                            });
+                            if collides_locally || collides_cross_file {
+                                return None;
+                            }
                         }
                     }
                     let mut by_file: Vec<(String, Vec<String>)> = Vec::new();
@@ -6043,6 +6081,77 @@ mod tests {
         assert!(
             stdout.contains(r#""id":4,"result":{"changes""#),
             "renaming to a genuinely free name must still work: {stdout}"
+        );
+    }
+
+    /// A REAL, live-confirmed silent-CORRUPTION bug found+fixed (production-
+    /// hardening PR-it1159, a fresh open-ended Explore survey finding, the
+    /// cross-file sibling to the SAME-file collision test above): the
+    /// collision guard used to only ever check the CURRENT file's own
+    /// top-level items, on the theory (now corrected) that a cross-file item
+    /// reached via `use` is never bare-identifier-reachable -- false for an
+    /// UNALIASED `use lib`, which imports `lib`'s own top-level names as bare
+    /// identifiers, exactly as this repo's own `examples/multifile/main.kupl`
+    /// demonstrates. Live-confirmed BEFORE this fix: with `lib.kupl`
+    /// declaring both `fun mean` and `fun total`, renaming `mean` -> `total`
+    /// from the CALL SITE in `main.kupl` (`use lib`) returned a non-null,
+    /// two-file `WorkspaceEdit` with zero collision warning; applying it left
+    /// `lib.kupl` with TWO functions named `total` (K0203) plus a downstream
+    /// K0200 type mismatch in `main.kupl`. `lib.kupl` is never written to
+    /// disk here -- `text_at_path` checks in-memory `buffers` (populated by
+    /// `didOpen`) before falling back to the filesystem, so opening BOTH
+    /// documents at URIs `used_file_paths` would resolve to is sufficient.
+    #[test]
+    fn rename_into_a_cross_file_top_level_name_returns_null_not_a_duplicate_definition() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let main_src = "use lib\n\nfun report(xs: List[Int]) -> Float {\n    mean(xs)\n}\n";
+        let lib_src = "fun mean(xs: List[Int]) -> Float {\n    0.0\n}\nfun total(xs: List[Int]) -> Int {\n    0\n}\n";
+        let did_open_main = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///rename_crossfile_it1159/main.kupl","text":{main_src:?}}}}}}}"#
+        );
+        let did_open_lib = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///rename_crossfile_it1159/lib.kupl","text":{lib_src:?}}}}}}}"#
+        );
+        // cursor on the `mean` CALL SITE in main.kupl (line 3, 4-space indent).
+        let rename_collides = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_crossfile_it1159/main.kupl"},"position":{"line":3,"character":5},"newName":"total"}}"#;
+        let rename_ok = r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///rename_crossfile_it1159/main.kupl"},"position":{"line":3,"character":5},"newName":"average"}}"#;
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init.to_string(), did_open_main, did_open_lib, rename_collides.to_string(), rename_ok.to_string()] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl lsp hung on a cross-file rename request");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":2,"result":null"#),
+            "renaming into a name that ALREADY exists in a used file must return null, not a cross-file \
+             duplicate-definition edit: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":3,"result":{"changes""#),
+            "renaming to a genuinely free name must still work across files: {stdout}"
         );
     }
 
