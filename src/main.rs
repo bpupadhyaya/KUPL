@@ -703,19 +703,51 @@ fn scaffold_project(name: &str) -> i32 {
 /// becoming the path or triggering "unexpected extra argument" like anything
 /// else.
 fn find_path_arg(args: &[String]) -> Result<&str, String> {
+    let is_run = matches!(args.first().map(String::as_str), Some("run"));
     let accepts_o = matches!(args.first().map(String::as_str), Some("native") | Some("build") | Some("bundle"));
     let mut path: Option<&str> = None;
     let mut i = 1;
+    // A REAL bug found+fixed (production-hardening PR-it1154, a fresh
+    // Explore survey's finding): a bare `--` is documented (PR-it798's own
+    // doc comment above) as meaning ONE specific thing -- "everything after
+    // this belongs to the PROGRAM `run` is executing" -- but this loop
+    // applied that "stop scanning entirely" semantics UNCONDITIONALLY, on
+    // EVERY subcommand routed through this function, not just `run`. For
+    // `dis`/`manifest`/`native`/`build`/`bundle`/`test`/`check`/`fmt`/
+    // `pkg tree|lock|fetch`, there is no "program" to forward args to at
+    // all, so `--` there can only sensibly mean the ordinary POSIX
+    // end-of-options marker (`rm -- --foo`'s own convention: everything
+    // AFTER a `--` is a literal positional argument, never re-interpreted
+    // as a flag, even if it starts with `--` itself) -- but breaking the
+    // scan entirely meant the token immediately following `--` was simply
+    // never looked at as a path candidate. Live-confirmed BEFORE this fix:
+    // a file genuinely named `--dashfile.kupl` could NEVER be passed to
+    // `kupl manifest` in ANY argument shape, including via `kupl manifest
+    // -- --dashfile.kupl` -- the one invocation the `--` separator exists
+    // to make possible in the first place (`a.starts_with("--")` below
+    // would otherwise just silently skip `--dashfile.kupl` as an
+    // unrecognized long flag). `is_run` scopes the ORIGINAL "stop
+    // scanning, the rest belongs to the program" behavior to `run` only,
+    // where it's still correct and unchanged; every other subcommand now
+    // treats `--` as "skip this token, then take the very next token
+    // literally as the path (or a genuine extra argument), regardless of
+    // its own spelling."
+    let mut past_separator = false;
     while i < args.len() {
         let a = args[i].as_str();
-        if a == "--" {
-            break; // everything after this belongs to the program, not kupl
+        if !past_separator && a == "--" {
+            if is_run {
+                break; // everything after this belongs to the program, not kupl
+            }
+            past_separator = true;
+            i += 1;
+            continue;
         }
-        if accepts_o && a == "-o" {
+        if !past_separator && accepts_o && a == "-o" {
             i += 2; // the flag AND its value, as a unit
             continue;
         }
-        if a.starts_with("--") {
+        if !past_separator && a.starts_with("--") {
             i += 1;
             continue;
         }
@@ -1217,6 +1249,57 @@ mod tests {
         assert_eq!(find_path_arg(&s(&["run", "foo.kupl", "--"])), Ok("foo.kupl"));
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it1154, a fresh
+    /// Explore survey's finding): the PR-it798 fix above scoped `--` to mean
+    /// "everything after this belongs to the program `run` executes" -- but
+    /// applied that "stop scanning entirely" behavior unconditionally, on
+    /// EVERY subcommand sharing this function, even the ones with no
+    /// "program" concept at all (`manifest`/`dis`/`build`/`bundle`/`test`/
+    /// `check`/`fmt`/`pkg tree|lock|fetch`). For those, a `--`-prefixed
+    /// FILENAME could never be passed in any argument shape, including via
+    /// the standard `-- <literal>` escape hatch (`rm -- --foo`'s own POSIX
+    /// convention) that `--` exists to make possible -- live-confirmed
+    /// before this fix: `kupl manifest -- --dashfile.kupl` (a genuinely
+    /// existing file) reported "missing <file.kupl> argument", since
+    /// breaking the scan entirely meant the very next token was never even
+    /// looked at as a path candidate.
+    #[test]
+    fn find_path_arg_honors_the_separator_as_a_literal_escape_for_non_run_subcommands() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // the actual PR-1154 repro: a `--`-prefixed filename, escaped via
+        // `--`, must now resolve to the literal path on subcommands with no
+        // "program args" concept.
+        assert_eq!(find_path_arg(&s(&["manifest", "--", "--dashfile.kupl"])), Ok("--dashfile.kupl"));
+        assert_eq!(find_path_arg(&s(&["dis", "--", "--dashfile.kupl"])), Ok("--dashfile.kupl"));
+        assert_eq!(find_path_arg(&s(&["build", "--", "--dashfile.kupl"])), Ok("--dashfile.kupl"));
+        assert_eq!(find_path_arg(&s(&["test", "--", "--dashfile.kupl"])), Ok("--dashfile.kupl"));
+        assert_eq!(find_path_arg(&s(&["check", "--", "--dashfile.kupl"])), Ok("--dashfile.kupl"));
+        // `run` is UNCHANGED: `--` still means "stop, the rest is the
+        // program's own args", so a `--`-prefixed filename still can't be
+        // escaped this way for `run` specifically -- there's no ambiguity
+        // to resolve there since `run`'s own contract requires the path to
+        // come BEFORE any `--`.
+        assert_eq!(
+            find_path_arg(&s(&["run", "--", "--dashfile.kupl"])),
+            Err("missing <file.kupl> argument".to_string())
+        );
+        // a genuine SECOND positional argument after the escaped literal is
+        // still correctly rejected, not silently dropped.
+        assert_eq!(
+            find_path_arg(&s(&["manifest", "--", "--dashfile.kupl", "extra.kupl"])),
+            Err("unexpected extra argument `extra.kupl`".to_string())
+        );
+        // `-o` after the separator, for a subcommand that normally accepts
+        // it, is now a literal token too (POSIX: nothing after `--` is ever
+        // re-interpreted as a flag) -- it becomes the path itself here since
+        // it's the first token seen after the separator.
+        assert_eq!(find_path_arg(&s(&["build", "--", "-o"])), Ok("-o"));
+        // all the ORIGINAL PR-it798 behavior for `run` is completely
+        // unaffected by this fix.
+        assert_eq!(find_path_arg(&s(&["run", "foo.kupl", "--", "--dashfile.kupl"])), Ok("foo.kupl"));
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it864, an Explore
     /// survey finding, independently re-verified live before implementing):
     /// the SAME "unexpected extra argument silently dropped" shape
@@ -1264,6 +1347,48 @@ mod tests {
         assert_eq!(d_ok.status.code(), Some(1), "a real semantic change must still report exit 1: {d_ok:?}");
         let c_ok = run(&["context", a.to_str().unwrap(), "main"]);
         assert_eq!(c_ok.status.code(), Some(0), "{c_ok:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end companion to
+    /// `find_path_arg_honors_the_separator_as_a_literal_escape_for_non_run_subcommands`
+    /// above: a real subprocess invocation, in a working directory
+    /// containing a file GENUINELY named with a leading `--` (an absolute
+    /// path wouldn't reproduce this -- the argument string itself must
+    /// start with `--`, so the process's cwd is set and the bare relative
+    /// filename is passed). Live-confirmed BEFORE this fix: `kupl manifest
+    /// -- --dashfile.kupl`, run with `--dashfile.kupl` genuinely present in
+    /// the cwd, still reported "missing <file.kupl> argument", exit 2.
+    #[test]
+    fn a_dash_prefixed_filename_is_reachable_via_the_separator_escape_hatch() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-dashfile-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dash_file = dir.join("--dashfile.kupl");
+        std::fs::write(
+            &dash_file,
+            "component Counter {\n    state count: Int = 0\n    expose fun current() -> Int { count }\n}\n",
+        )
+        .unwrap();
+
+        let out = std::process::Command::new(&bin)
+            .current_dir(&dir)
+            .args(["manifest", "--", "--dashfile.kupl"])
+            .output()
+            .expect("kupl runs");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "a dash-prefixed filename, escaped via `--`, must be found and processed: {out:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("\"name\":\"Counter\""),
+            "expected a real manifest JSON body describing the Counter component: {out:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
