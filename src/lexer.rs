@@ -169,6 +169,24 @@ impl<'a> Lexer<'a> {
             {
                 self.bump();
             }
+            // A hex digit run is a maximal munch, and `f`/`F` are themselves valid
+            // hex digits -- `f32` is the ONLY numeric suffix this collides with
+            // (every int-width suffix starts with `i`/`u`, neither a hex digit, so
+            // those already fall out of the loop on their own). Back off a genuine
+            // trailing `f32` so `peek_num_suffix` below can recognize it, matching
+            // the decimal path's own long-standing `10f32` support -- but only when
+            // a real (non-empty, underscore-stripped) hex digit body remains before
+            // it, so a bare `0xf32` still lexes as the plain hex integer 0xf32
+            // rather than backing into an "empty hex literal" error.
+            if radix == 16
+                && self.pos - digits_start >= 3
+                && &self.src[self.pos - 3..self.pos] == "f32"
+            {
+                let head: String = self.src[digits_start..self.pos - 3].replace('_', "");
+                if !head.is_empty() {
+                    self.pos -= 3;
+                }
+            }
             let text: String = self.src[digits_start..self.pos].replace('_', "");
             if text.is_empty() {
                 self.diags.push(Diag::error(
@@ -844,6 +862,29 @@ mod tests {
         assert_eq!(kinds("10f32"), vec![Tok::F32Lit(10.0), Tok::Newline, Tok::Eof]);
         // bare float is still Float
         assert_eq!(kinds("1.5"), vec![Tok::Float(1.5), Tok::Newline, Tok::Eof]);
+    }
+
+    #[test]
+    fn hex_and_binary_f32_suffix_is_disambiguated_from_hex_digits() {
+        // A REAL bug found+fixed (PR-it1131): `f`/`F` are themselves valid hex
+        // digits, so a hex literal's maximal-munch digit loop used to swallow a
+        // trailing `f32` suffix as three more hex digits, silently producing a
+        // large wrong `Int` instead of the `F32Lit` the design (and the decimal
+        // path's own `10f32` support) clearly intended.
+        assert_eq!(kinds("0xFFf32"), vec![Tok::F32Lit(255.0), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("0xAf32"), vec![Tok::F32Lit(10.0), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("0x1f32"), vec![Tok::F32Lit(1.0), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("0x0f32"), vec![Tok::F32Lit(0.0), Tok::Newline, Tok::Eof]);
+        // binary was never affected (`f` halts a binary digit run on its own) --
+        // locked in here so a future regression in the shared branch is caught.
+        assert_eq!(kinds("0b101f32"), vec![Tok::F32Lit(5.0), Tok::Newline, Tok::Eof]);
+        // no hex digit body remains once `f32` backs off -- stays a plain hex Int,
+        // not an "empty hex literal" error and not F32Lit(0.0).
+        assert_eq!(kinds("0xf32"), vec![Tok::Int(0xf32), Tok::Newline, Tok::Eof]);
+        // an explicit int-width suffix on hex was never ambiguous (`i`/`u` are not
+        // hex digits) -- unaffected by this fix, reconfirmed here.
+        use crate::value::IntW;
+        assert_eq!(kinds("0xFFu8"), vec![Tok::SizedInt(255, IntW::U8), Tok::Newline, Tok::Eof]);
     }
 
     #[test]
