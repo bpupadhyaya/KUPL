@@ -364,11 +364,23 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&c| c != ']') {
             self.pos += 1; // consume '-'
             let hi = self.range_endpoint()?;
-            if lo <= hi {
-                ranges.push((lo, hi));
-            } else {
-                ranges.push((hi, lo));
+            // A REAL bug found+fixed (production-hardening PR-it1170): a
+            // reversed range (`lo > hi`, e.g. `[z-a]` or `[9-0]`) used to be
+            // silently swapped into the valid `(hi, lo)` range instead of
+            // rejected -- so `[z-a]` matched EXACTLY like `[a-z]` with zero
+            // diagnostic. Live-confirmed before this fix (all three engines
+            // agreeing byte-for-byte, so a genuine behavioral gap, not a
+            // cross-engine divergence): `re_match("[z-a]", "m")` returned
+            // `true`. Every mainstream regex convention treats `lo > hi`
+            // as a compile error, since it's almost always a transposed
+            // typo, not intentional -- matching this file's own established
+            // "reject the ambiguous/likely-typo case with a clear error"
+            // convention already applied to `\D`/`\W`/`\S` as a range
+            // endpoint and a dangling `\` in a class.
+            if lo > hi {
+                return Err("invalid class range (start > end)".to_string());
             }
+            ranges.push((lo, hi));
         } else {
             ranges.push((lo, lo));
         }
@@ -1176,5 +1188,34 @@ mod tests {
         // (nothing follows the `-`... here there's no `-` at all, so this
         // just confirms the single-escape-as-sole-member case still works).
         assert!(m("^[\\t]$", "\t"));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1170): a reversed
+    /// character-class range (`lo > hi`, e.g. `[z-a]`) used to be silently
+    /// swapped into the valid `(hi, lo)` range instead of rejected -- so
+    /// `[z-a]` matched EXACTLY like `[a-z]` with zero diagnostic, masking
+    /// what's almost always a transposed typo. Live-confirmed BEFORE this
+    /// fix via `re_match`, agreeing byte-for-byte across the interpreter,
+    /// the VM, and a native-compiled binary (a genuine behavioral gap, not
+    /// a cross-engine divergence).
+    #[test]
+    fn a_reversed_class_range_is_a_clean_error_not_a_silent_swap() {
+        // BEFORE the fix, both of these compiled successfully and matched
+        // exactly like their forward-order counterparts.
+        assert!(compile("[z-a]").is_err());
+        assert!(compile("[9-0]").is_err());
+        // a reversed range combined with other members in the same class
+        // still errors, matching the established convention for every
+        // other class-level rejection in this file (see the negated-
+        // predefined-class test above).
+        assert!(compile("[x9-0y]").is_err());
+        // the degenerate equal-endpoint case (`lo == hi`) is NOT reversed
+        // and must still compile -- a discriminating pair confirming the
+        // fix's `>` boundary (not `>=`) is correct.
+        assert!(m("^[a-a]$", "a"));
+        assert!(!m("^[a-a]$", "b"));
+        // an ordinary forward range is completely unaffected.
+        assert!(m("^[a-z]+$", "hello"));
+        assert!(!m("^[a-z]+$", "HELLO"));
     }
 }

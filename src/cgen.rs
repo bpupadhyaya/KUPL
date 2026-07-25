@@ -5220,13 +5220,16 @@ static long kre_range_endpoint(KReP* p) {
    continuation (a `-` followed by a non-`]`) and push either the resulting
    range or `lo` alone; `hi` may itself be a plain char or a single-char
    escape. Mirrors regex.rs's `finish_class_member` exactly
-   (production-hardening PR-it659). */
+   (production-hardening PR-it659, and PR-it1170's reversed-range rejection
+   below -- the C string here MUST match regex.rs's own Err text exactly,
+   since native_regex_*_matches_interp_wording tests assert on it). */
 static void kre_finish_class_member(KReP* p, KReAtom* a, int* cap, long lo) {
     if (kre_peek(p) == '-' && p->pos + 1 < p->len && p->s[p->pos + 1] != ']') {
         p->pos++;
         long hi = kre_range_endpoint(p);
         if (p->err) return;
-        if (lo <= hi) kre_repush(a, cap, lo, hi); else kre_repush(a, cap, hi, lo);
+        if (lo > hi) { kre_fail(p, "invalid class range (start > end)"); return; }
+        kre_repush(a, cap, lo, hi);
     } else {
         kre_repush(a, cap, lo, lo);
     }
