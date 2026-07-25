@@ -6418,6 +6418,23 @@ mod tests {
         assert_eq!(resolve_formatting(&formatted), Some("[]".to_string()), "already-formatted source must be a no-op, not a spurious edit");
     }
 
+    /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-
+    /// hardening PR-it1161, a fresh Explore survey finding): `resolve_
+    /// formatting` shares `fmt.rs::format_program` with `kupl fmt` itself
+    /// (confirmed via a real `kupl lsp` subprocess) -- that function used to
+    /// render ONLY `Program.items`, never `Program.uses`, so a format-on-save
+    /// in ANY editor would silently delete every `use <path>` import
+    /// declaration from the file. See `fmt.rs`'s own `fmt_preserves_use_
+    /// declarations` test for the full writeup of why the bug went
+    /// undetected (dropping `use` consistently is trivially "idempotent"
+    /// from a fixpoint-only check's own narrow perspective).
+    #[test]
+    fn formatting_preserves_use_declarations() {
+        let messy = "use util\nuse lib.stats\n\nfun add(a:Int,b:Int)->Int{\n  a+b\n}\n";
+        let edits = resolve_formatting(messy).expect("parses cleanly, should format");
+        assert!(edits.contains("use util") && edits.contains("use lib.stats"), "{edits}");
+    }
+
     #[test]
     fn formatting_never_touches_a_file_with_comments() {
         // SAFETY GATE (same class as it518's rename hazard): `format_program`

@@ -109,6 +109,36 @@ fn scan_string_for_comments(b: &[u8], i: &mut usize) -> bool {
 
 pub fn format_program(p: &Program) -> String {
     let mut out = String::new();
+    // A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-
+    // hardening PR-it1161, a fresh Explore survey finding): this used to
+    // render ONLY `p.items`, never `p.uses` (the file's own `use <path>`
+    // module-import declarations, parsed separately by `parser.rs` into
+    // `Program`'s own dedicated field rather than as an `Item` variant) --
+    // so `kupl fmt`/`kupl fmt --write`, and `textDocument/formatting`
+    // (which shares this exact function, confirmed via a real `kupl lsp`
+    // subprocess), SILENTLY DELETED every `use` declaration from a file's
+    // own formatted output. Live-confirmed BEFORE this fix: a two-package
+    // project (`app` depending on `lib` via `kupl.toml`) with `use lib` at
+    // the top of `main.kupl` -- genuinely unused (KUPL has no unused-`use`
+    // lint) and so `kupl check` reports a clean `ok:` on the ORIGINAL file
+    // -- lost its `use lib` line entirely after `kupl fmt`, exit 0, zero
+    // warning of any kind; a format-on-save in any editor would silently
+    // corrupt the file's own dependency graph. Fixed by rendering `p.uses`
+    // FIRST, matching this language's own universal convention (every
+    // `use` declaration always precedes every item, confirmed against
+    // `examples/multifile/main.kupl`'s own real source), each on its own
+    // `use <path>` line in original source order (parser.rs pushes onto
+    // `Program::uses` in parse order, so no re-sorting is needed to
+    // preserve a minimal diff), followed by a blank-line separator before
+    // the first item if both are present.
+    for (path, _) in &p.uses {
+        out.push_str("use ");
+        out.push_str(path);
+        out.push('\n');
+    }
+    if !p.uses.is_empty() && !p.items.is_empty() {
+        out.push('\n');
+    }
     for (i, item) in p.items.iter().enumerate() {
         if i > 0 {
             out.push('\n');
@@ -860,6 +890,65 @@ mod tests {
     #[test]
     fn fmt_idempotent_fun() {
         roundtrip("fun add(a:Int,b:Int)->Int{a+b}\n");
+    }
+
+    /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-
+    /// hardening PR-it1161, a fresh Explore survey finding): `format_program`
+    /// used to render ONLY `Program.items`, never `Program.uses` -- so `kupl
+    /// fmt`/`kupl fmt --write` AND `textDocument/formatting` (which shares
+    /// this exact function) silently deleted every `use <path>` declaration
+    /// from a file's own formatted output. This is EXACTLY the shape the
+    /// pre-existing `roundtrip` helper above could never catch: dropping
+    /// `use` consistently across both formatting passes is still, from that
+    /// helper's own narrow "does it reach a stable fixpoint" perspective,
+    /// perfectly "idempotent" -- `roundtrip` never asserts the OUTPUT still
+    /// contains what the INPUT had. Live-confirmed BEFORE this fix, via a
+    /// real two-package project: `kupl fmt` on a file with a genuinely
+    /// UNUSED `use lib` (KUPL has no unused-`use` lint, so `kupl check`
+    /// reports a clean `ok:` on the original) silently dropped the `use
+    /// lib` line entirely, exit 0, zero warning -- and the SAME drop was
+    /// independently reproduced through the real `kupl lsp` subprocess's
+    /// own `textDocument/formatting` response. Fixed by rendering `p.uses`
+    /// first (this language's own universal convention -- every `use`
+    /// always precedes every item), in original source order.
+    #[test]
+    fn fmt_preserves_use_declarations() {
+        let src = "use util\nuse lib.stats\n\nfun main() uses io {\n    print(\"hi\")\n}\n";
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(p.uses.len(), 2, "sanity: both `use` declarations must actually parse: {:?}", p.uses);
+        let formatted = super::format_program(&p);
+        assert!(
+            formatted.contains("use util") && formatted.contains("use lib.stats"),
+            "both `use` declarations must survive formatting, in their original order: {formatted:?}"
+        );
+        // a single-line `use path\n` per declaration, `use util` strictly before
+        // `use lib.stats` (original source order preserved).
+        assert!(
+            formatted.find("use util").unwrap() < formatted.find("use lib.stats").unwrap(),
+            "original `use` order must be preserved: {formatted:?}"
+        );
+        // reformatting the ALREADY-formatted output must not lose them either
+        // (the discriminating idempotency check `roundtrip` alone couldn't
+        // provide, since it never checks CONTENT preservation, only fixpoint
+        // stability).
+        let (p2, d2) = parser::parse(&formatted);
+        assert!(d2.is_empty(), "formatted output failed to reparse: {d2:?}\n---\n{formatted}");
+        assert_eq!(p2.uses.len(), 2, "the reparsed formatted output must still have both uses: {formatted:?}");
+        let refmt = super::format_program(&p2);
+        assert_eq!(formatted, refmt, "formatter is not idempotent with respect to `use` declarations");
+    }
+
+    /// Sibling case: a file with NO `use` declarations at all must not gain
+    /// a spurious leading blank line.
+    #[test]
+    fn fmt_with_no_use_declarations_has_no_spurious_leading_blank_line() {
+        let src = "fun main() uses io { print(\"hi\") }\n";
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(!formatted.starts_with('\n'), "no leading blank line when there are no `use` declarations: {formatted:?}");
+        assert!(formatted.starts_with("fun main"), "{formatted:?}");
     }
 
     #[test]
