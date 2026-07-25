@@ -71,6 +71,36 @@ fn main() -> ExitCode {
         .unwrap_or(ExitCode::from(101))
 }
 
+/// True when EVERY newly-introduced error from recompiling `kupl fmt`'s own
+/// output (i.e. excluding any code already present on the ORIGINAL source,
+/// matching this call site's existing `src_error_codes` pre-existing-error
+/// distinction) matches the ONE specific, already-understood formatter gap
+/// PR-it837/889 confirmed and safely guarded against: a `Float`/`F32`
+/// literal that overflows to infinity has no valid KUPL literal syntax, so
+/// `format_program` renders Rust's raw `Display` text (`inf`, or `inff32`
+/// once the `f32` suffix is appended) instead of a number -- which re-lexes
+/// as an unbound identifier reference, K0240 "unknown name", rather than a
+/// parse error. Message-content matching (production-hardening PR-it1177;
+/// found via a fresh Explore survey, independently re-verified live before
+/// implementing -- the survey itself over-called this a silent-corruption
+/// risk, but PR-it837/889's existing round-trip guard, confirmed live here
+/// too, already fully closes that; the ONLY real remaining gap was this
+/// message's own generic "please report this as a KUPL bug" wording being
+/// needlessly alarming for a case that is neither a bug nor reportable-as-
+/// one) deliberately FAILS OPEN rather than proactively walking the AST: if
+/// this ever misses a case (a different malformed spelling, or a "did you
+/// mean" suggestion appended to the message), the existing generic message
+/// is used unchanged -- this only ever REFINES it, never changes
+/// correctness, safety, or the underlying refuse-to-corrupt behavior.
+fn is_known_non_finite_float_formatting_gap(
+    compile_errors: &[kupl::diag::Diag],
+    src_error_codes: &std::collections::HashSet<&'static str>,
+) -> bool {
+    let mut new_errors = compile_errors.iter().filter(|d| !src_error_codes.contains(d.code)).peekable();
+    new_errors.peek().is_some()
+        && new_errors.all(|d| d.code == "K0240" && (d.message.contains("`inf`") || d.message.contains("`inff32`")))
+}
+
 fn run_cli() -> ExitCode {
     // A bundled executable carries its module in a trailer — run it directly.
     if let Ok(exe) = std::env::current_exe() {
@@ -358,7 +388,11 @@ fn run_cli() -> ExitCode {
                 // round-tripping, which this enforces defensively rather than
                 // trusting silently.
                 if let Err(compile_errors) = kupl::run::compile(&formatted) {
-                    if compile_errors.iter().any(|d| !src_error_codes.contains(d.code)) {
+                    if is_known_non_finite_float_formatting_gap(&compile_errors, &src_error_codes) {
+                        eprintln!(
+                            "error: {file} contains a float literal that overflows to infinity (e.g. `1e400`), which has no valid KUPL literal syntax to format -- refusing to overwrite the file (original left untouched; rewrite the literal as a smaller value or a computed expression, e.g. `1.0 / 0.0`)"
+                        );
+                    } else if compile_errors.iter().any(|d| !src_error_codes.contains(d.code)) {
                         eprintln!(
                             "error: internal formatter bug producing invalid output for {file} -- refusing to overwrite the file (original left untouched; please report this as a KUPL bug)"
                         );
@@ -403,6 +437,12 @@ fn run_cli() -> ExitCode {
                 // pipeline and refuse to print it if it doesn't come back
                 // clean.
                 if let Err(compile_errors) = kupl::run::compile(&formatted) {
+                    if is_known_non_finite_float_formatting_gap(&compile_errors, &src_error_codes) {
+                        eprintln!(
+                            "error: {file} contains a float literal that overflows to infinity (e.g. `1e400`), which has no valid KUPL literal syntax to format -- refusing to print it (rewrite the literal as a smaller value or a computed expression, e.g. `1.0 / 0.0`)"
+                        );
+                        return 1;
+                    }
                     if compile_errors.iter().any(|d| !src_error_codes.contains(d.code)) {
                         eprintln!(
                             "error: internal formatter bug producing invalid output for {file} -- refusing to print it (please report this as a KUPL bug)"
@@ -1092,9 +1132,15 @@ mod tests {
     /// when formatting a file that ALREADY has one pre-existing check error
     /// ALSO introduces a genuinely DIFFERENT, NEW one (here, PR-it837's own
     /// overflowing-float-literal bug, layered into the same file), the
-    /// PR-it1142 fix above must still correctly refuse and blame the
-    /// formatter — the new-vs-pre-existing code-set comparison must not
-    /// become a blanket "any pre-existing error excuses everything" hole.
+    /// PR-it1142 fix above must still correctly refuse — the new-vs-pre-
+    /// existing code-set comparison must not become a blanket "any pre-
+    /// existing error excuses everything" hole. NOTE (production-hardening
+    /// PR-it1177): the refusal message this specific trigger produces was
+    /// refined from the generic "internal formatter bug, please report"
+    /// to a more specific, non-alarming one naming the known cause (see
+    /// `is_known_non_finite_float_formatting_gap`'s own doc comment) --
+    /// this test was updated accordingly; its core assertion (still
+    /// refuses, still prints nothing) is unchanged.
     #[test]
     fn fmt_still_refuses_when_a_pre_existing_error_is_joined_by_a_genuinely_new_one() {
         let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
@@ -1117,12 +1163,80 @@ mod tests {
         let printed = run(&["fmt", tmp.to_str().unwrap()]);
         assert_eq!(printed.status.code(), Some(1), "must still refuse: formatting introduces a genuinely NEW error: {printed:?}");
         assert!(
-            String::from_utf8_lossy(&printed.stderr).contains("internal formatter bug"),
-            "a genuinely new formatter-introduced error must still be blamed on the formatter: {printed:?}"
+            String::from_utf8_lossy(&printed.stderr).contains("overflows to infinity"),
+            "a genuinely new formatter-introduced error must still be refused, now with the specific known-cause message: {printed:?}"
         );
         assert!(printed.stdout.is_empty(), "must not print anything on stdout when refusing: {printed:?}");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A REAL, live-confirmed UX gap found+fixed (production-hardening PR-it1177, a
+    /// fresh Explore survey finding, independently re-verified live before
+    /// implementing): PR-it837/889's safety net (confirmed live here too --
+    /// zero risk of corruption on any of the three affected surfaces: plain
+    /// print, `--write`, and `lsp.rs::resolve_formatting`) already fully
+    /// prevents `kupl fmt` from ever emitting or writing the unparseable
+    /// `inf`/`inff32` text a `Float`/`F32` literal that overflows to
+    /// infinity renders to -- but its refusal message, "internal formatter
+    /// bug... please report this as a KUPL bug", is needlessly alarming and
+    /// misleading for this ONE specific, already-understood cause: it is
+    /// neither a bug nor something a user could usefully report (rewriting
+    /// the literal is the only fix). Live-confirmed before this fix: `kupl
+    /// fmt` on `let x = 1e400` (and the negative and `f32` variants) all
+    /// printed the generic "please report this as a KUPL bug" message.
+    /// Fixed by recognizing this ONE specific diagnostic signature (every
+    /// newly-introduced compile error is K0240 "unknown name" naming `inf`
+    /// or `inff32` -- the exact malformed spellings Rust's `Display` for
+    /// `f64`/`f32` infinity produces) and giving a clear, specific message
+    /// instead, on both the plain-print and `--write` paths. This test
+    /// covers the plain-print and `--write` paths directly (`--write` must
+    /// still leave the original file byte-for-byte untouched, unchanged
+    /// safety guarantee); `lsp.rs::resolve_formatting`'s own silent no-op
+    /// is unaffected (no user-visible message channel to refine there) and
+    /// is left as-is.
+    #[test]
+    fn fmt_names_the_specific_known_cause_for_an_overflowing_float_literal_instead_of_a_generic_bug_report() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+
+        for (i, (label, src)) in [
+            ("positive f64 overflow", "fun main() uses io {\n    let x = 1e400\n    print(x)\n}\n"),
+            ("negative f64 overflow", "fun main() uses io {\n    let x = -1e400\n    print(x)\n}\n"),
+            ("f32 overflow", "fun main() uses io {\n    let x = 1e40f32\n    print(x)\n}\n"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tmp =
+                std::env::temp_dir().join(format!("kupl_it1177_fmt_known_cause_{i}_{}.kupl", std::process::id()));
+            let original = src.as_bytes().to_vec();
+            std::fs::write(&tmp, &original).unwrap();
+
+            let printed = run(&["fmt", tmp.to_str().unwrap()]);
+            assert_eq!(printed.status.code(), Some(1), "{label}: {printed:?}");
+            let stderr = String::from_utf8_lossy(&printed.stderr).into_owned();
+            assert!(stderr.contains("overflows to infinity"), "{label}: {stderr}");
+            assert!(stderr.contains("1.0 / 0.0"), "{label}: must suggest a concrete, working workaround: {stderr}");
+            assert!(
+                !stderr.contains("internal formatter bug"),
+                "{label}: this known cause must not be reported as a mysterious internal bug: {stderr}"
+            );
+            assert!(printed.stdout.is_empty(), "{label}: {printed:?}");
+
+            let written = run(&["fmt", tmp.to_str().unwrap(), "--write"]);
+            assert_eq!(written.status.code(), Some(1), "{label}: {written:?}");
+            let write_stderr = String::from_utf8_lossy(&written.stderr).into_owned();
+            assert!(write_stderr.contains("overflows to infinity"), "{label}: {write_stderr}");
+            assert_eq!(std::fs::read(&tmp).unwrap(), original, "{label}: --write must leave the file untouched");
+
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     #[test]
