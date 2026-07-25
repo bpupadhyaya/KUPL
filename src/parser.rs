@@ -2297,6 +2297,33 @@ impl Parser {
                     v
                 }
             }
+            // A range pattern's own UPPER bound has the identical `Tok::Minus`-
+            // then-`Tok::Int`-or-`Tok::IntOverflowMin` shape `parse_pattern_
+            // primary_inner`'s own Minus arm already handles for a pattern's
+            // LEADING literal (production-hardening PR-it1189, closing a gap
+            // production-hardening PR-it1176 deliberately deferred: `5..
+            // -9223372036854775808` fell through to the generic `other => Err`
+            // arm below, which not only gave a less-specific message than the
+            // dedicated K0004 every OTHER `-9223372036854775808` site now
+            // gives, but genuinely desynced the parser -- `Tok::IntOverflowMin`
+            // was consumed as if it were "not an integer at all", so parsing
+            // resumed one token late and cascaded into unrelated K0102/K0103
+            // errors on the FOLLOWING lines. Confirmed live BEFORE this fix:
+            // `match x { 5..-9223372036854775808 => .. _ => .. }` produced
+            // THREE stacked diagnostics (K0111, then a spurious K0102 on the
+            // next match arm, then a spurious K0103 at the closing brace) from
+            // this ONE root cause -- while the mirror-image lower-bound case,
+            // `-9223372036854775808..5`, already parsed cleanly via PR-it1176's
+            // own `parse_pattern_primary_inner` fix. `neg` (whether a `-` was
+            // consumed just above) plays the exact same role here as
+            // `parse_pattern_primary_inner`'s own local match on the token
+            // after its `Tok::Minus` arm: `-9223372036854775808` folds to
+            // `i64::MIN`; a BARE, un-negated `9223372036854775808` is still a
+            // genuine K0004 overflow, using the SAME shared `int_overflow_min_
+            // diag` helper every other overflow site uses for byte-for-byte
+            // consistent wording.
+            Tok::IntOverflowMin if neg => i64::MIN,
+            Tok::IntOverflowMin => return Err(Self::int_overflow_min_diag(self.prev_span())),
             other => {
                 return Err(Diag::error(
                     "K0111",
@@ -2530,6 +2557,83 @@ mod tests {
         let (_, diags_pat) =
             parse("fun main() {\n    let x = 0\n    let y = match x {\n        9223372036854775808 => 1\n        _ => 0\n    }\n}\n");
         assert!(diags_pat.iter().any(|d| d.code == "K0004"), "{diags_pat:?}");
+    }
+
+    /// A REAL, live-confirmed bug found+fixed (production-hardening PR-it1189,
+    /// closing a gap PR-it1176 itself deliberately deferred): a range pattern's
+    /// own UPPER bound (`5..-9223372036854775808`) fell through to `maybe_range`'s
+    /// generic `other => Err(K0111)` arm instead of folding to `i64::MIN` the
+    /// way the mirror-image LOWER bound (`-9223372036854775808..5`, already
+    /// fixed at PR-it1176 via `parse_pattern_primary_inner`) does. Worse than
+    /// just a less-specific message: `Tok::IntOverflowMin` was consumed as if
+    /// it were "not an integer at all", desyncing the parser and cascading
+    /// into spurious K0102/K0103 errors on unrelated LATER lines. Confirmed
+    /// live BEFORE this fix: `match x { 5..-9223372036854775808 => .. _ => ..
+    /// }` produced three stacked diagnostics from this one root cause, while
+    /// the lower-bound mirror case parsed cleanly.
+    #[test]
+    fn range_pattern_upper_bound_folds_the_bare_decimal_i64_min_magnitude_too() {
+        let p = ok("fun main() {\n    let x = 0\n    let y = match x {\n        5..-9223372036854775808 => 1\n        _ => 0\n    }\n}\n");
+        let arm_pat = p
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Fun(f) if f.name == "main" => Some(f.body.stmts.clone()),
+                _ => None,
+            })
+            .unwrap()
+            .into_iter()
+            .find_map(|s| match s {
+                Stmt::Let { init: Expr { kind: ExprKind::Match { arms, .. }, .. }, .. } => Some(arms),
+                _ => None,
+            })
+            .expect("a match expression")[0]
+            .pattern
+            .kind
+            .clone();
+        assert!(
+            matches!(arm_pat, PatternKind::Range { lo: 5, hi: i64::MIN, inclusive: false }),
+            "{arm_pat:?}"
+        );
+
+        // discriminating pair: a bare, un-negated overflow upper bound is still
+        // a genuine K0004, using the SAME shared message as every other overflow
+        // site (not the generic K0111 "expected an integer upper bound").
+        let (_, diags) = parse("fun main() {\n    let x = 0\n    let y = match x {\n        5..9223372036854775808 => 1\n        _ => 0\n    }\n}\n");
+        let d = diags.iter().find(|d| d.code == "K0004").expect("expected K0004");
+        assert!(d.message.contains("does not fit in Int (64-bit)"), "{}", d.message);
+
+        // discriminating pair: a genuinely non-integer upper bound is still the
+        // ordinary K0111 -- this fix must not swallow real malformed input.
+        let (_, diags2) = parse("fun main() {\n    let x = 0\n    let y = match x {\n        0..a => 1\n        _ => 0\n    }\n}\n");
+        assert!(
+            diags2.iter().any(|d| d.code == "K0111" && d.message.starts_with("expected an integer upper bound")),
+            "{diags2:?}"
+        );
+
+        // sanity: the mirror-image LOWER bound (PR-it1176's own fix) is unaffected.
+        let p2 = ok("fun main() {\n    let x = 0\n    let y = match x {\n        -9223372036854775808..5 => 1\n        _ => 0\n    }\n}\n");
+        let arm_pat2 = p2
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Fun(f) if f.name == "main" => Some(f.body.stmts.clone()),
+                _ => None,
+            })
+            .unwrap()
+            .into_iter()
+            .find_map(|s| match s {
+                Stmt::Let { init: Expr { kind: ExprKind::Match { arms, .. }, .. }, .. } => Some(arms),
+                _ => None,
+            })
+            .expect("a match expression")[0]
+            .pattern
+            .kind
+            .clone();
+        assert!(
+            matches!(arm_pat2, PatternKind::Range { lo: i64::MIN, hi: 5, inclusive: false }),
+            "{arm_pat2:?}"
+        );
     }
 
     #[test]
