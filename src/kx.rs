@@ -685,6 +685,33 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
     }
 
     let ncomps = r.u32()?;
+    // A REAL, reasoned-through-code gap found+fixed (production-hardening
+    // PR-it1183, a fresh Explore survey finding, independently re-verified
+    // live before implementing): every OTHER index this decoder produces is
+    // either read directly from the file as its own already-narrow type
+    // (e.g. `nfuns`'s own `idx: u16` above) or explicitly bounds-checked
+    // before use -- but `component_names.insert(name, i as u16)` below casts
+    // this loop's own untrusted `u32` counter `i` DIRECTLY to `u16` with no
+    // check at all, the one index-generating site in this whole decoder that
+    // never received the "index truncation ALIASES the wrong entry"
+    // treatment `compile.rs`'s own K0806/K0807 checks apply on the ENCODE
+    // side (a `.kx` file produced by THIS compiler can never legitimately
+    // have more than 65536 top-level items, since compile.rs refuses to
+    // compile a program with that many first). But `decode()` is also the
+    // entry point for `kupl run <file.kx>` on a HAND-CRAFTED or CORRUPTED
+    // file, where `ncomps` is read directly from the file's own header with
+    // no such guarantee: for `ncomps > 65536`, `i as u16` wraps, so a LATER
+    // component (e.g. index 65536) silently OVERWRITES `component_names`'
+    // slot for an EARLIER, differently-named one (index 0) with the SAME
+    // truncated key -- `kupl run <file.kx> ComponentName65536` would then
+    // silently dispatch to `Component0`'s own code instead, exactly the
+    // "wrong entry silently runs" severity class this codebase has
+    // extensively hardened `.kx` decoding against everywhere else. Rejected
+    // instead with the SAME "corrupt .kx module" error shape every other
+    // decode-time validation in this file already uses.
+    if ncomps > u16::MAX as u32 + 1 {
+        return Err("corrupt .kx module: too many components".into());
+    }
     for i in 0..ncomps {
         r.charge::<ComponentMeta>()?;
         let name = r.s()?;
@@ -1283,6 +1310,49 @@ mod tests {
             t[i] ^= 0xFF;
             let _ = super::decode(&t); // Ok or Err, but never a crash
         }
+    }
+
+    /// A REAL, reasoned-through-code gap found+fixed (production-hardening
+    /// PR-it1183, a fresh Explore survey finding, independently re-verified
+    /// live before implementing -- see the fix's own doc comment right
+    /// before the new bounds check in `decode()`, immediately after `let
+    /// ncomps = r.u32()?;`, for the full writeup): every OTHER index
+    /// `decode()` produces is either read directly from the file as an
+    /// already-narrow type or explicitly bounds-checked, but
+    /// `component_names.insert(name, i as u16)` cast its own untrusted `u32`
+    /// loop counter directly to `u16` with no check -- for `ncomps > 65536`,
+    /// this WRAPS, silently aliasing a later component's name onto an
+    /// earlier component's own index. `compile.rs`'s K0806/K0807 checks
+    /// prevent this compiler's own output from ever reaching that count, but
+    /// `decode()` is also the entry point for `kupl run <file.kx>` on a
+    /// hand-crafted or corrupted file, where `ncomps` carries no such
+    /// guarantee. This test overwrites a valid, minimal (zero-component)
+    /// module's own encoded `ncomps` field with a huge value -- `ncomps`
+    /// occupies the 4 bytes immediately before the trailing `ai_funs` count
+    /// (`encode()`'s own field order: components, then ai_funs, with no
+    /// component data in between since the source module has none) -- and
+    /// confirms the SPECIFIC new "too many components" error, not merely
+    /// "any error" (ruling out an accidental silent-success wraparound) and
+    /// not a crash.
+    #[test]
+    fn ncomps_truncation_is_a_clean_specific_error_not_a_wraparound() {
+        let module = super::Module::default();
+        let mut bytes = super::encode(&module);
+        let len = bytes.len();
+        bytes[len - 8..len - 4].copy_from_slice(&100_000u32.to_le_bytes());
+        let err = super::decode(&bytes).expect_err("an impossibly large ncomps must be a clean error");
+        assert!(err.contains("too many components"), "{err}");
+
+        // discriminating pair: an ORDINARY module with a genuine, small
+        // component count must round-trip completely unaffected by this
+        // check -- it must not false-positive on normal, everyday module
+        // sizes anywhere near the actual boundary.
+        let src = "component Ok1 {\n    intent \"c\"\n    in click: Event\n    out value: Int\n    on click { emit value(1) }\n}\nfun main() {}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let real_module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+        assert_eq!(real_module.components.len(), 1, "sanity: the source declares exactly one component");
+        let real_bytes = super::encode(&real_module);
+        assert!(super::decode(&real_bytes).is_ok(), "an ordinary, small component count must not be rejected");
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it687): the sibling
