@@ -1715,18 +1715,48 @@ fn shadow_zones(program: &crate::ast::Program, name: &str) -> Vec<crate::diag::S
 }
 
 /// Whether `name` matches one of `c`'s own `state`/`prop`/`child` field
-/// names -- used ONLY by `local_binding_scope_for_rename`/
-/// `shadow_zones_for_rename` below, NEVER by `local_binding_scope`/
-/// `shadow_zones` themselves (see those two functions' own callers:
-/// `resolve_hover`/`resolve_signature_help`/`resolve_definition` must NOT
-/// treat a field reference as "locally bound with nothing further to show" --
-/// they need to fall through to `item_signature`/`item_definition`'s own
-/// dedicated, already-working field-aware resolvers, established at
-/// PR-it871/PR-it872/PR-it873).
+/// names, OR one of its own `fun`/`expose fun` method names -- used ONLY by
+/// `local_binding_scope_for_rename`/`shadow_zones_for_rename` below, NEVER by
+/// `local_binding_scope`/`shadow_zones` themselves (see those two functions'
+/// own callers: `resolve_hover`/`resolve_signature_help`/`resolve_definition`
+/// must NOT treat a field/method reference as "locally bound with nothing
+/// further to show" -- they need to fall through to `item_signature`/
+/// `item_definition`'s own dedicated, already-working field-aware
+/// resolvers, established at PR-it871/PR-it872/PR-it873).
+///
+/// A REAL, live-confirmed silent-CORRUPTION bug found+fixed (production-
+/// hardening PR-it1163, a fresh Explore survey finding, the SIXTH sibling
+/// instance of the SAME "hardcoded binding-kind list forgot an entry" shape
+/// PR-it1138's own doc comment below already catalogs five of): this
+/// function originally checked ONLY `props`/`state`/`children`, never
+/// `funs`/`exposes` -- but `check.rs::bind_component_env` inserts BOTH a
+/// component's own private (`fun`) AND exposed (`expose fun`) method names
+/// into the EXACT SAME per-component scope as props/state/children ("component
+/// functions (private and exposed) callable from any body"), shadowing an
+/// unrelated same-named top-level `fun` throughout the WHOLE component
+/// exactly like a field does. Live-confirmed BEFORE this fix, via a real
+/// `kupl lsp` subprocess: `fun helper() -> Int { 1 }` / `fun caller() -> Int
+/// { helper() }` / `component C { fun helper() -> Int { 2 } fun other() ->
+/// Int { 3 } expose fun get() -> Int { helper() } }` -- renaming the TOP-
+/// LEVEL `helper` to `other` returned a non-null `WorkspaceEdit` with ZERO
+/// collision warning, touching FOUR locations including `component C`'s own
+/// UNRELATED `fun helper` declaration and its call site inside `get()`.
+/// Applying that edit exactly as an editor would left `component C` with
+/// TWO methods named `other` -- `kupl check` on the result: `error[K0277]:
+/// method `other` is defined more than once in component `C`` -- the exact
+/// same "duplicate-definition compile error the editor gave zero warning
+/// about" severity class as PR-it1138/PR-it1159, just reached through the
+/// sibling `funs`/`exposes` gap rather than the already-fixed `props`/
+/// `state`/`children` one. `documentHighlight` (via `scoped_occurrences`)
+/// shares this SAME helper, so it also incorrectly highlighted the
+/// component's own unrelated method as an occurrence of the top-level one;
+/// fixed for both by this one shared function.
 fn component_field_named(c: &crate::ast::ComponentDecl, name: &str) -> bool {
     c.props.iter().any(|p| p.name == name)
         || c.state.iter().any(|s| s.name == name)
         || c.children.iter().any(|ch| ch.name == name)
+        || c.funs.iter().any(|f| f.name == name)
+        || c.exposes.iter().any(|f| f.name == name)
 }
 
 /// Like `local_binding_scope`, but additionally treats a component's own
@@ -5011,6 +5041,53 @@ mod tests {
         let child_locs = occurrences_cross_file(child_src, "ping", child_off, dir, &empty_buffers, dir, None);
         assert_eq!(child_locs.len(), 2, "child decl + its one use inside go(): {child_locs:?}");
         assert!(child_locs.iter().all(|(_, l0, ..)| *l0 == 8 || *l0 == 10), "{child_locs:?}");
+    }
+
+    /// A REAL, live-confirmed silent-CORRUPTION bug found+fixed (production-
+    /// hardening PR-it1163, a fresh Explore survey finding, the SIXTH sibling
+    /// instance of PR-it1138's own "hardcoded binding-kind list forgot an
+    /// entry" shape -- see `component_field_named`'s own doc comment for the
+    /// full writeup): `component_field_named` originally checked only
+    /// `props`/`state`/`children`, never `funs`/`exposes` -- but `check.rs::
+    /// bind_component_env` binds BOTH into the SAME per-component scope.
+    /// Live-confirmed BEFORE this fix: renaming the top-level `fun helper` to
+    /// `other` returned FOUR locations merged together (both the unrelated
+    /// top-level fun's decl+call AND the component's own private `fun
+    /// helper`'s decl+call), and applying that edit left `component C` with
+    /// two methods named `other` (`kupl check`: `error[K0277]: method
+    /// `other` is defined more than once`).
+    #[test]
+    fn component_private_and_exposed_funs_shadowing_an_unrelated_top_level_declaration_are_scoped_separately() {
+        let dir = std::path::Path::new("/fake/lsp-it1163-funs");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+
+        // private `fun` case.
+        let priv_src = "fun helper() -> Int { 1 }\nfun caller() -> Int { helper() }\ncomponent C {\n    intent \"c\"\n    fun helper() -> Int { 2 }\n    expose fun get() -> Int {\n        helper()\n    }\n}\n";
+        let fun_off = priv_src.find("fun helper").unwrap() + 4;
+        let fun_locs = occurrences_cross_file(priv_src, "helper", fun_off, dir, &empty_buffers, dir, None);
+        assert_eq!(
+            fun_locs.len(),
+            2,
+            "top-level fun decl + its one call site, NOT the component's own private fun: {fun_locs:?}"
+        );
+        assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
+        // the reverse direction: renaming the component's OWN private `fun
+        // helper` must find ONLY its own decl + its one call inside `get()`.
+        let priv_off = priv_src.find("fun helper() -> Int { 2 }").unwrap() + 4;
+        let priv_locs = occurrences_cross_file(priv_src, "helper", priv_off, dir, &empty_buffers, dir, None);
+        assert_eq!(priv_locs.len(), 2, "component's own fun decl + its one call, NOT the unrelated top-level fun: {priv_locs:?}");
+        assert!(priv_locs.iter().all(|(_, l0, ..)| *l0 == 4 || *l0 == 6), "{priv_locs:?}");
+
+        // `expose fun` case.
+        let exp_src = "fun widget() -> Int { 1 }\nfun caller() -> Int { widget() }\ncomponent C {\n    intent \"c\"\n    expose fun widget() -> Int { 2 }\n}\n";
+        let exp_off = exp_src.find("fun widget() -> Int { 2 }").unwrap() + 4;
+        let exp_locs = occurrences_cross_file(exp_src, "widget", exp_off, dir, &empty_buffers, dir, None);
+        assert_eq!(exp_locs.len(), 1, "the exposed method's own decl, no calls to it anywhere: {exp_locs:?}");
+        assert_eq!(exp_locs[0].1, 4, "{exp_locs:?}");
+        let top_off = exp_src.find("fun widget").unwrap() + 4;
+        let top_locs = occurrences_cross_file(exp_src, "widget", top_off, dir, &empty_buffers, dir, None);
+        assert_eq!(top_locs.len(), 2, "top-level fun decl + its one call site, NOT the exposed method: {top_locs:?}");
+        assert!(top_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{top_locs:?}");
     }
 
     /// A REAL bug (production-hardening PR-it742): unlike the cross-file rename/
