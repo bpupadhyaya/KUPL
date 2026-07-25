@@ -281,9 +281,32 @@ fn interface_of(item: &Item) -> String {
             for p in &f.params {
                 s.push_str(&format!(" {}", param_fingerprint(p)));
             }
-            if let Some(r) = &f.ret {
-                s.push_str(&format!(" -> {}", ty_str(r)));
-            }
+            // A REAL false-positive bug found+fixed (production-hardening
+            // PR-it1187, the SAME "one interface-fingerprint site is
+            // inconsistent with its siblings" class this file has repeatedly
+            // fixed -- PR-it580/643/646/864/1042/1043/1173): unlike this
+            // exact same field on `Item::Component`'s `expose fun` (below)
+            // and `Item::Contract`'s `sig` (further below), which both
+            // normalize an OMITTED return type to the string `"Unit"` via
+            // `.unwrap_or_else(|| "Unit".into())`, THIS site used to render
+            // NOTHING at all when `f.ret` was `None`, instead of the SAME
+            // `"Unit"` fallback -- so `fun f() { }` and `fun f() -> Unit { }`
+            // produced two DIFFERENT interface fingerprints (` -> Unit`
+            // present vs. absent), even though `check.rs` resolves both to
+            // the IDENTICAL `Ty::Unit` (`f.ret.as_ref().map(|t|
+            // self.resolve_ty(t)).unwrap_or(Ty::Unit)`, used consistently
+            // everywhere a function's return type is checked) -- zero
+            // caller-observable difference on any of the four engines.
+            // Confirmed live BEFORE this fix: `kupl diff` on exactly this
+            // pair of otherwise-identical files reported `[INTERFACE —
+            // breaking]`, even though `fmt.rs`'s own formatter (the
+            // `canonical()` equality oracle this file's own `diff_program`
+            // consults FIRST) does not normalize the two spellings either,
+            // so this pair isn't short-circuited away as textually
+            // identical before ever reaching `interface_of`'s own
+            // comparison. Fixed by matching the two already-correct sibling
+            // sites' exact pattern.
+            s.push_str(&format!(" -> {}", f.ret.as_ref().map(ty_str).unwrap_or_else(|| "Unit".into())));
             // A REAL false-positive bug found+fixed (production-hardening
             // PR-it1043, the SAME class PR-it646 fixed for `fulfills`/
             // `ports`/`exposes`): a `uses` effect budget is checked via SET
@@ -756,6 +779,35 @@ mod tests {
             "fun add(a: Float, b: Float) -> Float {\n    a + b\n}\n",
         );
         assert_eq!(lines, vec!["interface add"]);
+    }
+
+    /// A REAL false-positive bug found+fixed (production-hardening PR-it1187,
+    /// the SAME "one interface-fingerprint site is inconsistent with its
+    /// siblings" class this file has repeatedly fixed): `Item::Fun`'s own
+    /// return-type fingerprint used to omit the ` -> Unit` suffix entirely
+    /// when the source left the return type unwritten, unlike the
+    /// `Item::Component`/`Item::Contract` sibling sites, which both already
+    /// normalize an omitted return type to the SAME string as an explicit
+    /// `-> Unit` -- so `fun f() { }` and `fun f() -> Unit { }` (identical
+    /// under `check.rs`'s own resolved `Ty::Unit` on every engine) produced
+    /// two DIFFERENT fingerprints, misclassifying a purely cosmetic edit as
+    /// `[INTERFACE — breaking]`. Confirmed live before this fix.
+    #[test]
+    fn omitted_return_type_vs_explicit_unit_is_not_interface() {
+        let (lines, _) = diff_lines("fun f() {\n}\n", "fun f() -> Unit {\n}\n");
+        assert_eq!(lines, vec!["impl f"], "omitted vs. explicit `-> Unit` must be implementation-only");
+        // the reverse direction is symmetric.
+        let (lines, _) = diff_lines("fun f() -> Unit {\n}\n", "fun f() {\n}\n");
+        assert_eq!(lines, vec!["impl f"]);
+        // a component `expose fun`'s own already-correct sibling site is unaffected.
+        let (lines, _) = diff_lines(
+            "component W {\n    intent \"w\"\n    expose fun f() {\n    }\n}\n",
+            "component W {\n    intent \"w\"\n    expose fun f() -> Unit {\n    }\n}\n",
+        );
+        assert_eq!(lines, vec!["impl W"]);
+        // sanity: a GENUINE return-type change must still be flagged breaking.
+        let (lines, _) = diff_lines("fun f() {\n}\n", "fun f() -> Int {\n    0\n}\n");
+        assert_eq!(lines, vec!["interface f"], "an actual return-type change must still be flagged breaking");
     }
 
     #[test]
