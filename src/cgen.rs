@@ -2330,6 +2330,40 @@ static int k_eq(KValue a, KValue b) {
                 result = ok;
                 break;
             }
+            /* A REAL, live-confirmed cross-engine DIVERGENCE bug found+fixed
+               (production-hardening PR-it1180, the C-side half of value.rs's own
+               sibling fix -- see that fix's own doc comment for the full writeup):
+               neither K_FUN nor K_CLOSURE had a case here, both fell through to the
+               OLD `default: result = 0` -- so BEFORE this fix, native's k_eq agreed
+               with interp/vm on the WRONG answer (a cross-engine-CONSISTENT bug,
+               PR-it1180's own original finding). Fixing value.rs's `PartialEq` alone
+               (interp/vm) would have introduced a NEW, worse divergence -- confirmed
+               live: after only the Rust fix, `f == f` printed `true` on interp/vm but
+               still `false` on native. K_FUN's `fun` field is a plain function-table
+               index, so two K_FUN values are equal iff they name the SAME function --
+               no captured state to consider, mirroring `Value::Fun`'s by-name
+               comparison exactly. K_CLOSURE's `proto` field is the native equivalent
+               of `Rc<Block>`'s pointer identity in value.rs's own fix (each closure
+               LITERAL compiles to exactly one distinct prototype index) -- combined
+               with `origin_inst` (mirrors `origin_instance`) and a recursive,
+               iterative comparison of `caps` (mirrors `captures`, pushed onto the
+               SAME `sa`/`sb` work stack this function already uses for List/Ctor, not
+               a native recursive call -- consistent with this function's own
+               established stack-safety discipline).*/
+            case K_FUN: result = (x.as.fun == y.as.fun); break;
+            case K_CLOSURE: {
+                KClosure* cx = x.as.clo;
+                KClosure* cy = y.as.clo;
+                if (cx->proto != cy->proto || cx->origin_inst != cy->origin_inst || cx->ncaps != cy->ncaps) {
+                    result = 0;
+                    break;
+                }
+                for (int32_t i = 0; i < cx->ncaps; i++) {
+                    if (n == cap) { cap *= 2; sa = (KValue*)realloc(sa, sizeof(KValue) * cap); sb = (KValue*)realloc(sb, sizeof(KValue) * cap); }
+                    sa[n] = cx->caps[i]; sb[n] = cy->caps[i]; n++;
+                }
+                break;
+            }
             default: result = 0; break;
         }
     }
@@ -11100,6 +11134,50 @@ fun main() uses io { print("{e("NaN")}|{e("[1,2")}|{e("-")}|{e("")}|{e("[1,2] x"
 fun main() uses io { print("{d("\"\\uD83C\\uDF89\"")}|{d("\"caf\\u00e9\"")}|{d("\"\\uD83C\"")}") }
 "#;
         assert_eq!(native_main_stdout(src, "surr").trim(), "🎉:1|café:4|\u{FFFD}:1");
+    }
+
+    /// A REAL, live-confirmed cross-engine DIVERGENCE bug found+fixed
+    /// (production-hardening PR-it1180, the native/`k_eq` half of `value.rs`'s
+    /// own sibling fix -- see `k_eq`'s own doc comment, right before its new
+    /// `K_FUN`/`K_CLOSURE` cases, for the full writeup): neither tag had a case
+    /// in `k_eq`'s switch, both fell through to the OLD `default: result = 0`,
+    /// so `==` between two function values was unconditionally `false`
+    /// natively too. Live-confirmed BEFORE this fix (all three engines agreed
+    /// on the same WRONG answer): `f == f` printed `false` on interp/vm/native
+    /// alike. Fixing `value.rs` alone (interp/vm) would have introduced a NEW,
+    /// worse divergence -- confirmed live mid-fix: after only the Rust-side
+    /// change, interp/vm correctly printed `true` while native still printed
+    /// `false`. This test covers the SAME cases `value.rs`'s own
+    /// `function_typed_values_are_reflexively_equal_and_genuinely_distinct_
+    /// ones_are_not` test covers at the Rust level, but end to end through
+    /// real native compilation: a top-level `fun` reference's reflexivity and
+    /// distinctness from a different fun, a closure literal's reflexivity, and
+    /// -- the key discriminating case -- that the SAME closure code with
+    /// DIFFERENT captured values must NOT compare equal (proving `caps` are
+    /// genuinely compared via `k_eq`'s own work-stack, not just `proto`
+    /// identity).
+    #[test]
+    fn native_function_value_equality_matches_interp_and_vm() {
+        if !cc_available() {
+            return;
+        }
+        let src = r#"
+fun add1(x: Int) -> Int { x + 1 }
+fun add2(x: Int) -> Int { x + 2 }
+fun main() uses io {
+    let f = add1
+    let g = fn(x: Int) { x + 1 }
+    var i = 0
+    var closures = []
+    while i < 2 {
+        let captured = i
+        closures = closures.push(fn(x: Int) { x + captured })
+        i += 1
+    }
+    print("{f == f}|{f == add2}|{g == g}|{closures.get(0) == closures.get(0)}|{closures.get(0) == closures.get(1)}")
+}
+"#;
+        assert_eq!(native_main_stdout(src, "fneq").trim(), "true|false|true|true|false");
     }
 
     /// A coverage-closing verification (production-hardening PR-it661; no

@@ -674,6 +674,70 @@ impl PartialEq for Value {
                         return false;
                     }
                 }
+                // A REAL, live-confirmed silent-incorrect-result bug found+fixed
+                // (production-hardening PR-it1180, a fresh Explore survey finding,
+                // independently re-verified live before implementing): NONE of the
+                // four function-typed variants had a match arm here -- all four fell
+                // through to the catch-all `_ => false` below, so `==` between two
+                // function values was UNCONDITIONALLY `false`, even for the SAME value
+                // compared to itself, violating reflexivity. `check.rs`'s own `BinOp::
+                // Eq`/`Ne` type-checking (unlike `<`/`>`, which reject non-numeric/Str
+                // operands) places no restriction on function types, so `f == f` type-
+                // checks cleanly and silently returns the wrong answer -- and since
+                // `value_key_eq`'s own catch-all delegates to this SAME broken `==`
+                // (see its own arm below), the gap propagates to `Set`/`Map` key
+                // identity too: `Set([add1]).insert(add1).len()` returned `2`, silently
+                // breaking `Set`'s own documented "duplicates dropped" contract, and
+                // `List.contains(add1)` on a list already containing `add1` wrongly
+                // returned `false`. Live-confirmed BEFORE this fix, identically across
+                // ALL THREE engines (interp/vm/native -- a cross-engine-CONSISTENT bug,
+                // not a divergence one, but just as real): `let f = add1  print("{f ==
+                // f}")` printed `false`. Fixed by adding an arm for each variant, using
+                // the semantically appropriate notion of "same function value" for
+                // each: `Fun`/`Bound` compare by name (+ instance id for `Bound`) --
+                // there's no captured state to consider, two `Value::Fun` referencing
+                // the same top-level function ARE always interchangeable. `Closure`/
+                // `VmClosure` compare by CODE IDENTITY (the closure's own body, via
+                // `Rc::ptr_eq` -- the same closure LITERAL/prototype, not merely
+                // syntactically-identical-but-separately-created code) PLUS captured
+                // state (`origin_instance`/captures, recursively, pushed onto `stack`
+                // like every other nested-value arm above) -- two closures created
+                // from the SAME lambda expression but with DIFFERENT captured values
+                // (e.g. created on different iterations of a loop) behave differently
+                // on the same input and must NOT compare equal, so code identity alone
+                // is not sufficient; matching `Rc::ptr_eq`'s own reference-identity
+                // semantics is exactly right for two independently-written closure
+                // literals with identical source text, which are NOT the same value.
+                (Value::Fun(n1), Value::Fun(n2)) => {
+                    if n1 != n2 {
+                        return false;
+                    }
+                }
+                (Value::Bound(id1, n1), Value::Bound(id2, n2)) => {
+                    if id1 != id2 || n1 != n2 {
+                        return false;
+                    }
+                }
+                (Value::Closure(c1), Value::Closure(c2)) => {
+                    if !Rc::ptr_eq(&c1.body, &c2.body)
+                        || c1.origin_instance != c2.origin_instance
+                        || c1.captures.len() != c2.captures.len()
+                    {
+                        return false;
+                    }
+                    for ((n1, v1), (n2, v2)) in c1.captures.iter().zip(c2.captures.iter()) {
+                        if n1 != n2 {
+                            return false;
+                        }
+                        stack.push((v1, v2));
+                    }
+                }
+                (Value::VmClosure(p1, caps1, e1), Value::VmClosure(p2, caps2, e2)) => {
+                    if p1 != p2 || e1 != e2 || caps1.len() != caps2.len() {
+                        return false;
+                    }
+                    stack.extend(caps1.iter().zip(caps2.iter()));
+                }
                 _ => return false,
             }
         }
@@ -1433,5 +1497,67 @@ impl Env {
 impl Default for Env {
     fn default() -> Self {
         Env::new()
+    }
+}
+
+#[cfg(test)]
+mod value_eq_tests {
+    use super::*;
+
+    /// A REAL, live-confirmed silent-incorrect-result bug found+fixed
+    /// (production-hardening PR-it1180): `Value::eq`'s catch-all silently
+    /// returned `false` for EVERY function-typed variant, including a value
+    /// compared to itself -- violating reflexivity. See `impl PartialEq for
+    /// Value`'s own doc comment (right before the new match arms this fix
+    /// added) for the full writeup, and `cgen.rs::k_eq`'s own sibling doc
+    /// comment for the native-engine half of this fix (fixing this file
+    /// alone would have introduced a NEW native-vs-interp/vm divergence).
+    #[test]
+    fn function_typed_values_are_reflexively_equal_and_genuinely_distinct_ones_are_not() {
+        let fun_a = Value::Fun(Rc::new("a".to_string()));
+        let fun_a2 = Value::Fun(Rc::new("a".to_string()));
+        let fun_b = Value::Fun(Rc::new("b".to_string()));
+        assert_eq!(fun_a, fun_a2, "two Fun values naming the SAME top-level function must be equal");
+        assert_ne!(fun_a, fun_b, "two Fun values naming DIFFERENT functions must not be equal");
+
+        let bound_1a = Value::Bound(1, Rc::new("a".to_string()));
+        let bound_1a2 = Value::Bound(1, Rc::new("a".to_string()));
+        let bound_2a = Value::Bound(2, Rc::new("a".to_string()));
+        let bound_1b = Value::Bound(1, Rc::new("b".to_string()));
+        assert_eq!(bound_1a, bound_1a2, "same instance id + same method name must be equal");
+        assert_ne!(bound_1a, bound_2a, "a DIFFERENT instance id must not be equal, same method name");
+        assert_ne!(bound_1a, bound_1b, "a DIFFERENT method name must not be equal, same instance id");
+
+        let body = Rc::new(Block { stmts: Vec::new(), span: crate::diag::Span::new(0, 0) });
+        let other_body = Rc::new(Block { stmts: Vec::new(), span: crate::diag::Span::new(0, 0) });
+        let mk = |body: &Rc<Block>, captures: Vec<(Box<str>, Value)>| {
+            Value::Closure(Rc::new(Closure { params: vec![], body: body.clone(), captures, origin_instance: None }))
+        };
+        let c1 = mk(&body, vec![("x".into(), Value::Int(1))]);
+        let c1_same = mk(&body, vec![("x".into(), Value::Int(1))]);
+        let c1_diff_capture = mk(&body, vec![("x".into(), Value::Int(2))]);
+        let c2_diff_body = mk(&other_body, vec![("x".into(), Value::Int(1))]);
+        assert_eq!(c1, c1_same, "same body identity + same captured values must be equal");
+        assert_ne!(
+            c1, c1_diff_capture,
+            "the SAME closure code with a DIFFERENT captured value must NOT be equal -- \
+             they behave differently on the same input"
+        );
+        assert_ne!(c1, c2_diff_body, "a structurally-identical but SEPARATELY-created body must not be equal");
+
+        let vc1 = Value::VmClosure(0, Rc::new(vec![Value::Int(1)]), None);
+        let vc1_same = Value::VmClosure(0, Rc::new(vec![Value::Int(1)]), None);
+        let vc_diff_proto = Value::VmClosure(1, Rc::new(vec![Value::Int(1)]), None);
+        let vc_diff_capture = Value::VmClosure(0, Rc::new(vec![Value::Int(2)]), None);
+        let vc_diff_origin = Value::VmClosure(0, Rc::new(vec![Value::Int(1)]), Some(5));
+        assert_eq!(vc1, vc1_same, "same prototype + same captures + same origin must be equal");
+        assert_ne!(vc1, vc_diff_proto, "a different prototype index must not be equal");
+        assert_ne!(vc1, vc_diff_capture, "a different captured value must not be equal");
+        assert_ne!(vc1, vc_diff_origin, "a different origin instance must not be equal");
+
+        // discriminating pair: a function value must not be considered equal
+        // to a value of a genuinely different kind -- confirms the new arms
+        // didn't accidentally widen the catch-all instead of narrowing it.
+        assert_ne!(fun_a, Value::Int(0));
     }
 }
