@@ -326,6 +326,28 @@ impl<'a> Lexer<'a> {
         } else {
             match text.parse::<i64>() {
                 Ok(v) => self.push(Tok::Int(v), start),
+                // A REAL, live-confirmed ergonomic gap found+fixed (production-hardening
+                // PR-it1176, a long-deferred low-priority item): `i64::MIN` written the
+                // single most natural decimal way (`-9223372036854775808`) used to be
+                // REJECTED here, since the bare magnitude `9223372036854775808` is exactly
+                // one past `i64::MAX` and doesn't fit `i64` on its own -- the unary `-`
+                // is a SEPARATE token, applied later by the parser, so this K0004 fired
+                // before the parser ever saw a negation. The only prior workaround was an
+                // undocumented hex/binary bit-pattern (`0x8000000000000000`, PR-it851) or
+                // an explicit width suffix (`-9223372036854775808i64`, PR-it1146). Fixed
+                // the SAME way PR-it1146 fixed the analogous gap for signed width
+                // suffixes: defer this ONE exact magnitude instead of erroring
+                // immediately, via a dedicated `Tok::IntOverflowMin` marker (see its own
+                // doc comment in token.rs for why `Tok::Int`'s narrower `i64` payload,
+                // unlike `SizedInt`'s `i128`, can't just carry the raw un-negated
+                // magnitude directly) -- `parser.rs::parse_unary`'s `Tok::Minus` arm folds
+                // a directly preceding negation into `ExprKind::Int(i64::MIN)`; a bare,
+                // un-negated occurrence is instead caught by a deferred K0004 in
+                // `parser.rs`'s own primary-expression and pattern parsers, with the
+                // IDENTICAL message this arm previously gave directly (still a real
+                // error, one stage later). Every OTHER overflowing decimal magnitude is
+                // completely unaffected -- this check is scoped to this ONE exact string.
+                Err(_) if text == "9223372036854775808" => self.push(Tok::IntOverflowMin, start),
                 Err(_) => self.diags.push(Diag::error(
                     "K0004",
                     format!(
@@ -1093,14 +1115,46 @@ mod tests {
             "message should name the big(...) fix with the literal digits: {}",
             d.message
         );
-        // underscores in the source literal are stripped from the suggested call
-        let (_, du) = lex("9_223_372_036_854_775_808");
+        // underscores in the source literal are stripped from the suggested call.
+        // NOTE: `9_223_372_036_854_775_808` itself (i64::MIN's own magnitude) is
+        // deliberately NOT used as this probe -- since production-hardening PR-it1176
+        // that EXACT value no longer errors at lex time at all (see
+        // `a_bare_int_min_magnitude_defers_to_the_parser_not_the_lexer` below), so one
+        // more than it is used here instead, keeping this test's own original intent
+        // (underscore-stripping) unaffected by that unrelated, narrowly-scoped change.
+        let (_, du) = lex("9_223_372_036_854_775_809");
         let d2 = du.iter().find(|d| d.code == "K0004").expect("expected K0004");
         assert!(
-            d2.message.contains("big(\"9223372036854775808\")"),
+            d2.message.contains("big(\"9223372036854775809\")"),
             "underscores must be stripped in the suggestion: {}",
             d2.message
         );
+    }
+
+    /// A REAL, live-confirmed ergonomic gap found+fixed (production-hardening
+    /// PR-it1176, a long-deferred low-priority item picked up directly rather than
+    /// via another survey): `i64::MIN` written the single most natural decimal way
+    /// (`-9223372036854775808`) used to be a K0004 lex-time error, since the bare
+    /// magnitude is exactly one past `i64::MAX`. This raw-lexer-level test locks in
+    /// the MECHANISM (the bare magnitude, with or without underscores, defers to a
+    /// dedicated `Tok::IntOverflowMin` token instead of an immediate diagnostic) --
+    /// `parser.rs`'s own tests cover the full user-facing behavior (successful
+    /// negation, and the still-correct bare-occurrence error) end to end.
+    #[test]
+    fn a_bare_int_min_magnitude_defers_to_the_parser_not_the_lexer() {
+        assert_eq!(kinds("9223372036854775808"), vec![Tok::IntOverflowMin, Tok::Newline, Tok::Eof]);
+
+        // underscores are tolerated the same way ordinary decimal literals tolerate them
+        assert_eq!(
+            kinds("9_223_372_036_854_775_808"),
+            vec![Tok::IntOverflowMin, Tok::Newline, Tok::Eof]
+        );
+
+        // discriminating pair: one MORE than this magnitude is NOT specially deferred --
+        // it's still an ordinary, immediate K0004, confirming the check is scoped to this
+        // ONE exact string, not "anything close to i64::MIN".
+        let (_, diags_over) = lex("9223372036854775809");
+        assert!(diags_over.iter().any(|d| d.code == "K0004"), "{diags_over:?}");
     }
 
     #[test]

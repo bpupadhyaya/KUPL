@@ -6,6 +6,20 @@ use crate::diag::Span;
 pub enum Tok {
     // Literals
     Int(i64),
+    /// The exact digit sequence `9223372036854775808` (decimal, unsuffixed)
+    /// -- one past `i64::MAX`, i.e. `i64::MIN`'s own magnitude. Deferred
+    /// here (production-hardening PR-it1176) instead of an immediate K0004
+    /// at lex time, so `parser.rs::parse_unary`'s `Tok::Minus` arm can fold
+    /// a directly preceding unary negation into `ExprKind::Int(i64::MIN)`
+    /// -- mirroring PR-it1146's `SizedInt` "one past max magnitude"
+    /// widening for signed width suffixes, adapted for the unsized `Int`
+    /// case: unlike `SizedInt`'s `i128` payload, plain `Tok::Int(i64)` has
+    /// no wider representation to stash the un-negated magnitude in, hence
+    /// this dedicated marker token instead of reusing `Tok::Int` itself. A
+    /// BARE, un-negated occurrence is instead caught by a deferred K0004 in
+    /// `parser.rs`'s own primary-expression and pattern parsers, with the
+    /// identical message the lexer previously gave directly.
+    IntOverflowMin,
     /// A width-suffixed integer literal (`255u8`, `1000i16`), value in i128.
     SizedInt(i128, crate::value::IntW),
     /// An `f32`-suffixed float literal (`1.5f32`).
@@ -212,6 +226,7 @@ impl Tok {
     pub fn describe(&self) -> String {
         match self {
             Tok::Int(v) => format!("integer `{v}`"),
+            Tok::IntOverflowMin => "integer `9223372036854775808`".to_string(),
             Tok::SizedInt(v, w) => format!("integer `{v}{}`", w.name()),
             Tok::F32Lit(v) => format!("float `{v}f32`"),
             Tok::Float(v) => format!("float `{v}`"),

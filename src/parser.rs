@@ -1599,6 +1599,21 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// The deferred K0004 for a bare, un-negated `9223372036854775808` (see
+    /// `Tok::IntOverflowMin`'s own doc comment) -- shared by the primary-
+    /// expression and pattern parsers so both give the IDENTICAL message the
+    /// lexer used to give directly before this was deferred (production-
+    /// hardening PR-it1176).
+    fn int_overflow_min_diag(span: Span) -> Diag {
+        Diag::error(
+            "K0004",
+            "integer literal `9223372036854775808` does not fit in Int (64-bit) — use \
+             `big(\"9223372036854775808\")` for an arbitrary-precision BigInt"
+                .to_string(),
+            span,
+        )
+    }
+
     fn parse_unary(&mut self) -> PResult<Expr> {
         // Unlike the chain loops above, a prefix-operator run (`------x`,
         // `!!!!!!!!x`) recurses directly into `parse_unary` itself rather
@@ -1619,6 +1634,23 @@ impl Parser {
                 }
                 let span = self.span();
                 self.bump();
+                // A direct `-9223372036854775808` (unsuffixed decimal) folds
+                // straight to `i64::MIN` here, BEFORE recursing into the
+                // general operand parse -- unlike the `SizedInt` fold just
+                // below (which runs AFTER parsing, since `SizedInt`'s `i128`
+                // payload can carry the raw un-negated magnitude through
+                // parsing untouched), `Tok::Int`'s narrower `i64` payload has
+                // no room for that, so `Tok::IntOverflowMin` is a dedicated
+                // marker that must be intercepted right here, before it ever
+                // reaches the primary-expression parser's own deferred-error
+                // arm for a bare occurrence (production-hardening PR-it1176;
+                // see `Tok::IntOverflowMin`'s own doc comment in token.rs).
+                if matches!(self.peek(), Tok::IntOverflowMin) {
+                    self.bump();
+                    let span = span.merge(self.prev_span());
+                    self.depth -= 1;
+                    return Ok(Expr { kind: ExprKind::Int(i64::MIN), span });
+                }
                 let operand = self.parse_unary();
                 self.depth -= 1;
                 let operand = operand?;
@@ -1800,6 +1832,17 @@ impl Parser {
             Tok::Int(v) => {
                 self.bump();
                 Ok(Expr { kind: ExprKind::Int(v), span })
+            }
+            // A BARE, un-negated `9223372036854775808` -- deferred from an
+            // immediate lex-time K0004 (see `Tok::IntOverflowMin`'s own doc
+            // comment) so `parse_unary`'s `Tok::Minus` arm gets a chance to
+            // fold a directly preceding negation first (production-hardening
+            // PR-it1176). Reaching HERE means there was no such negation, so
+            // it's genuinely still an error -- the identical message the
+            // lexer used to give directly, one stage later.
+            Tok::IntOverflowMin => {
+                self.bump();
+                Err(Self::int_overflow_min_diag(span))
             }
             Tok::SizedInt(v, w) => {
                 self.bump();
@@ -2133,10 +2176,22 @@ impl Parser {
                 self.bump();
                 self.maybe_range(v, span)
             }
+            // Same deferred-K0004 shape as `parse_primary`'s own arm (production-
+            // hardening PR-it1176): a bare, un-negated `9223372036854775808` used
+            // as a pattern literal is genuinely still an error.
+            Tok::IntOverflowMin => {
+                self.bump();
+                Err(Self::int_overflow_min_diag(span))
+            }
             Tok::Minus => {
                 self.bump();
                 match self.bump() {
                     Tok::Int(v) => self.maybe_range(-v, span.merge(self.prev_span())),
+                    // `-9223372036854775808` as a pattern literal (e.g. `match x {
+                    // -9223372036854775808 => ... }`) folds to `i64::MIN` the same
+                    // way `parse_unary`'s own `Tok::Minus` arm does for expressions
+                    // (production-hardening PR-it1176).
+                    Tok::IntOverflowMin => self.maybe_range(i64::MIN, span.merge(self.prev_span())),
                     other => Err(Diag::error(
                         "K0111",
                         format!("expected an integer after `-` in pattern, found {}", other.describe()),
@@ -2408,6 +2463,73 @@ mod tests {
             "an unsigned width's negated zero must not be folded: {:?}",
             inits2[0].kind
         );
+    }
+
+    /// A REAL, live-confirmed ergonomic gap found+fixed (production-hardening
+    /// PR-it1176, a long-deferred low-priority item): `-9223372036854775808`, the
+    /// single most natural decimal way to write `i64::MIN`, used to be a K0004
+    /// error, since the bare magnitude `9223372036854775808` is exactly one past
+    /// `i64::MAX` and doesn't fit `i64` on its own -- the unary `-` is a SEPARATE
+    /// token, so this error fired before the parser ever saw a negation. The only
+    /// prior workarounds were an undocumented hex/binary bit pattern
+    /// (`0x8000000000000000`, PR-it851) or an explicit `i64` suffix
+    /// (`-9223372036854775808i64`, PR-it1146, unaffected here). Live-confirmed via
+    /// `cargo run -- check`/`run` before this fix: `let x = -9223372036854775808`
+    /// reported K0004 exactly like the bare, un-negated form. Fixed the same way
+    /// PR-it1146 fixed the analogous suffixed-width gap: `lexer.rs` defers this ONE
+    /// exact magnitude via a dedicated `Tok::IntOverflowMin` marker instead of
+    /// erroring immediately; `parse_unary`'s `Tok::Minus` arm folds a directly
+    /// preceding negation into a plain `ExprKind::Int(i64::MIN)` -- the AST never
+    /// carries an intermediate, unrepresentable node.
+    #[test]
+    fn unary_neg_folds_the_bare_decimal_i64_min_magnitude_into_a_plain_int_literal() {
+        let p = ok("fun main() {\n    let x = -9223372036854775808\n}\n");
+        let inits = main_body_inits(&p);
+        assert_eq!(inits.len(), 1);
+        assert!(matches!(inits[0].kind, ExprKind::Int(i64::MIN)), "{:?}", inits[0].kind);
+
+        // discriminating pair: a BARE, un-negated occurrence is still genuinely
+        // invalid -- the identical K0004 message the lexer used to give directly,
+        // now reported one stage later by the parser.
+        let (_, diags) = parse("fun main() {\n    let x = 9223372036854775808\n}\n");
+        let d = diags.iter().find(|d| d.code == "K0004").expect("expected K0004");
+        assert!(d.message.contains("does not fit in Int (64-bit)"), "{}", d.message);
+        assert!(d.message.contains("big(\"9223372036854775808\")"), "{}", d.message);
+
+        // discriminating pair: ordinary binary subtraction with this exact
+        // magnitude on the right (no genuine unary-minus grammar position) is
+        // UNAFFECTED -- still a clean K0004, not silently reinterpreted.
+        let (_, diags_sub) = parse("fun main() {\n    let y = 5\n    let x = y - 9223372036854775808\n}\n");
+        assert!(
+            diags_sub.iter().any(|d| d.code == "K0004"),
+            "binary subtraction must not be swept into the unary fold: {diags_sub:?}"
+        );
+
+        // the same fold applies to a `match` pattern literal.
+        let p2 = ok("fun main() {\n    let x = -9223372036854775808\n    let y = match x {\n        -9223372036854775808 => 1\n        _ => 0\n    }\n}\n");
+        let arm_pat = p2
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Fun(f) if f.name == "main" => Some(f.body.stmts.clone()),
+                _ => None,
+            })
+            .unwrap()
+            .into_iter()
+            .find_map(|s| match s {
+                Stmt::Let { init: Expr { kind: ExprKind::Match { arms, .. }, .. }, .. } => Some(arms),
+                _ => None,
+            })
+            .expect("a match expression")[0]
+            .pattern
+            .kind
+            .clone();
+        assert!(matches!(arm_pat, PatternKind::Int(i64::MIN)), "{arm_pat:?}");
+
+        // discriminating pair: a bare, un-negated pattern literal is still an error too.
+        let (_, diags_pat) =
+            parse("fun main() {\n    let x = 0\n    let y = match x {\n        9223372036854775808 => 1\n        _ => 0\n    }\n}\n");
+        assert!(diags_pat.iter().any(|d| d.code == "K0004"), "{diags_pat:?}");
     }
 
     #[test]
