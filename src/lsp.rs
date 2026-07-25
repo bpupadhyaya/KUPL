@@ -994,6 +994,24 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
                 return Some(format!("state {}{ty}\n// state field of component {}", s.name, c.name));
             }
         }
+        // A component's own PORT -- the SAME gap class as state/props/children
+        // above, never itself mirrored for `ComponentDecl.ports`: hovering a
+        // port (its own declaration `in click: Event`/`out value: Int`, or a
+        // bare reference such as `value` in `emit value(count)`) returned no
+        // hover at all, since only `state`/`props`/`children`/`exposes`/`funs`
+        // were ever searched, never `ports` (production-hardening PR-it1168,
+        // found via the struct-field-diff completeness-check technique
+        // established at PR-it1164 -- go-to-definition had the IDENTICAL gap
+        // in `item_definition`, fixed in the same change). Confirmed live
+        // before this fix via a real `kupl lsp` JSON-RPC session: hovering
+        // `value` inside `emit value(count)` returned `null`, while hovering
+        // the sibling state field `count` correctly returned its hover text.
+        if let Item::Component(c) = item {
+            if let Some(p) = c.ports.iter().find(|p| p.name == name) {
+                let dir = if p.dir == crate::ast::PortDir::In { "in" } else { "out" };
+                return Some(format!("{dir} {}: {}\n// port of component {}", p.name, ty_str(&p.ty), c.name));
+            }
+        }
         // A component's own PROP -- the SAME gap class as state fields above
         // (PR-it871), never itself mirrored for `ComponentDecl.props`: hovering
         // a prop (its own declaration, or a bare reference inside a method
@@ -1551,7 +1569,16 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
             .map(|f| f.span)
             .or_else(|| c.state.iter().find(|s| s.name == name).map(|s| s.span))
             .or_else(|| c.props.iter().find(|p| p.name == name).map(|p| p.span))
-            .or_else(|| c.children.iter().find(|ch| ch.name == name).map(|ch| ch.span)),
+            .or_else(|| c.children.iter().find(|ch| ch.name == name).map(|ch| ch.span))
+            // Also a component's own PORT -- the SAME gap class again, never
+            // mirrored for `ComponentDecl.ports` (production-hardening
+            // PR-it1168, found via the struct-field-diff completeness-check
+            // technique established at PR-it1164): "go to definition" on a
+            // port referenced by name (e.g. `value` in `emit value(count)`)
+            // found nothing at all, since only
+            // `exposes`/`funs`/`state`/`props`/`children` were ever searched
+            // here.
+            .or_else(|| c.ports.iter().find(|p| p.name == name).map(|p| p.span)),
         // A contract's exposed method signature -- same gap, never mirrored for
         // `ContractDecl.sigs` (PR-it571).
         Item::Contract(c) => c.sigs.iter().find(|f| f.name == name).map(|f| f.span),
@@ -4596,6 +4623,54 @@ mod tests {
         // the child is also a completion candidate, not just hover/definition
         let labels: Vec<String> = completions(src).into_iter().map(|(l, ..)| l).collect();
         assert!(labels.contains(&"bulb".to_string()), "child must be a completion candidate: {labels:?}");
+    }
+
+    /// A REAL LSP capability gap found+fixed (production-hardening PR-it1168,
+    /// found via the struct-field-diff completeness-check technique
+    /// established at PR-it1164): the SAME gap class as it871/it872/it873's
+    /// state/prop/child fixes above, just never itself mirrored for
+    /// `ComponentDecl.ports` -- hovering a port (its own declaration `in
+    /// click: Event`/`out value: Int`, or a bare reference such as `value` in
+    /// `emit value(count)`) returned NO hover at all, and "go to definition"
+    /// found nothing either, since item_signature/item_definition's
+    /// component fallthrough only ever searched
+    /// `state`/`props`/`children`/`exposes`/`funs`, never `ports`. Confirmed
+    /// live before this fix via a real `kupl lsp` JSON-RPC session: hovering
+    /// `value` inside `emit value(count)` returned `null`, while hovering
+    /// the sibling state field `count` correctly returned its hover text.
+    #[test]
+    fn hover_and_definition_work_on_component_ports() {
+        let src = "component Counter {\n    intent \"c\"\n    in click: Event\n    out value: Int\n    state count: Int = 0\n    on click {\n        count += 1\n        emit value(count)\n    }\n}\nfun main() {\n    let c = Counter()\n}\n";
+
+        // hover on the out-port's own declaration
+        let decl_line = src.lines().position(|l| l.contains("out value")).unwrap();
+        let ch = src.lines().nth(decl_line).unwrap().find("value").unwrap() + 1;
+        let h_decl = resolve_hover(src, decl_line, ch).expect("hover on port decl");
+        assert!(h_decl.contains("out value: Int"), "{h_decl}");
+        assert!(h_decl.contains("port of component Counter"), "{h_decl}");
+
+        // hover on a BARE reference to the port inside a handler body
+        let ref_line = src.lines().position(|l| l.contains("emit value(count)")).unwrap();
+        let ch2 = src.lines().nth(ref_line).unwrap().find("value").unwrap() + 1;
+        let h_ref = resolve_hover(src, ref_line, ch2).expect("hover on port reference");
+        assert!(h_ref.contains("out value: Int"), "{h_ref}");
+
+        // go-to-definition on the reference resolves to the port's OWN declaration line
+        let (l0, c0, _, _) = resolve_definition(src, ref_line, ch2).expect("definition of value");
+        assert_eq!(l0, decl_line, "definition should point at the `out value` line");
+        assert_eq!(c0, src.lines().nth(decl_line).unwrap().find("value").unwrap());
+
+        // the sibling state field still hovers as before (no regression)
+        let state_line = src.lines().position(|l| l.contains("state count")).unwrap();
+        let ch3 = src.lines().nth(state_line).unwrap().find("count").unwrap() + 1;
+        let h_state = resolve_hover(src, state_line, ch3).expect("hover on sibling state field decl");
+        assert!(h_state.contains("state count: Int"), "{h_state}");
+
+        // an in-port's own declaration also hovers correctly, with the right direction
+        let in_decl_line = src.lines().position(|l| l.contains("in click")).unwrap();
+        let ch4 = src.lines().nth(in_decl_line).unwrap().find("click").unwrap() + 1;
+        let h_in = resolve_hover(src, in_decl_line, ch4).expect("hover on in-port decl");
+        assert!(h_in.contains("in click: Event"), "{h_in}");
     }
 
     #[test]
