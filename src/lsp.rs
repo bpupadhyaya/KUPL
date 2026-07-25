@@ -2901,10 +2901,29 @@ fn collect_workspace_symbol_matches(
             for s in &c.sigs {
                 maybe_push_symbol_info(out, text, uri, &s.name, 6, s.span, needle, line_index);
             }
+            // A contract's own `law "..." { ... }` bodies were entirely absent
+            // from `workspace/symbol` search results too -- the SAME gap class
+            // as props/children below, just on `ContractDecl` rather than
+            // `ComponentDecl`: only `sigs` was ever walked here, never `laws`,
+            // even though `Law` carries its own name and top-level laws (via
+            // `Item::Law` just below) were already indexed
+            // (production-hardening PR-it1164).
+            for l in &c.laws {
+                maybe_push_symbol_info(out, text, uri, &l.name, 12, l.span, needle, line_index);
+            }
         }
         Item::Law(l) => maybe_push_symbol_info(out, text, uri, &l.name, 12, l.span, needle, line_index),
         Item::Component(c) => {
             maybe_push_symbol_info(out, text, uri, &c.name, 5, c.span, needle, line_index);
+            // Ports used to be entirely absent from `workspace/symbol` search
+            // results too, the SAME gap class as props/children below --
+            // searching for a port's own name (`in click: Event`/
+            // `out value: Int`) across the workspace found nothing, since only
+            // `state`/`props`/`children`/`exposes`/`funs` were ever walked
+            // here, never `ports` (production-hardening PR-it1164).
+            for p in &c.ports {
+                maybe_push_symbol_info(out, text, uri, &p.name, 8, p.span, needle, line_index);
+            }
             for s in &c.state {
                 maybe_push_symbol_info(out, text, uri, &s.name, 8, s.span, needle, line_index);
             }
@@ -7050,9 +7069,24 @@ mod tests {
         // (production-hardening PR-it873, the SAME gap class again, never itself
         // mirrored for `ComponentDecl.children` in the workspace-wide search path
         // either): searching for `addOn` used to find nothing at all here.
+        // a component's own PORT must also be a searchable workspace symbol
+        // (production-hardening PR-it1164, the SAME gap class yet again, never
+        // itself mirrored for `ComponentDecl.ports` in the workspace-wide search
+        // path either): searching for `addPort` used to find nothing at all here.
         std::fs::write(
             dir.join("comp.kupl"),
-            "component Base {\n    intent \"b2\"\n    expose fun ping() -> Int {\n        0\n    }\n}\ncomponent Box {\n    intent \"b\"\n    prop addr: Str\n    let addOn = Base()\n    expose fun show() -> Str {\n        addr\n    }\n}\n",
+            "component Base {\n    intent \"b2\"\n    expose fun ping() -> Int {\n        0\n    }\n}\ncomponent Box {\n    intent \"b\"\n    in addPort: Int\n    prop addr: Str\n    let addOn = Base()\n    expose fun show() -> Str {\n        addr\n    }\n}\n",
+        )
+        .unwrap();
+        // a contract's own LAW must also be a searchable workspace symbol
+        // (production-hardening PR-it1164, the SAME gap class as ports/props/
+        // children above, just on `ContractDecl.laws` instead of
+        // `ComponentDecl`): searching for `addingLaw` used to find nothing at
+        // all here, even though a TOP-LEVEL law with the same name shape was
+        // already indexed via `Item::Law`.
+        std::fs::write(
+            dir.join("contract.kupl"),
+            "contract Adder {\n    expose fun add(a: Int, b: Int) -> Int\n\n    law \"addingLaw works\" {\n        expect add(1, 2) == 3\n    }\n}\n",
         )
         .unwrap();
 
@@ -7061,6 +7095,9 @@ mod tests {
         assert!(matches.contains("\"name\":\"addTwo\""), "{matches}"); // found in the NESTED file
         assert!(matches.contains("\"name\":\"addr\""), "{matches}"); // the component's own prop
         assert!(matches.contains("\"name\":\"addOn\""), "{matches}"); // the component's own child
+        assert!(matches.contains("\"name\":\"addPort\""), "{matches}"); // the component's own port
+        assert!(matches.contains("\"name\":\"Adder\""), "{matches}"); // the contract itself
+        assert!(matches.contains("addingLaw works"), "{matches}"); // the contract's own law
         assert!(matches.contains("main.kupl"), "{matches}");
         assert!(matches.contains("lib/util.kupl") || matches.contains("lib%2Futil.kupl"), "{matches}");
         // case-insensitive substring match, not exact-name
