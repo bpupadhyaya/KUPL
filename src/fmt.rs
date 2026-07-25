@@ -797,12 +797,58 @@ fn reindent_inline(block: &str) -> String {
     // fine (important: it may live inside a `{…}` string interpolation, which must
     // stay on one line).
     let all_balanced = inner.iter().all(|l| {
-        l.bytes().filter(|&b| b == b'{').count() == l.bytes().filter(|&b| b == b'}').count()
+        let (open, close) = count_real_braces(l);
+        open == close
     });
     if all_balanced {
         return format!("{{ {} }}", inner.join("; "));
     }
     block.trim_end().to_string()
+}
+
+/// Count `{`/`}` bytes in `line` that represent REAL code (an actual nested
+/// block, or a string-interpolation boundary), excluding a `\{`/`\}`
+/// `escape_str` produces for a literal brace CHARACTER inside a string
+/// value. Tracks escape-sequence PARITY rather than just "is the
+/// immediately preceding byte a backslash" — `escape_str` ALSO
+/// independently escapes a literal backslash character as the 2-byte
+/// sequence `\\`, so an EVEN run of raw backslash bytes before a `{`/`}`
+/// means the brace is genuinely unescaped (each backslash pair consumes
+/// itself as one escaped-backslash-character unit, leaving the following
+/// byte fresh), while an ODD run means the LAST backslash is the escape
+/// marker for the brace itself. Byte-level (not char-level) scanning is
+/// safe here: `\`/`{`/`}` are all single-byte ASCII values, and no byte of
+/// a multi-byte UTF-8 sequence can ever equal an ASCII byte value.
+///
+/// A REAL bug found+fixed (production-hardening PR-it1186): `reindent_inline`
+/// used to count RAW `{`/`}` bytes with no escape-awareness at all, so a
+/// string literal containing a literal brace character (e.g. `"x\{"`, whose
+/// FORMATTED rendering is the 2-byte escape sequence `\{` per `escape_str`)
+/// was miscounted as an unbalanced CODE brace — a false positive PR-it889's
+/// own fix (a generic "recompile and refuse on divergence" safety net at
+/// every `kupl fmt` output call site) already prevented from silently
+/// corrupting a file, but which still made `kupl fmt` unconditionally
+/// REFUSE to format an ordinary, `kupl check`-clean program with a
+/// confusing "internal formatter bug" message. Confirmed live:
+/// `print("val={if true { "x\{" } else { "y" }}")` (a valid, checked-clean
+/// KUPL program) made `kupl fmt` exit 1 with that message before this fix.
+fn count_real_braces(line: &str) -> (usize, usize) {
+    let mut open = 0usize;
+    let mut close = 0usize;
+    let mut escaped = false;
+    for b in line.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match b {
+            b'\\' => escaped = true,
+            b'{' => open += 1,
+            b'}' => close += 1,
+            _ => {}
+        }
+    }
+    (open, close)
 }
 
 fn pattern_str(p: &Pattern) -> String {

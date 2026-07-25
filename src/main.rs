@@ -1039,8 +1039,25 @@ mod tests {
     /// usage either. Fixed identically: recompile the freshly-formatted
     /// text through the full pipeline and refuse to print it if it doesn't
     /// come back clean.
+    ///
+    /// UPDATED (production-hardening PR-it1186): `reindent_inline`'s own
+    /// per-line brace-counting heuristic gap -- the SPECIFIC root cause this
+    /// test's own input was chosen to trip -- is now CLOSED at the source
+    /// (`fmt.rs::count_real_braces` is now escape-aware, so a `\{`/`\}`
+    /// produced by `escape_str` for a literal brace CHARACTER no longer
+    /// miscounts as an unbalanced CODE brace). This exact input therefore no
+    /// longer needs the recompile-and-refuse safety net to fire at all --
+    /// `kupl fmt` now SUCCEEDS on it, producing valid, re-parseable,
+    /// semantically-equivalent output (confirmed live: `kupl run` on both
+    /// the original and the freshly-formatted file print the identical
+    /// `outer { end`). This test is kept (renamed, assertions flipped) as a
+    /// permanent regression guard for the FIX rather than the bug -- the
+    /// safety net itself (recompile-and-refuse on genuinely invalid output)
+    /// remains separately covered by the F32/`--write` cases above and by
+    /// PR-it1142's own pre-existing-checker-error test below, neither of
+    /// which depend on this specific brace-counting mechanism.
     #[test]
-    fn fmt_plain_print_refuses_to_emit_invalid_output_from_a_brace_counting_heuristic_gap() {
+    fn fmt_plain_print_succeeds_on_a_literal_doubled_brace_inside_interpolation() {
         let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
         if !bin.exists() {
             return; // no debug binary built yet -- nothing to test
@@ -1059,12 +1076,19 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "outer { end");
 
         let printed = run(&["fmt", tmp.to_str().unwrap()]);
-        assert_eq!(printed.status.code(), Some(1), "must refuse to print invalid output: {printed:?}");
-        assert!(
-            String::from_utf8_lossy(&printed.stderr).contains("refusing to print"),
-            "{printed:?}"
+        assert_eq!(printed.status.code(), Some(0), "must succeed, the heuristic gap is closed: {printed:?}");
+        assert!(printed.stderr.is_empty(), "must not warn/refuse on valid output: {printed:?}");
+
+        // the FORMATTED text must itself still be valid AND semantically
+        // equivalent to the original -- not just "didn't crash".
+        std::fs::write(&tmp, &printed.stdout).unwrap();
+        let ran_again = run(&["run", tmp.to_str().unwrap()]);
+        assert_eq!(ran_again.status.code(), Some(0), "formatted output must still run: {ran_again:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&ran_again.stdout).trim(),
+            "outer { end",
+            "formatted output must be semantically equivalent to the original"
         );
-        assert!(printed.stdout.is_empty(), "must not print anything on stdout when refusing: {printed:?}");
 
         let _ = std::fs::remove_file(&tmp);
     }
