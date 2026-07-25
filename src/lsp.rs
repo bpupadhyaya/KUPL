@@ -2471,6 +2471,20 @@ fn item_completions(program: &crate::ast::Program) -> Vec<(String, u8, String)> 
                 // for hover/go-to-definition (PR-it513); extend the same nested search
                 // here so typing `n` or `greet` inside a component body autocompletes
                 // (PR-it514).
+                // Ports used to be completely invisible to completion too, the SAME gap
+                // class as props/state/children below -- typing a port's own name
+                // inside a component body (e.g. `value` in `emit value(count)`, a
+                // genuinely referenceable identifier, unlike a contract's own law
+                // names which are never referenced by name from expression code and
+                // so correctly stay excluded here) got no completion for it at all,
+                // since only `state`/`props`/`children`/`exposes`/`funs` were ever
+                // pushed here, never `ports` (production-hardening PR-it1166, found
+                // via the SAME struct-field-diff completeness-check technique
+                // established at PR-it1164/PR-it1165 for workspace_symbols/item_symbol).
+                for p in &c.ports {
+                    let dir = if p.dir == crate::ast::PortDir::In { "in" } else { "out" };
+                    out.push((p.name.clone(), 6, format!("{} {}: {}", dir, p.name, crate::fmt::ty_str(&p.ty)))); // 6 = Variable
+                }
                 // Production-hardening PR-it960: split into two loops so an
                 // exposed method's completion detail renders via
                 // `exposed_fun_sig_str` (never shows `pub`), same
@@ -5195,13 +5209,28 @@ mod tests {
         // members. Fixed by extending the Component arm to also emit each exposed/private
         // method (kind 3 = Function, reusing the shared fun_sig_str detail) and each state
         // field (kind 6 = Variable) (PR-it514).
-        let src = "component Greeter {\n    intent \"g\"\n    state n: Int = 0\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\n";
+        // A component's own PORT is also a genuine completion candidate
+        // (production-hardening PR-it1166, the SAME gap class again, never
+        // itself mirrored for `ComponentDecl.ports`): an out-port name is
+        // referenced by name via `emit value(...)`, exactly like a state
+        // field or child is referenced by bare name -- typing inside a
+        // handler body got no completion for its own ports at all, since
+        // only `state`/`props`/`children`/`exposes`/`funs` were ever pushed
+        // in `item_completions`, never `ports`. (Found via the same
+        // struct-field-diff completeness-check technique established at
+        // PR-it1164/PR-it1165 for `workspace_symbols`/`item_symbol` --
+        // confirmed here that a contract's own `laws` do NOT need the same
+        // treatment, since a law's name is never referenced from expression
+        // code the way a port/prop/state/child name is.)
+        let src = "component Greeter {\n    intent \"g\"\n    in trigger: Event\n    out value: Int\n    state n: Int = 0\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\n";
         let items = completions(src);
         let labels: Vec<&str> = items.iter().map(|(l, _, _)| l.as_str()).collect();
         assert!(labels.contains(&"Greeter"), "the component's own name is still listed: {labels:?}");
         assert!(labels.contains(&"greet"), "exposed method must be a completion candidate: {labels:?}");
         assert!(labels.contains(&"helper"), "private method must be a completion candidate: {labels:?}");
         assert!(labels.contains(&"n"), "state field must be a completion candidate: {labels:?}");
+        assert!(labels.contains(&"trigger"), "an in-port must be a completion candidate: {labels:?}");
+        assert!(labels.contains(&"value"), "an out-port must be a completion candidate: {labels:?}");
         // the exposed method's completion carries its real signature as detail, like a
         // top-level function does.
         let greet = items.iter().find(|(l, _, _)| l == "greet").unwrap();
@@ -5209,6 +5238,9 @@ mod tests {
         assert!(greet.2.contains("fun greet(name: Str) -> Str"), "{greet:?}");
         let n = items.iter().find(|(l, _, _)| l == "n").unwrap();
         assert_eq!(n.1, 6, "state field completion kind must be Variable (6)");
+        let value = items.iter().find(|(l, _, _)| l == "value").unwrap();
+        assert_eq!(value.1, 6, "port completion kind must be Variable (6)");
+        assert!(value.2.contains("out value: Int"), "{value:?}");
     }
 
     #[test]
