@@ -2117,12 +2117,40 @@ impl LineIndex {
 /// not exact-scope), matching this file's established imprecision
 /// elsewhere, but enough to stop a rename from reaching a declaration in a
 /// STRUCTURALLY UNRELATED part of the file.
+/// `scoped_occurrences`-equivalent filtering for an OTHER file's own text:
+/// shadow-zone-filtered occurrences of `name`, tagged with `uri`. Factored
+/// out (production-hardening PR-it1162) so the forward-`use` loop below and
+/// the reverse-dependent loop it gained can share the IDENTICAL filtering
+/// logic instead of two copies silently drifting apart.
+fn filtered_occurrences_in_other_file(
+    other_path: &std::path::Path,
+    other_text: &str,
+    name: &str,
+) -> Vec<(String, usize, usize, usize, usize)> {
+    let (other_program, _diags) = crate::parser::parse(other_text);
+    let uri = path_to_uri(other_path);
+    let other_zones = shadow_zones_for_rename(&other_program, name);
+    let other_line_index = LineIndex::build(other_text);
+    let other_line_range = |span: crate::diag::Span| {
+        let start_line = other_line_index.resolve_line(other_text.len(), span.start);
+        let end_line = other_line_index.resolve_line(other_text.len(), span.end);
+        (start_line - 1)..=(end_line - 1)
+    };
+    occurrences(other_text, name)
+        .into_iter()
+        .filter(|(l0, ..)| !other_zones.iter().any(|z| other_line_range(*z).contains(l0)))
+        .map(|(l0, c0, l1, c1)| (uri.clone(), l0, c0, l1, c1))
+        .collect()
+}
+
 pub fn occurrences_cross_file(
     text: &str,
     name: &str,
     offset: usize,
     dir: &std::path::Path,
     buffers: &HashMap<PathBuf, String>,
+    current_path: &std::path::Path,
+    workspace_root: Option<&std::path::Path>,
 ) -> Vec<(String, usize, usize, usize, usize)> {
     let (program, _diags) = crate::parser::parse(text);
     let (same_file_occ, local_scope) = scoped_occurrences(text, &program, name, offset);
@@ -2131,41 +2159,106 @@ pub fn occurrences_cross_file(
     if local_scope.is_some() {
         return out;
     }
+    // A REAL correctness bug in a MUTATING operation (production-hardening
+    // PR-it876, a survey finding, independently re-verified live before
+    // fixing): `scoped_occurrences` (called above for THIS file) already
+    // filters same-file occurrences against `shadow_zones` when `name` is
+    // a top-level symbol -- excluding any occurrence that falls inside a
+    // DIFFERENT function's unrelated local of the same bare name -- the
+    // SAME-file half of it704/it739's local-vs-top-level collision fix.
+    // This cross-file loop never applied that SAME filtering to the OTHER
+    // file's own occurrences: it called plain, unscoped `occurrences`
+    // here, with no notion of the OTHER file's local shadows at all.
+    // Confirmed live before this fix: renaming a genuine top-level
+    // `mean(xs)` call (in `main.kupl`, `use stats`) returned FIVE
+    // locations instead of the expected TWO (the call site + the real
+    // `fun mean` declaration) -- the extra three were `stats.kupl`'s own
+    // UNRELATED `let mean = 5.0` local inside a completely different
+    // function `other()`, which would have been silently renamed too,
+    // corrupting `other()`'s logic exactly like it704/it739's own
+    // "corrupting a completely unrelated file" severity framing.
+    let mut forward_paths: Vec<PathBuf> = Vec::new();
     for fs_path in used_file_paths(&program, dir) {
         let Some(other_text) = text_at_path(&fs_path, buffers) else { continue };
-        let uri = path_to_uri(&fs_path);
-        // A REAL correctness bug in a MUTATING operation (production-hardening
-        // PR-it876, a survey finding, independently re-verified live before
-        // fixing): `scoped_occurrences` (called above for THIS file) already
-        // filters same-file occurrences against `shadow_zones` when `name` is
-        // a top-level symbol -- excluding any occurrence that falls inside a
-        // DIFFERENT function's unrelated local of the same bare name -- the
-        // SAME-file half of it704/it739's local-vs-top-level collision fix.
-        // This cross-file loop never applied that SAME filtering to the OTHER
-        // file's own occurrences: it called plain, unscoped `occurrences`
-        // here, with no notion of the OTHER file's local shadows at all.
-        // Confirmed live before this fix: renaming a genuine top-level
-        // `mean(xs)` call (in `main.kupl`, `use stats`) returned FIVE
-        // locations instead of the expected TWO (the call site + the real
-        // `fun mean` declaration) -- the extra three were `stats.kupl`'s own
-        // UNRELATED `let mean = 5.0` local inside a completely different
-        // function `other()`, which would have been silently renamed too,
-        // corrupting `other()`'s logic exactly like it704/it739's own
-        // "corrupting a completely unrelated file" severity framing.
+        out.extend(filtered_occurrences_in_other_file(&fs_path, &other_text, name));
+        forward_paths.push(fs_path);
+    }
+    // A REAL, live-confirmed correctness gap found+fixed (production-
+    // hardening PR-it1162, reconsidering a gap explicitly deferred at
+    // PR-it1159's own investigation): the loop above only ever searches
+    // files THIS file's own `use` declarations point to (the FORWARD
+    // direction) -- a rename triggered from a DECLARATION site (rather
+    // than a call site) never reached into files that `use` THIS one at
+    // all, since there is no forward `use` edge to follow. Live-confirmed
+    // BEFORE this fix: with `lib.kupl` declaring `fun mean` and `main.
+    // kupl` (`use lib`) calling bare `mean(xs)`, renaming `mean` from ITS
+    // OWN declaration in `lib.kupl` produced an edit touching ONLY `lib.
+    // kupl` -- applying it left `main.kupl`'s own call site referencing a
+    // name that no longer exists (a real, silent, delayed-discovery
+    // breakage: the editor shows a "successful" rename with zero warning,
+    // and `main.kupl` only reveals the break the next time it's checked/
+    // opened). Fixed by ALSO searching the REVERSE direction via
+    // `reverse_dependent_kupl_files` (see its own doc comment) when a
+    // workspace root is known, filtering each reverse-dependent file's own
+    // occurrences through the SAME `filtered_occurrences_in_other_file`
+    // helper the forward loop above uses, so both directions share
+    // identical correctness guarantees.
+    for other_path in reverse_dependent_kupl_files(current_path, workspace_root, &forward_paths, buffers) {
+        if let Some(other_text) = text_at_path(&other_path, buffers) {
+            out.extend(filtered_occurrences_in_other_file(&other_path, &other_text, name));
+        }
+    }
+    out
+}
+
+/// Every `.kupl` file under `workspace_root` (if known -- an empty result,
+/// not an error, if `None`, matching `workspace/symbol`'s own established
+/// "safe no-op without it" precedent for a client that never supplied a
+/// `rootUri`/`rootPath`) whose OWN `use` declarations resolve back to
+/// `current_path` -- the REVERSE of `used_file_paths`'s forward direction.
+/// Excludes `current_path` itself and anything already in `forward_paths`
+/// (a file a FORWARD search already covers, so returning it again here
+/// would just duplicate a caller's own work). Enumerates via
+/// `collect_kupl_files` (already symlink-cycle-safe). Paths are compared
+/// via `std::fs::canonicalize` (not raw `PathBuf` equality) since a
+/// workspace-root-relative walk and a `use`-relative join can legitimately
+/// produce two differently-styled paths to the SAME real file; a file that
+/// can't be canonicalized (e.g. deleted mid-scan, or an unsaved buffer with
+/// no real backing) is safely skipped, not an error. Shared (production-
+/// hardening PR-it1162) by BOTH `occurrences_cross_file`'s own reverse
+/// search AND `textDocument/rename`'s own collision guard -- a caller file
+/// having its OWN unrelated top-level item matching the rename's `new_name`
+/// is a genuine, live-confirmed K0203 "defined more than once" collision
+/// reachable ONLY through this reverse direction, the exact same collision
+/// class PR-it1159's own forward-direction check already guards against.
+fn reverse_dependent_kupl_files(
+    current_path: &std::path::Path,
+    workspace_root: Option<&std::path::Path>,
+    forward_paths: &[PathBuf],
+    buffers: &HashMap<PathBuf, String>,
+) -> Vec<PathBuf> {
+    let Some(root) = workspace_root else { return Vec::new() };
+    let Ok(current_canon) = std::fs::canonicalize(current_path) else { return Vec::new() };
+    let forward_canon: std::collections::HashSet<PathBuf> =
+        forward_paths.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
+    let mut all_files = Vec::new();
+    collect_kupl_files(root, &mut all_files);
+    let mut out = Vec::new();
+    for other_path in all_files {
+        let Ok(other_canon) = std::fs::canonicalize(&other_path) else { continue };
+        if other_canon == current_canon || forward_canon.contains(&other_canon) {
+            continue; // self, or already covered by a forward search
+        }
+        let Some(other_text) = text_at_path(&other_path, buffers) else { continue };
         let (other_program, _diags) = crate::parser::parse(&other_text);
-        let other_zones = shadow_zones_for_rename(&other_program, name);
-        let other_line_index = LineIndex::build(&other_text);
-        let other_line_range = |span: crate::diag::Span| {
-            let start_line = other_line_index.resolve_line(other_text.len(), span.start);
-            let end_line = other_line_index.resolve_line(other_text.len(), span.end);
-            (start_line - 1)..=(end_line - 1)
-        };
-        out.extend(
-            occurrences(&other_text, name)
-                .into_iter()
-                .filter(|(l0, ..)| !other_zones.iter().any(|z| other_line_range(*z).contains(l0)))
-                .map(move |(l0, c0, l1, c1)| (uri.clone(), l0, c0, l1, c1)),
-        );
+        let other_dir = other_path.parent().unwrap_or(root);
+        let uses_current = used_file_paths(&other_program, other_dir)
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .any(|p| p == current_canon);
+        if uses_current {
+            out.push(other_path);
+        }
     }
     out
 }
@@ -3271,7 +3364,16 @@ pub fn serve() -> i32 {
                     // doc comment for why this matters for rename specifically.
                     let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
                     let off = offset_at(&text, line, ch);
-                    let locs: Vec<String> = occurrences_cross_file(&text, &name, off, &dir, &buffers)
+                    let current_path = uri_to_path(uri).unwrap_or_default();
+                    let locs: Vec<String> = occurrences_cross_file(
+                        &text,
+                        &name,
+                        off,
+                        &dir,
+                        &buffers,
+                        &current_path,
+                        workspace_root.as_deref(),
+                    )
                         .into_iter()
                         .map(|(target_uri, l0, c0, l1, c1)| {
                             let u = if target_uri.is_empty() { uri.to_string() } else { target_uri };
@@ -3315,6 +3417,7 @@ pub fn serve() -> i32 {
                     // file into a proper multi-file WorkspaceEdit.
                     let dir = uri_to_path(uri).and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
                     let off = offset_at(&text, line, ch);
+                    let current_path = uri_to_path(uri).unwrap_or_default();
                     // A REAL gap found+fixed (production-hardening PR-it787, carried
                     // forward since PR-it767/it780 as the known, deliberately-deferred
                     // sub-case of rename validation): `is_valid_new_identifier` above
@@ -3358,16 +3461,36 @@ pub fn serve() -> i32 {
                     // downstream K0200 type-mismatch in `main.kupl`. Fixed by ALSO
                     // checking `new_name` against every file `used_file_paths` reaches
                     // from the current file -- the exact same file set
-                    // `occurrences_cross_file` itself mutates, no more and no less (a
-                    // rename triggered from a DECLARATION site, rather than a call
-                    // site, does NOT currently reach into caller files at all -- a
-                    // separate, pre-existing reach limitation, not touched by this fix
-                    // -- so no symmetric check is needed in that direction).
+                    // `occurrences_cross_file` itself mutated at the time (a rename
+                    // triggered from a DECLARATION site, rather than a call site, did
+                    // NOT then reach into caller files at all).
+                    //
+                    // PR-it1162 (see `occurrences_cross_file`'s own doc comment)
+                    // extended rename's own REACH into REVERSE-dependent files too --
+                    // this guard needed a SYMMETRIC extension, confirmed by a live
+                    // repro BEFORE assuming otherwise (an earlier draft of this fix
+                    // reasoned the reverse direction only renames EXISTING references,
+                    // never introduces a new top-level declaration, so it couldn't
+                    // collide -- WRONG, live-disproven): if a caller file already has
+                    // its OWN unrelated top-level item named `new_name`, renaming a
+                    // symbol it imports (via the reverse search) to that SAME name
+                    // makes that caller's own call site collide with its own
+                    // pre-existing declaration. Confirmed live: `lib.kupl` (`fun
+                    // mean`) and `main.kupl` (`use lib`, its OWN unrelated `fun
+                    // average`, calling `mean(xs)`) -- renaming `mean` -> `average`
+                    // FROM `lib.kupl`'s own declaration produced a non-null edit
+                    // touching both files with zero warning; applying it left
+                    // `lib.kupl` reporting K0203 "function `average` is defined more
+                    // than once" (comparing against `main.kupl`'s own pre-existing,
+                    // completely unrelated `fun average`) -- the EXACT SAME collision
+                    // class PR-it1159's own forward-direction check guards against,
+                    // just reachable from the opposite direction.
                     if new_name != name {
                         let (program, _diags) = crate::parser::parse(&text);
                         if local_binding_scope_for_rename(&program, off, &name).is_none() {
                             let collides_locally = top_level_item_named(&program, new_name);
-                            let collides_cross_file = used_file_paths(&program, &dir).iter().any(|fs_path| {
+                            let forward_paths = used_file_paths(&program, &dir);
+                            let collides_cross_file = forward_paths.iter().any(|fs_path| {
                                 text_at_path(fs_path, &buffers)
                                     .map(|other_text| {
                                         let (other_program, _diags) = crate::parser::parse(&other_text);
@@ -3375,13 +3498,36 @@ pub fn serve() -> i32 {
                                     })
                                     .unwrap_or(false)
                             });
-                            if collides_locally || collides_cross_file {
+                            let collides_reverse = reverse_dependent_kupl_files(
+                                &current_path,
+                                workspace_root.as_deref(),
+                                &forward_paths,
+                                &buffers,
+                            )
+                            .iter()
+                            .any(|fs_path| {
+                                text_at_path(fs_path, &buffers)
+                                    .map(|other_text| {
+                                        let (other_program, _diags) = crate::parser::parse(&other_text);
+                                        top_level_item_named(&other_program, new_name)
+                                    })
+                                    .unwrap_or(false)
+                            });
+                            if collides_locally || collides_cross_file || collides_reverse {
                                 return None;
                             }
                         }
                     }
                     let mut by_file: Vec<(String, Vec<String>)> = Vec::new();
-                    for (target_uri, l0, c0, l1, c1) in occurrences_cross_file(&text, &name, off, &dir, &buffers) {
+                    for (target_uri, l0, c0, l1, c1) in occurrences_cross_file(
+                        &text,
+                        &name,
+                        off,
+                        &dir,
+                        &buffers,
+                        &current_path,
+                        workspace_root.as_deref(),
+                    ) {
                         let u = if target_uri.is_empty() { uri.to_string() } else { target_uri };
                         let edit = format!(
                             "{{\"range\":{{\"start\":{{\"line\":{l0},\"character\":{c0}}},\"end\":{{\"line\":{l1},\"character\":{c1}}}}},\"newText\":\"{}\"}}",
@@ -4495,7 +4641,7 @@ mod tests {
         assert_eq!(local_only.len(), 1, "plain occurrences must NOT see the cross-file declaration: {local_only:?}");
 
         let mean_off = text.find("mean(xs)").unwrap();
-        let locs = occurrences_cross_file(&text, "mean", mean_off, dir, &empty_buffers);
+        let locs = occurrences_cross_file(&text, "mean", mean_off, dir, &empty_buffers, dir, None);
         assert_eq!(locs.len(), 2, "call site (this file) + declaration (lib/stats.kupl): {locs:?}");
         let local = locs.iter().filter(|(u, ..)| u.is_empty()).count();
         let cross = locs.iter().filter(|(u, ..)| !u.is_empty()).count();
@@ -4508,7 +4654,7 @@ mod tests {
         // A same-file-only symbol (no `use` involvement) is completely unaffected.
         let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\nfun main() {\n    print(add(1, 2))\n}\n";
         let add_off = src.find("add(1, 2)").unwrap();
-        let same_file = occurrences_cross_file(src, "add", add_off, dir, &empty_buffers);
+        let same_file = occurrences_cross_file(src, "add", add_off, dir, &empty_buffers, dir, None);
         assert_eq!(same_file.len(), 2, "decl + call, both same-file: {same_file:?}");
         assert!(same_file.iter().all(|(u, ..)| u.is_empty()), "{same_file:?}");
     }
@@ -4533,7 +4679,7 @@ mod tests {
         buffers.insert(dir.join("stats.kupl"), stats_text.to_string());
 
         let off = main_text.find("mean(xs)").unwrap();
-        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers);
+        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers, dir, None);
         assert_eq!(
             locs.len(),
             2,
@@ -4547,6 +4693,52 @@ mod tests {
         let (cross_uri, l0, c0, ..) = locs.iter().find(|(u, ..)| !u.is_empty()).unwrap().clone();
         assert!(cross_uri.ends_with("stats.kupl"), "{cross_uri}");
         assert_eq!((l0, c0), (0, 4), "must be `fun mean`'s OWN declaration, not `other()`'s `let mean`: {locs:?}");
+    }
+
+    /// A REAL, live-confirmed correctness gap found+fixed (production-
+    /// hardening PR-it1162, reconsidering a gap explicitly deferred at
+    /// PR-it1159's own investigation): `occurrences_cross_file`'s forward-
+    /// `use` loop never reached files that `use` the CURRENT file back --
+    /// a rename triggered from a DECLARATION site (rather than a call
+    /// site) only ever touched the declaration's own file, leaving every
+    /// caller silently referencing a name that no longer exists. This test
+    /// needs REAL files on disk (unlike the sibling test above, which uses
+    /// a fake path + in-memory buffers only) since `reverse_dependent_
+    /// kupl_files` genuinely calls `std::fs::canonicalize`/`collect_kupl_
+    /// files`.
+    #[test]
+    fn occurrences_cross_file_reaches_a_caller_when_renaming_from_the_declaration_with_a_known_workspace_root() {
+        let dir = std::env::temp_dir().join(format!("kupl-it1162-reverse-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib_path = dir.join("lib.kupl");
+        let main_path = dir.join("main.kupl");
+        let lib_text = "fun mean(xs: List[Int]) -> Float {\n    0.0\n}\n";
+        let main_text = "use lib\n\nfun report(xs: List[Int]) -> Float {\n    mean(xs)\n}\n";
+        std::fs::write(&lib_path, lib_text).unwrap();
+        std::fs::write(&main_path, main_text).unwrap();
+        let buffers: HashMap<PathBuf, String> = HashMap::new();
+
+        // `fun mean`'s OWN declaration, i.e. `offset` points at the `mean`
+        // in `lib.kupl` itself, not a call site.
+        let off = lib_text.find("mean").unwrap();
+
+        // WITHOUT a workspace root: the pre-existing, unchanged behavior --
+        // only the declaration's own file.
+        let no_root = occurrences_cross_file(lib_text, "mean", off, &dir, &buffers, &lib_path, None);
+        assert_eq!(no_root.len(), 1, "without a workspace root, only the same-file declaration: {no_root:?}");
+
+        // WITH a workspace root: must ALSO reach `main.kupl`'s own call site.
+        let with_root = occurrences_cross_file(lib_text, "mean", off, &dir, &buffers, &lib_path, Some(&dir));
+        assert_eq!(
+            with_root.len(),
+            2,
+            "with a workspace root, must reach the same-file declaration AND main.kupl's own call site: {with_root:?}"
+        );
+        let cross = with_root.iter().find(|(u, ..)| !u.is_empty()).expect("one cross-file occurrence");
+        assert!(cross.0.ends_with("main.kupl"), "{cross:?}");
+        assert_eq!((cross.1, cross.2), (3, 4), "must be main.kupl's own `mean(xs)` call site: {cross:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A REAL bug (production-hardening PR-it704): `resolve_definition_cross_file`/
@@ -4583,7 +4775,7 @@ mod tests {
         );
 
         // rename must ONLY touch the current file's occurrences of the parameter.
-        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers);
+        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers, dir, None);
         assert!(locs.iter().all(|(u, ..)| u.is_empty()), "must not reach into stats.kupl: {locs:?}");
         assert_eq!(locs.len(), 2, "the parameter declaration + its one interpolation use: {locs:?}");
 
@@ -4633,7 +4825,7 @@ mod tests {
         );
 
         // rename must ONLY touch the current file's occurrences of the local (decl + 2 uses).
-        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers);
+        let locs = occurrences_cross_file(main_text, "mean", off, dir, &buffers, dir, None);
         assert!(locs.iter().all(|(u, ..)| u.is_empty()), "must not reach into stats.kupl: {locs:?}");
         assert_eq!(locs.len(), 3, "declaration + print(mean) + trailing mean, all same-file: {locs:?}");
 
@@ -4684,7 +4876,7 @@ mod tests {
         let off = src.find("mean = 5.0").unwrap();
         let dir = std::path::Path::new("/fake/lsp-it741");
         let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
-        let locs = occurrences_cross_file(src, "mean", off, dir, &empty_buffers);
+        let locs = occurrences_cross_file(src, "mean", off, dir, &empty_buffers, dir, None);
         assert_eq!(locs.len(), 2, "only the local's own decl + use, NOT the unrelated fun: {locs:?}");
         // Neither location may fall on line 0 (the unrelated `fun mean` declaration)
         // or line 4 (its call site inside `helper()`'s `print(mean([1, 2, 3]))`).
@@ -4693,7 +4885,7 @@ mod tests {
         // Renaming the TOP-LEVEL `fun mean` itself is symmetrically protected: still
         // finds only its own declaration + call site, not the unrelated local in main().
         let fun_off = src.find("fun mean").unwrap() + 4;
-        let fun_locs = occurrences_cross_file(src, "mean", fun_off, dir, &empty_buffers);
+        let fun_locs = occurrences_cross_file(src, "mean", fun_off, dir, &empty_buffers, dir, None);
         assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
         assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 4), "{fun_locs:?}");
     }
@@ -4722,7 +4914,7 @@ mod tests {
         let off = src.find("helper = 2").unwrap();
         let dir = std::path::Path::new("/fake/lsp-it855");
         let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
-        let locs = occurrences_cross_file(src, "helper", off, dir, &empty_buffers);
+        let locs = occurrences_cross_file(src, "helper", off, dir, &empty_buffers, dir, None);
         assert_eq!(locs.len(), 2, "only the law's own local decl + use, NOT the unrelated fun: {locs:?}");
         // Neither location may fall on line 0 (the unrelated `fun helper` declaration)
         // or line 1 (its call site inside `caller()`).
@@ -4731,7 +4923,7 @@ mod tests {
         // Renaming the TOP-LEVEL `fun helper` itself is symmetrically protected:
         // still finds only its own declaration + call site, not the law's local.
         let fun_off = src.find("fun helper").unwrap() + 4;
-        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers);
+        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers, dir, None);
         assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
         assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
     }
@@ -4746,12 +4938,12 @@ mod tests {
         let off = src.find("helper = 2").unwrap();
         let dir = std::path::Path::new("/fake/lsp-it855-contract");
         let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
-        let locs = occurrences_cross_file(src, "helper", off, dir, &empty_buffers);
+        let locs = occurrences_cross_file(src, "helper", off, dir, &empty_buffers, dir, None);
         assert_eq!(locs.len(), 2, "only the contract law's own local decl + use: {locs:?}");
         assert!(locs.iter().all(|(_, l0, ..)| *l0 != 0 && *l0 != 1), "must not touch the unrelated fun: {locs:?}");
 
         let fun_off = src.find("fun helper").unwrap() + 4;
-        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers);
+        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers, dir, None);
         assert_eq!(fun_locs.len(), 2, "fun decl + its one call site: {fun_locs:?}");
         assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
     }
@@ -4776,7 +4968,7 @@ mod tests {
         // one call site in `caller()` -- NOT the component's own unrelated `state
         // helper` field reference inside `get()`.
         let fun_off = src.find("fun helper").unwrap() + 4;
-        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers);
+        let fun_locs = occurrences_cross_file(src, "helper", fun_off, dir, &empty_buffers, dir, None);
         assert_eq!(fun_locs.len(), 2, "fun decl + its one call site, NOT the state field: {fun_locs:?}");
         assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
 
@@ -4784,7 +4976,7 @@ mod tests {
         // decl + its one use inside `get()` -- NOT the unrelated top-level `fun
         // helper` decl or its call site in `caller()`.
         let state_off = src.find("helper: Int").unwrap();
-        let state_locs = occurrences_cross_file(src, "helper", state_off, dir, &empty_buffers);
+        let state_locs = occurrences_cross_file(src, "helper", state_off, dir, &empty_buffers, dir, None);
         assert_eq!(state_locs.len(), 2, "state decl + its one use, NOT the unrelated fun: {state_locs:?}");
         assert!(state_locs.iter().all(|(_, l0, ..)| *l0 == 4 || *l0 == 6), "{state_locs:?}");
     }
@@ -4802,13 +4994,13 @@ mod tests {
         // renaming the prop must reach BOTH uses, not just the one nearest the cursor.
         let prop_src = "fun widget() -> Int { 1 }\nfun caller() -> Int { widget() }\ncomponent C {\n    intent \"c\"\n    prop widget: Int\n    expose fun a() -> Int {\n        widget\n    }\n    expose fun b() -> Int {\n        widget + 1\n    }\n}\n";
         let prop_off = prop_src.find("widget: Int").unwrap();
-        let prop_locs = occurrences_cross_file(prop_src, "widget", prop_off, dir, &empty_buffers);
+        let prop_locs = occurrences_cross_file(prop_src, "widget", prop_off, dir, &empty_buffers, dir, None);
         assert_eq!(prop_locs.len(), 3, "prop decl + BOTH its uses across two methods: {prop_locs:?}");
         assert!(prop_locs.iter().all(|(_, l0, ..)| *l0 == 4 || *l0 == 6 || *l0 == 9), "{prop_locs:?}");
         // the reverse direction: renaming the unrelated top-level fun must not
         // reach into EITHER method that shadows it via the prop.
         let fun_off = prop_src.find("fun widget").unwrap() + 4;
-        let fun_locs = occurrences_cross_file(prop_src, "widget", fun_off, dir, &empty_buffers);
+        let fun_locs = occurrences_cross_file(prop_src, "widget", fun_off, dir, &empty_buffers, dir, None);
         assert_eq!(fun_locs.len(), 2, "fun decl + its one call site, NOT either shadowed use: {fun_locs:?}");
 
         // `child` case (the method call's own name `poke` is deliberately DIFFERENT
@@ -4816,7 +5008,7 @@ mod tests {
         // unrelated to this fix -- doesn't ALSO match the method-name token).
         let child_src = "component Worker {\n    intent \"w\"\n    expose fun poke() -> Int { 1 }\n}\nfun ping() -> Int { 2 }\nfun caller() -> Int { ping() }\ncomponent C {\n    intent \"c\"\n    let ping = Worker()\n    expose fun go() -> Int {\n        ping.poke()\n    }\n}\n";
         let child_off = child_src.find("let ping").unwrap() + 4;
-        let child_locs = occurrences_cross_file(child_src, "ping", child_off, dir, &empty_buffers);
+        let child_locs = occurrences_cross_file(child_src, "ping", child_off, dir, &empty_buffers, dir, None);
         assert_eq!(child_locs.len(), 2, "child decl + its one use inside go(): {child_locs:?}");
         assert!(child_locs.iter().all(|(_, l0, ..)| *l0 == 8 || *l0 == 10), "{child_locs:?}");
     }
@@ -6152,6 +6344,87 @@ mod tests {
         assert!(
             stdout.contains(r#""id":3,"result":{"changes""#),
             "renaming to a genuinely free name must still work across files: {stdout}"
+        );
+    }
+
+    /// A REAL, live-confirmed correctness gap found+fixed (production-
+    /// hardening PR-it1162, reconsidering a gap explicitly deferred at
+    /// PR-it1159's own investigation): renaming a symbol from ITS OWN
+    /// declaration (not a call site) never reached into files that `use`
+    /// it, so callers silently kept referencing a name that no longer
+    /// existed -- discovered the NEXT time that caller was checked, not by
+    /// the editor at rename time. Also confirms the SYMMETRIC collision
+    /// guard this fix needed: a caller file's own UNRELATED top-level item
+    /// sharing the new name is a genuine K0203 "defined more than once"
+    /// collision reachable ONLY through this reverse direction -- an
+    /// earlier draft of this fix assumed (wrongly, corrected after a live
+    /// repro) that the reverse direction could never collide since it only
+    /// renames existing references, never introduces a new declaration.
+    /// Needs REAL files on disk (unlike PR-it1159's own sibling test,
+    /// which uses fake URIs + `didOpen`-only buffers) since the reverse
+    /// search genuinely enumerates the workspace via `rootUri`.
+    #[test]
+    fn rename_from_a_declaration_site_reaches_callers_and_still_detects_a_reverse_collision() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-it1162-decl-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib_path = dir.join("lib.kupl");
+        let main_path = dir.join("main.kupl");
+        std::fs::write(&lib_path, "fun mean(xs: List[Int]) -> Float {\n    0.0\n}\n").unwrap();
+        std::fs::write(
+            &main_path,
+            "use lib\n\nfun average(x: Int) -> Int { x }\n\nfun report(xs: List[Int]) -> Float {\n    mean(xs)\n}\n",
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new(&bin)
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl lsp spawns");
+
+        let root_uri = path_to_uri(&dir);
+        let lib_uri = path_to_uri(&lib_path);
+        let lib_text = std::fs::read_to_string(&lib_path).unwrap();
+        let init = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"rootUri":{root_uri:?}}}}}"#);
+        let did_open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":{lib_uri:?},"text":{lib_text:?}}}}}}}"#
+        );
+        // cursor on `mean`'s OWN declaration in lib.kupl (line 0, "fun " = 4 chars).
+        let rename_collides =
+            format!(r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{{"textDocument":{{"uri":{lib_uri:?}}},"position":{{"line":0,"character":5}},"newName":"average"}}}}"#);
+        let rename_ok =
+            format!(r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{{"textDocument":{{"uri":{lib_uri:?}}},"position":{{"line":0,"character":5}},"newName":"genuinely_free_name"}}}}"#);
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            for body in [init, did_open, rename_collides, rename_ok] {
+                let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+            }
+        });
+
+        let out = wait_with_timeout_lsp(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = out.expect("kupl lsp hung on a declaration-site rename request");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl lsp panicked: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":2,"result":null"#),
+            "a reverse-direction collision (main.kupl's own unrelated `average`) must be detected: {stdout}"
+        );
+        assert!(
+            stdout.contains(r#""id":3,"result":{"changes""#) && stdout.contains("main.kupl"),
+            "a genuinely free name must reach INTO the caller file main.kupl, not just lib.kupl itself: {stdout}"
         );
     }
 
