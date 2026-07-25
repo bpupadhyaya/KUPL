@@ -404,10 +404,45 @@ fn parse_value(b: &[u8], pos: &mut usize, depth: usize) -> Result<Json, String> 
         // repro (`KUPL_AI_MOCK_CLASSIFY=X`).
         _ if matches!(b[*pos], b'0'..=b'9' | b'-') => {
             let start = *pos;
-            while *pos < b.len()
-                && matches!(b[*pos], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-            {
+            if b[*pos] == b'-' {
                 *pos += 1;
+            }
+            // A REAL bug found+fixed (production-hardening PR-it1171,
+            // extending json.rs's own identical fix to this sibling
+            // parser): mirrors json.rs's `number` exactly -- only consume
+            // each RFC 8259 grammar component (`int = "0" / (digit1-9
+            // *DIGIT)`, `frac = "." 1*DIGIT`, `exp = ("e"/"E") ["-"/"+"]
+            // 1*DIGIT`) when it's actually well-formed, instead of greedily
+            // consuming any `[0-9.eE+-]` run and deferring ALL validity
+            // checking to `.parse::<f64>()`, which is more permissive than
+            // the spec (`01`, `1.`, `-00` all used to parse successfully).
+            // Deliberately adds no new error path: an under-consumed
+            // malformed token leaves its own trailing byte(s) for the
+            // SAME pre-existing "unexpected character `X` at position N"
+            // catch-all (below) to reject, exactly as it already does for
+            // any other stray byte.
+            if *pos < b.len() && b[*pos] == b'0' {
+                *pos += 1;
+            } else {
+                while *pos < b.len() && b[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+            }
+            if *pos < b.len() && b[*pos] == b'.' && b.get(*pos + 1).is_some_and(u8::is_ascii_digit) {
+                *pos += 1;
+                while *pos < b.len() && b[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+            }
+            if *pos < b.len() && matches!(b[*pos], b'e' | b'E') {
+                let after_e = *pos + 1;
+                let digits_start = if matches!(b.get(after_e), Some(b'+') | Some(b'-')) { after_e + 1 } else { after_e };
+                if b.get(digits_start).is_some_and(u8::is_ascii_digit) {
+                    *pos = digits_start;
+                    while *pos < b.len() && b[*pos].is_ascii_digit() {
+                        *pos += 1;
+                    }
+                }
             }
             let s = std::str::from_utf8(&b[start..*pos]).unwrap_or("");
             // The embedded scanned text (`invalid number `{s}`` , not a bare
@@ -5535,6 +5570,19 @@ mod tests {
     /// (the scanned text embedded). Also fixes a smaller, independently-
     /// spotted wording slip: `"unexpected end of JSON"` -> `"unexpected end
     /// of input"`, matching json.rs exactly.
+    ///
+    /// The `"12.3.4"` case's own expected message changed again under
+    /// production-hardening PR-it1171 (json_parse's own number-grammar-
+    /// conformance fix, extended to this sibling parser in the same
+    /// iteration, per this campaign's established sibling-code-path-
+    /// natural-extension discipline -- this parser explicitly mirrors
+    /// json.rs's wording per PR-it792 above, so leaving it unfixed would
+    /// have silently drifted this test's own name, "matches json_rs", out
+    /// of parity): the number scanner now correctly stops after `12.3` (a
+    /// syntactically COMPLETE RFC 8259 number -- only ONE decimal point is
+    /// ever valid), leaving the second `.4` for the pre-existing
+    /// "unexpected trailing characters" path to reject instead of ever
+    /// reaching `.parse::<f64>()` at all.
     #[test]
     fn parse_json_matches_json_rs_on_trailing_content_and_unexpected_characters() {
         assert_eq!(
@@ -5542,7 +5590,10 @@ mod tests {
             Err("unexpected trailing characters at position 3".into())
         );
         assert_eq!(parse_json("X"), Err("unexpected character `X` at position 0".into()));
-        assert_eq!(parse_json("12.3.4"), Err("invalid number `12.3.4`".into()));
+        assert_eq!(
+            parse_json("12.3.4"),
+            Err("unexpected trailing characters at position 4".into())
+        );
         assert_eq!(parse_json(""), Err("unexpected end of input".into()));
         // a non-ASCII unrecognized character reports a CHAR position, not a
         // byte position -- "é" is two bytes but the FIRST character.
@@ -5554,6 +5605,37 @@ mod tests {
         );
         // genuinely well-formed input is completely unaffected.
         assert_eq!(parse_json("  42  "), Ok(Json::Num(42.0)));
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1171, the SIXTH
+    /// sibling instance of this parser's ongoing parity-with-`json.rs`
+    /// effort -- see PR-it792's own doc comment above for the prior five):
+    /// this parser's own number scanner had the IDENTICAL RFC 8259
+    /// conformance gap json.rs's own `number` was just fixed for --
+    /// greedily consuming any `[0-9.eE+-]` run and deferring ALL validity
+    /// checking to `.parse::<f64>()`, silently accepting a leading zero
+    /// followed by more digits (`01`) or a bare trailing decimal point
+    /// (`1.`) instead of rejecting them. Fixed with the identical
+    /// grammar-bounded scan, and the SAME "add no new error path" strategy
+    /// -- an under-consumed malformed token's trailing byte(s) fall through
+    /// to the pre-existing "unexpected character"/"unexpected trailing
+    /// characters" paths above.
+    #[test]
+    fn parse_json_number_grammar_matches_json_rs_conformance_fix() {
+        // BEFORE the fix, all of these parsed successfully.
+        assert!(parse_json("01").is_err());
+        assert!(parse_json("-00").is_err());
+        assert!(parse_json("1.").is_err());
+        // a lone `-` (no digit at all) still reaches `.parse::<f64>()` and
+        // fails there, preserving coverage of the "invalid number" message
+        // shape specifically, matching json.rs's own identical discriminating
+        // choice in its own sibling test.
+        assert_eq!(parse_json("-"), Err("invalid number `-`".into()));
+        // discriminating pair: every syntactically valid JSON number shape
+        // is completely unaffected.
+        assert_eq!(parse_json("0"), Ok(Json::Num(0.0)));
+        assert_eq!(parse_json("0.5"), Ok(Json::Num(0.5)));
+        assert_eq!(parse_json("1.5e10"), Ok(Json::Num(1.5e10)));
     }
 
     /// A REAL cross-engine SILENT VALUE DIVERGENCE found+fixed (production-

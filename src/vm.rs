@@ -3813,13 +3813,27 @@ fun probe() -> Str { "{e(hex_decode("abc"))}|{e(hex_decode("zz"))}|{e(base64_dec
     fn diff_json_parse_error_messages() {
         // PR-it116: malformed JSON gives the SAME specific, positioned error message on
         // interp/KVM (and native) — not a generic "invalid JSON".
+        //
+        // The third probe was `"1.2.3"` until production-hardening PR-it1171
+        // (json_parse's own number-grammar-conformance fix, tightening the
+        // scanner to RFC 8259's stricter `int`/`frac`/`exp` shape instead of
+        // greedily consuming any `[0-9.eE+-]` run): `"1.2.3"` used to trigger
+        // `invalid number` (the WHOLE malformed run reached `.parse::<f64>`
+        // and failed there), but now the scanner correctly stops after `1.2`
+        // (a syntactically complete number), leaving the second `.3` for the
+        // pre-existing "unexpected trailing characters" path to reject
+        // instead -- a DIFFERENT but equally correct rejection, not a
+        // regression. Replaced with `"-"` (a lone minus with no digit at
+        // all), which still reaches `.parse::<f64>` and fails there even
+        // after the fix, preserving this test's own coverage of the
+        // `invalid number` message shape specifically.
         let src = r#"fun e(j: Str) -> Str { match json_parse(j) { Ok(_) => "ok"
         Err(m) => m } }
-fun probe() -> Str { "{e("NaN")}|{e("[1,2")}|{e("1.2.3")}|{e("")}|{e("tru")}|{e("[1,2] x")}" }
+fun probe() -> Str { "{e("NaN")}|{e("[1,2")}|{e("-")}|{e("")}|{e("tru")}|{e("[1,2] x")}" }
 "#;
         assert_eq!(
             differential(src),
-            "unexpected character `N` at position 0|expected `,` or `]` in array|invalid number `1.2.3`|unexpected end of input|invalid literal (expected `true`)|unexpected trailing characters at position 6"
+            "unexpected character `N` at position 0|expected `,` or `]` in array|invalid number `-`|unexpected end of input|invalid literal (expected `true`)|unexpected trailing characters at position 6"
         );
     }
 

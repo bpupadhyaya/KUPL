@@ -119,14 +119,65 @@ impl Parser<'_> {
         }
     }
 
+    // A REAL bug found+fixed (production-hardening PR-it1171): this used to
+    // greedily consume any run of `[0-9.eE+-]` and defer ALL validity
+    // checking to `str::parse::<f64>` -- but RFC 8259's own number grammar
+    // (`number = [ "-" ] int [ frac ] [ exp ]`, `int = "0" / (digit1-9
+    // *DIGIT)`, `frac = "." 1*DIGIT`, `exp = ("e"/"E") ["-"/"+"] 1*DIGIT`)
+    // is STRICTER than Rust's `f64::from_str` (and the native mirror's
+    // `strtod`): it forbids a leading zero followed by more digits (`01`,
+    // `-00`) and requires at least one digit after a decimal point (`1.`).
+    // Neither parser enforces those, so `json_parse` used to silently
+    // ACCEPT syntactically-invalid JSON numbers -- format_num's own doc
+    // comment (below) already cites RFC 8259 §6 as this exact function's
+    // conformance bar, on the stringify side; this closes the matching gap
+    // on the parse side. Live-confirmed before this fix (identical across
+    // all three engines -- interp/VM share this file, native's `strtod` is
+    // equally permissive on this exact grammar point, so a genuine shared
+    // conformance gap, not a cross-engine divergence): `json_parse("01")`,
+    // `json_parse("1.")`, and `json_parse("-00")` all succeeded, returning
+    // `JNum(1.0)`, `JNum(1.0)`, and `JNum(-0.0)` respectively.
+    //
+    // Fixed by only consuming each grammar component when it's actually
+    // well-formed (a digit genuinely follows `.`, and a digit genuinely
+    // follows `e`/`E`[+-]?) -- deliberately WITHOUT adding any new error
+    // path here: a malformed number like `01` or `1.` now has its scan stop
+    // one character short of the full malformed token, leaving the
+    // trailing character(s) for the SAME pre-existing "unexpected trailing
+    // characters" (top level) / "expected `,` or `]` in array" / the
+    // object's own equivalent error paths to reject cleanly, exactly as
+    // they already do for any other stray character.
     fn number(&mut self) -> Result<Value, String> {
         let start = self.pos;
         if self.peek() == Some('-') {
             self.pos += 1;
         }
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
-        {
+        // int = "0" / (digit1-9 *DIGIT)
+        if self.peek() == Some('0') {
             self.pos += 1;
+        } else {
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        // frac = "." 1*DIGIT
+        if self.peek() == Some('.') && self.chars.get(self.pos + 1).is_some_and(char::is_ascii_digit) {
+            self.pos += 1;
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        // exp = ("e" / "E") ["-" / "+"] 1*DIGIT
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            let after_e = self.pos + 1;
+            let digits_start =
+                if matches!(self.chars.get(after_e), Some('+') | Some('-')) { after_e + 1 } else { after_e };
+            if self.chars.get(digits_start).is_some_and(char::is_ascii_digit) {
+                self.pos = digits_start;
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    self.pos += 1;
+                }
+            }
         }
         let s: String = self.chars[start..self.pos].iter().collect();
         s.parse::<f64>()
@@ -584,6 +635,36 @@ mod tests {
         assert!(parse("").is_err());
         assert!(parse("nul").is_err());
         assert!(parse("[1] extra").is_err());
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1171): RFC 8259's
+    /// number grammar (`int = "0" / (digit1-9 *DIGIT)`, `frac = "." 1*DIGIT`)
+    /// is STRICTER than Rust's `f64::from_str` -- a leading zero followed by
+    /// more digits, or a decimal point with no digit after it, both parse
+    /// successfully as an ordinary float, but neither is syntactically valid
+    /// JSON. `parse` used to accept both, silently normalizing them (`01` ->
+    /// `1`, `1.` -> `1.0`) instead of rejecting the malformed input.
+    #[test]
+    fn a_leading_zero_or_a_bare_trailing_decimal_point_is_a_clean_error_not_silently_normalized() {
+        // BEFORE the fix, all of these parsed successfully.
+        assert!(parse("01").is_err());
+        assert!(parse("-00").is_err());
+        assert!(parse("1.").is_err());
+        assert!(parse("1e").is_err());
+        assert!(parse("1e+").is_err());
+        // the SAME malformed numbers are rejected nested inside a container too,
+        // not just at the top level.
+        assert!(parse("[01, 2]").is_err());
+        assert!(parse("[0.5, 1.]").is_err());
+        // discriminating pair: every syntactically valid JSON number shape is
+        // completely unaffected.
+        assert!(parse("0").is_ok());
+        assert!(parse("0.5").is_ok());
+        assert!(parse("-0").is_ok());
+        assert!(parse("123").is_ok());
+        assert!(parse("1.5e10").is_ok());
+        assert!(parse("1e5").is_ok());
+        assert!(parse("-1.5E-3").is_ok());
     }
 
     #[test]

@@ -3225,10 +3225,35 @@ static char* kjp_string(KJP* p) {  /* assumes current char is the opening quote 
     }
     return b.buf ? b.buf : (char*)"";
 }
+/* Mirrors json.rs's own `number` exactly (production-hardening PR-it1171):
+   only consume each grammar component when it's actually well-formed per
+   RFC 8259 (`int = "0" / (digit1-9 *DIGIT)`, `frac = "." 1*DIGIT`,
+   `exp = ("e"/"E") ["-"/"+"] 1*DIGIT`) -- a bare `strtod`-style scan is
+   MORE permissive than the spec (accepts `01`, `1.`, `-00`), and
+   deliberately does NOT need a new error path here: stopping the scan one
+   character short of a malformed token leaves the trailing character(s)
+   for the SAME pre-existing "unexpected trailing characters" /
+   "expected `,` or `]` in array" error paths below to reject cleanly. */
 static KValue kjp_number(KJP* p) {
     long start = p->pos;
     if (kjp_peek(p) == '-') p->pos++;
-    while (p->pos < p->len) { unsigned char c = p->s[p->pos]; if ((c>='0'&&c<='9')||c=='.'||c=='e'||c=='E'||c=='+'||c=='-') p->pos++; else break; }
+    if (p->pos < p->len && p->s[p->pos] == '0') {
+        p->pos++;
+    } else {
+        while (p->pos < p->len && p->s[p->pos] >= '0' && p->s[p->pos] <= '9') p->pos++;
+    }
+    if (p->pos < p->len && p->s[p->pos] == '.' && p->pos + 1 < p->len && p->s[p->pos + 1] >= '0' && p->s[p->pos + 1] <= '9') {
+        p->pos++;
+        while (p->pos < p->len && p->s[p->pos] >= '0' && p->s[p->pos] <= '9') p->pos++;
+    }
+    if (p->pos < p->len && (p->s[p->pos] == 'e' || p->s[p->pos] == 'E')) {
+        long after_e = p->pos + 1;
+        long digits_start = (after_e < p->len && (p->s[after_e] == '+' || p->s[after_e] == '-')) ? after_e + 1 : after_e;
+        if (digits_start < p->len && p->s[digits_start] >= '0' && p->s[digits_start] <= '9') {
+            p->pos = digits_start;
+            while (p->pos < p->len && p->s[p->pos] >= '0' && p->s[p->pos] <= '9') p->pos++;
+        }
+    }
     long n = p->pos - start;
     char* buf = (char*)k_alloc((size_t)n + 1);
     memcpy(buf, p->s + start, n); buf[n] = 0;
@@ -11025,6 +11050,18 @@ fun main() uses io { print("{e(hex_decode("abc"))}|{e(hex_decode("zz"))}|{e(base
 
     /// Native JSON parse errors match the interpreter's specific, positioned messages
     /// (PR-it116 replaced a generic "invalid JSON" with per-site messages).
+    ///
+    /// The third probe was `"1.2.3"` until production-hardening PR-it1171
+    /// (json_parse's own number-grammar-conformance fix): `"1.2.3"` used to
+    /// trigger `invalid number`, but now the scanner correctly stops after
+    /// `1.2` (a syntactically complete number), leaving the second `.3` for
+    /// the pre-existing "unexpected trailing characters" path -- a
+    /// DIFFERENT but equally correct rejection. Replaced with `"-"`, which
+    /// still reaches `strtod` and fails there even after the fix,
+    /// preserving this test's own coverage of the `invalid number` message
+    /// shape specifically (and its own wording-parity requirement against
+    /// json.rs's own identical string, per this campaign's own established
+    /// c-template-exact-wording-parity discipline).
     #[test]
     fn native_json_parse_error_messages() {
         if !cc_available() {
@@ -11032,11 +11069,11 @@ fun main() uses io { print("{e(hex_decode("abc"))}|{e(hex_decode("zz"))}|{e(base
         }
         let src = r#"fun e(j: Str) -> Str { match json_parse(j) { Ok(_) => "ok"
         Err(m) => m } }
-fun main() uses io { print("{e("NaN")}|{e("[1,2")}|{e("1.2.3")}|{e("")}|{e("[1,2] x")}") }
+fun main() uses io { print("{e("NaN")}|{e("[1,2")}|{e("-")}|{e("")}|{e("[1,2] x")}") }
 "#;
         assert_eq!(
             native_main_stdout(src, "jerr").trim(),
-            "unexpected character `N` at position 0|expected `,` or `]` in array|invalid number `1.2.3`|unexpected end of input|unexpected trailing characters at position 6"
+            "unexpected character `N` at position 0|expected `,` or `]` in array|invalid number `-`|unexpected end of input|unexpected trailing characters at position 6"
         );
     }
 
