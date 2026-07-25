@@ -131,17 +131,32 @@ pub struct Interp {
     /// fatal, uncatchable native-stack abort — and matches the KVM's 10 000-frame
     /// limit so the two engines stay byte-identical on deep recursion.
     pub call_depth: usize,
-    /// Remaining `while`-loop iteration budget for THIS interp session
-    /// (production-hardening PR-it1156). `None` for every ordinary interp
-    /// session (`kupl run`/`kupl check`/native-adjacent worker interps) -- a
-    /// legitimate app's own `while true` event loop must NEVER be capped.
-    /// Only `run_tests` (`kupl test`) sets this to `Some(MAX_TEST_WHILE_
-    /// ITERATIONS)` on a freshly-constructed, per-test-item `Interp`, so a
-    /// runaway/accidental infinite loop inside a SINGLE `example`/law/
+    /// Remaining LOOP iteration budget for THIS interp session -- shared by
+    /// BOTH `Stmt::While` (production-hardening PR-it1156) and `Stmt::For`
+    /// (production-hardening PR-it1179: the SAME "kupl test has no hang
+    /// guard" bug class PR-it1156 fixed for `while` was never extended to
+    /// `for`, even though a `for` loop over a huge/adversarial `Range` is
+    /// just as capable of running a single test item for an unbounded
+    /// amount of wall-clock time -- live-confirmed BEFORE this fix: a `for`
+    /// loop performing the SAME 20,000,000 trivial iterations a `while`
+    /// loop hits its budget on in ~2.5s instead ran to full completion,
+    /// unbounded, in ~7.7s; a genuinely large range, e.g. `for i in
+    /// 0..100_000_000_000 { }`, would scale proportionally into HOURS with
+    /// zero guard). `None` for every ordinary interp session (`kupl run`/
+    /// `kupl check`/native-adjacent worker interps) -- a legitimate app's
+    /// own `while true` event loop or a genuinely large `for` iteration
+    /// must NEVER be capped. Only `run_tests` (`kupl test`) sets this to
+    /// `Some(MAX_TEST_LOOP_ITERATIONS)` on a freshly-constructed, per-test-
+    /// item `Interp`, so a runaway/accidental infinite `while` OR an
+    /// excessively large `for` range/list inside a SINGLE `example`/law/
     /// contract-law body fails with a clean panic (caught by run_tests's
     /// own already-existing `Flow::Panic` handling, exactly like any other
-    /// test failure) instead of hanging the whole `kupl test` invocation
-    /// forever.
+    /// test failure) instead of hanging (or merely running for an
+    /// unreasonably long time) the whole `kupl test` invocation. A single
+    /// shared budget (not a separate one per loop KIND) also correctly
+    /// bounds the TOTAL loop work across nested/sequential while+for
+    /// combinations within one test item, not just each construct in
+    /// isolation.
     pub test_step_budget: Option<u64>,
 }
 
@@ -187,25 +202,24 @@ pub const MAX_COMPONENT_MESSAGE_BYTES: u64 = 10_000_000;
 /// native runtime (`cgen.rs`).
 pub const MAX_ADVANCE_FIRES: usize = 10_000_000;
 
-/// Bound on `while`-loop iterations within a single `kupl test` example/
-/// law/contract-law body (production-hardening PR-it1156, a fresh Explore
-/// survey finding: `kupl test` had NO hang guard anywhere in its call
-/// path -- an accidental or adversarial `while true { ... }` inside any
-/// test item hung the whole process indefinitely, 100% CPU, zero
-/// diagnostic, live-confirmed with `kill -9` required). Empirically
-/// calibrated on this hardware: 20,000,000 trivial `while` iterations
-/// took ~5 seconds (`kupl run`), so 10,000,000 bounds a hung test to
-/// roughly 2.5 seconds before it cleanly fails -- comfortably beyond
-/// what ANY legitimate, deterministic `example`/`law` body should ever
-/// need (these are meant to be small, fast unit tests, not loop-heavy
-/// batch jobs), while still failing fast enough to be CI-friendly. Value
-/// matches `regex.rs::MATCH_BUDGET` and this file's own
-/// `MAX_ADVANCE_FIRES` sizing convention exactly, for the same "generous
-/// for real use, but caps runaway growth" rationale. Only ever set via
-/// `Interp::test_step_budget`, and only by `run_tests` -- see that
-/// field's own doc comment for why every OTHER interp session must never
-/// be capped.
-pub const MAX_TEST_WHILE_ITERATIONS: u64 = 10_000_000;
+/// Bound on `while`-loop AND `for`-loop iterations (combined, one shared
+/// budget) within a single `kupl test` example/law/contract-law body
+/// (production-hardening PR-it1156 for `while`, extended to `for` at
+/// PR-it1179 -- see `Interp::test_step_budget`'s own doc comment for the
+/// full writeup of why `for` needed the identical guard `while` already
+/// had). Empirically calibrated on this hardware: 20,000,000 trivial
+/// `while` iterations took ~5 seconds (`kupl run`), so 10,000,000 bounds a
+/// hung/excessively-long test to roughly 2.5 seconds before it cleanly
+/// fails -- comfortably beyond what ANY legitimate, deterministic
+/// `example`/`law` body should ever need (these are meant to be small,
+/// fast unit tests, not loop-heavy batch jobs), while still failing fast
+/// enough to be CI-friendly. Value matches `regex.rs::MATCH_BUDGET` and
+/// this file's own `MAX_ADVANCE_FIRES` sizing convention exactly, for the
+/// same "generous for real use, but caps runaway growth" rationale. Only
+/// ever set via `Interp::test_step_budget`, and only by `run_tests` -- see
+/// that field's own doc comment for why every OTHER interp session must
+/// never be capped.
+pub const MAX_TEST_LOOP_ITERATIONS: u64 = 10_000_000;
 
 impl Interp {
     pub fn new(db: ProgramDb) -> Interp {
@@ -1026,7 +1040,8 @@ impl Interp {
                     if !b {
                         break;
                     }
-                    // `kupl test`'s own hang guard (PR-it1156, see
+                    // `kupl test`'s own hang guard (PR-it1156, extended to
+                    // `Stmt::For`'s own loop below at PR-it1179 -- see
                     // `test_step_budget`'s own doc comment on the struct):
                     // `None` for every session except a fresh per-test-item
                     // interp under `run_tests`, so this is a no-op check for
@@ -1055,6 +1070,36 @@ impl Interp {
                 // keep looping, Ok(false) on `break`, Err to propagate.
                 macro_rules! step {
                     ($item:expr) => {{
+                        // A REAL, live-confirmed HANG-adjacent gap found+fixed
+                        // (production-hardening PR-it1179, a direct follow-up
+                        // investigation after this iteration's surveys came up
+                        // empty): `Stmt::While`'s own PR-it1156 hang guard was
+                        // never extended to `Stmt::For` -- a `for` loop over a
+                        // huge/adversarial `Range` (or a very large `List`) inside
+                        // a `kupl test` example/law/contract-law had NO iteration
+                        // budget at all. Live-confirmed BEFORE this fix: the SAME
+                        // 20,000,000 trivial iterations a `while` loop hits its
+                        // budget on in ~2.5s instead ran to full, unbounded
+                        // completion in ~7.7s via `for`; a genuinely large range
+                        // (`for i in 0..100_000_000_000 { }`) would scale into
+                        // HOURS with zero guard, functionally indistinguishable
+                        // from a hang for CI purposes. Shares the EXACT SAME
+                        // `test_step_budget` counter as `Stmt::While` above (a
+                        // single combined budget correctly bounds the TOTAL loop
+                        // work across nested/sequential while+for combinations
+                        // within one test item, not just each construct alone) --
+                        // `None` for every session except a fresh per-test-item
+                        // interp under `run_tests`, so this is a no-op check for
+                        // `kupl run`/`kupl check`/native-adjacent sessions.
+                        if let Some(budget) = &mut self.test_step_budget {
+                            if *budget == 0 {
+                                return Err(Self::panic_flow(
+                                    "test exceeded its `for`-loop iteration budget (likely an excessively large range or list)",
+                                    *span,
+                                ));
+                            }
+                            *budget -= 1;
+                        }
                         let scope = env.child();
                         scope.define(var, $item);
                         match self.exec_block(body, &scope) {

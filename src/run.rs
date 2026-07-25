@@ -1377,7 +1377,7 @@ pub fn run_tests(path: &str) -> i32 {
         // PR-it1156: bound this test item's own `while`-loop iterations so a
         // runaway/accidental infinite loop fails cleanly instead of hanging
         // `kupl test` forever -- see `test_step_budget`'s own doc comment.
-        interp.test_step_budget = Some(crate::interp::MAX_TEST_WHILE_ITERATIONS);
+        interp.test_step_budget = Some(crate::interp::MAX_TEST_LOOP_ITERATIONS);
         let env = interp.globals.child();
         match interp.exec_block(&law.body, &env) {
             Ok(_) | Err(Flow::Return(_)) => {
@@ -1473,7 +1473,7 @@ pub fn run_tests(path: &str) -> i32 {
             let db = ProgramDb::build(&compiled.program, &compiled.checked);
             let mut interp = Interp::new(db);
             // PR-it1156: see the top-level law loop's own identical comment above.
-            interp.test_step_budget = Some(crate::interp::MAX_TEST_WHILE_ITERATIONS);
+            interp.test_step_budget = Some(crate::interp::MAX_TEST_LOOP_ITERATIONS);
             let result = run_example(&mut interp, &c.name, example);
             match result {
                 Ok(None) => {
@@ -1536,7 +1536,7 @@ pub fn run_tests(path: &str) -> i32 {
                 let db = ProgramDb::build(&compiled.program, &compiled.checked);
                 let mut interp = Interp::new(db);
                 // PR-it1156: see the top-level law loop's own identical comment above.
-                interp.test_step_budget = Some(crate::interp::MAX_TEST_WHILE_ITERATIONS);
+                interp.test_step_budget = Some(crate::interp::MAX_TEST_LOOP_ITERATIONS);
                 let outcome: Result<(), Flow> = (|| {
                     let v = interp.instantiate(&c.name, &[], Span::default())?;
                     let Value::Component(id) = v else {
@@ -2412,6 +2412,90 @@ mod tests {
         );
         let code = run_with_timeout(legit_loop).expect("run_tests must not hang on a legitimate loop");
         assert_eq!(code, 0, "a legitimate, finite loop-based test must still pass cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, live-confirmed HANG-adjacent gap found+fixed (production-
+    /// hardening PR-it1179, a direct follow-up investigation after this
+    /// iteration's Explore surveys came up empty): the test right above
+    /// this one locks in PR-it1156's own hang guard for `while` loops, but
+    /// `Stmt::For` had NO equivalent guard at all -- a `for` loop over a
+    /// huge/adversarial `Range` inside a `kupl test` example/law/contract-
+    /// law could run for an UNBOUNDED amount of wall-clock time (not
+    /// literally infinite like `while true`, but a sufficiently large
+    /// range makes it functionally indistinguishable from a hang for any
+    /// CI purpose). Live-confirmed BEFORE this fix: `for i in 0..20000000
+    /// { x += 1 }` (the SAME iteration count a `while` loop hits its
+    /// budget on in ~2.5s) instead ran to full, unbounded completion in
+    /// ~7.7s. Fixed by extending the EXACT SAME `test_step_budget` guard
+    /// `Stmt::While` already had to `Stmt::For`'s own loop body, checked
+    /// once per iteration for BOTH the `Range` and `List` iteration arms.
+    /// This test mirrors the `while`-loop hang-guard test's own structure
+    /// exactly (all three test-item categories, plus a legitimate discrim-
+    /// inating control), just with `for` loops over large ranges instead.
+    #[test]
+    fn run_tests_does_not_hang_on_an_excessively_large_for_loop_range_in_any_test_item_kind() {
+        let dir = std::env::temp_dir().join(format!("kupl-runtests-for-hang-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_str().unwrap().to_string()
+        };
+        let run_with_timeout = |path: String| -> Option<i32> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(super::run_tests(&path));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(20)).ok()
+        };
+
+        // a top-level law with an excessively large `for` range must fail cleanly, not hang.
+        let hang_law = write(
+            "hang_for_law.kupl",
+            "law \"runaway for\" {\n    var x = 0\n    for i in 0..100000000000 {\n        x += 1\n    }\n    expect x == 1\n}\n",
+        );
+        let code = run_with_timeout(hang_law).expect("run_tests must not hang on a runaway for-loop law");
+        assert_eq!(code, 1, "an excessively large for-loop range must be a clean FAILURE, not a hang");
+
+        // a component example with a runaway `for` range must ALSO fail cleanly, and a
+        // SIBLING passing example in the SAME file must still run correctly.
+        let hang_example = write(
+            "hang_for_example.kupl",
+            "component Ok1 {\n    in click: Int\n    out value: Int\n    on click(n) { emit value(n) }\n    example { send click(1)\n        expect value == 1 }\n}\n\
+             component Loopy {\n    in click: Int\n    out value: Int\n    on click(n) {\n        var x = 0\n        for i in 0..100000000000 { x += 1 }\n        emit value(x)\n    }\n    example { send click(1)\n        expect value == 2 }\n}\n",
+        );
+        let code = run_with_timeout(hang_example).expect("run_tests must not hang on a runaway for-loop example");
+        assert_eq!(code, 1, "a file with one passing and one runaway for-loop example must still fail overall");
+
+        // a runaway CONTRACT law with a huge `for` range must also fail cleanly.
+        let hang_contract_law = write(
+            "hang_for_contract_law.kupl",
+            "contract Counting {\n    expose fun current() -> Int\n    law \"runaway\" {\n        var x = 0\n        for i in 0..100000000000 { x += 1 }\n        expect x == 1\n    }\n}\n\
+             component Impl fulfills Counting {\n    expose fun current() -> Int { 0 }\n}\n",
+        );
+        let code = run_with_timeout(hang_contract_law).expect("run_tests must not hang on a runaway for-loop contract law");
+        assert_eq!(code, 1, "a runaway for-loop contract law must be a clean FAILURE, not a hang");
+
+        // discriminating control: a LEGITIMATE, finite for-loop-based test (nowhere
+        // near the 10,000,000-iteration budget) must still pass.
+        let legit_loop = write(
+            "legit_for_loop.kupl",
+            "law \"sum of first 1000 naturals via for\" {\n    var total = 0\n    for i in 0..1000 {\n        total = total + i\n    }\n    expect total == 499500\n}\n",
+        );
+        let code = run_with_timeout(legit_loop).expect("run_tests must not hang on a legitimate for-loop");
+        assert_eq!(code, 0, "a legitimate, finite for-loop-based test must still pass cleanly");
+
+        // discriminating control: a for-loop over an ordinary LIST (not a Range) is
+        // ALSO guarded by the same shared budget, but a small, ordinary list must
+        // still pass cleanly -- the guard must not false-positive on everyday code.
+        let legit_list_loop = write(
+            "legit_for_list_loop.kupl",
+            "law \"sum a small list via for\" {\n    var total = 0\n    for x in [1, 2, 3, 4, 5] {\n        total = total + x\n    }\n    expect total == 15\n}\n",
+        );
+        let code = run_with_timeout(legit_list_loop).expect("run_tests must not hang on a legitimate list-based for-loop");
+        assert_eq!(code, 0, "a legitimate, small list-based for-loop test must still pass cleanly");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
