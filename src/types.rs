@@ -243,7 +243,29 @@ impl fmt::Display for Ty {
             Ty::Tensor => write!(f, "Tensor"),
             Ty::Map(k, v) => write!(f, "Map[{k}, {v}]"),
             Ty::Set(e) => write!(f, "Set[{e}]"),
-            Ty::Var(id) => write!(f, "?{id}"),
+            // A genuinely unconstrained inference variable (e.g. `let x = []`
+            // or `let x = par {}` with no further use pinning down an
+            // element type) reaching a user-facing diagnostic -- the SAME
+            // "meaningless raw id leaking into a message" bug class ai.rs's
+            // `build_shape` catch-all arm was already found+fixed for
+            // (production-hardening PR-it702, that fix's own doc comment
+            // literally calls the un-substituted rendering "a meaningless
+            // `?0`"), but that fix only prevented ai.rs's OWN specific
+            // qvar-substitution bug from producing an unbound `Ty::Var` in
+            // the first place -- it never touched this shared `Display`
+            // impl, which every OTHER type-checker diagnostic (e.g. K0200)
+            // still renders through. Live-confirmed before this fix: `kupl
+            // check` on `fun main() uses io { let x = []\n    let y: Str =
+            // x\n    print(\"{y}\") }` reported "expected Str, found
+            // List[?0]" -- an internal union-find slot index with zero
+            // meaning to a KUPL user, reachable via completely ordinary code
+            // (an empty list literal), not just an obscure construct.
+            // Dropping the numeric id (rendering `_` instead) is a pure
+            // display-only change -- `Ty::Var`'s equality/substitution/
+            // unification logic (types.rs's own `PartialEq`/`subst`/`unify`)
+            // all still compare by `id`, unaffected (production-hardening
+            // PR-it1169).
+            Ty::Var(_) => write!(f, "_"),
         }
     }
 }
@@ -284,4 +306,59 @@ pub struct ComponentSig {
 #[derive(Debug, Clone, Default)]
 pub struct ContractSig {
     pub sigs: HashMap<String, (Vec<Ty>, Ty, Vec<String>)>,
+}
+
+#[cfg(test)]
+mod tests {
+    /// A REAL diagnostic-quality bug found+fixed (production-hardening
+    /// PR-it1169): `Ty::Var`'s own `Display` impl rendered a genuinely
+    /// unconstrained inference variable as its raw internal union-find slot
+    /// index (`?0`, `?1`, ...) -- meaningless to a KUPL user, and reachable
+    /// via completely ordinary code (an empty list literal with no further
+    /// use pinning down its element type), not just an obscure construct.
+    /// `ai.rs`'s `build_shape` catch-all error arm was already found+fixed
+    /// for the SAME "meaningless `?0` leaking into a diagnostic" symptom
+    /// (PR-it702), but that fix only prevented ai.rs's OWN specific
+    /// qvar-substitution bug from producing an unbound `Ty::Var` in the
+    /// first place -- it never touched this shared `Display` impl, so every
+    /// OTHER type-checker diagnostic (e.g. K0200) still rendered through it
+    /// unfixed. Live-confirmed before this fix via a real `kupl check` run:
+    /// `let x = []` followed by an unrelated type mismatch using `x`
+    /// reported "expected Str, found List[?0]".
+    #[test]
+    fn an_unconstrained_empty_list_element_type_renders_without_a_meaningless_internal_id() {
+        let src = "fun main() uses io {\n    let x = []\n    let y: Str = x\n    print(\"{y}\")\n}\n";
+        let (program, parse_diags) = crate::parser::parse(src);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let (_checked, diags) = crate::check::check(&program);
+        let err = diags
+            .iter()
+            .find(|d| d.code == "K0200")
+            .unwrap_or_else(|| panic!("expected a K0200 type mismatch: {diags:?}"));
+        assert!(err.message.contains("List[_]"), "{}", err.message);
+        assert!(!err.message.contains("?0"), "must not leak the raw internal var id: {}", err.message);
+
+        // discriminating pair: an ordinary, fully-resolved type mismatch is
+        // UNAFFECTED -- the fix only changes rendering for a genuinely
+        // unconstrained `Ty::Var`, not every diagnostic.
+        let src2 = "fun main() uses io {\n    let y: Str = 5\n    print(y)\n}\n";
+        let (program2, _) = crate::parser::parse(src2);
+        let (_checked2, diags2) = crate::check::check(&program2);
+        let err2 = diags2
+            .iter()
+            .find(|d| d.code == "K0200")
+            .unwrap_or_else(|| panic!("expected a K0200 type mismatch: {diags2:?}"));
+        assert!(err2.message.contains("expected Str, found Int"), "{}", err2.message);
+
+        // an empty `par {}` block hits the exact same unconstrained-element-type
+        // path via a completely different expression kind.
+        let src3 = "fun main() uses io {\n    let x = par {}\n    let y: Str = x\n    print(\"{y}\")\n}\n";
+        let (program3, _) = crate::parser::parse(src3);
+        let (_checked3, diags3) = crate::check::check(&program3);
+        let err3 = diags3
+            .iter()
+            .find(|d| d.code == "K0200")
+            .unwrap_or_else(|| panic!("expected a K0200 type mismatch: {diags3:?}"));
+        assert!(err3.message.contains("List[_]"), "{}", err3.message);
+    }
 }
