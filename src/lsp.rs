@@ -1044,6 +1044,28 @@ fn signature_help_info(program: &crate::ast::Program, name: &str) -> Option<(Str
     for item in &program.items {
         match item {
             Item::Fun(f) if f.name == name => return Some((fun_sig_str(f), params_of(&f.params))),
+            // An ADT variant CONSTRUCTOR (`Circle(r: 5.0)`) is a genuine
+            // callable, exactly like a fun/method/contract signature --
+            // hover's own `item_signature` already resolves it via its own
+            // "constructor of a type?" fallback below, but signature_help_info
+            // never looked inside `Item::Type`'s variants at all, so typing a
+            // constructor call's arguments got no parameter hints, unlike
+            // typing an ordinary function call. Live-confirmed before this
+            // fix: `Circle(r: |1.0)` returned `null` signature help while an
+            // ordinary `helper(|5)` call correctly showed its signature
+            // (production-hardening PR-it1167, found via the struct-field-
+            // diff completeness-check technique established at PR-it1164,
+            // applied here to a genuinely different-shaped "enumerate every
+            // X" site than the workspace_symbol/document_symbol/completion
+            // family).
+            Item::Type(t) => {
+                if let Some(v) = t.variants.iter().find(|v| v.name == name) {
+                    let fs: Vec<String> =
+                        v.fields.iter().map(|p| format!("{}: {}", p.name, crate::fmt::ty_str(&p.ty))).collect();
+                    let sig = if fs.is_empty() { v.name.clone() } else { format!("{}({})", v.name, fs.join(", ")) };
+                    return Some((sig, params_of(&v.fields)));
+                }
+            }
             Item::Component(c) => {
                 // Production-hardening PR-it960: search separately, same
                 // rationale as `item_signature`'s own analogous fix.
@@ -3848,7 +3870,7 @@ mod tests {
     // a small multi-item program for the language-feature tests
     const PROG: &str = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\n\
                         type Shape = Circle(r: Float) | Square(s: Float)\n\
-                        fun main() uses io {\n    print(add(1, 2))\n}\n";
+                        fun main() uses io {\n    print(add(1, 2))\n    let c = Circle(r: 1.0)\n}\n";
 
     /// `LineIndex::resolve_utf16`'s own O(log L) result must be BYTE-FOR-BYTE
     /// identical to `diag::line_col_utf16`'s original O(L) full-rescan
@@ -4283,6 +4305,22 @@ mod tests {
             resolve_signature_help(PROG, type_line, 5).is_none(),
             "no active call on a line with no call at all"
         );
+
+        // An ADT variant CONSTRUCTOR call (`Circle(r: 1.0)`) is a genuine
+        // callable too (production-hardening PR-it1167, the SAME gap class
+        // as an ordinary function call, never itself mirrored for
+        // `Item::Type`'s variants in `signature_help_info`) -- hover already
+        // resolves a constructor's own signature, but signature help never
+        // looked inside a type's variants at all, so typing `Circle(r: |`
+        // used to show no parameter hint whatsoever.
+        let ctor_line = PROG.lines().position(|l| l.contains("let c = Circle(")).unwrap();
+        let ctor_line_text = PROG.lines().nth(ctor_line).unwrap();
+        let ctor_open_paren = ctor_line_text.find("Circle(").unwrap() + "Circle(".len();
+        let (ctor_label, ctor_params, ctor_active) = resolve_signature_help(PROG, ctor_line, ctor_open_paren)
+            .expect("signature help inside a constructor call's argument list");
+        assert_eq!(ctor_label, "Circle(r: Float)");
+        assert_eq!(ctor_params, vec!["r: Float".to_string()]);
+        assert_eq!(ctor_active, 0);
     }
 
     #[test]
