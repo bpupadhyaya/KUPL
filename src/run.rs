@@ -2929,6 +2929,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, live-confirmed FALSE-CONFIDENCE bug found+fixed (production-
+    /// hardening PR-it1182, a fresh Explore survey finding, independently
+    /// re-verified live before implementing -- see `prop::gen_str`'s own doc
+    /// comment for the full writeup): `prop::gen_str`'s alphabet used to be
+    /// lowercase letters and space ONLY, so a `forall s: Str` property whose
+    /// only counterexample needs an uppercase letter (or a digit, or
+    /// punctuation, or a non-ASCII character) could NEVER be falsified.
+    /// Live-confirmed BEFORE this fix via a real `kupl test` subprocess: this
+    /// EXACT law -- a trivially falsifiable property, since `"Q"` is an
+    /// ordinary, easily-constructed `Str` value -- reported `1 passed, 0
+    /// failed` on every run. This end-to-end test locks in the CLI-visible
+    /// behavior change, complementing `prop.rs`'s own more granular
+    /// `gen_str_produces_more_than_just_lowercase_letters_and_spaces` unit
+    /// test.
+    #[test]
+    fn forall_over_str_can_find_a_counterexample_that_needs_an_uppercase_letter() {
+        let dir = std::env::temp_dir().join(format!("kupl-forall-str-alphabet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("uppercase.kupl");
+        std::fs::write(
+            &file,
+            "law \"no uppercase Q\" {\n    forall s: Str {\n        expect !s.contains(\"Q\")\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::run_tests(file.to_str().unwrap()),
+            1,
+            "a property whose only counterexample needs an uppercase letter must now be caught, \
+             not silently pass 100/100 cases"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it905,
     /// a direct, self-initiated sibling-path sweep of PR-it903/PR-it904's own
     /// fix, independently re-verified live before implementing -- see

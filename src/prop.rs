@@ -106,11 +106,44 @@ fn gen_float(rng: &mut Rng) -> f64 {
 }
 
 fn gen_str(rng: &mut Rng) -> String {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz ";
+    // A REAL, live-confirmed coverage gap found+fixed (production-hardening
+    // PR-it1182, a fresh Explore survey finding, independently re-verified
+    // live before implementing): the alphabet used to be lowercase letters
+    // and space ONLY -- no uppercase, digits, punctuation, or non-ASCII
+    // characters were EVER generated. Unlike `gen_int`'s own deliberate,
+    // explicitly-documented range-capping (bounding magnitude specifically
+    // to avoid arithmetic overflow masking the property under test), this
+    // restriction had no stated rationale -- an accidental under-
+    // implementation, not an intentional scoping choice. Live-confirmed
+    // BEFORE this fix: `law "no uppercase Q" { forall s: Str { expect
+    // !s.contains("Q") } }` -- a trivially FALSIFIABLE property (any string
+    // containing `"Q"` is a valid, ordinary counterexample) -- reported
+    // `1 passed, 0 failed` on every run, since the generator could never
+    // produce `"Q"` (or any uppercase letter) at all. This is a
+    // FALSE-CONFIDENCE bug in `kupl test`'s own core property-testing
+    // feature: a user's buggy code that only fails for uppercase/digit/
+    // punctuation/non-ASCII input would silently pass 100/100 `forall`
+    // cases. Widened to include uppercase, digits, common punctuation, AND
+    // a small sample of multi-byte UTF-8 characters (including one
+    // requiring a UTF-16 surrogate pair) -- deliberately included given
+    // this exact UTF-8/UTF-16 boundary has been a REPEATED real-bug source
+    // elsewhere in this codebase (LSP position conversions, JSON `\u`
+    // surrogate-pair parsing), so a property generator that can actually
+    // produce such input has a real chance of catching similar bugs in
+    // USER code too. `shrink`'s own `Str` arm is UNAFFECTED (verified
+    // directly): it only ever REMOVES characters via `.chars()` (proper
+    // Unicode-aware iteration), never substitutes/replaces from this
+    // alphabet, so it shrinks correctly regardless of which characters are
+    // present.
+    const ALPHABET: &[char] = &[
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
+        's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
+        'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1',
+        '2', '3', '4', '5', '6', '7', '8', '9', ' ', '\t', '\n', '"', '\\', '\'', '.', ',', '!',
+        '?', '-', '_', 'é', '日', '🎉',
+    ];
     let len = rng.below(8) as usize;
-    (0..len)
-        .map(|_| ALPHABET[rng.below(ALPHABET.len() as u64) as usize] as char)
-        .collect()
+    (0..len).map(|_| ALPHABET[rng.below(ALPHABET.len() as u64) as usize]).collect()
 }
 
 fn gen_named(name: &str, rng: &mut Rng, types: &TypeDb, depth: usize) -> Result<Value, String> {
@@ -359,6 +392,42 @@ mod tests {
         for _ in 0..50 {
             assert_eq!(a.next(), b.next());
         }
+    }
+
+    /// A REAL, live-confirmed FALSE-CONFIDENCE bug found+fixed (production-
+    /// hardening PR-it1182, a fresh Explore survey finding, independently
+    /// re-verified live before implementing -- see `gen_str`'s own doc
+    /// comment for the full writeup): the generator's alphabet used to be
+    /// lowercase letters and space ONLY, so a `forall s: Str` property whose
+    /// only counterexample needs an uppercase letter, digit, punctuation, or
+    /// non-ASCII character could never be falsified -- `kupl test` would
+    /// silently report `1 passed, 0 failed` even for an ordinary,
+    /// trivially-falsifiable property. Live-confirmed BEFORE this fix via a
+    /// real `kupl test` subprocess: `forall s: Str { expect !s.contains(
+    /// "Q") }` reported a clean pass on every run. This test drives `gen_str`
+    /// over MANY samples and confirms it now genuinely produces characters
+    /// from every category the old alphabet was missing, over enough draws
+    /// (`CASES` -- the SAME budget a real `forall` uses) that a systematic
+    /// gap would reliably show up, not merely a probabilistic near-miss.
+    #[test]
+    fn gen_str_produces_more_than_just_lowercase_letters_and_spaces() {
+        let mut rng = Rng::new(SEED);
+        let mut saw_uppercase = false;
+        let mut saw_digit = false;
+        let mut saw_punctuation = false;
+        let mut saw_non_ascii = false;
+        for _ in 0..CASES {
+            for c in gen_str(&mut rng).chars() {
+                saw_uppercase |= c.is_ascii_uppercase();
+                saw_digit |= c.is_ascii_digit();
+                saw_punctuation |= matches!(c, '"' | '\\' | '\'' | '.' | ',' | '!' | '?' | '-' | '_');
+                saw_non_ascii |= !c.is_ascii();
+            }
+        }
+        assert!(saw_uppercase, "gen_str must be able to produce uppercase letters");
+        assert!(saw_digit, "gen_str must be able to produce digits");
+        assert!(saw_punctuation, "gen_str must be able to produce common punctuation");
+        assert!(saw_non_ascii, "gen_str must be able to produce non-ASCII (multi-byte UTF-8) characters");
     }
 
     #[test]
