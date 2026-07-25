@@ -1841,6 +1841,43 @@ fn component_field_named(c: &crate::ast::ComponentDecl, name: &str) -> bool {
         || c.children.iter().any(|ch| ch.name == name)
         || c.funs.iter().any(|f| f.name == name)
         || c.exposes.iter().any(|f| f.name == name)
+        // A REAL, live-confirmed correctness bug found+fixed (production-
+        // hardening PR-it1178, a fresh Explore survey finding, the SEVENTH
+        // sibling instance of the SAME "hardcoded binding-kind list forgot
+        // an entry" shape this function's own doc comment below already
+        // catalogs six of): a component's own `ports` (`in`/`out`) were
+        // never checked here. Unlike props/state/children/funs/exposes,
+        // `check.rs::bind_component_env` does NOT insert ports into
+        // `ctx.scopes` -- a port is referenced ONLY via the dedicated
+        // `emit <port>(...)` statement grammar (`Stmt::Emit`'s own `port:
+        // String` field, resolved by direct name-matching against
+        // `c.ports`, never through ordinary scope lookup) -- so this is NOT
+        // the SAME "shadows a same-named binding for type-checking" shape
+        // the other five fields share. But `scoped_occurrences`'s own
+        // occurrence-finding (`collect_occurrences`) is purely TEXTUAL/
+        // TOKEN-based (re-lexes the whole document, matching any
+        // `Tok::Ident` with the right text) -- it has no idea an
+        // occurrence's surrounding grammar makes it a port reference rather
+        // than an ordinary value use, so a port's own declaration AND its
+        // `emit` reference sites are unconditionally swept into the raw
+        // occurrence list. Without this check, THOSE occurrences were never
+        // excluded from an unrelated same-named top-level rename's edit,
+        // exactly the omission this function's shadow-zone role exists to
+        // prevent. Live-confirmed BEFORE this fix, via a real `kupl lsp`
+        // subprocess: `fun value() -> Int { 1 }` / `fun caller() -> Int {
+        // value() }` / `component C { in click: Event  out value: Int  on
+        // click { emit value(5) } }` -- renaming the TOP-LEVEL `value` to
+        // `renamed_fn` returned a non-null `WorkspaceEdit` touching FOUR
+        // locations, including `component C`'s own UNRELATED `out value:
+        // Int` port declaration and its `emit value(5)` reference. Applying
+        // that edit exactly as an editor would silently renames `C`'s own
+        // PUBLIC port interface (`out value` -> `out renamed_fn`) as an
+        // unintended side effect of a completely unrelated top-level
+        // rename -- any EXTERNAL `wire`/consumer of that port elsewhere
+        // (out of scope for this rename request, so not included in the
+        // edit) would be left referencing a port that no longer exists,
+        // silently breaking cross-component wiring with zero warning.
+        || c.ports.iter().any(|p| p.name == name)
 }
 
 /// Like `local_binding_scope`, but additionally treats a component's own
@@ -5289,6 +5326,57 @@ mod tests {
         let top_locs = occurrences_cross_file(exp_src, "widget", top_off, dir, &empty_buffers, dir, None);
         assert_eq!(top_locs.len(), 2, "top-level fun decl + its one call site, NOT the exposed method: {top_locs:?}");
         assert!(top_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{top_locs:?}");
+    }
+
+    /// A REAL, live-confirmed correctness bug found+fixed (production-hardening
+    /// PR-it1178, a fresh Explore survey finding, the SEVENTH sibling instance
+    /// of PR-it1138's own "hardcoded binding-kind list forgot an entry" shape
+    /// -- see `component_field_named`'s own doc comment for the full writeup):
+    /// a component's own `ports` were never checked here, unlike the other
+    /// five field kinds. Ports aren't bound into `ctx.scopes` the way props/
+    /// state/etc. are (an `emit <port>(...)` statement resolves its port by
+    /// direct name-matching, not scope lookup) -- but `scoped_occurrences`'s
+    /// own occurrence-finding is purely TEXTUAL (re-lexes the document,
+    /// blind to a token's surrounding grammar), so a port's declaration and
+    /// `emit` reference were still swept into the raw occurrence list and
+    /// never excluded from an unrelated same-named top-level rename. Live-
+    /// confirmed BEFORE this fix via a real `kupl lsp` subprocess: renaming
+    /// the top-level `fun value` to `renamed_fn` returned FOUR locations,
+    /// including `component C`'s own UNRELATED `out value: Int` port
+    /// declaration and its `emit value(5)` reference -- applying that edit
+    /// would silently change `C`'s own PUBLIC port interface as a side
+    /// effect of a completely unrelated rename, leaving any external
+    /// `wire`/consumer of that port referencing a name that no longer
+    /// exists.
+    #[test]
+    fn component_port_shadowing_an_unrelated_top_level_declaration_is_scoped_separately() {
+        let dir = std::path::Path::new("/fake/lsp-it1178-ports");
+        let empty_buffers: HashMap<PathBuf, String> = HashMap::new();
+
+        let src = "fun value() -> Int { 1 }\nfun caller() -> Int { value() }\ncomponent C {\n    intent \"c\"\n    in click: Event\n    out value: Int\n    on click {\n        emit value(5)\n    }\n}\n";
+
+        // renaming the top-level `fun value` must find ONLY its own decl + its
+        // one call site, NOT the component's own unrelated port decl/reference.
+        let fun_off = src.find("fun value").unwrap() + 4;
+        let fun_locs = occurrences_cross_file(src, "value", fun_off, dir, &empty_buffers, dir, None);
+        assert_eq!(
+            fun_locs.len(),
+            2,
+            "top-level fun decl + its one call site, NOT the component's own port: {fun_locs:?}"
+        );
+        assert!(fun_locs.iter().all(|(_, l0, ..)| *l0 == 0 || *l0 == 1), "{fun_locs:?}");
+
+        // the reverse direction: renaming the component's OWN port must find
+        // ONLY its own decl + its one `emit` reference, NOT the unrelated
+        // top-level fun/call.
+        let port_off = src.find("out value: Int").unwrap() + 4;
+        let port_locs = occurrences_cross_file(src, "value", port_off, dir, &empty_buffers, dir, None);
+        assert_eq!(
+            port_locs.len(),
+            2,
+            "the port's own decl + its one emit reference, NOT the unrelated top-level fun: {port_locs:?}"
+        );
+        assert!(port_locs.iter().all(|(_, l0, ..)| *l0 == 5 || *l0 == 7), "{port_locs:?}");
     }
 
     /// A REAL bug (production-hardening PR-it742): unlike the cross-file rename/
