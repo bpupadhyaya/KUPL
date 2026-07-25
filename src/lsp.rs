@@ -2659,23 +2659,43 @@ fn item_symbol(text: &str, item: &crate::ast::Item, line_index: &LineIndex) -> S
             symbol_json(&t.name, 10, &lsp_range(line_index, text, t.span), "", &children)
         }
         Item::Contract(c) => {
-            let children: Vec<String> = c
+            let mut children: Vec<String> = c
                 .sigs
                 .iter()
                 .map(|s| symbol_json(&s.name, 6, &lsp_range(line_index, text, s.span), &contract_sig_str(s), &[]))
                 .collect();
+            // A contract's own `law "..." { ... }` bodies used to be entirely
+            // absent from the document outline too, the SAME gap class as
+            // props/children/ports below -- only `sigs` was ever walked here,
+            // never `laws`, even though a TOP-LEVEL law with the same shape
+            // (via `Item::Law` just below) was already an outline entry, and
+            // `foldable_spans` (this function's own sibling, backing
+            // `textDocument/foldingRange`) already walked `c.laws` for fold
+            // arrows without ever surfacing them here in the outline
+            // (production-hardening PR-it1165, mirroring `workspace_symbols`'s
+            // own identical PR-it1164 fix for the SAME two fields).
+            children.extend(c.laws.iter().map(|l| symbol_json(&l.name, 12, &lsp_range(line_index, text, l.span), "", &[])));
             symbol_json(&c.name, 11, &lsp_range(line_index, text, c.span), "", &children)
         }
         Item::Law(l) => symbol_json(&l.name, 12, &lsp_range(line_index, text, l.span), "", &[]),
         Item::Component(c) => {
+            // Ports used to be entirely absent from the document outline too,
+            // the SAME gap class as props/children below -- a component's own
+            // declared ports (`in click: Event`/`out value: Int`) never
+            // appeared as child symbols at all, since only
+            // `state`/`props`/`children`/`exposes`/`funs` were ever walked
+            // here, never `ports` (production-hardening PR-it1165, mirroring
+            // `workspace_symbols`'s own identical PR-it1164 fix for the SAME
+            // field).
             let mut children: Vec<String> = c
-                .state
+                .ports
                 .iter()
-                .map(|s| {
-                    let detail = s.ty.as_ref().map(ty_str).unwrap_or_default();
-                    symbol_json(&s.name, 8, &lsp_range(line_index, text, s.span), &detail, &[])
-                })
+                .map(|p| symbol_json(&p.name, 8, &lsp_range(line_index, text, p.span), &ty_str(&p.ty), &[]))
                 .collect();
+            children.extend(c.state.iter().map(|s| {
+                let detail = s.ty.as_ref().map(ty_str).unwrap_or_default();
+                symbol_json(&s.name, 8, &lsp_range(line_index, text, s.span), &detail, &[])
+            }));
             // Props used to be entirely absent from the document/workspace symbol
             // outline, the SAME gap class as state fields above -- a component's
             // own declared props never appeared as child symbols at all, since
@@ -6873,7 +6893,7 @@ mod tests {
         // bugs already this campaign (it513/it514) -- an outline that only
         // shows component NAMES, none of their methods, would repeat the same
         // mistake in a fourth place.
-        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\ntype Shape = Circle(r: Float) | Square(s: Float)\ncomponent Sensor {\n    intent \"s\"\n    expose fun read() -> Int {\n        0\n    }\n}\ncomponent Greeter {\n    intent \"g\"\n    prop label: Str\n    state n: Int = 0\n    let temp = Sensor()\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\ncontract Store {\n    expose fun get(k: Str) -> Int\n}\n";
+        let src = "fun add(a: Int, b: Int) -> Int {\n    a + b\n}\ntype Shape = Circle(r: Float) | Square(s: Float)\ncomponent Sensor {\n    intent \"s\"\n    expose fun read() -> Int {\n        0\n    }\n}\ncomponent Greeter {\n    intent \"g\"\n    in trigger: Event\n    prop label: Str\n    state n: Int = 0\n    let temp = Sensor()\n    expose fun greet(name: Str) -> Str {\n        \"hi {name}\"\n    }\n    fun helper() -> Int {\n        5\n    }\n}\ncontract Store {\n    expose fun get(k: Str) -> Int\n\n    law \"gets return something\" {\n        expect get(\"k\") == 0\n    }\n}\n";
         let syms = document_symbols(src).expect("parses cleanly, should outline");
 
         // top-level items present with the right kinds
@@ -6886,19 +6906,26 @@ mod tests {
         assert!(syms.contains("\"name\":\"Circle\",\"kind\":22"), "{syms}"); // EnumMember
         assert!(syms.contains("\"name\":\"Square\",\"kind\":22"), "{syms}");
 
-        // component props (production-hardening PR-it872, the SAME gap class as
-        // state below, just never itself mirrored for `ComponentDecl.props`) +
-        // state + a CHILD (production-hardening PR-it873, the SAME gap class
-        // again, never itself mirrored for `ComponentDecl.children`) + BOTH
-        // exposed and private methods, all nested under the component
+        // a component PORT (production-hardening PR-it1165, the SAME gap
+        // class as props/state/children below, just never itself mirrored
+        // for `ComponentDecl.ports`) + props (production-hardening PR-it872,
+        // the SAME gap class as state below, just never itself mirrored for
+        // `ComponentDecl.props`) + state + a CHILD (production-hardening
+        // PR-it873, the SAME gap class again, never itself mirrored for
+        // `ComponentDecl.children`) + BOTH exposed and private methods, all
+        // nested under the component
+        assert!(syms.contains("\"name\":\"trigger\",\"kind\":8"), "{syms}"); // Field (port)
         assert!(syms.contains("\"name\":\"label\",\"kind\":8"), "{syms}"); // Field
         assert!(syms.contains("\"name\":\"n\",\"kind\":8"), "{syms}"); // Field
         assert!(syms.contains("\"name\":\"temp\",\"kind\":8"), "{syms}"); // Field (child)
         assert!(syms.contains("\"name\":\"greet\",\"kind\":6"), "{syms}"); // Method
         assert!(syms.contains("\"name\":\"helper\",\"kind\":6"), "{syms}");
 
-        // contract signature nested under the contract
+        // contract signature + a contract LAW (production-hardening
+        // PR-it1165, the SAME gap class again, never itself mirrored for
+        // `ContractDecl.laws`), both nested under the contract
         assert!(syms.contains("\"name\":\"get\",\"kind\":6"), "{syms}");
+        assert!(syms.contains("gets return something"), "{syms}");
 
         // unparseable source: nothing safe to outline
         assert_eq!(document_symbols("fun add(a: Int, b: Int -> Int {\n    a + b\n}\n"), None);
