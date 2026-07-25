@@ -10,6 +10,32 @@
 
 /// Parse CSV text into rows of string fields.
 pub fn parse(input: &str) -> Vec<Vec<String>> {
+    // A REAL, live-confirmed SILENT VALUE CORRUPTION bug found+fixed
+    // (production-hardening PR-it1172): a leading UTF-8 byte-order mark
+    // (U+FEFF -- commonly prepended by Excel/Windows tools to CSV exports)
+    // used to be pushed into the very first field as ordinary content by
+    // the final `else` arm below, exactly like any other character. That
+    // desyncs the `field.is_empty()` quote-open guard just above: by the
+    // time the parser reaches the file's REAL opening `"`, `field` is no
+    // longer empty (it already holds the invisible BOM), so that `"` is
+    // wrongly treated as literal content instead of opening a quoted field
+    // -- the SAME "mid-field quote" misparse PR-it712's own guard exists
+    // to prevent, just triggered by an invisible leading character rather
+    // than a visible one. Confirmed live before this fix, identically on
+    // interp/vm/native (cgen.rs's `k_csv_parse` has the SAME bug):
+    // `csv_parse("\u{FEFF}\"a,b\",c\n1,2,3")` produced a corrupted THREE-
+    // field first row (the BOM and a stray literal `"` baked in, the comma
+    // inside the quotes wrongly splitting the field) instead of the
+    // documented-grammar-correct TWO fields (`["a,b", "c"]`) every other
+    // CSV reader in common use (Python's `csv` with `utf-8-sig`, Excel
+    // itself, most JS/Go CSV libraries) produces by treating a leading BOM
+    // as invisible to parsing. Unreachable via this library's own
+    // `stringify` (which never emits a BOM), but a real gap when parsing
+    // externally-sourced CSV -- the same category as PR-it1073's bare-`\r`
+    // fix just below. A BOM appearing anywhere OTHER than the very start
+    // is unaffected (it's already just ordinary field content there,
+    // exactly as intended).
+    let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
     let chars: Vec<char> = input.chars().collect();
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
@@ -330,6 +356,41 @@ mod tests {
         assert_eq!(p("a,b\r\nc,d\n"), vec![vec!["a", "b"], vec!["c", "d"]]);
         // round-trips cleanly through this library's own stringify/parse.
         let original = vec![vec!["a".to_string(), "b\rc".to_string(), "d".to_string()]];
+        assert_eq!(p(&stringify(&original)), original);
+    }
+
+    /// A REAL, live-confirmed SILENT VALUE CORRUPTION bug found+fixed
+    /// (production-hardening PR-it1172, an Explore survey finding,
+    /// independently re-verified live before implementing, including its
+    /// equivalent in `cgen.rs`'s `k_csv_parse`): a leading UTF-8 byte-order
+    /// mark (U+FEFF -- commonly prepended by Excel/Windows tools to CSV
+    /// exports) used to be pushed into the very first field as ordinary
+    /// content, desyncing the `field.is_empty()` quote-open guard just
+    /// above -- by the time the parser reached the file's REAL opening
+    /// `"`, `field` was no longer empty, so that `"` was wrongly treated
+    /// as literal content instead of opening a quoted field, exactly the
+    /// "mid-field quote" misparse PR-it712's own guard exists to prevent.
+    /// `parse("\u{FEFF}\"a,b\",c\n1,2,3")` used to produce a corrupted
+    /// THREE-field first row instead of the documented-grammar-correct TWO
+    /// fields, with the BOM and a stray literal `"` baked into the output.
+    #[test]
+    fn a_leading_bom_is_invisible_to_parsing_not_pushed_into_the_first_field() {
+        // the bug's reproducer: a leading BOM used to corrupt the first row's
+        // own field count and content.
+        assert_eq!(p("\u{FEFF}\"a,b\",c\n1,2,3"), vec![vec!["a,b", "c"], vec!["1", "2", "3"]]);
+        // an unquoted first field is affected the same way -- the BOM used to
+        // be baked in as a leading invisible character.
+        assert_eq!(p("\u{FEFF}a,b"), vec![vec!["a", "b"]]);
+        // discriminating pair: a BOM anywhere OTHER than the very start is
+        // completely unaffected -- it's already just ordinary field content
+        // there, exactly as intended.
+        assert_eq!(p("a,b\u{FEFF}c\nd,e"), vec![vec!["a", "b\u{FEFF}c"], vec!["d", "e"]]);
+        // a BOM-only input (no other content) parses as a single empty row,
+        // not a crash or a phantom field.
+        assert_eq!(p("\u{FEFF}"), Vec::<Vec<String>>::new());
+        // round-trips cleanly: this library's own stringify never emits a
+        // BOM, so re-parsing its own output is unaffected either way.
+        let original = vec![vec!["a,b".to_string(), "c".to_string()]];
         assert_eq!(p(&stringify(&original)), original);
     }
 

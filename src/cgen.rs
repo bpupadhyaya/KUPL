@@ -3519,6 +3519,17 @@ static KValue k_query_build(KValue lst) {
 }
 static KValue k_csv_parse(KValue s) {
     const char* in = k_as_str(s);
+    /* Mirrors csv.rs's own identical PR-it1172 fix exactly: a leading
+       UTF-8 byte-order mark (0xEF 0xBB 0xBF) is invisible to parsing,
+       matching every other CSV reader in common use -- see csv.rs's own
+       doc comment for the full live-confirmed repro. Safe to read
+       in[1]/in[2] here even for a very short string: `&&` short-circuits
+       left-to-right, and in[0] being the NUL terminator (0x00) on an
+       empty string never equals 0xEF, so a short string can never reach
+       the in[1]/in[2] reads at all. */
+    if ((unsigned char)in[0] == 0xEF && (unsigned char)in[1] == 0xBB && (unsigned char)in[2] == 0xBF) {
+        in += 3;
+    }
     long n = (long)strlen(in), i = 0;
     /* growable (PR-it558: were fixed 4096-slot stack arrays, silently dropping any
        row or column past the 4096th -- the same bug class as it555-557). */
