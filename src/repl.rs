@@ -210,7 +210,26 @@ pub fn repl() -> i32 {
             Err(d) => {
                 eprintln!("error[{}]: {}", d.code, d.message);
             }
-            Ok(stmt) => {
+            Ok(mut stmt) => {
+                // A REAL, live-confirmed silent-WRONG-VALUE bug found+fixed
+                // (production-hardening PR-it1181): unlike the item-declaration
+                // path above (which routes through `run::compile`, calling
+                // `callargs::resolve_call_args` like an ordinary program), a
+                // bare statement/expression used to go straight from parsing to
+                // execution -- named-argument calls were silently reinterpreted
+                // POSITIONALLY, and a trailing default parameter panicked
+                // instead of being applied. See `resolve_call_args_in_stmt`'s
+                // own doc comment for the full writeup and live repro.
+                let call_diags = crate::callargs::resolve_call_args_in_stmt(
+                    interp.db.funs.values().map(|f| f.as_ref()),
+                    &mut stmt,
+                );
+                if !call_diags.is_empty() {
+                    for d in &call_diags {
+                        eprintln!("error[{}]: {}", d.code, d.message);
+                    }
+                    continue;
+                }
                 let env = interp.globals.clone();
                 match interp.exec_stmt_public(&stmt, &env) {
                     Ok(Value::Unit) => {}
@@ -729,6 +748,88 @@ mod tests {
         assert!(
             !stdout.contains("should not run"),
             ":quit must genuinely terminate the session, not get silently appended to a dead buffer: {stdout}"
+        );
+        assert!(out.status.success(), ":quit must exit cleanly: {out:?}");
+    }
+
+    /// A REAL, live-confirmed silent-WRONG-VALUE bug found+fixed (production-
+    /// hardening PR-it1181, a fresh Explore survey finding, independently
+    /// re-verified live before implementing -- see `callargs::
+    /// resolve_call_args_in_stmt`'s own doc comment for the full writeup): a
+    /// bare statement/expression typed at the REPL prompt -- the REPL's OWN
+    /// PRIMARY interactive mode -- went straight from parsing to execution,
+    /// entirely bypassing `callargs::resolve_call_args`, unlike the item-
+    /// declaration path (`fun`/`type`/...) a few lines above, which routes
+    /// through `run::compile` like an ordinary program. Live-confirmed BEFORE
+    /// this fix via a real `kupl repl` subprocess: `fun sub(a: Int, b: Int)
+    /// -> Int { a - b }` then `sub(b: 2, a: 10)` printed `-8` (the named
+    /// arguments silently reinterpreted POSITIONALLY) instead of the correct
+    /// `8` the IDENTICAL call gives inside a function body; `fun greet(name:
+    /// Str, punct: Str = "!") -> Str { "{name}{punct}" }` then `greet("hi")`
+    /// panicked instead of correctly applying the trailing default.
+    #[test]
+    fn a_bare_statement_at_the_repl_prompt_resolves_named_arguments_and_defaults_like_a_real_program() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "fun sub(a: Int, b: Int) -> Int { a - b }\n\
+             sub(b: 2, a: 10)\n\
+             fun greet(name: Str, punct: Str = \"!\") -> Str { \"{name}{punct}\" }\n\
+             greet(\"hi\")\n\
+             fun add(a: Int, b: Int) -> Int { a + b }\n\
+             add(3, 4)\n\
+             sub(a: 1, c: 2)\n\
+             :quit\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung on named-arg/default resolution").expect("wait_with_output succeeds");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("8\n"),
+            "named arguments must resolve correctly (10 - 2 = 8), not positionally (-8): {stdout}"
+        );
+        assert!(!stdout.contains("-8"), "must not silently compute the WRONG positional answer: {stdout}");
+        assert!(
+            stdout.contains("hi!"),
+            "a trailing default parameter must be applied, not panic: {stdout}"
+        );
+        assert!(
+            !stderr.contains("takes 2 argument"),
+            "must not panic on a missing-but-defaulted trailing argument: {stderr}"
+        );
+        // discriminating pair: an ordinary POSITIONAL call (baseline, no named
+        // args/defaults involved at all) must be completely unaffected.
+        assert!(stdout.contains("7\n"), "an ordinary positional call must still work: {stdout}");
+        // discriminating pair: a genuinely malformed named-arg call (unknown
+        // parameter name) must still be a clean error, not silently accepted
+        // or a panic/crash.
+        assert!(
+            stderr.contains("K0273") || stderr.contains("K0274"),
+            "an unknown parameter name must still be a clean, reported error: {stderr}"
+        );
+        assert!(
+            !stdout.contains("panicked at") && !stdout.contains("internal compiler error"),
+            "kupl repl panicked: {stdout}"
         );
         assert!(out.status.success(), ":quit must exit cleanly: {out:?}");
     }

@@ -98,6 +98,57 @@ pub fn resolve_call_args(program: &mut Program) -> Vec<Diag> {
     r.diags
 }
 
+/// Resolve named-argument/default-parameter calls within a SINGLE bare
+/// statement, given the CURRENTLY KNOWN top-level function signatures --
+/// used ONLY by `repl.rs`'s own statement/expression evaluation path
+/// (production-hardening PR-it1181, a fresh Explore survey finding,
+/// independently re-verified live before implementing).
+///
+/// A REAL, live-confirmed silent-WRONG-VALUE bug found+fixed: the REPL's
+/// item-declaration path (`fun`/`type`/`component`/...) routes through
+/// `run::compile`, which calls `resolve_call_args` above like an ordinary
+/// program -- but a BARE statement/expression typed at the prompt (the
+/// REPL's OWN primary interactive mode) went straight from
+/// `parser::parse_stmt_fragment` to `Interp::exec_stmt_public`, entirely
+/// bypassing this whole module. Live-confirmed BEFORE this fix, via a real
+/// `kupl repl` subprocess: `fun sub(a: Int, b: Int) -> Int { a - b }` then
+/// `sub(b: 2, a: 10)` printed `-8` (the named arguments silently
+/// reinterpreted POSITIONALLY: `a=2, b=10`) instead of the correct `8` the
+/// IDENTICAL call gives when written inside a function body; `fun greet(
+/// name: Str, punct: Str = "!") -> Str { "{name}{punct}" }` then
+/// `greet("hi")` panicked ``greet` takes 2 argument(s), 1 given`` instead
+/// of correctly applying the trailing default and printing `hi!`.
+///
+/// Mirrors `fun_body`'s own scope setup exactly (push one frame, no params
+/// to bind since a bare statement isn't inside any function, walk via the
+/// SAME `block`/`stmt` methods `resolve_call_args`'s whole-program walk
+/// uses) -- so a `let` WITHIN the statement itself correctly shadows a
+/// same-named top-level function, exactly like it would inside a real
+/// fun's body, reusing `Resolver`'s existing `is_local` shadowing guard
+/// unchanged (see `resolve_call_args`'s own doc comment, PR-it894, for why
+/// that guard matters). Deliberately does NOT persist shadowing across
+/// SEPARATE REPL submissions (e.g. a `let combine = fn(m, n) {...}` typed
+/// at an earlier prompt does not shadow a later bare `combine(y: 2, x: 5)`
+/// call in a NEW submission) -- this matches the REPL's own existing,
+/// pre-existing architecture: `defs_items`/`run::compile` already only
+/// track ITEM declarations, never bare-statement `let`s, so an item
+/// declaration typed afterward has this exact same limitation already;
+/// not a new regression this fix introduces.
+pub fn resolve_call_args_in_stmt<'a>(known_funs: impl Iterator<Item = &'a FunDecl>, stmt: &mut Stmt) -> Vec<Diag> {
+    let mut funs: HashMap<String, Vec<Param>> = HashMap::new();
+    for f in known_funs {
+        if f.ai.is_some() {
+            continue; // ai funs are prompt templates, not ordinary calls
+        }
+        funs.insert(f.name.clone(), f.params.clone());
+    }
+    let mut r = Resolver { funs: &funs, diags: Vec::new(), temp_counter: 0, scope: Vec::new() };
+    r.push();
+    r.stmt(stmt);
+    r.pop();
+    r.diags
+}
+
 struct Resolver<'a> {
     funs: &'a HashMap<String, Vec<Param>>,
     diags: Vec<Diag>,
