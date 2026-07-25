@@ -338,12 +338,43 @@ fn interface_of(item: &Item) -> String {
             // sig-interface gap `PR-it580` fixed for contract method effects,
             // just for `Item::Type` this time (production-hardening PR-it643).
             s.push_str(&format!("[{}]", t.type_params.join(",")));
-            for v in &t.variants {
-                s.push_str(&format!("{}(", v.name));
-                for fld in &v.fields {
-                    s.push_str(&format!("{}:{},", fld.name, ty_str(&fld.ty)));
-                }
-                s.push(')');
+            // A REAL, live-confirmed FALSE POSITIVE found+fixed (production-
+            // hardening PR-it1173, the SAME "order consumed by name/set
+            // membership, but fingerprinted by declaration order" bug class
+            // already fixed for `fulfills`/`ports`/`exposes` (PR-it646) and
+            // `uses` effects (PR-it1043), just for a sum type's own variant
+            // LIST this time -- a variant's own FIELDS are correctly left
+            // in declaration order below (genuinely caller-observable:
+            // constructors/patterns can be positional), but the variants
+            // themselves are matched by NAME everywhere (there is no
+            // positional variant selector or ordinal comparison for user
+            // sum types anywhere in this codebase), so their declaration
+            // order carries no interface-observable meaning. Confirmed
+            // live before this fix: `type C = Red | Green | Blue` reordered
+            // to `type C = Blue | Green | Red` (no other change) reported
+            // `[INTERFACE — breaking]`; a program pattern-matching on `C`
+            // by name produced byte-identical output regardless of which
+            // declaration order was used. Fixed the same way as the
+            // Component arm just below: render each variant's own
+            // substring first, then sort the LIST of rendered variants
+            // (not each variant's own field order) before joining, so a
+            // pure reorder no longer changes the fingerprint while a
+            // genuine addition/removal/rename still does.
+            let mut variants: Vec<String> = t
+                .variants
+                .iter()
+                .map(|v| {
+                    let mut vs = format!("{}(", v.name);
+                    for fld in &v.fields {
+                        vs.push_str(&format!("{}:{},", fld.name, ty_str(&fld.ty)));
+                    }
+                    vs.push(')');
+                    vs
+                })
+                .collect();
+            variants.sort();
+            for v in variants {
+                s.push_str(&v);
             }
         }
         Item::Component(c) => {
@@ -1043,6 +1074,54 @@ mod tests {
         // sanity: a GENUINE effect addition (not just reordered) still reports breaking.
         let (lines, _) = diff_lines("fun f() uses io, net {\n    1\n}\n", "fun f() uses io, net, fs {\n    1\n}\n");
         assert_eq!(lines, vec!["interface f"], "an actual new effect must still be flagged breaking");
+    }
+
+    /// A REAL, live-confirmed FALSE POSITIVE found+fixed (production-
+    /// hardening PR-it1173, the SAME class as `PR-it646`'s `fulfills`/
+    /// `ports`/`exposes` fix and `PR-it1043`'s `uses`-effects fix,
+    /// independently re-verified live before implementing): a sum type's
+    /// own variants are matched BY NAME everywhere (there is no positional
+    /// variant selector or ordinal comparison anywhere in this codebase),
+    /// so declaration order is not interface-observable -- but
+    /// `interface_of`'s `Item::Type` arm rendered variants in raw
+    /// declaration order, so reordering a type's variants with no other
+    /// change was wrongly flagged `[INTERFACE — breaking]`. A variant's
+    /// own FIELD order is deliberately UNCHANGED by this fix (still
+    /// declaration order) -- fields genuinely ARE caller-observable
+    /// (constructors/patterns can be positional).
+    #[test]
+    fn type_variant_reorder_is_not_interface() {
+        // NOTE: same as the two tests above -- `canonical()` preserves source
+        // order, so reordering still registers as SOME change; the fix is
+        // about the interface/impl CLASSIFICATION, so the expectation is `impl`.
+        let (lines, _) =
+            diff_lines("type C = Red | Green | Blue\n", "type C = Blue | Green | Red\n");
+        assert_eq!(lines, vec!["impl C"], "reordering a type's variants must be implementation-only");
+
+        // a variant with fields reorders the same way.
+        let (lines, _) = diff_lines(
+            "type Shape = Circle(r: Float) | Square(s: Float)\n",
+            "type Shape = Square(s: Float) | Circle(r: Float)\n",
+        );
+        assert_eq!(lines, vec!["impl Shape"]);
+
+        // sanity: a GENUINE variant addition/removal/rename still reports breaking.
+        let (lines, _) =
+            diff_lines("type C = Red | Green | Blue\n", "type C = Red | Green | Blue | Yellow\n");
+        assert_eq!(lines, vec!["interface C"], "an actual new variant must still be flagged breaking");
+        let (lines, _) = diff_lines("type C = Red | Green | Blue\n", "type C = Red | Green\n");
+        assert_eq!(lines, vec!["interface C"], "an actual removed variant must still be flagged breaking");
+        let (lines, _) =
+            diff_lines("type C = Red | Green | Blue\n", "type C = Red | Green | Purple\n");
+        assert_eq!(lines, vec!["interface C"], "a renamed variant must still be flagged breaking");
+
+        // sanity: a variant's OWN field order is still declaration-order-sensitive,
+        // unaffected by this fix.
+        let (lines, _) = diff_lines(
+            "type P = Pair(a: Int, b: Str)\n",
+            "type P = Pair(b: Str, a: Int)\n",
+        );
+        assert_eq!(lines, vec!["interface P"], "a variant's own field order must still be interface-sensitive");
     }
 
     /// Same false-positive shape as the component test above, for `Item::Contract`'s
