@@ -333,6 +333,69 @@ fn inhabited_named_types(types: &HashMap<String, TypeSig>) -> HashSet<String> {
     inhabited
 }
 
+/// Whether `ty` (already RESOLVED, so a generic instantiation's own type
+/// arguments are concrete, e.g. `Box[Int]`) is a shape `prop::generate` can
+/// actually produce a value for -- closes a gap this file's own doc comment
+/// on `inhabited_named_types` already flagged as known but deliberately
+/// left open: "`is_generatable` only checks the forall binder's OWN
+/// top-level type, not types nested inside a variant's fields" (production-
+/// hardening PR-it693/PR-it727). `prop::is_generatable` operates on raw,
+/// pre-resolution `TyExpr` and only ever inspects the ONE type handed to
+/// it -- it has no way to see that a field several layers down is a
+/// user-defined GENERIC instantiation, since a type parameter's raw AST
+/// form (`T`) carries no information about what it's eventually
+/// instantiated to. This function instead walks the CHECKED, substituted
+/// `Ty` representation, so `Box[T]`'s own `v: T` field is already `Int` by
+/// the time it's examined, not an opaque, unregistered `T`.
+///
+/// A monomorphic named type's fields are checked recursively (self/mutual
+/// reference short-circuits via `visited` as shape-OK -- finiteness in the
+/// presence of recursion is `inhabited_named_types`'s own, separate
+/// concern, checked independently right after this one). A user-defined
+/// GENERIC instantiation (non-empty type arguments) is unconditionally
+/// unsupported regardless of what's inside, mirroring `prop::generate`'s
+/// own `TyExprKind::Generic` match arm, which only ever special-cases
+/// `"List"`/`"Option"` and fails closed (`no generator for type ...`) for
+/// every other generic name -- so a nested `Box[Int]` field can be
+/// rejected without needing to know Box's own field structure at all.
+///
+/// A REAL silent-footgun bug found+fixed (production-hardening PR-it1185):
+/// `type Box[T] = Wrap(v: T)` / `type Wrapper = W(inner: Box[Int])` /
+/// `law "x" { forall w: Wrapper { expect true } }` passed `kupl check`
+/// cleanly (exit 0, zero diagnostics) and then unconditionally FAILED
+/// every single `kupl test` run with `error[K0900]: panic: no generator
+/// for type `Box[Int]`` -- even for a tautologically true body -- exactly
+/// the failure class `is_generatable` (PR-it693) was built to prevent, one
+/// level of type nesting deeper than it previously checked. Confirmed live
+/// before this fix.
+fn ty_shape_is_generatable(ty: &Ty, types: &HashMap<String, TypeSig>, visited: &mut HashSet<String>) -> bool {
+    match ty {
+        Ty::Int | Ty::Bool | Ty::Float | Ty::Str => true,
+        Ty::List(inner) | Ty::Option(inner) => ty_shape_is_generatable(inner, types, visited),
+        Ty::Named(n, targs) => {
+            if !targs.is_empty() {
+                return false;
+            }
+            if visited.contains(n) {
+                return true;
+            }
+            match types.get(n) {
+                Some(sig) if !sig.variants.is_empty() => {
+                    visited.insert(n.clone());
+                    let ok = sig
+                        .variants
+                        .iter()
+                        .all(|v| v.fields.iter().all(|(_, fty)| ty_shape_is_generatable(fty, types, visited)));
+                    visited.remove(n);
+                    ok
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn common_method_alias(name: &str) -> Option<&'static str> {
     match name {
         "length" | "size" | "count_elements" => Some("len"),
@@ -2566,10 +2629,17 @@ impl Checker {
                     // silently pass THIS check (no unify/resolve failure) and
                     // then unconditionally FAIL every `kupl test` run at
                     // runtime, even for a tautologically true body like
-                    // `expect true` (production-hardening PR-it693).
+                    // `expect true` (production-hardening PR-it693). `resolve_ty`
+                    // is called exactly ONCE here (not once per check below) and
+                    // its result reused throughout — it both emits diagnostics
+                    // for an unresolvable name AND allocates fresh unification-
+                    // var ids for a generic instantiation, so calling it twice
+                    // for the SAME `ty` would double-diagnose and/or hand two
+                    // different checks two different fresh vars for one type.
+                    let t = self.resolve_ty(ty);
                     let structurally_ok = crate::prop::is_generatable(ty, &|n| {
                         self.checked.types.get(n).is_some_and(|sig| !sig.variants.is_empty())
-                    });
+                    }) && ty_shape_is_generatable(&t, &self.checked.types, &mut HashSet::new());
                     if !structurally_ok {
                         self.err(
                             "K0276",
@@ -2589,7 +2659,6 @@ impl Checker {
                             ty.span,
                         );
                     }
-                    let t = self.resolve_ty(ty);
                     ctx.scopes.insert(name, t, false);
                 }
                 self.check_block(body, ctx);
@@ -6546,6 +6615,54 @@ mod generic_tests {
             "type Tree = Leaf | Node(l: Tree, r: Tree)\ntype Forest = Bar(xs: List[Tree])\nlaw \"x\" { forall f: Forest { expect true } }\n"
         )
         .is_empty());
+    }
+
+    /// A REAL silent-footgun bug found+fixed (production-hardening
+    /// PR-it1185): the SAME failure mode PR-it693 closed for a `forall`
+    /// binder's OWN top-level type -- pass `kupl check` cleanly, then
+    /// unconditionally fail every `kupl test` run at runtime, even for a
+    /// tautologically true body -- was still reachable ONE level of type
+    /// nesting deeper. `is_generatable`'s own doc comment already flagged
+    /// this exact gap as pre-existing and deliberately left open by
+    /// PR-it727 ("K0276 only checks the forall binder's OWN top-level
+    /// type, not types nested inside a variant's fields"). `type Box[T] =
+    /// Wrap(v: T)` used as a FIELD of another type (`type Wrapper =
+    /// W(inner: Box[Int])`) is the concrete shape: `Box[Int]` is a
+    /// user-defined GENERIC instantiation, which `prop::generate` never
+    /// supports (only `List[T]`/`Option[T]` are special-cased generics),
+    /// but nothing previously inspected `Wrapper`'s OWN field types to
+    /// notice. Confirmed live BEFORE this fix: `kupl check` said "ok",
+    /// `kupl test` failed with `error[K0900]: panic: no generator for type
+    /// `Box[Int]`` even for `expect true`.
+    #[test]
+    fn forall_binder_over_a_type_whose_field_is_an_unsupported_generic_instantiation_is_rejected_at_check_time() {
+        let err = errors(
+            "type Box[T] = Wrap(v: T)\ntype Wrapper = W(inner: Box[Int])\nlaw \"x\" { forall w: Wrapper { expect true } }\n",
+        );
+        assert!(
+            err.iter().any(|d| d.code == "K0276"
+                && d.message.contains("forall variable `w`")
+                && d.message.contains("Wrapper")),
+            "{err:?}"
+        );
+        // Burying the SAME unsupported generic field one level deeper (inside a
+        // List, and inside a second wrapping record) must still be caught.
+        let nested_err = errors(
+            "type Box[T] = Wrap(v: T)\ntype Wrapper = W(inner: Box[Int])\ntype Outer = O(w: List[Wrapper])\nlaw \"x\" { forall o: Outer { expect true } }\n",
+        );
+        assert!(
+            nested_err.iter().any(|d| d.code == "K0276" && d.message.contains("Outer")),
+            "{nested_err:?}"
+        );
+        // A monomorphic named type wrapping ANOTHER monomorphic named type
+        // (no generics anywhere) must NOT be affected by this fix.
+        assert!(errors(
+            "type Inner = I(x: Int)\ntype Outer = O(i: Inner)\nlaw \"x\" { forall o: Outer { expect true } }\n"
+        )
+        .is_empty());
+        // A generic type used monomorphically is unaffected too -- only an
+        // ACTUAL instantiation (`Box[Int]`) is rejected, not the declaration.
+        assert!(errors("type Box[T] = Wrap(v: T)\nlaw \"x\" { forall n: Int { expect true } }\n").is_empty());
     }
 
     /// A REAL false-positive bug found+fixed (production-hardening
