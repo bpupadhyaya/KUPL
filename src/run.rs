@@ -684,9 +684,26 @@ pub fn pkg_tree(path: &str) -> i32 {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("kupl.lock");
-    let locked = std::fs::read_to_string(&lock_path)
-        .ok()
-        .map(|t| crate::loader::lock_hashes(&t));
+    // A REAL bug found+fixed (production-hardening PR-it1210, the SAME
+    // discarded-`io::Error` class fixed for `scaffold_project` at PR-it1208):
+    // `.ok()` collapsed EVERY read failure into the same `None` as "no
+    // kupl.lock yet" -- a genuinely unreadable lockfile (permission denied,
+    // or replaced by a directory) silently skipped ALL drift/orphan
+    // reporting below with zero diagnostic, making a stale/inconsistent
+    // project look identical to a perfectly locked one. Live-confirmed
+    // before this fix: `chmod 000 kupl.lock` then `kupl pkg tree` printed
+    // the exact same output as a fresh project with no lockfile at all.
+    // `io::ErrorKind::NotFound` (the one legitimate "not locked yet" case)
+    // still silently becomes `None`, unchanged; any OTHER read failure now
+    // warns instead of vanishing.
+    let locked = match std::fs::read_to_string(&lock_path) {
+        Ok(t) => Some(crate::loader::lock_hashes(&t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("warning: kupl.lock exists but could not be read: {e}");
+            None
+        }
+    };
     for d in &deps {
         let ver = if d.version.is_empty() { "?".to_string() } else { d.version.clone() };
         // A REAL bug found+fixed (production-hardening PR-it763, the second

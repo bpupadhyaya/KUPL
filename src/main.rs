@@ -2621,6 +2621,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A REAL bug found+fixed (production-hardening PR-it1210, the SAME
+    /// discarded-`io::Error` class fixed for `scaffold_project` at PR-it1208):
+    /// `pkg_tree`'s own `kupl.lock`-reading logic used `.ok()`, collapsing a
+    /// genuinely unreadable lockfile (permission denied) into the exact same
+    /// `None` as "no lockfile yet" -- silently skipping ALL drift/orphan
+    /// reporting with zero diagnostic to the user. Live-confirmed BEFORE this
+    /// fix: `chmod 000 kupl.lock` then `kupl pkg tree` printed byte-identical
+    /// output to a project with no lockfile at all, no warning, exit 0.
+    #[test]
+    #[cfg(unix)]
+    fn pkg_tree_warns_instead_of_silently_skipping_drift_detection_when_the_lockfile_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("kupl-pkgtree-unreadable-lock-{}", std::process::id()));
+        let dir = base.join("proj");
+        let dep = base.join("dep");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("kupl.toml"), "[project]\nname = \"dep\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(dep.join("main.kupl"), "pub fun helper() -> Int {\n    1\n}\n").unwrap();
+        // `pkg_tree` returns early (before ever reading `kupl.lock`) when the
+        // manifest has NO dependencies at all -- this test needs a real
+        // dependency to reach the buggy lockfile-reading code path.
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"proj\"\nentry = \"main.kupl\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "use dep\nfun main() {}\n").unwrap();
+        let main_str = dir.join("main.kupl").to_str().unwrap().to_string();
+
+        assert!(
+            std::process::Command::new(&bin).args(["pkg", "lock", &main_str]).status().unwrap().success(),
+            "pkg lock must succeed"
+        );
+        let lock_path = dir.join("kupl.lock");
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out = std::process::Command::new(&bin).args(["pkg", "tree", &main_str]).output().unwrap();
+
+        // restore permissions before any cleanup, whether or not the assertions below panic.
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(out.status.success(), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("kupl.lock exists but could not be read"),
+            "an unreadable lockfile must warn, not silently vanish: {stderr:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A REAL structural test-coverage gap found+closed (production-hardening
     /// PR-it785, an Explore survey finding into the differential-testing
     /// harness's OWN meta-level coverage, independently re-verified live
