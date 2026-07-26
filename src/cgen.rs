@@ -6512,16 +6512,28 @@ static KValue k_now(void) { return k_int((int64_t)time(0)); }
 /* read one line from stdin (newline stripped); None at EOF */
 static KValue k_read_line(void) {
     KBuf b = { 0, 0, 0 };
-    int c, any = 0;
+    int c, any = 0, saw_newline = 0;
     while ((c = getchar()) != EOF) {
         any = 1;
-        if (c == '\n') break;
+        if (c == '\n') { saw_newline = 1; break; }
         char ch = (char)c;
         kb_write(&b, &ch, 1);
     }
     if (!any) return k_none();
-    /* strip a trailing \r (CRLF input) */
-    if (b.len > 0 && b.buf[b.len - 1] == '\r') { b.len--; b.buf[b.len] = 0; }
+    /* Only strip a trailing \r when it directly precedes a REAL '\n'
+       terminator (production-hardening PR-it1191, the sibling of PR-it817's
+       identical fix for `Str.lines()` just above): this used to strip ANY
+       trailing '\r' unconditionally, including a bare one at EOF with no
+       following '\n' at all. `proc_builtin`'s own "read_line" arm
+       (interp.rs, shared verbatim by the VM's `Op::CallBuiltin`) only pops
+       a '\r' AFTER first confirming the line's own last byte was '\n' -- a
+       lone trailing '\r' immediately followed by EOF is ordinary content,
+       not a CRLF terminator, and must be preserved on every engine.
+       Confirmed live: piping the 4 raw bytes `abc\r` (no trailing `\n` at
+       all) into `match read_line() { Some(s) => print(s.len()) .. }`
+       printed `4` on both `kupl run` and `kupl run --vm`, but `3` on a
+       `kupl native`-compiled binary given the identical stdin bytes. */
+    if (saw_newline && b.len > 0 && b.buf[b.len - 1] == '\r') { b.len--; b.buf[b.len] = 0; }
     /* a KUPL Str is NUL-free valid UTF-8 — reject rather than truncate (native) or
        embed (interp), matching the interpreter. */
     if (b.buf && memchr(b.buf, 0, b.len)) k_panic("read_line: stdin line contains a NUL byte");
@@ -17511,6 +17523,70 @@ fun main() uses io {
         assert_eq!(run_with(&[0xFFu8, 0xFE]), (String::new(), "panic: read_all: stdin is not valid UTF-8".to_string()));
         // valid input is unaffected.
         assert_eq!(run_with(b"hello").0, "all:[hello]\n");
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// A REAL, live-confirmed cross-engine divergence found+fixed (production-
+    /// hardening PR-it1191, found via a fresh Explore survey targeting a cold
+    /// function in cgen.rs, independently re-verified live before implementing):
+    /// `k_read_line` unconditionally stripped a trailing `\r` from the line
+    /// buffer once its `getchar()` loop ended, regardless of whether the loop
+    /// terminated via a real `'\n'` or via EOF with no `'\n'` ever seen -- the
+    /// SAME "unconditional trailing-CR-strip" bug shape already found+fixed for
+    /// the sibling `Str.lines()` builtin in this exact file (`production-
+    /// hardening PR-it817`, whose own doc comment states the general principle:
+    /// "a lone trailing `\r` with no `\n` is ordinary content and must be
+    /// preserved"), just never applied to THIS call site. `proc_builtin`'s own
+    /// `"read_line"` arm (interp.rs, shared verbatim by the VM's own
+    /// `Op::CallBuiltin`) only pops a `\r` AFTER first confirming the line's own
+    /// last byte was `\n` -- so a bare trailing `\r` immediately followed by EOF
+    /// (no `\n` at all, e.g. a truncated CRLF stream or old Mac-style line
+    /// endings with no final newline) is preserved as ordinary content on
+    /// interp/VM but silently DROPPED on native. Live-confirmed BEFORE this fix:
+    /// piping the 4 raw bytes `abc\r` (no trailing `\n`) into `match
+    /// read_line() { Some(s) => print(s.len()) .. }` printed `4` on both `kupl
+    /// run` and `kupl run --vm`, but `3` on a `kupl native`-compiled binary
+    /// given the IDENTICAL stdin bytes.
+    #[test]
+    fn native_read_line_preserves_a_bare_trailing_cr_with_no_following_newline_at_eof() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io {\n    match read_line() {\n        \
+                   Some(s) => print(\"{s.len()}\")\n        None => print(\"none\")\n    }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).unwrap();
+        let c = super::emit_c(&module).expect("emit_c");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-readline-cr-{}", std::process::id()));
+        let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
+        std::fs::write(&cp, &c).unwrap();
+        assert!(std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .status().unwrap().success());
+        let run_with = |input: &[u8]| -> String {
+            use std::io::Write;
+            let mut child = std::process::Command::new(&bin)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            let out = child.wait_with_output().unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // the core repro: a bare trailing CR with NO following newline at EOF
+        // must be preserved as ordinary content (len 4, not 3).
+        assert_eq!(run_with(b"abc\r"), "4\n");
+        // discriminating pair: a genuine CRLF terminator still strips BOTH
+        // bytes (len 3), unaffected by this fix.
+        assert_eq!(run_with(b"abc\r\n"), "3\n");
+        // discriminating pair: a bare LF terminator (no CR at all) is untouched.
+        assert_eq!(run_with(b"abc\n"), "3\n");
+        // discriminating pair: empty stdin (immediate EOF) still reports None.
+        assert_eq!(run_with(b""), "none\n");
+        // discriminating pair: a CR in the MIDDLE of the line (not trailing)
+        // must never be stripped, on either code path.
+        assert_eq!(run_with(b"a\rb\n"), "3\n");
         let _ = std::fs::remove_file(&cp);
         let _ = std::fs::remove_file(&bin);
     }
