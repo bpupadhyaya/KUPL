@@ -2208,6 +2208,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A verification-only finding (production-hardening PR-it1200, the
+    /// sibling check flagged by PR-it1199's own NEXT-note): `repl.rs` uses
+    /// `println!`/`print!` directly (unlike `lsp.rs::serve`, which already
+    /// discards its own write `Result`s via `let _ = write!(...)` and so is
+    /// structurally immune), so `kupl repl` piped to a reader that closes
+    /// early COULD in principle hit the exact same broken-pipe panic
+    /// PR-it1199 fixed for `kupl fmt`. Live-confirmed BEFORE writing this
+    /// test that it does NOT, because `main.rs`'s panic hook is installed
+    /// ONCE, process-globally, before any subcommand dispatch -- it already
+    /// covers every subcommand's own panics uniformly, `kupl repl`
+    /// included, with no further code change needed. This test locks that
+    /// in as a permanent regression guard using the SAME deterministic
+    /// closed-pipe technique as the sibling `kupl fmt` test above.
+    #[test]
+    fn kupl_repl_piped_to_a_closed_reader_does_not_report_a_misleading_internal_error() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        // Close OUR read end of stdout immediately -- before the child has
+        // had a chance to print its own startup banner -- simulating a
+        // reader that exits before (or without ever) consuming any output.
+        drop(child.stdout.take());
+
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(b"2 + 3\n:quit\n");
+        });
+
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung after its stdout reader closed early");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("internal compiler error"),
+            "a closed stdout reader must not be reported as a KUPL bug: {stderr:?}"
+        );
+        assert!(!stderr.contains("panicked at"), "a closed stdout reader must not show a raw panic: {stderr:?}");
+    }
+
     /// A coverage-closing test, per production-hardening PR-it651 (no bug
     /// found -- `repl.rs`'s own core state-management claim, "Keep live
     /// values/instances; swap in the new definitions" (its redefinition-
