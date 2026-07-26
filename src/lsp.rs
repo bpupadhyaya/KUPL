@@ -2602,7 +2602,20 @@ fn item_completions(program: &crate::ast::Program) -> Vec<(String, u8, String)> 
                 out.push((f.name.clone(), 3, sig)); // 3 = Function
             }
             Item::Type(t) => {
-                out.push((t.name.clone(), 22, format!("type {}", t.name))); // 22 = Struct
+                // PRODUCTION-HARDENING (PR-it1196): this used to hand-roll
+                // `format!("type {}", t.name)`, dropping `t.type_params`
+                // entirely -- the SAME `[T]` gap already fixed for hover
+                // (`item_signature`, PR-it957) and `fun_sig_str`, but never
+                // mirrored here despite the Fun/variant arms right below
+                // already reusing `item_signature` correctly. A generic
+                // `type Box[T] = Value(v: T)`'s completion `detail` used to
+                // read `type Box`, silently hiding that `T` is a declared
+                // type parameter rather than an unresolved name. Reuse
+                // `item_signature` here too, matching the established
+                // pattern instead of re-deriving a second, incomplete
+                // rendering.
+                let sig = item_signature(program, &t.name).unwrap_or_default();
+                out.push((t.name.clone(), 22, sig)); // 22 = Struct
                 for v in &t.variants {
                     let sig = item_signature(program, &v.name).unwrap_or_default();
                     out.push((v.name.clone(), 4, sig)); // 4 = Constructor
@@ -2815,7 +2828,29 @@ fn item_symbol(text: &str, item: &crate::ast::Item, line_index: &LineIndex) -> S
                 .iter()
                 .map(|v| symbol_json(&v.name, 22, &lsp_range(line_index, text, v.span), &variant_detail(v), &[]))
                 .collect();
-            symbol_json(&t.name, 10, &lsp_range(line_index, text, t.span), "", &children)
+            // PRODUCTION-HARDENING (PR-it1196): a generic `type Box[T] =
+            // ...` used to hard-code an empty `detail` for its OWN outline
+            // entry just like a non-generic type -- silently dropping `[T]`
+            // the SAME way `item_signature` (hover, PR-it957) and
+            // `item_completions` (just above) once did. Unlike a NON-
+            // generic type (which deliberately carries no `detail` at all,
+            // same as `Component`/`Contract`'s own entries just below --
+            // there is no "natural signature" to show, see this file's own
+            // `document_symbols_populate_the_detail_field_with_signatures`
+            // test), a generic type DOES have a natural, useful detail: its
+            // own `[T]` parameter list, which is exactly what a hovering
+            // developer needs to know `T` isn't an unresolved name. Only
+            // set `detail` when `type_params` is non-empty, preserving the
+            // existing no-spurious-detail behavior for plain types.
+            // `item_symbol` has no `&Program` to call `item_signature`
+            // with, so `tp` is computed locally, matching `item_signature`'s
+            // own established `tp` pattern exactly.
+            let detail = if t.type_params.is_empty() {
+                String::new()
+            } else {
+                format!("type {}[{}]", t.name, t.type_params.join(", "))
+            };
+            symbol_json(&t.name, 10, &lsp_range(line_index, text, t.span), &detail, &children)
         }
         Item::Contract(c) => {
             let mut children: Vec<String> = c
@@ -6426,6 +6461,34 @@ mod tests {
         assert!(
             h4.contains("type Pair[A, B] = Pair(first: A, second: B)"),
             "hover on multi-param generic type: {h4}"
+        );
+
+        // PRODUCTION-HARDENING (PR-it1196): this test's OWN doc comment
+        // above already claimed "completion detail[] and documentSymbol
+        // detail... all four route through these SAME two helpers" -- but
+        // until this fix, `item_completions`/`item_symbol`'s own `Item::
+        // Type` arms did NOT route through `item_signature` at all (unlike
+        // the Fun/variant arms right next to them), so `[T]` was silently
+        // dropped from completion and documentSymbol for a generic type
+        // specifically (hover alone was fixed at PR-it957). This exact gap
+        // between the doc comment's claim and the test body's actual
+        // coverage is why it went unnoticed for so long -- asserting it
+        // here too closes that gap.
+        let comps = completions(src);
+        let box_comp = comps.iter().find(|(name, ..)| name == "Box").expect("Box completion");
+        assert_eq!(
+            box_comp.2, "type Box[T] = Value(v: T)",
+            "completion detail for a generic type must include its `[T]` type params: {comps:?}"
+        );
+
+        let outline = document_symbols(src).expect("document_symbols on a well-formed program");
+        assert!(
+            outline.contains("\"name\":\"Box\",\"kind\":10") && outline.contains("\"detail\":\"type Box[T]\""),
+            "documentSymbol detail for a generic type must include its `[T]` type params: {outline}"
+        );
+        assert!(
+            outline.contains("\"detail\":\"type Pair[A, B]\""),
+            "documentSymbol detail for a multi-param generic type must include its own params: {outline}"
         );
     }
 
