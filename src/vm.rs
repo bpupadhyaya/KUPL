@@ -291,13 +291,30 @@ impl<'m> Vm<'m> {
     }
 
     fn run_lifecycle(&mut self, id: usize, key: &str) -> Result<(), VmError> {
+        // PRODUCTION-HARDENING (PR-it1204): this used to grab only the FIRST
+        // matching handler via `.find()`, unlike `interp.rs::run_lifecycle`'s
+        // own `for h in &comp.handlers { if matches { ... } }` loop, which
+        // runs EVERY matching handler. For legitimate `.kupl` source this
+        // was invisible -- `check.rs`'s K0209 rejects a component declaring
+        // two `on start`/`on stop` handlers, so `meta.handlers` from valid
+        // compiled output is always key-unique -- but `kx.rs::decode()`
+        // performs no such cross-validation on a `.kx` module (a
+        // documented, directly-loadable distributable format), so a
+        // corrupted/hand-edited `.kx` with two handlers for the SAME
+        // trigger silently dropped the extra one instead of running it,
+        // diverging from `interp.rs`'s own reference semantics. Live-
+        // confirmed BEFORE this fix via a decode/duplicate/re-encode probe
+        // (not hand-patched bytes): an `app` with `on start { n += 100 }` /
+        // `on stop { n += 5; print(n) }`, corrupted to carry a SECOND
+        // `"@start"` entry pointing at the `on stop` chunk, printed `105`
+        // (only the original `on start` ran) instead of `110` (both would
+        // run under `interp.rs`-matching semantics). Fixed by collecting
+        // EVERY matching chunk index first (ending the borrow of `self.
+        // module` before the mutable `call_chunk_nested` calls below) and
+        // running each in turn, mirroring `interp.rs` exactly.
         let meta = &self.module.components[self.instances[id].comp as usize];
-        let handler = meta
-            .handlers
-            .iter()
-            .find(|(k, _, _)| k == key)
-            .map(|(_, chunk, has_param)| (*chunk, *has_param));
-        if let Some((chunk, _)) = handler {
+        let chunks: Vec<u16> = meta.handlers.iter().filter(|(k, _, _)| k == key).map(|(_, chunk, _)| *chunk).collect();
+        for chunk in chunks {
             self.call_chunk_nested(chunk, Vec::new(), Some(id))?;
         }
         Ok(())
@@ -325,14 +342,17 @@ impl<'m> Vm<'m> {
                     span: Span::default(),
                 });
             }
+            // PRODUCTION-HARDENING (PR-it1204): same `.find()` -> "collect
+            // and run every match" fix as `run_lifecycle` just above, for
+            // the identical reason -- see that function's own doc comment
+            // for the full writeup and live-confirmed repro. `interp.rs::
+            // drain`'s own loop runs every matching handler and clones
+            // `value` per iteration (`value.clone()`); mirrored here.
             let meta = &self.module.components[self.instances[id].comp as usize];
-            let handler = meta
-                .handlers
-                .iter()
-                .find(|(k, _, _)| *k == port)
-                .map(|(_, chunk, has_param)| (*chunk, *has_param));
-            if let Some((chunk, has_param)) = handler {
-                let args = if has_param { vec![value] } else { Vec::new() };
+            let matches: Vec<(u16, bool)> =
+                meta.handlers.iter().filter(|(k, _, _)| *k == port).map(|(_, chunk, has_param)| (*chunk, *has_param)).collect();
+            for (chunk, has_param) in matches {
+                let args = if has_param { vec![value.clone()] } else { Vec::new() };
                 match self.call_chunk_nested(chunk, args, Some(id)) {
                     Ok(_) => {}
                     Err(e) if self.instances[id].restart_on_failure => {
@@ -1831,6 +1851,7 @@ mod tests {
     use super::*;
     use crate::interp::{Flow, Interp, ProgramDb};
     use crate::value::Value;
+
 
     /// Run `probe()` on both engines; assert both succeed with equal results.
     fn differential(src: &str) -> String {
@@ -22210,5 +22231,65 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
             "a capture-count mismatch must be a clean error, not a silently-corrupted parameter value",
         );
         assert_eq!(err.msg, "corrupt .kx module: closure capture count mismatch");
+    }
+
+    /// A REAL, LIVE-CONFIRMED cross-engine divergence found+fixed
+    /// (production-hardening PR-it1204, a fresh cold-function survey of
+    /// vm.rs, its second application to this file this cycle -- the first
+    /// closed a DIFFERENT gap, `push_closure_frame`'s own capture-count
+    /// check, PR-it1192): `run_lifecycle`/`drain` used to grab only the
+    /// FIRST matching handler via `.find()`, unlike `interp.rs::run_
+    /// lifecycle`/`drain`'s own `for h in &comp.handlers { if matches
+    /// { ... } }` loop, which runs EVERY matching handler. For legitimate
+    /// `.kupl` source this was invisible -- `check.rs`'s K0209 rejects a
+    /// component declaring two `on start`/`on stop`/`on <port>` handlers,
+    /// so compiled `meta.handlers` is always key-unique -- but `kx.rs::
+    /// decode()` performs NO such cross-validation on a `.kx` module, a
+    /// documented, directly-loadable distributable format, so a corrupted/
+    /// hand-edited `.kx` carrying two handlers for the SAME trigger key
+    /// silently dropped the extra one instead of running it, diverging
+    /// from `interp.rs`'s own reference semantics. Confirmed live BEFORE
+    /// this fix via a modify-the-in-memory-module technique (mirroring the
+    /// sibling test above, not raw byte-patching): duplicating `App`'s own
+    /// `"@start"` handler entry in `module.components[0].handlers` left
+    /// `n` at `100` (only ONE `on start` ran) instead of `200` (both would
+    /// run under `interp.rs`-matching semantics).
+    #[test]
+    fn a_duplicated_handler_key_in_a_corrupted_kx_module_runs_every_matching_handler_not_just_the_first() {
+        let src = "app App {\n    intent \"probe\"\n    state n: Int = 0\n    on start { n = n + 100 }\n\
+                   expose fun get() -> Int { n }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+
+        // sanity: a legitimate, key-unique module still runs the ONE
+        // handler exactly once.
+        let idx = *module.component_names.get("App").expect("App in module");
+        let mut vm = Vm::new(&module);
+        let id = vm.instantiate(idx, Vec::new()).expect("kvm instantiate");
+        vm.run_lifecycle(id, "@start").expect("kvm lifecycle");
+        assert_eq!(vm.call_expose(id, "get", vec![]).unwrap().to_string(), "100");
+
+        // corrupt the module: duplicate the SAME "@start" entry a second
+        // time -- exactly what a hand-edited/corrupted `.kx` file's own
+        // `decode()` would hand the VM, since `decode()` never cross-
+        // validates that `handlers` is key-unique.
+        let dup = module.components[idx as usize]
+            .handlers
+            .iter()
+            .find(|(k, _, _)| k == "@start")
+            .cloned()
+            .expect("the test needs App to have an @start handler to duplicate");
+        module.components[idx as usize].handlers.push(dup);
+
+        let mut vm2 = Vm::new(&module);
+        let id2 = vm2.instantiate(idx, Vec::new()).expect("kvm instantiate");
+        vm2.run_lifecycle(id2, "@start").expect("kvm lifecycle");
+        assert_eq!(
+            vm2.call_expose(id2, "get", vec![]).unwrap().to_string(),
+            "200",
+            "a duplicated handler key must run EVERY matching handler, matching interp.rs's own \
+             reference semantics -- not silently drop every match after the first"
+        );
     }
 }
