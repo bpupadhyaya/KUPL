@@ -931,11 +931,26 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
                         if v.fields.is_empty() {
                             v.name.clone()
                         } else {
-                            let fs: Vec<String> = v
-                                .fields
-                                .iter()
-                                .map(|p| format!("{}: {}", p.name, ty_str(&p.ty)))
-                                .collect();
+                            // PRODUCTION-HARDENING (PR-it1197): this used to
+                            // hand-roll `format!("{}: {}", p.name,
+                            // ty_str(&p.ty))`, silently dropping
+                            // `p.default` -- the SAME `x: Ty = EXPR` gap
+                            // `param_str`'s own doc comment (PR-it675)
+                            // claims is fixed for "every LSP signature
+                            // renderer", but this closure (and its sibling
+                            // just below) never actually routed through
+                            // `param_str`, unlike `variant_detail` (used by
+                            // `item_symbol`/documentSymbol), which already
+                            // did. A variant field with a default (e.g.
+                            // `Circle(r: Float = 1.0)`, valid KUPL since
+                            // variant fields parse via the SAME
+                            // `parse_params` as function parameters) showed
+                            // `Circle(r: Float)` on hover/completion here
+                            // while documentSymbol correctly showed
+                            // `Circle(r: Float = 1.0)` for the identical
+                            // AST node. Reuse `param_str` instead of
+                            // re-deriving a second, incomplete rendering.
+                            let fs: Vec<String> = v.fields.iter().map(param_str).collect();
                             format!("{}({})", v.name, fs.join(", "))
                         }
                     })
@@ -967,11 +982,12 @@ fn item_signature(program: &crate::ast::Program, name: &str) -> Option<String> {
         if let Item::Type(t) = item {
             for v in &t.variants {
                 if v.name == name {
-                    let fs: Vec<String> = v
-                        .fields
-                        .iter()
-                        .map(|p| format!("{}: {}", p.name, ty_str(&p.ty)))
-                        .collect();
+                    // PRODUCTION-HARDENING (PR-it1197): same `param_str`
+                    // fix as the sibling closure above, for hovering the
+                    // constructor NAME directly (e.g. `Circle` at its own
+                    // declaration or a `Circle(r: 1.0)` call site) rather
+                    // than the enclosing `type` declaration.
+                    let fs: Vec<String> = v.fields.iter().map(param_str).collect();
                     let sig = if fs.is_empty() {
                         v.name.clone()
                     } else {
@@ -6404,6 +6420,56 @@ mod tests {
         let (label, params) = signature_help_info(&program, "greet").expect("signature help");
         assert!(label.contains("= \"World\"") && label.contains("= false"), "label: {label}");
         assert_eq!(params, vec!["name: Str = \"World\"", "loud: Bool = false"]);
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1197, the SAME `Param.default` gap as PR-it675 immediately
+    /// above, just for a field kind PR-it675's own test never covered: a
+    /// VARIANT's own field default (`Circle(r: Float = 1.0)`, valid KUPL
+    /// since a variant's fields parse via the SAME `parse_params` as a
+    /// function's). `item_signature`'s own `Item::Type` arm (the type's
+    /// full signature, e.g. hovering `Shape`) and its own separate
+    /// "constructor of a type" closure (hovering `Circle` directly) both
+    /// hand-rolled `format!("{}: {}", p.name, ty_str(&p.ty))` instead of
+    /// reusing `param_str` -- unlike `variant_detail` (used by
+    /// `item_symbol`, backing `documentSymbol`), which already routed
+    /// through `param_str` correctly. Confirmed live BEFORE this fix:
+    /// hover on `Shape`/`Circle` and completion for `Circle` all showed
+    /// `Circle(r: Float)`, silently hiding that `r` is optional, while
+    /// `documentSymbol`'s outline for the SAME `Circle` correctly showed
+    /// `Circle(r: Float = 1.0)`.
+    #[test]
+    fn hover_and_completion_show_a_variant_fields_own_default_value() {
+        let src = "type Shape = Circle(r: Float = 1.0) | Square(s: Float)\n";
+
+        let type_line = src.lines().position(|l| l.starts_with("type Shape")).unwrap();
+        let h_type = resolve_hover(src, type_line, 6).expect("hover on Shape");
+        assert!(
+            h_type.contains("type Shape = Circle(r: Float = 1.0) | Square(s: Float)"),
+            "hover on the type's own full signature must show the variant field's default: {h_type}"
+        );
+
+        let ctor_ch = src.find("Circle").unwrap() + 1;
+        let h_ctor = resolve_hover(src, type_line, ctor_ch).expect("hover on Circle");
+        assert!(
+            h_ctor.contains("Circle(r: Float = 1.0)"),
+            "hover on the constructor itself must show its own field's default: {h_ctor}"
+        );
+
+        let comps = completions(src);
+        let circle = comps.iter().find(|(n, ..)| n == "Circle").expect("Circle completion");
+        assert!(
+            circle.2.contains("Circle(r: Float = 1.0)"),
+            "completion detail for a constructor must show its own field's default: {circle:?}"
+        );
+
+        // documentSymbol was already correct before this fix (via
+        // variant_detail -> param_str) -- reconfirm no regression.
+        let outline = document_symbols(src).expect("document_symbols on a well-formed program");
+        assert!(
+            outline.contains("\"detail\":\"Circle(r: Float = 1.0)\""),
+            "documentSymbol detail must still show the variant field's default: {outline}"
+        );
     }
 
     /// A REAL, LIVE-CONFIRMED hover/completion/documentSymbol content-quality
