@@ -1619,11 +1619,35 @@ fn item_definition(text: &str, program: &crate::ast::Program, name: &str) -> Opt
         Item::Contract(c) => c.sigs.iter().find(|f| f.name == name).map(|f| f.span),
         _ => None,
     })?;
-    // locate the name token within the declaration for a precise range
-    let decl_start = span.start as usize;
-    let name_off = text.get(decl_start..).and_then(|s| s.find(name)).map(|i| decl_start + i)?;
-    let (l0, c0) = crate::diag::line_col_utf16(text, name_off as u32);
-    let (l1, c1) = crate::diag::line_col_utf16(text, (name_off + name.len()) as u32);
+    // locate the name TOKEN within the declaration for a precise range.
+    //
+    // PRODUCTION-HARDENING (PR-it1195): this used to be a raw, unanchored
+    // `text[decl_start..].find(name)` -- for `Item::Fun`/`Type`/`Component`/
+    // `Contract`, `span.start` is the byte offset of the declaring KEYWORD
+    // (`fun`/`type`/`component`/`contract`, see `parse_fun`/`parse_component`
+    // etc. in parser.rs), not the identifier itself, so this assumed the
+    // very NEXT occurrence of the name's text after the keyword is the real
+    // identifier token. A `/* ... */` comment sitting between the keyword
+    // and the name that happens to MENTION the name anywhere -- e.g. a
+    // leftover rename note `fun /* was: computeTotal */ greet(...)` --
+    // collides with this raw text search and silently returns a
+    // well-formed-looking definition range that points INTO the comment
+    // instead of at the real declaration. Every other lookup in this file
+    // that needs a real identifier TOKEN (`collect_occurrences` above,
+    // `local_binding_scope`, etc.) already re-lexes via `crate::lexer::lex`
+    // and matches on `Tok::Ident`, which correctly skips comments -- this
+    // was the one dual-implementation site using a naive text search
+    // instead. Fixed by lexing `text` and taking the first `Ident` token
+    // whose own span starts at or after `decl_start`, matching the
+    // established pattern instead of re-deriving it via substring search.
+    let decl_start = span.start;
+    let (tokens, _diags) = crate::lexer::lex(text);
+    let name_span = tokens.iter().find_map(|t| match &t.tok {
+        crate::token::Tok::Ident(s) if s == name && t.span.start >= decl_start => Some(t.span),
+        _ => None,
+    })?;
+    let (l0, c0) = crate::diag::line_col_utf16(text, name_span.start);
+    let (l1, c1) = crate::diag::line_col_utf16(text, name_span.end);
     Some((l0 - 1, c0 - 1, l1 - 1, c1 - 1))
 }
 
@@ -3912,6 +3936,34 @@ mod tests {
         // the call site; the OLD truncated name resolves to nothing.
         assert_eq!(occurrences(src, "a\u{b0}b"), vec![(0, 4, 0, 7), (1, 19, 1, 22)]);
         assert_eq!(occurrences(src, "a"), Vec::<(usize, usize, usize, usize)>::new());
+    }
+
+    /// A REAL, live-confirmed wrong-answer bug found+fixed (production-
+    /// hardening PR-it1195, an Explore survey finding on `item_definition`):
+    /// see `item_definition`'s own doc comment for the full analysis. A
+    /// `/* ... */` comment sitting between a declaration's keyword and its
+    /// own name that happens to MENTION the name anywhere (e.g. a leftover
+    /// rename note) used to make the raw `text.find(name)` lookup match
+    /// INSIDE the comment instead of the real identifier token -- a
+    /// well-formed-looking, non-`None` goto-definition range pointing at the
+    /// wrong place. Confirmed live BEFORE this fix: this exact source
+    /// returned `Some((0, 7, 0, 12))` (the `greet` inside `/* greet */`)
+    /// instead of the real declaration's own `greet` at `(0, 17, 0, 22)`.
+    #[test]
+    fn goto_definition_skips_over_a_comment_that_mentions_the_declared_name() {
+        let src = "fun /* greet */ greet(name: Str) -> Str { \"hi {name}\" }\nfun main() -> Str { greet(\"world\") }\n";
+        // sanity: the comment's own `greet` really does appear before the
+        // real declaration's `greet` in the raw text, so a naive substring
+        // search would have found the comment's copy first.
+        assert_eq!(&src[7..12], "greet");
+        assert_eq!(&src[16..21], "greet");
+        // goto-definition from the call site in `main` must land on the
+        // REAL identifier token (inside the `fun` declaration, after the
+        // comment), not the comment's own mention of the same text.
+        assert_eq!(resolve_definition(src, 1, 21), Some((0, 16, 0, 21)));
+        // goto-definition at the declaration's own name must also resolve
+        // to itself, not the comment.
+        assert_eq!(resolve_definition(src, 0, 18), Some((0, 16, 0, 21)));
     }
 
     /// Sibling to the unit test above, exercising the FULL `textDocument/
