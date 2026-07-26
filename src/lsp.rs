@@ -2970,6 +2970,15 @@ fn foldable_spans(item: &crate::ast::Item, out: &mut Vec<crate::diag::Span>) {
         Item::Type(t) => out.push(t.span),
         Item::Contract(c) => {
             out.push(c.span);
+            // A contract method signature has no body of its own to fold, but
+            // KUPL's own newline-insensitive-inside-parens lexing (see
+            // `lexer.rs`) legally lets its parameter list span multiple
+            // physical lines -- `item_symbol`'s own `Item::Contract` arm
+            // above already walks `c.sigs` for the SAME reason; this arm
+            // never mirrored that (production-hardening PR-it1207, the SAME
+            // gap shape as PR-it1165's own `c.sigs`/`c.laws` fix for
+            // `item_symbol`, just never applied here).
+            out.extend(c.sigs.iter().map(|s| s.span));
             out.extend(c.laws.iter().map(|l| l.span));
         }
         Item::Law(l) => out.push(l.span),
@@ -7557,6 +7566,25 @@ mod tests {
         assert!(top_ranges.contains("{\"startLine\":0,\"endLine\":2}"), "fun add: {top_ranges}");
         assert!(top_ranges.contains("{\"startLine\":3,\"endLine\":6}"), "multi-line type Row: {top_ranges}");
         assert_eq!(top_ranges.matches("\"startLine\"").count(), 2, "{top_ranges}");
+
+        // A REAL coverage gap found+closed (production-hardening PR-it1207):
+        // this test's own name claims "every multiline construct" folds, but
+        // every prior contract case above used a SINGLE-LINE `expose fun
+        // get(k: Str) -> Int` signature -- never a multi-line one. A contract
+        // method signature has no body to piggyback a span on (unlike a
+        // top-level `fun`), yet KUPL's own newline-insensitive-inside-parens
+        // lexing legally lets its parameter list span several physical
+        // lines, and `item_symbol`'s own `Item::Contract` arm already walks
+        // `c.sigs` for exactly this reason -- `foldable_spans` never mirrored
+        // that, so a wrapped signature silently got zero fold arrow.
+        let wrapped_sig = "contract Store {\n    expose fun get(\n        k: Str\n    ) -> Int\n    \
+                            law \"x\" {\n        expect get(\"a\") == 0\n    }\n}\n";
+        let wrapped_ranges = folding_ranges(wrapped_sig).expect("parses cleanly");
+        assert!(
+            wrapped_ranges.contains("{\"startLine\":1,\"endLine\":3}"),
+            "the multi-line `get(...)` signature must fold: {wrapped_ranges}"
+        );
+        assert_eq!(wrapped_ranges.matches("\"startLine\"").count(), 3, "{wrapped_ranges}"); // contract + sig + law
     }
 
     #[test]
