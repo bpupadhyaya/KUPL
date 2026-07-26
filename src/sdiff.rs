@@ -389,7 +389,28 @@ fn interface_of(item: &Item) -> String {
                 .map(|v| {
                     let mut vs = format!("{}(", v.name);
                     for fld in &v.fields {
-                        vs.push_str(&format!("{}:{},", fld.name, ty_str(&fld.ty)));
+                        // PRODUCTION-HARDENING (PR-it1201): this used to
+                        // hand-roll `format!("{}:{},", fld.name,
+                        // ty_str(&fld.ty))`, silently dropping `fld.default`
+                        // -- unlike the `Item::Fun`/`Item::Component`-expose
+                        // param loops above, which already reuse
+                        // `param_fingerprint` for this exact reason. A
+                        // variant field's own default is REJECTED by
+                        // `check.rs::reject_param_defaults` (K0275) on
+                        // every program `kupl check` accepts, so this is
+                        // NOT live-reachable for any pair of check-clean
+                        // files -- confirmed live before this fix (matching
+                        // the SAME disprove-then-fix-as-defensive-in-depth
+                        // disposition as PR-it1190/PR-it1198): `type Shape =
+                        // Circle(r: Float = 1.0) | ...` reformatted to
+                        // `Circle(r: Float = 99.0)` reported `[implementation
+                        // only]` instead of the change being visible at all
+                        // in the fingerprint, while `kupl check` on the SAME
+                        // file unconditionally rejects it with K0275. Fixed
+                        // as defensive-in-depth, reusing `param_fingerprint`
+                        // to match the established, already-correct pattern.
+                        vs.push_str(&param_fingerprint(fld));
+                        vs.push(',');
                     }
                     vs.push(')');
                     vs
@@ -469,7 +490,13 @@ fn interface_of(item: &Item) -> String {
             for sig in sigs {
                 s.push_str(&format!(" {}(", sig.name));
                 for p in &sig.params {
-                    s.push_str(&format!("{}:{},", p.name, ty_str(&p.ty)));
+                    // PRODUCTION-HARDENING (PR-it1201): same `param_fingerprint`
+                    // fix as the sibling `Item::Type` variant-field loop above,
+                    // for a contract sig's own param default -- equally rejected
+                    // by K0275 on every check-clean program, fixed as
+                    // defensive-in-depth for the same reason.
+                    s.push_str(&param_fingerprint(p));
+                    s.push(',');
                 }
                 s.push_str(&format!(")->{}", sig.ret.as_ref().map(ty_str).unwrap_or_else(|| "Unit".into())));
                 // A contract method's declared effect BUDGET is part of its public
@@ -860,6 +887,30 @@ mod tests {
             "fun greet(name: Str = \"World\") -> Str {\n    let n = name\n    n\n}\n",
         );
         assert_eq!(lines, vec!["impl greet"]);
+
+        // PRODUCTION-HARDENING (PR-it1201): the SAME gap this test's own doc
+        // comment already describes -- for a variant's own FIELD default and
+        // a contract sig's own PARAM default, the two remaining places
+        // `interface_of` hand-rolled `{name}:{ty}` instead of reusing
+        // `param_fingerprint` (unlike the three cases already covered
+        // above). NOTE: `check.rs::reject_param_defaults` (K0275)
+        // unconditionally rejects a default on EITHER of these two
+        // positions -- `diff_lines` only asserts PARSE diagnostics are
+        // empty (K0275 is a check-time diagnostic), so these inputs are
+        // syntactically valid but never pass `kupl check`; fixed as
+        // defensive-in-depth to match the established, already-correct
+        // sibling pattern, not because either of these specific pairs can
+        // occur in a real, checkable program.
+        let (lines, _) = diff_lines(
+            "type Shape = Circle(r: Float = 1.0) | Square(s: Float)\n",
+            "type Shape = Circle(r: Float = 99.0) | Square(s: Float)\n",
+        );
+        assert_eq!(lines, vec!["interface Shape"]);
+        let (lines, _) = diff_lines(
+            "contract Store {\n intent \"s\"\n expose fun get(k: Str = \"a\") -> Int\n law \"l\" { expect 1 == 1 }\n}\n",
+            "contract Store {\n intent \"s\"\n expose fun get(k: Str = \"b\") -> Int\n law \"l\" { expect 1 == 1 }\n}\n",
+        );
+        assert_eq!(lines, vec!["interface Store"]);
     }
 
     /// A REAL BUG found+fixed (PR-it580): `interface_of`'s contract-sig branch was the
