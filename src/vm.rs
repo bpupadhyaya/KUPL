@@ -519,8 +519,25 @@ impl<'m> Vm<'m> {
             return Err(VmError { msg: format!("no component `{name}`"), span: Span::default() });
         };
         let id = self.instantiate(idx, props)?;
-        self.run_lifecycle(id, "@start")?;
-        self.arm_timers(id);
+        // `self.instantiate` recursively constructs every `let child = Child()`
+        // descendant too (mirroring `interp.rs::Interp::instantiate`'s own
+        // recursive child creation) -- `on start` and timer-arming must reach
+        // ALL of them, not just `id` itself, exactly like `run_app`'s own
+        // `0..started` loop just above does and `interp.rs::start_all`'s own
+        // doc comment ("deliver `on start` to instance `id` and all its
+        // descendants") requires (production-hardening PR-it1209, a THIRD
+        // cold-function survey of vm.rs, its third application to this file
+        // this cycle -- the first two closed DIFFERENT gaps,
+        // `push_closure_frame`'s own capture-count check PR-it1192 and
+        // `run_lifecycle`/`drain`'s own `.find()` gap PR-it1204). Before this
+        // fix, only `id`'s own `on start`/timers fired -- any child's `on
+        // start` handler and any of its timers were silently never delivered/
+        // armed at all.
+        let started = self.instances.len();
+        for child_id in id..started {
+            self.run_lifecycle(child_id, "@start")?;
+            self.arm_timers(child_id);
+        }
         self.drain()?;
         Ok(id)
     }
@@ -22322,6 +22339,66 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
             "200",
             "a duplicated handler key must run EVERY matching handler, matching interp.rs's own \
              reference semantics -- not silently drop every match after the first"
+        );
+    }
+
+    /// A REAL, LIVE-CONFIRMED cross-engine divergence found+fixed
+    /// (production-hardening PR-it1209, a THIRD cold-function survey of
+    /// vm.rs, its third application to this file this cycle -- the first two
+    /// closed DIFFERENT gaps, `push_closure_frame`'s own capture-count check
+    /// PR-it1192 and `run_lifecycle`/`drain`'s own `.find()` gap PR-it1204):
+    /// `instantiate_named` only ever delivered `on start` and armed timers
+    /// for the SINGLE instance id it returned, never any of its own `let
+    /// child = Child()` descendants -- `self.instantiate` recursively
+    /// constructs the whole tree (mirroring `interp.rs::Interp::instantiate`'s
+    /// own recursive child creation), but `interp.rs`'s own `start_all` (see
+    /// its own doc comment: "deliver `on start` to instance `id` and all its
+    /// descendants") and this file's own sibling `run_app` (its `0..started`
+    /// loop just above `instantiate_named`) both correctly loop over EVERY
+    /// instance the instantiation produced, not just the top one.
+    /// `instantiate_named` is `pub fn`, documented as "public for tests and
+    /// future law-running on the VM" -- not reachable via the primary `kupl
+    /// run --vm` CLI path today (that goes through the correctly-hardened
+    /// `run_app`), but IS the VM's own general-purpose instantiation entry
+    /// point, already exercised by 9 pre-existing tests in this exact
+    /// module -- none of which happened to use a component with a child,
+    /// which is exactly why this gap survived undetected until now.
+    #[test]
+    fn instantiate_named_delivers_on_start_to_every_descendant_not_just_the_returned_id() {
+        let src = "component Child {\n    state n: Int = 0\n    on start { n = 99 }\n\
+                   expose fun get() -> Int { n }\n}\n\
+                   component Parent {\n    let c = Child()\n    expose fun childVal() -> Int { c.get() }\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter: instantiate + start_all, matching the reference semantics.
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let inst = interp
+            .instantiate("Parent", &[], crate::diag::Span::default())
+            .ok()
+            .and_then(|v| match v {
+                Value::Component(id) => Some(id),
+                _ => None,
+            })
+            .expect("instantiates");
+        interp.start_all().ok();
+        let f = Value::Bound(inst, std::rc::Rc::new("childVal".to_string()));
+        let i_val = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v.to_string(),
+            Err(Flow::Panic { msg, .. }) => panic!("interp childVal() panicked: {msg}"),
+            Err(_) => panic!("interp childVal() returned an unexpected non-value Flow"),
+        };
+        assert_eq!(i_val, "99", "interp.rs's own reference semantics: the child's `on start` must have run");
+
+        // vm: instantiate_named + call_expose, the SAME public API path.
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let id = vm.instantiate_named("Parent", vec![]).expect("instantiates");
+        let v_val = vm.call_expose(id, "childVal", vec![]).unwrap().to_string();
+        assert_eq!(
+            v_val, i_val,
+            "instantiate_named must deliver `on start` to every descendant it creates, not just the \
+             returned parent id, matching interp.rs's own start_all semantics exactly"
         );
     }
 }
