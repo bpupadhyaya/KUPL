@@ -202,6 +202,27 @@ fn fmt_type(out: &mut String, t: &TypeDecl) {
                     out.push_str(", ");
                 }
                 out.push_str(&format!("{}: {}", f.name, ty_str(&f.ty)));
+                // PRODUCTION-HARDENING (PR-it1198): this used to stop at
+                // `{name}: {ty}`, silently dropping `f.default` -- a
+                // variant field parses via the SAME `parse_params` as a
+                // function parameter (confirmed via parser.rs's own
+                // `parse_type_decl`), so `Circle(r: Float = 1.0)` is
+                // ordinary, valid KUPL. Unlike `fmt_fun`'s own parameter
+                // loop just above (which already renders ` = {expr}` via
+                // `expr_str`, PR-it675's canonical-formatter side), this
+                // loop never did -- `kupl fmt --write` on a type with a
+                // defaulted variant field SILENTLY DELETED the default
+                // from the source file itself. Live-confirmed BEFORE this
+                // fix: `type Shape = Circle(r: Float = 1.0) | Square(s:
+                // Float)` reformatted (even with `--write`, in place) to
+                // `type Shape = Circle(r: Float) | Square(s: Float)`, a
+                // genuine, silent, destructive loss of source semantics --
+                // found as a spot-check follow-on from the SAME bug shape
+                // just fixed in lsp.rs's own variant renderers (PR-it1197)
+                // for hover/completion display only, not source rewriting.
+                if let Some(d) = &f.default {
+                    out.push_str(&format!(" = {}", expr_str(d, 0)));
+                }
             }
             out.push(')');
         }
@@ -1175,6 +1196,47 @@ mod tests {
         assert!(d1.is_empty(), "input diags: {d1:?}");
         let f1 = super::format_program(&p1);
         assert!(f1.contains("= \"missing\""), "default value was dropped:\n{f1}");
+        roundtrip(src);
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1198, the SAME
+    /// `Param.default` gap as PR-it1141 immediately above, just for a
+    /// DIFFERENT field kind: a union VARIANT's own field default (`Circle(r:
+    /// Float = 1.0)`), which parses via the SAME `parse_params` as a
+    /// function parameter (confirmed via parser.rs's own `parse_type_decl`).
+    /// `fmt_type`'s union-variant rendering loop hand-rolled `format!("{}:
+    /// {}", f.name, ty_str(&f.ty))` and never checked `f.default` at all,
+    /// unlike `fmt_fun`'s own parameter loop (which already renders `=
+    /// {expr}`). `roundtrip()` alone can't catch this for the SAME reason
+    /// noted at PR-it1141 -- the data is already gone by the first format
+    /// pass, so f1==f2 trivially -- so assert the literal default text
+    /// actually survives formatting, same technique as that test.
+    ///
+    /// NOTE ON SEVERITY: `check.rs`'s `reject_param_defaults` (K0275)
+    /// UNCONDITIONALLY rejects a constructor/variant field default as a
+    /// diagnostic error -- confirmed live: `kupl check` on this exact
+    /// source reports `error[K0275]: constructor field "r" cannot have a
+    /// default value`. This means a variant-field default can NEVER appear
+    /// in a fully valid, checked KUPL program, and `kupl fmt --write`
+    /// itself REFUSES to overwrite a file with pre-existing check errors
+    /// (confirmed live) -- so, UNLIKE PR-it1141's own case (a legitimate,
+    /// checker-accepted contract signature default), this specific fix is
+    /// NOT a live in-place-file-corruption bug; `--write` can never reach
+    /// the buggy code path on a real file. It IS a genuine correctness bug
+    /// in the formatter's own non-writing preview/stdout path (`kupl fmt`
+    /// without `--write` prints the reformatted text even when the input
+    /// has check errors, confirmed live), and the underlying rendering
+    /// logic was provably incomplete regardless of reachability -- fixed
+    /// as defensive-in-depth, matching this file's own established
+    /// pattern, with this note scrupulously distinguishing it from a
+    /// destructive bug.
+    #[test]
+    fn fmt_preserves_default_values_on_a_union_variants_own_field() {
+        let src = "type Shape = Circle(r: Float = 1.0) | Square(s: Float)\n";
+        let (p1, d1) = parser::parse(src);
+        assert!(d1.is_empty(), "input diags: {d1:?}");
+        let f1 = super::format_program(&p1);
+        assert!(f1.contains("Circle(r: Float = 1.0)"), "variant field default was dropped:\n{f1}");
         roundtrip(src);
     }
 
