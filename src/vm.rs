@@ -606,6 +606,48 @@ impl<'m> Vm<'m> {
         dst: Reg,
         inst: Option<usize>,
     ) -> Result<(), VmError> {
+        // A REAL bug found+fixed (production-hardening PR-it1192, found via a
+        // fresh Explore survey targeting a genuinely cold function -- neither
+        // `push_frame` nor `push_closure_frame` had any prior hardening
+        // comment, unlike every OTHER `.kx`-decoded-field cross-check in this
+        // file, e.g. PR-it687/744/745/920): this loop used to write EVERY
+        // element of `captures` into `stack[base..]` unconditionally, with NO
+        // check that `captures.len()` matches the callee chunk's OWN declared
+        // `ncaps` field -- only the overall stack bounds (set by `push_frame`
+        // just above, sized to `chunk.nregs`, which is comfortably larger
+        // than `ncaps` to also hold params/locals) were checked, via
+        // `self.stack.get_mut`. A `.kx` file where `Op::MakeClosure`'s own
+        // `ncaps` operand (which determines the CLOSURE VALUE's own actual
+        // `captures.len()`, set at closure-creation time) disagrees with the
+        // CALLEE chunk's own separately-encoded `ncaps` field (which
+        // `push_frame` already used, just above, to decide WHERE parameters
+        // go: `base + chunk.ncaps + i`) is exactly the kind of "individually
+        // valid-shaped, cross-field inconsistent" corruption this codebase's
+        // established `.kx` threat model treats as untrusted input, never
+        // reachable through `compile.rs`'s own compiler (which always derives
+        // both `ncaps` fields from the identical `captures.len()` at compile
+        // time) but fully reachable through a hand-edited or corrupted file.
+        // If `captures.len() > chunk.ncaps`, the excess captures land on TOP
+        // of the parameter register(s) `push_frame` just placed, silently
+        // overwriting a live parameter value with no error at all -- live-
+        // confirmed BEFORE this fix (patching a real `MakeClosure`'s `ncaps`
+        // operand from 1 to 2 for a closure `fn(p) { p + cap }`): the correct
+        // result `1006` (`7 + 999`) became `Err(VmError { msg: "invalid
+        // operand types: Unit and Int", .. })` -- the overwritten `p`
+        // register held `Value::Unit` (an unrelated, not-yet-written local in
+        // the closure-creating frame) instead of `7`, surfacing as a
+        // confusing, unrelated-looking type error far from the actual root
+        // cause, rather than the clean, specific "corrupt .kx module: ..."
+        // diagnostic every sibling cross-field check in this file already
+        // gives. Rejected here, at the single earliest point this mismatch is
+        // detectable, before writing ANY capture into the stack.
+        let chunk = self.chunk(proto)?;
+        if captures.len() != chunk.ncaps as usize {
+            return Err(VmError {
+                msg: "corrupt .kx module: closure capture count mismatch".into(),
+                span: Span::default(),
+            });
+        }
         self.push_frame(proto, args, dst, inst)?;
         let base = self.frames.last().unwrap().base;
         for (i, c) in captures.iter().enumerate() {
@@ -22004,5 +22046,67 @@ fun main() {\n    print(nat_x(\"t\"))\n}\n";
             )
             .expect("must complete correctly (not panic, not spuriously error)");
         assert_eq!(result.to_string(), "hi");
+    }
+
+    /// A REAL bug found+fixed (production-hardening PR-it1192, found via a
+    /// fresh Explore survey targeting the genuinely cold `push_frame`/
+    /// `push_closure_frame` pair -- unlike every OTHER `.kx`-decoded cross-
+    /// field check in this file (PR-it687/744/745/920 among others),
+    /// `push_closure_frame`'s own capture-placement loop had NO check that
+    /// `captures.len()` (the CLOSURE VALUE's own actual capture count, fixed
+    /// at the `Op::MakeClosure` that created it) matches the CALLEE chunk's
+    /// own separately-`.kx`-encoded `ncaps` field (which `push_frame` already
+    /// uses, one line above, to decide WHERE parameters go:
+    /// `base + chunk.ncaps + i`). `kx.rs::decode()` reads `Op::MakeClosure`'s
+    /// own `ncaps` operand and each `Chunk`'s own `ncaps` field from
+    /// INDEPENDENT byte positions with no cross-validation between them --
+    /// exactly the same "individually valid-shaped, cross-field
+    /// inconsistent" corruption class this file's threat model already
+    /// defends against everywhere else -- NOT reachable from any valid,
+    /// `check.rs`-accepted `.kupl` source (`compile.rs` always derives both
+    /// fields from the identical `captures.len()`), but fully reachable via
+    /// a hand-crafted/corrupted `.kx` file. Live-confirmed BEFORE this fix:
+    /// for `fun mk(cap: Int) -> fn(Int) -> Int { fn(p) { p + cap } }`, with
+    /// `mk`'s own `MakeClosure` op's `ncaps` operand corrupted from 1 to 2,
+    /// `probe()`'s correct result `1006` (`7 + 999`) became `Err(VmError {
+    /// msg: "invalid operand types: Unit and Int", .. })` -- the excess
+    /// "capture" silently overwrote the just-placed parameter register `p`
+    /// with an unrelated, not-yet-written local (`Value::Unit`) from the
+    /// closure-creating frame, surfacing as a confusing, unrelated-looking
+    /// type error far from the actual root cause, instead of the clean,
+    /// specific "corrupt .kx module: ..." diagnostic every sibling
+    /// cross-field check in this file already gives.
+    #[test]
+    fn a_closures_capture_count_disagreeing_with_its_callee_chunks_own_ncaps_is_a_clean_error_not_silent_parameter_corruption() {
+        let src = "fun mk(cap: Int) -> fn(Int) -> Int {\n    fn(p) { p + cap }\n}\n\
+                   fun probe() -> Int {\n    let g = mk(999)\n    g(7)\n}\n";
+        let compiled = crate::run::compile(src).expect("compiles");
+        let mut module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+
+        // sanity: a legitimate module still runs correctly.
+        let mut vm = Vm::new(&module);
+        assert_eq!(vm.call_named("probe", vec![]).unwrap().to_string(), "1006");
+
+        // corrupt `mk`'s own `MakeClosure` op's `ncaps` operand from 1 to 2 --
+        // exactly what a hand-edited/corrupted `.kx` file's `decode()` would
+        // hand the VM, since `decode()` never cross-checks a `MakeClosure`'s
+        // `ncaps` against its own proto chunk's separately-encoded `ncaps`.
+        let mk_idx = module.funs["mk"];
+        let mut patched = false;
+        for op in module.chunks[mk_idx as usize].code.iter_mut() {
+            if let crate::bytecode::Op::MakeClosure { ncaps, .. } = op {
+                assert_eq!(*ncaps, 1, "the test needs `mk`'s closure to genuinely capture exactly 1 value");
+                *ncaps = 2;
+                patched = true;
+            }
+        }
+        assert!(patched, "the test needs to find and patch `mk`'s own MakeClosure op");
+
+        let mut vm2 = Vm::new(&module);
+        let err = vm2.call_named("probe", vec![]).expect_err(
+            "a capture-count mismatch must be a clean error, not a silently-corrupted parameter value",
+        );
+        assert_eq!(err.msg, "corrupt .kx module: closure capture count mismatch");
     }
 }
