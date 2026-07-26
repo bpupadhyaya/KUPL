@@ -551,9 +551,42 @@ impl<'m> Vm<'m> {
                 span: Span::default(),
             });
         };
-        let v = self.call_chunk_nested(chunk, args, Some(id))?;
-        self.drain()?;
-        Ok(v)
+        let result = self.call_chunk_nested(chunk, args, Some(id));
+        // A REAL, LIVE-CONFIRMED cross-engine divergence found+fixed
+        // (production-hardening PR-it1211, a fresh cold-function-survey side
+        // finding): this function's own SIBLING -- the `Op::Method` opcode
+        // handler for `w.boom()`-style exposed-method calls compiled from
+        // actual KUPL source -- was already fixed at PR-it967/its own vm.rs
+        // mirror to check `restart_on_failure` and restart a supervised
+        // child on a panic before re-propagating it, matching interp.rs's
+        // own `eval_method` fix exactly. `call_expose` -- the SAME "call an
+        // exposed method on a live instance" operation, just exposed as a
+        // `pub fn` Rust API rather than reached via compiled bytecode --
+        // never got the identical fix, silently leaving a supervised
+        // child's state UN-restarted (stale pre-crash values) after a panic
+        // reached through this specific entry point. Live-confirmed: a
+        // `supervise w restart on_failure` child, `bump()`ed twice then
+        // crashed via `boom()` then read via `read()`, ALL through
+        // `call_expose` -- interp.rs (`call_value`/`eval_method`, its own
+        // PR-it967 fix) correctly reset state to `0`; the VM, through this
+        // function alone, left it at the stale `2`. Not reachable via
+        // `kupl run --vm`'s own primary CLI path today (in-language method
+        // calls compile to the already-fixed `Op::Method` handler above),
+        // but `call_expose` is the VM's own general-purpose "call an
+        // exposed method" API, already exercised by 20+ pre-existing tests
+        // in this exact module, none of which happened to combine a
+        // supervised child with a THIS-API-reached panic.
+        let mut should_drain = result.is_ok();
+        if let Err(ref e) = result {
+            if self.instances[id].restart_on_failure {
+                self.restart(id, &e.msg)?;
+                should_drain = true;
+            }
+        }
+        if should_drain {
+            self.drain()?;
+        }
+        result
     }
 
     /// Send a message to an instance's in port and drain to quiescence.
@@ -19850,6 +19883,90 @@ component Relay967 {
             i_after, "0",
             "restart must reset n back to 0 -- a stale/un-reset n would show 2"
         );
+    }
+
+    /// A REAL, LIVE-CONFIRMED cross-engine divergence found+fixed
+    /// (production-hardening PR-it1211, a fourth cold-function survey of
+    /// vm.rs that started clean but surfaced this via a scratch probe
+    /// exploring a variant of the sibling test above): the test just above
+    /// (`diff_direct_call_panic_on_supervised_child_restarts_and_resets_its_
+    /// state`, PR-it967) always crashes the supervised CHILD indirectly --
+    /// via a PARENT's own exposed method calling `w.boom()` in KUPL source,
+    /// which compiles to the ALREADY-fixed `Op::Method` handler. This test
+    /// instead calls `call_expose` DIRECTLY on the child instance itself
+    /// (obtained via `Value::Component`, exactly as `instantiate_named`'s
+    /// PR-it1209 doc comment anticipates a future caller doing), bypassing
+    /// the opcode handler entirely -- `call_expose` is a SEPARATE, sibling
+    /// "call an exposed method on a live instance" code path that never got
+    /// the PR-it967 restart-on-failure fix its opcode-handler sibling did.
+    /// Confirmed live BEFORE this fix: `interp` (`call_value`, its own
+    /// PR-it967 fix in `eval_method`) correctly reset `n` to `0` after the
+    /// crash; the VM, reached ONLY through `call_expose`, left it at the
+    /// stale pre-crash `2`.
+    #[test]
+    fn diff_call_expose_directly_on_a_supervised_child_restarts_and_resets_its_state() {
+        let src = "\
+component Worker1211 {
+    intent \"w\"
+    state n: Int = 0
+    expose fun bump() { n += 1 }
+    expose fun boom() { n = 1 / 0 }
+    expose fun read() -> Int { n }
+}
+component Parent1211 {
+    intent \"p\"
+    let w = Worker1211()
+    supervise w restart on_failure
+    expose fun get_w() -> Worker1211 { w }
+}
+";
+        let compiled = crate::run::compile(src).expect("compiles");
+
+        // interpreter
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut it = Interp::new(db);
+        let pid = match it.instantiate("Parent1211", &[], crate::diag::Span::default()) {
+            Ok(Value::Component(id)) => id,
+            _ => panic!("interp instantiate failed"),
+        };
+        let call_i = |it: &mut Interp, id: usize, name: &str| {
+            let f = Value::Bound(id, std::rc::Rc::new(name.to_string()));
+            it.call_value(f, vec![], crate::diag::Span::default())
+        };
+        let child_i = match call_i(&mut it, pid, "get_w") {
+            Ok(Value::Component(id)) => id,
+            _ => panic!("get_w failed"),
+        };
+        assert!(call_i(&mut it, child_i, "bump").is_ok(), "bump 1");
+        assert!(call_i(&mut it, child_i, "bump").is_ok(), "bump 2");
+        assert!(
+            call_i(&mut it, child_i, "boom").is_err(),
+            "interp: the panic must still surface to the direct caller"
+        );
+        let i_after = match call_i(&mut it, child_i, "read") {
+            Ok(v) => v.to_string(),
+            Err(_) => panic!("read after restart failed"),
+        };
+
+        // KVM
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module compiles");
+        let mut vm = Vm::new(&module);
+        let vpid = vm.instantiate_named("Parent1211", vec![]).expect("KVM instantiate failed");
+        let child_v = match vm.call_expose(vpid, "get_w", vec![]) {
+            Ok(Value::Component(id)) => id,
+            other => panic!("KVM get_w failed: {other:?}"),
+        };
+        vm.call_expose(child_v, "bump", vec![]).expect("bump 1");
+        vm.call_expose(child_v, "bump", vec![]).expect("bump 2");
+        assert!(
+            vm.call_expose(child_v, "boom", vec![]).is_err(),
+            "KVM: the panic must still surface to the direct caller"
+        );
+        let v_after = vm.call_expose(child_v, "read", vec![]).expect("read after restart").to_string();
+
+        assert_eq!(i_after, v_after, "interpreter and KVM disagree on post-restart state");
+        assert_eq!(i_after, "0", "restart must reset n back to 0 -- a stale/un-reset n would show 2");
     }
 
     #[test]
