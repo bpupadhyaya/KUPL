@@ -571,6 +571,38 @@ const BUILTIN_FUNS: &[&str] = &[
     "read_file", "read_line", "remove_dir", "shuffle", "tensor", "to_str", "write_file", "zeros",
 ];
 
+/// PRODUCTION-HARDENING (PR-it1202): every `(name, arity)` pair `infer_call`'s
+/// own builtin dispatch match (below, `match (name.as_str(), args.len())`)
+/// recognizes, as bare NAMES -- a REAL, LIVE-CONFIRMED diagnostic-quality
+/// bug found+fixed: a call to a genuine builtin with the WRONG arity used to
+/// fall through that match's `_ => {}` arm silently, land in the GENERIC
+/// unknown-identifier path, and emit `error[K0240]: unknown name 'print'`
+/// for `print()` (0 args, `print` only accepts 1) instead of a proper
+/// arity-mismatch diagnostic -- actively MISLEADING for a name that isn't
+/// unknown at all. Worse, `read_file("a", "b")` (2 args; only 1 is valid)
+/// reported `unknown name 'read_file' (did you mean 'read_line'?)`,
+/// pointing the user at an unrelated function. Confirmed live for BOTH
+/// `kupl check` and `kupl run` before this fix. Deliberately a SEPARATE
+/// list from `BUILTIN_FUNS` above (which is suggestion-only and
+/// deliberately incomplete -- it excludes capitalized constructors like
+/// `Map`/`Set`/`Some`/`Ok`/`Err` and several later-added builtins like
+/// `eprint`/`exit`/`now`/the date/time and csv/query/url families) --
+/// THIS list must be a COMPLETE, accurate mirror of every name the match
+/// below handles, since it's used to decide whether a wrong-arity call
+/// gets a real arity diagnostic at all, not just a best-effort hint.
+const BUILTIN_CALL_NAMES: &[&str] = &[
+    "append_file", "arange", "args", "big", "csv_parse", "csv_stringify", "date_iso",
+    "date_make", "day_of", "delete_file", "env_var", "eprint", "Err", "exec", "exit",
+    "file_exists", "format_time", "hash_fnv", "hex_decode", "hex_encode", "hour_of",
+    "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
+    "make_dir", "Map", "minute_of", "month_of", "now", "Ok", "panic", "parse_iso",
+    "path_base", "path_dir", "path_ext", "path_join", "print", "query_build", "query_parse",
+    "random_floats", "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace",
+    "read_all", "read_file", "read_line", "remove_dir", "second_of", "Set", "shuffle", "Some",
+    "tensor", "to_str", "url_decode", "url_encode", "weekday_of", "write_file", "year_of",
+    "yearday_of", "zeros",
+];
+
 /// What surrounds the body being checked.
 struct Ctx<'a> {
     scopes: Scopes,
@@ -3669,6 +3701,28 @@ impl Checker {
                     let t = self.infer_expr(&args[0].value, ctx);
                     return Ty::Result(Box::new(self.uni.fresh()), Box::new(self.uni.apply(&t)));
                 }
+                // PRODUCTION-HARDENING (PR-it1202): `name` matched NONE of
+                // the specific `(name, arity)` arms above -- but IS a real
+                // builtin name (`BUILTIN_CALL_NAMES`'s own doc comment has
+                // the full writeup), so this is a wrong-ARITY call, not an
+                // unknown-NAME one. Without this arm, the match fell
+                // through to `_ => {}` and the caller below resolved `name`
+                // via the generic unknown-identifier path (K0240),
+                // misreporting a genuine builtin as "unknown" -- confirmed
+                // live before this fix. Still walk each argument so its
+                // own sub-expressions are checked (matching the identical
+                // discipline in the general-callable K0242 arm below).
+                (name, n) if BUILTIN_CALL_NAMES.contains(&name) => {
+                    for a in args {
+                        self.infer_expr(&a.value, ctx);
+                    }
+                    self.err(
+                        "K0242",
+                        format!("no matching call to builtin `{name}` with {}", plural(n, "argument")),
+                        span,
+                    );
+                    return self.uni.fresh();
+                }
                 _ => {}
             }
             // user constructor
@@ -5901,6 +5955,65 @@ mod generic_tests {
             exh.iter().any(|d| d.code == "K0257" && d.message.contains("missing B, C")),
             "{exh:?}"
         );
+    }
+
+    /// A REAL, LIVE-CONFIRMED diagnostic-quality bug found+fixed (production-
+    /// hardening PR-it1202, a fresh close-read of check.rs, a file that
+    /// hadn't had a dedicated survey this cycle): `infer_call`'s builtin
+    /// dispatch (`match (name.as_str(), args.len())`) matches every builtin
+    /// as a literal `(name, arity)` tuple -- a call with the WRONG arity
+    /// matched NONE of those arms and fell through to `_ => {}` silently,
+    /// landing in the GENERIC unknown-identifier path and misreporting a
+    /// perfectly real builtin as `error[K0240]: unknown name`. Confirmed
+    /// live before this fix on BOTH `kupl check` and `kupl run`: `print()`
+    /// (0 args; `print` takes 1) said `unknown name 'print'`; `read_file(
+    /// "a", "b")` (2 args; `read_file` takes 1) said `unknown name
+    /// 'read_file' (did you mean 'read_line'?)` -- actively misdirecting
+    /// toward an unrelated function. Also affected capitalized
+    /// constructor-style builtins never listed in `BUILTIN_FUNS`'s own
+    /// suggestion-only list at all (`Map`, `Set`, `Some`, `Ok`, `Err`).
+    /// Fixed by adding a new `BUILTIN_CALL_NAMES` list (a complete mirror of
+    /// every name the dispatch match handles, unlike `BUILTIN_FUNS`) and a
+    /// final match arm that recognizes a known-name-wrong-arity call and
+    /// emits a proper K0242 arity diagnostic instead.
+    #[test]
+    fn wrong_arity_builtin_call_gets_an_arity_error_not_unknown_name() {
+        let e = errors("fun main() uses io {\n    print()\n}\n");
+        assert!(
+            e.iter().any(|d| d.code == "K0242" && d.message.contains("no matching call to builtin `print`")),
+            "{e:?}"
+        );
+        assert!(!e.iter().any(|d| d.code == "K0240"), "print must not be reported as unknown: {e:?}");
+
+        let e2 = errors("fun main() uses io {\n    let x = read_file(\"a\", \"b\")\n    0\n}\n");
+        assert!(
+            e2.iter().any(|d| d.code == "K0242" && d.message.contains("no matching call to builtin `read_file`")),
+            "{e2:?}"
+        );
+        assert!(
+            !e2.iter().any(|d| d.code == "K0240"),
+            "read_file must not be reported as unknown, nor suggest an unrelated `read_line`: {e2:?}"
+        );
+
+        // a capitalized, constructor-style builtin NOT in BUILTIN_FUNS's own
+        // suggestion-only list -- confirms BUILTIN_CALL_NAMES is genuinely a
+        // separate, more complete list, not just a rename of BUILTIN_FUNS.
+        let e3 = errors("fun main() {\n    let m = Map(1)\n    0\n}\n");
+        assert!(
+            e3.iter().any(|d| d.code == "K0242" && d.message.contains("no matching call to builtin `Map`")),
+            "{e3:?}"
+        );
+
+        // a GENUINELY unknown name (not a builtin at all, even with a wrong
+        // arity) must still get K0240 with its existing did-you-mean intact.
+        let e4 = errors("fun main() {\n    prnt(1)\n    0\n}\n");
+        assert!(
+            e4.iter().any(|d| d.code == "K0240" && d.message.contains("did you mean `print`?")),
+            "{e4:?}"
+        );
+
+        // a builtin called with a VALID arity must still resolve cleanly.
+        assert!(errors("fun main() uses io {\n    print(\"hello\")\n}\n").is_empty());
     }
 
     #[test]
