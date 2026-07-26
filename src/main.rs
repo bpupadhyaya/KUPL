@@ -714,8 +714,8 @@ fn scaffold_project(name: &str) -> i32 {
         }
         true
     };
-    if std::fs::create_dir_all(root).is_err() {
-        eprintln!("error: cannot create {name}/");
+    if let Err(e) = std::fs::create_dir_all(root) {
+        eprintln!("error: cannot create {name}/: {e}");
         return 1;
     }
     if !write(&root.join("main.kupl"), &main_src)
@@ -1649,6 +1649,48 @@ mod tests {
         let n_ok = run(&["new", "demo"], &dir);
         assert_eq!(n_ok.status.code(), Some(0), "{n_ok:?}");
         assert!(dir.join("demo").join("kupl.toml").exists(), "a valid `new` invocation must still scaffold the project");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL message-quality bug found+fixed (production-hardening
+    /// PR-it1208, a fresh CLI-robustness survey finding): `scaffold_project`'s
+    /// `create_dir_all` failure branch discarded the underlying `io::Error`
+    /// via `.is_err()`, printing only `error: cannot create demo/` with ZERO
+    /// indication of why -- permission denied, a read-only filesystem, and a
+    /// full disk would all print byte-for-byte the same message. Every OTHER
+    /// fallible filesystem op in this exact same function (and file --
+    /// `build_module`'s own read/write failures, `run`'s own file-read
+    /// failure) already interpolates `{e}`; `create_dir_all` was the one
+    /// straggler. Live-confirmed BEFORE this fix: `kupl new proj` inside a
+    /// `chmod 555` (read-only, unwritable) directory printed only `error:
+    /// cannot create proj/`, exit 1 -- the underlying `Permission denied (os
+    /// error 13)` was silently swallowed.
+    #[test]
+    #[cfg(unix)]
+    fn new_reports_the_underlying_os_error_when_the_project_directory_cannot_be_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-new-readonly-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let n = std::process::Command::new(&bin).args(["new", "proj"]).current_dir(&dir).output().expect("kupl runs");
+
+        // restore write permission before any cleanup, whether or not the assertions below panic.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(n.status.code(), Some(1), "{n:?}");
+        let stderr = String::from_utf8_lossy(&n.stderr);
+        assert!(stderr.starts_with("error: cannot create proj/: "), "{stderr:?}");
+        assert!(
+            stderr.len() > "error: cannot create proj/: ".len(),
+            "the underlying OS error must not be silently dropped: {stderr:?}"
+        );
+        assert!(!dir.join("proj").exists(), "a failed `new` invocation must not leave a partial project dir");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
