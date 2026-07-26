@@ -14,7 +14,16 @@ use crate::value::{value_key_eq, Closure, Env, IntW, Value};
 
 /// Non-local control flow during evaluation.
 pub enum Flow {
-    Panic { msg: String, span: Span },
+    // PRODUCTION-HARDENING (PR-it1194): `already_reported` distinguishes a
+    // `Flow::Panic` whose `msg` is ALREADY a complete, self-descriptive
+    // test-failure report (currently only `run_forall`'s own counterexample
+    // message) from a genuine runtime panic. `run.rs`'s law-reporting logic
+    // used to tell these apart via `msg.starts_with("property failed for
+    // ")` -- a plain user `panic("property failed for ...")` (not from
+    // `run_forall` at all) collided with that exact phrase and silently lost
+    // both the "panic: " prefix and the entire rich `error[K0900]` stderr
+    // diagnostic. Every other construction site sets this to `false`.
+    Panic { msg: String, span: Span, already_reported: bool },
     Return(Value),
     Break,
     Continue,
@@ -256,7 +265,7 @@ impl Interp {
     }
 
     fn panic_flow(msg: impl Into<String>, span: Span) -> Flow {
-        Flow::Panic { msg: msg.into(), span }
+        Flow::Panic { msg: msg.into(), span, already_reported: false }
     }
 
     // ---------------- component runtime ----------------
@@ -1178,6 +1187,7 @@ impl Interp {
                     return Err(Flow::Panic {
                         msg: format!("expectation failed: {}", crate::fmt::expr_str(expr, 0)),
                         span: *span,
+                        already_reported: false,
                     });
                 }
                 Ok(Value::Unit)
@@ -1235,10 +1245,16 @@ impl Interp {
                 } else {
                     format!(" (panic: {msg})")
                 };
-                return Err(Self::panic_flow(
-                    format!("property failed for {}{}", binding.join(", "), detail),
+                // PR-it1194: constructed directly (not via `panic_flow`) so
+                // `already_reported` can be set `true` -- this message is
+                // ALREADY complete (see the doc comment on `Flow::Panic`
+                // itself); `run.rs`'s law-reporting logic must not re-wrap
+                // it in "panic: " or emit a spurious `error[K0900]` block.
+                return Err(Flow::Panic {
+                    msg: format!("property failed for {}{}", binding.join(", "), detail),
                     span,
-                ));
+                    already_reported: true,
+                });
             }
         }
         Ok(Value::Unit)
@@ -2054,7 +2070,7 @@ impl Interp {
                         }
                     }
                 }
-                Err(Flow::Panic { msg, span })
+                Err(Flow::Panic { msg, span, already_reported: false })
             }
         }
     }
@@ -5711,7 +5727,7 @@ fn builtin_method(
             .or_else(|| crate::parallel::try_par_filter(&recv, name, &args, &image))
         {
             callback_invoked.set(true);
-            return res.map_err(|msg| Flow::Panic { msg, span });
+            return res.map_err(|msg| Flow::Panic { msg, span, already_reported: false });
         }
     }
     let mut call = |f: Value, args: Vec<Value>| -> Result<Value, String> {
@@ -5724,7 +5740,7 @@ fn builtin_method(
     };
     match shared_method(&recv, name, args, &mut call) {
         Ok(v) => Ok(v),
-        Err(msg) => Err(Flow::Panic { msg, span }),
+        Err(msg) => Err(Flow::Panic { msg, span, already_reported: false }),
     }
 }
 

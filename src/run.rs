@@ -571,7 +571,7 @@ pub fn run_program(path: &str) -> i32 {
 
     match outcome {
         Ok(()) => 0,
-        Err(Flow::Panic { msg, span }) => {
+        Err(Flow::Panic { msg, span, .. }) => {
             report_panic_map(&msg, span, &map);
             101
         }
@@ -1404,10 +1404,10 @@ pub fn run_tests(path: &str) -> i32 {
             // pattern -- `snippet()` is no longer called anywhere after this
             // fix (see its sibling fixes below), so it's removed as dead
             // code rather than left orphaned.
-            Err(Flow::Panic { msg, span }) => {
+            Err(Flow::Panic { msg, span, already_reported }) => {
                 let detail = if let Some(cond) = msg.strip_prefix("expectation failed: ") {
                     format!("`{cond}` was not satisfied")
-                } else if msg.starts_with("property failed for ") {
+                } else if already_reported {
                     // A `forall` counterexample (interp.rs's `run_forall`) is
                     // ALREADY a complete, self-descriptive test-failure
                     // message in its own right (PR-it771) -- not a genuine
@@ -1421,6 +1421,16 @@ pub fn run_tests(path: &str) -> i32 {
                     // (`forall x: Int { expect x == 999999 }`, deterministically
                     // false at x=0) print a spurious `error[K0900]` block, as
                     // if the interpreter itself had crashed.
+                    //
+                    // PRODUCTION-HARDENING (PR-it1194): this used to be a
+                    // `msg.starts_with("property failed for ")` text check --
+                    // a user's own `panic("property failed for ...")` (NOT
+                    // from `run_forall`) collided with the exact phrase and
+                    // silently lost its "panic: " prefix AND its entire
+                    // stderr diagnostic. Now driven by the structural
+                    // `already_reported` flag `run_forall` sets explicitly,
+                    // matching PR-it1193's callback-panic fix's own
+                    // structural-signal-over-string-matching principle.
                     msg
                 } else {
                     // A REAL reporting-consistency bug found+fixed (same
@@ -1484,7 +1494,7 @@ pub fn run_tests(path: &str) -> i32 {
                     println!("FAIL  {label}: {failure}");
                     failed += 1;
                 }
-                Err(Flow::Panic { msg, span }) => {
+                Err(Flow::Panic { msg, span, .. }) => {
                     println!("FAIL  {label}: panic: {msg}");
                     report_panic_map(&msg, span, &map);
                     failed += 1;
@@ -1540,7 +1550,11 @@ pub fn run_tests(path: &str) -> i32 {
                 let outcome: Result<(), Flow> = (|| {
                     let v = interp.instantiate(&c.name, &[], Span::default())?;
                     let Value::Component(id) = v else {
-                        return Err(Flow::Panic { msg: "instantiation failed".into(), span: law.span });
+                        return Err(Flow::Panic {
+                            msg: "instantiation failed".into(),
+                            span: law.span,
+                            already_reported: false,
+                        });
                     };
                     interp.start_all()?;
                     let env = interp.globals.child();
@@ -1565,11 +1579,14 @@ pub fn run_tests(path: &str) -> i32 {
                     // panic, see the sibling comment above); and call
                     // `report_panic_map` for a genuine panic so contract-law
                     // failures get the SAME rich stderr diagnostic as a
-                    // component-example panic.
-                    Err(Flow::Panic { msg, span }) => {
+                    // component-example panic. PR-it1194: driven by the
+                    // structural `already_reported` flag, not a
+                    // `msg.starts_with(...)` text check -- see the
+                    // top-level law loop's identical fix above.
+                    Err(Flow::Panic { msg, span, already_reported }) => {
                         let detail = if let Some(cond) = msg.strip_prefix("expectation failed: ") {
                             format!("`{cond}` was not satisfied")
-                        } else if msg.starts_with("property failed for ") {
+                        } else if already_reported {
                             msg
                         } else {
                             report_panic_map(&msg, span, &map);
@@ -2750,6 +2767,89 @@ mod tests {
             stderr.is_empty(),
             "a forall property-test failure (an EXPECTED test outcome, not a genuine \
              interpreter panic) must not produce a report_panic_map diagnostic: {stderr:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1194, a fresh sweep for the "message-substring-check-driving-
+    /// control-flow" anti-pattern PR-it1193 fixed one instance of). Both law
+    /// loops used to tell a `forall` counterexample's own already-complete
+    /// message apart from a genuine panic via `msg.starts_with("property
+    /// failed for ")` -- a PLAIN, non-`forall` `panic(...)` call whose
+    /// message happens to start with that exact phrase (nothing to do with
+    /// `run_forall` at all) collided with the check and silently lost BOTH
+    /// its "panic: " stdout prefix AND its entire `error[K0900]` stderr
+    /// diagnostic. Live-confirmed before this fix: `law "weird" { expect (0
+    /// == panic("property failed for a totally different, unrelated
+    /// reason")) }` printed a stdout line with no "panic: " prefix and left
+    /// stderr completely empty, while the byte-identical law with a message
+    /// NOT starting with that phrase got both. Fixed by giving `Flow::Panic`
+    /// a structural `already_reported` field that only `run_forall`'s own
+    /// counterexample construction sets `true`, matching PR-it1193's own
+    /// structural-signal-over-string-matching principle. This test covers
+    /// both directions: a plain panic colliding with the magic phrase must
+    /// now get the full "panic: " + stderr treatment, and a genuine `forall`
+    /// counterexample must still be left alone (no regression).
+    #[test]
+    fn a_plain_panic_colliding_with_the_forall_report_phrase_is_not_swallowed() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-forall-phrase-collision-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let collide_file = dir.join("collide.kupl");
+        std::fs::write(
+            &collide_file,
+            "law \"weird\" {\n    \
+             expect (0 == panic(\"property failed for a totally different, unrelated reason\"))\n\
+             }\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["test", collide_file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("panic: property failed for a totally different, unrelated reason"),
+            "a plain panic must keep its \"panic: \" prefix even when its message collides \
+             with the forall-report phrase: {stdout:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("error[K0900]"),
+            "a plain panic must still get the rich stderr diagnostic even when its message \
+             collides with the forall-report phrase: {stderr:?}"
+        );
+
+        let forall_file = dir.join("forall.kupl");
+        std::fs::write(
+            &forall_file,
+            "law \"always positive\" {\n    forall x: Int {\n        expect x > 0\n    }\n}\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["test", forall_file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("FAIL  law \"always positive\": property failed for"),
+            "a genuine forall counterexample's own report must NOT gain a \"panic: \" prefix: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("panic: property failed for"),
+            "a genuine forall counterexample must not be double-wrapped: {stdout:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.is_empty(),
+            "a genuine forall counterexample (an EXPECTED test outcome) must still not \
+             produce a report_panic_map diagnostic: {stderr:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
