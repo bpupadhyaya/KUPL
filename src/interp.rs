@@ -3921,7 +3921,26 @@ pub fn shared_method(
             Some(Value::Int(_)) => Err("shift amount must be in 0..=63".into()),
             _ => Err("`ushr` needs an Int".into()),
         },
-        (Value::Float(v), "to_str") => Ok(Value::str(v.to_string())),
+        // PRODUCTION-HARDENING (PR-it1205): this used to call `v.to_string()`
+        // directly on the raw `f64`, using Rust's own `Display` (which
+        // renders a whole-number float WITHOUT a trailing `.0`, e.g.
+        // `5.0_f64.to_string() == "5"`) instead of `Value`'s own `Display`
+        // (`impl fmt::Display for Value`, value.rs -- always shows `.0` for
+        // a finite, fractionless `Float`, matching this language's own
+        // documented float-formatting convention, and what string
+        // interpolation / the free-function `to_str(x)` / the sibling
+        // `F32.to_str()` arm just above all already correctly use).
+        // Live-confirmed BEFORE this fix: `let x = 5.0` then `x.to_str()`
+        // printed `"5"` while `"{x}"` and `to_str(x)` on the SAME value
+        // both printed `"5.0"` -- an internal inconsistency WITHIN this
+        // single reference engine (not merely a cross-engine one), since
+        // `kupl native`'s own `k_to_str` always routes through the shared
+        // `k_show` display routine and correctly printed `"5.0"` for all
+        // three forms. `vm.rs` shares this exact function verbatim (`use
+        // crate::interp::shared_method`), so it was affected identically.
+        // Fixed by wrapping back into `Value` first, mirroring the `F32`
+        // arm's own already-correct pattern exactly.
+        (Value::Float(v), "to_str") => Ok(Value::str(Value::Float(*v).to_string())),
         (Value::Float(v), "fmt") => match args.into_iter().next() {
             Some(Value::Int(d)) => Ok(Value::str(format_float(*v, d))),
             _ => Err("`fmt` needs an Int number of decimals".into()),

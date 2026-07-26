@@ -17625,6 +17625,38 @@ fun probe() -> Str {
         assert_eq!(differential(ok), "[2, 4, 6]");
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1205, the cold-function survey technique's second application
+    /// to interp.rs -- its first, PR-it1193, closed a DIFFERENT gap in
+    /// `eval_method`'s own UFCS-retry gate, the test just above): `Float.
+    /// to_str()` (in `shared_method`, imported here verbatim via `use
+    /// crate::interp::shared_method`, so this test covers BOTH engines at
+    /// once) used to call `v.to_string()` directly on the raw `f64`,
+    /// using Rust's own `Display` (no trailing `.0` on a whole number)
+    /// instead of `Value`'s own `Display` (always shows `.0`, matching
+    /// this language's documented convention). Live-confirmed BEFORE this
+    /// fix: `5.0.to_str()` printed `"5"` while `"{5.0}"` and `to_str(5.0)`
+    /// on the SAME value both printed `"5.0"` -- a genuine INTERNAL
+    /// inconsistency within interp.rs itself (not merely a cross-engine
+    /// one), and `kupl native`'s own `k_to_str` (which always routes
+    /// through the shared `k_show` display routine) correctly agreed with
+    /// interpolation/the free function, disagreeing only with the buggy
+    /// `.to_str()` method form.
+    #[test]
+    fn diff_float_to_str_shows_the_trailing_point_zero_matching_interpolation_and_the_free_function() {
+        assert_eq!(differential("fun probe() -> Str {\n    (5.0).to_str()\n}\n"), "5.0");
+        assert_eq!(differential("fun probe() -> Str {\n    (-3.0).to_str()\n}\n"), "-3.0");
+        assert_eq!(differential("fun probe() -> Str {\n    (0.0).to_str()\n}\n"), "0.0");
+        // a non-integral float was never affected -- reconfirm no regression.
+        assert_eq!(differential("fun probe() -> Str {\n    (3.5).to_str()\n}\n"), "3.5");
+        // the free-function form and interpolation were always correct --
+        // confirm all three forms now agree on the SAME value.
+        assert_eq!(
+            differential("fun probe() -> Str {\n    let x = 5.0\n    \"{x.to_str()}|{x}|{to_str(x)}\"\n}\n"),
+            "5.0|5.0|5.0"
+        );
+    }
+
     #[test]
     fn diff_json_nested_roundtrip_and_key_order() {
         // JSON serialize/parse of nested structures is byte-identical on interp/KVM: JObj keys
