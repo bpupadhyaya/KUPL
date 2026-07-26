@@ -2259,9 +2259,49 @@ impl Interp {
         }
         // UFCS: if there's no built-in method, fall back to a top-level function
         // `name(recv, args…)`. Built-in methods take precedence (tried first).
+        //
+        // A REAL, live-confirmed silent-panic-swallowing bug found+fixed
+        // (production-hardening PR-it1193, found via a fresh Explore survey
+        // targeting a genuinely cold spot -- this exact retry GATE, as
+        // opposed to the various `shared_method` arms' own "has no method"
+        // wording, already covered by PR-it1053): this retry used to decide
+        // "the receiver genuinely has no such builtin method, safe to retry
+        // as UFCS" purely by SUBSTRING-matching the panic MESSAGE against
+        // `"has no method"` -- but `shared_method`'s own `call` closure
+        // flattens ANY nested `Flow::Panic` from a user callback into a
+        // plain, untagged `String` (see `builtin_method` below), and a
+        // user's own `panic(...)` call can supply ANY text. A callback that
+        // legitimately panics with a message that merely CONTAINS that
+        // phrase (e.g. an app-level error like `panic("user has no method
+        // to reset their password")`) was silently DISCARDED here and
+        // replaced with the result of calling a same-named top-level
+        // function instead -- an explicit, intentional `panic()` call,
+        // which should always abort the program, produced NO error at all.
+        // Confirmed live BEFORE this fix, with a same-named shadow `fun
+        // map`: `xs.map(fn x { panic("boom: this value has no method
+        // here") })` printed the SHADOW function's own unrelated result
+        // (`[999]`) at exit 0 on BOTH `kupl run` and `kupl run --vm`
+        // (`vm.rs`'s own UFCS retry shares the IDENTICAL substring-match
+        // gate) -- while `kupl native` correctly panicked with the exact
+        // message and exited 101, since native resolves builtin-vs-UFCS
+        // STRUCTURALLY (by the receiver's own runtime tag), never by
+        // inspecting a panic message's text. This was therefore BOTH a
+        // correctness bug (an explicit panic silently vanishing) and a
+        // genuine interp+VM-vs-native THREE-WAY divergence, not merely a
+        // cosmetic message-wording issue. Fixed by tracking whether
+        // `shared_method` ever actually INVOKED a user callback for this
+        // specific dispatch attempt (via `callback_invoked` below) --
+        // a genuine "no such method" failure is a purely STATIC rejection
+        // of `(recv, name)` that `shared_method`'s own match falls through
+        // WITHOUT ever calling into user code at all, so retrying as UFCS
+        // is now gated on BOTH the message text (preserving today's exact
+        // wording-based behavior for the genuine case) AND the callback
+        // never having run (excluding any nested-panic false positive,
+        // regardless of what text it happens to contain).
         if self.db.funs.contains_key(name) {
-            match builtin_method(recv.clone(), name, args.clone(), span, self) {
-                Err(Flow::Panic { msg, .. }) if msg.contains("has no method") => {
+            let callback_invoked = std::cell::Cell::new(false);
+            match builtin_method(recv.clone(), name, args.clone(), span, self, &callback_invoked) {
+                Err(Flow::Panic { msg, .. }) if !callback_invoked.get() && msg.contains("has no method") => {
                     let decl = self.db.funs.get(name).cloned().unwrap();
                     let mut full = Vec::with_capacity(args.len() + 1);
                     full.push(recv);
@@ -2272,7 +2312,7 @@ impl Interp {
                 other => return other,
             }
         }
-        builtin_method(recv, name, args, span, self)
+        builtin_method(recv, name, args, span, self, &std::cell::Cell::new(false))
     }
 }
 
@@ -5643,12 +5683,26 @@ pub fn tensor_builtin(name: &str, arg: &Value) -> Result<Value, String> {
     }
 }
 
+/// `callback_invoked` is set to `true` the moment ANY user callback runs for
+/// this specific dispatch attempt (production-hardening PR-it1193, see
+/// `eval_method`'s own UFCS-retry gate for the full writeup of the bug this
+/// closes) -- lets the caller distinguish a genuine "no such builtin method"
+/// rejection (`shared_method`'s own match falls through WITHOUT ever
+/// running user code) from a callback's own panic message merely
+/// CONTAINING the same wording. The real-thread `par_map`/`par_filter` fast
+/// path below ALSO marks it unconditionally on any `Some(res)` outcome
+/// (success or panic) -- reaching that branch at all already means `name`
+/// matched `"par_map"`/`"par_filter"` exactly (each helper's own internal
+/// `if name != ... { return None }` gate), so a panic from THAT path can
+/// never legitimately be a "no such method" case either, regardless of its
+/// own message text.
 fn builtin_method(
     recv: Value,
     name: &str,
     args: Vec<Value>,
     span: Span,
     interp: &mut Interp,
+    callback_invoked: &std::cell::Cell<bool>,
 ) -> EvalResult {
     // real-thread fast path: `xs.par_map(pure_fn)` over a large list. Falls
     // through to the sequential shared_method on any non-qualifying call.
@@ -5656,10 +5710,12 @@ fn builtin_method(
         if let Some(res) = crate::parallel::try_par_map(&recv, name, &args, &image)
             .or_else(|| crate::parallel::try_par_filter(&recv, name, &args, &image))
         {
+            callback_invoked.set(true);
             return res.map_err(|msg| Flow::Panic { msg, span });
         }
     }
     let mut call = |f: Value, args: Vec<Value>| -> Result<Value, String> {
+        callback_invoked.set(true);
         match interp.call_value(f, args, span) {
             Ok(v) => Ok(v),
             Err(Flow::Panic { msg, .. }) => Err(msg),

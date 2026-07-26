@@ -1409,10 +1409,34 @@ impl<'m> Vm<'m> {
                     // top-level function exists — built-in methods win)
                     let ufcs = self.module.funs.get(&method).copied();
                     let backup = ufcs.map(|_| (r.clone(), args.clone()));
-                    let mut call = |f: Value, args: Vec<Value>| self.call_value_nested(f, args);
+                    // A REAL, live-confirmed silent-panic-swallowing bug
+                    // found+fixed (production-hardening PR-it1193, the SAME
+                    // fix as interp.rs::eval_method's own identical gate --
+                    // see that doc comment for the full writeup): retrying
+                    // as UFCS purely because the panic MESSAGE contains
+                    // `"has no method"` let a user callback's own arbitrary
+                    // `panic(...)` text (e.g. `panic("user has no method to
+                    // reset their password")`) be silently discarded and
+                    // replaced with a same-named top-level function's
+                    // result -- confirmed live: `xs.map(fn x { panic("boom:
+                    // this value has no method here") })`, with a shadow
+                    // `fun map`, printed the shadow's own unrelated result
+                    // at exit 0 instead of panicking, identically to
+                    // interp.rs's own pre-fix bug (this file shares the
+                    // EXACT same gate shape). `callback_invoked` tracks
+                    // whether `shared_method` ever actually ran user code
+                    // for THIS dispatch attempt -- a genuine "no such
+                    // method" rejection never does, so gating the retry on
+                    // BOTH the message text AND the callback never having
+                    // run excludes any nested-panic false positive.
+                    let callback_invoked = std::cell::Cell::new(false);
+                    let mut call = |f: Value, args: Vec<Value>| {
+                        callback_invoked.set(true);
+                        self.call_value_nested(f, args)
+                    };
                     match shared_method(&r, &method, args, &mut call) {
                         Ok(v) => set!(dst, v),
-                        Err(msg) if backup.is_some() && msg.contains("has no method") => {
+                        Err(msg) if backup.is_some() && !callback_invoked.get() && msg.contains("has no method") => {
                             // UFCS: `recv.method(args)` -> `method(recv, args…)`
                             let (recv, margs) = backup.unwrap();
                             let mut full = Vec::with_capacity(margs.len() + 1);
@@ -17500,6 +17524,84 @@ fun probe() -> Str {
 }
 "#;
         assert_eq!(differential(src), "6.0|1.0|false|true|5|0|true|true|true|true");
+    }
+
+    /// A REAL, live-confirmed silent-panic-swallowing bug found+fixed
+    /// (production-hardening PR-it1193, found via a fresh Explore survey
+    /// targeting a genuinely cold spot -- `eval_method`'s own UFCS-retry
+    /// GATE, as opposed to the various `shared_method` arms' own "has no
+    /// method" wording already covered by PR-it1053 just above): both
+    /// `interp.rs::eval_method` and this file's own `Op::Method` handler
+    /// used to decide "retry as UFCS" purely by checking whether the panic
+    /// MESSAGE contained the substring `"has no method"` -- but a nested
+    /// user callback's own `panic(...)` call can supply ANY text, and
+    /// `shared_method`'s `call` closure flattens any such panic into a
+    /// plain, untagged `String` with no way to distinguish it from a
+    /// GENUINE "no such builtin method" rejection. A callback that
+    /// legitimately panics with a message merely CONTAINING that phrase
+    /// (a plausible real message, e.g. an app-level "user has no method to
+    /// reset their password") was silently DISCARDED and replaced with a
+    /// same-named top-level function's result instead -- an explicit,
+    /// intentional `panic()` call, which should ALWAYS abort the program,
+    /// produced no error at all. Confirmed live BEFORE this fix: with a
+    /// same-named shadow `fun map`, `xs.map(fn x { panic("boom: this value
+    /// has no method here") })` printed the SHADOW function's own
+    /// unrelated result (`[999]`) at exit 0 on BOTH `kupl run` and `kupl
+    /// run --vm` -- while `kupl native` correctly panicked with the exact
+    /// message and exited 101, since native resolves builtin-vs-UFCS
+    /// STRUCTURALLY (by the receiver's own runtime tag), never by
+    /// inspecting a panic message's text. This was therefore BOTH a
+    /// correctness bug (an explicit panic silently vanishing) and a
+    /// genuine interp+VM-vs-native THREE-WAY divergence -- invisible to
+    /// `differential()`'s own interp-vs-VM comparison ALONE (both engines
+    /// were WRONG identically); native's own (already-correct, unaffected
+    /// by this fix since cgen.rs resolves UFCS structurally and was never
+    /// touched here) behavior was independently confirmed live via a real
+    /// compiled binary during this fix's own investigation, not re-checked
+    /// by this specific Rust test. Fixed by tracking whether `shared_method`
+    /// (or the `par_map`/`par_filter` fast path) ever actually ran a user callback
+    /// for the specific dispatch attempt -- a genuine "no such method"
+    /// rejection never does, so the retry is now gated on BOTH the
+    /// message text (preserving the exact wording-based behavior for the
+    /// genuine case, confirmed unaffected by the sanity check below) AND
+    /// the callback never having run.
+    #[test]
+    fn diff_a_callback_panic_mentioning_has_no_method_is_not_swallowed_by_the_ufcs_retry() {
+        let src = r#"fun map(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    [999]
+}
+fun probe() -> List[Int] {
+    let xs = [1, 2, 3]
+    xs.map(fn x {
+        if x > 0 {
+            panic("boom: this value has no method here")
+        } else {
+            x
+        }
+    })
+}
+"#;
+        assert_eq!(differential(src), "panic: boom: this value has no method here");
+
+        // sanity: the legitimate UFCS-retry case (a genuinely unrecognized
+        // builtin method, no callback ever runs) must remain unaffected --
+        // this fix must not accidentally disable UFCS altogether.
+        let legit = r#"fun greet(name: Str) -> Str {
+    "hello " + name
+}
+fun probe() -> Str {
+    "world".greet()
+}
+"#;
+        assert_eq!(differential(legit), "hello world");
+
+        // sanity: an ordinary, non-panicking `map` call is completely
+        // unaffected (the callback DOES run, but returns Ok, not a panic).
+        let ok = r#"fun probe() -> List[Int] {
+    [1, 2, 3].map(fn x { x * 2 })
+}
+"#;
+        assert_eq!(differential(ok), "[2, 4, 6]");
     }
 
     #[test]
