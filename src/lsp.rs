@@ -1481,6 +1481,19 @@ fn find_uses_clause_range(text: &str, fun_span: crate::diag::Span) -> Option<(us
     let mut stripped = String::new();
     let mut segment_start = 0usize;
     while i < bytes.len() {
+        // A `//` line comment (never handled here before this fix -- only
+        // `/* ... */` was, by PR-it1157) extends to the physical end of
+        // line. Only checked at `depth == 0`: inside a `/* ... */` block
+        // comment, a `//` has no special meaning and is already correctly
+        // ignored by the `depth > 0` branch below.
+        if depth == 0 && bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            stripped.push_str(&after_kw[segment_start..i]);
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            segment_start = i;
+            continue;
+        }
         if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
             if depth == 0 {
                 stripped.push_str(&after_kw[segment_start..i]);
@@ -4399,6 +4412,45 @@ mod tests {
             diags.extend(crate::effects::check_effects(&program));
         }
         assert!(!diags.iter().any(|d| d.code == "K0301"), "{fixed:?} -> {diags:?}");
+    }
+
+    /// Sibling to the two block-comment tests above, covering the OTHER
+    /// comment kind this language's own lexer recognizes: a `//` line
+    /// comment (production-hardening PR-it1206, a fresh open-ended Explore
+    /// survey finding). PR-it1157's own fix taught the scan to skip over
+    /// `/* ... */` but never taught it about `//`, so a `-` or `{` inside an
+    /// ordinary trailing line comment (before the REAL `->`) was still
+    /// misread as the clause's own end -- corrupting the "Widen `uses`
+    /// clause" quick-fix's replacement range exactly the same way the
+    /// block-comment bug did.
+    #[test]
+    fn code_action_widening_a_uses_clause_does_not_corrupt_a_trailing_line_comment_containing_a_hyphen() {
+        // Unlike the block-comment sibling above, a `//` line comment always
+        // consumes to the physical end of line -- so it can only appear
+        // mid-clause when a trailing comma lets the clause continue onto the
+        // NEXT line (a bare `uses io // comment` with no comma is not valid
+        // syntax at all: the arrow would be swallowed by the comment, and
+        // K0100 fires before this fix is even reachable).
+        let src = "ai fun helper() -> Str { intent \"say hi\" }\n\
+                   pub fun outer(x: Int) uses io, // trailing note - the io.fs bit below is real\n    io.fs -> Str {\n    print(to_str(x))\n    read_file(\"path\")\n    helper()\n}\n";
+        let actions = resolve_code_actions(src, 0, src.len());
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let (title, start, end, new_text) = &actions[0];
+        assert_eq!(title, "Widen `uses` clause to add `ai`");
+        let mut fixed = src.to_string();
+        fixed.replace_range(*start..*end, new_text);
+        let (program, mut diags) = crate::parser::parse(&fixed);
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "the fix must not corrupt the source into something that fails to parse: {fixed:?} -> {diags:?}"
+        );
+        diags.extend(crate::check::check(&program).1);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(crate::effects::check_effects(&program));
+        }
+        assert!(!diags.iter().any(|d| d.code == "K0301"), "{fixed:?} -> {diags:?}");
+        assert!(fixed.contains("uses io, io.fs, ai"), "{fixed:?}");
+        assert!(fixed.contains("-> Str {"), "the return arrow must survive intact: {fixed:?}");
     }
 
     /// The related side-benefit half of PR-it1157's own fix: `find_uses_
