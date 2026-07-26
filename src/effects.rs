@@ -1260,7 +1260,33 @@ fn collect_expr(
     // reads correctly for the forwarding case too (a function that hands an
     // unverifiable callback to something else still cannot have its own
     // effects verified).
-    if fn_typed_params.contains(name) {
+    // PRODUCTION-HARDENING (PR-it1203): `!is_method_call` guards this check
+    // -- for `ExprKind::MethodCall`, `name` (bound above) is the METHOD
+    // SELECTOR (e.g. `ping` in `inst.ping(1)`), which has no relationship
+    // to any local binding at all; KUPL's method-call syntax `receiver.
+    // name(...)` can never mean "invoke the enclosing function's own
+    // function-typed parameter named `name`" (that's only ever reachable
+    // via a PLAIN call `name(...)` or a bare `name` reference, both
+    // already `is_method_call == false`). Before this fix, a method call
+    // whose SELECTOR happened to textually collide with an unrelated
+    // function-typed parameter of the SAME enclosing function was wrongly
+    // treated as "a call through that parameter," short-circuiting BEFORE
+    // ever reaching the real component-method/UFCS resolution below and
+    // producing a spurious K0303 warning. Live-confirmed BEFORE this fix:
+    // `pub fun apply(ping: fn(Int) -> Int, opt: Option[Logger]) -> Int {
+    // match opt { Some(inst) => inst.ping(1) None => 0 } }` (where `Logger`
+    // exposes an unrelated `ping` method) reported `warning[K0303]: 'apply'
+    // calls a value of function type`, while the SAME body with the
+    // parameter renamed to `cb` (no collision) reported NOTHING for the
+    // identical `inst.ping(1)` call -- proving the warning was driven
+    // purely by the textual collision, not any real ambiguity. A false
+    // positive only (never a soundness hole: the underlying component
+    // method's own effects are independently checked via K0301 at its own
+    // declaration site, matching this file's own established "over-
+    // attribution is sound, under-attribution is the only real risk"
+    // principle, PR-it569/933/993's shared doc comment above), but the
+    // SAME diagnostic-noise class those two sibling fixes exist to avoid.
+    if !is_method_call && fn_typed_params.contains(name) {
         *unresolved = true;
         *plain_call_unresolved = true;
         return;
@@ -2445,6 +2471,65 @@ mod tests {
             !pure.contains("apply"),
             "apply must NOT be classified pure -- it calls through a parameter that collides \
              with an unrelated global function name: {pure:?}"
+        );
+    }
+
+    /// A REAL, LIVE-CONFIRMED false-positive bug found+fixed (production-
+    /// hardening PR-it1203, a fresh Explore survey finding): the SAME
+    /// `fn_typed_params.contains(name)` check the sibling test above exists
+    /// to VERIFY (correctly fires for a PLAIN call/bare reference colliding
+    /// with a parameter name) used to ALSO wrongly fire for a METHOD
+    /// call's own SELECTOR -- `inst.ping(1)`'s `name` is `"ping"`, which
+    /// has no relationship to any local binding, but was checked against
+    /// `fn_typed_params` exactly like a plain call/bare Ident reference
+    /// would be. Confirmed live BEFORE this fix: a `Logger` component
+    /// exposing `ping`, called via `inst.ping(1)` inside `pub fun apply
+    /// (ping: fn(Int) -> Int, opt: Option[Logger])` (an UNRELATED
+    /// function-typed parameter that merely happens to share the METHOD's
+    /// own name) wrongly warned K0303, while the identical body with the
+    /// parameter renamed to `cb` (no textual collision) warned nothing at
+    /// all for the SAME `inst.ping(1)` call -- proving the warning was
+    /// driven purely by the textual collision between a method SELECTOR
+    /// and an unrelated parameter NAME, not any real ambiguity (KUPL's
+    /// method-call syntax can never mean "invoke a local function-typed
+    /// parameter" -- that's only reachable via a plain call or bare
+    /// reference, both already excluded from this bug).
+    #[test]
+    fn a_method_calls_own_selector_colliding_with_an_unrelated_parameter_name_does_not_warn_k0303() {
+        let src = |param: &str| {
+            format!(
+                "component Logger {{\n    intent \"l\"\n    expose fun ping(x: Int) uses io -> Int {{\n        \
+                 print(to_str(x))\n        x\n    }}\n}}\n\
+                 pub fun apply({param}: fn(Int) -> Int, opt: Option[Logger]) -> Int {{\n    \
+                 match opt {{\n        Some(inst) => inst.ping(1)\n        None => 0\n    }}\n}}\n"
+            )
+        };
+        let colliding = diags_for(&src("ping"));
+        assert!(
+            !colliding.iter().any(|d| d.code == "K0303" && d.message.contains("apply")),
+            "a method call's own selector colliding with an unrelated function-typed parameter's \
+             name must not warn K0303 on the enclosing function: {colliding:?}"
+        );
+
+        // the non-colliding control case must ALSO stay clean, confirming
+        // this isn't just a coincidental widening of what's suppressed.
+        let control = diags_for(&src("cb"));
+        assert!(
+            !control.iter().any(|d| d.code == "K0303" && d.message.contains("apply")),
+            "{control:?}"
+        );
+
+        // the PR-it933 collision case (a PLAIN call, not a method call)
+        // must still warn -- this fix must not over-broaden into silencing
+        // the sibling bug that test guards against.
+        let plain_call_collision = diags_for(
+            "fun log(x: Int) -> Int {\n    x\n}\n\
+             pub fun apply(log: fn(Int) -> Int, x: Int) -> Int {\n    log(x)\n}\n",
+        );
+        assert!(
+            plain_call_collision.iter().any(|d| d.code == "K0303"),
+            "a PLAIN call through a parameter whose name collides with an existing function must \
+             still warn K0303 -- this is the PR-it933 case, unaffected by PR-it1203: {plain_call_collision:?}"
         );
     }
 }
