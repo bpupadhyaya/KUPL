@@ -18927,6 +18927,64 @@ component Store {
         assert!(crate::compile::compile_module(&small.program, &small.checked).is_ok());
     }
 
+    /// A REAL, statically-confirmed bug found+fixed (production-hardening
+    /// PR-it1190): PR-it685's own fix above closed the ARITHMETIC-overflow
+    /// class (257+ fields), but its OWN threshold (`*slot > 255`) was still
+    /// off by one for what it actually protects. Each field's individual
+    /// slot INDEX (0..255) fits a `u8` fine for exactly 256 total fields --
+    /// but `ComponentMeta::nslots` doesn't store an index, it stores the
+    /// COUNT of slots to allocate, and a `u8` can only represent counts
+    /// 0..=255, not 256. The OLD check let a component with EXACTLY 256
+    /// combined slots through untouched, and `compile_component`'s own
+    /// `nslots: (slot & 0xff) as u8` then silently truncated the count 256
+    /// down to 0 -- `vm.rs::instantiate`'s `slots.resize(0, ..)` and
+    /// `cgen.rs::k_instantiate`'s `malloc(1 * sizeof(KValue))` would both
+    /// under-allocate a component whose compiled `StateSet` ops still
+    /// target indices up to 255, corrupting native's own unchecked
+    /// `k_state_set` array write in particular. NOT independently
+    /// live-reachable via any currently-compilable program, however: a
+    /// 256-total-slot component (whether via 256 state fields, 256 props,
+    /// or 256 zero-arg children -- all three tried) always ALSO hits the
+    /// separate, coincidentally-identical `K0801` "more than 256 registers"
+    /// limit first and refuses to compile for an unrelated reason, since
+    /// this compiler's register allocator needs at least one dedicated
+    /// register per prop/state-init/child-instantiation statement with no
+    /// reuse. Tightened anyway as defensive-in-depth against a genuinely
+    /// incorrect boundary condition, independent of whether an unrelated
+    /// guard happens to mask it today -- see `alloc_slot`'s own updated
+    /// doc comment in compile.rs for the full write-up.
+    #[test]
+    fn a_component_with_exactly_256_combined_slots_is_now_rejected_not_silently_truncated_to_zero() {
+        let mut src = String::from("component Big256 {\n    intent \"exactly 256 slots\"\n");
+        for i in 0..256 {
+            src.push_str(&format!("    state f{i}: Int = {i}\n"));
+        }
+        src.push_str("    expose fun first() -> Int { f0 }\n}\n");
+        src.push_str("fun main() uses io {\n    let b = Big256()\n    print(\"{b.first()}\")\n}\n");
+        let compiled = crate::run::compile(&src).expect("checker accepts 256 state fields");
+        let err = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect_err("exactly 256 slots must be rejected, not silently truncated to an nslots of 0");
+        assert!(
+            err.iter().any(|d| d.code == "K0805"),
+            "expected a K0805 diagnostic for exactly 256 combined slots, got: {err:?}"
+        );
+
+        // discriminating pair: 255 combined slots (the new, correct maximum a
+        // u8 COUNT can represent) must still compile cleanly -- this fix must
+        // not accidentally narrow the limit any further than necessary.
+        let mut src255 = String::from("component Big255 {\n    intent \"exactly 255 slots\"\n");
+        for i in 0..255 {
+            src255.push_str(&format!("    state f{i}: Int = {i}\n"));
+        }
+        src255.push_str("    expose fun first() -> Int { f0 }\n}\n");
+        src255.push_str("fun main() uses io {\n    let b = Big255()\n    print(\"{b.first()}\")\n}\n");
+        let compiled255 = crate::run::compile(&src255).expect("checker accepts 255 state fields");
+        assert!(
+            crate::compile::compile_module(&compiled255.program, &compiled255.checked).is_ok(),
+            "exactly 255 combined slots must still compile cleanly"
+        );
+    }
+
     /// A coverage-closing test, per production-hardening PR-it621's convention
     /// (no bug found, but a genuine untested shape closed with a permanent
     /// test). PR-it686 investigated whether the SAME "narrow u8 count field"

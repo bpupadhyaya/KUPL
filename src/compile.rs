@@ -171,7 +171,7 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
 
 /// Assign the next component-instance slot for a prop/state field/child,
 /// erroring (once per component) instead of silently wrapping if the
-/// combined count exceeds 256. A REAL bug found+fixed (production-hardening
+/// combined count exceeds 255. A REAL bug found+fixed (production-hardening
 /// PR-it685): `ComponentMeta::nslots` and every `Op::StateGet`/`StateSet`
 /// slot index are `u8` (`bytecode.rs`), so the ORIGINAL code tracked the
 /// running counter as a bare `u8` too — a component with 257+ combined
@@ -186,6 +186,36 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
 /// "too large" diagnostic pattern exactly), so the overflow is detected
 /// and reported BEFORE the truncating cast into the `u8`-keyed slot map,
 /// instead of after.
+///
+/// UPDATE (production-hardening PR-it1190): the threshold above was still
+/// off by one for what it actually protects. `slots`' own `u8` VALUES (each
+/// field's individual index, 0..255) are fine for exactly 256 total
+/// fields -- but `ComponentMeta::nslots` doesn't store an index, it stores
+/// the COUNT of slots to allocate, and a u8 can only hold counts 0..=255,
+/// not 256. The OLD `*slot > 255` check let a 256-total-field component
+/// through untouched (its 256 individual index values, 0..255, all fit a
+/// u8 fine), but `compile_component`'s own `nslots: (slot & 0xff) as u8`
+/// then truncated the COUNT 256 down to 0 -- `vm.rs::instantiate`'s
+/// `slots.resize(0, ..)` and `cgen.rs::k_instantiate`'s `malloc(1 *
+/// sizeof(KValue))` both then under-allocate a component whose compiled
+/// `StateSet` ops still target indices up to 255, corrupting native's
+/// unchecked `k_state_set` array write in particular. NOT independently
+/// live-reachable via any currently-compilable program, however: every
+/// constructed 256-slot repro (256 state fields; 256 props; 256
+/// zero-arg children) hit the SEPARATE, coincidentally-identical `K0801`
+/// "more than 256 registers" limit first and refused to compile, since
+/// this compiler's register allocator needs at least one dedicated
+/// register per prop/state-init/child-instantiation statement with no
+/// reuse -- confirmed via 6 separately constructed repros (10/100/200/
+/// 250/251..256 state fields, 256 props, 256 children), none of which
+/// reached this code path with a still-compiling program. Tightened
+/// anyway as defensive-in-depth: the ORIGINAL reasoning here ("matches
+/// alloc_slot's own masking") was never actually correct for a COUNT
+/// field, independent of whether K0801 happens to mask it today -- a
+/// future, unrelated widening of K0801's own register cap (or a smarter
+/// register allocator that reuses dead registers) could make this
+/// reachable without anyone revisiting this comment. Now correctly caps
+/// the total at 255 (the actual maximum a `u8` COUNT can represent).
 fn alloc_slot(
     shared: &mut Shared,
     slots: &mut HashMap<String, u8>,
@@ -194,11 +224,11 @@ fn alloc_slot(
     name: &str,
     span: Span,
 ) {
-    if *slot > 255 && !*too_many {
+    if *slot >= 255 && !*too_many {
         *too_many = true;
         shared.diags.push(Diag::error(
             "K0805",
-            "component has too many props + state fields + children for KVM v0 (more than 256 total)",
+            "component has too many props + state fields + children for KVM v0 (more than 255 total)",
             span,
         ));
     }
