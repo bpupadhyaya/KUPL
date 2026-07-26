@@ -45,6 +45,30 @@ fn main() -> ExitCode {
     // panic + backtrace at the user. Convert any panic into one concise,
     // reportable line. The worker-thread join below turns it into exit code 101.
     std::panic::set_hook(Box::new(|info| {
+        // PRODUCTION-HARDENING (PR-it1199): piping `kupl`'s output to any
+        // reader that closes its end before reading everything -- `kupl fmt
+        // file.kupl | head -1`, or a reader that fails to even start at all
+        // (confirmed live: macOS's `cat -A`, an invalid flag there, exits
+        // near-instantly, closing the pipe before this process's first
+        // write) -- is entirely ordinary, expected shell usage, not a
+        // program error. Rust's stdlib runtime ignores SIGPIPE by default,
+        // so a write to a closed pipe returns an `io::Error` instead of
+        // killing the process outright -- and `print!`/`println!`/`eprint!`/
+        // `eprintln!` all PANIC on that error, landing here with the
+        // stable, well-known payload text `"failed printing to std{out,err}:
+        // ..."` (confirmed live via a temporary probe: `Some("failed
+        // printing to stdout: Broken pipe (os error 32)")`, `info.location()`
+        // pointing at the standard library's own internal `io/stdio.rs`).
+        // Before this fix, this was indistinguishable from a genuine KUPL
+        // bug, alarming users with "internal compiler error" for a
+        // completely benign, common pattern (`| head`, `| less`, a reader
+        // exiting early for any reason). Suppress ONLY this specific,
+        // recognizable write-failure panic -- every OTHER panic (an actual
+        // bug) still gets the full "internal compiler error" report
+        // unchanged.
+        if info.payload().downcast_ref::<String>().is_some_and(|msg| is_broken_pipe_panic_message(msg)) {
+            return;
+        }
         let loc = info
             .location()
             .map(|l| format!(" [{}:{}]", l.file(), l.line()))
@@ -69,6 +93,18 @@ fn main() -> ExitCode {
         .expect("spawn main thread")
         .join()
         .unwrap_or(ExitCode::from(101))
+}
+
+/// True when `msg` is the stable, well-known panic payload text `print!`/
+/// `println!`/`eprint!`/`eprintln!` produce when a write to a closed stdout/
+/// stderr pipe fails (e.g. `"failed printing to stdout: Broken pipe (os
+/// error 32)"`) -- see `main`'s own panic hook doc comment (PR-it1199) for
+/// the full rationale. Deliberately narrow (`starts_with`, not a bare
+/// substring match anywhere) so an unrelated genuine panic whose OWN message
+/// happens to mention printing/stdout for some other reason is not
+/// accidentally swallowed.
+fn is_broken_pipe_panic_message(msg: &str) -> bool {
+    msg.starts_with("failed printing to std")
 }
 
 /// True when EVERY newly-introduced error from recompiling `kupl fmt`'s own
@@ -838,7 +874,7 @@ fn with_file(args: &[String], f: impl Fn(&str, &str) -> i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_module, find_path_arg, valid_project_name, with_file, USAGE};
+    use super::{build_module, find_path_arg, is_broken_pipe_panic_message, valid_project_name, with_file, USAGE};
 
     /// A REAL bug found+fixed (production-hardening PR-it974): `USAGE`'s
     /// banner used to hardcode a literal "(v0.2)", stale since the crate's
@@ -2096,6 +2132,80 @@ mod tests {
                 "kupl repl panicked on input starting {preview:?}: {combined}"
             );
         }
+    }
+
+    /// `is_broken_pipe_panic_message` (backing the PR-it1199 panic-hook fix
+    /// just below) must recognize the exact stable payload text Rust's
+    /// `print!`/`println!`/`eprint!`/`eprintln!` macros produce on a write
+    /// failure -- confirmed live via a temporary probe before this fix:
+    /// `Some("failed printing to stdout: Broken pipe (os error 32)")` --
+    /// for BOTH stdout and stderr, while NOT swallowing an unrelated genuine
+    /// panic whose own message happens to be superficially similar-looking.
+    #[test]
+    fn is_broken_pipe_panic_message_matches_only_the_known_stdlib_write_failure_text() {
+        assert!(is_broken_pipe_panic_message("failed printing to stdout: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_panic_message("failed printing to stderr: Broken pipe (os error 32)"));
+        // a DIFFERENT underlying io::Error (not a broken pipe) still hits
+        // the exact same stdlib write path and payload PREFIX -- correctly
+        // still suppressed, since ANY write failure to std{out,err} is
+        // equally not a KUPL bug.
+        assert!(is_broken_pipe_panic_message("failed printing to stdout: Resource temporarily unavailable (os error 35)"));
+        // an unrelated genuine panic must NOT be swallowed, even one that
+        // happens to mention "printing" or "stdout" for its own reasons.
+        assert!(!is_broken_pipe_panic_message("assertion failed: printing to stdout worked"));
+        assert!(!is_broken_pipe_panic_message("index out of bounds: the len is 0 but the index is 3"));
+        assert!(!is_broken_pipe_panic_message(""));
+    }
+
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening
+    /// PR-it1199): piping `kupl`'s output to a reader that closes its end
+    /// before consuming everything -- `kupl fmt file.kupl | head -1`, or a
+    /// reader that fails to even start (confirmed live: `cat -A` on macOS,
+    /// an invalid flag there, exits near-instantly) -- is entirely ordinary
+    /// shell usage, not a program error. Rust's runtime ignores SIGPIPE by
+    /// default, so the write failure surfaces as an `io::Error` that
+    /// `print!`/`println!` turn into a PANIC -- before this fix,
+    /// indistinguishable from a genuine KUPL bug, alarming users with
+    /// "kupl: internal compiler error" for completely benign behavior.
+    /// Confirmed live BEFORE this fix: `kupl fmt <file> | cat -A` (macOS)
+    /// reliably printed the internal-compiler-error line; AFTER, it does
+    /// not. This test reproduces the SAME mechanism deterministically
+    /// (rather than relying on a specific external reader program's own
+    /// timing): closing our own read end of the child's stdout pipe
+    /// immediately after spawning guarantees the child's very next write
+    /// gets a broken-pipe error, regardless of platform or race timing.
+    #[test]
+    fn kupl_fmt_piped_to_a_closed_reader_does_not_report_a_misleading_internal_error() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-broken-pipe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("prog.kupl");
+        std::fs::write(&file, "fun main() -> Int {\n    1 + 2\n}\n").unwrap();
+
+        let mut child = std::process::Command::new(&bin)
+            .args(["fmt", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl fmt spawns");
+        // Close OUR read end of stdout immediately -- before the child has
+        // had a chance to write anything -- simulating a reader that exits
+        // before (or without ever) consuming the output.
+        drop(child.stdout.take());
+
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.expect("kupl fmt hung after its stdout reader closed early");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("internal compiler error"),
+            "a closed stdout reader must not be reported as a KUPL bug: {stderr:?}"
+        );
+        assert!(!stderr.contains("panicked at"), "a closed stdout reader must not show a raw panic: {stderr:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A coverage-closing test, per production-hardening PR-it651 (no bug
