@@ -39,6 +39,7 @@ runaway program fails cleanly instead of taking down the host. Each is enforced 
 | LSP workspace file scan | `5_000` files | language server (`lsp.rs` `MAX_WORKSPACE_FILES`) — caps how many files a single workspace scan tracks |
 | `http_serve` request head / body | `64 KiB` head, `10 MiB` body | interpreter (`interp.rs` — head-read loop, `MAX_BODY_SIZE`), native (`cgen.rs` — the same 64KB head cap, `K_MAX_HTTP_BODY`) — a request head or `Content-Length` body larger than the cap is truncated rather than fully buffered |
 | String contents | no NUL bytes | lexer rejects `\0` and raw NUL (diagnostic `K0008`) — keeps strings safe across the native C runtime, which is NUL-terminated |
+| Wall-clock execution time (`kupl run`/`--vm`) | opt-in, `--timeout=<seconds>`, off by default | CLI watchdog thread (`main.rs`/`timeout.rs`) — a hard process kill with a clean `K0901` diagnostic and exit code `124` after the deadline; not enabled unless requested |
 
 ### Crash safety
 
@@ -91,9 +92,10 @@ mechanism:
   subprocesses) and network access. There is no syscall filtering, no filesystem
   jail, and no capability revocation at runtime.
 - The resource limits above bound **recursion, tensor allocation, JSON nesting, and
-  LSP frame size**. They do **not** bound total memory, total CPU time, wall-clock
-  time, file-descriptor count, or output volume. A program can still allocate until
-  the OS kills it, or loop forever.
+  LSP frame size**. `kupl run`/`--vm` can be given an opt-in `--timeout=<seconds>`
+  wall-clock limit (off by default). They do **not** bound total memory, total CPU
+  time, file-descriptor count, or output volume by default. A program can still
+  allocate until the OS kills it, or loop forever if `--timeout` isn't set.
 
 **Do not run untrusted KUPL as a way to sandbox it.** If you need to execute
 untrusted code, run KUPL inside an OS-level sandbox (container, VM, seccomp, cgroup

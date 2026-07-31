@@ -175,6 +175,7 @@ Severity: **E** = error, **W** = warning.
 | Code | Sev | Meaning |
 |---|---|---|
 | K0900 | E | panic (message + source span; exit code 101). Common panics: `integer overflow in addition/subtraction/multiplication/negation/abs/sum` · `division by zero` · `remainder by zero` · `expectation failed` · `no match arm matched` · `list index out of range` · `tensor length mismatch` · user `panic(msg)` |
+| K0901 | E | `kupl run --timeout=<seconds>` exceeded; the process was killed (exit code 124) |
 
 A panic inside a component whose parent declared
 `supervise child restart on_failure` does **not** exit: the child's state is

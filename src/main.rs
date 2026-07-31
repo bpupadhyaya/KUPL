@@ -18,6 +18,7 @@ const USAGE: &str = concat!(
 
 Usage:
   kupl run <file.kupl> [--vm]       Run the app / `fun main` (--vm: on the KVM bytecode VM)
+  kupl run <file.kupl> [--timeout=N] Kill the process after N seconds (exit 124)
   kupl run <file.kx>                Run a compiled .kx module on the KVM
   kupl build <file.kupl> [-o f.kx]  Compile to a .kx bytecode module
   kupl bundle <file.kupl> [-o app]  Produce a self-contained executable (VM + module)
@@ -185,6 +186,22 @@ fn run_cli() -> ExitCode {
         .collect();
     let json = args.iter().any(|a| a == "--json");
     let vm = args.iter().any(|a| a == "--vm");
+    // Opt-in wall-clock execution limit (`--timeout=<seconds>`), scoped to
+    // `run` only -- see src/timeout.rs's own doc comment for the rationale
+    // (a hard-kill watchdog thread, not an in-engine construct). Any other
+    // subcommand silently ignores `--timeout=...` the same way it already
+    // ignores any other `--flag` it doesn't recognize, via `find_path_arg`'s
+    // existing generic `--`-prefixed-token skip.
+    if matches!(args.first().map(String::as_str), Some("run")) {
+        match kupl::timeout::parse_flag(&args) {
+            Ok(Some(secs)) => kupl::timeout::arm(secs),
+            Ok(None) => {}
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return ExitCode::from(2);
+            }
+        }
+    }
     // A REAL, LIVE-CONFIRMED silent-wrong-behavior bug found+fixed
     // (production-hardening PR-it998, a close-read survey of this file's
     // CLI dispatch): this used to scan for the FIRST non-`--`-prefixed
@@ -2921,6 +2938,96 @@ mod tests {
         assert_eq!(i3.stdout, v3.stdout, "interp/vm must agree");
         assert_eq!(i3.status.code(), Some(0), "{i3:?}");
         assert_eq!(String::from_utf8_lossy(&i3.stdout).trim(), "-99", "an ordinary positional shadowing call must still resolve to the LOCAL closure, unaffected by this fix");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A NEW opt-in CLI safety net (production-hardening: KUPL production-
+    /// readiness phase 1): `--timeout=<seconds>` kills a runaway `kupl run`/
+    /// `kupl run --vm` process with a clean `K0901` diagnostic and exit code
+    /// `124`, rather than letting it loop forever. Drives the REAL compiled
+    /// binary against a genuine infinite loop, on both engines, bounding the
+    /// TEST's own wait via `wait_with_timeout` so a bug in the feature itself
+    /// (the watchdog never firing) fails the test cleanly instead of hanging
+    /// the test suite.
+    #[test]
+    fn timeout_flag_kills_a_runaway_program_on_both_engines() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-timeout-flag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("runaway.kupl");
+        std::fs::write(&file, "fun main() {\n    var x = 0\n    while true { x += 1 }\n}\n").unwrap();
+
+        for extra_args in [vec![], vec!["--vm".to_string()]] {
+            let mut args = vec!["run".to_string(), "--timeout=1".to_string(), file.to_str().unwrap().to_string()];
+            args.extend(extra_args);
+            let child = std::process::Command::new(&bin)
+                .args(&args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("kupl spawns");
+            let out = wait_with_timeout(child, std::time::Duration::from_secs(10))
+                .expect("the watchdog must kill the process well within 10s of a 1s --timeout");
+            assert_eq!(out.status.code(), Some(124), "{out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("K0901"),
+                "the timeout kill must report K0901: {out:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A companion to the timeout test above: an ordinary, fast-finishing
+    /// program must be entirely unaffected by a generous `--timeout` -- the
+    /// flag must never fire early or change output/exit code for a program
+    /// that finishes well within the deadline.
+    #[test]
+    fn timeout_flag_does_not_affect_a_program_that_finishes_in_time() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-timeout-flag-noop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fast.kupl");
+        std::fs::write(&file, "fun main() { print(\"hi\") }\n").unwrap();
+
+        let out = std::process::Command::new(&bin)
+            .args(["run", "--timeout=60", file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi", "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--timeout` must reject a malformed value with a clean usage error
+    /// (exit 2), not a panic or a silently-ignored flag.
+    #[test]
+    fn timeout_flag_rejects_a_malformed_value() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-timeout-flag-bad-value-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fast.kupl");
+        std::fs::write(&file, "fun main() { print(\"hi\") }\n").unwrap();
+
+        for bad in ["--timeout=0", "--timeout=soon", "--timeout=-5"] {
+            let out = std::process::Command::new(&bin)
+                .args(["run", bad, file.to_str().unwrap()])
+                .output()
+                .expect("kupl runs");
+            assert_eq!(out.status.code(), Some(2), "{bad}: {out:?}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

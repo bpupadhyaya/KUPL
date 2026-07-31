@@ -5,7 +5,8 @@
 All file-taking commands are **multi-file aware**: they load the entry file
 plus everything reachable through `use`, and diagnostics point into the file
 they belong to. Exit codes: `0` success · `1` compile/test/diff failure ·
-`2` usage or I/O error · `101` runtime panic.
+`2` usage or I/O error · `101` runtime panic · `124` `--timeout` exceeded (see
+below).
 
 ## Running
 
@@ -27,6 +28,16 @@ interpreter (enforced by differential tests).
 
 ### `kupl run <file.kx>`
 Runs a compiled bytecode module directly — no source needed.
+
+### `kupl run <file.kupl> --timeout=<seconds>`
+Opt-in wall-clock execution limit (default: unlimited). Works with both the
+interpreter and `--vm`. If the process is still running after `<seconds>`
+seconds, it is killed with a `K0901` diagnostic on stderr and exit code `124`
+(matching the coreutils `timeout(1)` convention). This is a hard kill — it
+skips `on stop`/graceful component shutdown, though already-flushed stdout
+survives. It is an operational safety net for runaway programs, not a
+sandbox — see `docs/PRODUCTION.md`'s threat-model section for what it does
+and does not bound.
 
 ### `kupl repl`
 Interactive session. Enter expressions, statements, or whole declarations

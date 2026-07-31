@@ -14,6 +14,9 @@ change and the release process.
   sweep across `examples/*.kupl`.
 - `SECURITY.md`, `docs/VERSIONING.md`: a documented vulnerability-reporting
   channel and a versioning/release policy.
+- `kupl run`/`kupl run --vm --timeout=<seconds>`: an opt-in wall-clock
+  execution limit (off by default). Kills a runaway process with a clean
+  `K0901` diagnostic and exit code `124` after the deadline.
 
 ## [1.0.0-alpha]
 
