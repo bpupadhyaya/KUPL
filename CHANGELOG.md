@@ -21,6 +21,11 @@ change and the release process.
   cap (off by default). Prints a `K0902` diagnostic before aborting on the
   first over-cap allocation. Does not apply to `kupl native`'s generated
   executable — see `docs/PRODUCTION.md`'s Known Limitations.
+- `sha256(s)` and `hmac_sha256(key, msg)` standard library builtins:
+  cryptographic hashing and message authentication, hand-rolled in-tree
+  (zero external dependencies), verified against FIPS 180-4/RFC 4231
+  known-answer test vectors, byte-identical across all four engines
+  including native.
 
 ## [1.0.0-alpha]
 

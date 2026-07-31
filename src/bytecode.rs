@@ -227,6 +227,8 @@ pub const BUILTIN_REMOVE_DIR: u8 = 62;
 pub const BUILTIN_BIG: u8 = 63;
 pub const BUILTIN_HTTP_SERVE: u8 = 64;
 pub const BUILTIN_RAT: u8 = 65;
+pub const BUILTIN_SHA256: u8 = 66;
+pub const BUILTIN_HMAC_SHA256: u8 = 67;
 
 impl Module {
     pub fn disassemble(&self) -> String {

@@ -708,6 +708,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             BUILTIN_BIG => format!("regs[{dst}] = k_big_builtin(regs[{start}]); (void){argc};"),
             BUILTIN_HTTP_SERVE => format!("regs[{dst}] = k_http_serve(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RAT => format!("regs[{dst}] = k_rat_builtin(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_SHA256 => format!("regs[{dst}] = k_sha256(regs[{start}]); (void){argc};"),
+            BUILTIN_HMAC_SHA256 => format!("regs[{dst}] = k_hmac_sha256(regs[{start}], regs[{start}+1]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -6147,6 +6149,109 @@ static KValue k_hash_fnv(KValue sv) {
     uint64_t h = 0xcbf29ce484222325ULL;
     for (size_t i = 0; s[i]; i++) { h ^= s[i]; h *= 0x100000001b3ULL; }
     return k_int((int64_t)h);
+}
+/* SHA-256 (FIPS 180-4), a direct C port of encoding.rs's own sha256_bytes --
+   byte-for-byte identical algorithm, verified byte-identical output via the
+   mandatory interp-vs-native sweep. `msg`/`msg_len` (not a NUL-terminated
+   C string) since this is also used internally by k_hmac_sha256 below on a
+   binary intermediate digest that is not itself valid UTF-8 text. */
+static void k_sha256_raw(const unsigned char* msg, size_t msg_len, unsigned char out[32]) {
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+    };
+    uint32_t h[8] = {
+        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
+    };
+    uint64_t bit_len = (uint64_t)msg_len * 8;
+    size_t padded_len = msg_len + 1;
+    while (padded_len % 64 != 56) padded_len++;
+    padded_len += 8;
+    unsigned char* padded = k_alloc(padded_len);
+    memcpy(padded, msg, msg_len);
+    padded[msg_len] = 0x80;
+    memset(padded + msg_len + 1, 0, padded_len - msg_len - 1 - 8);
+    for (int i = 0; i < 8; i++) padded[padded_len - 8 + i] = (unsigned char)(bit_len >> (56 - 8 * i));
+
+    for (size_t off = 0; off < padded_len; off += 64) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++) {
+            const unsigned char* b = padded + off + i * 4;
+            w[i] = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+        }
+        for (int i = 16; i < 64; i++) {
+            uint32_t x = w[i - 15];
+            uint32_t s0 = (x >> 7 | x << 25) ^ (x >> 18 | x << 14) ^ (x >> 3);
+            uint32_t y = w[i - 2];
+            uint32_t s1 = (y >> 17 | y << 15) ^ (y >> 19 | y << 13) ^ (y >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; i++) {
+            uint32_t s1 = (e >> 6 | e << 26) ^ (e >> 11 | e << 21) ^ (e >> 25 | e << 7);
+            uint32_t ch = (e & f) ^ ((~e) & g);
+            uint32_t temp1 = hh + s1 + ch + K[i] + w[i];
+            uint32_t s0 = (a >> 2 | a << 30) ^ (a >> 13 | a << 19) ^ (a >> 22 | a << 10);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t temp2 = s0 + maj;
+            hh = g; g = f; f = e; e = d + temp1;
+            d = c; c = b; b = a; a = temp1 + temp2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+    for (int i = 0; i < 8; i++) {
+        out[i * 4] = (unsigned char)(h[i] >> 24);
+        out[i * 4 + 1] = (unsigned char)(h[i] >> 16);
+        out[i * 4 + 2] = (unsigned char)(h[i] >> 8);
+        out[i * 4 + 3] = (unsigned char)h[i];
+    }
+}
+static KValue k_bytes_to_hex(const unsigned char* bytes, size_t n) {
+    const char* H = "0123456789abcdef";
+    char* out = k_alloc(n * 2 + 1);
+    for (size_t i = 0; i < n; i++) { out[2 * i] = H[bytes[i] >> 4]; out[2 * i + 1] = H[bytes[i] & 0xF]; }
+    out[n * 2] = 0;
+    return k_str(out);
+}
+static KValue k_sha256(KValue sv) {
+    unsigned char digest[32];
+    k_sha256_raw((const unsigned char*)sv.as.s, strlen(sv.as.s), digest);
+    return k_bytes_to_hex(digest, 32);
+}
+static KValue k_hmac_sha256(KValue keyv, KValue msgv) {
+    const size_t BLOCK_SIZE = 64;
+    const unsigned char* key = (const unsigned char*)keyv.as.s;
+    size_t key_len = strlen(keyv.as.s);
+    unsigned char key_block[64] = {0};
+    if (key_len > BLOCK_SIZE) {
+        k_sha256_raw(key, key_len, key_block);
+        memset(key_block + 32, 0, BLOCK_SIZE - 32);
+    } else {
+        memcpy(key_block, key, key_len);
+    }
+    unsigned char ipad[64], opad[64];
+    for (size_t i = 0; i < BLOCK_SIZE; i++) { ipad[i] = (unsigned char)(0x36 ^ key_block[i]); opad[i] = (unsigned char)(0x5c ^ key_block[i]); }
+
+    const unsigned char* msg = (const unsigned char*)msgv.as.s;
+    size_t msg_len = strlen(msgv.as.s);
+    unsigned char* inner_input = k_alloc(BLOCK_SIZE + msg_len);
+    memcpy(inner_input, ipad, BLOCK_SIZE);
+    memcpy(inner_input + BLOCK_SIZE, msg, msg_len);
+    unsigned char inner_digest[32];
+    k_sha256_raw(inner_input, BLOCK_SIZE + msg_len, inner_digest);
+
+    unsigned char outer_input[64 + 32];
+    memcpy(outer_input, opad, BLOCK_SIZE);
+    memcpy(outer_input + BLOCK_SIZE, inner_digest, 32);
+    unsigned char out_digest[32];
+    k_sha256_raw(outer_input, BLOCK_SIZE + 32, out_digest);
+    return k_bytes_to_hex(out_digest, 32);
 }
 static int k_url_unreserved(unsigned char b) {
     return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')

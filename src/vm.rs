@@ -94,6 +94,8 @@ fn builtin_argc(which: u8) -> Option<u8> {
         BUILTIN_BIG => 1,
         BUILTIN_HTTP_SERVE => 2,
         BUILTIN_RAT => 2,
+        BUILTIN_SHA256 => 1,
+        BUILTIN_HMAC_SHA256 => 2,
         _ => return None,
     })
 }
@@ -1226,19 +1228,24 @@ impl<'m> Vm<'m> {
                         }
                         BUILTIN_NOW => set!(dst, Value::Int(crate::interp::now_seconds())),
                         BUILTIN_BASE64_ENCODE | BUILTIN_BASE64_DECODE | BUILTIN_HEX_ENCODE
-                        | BUILTIN_HEX_DECODE | BUILTIN_HASH_FNV => {
+                        | BUILTIN_HEX_DECODE | BUILTIN_HASH_FNV | BUILTIN_SHA256 => {
                             let name = match which {
                                 BUILTIN_BASE64_ENCODE => "base64_encode",
                                 BUILTIN_BASE64_DECODE => "base64_decode",
                                 BUILTIN_HEX_ENCODE => "hex_encode",
                                 BUILTIN_HEX_DECODE => "hex_decode",
-                                _ => "hash_fnv",
+                                BUILTIN_HASH_FNV => "hash_fnv",
+                                _ => "sha256",
                             };
                             match crate::interp::encoding_builtin(name, &args) {
                                 Ok(v) => set!(dst, v),
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_HMAC_SHA256 => match crate::interp::encoding_builtin("hmac_sha256", &args) {
+                            Ok(v) => set!(dst, v),
+                            Err(msg) => return Err(VmError { msg, span }),
+                        },
                         BUILTIN_BIG => match crate::interp::big_builtin(&args[0]) {
                             Ok(v) => set!(dst, v),
                             Err(msg) => return Err(VmError { msg, span }),
@@ -20723,6 +20730,20 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
         // FNV is stable and equal across engines
         assert_eq!(differential("fun probe() -> Int {\n    hash_fnv(\"foobar\")\n}\n"), (0x85944171f73967e8u64 as i64).to_string());
         assert_eq!(differential("fun probe() -> Bool {\n    hash_fnv(\"a\") == hash_fnv(\"a\")\n}\n"), "true");
+        // sha256/hmac_sha256 (production-readiness phase 1): FIPS 180-4 /
+        // independently-openssl-computed known-answer values, matching
+        // encoding.rs's own KAT tests exactly -- confirmed byte-identical
+        // between interp and KVM here, and separately confirmed against
+        // native via a live `kupl native` run before this test was added
+        // (see the git history for this commit).
+        assert_eq!(
+            differential("fun probe() -> Str {\n    sha256(\"abc\")\n}\n"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            differential("fun probe() -> Str {\n    hmac_sha256(\"key\", \"\")\n}\n"),
+            "5d5d139563c95b5967b9bd9a8c9b233a9dedb45072794cd232dc1b74832607d0"
+        );
         // invalid input → Err on both engines
         assert_eq!(
             differential("fun probe() -> Bool {\n    match hex_decode(\"zz\") {\n        Ok(_) => false\n        Err(_) => true\n    }\n}\n"),

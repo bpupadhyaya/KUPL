@@ -51,6 +51,8 @@ unless supervised.
 | `base64_encode(s)` / `hex_encode(s)` | `(Str) -> Str` | encode the UTF-8 bytes; pure |
 | `base64_decode(s)` / `hex_decode(s)` | `(Str) -> Result[Str, Str]` | `Err` on malformed input or non-UTF-8 |
 | `hash_fnv(s)` | `(Str) -> Int` | FNV-1a 64-bit; stable, non-cryptographic |
+| `sha256(s)` | `(Str) -> Str` | SHA-256 (FIPS 180-4), lowercase hex digest; **cryptographic**, unlike `hash_fnv` |
+| `hmac_sha256(key, msg)` | `(Str, Str) -> Str` | HMAC-SHA256 (RFC 2104/4231), lowercase hex digest |
 | `csv_parse(text)` | `(Str) -> List[List[Str]]` | RFC 4180; handles quoted fields |
 | `csv_stringify(rows)` | `(List[List[Str]]) -> Str` | quotes fields with `,` `"` or newline |
 | `url_encode(s)` | `(Str) -> Str` | percent-encode; space → `%20`; keeps `A-Za-z0-9-_.~` |
@@ -130,11 +132,15 @@ with a positive denominator, so equality and `to_string` are canonical. `+ - * /
 and comparisons, plus `.num`/`.den` (BigInt), `.to_float`, and `.recip`. No
 rounding error — `rat(1,3) + rat(1,6)` is exactly `rat(1,2)`. Native too.
 
-**Encodings** (`base64_*`, `hex_*`, `hash_fnv`) are pure and byte-identical on
-every engine including native. They work on the string's UTF-8 bytes; `*_decode`
-returns `Err` on malformed input or if the decoded bytes are not valid UTF-8.
-`hash_fnv` is deterministic and stable across runs and engines — good for
-bucketing/sharding, not for security.
+**Encodings** (`base64_*`, `hex_*`, `hash_fnv`, `sha256`, `hmac_sha256`) are
+pure and byte-identical on every engine including native. They work on the
+string's UTF-8 bytes; `*_decode` returns `Err` on malformed input or if the
+decoded bytes are not valid UTF-8. `hash_fnv` is deterministic and stable
+across runs and engines — good for bucketing/sharding, not for security.
+`sha256`/`hmac_sha256` are the cryptographic alternative — hand-rolled
+in-tree (this codebase has zero external dependencies), verified against
+FIPS 180-4/RFC 4231 known-answer test vectors; see `SECURITY.md` for the
+"no independent formal audit" caveat.
 
 **CSV** (`csv_parse`/`csv_stringify`) follows RFC 4180: `,` field separator,
 `\n` or `\r\n` row endings on input (`\n` on output), quoted fields for

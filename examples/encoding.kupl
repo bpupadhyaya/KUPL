@@ -1,8 +1,11 @@
-// Data encodings & hashing — base64, hex, and a fast non-crypto hash.
+// Data encodings & hashing — base64, hex, a fast non-crypto hash, and
+// cryptographic hashing.
 //
 //   base64_encode(s) -> Str            base64_decode(s) -> Result[Str, Str]
 //   hex_encode(s)    -> Str            hex_decode(s)    -> Result[Str, Str]
 //   hash_fnv(s)      -> Int            FNV-1a 64-bit (stable, non-crypto)
+//   sha256(s)        -> Str            SHA-256 (FIPS 180-4), hex digest
+//   hmac_sha256(k,m) -> Str            HMAC-SHA256 (RFC 2104/4231), hex digest
 //
 // All pure and deterministic. Encode/decode operate on the string's UTF-8
 // bytes; decode returns Err on malformed input or non-UTF-8 output.
@@ -36,4 +39,9 @@ fun main() uses io {
         Ok(_) => print("unexpected")
         Err(_) => print("bad base64 handled")
     }
+
+    // cryptographic hashing (unlike hash_fnv above) — content integrity,
+    // and message authentication with a shared secret.
+    print(sha256("abc"))                       // ba7816bf...20015ad
+    print(hmac_sha256("shared-secret", "the message"))
 }

@@ -1886,9 +1886,16 @@ impl Interp {
                 }
                 ("now", 0) => return Ok(Value::Int(now_seconds())),
                 ("base64_encode", 1) | ("base64_decode", 1) | ("hex_encode", 1)
-                | ("hex_decode", 1) | ("hash_fnv", 1) => {
+                | ("hex_decode", 1) | ("hash_fnv", 1) | ("sha256", 1) => {
                     let v = self.eval(&args[0].value, env)?;
                     return encoding_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
+                }
+                ("hmac_sha256", 2) => {
+                    let mut vals = Vec::with_capacity(2);
+                    for a in args {
+                        vals.push(self.eval(&a.value, env)?);
+                    }
+                    return encoding_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
                 ("csv_parse", 1) | ("csv_stringify", 1) => {
                     let v = self.eval(&args[0].value, env)?;
@@ -5034,6 +5041,14 @@ pub fn encoding_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         "base64_encode" => Value::str(enc::base64_encode(&s)),
         "hex_encode" => Value::str(enc::hex_encode(&s)),
         "hash_fnv" => Value::Int(enc::hash_fnv(&s)),
+        "sha256" => Value::str(enc::sha256_hex(&s)),
+        "hmac_sha256" => {
+            let msg = match &args[1] {
+                Value::Str(m) => m.as_str().to_string(),
+                other => other.to_string(),
+            };
+            Value::str(enc::hmac_sha256_hex(&s, &msg))
+        }
         "base64_decode" => match enc::base64_decode(&s) {
             Ok(v) => Value::ok(Value::str(v)),
             Err(e) => Value::err(Value::str(e)),

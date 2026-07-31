@@ -593,13 +593,13 @@ const BUILTIN_FUNS: &[&str] = &[
 const BUILTIN_CALL_NAMES: &[&str] = &[
     "append_file", "arange", "args", "big", "csv_parse", "csv_stringify", "date_iso",
     "date_make", "day_of", "delete_file", "env_var", "eprint", "Err", "exec", "exit",
-    "file_exists", "format_time", "hash_fnv", "hex_decode", "hex_encode", "hour_of",
-    "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
+    "file_exists", "format_time", "hash_fnv", "hex_decode", "hex_encode", "hmac_sha256",
+    "hour_of", "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
     "make_dir", "Map", "minute_of", "month_of", "now", "Ok", "panic", "parse_iso",
     "path_base", "path_dir", "path_ext", "path_join", "print", "query_build", "query_parse",
     "random_floats", "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace",
-    "read_all", "read_file", "read_line", "remove_dir", "second_of", "Set", "shuffle", "Some",
-    "tensor", "to_str", "url_decode", "url_encode", "weekday_of", "write_file", "year_of",
+    "read_all", "read_file", "read_line", "remove_dir", "second_of", "Set", "sha256", "shuffle",
+    "Some", "tensor", "to_str", "url_decode", "url_encode", "weekday_of", "write_file", "year_of",
     "yearday_of", "zeros",
 ];
 
@@ -3639,6 +3639,18 @@ impl Checker {
                     let t = self.infer_expr(&args[0].value, ctx);
                     self.unify(&Ty::Str, &t, args[0].value.span, "hash_fnv argument");
                     return Ty::Int;
+                }
+                ("sha256", 1) => {
+                    let t = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &t, args[0].value.span, "sha256 argument");
+                    return Ty::Str;
+                }
+                ("hmac_sha256", 2) => {
+                    let kt = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &kt, args[0].value.span, "hmac_sha256 key argument");
+                    let mt = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&Ty::Str, &mt, args[1].value.span, "hmac_sha256 message argument");
+                    return Ty::Str;
                 }
                 ("csv_parse", 1) => {
                     let t = self.infer_expr(&args[0].value, ctx);
