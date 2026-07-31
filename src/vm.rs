@@ -96,6 +96,10 @@ fn builtin_argc(which: u8) -> Option<u8> {
         BUILTIN_RAT => 2,
         BUILTIN_SHA256 => 1,
         BUILTIN_HMAC_SHA256 => 2,
+        BUILTIN_LOG_DEBUG => 1,
+        BUILTIN_LOG_INFO => 1,
+        BUILTIN_LOG_WARN => 1,
+        BUILTIN_LOG_ERROR => 1,
         _ => return None,
     })
 }
@@ -1136,6 +1140,18 @@ impl<'m> Vm<'m> {
                                 _ => "eprint",
                             };
                             match crate::interp::proc_builtin(name, &args) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
+                        BUILTIN_LOG_DEBUG | BUILTIN_LOG_INFO | BUILTIN_LOG_WARN | BUILTIN_LOG_ERROR => {
+                            let name = match which {
+                                BUILTIN_LOG_DEBUG => "log_debug",
+                                BUILTIN_LOG_INFO => "log_info",
+                                BUILTIN_LOG_WARN => "log_warn",
+                                _ => "log_error",
+                            };
+                            match crate::interp::log_builtin(name, &args) {
                                 Ok(v) => set!(dst, v),
                                 Err(msg) => return Err(VmError { msg, span }),
                             }

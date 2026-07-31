@@ -35,6 +35,7 @@ unless supervised.
 | `read_line()` | `() -> Option[Str]` — **uses `io.env`** | one line from stdin (trailing newline stripped); `None` at EOF |
 | `read_all()` | `() -> Str` — **uses `io.env`** | all of stdin as one string (empty at EOF) |
 | `eprint(v)` | `(any) -> Unit` — **uses `io`** | prints Display form + newline to stderr |
+| `log_debug/log_info/log_warn/log_error(v)` | `(any) -> Unit` — **uses `io`** | one `<UTC-ISO-8601-timestamp> [LEVEL] <v>` line to stderr; no level filtering |
 | `exit(code)` | `(Int) -> !` | flushes stdout and terminates the process |
 | `random_ints(seed, count)` | `(Int, Int) -> List[Int]` | deterministic; `count ≤ 0` → empty |
 | `random_floats(seed, count)` | `(Int, Int) -> List[Float]` | each in `[0.0, 1.0)`; deterministic |
@@ -80,6 +81,13 @@ Unix-filter programs (`echo … | kupl run filter.kupl`); `read_line` strips the
 trailing newline and returns `None` at end of input, so `while let Some(l) =
 read_line() { … }` drains stdin.
 `exit` diverges (like `panic`) so it needs no effect.
+
+`log_debug`/`log_info`/`log_warn`/`log_error` are deliberately minimal —
+one unconditional line per call, no level filtering, no structured
+key-value fields, no configurable output destination — matching this
+stdlib's own established style rather than a full logging framework. They
+carry the same `io` effect as `eprint` (a subset of that capability, not a
+new sub-effect), since they write to stderr the same way.
 
 `random_ints` / `random_floats` / `shuffle` are **pure** (no effect): a given
 seed always yields the same result (xorshift64\*), so simulations and tests are

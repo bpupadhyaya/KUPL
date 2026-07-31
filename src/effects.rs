@@ -832,6 +832,9 @@ fn builtin_effects(name: &str) -> Option<&'static str> {
         "now" => Some("io.time"),
         // stderr output is ordinary `io` (`exit` diverges like `panic`: no effect)
         "eprint" => Some("io"),
+        // structured logging writes to stderr too -- a subset of the same `io`
+        // capability `eprint` already carries, not a new sub-effect
+        "log_debug" | "log_info" | "log_warn" | "log_error" => Some("io"),
         _ => None,
     }
 }

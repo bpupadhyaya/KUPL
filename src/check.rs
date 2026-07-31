@@ -595,6 +595,7 @@ const BUILTIN_CALL_NAMES: &[&str] = &[
     "date_make", "day_of", "delete_file", "env_var", "eprint", "Err", "exec", "exit",
     "file_exists", "format_time", "hash_fnv", "hex_decode", "hex_encode", "hmac_sha256",
     "hour_of", "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
+    "log_debug", "log_error", "log_info", "log_warn",
     "make_dir", "Map", "minute_of", "month_of", "now", "Ok", "panic", "parse_iso",
     "path_base", "path_dir", "path_ext", "path_join", "print", "query_build", "query_parse",
     "random_floats", "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace",
@@ -3693,6 +3694,10 @@ impl Checker {
                     return Ty::Str;
                 }
                 ("eprint", 1) => {
+                    self.infer_expr(&args[0].value, ctx);
+                    return Ty::Unit;
+                }
+                ("log_debug", 1) | ("log_info", 1) | ("log_warn", 1) | ("log_error", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Unit;
                 }

@@ -229,6 +229,10 @@ pub const BUILTIN_HTTP_SERVE: u8 = 64;
 pub const BUILTIN_RAT: u8 = 65;
 pub const BUILTIN_SHA256: u8 = 66;
 pub const BUILTIN_HMAC_SHA256: u8 = 67;
+pub const BUILTIN_LOG_DEBUG: u8 = 68;
+pub const BUILTIN_LOG_INFO: u8 = 69;
+pub const BUILTIN_LOG_WARN: u8 = 70;
+pub const BUILTIN_LOG_ERROR: u8 = 71;
 
 impl Module {
     pub fn disassemble(&self) -> String {

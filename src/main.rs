@@ -2784,6 +2784,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// New stdlib builtins (production-readiness phase 1):
+    /// `log_debug`/`log_info`/`log_warn`/`log_error` each write one
+    /// `<UTC-ISO-8601-timestamp> [LEVEL] <message>` line to stderr. The
+    /// timestamp is genuine wall-clock time (unlike everything else this
+    /// stdlib exposes, which is deterministic), so this test strips the
+    /// leading timestamp token from every line before comparing interp
+    /// against `--vm` -- confirming the LEVEL tag and message text agree
+    /// byte-for-byte, without asserting on the one field that's allowed to
+    /// differ by construction.
+    #[test]
+    fn log_builtins_write_matching_level_tagged_lines_to_stderr_on_both_engines() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-log-builtins-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("logging.kupl");
+        std::fs::write(
+            &file,
+            "fun main() uses io {\n    log_debug(\"debug msg\")\n    log_info(\"info msg\")\n    \
+             log_warn(\"warn msg\")\n    log_error(\"error msg\")\n    log_info(42)\n}\n",
+        )
+        .unwrap();
+
+        let strip_timestamps = |out: &[u8]| -> String {
+            String::from_utf8_lossy(out)
+                .lines()
+                .map(|l| l.splitn(2, ' ').nth(1).unwrap_or(l))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+
+        assert_eq!(interp.status.code(), Some(0), "{interp:?}");
+        assert_eq!(vm.status.code(), Some(0), "{vm:?}");
+        assert!(interp.stdout.is_empty(), "log_* must write to stderr, not stdout: {interp:?}");
+        assert!(vm.stdout.is_empty(), "log_* must write to stderr, not stdout: {vm:?}");
+
+        let (i_stripped, v_stripped) = (strip_timestamps(&interp.stderr), strip_timestamps(&vm.stderr));
+        assert_eq!(i_stripped, v_stripped, "interp and vm must agree on level tags and message text");
+        assert_eq!(
+            i_stripped,
+            "[DEBUG] debug msg\n[INFO] info msg\n[WARN] warn msg\n[ERROR] error msg\n[INFO] 42",
+            "{i_stripped:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL, live-confirmed dead-code bug found+fixed (production-hardening
     /// PR-it1144, an Explore-agent survey side-finding, independently
     /// re-verified live before implementing -- see `interp.rs::Interp::

@@ -710,6 +710,10 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             BUILTIN_RAT => format!("regs[{dst}] = k_rat_builtin(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_SHA256 => format!("regs[{dst}] = k_sha256(regs[{start}]); (void){argc};"),
             BUILTIN_HMAC_SHA256 => format!("regs[{dst}] = k_hmac_sha256(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_LOG_DEBUG => format!("regs[{dst}] = k_log_debug(regs[{start}]); (void){argc};"),
+            BUILTIN_LOG_INFO => format!("regs[{dst}] = k_log_info(regs[{start}]); (void){argc};"),
+            BUILTIN_LOG_WARN => format!("regs[{dst}] = k_log_warn(regs[{start}]); (void){argc};"),
+            BUILTIN_LOG_ERROR => format!("regs[{dst}] = k_log_error(regs[{start}]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -6614,6 +6618,19 @@ static KValue k_parse_iso(KValue sv) {
     }
 }
 static KValue k_now(void) { return k_int((int64_t)time(0)); }
+/* Structured logging -- a direct C port of interp.rs's own log_builtin,
+   reusing the SAME two primitives (k_date_iso/k_now, k_show) that Rust's
+   crate::time::iso/now_seconds and Display are already built from, so the
+   two are byte-identical by construction. */
+static KValue k_log_write(const char* level, KValue v) {
+    KValue ts = k_date_iso(k_now());
+    fprintf(stderr, "%s [%s] %s\n", ts.as.s, level, k_show(v));
+    return k_unit();
+}
+static KValue k_log_debug(KValue v) { return k_log_write("DEBUG", v); }
+static KValue k_log_info(KValue v) { return k_log_write("INFO", v); }
+static KValue k_log_warn(KValue v) { return k_log_write("WARN", v); }
+static KValue k_log_error(KValue v) { return k_log_write("ERROR", v); }
 /* read one line from stdin (newline stripped); None at EOF */
 static KValue k_read_line(void) {
     KBuf b = { 0, 0, 0 };

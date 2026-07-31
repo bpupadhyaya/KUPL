@@ -1813,6 +1813,10 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return proc_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("log_debug", 1) | ("log_info", 1) | ("log_warn", 1) | ("log_error", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return log_builtin(name, &[v]).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("args", 0) | ("read_line", 0) | ("read_all", 0) => {
                     return proc_builtin(name, &[]).map_err(|m| Self::panic_flow(m, span))
                 }
@@ -4911,6 +4915,29 @@ pub fn proc_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err(format!("unknown process builtin `{name}`")),
     }
+}
+
+/// Structured logging — shared by interpreter and KVM. Deliberately minimal
+/// (matching this stdlib's own established style): one formatted line to
+/// stderr per call (UTC ISO-8601 timestamp + level + the argument's own
+/// `Display` form, exactly like `eprint`'s own permissiveness -- any value,
+/// not just `Str`), no level filtering, no structured key-value fields, no
+/// configurable destination. Carries the `io` effect (a subset of the same
+/// capability `eprint` already carries, not a new sub-effect -- see
+/// `effects.rs`). Mirrored in `cgen.rs` via `k_date_iso(k_now())` + `k_show`,
+/// the same two primitives this function's own `crate::time::iso`/
+/// `now_seconds` calls are built from, so the two are byte-identical by
+/// construction, not by coincidence.
+pub fn log_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    let level = match name {
+        "log_debug" => "DEBUG",
+        "log_info" => "INFO",
+        "log_warn" => "WARN",
+        "log_error" => "ERROR",
+        _ => return Err(format!("unknown log builtin `{name}`")),
+    };
+    eprintln!("{} [{}] {}", crate::time::iso(now_seconds()), level, args[0]);
+    Ok(Value::Unit)
 }
 
 /// URL & query-string builtins — shared by interpreter and KVM. Pure.

@@ -26,6 +26,10 @@ change and the release process.
   (zero external dependencies), verified against FIPS 180-4/RFC 4231
   known-answer test vectors, byte-identical across all four engines
   including native.
+- `log_debug`/`log_info`/`log_warn`/`log_error(v)` standard library
+  builtins: minimal structured logging (one `<timestamp> [LEVEL] <v>`
+  line to stderr per call), byte-identical across all four engines
+  including native.
 
 ## [1.0.0-alpha]
 
