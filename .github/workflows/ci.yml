@@ -1,0 +1,78 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Build tests
+        run: cargo build --tests --locked --verbose
+
+      # KUPL's own byte-identity guarantee across the interpreter/VM/native
+      # engines is verified by its test suite (~1620 lib + ~40 main tests) --
+      # this is the single most important CI step.
+      - name: Test
+        run: cargo test --locked --verbose
+
+      # No fmt/clippy config exists in this repo yet, so these are advisory
+      # (non-blocking) rather than gating merges on a style/lint pass the
+      # codebase has never been held to.
+      - name: Format check (advisory)
+        run: cargo fmt --check
+        continue-on-error: true
+
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true
+
+  examples-parity:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      # Mirrors this project's own manual interp-vs-vm parity sweep: every
+      # example with a `main()` must produce byte-identical output on the
+      # tree-walking interpreter and the register-based bytecode VM.
+      - name: Interpreter vs VM parity sweep
+        env:
+          KUPL_AI_MOCK: "1"
+        run: |
+          set -e
+          fail=0
+          for f in examples/*.kupl; do
+            if grep -q "fun main(" "$f"; then
+              i=$(./target/release/kupl run "$f" 2>&1) || true
+              v=$(./target/release/kupl run --vm "$f" 2>&1) || true
+              if [ "$i" != "$v" ]; then
+                echo "MISMATCH: $f"
+                fail=1
+              fi
+            fi
+          done
+          exit $fail
