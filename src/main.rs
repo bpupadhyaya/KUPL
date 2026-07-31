@@ -2,6 +2,15 @@ use std::process::ExitCode;
 
 use kupl::{repl, run};
 
+// Registered here, in the BINARY crate only (never src/lib.rs) -- see
+// memcap.rs's own doc comment for why: this must not force a memory cap
+// onto anyone embedding `kupl` as a library. Declaring a `#[global_allocator]`
+// is process-wide, but doing nothing (the default `CAP` is `usize::MAX`)
+// until `--max-memory=<MB>` is actually parsed below has zero behavioral
+// effect on ordinary use.
+#[global_allocator]
+static ALLOC: kupl::memcap::CappedAlloc = kupl::memcap::CappedAlloc;
+
 // SOUNDNESS FIX (production-hardening PR-it974): this banner used to hardcode
 // a literal "(v0.2)" -- stale since Cargo.toml (and `kupl version`/`kupl
 // --version`, which reads `env!("CARGO_PKG_VERSION")` at line ~349) moved on
@@ -19,6 +28,7 @@ const USAGE: &str = concat!(
 Usage:
   kupl run <file.kupl> [--vm]       Run the app / `fun main` (--vm: on the KVM bytecode VM)
   kupl run <file.kupl> [--timeout=N] Kill the process after N seconds (exit 124)
+  kupl run <file.kupl> [--max-memory=N] Abort if total allocation exceeds N MB
   kupl run <file.kx>                Run a compiled .kx module on the KVM
   kupl build <file.kupl> [-o f.kx]  Compile to a .kx bytecode module
   kupl bundle <file.kupl> [-o app]  Produce a self-contained executable (VM + module)
@@ -195,6 +205,16 @@ fn run_cli() -> ExitCode {
     if matches!(args.first().map(String::as_str), Some("run")) {
         match kupl::timeout::parse_flag(&args) {
             Ok(Some(secs)) => kupl::timeout::arm(secs),
+            Ok(None) => {}
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return ExitCode::from(2);
+            }
+        }
+        // Same scoping rationale as --timeout just above -- see
+        // src/memcap.rs's own doc comment.
+        match kupl::memcap::parse_flag(&args) {
+            Ok(Some(bytes)) => kupl::memcap::set_cap_bytes(bytes),
             Ok(None) => {}
             Err(msg) => {
                 eprintln!("error: {msg}");
@@ -3022,6 +3042,88 @@ mod tests {
         std::fs::write(&file, "fun main() { print(\"hi\") }\n").unwrap();
 
         for bad in ["--timeout=0", "--timeout=soon", "--timeout=-5"] {
+            let out = std::process::Command::new(&bin)
+                .args(["run", bad, file.to_str().unwrap()])
+                .output()
+                .expect("kupl runs");
+            assert_eq!(out.status.code(), Some(2), "{bad}: {out:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A NEW opt-in CLI safety net (production-hardening: KUPL production-
+    /// readiness phase 1): `--max-memory=<MB>` aborts a `kupl run`/`kupl run
+    /// --vm` process with a clean `K0902` diagnostic once total allocation
+    /// exceeds the cap, on both engines. `"x".repeat(90_000_000)` (90MB, a
+    /// single bulk allocation) is deliberately kept under the LANGUAGE's own
+    /// separate 100MB `.repeat()` result-size guard (`interp.rs`'s `"repeat"`
+    /// arm) so the process-level memory cap -- not that unrelated guard -- is
+    /// what's actually being exercised here.
+    #[test]
+    fn max_memory_flag_aborts_an_oversized_allocation_on_both_engines() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-max-memory-flag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("blowup.kupl");
+        std::fs::write(&file, "fun main() {\n    let s = \"x\".repeat(90000000)\n    print(s.len())\n}\n").unwrap();
+
+        for extra_args in [vec![], vec!["--vm".to_string()]] {
+            let mut args = vec!["run".to_string(), "--max-memory=32".to_string(), file.to_str().unwrap().to_string()];
+            args.extend(extra_args);
+            let out = std::process::Command::new(&bin).args(&args).output().expect("kupl runs");
+            assert!(!out.status.success(), "{out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("K0902"),
+                "the memory-cap abort must report K0902: {out:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A companion to the memory-cap test above: an ordinary program that
+    /// stays comfortably under a generous cap must be entirely unaffected --
+    /// same output, same exit code, as with no cap at all.
+    #[test]
+    fn max_memory_flag_does_not_affect_a_program_under_the_cap() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-max-memory-flag-noop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fast.kupl");
+        std::fs::write(&file, "fun main() { print(\"hi\") }\n").unwrap();
+
+        let out = std::process::Command::new(&bin)
+            .args(["run", "--max-memory=64", file.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi", "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--max-memory` must reject a malformed value with a clean usage error
+    /// (exit 2), not a panic or a silently-ignored flag.
+    #[test]
+    fn max_memory_flag_rejects_a_malformed_value() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-max-memory-flag-bad-value-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fast.kupl");
+        std::fs::write(&file, "fun main() { print(\"hi\") }\n").unwrap();
+
+        for bad in ["--max-memory=0", "--max-memory=lots", "--max-memory=-16"] {
             let out = std::process::Command::new(&bin)
                 .args(["run", bad, file.to_str().unwrap()])
                 .output()

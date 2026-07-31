@@ -5,8 +5,9 @@
 All file-taking commands are **multi-file aware**: they load the entry file
 plus everything reachable through `use`, and diagnostics point into the file
 they belong to. Exit codes: `0` success · `1` compile/test/diff failure ·
-`2` usage or I/O error · `101` runtime panic · `124` `--timeout` exceeded (see
-below).
+`2` usage or I/O error · `101` runtime panic · `124` `--timeout` exceeded ·
+non-zero (platform abort code, typically `134`) `--max-memory` exceeded (see
+below for both).
 
 ## Running
 
@@ -38,6 +39,17 @@ skips `on stop`/graceful component shutdown, though already-flushed stdout
 survives. It is an operational safety net for runaway programs, not a
 sandbox — see `docs/PRODUCTION.md`'s threat-model section for what it does
 and does not bound.
+
+### `kupl run <file.kupl> --max-memory=<MB>`
+Opt-in total-allocation cap (default: unlimited). Works with both the
+interpreter and `--vm`, since both run inside the same process — a custom
+allocator tracks total bytes allocated and rejects any allocation that would
+push the total past the cap. Prints a `K0902` diagnostic to stderr before the
+process aborts (Rust's own allocation-failure handler; the exact abort exit
+code is platform-dependent, typically `134` on Unix). **Does not apply to
+`kupl native`'s generated executable** — that's a separate, standalone
+process; use `ulimit -v`/cgroups/a container to bound its memory instead.
+Like `--timeout`, this is an operational safety net, not a sandbox.
 
 ### `kupl repl`
 Interactive session. Enter expressions, statements, or whole declarations

@@ -17,6 +17,10 @@ change and the release process.
 - `kupl run`/`kupl run --vm --timeout=<seconds>`: an opt-in wall-clock
   execution limit (off by default). Kills a runaway process with a clean
   `K0901` diagnostic and exit code `124` after the deadline.
+- `kupl run`/`kupl run --vm --max-memory=<MB>`: an opt-in total-allocation
+  cap (off by default). Prints a `K0902` diagnostic before aborting on the
+  first over-cap allocation. Does not apply to `kupl native`'s generated
+  executable — see `docs/PRODUCTION.md`'s Known Limitations.
 
 ## [1.0.0-alpha]
 

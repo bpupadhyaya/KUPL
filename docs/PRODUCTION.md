@@ -40,6 +40,7 @@ runaway program fails cleanly instead of taking down the host. Each is enforced 
 | `http_serve` request head / body | `64 KiB` head, `10 MiB` body | interpreter (`interp.rs` — head-read loop, `MAX_BODY_SIZE`), native (`cgen.rs` — the same 64KB head cap, `K_MAX_HTTP_BODY`) — a request head or `Content-Length` body larger than the cap is truncated rather than fully buffered |
 | String contents | no NUL bytes | lexer rejects `\0` and raw NUL (diagnostic `K0008`) — keeps strings safe across the native C runtime, which is NUL-terminated |
 | Wall-clock execution time (`kupl run`/`--vm`) | opt-in, `--timeout=<seconds>`, off by default | CLI watchdog thread (`main.rs`/`timeout.rs`) — a hard process kill with a clean `K0901` diagnostic and exit code `124` after the deadline; not enabled unless requested |
+| Total memory allocation (`kupl run`/`--vm`) | opt-in, `--max-memory=<MB>`, off by default | a custom `#[global_allocator]` (`main.rs`/`memcap.rs`) caps the interpreter/KVM/`.kx` engines uniformly (they share one process); a `K0902` diagnostic prints before the process aborts on the first over-cap allocation. Does **not** cover `kupl native`'s generated executable, a separate standalone process — see Known limitations |
 
 ### Crash safety
 
@@ -93,9 +94,12 @@ mechanism:
   jail, and no capability revocation at runtime.
 - The resource limits above bound **recursion, tensor allocation, JSON nesting, and
   LSP frame size**. `kupl run`/`--vm` can be given an opt-in `--timeout=<seconds>`
-  wall-clock limit (off by default). They do **not** bound total memory, total CPU
-  time, file-descriptor count, or output volume by default. A program can still
-  allocate until the OS kills it, or loop forever if `--timeout` isn't set.
+  wall-clock limit and an opt-in `--max-memory=<MB>` allocation cap (both off by
+  default). Neither bounds file-descriptor count or output volume, and
+  `--max-memory` has no effect at all on `kupl native`'s generated executable (a
+  separate standalone process — see Known limitations for what to use instead). A
+  program can still allocate until the OS kills it, or loop forever, if these
+  flags aren't set.
 
 **Do not run untrusted KUPL as a way to sandbox it.** If you need to execute
 untrusted code, run KUPL inside an OS-level sandbox (container, VM, seccomp, cgroup
@@ -221,6 +225,11 @@ Being honest about what is not yet production-grade:
 - **Alpha stability.** The language and `.kx` binary format are versioned (a `.kx`
   built by a different compiler version is rejected with a clear message), but no
   long-term source or ABI stability is promised yet.
+- **`--max-memory` doesn't cover `kupl native` output.** The opt-in memory cap is a
+  `#[global_allocator]` inside the `kupl` process — it has no effect on a `kupl
+  native`-compiled binary, which is a separate, standalone C-compiled executable
+  that never links it. Use `ulimit -v`/cgroups (or a container) to bound a native
+  binary's memory instead.
 
 For the full design-vs-implemented audit, see [`GAPS.md`](GAPS.md). For the language
 itself, see [`reference/LANGUAGE-REFERENCE.md`](reference/LANGUAGE-REFERENCE.md); for

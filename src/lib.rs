@@ -36,6 +36,7 @@ pub mod prop;
 pub mod registry;
 pub mod repl;
 pub mod run;
+pub mod memcap;
 pub mod sdiff;
 pub mod timeout;
 pub mod token;
