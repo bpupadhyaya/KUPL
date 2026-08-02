@@ -901,7 +901,15 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       clamp/is_nan/is_infinite); Map (is_empty/get_or/merge/map_values); Set
       (is_empty/is_subset)
 - [ ] System tier: ownership, `low`/`asm` (design §6; audit #4)
-- [ ] Capabilities as attenuable values (`cap.Http.limited_to(…)`)
+- [ ] Capabilities as attenuable values (`cap.Http.limited_to(…)`) — design
+      sketch written (it112, `docs/design/CAPABILITIES.md`): confirmed
+      `requires` is a reserved word with NO grammar production (the vision
+      text's own syntax doesn't parse today) and effects are 100% static/
+      syntactic with zero runtime capability objects; recommends an
+      ADDITIVE layer (existing `uses io.net` unchanged, new capability-typed
+      props + `_with`-suffixed builtin variants) over collapsing effects
+      into capabilities, and a Cap.Net-only first slice if picked up. Not
+      implemented — a bounded design deliverable, not code.
 
 ## Tier 4 — ecosystem
 

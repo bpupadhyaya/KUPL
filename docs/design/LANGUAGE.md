@@ -139,7 +139,12 @@ pub fun fetch_user(id: UserId) uses net -> Result[User, NetError] {
   (or derived) capability is in scope via `requires`. No ambient authority — AI-generated
   code physically cannot exfiltrate data or touch disk unless the surrounding component
   was granted that capability. Capabilities are attenuable: `cap.Sql.read_only()`,
-  `cap.Http.limited_to("api.example.com")`.
+  `cap.Http.limited_to("api.example.com")`. **Not yet implemented** — the
+  effect system as actually shipped (`src/effects.rs`) is 100% static/
+  syntactic (`uses io.net`, checked at compile time, no runtime capability
+  value), and `requires` is a reserved word with no grammar production.
+  See `CAPABILITIES.md` for a design sketch of what closing this gap
+  would require.
 - Errors are values: `Result[T, E]` with `?` propagation, `Option[T]` instead of null.
   `panic` exists only for bugs (contract violation, index out of bounds) and is caught
   at component boundaries by supervision — a panic kills the instance, not the program.
