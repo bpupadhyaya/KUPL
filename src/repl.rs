@@ -296,15 +296,27 @@ pub fn repl() -> i32 {
 /// can reference already-migrated props/state/kept children. Still
 /// refuses the WHOLE upgrade (no instances touched) if: a PRE-EXISTING
 /// child's own `component` type changed (nothing sound to migrate a
-/// live instance TO a different type); a PRE-EXISTING child was REMOVED
+/// live instance TO a different type); or a PRE-EXISTING child was REMOVED
 /// (cleanly stopping/unsupervising a live actor needs `on stop` +
-/// supervision-tree surgery, out of scope for now -- the removed child
-/// would otherwise become a permanently orphaned, unreachable-but-still-
-/// running instance); or any WIRE between two PRE-EXISTING children
-/// changed (re-routing an established connection is a materially
-/// different problem than adding one). A NEW wire touching a NEWLY-added
-/// child is fine and gets registered once that child exists, mirroring
-/// `instantiate`'s own wire-registration step exactly.
+/// supervision-tree surgery -- and, unlike a `state`/`prop` field, there is
+/// NO existing mechanism anywhere in this engine for tearing down ONE live
+/// instance while its siblings keep running; supervision's own restart
+/// replaces an instance's STATE in place, it never removes an id from the
+/// graph -- out of scope for now, the removed child would otherwise become
+/// a permanently orphaned, unreachable-but-still-running instance).
+///
+/// `wires` between children may now be ADDED or REMOVED freely (it115
+/// follow-up, relaxing the original wires-between-kept-children-frozen
+/// guard) -- a wire touching a NEWLY-added child is registered once that
+/// child exists (mirroring `instantiate`'s own wire-registration step
+/// exactly, and this was ALREADY true before it115); a wire between two
+/// KEPT children that's genuinely NEW is registered the same way (this
+/// loop was never actually restricted to new children, only the GUARD
+/// was); a wire that existed between two kept children in the OLD
+/// declaration but is gone from the NEW one is explicitly pruned from the
+/// source instance's own `Instance.wires` map, since a kept child's
+/// instance is otherwise never touched and would keep routing to a
+/// connection the new declaration no longer describes.
 ///
 /// `props` may change (it112->it113 follow-up, relaxing the original
 /// props-frozen guard): a prop present under the SAME name in both old and
@@ -378,9 +390,12 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
             _ => {}
         }
     }
-    // A wire touching ONLY pre-existing (kept) children must stay IDENTICAL
-    // -- re-routing an established connection is out of scope; a wire
-    // touching a newly-added child is fine, handled once that child exists.
+    // A wire touching ONLY pre-existing (kept) children may now be ADDED or
+    // REMOVED (it115 follow-up) -- computed here so the per-instance loop
+    // below can prune a REMOVED one from the source instance's own
+    // `.wires` map (an ADDED one is already handled by that loop's
+    // existing "wire not in old_comp.wires" registration step, which was
+    // never restricted to NEW children in the first place).
     let kept_children: std::collections::BTreeSet<String> =
         old_child_map.keys().filter(|n| new_child_map.contains_key(*n)).cloned().collect();
     let wire_key = |w: &crate::ast::WireDecl| (w.from.clone(), w.to.clone());
@@ -396,9 +411,6 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
         .filter(|w| kept_children.contains(&w.from.0) && kept_children.contains(&w.to.0))
         .map(wire_key)
         .collect();
-    if old_kept_wires != new_kept_wires {
-        return Err("a wire between two pre-existing children changed — :upgrade cannot yet re-route existing wiring (see its own doc comment)".into());
-    }
 
     for id in &target_ids {
         let old_env = interp.instances[*id].env.clone();
@@ -459,9 +471,10 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
             new_env.define(&child.name, v);
         }
         // wires: only a genuinely NEW wire (not already present in
-        // `old_comp.wires` verbatim) needs registering -- a wire between
-        // two kept children is unchanged (guaranteed above) and already
-        // lives on those children's own untouched `Instance.wires`.
+        // `old_comp.wires` verbatim) needs registering -- this was NEVER
+        // restricted to wires touching a new child, so a NEW wire between
+        // two KEPT children (it115's own re-routing case) is already
+        // handled correctly by this same loop.
         let old_wire_set: std::collections::BTreeSet<_> =
             old_comp.wires.iter().map(|w| (w.from.clone(), w.to.clone())).collect();
         for wire in &new_comp.wires {
@@ -474,6 +487,21 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
                 return Err(format!("new wire references unknown child (`{from_child}` -> `{to_child}`)"));
             };
             interp.instances[src].wires.entry(from_port.clone()).or_default().push((dst, to_port.clone()));
+        }
+        // a wire between two KEPT children that existed in the OLD
+        // declaration but is gone from the NEW one (it115) must be pruned
+        // from the source instance's own `.wires` map -- we never touch a
+        // kept child's own instance, so its stale entry would otherwise
+        // keep routing to a connection the new declaration no longer
+        // describes.
+        for (from, to) in old_kept_wires.difference(&new_kept_wires) {
+            let (from_child, from_port) = from;
+            let (to_child, to_port) = to;
+            if let (Some(&src), Some(&dst)) = (child_ids.get(from_child), child_ids.get(to_child)) {
+                if let Some(targets) = interp.instances[src].wires.get_mut(from_port) {
+                    targets.retain(|(d, p)| !(*d == dst && p == to_port));
+                }
+            }
         }
         interp.instances[*id].env = new_env;
         interp.instances[*id].comp = new_comp.clone();
@@ -893,43 +921,75 @@ mod tests {
         );
     }
 
-    /// it114 follow-up: a wire touching a NEWLY-added child gets registered
-    /// once that child exists; a wire between two PRE-EXISTING children
-    /// changing still refuses the whole upgrade (re-routing an established
-    /// connection is out of scope).
+    /// it114: a wire touching a NEWLY-added child gets registered once that
+    /// child exists. it115 follow-up: a wire between two PRE-EXISTING
+    /// (kept) children may now be ADDED or REMOVED too -- an added one is
+    /// registered the same way as a new-child wire; a removed one is
+    /// pruned from the source instance's own `Instance.wires` map, since
+    /// that instance is otherwise never touched by the upgrade.
     #[test]
-    fn upgrade_registers_a_wire_to_a_new_child_but_refuses_rerouting_an_existing_one() {
+    fn upgrade_registers_a_new_wire_and_reroutes_or_prunes_an_existing_one() {
+        // a wire touching a NEW child (`c`) must succeed and get registered.
         let mut interp = interp_with_one_instance(
             "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    wire a.o -> b.i\n}\n",
             "Parent",
         );
-        // a wire between two KEPT children (a -> b) changing must refuse,
-        // even though both endpoints still individually exist.
         redefine(
             &mut interp,
-            "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n}\n",
+            "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    let c = Dst()\n    wire a.o -> b.i\n    wire a.o -> c.i\n}\n",
         );
-        let err = upgrade_instances(&mut interp, "Parent").expect_err("removing an existing wire must be refused");
-        assert!(err.contains("pre-existing children changed"), "{err}");
+        assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+            panic!("child `a` must still resolve to a component instance");
+        };
+        let Some(crate::value::Value::Component(c_id)) = interp.instances[0].env.get("c") else {
+            panic!("child `c` must be a newly constructed component instance");
+        };
+        let routed_to_c = interp.instances[a_id].wires.get("o").is_some_and(|targets| targets.contains(&(c_id, "i".to_string())));
+        assert!(routed_to_c, "the new wire to the newly-added child must be registered on the source instance");
 
-        // a wire touching a NEW child (`c`) must succeed and get registered.
+        // a wire between two PRE-EXISTING (kept) children removed in the
+        // new declaration must be pruned from the source's own `.wires`.
         let mut interp2 = interp_with_one_instance(
             "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    wire a.o -> b.i\n}\n",
             "Parent",
         );
         redefine(
             &mut interp2,
-            "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    let c = Dst()\n    wire a.o -> b.i\n    wire a.o -> c.i\n}\n",
+            "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n}\n",
         );
         assert_eq!(upgrade_instances(&mut interp2, "Parent"), Ok(1));
-        let Some(crate::value::Value::Component(a_id)) = interp2.instances[0].env.get("a") else {
+        let Some(crate::value::Value::Component(a_id2)) = interp2.instances[0].env.get("a") else {
             panic!("child `a` must still resolve to a component instance");
         };
-        let Some(crate::value::Value::Component(c_id)) = interp2.instances[0].env.get("c") else {
-            panic!("child `c` must be a newly constructed component instance");
+        let Some(crate::value::Value::Component(b_id2)) = interp2.instances[0].env.get("b") else {
+            panic!("child `b` must still resolve to a component instance");
         };
-        let routed_to_c = interp2.instances[a_id].wires.get("o").is_some_and(|targets| targets.contains(&(c_id, "i".to_string())));
-        assert!(routed_to_c, "the new wire to the newly-added child must be registered on the source instance");
+        let still_routed = interp2.instances[a_id2].wires.get("o").is_some_and(|targets| targets.contains(&(b_id2, "i".to_string())));
+        assert!(!still_routed, "a removed wire between two kept children must be pruned, not left dangling");
+
+        // re-routing: `a.o` moves from `b` to a THIRD pre-existing child `c`.
+        let mut interp3 = interp_with_one_instance(
+            "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    let c = Dst()\n    wire a.o -> b.i\n}\n",
+            "Parent",
+        );
+        redefine(
+            &mut interp3,
+            "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    let c = Dst()\n    wire a.o -> c.i\n}\n",
+        );
+        assert_eq!(upgrade_instances(&mut interp3, "Parent"), Ok(1));
+        let Some(crate::value::Value::Component(a_id3)) = interp3.instances[0].env.get("a") else {
+            panic!("child `a` must still resolve to a component instance");
+        };
+        let Some(crate::value::Value::Component(b_id3)) = interp3.instances[0].env.get("b") else {
+            panic!("child `b` must still resolve to a component instance");
+        };
+        let Some(crate::value::Value::Component(c_id3)) = interp3.instances[0].env.get("c") else {
+            panic!("child `c` must still resolve to a component instance");
+        };
+        let targets = interp3.instances[a_id3].wires.get("o").cloned().unwrap_or_default();
+        assert!(!targets.contains(&(b_id3, "i".to_string())), "the old route to `b` must be gone");
+        assert!(targets.contains(&(c_id3, "i".to_string())), "the new route to `c` must be registered");
     }
 
     /// it112->it113 follow-up: a genuinely NEW prop carrying its own
