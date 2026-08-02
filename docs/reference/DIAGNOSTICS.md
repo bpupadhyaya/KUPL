@@ -48,6 +48,7 @@ Severity: **E** = error, **W** = warning.
 | K0120 | E | malformed duration literal (expected `<int><unit>`, unit in `ms`/`s`/`m`/`h`) |
 | K0121 | E | expression nesting too deep (bounded to keep the checker fast on pathological input) |
 | K0122 | E | malformed `supervise ... restart on_failure max <n> in <duration>` restart-intensity clause |
+| K0123 | E | unsupported generic bound (only `[T: Ord]` is currently supported) |
 
 ## K02xx — Type & semantic checker
 
@@ -141,6 +142,7 @@ Severity: **E** = error, **W** = warning.
 | K0287 | E | an `@` pattern's own name is also bound by a nested sub-pattern — the interpreter and the VM/native compiler disagree on which binding wins |
 | K0288 | E | state field is declared more than once — the first declaration is silently discarded |
 | K0289 | E | a component's own function is referenced as a value (not called directly) — supported on the interpreter only, not yet on the VM/native engines |
+| K0290 | E | a generic call's actual argument type does not satisfy its declared `[T: Ord]` bound |
 
 ## K03xx — Effects & style
 

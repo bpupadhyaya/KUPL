@@ -289,6 +289,32 @@ engines discipline as every prior campaign.
   interp/vm parity for both the escalation and sliding-window-expiry
   cases, and two native-specific tests exercising `cgen.rs`'s own
   independent C implementation directly).
+- **Bounded generics: `[T: Ord]` (it103)** — closes a gap this doc has
+  named explicitly since the "100-iteration enrichment campaign complete"
+  summary above: `fun mymax[T: Ord](a: T, b: T) -> T { if a > b { a } else
+  { b } }` now type-checks and runs correctly. `Ord` is currently the
+  ONLY supported bound (an unrecognized bound name is a clean `K0123`
+  parse error, not silently accepted). Purely a `check.rs` feature — KUPL's
+  generics are dynamically typed at runtime on every engine (comparison
+  dispatches on the actual `Value`/`KValue`'s own runtime tag, never a
+  static type), confirmed live before implementing, so **zero changes were
+  needed to interp.rs/vm.rs/cgen.rs's own execution** — the entire feature
+  is a compile-time-only relaxation plus a NEW call-site check. An
+  Ord-bounded type parameter is exempted from the existing K0281
+  parametricity check specifically for comparison operators (`<`/`<=`/
+  `>`/`>=`), while every other narrowing case (return value, internal
+  `let`, aliasing two type parameters) is still correctly rejected. The
+  call-site half closes what would otherwise be an incomplete guarantee:
+  calling a bounded generic with a non-orderable concrete type (e.g. a
+  user record) is now a compile-time `K0290`, not a deferred runtime
+  panic (confirmed live: before this fix, the same call type-checked
+  cleanly and only panicked at runtime inside the body's own comparison).
+  Five new permanent regression tests (grammar/unknown-bound rejection,
+  body-checking relaxation with a non-comparison-narrowing regression
+  check, call-site rejection with a mixed bounded/unbounded regression
+  check, `kupl fmt` round-trip, and a native-specific test proving the
+  "zero runtime changes" claim live across three independently-typed call
+  sites for the same generic function).
 
 ## Final stretch — prioritized shortlist (it42–50)
 

@@ -4,10 +4,10 @@
 
 This manual describes the KUPL language *as implemented* by the reference
 toolchain in this repository. Features that exist only in the design proposal
-(kernels/`at()`, capabilities-as-values, generics with bounds, the
-system/hardware tiers) are covered in [`../design/LANGUAGE.md`](../design/LANGUAGE.md)
-and are marked **[design]** where mentioned. Everything else on this page runs
-today, identically, on all four execution engines.
+(kernels/`at()`, capabilities-as-values, the system/hardware tiers) are
+covered in [`../design/LANGUAGE.md`](../design/LANGUAGE.md) and are marked
+**[design]** where mentioned. Everything else on this page runs today,
+identically, on all four execution engines.
 
 Companion documents:
 [Standard Library](STDLIB.md) · [CLI](CLI.md) · [Diagnostics index](DIAGNOSTICS.md)
@@ -167,12 +167,21 @@ ports, props, expose signatures.
 ```kupl
 fun identity[T](x: T) -> T { x }
 fun apply2[T, U](f: fn(T) -> U, a: T, b: T) -> List[U] { [f(a), f(b)] }
+fun mymax[T: Ord](a: T, b: T) -> T { if a > b { a } else { b } }
 ```
 
 Type parameters in `[...]` are universally quantified and instantiated fresh
 at every call site — `identity(42)`, `identity("s")`, and `identity(true)` in
-one program all check. Bounds (`[T: Ord]`) are **[design]**. Type parameters
-on `type` declarations are **[design]**.
+one program all check. A generic function's body must treat its type
+parameters abstractly — it may not narrow `T` to a concrete type (K0281) —
+**except** for a BOUNDED type parameter, `[T: Ord]`, which additionally
+permits the comparison operators (`<`, `<=`, `>`, `>=`) on values of that
+type. `Ord` is currently the only supported bound (an unrecognized bound
+name is K0123); the bound is checked at every CALL site too, not just
+inside the body — passing a type that doesn't support ordering (anything
+other than `Int`, `Float`, `Str`, or another numeric type) for an
+Ord-bounded parameter is a compile-time `K0290`, not a deferred runtime
+panic. Type parameters on `type` declarations are **[design]**.
 
 ## 4. Expressions
 

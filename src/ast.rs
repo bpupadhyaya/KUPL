@@ -54,6 +54,22 @@ pub struct FunDecl {
     pub name: String,
     /// Type parameters: `fun first[T](xs: List[T]) -> Option[T]`
     pub type_params: Vec<String>,
+    /// Bounded generics (it103, universal-language enrichment campaign):
+    /// type parameter name -> bound name, e.g. `fun sort[T: Ord](...)` ->
+    /// `{"T": "Ord"}`. Empty for ordinary, unbounded generics (the
+    /// overwhelming common case) -- a SEPARATE, additive field rather than
+    /// widening `type_params` itself, to avoid touching that field's own
+    /// 28 existing call sites across check.rs/fmt.rs/lsp.rs/resolve.rs/
+    /// sdiff.rs, none of which need to know about bounds. `"Ord"` is
+    /// currently the ONLY supported bound (checked at parse time, K0123) --
+    /// a built-in, compiler-recognized bound rather than routed through the
+    /// existing `contract`/`fulfills` system, which today only models a
+    /// COMPONENT exposing certain methods, not a primitive/user TYPE
+    /// supporting certain operators; generalizing contracts to cover types
+    /// is a separate, larger future step (LANGUAGE.md's own "Generics with
+    /// contract bounds" framing anticipates it, but doesn't require this
+    /// increment to build the general mechanism first).
+    pub type_param_bounds: std::collections::HashMap<String, String>,
     pub params: Vec<Param>,
     pub ret: Option<TyExpr>,
     pub effects: Vec<String>,

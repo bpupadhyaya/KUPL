@@ -45,6 +45,16 @@ change and the release process.
   an unbounded panic/restart crash loop. Omitting `max … in …` preserves
   unlimited restarts. Byte-identical across all four engines including
   native. See `docs/reference/LANGUAGE-REFERENCE.md` §9.
+- Bounded generics: `fun mymax[T: Ord](a: T, b: T) -> T { if a > b { a }
+  else { b } }`. `Ord` is currently the only supported bound. Comparing two
+  values of an Ord-bounded type parameter is permitted inside a generic
+  function's body (previously rejected as an unsound narrowing, K0281);
+  calling such a function with a concrete type that doesn't support
+  ordering is a compile-time error (`K0290`), not a deferred runtime panic.
+  Byte-identical across all four engines including native (a pure
+  type-checker feature — KUPL's generics are dynamically typed at runtime,
+  so no engine's own execution changed). See
+  `docs/reference/LANGUAGE-REFERENCE.md` §3.
 
 ## [1.0.0-alpha]
 

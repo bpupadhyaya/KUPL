@@ -240,7 +240,19 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
     }
     out.push_str(&format!("fun {}", f.name));
     if !f.type_params.is_empty() {
-        out.push_str(&format!("[{}]", f.type_params.join(", ")));
+        // Bounded generics (it103): render `T: Ord` for a bounded param,
+        // plain `T` otherwise -- `type_param_bounds` is a separate,
+        // additive map (not a field on `type_params` itself), so this is
+        // a per-name lookup rather than a direct zip.
+        let tps: Vec<String> = f
+            .type_params
+            .iter()
+            .map(|tp| match f.type_param_bounds.get(tp) {
+                Some(bound) => format!("{tp}: {bound}"),
+                None => tp.clone(),
+            })
+            .collect();
+        out.push_str(&format!("[{}]", tps.join(", ")));
     }
     out.push('(');
     for (i, p) in f.params.iter().enumerate() {
@@ -1140,6 +1152,24 @@ mod tests {
         roundtrip("type Pair[A, B] = Pair(first: A, second: B)\n");
         roundtrip("type Tree[T] = Leaf | Node(value: T, left: Tree[T], right: Tree[T])\n");
         roundtrip("type Box[T] = { item: T }\n");
+    }
+
+    /// Bounded generics (it103): `[T: Ord]` must round-trip on a `fun`'s own
+    /// type parameters, exactly like the unbounded case above already does
+    /// for type declarations -- confirmed live BEFORE this fix that fmt
+    /// silently dropped the bound entirely, tripping the formatter's own
+    /// "internal formatter bug producing invalid output" safety check (the
+    /// re-parsed, re-formatted output no longer matched, since the dropped
+    /// bound made `a > b` inside the body newly ill-typed... except `kupl
+    /// fmt` formats from the AST directly and never re-typechecks, so the
+    /// ACTUAL failure mode confirmed live was simpler: the round-trip
+    /// helper's own reparse-and-compare check caught the byte-level
+    /// mismatch directly).
+    #[test]
+    fn fmt_preserves_bounded_generic_type_params() {
+        roundtrip("fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n");
+        // a mix of bounded and unbounded type parameters on the SAME function.
+        roundtrip("fun pick[T: Ord, U](cond: Bool, a: T, b: T, extra: U) -> T {\n    if cond { a } else { b }\n}\n");
     }
 
     /// A cheap coverage-closing test (no bug found, per PR-it645) for a shape

@@ -12378,6 +12378,28 @@ fun main() uses io {
         assert_eq!(native_main_stdout(src, "generics").trim(), "5|hi|[1, 2]|42|x|Box(Box(7))");
     }
 
+    /// Bounded generics (it103) on native: `[T: Ord]` is a PURE check.rs
+    /// (type-checker only) feature -- KUPL's generics are dynamically typed
+    /// at runtime (every engine's `>`/`<` dispatches on the actual `Value`/
+    /// `KValue`'s own runtime tag, never a static type), confirmed by
+    /// reading `raw_binary_op`'s own signature before implementing this
+    /// feature -- so a bounded generic function needs ZERO codegen changes,
+    /// only the type-checker's own comparison-operator and call-site
+    /// handling. This test proves that claim live rather than just asserting
+    /// it: `mymax[T: Ord]` compiles and runs on native, matching the
+    /// interpreter exactly, across three independently-typed call sites
+    /// (Int/Float/Str) for the SAME generic function.
+    #[test]
+    fn native_bounded_generic_ord_comparison_matches_interp() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n\
+                   fun main() uses io {\n    \
+                   print(mymax(3, 5))\n    print(mymax(3.5, 2.1))\n    print(mymax(\"apple\", \"banana\"))\n}\n";
+        assert_eq!(native_main_stdout(src, "boundedgeneric").trim(), "5\n3.5\nbanana");
+    }
+
     /// Native closures capture by value (PR-it76): returned closures keep independent
     /// environments and loop-variable capture is value-at-creation, matching interp/KVM.
     #[test]

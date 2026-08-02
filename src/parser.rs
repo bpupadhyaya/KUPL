@@ -436,9 +436,26 @@ impl Parser {
         let start = self.expect(Tok::KwFun)?;
         let (name, _) = self.expect_ident()?;
         let mut type_params = Vec::new();
+        let mut type_param_bounds = std::collections::HashMap::new();
         if self.eat(&Tok::LBracket) {
             loop {
                 let (tp, _) = self.expect_ident()?;
+                // Bounded generics (it103): `fun sort[T: Ord](...)` -- `Ord`
+                // is currently the ONLY supported bound, matching K0118's own
+                // precedent (a small, fixed set of contextual keywords
+                // validated immediately at parse time rather than deferred
+                // to the checker).
+                if self.eat(&Tok::Colon) {
+                    let (bound, bspan) = self.expect_ident()?;
+                    if bound != "Ord" {
+                        return Err(Diag::error(
+                            "K0123",
+                            format!("unsupported generic bound `{bound}` (only `Ord` is currently supported)"),
+                            bspan,
+                        ));
+                    }
+                    type_param_bounds.insert(tp.clone(), bound);
+                }
                 type_params.push(tp);
                 if !self.eat(&Tok::Comma) {
                     break;
@@ -471,7 +488,7 @@ impl Parser {
         };
         let body = self.parse_block()?;
         let span = start.merge(body.span);
-        Ok(FunDecl { name, type_params, params, ret, effects, body, is_pub, ai: None, span })
+        Ok(FunDecl { name, type_params, type_param_bounds, params, ret, effects, body, is_pub, ai: None, span })
     }
 
     /// `ai fun name(params) -> T { intent "..." [model "..."] }`
@@ -542,6 +559,7 @@ impl Parser {
         Ok(FunDecl {
             name,
             type_params: Vec::new(),
+            type_param_bounds: std::collections::HashMap::new(),
             params,
             ret,
             effects,

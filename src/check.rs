@@ -22,6 +22,13 @@ pub struct Checked {
     pub contracts: HashMap<String, ContractSig>,
     /// `ai fun` signatures: everything the runtime needs to execute the call.
     pub ai_funs: HashMap<String, crate::ai::AiFunMeta>,
+    /// Bounded generics (it103): fun name -> one entry per `qvars[i]`
+    /// (`funs`'s own quantified-var list, same order), `Some(bound)` for a
+    /// bounded type parameter (currently only `"Ord"`) or `None` for an
+    /// ordinary unbounded one. A SEPARATE, additive map rather than
+    /// widening `funs`'s own tuple, to avoid touching its many existing
+    /// consumers that have no need to know about bounds.
+    pub fun_type_param_bounds: HashMap<String, Vec<Option<String>>>,
 }
 
 pub fn check(program: &Program) -> (Checked, Vec<Diag>) {
@@ -30,6 +37,7 @@ pub fn check(program: &Program) -> (Checked, Vec<Diag>) {
         diags: Vec::new(),
         uni: Unifier::default(),
         tyvars: HashMap::new(),
+        tyvar_bounds: HashMap::new(),
     };
     ck.collect(program);
     ck.check_bodies(program);
@@ -42,6 +50,14 @@ struct Checker {
     uni: Unifier,
     /// In-scope type parameters while resolving a generic function.
     tyvars: HashMap<String, Ty>,
+    /// Bounded generics (it103): in-scope type parameter NAME -> bound name
+    /// (currently only `"Ord"`), populated alongside `tyvars` in
+    /// `check_fun`. A comparison operator (`</`<=`/`>`/`>=`) on an
+    /// Ord-bounded type parameter is legal WITHOUT narrowing it to a
+    /// concrete type (unlike the unbounded case, which `default_numeric`'s
+    /// own speculative defaulting would otherwise force, tripping the
+    /// post-hoc K0281 parametricity check).
+    tyvar_bounds: HashMap<String, String>,
 }
 
 /// Lexical scope stack for body checking.
@@ -895,12 +911,14 @@ impl Checker {
                 }
                 Item::Fun(f) => {
                     let mut qvars = Vec::new();
+                    let mut qvar_bounds = Vec::new();
                     self.tyvars.clear();
                     for tp in &f.type_params {
                         let v = self.uni.fresh();
                         if let Ty::Var(id) = v {
                             qvars.push(id);
                         }
+                        qvar_bounds.push(f.type_param_bounds.get(tp).cloned());
                         self.tyvars.insert(tp.clone(), v);
                     }
                     let params: Vec<Ty> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
@@ -914,6 +932,9 @@ impl Checker {
                         );
                     }
                     self.checked.funs.insert(f.name.clone(), (params, ret, qvars));
+                    if qvar_bounds.iter().any(Option::is_some) {
+                        self.checked.fun_type_param_bounds.insert(f.name.clone(), qvar_bounds);
+                    }
                 }
                 Item::Component(c) => {
                     let mut sig = ComponentSig::default();
@@ -1707,10 +1728,12 @@ impl Checker {
             self.check_default_params_dont_reference_sibling_params(f);
         }
         self.tyvars.clear();
+        self.tyvar_bounds.clear();
         for tp in &f.type_params {
             let v = self.uni.fresh();
             self.tyvars.insert(tp.clone(), v);
         }
+        self.tyvar_bounds.clone_from(&f.type_param_bounds);
         let mut ctx = Ctx {
             scopes: Scopes::new(),
             ret: f.ret.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit),
@@ -1841,6 +1864,7 @@ impl Checker {
             }
         }
         self.tyvars.clear();
+        self.tyvar_bounds.clear();
     }
 
     /// Put props (immutable) and state (mutable) in scope.
@@ -2701,6 +2725,16 @@ impl Checker {
         }
     }
 
+    /// True if `t` is (still, i.e. unresolved to anything concrete) one of
+    /// the CURRENT function's own type-parameter vars, AND that parameter
+    /// is bound by `Ord` -- see the `BinOp::Lt`/etc. call site's own doc
+    /// comment for why this matters.
+    fn is_ord_bounded_tyvar(&self, t: &Ty) -> bool {
+        self.tyvars
+            .iter()
+            .any(|(name, v)| v == t && self.tyvar_bounds.get(name).is_some_and(|b| b == "Ord"))
+    }
+
     fn default_numeric(&mut self, ty: Ty) -> Ty {
         match ty {
             Ty::Var(_) => {
@@ -2939,6 +2973,23 @@ impl Checker {
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         self.unify(&lt, &rt, expr.span, "comparison");
                         let t = self.uni.apply(&lt);
+                        // Bounded generics (it103): comparing two values of
+                        // an Ord-bounded type parameter is legal WITHOUT
+                        // resolving it to a concrete type -- unlike the
+                        // unbounded case just below, `default_numeric`'s own
+                        // speculative defaulting must NOT run here, since
+                        // forcing `T` to e.g. `Int` would trip the post-hoc
+                        // K0281 parametricity check (this exact narrowing IS
+                        // the violation that check exists to catch for an
+                        // UNBOUNDED type parameter -- an Ord bound is what
+                        // makes it sound: the body never actually inspects
+                        // the concrete type, it only relies on comparability,
+                        // which the bound guarantees at every call site
+                        // instead, see the `K0287` check on generic calls
+                        // below).
+                        if self.is_ord_bounded_tyvar(&t) {
+                            return Ty::Bool;
+                        }
                         if let Some(ret) = self.operator_overload(*op, &t, expr.span) {
                             return ret;
                         }
@@ -3277,8 +3328,24 @@ impl Checker {
 
     /// Instantiate a function scheme: quantified vars become fresh vars.
     fn instantiate_scheme(&mut self, params: &[Ty], ret: &Ty, qvars: &[u32]) -> (Vec<Ty>, Ty) {
+        let (params, ret, _mapping) = self.instantiate_scheme_with_mapping(params, ret, qvars);
+        (params, ret)
+    }
+
+    /// Same as `instantiate_scheme`, but also returns the qvar-id -> fresh-var
+    /// mapping -- used by bounded-generics call-site checking (it103), which
+    /// needs to inspect what a SPECIFIC bounded qvar resolved to AFTER the
+    /// caller unifies the fresh params against the actual call arguments
+    /// (`instantiate_scheme`'s own plain callers have no such need, so they
+    /// keep using the simpler wrapper above).
+    fn instantiate_scheme_with_mapping(
+        &mut self,
+        params: &[Ty],
+        ret: &Ty,
+        qvars: &[u32],
+    ) -> (Vec<Ty>, Ty, HashMap<u32, Ty>) {
         if qvars.is_empty() {
-            return (params.to_vec(), ret.clone());
+            return (params.to_vec(), ret.clone(), HashMap::new());
         }
         let mut mapping: HashMap<u32, Ty> = HashMap::new();
         for q in qvars {
@@ -3287,6 +3354,7 @@ impl Checker {
         (
             params.iter().map(|p| Self::subst_ty(p, &mapping)).collect(),
             Self::subst_ty(ret, &mapping),
+            mapping,
         )
     }
 
@@ -3780,6 +3848,72 @@ impl Checker {
                     self.check_ctor_args(name, &sig, args, span, ctx);
                     return Ty::Component(name.clone());
                 }
+            }
+            // Bounded generics (it103): a bare-Ident call to a user function
+            // with at least one bounded type parameter gets its OWN
+            // instantiation path (rather than falling through to "general
+            // callable" below, which discards the qvar-id -> fresh-var
+            // mapping via the plain `instantiate_scheme` wrapper) so each
+            // bounded qvar's RESOLVED concrete type -- after unifying
+            // against the actual call arguments, exactly like the general
+            // path does -- can be checked against its own bound. This is
+            // what makes the bound a genuine COMPILE-TIME guarantee rather
+            // than just a body-checking relaxation: without this,
+            // `mymax(a_record, another_record)` for a non-orderable user
+            // type would type-check cleanly and only panic at RUNTIME
+            // inside the body's `a > b` (K0900, confirmed live before this
+            // fix). Deliberately OUTSIDE the `!self.checked.funs.contains_
+            // key(name)` guard above (that guard exists for the ctor/
+            // component special cases, which by definition are NOT already
+            // in `funs` -- a real function call must NOT be excluded by it,
+            // confirmed live: this check was originally nested INSIDE that
+            // guard and was consequently dead code for every genuine
+            // function call, since `mymax` IS in `funs`).
+            if let (Some((params, ret, qvars)), Some(bounds)) = (
+                self.checked.funs.get(name).cloned(),
+                self.checked.fun_type_param_bounds.get(name).cloned(),
+            ) {
+                let (params, ret, mapping) = self.instantiate_scheme_with_mapping(&params, &ret, &qvars);
+                if params.len() == args.len() {
+                    for (i, a) in args.iter().enumerate() {
+                        if let Some(n) = &a.name {
+                            self.err(
+                                "K0241",
+                                format!(
+                                    "`{n}:` is a named argument, but named arguments are only allowed for constructors and props here -- call positionally instead: `{}`",
+                                    crate::fmt::expr_str(&a.value, 0)
+                                ),
+                                a.value.span,
+                            );
+                        }
+                        let want = self.uni.apply(&params[i]);
+                        let at = self.check_expr_expecting(&a.value, &want, ctx);
+                        let want = self.uni.apply(&params[i]);
+                        self.check_assign(&want, &at, a.value.span, &format!("argument {}", i + 1));
+                    }
+                    for (q, bound) in qvars.iter().zip(bounds.iter()) {
+                        let Some(bound_name) = bound else { continue };
+                        let resolved = self.uni.apply(&mapping[q]);
+                        if bound_name == "Ord"
+                            && !resolved.is_numeric()
+                            && resolved != Ty::Str
+                            && !matches!(resolved, Ty::Var(_))
+                        {
+                            self.err(
+                                "K0290",
+                                format!(
+                                    "type `{resolved}` does not satisfy the `Ord` bound -- only Int, Float, Str, and other numeric types support ordering"
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                    return self.uni.apply(&ret);
+                }
+                // arity mismatch: fall through to "general callable" below,
+                // which already produces the correct K0242 diagnostic
+                // uniformly (this path only needed a special case for the
+                // MATCHING-arity success path).
             }
         }
         // general callable
@@ -7911,6 +8045,87 @@ mod generic_tests {
             )
             .is_empty()
         );
+    }
+
+    /// Bounded generics (universal-language enrichment campaign, it103):
+    /// `fun sort[T: Ord](...)` -- already specified in `docs/design/
+    /// LANGUAGE.md` ("Generics with contract bounds: `fun sort[T: Ord]
+    /// (xs: List[T]) -> List[T]`") and listed in `docs/GAPS.md`'s own
+    /// honest remaining gaps, but unimplemented until now. Before this fix,
+    /// `a > b` on an unbounded type parameter was rejected by K0281 (the
+    /// `generic_fun_cannot_narrow_its_own_type_parameter` test above); an
+    /// EXPLICIT `Ord` bound must lift that restriction for comparison
+    /// operators specifically, while every other narrowing case (return
+    /// value, internal `let`, aliasing two type parameters) must still be
+    /// rejected exactly as before -- this is a NARROW carve-out, not a
+    /// general relaxation.
+    #[test]
+    fn bounded_generic_ord_permits_comparison_without_narrowing() {
+        // the exact live-confirmed repro: `a > b` on an Ord-bounded T is
+        // sound and must type-check cleanly.
+        assert!(
+            errors("fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\nfun main() { print(mymax(3, 5)) }\n").is_empty(),
+            "an Ord-bounded comparison must not be flagged as narrowing"
+        );
+        // ALL FOUR comparison operators, not just `>`.
+        for op in ["<", "<=", ">", ">="] {
+            let src = format!(
+                "fun cmp[T: Ord](a: T, b: T) -> Bool {{ a {op} b }}\nfun main() {{ print(cmp(3, 5)) }}\n"
+            );
+            assert!(errors(&src).is_empty(), "operator `{op}` on an Ord-bounded T must type-check: {:?}", errors(&src));
+        }
+        // the bound is per-call-site polymorphic: Int, Float, and Str all
+        // independently satisfy Ord for the SAME generic function.
+        assert!(
+            errors(
+                "fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n\
+                 fun main() {\n    print(mymax(3, 5))\n    print(mymax(3.5, 2.1))\n    print(mymax(\"a\", \"b\"))\n}\n"
+            )
+            .is_empty(),
+            "Int/Float/Str must each independently satisfy an Ord bound at their own call site"
+        );
+        // narrowing OUTSIDE a comparison context is STILL rejected for an
+        // Ord-bounded T -- the bound only carves out comparison operators,
+        // it does not disable the general parametricity check entirely.
+        let e = errors("fun sneaky[T: Ord](x: T) -> T {\n    let y: Int = x\n    x\n}\nfun main() { let _: Str = sneaky(\"hi\") }\n");
+        assert!(e.iter().any(|d| d.code == "K0281"), "an Ord bound must not disable the K0281 check for non-comparison narrowing: {e:?}");
+    }
+
+    /// The call-site half of bounded generics (it103): the checker must
+    /// verify, AT EACH CALL SITE, that the concrete type substituted for an
+    /// Ord-bounded type parameter actually supports ordering -- otherwise
+    /// the bound is only a body-checking relaxation, not a genuine
+    /// compile-time guarantee, and a non-orderable type would slip through
+    /// to a RUNTIME panic instead (confirmed live before this fix: calling
+    /// `mymax` with two user-record arguments type-checked with zero
+    /// diagnostics and only panicked at runtime inside `a > b`, K0900
+    /// "invalid operand types").
+    #[test]
+    fn bounded_generic_ord_call_site_rejects_a_non_orderable_type() {
+        let src = "type Point = Point(x: Int, y: Int)\n\
+                    fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n\
+                    fun main() { print(mymax(Point(1, 2), Point(3, 4))) }\n";
+        let e = errors(src);
+        assert!(
+            e.iter().any(|d| d.code == "K0290"),
+            "calling an Ord-bounded generic with a non-orderable user type must be a compile-time K0290, not a deferred runtime panic: {e:?}"
+        );
+        // a mixed bounded/unbounded generic function: the SAME call-site
+        // check applies only to the BOUNDED parameter, never the unbounded
+        // one (which accepts anything, including Point).
+        let mixed_src = "type Point = Point(x: Int, y: Int)\n\
+                          fun pick[T: Ord, U](cond: Bool, a: T, b: T, extra: U) -> T {\n    if cond { if a > b { a } else { b } } else { a }\n}\n\
+                          fun main() { print(pick(true, 3, 7, Point(1, 2))) }\n";
+        assert!(errors(mixed_src).is_empty(), "the unbounded U parameter must accept a non-orderable type freely: {:?}", errors(mixed_src));
+    }
+
+    /// Grammar-level coverage (it103): `[T: Ord]` is the only currently
+    /// supported bound -- any OTHER bound name is a clean `K0123` parse
+    /// error, never silently accepted or a bare parser panic.
+    #[test]
+    fn bounded_generic_rejects_unknown_bound_names() {
+        let e = errors("fun f[T: Eq](a: T, b: T) -> Bool { a == b }\nfun main() { print(f(1, 2)) }\n");
+        assert!(e.iter().any(|d| d.code == "K0123"), "an unsupported bound name must be K0123: {e:?}");
     }
 
     /// A REAL, confirmed-non-exploitable bug found+explicitly rejected
