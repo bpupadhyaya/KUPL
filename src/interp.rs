@@ -1800,6 +1800,34 @@ impl Interp {
         for b in branches {
             let ExprKind::Call { callee, args } = &b.kind else { return Ok(None) };
             let ExprKind::Ident(name) = &callee.kind else { return Ok(None) };
+            // A REAL, LIVE-CONFIRMED bug found+fixed in this SAME it99
+            // increment (a fresh live check against `eval_call`'s own
+            // precedence, prompted by widening this fast path's coverage in
+            // a later iteration): this check used to be JUST
+            // `image.pure_funs.contains(name)`, with no check for whether
+            // `name` actually resolves to the top-level function at all --
+            // `eval_call`'s own dispatch (the sequential reference this
+            // fast path must match byte-for-byte) checks a LOCAL binding
+            // (`env.get(name)`) and a component-private/exposed fun of the
+            // same name BEFORE ever falling back to the top-level table.
+            // Live-confirmed: `let add1 = fn(x) { x + 100 }` shadowing a
+            // pure top-level `fun add1(x) { x + 1 }`, called as
+            // `par { add1(5), add1(6) }`, printed `[6, 7]` (incorrectly
+            // calling the top-level fun) on `kupl run` while `kupl run
+            // --vm` (sequential only, pre-VM-wiring) correctly printed
+            // `[105, 106]` (calling the local closure) -- a genuine
+            // cross-engine value divergence. Same shape for a component's
+            // own private fun of the same name as a pure top-level fun,
+            // called bare inside that component's own handler.
+            if env.get(name).is_some() {
+                return Ok(None);
+            }
+            if let Some(id) = self.current {
+                let comp = self.instances[id].comp.clone();
+                if comp.funs.iter().chain(comp.exposes.iter()).any(|f| f.name == *name) {
+                    return Ok(None);
+                }
+            }
             if !image.pure_funs.contains(name.as_str()) {
                 return Ok(None);
             }

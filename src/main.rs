@@ -3171,6 +3171,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (universal-language enrichment
+    /// campaign, it100): `par { }`'s real-thread fast path used to gate
+    /// SOLELY on `image.pure_funs.contains(name)`, never checking whether
+    /// `name` is shadowed by a LOCAL binding first -- unlike `eval_call`'s
+    /// own top-level-fun dispatch (the sequential reference this fast path
+    /// must match exactly), which always checks `env.get(name)` first. A
+    /// local closure shadowing a pure top-level function of the same name,
+    /// called inside `par { }`, used to silently call the WRONG (top-level)
+    /// function -- `kupl run` printed `[6, 7]` (top-level `add1`, x+1)
+    /// while the correct answer (confirmed via `kupl run --vm`, sequential
+    /// only) is `[105, 106]` (the local closure, x+100).
+    #[test]
+    fn par_block_fast_path_never_calls_a_top_level_fun_shadowed_by_a_local_closure() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-par-block-local-shadow-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("par_local_shadow.kupl");
+        std::fs::write(
+            &file,
+            "fun add1(x: Int) -> Int {\n    x + 1\n}\n\
+             fun main() uses io {\n    let add1 = fn(x) { x + 100 }\n    \
+             let r = par {\n        add1(5),\n        add1(6)\n    }\n    print(r)\n}\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.stdout, vm.stdout, "interp/vm must agree: {interp:?} {vm:?}");
+        assert_eq!(interp.status.code(), Some(0), "{interp:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&interp.stdout).trim(),
+            "[105, 106]",
+            "must call the LOCAL closure (x+100), never the shadowed top-level fun (x+1): {interp:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The SAME bug class as the local-closure-shadow test above (it100),
+    /// for a component's own private fun of the same name as a pure
+    /// top-level fun, called bare inside that component's own handler --
+    /// `eval_call`'s component-local-function dispatch also runs BEFORE the
+    /// top-level fallback. Live-confirmed the identical symptom: `kupl run`
+    /// printed `[6, 7]` (the top-level `add1`) instead of the correct
+    /// `[1005, 1006]` (the component's own `add1`, x+1000).
+    #[test]
+    fn par_block_fast_path_never_calls_a_top_level_fun_shadowed_by_a_component_private_fun() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-par-block-comp-shadow-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("par_comp_shadow.kupl");
+        std::fs::write(
+            &file,
+            "fun add1(x: Int) -> Int {\n    x + 1\n}\n\
+             component Widget {\n    fun add1(x: Int) -> Int {\n        x + 1000\n    }\n    \
+             expose fun run() -> List[Int] {\n        par {\n            add1(5),\n            add1(6)\n        }\n    }\n}\n\
+             fun main() uses io {\n    let w = Widget()\n    print(w.run())\n}\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.stdout, vm.stdout, "interp/vm must agree: {interp:?} {vm:?}");
+        assert_eq!(interp.status.code(), Some(0), "{interp:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&interp.stdout).trim(),
+            "[1005, 1006]",
+            "must call the component's OWN add1 (x+1000), never the shadowed top-level fun (x+1): {interp:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A NEW opt-in CLI safety net (production-hardening: KUPL production-
     /// readiness phase 1): `--timeout=<seconds>` kills a runaway `kupl run`/
     /// `kupl run --vm` process with a clean `K0901` diagnostic and exit code
