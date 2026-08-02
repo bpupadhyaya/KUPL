@@ -315,6 +315,20 @@ engines discipline as every prior campaign.
   check, `kupl fmt` round-trip, and a native-specific test proving the
   "zero runtime changes" claim live across three independently-typed call
   sites for the same generic function).
+- **`kupl diff` bound-change detection (it104)** — a direct follow-up to
+  it103, found by re-auditing `sdiff.rs`'s own interface fingerprint for
+  the exact same "one site doesn't render a field its siblings already do"
+  false-negative class this file has repeatedly closed before
+  (PR-it580/643/646/864/1042/1043/1173/1187): `Item::Fun`'s fingerprint
+  included `type_params` (bare names) but not the new
+  `type_param_bounds`, so `kupl diff` misclassified ADDING an `Ord` bound
+  to a previously-unbounded generic function as `[implementation only]` —
+  confirmed live before fixing (a genuinely breaking change: a caller
+  passing a non-orderable type compiled cleanly before the bound existed
+  and fails to compile, K0290, after). Fixed and confirmed live in both
+  directions (bound added, bound removed) plus a regression check that an
+  unrelated body-only change with the SAME bound still correctly reports
+  implementation-only. One new permanent regression test.
 
 ## Final stretch — prioritized shortlist (it42–50)
 

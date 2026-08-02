@@ -271,10 +271,37 @@ fn interface_of(item: &Item) -> String {
     let mut s = String::new();
     match item {
         Item::Fun(f) => {
+            // Bounded generics (universal-language enrichment campaign,
+            // it104, a direct follow-up to it103's own new
+            // `type_param_bounds` field): a REAL, live-confirmed
+            // false-negative found+fixed -- this fingerprint used to
+            // render ONLY the bare type parameter names
+            // (`type_params.join(",")`), so ADDING a `: Ord` bound to a
+            // previously-unbounded generic function's type parameter
+            // (`fun mymax[T](...)` -> `fun mymax[T: Ord](...)`) was
+            // classified as `[implementation only]` by `kupl diff`,
+            // exactly like this file's own long history of the SAME
+            // "one interface-fingerprint site doesn't render a field its
+            // sibling sites already do" false-negative class
+            // (PR-it580/643/646/864/1042/1043/1173/1187, all cited just
+            // below in this same match arm). This IS a genuinely breaking
+            // interface change: any existing caller passing a
+            // non-orderable type (a user record, say) for `T` compiled
+            // cleanly before the bound was added and fails to compile
+            // (K0290) after -- confirmed live before this fix, via `kupl
+            // diff` on exactly this before/after pair.
+            let tps: Vec<String> = f
+                .type_params
+                .iter()
+                .map(|tp| match f.type_param_bounds.get(tp) {
+                    Some(bound) => format!("{tp}:{bound}"),
+                    None => tp.clone(),
+                })
+                .collect();
             s.push_str(&format!(
                 "fun {}[{}] pub={} ai={}",
                 f.name,
-                f.type_params.join(","),
+                tps.join(","),
                 f.is_pub,
                 f.ai.is_some()
             ));
@@ -1007,6 +1034,55 @@ mod tests {
             "type Pair[B, A] = Pair(first: A, second: B)\n",
         );
         assert_eq!(lines, vec!["interface Pair"]);
+    }
+
+    /// A REAL, live-confirmed misclassification bug found+fixed (universal-
+    /// language enrichment campaign, it104, a direct follow-up to it103's
+    /// own new bounded-generics feature): the SAME "one interface-
+    /// fingerprint site doesn't render a field its siblings already do"
+    /// false-negative class this file has repeatedly closed (PR-it580/643/
+    /// 646/864/1042/1043/1173/1187, all cited in `interface_of`'s own doc
+    /// comments) -- `Item::Fun`'s fingerprint rendered `type_params` (bare
+    /// names) but not `type_param_bounds`, so ADDING an `Ord` bound to a
+    /// previously-unbounded generic function's type parameter was
+    /// misclassified `[implementation only]`. This IS a genuinely breaking
+    /// change: a caller passing a non-orderable type for `T` compiled
+    /// cleanly before the bound existed and fails to compile (K0290) after.
+    #[test]
+    fn generic_fun_bound_change_is_interface() {
+        let (lines, _) = diff_lines(
+            "fun mymax[T](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n",
+            "fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n",
+        );
+        assert_eq!(lines, vec!["interface mymax"], "adding an Ord bound must be a breaking interface change");
+
+        // removing a bound is the same shape (a change to the type
+        // parameter's own constraint list either direction), and must ALSO
+        // be reported -- `kupl diff` has no narrower "widening vs
+        // narrowing" variance classification anywhere else in this file
+        // either, so treating any bound change as reportable is consistent
+        // with its existing binary (changed vs unchanged) design.
+        let (lines, _) = diff_lines(
+            "fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n",
+            "fun mymax[T](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n",
+        );
+        assert_eq!(lines, vec!["interface mymax"], "removing an Ord bound must also be reported");
+
+        // sanity: an UNRELATED body-only change (same bound, same
+        // signature) must remain implementation-only -- locks the fix is
+        // scoped to the bound itself, not over-broadly triggered.
+        let (lines, _) = diff_lines(
+            "fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n",
+            "fun mymax[T: Ord](a: T, b: T) -> T {\n    if a >= b { a } else { b }\n}\n",
+        );
+        assert_eq!(lines, vec!["impl mymax"], "a body-only change with the SAME bound must remain implementation-only");
+
+        // sanity: no change at all (same bound) is genuinely unchanged.
+        let (lines, changed) = diff_lines(
+            "fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n",
+            "fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\n",
+        );
+        assert!(lines.is_empty() && !changed, "identical bounded generic declarations must report no change: {lines:?}");
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it864, an Explore
