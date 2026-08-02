@@ -59,10 +59,9 @@ change and the release process.
   ordered by codepoint (comparisons, `.sort()`, `.min()`/`.max()`, and
   the `[T: Ord]` bound all support it); no `Add` — use
   `to_str(a) + to_str(b)` to build a `Str` from two `Char`s. New lexer
-  diagnostics `K0011`/`K0012`/`K0013`. Byte-identical across the
-  interpreter, `kupl run --vm`, `.kx` build/run, and `kupl bundle`;
-  `kupl native` does not yet support `Char` literals and reports a clean,
-  explicit error rather than compiling or crashing.
+  diagnostics `K0011`/`K0012`/`K0013`. Byte-identical across all four
+  engines — the interpreter, `kupl run --vm`, `.kx` build/run, `kupl
+  bundle`, and `kupl native`.
 
 ## [1.0.0-alpha]
 

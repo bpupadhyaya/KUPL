@@ -581,23 +581,19 @@ fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
             // reconstruct from the exact 32-bit pattern (never lossy)
             format!("k_f32_bits({}u)", v.to_bits())
         }
-        // `Char` (universal-language enrichment campaign, it105): a genuine,
-        // well-scoped first slice landed on interp.rs + the KVM (the SHARED
-        // `Op::Const` const-pool mechanism and `raw_binary_op` comparison
-        // dispatch both already generalize to it with ZERO new plumbing --
-        // confirmed live, not assumed), but `kupl native`'s C runtime has no
-        // `K_CHAR` tag/representation yet -- deliberately deferred, mirroring
-        // this campaign's own established staged-rollout precedent (it99's
-        // `par { }` fast path landed interp-only before it101 wired the VM;
-        // K0289 is the analogous "interpreter only, not yet on VM/native"
-        // pattern for a different feature). A clear, Char-specific message
-        // here (rather than the generic catch-all below, which exists for
-        // things that can NEVER be a compile-time constant at all, like a
-        // live closure/component reference -- a `Char` literal is a
-        // perfectly ordinary constant, just not yet implemented for this
-        // ONE backend) so a user hits an honest "not yet" instead of a
-        // confusing "non-serializable".
-        Value::Char(c) => return Err(format!("Char literals ('{c}') are not yet supported by `kupl native` (interpreter and `kupl run --vm` only for now)")),
+        // `Char` (it105 landed this on interp.rs + the KVM first, staged
+        // deliberately -- see it106's own private continuity note for why:
+        // the KVM needed zero new plumbing since `Value::Char` slots into
+        // the existing `Op::Const` pool and shares `raw_binary_op` with
+        // interp.rs, but native's C runtime had no `K_CHAR` representation
+        // at all). it106 closes that gap: a `Char` constant compiles to
+        // `k_char(<codepoint>u)`, mirroring `F32`'s own `k_f32_bits(...)`
+        // pattern just above (a plain numeric payload, reconstructed
+        // exactly -- a Unicode scalar value's `u32` codepoint has no lossy
+        // representation concern the way a float's bit pattern does, but
+        // the "emit the raw numeric payload, not a source-text literal"
+        // shape is the same).
+        Value::Char(c) => format!("k_char({}u)", *c as u32),
         other => return Err(format!("non-serializable constant {other}")),
     })
 }
@@ -973,9 +969,9 @@ typedef struct KBig KBig;
 typedef struct KRat KRat;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_CHAR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL } tag;
     union {
-        int64_t i; double f; int b; float f32v;
+        int64_t i; double f; int b; float f32v; int32_t ch;
         const char* s;
         KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
         int32_t fun; KSized* sized; KBig* big; KRat* rat;
@@ -1017,6 +1013,44 @@ static KValue k_int(int64_t v)   { KValue x; x.tag = K_INT;   x.as.i = v; return
 static KValue k_float(double v)  { KValue x; x.tag = K_FLOAT; x.as.f = v; return x; }
 static KValue k_f32(float v)     { KValue x; x.tag = K_F32;   x.as.f32v = v; return x; }
 static KValue k_f32_bits(uint32_t bits) { float v; memcpy(&v, &bits, 4); return k_f32(v); }
+/* `Char` (it105, native follow-up): a single Unicode scalar value, stored as
+   its raw codepoint (already validated by the Rust compiler at codegen time
+   -- every `k_char(...)` call site is generated from a real `char`, never
+   parsed from untrusted input on the C side, so no validation is needed
+   here). Comparison/equality operate on this codepoint directly (numeric
+   compare == codepoint order, matching Rust's own `char: Ord`); only
+   DISPLAY needs the UTF-8 encoding, via `k_char_utf8` below. */
+static KValue k_char(int32_t cp) { KValue x; x.tag = K_CHAR; x.as.ch = cp; return x; }
+/* Encode Unicode codepoint `cp` as UTF-8 into `out` (caller-provided, at
+   least 5 bytes: up to 4 data bytes + NUL) -- the standard bit-packing
+   scheme, mirroring `char::encode_utf8` on the Rust side (the ENCODE
+   direction; this file already has `k_utf8_len`/`kre_utf8_cp` for the
+   opposite DECODE direction, used by `.chars()`/regex, but nothing that
+   goes the other way until now). Returns the byte length written
+   (excluding the NUL). */
+static int k_char_utf8(int32_t cp, char* out) {
+    uint32_t u = (uint32_t)cp;
+    if (u < 0x80) { out[0] = (char)u; out[1] = 0; return 1; }
+    if (u < 0x800) {
+        out[0] = (char)(0xC0 | (u >> 6));
+        out[1] = (char)(0x80 | (u & 0x3F));
+        out[2] = 0;
+        return 2;
+    }
+    if (u < 0x10000) {
+        out[0] = (char)(0xE0 | (u >> 12));
+        out[1] = (char)(0x80 | ((u >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (u & 0x3F));
+        out[3] = 0;
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (u >> 18));
+    out[1] = (char)(0x80 | ((u >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((u >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (u & 0x3F));
+    out[4] = 0;
+    return 4;
+}
 
 /* ---- fixed-width integers (mirror value.rs IntW + interp raw_binary_op) ---- */
 static int k_iw_bits(int w) { switch (w % 4) { case 0: return 8; case 1: return 16; case 2: return 32; default: return 64; } }
@@ -1829,6 +1863,7 @@ static const char* k_type_name(KValue v) {
         case K_FLOAT: return "Float";
         case K_BOOL: return "Bool";
         case K_STR: return "Str";
+        case K_CHAR: return "Char";
         case K_UNIT: return "Unit";
         case K_LIST: return "List";
         case K_CTOR: return k_demangle_for_display(CTORS[v.as.ctor->ctor].type_name);
@@ -2100,6 +2135,15 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
             kb_puts(b, "\""); kb_puts(b, x.as.s); kb_puts(b, "\"");
             continue;
         }
+        /* mirrors value.rs's own top-level-bare/nested-quoted Char
+           convention exactly: single-quoted when nested (List/Ctor/Map/
+           Set), bare at top level -- same asymmetry K_STR gets above,
+           just with `'` instead of `"`. */
+        if (item.quote_str && x.tag == K_CHAR) {
+            char cbuf[5]; k_char_utf8(x.as.ch, cbuf);
+            kb_puts(b, "'"); kb_puts(b, cbuf); kb_puts(b, "'");
+            continue;
+        }
         switch (x.tag) {
             case K_INT: snprintf(tmp, sizeof tmp, "%lld", (long long)x.as.i); kb_puts(b, tmp); break;
             case K_BIGINT: kb_puts(b, k_big_to_decimal(x.as.big)); break;
@@ -2108,6 +2152,7 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
             case K_BOOL: kb_puts(b, x.as.b ? "true" : "false"); break;
             case K_UNIT: kb_puts(b, "()"); break;
             case K_STR: kb_puts(b, x.as.s); break;
+            case K_CHAR: { char cbuf[5]; k_char_utf8(x.as.ch, cbuf); kb_puts(b, cbuf); break; }
             case K_LIST: {
                 if (n == cap) { cap *= 2; stack = (KDisplayItem*)realloc(stack, sizeof(KDisplayItem) * cap); }
                 stack[n].kind = 0; stack[n].lit = "]"; n++;
@@ -2318,6 +2363,7 @@ static int k_eq(KValue a, KValue b) {
             case K_UNIT: break;
             case K_COMPONENT: result = (x.as.i == y.as.i); break;
             case K_STR: result = (strcmp(x.as.s, y.as.s) == 0); break;
+            case K_CHAR: result = (x.as.ch == y.as.ch); break;
             case K_SIZEDINT: result = (x.as.sized->width == y.as.sized->width && x.as.sized->v == y.as.sized->v); break;
             case K_F32: result = (x.as.f32v == y.as.f32v); break;
             case K_BIGINT: result = (k_big_cmp(x, y) == 0); break;
@@ -2823,6 +2869,10 @@ static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
     if (a.tag == K_INT && b.tag == K_INT) { x = 0; y = 0; c = (a.as.i < b.as.i) ? -1 : (a.as.i > b.as.i); }
     else if (a.tag == K_SIZEDINT && b.tag == K_SIZEDINT) { __int128 p = a.as.sized->v, q = b.as.sized->v; c = (p < q) ? -1 : (p > q); }
     else if (a.tag == K_STR && b.tag == K_STR) { is_str = 1; int r = strcmp(a.as.s, b.as.s); c = (r < 0) ? -1 : (r > 0); }
+    /* by codepoint, matching Rust's own `char: Ord` (which `raw_binary_op`
+       delegates to on interp/vm) exactly -- a plain numeric compare, no
+       UTF-8 encoding involved. */
+    else if (a.tag == K_CHAR && b.tag == K_CHAR) { c = (a.as.ch < b.as.ch) ? -1 : (a.as.ch > b.as.ch); }
     else if (a.tag == K_BIGINT && b.tag == K_BIGINT) { c = k_big_cmp(a, b); }
     else if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { c = k_rat_cmp(a, b); }
     else if (a.tag == K_CTOR) {
@@ -10440,19 +10490,41 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let _ = std::fs::remove_file(&bin);
     }
 
-    /// `Char` (it105) is staged interp+VM-only, mirroring the K0289
-    /// precedent: `kupl native` must cleanly reject a `Char` literal with an
-    /// honest, feature-specific message rather than panicking or silently
-    /// misgenerating C. `cc_available()` is deliberately NOT required here --
-    /// `emit_c` must fail before any C compiler ever gets invoked.
+    /// `Char` (it105 landed interp+VM only; it106 closes the native gap) --
+    /// `kupl native` now supports Char literals via a real `K_CHAR` KValue
+    /// tag in the C runtime. Drives the REAL compiled native binary,
+    /// covering comparison operators, equality, `.sort()`/`.max()` (which
+    /// route through `k_cmp`/`k_list_order`, not a Char-specific path),
+    /// display (bare at top level, single-quoted when nested -- the K_STR
+    /// convention's own sibling), and a non-ASCII multi-byte codepoint
+    /// (exercises `k_char_utf8`'s 2/3/4-byte encoding paths, not just the
+    /// single-byte ASCII fast path). Expected output independently
+    /// cross-checked against `kupl run`/`kupl run --vm` on the SAME source
+    /// before hardcoding it here (this file's own established convention
+    /// for every other `native_*_matches_interp`-style test above).
     #[test]
-    fn native_char_literal_is_cleanly_rejected_not_miscompiled() {
-        let src = "fun main() {\n    let a = 'a'\n    print(a)\n}\n";
-        let compiled = crate::run::compile(src).expect("program type-checks (Char is valid on interp/VM)");
-        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
-        let err = super::emit_c(&module).expect_err("emit_c must reject a Char literal, not silently miscompile it");
-        assert!(err.contains("Char literals"), "error should name the feature: {err}");
-        assert!(err.contains("not yet supported by `kupl native`"), "error should be the staged-rollout message: {err}");
+    fn native_char_literal_comparisons_ordering_and_display() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() {\n\
+                   \x20   let a = 'a'\n\
+                   \x20   let b = 'b'\n\
+                   \x20   print(a)\n\
+                   \x20   print(a == 'a')\n\
+                   \x20   print(a == b)\n\
+                   \x20   print(a < b)\n\
+                   \x20   print(a > b)\n\
+                   \x20   print(['a', 'b', 'c'])\n\
+                   \x20   print(['c', 'a', 'b'].sort())\n\
+                   \x20   print(['c', 'a', 'b'].max())\n\
+                   \x20   print('π')\n\
+                   \x20   print('😀' == '😀')\n\
+                   }\n";
+        assert_eq!(
+            native_main_stdout(src, "char").trim(),
+            "a\ntrue\nfalse\ntrue\nfalse\n['a', 'b', 'c']\n['a', 'b', 'c']\nSome('c')\nπ\ntrue"
+        );
     }
 
     /// Compile `src` (a component app) to native, run it, and return stdout.

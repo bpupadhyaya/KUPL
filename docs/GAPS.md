@@ -363,6 +363,38 @@ engines discipline as every prior campaign.
   permanent regression tests across the lexer, `check.rs`, `kupl fmt`
   round-trip, `cgen.rs`'s clean-rejection behavior, and an interp-vs-vm
   parity test in `main.rs`.
+- **`kupl native` `Char` support (it106)** — closes the staged-rollout gap
+  it105 deliberately left open: a real `K_CHAR` KValue tag in the native C
+  runtime, so `Char` is now byte-identical across all FOUR engines, not
+  just interp/VM/`.kx`. Pure engine-porting (Char's own semantics were
+  already fully settled by it105) — a new `k_char(codepoint)` constructor
+  and `k_char_utf8` encoder (the C-side counterpart to Rust's
+  `char::encode_utf8`, needed only for DISPLAY; comparisons/equality
+  operate on the raw codepoint directly, no UTF-8 involved), wired into
+  `k_type_name`, `k_display` (bare at top level, single-quoted when
+  nested — the same asymmetry `K_STR` already has, confirmed live
+  including through a `Some(...)` wrapper, which correctly re-quotes a
+  nested Char via the SAME generic Ctor-field-display path Str already
+  uses), `k_eq`/`k_key_eq` (the latter needed no code change at all — its
+  `default:` case already delegates to `k_eq` for any non-composite,
+  non-float tag), and `k_cmp`/`k_list_order` (`.sort()`/`.min()`/`.max()`
+  all work with zero Char-specific code, since `k_list_order` falls
+  through to the generic `k_cmp`-based path for any non-float tag).
+  `Value::Char`'s constant-pool emission changed from an error message to
+  `k_char(<codepoint>u)`, mirroring `F32`'s own `k_f32_bits(...)` pattern
+  (a raw numeric payload, not a source-text literal). New permanent
+  regression test in `cgen.rs` driving the real compiled native binary
+  across comparisons, `.sort()`/`.max()`, nested-Option display, and a
+  non-ASCII multi-byte codepoint (`'😀'`, exercising `k_char_utf8`'s
+  4-byte encoding path, not just ASCII). Full `cargo test` green twice
+  sequentially (1647 lib + 59 main tests, unchanged from it105 — one
+  native test removed, one added, net zero), all 363 `cgen::` tests green
+  (confirms inserting `K_CHAR` into the tag enum didn't shift any other
+  tag's behavior), interp-vs-vm AND interp-vs-native sweeps across all
+  eligible `examples/*.kupl` clean, revert-and-verify via `git stash`
+  confirmed the pre-fix binary still cleanly rejects Char in `kupl native`
+  with the exact it105 error message, and the restored binary compiles
+  and runs it correctly.
 
 ## Final stretch — prioritized shortlist (it42–50)
 
@@ -508,11 +540,12 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       math (it24). **BigInt (`big(...)`) and Rational (`rat(...)`) have since
       shipped too** — arbitrary-precision arithmetic and exact fractions, both
       byte-identical on every engine including native (see `STDLIB.md`).
-      **`Char` has since landed too (it105)** — a single Unicode scalar value
-      (`'a'`), interp+VM+`.kx`+bundle byte-identical, ordered by codepoint;
-      `kupl native` cleanly, explicitly defers it for now (interpreter/VM
-      only), mirroring the K0289 staged-rollout precedent. Byte (as a type
-      distinct from `u8`) and a base-10 `Decimal` type are still to do.
+      **`Char` has since landed too (it105/it106)** — a single Unicode
+      scalar value (`'a'`), byte-identical on ALL FOUR engines including
+      native (`kupl native` closed its staged-rollout gap at it106, via a
+      real `K_CHAR` KValue tag in the C runtime), ordered by codepoint.
+      Byte (as a type distinct from `u8`) and a base-10 `Decimal` type are
+      still to do.
 - [x] Broader standard library (audit #3, it12) — ~40 methods across all core
       types, all engines byte-identical incl. native. List (is_empty/concat/
       unique/init/tail/product/min/max/flatten/count/flat_map/window/chunk); Str
