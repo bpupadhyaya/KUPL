@@ -1,3 +1,27 @@
+> **Progress:** slice 4 now also on the KVM (it101) — `par { }`'s real-thread
+> fast path is wired into `vm.rs` (a new `Op::ParBlock`, `compile.rs`'s own
+> compile-time structural gate mirroring interp.rs's `resolve_par_branches`,
+> `Chunk.par_blocks` side-table, full `.kx` encode/decode round-trip). Purity
+> is a RUNTIME check against `image.pure_funs` in the op's own handler
+> (compile.rs has no effects.rs access), falling back to sequential
+> `call_chunk_nested` calls whenever the image is unset, a branch is impure,
+> or an argument/result isn't portable. `cgen.rs` (native) ALSO needed an arm
+> — it shares the same bytecode `Op` enum (`kupl native` compiles source →
+> AST → bytecode → C), a fact confirmed only by reading the code, not assumed
+> — codegen'd as a plain sequential call sequence (native has no threading;
+> concurrency stays deferred there per it99's own decision), byte-identical
+> to what native already produced before this op existed. Found and fixed
+> a THIRD instance of the it100 shadowing bug class while building this
+> slice's own compile-time gate: a top-level fun sharing a NAME with a
+> builtin call form (e.g. a user's own `to_str(x)`) is still routed to the
+> BUILTIN by both engines' bare-call dispatch, but the fast path ignored
+> this — fixed in BOTH interp.rs and compile.rs via a new shared
+> `BUILTIN_CALL_NAMES` name list (bytecode.rs), and a fourth instance
+> (component-private fun shadow) was caught and fixed in compile.rs's own
+> gate before it ever shipped, live-tested during implementation rather than
+> discovered after. `bytecode.rs`'s `aliasing_regs` (native's self-rebind
+> escape analysis) also gained a defensive `Op::ParBlock` arm.
+>
 > **Progress:** slice 4 fast-path shadowing fix (it100) — the fast path
 > introduced below gated solely on `image.pure_funs.contains(name)`, never
 > checking whether `name` actually resolves to the top-level function at all.

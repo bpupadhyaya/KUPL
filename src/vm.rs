@@ -1578,6 +1578,89 @@ impl<'m> Vm<'m> {
                     let items: Vec<Value> = (0..len).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     set!(dst, Value::List(Rc::new(items)));
                 }
+                // `par { }`'s real-thread fast path on the KVM (universal-
+                // language concurrency arc, it101 -- the VM-side sibling of
+                // interp.rs's own it99/it100 fast path). `compile.rs` only
+                // ever emits this op when every branch is STRUCTURALLY a
+                // plain call to a top-level named function with already-
+                // consecutive, portable-shaped argument registers; PURITY
+                // itself is a RUNTIME check against `self.image.pure_funs`
+                // here, exactly like `try_par_map`/`try_par_filter` already
+                // defer purity to runtime (compile.rs has no access to
+                // effects.rs's inference). Falls back to calling each
+                // branch SEQUENTIALLY via `call_chunk_nested` (branch order,
+                // propagating the FIRST panic via `?`, exactly matching
+                // what this op's own compile-time sequential-MakeList
+                // sibling would have produced) whenever the image is unset,
+                // a branch turns out impure, an argument isn't portable, or
+                // `try_par_block` itself returns `None` (a spawn failure or
+                // a non-portable RESULT discovered only after actually
+                // calling it -- mirrors `try_par_map`'s identical handling).
+                Op::ParBlock { dst, table } => {
+                    let branches = chunk.par_blocks.get(table as usize).ok_or_else(|| VmError {
+                        msg: "corrupt .kx module: par_blocks table index out of range".into(),
+                        span,
+                    })?;
+                    let image = self.image.clone();
+                    let mut fast_result: Option<Vec<Value>> = None;
+                    if let Some(image) = &image {
+                        let mut resolved: Vec<(String, Vec<crate::parallel::PortableValue>, Span)> =
+                            Vec::with_capacity(branches.len());
+                        let mut qualifies = true;
+                        'branches: for b in branches {
+                            let name = match konst!(b.fun_name) {
+                                Value::Str(s) => s.as_str().to_string(),
+                                _ => {
+                                    qualifies = false;
+                                    break;
+                                }
+                            };
+                            if !image.pure_funs.contains(name.as_str()) {
+                                qualifies = false;
+                                break;
+                            }
+                            let mut portable_args = Vec::with_capacity(b.argc as usize);
+                            for i in 0..b.argc {
+                                let v = reg!(b.start as u16 + i as u16);
+                                match crate::parallel::to_portable(&v) {
+                                    Some(pv) => portable_args.push(pv),
+                                    None => {
+                                        qualifies = false;
+                                        break 'branches;
+                                    }
+                                }
+                            }
+                            resolved.push((name, portable_args, b.span));
+                        }
+                        if qualifies {
+                            if let Some(results) = crate::parallel::try_par_block(&resolved, image) {
+                                let mut values = Vec::with_capacity(results.len());
+                                for r in results {
+                                    match r {
+                                        Ok(v) => values.push(v),
+                                        Err((msg, pspan)) => return Err(VmError { msg, span: pspan }),
+                                    }
+                                }
+                                fast_result = Some(values);
+                            }
+                        }
+                    }
+                    let values = match fast_result {
+                        Some(v) => v,
+                        None => {
+                            let mut values = Vec::with_capacity(branches.len());
+                            for b in branches {
+                                let mut args = Vec::with_capacity(b.argc as usize);
+                                for i in 0..b.argc {
+                                    args.push(reg!(b.start as u16 + i as u16));
+                                }
+                                values.push(self.call_chunk_nested(b.fun, args, None)?);
+                            }
+                            values
+                        }
+                    };
+                    set!(dst, Value::List(Rc::new(values)));
+                }
                 Op::MakeCtor { dst, ctor, start, len } => {
                     // `ctor` is a hand-crafted-`.kx`-reachable field -- legitimate
                     // `compile.rs` output never emits an out-of-range one, but a

@@ -1828,6 +1828,17 @@ impl Interp {
                     return Ok(None);
                 }
             }
+            // A THIRD instance of the SAME shadowing bug class, found while
+            // implementing the VM's own sibling gate (it101): a top-level
+            // fun sharing a NAME with a builtin call form is still routed
+            // to the BUILTIN by `eval_call`'s own bare-call dispatch
+            // (builtins are checked FIRST, unconditionally, in a giant
+            // match on the literal name) -- see `BUILTIN_CALL_NAMES`'s own
+            // doc comment (bytecode.rs) for the live-confirmed repro and
+            // the deliberate name-only (not arity-precise) conservatism.
+            if crate::bytecode::BUILTIN_CALL_NAMES.contains(&name.as_str()) {
+                return Ok(None);
+            }
             if !image.pure_funs.contains(name.as_str()) {
                 return Ok(None);
             }

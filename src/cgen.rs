@@ -830,6 +830,30 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             let m = str_const(chunk, *idx)?;
             format!("k_panic(\"{}\");", c_escape(m))
         }
+        // `par { }`'s real-thread fast path (it101) has NO native counterpart
+        // -- generated C has no threading, and this campaign deliberately
+        // keeps native concurrency sequential/deferred (see it99's own design
+        // note). Codegen'd as a plain sequential call sequence, branch order,
+        // into a local buffer then `k_list` -- semantically IDENTICAL to what
+        // native already did before this op existed (a `Call` per branch
+        // then `MakeList`), just expressed via this op instead. A panic in
+        // any branch's `fun_{fun}` call propagates via the existing
+        // setjmp/longjmp mechanism exactly like an ordinary `Op::Call` would
+        // -- no special handling needed, and branch order is naturally
+        // preserved (call N+1 never runs once call N has longjmp'd away).
+        ParBlock { dst, table } => {
+            let branches = chunk
+                .par_blocks
+                .get(*table as usize)
+                .ok_or_else(|| "corrupt module: par_blocks table index out of range".to_string())?;
+            let n = branches.len();
+            let mut s = format!("{{ KValue _par_tmp[{}];", n.max(1));
+            for (i, b) in branches.iter().enumerate() {
+                let _ = write!(s, " _par_tmp[{i}] = fun_{}(0, &regs[{}]); (void){};", b.fun, b.start, b.argc);
+            }
+            let _ = write!(s, " regs[{dst}] = k_list(_par_tmp, {n}); }}");
+            s
+        }
     };
     let _ = writeln!(out, "{line}");
     Ok(())
@@ -9385,6 +9409,7 @@ mod tests {
                     consts: vec![],
                     code: vec![crate::bytecode::Op::Ret(0)],
                     spans: vec![crate::diag::Span::default()],
+                    par_blocks: vec![],
                 },
                 crate::bytecode::Chunk {
                     name: "main".into(),
@@ -9394,6 +9419,7 @@ mod tests {
                     consts: vec![],
                     code: vec![crate::bytecode::Op::Ret(0)],
                     spans: vec![crate::diag::Span::default()],
+                    par_blocks: vec![],
                 },
             ],
             ..Default::default()

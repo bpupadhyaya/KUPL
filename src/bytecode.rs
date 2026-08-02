@@ -92,6 +92,44 @@ pub enum Op {
     /// interpolated intent string, then this op reads the parameter registers,
     /// performs the provider call, and converts the response per the shape.
     CallAi { dst: Reg, info: u16, intent: Reg },
+
+    /// `par { }`'s real-thread fast path (KUPL universal-language
+    /// concurrency arc, it101 -- the VM-side sibling of interp.rs's own
+    /// it99/it100 fast path). `dst <- List` built from
+    /// `chunks[c].par_blocks[table]`, one element per branch, in branch
+    /// order. Only emitted when EVERY branch is STRUCTURALLY a plain call
+    /// to a top-level named function with already-consecutive, portable-
+    /// shaped argument registers (`compile.rs`'s own compile-time gate,
+    /// mirroring interp.rs's `resolve_par_branches`); PURITY itself
+    /// (`image.pure_funs`) is a RUNTIME check in the op's own handler,
+    /// exactly like `try_par_map`/`try_par_filter` already defer purity to
+    /// runtime -- so this op's handler must always be prepared to fall back
+    /// to calling each branch sequentially (via `call_chunk_nested`, using
+    /// each `ParBranch`'s own `fun`/`start`/`argc`) when the image is
+    /// unset, a branch turns out impure, or an argument/result isn't
+    /// portable. Strictly additive: a `par { }` that doesn't qualify at
+    /// compile time still compiles to the unchanged `MakeList`-based
+    /// sequential form below, this op is never emitted for it.
+    ParBlock { dst: Reg, table: u16 },
+}
+
+/// One `par { }` branch descriptor for `Op::ParBlock`, referenced by
+/// `Chunk.par_blocks[table]`. Doesn't fit `Op`'s own fixed-width tuple
+/// shape since branch count/args vary per `par { }` site -- mirrors the
+/// existing `Module.ctors`/`Module.components` side-table pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParBranch {
+    /// const-pool string index of the callee's name, for the runtime
+    /// `image.pure_funs` purity lookup (mirrors `Op::Method`'s own `name`
+    /// operand, resolved the same way via the chunk's own `consts`).
+    pub fun_name: u16,
+    /// chunk index of the callee, for the sequential fallback.
+    pub fun: u16,
+    /// first of `argc` already-consecutive argument registers.
+    pub start: Reg,
+    pub argc: u8,
+    /// this branch's own call-site span.
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +145,9 @@ pub struct Chunk {
     pub code: Vec<Op>,
     /// Source span per instruction (for panics).
     pub spans: Vec<Span>,
+    /// `par { }` branch descriptors, indexed by `Op::ParBlock`'s own
+    /// `table` operand -- see `ParBranch`'s own doc comment.
+    pub par_blocks: Vec<Vec<ParBranch>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,6 +275,45 @@ pub const BUILTIN_LOG_INFO: u8 = 69;
 pub const BUILTIN_LOG_WARN: u8 = 70;
 pub const BUILTIN_LOG_ERROR: u8 = 71;
 
+/// Every identifier that `eval_call` (interp.rs) / `call()` (compile.rs)
+/// special-case as a builtin call FORM (`name(args...)` bare-call syntax) --
+/// used by `par { }`'s real-thread fast path (it101) to exclude a branch
+/// whose callee name COULD be a builtin, regardless of the branch's own
+/// arity. Deliberately name-only, not (name, arity)-precise like the two
+/// engines' own dispatch matches: a user CAN legally define a top-level
+/// function sharing a builtin's name (KUPL has no reserved-word restriction
+/// on it, confirmed live -- `fun to_str(x: Int) -> Int { x + 1 }` compiles
+/// and its OWN 1-arg bare call `to_str(5)` is still routed to the BUILTIN
+/// by both engines' own bare-call dispatch, exactly like a same-arity
+/// builtin/ctor collision anywhere else in this compiler already resolves
+/// in the builtin's favor), and `par { }`'s own fast-path gates (this file,
+/// interp.rs's `resolve_par_branches`, compile.rs's
+/// `try_par_branch_descs`) must match that same-arity divergence exactly.
+/// Checking the name ALONE (ignoring arity) is a deliberately CONSERVATIVE
+/// superset -- the only cost of over-excluding a differently-arity'd
+/// same-named user function is a missed fast-path optimization (falls back
+/// to the always-correct sequential path), never a wrong answer, so this
+/// trades a vanishingly rare false negative for a guarantee of no false
+/// positive, without needing to duplicate either engine's own (name, arity)
+/// builtin dispatch table here. Live-confirmed as a genuine, both-engine
+/// divergence before this const existed: a top-level `to_str(x) { x + 1 }`
+/// called inside `par { to_str(5), to_str(6) }` gave `[6, 7]` (the WRONG,
+/// shadowing top-level fun) on `kupl run` AND `kupl run --vm`, instead of
+/// the correct `["5", "6"]` (the builtin, confirmed via the sequential
+/// fallback forced by a non-qualifying argument).
+pub const BUILTIN_CALL_NAMES: &[&str] = &[
+    "print", "to_str", "panic", "Map", "Set", "tensor", "zeros", "arange", "read_file",
+    "write_file", "append_file", "delete_file", "file_exists", "json_parse", "json_stringify",
+    "env_var", "args", "read_line", "read_all", "exec", "path_join", "path_base", "path_dir",
+    "path_ext", "list_dir", "make_dir", "remove_dir", "big", "http_serve", "rat", "eprint",
+    "exit", "random_ints", "random_floats", "shuffle", "http_get", "http_post", "re_match",
+    "re_find", "re_find_all", "re_replace", "format_time", "year_of", "month_of", "day_of",
+    "hour_of", "minute_of", "second_of", "weekday_of", "yearday_of", "date_iso", "parse_iso",
+    "date_make", "now", "base64_encode", "base64_decode", "hex_encode", "hex_decode",
+    "hash_fnv", "sha256", "hmac_sha256", "log_debug", "log_info", "log_warn", "log_error",
+    "csv_parse", "csv_stringify", "url_encode", "url_decode", "query_parse", "query_build",
+];
+
 impl Module {
     pub fn disassemble(&self) -> String {
         let mut out = String::new();
@@ -275,7 +355,7 @@ impl Module {
 /// their receiver. This should be re-examined per-method before any backend
 /// relies on this analysis for a method whose semantics could stash the
 /// receiver elsewhere.
-fn aliasing_regs(op: &Op) -> Vec<Reg> {
+fn aliasing_regs(chunk: &Chunk, op: &Op) -> Vec<Reg> {
     match op {
         Op::Move(_dst, src) => vec![*src],
         // A REAL, LIVE-CONFIRMED silent value-corruption bug found+fixed
@@ -402,6 +482,31 @@ fn aliasing_regs(op: &Op) -> Vec<Reg> {
         Op::GetField { obj, .. } | Op::GetFieldNamed { obj, .. } => vec![*obj],
         Op::StateSet(_slot, src) => vec![*src],
         Op::EmitOp { payload: Some(r), .. } => vec![*r],
+        // Defensive static-analysis completeness (it101, the SAME shape as
+        // `MakeInstance`'s own PR-it968 arm above -- see its doc comment for
+        // the general pattern this mirrors): each branch's own
+        // `start..start+argc` argument registers are passed into a CALLED
+        // function -- in the sequential fallback (`call_chunk_nested`,
+        // vm.rs) exactly like `Op::Call`'s own identical treatment just
+        // above, since the callee receives the raw `Value` (Rc-based, not a
+        // deep clone) and could retain it. The real-thread fast path itself
+        // is NOT a concern here (`to_portable` deep-clones every argument
+        // before it ever crosses a thread boundary, per `parallel.rs`'s own
+        // doc comment -- no aliasing possible there), but this analysis is
+        // conservative BY DESIGN (matching every sibling arm's own
+        // reasoning): it protects a FUTURE self-rebind optimization on
+        // these SAME registers regardless of which of `ParBlock`'s two
+        // internal paths actually runs at compile time (a runtime
+        // decision this static analysis cannot see). Needs `chunk` (not
+        // just `op`) since the branch descriptors live in
+        // `chunk.par_blocks`, not in the op's own fixed-width fields.
+        Op::ParBlock { table, .. } => chunk
+            .par_blocks
+            .get(*table as usize)
+            .map(|branches| {
+                branches.iter().flat_map(|b| b.start..b.start.saturating_add(b.argc)).collect()
+            })
+            .unwrap_or_default(),
         _ => vec![],
     }
 }
@@ -820,7 +925,7 @@ fn reg_escapes(chunk: &Chunk, op_idx: usize, reg: Reg) -> bool {
         .enumerate()
         .take(end)
         .skip(start)
-        .any(|(i, op)| i != op_idx && aliasing_regs(op).contains(&reg))
+        .any(|(i, op)| i != op_idx && aliasing_regs(chunk, op).contains(&reg))
 }
 
 #[cfg(test)]
@@ -841,6 +946,7 @@ mod escape_tests {
             consts: vec![],
             code,
             spans,
+            par_blocks: vec![],
         }
     }
 

@@ -3085,6 +3085,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The SAME hang-avoidance property as the test above, on the KVM's OWN
+    /// `Op::ParBlock` fast path (it101) -- a genuinely NEW thread-spawn site
+    /// distinct from interp.rs's own it99 worker threads, so it needs its
+    /// own dedicated coverage rather than assuming interp.rs's own
+    /// hang-avoidance test "covers" this too.
+    #[test]
+    fn par_block_vm_fast_path_does_not_hang_when_an_earlier_panic_makes_a_later_infinite_loop_unreachable() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-par-block-vm-hang-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("par_vm_hang.kupl");
+        std::fs::write(
+            &file,
+            "fun boom() -> Int {\n    1 / 0\n}\n\
+             fun spin() -> Int {\n    var y = 0\n    while true {\n        y = y + 1\n    }\n    y\n}\n\
+             fun main() uses io {\n    let results = par {\n        boom(),\n        spin()\n    }\n    print(results)\n}\n",
+        )
+        .unwrap();
+
+        let child = std::process::Command::new(&bin)
+            .args(["run", "--vm", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(10))
+            .expect("an earlier branch's panic must resolve the block promptly despite a later infinite-loop sibling");
+        assert_ne!(out.status.code(), Some(0), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("division by zero"), "{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `par { }`'s real-thread fast path must report the SAME error, at the
     /// SAME precise span, that the sequential reference would -- and that
     /// span is the REAL, original location deep inside the panicking
@@ -3245,6 +3281,46 @@ mod tests {
             String::from_utf8_lossy(&interp.stdout).trim(),
             "[1005, 1006]",
             "must call the component's OWN add1 (x+1000), never the shadowed top-level fun (x+1): {interp:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A THIRD instance of the SAME shadowing bug class as the two tests
+    /// above (it101): a top-level fun sharing a NAME with a builtin call
+    /// form (`to_str`) is still routed to the BUILTIN by both engines' own
+    /// bare-call dispatch (builtins are checked FIRST, unconditionally),
+    /// but `par { }`'s fast path used to ignore this and call the
+    /// shadowing top-level fun instead. Live-confirmed before the fix
+    /// (`BUILTIN_CALL_NAMES`, bytecode.rs): `fun to_str(x: Int) -> Int { x
+    /// + 1 }` called inside `par { to_str(5), to_str(6) }` printed `[6, 7]`
+    /// on BOTH `kupl run` and `kupl run --vm`, instead of the correct
+    /// `["5", "6"]` (the builtin -- confirmed via the sequential fallback
+    /// forced by a non-qualifying `5 + 0` argument).
+    #[test]
+    fn par_block_fast_path_never_calls_a_top_level_fun_shadowed_by_a_builtin_name() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-par-block-builtin-shadow-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("par_builtin_shadow.kupl");
+        std::fs::write(
+            &file,
+            "fun to_str(x: Int) -> Int {\n    x + 1\n}\n\
+             fun main() uses io {\n    let r = par {\n        to_str(5),\n        to_str(6)\n    }\n    print(r)\n}\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.stdout, vm.stdout, "interp/vm must agree: {interp:?} {vm:?}");
+        assert_eq!(interp.status.code(), Some(0), "{interp:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&interp.stdout).trim(),
+            "[\"5\", \"6\"]",
+            "must call the BUILTIN to_str, never the shadowing top-level fun: {interp:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

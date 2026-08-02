@@ -247,6 +247,25 @@ engines discipline as every prior campaign.
   local binding and the current component's own funs/exposes first,
   mirroring `eval_call`'s exact precedence. Two new permanent regression
   tests.
+- **`par { }` real-thread fast path on the KVM (it101)** — the SAME fast
+  path from it99 now also fires on `kupl run --vm`: a new `Op::ParBlock`
+  bytecode op (plus a `Chunk.par_blocks` side-table and full `.kx`
+  encode/decode support), emitted by a compile-time structural gate in
+  `compile.rs` mirroring interp.rs's own gate exactly, with purity checked
+  at runtime in the op's own VM handler (falling back to sequential
+  `call_chunk_nested` calls otherwise) — additive only, same guarantee as
+  it99. `kupl native` (`cgen.rs`) needed a corresponding arm too, since it
+  shares the same bytecode `Op` enum; codegen'd as a plain sequential call
+  sequence (native concurrency stays deferred, per it99's own decision) —
+  byte-identical to native's prior output. Found and fixed a THIRD instance
+  of it100's own shadowing bug class (a top-level fun sharing a name with a
+  **builtin** call form, e.g. a user's own `to_str(x)`, is still routed to
+  the builtin by both engines' dispatch) via a new shared
+  `BUILTIN_CALL_NAMES` list checked in both interp.rs and compile.rs, plus a
+  fourth instance (component-private fun shadow) caught and fixed in
+  compile.rs's own gate before shipping. Three new permanent regression
+  tests, plus a dedicated VM-side hang-avoidance test for the new
+  thread-spawn site.
 
 ## Final stretch — prioritized shortlist (it42–50)
 

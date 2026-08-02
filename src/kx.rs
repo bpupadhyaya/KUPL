@@ -69,6 +69,18 @@ pub fn encode(m: &Module) -> Vec<u8> {
             w.u32(sp.start);
             w.u32(sp.end);
         }
+        w.u32(c.par_blocks.len() as u32);
+        for branches in &c.par_blocks {
+            w.u32(branches.len() as u32);
+            for b in branches {
+                w.u16(b.fun_name);
+                w.u16(b.fun);
+                w.u8(b.start);
+                w.u8(b.argc);
+                w.u32(b.span.start);
+                w.u32(b.span.end);
+            }
+        }
     }
 
     w.u32(m.ctors.len() as u32);
@@ -444,6 +456,11 @@ fn encode_op(w: &mut W, op: &Op) {
             w.u16(*name);
             w.u8(*value);
         }
+        ParBlock { dst, table } => {
+            w.u8(44);
+            w.u8(*dst);
+            w.u16(*table);
+        }
     }
 }
 
@@ -651,7 +668,25 @@ pub fn decode(buf: &[u8]) -> DecodeResult<Module> {
             let end = r.u32()?;
             spans.push(Span::new(start, end));
         }
-        m.chunks.push(Chunk { name, ncaps, nparams, nregs, consts, code, spans });
+        let nblocks = r.u32()?;
+        let mut par_blocks = Vec::with_capacity(r.cap::<Vec<ParBranch>>(nblocks as usize));
+        for _ in 0..nblocks {
+            r.charge::<Vec<ParBranch>>()?;
+            let nbranches = r.u32()?;
+            let mut branches = Vec::with_capacity(r.cap::<ParBranch>(nbranches as usize));
+            for _ in 0..nbranches {
+                r.charge::<ParBranch>()?;
+                let fun_name = r.u16()?;
+                let fun = r.u16()?;
+                let start = r.u8()?;
+                let argc = r.u8()?;
+                let span_start = r.u32()?;
+                let span_end = r.u32()?;
+                branches.push(ParBranch { fun_name, fun, start, argc, span: Span::new(span_start, span_end) });
+            }
+            par_blocks.push(branches);
+        }
+        m.chunks.push(Chunk { name, ncaps, nparams, nregs, consts, code, spans, par_blocks });
     }
 
     let nctors = r.u32()?;
@@ -951,6 +986,7 @@ fn decode_op(r: &mut R) -> DecodeResult<Op> {
         40 => WithField { dst: r.u8()?, obj: r.u8()?, name: r.u16()?, value: r.u8()? },
         42 => CallComp { dst: r.u8()?, fun: r.u16()?, start: r.u8()?, argc: r.u8()? },
         43 => CallAi { dst: r.u8()?, info: r.u16()?, intent: r.u8()? },
+        44 => ParBlock { dst: r.u8()?, table: r.u16()? },
         t => return Err(format!("unknown opcode {t}")),
     })
 }
@@ -1231,10 +1267,26 @@ mod tests {
             Op::EmitOp { port: 1014, payload: None },
             Op::Panic(1015),
             Op::CallAi { dst: 108, info: 1016, intent: 109 },
+            Op::ParBlock { dst: 110, table: 1017 },
         ];
         let n = code.len();
         let spans: Vec<crate::diag::Span> =
             (0..n).map(|i| crate::diag::Span::new(i as u32, (i + 1) as u32)).collect();
+        // Covers `ParBranch`'s own encode/decode symmetry too (it101), with a
+        // second, EMPTY inner Vec sibling to exercise a `par_blocks` table
+        // entry with zero branches (a `par {}` with 0 branches never reaches
+        // the fast path in practice, but the wire format must round-trip it
+        // anyway since `table` is just an index, not a non-empty guarantee).
+        let par_blocks = vec![
+            vec![crate::bytecode::ParBranch {
+                fun_name: 1018,
+                fun: 111,
+                start: 112,
+                argc: 3,
+                span: crate::diag::Span::new(5000, 5001),
+            }],
+            vec![],
+        ];
         let module = Module {
             chunks: vec![Chunk {
                 name: "op_coverage".to_string(),
@@ -1244,6 +1296,7 @@ mod tests {
                 consts: vec![],
                 code,
                 spans,
+                par_blocks,
             }],
             ..Default::default()
         };
@@ -1254,14 +1307,14 @@ mod tests {
             "every Op variant, with distinct per-field values, must survive an encode/decode round trip"
         );
         // Sanity: confirm this test really did cover every DISTINCT variant
-        // (45 entries total -- 43 variants plus one extra `MakeRange`/`EmitOp`
+        // (46 entries total -- 44 variants plus one extra `MakeRange`/`EmitOp`
         // each, to cover both branches of their own internal `bool`/`Option`),
         // so a FUTURE new Op added to the enum without a corresponding entry
         // here fails loudly instead of silently going unfuzzed.
         let distinct: std::collections::HashSet<_> =
             decoded.chunks[0].code.iter().map(std::mem::discriminant).collect();
-        assert_eq!(n, 45, "expected 43 Op variants + 2 extra branch-coverage entries (MakeRange, EmitOp)");
-        assert_eq!(distinct.len(), 43, "Op has 43 DISTINCT variants as of PR-it1032 -- if this fails, a variant was ADDED or REMOVED; update this test's own `code` list to match");
+        assert_eq!(n, 46, "expected 44 Op variants + 2 extra branch-coverage entries (MakeRange, EmitOp)");
+        assert_eq!(distinct.len(), 44, "Op has 44 DISTINCT variants as of it101 (ParBlock added) -- if this fails, a variant was ADDED or REMOVED; update this test's own `code` list to match");
     }
 
     #[test]

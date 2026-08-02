@@ -62,6 +62,7 @@ pub fn compile_module(program: &Program, checked: &Checked) -> Result<Module, Ve
             consts: Vec::new(),
             code: Vec::new(),
             spans: Vec::new(),
+            par_blocks: Vec::new(),
         });
     }
 
@@ -264,6 +265,7 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
                 consts: Vec::new(),
                 code: Vec::new(),
                 spans: Vec::new(),
+                par_blocks: Vec::new(),
             },
             f.span,
         );
@@ -519,6 +521,7 @@ impl<'s> FnCompiler<'s> {
                 consts: Vec::new(),
                 code: Vec::new(),
                 spans: Vec::new(),
+                par_blocks: Vec::new(),
             },
             comp: None,
             scopes: vec![Vec::new()],
@@ -1682,6 +1685,27 @@ impl<'s> FnCompiler<'s> {
             }
             ExprKind::Await(inner) => self.expr(inner),
             ExprKind::Par(branches) => {
+                // Real-thread fast path (KUPL universal-language concurrency
+                // arc, it101 -- the VM-side sibling of interp.rs's own it99/
+                // it100 fast path): fires only when EVERY branch is
+                // STRUCTURALLY a plain call to a top-level named function
+                // (never shadowed by a local -- the it100 lesson, applied
+                // here from the start) with plain-literal/identifier
+                // arguments. PURITY itself is a RUNTIME check in vm.rs's own
+                // `Op::ParBlock` handler (compile.rs has no access to
+                // effects.rs's inference), exactly like `try_par_map`/
+                // `try_par_filter` already defer purity to runtime. Any
+                // non-qualifying branch falls the WHOLE block back to the
+                // exact, unchanged sequential `consecutive()`+`MakeList`
+                // compilation below -- additive only, never a behavior
+                // change, matching every other fast path in this compiler.
+                if let Some(descs) = self.try_par_branch_descs(branches) {
+                    let table = self.chunk.par_blocks.len() as u16;
+                    self.chunk.par_blocks.push(descs);
+                    let dst = self.alloc(span);
+                    self.emit(Op::ParBlock { dst, table }, span);
+                    return dst;
+                }
                 // fork-join: evaluate each branch, collect into a list (same
                 // deterministic branch order as the interpreter)
                 let start = self.consecutive(branches, span);
@@ -1690,6 +1714,111 @@ impl<'s> FnCompiler<'s> {
                 dst
             }
         }
+    }
+
+    /// Compile-time-only structural shape check for `par { }`'s real-thread
+    /// fast path (it101 -- see `ExprKind::Par`'s own arm above for the full
+    /// design rationale): every branch must be a plain call `f(args...)` to
+    /// a genuine TOP-LEVEL function (`self.lookup(name).is_none()` -- not
+    /// shadowed by a local/capture, matching the it100 fix's own lesson
+    /// applied here from the very start, unlike interp.rs's own it99 which
+    /// needed a follow-up fix -- and `self.shared.module.funs` actually
+    /// resolves it, which naturally EXCLUDES builtins/ctors/component-
+    /// construction/indirect calls AND component-private funs, since that
+    /// map only ever contains top-level function names), with every
+    /// argument a plain identifier or literal (never a nested call/compound
+    /// expression, so evaluating every branch's own args eagerly, before
+    /// any of the actual calls happen, can never diverge from the
+    /// sequential reference's own left-to-right order -- identical
+    /// reasoning to interp.rs's `resolve_par_branches`). Returns `None`
+    /// (never a hard error) on ANY non-qualifying branch -- always safe for
+    /// the caller to fall back to the ordinary sequential
+    /// `consecutive()`+`MakeList` compilation. PURITY itself is NOT checked
+    /// here (compile.rs has no access to effects.rs's inference) -- it's a
+    /// RUNTIME check in vm.rs's own `Op::ParBlock` handler, exactly like
+    /// `try_par_map`/`try_par_filter` already defer purity to runtime.
+    ///
+    /// Two passes: the first confirms EVERY branch qualifies before
+    /// compiling ANY registers for ANY of them -- a partial compile on a
+    /// later-disqualifying branch would leak allocated-but-unused registers
+    /// into this chunk with no way to roll back (`self.next` only grows,
+    /// mirroring why `consecutive()`'s own two-phase shape exists).
+    fn try_par_branch_descs(&mut self, branches: &[Expr]) -> Option<Vec<ParBranch>> {
+        if self.chunk.par_blocks.len() >= u16::MAX as usize {
+            return None; // practically unreachable -- defensive, matches K0801-class caps
+        }
+        for b in branches {
+            let ExprKind::Call { callee, args } = &b.kind else { return None };
+            let ExprKind::Ident(name) = &callee.kind else { return None };
+            if self.lookup(name).is_some() {
+                return None; // shadowed by a local: not a top-level call
+            }
+            // A REAL, LIVE-CONFIRMED bug found+fixed while writing this VERY
+            // gate (it101, the SAME shadowing class it100 already fixed in
+            // interp.rs's own resolve_par_branches -- this gate is checking
+            // `self.lookup`/`module.funs` FRESH here, so it needed the SAME
+            // fix independently, not inherited from interp.rs's fix):
+            // `call()`'s own precedence checks a component-private/exposed
+            // fun of the same name BEFORE ever falling back to the top-level
+            // table (`self.comp.as_ref().and_then(|c| c.funs.get(name))`),
+            // but component funs live in a SEPARATE map from `self.lookup`'s
+            // own local-scope stack, so `self.lookup(name).is_none()` alone
+            // does NOT rule out a component-fun shadow. Live-confirmed:
+            // `component Widget { fun add1(x) { x + 1000 } expose fun run()
+            // { par { add1(5), add1(6) } } }` alongside a pure top-level
+            // `fun add1(x) { x + 1 }` printed `[6, 7]` (the WRONG, top-level
+            // fun) on `kupl run --vm` while `kupl run` (already fixed at
+            // it100) correctly printed `[1005, 1006]` (the component's own
+            // `add1`) -- a genuine cross-engine divergence caught before
+            // this increment ever shipped.
+            if self.comp.as_ref().is_some_and(|c| c.funs.contains_key(name.as_str())) {
+                return None;
+            }
+            // A THIRD instance of the SAME shadowing bug class, found while
+            // finishing this gate (it101): a top-level fun sharing a NAME
+            // with a builtin call form is still routed to the BUILTIN by
+            // `call()`'s own bare-call dispatch (builtins are checked
+            // FIRST, unconditionally) -- see `BUILTIN_CALL_NAMES`'s own doc
+            // comment (bytecode.rs) for the live-confirmed repro and the
+            // deliberate name-only (not arity-precise) conservatism.
+            if BUILTIN_CALL_NAMES.contains(&name.as_str()) {
+                return None;
+            }
+            if !self.shared.module.funs.contains_key(name.as_str()) {
+                return None; // builtin/ctor/component/indirect -- not a plain top-level fun
+            }
+            for a in args {
+                if a.name.is_some() {
+                    return None; // named args: keep the gate simple, fall back
+                }
+                let safe = matches!(
+                    &a.value.kind,
+                    ExprKind::Ident(_) | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Unit
+                );
+                if !safe {
+                    return None;
+                }
+            }
+        }
+        // Second pass: every branch qualifies -- now safe to actually
+        // compile each branch's own argument registers. Reuses
+        // `consecutive()` (the SAME helper `call()`'s own "direct call to a
+        // top-level fun" arm already uses for ordinary calls) rather than
+        // hand-rolling register allocation here -- it already solves the
+        // exact "N expressions into a guaranteed-consecutive final block"
+        // problem correctly, including the PR-it1004 argument-evaluation-
+        // order hazard documented on its own doc comment just below.
+        let mut descs = Vec::with_capacity(branches.len());
+        for b in branches {
+            let ExprKind::Call { callee, args } = &b.kind else { unreachable!() };
+            let ExprKind::Ident(name) = &callee.kind else { unreachable!() };
+            let fun = *self.shared.module.funs.get(name.as_str()).unwrap();
+            let fun_name = self.const_idx(Value::str(name.clone()), b.span);
+            let exprs: Vec<Expr> = args.iter().map(|a| a.value.clone()).collect();
+            let start = self.consecutive(&exprs, b.span);
+            descs.push(ParBranch { fun_name, fun, start, argc: args.len() as u8, span: b.span });
+        }
+        Some(descs)
     }
 
     /// Compile expressions into freshly-allocated CONSECUTIVE registers;
@@ -2413,6 +2542,7 @@ mod tests {
             consts: Vec::new(),
             code: Vec::new(),
             spans: Vec::new(),
+            par_blocks: Vec::new(),
         }
     }
 
