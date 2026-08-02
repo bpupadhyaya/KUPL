@@ -1,3 +1,12 @@
+> **Progress:** slice 4 fast-path shadowing fix (it100) — the fast path
+> introduced below gated solely on `image.pure_funs.contains(name)`, never
+> checking whether `name` actually resolves to the top-level function at all.
+> `eval_call` (the sequential reference this fast path must match exactly)
+> checks a local binding and a component-private/exposed fun of the same name
+> BEFORE ever falling back to the top-level table — live-confirmed both gaps
+> as genuine cross-engine value divergences (`kupl run` vs `kupl run --vm`)
+> and fixed by replicating that same precedence in `resolve_par_branches`.
+>
 > **Progress:** slice 4 landed (it99) — `par { }` fork-join itself now has a
 > real-thread fast path (step 4 of Dependencies & ordering, below), on the
 > interpreter only: fires when EVERY branch is a plain call to a statically

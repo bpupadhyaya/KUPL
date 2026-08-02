@@ -237,6 +237,16 @@ engines discipline as every prior campaign.
   design doc's own slice 4 progress note). Verified live: correct results,
   genuine concurrent threading, hang-avoidance under a panic + infinite-loop
   sibling, and branch-order-correct error priority under repetition.
+- **`par { }` fast-path shadowing fix (it100)** — it99's own fast path gated
+  solely on `image.pure_funs.contains(name)`, never checking whether `name`
+  actually resolves to the top-level function at all. Live-confirmed two
+  divergences from the sequential reference: a local closure shadowing a
+  pure top-level fun of the same name, and a component's own private fun of
+  the same name as a pure top-level fun, both called bare inside `par { }`,
+  silently dispatched to the WRONG (top-level) function. Fixed by checking a
+  local binding and the current component's own funs/exposes first,
+  mirroring `eval_call`'s exact precedence. Two new permanent regression
+  tests.
 
 ## Final stretch — prioritized shortlist (it42–50)
 
