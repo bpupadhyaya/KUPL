@@ -810,20 +810,24 @@ completion (3). Everything stays byte-identical across engines.
       handlers on a virtual clock advanced explicitly (`advance 5s` example
       step; `kupl run` auto-advances bounded). Deterministic, byte-identical on
       interpreter + KVM. Durations `ms`/`s`/`m`/`h`. (`examples/timers.kupl`)
-- [◐] **Hot-swap state migration (it111, extended it113/it114)** — `kupl
-      repl`'s `:upgrade <Component>` command (Erlang `code_change`
+- [◐] **Hot-swap state migration (it111, extended it113/it114/it115)** —
+      `kupl repl`'s `:upgrade <Component>` command (Erlang `code_change`
       equivalent, design open Q4): migrates every LIVE instance's `state`
       and `props` by name (matched names keep their current value; new
       fields/props with a default get a fresh value; a removed field/prop
       is dropped) and swaps in the redefined component's methods
-      immediately. `children` may now GROW too (it114): a genuinely new
-      child is constructed fresh and any new wire touching it gets
-      registered; a kept child's own live instance/wiring is never
-      touched. Still refuses the whole upgrade if: a new prop has no
-      default; a pre-existing child's own component type changed or was
-      removed; or a wire between two pre-existing children changed (see
-      `repl.rs::upgrade_instances`'s own doc comment for the full list).
-      No child removal or existing-wire re-routing yet.
+      immediately. `children` may GROW (it114): a genuinely new child is
+      constructed fresh. `wires` between children may now be freely ADDED
+      or REMOVED (it115), including RE-ROUTING an existing connection
+      between two pre-existing children — a kept child's own live
+      instance is never touched, only its `.wires` map is pruned/extended
+      as needed. Still refuses the whole upgrade if: a new prop has no
+      default; a pre-existing child's own component type changed; or a
+      pre-existing child was REMOVED (see `repl.rs::upgrade_instances`'s
+      own doc comment — child removal needs a "tear down one live
+      instance while its siblings keep running" mechanism that doesn't
+      exist anywhere else in the engine yet, a materially bigger problem
+      than everything else this command handles).
 
 ## Tier 3 — audit-driven priorities (next arc)
 
@@ -944,7 +948,8 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 2. Int default → **decided & shipped:** i64 checked, overflow panics.
 3. Effect granularity → shipped hierarchical effects (`io` covers `io.fs`/`io.net`/`io.env`/`io.proc`/`io.time`; plus `ai`).
 4. Hot-swap state migration → supervision restart hook shipped; automatic
-   by-name `state` migration shipped (it111, `kupl repl :upgrade`); a
-   user-provided migration hook (for a field whose SHAPE, not just name,
-   changed) and wiring/supervision-topology re-routing remain TBD.
+   by-name `state`/`props` migration and wire re-routing shipped (it111,
+   it113, it115, `kupl repl :upgrade`); a user-provided migration hook
+   (for a field whose SHAPE, not just name, changed) and removing a live
+   child (supervision-topology shrinkage) remain TBD.
 5. Package identity → `kupl.toml` shipped; registry governance TBD.
