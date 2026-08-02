@@ -7548,6 +7548,44 @@ mod generic_tests {
         assert!(!errors(two_children).iter().any(|d| d.code == "K0286"), "{:?}", errors(two_children));
     }
 
+    /// `supervise child restart on_failure max N in <duration>` (universal-
+    /// language enrichment campaign, it102 -- a BEAM/Erlang-inspired
+    /// restart-intensity limit). Grammar-level coverage: a well-formed
+    /// clause parses cleanly, and each of the three malformed shapes gets
+    /// the SAME clean `K0122` diagnostic (never a bare parser panic or a
+    /// misleading unrelated error) -- `max` after `restart never` (nothing
+    /// to limit), a non-positive restart count, and a missing `in
+    /// <duration>` suffix.
+    #[test]
+    fn supervise_restart_intensity_limit_grammar() {
+        let src = |clause: &str| {
+            format!(
+                "component Flaky {{\n    intent \"f\"\n    in go: Int\n    on go(n) {{ let v = 100 / n }}\n}}\n\
+                 app Main {{\n    intent \"m\"\n    let flaky = Flaky()\n    {clause}\n}}\n"
+            )
+        };
+        assert!(
+            errors(&src("supervise flaky restart on_failure max 5 in 10s")).is_empty(),
+            "a well-formed restart-intensity clause must parse cleanly: {:?}",
+            errors(&src("supervise flaky restart on_failure max 5 in 10s"))
+        );
+        let never_with_max = errors(&src("supervise flaky restart never max 5 in 10s"));
+        assert!(
+            never_with_max.iter().any(|d| d.code == "K0122"),
+            "`max` after `restart never` must be K0122: {never_with_max:?}"
+        );
+        let zero_count = errors(&src("supervise flaky restart on_failure max 0 in 10s"));
+        assert!(
+            zero_count.iter().any(|d| d.code == "K0122"),
+            "a non-positive restart count must be K0122: {zero_count:?}"
+        );
+        let missing_in = errors(&src("supervise flaky restart on_failure max 5"));
+        assert!(
+            missing_in.iter().any(|d| d.code == "K0122"),
+            "a missing `in <duration>` suffix must be K0122: {missing_in:?}"
+        );
+    }
+
     /// A REAL, live-confirmed HIGH-severity soundness hole (production-
     /// hardening PR-it994): a prop's DEFAULT VALUE was never type-checked
     /// against the prop's own declared type -- `kupl check` reported "ok"

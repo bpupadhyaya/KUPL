@@ -118,6 +118,15 @@ pub struct Instance {
     pub restart_on_failure: bool,
     /// Armed `on every`/`on after` timers.
     pub timers: Vec<TimerState>,
+    /// Set by the parent's `supervise child restart on_failure max N in
+    /// <duration>` (BEAM/Erlang-inspired restart-intensity limit). `None`
+    /// (the default, and the case whenever `max ... in ...` is omitted)
+    /// preserves today's exact unlimited-restart behavior.
+    pub max_restarts: Option<(u32, i64)>,
+    /// Virtual-ms timestamps of past restarts still inside the sliding
+    /// window, oldest first — only populated/consulted when `max_restarts`
+    /// is `Some`.
+    pub restart_history: VecDeque<i64>,
 }
 
 pub struct Interp {
@@ -345,6 +354,8 @@ impl Interp {
             last_emit: HashMap::new(),
             restart_on_failure: false,
             timers: Vec::new(),
+            max_restarts: None,
+            restart_history: VecDeque::new(),
         });
 
         // children (constructed after the parent exists, in declaration order)
@@ -358,12 +369,13 @@ impl Interp {
             let v = self.instantiate(&child.component, &child_args, child.span)?;
             if let Value::Component(cid) = v {
                 child_ids.insert(child.name.clone(), cid);
-                let supervised = comp
+                let supervise = comp
                     .supervises
                     .iter()
-                    .any(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
-                if supervised {
+                    .find(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
+                if let Some(s) = supervise {
                     self.instances[cid].restart_on_failure = true;
+                    self.instances[cid].max_restarts = s.max_restarts;
                 }
             }
             env.define(&child.name, v);
@@ -644,7 +656,38 @@ impl Interp {
 
     /// Supervision restart: reset state fields to their initial values, keep
     /// props/children/wires, re-run `on start`.
+    ///
+    /// A restart-intensity limit (`supervise child restart on_failure max N
+    /// in <duration>`, BEAM/Erlang-inspired `max_restarts`/`max_seconds`) is
+    /// checked FIRST: if this instance has already restarted `N` times
+    /// within the trailing `window_ms` (virtual-clock, so this stays
+    /// deterministic and reproducible, matching timers' own discipline),
+    /// this call escalates instead — returning the panic as an ordinary
+    /// `Err`, exactly as if `restart_on_failure` were `false`, so every
+    /// EXISTING call site's own `self.restart(id, &msg)?` already handles
+    /// this correctly with zero changes (the `?` just propagates it
+    /// upward). No `max ... in ...` clause (the default) preserves today's
+    /// exact unlimited-restart behavior.
     fn restart(&mut self, id: usize, panic_msg: &str) -> Result<(), Flow> {
+        if let Some((max_n, window_ms)) = self.instances[id].max_restarts {
+            let now = self.now;
+            let history = &mut self.instances[id].restart_history;
+            while let Some(&oldest) = history.front() {
+                if now - oldest > window_ms {
+                    history.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if history.len() as u32 >= max_n {
+                let comp_name = self.instances[id].comp.name.clone();
+                eprintln!(
+                    "[supervise] {comp_name} exceeded {max_n} restart(s) within {window_ms}ms — escalating instead of restarting"
+                );
+                return Err(Self::panic_flow(panic_msg.to_string(), Span::default()));
+            }
+            self.instances[id].restart_history.push_back(now);
+        }
         let comp = self.instances[id].comp.clone();
         eprintln!("[supervise] {} restarted after panic: {panic_msg}", comp.name);
         self.reset_instance_state(id)?;

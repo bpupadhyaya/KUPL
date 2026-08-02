@@ -3326,6 +3326,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `supervise child restart on_failure max N in <duration>` (universal-
+    /// language enrichment campaign, it102 -- a BEAM/Erlang-inspired
+    /// restart-intensity limit, `max_restarts`/`max_seconds`): once a
+    /// supervised child has restarted `N` times within the trailing
+    /// `duration` (virtual-clock), the NEXT panic escalates instead of
+    /// restarting again -- exactly as if the child were unsupervised,
+    /// crashing the whole program. Drives a real pipeline (mirroring
+    /// `examples/supervise.kupl`'s own Feed/Divider shape) where the SECOND
+    /// bad input arrives well within the 1-restart/10s limit's window, so
+    /// it must escalate rather than restart a second time.
+    #[test]
+    fn supervise_restart_intensity_limit_escalates_once_exceeded_within_the_window() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-supervise-intensity-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("intensity.kupl");
+        std::fs::write(
+            &file,
+            "component Divider {\n    intent \"Divides 100 by whatever arrives.\"\n    in input: Int\n    out result: Int\n    on input(n) {\n        emit result(100 / n)\n    }\n}\n\
+             component Feed {\n    intent \"Feeds two bad (zero) inputs in a row.\"\n    out numbers: Int\n    on start {\n        emit numbers(0)\n        emit numbers(0)\n    }\n}\n\
+             app Main {\n    intent \"Restart-intensity limit of 1 per 10s -- the second bad input must escalate.\"\n    let feed = Feed()\n    let divider = Divider()\n    wire feed.numbers -> divider.input\n    supervise divider restart on_failure max 1 in 10s\n}\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.stdout, vm.stdout, "interp/vm stdout must agree: {interp:?} {vm:?}");
+        assert_ne!(interp.status.code(), Some(0), "must escalate (nonzero exit), not restart forever: {interp:?}");
+        assert_eq!(interp.status.code(), vm.status.code(), "interp/vm exit codes must agree: {interp:?} {vm:?}");
+        let interp_err = String::from_utf8_lossy(&interp.stderr);
+        let vm_err = String::from_utf8_lossy(&vm.stderr);
+        assert!(interp_err.contains("restarted after panic"), "the FIRST panic must still restart: {interp_err}");
+        assert!(
+            interp_err.contains("exceeded 1 restart(s)") && interp_err.contains("escalating"),
+            "the SECOND panic must escalate instead of restarting: {interp_err}"
+        );
+        assert!(
+            vm_err.contains("exceeded 1 restart(s)") && vm_err.contains("escalating"),
+            "the VM must escalate identically: {vm_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The SLIDING-WINDOW complement to the test above (it102): restarts
+    /// spaced FARTHER apart than the configured window must NEVER escalate,
+    /// no matter how many of them accumulate over the program's lifetime --
+    /// confirms old restart timestamps correctly age out of the window
+    /// rather than the limit being a lifetime cap in disguise. A component
+    /// panics every 6s (via `on every`) with a restart-intensity limit of 1
+    /// per 5s -- each restart is always outside the trailing window, so
+    /// `kupl run`'s own bounded auto-advance (100 timer fires) drives 100
+    /// consecutive successful restarts and the program exits cleanly.
+    #[test]
+    fn supervise_restart_intensity_limit_never_escalates_when_restarts_are_spaced_beyond_the_window() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-supervise-window-expiry-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("window_expiry.kupl");
+        std::fs::write(
+            &file,
+            "component Bomb {\n    intent \"Panics every 6s.\"\n    on every 6s {\n        panic(\"boom\")\n    }\n}\n\
+             app Root {\n    intent \"max 1 restart per 5s -- 6s-apart restarts are always outside the window.\"\n    let b = Bomb()\n    supervise b restart on_failure max 1 in 5s\n}\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.status.code(), Some(0), "restarts spaced beyond the window must never escalate: {interp:?}");
+        assert_eq!(vm.status.code(), Some(0), "{vm:?}");
+        let interp_err = String::from_utf8_lossy(&interp.stderr);
+        let vm_err = String::from_utf8_lossy(&vm.stderr);
+        assert!(!interp_err.contains("exceeded"), "must never escalate: {interp_err}");
+        assert!(!vm_err.contains("exceeded"), "must never escalate: {vm_err}");
+        assert!(interp_err.matches("restarted after panic").count() > 1, "must restart repeatedly: {interp_err}");
+        assert_eq!(
+            interp_err.matches("restarted after panic").count(),
+            vm_err.matches("restarted after panic").count(),
+            "interp/vm must restart the same number of times: {interp_err}\n---\n{vm_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A NEW opt-in CLI safety net (production-hardening: KUPL production-
     /// readiness phase 1): `--timeout=<seconds>` kills a runaway `kupl run`/
     /// `kupl run --vm` process with a clean `K0901` diagnostic and exit code

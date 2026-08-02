@@ -266,6 +266,29 @@ engines discipline as every prior campaign.
   compile.rs's own gate before shipping. Three new permanent regression
   tests, plus a dedicated VM-side hang-avoidance test for the new
   thread-spawn site.
+- **Supervision restart-intensity limits (it102)** — `supervise child
+  restart on_failure max N in <duration>` (BEAM/Erlang-inspired
+  `max_restarts`/`max_seconds`, already specified in
+  `docs/design/LANGUAGE.md`'s own original vision but never implemented
+  until now): once a supervised child has restarted `N` times within the
+  trailing `duration` (virtual clock, so this stays deterministic and
+  reproducible, matching timers), the NEXT panic escalates instead of
+  restarting again — a safety valve against an unbounded panic/restart
+  crash loop. Fully opt-in and additive: omitting `max … in …` preserves
+  today's exact unlimited-restart behavior. New `K0122` diagnostic
+  (malformed clause) and `K0808` (restart count too large for the KVM's
+  `u16` operand). Implemented across all three engines: interp.rs/vm.rs
+  track a per-instance sliding-window restart history (pruned
+  `VecDeque<i64>`); `cgen.rs` uses an equivalent fixed-size ring buffer
+  (`KInstance`'s own doc comment) since C has no dynamic `Vec` — verified
+  behaviorally equivalent to the sliding-window prune-then-check-length
+  approach. `Op::MakeInstance` gained two new operands (`max_restarts`,
+  `window_ms_const`) to carry this from the parent's `supervise` clause
+  through to runtime, with full `.kx` encode/decode support. Seven new
+  permanent regression tests (parser grammar, `kupl fmt` round-trip,
+  interp/vm parity for both the escalation and sliding-window-expiry
+  cases, and two native-specific tests exercising `cgen.rs`'s own
+  independent C implementation directly).
 
 ## Final stretch — prioritized shortlist (it42–50)
 

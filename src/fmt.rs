@@ -410,7 +410,10 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
             SupervisePolicy::RestartOnFailure => "on_failure",
             SupervisePolicy::Never => "never",
         };
-        out.push_str(&format!("supervise {} restart {policy}\n", s.child));
+        match s.max_restarts {
+            Some((n, ms)) => out.push_str(&format!("supervise {} restart {policy} max {n} in {}\n", s.child, fmt_duration(ms))),
+            None => out.push_str(&format!("supervise {} restart {policy}\n", s.child)),
+        }
     }
     // handlers: on start, timers, port handlers (in in-port order), on stop
     let mut handlers: Vec<&Handler> = Vec::new();
@@ -957,6 +960,22 @@ mod tests {
     #[test]
     fn fmt_idempotent_fun() {
         roundtrip("fun add(a:Int,b:Int)->Int{a+b}\n");
+    }
+
+    /// `supervise child restart on_failure max N in <duration>` (it102) must
+    /// round-trip through `kupl fmt` like every other construct, and an
+    /// ORDINARY `supervise` clause (no restart-intensity suffix) must be
+    /// completely unaffected.
+    #[test]
+    fn fmt_idempotent_supervise_with_restart_intensity_limit() {
+        roundtrip(
+            "component W {\n    intent \"w\"\n}\n\
+             app Main {\n    intent \"m\"\n    let w = W()\n    supervise w restart on_failure max 5 in 10s\n}\n",
+        );
+        roundtrip(
+            "component W {\n    intent \"w\"\n}\n\
+             app Main {\n    intent \"m\"\n    let w = W()\n    supervise w restart on_failure\n}\n",
+        );
     }
 
     /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-

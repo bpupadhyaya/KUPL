@@ -297,10 +297,13 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
             fc.emit(Op::StateSet(slots[&s.name], r), s.span);
         }
         for child in &c.children {
-            let supervised = c.supervises.iter().any(|s| {
-                s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure
-            });
-            let r = fc.instance_expr(&child.component, &child.args, child.span, supervised as u8);
+            let supervise = c
+                .supervises
+                .iter()
+                .find(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
+            let max_restarts = supervise.and_then(|s| s.max_restarts);
+            let r =
+                fc.instance_expr(&child.component, &child.args, child.span, supervise.is_some() as u8, max_restarts);
             fc.emit(Op::StateSet(slots[&child.name], r), child.span);
         }
         for w in &c.wires {
@@ -551,8 +554,20 @@ impl<'s> FnCompiler<'s> {
     }
 
     /// Construct a component instance: args ordered to prop order, defaults
-    /// filled by calling the prop's default chunk.
-    fn instance_expr(&mut self, comp_name: &str, args: &[Arg], span: Span, policy: u8) -> Reg {
+    /// filled by calling the prop's default chunk. `max_restarts` (it102) is
+    /// the parent's `supervise child restart on_failure max N in <duration>`
+    /// clause, if any -- only meaningful when `policy == 1`; ad-hoc
+    /// instantiation (this function's OTHER call site, `let w = Widget()`
+    /// outside a declarative `children` list) always passes `None`, since
+    /// such an instance is never supervised at all.
+    fn instance_expr(
+        &mut self,
+        comp_name: &str,
+        args: &[Arg],
+        span: Span,
+        policy: u8,
+        max_restarts: Option<(u32, i64)>,
+    ) -> Reg {
         let Some(&comp_idx) = self.shared.module.component_names.get(comp_name) else {
             self.err("K0208", format!("unknown component `{comp_name}` (KVM)"), span);
             return self.const_reg(Value::Unit, span);
@@ -662,8 +677,36 @@ impl<'s> FnCompiler<'s> {
             self.emit(Op::Move(r, t), span);
         }
         let dst = self.alloc(span);
+        let (max_restarts, window_ms_const) = match max_restarts {
+            Some((n, ms)) => {
+                // `Op::MakeInstance.max_restarts` is a `u16` (0 is the "no
+                // limit" sentinel) -- a restart count > 65535 is not a
+                // realistic supervision policy (a component restarting that
+                // many times is already a runaway crash loop the LOWER
+                // bound of this feature exists to catch), so this is a
+                // clean compile error rather than a silent truncation,
+                // matching this file's own K0801-class fixed-width-operand
+                // guards elsewhere.
+                let n16 = if n as u32 > u16::MAX as u32 {
+                    self.err("K0808", format!("restart count `{n}` is too large (max 65535)"), span);
+                    0
+                } else {
+                    n as u16
+                };
+                (n16, self.const_idx(Value::Int(ms), span))
+            }
+            None => (0, 0),
+        };
         self.emit(
-            Op::MakeInstance { dst, comp: comp_idx, start, argc: props.len() as u8, policy },
+            Op::MakeInstance {
+                dst,
+                comp: comp_idx,
+                start,
+                argc: props.len() as u8,
+                policy,
+                max_restarts,
+                window_ms_const,
+            },
             span,
         );
         dst
@@ -1995,7 +2038,7 @@ impl<'s> FnCompiler<'s> {
                 && self.shared.module.component_names.contains_key(name.as_str())
             {
                 let comp_name = name.clone();
-                return self.instance_expr(&comp_name, args, span, 0);
+                return self.instance_expr(&comp_name, args, span, 0, None);
             }
             // direct call to a top-level fun
             if self.lookup(name).is_none() {

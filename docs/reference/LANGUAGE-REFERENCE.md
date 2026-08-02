@@ -733,6 +733,15 @@ let b = Cache(store: LoudStore())              // …or another — same consume
   resets the child's `state` fields to their initial values (props, children,
   and wiring are preserved), re-runs `on start`, and the app continues.
 - `restart never` documents the escalation default explicitly.
+- `supervise child restart on_failure max N in <duration>` (BEAM/Erlang-
+  inspired restart-intensity limit, `max_restarts`/`max_seconds`): if the
+  child has already restarted `N` times within the trailing `duration`
+  (virtual clock — deterministic, matching timers), the NEXT panic escalates
+  instead of restarting again, printing `[supervise] Comp exceeded N
+  restart(s) within …ms — escalating instead of restarting` and terminating
+  the program exactly like an unsupervised panic — a safety valve against an
+  unbounded panic/restart crash loop. Omitting `max … in …` (the default)
+  preserves unlimited restarts.
 
 ## 10. Numerics and equality (normative)
 

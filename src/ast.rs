@@ -175,11 +175,21 @@ pub struct WireDecl {
     pub span: Span,
 }
 
-/// `supervise child restart on_failure` / `supervise child restart never`
+/// `supervise child restart on_failure` / `supervise child restart never` /
+/// `supervise child restart on_failure max 5 in 10s`
 #[derive(Debug, Clone)]
 pub struct SuperviseDecl {
     pub child: String,
     pub policy: SupervisePolicy,
+    /// Restart-intensity limit (BEAM/Erlang-inspired `max_restarts`/
+    /// `max_seconds`): `Some((n, window_ms))` means more than `n` restarts
+    /// within any sliding `window_ms` virtual-time window escalates the
+    /// panic instead of restarting again (matching what an unsupervised
+    /// child's failure already does) -- a safety valve against an
+    /// unbounded panic/restart crash loop. `None` (the syntax is omitted)
+    /// preserves today's exact unlimited-restart behavior; only meaningful
+    /// alongside `SupervisePolicy::RestartOnFailure`.
+    pub max_restarts: Option<(u32, i64)>,
     pub span: Span,
 }
 

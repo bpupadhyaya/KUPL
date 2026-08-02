@@ -38,6 +38,13 @@ change and the release process.
   results and error reporting (including the exact panic span) match the
   sequential reference byte-for-byte. See
   `docs/design/bigarcs/3-real-concurrency.md`.
+- `supervise child restart on_failure max N in <duration>`: an opt-in
+  BEAM/Erlang-inspired restart-intensity limit. Once a supervised child has
+  restarted `N` times within the trailing `duration` (virtual clock), the
+  next panic escalates instead of restarting again — a safety valve against
+  an unbounded panic/restart crash loop. Omitting `max … in …` preserves
+  unlimited restarts. Byte-identical across all four engines including
+  native. See `docs/reference/LANGUAGE-REFERENCE.md` §9.
 
 ## [1.0.0-alpha]
 

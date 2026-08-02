@@ -1066,8 +1066,12 @@ pub(crate) fn manifest_json(program: &crate::ast::Program) -> String {
             .supervises
             .iter()
             .map(|sv| {
+                let max_restarts = match sv.max_restarts {
+                    Some((n, ms)) => format!("{{\"count\":{n},\"window_ms\":{ms}}}"),
+                    None => "null".to_string(),
+                };
                 format!(
-                    "{{\"child\":\"{}\",\"policy\":\"{}\"}}",
+                    "{{\"child\":\"{}\",\"policy\":\"{}\",\"max_restarts\":{max_restarts}}}",
                     esc(&sv.child),
                     match sv.policy {
                         crate::ast::SupervisePolicy::RestartOnFailure => "restart_on_failure",

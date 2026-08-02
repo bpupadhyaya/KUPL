@@ -406,13 +406,15 @@ fn encode_op(w: &mut W, op: &Op) {
             w.u8(*a);
             w.u8(*b);
         }
-        MakeInstance { dst, comp, start, argc, policy } => {
+        MakeInstance { dst, comp, start, argc, policy, max_restarts, window_ms_const } => {
             w.u8(36);
             w.u8(*dst);
             w.u16(*comp);
             w.u8(*start);
             w.u8(*argc);
             w.u8(*policy);
+            w.u16(*max_restarts);
+            w.u16(*window_ms_const);
         }
         WireOp { from, out_port, to, in_port } => {
             w.u8(37);
@@ -969,7 +971,15 @@ fn decode_op(r: &mut R) -> DecodeResult<Op> {
         33 => Concat(r.u8()?, r.u8()?, r.u8()?),
         34 => StateGet(r.u8()?, r.u8()?),
         35 => StateSet(r.u8()?, r.u8()?),
-        36 => MakeInstance { dst: r.u8()?, comp: r.u16()?, start: r.u8()?, argc: r.u8()?, policy: r.u8()? },
+        36 => MakeInstance {
+            dst: r.u8()?,
+            comp: r.u16()?,
+            start: r.u8()?,
+            argc: r.u8()?,
+            policy: r.u8()?,
+            max_restarts: r.u16()?,
+            window_ms_const: r.u16()?,
+        },
         37 => WireOp { from: r.u8()?, out_port: r.u16()?, to: r.u8()?, in_port: r.u16()? },
         38 => EmitOp {
             port: r.u16()?,
@@ -1261,7 +1271,7 @@ mod tests {
             Op::Concat(94, 95, 96),
             Op::StateGet(97, 98),
             Op::StateSet(99, 100),
-            Op::MakeInstance { dst: 101, comp: 1010, start: 102, argc: 103, policy: 104 },
+            Op::MakeInstance { dst: 101, comp: 1010, start: 102, argc: 103, policy: 104, max_restarts: 149, window_ms_const: 1050 },
             Op::WireOp { from: 105, out_port: 1011, to: 106, in_port: 1012 },
             Op::EmitOp { port: 1013, payload: Some(107) },
             Op::EmitOp { port: 1014, payload: None },

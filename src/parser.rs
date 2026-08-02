@@ -991,7 +991,55 @@ impl Parser {
                         ))
                     }
                 };
-                c.supervises.push(SuperviseDecl { child, policy, span: sspan.merge(self.prev_span()) });
+                // Optional restart-intensity limit (BEAM/Erlang-inspired
+                // `max_restarts`/`max_seconds`): `max <n> in <duration>`,
+                // e.g. `supervise child restart on_failure max 5 in 10s`.
+                // Contextual -- `max`/`in` are ordinary identifiers
+                // everywhere else, only meaningful in this exact position,
+                // matching this file's own established convention for
+                // `restart`/`on_failure`/`never` just above.
+                let max_restarts = if self.eat(&Tok::Ident("max".to_string())) {
+                    if policy != SupervisePolicy::RestartOnFailure {
+                        return Err(Diag::error(
+                            "K0122",
+                            "a restart-intensity limit (`max ... in ...`) only applies to `restart on_failure`",
+                            self.prev_span(),
+                        ));
+                    }
+                    let nspan = self.span();
+                    let n = match self.bump() {
+                        Tok::Int(n) if n > 0 => n,
+                        other => {
+                            return Err(Diag::error(
+                                "K0122",
+                                format!("expected a positive restart count after `max`, found {}", other.describe()),
+                                nspan,
+                            ))
+                        }
+                    };
+                    let n: u32 = n.try_into().map_err(|_| {
+                        Diag::error("K0122", format!("restart count `{n}` is too large"), nspan)
+                    })?;
+                    // `in` is the reserved `for x in xs` keyword (Tok::KwIn),
+                    // not a plain identifier -- `expect_ident` would reject it.
+                    if !self.eat(&Tok::KwIn) {
+                        return Err(Diag::error(
+                            "K0122",
+                            format!("expected `in <duration>` after the restart count, found {}", self.peek().describe()),
+                            self.span(),
+                        ));
+                    }
+                    let ms = self.parse_duration()?;
+                    Some((n, ms))
+                } else {
+                    None
+                };
+                c.supervises.push(SuperviseDecl {
+                    child,
+                    policy,
+                    max_restarts,
+                    span: sspan.merge(self.prev_span()),
+                });
                 self.expect_terminator()
             }
             Tok::KwOn => {

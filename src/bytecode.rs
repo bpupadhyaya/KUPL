@@ -78,7 +78,23 @@ pub enum Op {
     /// dst <- new instance of components[comp]; props from regs[start..start+argc].
     /// policy: 0 = escalate on panic, 1 = restart on failure (set by the parent's
     /// `supervise` clause, resolved at compile time).
-    MakeInstance { dst: Reg, comp: u16, start: Reg, argc: u8, policy: u8 },
+    ///
+    /// `max_restarts`/`window_ms_const` (it102, BEAM/Erlang-inspired restart-
+    /// intensity limit): `max_restarts == 0` means no limit (today's exact
+    /// behavior, and the only legal value whenever `policy == 0`); a nonzero
+    /// value means more than `max_restarts` restarts within a sliding
+    /// `consts[window_ms_const]` (a `Value::Int`, milliseconds) window
+    /// escalates instead of restarting again -- set by the parent's
+    /// `supervise child restart on_failure max N in <duration>` clause.
+    MakeInstance {
+        dst: Reg,
+        comp: u16,
+        start: Reg,
+        argc: u8,
+        policy: u8,
+        max_restarts: u16,
+        window_ms_const: u16,
+    },
     /// wire regs[from].out consts[out_port] -> regs[to].in consts[in_port]
     WireOp { from: Reg, out_port: u16, to: Reg, in_port: u16 },
     /// emit on the current instance's out port consts[port]
@@ -1083,7 +1099,7 @@ mod escape_tests {
         // mirroring the sibling MakeList/MakeCtor test just above.
         let c = chunk(vec![
             Op::MakeList { dst: 0, start: 0, len: 0 },
-            Op::MakeInstance { dst: 1, comp: 0, start: 0, argc: 1, policy: 0 }, // Widget(items: xs) embeds it
+            Op::MakeInstance { dst: 1, comp: 0, start: 0, argc: 1, policy: 0, max_restarts: 0, window_ms_const: 0 }, // Widget(items: xs) embeds it
             self_push(0),
         ]);
         assert!(method_recv_escapes(&c, 2));

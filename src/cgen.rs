@@ -790,10 +790,27 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
         Concat(d, a, b) => format!("regs[{d}] = k_concat(regs[{a}], regs[{b}]);"),
         StateGet(dst, slot) => format!("regs[{dst}] = k_state_get({slot});"),
         StateSet(slot, src) => format!("k_state_set({slot}, regs[{src}]);"),
-        MakeInstance { dst, comp, start, argc, policy } => {
-            // props are argc consecutive registers from `start`
+        MakeInstance { dst, comp, start, argc, policy, max_restarts, window_ms_const } => {
+            // props are argc consecutive registers from `start`. Restart-
+            // intensity config (it102) is a COMPILE-TIME constant here --
+            // unlike vm.rs's runtime `konst!` lookup, cgen.rs generates C
+            // source once, so the window value is read directly out of
+            // `chunk.consts` now and inlined as a literal, mirroring how
+            // `Op::Const`'s own `const_expr` already embeds constant VALUES
+            // rather than emitting a runtime const-pool read.
+            let intensity = if *max_restarts > 0 {
+                let window_ms = match &chunk.consts[*window_ms_const as usize] {
+                    Value::Int(ms) => *ms,
+                    other => return Err(format!("restart-intensity window constant must be an Int, found {other}")),
+                };
+                format!(
+                    " k_insts[_id].max_restarts = {max_restarts}; k_insts[_id].restart_window_ms = {window_ms}LL; k_insts[_id].restart_times = (long long*)calloc({max_restarts}, sizeof(long long));"
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{{ int _id = k_instantiate({comp}, &regs[{start}], {argc}); k_insts[_id].restart_on_failure = ({policy} == 1); regs[{dst}] = k_component(_id); }}"
+                "{{ int _id = k_instantiate({comp}, &regs[{start}], {argc}); k_insts[_id].restart_on_failure = ({policy} == 1);{intensity} regs[{dst}] = k_component(_id); }}"
             )
         }
         WireOp { from, out_port, to, in_port } => {
@@ -8665,7 +8682,19 @@ typedef struct { const char* out_port; int to; const char* in_port; } KWire;
 typedef struct { int chunk; int every; long long interval; long long next_fire; int active; } KTimer;
 typedef struct { int comp; KValue* slots; int nslots;
                  KWire* wires; int nwires; int restart_on_failure;
-                 KTimer* timers; int ntimers; } KInstance;
+                 KTimer* timers; int ntimers;
+                 /* restart-intensity limit (it102): max_restarts==0 means no
+                    limit. restart_times is a FIXED ring buffer sized to
+                    max_restarts -- once restart_count reaches max_restarts,
+                    restart_times[restart_ring_pos] holds the OLDEST of the
+                    last max_restarts restarts; if it's still within
+                    restart_window_ms of k_vnow, ALL max_restarts of them are
+                    (each newer than the oldest), so escalate instead of
+                    restarting -- equivalent to interp.rs/vm.rs's own
+                    prune-then-check-length sliding window, without a
+                    dynamically-growing buffer. */
+                 int max_restarts; long long restart_window_ms;
+                 long long* restart_times; int restart_ring_pos; int restart_count; } KInstance;
 static KInstance* k_insts = 0;
 static int k_ninsts = 0;
 static int k_print_unwired = 0;
@@ -8697,6 +8726,8 @@ static int k_instantiate(int comp_idx, KValue* props, int nprops) {
     for (int i = 0; i < ns; i++) k_insts[id].slots[i] = (i < nprops) ? props[i] : k_unit();
     k_insts[id].wires = 0; k_insts[id].nwires = 0; k_insts[id].restart_on_failure = 0;
     k_insts[id].timers = 0; k_insts[id].ntimers = 0;
+    k_insts[id].max_restarts = 0; k_insts[id].restart_window_ms = 0;
+    k_insts[id].restart_times = 0; k_insts[id].restart_ring_pos = 0; k_insts[id].restart_count = 0;
     int saved = k_cur_inst;
     k_cur_inst = id;
     CHUNKS[COMPS[comp_idx].init_chunk](0, 0);   /* children created here get higher ids */
@@ -9030,7 +9061,34 @@ static void k_arm_timers(int id) {
 }
 
 /* supervision restart: [supervise] line, reset state, re-run @start, re-arm */
+/* Restart-intensity limit (it102): mirrors interp.rs/vm.rs's own `restart`
+   check exactly, via the fixed ring buffer KInstance's own doc comment
+   describes. Escalates via k_panic (longjmp to the enclosing pad, or
+   exit(101) if none) instead of returning -- the caller (k_restart) must
+   return immediately afterward without falling through to the actual
+   restart, matching every other engine's "escalate instead of restarting"
+   semantics for this new failure mode. */
+static int k_restart_intensity_exceeded(int id, const char* msg) {
+    KInstance* in = &k_insts[id];
+    if (in->max_restarts == 0) return 0;
+    if (in->restart_count >= in->max_restarts) {
+        long long oldest = in->restart_times[in->restart_ring_pos];
+        if (k_vnow - oldest <= in->restart_window_ms) {
+            const KCompMeta* cm = &COMPS[in->comp];
+            fprintf(stderr, "[supervise] %s exceeded %d restart(s) within %lldms \xe2\x80\x94 escalating instead of restarting\n",
+                    cm->name, in->max_restarts, in->restart_window_ms);
+            k_panic(msg);
+            return 1; /* unreachable unless k_panic's own exit(101) path is hit mid-shutdown */
+        }
+    }
+    in->restart_times[in->restart_ring_pos] = k_vnow;
+    in->restart_ring_pos = (in->restart_ring_pos + 1) % in->max_restarts;
+    if (in->restart_count < in->max_restarts) in->restart_count++;
+    return 0;
+}
+
 static void k_restart(int id, const char* msg) {
+    if (k_restart_intensity_exceeded(id, msg)) return;
     const KCompMeta* cm = &COMPS[k_insts[id].comp];
     fprintf(stderr, "[supervise] %s restarted after panic: %s\n", cm->name, msg);
     int saved = k_cur_inst; k_cur_inst = id;
@@ -17798,6 +17856,83 @@ fun main() uses io {
         // [supervise] lines go to stderr. Just assert clean stdout + termination.
         let out = native_stdout(src, "sup");
         assert_eq!(out, "", "supervised panics keep stdout clean: {out:?}");
+    }
+
+    /// `supervise child restart on_failure max N in <duration>` (universal-
+    /// language enrichment campaign, it102) on native: a restart-intensity
+    /// limit escalates (crashing the whole program, exit 101, exactly like
+    /// an unsupervised panic) once exceeded within the window -- mirrors
+    /// `main.rs`'s own interp/vm parity test
+    /// (`supervise_restart_intensity_limit_escalates_once_exceeded_within_the_window`)
+    /// on the THIRD engine, since `cgen.rs` has its own independent C
+    /// implementation (a fixed ring buffer, `KInstance`'s own doc comment)
+    /// that needs its own direct verification, not just a downstream
+    /// consequence of the VM's.
+    #[test]
+    fn native_supervise_restart_intensity_limit_escalates_once_exceeded_within_the_window() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Divider {\n    intent \"x\"\n    in input: Int\n    out result: Int\n    on input(n) {\n        emit result(100 / n)\n    }\n}\n\
+                   component Feed {\n    intent \"x\"\n    out numbers: Int\n    on start {\n        emit numbers(0)\n        emit numbers(0)\n    }\n}\n\
+                   app Main {\n    intent \"x\"\n    let feed = Feed()\n    let divider = Divider()\n    \
+                   wire feed.numbers -> divider.input\n    supervise divider restart on_failure max 1 in 10s\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-supintensity-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("restarted after panic"), "the FIRST panic must still restart: {stderr:?}");
+        assert!(
+            stderr.contains("exceeded 1 restart(s)") && stderr.contains("escalating"),
+            "the SECOND panic must escalate instead of restarting: {stderr:?}"
+        );
+        assert!(!out.status.success(), "an escalated panic must crash the program: {out:?}");
+    }
+
+    /// The SLIDING-WINDOW complement on native (it102, mirrors main.rs's own
+    /// `supervise_restart_intensity_limit_never_escalates_when_restarts_are_spaced_beyond_the_window`):
+    /// restarts spaced FARTHER apart than the window must never escalate,
+    /// confirming the fixed ring buffer (`KInstance`'s own doc comment)
+    /// correctly treats an old timestamp as expired rather than counting it
+    /// forever.
+    #[test]
+    fn native_supervise_restart_intensity_limit_never_escalates_when_restarts_are_spaced_beyond_the_window() {
+        if !cc_available() {
+            return;
+        }
+        let src = "component Bomb {\n    intent \"x\"\n    on every 6s {\n        panic(\"boom\")\n    }\n}\n\
+                   app Root {\n    intent \"x\"\n    let b = Bomb()\n    supervise b restart on_failure max 1 in 5s\n}\n";
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-supwindow-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let out = std::process::Command::new(&bin).output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "restarts spaced beyond the window must never escalate: {out:?}");
+        assert!(!stderr.contains("exceeded"), "must never escalate: {stderr:?}");
+        assert!(stderr.matches("restarted after panic").count() > 1, "must restart repeatedly: {stderr:?}");
     }
 
     /// A TIMER-triggered supervised restart (the exact it509 double-delay

@@ -131,6 +131,13 @@ struct VmInstance {
     wires: std::collections::HashMap<String, Vec<(usize, String)>>,
     restart_on_failure: bool,
     timers: Vec<VmTimer>,
+    /// `supervise child restart on_failure max N in <duration>` (it102,
+    /// BEAM/Erlang-inspired restart-intensity limit): `Some((n, window_ms))`
+    /// -- mirrors interp.rs's `Instance::max_restarts` exactly.
+    max_restarts: Option<(u32, i64)>,
+    /// Virtual-ms timestamps of past restarts still inside the sliding
+    /// window, oldest first -- only used when `max_restarts` is `Some`.
+    restart_history: std::collections::VecDeque<i64>,
 }
 
 pub struct Vm<'m> {
@@ -372,7 +379,34 @@ impl<'m> Vm<'m> {
     }
 
     /// Supervision restart: reset state (restart chunk), re-run `on start`.
+    ///
+    /// A restart-intensity limit (`supervise child restart on_failure max N
+    /// in <duration>`, it102) is checked FIRST, mirroring interp.rs's
+    /// `restart` exactly: if this instance has already restarted `N` times
+    /// within the trailing `window_ms` (virtual-clock), this call escalates
+    /// instead -- returning the panic as an ordinary `Err`, so every
+    /// EXISTING call site's own `self.restart(id, &e.msg)?` already handles
+    /// this correctly with zero changes.
     fn restart(&mut self, id: usize, panic_msg: &str) -> Result<(), VmError> {
+        if let Some((max_n, window_ms)) = self.instances[id].max_restarts {
+            let now = self.now;
+            let history = &mut self.instances[id].restart_history;
+            while let Some(&oldest) = history.front() {
+                if now - oldest > window_ms {
+                    history.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if history.len() as u32 >= max_n {
+                let name = self.module.components[self.instances[id].comp as usize].name.clone();
+                eprintln!(
+                    "[supervise] {name} exceeded {max_n} restart(s) within {window_ms}ms — escalating instead of restarting"
+                );
+                return Err(VmError { msg: panic_msg.to_string(), span: Span::default() });
+            }
+            self.instances[id].restart_history.push_back(now);
+        }
         let meta = &self.module.components[self.instances[id].comp as usize];
         let name = meta.name.clone();
         let restart_chunk = meta.restart_chunk;
@@ -406,6 +440,8 @@ impl<'m> Vm<'m> {
             wires: std::collections::HashMap::new(),
             restart_on_failure: false,
             timers: Vec::new(),
+            max_restarts: None,
+            restart_history: std::collections::VecDeque::new(),
         });
         self.call_chunk_nested(init, Vec::new(), Some(id))?;
         Ok(id)
@@ -1942,7 +1978,7 @@ impl<'m> Vm<'m> {
                         }
                     }
                 }
-                Op::MakeInstance { dst, comp, start, argc, policy } => {
+                Op::MakeInstance { dst, comp, start, argc, policy, max_restarts, window_ms_const } => {
                     let props: Vec<Value> = (0..argc).map(|i| Ok(reg!(start as u16 + i as u16))).collect::<Result<Vec<Value>, VmError>>()?;
                     let id = self.instantiate(comp, props).map_err(|mut e| {
                         if e.span == Span::default() {
@@ -1951,6 +1987,18 @@ impl<'m> Vm<'m> {
                         e
                     })?;
                     self.instances[id].restart_on_failure = policy == 1;
+                    if max_restarts > 0 {
+                        let window_ms = match konst!(window_ms_const) {
+                            Value::Int(ms) => *ms,
+                            _ => {
+                                return Err(VmError {
+                                    msg: "corrupt .kx module: restart-intensity window constant must be an Int".into(),
+                                    span,
+                                })
+                            }
+                        };
+                        self.instances[id].max_restarts = Some((max_restarts as u32, window_ms));
+                    }
                     set!(dst, Value::Component(id));
                 }
                 Op::WireOp { from, out_port, to, in_port } => {

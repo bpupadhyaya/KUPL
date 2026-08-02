@@ -1,3 +1,23 @@
+> **Progress:** restart-intensity limits landed (it102, universal-language
+> enrichment campaign) — `supervise child restart on_failure max N in
+> <duration>` (BEAM/Erlang-inspired `max_restarts`/`max_seconds`, already
+> specified in `docs/design/LANGUAGE.md`'s own original vision, §"Instantiation,
+> wiring, supervision", but unimplemented until now). `KInstance` gains a
+> FIXED-SIZE ring buffer of restart timestamps (sized to `max_restarts`,
+> avoiding a dynamic `Vec` in C) — behaviorally equivalent to interp.rs/vm.rs's
+> own prune-then-check-length sliding window over a `VecDeque`: once the ring
+> is full, its OLDEST entry (`restart_times[restart_ring_pos]`) is still within
+> the window iff ALL `max_restarts` of the last restarts are, since every other
+> entry is newer. Escalates via the SAME `k_panic`/setjmp-longjmp mechanism
+> slice 3 already established, just triggered from a NEW check ahead of the
+> ordinary restart path rather than only from `k_dispatch`'s own panic catch.
+> `Op::MakeInstance` gained two new operands (`max_restarts`, a `u16` count;
+> `window_ms_const`, a const-pool index) — resolved to a COMPILE-TIME literal
+> here (unlike vm.rs's runtime `konst!` lookup, since cgen.rs generates C
+> source once). Live-verified byte-identical to interp/VM on both the
+> escalation case and the sliding-window-expiry case (restarts spaced beyond
+> the window never escalate, confirmed via a 100-fire timer-driven test).
+>
 > **Progress:** slice 4 landed (it39) — native CROSS-COMPONENT EXPOSE CALLS.
 > A component Method call on a K_COMPONENT receiver dispatches to the target
 > instance's expose chunk (looked up in a per-component KExpose[] table, run with

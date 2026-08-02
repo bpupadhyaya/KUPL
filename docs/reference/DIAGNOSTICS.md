@@ -47,6 +47,7 @@ Severity: **E** = error, **W** = warning.
 | K0119 | E | an `ai fun` body is `intent "…"` optionally followed by `model "…"` |
 | K0120 | E | malformed duration literal (expected `<int><unit>`, unit in `ms`/`s`/`m`/`h`) |
 | K0121 | E | expression nesting too deep (bounded to keep the checker fast on pathological input) |
+| K0122 | E | malformed `supervise ... restart on_failure max <n> in <duration>` restart-intensity clause |
 
 ## K02xx — Type & semantic checker
 
@@ -169,6 +170,7 @@ Severity: **E** = error, **W** = warning.
 | K0805 | E | component has too many props + state fields + children for KVM v0 (more than 256 total) |
 | K0806 | E | chunk has too many distinct constants for KVM v0 (more than 65536) |
 | K0807 | E | module has too many functions/closures/component methods for KVM v0 (more than 65536 chunks) |
+| K0808 | E | `supervise ... max N in ...` restart count too large for KVM v0 (more than 65535) |
 
 ## K09xx — Runtime
 
