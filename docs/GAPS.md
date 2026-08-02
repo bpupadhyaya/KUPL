@@ -810,14 +810,20 @@ completion (3). Everything stays byte-identical across engines.
       handlers on a virtual clock advanced explicitly (`advance 5s` example
       step; `kupl run` auto-advances bounded). Deterministic, byte-identical on
       interpreter + KVM. Durations `ms`/`s`/`m`/`h`. (`examples/timers.kupl`)
-- [◐] **Hot-swap state migration (it111)** — `kupl repl`'s new `:upgrade
-      <Component>` command (Erlang `code_change` equivalent, design open
-      Q4): migrates every LIVE instance's `state` fields by name (matched
-      names keep their current value; new fields get a fresh `init`
-      default) and swaps in the redefined component's methods
-      immediately. Deliberately narrow v1 scope — refuses if `props` or
-      `children` changed (see `repl.rs::upgrade_instances`'s own doc
-      comment). No wiring/supervision-topology re-routing yet.
+- [◐] **Hot-swap state migration (it111, extended it113/it114)** — `kupl
+      repl`'s `:upgrade <Component>` command (Erlang `code_change`
+      equivalent, design open Q4): migrates every LIVE instance's `state`
+      and `props` by name (matched names keep their current value; new
+      fields/props with a default get a fresh value; a removed field/prop
+      is dropped) and swaps in the redefined component's methods
+      immediately. `children` may now GROW too (it114): a genuinely new
+      child is constructed fresh and any new wire touching it gets
+      registered; a kept child's own live instance/wiring is never
+      touched. Still refuses the whole upgrade if: a new prop has no
+      default; a pre-existing child's own component type changed or was
+      removed; or a wire between two pre-existing children changed (see
+      `repl.rs::upgrade_instances`'s own doc comment for the full list).
+      No child removal or existing-wire re-routing yet.
 
 ## Tier 3 — audit-driven priorities (next arc)
 
