@@ -1,3 +1,21 @@
+> **Progress:** slice 4 landed (it99) — `par { }` fork-join itself now has a
+> real-thread fast path (step 4 of Dependencies & ordering, below), on the
+> interpreter only: fires when EVERY branch is a plain call to a statically
+> pure, top-level named function with plain-literal/identifier arguments
+> (args evaluated eagerly in the real environment, sequentially, before any
+> concurrent dispatch — only the function CALLS run on worker threads). A
+> new dedicated `ParBranchOutcome` enum (not a reuse of the existing
+> `EvalOutcome`, to avoid touching the already-hardened `par_map`/
+> `par_filter` machinery) carries the panicking branch's REAL, original span
+> from deep inside the callee's own body — matching the sequential
+> reference's own un-rewrapped span exactly (a direct function call is never
+> span-rewrapped, unlike `.map(f)`/`.par_map(f)`'s method-dispatch wrapper).
+> Any non-qualifying branch (a closure, an impure/unknown callee, a
+> compound/nested-call argument, a non-portable result) falls the WHOLE
+> block back to the unchanged sequential loop. VM and native are still
+> sequential/deferred, matching this arc's own established per-engine
+> rollout order.
+>
 > **Progress:** slice 3 landed (it35) — the real-thread fast path is now on the
 > KVM too (Vm carries an Option<ProgramImage>, set on source runs; workers still
 > use the tree-Interp, so results are identical to the interpreter). par_map and

@@ -717,6 +717,166 @@ fn eval_one(
     }
 }
 
+/// The two ways a `par { }` branch's own call can fail, DISTINCT from the
+/// shared `EvalOutcome` above (a dedicated type, not a reuse — see its own
+/// rationale below) — `Panic` carries the REAL, original span from deep
+/// inside the callee's own body, not the branch's own call-site span.
+/// Necessary because, unlike a `.map(f)`/`.par_map(f)` METHOD callback
+/// (whose dispatch wrapper always re-wraps a callback panic with the
+/// method-call's OWN span, identically on both the sequential and parallel
+/// paths — independently confirmed live: `xs.map(bad)` and
+/// `xs.par_map(bad)` both report `bad`'s panic at their own call site, not
+/// inside `bad`'s body), a `par { }` branch is a DIRECT function call —
+/// its sequential reference (`self.eval(b, env)?`) does NOT rewrap the
+/// error at all, so whatever precise span the panic originated at (e.g.
+/// `100 / x` inside the callee's own body) propagates completely unchanged.
+/// Matching that exactly requires threading the REAL span through the
+/// worker/channel boundary — reusing the shared `EvalOutcome::Panic(String)`
+/// (which the already-hardened `eval_one`/`try_par_map`/`try_par_filter`
+/// deliberately keep span-free, since their own caller always discards it
+/// in favor of the method call's own span) would either lose this
+/// information or require touching that proven, heavily-tested code for no
+/// benefit to it. `Span` is a plain `Copy` pair of `u32`s, trivially
+/// `Send + Sync`.
+#[derive(Clone)]
+enum ParBranchOutcome {
+    Panic(String, Span),
+    NonPortableResult,
+}
+
+/// Evaluate `fname` with `args` (already portable) on a worker thread,
+/// generalizing `eval_one`'s single-argument shape to N arguments — used by
+/// `par { }`'s own real-thread fast path below, where each branch is an
+/// INDEPENDENT call, possibly to a DIFFERENT function with a DIFFERENT
+/// number of arguments (unlike `par_map`/`par_filter`, where every element
+/// calls the SAME single-argument callback).
+fn eval_call_portable(
+    interp: &mut crate::interp::Interp,
+    fname: &str,
+    args: &[PortableValue],
+    call_span: Span,
+) -> Result<PortableValue, ParBranchOutcome> {
+    let f = Value::Fun(Rc::new(fname.to_string()));
+    let vals: Vec<Value> = args.iter().map(from_portable).collect();
+    match interp.call_value(f, vals, call_span) {
+        Ok(v) => to_portable(&v).ok_or(ParBranchOutcome::NonPortableResult),
+        Err(crate::interp::Flow::Panic { msg, span, .. }) => Err(ParBranchOutcome::Panic(msg, span)),
+        Err(_) => Err(ParBranchOutcome::Panic("invalid control flow in a par { } branch".to_string(), call_span)),
+    }
+}
+
+/// The real-thread fast path for `par { }`: each branch is INDEPENDENTLY a
+/// call `(fname, args)` — possibly to a different function, with a
+/// different argument count, unlike `par_map`/`par_filter`'s "same
+/// function, many elements" shape. One worker thread per branch (branch
+/// counts are small in practice — this is a fork-join over a HANDFUL of
+/// independent tasks, not a bulk list operation — so no chunking is needed,
+/// unlike `par_eval`'s list-oriented chunking above).
+///
+/// Reuses `par_eval`'s own hard-won hang-avoidance discipline EXACTLY (see
+/// its own doc comment above for the full incident history, PR-it821/
+/// PR-it844): unscoped threads + a channel (never `std::thread::scope`,
+/// which cannot return until every thread joins and would hang the WHOLE
+/// block if any later branch never terminates while an earlier branch
+/// already panicked), a contiguous-prefix-by-BRANCH-INDEX stop-early check
+/// (matching the sequential reference's own left-to-right, stop-at-first-
+/// error semantics — branch 0's panic must always win over branch 2's, even
+/// if branch 2's worker happens to finish first), and an abandoned
+/// (detached, not killed — Rust has no safe thread-cancellation API) thread
+/// for any worker whose branch starts after the earliest known error.
+fn par_eval_branches(
+    branches: &[(String, Vec<PortableValue>, Span)],
+    image: &Arc<ProgramImage>,
+) -> Vec<Result<PortableValue, ParBranchOutcome>> {
+    let n = branches.len();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<PortableValue, ParBranchOutcome>)>();
+    let mut num_spawned = 0usize;
+    for (i, (fname, args, call_span)) in branches.iter().enumerate() {
+        let image = Arc::clone(image);
+        let fname = fname.clone();
+        let args = args.clone();
+        let call_span = *call_span;
+        let tx = tx.clone();
+        // Same 2GiB stack sizing as par_eval's own workers (PR-it729) — a
+        // pure function recursing near MAX_CALL_DEPTH must hit the clean
+        // guard panic, not a real native stack overflow.
+        let spawned = std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(move || {
+            let mut interp = crate::interp::Interp::new_bare(image.worker_db());
+            let r = eval_call_portable(&mut interp, &fname, &args, call_span);
+            let _ = tx.send((i, r));
+        });
+        match spawned {
+            Ok(_handle) => num_spawned += 1,
+            // A spawn failure is not a real error — the SAME "fall back to
+            // sequential" signal `gate`/`par_eval_with_stack_size` already
+            // use for this exact condition (PR-it1098). A single marker
+            // element is enough for the caller (`try_par_block`) to detect
+            // and fall all the way back to the unchanged sequential path.
+            Err(_) => return vec![Err(ParBranchOutcome::NonPortableResult)],
+        }
+    }
+    drop(tx); // our own extra sender; each worker holds its own clone
+
+    let mut slots: Vec<Option<Result<PortableValue, ParBranchOutcome>>> = vec![None; num_spawned];
+    let mut received = 0usize;
+    while received < num_spawned {
+        match rx.recv() {
+            Ok((i, r)) => {
+                slots[i] = Some(r);
+                received += 1;
+            }
+            // All senders dropped without every worker reporting — only
+            // possible if a worker suffered a REAL Rust panic (not a KUPL
+            // one; those are already caught inside `eval_call_portable`).
+            Err(_) => break,
+        }
+        let prefix_len = slots.iter().take_while(|s| s.is_some()).count();
+        let has_error = slots[..prefix_len].iter().any(|s| s.as_ref().unwrap().is_err());
+        if has_error {
+            let mut out = Vec::with_capacity(n);
+            for slot in &slots[..prefix_len] {
+                out.push(slot.clone().unwrap());
+            }
+            return out;
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for slot in slots {
+        out.push(slot.expect("par { } worker thread panicked (no result received)"));
+    }
+    out
+}
+
+/// The gated real-thread fast path for `par { a, b, c }`: returns
+/// `Some(results)` (one per branch, in branch order) only when every
+/// underlying worker call either completed successfully or genuinely
+/// panicked (a KUPL-level error the sequential path would ALSO raise at
+/// that exact branch, WITH the exact same span — see `ParBranchOutcome`'s
+/// own doc comment) — `None` means something was fundamentally unrunnable
+/// (a spawn failure, or a callback whose OWN result turned out
+/// non-portable, mirroring `try_par_map`'s identical "discard and fall back
+/// to sequential" handling for the same condition, PR-it1061/PR-it922) and
+/// the caller must fall all the way back to today's unchanged sequential
+/// branch-by-branch loop. Callers are responsible for resolving each
+/// branch's own call target + arguments (which may reference LOCAL
+/// bindings only the calling thread/environment has access to) into a
+/// `(name, portable_args, call_span)` triple BEFORE calling this — only the
+/// function CALLS themselves run concurrently, never argument evaluation.
+pub fn try_par_block(
+    branches: &[(String, Vec<PortableValue>, Span)],
+    image: &Arc<ProgramImage>,
+) -> Option<Vec<Result<Value, (String, Span)>>> {
+    let mut out = Vec::with_capacity(branches.len());
+    for r in par_eval_branches(branches, image) {
+        match r {
+            Ok(pv) => out.push(Ok(from_portable(&pv))),
+            Err(ParBranchOutcome::Panic(msg, span)) => out.push(Err((msg, span))),
+            Err(ParBranchOutcome::NonPortableResult) => return None,
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

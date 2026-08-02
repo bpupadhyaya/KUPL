@@ -3014,6 +3014,163 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// KUPL universal-language concurrency arc (continuing
+    /// docs/design/bigarcs/3-real-concurrency.md's own deferred step 4):
+    /// `par { }`'s real-thread fast path must produce EXACTLY the same
+    /// result a purely sequential branch-by-branch evaluation would, for
+    /// ordinary independent pure-function branches. Runs interp and VM (the
+    /// fast path is interp.rs-only for this increment; the VM still takes
+    /// the unchanged sequential path) and asserts they agree.
+    #[test]
+    fn par_block_with_pure_call_branches_produces_the_same_result_on_both_engines() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-par-block-happy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("par_happy.kupl");
+        std::fs::write(
+            &file,
+            "fun square(n: Int) -> Int {\n    n * n\n}\n\
+             fun cube(n: Int) -> Int {\n    n * n * n\n}\n\
+             fun main() uses io {\n    let results = par {\n        square(5),\n        cube(3),\n        square(7)\n    }\n    print(results)\n}\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.stdout, vm.stdout, "interp/vm must agree: {interp:?} {vm:?}");
+        assert_eq!(interp.status.code(), Some(0), "{interp:?}");
+        assert_eq!(String::from_utf8_lossy(&interp.stdout).trim(), "[25, 27, 49]");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `par { }`'s real-thread fast path must never hang: an earlier
+    /// branch's panic must resolve the whole block promptly even when a
+    /// LATER branch is a genuine infinite loop running concurrently on its
+    /// own worker thread (mirroring the sibling `par_map`/`par_filter`
+    /// hang-avoidance tests' own discipline, PR-it821/PR-it844). Bounds the
+    /// TEST's own wait so a regression that reintroduces a join/hang fails
+    /// cleanly instead of hanging the suite.
+    #[test]
+    fn par_block_does_not_hang_when_an_earlier_panic_makes_a_later_infinite_loop_unreachable() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-par-block-hang-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("par_hang.kupl");
+        std::fs::write(
+            &file,
+            "fun boom() -> Int {\n    1 / 0\n}\n\
+             fun spin() -> Int {\n    var y = 0\n    while true {\n        y = y + 1\n    }\n    y\n}\n\
+             fun main() uses io {\n    let results = par {\n        boom(),\n        spin()\n    }\n    print(results)\n}\n",
+        )
+        .unwrap();
+
+        let child = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(10))
+            .expect("an earlier branch's panic must resolve the block promptly despite a later infinite-loop sibling");
+        assert_ne!(out.status.code(), Some(0), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("division by zero"), "{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `par { }`'s real-thread fast path must report the SAME error, at the
+    /// SAME precise span, that the sequential reference would -- and that
+    /// span is the REAL, original location deep inside the panicking
+    /// branch's own callee body (e.g. `100 / x`), NOT the branch's own
+    /// call-site span and NOT the whole `par { }` block's span, because a
+    /// direct function call is never rewrapped (unlike `.map(f)`/
+    /// `.par_map(f)`'s method-dispatch wrapper). Forces the TRUE sequential
+    /// path via a non-qualifying argument expression (`0 + 0`, which
+    /// `resolve_par_branches` deliberately excludes from the fast path) and
+    /// asserts it reports the IDENTICAL span the fast path reports for the
+    /// qualifying case.
+    #[test]
+    fn par_block_error_span_exactly_matches_the_sequential_fallbacks_own_span() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-par-block-span-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let preamble = "fun boom_a(x: Int) -> Int {\n    100 / x\n}\n\
+             fun boom_b(y: Int) -> Int {\n    200 / y\n}\n";
+
+        let fast_path = dir.join("par_span_fast.kupl");
+        std::fs::write(
+            &fast_path,
+            format!("{preamble}fun main() uses io {{\n    let results = par {{\n        boom_a(0),\n        boom_b(0)\n    }}\n    print(results)\n}}\n"),
+        )
+        .unwrap();
+        let sequential_fallback = dir.join("par_span_sequential.kupl");
+        std::fs::write(
+            &sequential_fallback,
+            format!("{preamble}fun main() uses io {{\n    let results = par {{\n        boom_a(0 + 0),\n        boom_b(0)\n    }}\n    print(results)\n}}\n"),
+        )
+        .unwrap();
+
+        let fast = std::process::Command::new(&bin).args(["run", fast_path.to_str().unwrap()]).output().unwrap();
+        let sequential =
+            std::process::Command::new(&bin).args(["run", sequential_fallback.to_str().unwrap()]).output().unwrap();
+        assert_ne!(fast.status.code(), Some(0), "{fast:?}");
+        assert_eq!(fast.status.code(), sequential.status.code(), "{fast:?} {sequential:?}");
+        let fast_err = String::from_utf8_lossy(&fast.stderr);
+        let sequential_err = String::from_utf8_lossy(&sequential.stderr);
+        assert!(fast_err.contains(":2:5"), "fast path must point at `100 / x` inside boom_a's own body: {fast_err}");
+        assert!(
+            sequential_err.contains(":2:5"),
+            "sequential fallback must point at `100 / x` inside boom_a's own body: {sequential_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `par { }`'s real-thread fast path must always surface the FIRST
+    /// branch's (by source order) error, even though workers may finish in
+    /// any order -- matching the sequential reference's own left-to-right,
+    /// stop-at-first-error semantics exactly. Runs repeatedly since a
+    /// thread-scheduling-order bug would only show up intermittently.
+    #[test]
+    fn par_block_always_reports_the_first_branchs_error_regardless_of_worker_finish_order() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-par-block-order-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("par_order.kupl");
+        std::fs::write(
+            &file,
+            "fun boom_a(x: Int) -> Int {\n    100 / x\n}\n\
+             fun boom_b(y: Int) -> Int {\n    200 / y\n}\n\
+             fun main() uses io {\n    let results = par {\n        boom_a(0),\n        boom_b(0)\n    }\n    print(results)\n}\n",
+        )
+        .unwrap();
+
+        for _ in 0..8 {
+            let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            assert_ne!(out.status.code(), Some(0), "{out:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("100 / x") || stderr.contains(":2:5"),
+                "must always report boom_a's error (the FIRST branch), never boom_b's: {stderr}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A NEW opt-in CLI safety net (production-hardening: KUPL production-
     /// readiness phase 1): `--timeout=<seconds>` kills a runaway `kupl run`/
     /// `kupl run --vm` process with a clean `K0901` diagnostic and exit code

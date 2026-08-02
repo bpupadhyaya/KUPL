@@ -214,6 +214,30 @@ C parser's error-message text is less detailed than the interpreter's Rust parse
 a cosmetic error-string difference; every successful parse and all normal output
 match). No native codegen divergence was found.
 
+## Universal-language enrichment campaign (it99–) — concurrency-first
+
+KUPL's own name is "K Universal Programming Language" — this campaign takes that
+literally: borrowing and improving on the best features from across the language
+landscape, starting with concurrency, held to the same byte-identical-across-
+engines discipline as every prior campaign.
+
+- **`par { }` real-thread fast path (it99)** — the fourth and final step of
+  `docs/design/bigarcs/3-real-concurrency.md`'s own "Dependencies & ordering"
+  plan, previously designed but never implemented: `par { }` fork-join branches
+  now run on genuine OS threads when every branch is a plain call to a
+  statically pure, top-level named function with plain-literal/identifier
+  arguments (the same `pure_funs` gate `par_map`/`par_filter` already use).
+  Any non-qualifying branch falls the whole block back to the exact, unchanged
+  sequential loop — additive only, never a behavior change. Matches the
+  sequential reference exactly, including error reporting: a panicking
+  branch's REAL, original span (from deep inside the callee's own body, since
+  a direct function call is never span-rewrapped, unlike `.map(f)`'s method-
+  dispatch wrapper) propagates through the worker/channel boundary unchanged.
+  Interpreter only for this slice; VM and native stay sequential (see the
+  design doc's own slice 4 progress note). Verified live: correct results,
+  genuine concurrent threading, hang-avoidance under a panic + infinite-loop
+  sibling, and branch-order-correct error priority under repetition.
+
 ## Final stretch — prioritized shortlist (it42–50)
 
 The four big arcs (sized numerics, packages, real-thread concurrency, native

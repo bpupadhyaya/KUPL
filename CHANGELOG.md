@@ -30,6 +30,12 @@ change and the release process.
   builtins: minimal structured logging (one `<timestamp> [LEVEL] <v>`
   line to stderr per call), byte-identical across all four engines
   including native.
+- `par { }` fork-join branches now run on genuine OS threads (interpreter
+  only) when every branch is a call to a statically pure, top-level named
+  function with plain-literal/identifier arguments; all other branches fall
+  back to the unchanged sequential path. Strictly additive — results and
+  error reporting (including the exact panic span) match the sequential
+  reference byte-for-byte. See `docs/design/bigarcs/3-real-concurrency.md`.
 
 ## [1.0.0-alpha]
 

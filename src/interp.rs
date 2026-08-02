@@ -1698,11 +1698,69 @@ impl Interp {
             }
             ExprKind::Await(inner) => self.eval(inner, env),
             ExprKind::Par(branches) => {
-                // Fork-join: evaluate each independent branch and collect the
-                // results into a list. Branches share only the (immutable)
-                // enclosing scope, so evaluation order does not affect results;
-                // v1.0-alpha runs them in deterministic branch order (a
-                // multi-threaded scheduler is a later, semantics-preserving step).
+                // Real-thread fast path (KUPL universal-language concurrency
+                // arc, continuing docs/design/bigarcs/3-real-concurrency.md's
+                // own deferred step 4, "par { } fork-join: parallelize only
+                // the all-pure, plain-data-free-var case"): fires only when
+                // EVERY branch is a plain call `f(args...)` to a statically
+                // pure, top-level named function (the SAME `pure_funs` set
+                // `par_map`/`par_filter`'s own gate already uses) with
+                // portable arguments. Args are evaluated HERE, sequentially,
+                // in the real calling environment (they may reference local
+                // bindings a worker thread has no access to) — only the
+                // function CALLS themselves, not argument evaluation, run
+                // concurrently. Any branch that doesn't qualify (not a bare
+                // call, an impure/unknown/closure callee, a non-portable
+                // argument or result) falls all the way back to today's
+                // exact, unchanged sequential loop — parallelism is strictly
+                // additive, never a behavior change.
+                if let Some(image) = self.image.clone() {
+                    if let Some(resolved) = self.resolve_par_branches(branches, env, &image)? {
+                        match crate::parallel::try_par_block(&resolved, &image) {
+                            Some(results) => {
+                                // Mirrors the sequential loop's own `?`
+                                // early-return: the FIRST branch (by index,
+                                // i.e. source order) that panicked is the
+                                // one whose message surfaces — matching
+                                // exactly what evaluating branches one at a
+                                // time, left to right, would have reported.
+                                // The error's span is the REAL, original span
+                                // from deep inside the panicking branch's own
+                                // callee body — NOT the branch's own call-site
+                                // span, and NOT the whole `par { }` block.
+                                // Unlike `xs.map(f)`/`xs.par_map(f)` (whose
+                                // dispatch wrapper always rewraps a callback
+                                // panic with the method call's own span, on
+                                // both the sequential and parallel paths), a
+                                // `par { }` branch is a DIRECT function call —
+                                // its sequential reference (`self.eval(b,
+                                // env)?`) does not rewrap the error at all, so
+                                // this must match that exactly (see
+                                // `ParBranchOutcome`'s own doc comment in
+                                // parallel.rs).
+                                let mut values = Vec::with_capacity(results.len());
+                                for r in results.into_iter() {
+                                    match r {
+                                        Ok(v) => values.push(v),
+                                        Err((msg, span)) => return Err(Self::panic_flow(msg, span)),
+                                    }
+                                }
+                                return Ok(Value::List(Rc::new(values)));
+                            }
+                            // Something was fundamentally unrunnable (spawn
+                            // failure or a non-portable callback RESULT,
+                            // discovered only after actually calling it) —
+                            // fall through to the sequential path below,
+                            // safe to redundantly re-run since every
+                            // resolved branch is a call to a PURE function.
+                            None => {}
+                        }
+                    }
+                }
+                // Fork-join fallback: evaluate each independent branch and
+                // collect the results into a list, in deterministic branch
+                // order. Branches share only the (immutable) enclosing
+                // scope, so evaluation order does not affect results.
                 let mut results = Vec::with_capacity(branches.len());
                 for b in branches {
                     results.push(self.eval(b, env)?);
@@ -1710,6 +1768,62 @@ impl Interp {
                 Ok(Value::List(Rc::new(results)))
             }
         }
+    }
+
+    /// Try to resolve `par { }`'s own branches into `(fn_name, portable_args)`
+    /// pairs for the real-thread fast path (see `ExprKind::Par`'s own eval
+    /// arm above for the full design rationale). Returns `Ok(None)` if ANY
+    /// branch doesn't qualify — never a hard error, always safe to fall back
+    /// to the sequential path.
+    ///
+    /// Each argument expression is deliberately restricted to a plain
+    /// identifier or literal (`Int`/`Float`/`Bool`/`Unit`) — never a nested
+    /// call or compound expression — so evaluating EVERY branch's own
+    /// arguments upfront, before any of the actual (potentially reordered/
+    /// concurrent) function calls happen, can never diverge from the
+    /// sequential reference's own left-to-right order: a variable lookup or
+    /// literal has zero possibility of a side effect or a panic, so the
+    /// ORDER they're evaluated in is unobservable. A nested call or
+    /// arithmetic sub-expression as an argument is excluded for exactly
+    /// this reason — it COULD panic or have an effect, and evaluating it
+    /// eagerly here, before an EARLIER branch's own call has even run,
+    /// could surface a panic out of the sequential reference's own
+    /// left-to-right order. A future iteration could widen this once a
+    /// per-expression purity/panic-freedom analysis exists to justify it.
+    fn resolve_par_branches(
+        &mut self,
+        branches: &[Expr],
+        env: &Env,
+        image: &std::sync::Arc<crate::parallel::ProgramImage>,
+    ) -> Result<Option<Vec<(String, Vec<crate::parallel::PortableValue>, Span)>>, Flow> {
+        let mut resolved = Vec::with_capacity(branches.len());
+        for b in branches {
+            let ExprKind::Call { callee, args } = &b.kind else { return Ok(None) };
+            let ExprKind::Ident(name) = &callee.kind else { return Ok(None) };
+            if !image.pure_funs.contains(name.as_str()) {
+                return Ok(None);
+            }
+            let mut portable_args = Vec::with_capacity(args.len());
+            for a in args {
+                if a.name.is_some() {
+                    return Ok(None); // named args: keep the gate simple, fall back
+                }
+                let safe = matches!(
+                    &a.value.kind,
+                    ExprKind::Ident(_) | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Unit
+                );
+                if !safe {
+                    return Ok(None);
+                }
+                let v = self.eval(&a.value, env)?;
+                match crate::parallel::to_portable(&v) {
+                    Some(pv) => portable_args.push(pv),
+                    None => return Ok(None),
+                }
+            }
+            resolved.push((name.clone(), portable_args, b.span));
+        }
+        Ok(Some(resolved))
     }
 
     fn eval_ident(&mut self, name: &str, span: Span, env: &Env) -> EvalResult {
