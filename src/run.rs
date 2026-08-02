@@ -389,6 +389,115 @@ pub fn emit_context(path: &str, name: &str, json: bool) -> i32 {
     0
 }
 
+/// `kupl patch <target> <ItemName> <replacement> [--write]` (it110): applies
+/// a component-granular edit — replaces the NAMED item's entire source span
+/// in `target` with the canonical (formatted) text of the single item found
+/// in `replacement`. The semantic inverse of `kupl context`'s own item
+/// extraction and `kupl diff`'s own item-identity model (reuses
+/// `sdiff::item_name`/`item_span` directly, rather than a third copy of the
+/// same match). "Models edit components, not line ranges"
+/// (`docs/design/LANGUAGE.md` §6) — this is the CLI surface for that: point
+/// at an item by name, hand it a complete replacement, get back a whole,
+/// safety-checked file, never a fragile line-based diff/patch.
+///
+/// Deliberately single-file, single-item, no cross-file `use` resolution —
+/// `target`/`replacement` are parsed directly (`parser::parse`, mirroring
+/// `kupl fmt`'s own loading style), NOT `load_compile` (which would pull in
+/// dependency items under mangled names, irrelevant here since a patch only
+/// ever targets an item the target file itself declares).
+///
+/// Safety net (mirrors `kupl fmt --write`'s own PR-it837/889 discipline
+/// exactly): recompiles the patched text and refuses to write if it
+/// introduces compile errors the target didn't already have — a patch can
+/// never make a file's error set WORSE, though (like `fmt --write`) it may
+/// leave an already-broken file still broken if the patch doesn't fix
+/// everything.
+pub fn patch_cmd(target_path: &str, name: &str, replacement_path: &str, write: bool) -> i32 {
+    let target_src = match std::fs::read_to_string(target_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {target_path}: {e}");
+            return 1;
+        }
+    };
+    let (target_program, target_parse_diags) = parser::parse(&target_src);
+    let target_parse_errors: Vec<Diag> =
+        target_parse_diags.into_iter().filter(|d| d.severity == Severity::Error).collect();
+    if !target_parse_errors.is_empty() {
+        print_diags(&target_parse_errors, &target_src, target_path);
+        return 1;
+    }
+    let Some(target_item) = target_program.items.iter().find(|it| crate::sdiff::item_name(it) == name) else {
+        eprintln!("error: no item named `{name}` in {target_path}");
+        return 1;
+    };
+    let target_span = crate::sdiff::item_span(target_item);
+
+    let replacement_src = match std::fs::read_to_string(replacement_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {replacement_path}: {e}");
+            return 1;
+        }
+    };
+    let (replacement_program, replacement_diags) = parser::parse(&replacement_src);
+    let replacement_errors: Vec<Diag> =
+        replacement_diags.into_iter().filter(|d| d.severity == Severity::Error).collect();
+    if !replacement_errors.is_empty() {
+        print_diags(&replacement_errors, &replacement_src, replacement_path);
+        return 1;
+    }
+    if replacement_program.items.len() != 1 {
+        eprintln!(
+            "error: {replacement_path} must contain exactly one item, found {}",
+            replacement_program.items.len()
+        );
+        return 1;
+    }
+    if !replacement_program.uses.is_empty() {
+        eprintln!(
+            "error: {replacement_path} must not contain `use` declarations — patch only replaces one item's own body, not the target file's imports"
+        );
+        return 1;
+    }
+    let replacement_text = crate::fmt::format_program(&Program {
+        items: vec![replacement_program.items[0].clone()],
+        uses: vec![],
+    });
+    let replacement_text = replacement_text.trim_end();
+
+    let start = (target_span.start as usize).min(target_src.len());
+    let end = (target_span.end as usize).min(target_src.len());
+    let mut patched = String::with_capacity(target_src.len() + replacement_text.len());
+    patched.push_str(&target_src[..start]);
+    patched.push_str(replacement_text);
+    patched.push_str(&target_src[end..]);
+
+    let target_error_codes: std::collections::HashSet<&'static str> = match compile(&target_src) {
+        Ok(_) => std::collections::HashSet::new(),
+        Err(errs) => errs.iter().map(|d| d.code).collect(),
+    };
+    if let Err(patched_errors) = compile(&patched) {
+        if patched_errors.iter().any(|d| !target_error_codes.contains(d.code)) {
+            eprintln!(
+                "error: applying this patch would introduce new errors in {target_path} — refusing (original left untouched); run `kupl check` on the patched output to see details"
+            );
+            return 1;
+        }
+    }
+
+    if write {
+        if let Err(e) = crate::loader::write_atomically(std::path::Path::new(target_path), &patched) {
+            eprintln!("error: cannot write {target_path}: {e}");
+            return 1;
+        }
+        println!("patched: {target_path}");
+    } else {
+        print!("{patched}");
+    }
+    0
+}
+
 fn collect_ty_names(t: &crate::ast::TyExpr, f: &mut impl FnMut(&str)) {
     use crate::ast::TyExprKind;
     match &t.kind {
@@ -3597,6 +3706,100 @@ mod tests {
         assert_eq!(super::emit_context(p, "does_not_exist", false), 1, "a missing item is a clean error");
         assert_eq!(super::emit_context(p, "target", true), 0, "--json succeeds too (content verified via the real CLI binary in main.rs)");
         assert_eq!(super::emit_context(p, "does_not_exist", true), 1, "--json missing-item is still a clean error return code");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `kupl patch <target> <ItemName> <replacement>` (it110): a
+    /// component-granular edit, the semantic inverse of `kupl context`'s own
+    /// item extraction. Covers: preview (no `--write`) leaves the file
+    /// untouched but prints the patched whole-file text; `--write` mutates
+    /// the target in place; only the named item's span changes, everything
+    /// else (including an UNRELATED sibling function) is byte-for-byte
+    /// preserved.
+    #[test]
+    fn patch_cmd_replaces_only_the_named_item_and_write_mutates_in_place() {
+        let dir = std::env::temp_dir().join(format!("kupl-patch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.kupl");
+        let replacement = dir.join("replacement.kupl");
+        std::fs::write(
+            &target,
+            "fun helper(n: Int) -> Int {\n    n * 2\n}\nfun target() -> Int {\n    helper(1)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(&replacement, "fun target() -> Int {\n    helper(21)\n}\n").unwrap();
+        let t = target.to_str().unwrap();
+        let r = replacement.to_str().unwrap();
+
+        // preview: succeeds, does NOT mutate the file.
+        let before = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(super::patch_cmd(t, "target", r, false), 0);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before, "preview (no --write) must not mutate the file");
+
+        // --write: mutates in place; the UNCHANGED `helper` function is preserved verbatim.
+        assert_eq!(super::patch_cmd(t, "target", r, true), 0);
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(after.contains("fun helper(n: Int) -> Int {\n    n * 2\n}"), "unrelated item must survive untouched: {after:?}");
+        assert!(after.contains("helper(21)"), "the patched item's new body must be present: {after:?}");
+        assert!(!after.contains("helper(1)\n}"), "the OLD body must be gone: {after:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every clean-error path `patch_cmd` promises: a missing target item, a
+    /// replacement file with more than one item, and a replacement file
+    /// containing a `use` declaration (out of scope — patch replaces one
+    /// item's body, not the target's imports) are all rejected with a
+    /// non-zero exit and the target file left untouched.
+    #[test]
+    fn patch_cmd_rejects_missing_item_multi_item_replacement_and_use_declarations() {
+        let dir = std::env::temp_dir().join(format!("kupl-patch-reject-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.kupl");
+        std::fs::write(&target, "fun target() -> Int {\n    1\n}\n").unwrap();
+        let t = target.to_str().unwrap();
+        let before = std::fs::read_to_string(&target).unwrap();
+
+        let missing = dir.join("missing_item.kupl");
+        std::fs::write(&missing, "fun target() -> Int {\n    2\n}\n").unwrap();
+        assert_eq!(super::patch_cmd(t, "does_not_exist", missing.to_str().unwrap(), true), 1);
+
+        let multi = dir.join("multi.kupl");
+        std::fs::write(&multi, "fun a() -> Int { 1 }\nfun b() -> Int { 2 }\n").unwrap();
+        assert_eq!(super::patch_cmd(t, "target", multi.to_str().unwrap(), true), 1, "a multi-item replacement must be rejected");
+
+        let with_use = dir.join("with_use.kupl");
+        std::fs::write(&with_use, "use somewhere\nfun target() -> Int {\n    2\n}\n").unwrap();
+        assert_eq!(super::patch_cmd(t, "target", with_use.to_str().unwrap(), true), 1, "a `use` in the replacement must be rejected");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before, "every rejected patch must leave the target untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `--write` safety net (mirrors `kupl fmt --write`'s own PR-it837/
+    /// 889 discipline exactly): a patch that would introduce a NEW compile
+    /// error (here, a reference to a name that doesn't exist) is refused,
+    /// with the target left byte-for-byte untouched -- confirmed via a
+    /// direct read-back, not just the return code.
+    #[test]
+    fn patch_cmd_refuses_to_write_a_patch_that_introduces_a_new_compile_error() {
+        let dir = std::env::temp_dir().join(format!("kupl-patch-safety-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.kupl");
+        std::fs::write(&target, "fun target() -> Int {\n    1\n}\n").unwrap();
+        let t = target.to_str().unwrap();
+        let before = std::fs::read_to_string(&target).unwrap();
+
+        let broken = dir.join("broken.kupl");
+        std::fs::write(&broken, "fun target() -> Int {\n    totally_unknown_fn(5)\n}\n").unwrap();
+        assert_eq!(super::patch_cmd(t, "target", broken.to_str().unwrap(), true), 1, "must refuse a patch that breaks the file");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before, "refused patch must leave the target byte-for-byte untouched");
+
+        // sanity: an equivalent, VALID patch on the SAME target succeeds.
+        let ok = dir.join("ok.kupl");
+        std::fs::write(&ok, "fun target() -> Int {\n    2\n}\n").unwrap();
+        assert_eq!(super::patch_cmd(t, "target", ok.to_str().unwrap(), true), 0, "a valid patch to the same target must still succeed");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

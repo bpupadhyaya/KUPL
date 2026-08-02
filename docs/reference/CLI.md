@@ -130,6 +130,17 @@ the same data as `{"target":{"name","source"},"dependencies":[{"name",
 directly (e.g. an `ai fun` agent via `exec("kupl", ["context", "--json",
 path, name])` + `json_parse`) — mirrors `kupl check --json`.
 
+### `kupl patch <file.kupl> <ItemName> <replacement.kupl> [--write]`
+Replaces the named item's entire source span with the single item found in
+`replacement.kupl` — a component-granular edit, the semantic inverse of
+`kupl context`'s own item extraction ("models edit components, not line
+ranges", `docs/design/LANGUAGE.md` §6). `replacement.kupl` must contain
+exactly one item and no `use` declarations. Prints the patched whole file by
+default (non-mutating preview); `--write` (position-independent) overwrites
+`<file.kupl>` in place — and, mirroring `kupl fmt --write`, refuses to write
+a patch that would introduce a new compile error the original didn't already
+have, leaving the file untouched.
+
 ### `kupl manifest <file.kupl>`
 JSON component manifests: name, kind, intent, ports (name/dir/type), props,
 state, exposes (params/returns/effects), fulfills, children, wires, example

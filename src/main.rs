@@ -44,6 +44,8 @@ Usage:
   kupl fmt <file.kupl> [--write]    Print (or rewrite to) canonical form
   kupl fmt <file.kupl> --check      Exit nonzero if the file isn't already canonical (CI gate)
   kupl context <file.kupl> <name>   Emit an item + its direct deps (LLM context)
+  kupl context <file.kupl> <name> --json  Same, as machine-readable JSON
+  kupl patch <f> <name> <repl> [--write]  Replace one item with repl's content
   kupl manifest <file.kupl>         Emit component manifests as JSON (visual tools)
   kupl repl                         Start an interactive session
   kupl lsp                          Start the Language Server (stdio, for editors)
@@ -558,6 +560,25 @@ fn run_cli() -> ExitCode {
                 }
             }
         }
+        // `--write` (it110), same position-independent filtering as
+        // `context`'s own `--json` handling right above.
+        Some("patch") => {
+            let write = args.iter().any(|a| a == "--write");
+            let positional: Vec<&String> = args[1..].iter().filter(|a| a.as_str() != "--write").collect();
+            match (positional.first(), positional.get(1), positional.get(2)) {
+                (Some(target), Some(name), Some(replacement)) if positional.get(3).is_none() => {
+                    run::patch_cmd(target, name, replacement, write)
+                }
+                (Some(_), Some(_), Some(_)) => {
+                    eprintln!("error: unexpected extra argument `{}`", positional[3]);
+                    2
+                }
+                _ => {
+                    eprintln!("usage: kupl patch <file.kupl> <ItemName> <replacement.kupl> [--write]");
+                    2
+                }
+            }
+        }
         Some("repl") => repl::repl(),
         Some("lsp") => kupl::lsp::serve(),
         Some("version") | Some("--version") | Some("-V") => {
@@ -952,7 +973,7 @@ mod tests {
     fn usage_text_mentions_every_dispatched_top_level_subcommand() {
         for cmd in [
             "run", "build", "bundle", "native", "dis", "diff", "new", "pkg", "test", "check", "fmt", "context",
-            "manifest", "repl", "lsp", "version",
+            "patch", "manifest", "repl", "lsp", "version",
         ] {
             assert!(
                 USAGE.contains(&format!("kupl {cmd}")),
@@ -1630,6 +1651,57 @@ mod tests {
         let missing_stdout = String::from_utf8_lossy(&missing.stdout);
         kupl::json::parse(&missing_stdout)
             .unwrap_or_else(|e| panic!("missing-item error under --json must still be valid JSON: {e}\n{missing_stdout}"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `kupl patch <file> <ItemName> <replacement> [--write]` (it110), the
+    /// CLI dispatch layer above `run::patch_cmd` (that function's own tests
+    /// cover the underlying logic directly) -- drives the REAL compiled
+    /// binary to confirm arg parsing: `--write` is position-independent
+    /// (matches `context`'s own `--json` handling), a wrong argument count
+    /// is a clean usage error (exit 2), and a genuine extra positional
+    /// argument is rejected rather than silently dropped (the SAME PR-it864
+    /// shape `diff`/`context` are already locked against, just above).
+    #[test]
+    fn patch_cli_write_flag_is_position_independent_and_extra_arguments_are_rejected() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-patch-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.kupl");
+        let replacement = dir.join("replacement.kupl");
+        std::fs::write(&target, "fun target() -> Int {\n    1\n}\n").unwrap();
+        std::fs::write(&replacement, "fun target() -> Int {\n    2\n}\n").unwrap();
+        let t = target.to_str().unwrap();
+        let r = replacement.to_str().unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).output().expect("kupl runs")
+        };
+
+        // `--write` before vs. after the positionals: both apply the patch (position-independent).
+        let out1 = run(&["patch", "--write", t, "target", r]);
+        assert!(out1.status.success(), "{out1:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fun target() -> Int {\n    2\n}\n");
+        std::fs::write(&target, "fun target() -> Int {\n    1\n}\n").unwrap();
+        let out2 = run(&["patch", t, "target", r, "--write"]);
+        assert!(out2.status.success(), "{out2:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fun target() -> Int {\n    2\n}\n");
+
+        // wrong argument count -> usage error, exit 2.
+        let too_few = run(&["patch", t, "target"]);
+        assert_eq!(too_few.status.code(), Some(2), "{too_few:?}");
+        assert!(String::from_utf8_lossy(&too_few.stderr).contains("usage: kupl patch"), "{too_few:?}");
+
+        // a genuine extra positional argument is rejected, not silently dropped.
+        let extra = run(&["patch", t, "target", r, "extra_typo"]);
+        assert_eq!(extra.status.code(), Some(2), "{extra:?}");
+        assert!(
+            String::from_utf8_lossy(&extra.stderr).contains("unexpected extra argument `extra_typo`"),
+            "{extra:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

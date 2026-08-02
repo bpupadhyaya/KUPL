@@ -603,6 +603,63 @@ engines discipline as every prior campaign.
   moved out manually before the revert build and restored after)
   confirmed the pre-fix binary rejects `--json`/`text_embed` cleanly
   while the restored binary computes both correctly.
+- **`kupl patch` (it110)** — closes the Tier 4 gap this doc has named
+  since early in the campaign. First investigated and RULED OUT candidate
+  (a), capabilities as attenuable values (`cap.Http.limited_to(...)`):
+  confirmed live that ZERO implementation exists today (no `cap`
+  namespace, no capability types, nothing) — the vision doc's own framing
+  ("effects are BACKED BY capabilities") means implementing this fully
+  would mean connecting the EXISTING, fully-static effect checker
+  (`src/effects.rs`) to a brand-new RUNTIME authority-passing mechanism,
+  a genuinely deep, cross-cutting redesign rather than "add a type" —
+  correctly judged too large for one iteration without a dedicated design
+  pass, per this campaign's own "investigate and rule out" precedent
+  (it103, it107).
+
+  `kupl patch <target> <ItemName> <replacement> [--write]` (`src/run.rs`,
+  `src/main.rs`) replaces the named item's ENTIRE source span in `target`
+  with the canonical (formatted) text of the single item found in
+  `replacement` — "models edit components, not line ranges"
+  (`docs/design/LANGUAGE.md` §6), the semantic INVERSE of `kupl
+  context`'s own item extraction. Reuses `sdiff::item_name`/`item_span`
+  directly (already `pub(crate)`, already shared with `repl.rs`) rather
+  than a third copy of the same match. Deliberately single-file,
+  single-item, no cross-file `use` resolution: both files are parsed
+  directly (`parser::parse`, mirroring `kupl fmt`'s own loading style),
+  not `load_compile` (irrelevant here — patch only ever targets an item
+  the target file itself declares). The replacement must contain EXACTLY
+  ONE item and no `use` declarations (both clean, explicit errors, not
+  silently ignored). Default mode PRINTS the patched whole-file text
+  (non-mutating, safe preview); `--write` (position-independent, matching
+  `context --json`'s own precedent) atomically overwrites the target.
+
+  **Safety net, deliberately mirroring `kupl fmt --write`'s own
+  PR-it837/889 discipline exactly**: recompiles the patched text and
+  refuses to write if it introduces compile errors the target didn't
+  already have — confirmed live end-to-end (a patch referencing an
+  unknown name is refused, with the original file byte-for-byte
+  untouched; an equivalent VALID patch to the same target still
+  succeeds). A pure CLI feature like `kupl context`/`kupl diff` before
+  it — zero interp/vm/cgen engine changes, so the interp-vs-native sweep
+  doesn't apply this iteration (cgen.rs untouched).
+
+  New permanent regression tests: `run.rs` (item replacement + `--write`
+  mutation, with an UNRELATED sibling item confirmed byte-for-byte
+  preserved; all three reject-with-original-untouched paths — missing
+  item, multi-item replacement, a `use` in the replacement; the safety
+  net's refuse-and-leave-untouched behavior, confirmed via a direct
+  read-back, not just the return code) and `main.rs` (the CLI dispatch
+  layer: `--write` position-independence, wrong-argument-count usage
+  error, and the PR-it864-shaped "genuine extra argument, not silently
+  dropped" check already applied to `diff`/`context`). `docs/GAPS.md`
+  and `USAGE`/the `usage_text_mentions_every_dispatched_top_level_
+  subcommand` test both updated. Full `cargo test` green twice
+  sequentially (1680 lib + 61 main tests, identical both runs, no
+  stack-overflow casualties this time), interp-vs-vm sweep across all
+  eligible `examples/*.kupl` clean, and revert-and-verify via `git
+  stash` confirmed the pre-fix binary rejects `patch` as an unrecognized
+  subcommand (falling to the generic usage banner) while the restored
+  binary applies the patch correctly.
 
 ## Final stretch — prioritized shortlist (it42–50)
 
@@ -788,7 +845,13 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       path dependencies — already landed; no live server is hosted yet)
 - [x] LSP: hover, completion, go-to-definition — DONE (it44; see the
       "Final stretch" entry above, which this line used to stale-duplicate).
-- [ ] `kupl patch` (component-granular edits); conformance suite numbering
+- [x] `kupl patch` (it110) — `kupl patch <file> <ItemName> <replacement>
+      [--write]` replaces one item's entire source span with a replacement
+      file's own single item, the semantic inverse of `kupl context`'s item
+      extraction ("models edit components, not line ranges",
+      `docs/design/LANGUAGE.md` §6). Safety-checked like `kupl fmt --write`
+      (refuses to write a patch that introduces new compile errors). No
+      conformance suite numbering yet.
 - [ ] WASM target; cross-compilation story
 
 ## Resolved design open questions (LANGUAGE.md §12)

@@ -80,6 +80,12 @@ change and the release process.
   similarity, for building lightweight prompt-context retrieval without
   a hosted embedding model. Byte-identical across all four engines
   including native.
+- `kupl patch <target> <ItemName> <replacement> [--write]`: replaces one
+  item's entire source span with a replacement file's own single item —
+  a component-granular edit, the semantic inverse of `kupl context`.
+  Prints the patched file by default; `--write` overwrites in place, and
+  (mirroring `kupl fmt --write`) refuses to write a patch that would
+  introduce a new compile error, leaving the original untouched.
 
 ## [1.0.0-alpha]
 
