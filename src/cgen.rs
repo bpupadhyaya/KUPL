@@ -733,6 +733,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             // k_big_pow), mirroring src/decimal.rs's own Rust
             // implementation.
             BUILTIN_DEC => format!("regs[{dst}] = k_dec_builtin(regs[{start}]); (void){argc};"),
+            BUILTIN_TEXT_EMBED => format!("regs[{dst}] = k_text_embed(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_COSINE_SIMILARITY => format!("regs[{dst}] = k_cosine_similarity(regs[{start}], regs[{start}+1]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -6479,11 +6481,86 @@ static KValue k_hex_decode(KValue sv) {
     out[n / 2] = 0;
     return k_ok(k_str((char*)out));
 }
+/* FNV-1a core, extracted (it109) so `text_embed` below can hash a raw
+   `(buf, len)` word slice directly -- no NUL-terminated copy or KValue
+   wrapper needed, unlike `k_hash_fnv`'s own NUL-terminated-string API. */
+static uint64_t k_fnv1a(const unsigned char* buf, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) { h ^= buf[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
 static KValue k_hash_fnv(KValue sv) {
     const unsigned char* s = (const unsigned char*)sv.as.s;
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (size_t i = 0; s[i]; i++) { h ^= s[i]; h *= 0x100000001b3ULL; }
-    return k_int((int64_t)h);
+    return k_int((int64_t)k_fnv1a(s, strlen((const char*)s)));
+}
+#define K_MAX_EMBED_DIMS 100000000LL
+/* `text_embed(s, dims)` (it109): a direct C port of `embed.rs::text_embed`
+   -- a from-scratch, zero-dependency bag-of-words hash embedding, NOT a
+   neural one. Tokenization is deliberately ASCII-byte-wise (see
+   `embed.rs`'s own doc comment for why): a "word" is a maximal run of
+   ASCII `[0-9A-Za-z]` bytes, lowercased in place; any OTHER byte,
+   including every non-ASCII UTF-8 byte, is a separator -- so this needs
+   NO UTF-8 decoding at all, unlike most of this file's other string
+   builtins. Each word is hashed via the SAME `k_fnv1a` the `hash_fnv`
+   builtin uses, bucketed mod `dims`, accumulated as a raw count, then the
+   whole vector is L2-normalized. */
+static KValue k_text_embed(KValue sv, KValue dimsv) {
+    int64_t dims_i = dimsv.as.i;
+    if (dims_i <= 0) k_panic("text_embed needs a positive dims");
+    if (dims_i > K_MAX_EMBED_DIMS) k_panic("text_embed dims too large");
+    size_t dims = (size_t)dims_i;
+    double* vec = (double*)k_alloc(sizeof(double) * dims);
+    for (size_t i = 0; i < dims; i++) vec[i] = 0.0;
+    const unsigned char* s = (const unsigned char*)sv.as.s;
+    size_t slen = strlen((const char*)s);
+    unsigned char* word = (unsigned char*)k_alloc(slen < 1 ? 1 : slen);
+    size_t wlen = 0;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char b = s[i];
+        int is_alnum = (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
+        if (is_alnum) {
+            word[wlen++] = (b >= 'A' && b <= 'Z') ? (unsigned char)(b + 32) : b;
+        } else if (wlen > 0) {
+            uint64_t h = k_fnv1a(word, wlen);
+            vec[(size_t)(h % (uint64_t)dims)] += 1.0;
+            wlen = 0;
+        }
+    }
+    if (wlen > 0) {
+        uint64_t h = k_fnv1a(word, wlen);
+        vec[(size_t)(h % (uint64_t)dims)] += 1.0;
+    }
+    double norm = 0.0;
+    for (size_t i = 0; i < dims; i++) norm += vec[i] * vec[i];
+    norm = sqrt(norm);
+    if (norm > 0.0) {
+        for (size_t i = 0; i < dims; i++) vec[i] /= norm;
+    }
+    KValue* items = (KValue*)k_alloc(sizeof(KValue) * (dims < 1 ? 1 : dims));
+    for (size_t i = 0; i < dims; i++) items[i] = k_float(vec[i]);
+    return k_list(items, (int)dims);
+}
+/* `cosine_similarity(a, b)` -- a direct C port of
+   `embed.rs::cosine_similarity`. `Err` (here, a clean panic) on a length
+   mismatch; `0.0`, not NaN, for a zero vector (an empty/all-separator
+   `text_embed` input is a real, reachable case). */
+static KValue k_cosine_similarity(KValue av, KValue bv) {
+    KList* a = av.as.list;
+    KList* b = bv.as.list;
+    if (a->len != b->len) {
+        char m[128];
+        snprintf(m, sizeof m, "cosine_similarity needs two vectors of the same length, found %lld and %lld",
+                 (long long)a->len, (long long)b->len);
+        k_panic(m);
+    }
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (int64_t i = 0; i < a->len; i++) {
+        double x = a->items[i].as.f, y = b->items[i].as.f;
+        dot += x * y; na += x * x; nb += y * y;
+    }
+    na = sqrt(na); nb = sqrt(nb);
+    if (na == 0.0 || nb == 0.0) return k_float(0.0);
+    return k_float(dot / (na * nb));
 }
 /* SHA-256 (FIPS 180-4), a direct C port of encoding.rs's own sha256_bytes --
    byte-for-byte identical algorithm, verified byte-identical output via the
@@ -10819,6 +10896,81 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             ("fun main() { print(dec(\"abc\")) }\n", "decbad"),
             ("fun main() { print(dec(\"1.2.3\")) }\n", "decdot2"),
             ("fun main() { print(dec(\"\")) }\n", "decempty"),
+        ] {
+            let compiled = crate::run::compile(src).expect("program compiles");
+            let interp_db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+            let mut interp = crate::interp::Interp::new(interp_db);
+            let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+            let interp_msg = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+                Err(crate::interp::Flow::Panic { msg, .. }) => msg,
+                Ok(_) => panic!("expected a panic for {src:?}, got Ok"),
+                Err(_) => panic!("expected a panic for {src:?}, got a non-panic Flow"),
+            };
+            let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+            let c = super::emit_c(&module).expect("emit_c succeeds");
+            let base = std::env::temp_dir().join(format!("kupl-cgen-{tag}-{}", std::process::id()));
+            let cpath = base.with_extension("c");
+            let bin = base.with_extension("out");
+            std::fs::write(&cpath, &c).unwrap();
+            let status = std::process::Command::new(cc())
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .status()
+                .expect("cc runs");
+            assert!(status.success(), "generated C must compile for {src:?}");
+            let out = std::process::Command::new(&bin).output().expect("binary runs");
+            let native_stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                native_stderr.contains(&format!("panic: {interp_msg}")),
+                "native/interp panic message mismatch for {src:?}: interp said {interp_msg:?}, native stderr was {native_stderr:?}"
+            );
+            let _ = std::fs::remove_file(&cpath);
+            let _ = std::fs::remove_file(&bin);
+        }
+    }
+
+    /// `text_embed`/`cosine_similarity` (it109) -- a from-scratch,
+    /// zero-dependency bag-of-words hash embedding (see `embed.rs`'s own
+    /// doc comment), landed on ALL FOUR engines immediately rather than
+    /// staged (unlike `Char`/`Decimal`'s own it105/it107 native rollout --
+    /// this reuses the EXISTING `k_hash_fnv`/`k_fnv1a` primitive directly,
+    /// with no new bignum-style representation needed, so there was no
+    /// reason to defer native). Drives the REAL compiled native binary;
+    /// expected output independently cross-checked against `kupl run` on
+    /// the SAME source before hardcoding it here.
+    #[test]
+    fn native_text_embed_and_cosine_similarity() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() {\n\
+                   \x20   let a = text_embed(\"the cat sat on the mat\", 64)\n\
+                   \x20   let b = text_embed(\"a cat sat on a mat today\", 64)\n\
+                   \x20   let c = text_embed(\"quantum physics and relativity\", 64)\n\
+                   \x20   print(cosine_similarity(a, b) > cosine_similarity(a, c))\n\
+                   \x20   print(cosine_similarity(a, a))\n\
+                   \x20   print(text_embed(\"\", 4))\n\
+                   \x20   print(cosine_similarity(text_embed(\"\", 4), text_embed(\"hi\", 4)))\n\
+                   \x20   print(text_embed(\"Hello World\", 32) == text_embed(\"hello world\", 32))\n\
+                   }\n";
+        assert_eq!(
+            native_main_stdout(src, "embed").trim(),
+            "true\n1.0\n[0.0, 0.0, 0.0, 0.0]\n0.0\ntrue"
+        );
+    }
+
+    /// Every error path native's own `k_text_embed`/`k_cosine_similarity`
+    /// hand-port introduces must panic with the EXACT SAME text as
+    /// `embed.rs`, mirroring the SAME live-verified discipline it108
+    /// applied to `Decimal`'s own error messages.
+    #[test]
+    fn native_text_embed_error_messages_match_interp_exactly() {
+        if !cc_available() {
+            return;
+        }
+        for (src, tag) in [
+            ("fun main() { print(text_embed(\"hi\", 0)) }\n", "embeddims0"),
+            ("fun main() { print(text_embed(\"hi\", -1)) }\n", "embeddimsneg"),
+            ("fun main() { print(cosine_similarity([1.0], [1.0, 2.0])) }\n", "embedlenmismatch"),
         ] {
             let compiled = crate::run::compile(src).expect("program compiles");
             let interp_db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);

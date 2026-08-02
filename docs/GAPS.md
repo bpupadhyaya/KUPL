@@ -534,6 +534,75 @@ engines discipline as every prior campaign.
   still cleanly rejects `dec(...)` in `kupl native` (the it107 staged
   message) AND still panics on `-dec(...)` (the it107 negation bug),
   while the restored binary computes both correctly.
+- **Prompt-context builders (it109)** — closes the Tier 1.5 gap this doc
+  named since early in the campaign, in two independent halves.
+
+  **`kupl context --json`** (`src/run.rs`): the same dependency-closed
+  target+direct-dependency data plain-text `kupl context` already
+  produced, now ALSO available as a structured `{"target":{"name",
+  "source"},"dependencies":[{"name","source"},...]}` object — mirroring
+  `kupl check --json`'s own established "structured output for a program
+  to consume" pattern. Both error paths (missing item, ambiguous item)
+  emit valid JSON under `--json` too, not a plain-text fallback a caller
+  parsing stdout couldn't handle. A CLI-only change — no interp/vm/cgen
+  engine changes at all, since `kupl context` has never been a language
+  builtin, only a tool an `ai fun` agent can reach via `exec("kupl",
+  ["context", "--json", path, name])` + `json_parse`.
+
+  **`text_embed(s, dims) -> List[Float]` / `cosine_similarity(a, b) ->
+  Float`** (`src/embed.rs`, new file): a from-scratch, zero-dependency
+  **bag-of-words hash embedding** — the classic "hashing trick"
+  (Weinberger et al. 2009; the same technique behind Vowpal Wabbit /
+  scikit-learn's `HashingVectorizer`), deliberately NOT a neural
+  embedding (no model, no weights, no network call, nothing that would
+  conflict with this codebase's zero-external-dependency principle).
+  Tokenizes into maximal runs of ASCII `[0-9A-Za-z]` bytes (lowercased),
+  hashes each word via the SAME `hash_fnv`/`k_fnv1a` primitive the
+  existing `hash_fnv` builtin already exposes and mirrors on native,
+  buckets mod `dims`, accumulates raw counts, then L2-normalizes.
+  Tokenization is deliberately ASCII-only (any non-ASCII byte, including
+  every UTF-8 continuation/lead byte, is just a separator) — matching
+  this codebase's OWN existing, documented native-backend convention for
+  text processing (`kupl native`'s `to_upper`/`to_lower` and regex
+  character classes are both already ASCII-oriented, per `STDLIB.md`),
+  deliberately chosen over introducing a NEW, wider Unicode-vs-ASCII
+  divergence class between interp/vm and native. Landed on ALL FOUR
+  engines immediately (unlike `Char`/`Decimal`'s own staged native
+  rollout) since reusing the existing hash primitive needed no new
+  bignum-style representation work to defer.
+
+  **A REAL, live-confirmed regression found+fixed along the way**,
+  unrelated to either feature's own logic: adding two new match arms to
+  `interp.rs::eval_call`'s already-large dispatch match grew that
+  function's per-call stack-frame footprint in an unoptimized debug
+  build just enough to tip `vm::tests::diff_ackermann_nonprimitive_
+  recursion` — an ALREADY-marginal deep-recursion test whose own prior
+  comment documented it as fitting the default test-thread stack by a
+  thin margin — into a genuine stack overflow, aborting the whole test
+  binary. Confirmed via `git stash` (passes on the pre-it109 tree,
+  overflows after) before concluding this was a real regression, not a
+  flake. Fixed the SAME way the neighboring `diff_mutual_recursion` test
+  already handles this exact class of problem: an explicit
+  `std::thread::Builder` with a 2GB stack, not a change to the
+  interpreter or to Ackermann's own recursion depth.
+
+  New permanent regression tests: `embed.rs`'s own unit-test module
+  (determinism, L2-normalization, case-insensitivity, related-vs-
+  unrelated ranking, zero-vector/zero-dims/mismatched-length edges),
+  `run.rs`/`main.rs` (`--json` return-code coverage plus a subprocess
+  test parsing the REAL binary's stdout with this codebase's own
+  `json::parse` to verify shape and content, not just "did it not
+  crash"), `check.rs` (type-checking + wrong-arity-is-K0242-not-K0240),
+  `vm.rs` (an interp-vs-KVM differential test), and `cgen.rs` (a native
+  coverage test plus a native-vs-interp exact-error-message test,
+  mirroring `Decimal`'s own it108 message-matching discipline). Full
+  `cargo test` green twice sequentially (1677 lib + 60 main tests,
+  identical both runs), interp-vs-vm AND interp-vs-native sweeps across
+  all eligible `examples/*.kupl` clean, and revert-and-verify via `git
+  stash` (embed.rs is a NEW untracked file, so — per the it107 lesson —
+  moved out manually before the revert build and restored after)
+  confirmed the pre-fix binary rejects `--json`/`text_embed` cleanly
+  while the restored binary computes both correctly.
 
 ## Final stretch — prioritized shortlist (it42–50)
 
@@ -592,8 +661,16 @@ completion (3). Everything stays byte-identical across engines.
       in the parameter scope (`intent "Reply to {msg}"`). `echo` debug provider.
       (Known limitation: effects don't propagate across expose/method calls —
       candidate for a future type-aware effect pass.)
-- [ ] **Prompt-context builders** — `kupl context` output as a first-class
-      value; embeddings + similarity as stdlib
+- [x] **Prompt-context builders (it109)** — `kupl context --json` emits
+      the same dependency-closed target+direct-dependency data as plain-
+      text `kupl context`, structured for a program to consume (mirrors
+      `kupl check --json`'s own established pattern; an `ai fun` agent can
+      reach it via `exec("kupl", ["context", "--json", path, name])` +
+      `json_parse`). `text_embed(s, dims) -> List[Float]` /
+      `cosine_similarity(a, b) -> Float`: a from-scratch, zero-dependency
+      bag-of-words hash embedding (the classic "hashing trick" — no model,
+      no weights, no network call), byte-identical on all four engines
+      including native (see `STDLIB.md`).
 - [◐] **`ai fun` on the native backend** — the deterministic `KUPL_AI_MOCK*`
       path compiles natively and COMPLETELY (it51 non-tool, it52 tool use),
       byte-identical to the interpreter: structured `Result`/record/`List`

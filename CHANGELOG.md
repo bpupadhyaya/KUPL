@@ -70,6 +70,16 @@ change and the release process.
   stored scale (`dec("2.50")` prints `2.50`). Byte-identical across all
   four engines — the interpreter, `kupl run --vm`, `.kx` build/run, `kupl
   bundle`, and `kupl native`.
+- `kupl context --json`: the same target+direct-dependency data as
+  plain-text `kupl context`, structured for a program to consume
+  (mirrors `kupl check --json`). Error paths (missing/ambiguous item)
+  emit valid JSON under `--json` too.
+- `text_embed(s, dims) -> List[Float]` / `cosine_similarity(a, b) ->
+  Float`: a from-scratch, zero-dependency bag-of-words hash embedding
+  (the "hashing trick" — no model, no network call) and cosine
+  similarity, for building lightweight prompt-context retrieval without
+  a hosted embedding model. Byte-identical across all four engines
+  including native.
 
 ## [1.0.0-alpha]
 

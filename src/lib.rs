@@ -9,6 +9,7 @@ pub mod json;
 pub mod regex;
 pub mod time;
 pub mod encoding;
+pub mod embed;
 pub mod csv;
 pub mod url;
 pub mod manifest;

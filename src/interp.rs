@@ -1986,6 +1986,16 @@ impl Interp {
                     let v = self.eval(&args[0].value, env)?;
                     return dec_builtin(&v).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("text_embed", 2) => {
+                    let s = self.eval(&args[0].value, env)?;
+                    let d = self.eval(&args[1].value, env)?;
+                    return text_embed_builtin(&s, &d).map_err(|m| Self::panic_flow(m, span));
+                }
+                ("cosine_similarity", 2) => {
+                    let a = self.eval(&args[0].value, env)?;
+                    let b = self.eval(&args[1].value, env)?;
+                    return cosine_similarity_builtin(&a, &b).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("path_join", 2) | ("path_base", 1) | ("path_dir", 1) | ("path_ext", 1) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -5996,6 +6006,45 @@ pub fn dec_builtin(v: &Value) -> Result<Value, String> {
         Value::Str(s) => crate::decimal::Decimal::from_str(s).map(|d| Value::Decimal(Rc::new(d))),
         other => Err(format!("`dec` needs an Int or a Str, found {}", other.type_name())),
     }
+}
+
+/// `text_embed(s, dims)` — a from-scratch, zero-dependency bag-of-words
+/// hash embedding (`it109`); see `embed.rs`'s own doc comment for the
+/// technique. `s`/`dims` are checked as `Str`/`Int` statically, so the
+/// `other =>` arms below are defensive, not reachable through ordinary
+/// KUPL source.
+pub fn text_embed_builtin(s: &Value, dims: &Value) -> Result<Value, String> {
+    let s = match s {
+        Value::Str(s) => s.as_str(),
+        other => return Err(format!("`text_embed` needs a Str, found {}", other.type_name())),
+    };
+    let dims = match dims {
+        Value::Int(n) => *n,
+        other => return Err(format!("`text_embed` needs an Int dims, found {}", other.type_name())),
+    };
+    let v = crate::embed::text_embed(s, dims)?;
+    Ok(Value::List(Rc::new(v.into_iter().map(Value::Float).collect())))
+}
+
+/// `cosine_similarity(a, b)` — see `embed.rs`. `a`/`b` are checked as
+/// `List[Float]` statically; the per-element `other =>` arm below is
+/// defensive, not reachable through ordinary KUPL source.
+pub fn cosine_similarity_builtin(a: &Value, b: &Value) -> Result<Value, String> {
+    fn to_vec(v: &Value) -> Result<Vec<f64>, String> {
+        match v {
+            Value::List(items) => items
+                .iter()
+                .map(|it| match it {
+                    Value::Float(f) => Ok(*f),
+                    other => Err(format!("`cosine_similarity` needs List[Float], found an element of type {}", other.type_name())),
+                })
+                .collect(),
+            other => Err(format!("`cosine_similarity` needs a List[Float], found {}", other.type_name())),
+        }
+    }
+    let a = to_vec(a)?;
+    let b = to_vec(b)?;
+    Ok(Value::Float(crate::embed::cosine_similarity(&a, &b)?))
 }
 
 /// Pure `/`-path helpers (no effect). They operate lexically on forward-slash

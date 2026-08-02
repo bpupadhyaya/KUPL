@@ -121,9 +121,14 @@ identical.
 
 ## AI & editor tooling
 
-### `kupl context <file.kupl> <ItemName>`
+### `kupl context <file.kupl> <ItemName> [--json]`
 Emits the named item's source plus the full source of everything it directly
 references — the minimal dependency-closed context for an LLM prompt.
+`--json` (position-independent, like every other `--flag` in this CLI) emits
+the same data as `{"target":{"name","source"},"dependencies":[{"name",
+"source"},...]}` instead of the plain-text form, so a program can consume it
+directly (e.g. an `ai fun` agent via `exec("kupl", ["context", "--json",
+path, name])` + `json_parse`) — mirrors `kupl check --json`.
 
 ### `kupl manifest <file.kupl>`
 JSON component manifests: name, kind, intent, ports (name/dir/type), props,

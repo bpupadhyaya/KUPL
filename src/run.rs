@@ -72,7 +72,17 @@ pub(crate) fn sort_diags(diags: &mut [Diag]) {
 
 /// `kupl context <name>`: emit the item plus the source of everything it
 /// directly references — the minimal dependency-closed context for an LLM.
-pub fn emit_context(path: &str, name: &str) -> i32 {
+/// `json`: machine-readable output (it109) -- mirrors `kupl check --json`/
+/// `kupl manifest`'s own established "the same tool, a structured form for
+/// a program to consume" pattern, rather than forcing a caller to parse
+/// this command's human-oriented `// --- direct dependencies ---` banner
+/// text. A KUPL program can reach this via `exec("kupl", ["context",
+/// "--json", path, name])` + `json_parse`, giving `ai fun` agents a way to
+/// build their own dependency-closed context programmatically -- the
+/// "first-class value" half of the `docs/GAPS.md` Tier 1.5 gap this
+/// closes (the embeddings/similarity half is `text_embed`/
+/// `cosine_similarity`, new stdlib builtins, not a CLI change).
+pub fn emit_context(path: &str, name: &str, json: bool) -> i32 {
     let Ok((compiled, map)) = load_compile(path) else { return 1 };
     let file = path;
     let src: &str = &map.concat;
@@ -124,16 +134,28 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
             .collect();
         match matches.as_slice() {
             [] => {
-                eprintln!("error: no item named `{name}` in {file}");
+                if json {
+                    println!("{{\"error\":\"no item named `{}` in {}\"}}", crate::diag::json_escape(name), crate::diag::json_escape(file));
+                } else {
+                    eprintln!("error: no item named `{name}` in {file}");
+                }
                 return 1;
             }
             [only] => *only,
             many => {
                 let candidates: Vec<&str> = many.iter().map(|item| item_name(item)).collect();
-                eprintln!(
-                    "error: `{name}` is ambiguous across dependencies — did you mean one of: {}?",
-                    candidates.join(", ")
-                );
+                if json {
+                    let list = candidates.iter().map(|c| format!("\"{}\"", crate::diag::json_escape(c))).collect::<Vec<_>>().join(",");
+                    println!(
+                        "{{\"error\":\"`{}` is ambiguous across dependencies\",\"candidates\":[{list}]}}",
+                        crate::diag::json_escape(name)
+                    );
+                } else {
+                    eprintln!(
+                        "error: `{name}` is ambiguous across dependencies — did you mean one of: {}?",
+                        candidates.join(", ")
+                    );
+                }
                 return 1;
             }
         }
@@ -330,6 +352,30 @@ pub fn emit_context(path: &str, name: &str) -> i32 {
         Item::Contract(ct) => ct.span,
         Item::Law(l) => l.span,
     };
+    if json {
+        let mut out = String::from("{\"target\":{\"name\":\"");
+        out.push_str(&crate::diag::json_escape(target_name));
+        out.push_str("\",\"source\":\"");
+        out.push_str(&crate::diag::json_escape(&slice(target_span)));
+        out.push_str("\"},\"dependencies\":[");
+        let mut first = true;
+        for dep in &referenced {
+            if let Some((_, span)) = items.iter().find(|(i, _)| i == dep) {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str("{\"name\":\"");
+                out.push_str(&crate::diag::json_escape(dep));
+                out.push_str("\",\"source\":\"");
+                out.push_str(&crate::diag::json_escape(&slice(*span)));
+                out.push_str("\"}");
+            }
+        }
+        out.push_str("]}");
+        println!("{out}");
+        return 0;
+    }
     println!("// kupl context: {name} ({file})");
     println!("{}", slice(target_span));
     if !referenced.is_empty() {
@@ -3547,8 +3593,10 @@ mod tests {
         let file = dir.join("p.kupl");
         std::fs::write(&file, "fun helper(n: Int) -> Int {\n    n * 2\n}\nfun target() -> Int {\n    helper(1)\n}\n").unwrap();
         let p = file.to_str().unwrap();
-        assert_eq!(super::emit_context(p, "target"), 0, "a present item resolves");
-        assert_eq!(super::emit_context(p, "does_not_exist"), 1, "a missing item is a clean error");
+        assert_eq!(super::emit_context(p, "target", false), 0, "a present item resolves");
+        assert_eq!(super::emit_context(p, "does_not_exist", false), 1, "a missing item is a clean error");
+        assert_eq!(super::emit_context(p, "target", true), 0, "--json succeeds too (content verified via the real CLI binary in main.rs)");
+        assert_eq!(super::emit_context(p, "does_not_exist", true), 1, "--json missing-item is still a clean error return code");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

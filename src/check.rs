@@ -580,11 +580,12 @@ const BUILTIN_METHODS: &[&str] = &[
 /// suggestions on an unknown name (K0240). Suggestion-only and best-effort — same discipline as
 /// BUILTIN_METHODS: a missing entry only costs a hint, never changes resolution (PR-it249).
 const BUILTIN_FUNS: &[&str] = &[
-    "append_file", "arange", "args", "big", "dec", "delete_file", "env_var", "exec", "file_exists",
-    "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir", "make_dir",
-    "panic", "path_base", "path_dir", "path_ext", "path_join", "print", "random_floats",
-    "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace", "read_all",
-    "read_file", "read_line", "remove_dir", "shuffle", "tensor", "to_str", "write_file", "zeros",
+    "append_file", "arange", "args", "big", "cosine_similarity", "dec", "delete_file", "env_var",
+    "exec", "file_exists", "http_get", "http_post", "http_serve", "json_parse", "json_stringify",
+    "list_dir", "make_dir", "panic", "path_base", "path_dir", "path_ext", "path_join", "print",
+    "random_floats", "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace",
+    "read_all", "read_file", "read_line", "remove_dir", "shuffle", "tensor", "text_embed",
+    "to_str", "write_file", "zeros",
 ];
 
 /// PRODUCTION-HARDENING (PR-it1202): every `(name, arity)` pair `infer_call`'s
@@ -607,7 +608,7 @@ const BUILTIN_FUNS: &[&str] = &[
 /// below handles, since it's used to decide whether a wrong-arity call
 /// gets a real arity diagnostic at all, not just a best-effort hint.
 const BUILTIN_CALL_NAMES: &[&str] = &[
-    "append_file", "arange", "args", "big", "csv_parse", "csv_stringify", "date_iso",
+    "append_file", "arange", "args", "big", "cosine_similarity", "csv_parse", "csv_stringify", "date_iso",
     "date_make", "day_of", "dec", "delete_file", "env_var", "eprint", "Err", "exec", "exit",
     "file_exists", "format_time", "hash_fnv", "hex_decode", "hex_encode", "hmac_sha256",
     "hour_of", "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
@@ -616,7 +617,7 @@ const BUILTIN_CALL_NAMES: &[&str] = &[
     "path_base", "path_dir", "path_ext", "path_join", "print", "query_build", "query_parse",
     "random_floats", "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace",
     "read_all", "read_file", "read_line", "remove_dir", "second_of", "Set", "sha256", "shuffle",
-    "Some", "tensor", "to_str", "url_decode", "url_encode", "weekday_of", "write_file", "year_of",
+    "Some", "tensor", "text_embed", "to_str", "url_decode", "url_encode", "weekday_of", "write_file", "year_of",
     "yearday_of", "zeros",
 ];
 
@@ -3639,6 +3640,21 @@ impl Checker {
                 ("dec", 1) => {
                     self.infer_expr(&args[0].value, ctx);
                     return Ty::Decimal;
+                }
+                ("text_embed", 2) => {
+                    let s = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::Str, &s, args[0].value.span, "text_embed text");
+                    let d = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&Ty::Int, &d, args[1].value.span, "text_embed dims");
+                    return Ty::List(Box::new(Ty::Float));
+                }
+                ("cosine_similarity", 2) => {
+                    let want = Ty::List(Box::new(Ty::Float));
+                    let a = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&want, &a, args[0].value.span, "cosine_similarity");
+                    let b = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&want, &b, args[1].value.span, "cosine_similarity");
+                    return Ty::Float;
                 }
                 ("path_join", 2) => {
                     for a in args {
@@ -7431,6 +7447,29 @@ mod generic_tests {
         let e = errors("fun main() { let _ = dec(\"1\", \"2\") }\n");
         assert!(!e.iter().any(|d| d.code == "K0240"), "must not be misreported as unknown name: {e:?}");
         assert!(e.iter().any(|d| d.code == "K0242"), "must be a wrong-argument-count error: {e:?}");
+    }
+
+    /// `text_embed`/`cosine_similarity` (it109) type as `(Str, Int) ->
+    /// List[Float]` / `(List[Float], List[Float]) -> Float` -- and, like
+    /// `dec_wrong_arity_...` above, must be in `BUILTIN_CALL_NAMES` so a
+    /// wrong-arity call gets a real K0242, not a misleading K0240 "unknown
+    /// name" (the PR-it1202 lesson).
+    #[test]
+    fn text_embed_and_cosine_similarity_type_check_correctly() {
+        assert!(errors("fun main() { let v: List[Float] = text_embed(\"hi\", 8) }\n").is_empty());
+        assert!(errors("fun main() { let _: Float = cosine_similarity(text_embed(\"a\", 8), text_embed(\"b\", 8)) }\n").is_empty());
+        // wrong arg types are real type errors, not silently accepted
+        let bad_dims = errors("fun main() { let _ = text_embed(\"hi\", \"nope\") }\n");
+        assert!(bad_dims.iter().any(|d| d.code == "K0200"), "{bad_dims:?}");
+        let bad_vec = errors("fun main() { let _ = cosine_similarity([\"a\"], [\"b\"]) }\n");
+        assert!(bad_vec.iter().any(|d| d.code == "K0200"), "{bad_vec:?}");
+        // wrong arity is a real arity error, not "unknown name"
+        let e1 = errors("fun main() { let _ = text_embed(\"hi\") }\n");
+        assert!(!e1.iter().any(|d| d.code == "K0240"), "{e1:?}");
+        assert!(e1.iter().any(|d| d.code == "K0242"), "{e1:?}");
+        let e2 = errors("fun main() { let _ = cosine_similarity([1.0]) }\n");
+        assert!(!e2.iter().any(|d| d.code == "K0240"), "{e2:?}");
+        assert!(e2.iter().any(|d| d.code == "K0242"), "{e2:?}");
     }
 
     #[test]

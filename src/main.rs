@@ -539,17 +539,25 @@ fn run_cli() -> ExitCode {
         // identical fix immediately above (both share this exact match
         // pattern) -- `args.get(3)` was never examined, so a genuinely
         // unexpected THIRD positional argument was silently ignored.
-        Some("context") => match (args.get(1), args.get(2)) {
-            (Some(path), Some(name)) if args.get(3).is_none() => run::emit_context(path, name),
-            (Some(_), Some(_)) => {
-                eprintln!("error: unexpected extra argument `{}`", args[3]);
-                2
+        // `--json` (it109) is filtered out of the positional list first
+        // (like `check`/`manifest`'s own `--json` handling, `json` parsed
+        // once at the top) -- `kupl context --json a.kupl name` and `kupl
+        // context a.kupl name --json` both work, matching how every other
+        // `--flag` in this CLI is position-independent.
+        Some("context") => {
+            let positional: Vec<&String> = args[1..].iter().filter(|a| a.as_str() != "--json").collect();
+            match (positional.first(), positional.get(1)) {
+                (Some(path), Some(name)) if positional.get(2).is_none() => run::emit_context(path, name, json),
+                (Some(_), Some(_)) => {
+                    eprintln!("error: unexpected extra argument `{}`", positional[2]);
+                    2
+                }
+                _ => {
+                    eprintln!("usage: kupl context <file.kupl> <item-name> [--json]");
+                    2
+                }
             }
-            _ => {
-                eprintln!("usage: kupl context <file.kupl> <item-name>");
-                2
-            }
-        },
+        }
         Some("repl") => repl::repl(),
         Some("lsp") => kupl::lsp::serve(),
         Some("version") | Some("--version") | Some("-V") => {
@@ -1558,6 +1566,70 @@ mod tests {
         assert_eq!(d_ok.status.code(), Some(1), "a real semantic change must still report exit 1: {d_ok:?}");
         let c_ok = run(&["context", a.to_str().unwrap(), "main"]);
         assert_eq!(c_ok.status.code(), Some(0), "{c_ok:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `kupl context --json` (it109): the machine-readable form of `kupl
+    /// context`'s dependency-closed output, mirroring `kupl check --json`'s
+    /// own established "structured output for a program to consume"
+    /// pattern -- gives an `ai fun` agent a way to build its own context via
+    /// `exec("kupl", ["context", "--json", path, name])` + `json_parse`,
+    /// closing the "as a first-class value" half of `docs/GAPS.md`'s Tier
+    /// 1.5 gap. Drives the REAL compiled binary and parses its stdout with
+    /// this codebase's OWN `json::parse` (not a hand-rolled string check),
+    /// confirming the output is genuinely valid JSON with the right shape
+    /// AND content, and that `--json` works positioned either before or
+    /// after the positional arguments. Also confirms the missing-item error
+    /// path emits valid JSON under `--json` rather than falling back to
+    /// plain text a caller parsing stdout as JSON couldn't handle.
+    #[test]
+    fn context_json_output_is_valid_json_with_the_expected_shape() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-context-json-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("p.kupl");
+        std::fs::write(
+            &file,
+            "fun helper(n: Int) -> Int {\n    n * 2\n}\nfun target() -> Int {\n    helper(1)\n}\n",
+        )
+        .unwrap();
+        let p = file.to_str().unwrap();
+
+        for args in [
+            vec!["context", "--json", p, "target"],
+            vec!["context", p, "target", "--json"],
+        ] {
+            let out = std::process::Command::new(&bin).args(&args).output().expect("kupl runs");
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let parsed = kupl::json::parse(&stdout).unwrap_or_else(|e| panic!("invalid JSON for {args:?}: {e}\n{stdout}"));
+            let kupl::value::Value::Ctor { variant, fields, .. } = &parsed else { panic!("expected a Json value: {parsed}") };
+            assert_eq!(variant.as_str(), "JObj");
+            let kupl::value::Value::Map(pairs) = &fields[0] else { panic!("JObj field must be a Map") };
+            let get = |key: &str| pairs.iter().find(|(k, _)| matches!(k, kupl::value::Value::Str(s) if s.as_str() == key)).map(|(_, v)| v);
+            let target_obj = get("target").expect("has target");
+            let kupl::value::Value::Ctor { fields: target_fields, .. } = target_obj else { panic!("target is not a Json object") };
+            let kupl::value::Value::Map(target_pairs) = &target_fields[0] else { panic!("target's JObj field must be a Map") };
+            let tget = |key: &str| target_pairs.iter().find(|(k, _)| matches!(k, kupl::value::Value::Str(s) if s.as_str() == key)).map(|(_, v)| v);
+            let name_val = tget("name").expect("target has name");
+            let kupl::value::Value::Ctor { fields: name_fields, .. } = name_val else { panic!("name is not a JStr") };
+            let kupl::value::Value::Str(name_str) = &name_fields[0] else { panic!("JStr field must be a Str") };
+            assert_eq!(name_str.as_str(), "target");
+            let deps_val = get("dependencies").expect("has dependencies");
+            let kupl::value::Value::Ctor { fields: deps_fields, .. } = deps_val else { panic!("dependencies is not a JArr") };
+            let kupl::value::Value::List(deps_list) = &deps_fields[0] else { panic!("JArr field must be a List") };
+            assert_eq!(deps_list.len(), 1, "helper is the one direct dependency: {args:?}");
+        }
+
+        let missing = std::process::Command::new(&bin).args(["context", "--json", p, "does_not_exist"]).output().expect("kupl runs");
+        assert_eq!(missing.status.code(), Some(1));
+        let missing_stdout = String::from_utf8_lossy(&missing.stdout);
+        kupl::json::parse(&missing_stdout)
+            .unwrap_or_else(|e| panic!("missing-item error under --json must still be valid JSON: {e}\n{missing_stdout}"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -101,6 +101,8 @@ fn builtin_argc(which: u8) -> Option<u8> {
         BUILTIN_LOG_WARN => 1,
         BUILTIN_LOG_ERROR => 1,
         BUILTIN_DEC => 1,
+        BUILTIN_TEXT_EMBED => 2,
+        BUILTIN_COSINE_SIMILARITY => 2,
         _ => return None,
     })
 }
@@ -1308,6 +1310,14 @@ impl<'m> Vm<'m> {
                             Err(msg) => return Err(VmError { msg, span }),
                         },
                         BUILTIN_DEC => match crate::interp::dec_builtin(&args[0]) {
+                            Ok(v) => set!(dst, v),
+                            Err(msg) => return Err(VmError { msg, span }),
+                        },
+                        BUILTIN_TEXT_EMBED => match crate::interp::text_embed_builtin(&args[0], &args[1]) {
+                            Ok(v) => set!(dst, v),
+                            Err(msg) => return Err(VmError { msg, span }),
+                        },
+                        BUILTIN_COSINE_SIMILARITY => match crate::interp::cosine_similarity_builtin(&args[0], &args[1]) {
                             Ok(v) => set!(dst, v),
                             Err(msg) => return Err(VmError { msg, span }),
                         },
@@ -2838,6 +2848,46 @@ mod tests {
         assert_eq!(differential(r#"fun probe() -> Str { "{-dec("3.14")}" }"#), "-3.14");
         assert_eq!(differential(r#"fun probe() -> Str { "{-dec("-3.14")}" }"#), "3.14");
         assert_eq!(differential(r#"fun probe() -> Str { "{-dec(0)}" }"#), "0");
+    }
+
+    /// `text_embed`/`cosine_similarity` (it109) interp/KVM parity -- a
+    /// from-scratch bag-of-words hash embedding, see `embed.rs`'s own doc
+    /// comment for the technique. Covers determinism, self-similarity == 1,
+    /// related-vs-unrelated ranking, the zero-dims/mismatched-length error
+    /// paths, and the zero-vector-is-0.0-not-NaN edge case.
+    #[test]
+    fn diff_text_embed_and_cosine_similarity() {
+        assert_eq!(
+            differential(r#"fun probe() -> Str { "{cosine_similarity(text_embed("hello world", 32), text_embed("hello world", 32))}" }"#),
+            "1.0"
+        );
+        assert_eq!(
+            differential(r#"fun probe() -> Str { "{text_embed("", 4)}" }"#),
+            "[0.0, 0.0, 0.0, 0.0]"
+        );
+        assert_eq!(
+            differential(r#"fun probe() -> Str { "{cosine_similarity(text_embed("", 4), text_embed("hi", 4))}" }"#),
+            "0.0"
+        );
+        assert_eq!(differential(r#"fun probe() -> Str { "{text_embed("hi", 0)}" }"#), "panic: text_embed needs a positive dims");
+        assert_eq!(
+            differential(r#"fun probe() -> Str { "{cosine_similarity([1.0], [1.0, 2.0])}" }"#),
+            "panic: cosine_similarity needs two vectors of the same length, found 1 and 2"
+        );
+        // related text scores strictly higher than unrelated text on both engines identically
+        assert_eq!(
+            differential(
+                r#"fun probe() -> Str {
+    let a = text_embed("the cat sat on the mat", 64)
+    let b = text_embed("a cat sat on a mat today", 64)
+    let c = text_embed("quantum physics and relativity", 64)
+    let sim_ab = cosine_similarity(a, b)
+    let sim_ac = cosine_similarity(a, c)
+    "{sim_ab > sim_ac}"
+}"#
+            ),
+            "true"
+        );
     }
 
     /// A REAL, LIVE-CONFIRMED cross-engine bug fixed alongside `Decimal`'s
@@ -16066,12 +16116,21 @@ fun probe() -> Str {
         // computed by recursion. This stresses call-stack management and argument-evaluation order far
         // beyond simple or mutual recursion (it139), and is byte-identical on interp/KVM: A(1,5)=7,
         // A(2,2)=7, A(2,4)=11, A(2,5)=13. (The deeper m=3 cases A(3,3)=61 and A(3,4)=125 are
-        // exercised by the native test in cgen.rs, which runs in a subprocess with a full stack.
-        // Ackermann nests a recursive call in argument position, holding several eval frames open per
-        // KUPL level, so even A(3,2) overflows the 2 MB test-thread stack in a debug build — hence the
-        // in-process differential stays at m<=2.) The rest of the batch-11 sweep (List.get OOB->None,
-        // flatten, try `?` chains, mutual recursion) was already locked and consistent.
-        let src = r#"fun ackermann(m: Int, n: Int) -> Int {
+        // exercised by the native test in cgen.rs, which runs in a subprocess with a full stack.)
+        // Ackermann nests a recursive call in argument position, holding several `eval` frames open per
+        // KUPL level, so this test's own margin against the default test-thread stack was ALREADY thin
+        // by design (this comment used to say A(2,5) fit under the ambient ~2MB default without any
+        // explicit wrapping) -- a REAL, live-confirmed regression (it109): adding two new match arms to
+        // `eval_call`'s own already-large dispatch match (for the unrelated `text_embed`/
+        // `cosine_similarity` builtins) grew that function's per-call stack-frame footprint in an
+        // unoptimized debug build enough to tip this ALREADY-marginal test over into a genuine stack
+        // overflow, confirmed via `git stash` (passes on the pre-it109 tree, overflows after). Fixed the
+        // SAME way `diff_mutual_recursion` right below already handles this exact class of problem --
+        // an explicit big-stack thread, not a change to Ackermann's own recursion depth.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = r#"fun ackermann(m: Int, n: Int) -> Int {
     if m == 0 { n + 1 }
     else { if n == 0 { ackermann(m - 1, 1) } else { ackermann(m - 1, ackermann(m, n - 1)) } }
 }
@@ -16079,7 +16138,11 @@ fun probe() -> Str {
     "{ackermann(0, 0)}|{ackermann(1, 5)}|{ackermann(2, 2)}|{ackermann(2, 4)}|{ackermann(2, 5)}"
 }
 "#;
-        assert_eq!(differential(src), "1|7|7|11|13");
+                assert_eq!(differential(src), "1|7|7|11|13");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

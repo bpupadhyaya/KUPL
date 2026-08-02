@@ -65,6 +65,8 @@ unless supervised.
 | `rat(n, d)` | `(Int, Int) -> Rational` | exact fraction `n/d`, reduced (panics if `d == 0`); pure |
 | `.num/.den/.to_float/.recip` on Rational | methods | numerator/denominator (BigInt), nearest Float, reciprocal |
 | `dec(x)` | `(Int) -> Decimal` / `(Str) -> Decimal` | exact base-10 decimal (panics on a malformed string); pure |
+| `text_embed(s, dims)` | `(Str, Int) -> List[Float]` | zero-dependency bag-of-words hash embedding, L2-normalized; pure |
+| `cosine_similarity(a, b)` | `(List[Float], List[Float]) -> Float` | cosine similarity of two equal-length vectors; pure |
 | `exec(program, args)` | `(Str, List[Str]) -> Result[Str, Str]` — **uses `io.proc`** | run a program (argv, no shell); `Ok` = stdout on exit 0 |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
@@ -164,6 +166,24 @@ across runs and engines — good for bucketing/sharding, not for security.
 in-tree (this codebase has zero external dependencies), verified against
 FIPS 180-4/RFC 4231 known-answer test vectors; see `SECURITY.md` for the
 "no independent formal audit" caveat.
+
+**Text embeddings** (`text_embed`, `cosine_similarity`) are a
+from-scratch, zero-dependency **bag-of-words hash embedding** — the
+classic "hashing trick" (the same technique behind Vowpal Wabbit /
+scikit-learn's `HashingVectorizer`), NOT a neural embedding: there is no
+model, no weights, and no network call. `text_embed(s, dims)` tokenizes
+`s` into maximal runs of ASCII `[0-9A-Za-z]` bytes (lowercased; any
+other byte, including every non-ASCII UTF-8 byte, is a separator —
+matching this codebase's own existing ASCII-oriented convention for
+`to_upper`/`to_lower`/regex classes on the native backend), hashes each
+word with the same algorithm `hash_fnv` uses, buckets mod `dims`,
+accumulates raw counts, then L2-normalizes the result. `text_embed`
+panics if `dims` isn't positive; `cosine_similarity` panics if its two
+vectors have different lengths, and returns `0.0` (not `NaN`) for a
+zero vector. Deterministic and byte-identical on every engine including
+native. A lightweight building block for prompt-context retrieval (rank
+candidate context snippets by similarity to a query) without depending
+on a hosted embedding model.
 
 **CSV** (`csv_parse`/`csv_stringify`) follows RFC 4180: `,` field separator,
 `\n` or `\r\n` row endings on input (`\n` on output), quoted fields for
