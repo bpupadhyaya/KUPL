@@ -29,12 +29,28 @@ parts of `src/check.rs`'s contract-fulfillment checking.
   There is no runtime token, object, or value involved anywhere in this
   process — it is purely "does this function's call graph reach an
   effectful builtin," checked once at compile time.
-- **`requires` is a reserved word with NO grammar production.**
-  `src/parser.rs`'s own reserved-identifier list includes `requires`
-  (confirmed live via `grep`), but there is no parser rule that consumes it —
-  the `app TodoApp { requires db: cap.Sql, http: cap.HttpServer ... }` syntax
-  in LANGUAGE.md §1's own example does not parse today. It is aspirational
-  vision text, not a designed-and-deferred feature.
+- **CORRECTION (it113): `requires` DOES parse — it112's claim above was
+  wrong, caught by live-testing rather than trusting a `grep` survey.**
+  `src/parser.rs::parse_component_member`'s `Tok::KwProp | Tok::KwRequires
+  =>` arm treats `requires` as a byte-for-byte syntactic ALIAS for `prop`:
+  the same comma-separated `name: ty (= default)?` list, pushed into the
+  exact same `ComponentDecl.props: Vec<PropDecl>` field, with nothing
+  anywhere recording which keyword spelled a given prop. This has been true
+  since the project's very first commit (`git log -S"KwRequires"` →
+  `9729904`), not a later, half-finished feature. Live-confirmed: a
+  `component` with `requires db: Int, tag: Str` compiles and runs
+  identically to the equivalent `prop` declaration. The ONE real restriction
+  found is unrelated to `requires` itself — `app` blocks (unlike plain
+  `component` blocks) reject ANY props at all ("v0.1 apps must be
+  self-contained"), which is why LANGUAGE.md §1's own example wraps its
+  `requires` clause in an `app`; the same clause in a `component` works
+  today. `requires` has ZERO distinct semantics from `prop` anywhere in the
+  compiler (parser, `check.rs`, interp/vm/cgen) — pure alternate spelling,
+  not a capability-aware keyword. This doesn't change the actual gap (§2 below
+  still holds: no `cap` namespace/type/runtime value exists), but it
+  STRENGTHENS §3.3's own scope-reduction finding — the `requires` syntax
+  doesn't need to be treated as a stand-in for `prop`, it already IS exactly
+  `prop`, today, with no grammar work required at all.
 - **There is no `cap` namespace, no capability type, and no runtime
   authority-passing value anywhere in the codebase** (confirmed via `grep`
   across `src/*.rs` at it109, re-confirmed here).
@@ -89,29 +105,46 @@ entire "no ambient authority" guarantee collapses immediately. Contrast with
 
 ### 3.2 Root capabilities are seeded at exactly one place
 
-The runtime seeds a fixed set of ROOT capability values only at the
-composition root — the top-level `app`'s own construction, or an implicit
-binding available to `fun main`. Every other component in the instance
-graph only ever RECEIVES a capability (or an attenuated derivative of one)
-through an ordinary constructor prop, exactly like a contract-typed
-dependency does today. No component can reach outside its own prop list to
-find one — this is what makes "capability in scope" a purely lexical,
-audit-by-reading-the-props property, matching the vision text's "no ambient
-authority" claim literally.
+**Correction (it113):** the original draft of this section assumed a root
+capability could be an ordinary `prop`/`requires` field on the top-level
+`app`, supplied like any constructor argument. Live-tested and found FALSE:
+`kupl run`/`kupl run --vm`/`kupl native` all refuse to construct a top-level
+`app` that declares ANY props at all — `error: app \`X\` requires props
+(...) — v0.1 apps must be self-contained` (`src/run.rs`/`src/vm.rs`/
+`src/cgen.rs`, each independently enforcing the same rule at the "how do we
+invoke the CLI entry point with zero args" step). This is a RUNTIME/
+invocation-time restriction, not a parser/compile-time ban — an app CAN
+declare props and compiles fine either way — but it means a real root
+capability can never arrive as an ordinary CLI-supplied constructor
+argument, since `kupl run file.kupl` has no mechanism to pass one in.
+
+So root-seeding cannot use the `app`-prop path this sketch originally
+assumed; it needs the OTHER option already named above: an implicit
+binding the runtime injects directly into `fun main`'s own scope (or into
+the top-level `app`'s own construction internally, NOT via its declared
+prop list) — conceptually a prelude-like value the runtime constructs once
+per process and hands to the entry point, the same way `env_args()`-style
+runtime-provided values would need to work if KUPL ever grows a CLI-args
+builtin. This still preserves the "purely lexical, audit-by-reading-the-
+props" property for every component BELOW the entry point — only `fun
+main`/the top-level app's own body is special, everything it hands
+downward is an ordinary prop from there on.
 
 ### 3.3 Attenuation is ordinary method calls, no new syntax
 
 ```kupl
 app TodoApp {
     intent "..."
-    prop net: Cap.Http                     // an ordinary prop, capability-typed
+    // `net` is NOT a declared prop (see 3.2's correction — a top-level
+    // app can't take CLI-supplied props) -- it's the runtime-injected
+    // root capability, implicitly in scope in the app's own body.
 
     let store = TodoStore(net.limited_to("api.example.com"))
 }
 
 component TodoStore {
     intent "..."
-    prop net: Cap.Http                     // narrower than the caller's own `net`
+    requires net: Cap.Http                 // narrower than the caller's own `net`
 
     expose fun sync() uses io.net -> Result[Unit, Str] {
         http_get_with(net, "https://api.example.com/todos")   // see 3.4
@@ -121,13 +154,16 @@ component TodoStore {
 
 `cap.limited_to(host: Str) -> Cap.Http` / `cap.read_only() -> Cap.Sql` are
 plain methods on the capability's own type, returning a NEW capability value
-of the SAME underlying kind carrying a narrower scope. No `requires` keyword
-needed at all — `prop` (already fully implemented, including contract-typed
-props) already expresses "this component needs one of these, passed in
-explicitly," which is exactly what a capability also needs. This is the
-sketch's main scope-reduction finding: the vision text's own `requires`
-clause syntax is not a prerequisite for capabilities-as-values; it could be
-an independent, later syntactic-sugar layer over what `prop` already does.
+of the SAME underlying kind carrying a narrower scope. **Correction (it113):**
+the previous draft claimed `requires` had no grammar production and framed
+"no new `requires` keyword needed" as this sketch's scope-reduction finding
+— live-testing found `requires` already parses today as a full alias for
+`prop` (see §1's own correction above), so the ACTUAL finding is stronger
+than originally stated: every non-root component in the graph (like
+`TodoStore` above) needs literally ZERO new syntax, today's `requires`/`prop`
+already express "this component needs one of these, passed in explicitly."
+The only genuinely new piece is the root-seeding mechanism at the entry
+point itself (§3.2), which is runtime injection, not a prop at all.
 
 ### 3.4 Enforcement: additive, not a replacement for effects — pick ONE
 

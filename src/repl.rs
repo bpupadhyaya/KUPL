@@ -284,19 +284,35 @@ pub fn repl() -> i32 {
 ///
 /// Deliberately narrow v1 scope, matching Erlang's own `code_change`
 /// (which migrates a process's STATE term, not its supervision tree):
-/// refuses (returning `Err`, no instances touched) unless `props` and
-/// `children` are STRUCTURALLY UNCHANGED (by name — a prop's own TYPE or
-/// default value changing is not checked, since an existing instance's
-/// already-supplied prop value keeps working under its own actual runtime
-/// type regardless). This sidesteps two real complications a fuller
-/// design would need to solve: a newly required prop with no default has
-/// no value to migrate FROM at all, and a changed `children`/`wires` list
-/// would need re-spawning/re-routing, not just a `state` copy. Handler/
-/// method bodies always take effect immediately (methods are looked up
-/// via `Instance.comp` at CALL time, never cached per-instance), so
+/// `children` must be STRUCTURALLY UNCHANGED (by `name:component` pair) --
+/// refuses entirely (no instances touched) otherwise, since a changed
+/// `children`/`wires` list would need re-spawning/re-routing, a materially
+/// different and larger problem than a `state`/`prop` value copy, still out
+/// of scope for this iteration.
+///
+/// `props` may change (it112->it113 follow-up, relaxing the original
+/// props-frozen guard): a prop present under the SAME name in both old and
+/// new keeps its current runtime value (a prop's own TYPE or default value
+/// changing is not checked, since an existing instance's already-supplied
+/// value keeps working under its own actual runtime type regardless); a
+/// prop only in the OLD declaration is simply dropped; a prop only in the
+/// NEW declaration is migrated by evaluating its own `default` expression
+/// (against the instance's own migrated env, so it can see already-migrated
+/// props) -- mirroring exactly how a genuinely new `state` field already
+/// gets its own fresh `init` below. A newly required prop with **no**
+/// default still has nothing to migrate FROM, so that case alone still
+/// refuses the whole upgrade (no instances touched, not a partial one).
+/// Matching is by OLD-PROP-NAME-SET membership, not a blind `old_env.get`
+/// lookup -- an instance's env holds props AND state together by name, so a
+/// prop renamed from a same-named OLD state field must still be treated as
+/// genuinely new (evaluate its own default) rather than accidentally
+/// inheriting the old state field's stale value.
+///
+/// Handler/method bodies always take effect immediately (methods are looked
+/// up via `Instance.comp` at CALL time, never cached per-instance), so
 /// swapping `instance.comp` alone is what makes logic-only redefinitions
-/// (the common case) instantly live — this function's own job is
-/// entirely about the STATE the new logic runs against.
+/// (the common case) instantly live — this function's own job is entirely
+/// about the STATE (and now PROPS) the new logic runs against.
 ///
 /// Returns the number of instances upgraded (`Ok(0)` if none exist yet —
 /// not an error, since redefining a component with no live instances is
@@ -318,8 +334,14 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
     let prop_names = |c: &crate::ast::ComponentDecl| -> std::collections::BTreeSet<String> {
         c.props.iter().map(|p| p.name.clone()).collect()
     };
-    if prop_names(&old_comp) != prop_names(&new_comp) {
-        return Err("props changed — :upgrade only migrates `state` field changes for now (see its own doc comment)".into());
+    let old_prop_names = prop_names(&old_comp);
+    for p in &new_comp.props {
+        if !old_prop_names.contains(&p.name) && p.default.is_none() {
+            return Err(format!(
+                "prop `{}` was added without a default value — :upgrade has no old value to migrate it from (see its own doc comment)",
+                p.name
+            ));
+        }
     }
     let child_sig = |c: &crate::ast::ComponentDecl| -> std::collections::BTreeSet<String> {
         c.children.iter().map(|ch| format!("{}:{}", ch.name, ch.component)).collect()
@@ -331,12 +353,24 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
     for id in &target_ids {
         let old_env = interp.instances[*id].env.clone();
         let new_env = interp.globals.child();
-        // props: names are guaranteed identical (checked above), so every
-        // prop's CURRENT value is guaranteed present in `old_env`'s own
-        // LOCAL scope (it was `define`d there at construction, never
-        // shadowed) — never a same-named global misread as a prop.
+        // props: a name present in OLD-PROP-NAMES keeps its current value
+        // (guaranteed present in `old_env`'s own LOCAL scope — it was
+        // `define`d there at construction, never shadowed); a genuinely NEW
+        // prop name (checked above to carry a default) is migrated by
+        // evaluating that default fresh, exactly like a new `state` field
+        // below. Checked via the NAME-SET, not a blind `old_env.get`, so a
+        // prop renamed from a same-named old STATE field can't accidentally
+        // inherit that field's stale value (see this function's own doc
+        // comment).
         for p in &new_comp.props {
-            let v = old_env.get(&p.name).ok_or_else(|| format!("internal error: prop `{}` unexpectedly missing", p.name))?;
+            let v = if old_prop_names.contains(&p.name) {
+                old_env.get(&p.name).ok_or_else(|| format!("internal error: prop `{}` unexpectedly missing", p.name))?
+            } else {
+                let default_expr = p.default.as_ref().expect("checked above: a new prop must carry a default");
+                interp.eval(default_expr, &new_env).map_err(|_| {
+                    format!("evaluating the default for new prop `{}` failed", p.name)
+                })?
+            };
             new_env.define(&p.name, v);
         }
         // state: migrate by name, evaluating a genuinely NEW field's own
@@ -708,22 +742,23 @@ mod tests {
         assert!(upgrade_instances(&mut interp, "DoesNotExist").is_err());
     }
 
-    /// The v1 scope guard: a `props` or `children` change refuses the
-    /// upgrade entirely (no instance touched, not a partial migration) --
-    /// see `upgrade_instances`'s own doc comment for why these two are
-    /// deliberately out of scope for now.
+    /// A `children` change always refuses the upgrade entirely (no instance
+    /// touched) -- still out of scope this iteration, see
+    /// `upgrade_instances`'s own doc comment. A `props` change only refuses
+    /// when the genuinely NEW prop carries no default (nothing to migrate
+    /// it from); see the tests below for the now-supported success cases.
     #[test]
-    fn upgrade_refuses_when_props_or_children_changed() {
+    fn upgrade_refuses_when_a_new_prop_has_no_default_or_children_changed() {
         let mut interp = interp_with_one_instance(
             "component P {\n    intent \"p\"\n    prop x: Int = 1\n    state n: Int = 0\n}\n",
             "P",
         );
         redefine(
             &mut interp,
-            "component P {\n    intent \"p\"\n    prop x: Int = 1\n    prop y: Int = 2\n    state n: Int = 0\n}\n",
+            "component P {\n    intent \"p\"\n    prop x: Int = 1\n    prop y: Int\n    state n: Int = 0\n}\n",
         );
-        let err = upgrade_instances(&mut interp, "P").expect_err("a prop change must be refused");
-        assert!(err.contains("props changed"), "{err}");
+        let err = upgrade_instances(&mut interp, "P").expect_err("a new prop with no default must be refused");
+        assert!(err.contains("added without a default"), "{err}");
 
         let mut interp2 = interp_with_one_instance(
             "component Leaf {\n    intent \"l\"\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n}\n",
@@ -735,6 +770,52 @@ mod tests {
         );
         let err2 = upgrade_instances(&mut interp2, "Parent").expect_err("a children change must be refused");
         assert!(err2.contains("children changed"), "{err2}");
+    }
+
+    /// it112->it113 follow-up: a genuinely NEW prop carrying its own
+    /// `default` migrates fine (evaluated fresh, exactly like a new `state`
+    /// field), and a REMOVED prop is silently dropped -- no longer a
+    /// blanket refusal the moment `props` differs at all.
+    #[test]
+    fn upgrade_migrates_a_new_prop_with_default_and_drops_a_removed_one() {
+        let mut interp = interp_with_one_instance(
+            "component P {\n    intent \"p\"\n    prop x: Int = 1\n    prop z: Int = 2\n    state n: Int = 0\n}\n",
+            "P",
+        );
+        redefine(
+            &mut interp,
+            "component P {\n    intent \"p\"\n    prop x: Int = 1\n    prop y: Int = 42\n    state n: Int = 0\n}\n",
+        );
+        assert_eq!(upgrade_instances(&mut interp, "P"), Ok(1));
+        assert_eq!(interp.instances[0].env.get("x"), Some(crate::value::Value::Int(1)), "an unchanged prop keeps its value");
+        assert_eq!(
+            interp.instances[0].env.get("y"),
+            Some(crate::value::Value::Int(42)),
+            "a genuinely new prop must get its own fresh default"
+        );
+        assert_eq!(interp.instances[0].env.get("z"), None, "a removed prop must be dropped, not left dangling");
+    }
+
+    /// The specific correctness edge case this follow-up must NOT get
+    /// wrong: a prop renamed from a same-named OLD *state* field must
+    /// evaluate its own new default, never accidentally inherit the old
+    /// state field's stale value via a blind by-name env lookup.
+    #[test]
+    fn upgrade_does_not_confuse_a_new_prop_with_a_same_named_old_state_field() {
+        let mut interp = interp_with_one_instance(
+            "component P {\n    intent \"p\"\n    prop x: Int = 1\n    state y: Str = \"old-state-value\"\n}\n",
+            "P",
+        );
+        redefine(
+            &mut interp,
+            "component P {\n    intent \"p\"\n    prop x: Int = 1\n    prop y: Str = \"new-prop-default\"\n}\n",
+        );
+        assert_eq!(upgrade_instances(&mut interp, "P"), Ok(1));
+        assert_eq!(
+            interp.instances[0].env.get("y"),
+            Some(crate::value::Value::str("new-prop-default".to_string())),
+            "a prop named like an old STATE field must get its own default, not the stale state value"
+        );
     }
 
     #[test]

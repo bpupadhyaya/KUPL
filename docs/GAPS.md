@@ -902,14 +902,19 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       (is_empty/is_subset)
 - [ ] System tier: ownership, `low`/`asm` (design §6; audit #4)
 - [ ] Capabilities as attenuable values (`cap.Http.limited_to(…)`) — design
-      sketch written (it112, `docs/design/CAPABILITIES.md`): confirmed
-      `requires` is a reserved word with NO grammar production (the vision
-      text's own syntax doesn't parse today) and effects are 100% static/
-      syntactic with zero runtime capability objects; recommends an
+      sketch written (it112, `docs/design/CAPABILITIES.md`; corrected it113):
+      `requires` actually already parses (a full syntactic alias for `prop`
+      since the project's first commit — it112's "no grammar production"
+      claim was wrong, caught by live-testing rather than trusting a `grep`
+      survey), but effects are still 100% static/syntactic with zero runtime
+      capability objects, and no `cap` namespace/type exists; recommends an
       ADDITIVE layer (existing `uses io.net` unchanged, new capability-typed
       props + `_with`-suffixed builtin variants) over collapsing effects
-      into capabilities, and a Cap.Net-only first slice if picked up. Not
-      implemented — a bounded design deliverable, not code.
+      into capabilities, root capabilities injected at `fun main`/the entry
+      point rather than as an app prop (top-level apps can't take
+      CLI-supplied props — a second it113 correction), and a Cap.Net-only
+      first slice if picked up. Not implemented — a bounded design
+      deliverable, not code.
 
 ## Tier 4 — ecosystem
 

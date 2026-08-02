@@ -142,9 +142,11 @@ pub fun fetch_user(id: UserId) uses net -> Result[User, NetError] {
   `cap.Http.limited_to("api.example.com")`. **Not yet implemented** — the
   effect system as actually shipped (`src/effects.rs`) is 100% static/
   syntactic (`uses io.net`, checked at compile time, no runtime capability
-  value), and `requires` is a reserved word with no grammar production.
-  See `CAPABILITIES.md` for a design sketch of what closing this gap
-  would require.
+  value). `requires` itself already parses (it's a full syntactic alias for
+  `prop`, live-confirmed at it113 — an earlier it112 note wrongly claimed it
+  didn't), but no `cap` namespace/type/runtime capability value exists to
+  put on the other side of the colon. See `CAPABILITIES.md` for a design
+  sketch of what closing this gap would require.
 - Errors are values: `Result[T, E]` with `?` propagation, `Option[T]` instead of null.
   `panic` exists only for bugs (contract violation, index out of bounds) and is caught
   at component boundaries by supervision — a panic kills the instance, not the program.
