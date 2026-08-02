@@ -279,6 +279,37 @@ impl Interp {
 
     // ---------------- component runtime ----------------
 
+    /// Construct ONE child instance from its own `ChildDecl` (evaluating its
+    /// constructor args against `parent_env`) and apply its own supervise
+    /// policy from `supervises`, if any. Shared by `instantiate`'s own
+    /// children loop and `repl.rs`'s `:upgrade` newly-added-child migration
+    /// (it114), so the two stay consistent by construction rather than by
+    /// convention — a bug fixed in one would otherwise need remembering to
+    /// fix in the other.
+    pub(crate) fn instantiate_child(
+        &mut self,
+        supervises: &[SuperviseDecl],
+        child: &ChildDecl,
+        parent_env: &Env,
+    ) -> EvalResult {
+        let mut child_args = Vec::new();
+        for a in &child.args {
+            let v = self.eval(&a.value, parent_env)?;
+            child_args.push((a.name.clone(), v));
+        }
+        let v = self.instantiate(&child.component, &child_args, child.span)?;
+        if let Value::Component(cid) = v {
+            let supervise = supervises
+                .iter()
+                .find(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
+            if let Some(s) = supervise {
+                self.instances[cid].restart_on_failure = true;
+                self.instances[cid].max_restarts = s.max_restarts;
+            }
+        }
+        Ok(v)
+    }
+
     /// Create an instance of `comp_name`; args are already-evaluated prop values.
     pub fn instantiate(
         &mut self,
@@ -361,22 +392,9 @@ impl Interp {
         // children (constructed after the parent exists, in declaration order)
         let mut child_ids: HashMap<String, usize> = HashMap::new();
         for child in &comp.children {
-            let mut child_args = Vec::new();
-            for a in &child.args {
-                let v = self.eval(&a.value, &env)?;
-                child_args.push((a.name.clone(), v));
-            }
-            let v = self.instantiate(&child.component, &child_args, child.span)?;
+            let v = self.instantiate_child(&comp.supervises, child, &env)?;
             if let Value::Component(cid) = v {
                 child_ids.insert(child.name.clone(), cid);
-                let supervise = comp
-                    .supervises
-                    .iter()
-                    .find(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
-                if let Some(s) = supervise {
-                    self.instances[cid].restart_on_failure = true;
-                    self.instances[cid].max_restarts = s.max_restarts;
-                }
             }
             env.define(&child.name, v);
         }
