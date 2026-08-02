@@ -660,6 +660,64 @@ engines discipline as every prior campaign.
   stash` confirmed the pre-fix binary rejects `patch` as an unrecognized
   subcommand (falling to the generic usage banner) while the restored
   binary applies the patch correctly.
+- **Hot-swap state migration, first slice (it111)** — closes part of the
+  Tier 2 design-open Q4 gap this doc has named since the campaign began
+  (Erlang's `code_change` equivalent). Investigated candidate (a),
+  capabilities as attenuable values, with a genuinely different framing
+  from it110's own attempt (produce a design sketch, not implementation)
+  but chose (b) after finding a much more concretely scoped path:
+  `src/interp.rs`'s `Env` stores component instance state/props by NAME
+  (a `Vec<(Box<str>, Value)>`, `EnvInner`), not positional index — a key
+  discovery made BEFORE writing any code, not assumed, that removes the
+  hardest part a naive migration design would otherwise need to solve
+  (field-layout reconciliation across old/new shapes).
+
+  `kupl repl`'s new `:upgrade <ComponentName>` command migrates every
+  LIVE instance of the just-redefined component: a `state` field present
+  in BOTH the old and new declaration keeps its CURRENT runtime value; a
+  field only in the new declaration gets its own fresh `init` default
+  (evaluated against the migrated env, so later fields can reference
+  earlier ones, exactly like `instantiate`'s own left-to-right
+  evaluation order); a field only in the old declaration is dropped.
+  Swapping `instance.comp` to the new `Rc<ComponentDecl>` makes new/
+  changed METHODS immediately callable too (methods are looked up via
+  `Instance.comp` at CALL time, never cached per-instance, confirmed by
+  reading `eval_method` before assuming this).
+
+  **Deliberately narrow v1 scope, matching Erlang's own `code_change`
+  itself** (which migrates a process's STATE term, not its supervision
+  tree): refuses the WHOLE upgrade (no instance touched, not a partial
+  migration) unless `props` and `children` are structurally unchanged by
+  name. This sidesteps two real complications a fuller design would need
+  to solve immediately: a newly-required prop with no default has
+  nothing to migrate FROM at all, and a changed `children`/`wires` list
+  would need re-spawning/re-routing, not just a `state` copy — both
+  explicitly flagged as follow-up work, not silently ignored. The
+  EXISTING, already-tested "frozen snapshot" default behavior (an
+  instance NOT explicitly `:upgrade`d stays frozen to its original
+  shape, confirmed by `repl_preserves_live_variable_and_component_
+  state_across_redefinition`) is completely UNCHANGED — `:upgrade` is
+  purely additive, opt-in.
+
+  A REPL-only feature (the interpreter is the only engine `kupl repl`
+  ever runs on) — zero vm.rs/cgen.rs changes, matching how `forall`
+  property tests are ALSO interp-only by established precedent (K0804).
+
+  New permanent regression tests: `repl.rs` (the core migration contract
+  — matching-name state preserved, new fields defaulted, methods
+  immediately callable — plus both guard-rejection paths, plus the
+  zero-instances/unknown-component cases, all exercising
+  `upgrade_instances` directly without the REPL I/O loop) and `main.rs`
+  (a real `kupl repl` subprocess test: before `:upgrade`, the frozen-
+  snapshot panic still fires exactly as it did before this change; after
+  `:upgrade`, the new method works AND the migrated state continues
+  accumulating from its OLD value, not a reset). Full `cargo test` green
+  twice sequentially (1683 lib + 62 main tests, identical both runs, no
+  stack-overflow casualties), interp-vs-vm sweep across all eligible
+  `examples/*.kupl` clean (cgen.rs untouched, so no native sweep this
+  iteration), and revert-and-verify via `git stash` confirmed the
+  pre-fix binary reports `:upgrade` as an unknown REPL command while the
+  restored binary migrates instances correctly.
 
 ## Final stretch — prioritized shortlist (it42–50)
 
@@ -752,7 +810,14 @@ completion (3). Everything stays byte-identical across engines.
       handlers on a virtual clock advanced explicitly (`advance 5s` example
       step; `kupl run` auto-advances bounded). Deterministic, byte-identical on
       interpreter + KVM. Durations `ms`/`s`/`m`/`h`. (`examples/timers.kupl`)
-- [ ] **Hot-swap state migration** (design open Q4; visual live-editing hook, see `VISUAL-TOOLS-CONTRACT.md`)
+- [◐] **Hot-swap state migration (it111)** — `kupl repl`'s new `:upgrade
+      <Component>` command (Erlang `code_change` equivalent, design open
+      Q4): migrates every LIVE instance's `state` fields by name (matched
+      names keep their current value; new fields get a fresh `init`
+      default) and swaps in the redefined component's methods
+      immediately. Deliberately narrow v1 scope — refuses if `props` or
+      `children` changed (see `repl.rs::upgrade_instances`'s own doc
+      comment). No wiring/supervision-topology re-routing yet.
 
 ## Tier 3 — audit-driven priorities (next arc)
 
@@ -859,5 +924,8 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 1. UI trees → `docs/design/UI.md` (render = component construction). **Designed.**
 2. Int default → **decided & shipped:** i64 checked, overflow panics.
 3. Effect granularity → shipped hierarchical effects (`io` covers `io.fs`/`io.net`/`io.env`/`io.proc`/`io.time`; plus `ai`).
-4. Hot-swap state migration → supervision restart hook shipped; migration TBD.
+4. Hot-swap state migration → supervision restart hook shipped; automatic
+   by-name `state` migration shipped (it111, `kupl repl :upgrade`); a
+   user-provided migration hook (for a field whose SHAPE, not just name,
+   changed) and wiring/supervision-topology re-routing remain TBD.
 5. Package identity → `kupl.toml` shipped; registry governance TBD.

@@ -54,7 +54,12 @@ Like `--timeout`, this is an operational safety net, not a sandbox.
 ### `kupl repl`
 Interactive session. Enter expressions, statements, or whole declarations
 (`fun`/`type`/`component` — multi-line input is detected by bracket balance).
-Commands: `:help` `:defs` `:quit`.
+Redefining a component leaves already-spawned instances frozen to their
+original shape by default (safe, deliberate); `:upgrade <Component>`
+hot-swaps every live instance to the just-redefined shape, migrating
+`state` fields by name (a matched name keeps its value; a new field gets
+its own fresh default) — refuses if `props` or `children` changed. Commands:
+`:help` `:defs` `:upgrade <Component>` `:quit`.
 
 ## Compiling & packaging
 

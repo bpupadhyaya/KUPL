@@ -9,7 +9,7 @@ use crate::value::Value;
 
 const BANNER: &str = "KUPL v0.1 — K Universal Programming Language
 Type declarations (fun/type/component/app), statements, or expressions.
-Commands: :help  :defs  :quit";
+Commands: :help  :defs  :upgrade <Component>  :quit";
 
 pub fn repl() -> i32 {
     println!("{BANNER}");
@@ -85,6 +85,34 @@ pub fn repl() -> i32 {
                         for (_, text) in &defs_items {
                             print!("{text}");
                         }
+                    }
+                    continue;
+                }
+                // `:upgrade <Component>` (it111): hot-swap state migration
+                // for existing LIVE instances -- the design-open Q4 gap
+                // (`docs/design/LANGUAGE.md` §12, Erlang's `code_change`
+                // equivalent). Without this, redefining a component leaves
+                // every ALREADY-spawned instance permanently frozen to its
+                // OLD shape (`Instance.comp` is a snapshot `Rc`, confirmed
+                // by this file's own `defs_items`-driven recompile never
+                // touching `interp.instances`) -- correct and safe as a
+                // DEFAULT (an already-tested, deliberate design this command
+                // does not change), but it means a visual-live-editing tool
+                // can never bring a running canvas's existing nodes forward
+                // to a just-edited definition without restarting the whole
+                // session. See `upgrade_instances`'s own doc comment for the
+                // exact migration semantics and its deliberate v1 scope
+                // limits.
+                other if other == ":upgrade" || other.starts_with(":upgrade ") => {
+                    let name = other.strip_prefix(":upgrade").unwrap().trim();
+                    if name.is_empty() {
+                        println!("usage: :upgrade <ComponentName>");
+                        continue;
+                    }
+                    match upgrade_instances(&mut interp, name) {
+                        Ok(0) => println!("no live instances of `{name}` to upgrade"),
+                        Ok(n) => println!("upgraded {n} instance(s) of `{name}` to its current definition"),
+                        Err(e) => println!("cannot upgrade `{name}`: {e}"),
                     }
                     continue;
                 }
@@ -241,6 +269,96 @@ pub fn repl() -> i32 {
             }
         }
     }
+}
+
+/// `:upgrade <name>` (it111) — hot-swap every LIVE instance of the
+/// component currently named `name` to `interp.db`'s CURRENT (just
+/// redefined) declaration, migrating `state` field values by NAME:
+/// a field present in both the old and new declaration keeps its
+/// CURRENT runtime value; a field only in the new declaration is
+/// initialized fresh via its own `init` expression (evaluated in the
+/// instance's OWN migrated env, so a later field's init can reference an
+/// earlier one — the same left-to-right evaluation order `instantiate`
+/// itself already uses for a brand-new instance). A field only in the OLD
+/// declaration is simply dropped.
+///
+/// Deliberately narrow v1 scope, matching Erlang's own `code_change`
+/// (which migrates a process's STATE term, not its supervision tree):
+/// refuses (returning `Err`, no instances touched) unless `props` and
+/// `children` are STRUCTURALLY UNCHANGED (by name — a prop's own TYPE or
+/// default value changing is not checked, since an existing instance's
+/// already-supplied prop value keeps working under its own actual runtime
+/// type regardless). This sidesteps two real complications a fuller
+/// design would need to solve: a newly required prop with no default has
+/// no value to migrate FROM at all, and a changed `children`/`wires` list
+/// would need re-spawning/re-routing, not just a `state` copy. Handler/
+/// method bodies always take effect immediately (methods are looked up
+/// via `Instance.comp` at CALL time, never cached per-instance), so
+/// swapping `instance.comp` alone is what makes logic-only redefinitions
+/// (the common case) instantly live — this function's own job is
+/// entirely about the STATE the new logic runs against.
+///
+/// Returns the number of instances upgraded (`Ok(0)` if none exist yet —
+/// not an error, since redefining a component with no live instances is
+/// the ordinary case `:upgrade` is a no-op safety net for).
+fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<usize, String> {
+    let Some(new_comp) = interp.db.components.get(name).cloned() else {
+        return Err(format!("no component named `{name}`"));
+    };
+    let target_ids: Vec<usize> =
+        (0..interp.instances.len()).filter(|&i| interp.instances[i].comp.name == name).collect();
+    if target_ids.is_empty() {
+        return Ok(0);
+    }
+    // Every targeted instance currently shares the SAME (old) `Rc<ComponentDecl>`
+    // (they were all spawned from the same prior `:name` definition) — reading
+    // the first one's own `comp` is representative for the structural guard below.
+    let old_comp = interp.instances[target_ids[0]].comp.clone();
+
+    let prop_names = |c: &crate::ast::ComponentDecl| -> std::collections::BTreeSet<String> {
+        c.props.iter().map(|p| p.name.clone()).collect()
+    };
+    if prop_names(&old_comp) != prop_names(&new_comp) {
+        return Err("props changed — :upgrade only migrates `state` field changes for now (see its own doc comment)".into());
+    }
+    let child_sig = |c: &crate::ast::ComponentDecl| -> std::collections::BTreeSet<String> {
+        c.children.iter().map(|ch| format!("{}:{}", ch.name, ch.component)).collect()
+    };
+    if child_sig(&old_comp) != child_sig(&new_comp) {
+        return Err("children changed — :upgrade only migrates `state` field changes for now (see its own doc comment)".into());
+    }
+
+    for id in &target_ids {
+        let old_env = interp.instances[*id].env.clone();
+        let new_env = interp.globals.child();
+        // props: names are guaranteed identical (checked above), so every
+        // prop's CURRENT value is guaranteed present in `old_env`'s own
+        // LOCAL scope (it was `define`d there at construction, never
+        // shadowed) — never a same-named global misread as a prop.
+        for p in &new_comp.props {
+            let v = old_env.get(&p.name).ok_or_else(|| format!("internal error: prop `{}` unexpectedly missing", p.name))?;
+            new_env.define(&p.name, v);
+        }
+        // state: migrate by name, evaluating a genuinely NEW field's own
+        // init fresh (against `new_env`, so it can see already-migrated
+        // props/earlier state fields, exactly like `instantiate` does).
+        for s in &new_comp.state {
+            let was_present = old_comp.state.iter().any(|os| os.name == s.name);
+            let v = if was_present {
+                old_env
+                    .get(&s.name)
+                    .ok_or_else(|| format!("internal error: state field `{}` unexpectedly missing", s.name))?
+            } else {
+                interp.eval(&s.init, &new_env).map_err(|_| {
+                    format!("evaluating the new default for state field `{}` failed", s.name)
+                })?
+            };
+            new_env.define(&s.name, v);
+        }
+        interp.instances[*id].env = new_env;
+        interp.instances[*id].comp = new_comp.clone();
+    }
+    Ok(target_ids.len())
 }
 
 fn is_item(src: &str) -> bool {
@@ -516,7 +634,108 @@ fn is_comment_and_whitespace_only(src: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{braces_balanced, is_comment_and_whitespace_only, is_item};
+    use super::{braces_balanced, is_comment_and_whitespace_only, is_item, upgrade_instances};
+    use crate::interp::{Interp, ProgramDb};
+
+    /// Compile `src`, build a fresh `Interp`, and spawn ONE instance of
+    /// `comp_name` with no constructor args -- the shared setup every
+    /// `upgrade_instances` test below starts from.
+    fn interp_with_one_instance(src: &str, comp_name: &str) -> Interp {
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        interp
+            .instantiate(comp_name, &[], crate::diag::Span::default())
+            .unwrap_or_else(|_| panic!("{comp_name} must construct with no args"));
+        interp
+    }
+
+    /// Redefine `interp`'s component set to `new_src`'s, mirroring
+    /// `repl()`'s own exact redefinition mechanism (`ProgramDb::build` +
+    /// swap-in-a-fresh-`Interp`-carrying-over-`instances`/`globals`) --
+    /// see that function's own `defined.` branch for the real code this
+    /// copies.
+    fn redefine(interp: &mut Interp, new_src: &str) {
+        let compiled = crate::run::compile(new_src).expect("redefinition compiles");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let old = std::mem::replace(interp, Interp::new(db));
+        interp.instances = old.instances;
+        interp.globals = old.globals;
+    }
+
+    /// The core migration contract: a state field present in BOTH the old
+    /// and new definition keeps its CURRENT (mutated) value; a field only
+    /// in the new definition gets its own fresh `init` default; the
+    /// instance's `comp` is swapped so new methods are immediately
+    /// callable. Live-confirmed via a real `kupl repl` subprocess before
+    /// writing this test (not assumed) -- this exercises the SAME
+    /// `upgrade_instances` function directly, without the REPL I/O loop.
+    #[test]
+    fn upgrade_migrates_matching_state_by_name_and_defaults_new_fields() {
+        let mut interp = interp_with_one_instance(
+            "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    expose fun bump(v: Int) -> Int {\n        n = n + v\n        n\n    }\n}\n",
+            "Counter",
+        );
+        // mutate state before upgrading (directly, via a real exposed call --
+        // Value::Bound is exactly how a method call resolves an instance +
+        // name to a callable, see interp.rs's own `eval` ExprKind::Field
+        // arm), so migration-vs-reset is unambiguous.
+        let bump = crate::value::Value::Bound(0, std::rc::Rc::new("bump".to_string()));
+        if interp.call_value(bump, vec![crate::value::Value::Int(5)], crate::diag::Span::default()).is_err() {
+            panic!("bump(5) must succeed");
+        }
+
+        redefine(
+            &mut interp,
+            "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    state label: Str = \"fresh\"\n    expose fun bump(v: Int) -> Int {\n        n = n + v\n        n\n    }\n    expose fun readLabel() -> Str {\n        label\n    }\n}\n",
+        );
+        assert_eq!(upgrade_instances(&mut interp, "Counter"), Ok(1));
+        assert_eq!(interp.instances[0].env.get("n"), Some(crate::value::Value::Int(5)), "existing state must be MIGRATED, not reset");
+        assert_eq!(
+            interp.instances[0].env.get("label"),
+            Some(crate::value::Value::str("fresh".to_string())),
+            "a genuinely new field must get its own fresh default"
+        );
+        assert_eq!(interp.instances[0].comp.name, "Counter");
+        assert!(interp.instances[0].comp.exposes.iter().any(|f| f.name == "readLabel"), "the new method must be immediately callable");
+    }
+
+    #[test]
+    fn upgrade_reports_zero_for_no_live_instances_and_errors_on_an_unknown_component() {
+        let compiled = crate::run::compile("component Foo {\n    intent \"f\"\n    state n: Int = 0\n}\n").unwrap();
+        let mut interp = Interp::new(ProgramDb::build(&compiled.program, &compiled.checked));
+        assert_eq!(upgrade_instances(&mut interp, "Foo"), Ok(0));
+        assert!(upgrade_instances(&mut interp, "DoesNotExist").is_err());
+    }
+
+    /// The v1 scope guard: a `props` or `children` change refuses the
+    /// upgrade entirely (no instance touched, not a partial migration) --
+    /// see `upgrade_instances`'s own doc comment for why these two are
+    /// deliberately out of scope for now.
+    #[test]
+    fn upgrade_refuses_when_props_or_children_changed() {
+        let mut interp = interp_with_one_instance(
+            "component P {\n    intent \"p\"\n    prop x: Int = 1\n    state n: Int = 0\n}\n",
+            "P",
+        );
+        redefine(
+            &mut interp,
+            "component P {\n    intent \"p\"\n    prop x: Int = 1\n    prop y: Int = 2\n    state n: Int = 0\n}\n",
+        );
+        let err = upgrade_instances(&mut interp, "P").expect_err("a prop change must be refused");
+        assert!(err.contains("props changed"), "{err}");
+
+        let mut interp2 = interp_with_one_instance(
+            "component Leaf {\n    intent \"l\"\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n}\n",
+            "Parent",
+        );
+        redefine(
+            &mut interp2,
+            "component Leaf {\n    intent \"l\"\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n    let b = Leaf()\n}\n",
+        );
+        let err2 = upgrade_instances(&mut interp2, "Parent").expect_err("a children change must be refused");
+        assert!(err2.contains("children changed"), "{err2}");
+    }
 
     #[test]
     fn braces_balanced_drives_multiline_reads() {

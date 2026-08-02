@@ -2555,6 +2555,60 @@ mod tests {
         assert!(stdout.contains("new-shape"), "a new instance must see the new method: {stdout}");
     }
 
+    /// `:upgrade <Component>` (it111) end-to-end via the REAL `kupl repl`
+    /// subprocess -- the companion feature to the test just above: WITHOUT
+    /// `:upgrade`, a pre-existing instance stays frozen to its old shape
+    /// (confirmed by that test); WITH it, the SAME pre-existing instance's
+    /// existing state is migrated by name and the new method becomes
+    /// immediately callable -- the hot-swap state-migration gap
+    /// (`docs/design/LANGUAGE.md` §12 Q4, Erlang's `code_change`
+    /// equivalent) this command closes.
+    #[test]
+    fn repl_upgrade_command_migrates_live_instance_state_and_unlocks_new_methods() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    \
+                      expose fun bump(v: Int) -> Int {\n        n = n + v\n        n\n    }\n}\n\
+                      let c = Counter()\n\
+                      c.bump(5)\n\
+                      component Counter {\n    intent \"c\"\n    state n: Int = 0\n    state label: Str = \"fresh\"\n    \
+                      expose fun bump(v: Int) -> Int {\n        n = n + v\n        n\n    }\n    \
+                      expose fun readLabel() -> Str {\n        label\n    }\n}\n\
+                      c.readLabel()\n\
+                      :upgrade Counter\n\
+                      c.readLabel()\n\
+                      c.bump(1)\n\
+                      :quit\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!format!("{stdout}{stderr}").contains("panicked at"), "kupl repl panicked: {stdout}{stderr}");
+        // before :upgrade, the pre-existing instance is still frozen (matches the sibling test above)
+        assert!(stderr.contains("does not expose") && stderr.contains("readLabel"), "{stderr}");
+        // :upgrade reports success
+        assert!(stdout.contains("upgraded 1 instance"), "{stdout}");
+        // after :upgrade: the NEW method works, and the EXISTING state (5) carried over -- 5+1=6, not 0+1=1
+        assert!(stdout.contains("fresh"), "the new field's own default must apply: {stdout}");
+        assert!(stdout.contains("\n6\n") || stdout.contains(" 6\n"), "bump(1) after upgrade must continue from the MIGRATED value 5, not reset to 0: {stdout}");
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it758): the test
     /// immediately above proves a redefined COMPONENT's own decl is safely
     /// frozen per-instance -- but a plain top-level value whose declared

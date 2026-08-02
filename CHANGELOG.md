@@ -86,6 +86,15 @@ change and the release process.
   Prints the patched file by default; `--write` overwrites in place, and
   (mirroring `kupl fmt --write`) refuses to write a patch that would
   introduce a new compile error, leaving the original untouched.
+- `kupl repl`'s new `:upgrade <ComponentName>` command: hot-swap state
+  migration for live instances of a just-redefined component (Erlang's
+  `code_change` equivalent). A `state` field present in both the old and
+  new definition keeps its current value; a field only in the new
+  definition gets its own fresh default; methods take effect
+  immediately. Refuses (no instance touched) if `props` or `children`
+  changed. The existing default behavior (redefinition without
+  `:upgrade` leaves live instances frozen to their original shape) is
+  unchanged — this is purely additive, opt-in.
 
 ## [1.0.0-alpha]
 
