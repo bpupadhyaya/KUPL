@@ -2582,6 +2582,14 @@ pub fn raw_unary_op(op: UnOp, v: Value) -> Result<Value, String> {
         }
         (UnOp::Neg, Value::BigInt(ref b)) => Ok(Value::BigInt(Rc::new(b.negate()))),
         (UnOp::Neg, Value::Rational(ref r)) => Ok(Value::Rational(Rc::new(r.negate()))),
+        // A REAL bug found+fixed (it108, caught while re-auditing this exact
+        // function during a fresh `kupl native` scoping pass, mirroring
+        // it105's own live-verification discipline): `Decimal` is
+        // `is_numeric()`, so `-dec("3.14")` type-checked fine (K0236) but
+        // this match had no `Value::Decimal` arm, panicking "invalid
+        // operand type Decimal" at runtime on BOTH interp and the KVM
+        // (which shares this function) -- confirmed live before this fix.
+        (UnOp::Neg, Value::Decimal(ref d)) => Ok(Value::Decimal(Rc::new(crate::decimal::Decimal::negate(d)))),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (_, other) => Err(format!("invalid operand type {}", other.type_name())),
     }

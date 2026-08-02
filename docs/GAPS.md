@@ -478,6 +478,62 @@ engines discipline as every prior campaign.
   eligible `examples/*.kupl` clean, and revert-and-verify via `git stash`
   confirmed the pre-fix binary cleanly rejects `dec(...)` as an unknown
   name while the restored binary computes it correctly.
+- **`kupl native` `Decimal` support (it108)** — closes the staged-rollout
+  gap it107 deliberately left open: a real `K_DECIMAL` KValue tag in the
+  native C runtime, so `Decimal` is now byte-identical across all FOUR
+  engines, not just interp/VM/`.kx`. Pure engine-porting, and — unlike
+  Char's own native port (it106), which needed brand-new C bignum-free
+  scalar code — this reuses `KRat`'s EXISTING `KBig`-based primitives
+  wholesale: `k_big_mul`/`k_big_divmod`/`k_big_pow` (the last for the
+  `10^shift` scale-alignment step) needed zero new C bignum algorithm
+  work at all, only a new `KDec { KBig* sig; uint32_t scale; }` struct
+  composing them, mirroring `KRat { KBig* num; KBig* den; }`'s own shape.
+  A `k_utf8_trim_range` reuse for `dec(...)`'s own Unicode-whitespace
+  trim too (the SAME primitive `k_big_from_str` already uses). Wired
+  into `k_type_name`, `k_display`, `k_eq` (scale-ALIGNED comparison, not
+  raw struct equality — Decimal is deliberately NOT auto-reduced like
+  Rational, so `dec("2.50")`/`dec("2.5")` have different stored
+  sig/scale but must compare equal), `k_cmp` (`.sort()`/`.min()`/`.max()`
+  needed zero extra code, since `k_list_order` already falls through to
+  `k_cmp`'s generic path), `k_add`/`k_sub`/`k_mul`/`k_div`/`k_rem`
+  (rejected, mirroring `Rational`'s own precedent)/`k_neg`, and
+  `.sum()`/`.product()`.
+
+  Every native error message was verified to match `decimal.rs`'s exact
+  wording, not just its behavior — confirmed live this diverged before
+  fixing: a first draft's parse-error paths summarized the failure
+  category ("invalid Decimal: non-digit character") where interp echoes
+  the actual malformed input ("invalid Decimal: abc"), the SAME "echo,
+  don't summarize" convention this codebase's other parse errors
+  (`BigInt::from_str`, `parse_iso`, `query_parse`) already follow. Fixed
+  by echoing the original untrimmed input string in every generic error
+  path, with a dynamically-sized buffer (no length cap) to match Rust's
+  own unbounded `String` formatting exactly.
+
+  **A SEPARATE real bug found+fixed along the way**, this one NOT a
+  wording mismatch but a genuine "type-checks then panics" gap in
+  `Decimal`'s own it107 landing: `interp.rs::raw_unary_op` (shared by
+  interp AND the KVM) had no `Value::Decimal` arm, so `-dec("3.14")`
+  type-checked fine (K0236 gates on `is_numeric()`, which Decimal
+  satisfies) but panicked "invalid operand type Decimal" at runtime on
+  BOTH engines — found via careful re-auditing while scoping this native
+  work, not a live user report. Fixed by adding the missing arm.
+
+  New permanent regression tests: `cgen.rs` (a coverage test driving the
+  compiled native binary across arithmetic/ordering/negation/`.sort()`/
+  `.sum()`/scale-insensitive-equality, and a SEPARATE test asserting
+  every native error path's message text matches interp's exactly,
+  panic-string for panic-string), and a `vm.rs` differential test for
+  the negation fix. Full `cargo test` green twice sequentially (1665 lib
+  + 59 main tests, identical both runs — net delta from it107: -1
+  rejection test removed, +3 coverage/regression tests added), all 365
+  `cgen::` tests green (confirms inserting `K_DECIMAL` into the tag enum
+  didn't shift any other tag's behavior), interp-vs-vm AND
+  interp-vs-native sweeps across all eligible `examples/*.kupl` clean,
+  and revert-and-verify via `git stash` confirmed the pre-fix binary
+  still cleanly rejects `dec(...)` in `kupl native` (the it107 staged
+  message) AND still panics on `-dec(...)` (the it107 negation bug),
+  while the restored binary computes both correctly.
 
 ## Final stretch — prioritized shortlist (it42–50)
 
@@ -627,13 +683,13 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       scalar value (`'a'`), byte-identical on ALL FOUR engines including
       native (`kupl native` closed its staged-rollout gap at it106, via a
       real `K_CHAR` KValue tag in the C runtime), ordered by codepoint.
-      **`Decimal` (`dec(...)`) has since landed too (it107)** — an exact
-      base-10 arbitrary-precision decimal (`sig * 10^-scale`, built on
-      `BigInt` exactly like `Rational` is), interp + KVM + `.kx` + bundle
-      byte-identical (a plain runtime builtin call, never a compile-time
-      constant, so no lexer/`.kx` changes were needed at all); `kupl
-      native` cleanly, explicitly defers it for now (interpreter/VM only),
-      mirroring the `Char` staged-rollout precedent. Byte (as a type
+      **`Decimal` (`dec(...)`) has since landed too (it107/it108)** — an
+      exact base-10 arbitrary-precision decimal (`sig * 10^-scale`, built
+      on `BigInt` exactly like `Rational` is), byte-identical on ALL FOUR
+      engines including native (`kupl native` closed its staged-rollout
+      gap at it108, via a `KBig`-based `K_DECIMAL` KValue reusing the SAME
+      `k_big_mul`/`k_big_divmod`/`k_big_pow` primitives `KRat` already
+      has). Byte (as a type
       distinct from `u8`, investigated and left genuinely open — no
       current builtin returns/consumes raw bytes in a way a distinct type
       would improve, see the campaign log below) is the one remaining

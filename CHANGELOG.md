@@ -67,10 +67,9 @@ change and the release process.
   digits of precision beyond the operands' own scale (`%` is not
   supported — same as `Rational`). Equality/ordering align scale first
   (`dec("2.50") == dec("2.5")`), but `Display` preserves each value's own
-  stored scale (`dec("2.50")` prints `2.50`). Byte-identical across the
-  interpreter, `kupl run --vm`, `.kx` build/run, and `kupl bundle`;
-  `kupl native` does not yet support `dec(...)` and reports a clean,
-  explicit error rather than compiling or crashing.
+  stored scale (`dec("2.50")` prints `2.50`). Byte-identical across all
+  four engines — the interpreter, `kupl run --vm`, `.kx` build/run, `kupl
+  bundle`, and `kupl native`.
 
 ## [1.0.0-alpha]
 

@@ -727,18 +727,12 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             BUILTIN_LOG_INFO => format!("regs[{dst}] = k_log_info(regs[{start}]); (void){argc};"),
             BUILTIN_LOG_WARN => format!("regs[{dst}] = k_log_warn(regs[{start}]); (void){argc};"),
             BUILTIN_LOG_ERROR => format!("regs[{dst}] = k_log_error(regs[{start}]); (void){argc};"),
-            // `Decimal`/`dec(...)` (it107): landed on interp.rs + the KVM
-            // this iteration (a plain runtime builtin call, like `big`/
-            // `rat` -- never a compile-time constant, so `.kx`/`bundle`
-            // already work with zero extra plumbing, confirmed live), but
-            // `kupl native`'s C runtime has no `K_DECIMAL` representation
-            // yet -- deliberately staged, mirroring `Char`'s own it105->
-            // it106 precedent (and Decimal is a substantially larger lift
-            // than Char was: it needs a full BigInt-backed significand +
-            // scale representation and rounding-aware division ported to
-            // C, not just a scalar codepoint). A clear, feature-specific
-            // message here instead of the generic catch-all below.
-            BUILTIN_DEC => return Err("Decimal ('dec') is not yet supported by `kupl native` (interpreter and `kupl run --vm` only for now)".into()),
+            // `Decimal`/`dec(...)` (it107 landed interp+KVM; it108 closes
+            // native's staged gap): a K_DECIMAL KValue built on the SAME
+            // KBig primitives KRat already uses (k_big_mul/k_big_divmod/
+            // k_big_pow), mirroring src/decimal.rs's own Rust
+            // implementation.
+            BUILTIN_DEC => format!("regs[{dst}] = k_dec_builtin(regs[{start}]); (void){argc};"),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -979,14 +973,15 @@ typedef struct { const char* type_name; const char* variant; int arity; const ch
 typedef struct { __int128 v; int width; } KSized;
 typedef struct KBig KBig;
 typedef struct KRat KRat;
+typedef struct KDec KDec;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_CHAR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_CHAR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL, K_DECIMAL } tag;
     union {
         int64_t i; double f; int b; float f32v; int32_t ch;
         const char* s;
         KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
-        int32_t fun; KSized* sized; KBig* big; KRat* rat;
+        int32_t fun; KSized* sized; KBig* big; KRat* rat; KDec* dec;
         struct { int64_t lo, hi; int incl; } range;
     } as;
 };
@@ -1809,6 +1804,205 @@ static double k_rat_to_f64(KRat* r) {
     return strtod(sci, 0);
 }
 
+/* ---- Decimal: exact base-10 arbitrary-precision decimals over KBig, a C
+   mirror of src/decimal.rs (it108 -- landed on interp/KVM at it107, this
+   closes the native staged-rollout gap). `sig * 10^-scale`; NOT reduced
+   like KRat -- `dec("2.50")` keeps scale 2 (Display shows "2.50"), even
+   though it compares equal to `dec("2.5")` (scale 1). See decimal.rs's
+   own top-of-file doc comment for why `K_MAX_DECIMAL_SCALE` (far below
+   K_MAX_BIGINT_LIMBS) exists: it keeps `k_dec_align`'s scale-matching
+   multiplication cheap regardless of the OTHER operand's own size, by
+   construction, without needing a separate cost-estimate function the
+   way k_rat_cmp_would_be_too_expensive does. */
+struct KDec { KBig* sig; uint32_t scale; };
+static KValue k_dec_v(KDec* d) { KValue x; x.tag = K_DECIMAL; x.as.dec = d; return x; }
+static KDec* k_dec_make(KBig* sig, uint32_t scale) {
+    KDec* d = (KDec*)k_alloc(sizeof(KDec));
+    d->sig = sig; d->scale = scale;
+    return d;
+}
+#define K_MAX_DECIMAL_SCALE 1000u
+#define K_DEC_DIV_EXTRA_DIGITS 34u
+static void k_dec_check_size(KDec* d) {
+    if (d->sig->n > K_MAX_BIGINT_LIMBS || d->scale > K_MAX_DECIMAL_SCALE) {
+        char m[160];
+        snprintf(m, sizeof m,
+                 "Decimal arithmetic result would be too large to compute (limit ~%d limbs / %u-digit scale)",
+                 K_MAX_BIGINT_LIMBS, K_MAX_DECIMAL_SCALE);
+        k_panic(m);
+    }
+}
+/* `dec(x)` -- an Int (scale 0) or a Str, parsed exactly (optional sign,
+   digits, optional single `.` then more digits) -- mirrors
+   decimal.rs::Decimal::from_str exactly, including its Unicode-whitespace
+   trim (reusing k_utf8_trim_range, the SAME primitive k_big_from_str
+   already uses for its own trim). */
+static KValue k_dec_builtin(KValue v) {
+    if (v.tag == K_INT) return k_dec_v(k_dec_make(k_big_from_i64(v.as.i), 0));
+    if (v.tag == K_DECIMAL) return v;
+    if (v.tag != K_STR) {
+        char m[80];
+        snprintf(m, sizeof m, "`dec` needs an Int or a Str, found %s", k_type_name(v));
+        k_panic(m);
+    }
+    const char* s = v.as.s;
+    /* Mirrors decimal.rs::Decimal::from_str's error text EXACTLY (every
+       error panics with "invalid Decimal: {s}", echoing the FULL ORIGINAL
+       (untrimmed) input -- no length cap on the Rust side, so none here
+       either, a dynamically sized buffer rather than a fixed one -- and
+       confirmed live this diverged before this fix: native said "invalid
+       Decimal: non-digit character", interp said "invalid Decimal: abc"). */
+    char* invalid_msg = (char*)k_alloc(strlen(s) + 32);
+    sprintf(invalid_msg, "invalid Decimal: %s", s);
+    long start, end;
+    k_utf8_trim_range(s, &start, &end);
+    long i = start;
+    int neg = 0;
+    if (i < end && s[i] == '-') { neg = 1; i++; }
+    else if (i < end && s[i] == '+') { i++; }
+    /* find only the FIRST `.` -- mirrors Rust's `split_once('.')` exactly;
+       a SECOND `.` is left embedded in frac_part and rejected below by the
+       all-digits check, the SAME generic message Rust's own
+       `frac_part.bytes().all(is_ascii_digit)` check produces for it (no
+       special-cased "multiple decimal points" wording -- that would be a
+       message divergence from interp/vm). */
+    long dot = -1;
+    for (long j = i; j < end; j++) { if (s[j] == '.') { dot = j; break; } }
+    long int_start = i, int_end = (dot >= 0) ? dot : end;
+    long frac_start = (dot >= 0) ? dot + 1 : end, frac_end = end;
+    long int_len = int_end - int_start, frac_len = frac_end - frac_start;
+    if (int_len == 0 && frac_len == 0) k_panic(invalid_msg);
+    for (long j = int_start; j < int_end; j++) if (s[j] < '0' || s[j] > '9') k_panic(invalid_msg);
+    for (long j = frac_start; j < frac_end; j++) if (s[j] < '0' || s[j] > '9') k_panic(invalid_msg);
+    if ((uint64_t)frac_len > (uint64_t)K_MAX_DECIMAL_SCALE) {
+        char m[160];
+        snprintf(m, sizeof m, "invalid Decimal: %ld fractional digits exceeds the %u-digit scale limit", frac_len, K_MAX_DECIMAL_SCALE);
+        k_panic(m);
+    }
+    long dlen = int_len + frac_len;
+    char* digits = (char*)k_alloc((size_t)dlen + 2);
+    long p = 0;
+    for (long j = int_start; j < int_end; j++) digits[p++] = s[j];
+    for (long j = frac_start; j < frac_end; j++) digits[p++] = s[j];
+    if (p == 0) digits[p++] = '0';
+    digits[p] = 0;
+    KBig* mag = k_big_from_str(digits);
+    if (!mag) k_panic(invalid_msg);
+    if (neg) mag = k_big_negate(mag);
+    return k_dec_v(k_dec_make(mag, (uint32_t)frac_len));
+}
+/* Scale both operands' significands to a shared common scale
+   (`max(a.scale, b.scale)`) so their significands become directly
+   comparable/addable -- the decimal analogue of k_rat_add's own
+   cross-multiplication to a shared denominator. */
+static void k_dec_align(KDec* a, KDec* b, KBig** out_a, KBig** out_b, uint32_t* out_scale) {
+    uint32_t scale = a->scale > b->scale ? a->scale : b->scale;
+    *out_a = (a->scale < scale)
+        ? k_big_mul(k_big_v(a->sig), k_big_v(k_big_pow(k_big_v(k_big_from_i64(10)), scale - a->scale)))
+        : a->sig;
+    *out_b = (b->scale < scale)
+        ? k_big_mul(k_big_v(b->sig), k_big_v(k_big_pow(k_big_v(k_big_from_i64(10)), scale - b->scale)))
+        : b->sig;
+    *out_scale = scale;
+}
+static KDec* k_dec_add(KValue av, KValue bv) {
+    KBig *asig, *bsig; uint32_t scale;
+    k_dec_align(av.as.dec, bv.as.dec, &asig, &bsig, &scale);
+    return k_dec_make(k_big_add(k_big_v(asig), k_big_v(bsig)), scale);
+}
+static KDec* k_dec_sub(KValue av, KValue bv) {
+    KBig *asig, *bsig; uint32_t scale;
+    k_dec_align(av.as.dec, bv.as.dec, &asig, &bsig, &scale);
+    return k_dec_make(k_big_sub(k_big_v(asig), k_big_v(bsig)), scale);
+}
+/* Always exact (unlike div): sig/scale each simply combine. */
+static KDec* k_dec_mul(KValue av, KValue bv) {
+    KDec* a = av.as.dec; KDec* b = bv.as.dec;
+    return k_dec_make(k_big_mul(k_big_v(a->sig), k_big_v(b->sig)), a->scale + b->scale);
+}
+static KDec* k_dec_negate(KDec* a) { return k_dec_make(k_big_negate(a->sig), a->scale); }
+static int k_dec_cmp(KValue av, KValue bv) {
+    KBig *asig, *bsig; uint32_t scale;
+    k_dec_align(av.as.dec, bv.as.dec, &asig, &bsig, &scale);
+    (void)scale;
+    return k_big_cmp(k_big_v(asig), k_big_v(bsig));
+}
+/* `Err` on division by zero, or if the result's scale would exceed
+   K_MAX_DECIMAL_SCALE. Rounds half-away-from-zero at the last digit --
+   see decimal.rs::DIV_EXTRA_DIGITS's own doc comment for why a rounding
+   policy is unavoidable here (unlike k_rat_div, which is always exact). */
+static KDec* k_dec_div(KValue av, KValue bv) {
+    KDec* a = av.as.dec; KDec* b = bv.as.dec;
+    if (b->sig->n == 0) k_panic("division by zero");
+    uint32_t max_scale = a->scale > b->scale ? a->scale : b->scale;
+    uint32_t target_scale = max_scale + K_DEC_DIV_EXTRA_DIGITS;
+    if (target_scale > K_MAX_DECIMAL_SCALE) {
+        char m[160];
+        snprintf(m, sizeof m,
+                 "Decimal division would require %u digits of scale, exceeding the %u-digit limit",
+                 target_scale, K_MAX_DECIMAL_SCALE);
+        k_panic(m);
+    }
+    /* shift = target_scale - a.scale + b.scale, always >= 0 since
+       target_scale >= a.scale by construction (mirrors decimal.rs::div
+       exactly). */
+    uint32_t shift = target_scale + b->scale - a->scale;
+    KBig* scaled_num = (shift == 0) ? a->sig
+        : k_big_mul(k_big_v(a->sig), k_big_v(k_big_pow(k_big_v(k_big_from_i64(10)), shift)));
+    KBig* q = k_big_divmod(k_big_v(scaled_num), k_big_v(b->sig), 0);
+    KBig* r = k_big_divmod(k_big_v(scaled_num), k_big_v(b->sig), 1);
+    int result_neg = (scaled_num->neg != b->sig->neg);
+    KBig r_abs; r_abs.neg = 0; r_abs.n = r->n; r_abs.limbs = r->limbs;
+    KBig b_abs; b_abs.neg = 0; b_abs.n = b->sig->n; b_abs.limbs = b->sig->limbs;
+    KBig* twice_r = k_big_add(k_big_v(&r_abs), k_big_v(&r_abs));
+    if (k_big_cmp(k_big_v(twice_r), k_big_v(&b_abs)) >= 0) {
+        KBig* one = k_big_from_i64(1);
+        q = result_neg ? k_big_sub(k_big_v(q), k_big_v(one)) : k_big_add(k_big_v(q), k_big_v(one));
+    }
+    return k_dec_make(q, target_scale);
+}
+/* Prints exactly `scale` digits after the decimal point (zero-padded on
+   the left if the magnitude has fewer digits than `scale`), matching
+   decimal.rs's own `Display` impl exactly -- e.g. `dec("2.50")` (sig=250,
+   scale=2) prints "2.50", not "2.5". */
+static char* k_dec_to_decimal(KDec* d) {
+    KBig abs_big; abs_big.neg = 0; abs_big.n = d->sig->n; abs_big.limbs = d->sig->limbs;
+    char* digits = k_big_to_decimal(&abs_big);
+    int neg = d->sig->neg;
+    uint32_t scale = d->scale;
+    size_t dlen = strlen(digits);
+    char* out;
+    if (scale == 0) {
+        if (!neg) return digits;
+        out = (char*)k_alloc(dlen + 2);
+        out[0] = '-';
+        memcpy(out + 1, digits, dlen + 1);
+        return out;
+    }
+    if (dlen > (size_t)scale) {
+        size_t split = dlen - scale;
+        size_t cap = dlen + 3 + (size_t)(neg ? 1 : 0);
+        out = (char*)k_alloc(cap);
+        size_t p = 0;
+        if (neg) out[p++] = '-';
+        memcpy(out + p, digits, split); p += split;
+        out[p++] = '.';
+        memcpy(out + p, digits + split, dlen - split); p += dlen - split;
+        out[p] = 0;
+        return out;
+    }
+    size_t zeros = (size_t)scale - dlen;
+    size_t cap = dlen + zeros + 3 + (size_t)(neg ? 1 : 0);
+    out = (char*)k_alloc(cap);
+    size_t p = 0;
+    if (neg) out[p++] = '-';
+    out[p++] = '0'; out[p++] = '.';
+    for (size_t z = 0; z < zeros; z++) out[p++] = '0';
+    memcpy(out + p, digits, dlen); p += dlen;
+    out[p] = 0;
+    return out;
+}
+
 static KValue k_fun(int32_t idx) { KValue x; x.tag = K_FUN;   x.as.fun = idx; return x; }
 
 static KValue k_range(KValue lo, KValue hi, int incl) {
@@ -1872,6 +2066,7 @@ static const char* k_type_name(KValue v) {
         case K_F32: return "f32";
         case K_BIGINT: return "BigInt";
         case K_RATIONAL: return "Rational";
+        case K_DECIMAL: return "Decimal";
         case K_FLOAT: return "Float";
         case K_BOOL: return "Bool";
         case K_STR: return "Str";
@@ -2160,6 +2355,7 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
             case K_INT: snprintf(tmp, sizeof tmp, "%lld", (long long)x.as.i); kb_puts(b, tmp); break;
             case K_BIGINT: kb_puts(b, k_big_to_decimal(x.as.big)); break;
             case K_RATIONAL: kb_puts(b, k_rat_to_decimal(x.as.rat)); break;
+            case K_DECIMAL: kb_puts(b, k_dec_to_decimal(x.as.dec)); break;
             case K_FLOAT: k_fmt_float(b, x.as.f); break;
             case K_BOOL: kb_puts(b, x.as.b ? "true" : "false"); break;
             case K_UNIT: kb_puts(b, "()"); break;
@@ -2396,6 +2592,14 @@ static int k_eq(KValue a, KValue b) {
                 result = (k_big_cmp(k_big_v(x.as.rat->num), k_big_v(y.as.rat->num)) == 0
                        && k_big_cmp(k_big_v(x.as.rat->den), k_big_v(y.as.rat->den)) == 0);
                 break;
+            /* UNLIKE Rational (always stored reduced, so structural
+               num/den equality IS mathematical equality), a Decimal is
+               NOT auto-reduced -- dec("2.50") and dec("2.5") have
+               DIFFERENT stored sig/scale but must compare equal, so this
+               needs the SAME scale-aligning comparison k_dec_cmp uses for
+               ordering, matching decimal.rs's own PartialEq (which calls
+               Decimal::cmp, not a raw struct comparison). */
+            case K_DECIMAL: result = (k_dec_cmp(x, y) == 0); break;
             case K_LIST:
                 if (x.as.list->len != y.as.list->len) { result = 0; break; }
                 for (int64_t i = 0; i < x.as.list->len; i++) {
@@ -2784,6 +2988,7 @@ static KValue k_add(KValue a, KValue b) {
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 0);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_add(a, b); k_big_check_size(r, "BigInt"); return k_big_v(r); }
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { KRat* r = k_rat_add(a, b); k_rat_check_size(r); return k_rat_v(r); }
+    if (a.tag == K_DECIMAL && b.tag == K_DECIMAL) { KDec* r = k_dec_add(a, b); k_dec_check_size(r); return k_dec_v(r); }
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("add", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -2799,6 +3004,7 @@ static KValue k_sub(KValue a, KValue b) {
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 1);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_sub(a, b); k_big_check_size(r, "BigInt"); return k_big_v(r); }
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { KRat* r = k_rat_sub(a, b); k_rat_check_size(r); return k_rat_v(r); }
+    if (a.tag == K_DECIMAL && b.tag == K_DECIMAL) { KDec* r = k_dec_sub(a, b); k_dec_check_size(r); return k_dec_v(r); }
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("sub", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -2814,6 +3020,7 @@ static KValue k_mul(KValue a, KValue b) {
     if (a.tag == K_TENSOR && b.tag == K_TENSOR) return k_tensor_binop(a, b, 2);
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_mul(a, b); k_big_check_size(r, "BigInt"); return k_big_v(r); }
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { KRat* r = k_rat_mul(a, b); k_rat_check_size(r); return k_rat_v(r); }
+    if (a.tag == K_DECIMAL && b.tag == K_DECIMAL) { KDec* r = k_dec_mul(a, b); k_dec_check_size(r); return k_dec_v(r); }
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("mul", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -2833,6 +3040,7 @@ static KValue k_div(KValue a, KValue b) {
        leaving Div/Rem as a special, unchecked case for no principled reason. */
     if (a.tag == K_BIGINT && b.tag == K_BIGINT) { KBig* r = k_big_divmod(a, b, 0); k_big_check_size(r, "BigInt"); return k_big_v(r); }
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { KRat* r = k_rat_div(a, b); k_rat_check_size(r); return k_rat_v(r); }
+    if (a.tag == K_DECIMAL && b.tag == K_DECIMAL) { KDec* r = k_dec_div(a, b); k_dec_check_size(r); return k_dec_v(r); }
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("div", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -2858,6 +3066,7 @@ static KValue k_rem(KValue a, KValue b) {
        error) -- confirmed diverging LIVE (interp/vm said the specific
        message, native said the generic one). */
     if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) k_panic("Rational remainder is not supported");
+    if (a.tag == K_DECIMAL && b.tag == K_DECIMAL) k_panic("Decimal remainder is not supported");
     { KValue _o; if (a.tag == K_CTOR && k_op_overload("rem", a, b, &_o)) return _o; }
     k_panic("invalid operand types"); return k_unit();
 }
@@ -2887,6 +3096,7 @@ static KValue k_cmp(KValue a, KValue b, int op) { /* 0:< 1:<= 2:> 3:>= */
     else if (a.tag == K_CHAR && b.tag == K_CHAR) { c = (a.as.ch < b.as.ch) ? -1 : (a.as.ch > b.as.ch); }
     else if (a.tag == K_BIGINT && b.tag == K_BIGINT) { c = k_big_cmp(a, b); }
     else if (a.tag == K_RATIONAL && b.tag == K_RATIONAL) { c = k_rat_cmp(a, b); }
+    else if (a.tag == K_DECIMAL && b.tag == K_DECIMAL) { c = k_dec_cmp(a, b); }
     else if (a.tag == K_CTOR) {
         static const char* CMPFN[4] = { "lt", "le", "gt", "ge" };
         KValue _o;
@@ -2958,6 +3168,7 @@ static KValue k_neg(KValue a) {
     }
     if (a.tag == K_BIGINT) return k_big_v(k_big_negate(a.as.big));
     if (a.tag == K_RATIONAL) return k_rat_v(k_rat_negate(a.as.rat));
+    if (a.tag == K_DECIMAL) return k_dec_v(k_dec_negate(a.as.dec));
     char buf[80]; snprintf(buf, sizeof buf, "invalid operand type %s", k_type_name(a));
     k_panic(buf); return k_unit();
 }
@@ -7174,6 +7385,11 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 for (int64_t i = 0; i < l->len; i++) { acc = k_rat_add(k_rat_v(acc), l->items[i]); k_rat_check_size(acc); }
                 return k_rat_v(acc);
             }
+            if (l->len > 0 && l->items[0].tag == K_DECIMAL) {
+                KDec* acc = k_dec_make(k_big_from_i64(0), 0);
+                for (int64_t i = 0; i < l->len; i++) { acc = k_dec_add(k_dec_v(acc), l->items[i]); k_dec_check_size(acc); }
+                return k_dec_v(acc);
+            }
             int64_t si = 0; double sf = 0; int isf = 0;
             for (int64_t i = 0; i < l->len; i++) {
                 KValue it = l->items[i];
@@ -7421,6 +7637,11 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
                 KRat* acc = k_rat_norm(k_big_from_i64(1), k_big_from_i64(1));
                 for (int64_t i = 0; i < l->len; i++) { acc = k_rat_mul(k_rat_v(acc), l->items[i]); k_rat_check_size(acc); }
                 return k_rat_v(acc);
+            }
+            if (l->len > 0 && l->items[0].tag == K_DECIMAL) {
+                KDec* acc = k_dec_make(k_big_from_i64(1), 0);
+                for (int64_t i = 0; i < l->len; i++) { acc = k_dec_mul(k_dec_v(acc), l->items[i]); k_dec_check_size(acc); }
+                return k_dec_v(acc);
             }
             int64_t pi = 1; double pf = 1; int isf = 0;
             for (int64_t i = 0; i < l->len; i++) {
@@ -10539,20 +10760,95 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         );
     }
 
-    /// `Decimal`/`dec(...)` (it107) is staged interp+VM-only, mirroring the
-    /// K0289/Char (it105) precedent: `kupl native` must cleanly reject a
-    /// `dec(...)` call with an honest, feature-specific message rather than
-    /// crashing or emitting a bogus `k_call`. `cc_available()` is
-    /// deliberately NOT required here -- `emit_c` must fail before any C
-    /// compiler ever gets invoked.
+    /// `Decimal`/`dec(...)` (it107 landed interp+KVM; it108 closes native's
+    /// staged gap) -- `kupl native` now supports `dec(...)` via a real
+    /// `K_DECIMAL` KValue built on the SAME `KBig` primitives `KRat`
+    /// already uses. Drives the REAL compiled native binary, covering
+    /// construction, exact `+ - *`, rounding `/`, comparison, negation,
+    /// `.sort()`, scale-insensitive equality with scale-preserving
+    /// display, and `.sum()`. Expected output independently cross-checked
+    /// against `kupl run` on the SAME source before hardcoding it here
+    /// (this file's own established convention).
     #[test]
-    fn native_decimal_is_cleanly_rejected_not_miscompiled() {
-        let src = "fun main() {\n    let a = dec(\"3.14\")\n    print(a)\n}\n";
-        let compiled = crate::run::compile(src).expect("program type-checks (Decimal is valid on interp/VM)");
-        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
-        let err = super::emit_c(&module).expect_err("emit_c must reject dec(...), not silently miscompile it");
-        assert!(err.contains("Decimal"), "error should name the feature: {err}");
-        assert!(err.contains("not yet supported by `kupl native`"), "error should be the staged-rollout message: {err}");
+    fn native_decimal_arithmetic_ordering_and_display() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() {\n\
+                   \x20   let a = dec(\"3.14\")\n\
+                   \x20   let b = dec(\"1.86\")\n\
+                   \x20   print(a)\n\
+                   \x20   print(a + b)\n\
+                   \x20   print(a - b)\n\
+                   \x20   print(a * b)\n\
+                   \x20   print(a / b)\n\
+                   \x20   print(a > b)\n\
+                   \x20   print(a == dec(\"3.14\"))\n\
+                   \x20   print(-a)\n\
+                   \x20   print([dec(3), dec(1), dec(2)].sort())\n\
+                   \x20   print(dec(\"2.50\") == dec(\"2.5\"))\n\
+                   \x20   print(dec(\"2.50\"))\n\
+                   \x20   print([dec(\"1.1\"), dec(\"2.22\")].sum())\n\
+                   }\n";
+        assert_eq!(
+            native_main_stdout(src, "decimal").trim(),
+            format!(
+                "3.14\n5.00\n1.28\n5.8404\n{}\ntrue\ntrue\n-3.14\n[1, 2, 3]\ntrue\n2.50\n3.32",
+                "1.688172043010752688172043010752688172"
+            )
+        );
+    }
+
+    /// Every error path native's own `k_dec_builtin`/`k_dec_div`/`k_rem`
+    /// hand-port introduces must panic with the EXACT SAME text as
+    /// `decimal.rs` -- confirmed live this diverged before matching the
+    /// wording precisely: native originally said "invalid Decimal:
+    /// non-digit character" (a category description) where interp said
+    /// "invalid Decimal: abc" (echoing the actual malformed input), the
+    /// same "echo the offending input, don't summarize it" convention
+    /// this codebase's OTHER parse-error messages already follow
+    /// (`BigInt::from_str`, `parse_iso`, `query_parse`, ...).
+    #[test]
+    fn native_decimal_error_messages_match_interp_exactly() {
+        if !cc_available() {
+            return;
+        }
+        for (src, tag) in [
+            ("fun main() { print(dec(1) / dec(0)) }\n", "decdiv0"),
+            ("fun main() { print(dec(1) % dec(2)) }\n", "decrem"),
+            ("fun main() { print(dec(\"abc\")) }\n", "decbad"),
+            ("fun main() { print(dec(\"1.2.3\")) }\n", "decdot2"),
+            ("fun main() { print(dec(\"\")) }\n", "decempty"),
+        ] {
+            let compiled = crate::run::compile(src).expect("program compiles");
+            let interp_db = crate::interp::ProgramDb::build(&compiled.program, &compiled.checked);
+            let mut interp = crate::interp::Interp::new(interp_db);
+            let f = crate::value::Value::Fun(std::rc::Rc::new("main".to_string()));
+            let interp_msg = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+                Err(crate::interp::Flow::Panic { msg, .. }) => msg,
+                Ok(_) => panic!("expected a panic for {src:?}, got Ok"),
+                Err(_) => panic!("expected a panic for {src:?}, got a non-panic Flow"),
+            };
+            let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+            let c = super::emit_c(&module).expect("emit_c succeeds");
+            let base = std::env::temp_dir().join(format!("kupl-cgen-{tag}-{}", std::process::id()));
+            let cpath = base.with_extension("c");
+            let bin = base.with_extension("out");
+            std::fs::write(&cpath, &c).unwrap();
+            let status = std::process::Command::new(cc())
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .status()
+                .expect("cc runs");
+            assert!(status.success(), "generated C must compile for {src:?}");
+            let out = std::process::Command::new(&bin).output().expect("binary runs");
+            let native_stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                native_stderr.contains(&format!("panic: {interp_msg}")),
+                "native/interp panic message mismatch for {src:?}: interp said {interp_msg:?}, native stderr was {native_stderr:?}"
+            );
+            let _ = std::fs::remove_file(&cpath);
+            let _ = std::fs::remove_file(&bin);
+        }
     }
 
     /// Compile `src` (a component app) to native, run it, and return stdout.

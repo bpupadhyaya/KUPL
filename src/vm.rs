@@ -2827,6 +2827,19 @@ mod tests {
         assert_eq!(differential(r#"fun probe() -> Str { "{[dec(3), dec(1), dec(2)].sort()}" }"#), "[1, 2, 3]");
     }
 
+    /// A REAL bug found+fixed (it108, caught while re-auditing
+    /// `raw_unary_op` during a fresh `kupl native` scoping pass for
+    /// Decimal): `Decimal` is `is_numeric()`, so `-dec("3.14")`
+    /// type-checked fine (K0236) but `raw_unary_op` had no `Value::Decimal`
+    /// arm, panicking "invalid operand type Decimal" on BOTH interp and the
+    /// KVM (which shares this function) -- confirmed live before this fix.
+    #[test]
+    fn diff_decimal_negation() {
+        assert_eq!(differential(r#"fun probe() -> Str { "{-dec("3.14")}" }"#), "-3.14");
+        assert_eq!(differential(r#"fun probe() -> Str { "{-dec("-3.14")}" }"#), "3.14");
+        assert_eq!(differential(r#"fun probe() -> Str { "{-dec(0)}" }"#), "0");
+    }
+
     /// A REAL, LIVE-CONFIRMED cross-engine bug fixed alongside `Decimal`'s
     /// own wiring (it107): `check.rs` widened K0234 to accept `Char` at
     /// it105, but `interp.rs::list_order` (shared by interp AND the KVM via
