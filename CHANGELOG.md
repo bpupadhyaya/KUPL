@@ -62,6 +62,15 @@ change and the release process.
   diagnostics `K0011`/`K0012`/`K0013`. Byte-identical across all four
   engines — the interpreter, `kupl run --vm`, `.kx` build/run, `kupl
   bundle`, and `kupl native`.
+- `Decimal`: an exact base-10 arbitrary-precision decimal, `dec("3.14")`
+  (also accepts an `Int`). `+`/`-`/`*` are exact; `/` rounds to 34 extra
+  digits of precision beyond the operands' own scale (`%` is not
+  supported — same as `Rational`). Equality/ordering align scale first
+  (`dec("2.50") == dec("2.5")`), but `Display` preserves each value's own
+  stored scale (`dec("2.50")` prints `2.50`). Byte-identical across the
+  interpreter, `kupl run --vm`, `.kx` build/run, and `kupl bundle`;
+  `kupl native` does not yet support `dec(...)` and reports a clean,
+  explicit error rather than compiling or crashing.
 
 ## [1.0.0-alpha]
 

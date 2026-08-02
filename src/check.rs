@@ -580,7 +580,7 @@ const BUILTIN_METHODS: &[&str] = &[
 /// suggestions on an unknown name (K0240). Suggestion-only and best-effort — same discipline as
 /// BUILTIN_METHODS: a missing entry only costs a hint, never changes resolution (PR-it249).
 const BUILTIN_FUNS: &[&str] = &[
-    "append_file", "arange", "args", "big", "delete_file", "env_var", "exec", "file_exists",
+    "append_file", "arange", "args", "big", "dec", "delete_file", "env_var", "exec", "file_exists",
     "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir", "make_dir",
     "panic", "path_base", "path_dir", "path_ext", "path_join", "print", "random_floats",
     "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace", "read_all",
@@ -608,7 +608,7 @@ const BUILTIN_FUNS: &[&str] = &[
 /// gets a real arity diagnostic at all, not just a best-effort hint.
 const BUILTIN_CALL_NAMES: &[&str] = &[
     "append_file", "arange", "args", "big", "csv_parse", "csv_stringify", "date_iso",
-    "date_make", "day_of", "delete_file", "env_var", "eprint", "Err", "exec", "exit",
+    "date_make", "day_of", "dec", "delete_file", "env_var", "eprint", "Err", "exec", "exit",
     "file_exists", "format_time", "hash_fnv", "hex_decode", "hex_encode", "hmac_sha256",
     "hour_of", "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
     "log_debug", "log_error", "log_info", "log_warn",
@@ -3635,6 +3635,10 @@ impl Checker {
                         self.infer_expr(&a.value, ctx);
                     }
                     return Ty::Rational;
+                }
+                ("dec", 1) => {
+                    self.infer_expr(&args[0].value, ctx);
+                    return Ty::Decimal;
                 }
                 ("path_join", 2) => {
                     for a in args {
@@ -7398,6 +7402,35 @@ mod generic_tests {
         // accidentally widen the check itself too far.
         let bad = errors("type P = P(x: Int)\nfun main() { let _ = P(1) < P(2) }\n");
         assert!(bad.iter().any(|d| d.code == "K0234"), "a non-orderable type must still be rejected: {bad:?}");
+    }
+
+    /// `Decimal` (it107) is `is_numeric()`, so it needs NO explicit K0234/
+    /// K0290 widening the way non-numeric `Char` did at it105 -- every
+    /// site that already gates on `is_numeric()` (comparison operators,
+    /// arithmetic, `.sort()`/`.max()`, `.sum()`, and the `[T: Ord]` bound)
+    /// picks it up automatically. This test locks that in.
+    #[test]
+    fn decimal_is_numeric_everywhere_ordinary_numeric_types_are() {
+        assert!(errors("fun main() { let _ = dec(\"1.5\") < dec(\"2.5\") }\n").is_empty(), "comparison operator");
+        assert!(errors("fun main() { let _ = dec(\"1\") + dec(\"2\") }\n").is_empty(), "arithmetic");
+        assert!(errors("fun main() { let _ = [dec(3), dec(1)].sort() }\n").is_empty(), "List.sort");
+        assert!(errors("fun main() { let _ = [dec(3), dec(1)].sum() }\n").is_empty(), "List.sum");
+        assert!(
+            errors("fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\nfun main() { let _ = mymax(dec(1), dec(2)) }\n").is_empty(),
+            "Decimal satisfies an Ord-bounded generic type parameter"
+        );
+    }
+
+    /// A wrong-arity `dec(...)` call must get a real arity diagnostic, not
+    /// the misleading "unknown name" K0240 the PR-it1202 lesson (see
+    /// `BUILTIN_CALL_NAMES`'s own doc comment) exists to prevent -- this
+    /// would have silently regressed if `dec` were added to `infer_call`'s
+    /// dispatch match but forgotten from that separate name list.
+    #[test]
+    fn dec_wrong_arity_is_a_real_arity_error_not_unknown_name() {
+        let e = errors("fun main() { let _ = dec(\"1\", \"2\") }\n");
+        assert!(!e.iter().any(|d| d.code == "K0240"), "must not be misreported as unknown name: {e:?}");
+        assert!(e.iter().any(|d| d.code == "K0242"), "must be a wrong-argument-count error: {e:?}");
     }
 
     #[test]

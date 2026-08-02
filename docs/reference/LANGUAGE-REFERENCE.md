@@ -761,9 +761,11 @@ let b = Cache(store: LoudStore())              // …or another — same consume
 - `Float` follows IEEE-754; division by zero yields `inf`/`nan` (no panic).
 - `==`/`!=` are structural for every type; `<` `<=` `>` `>=` are defined for
   every numeric type (`Int`, the sized integers `i8`/`i16`/`i32`/`i64`/`u8`/
-  `u16`/`u32`/`u64`, `Float`, `f32`, `BigInt`, `Rational`), `Str`
+  `u16`/`u32`/`u64`, `Float`, `f32`, `BigInt`, `Rational`, `Decimal`), `Str`
   (lexicographic by bytes), and `Char` (by Unicode codepoint) — not just
-  `Int`, `Float`, and `Str`.
+  `Int`, `Float`, and `Str`. `Decimal` equality/ordering align scale first
+  (`dec("2.50") == dec("2.5")`), but `Display` preserves each value's own
+  stored scale.
 - Display of floats uses the shortest representation that round-trips
   (`3.5`, `0.30000000000000004`); whole floats show one decimal (`12.0`).
   All engines — including native machine code — format identically.

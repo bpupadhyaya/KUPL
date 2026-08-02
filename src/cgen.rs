@@ -727,6 +727,18 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             BUILTIN_LOG_INFO => format!("regs[{dst}] = k_log_info(regs[{start}]); (void){argc};"),
             BUILTIN_LOG_WARN => format!("regs[{dst}] = k_log_warn(regs[{start}]); (void){argc};"),
             BUILTIN_LOG_ERROR => format!("regs[{dst}] = k_log_error(regs[{start}]); (void){argc};"),
+            // `Decimal`/`dec(...)` (it107): landed on interp.rs + the KVM
+            // this iteration (a plain runtime builtin call, like `big`/
+            // `rat` -- never a compile-time constant, so `.kx`/`bundle`
+            // already work with zero extra plumbing, confirmed live), but
+            // `kupl native`'s C runtime has no `K_DECIMAL` representation
+            // yet -- deliberately staged, mirroring `Char`'s own it105->
+            // it106 precedent (and Decimal is a substantially larger lift
+            // than Char was: it needs a full BigInt-backed significand +
+            // scale representation and rounding-aware division ported to
+            // C, not just a scalar codepoint). A clear, feature-specific
+            // message here instead of the generic catch-all below.
+            BUILTIN_DEC => return Err("Decimal ('dec') is not yet supported by `kupl native` (interpreter and `kupl run --vm` only for now)".into()),
             _ => return Err("unknown builtin".into()),
         },
         CallValue { dst, f, start, argc } => {
@@ -10525,6 +10537,22 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             native_main_stdout(src, "char").trim(),
             "a\ntrue\nfalse\ntrue\nfalse\n['a', 'b', 'c']\n['a', 'b', 'c']\nSome('c')\nπ\ntrue"
         );
+    }
+
+    /// `Decimal`/`dec(...)` (it107) is staged interp+VM-only, mirroring the
+    /// K0289/Char (it105) precedent: `kupl native` must cleanly reject a
+    /// `dec(...)` call with an honest, feature-specific message rather than
+    /// crashing or emitting a bogus `k_call`. `cc_available()` is
+    /// deliberately NOT required here -- `emit_c` must fail before any C
+    /// compiler ever gets invoked.
+    #[test]
+    fn native_decimal_is_cleanly_rejected_not_miscompiled() {
+        let src = "fun main() {\n    let a = dec(\"3.14\")\n    print(a)\n}\n";
+        let compiled = crate::run::compile(src).expect("program type-checks (Decimal is valid on interp/VM)");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+        let err = super::emit_c(&module).expect_err("emit_c must reject dec(...), not silently miscompile it");
+        assert!(err.contains("Decimal"), "error should name the feature: {err}");
+        assert!(err.contains("not yet supported by `kupl native`"), "error should be the staged-rollout message: {err}");
     }
 
     /// Compile `src` (a component app) to native, run it, and return stdout.

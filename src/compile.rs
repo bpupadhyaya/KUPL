@@ -1960,6 +1960,7 @@ impl<'s> FnCompiler<'s> {
                 ("big", 1) => Some(BUILTIN_BIG),
                 ("http_serve", 2) => Some(BUILTIN_HTTP_SERVE),
                 ("rat", 2) => Some(BUILTIN_RAT),
+                ("dec", 1) => Some(BUILTIN_DEC),
                 ("eprint", 1) => Some(BUILTIN_EPRINT),
                 ("exit", 1) => Some(BUILTIN_EXIT),
                 ("random_ints", 2) => Some(BUILTIN_RANDOM_INTS),

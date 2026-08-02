@@ -64,6 +64,7 @@ unless supervised.
 | `.pow/.abs/.sign/.is_negative` on BigInt | methods | power (Int exp), absolute value, `-1/0/1`, sign test |
 | `rat(n, d)` | `(Int, Int) -> Rational` | exact fraction `n/d`, reduced (panics if `d == 0`); pure |
 | `.num/.den/.to_float/.recip` on Rational | methods | numerator/denominator (BigInt), nearest Float, reciprocal |
+| `dec(x)` | `(Int) -> Decimal` / `(Str) -> Decimal` | exact base-10 decimal (panics on a malformed string); pure; not yet on `kupl native` |
 | `exec(program, args)` | `(Str, List[Str]) -> Result[Str, Str]` — **uses `io.proc`** | run a program (argv, no shell); `Ok` = stdout on exit 0 |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
@@ -139,6 +140,19 @@ every engine including native (a from-scratch base-1e9 bignum).
 with a positive denominator, so equality and `to_string` are canonical. `+ - * /`
 and comparisons, plus `.num`/`.den` (BigInt), `.to_float`, and `.recip`. No
 rounding error — `rat(1,3) + rat(1,6)` is exactly `rat(1,2)`. Native too.
+
+**Decimal** (`dec`): an exact base-10 arbitrary-precision decimal built on
+`BigInt` (a signed significand plus a scale — the digit count after the
+decimal point), NOT auto-reduced like `Rational`: `dec("2.50") ==
+dec("2.5")` (equality aligns scale before comparing) but each keeps its
+own stored scale for display (`dec("2.50")` prints `"2.50"`, not
+`"2.5"`) — matching how SQL `DECIMAL`/`NUMERIC` columns preserve a
+value's own precision. `+ - *` are exact; `/` is not (decimal division
+doesn't generally terminate, e.g. `1/3`) and rounds to 34 extra digits of
+precision beyond the operands' own scale (mirroring IEEE 754-2008
+`decimal128`'s significant-digit count); `%` is not supported (same as
+`Rational`). Interpreter and `kupl run --vm` only for now — `kupl native`
+does not yet support `dec(...)` and reports a clean error.
 
 **Encodings** (`base64_*`, `hex_*`, `hash_fnv`, `sha256`, `hmac_sha256`) are
 pure and byte-identical on every engine including native. They work on the

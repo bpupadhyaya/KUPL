@@ -100,6 +100,7 @@ fn builtin_argc(which: u8) -> Option<u8> {
         BUILTIN_LOG_INFO => 1,
         BUILTIN_LOG_WARN => 1,
         BUILTIN_LOG_ERROR => 1,
+        BUILTIN_DEC => 1,
         _ => return None,
     })
 }
@@ -1303,6 +1304,10 @@ impl<'m> Vm<'m> {
                             Err(msg) => return Err(VmError { msg, span }),
                         },
                         BUILTIN_RAT => match crate::interp::rat_builtin(&args[0], &args[1]) {
+                            Ok(v) => set!(dst, v),
+                            Err(msg) => return Err(VmError { msg, span }),
+                        },
+                        BUILTIN_DEC => match crate::interp::dec_builtin(&args[0]) {
                             Ok(v) => set!(dst, v),
                             Err(msg) => return Err(VmError { msg, span }),
                         },
@@ -2794,6 +2799,50 @@ mod tests {
         assert_eq!(differential("fun probe() -> Str {\n    \"{rat(1, 3) + rat(1, 6)}\"\n}\n"), "1/2");
         assert_eq!(differential("fun probe() -> Str {\n    \"{big(5) / big(0)}\"\n}\n"), "panic: division by zero");
         assert_eq!(differential("fun probe() -> Str {\n    \"{rat(1, 0)}\"\n}\n"), "panic: division by zero");
+    }
+
+    /// `Decimal` (it107) interp/KVM parity -- construction, exact +/-/*,
+    /// rounding `/`, comparison, scale-insensitive equality with
+    /// scale-preserving Display, and division by zero. `raw_binary_op`/
+    /// `list_order` are SHARED between interp.rs and vm.rs (`use
+    /// crate::interp::{raw_binary_op, ...}`), so this is mostly a
+    /// sanity check that the shared function is reached correctly through
+    /// BOTH engines' own dispatch, not a search for algorithmic bugs
+    /// (`decimal.rs`'s own unit tests already cover those directly).
+    #[test]
+    fn diff_decimal_edges() {
+        // Inside a `{...}` interpolation the lexer resumes ORDINARY
+        // tokenizing, so a nested `Str` argument like `"3.14"` is a ordinary
+        // string TOKEN there, not string CONTENT -- it needs no `\"`
+        // escaping (that escape is only for a literal `"` appearing as
+        // content OUTSIDE `{}`, confirmed live: escaping the nested quotes
+        // here produces a real K0005/K0007 parse error instead).
+        assert_eq!(differential(r#"fun probe() -> Str { "{dec("3.14")}" }"#), "3.14");
+        assert_eq!(differential(r#"fun probe() -> Str { "{dec("1.1") + dec("2.22")}" }"#), "3.32");
+        assert_eq!(differential(r#"fun probe() -> Str { "{dec("2.5") * dec(4)}" }"#), "10.0");
+        assert_eq!(differential(r#"fun probe() -> Str { "{dec(1) / dec(4)}" }"#), format!("0.25{}", "0".repeat(32)));
+        assert_eq!(differential(r#"fun probe() -> Str { "{dec(1) / dec(0)}" }"#), "panic: division by zero");
+        assert_eq!(differential(r#"fun probe() -> Str { "{dec("2.50") == dec("2.5")}" }"#), "true");
+        assert_eq!(differential(r#"fun probe() -> Str { "{dec("1.4") < dec("1.5")}" }"#), "true");
+        assert_eq!(differential(r#"fun probe() -> Str { "{[dec(3), dec(1), dec(2)].sort()}" }"#), "[1, 2, 3]");
+    }
+
+    /// A REAL, LIVE-CONFIRMED cross-engine bug fixed alongside `Decimal`'s
+    /// own wiring (it107): `check.rs` widened K0234 to accept `Char` at
+    /// it105, but `interp.rs::list_order` (shared by interp AND the KVM via
+    /// `shared_method`) was never given a matching `Value::Char` arm, so
+    /// `['c','a','b'].sort()`/`.min()`/`.max()` type-checked fine and then
+    /// PANICKED "min/max need Int, Float, Str, or another orderable type"
+    /// on BOTH engines -- while `kupl native`'s `k_list_order` (which falls
+    /// through to the generic, type-agnostic `k_cmp` for any non-float tag)
+    /// already handled it correctly, a genuine three-way divergence.
+    /// Confirmed live via all three engines before this fix.
+    #[test]
+    fn diff_char_sort_min_max_now_orderable() {
+        assert_eq!(differential("fun probe() -> Str {\n    \"{['c', 'a', 'b'].sort()}\"\n}\n"), "['a', 'b', 'c']");
+        // `.min()`/`.max()` return `Option[T]` (`Some('a')`, not bare `'a'`).
+        assert_eq!(differential("fun probe() -> Str {\n    \"{['c', 'a', 'b'].min()}\"\n}\n"), "Some('a')");
+        assert_eq!(differential("fun probe() -> Str {\n    \"{['c', 'a', 'b'].max()}\"\n}\n"), "Some('c')");
     }
 
     /// A coverage-closing verification (production-hardening PR-it717; no bug

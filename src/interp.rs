@@ -1982,6 +1982,10 @@ impl Interp {
                     let d = self.eval(&args[1].value, env)?;
                     return rat_builtin(&n, &d).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("dec", 1) => {
+                    let v = self.eval(&args[0].value, env)?;
+                    return dec_builtin(&v).map_err(|m| Self::panic_flow(m, span));
+                }
                 ("path_join", 2) | ("path_base", 1) | ("path_dir", 1) | ("path_ext", 1) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -2674,6 +2678,33 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             }
             Ok(Value::Rational(Rc::new(result)))
         }
+        (Value::Decimal(a), Value::Decimal(b)) => {
+            use std::cmp::Ordering;
+            let result = match op {
+                Add => crate::decimal::Decimal::add(a, b)?,
+                Sub => crate::decimal::Decimal::sub(a, b)?,
+                Mul => crate::decimal::Decimal::mul(a, b),
+                Div => crate::decimal::Decimal::div(a, b)?,
+                Lt => return Ok(Value::Bool(crate::decimal::Decimal::cmp(a, b)? == Ordering::Less)),
+                Le => return Ok(Value::Bool(crate::decimal::Decimal::cmp(a, b)? != Ordering::Greater)),
+                Gt => return Ok(Value::Bool(crate::decimal::Decimal::cmp(a, b)? == Ordering::Greater)),
+                Ge => return Ok(Value::Bool(crate::decimal::Decimal::cmp(a, b)? != Ordering::Less)),
+                Rem => return Err("Decimal remainder is not supported".into()),
+                _ => unreachable!(),
+            };
+            // Same size-cap check as BigInt/Rational above (PR-it639's own
+            // "ordinary repeated ops can walk an in-range value past the
+            // cap one step at a time" lesson) -- Decimal's own add/sub/mul
+            // can each grow `sig`/`scale` the same way.
+            if result.exceeds_max_size() {
+                return Err(format!(
+                    "Decimal arithmetic result would be too large to compute (limit ~{} limbs / {}-digit scale)",
+                    crate::bigint::MAX_BIGINT_LIMBS,
+                    crate::decimal::MAX_DECIMAL_SCALE
+                ));
+            }
+            Ok(Value::Decimal(Rc::new(result)))
+        }
         (Value::Int(a), Value::Int(b)) => {
             let (a, b) = (*a, *b);
             Ok(match op {
@@ -2992,7 +3023,7 @@ pub fn shared_method(
         // checker/runtime completeness gap as it547's unary `-`, just in a List method
         // instead of an operator). Dispatch on the first element's variant; Int/Float keep
         // their EXISTING loop (and its own overflow wording) below, unchanged.
-        (Value::List(items), "sum") if matches!(items.first(), Some(Value::SizedInt(_) | Value::F32(_) | Value::BigInt(_) | Value::Rational(_))) => {
+        (Value::List(items), "sum") if matches!(items.first(), Some(Value::SizedInt(_) | Value::F32(_) | Value::BigInt(_) | Value::Rational(_) | Value::Decimal(_))) => {
             match items.first().unwrap() {
                 Value::SizedInt(b) => {
                     let w = b.1;
@@ -3058,6 +3089,28 @@ pub fn shared_method(
                         }
                     }
                     Ok(Value::Rational(Rc::new(acc)))
+                }
+                // Same PR-it943-shaped fix as BigInt/Rational just above --
+                // the shared `raw_binary_op` boundary checks
+                // `exceeds_max_size()` after every `+`, but this loop's own
+                // accumulator calls `Decimal::add` directly, so it needs the
+                // SAME per-step check to fail fast instead of silently
+                // building a result past `MAX_DECIMAL_SCALE`/
+                // `MAX_BIGINT_LIMBS` three summands past the cap.
+                Value::Decimal(_) => {
+                    let mut acc = crate::decimal::Decimal::zero();
+                    for item in items.iter() {
+                        let Value::Decimal(d) = item else { unreachable!() };
+                        acc = crate::decimal::Decimal::add(&acc, d)?;
+                        if acc.exceeds_max_size() {
+                            return Err(format!(
+                                "Decimal arithmetic result would be too large to compute (limit ~{} limbs / {}-digit scale)",
+                                crate::bigint::MAX_BIGINT_LIMBS,
+                                crate::decimal::MAX_DECIMAL_SCALE
+                            ));
+                        }
+                    }
+                    Ok(Value::Decimal(Rc::new(acc)))
                 }
                 _ => unreachable!(),
             }
@@ -3338,7 +3391,7 @@ pub fn shared_method(
             let start = if items.is_empty() { 0 } else { 1 };
             Ok(Value::List(Rc::new(items[start..].to_vec())))
         }
-        (Value::List(items), "product") if matches!(items.first(), Some(Value::SizedInt(_) | Value::F32(_) | Value::BigInt(_) | Value::Rational(_))) => {
+        (Value::List(items), "product") if matches!(items.first(), Some(Value::SizedInt(_) | Value::F32(_) | Value::BigInt(_) | Value::Rational(_) | Value::Decimal(_))) => {
             match items.first().unwrap() {
                 Value::SizedInt(b) => {
                     let w = b.1;
@@ -3401,6 +3454,21 @@ pub fn shared_method(
                         }
                     }
                     Ok(Value::Rational(Rc::new(acc)))
+                }
+                Value::Decimal(_) => {
+                    let mut acc = crate::decimal::Decimal::from_i64(1);
+                    for item in items.iter() {
+                        let Value::Decimal(d) = item else { unreachable!() };
+                        acc = crate::decimal::Decimal::mul(&acc, d);
+                        if acc.exceeds_max_size() {
+                            return Err(format!(
+                                "Decimal arithmetic result would be too large to compute (limit ~{} limbs / {}-digit scale)",
+                                crate::bigint::MAX_BIGINT_LIMBS,
+                                crate::decimal::MAX_DECIMAL_SCALE
+                            ));
+                        }
+                    }
+                    Ok(Value::Decimal(Rc::new(acc)))
                 }
                 _ => unreachable!(),
             }
@@ -4841,6 +4909,21 @@ fn list_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
         (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
         (Value::Float(x), Value::Float(y)) => Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal)),
         (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
+        // A REAL, LIVE-CONFIRMED cross-engine DIVERGENCE found+fixed
+        // (it107, discovered while wiring `Decimal` into this exact
+        // function): `check.rs`'s K0234 was widened for `Char` at it105,
+        // but this hand-written match was never updated to match --
+        // `['c','a','b'].sort()` type-checked fine and then panicked
+        // "min/max need Int, Float, Str, or another orderable type" on
+        // BOTH interp AND the KVM (which shares this function via
+        // `crate::interp::shared_method`), while native's `k_list_order`
+        // already handled it correctly (it falls through to the generic,
+        // type-agnostic `k_cmp` for any non-float tag, so it never needed
+        // a dedicated Char arm the way this hand-enumerated match does) --
+        // confirmed live via all three `kupl run`/`kupl run --vm`/`kupl
+        // native` before this fix, matching the exact shape of PR-it549's
+        // own BigInt-keyed divergence just below.
+        (Value::Char(x), Value::Char(y)) => Ok(x.cmp(y)),
         // A REAL cross-engine DIVERGENCE found+fixed, PR-it549: min_by/max_by's key type
         // isn't restricted by the checker (any type unifies), and native's comparator
         // (k_cmp, shared with `<`/`<=`/etc) already handled these — so a BigInt-keyed
@@ -4864,7 +4947,8 @@ fn list_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
             }
             Ok(x.cmp(y))
         }
-        _ => Err("`min`/`max` need Int, Float, Str, or another orderable type".into()),
+        (Value::Decimal(x), Value::Decimal(y)) => crate::decimal::Decimal::cmp(x, y),
+        _ => Err("`min`/`max` need Int, Float, Str, Char, or another orderable type".into()),
     }
 }
 
@@ -5891,6 +5975,19 @@ pub fn rat_builtin(n: &Value, d: &Value) -> Result<Value, String> {
     };
     let r = crate::rational::Rational::new(to_big(n)?, to_big(d)?)?;
     Ok(Value::Rational(Rc::new(r)))
+}
+
+/// `dec(x)` — an exact base-10 decimal (`it107`). Accepts an `Int` (scale
+/// 0) or a `Str` (parsed exactly, e.g. `"3.14"`/`"-0.005"`) -- mirrors
+/// `big`'s own accepted-input shape exactly.
+pub fn dec_builtin(v: &Value) -> Result<Value, String> {
+    use std::rc::Rc;
+    match v {
+        Value::Int(n) => Ok(Value::Decimal(Rc::new(crate::decimal::Decimal::from_i64(*n)))),
+        Value::Decimal(d) => Ok(Value::Decimal(d.clone())),
+        Value::Str(s) => crate::decimal::Decimal::from_str(s).map(|d| Value::Decimal(Rc::new(d))),
+        other => Err(format!("`dec` needs an Int or a Str, found {}", other.type_name())),
+    }
 }
 
 /// Pure `/`-path helpers (no effect). They operate lexically on forward-slash

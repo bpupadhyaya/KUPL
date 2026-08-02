@@ -278,6 +278,8 @@ pub enum Value {
     /// An arbitrary-precision integer (`big(…)`).
     BigInt(Rc<crate::bigint::BigInt>),
     Rational(Rc<crate::rational::Rational>),
+    /// An exact base-10 arbitrary-precision decimal (`dec(…)`).
+    Decimal(Rc<crate::decimal::Decimal>),
     Float(f64),
     Bool(bool),
     Str(Rc<String>),
@@ -452,6 +454,7 @@ impl Value {
             Value::F32(_) => "f32".into(),
             Value::BigInt(_) => "BigInt".into(),
             Value::Rational(_) => "Rational".into(),
+            Value::Decimal(_) => "Decimal".into(),
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "Str".into(),
@@ -597,6 +600,14 @@ impl PartialEq for Value {
                     }
                 }
                 (Value::Rational(x), Value::Rational(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                // scale-insensitive (Decimal's own `PartialEq` aligns scales
+                // before comparing significands -- `dec("2.50") ==
+                // dec("2.5")` -- see decimal.rs's own doc comment).
+                (Value::Decimal(x), Value::Decimal(y)) => {
                     if x != y {
                         return false;
                     }
@@ -1033,6 +1044,7 @@ impl fmt::Display for Value {
                 Value::SizedInt(b) => write!(f, "{}", b.0)?,
                 Value::BigInt(b) => write!(f, "{b}")?,
                 Value::Rational(r) => write!(f, "{r}")?,
+                Value::Decimal(d) => write!(f, "{d}")?,
                 Value::F32(x) => {
                     if x.fract() == 0.0 && x.is_finite() {
                         write!(f, "{x:.1}")?;

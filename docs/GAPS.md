@@ -395,6 +395,89 @@ engines discipline as every prior campaign.
   confirmed the pre-fix binary still cleanly rejects Char in `kupl native`
   with the exact it105 error message, and the restored binary compiles
   and runs it correctly.
+- **`Decimal` primitive type (it107)** — an exact base-10 arbitrary-
+  precision decimal (`dec("3.14")`), closing the last item this doc's own
+  "Byte/Char/BigInt/Decimal" gap line had left open besides `Byte`. Chosen
+  after first investigating and formally RULING OUT `Byte` as a distinct
+  type (a legitimate "investigate and rule out" outcome the it107
+  NEXT-note itself anticipated): `src/encoding.rs`'s base64/hex builtins
+  and every file-I/O/HTTP builtin in `docs/reference/STDLIB.md` already
+  operate on `Str`, round-tripping binary-safe data through it (base64/hex
+  decode validate UTF-8 and reject otherwise) — nothing in the current
+  stdlib returns or consumes raw bytes in a shape a distinct `Byte` type
+  would improve, so introducing one now would need inventing binary-mode
+  I/O from scratch just to give it a consumer, a much larger and separate
+  design question than this note originally scoped.
+
+  `Decimal` (`src/decimal.rs`, new file) is `sig * 10^-scale` — a signed
+  `BigInt` significand plus a `u32` scale — built on `BigInt` exactly the
+  way `Rational` is (`src/bigint.rs`/`src/rational.rs` were read as the
+  explicit templates, per the campaign's own NEXT-note). Unlike
+  `Rational`, a `Decimal` is NOT auto-reduced: `dec("2.50") == dec("2.5")`
+  (equality aligns scales before comparing) but each keeps its OWN stored
+  scale for `Display` (`dec("2.50").to_string() == "2.50"`) — matching
+  how SQL `DECIMAL`/`NUMERIC` and financial libraries preserve a value's
+  own precision rather than silently trimming trailing zeros a caller
+  wrote intentionally. `+`/`-`/`*` are always exact; `/` is NOT (decimal
+  division doesn't generally terminate, e.g. `1/3`) and computes 34 extra
+  digits of precision beyond `max(a.scale, b.scale)` — mirroring IEEE
+  754-2008 `decimal128`'s own significant-digit count, a standards-
+  referenced choice — rounding half-away-from-zero at the final digit.
+  `%` is deliberately unsupported (a clean runtime error), mirroring
+  `Rational`'s own "remainder is not supported" precedent exactly.
+
+  A conservative `MAX_DECIMAL_SCALE` cap (1,000 digits — far below
+  `BigInt`'s own ~180,000-digit cap) exists for a DIFFERENT reason than
+  `BigInt`/`Rational`'s own caps: aligning two operands to a shared scale
+  can force multiplying an independently-large significand by a
+  `10^shift`-magnitude power, and capping `scale` directly (rather than
+  needing a separate cost-estimate function like `Rational::
+  cmp_would_be_too_expensive`, PR-it718) keeps that multiplication cheap
+  by construction regardless of the OTHER operand's own size — documented
+  at length in `decimal.rs`'s own top-of-file doc comment, with a
+  dedicated test confirming this stays fast even at the cap.
+
+  Landed on the interpreter and the KVM, `.kx` build/run, and `kupl
+  bundle`, ALL verified byte-identical live with zero extra plumbing for
+  `.kx`/bundle specifically — confirmed live that (unlike `Char`, a
+  LITERAL that must round-trip through the constant pool) `dec(...)` is a
+  plain runtime builtin call, exactly like `big`/`rat`, so it never
+  touches `kx.rs`'s constant-pool encoding at all. `kupl native` cleanly,
+  explicitly defers `dec(...)` with a feature-specific message, mirroring
+  the `Char` it105→it106 staged-rollout precedent (a substantially bigger
+  follow-up than Char's own native port, left for a future iteration:
+  Decimal needs a full BigInt-backed significand+scale representation and
+  rounding-aware division ported to C, not just a scalar codepoint).
+
+  **A real, live-confirmed CROSS-ENGINE bug found+fixed along the way**,
+  unrelated to Decimal itself but discovered while wiring `Decimal` into
+  the exact same function: `interp.rs::list_order` (shared by the
+  interpreter AND the KVM via `shared_method`) was never given a
+  `Value::Char` arm when `check.rs`'s K0234 was widened to accept `Char`
+  at it105 — so `['c','a','b'].sort()`/`.min()`/`.max()` type-checked
+  fine and then PANICKED "min/max need Int, Float, Str, or another
+  orderable type" on BOTH interp and the KVM, while `kupl native`'s own
+  `k_list_order` (which falls through to the generic, type-agnostic
+  `k_cmp` for any non-float tag) already handled it correctly — a genuine
+  three-way divergence that slipped through it105's own testing. Fixed by
+  adding the missing arm; confirmed live via all three engines before and
+  after.
+
+  New permanent regression tests: `decimal.rs`'s own unit-test module
+  (parsing, scale-insensitive equality with scale-preserving display,
+  exact arithmetic, rounding division, ordering, and two dedicated
+  cost-safety tests for the scale-cap reasoning above), `check.rs` (a
+  `is_numeric()`-everywhere-numeric-types-are test, and a wrong-arity
+  regression test for the PR-it1202 "must not misreport as unknown name"
+  lesson), an interp-vs-vm differential test in `vm.rs` covering
+  construction/arithmetic/comparison/division-by-zero, a SEPARATE
+  differential test locking in the `Char` `.sort()`/`.min()`/`.max()` fix
+  above, and a `cgen.rs` clean-rejection test for native. Full `cargo
+  test` green twice sequentially (1663 lib + 59 main tests, identical
+  both runs), interp-vs-vm AND interp-vs-native sweeps across all
+  eligible `examples/*.kupl` clean, and revert-and-verify via `git stash`
+  confirmed the pre-fix binary cleanly rejects `dec(...)` as an unknown
+  name while the restored binary computes it correctly.
 
 ## Final stretch — prioritized shortlist (it42–50)
 
@@ -544,8 +627,17 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       scalar value (`'a'`), byte-identical on ALL FOUR engines including
       native (`kupl native` closed its staged-rollout gap at it106, via a
       real `K_CHAR` KValue tag in the C runtime), ordered by codepoint.
-      Byte (as a type distinct from `u8`) and a base-10 `Decimal` type are
-      still to do.
+      **`Decimal` (`dec(...)`) has since landed too (it107)** — an exact
+      base-10 arbitrary-precision decimal (`sig * 10^-scale`, built on
+      `BigInt` exactly like `Rational` is), interp + KVM + `.kx` + bundle
+      byte-identical (a plain runtime builtin call, never a compile-time
+      constant, so no lexer/`.kx` changes were needed at all); `kupl
+      native` cleanly, explicitly defers it for now (interpreter/VM only),
+      mirroring the `Char` staged-rollout precedent. Byte (as a type
+      distinct from `u8`, investigated and left genuinely open — no
+      current builtin returns/consumes raw bytes in a way a distinct type
+      would improve, see the campaign log below) is the one remaining
+      item here.
 - [x] Broader standard library (audit #3, it12) — ~40 methods across all core
       types, all engines byte-identical incl. native. List (is_empty/concat/
       unique/init/tail/product/min/max/flatten/count/flat_map/window/chunk); Str

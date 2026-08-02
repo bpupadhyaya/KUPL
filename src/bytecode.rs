@@ -290,6 +290,7 @@ pub const BUILTIN_LOG_DEBUG: u8 = 68;
 pub const BUILTIN_LOG_INFO: u8 = 69;
 pub const BUILTIN_LOG_WARN: u8 = 70;
 pub const BUILTIN_LOG_ERROR: u8 = 71;
+pub const BUILTIN_DEC: u8 = 72;
 
 /// Every identifier that `eval_call` (interp.rs) / `call()` (compile.rs)
 /// special-case as a builtin call FORM (`name(args...)` bare-call syntax) --
@@ -321,7 +322,7 @@ pub const BUILTIN_CALL_NAMES: &[&str] = &[
     "print", "to_str", "panic", "Map", "Set", "tensor", "zeros", "arange", "read_file",
     "write_file", "append_file", "delete_file", "file_exists", "json_parse", "json_stringify",
     "env_var", "args", "read_line", "read_all", "exec", "path_join", "path_base", "path_dir",
-    "path_ext", "list_dir", "make_dir", "remove_dir", "big", "http_serve", "rat", "eprint",
+    "path_ext", "list_dir", "make_dir", "remove_dir", "big", "http_serve", "rat", "dec", "eprint",
     "exit", "random_ints", "random_floats", "shuffle", "http_get", "http_post", "re_match",
     "re_find", "re_find_all", "re_replace", "format_time", "year_of", "month_of", "day_of",
     "hour_of", "minute_of", "second_of", "weekday_of", "yearday_of", "date_iso", "parse_iso",
