@@ -1969,6 +1969,8 @@ impl<'s> FnCompiler<'s> {
                 ("random_floats", 2) => Some(BUILTIN_RANDOM_FLOATS),
                 ("shuffle", 2) => Some(BUILTIN_SHUFFLE),
                 ("http_get", 1) => Some(BUILTIN_HTTP_GET),
+                ("http_get_with", 2) => Some(BUILTIN_HTTP_GET_WITH),
+                ("cap_net_root", 0) => Some(BUILTIN_CAP_NET_ROOT),
                 ("http_post", 2) => Some(BUILTIN_HTTP_POST),
                 ("re_match", 2) => Some(BUILTIN_RE_MATCH),
                 ("re_find", 2) => Some(BUILTIN_RE_FIND),

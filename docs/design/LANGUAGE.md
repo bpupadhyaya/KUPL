@@ -135,18 +135,22 @@ pub fun fetch_user(id: UserId) uses net -> Result[User, NetError] {
   `uses io`, `uses net`, `uses db.read`, `uses db.write`, `uses time`, `uses rand`,
   `uses gpu`, `uses unsafe`. Effects are inferred inside a component but **must be
   written explicitly on every `pub`/`expose` signature** (boundary explicitness rule).
-- Effects are backed by **capabilities**: you can only perform `net` if a `cap.Net`
+- Effects are backed by **capabilities**: you can only perform `net` if a `CapNet`
   (or derived) capability is in scope via `requires`. No ambient authority — AI-generated
   code physically cannot exfiltrate data or touch disk unless the surrounding component
-  was granted that capability. Capabilities are attenuable: `cap.Sql.read_only()`,
-  `cap.Http.limited_to("api.example.com")`. **Not yet implemented** — the
-  effect system as actually shipped (`src/effects.rs`) is 100% static/
-  syntactic (`uses io.net`, checked at compile time, no runtime capability
-  value). `requires` itself already parses (it's a full syntactic alias for
-  `prop`, live-confirmed at it113 — an earlier it112 note wrongly claimed it
-  didn't), but no `cap` namespace/type/runtime capability value exists to
-  put on the other side of the colon. See `CAPABILITIES.md` for a design
-  sketch of what closing this gap would require.
+  was granted that capability. Capabilities are attenuable: `net.limited_to("api.example.com")`.
+  **Partially implemented (it116)** — the effect system as actually shipped
+  (`src/effects.rs`) is still 100% static/syntactic (`uses io.net`, checked
+  at compile time); capabilities are a SEPARATE, additive layer: `CapNet`
+  (a flat type name, not the dotted `Cap.Net` this text once implied —
+  KUPL has no dotted-type-path grammar), `.limited_to(host)`, and
+  `http_get_with(cap, url)` are real and tested across all three engines.
+  `requires` itself already parses (it's a full syntactic alias for
+  `prop`, live-confirmed at it113). **One gap remains**: `cap_net_root()`
+  (the entry point for obtaining a capability at all) is not yet
+  restricted to `fun main`'s own top-level body, so "no ambient authority"
+  is not yet a real guarantee. See `CAPABILITIES.md` for the full design
+  and implementation status.
 - Errors are values: `Result[T, E]` with `?` propagation, `Option[T]` instead of null.
   `panic` exists only for bugs (contract violation, index out of bounds) and is caught
   at component boundaries by supervision — a panic kills the instance, not the program.

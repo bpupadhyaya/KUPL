@@ -1,0 +1,65 @@
+// Capabilities as attenuable values (it116) — see docs/design/CAPABILITIES.md.
+//
+//   cap_net_root()               -> CapNet   (the UNRESTRICTED root capability)
+//   cap.limited_to(host: Str)    -> CapNet   (a NARROWER capability; NEVER widens)
+//   http_get_with(cap, url)      -> Result[Str, Str]
+//
+// A capability is an opaque runtime value: it cannot be pattern-matched into
+// or constructed from a literal, only obtained from `cap_net_root()` and
+// narrowed from there. `http_get_with` checks the URL's host against the
+// capability's own carried scope BEFORE ever reaching the network — an
+// out-of-scope host is rejected locally, `curl` is never even invoked.
+//
+// **Known, deliberate v1 gap** (see docs/GAPS.md's own capabilities entry):
+// `cap_net_root()` is NOT YET restricted to `fun main`'s own top-level body —
+// it is callable from anywhere today, the same as any other builtin. This
+// example demonstrates the VALUE/METHOD/builtin engine wiring, which is real
+// and fully tested; it is not yet a genuine security boundary.
+//
+// This file makes NO real network call by default (so it's safe for the
+// interp-vs-vm/interp-vs-native sweep) — pass a URL to actually fetch it:
+//   kupl run examples/capabilities.kupl -- https://example.com/
+
+component TodoStore {
+    intent "Fetches todos, scoped to exactly one host."
+    requires net: CapNet
+
+    expose fun sync() uses io.net -> Result[Str, Str] {
+        http_get_with(net, "http://not-the-allowed-host.invalid/todos")
+    }
+}
+
+fun main() uses io, io.net {
+    let root = cap_net_root()
+    print(root)
+
+    let scoped = root.limited_to("api.example.com")
+    print(scoped)
+
+    // re-limiting to the SAME host is a no-op, not a widen error.
+    print(scoped.limited_to("api.example.com"))
+
+    // the capability narrows what the ALREADY-granted `io.net` effect can
+    // reach: a component holding `scoped` cannot fetch from a DIFFERENT
+    // host, even though it fully declares `uses io.net`.
+    let store = TodoStore(scoped)
+    match store.sync() {
+        Ok(_) => print("fetched (unexpected — host should have been blocked)")
+        Err(e) => print("blocked as expected: {e}")
+    }
+
+    let urls = args()
+    if urls.is_empty() {
+        print("(pass a URL as an arg to see a real fetch through a MATCHING-host capability)")
+    } else {
+        // an UNRESTRICTED root capability, so any URL the caller actually
+        // passed in is reachable — narrowing to the exact matching host
+        // is exactly what `TodoStore` above already demonstrated.
+        for url in urls {
+            match http_get_with(root, url) {
+                Ok(body) => print("{url} -> {body.len()} bytes")
+                Err(e) => print("{url} -> error: {e}")
+            }
+        }
+    }
+}

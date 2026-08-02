@@ -280,6 +280,11 @@ pub enum Value {
     Rational(Rc<crate::rational::Rational>),
     /// An exact base-10 arbitrary-precision decimal (`dec(…)`).
     Decimal(Rc<crate::decimal::Decimal>),
+    /// A capability (it116): an opaque, non-user-constructible runtime value
+    /// naming an allowed scope for a specific effect family. `None` is an
+    /// UNRESTRICTED (root) capability; `Some(host)` is narrowed to exactly
+    /// that host. See `docs/design/CAPABILITIES.md`.
+    CapNet(Rc<CapNetInner>),
     Float(f64),
     Bool(bool),
     Str(Rc<String>),
@@ -316,6 +321,16 @@ pub enum Value {
     /// Insertion-ordered immutable set.
     Set(Rc<Vec<Value>>),
     Range(i64, i64, bool),
+}
+
+/// A `CapNet` capability's own carried scope. `None` = unrestricted (only
+/// ever produced by `cap_net_root()`); `Some(host)` = may only reach that
+/// exact host. Structural equality by design — two capabilities with the
+/// SAME scope are the same VALUE, matching `Decimal`/`Rational`'s own
+/// by-value (not by-identity) equality precedent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapNetInner {
+    pub allowed_host: Option<String>,
 }
 
 pub struct Closure {
@@ -455,6 +470,7 @@ impl Value {
             Value::BigInt(_) => "BigInt".into(),
             Value::Rational(_) => "Rational".into(),
             Value::Decimal(_) => "Decimal".into(),
+            Value::CapNet(_) => "CapNet".into(),
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "Str".into(),
@@ -608,6 +624,11 @@ impl PartialEq for Value {
                 // before comparing significands -- `dec("2.50") ==
                 // dec("2.5")` -- see decimal.rs's own doc comment).
                 (Value::Decimal(x), Value::Decimal(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::CapNet(x), Value::CapNet(y)) => {
                     if x != y {
                         return false;
                     }
@@ -1045,6 +1066,10 @@ impl fmt::Display for Value {
                 Value::BigInt(b) => write!(f, "{b}")?,
                 Value::Rational(r) => write!(f, "{r}")?,
                 Value::Decimal(d) => write!(f, "{d}")?,
+                Value::CapNet(c) => match &c.allowed_host {
+                    None => write!(f, "<CapNet root>")?,
+                    Some(h) => write!(f, "<CapNet limited_to {h:?}>")?,
+                },
                 Value::F32(x) => {
                     if x.fract() == 0.0 && x.is_finite() {
                         write!(f, "{x:.1}")?;

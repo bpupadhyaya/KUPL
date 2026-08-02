@@ -680,6 +680,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             BUILTIN_MAKE_DIR => format!("regs[{dst}] = k_make_dir(regs[{start}]); (void){argc};"),
             BUILTIN_REMOVE_DIR => format!("regs[{dst}] = k_remove_dir(regs[{start}]); (void){argc};"),
             BUILTIN_HTTP_GET => format!("regs[{dst}] = k_http_get(regs[{start}]); (void){argc};"),
+            BUILTIN_HTTP_GET_WITH => format!("regs[{dst}] = k_http_get_with(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_CAP_NET_ROOT => format!("regs[{dst}] = k_cap_net_root(); (void){start}; (void){argc};"),
             BUILTIN_HTTP_POST => format!("regs[{dst}] = k_http_post(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_MATCH => format!("regs[{dst}] = k_re_match(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_FIND => format!("regs[{dst}] = k_re_find(regs[{start}], regs[{start}+1]); (void){argc};"),
@@ -976,14 +978,18 @@ typedef struct { __int128 v; int width; } KSized;
 typedef struct KBig KBig;
 typedef struct KRat KRat;
 typedef struct KDec KDec;
+/* it116: `allowed_host == NULL` is the UNRESTRICTED (root) capability,
+   mirroring Rust's `CapNetInner { allowed_host: Option<String> }` (`NULL`
+   <-> `None`) exactly. */
+typedef struct { const char* allowed_host; } KCapNet;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_CHAR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL, K_DECIMAL } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_CHAR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL, K_DECIMAL, K_CAPNET } tag;
     union {
         int64_t i; double f; int b; float f32v; int32_t ch;
         const char* s;
         KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
-        int32_t fun; KSized* sized; KBig* big; KRat* rat; KDec* dec;
+        int32_t fun; KSized* sized; KBig* big; KRat* rat; KDec* dec; KCapNet* capnet;
         struct { int64_t lo, hi; int incl; } range;
     } as;
 };
@@ -2069,6 +2075,7 @@ static const char* k_type_name(KValue v) {
         case K_BIGINT: return "BigInt";
         case K_RATIONAL: return "Rational";
         case K_DECIMAL: return "Decimal";
+        case K_CAPNET: return "CapNet";
         case K_FLOAT: return "Float";
         case K_BOOL: return "Bool";
         case K_STR: return "Str";
@@ -2358,6 +2365,13 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
             case K_BIGINT: kb_puts(b, k_big_to_decimal(x.as.big)); break;
             case K_RATIONAL: kb_puts(b, k_rat_to_decimal(x.as.rat)); break;
             case K_DECIMAL: kb_puts(b, k_dec_to_decimal(x.as.dec)); break;
+            case K_CAPNET:
+                if (x.as.capnet->allowed_host) {
+                    kb_printf(b, "<CapNet limited_to \"%s\">", x.as.capnet->allowed_host);
+                } else {
+                    kb_puts(b, "<CapNet root>");
+                }
+                break;
             case K_FLOAT: k_fmt_float(b, x.as.f); break;
             case K_BOOL: kb_puts(b, x.as.b ? "true" : "false"); break;
             case K_UNIT: kb_puts(b, "()"); break;
@@ -2679,6 +2693,14 @@ static int k_eq(KValue a, KValue b) {
                a native recursive call -- consistent with this function's own
                established stack-safety discipline).*/
             case K_FUN: result = (x.as.fun == y.as.fun); break;
+            /* Structural equality by scope, mirroring value.rs's own
+               `CapNetInner: PartialEq` derive exactly. */
+            case K_CAPNET: {
+                const char* hx = x.as.capnet->allowed_host;
+                const char* hy = y.as.capnet->allowed_host;
+                result = (hx == NULL && hy == NULL) || (hx != NULL && hy != NULL && strcmp(hx, hy) == 0);
+                break;
+            }
             case K_CLOSURE: {
                 KClosure* cx = x.as.clo;
                 KClosure* cy = y.as.clo;
@@ -4751,6 +4773,30 @@ static KValue k_http_serve(KValue port, KValue handler) {
    captures raw tokens, not an evaluated arithmetic result, so stringifying
    the `(10 * 1024 * 1024)` macro would produce `"(10 * 1024 * 1024)"`, not
    a value curl's `--max-filesize` can parse. */
+/* it116: `host == NULL` builds an UNRESTRICTED (root) capability, mirroring
+   `Value::CapNet(Rc::new(CapNetInner { allowed_host: None }))` exactly. */
+static KValue k_capnet_v(const char* host) {
+    KCapNet* c = (KCapNet*)k_alloc(sizeof(KCapNet));
+    c->allowed_host = host;
+    KValue x; x.tag = K_CAPNET; x.as.capnet = c;
+    return x;
+}
+
+/* MUST stay byte-identical to interp.rs's own `url_host` (shared by
+   interp.rs/vm.rs) -- deliberately simple string slicing, not a full URL
+   parser: strips a leading `scheme://` if present, then stops at the
+   first `/`, `?`, `#`, or `:` (port). */
+static char* k_url_host(const char* url) {
+    const char* p = strstr(url, "://");
+    const char* start = p ? p + 3 : url;
+    size_t len = 0;
+    while (start[len] && start[len] != '/' && start[len] != '?' && start[len] != '#' && start[len] != ':') len++;
+    char* out = (char*)k_alloc(len + 1);
+    memcpy(out, start, len);
+    out[len] = 0;
+    return out;
+}
+
 static KValue k_http_get(KValue url) {
     char* argv[] = { (char*)"curl", (char*)"-sS", (char*)"--fail", (char*)"--max-time", (char*)"30",
                       (char*)"--max-filesize", (char*)"10485760", (char*)k_as_str(url), 0 };
@@ -4761,6 +4807,31 @@ static KValue k_http_post(KValue url, KValue body) {
                       (char*)"--max-filesize", (char*)"10485760", (char*)"-X", (char*)"POST",
                       (char*)"--data-binary", (char*)"@-", (char*)k_as_str(url), 0 };
     return k_run_curl(argv, k_as_str(body));
+}
+
+/* it116: like k_http_get but checks `url`'s host against `cap`'s own
+   carried scope FIRST -- MUST stay behaviorally identical to interp.rs's
+   own `http_get_with`. An unrestricted (root) capability allows any host;
+   an out-of-scope host is an ordinary Err value, not a panic. */
+static KValue k_http_get_with(KValue cap, KValue url) {
+    if (cap.tag != K_CAPNET) k_panic("http_get_with needs a CapNet");
+    const char* allowed = cap.as.capnet->allowed_host;
+    if (allowed) {
+        char* host = k_url_host(k_as_str(url));
+        if (strcmp(host, allowed) != 0) {
+            char buf[256];
+            snprintf(buf, sizeof buf, "capability limited to `%s`, cannot reach `%s`", allowed, host);
+            return k_err(k_str(k_strdup(buf)));
+        }
+    }
+    return k_http_get(url);
+}
+
+/* it116: the UNRESTRICTED root CapNet capability.
+   **NOT YET call-site-restricted** -- see interp.rs's own `cap_net_root`
+   doc comment for the full explanation of this known, tracked v1 gap. */
+static KValue k_cap_net_root(void) {
+    return k_capnet_v(NULL);
 }
 
 /* ---- ai fun (mock/deterministic path; mirrors src/ai.rs convert +
@@ -7279,6 +7350,22 @@ static KValue k_set_from(KValue v) {
 }
 
 static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
+    if (recv.tag == K_CAPNET) {
+        (void)argc;
+        /* Attenuation narrows, never widens (mirrors interp.rs's own
+           `shared_method` "limited_to" arm exactly -- see its doc comment
+           for the CAPABILITIES.md §5 invariant this resolves). */
+        if (!strcmp(name, "limited_to")) {
+            if (args[0].tag != K_STR) k_panic("`limited_to` needs a Str");
+            const char* host = args[0].as.s;
+            const char* cur = recv.as.capnet->allowed_host;
+            if (cur == NULL) return k_capnet_v(k_strdup(host));
+            if (!strcmp(cur, host)) return recv;
+            char buf[256];
+            snprintf(buf, sizeof buf, "cannot widen a capability already limited to `%s` to a different host `%s`", cur, host);
+            k_panic(buf);
+        }
+    }
     if (recv.tag == K_BIGINT) {
         if (!strcmp(name, "pow")) { (void)argc; if (args[0].as.i < 0) k_panic("`pow` exponent must be non-negative"); return k_big_v(k_big_pow(recv, args[0].as.i)); }
         if (!strcmp(name, "abs")) { KBig* a = recv.as.big; return k_big_v(k_big_norm(0, a->limbs, a->n)); }
@@ -10834,6 +10921,38 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         assert_eq!(
             native_main_stdout(src, "char").trim(),
             "a\ntrue\nfalse\ntrue\nfalse\n['a', 'b', 'c']\n['a', 'b', 'c']\nSome('c')\nπ\ntrue"
+        );
+    }
+
+    /// `CapNet` capabilities (it116) -- `kupl native` supports the full
+    /// slice in the SAME iteration as interp/KVM (unlike `Char`/`Decimal`,
+    /// which each staged native across a follow-up iteration): construction
+    /// via `cap_net_root()`, `.limited_to()` narrowing (idempotent on the
+    /// SAME host), the narrow-never-widen panic, and `http_get_with`'s
+    /// host-scope check short-circuiting BEFORE any real network I/O (so
+    /// this test needs no network access to be deterministic). Expected
+    /// output independently cross-checked against `kupl run` on the SAME
+    /// source before hardcoding it here (this file's own established
+    /// convention).
+    #[test]
+    fn native_capnet_limited_to_and_http_get_with_host_check() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io.net {\n\
+                   \x20   let root = cap_net_root()\n\
+                   \x20   print(root)\n\
+                   \x20   let a = root.limited_to(\"example.com\")\n\
+                   \x20   print(a)\n\
+                   \x20   print(a == a.limited_to(\"example.com\"))\n\
+                   \x20   match http_get_with(a, \"http://other.invalid/\") {\n\
+                   \x20       Ok(_) => print(\"unexpected ok\")\n\
+                   \x20       Err(e) => print(e)\n\
+                   \x20   }\n\
+                   }\n";
+        assert_eq!(
+            native_main_stdout(src, "capnet").trim(),
+            "<CapNet root>\n<CapNet limited_to \"example.com\">\ntrue\ncapability limited to `example.com`, cannot reach `other.invalid`"
         );
     }
 

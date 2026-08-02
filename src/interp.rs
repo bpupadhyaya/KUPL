@@ -2097,6 +2097,15 @@ impl Interp {
                     }
                     return http_builtin(name, &vals).map_err(|m| Self::panic_flow(m, span));
                 }
+                ("http_get_with", 2) => {
+                    let cap = self.eval(&args[0].value, env)?;
+                    let url = self.eval(&args[1].value, env)?;
+                    let Value::Str(url) = &url else {
+                        return Err(Self::panic_flow("http_get_with needs a Str url", span));
+                    };
+                    return http_get_with(&cap, url).map_err(|m| Self::panic_flow(m, span));
+                }
+                ("cap_net_root", 0) => return Ok(cap_net_root()),
                 ("re_match", 2) | ("re_find", 2) | ("re_find_all", 2) | ("re_replace", 3) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -3742,6 +3751,22 @@ pub fn shared_method(
                 Ok(Value::List(Rc::new(out)))
             }
             _ => Err("`chunk` needs a positive Int".into()),
+        },
+        // it116: attenuation narrows, never widens (CAPABILITIES.md §5's own
+        // open question, resolved here) -- an already-limited capability
+        // can only be narrowed to the SAME host again (a no-op) or refused;
+        // only an unrestricted (root) capability can be freshly limited.
+        (Value::CapNet(c), "limited_to") => match args.into_iter().next() {
+            Some(Value::Str(ref host)) => match &c.allowed_host {
+                None => Ok(Value::CapNet(Rc::new(crate::value::CapNetInner {
+                    allowed_host: Some((**host).clone()),
+                }))),
+                Some(h) if *h == **host => Ok(Value::CapNet(c.clone())),
+                Some(h) => Err(format!(
+                    "cannot widen a capability already limited to `{h}` to a different host `{host}`"
+                )),
+            },
+            _ => Err("`limited_to` needs a Str".into()),
         },
         (Value::Str(s), "len") => Ok(Value::Int(s.chars().count() as i64)),
         (Value::Str(s), "contains") => match args.into_iter().next() {
@@ -5568,6 +5593,61 @@ pub fn http_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     })
 }
 
+/// Extract the HOST portion of a URL (`scheme://host[:port][/path]`) --
+/// shared by `http_get_with`'s own host-scope check and MUST stay
+/// byte-identical to its native mirror (`cgen.rs`'s `k_url_host`).
+/// Deliberately simple string slicing, not a full URL parser: strips a
+/// leading `scheme://` if present, then stops at the first `/`, `?`, `#`,
+/// or `:` (port).
+pub fn url_host(url: &str) -> &str {
+    let after_scheme = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => url,
+    };
+    let end = after_scheme.find(['/', '?', '#', ':']).unwrap_or(after_scheme.len());
+    &after_scheme[..end]
+}
+
+/// `http_get_with(cap, url)` (it116) -- like `http_get(url)` but checks
+/// `url`'s host against `cap`'s own carried scope FIRST (CAPABILITIES.md
+/// §3.4 Option B: additive, `uses io.net` stays unchanged, capabilities
+/// narrow what an already-granted effect can reach, they don't replace
+/// the effect declaration). An unrestricted (root) capability allows any
+/// host, exactly like `http_get` always has. An out-of-scope host is an
+/// ordinary `Err` value (matching `http_get`'s own "unreachable host,
+/// non-2xx, ... " Result-of-failure style), not a panic.
+pub fn http_get_with(cap: &Value, url: &str) -> Result<Value, String> {
+    let Value::CapNet(c) = cap else {
+        return Err("http_get_with needs a CapNet".into());
+    };
+    if let Some(allowed) = &c.allowed_host {
+        let host = url_host(url);
+        if host != allowed {
+            return Ok(Value::err(Value::str(format!(
+                "capability limited to `{allowed}`, cannot reach `{host}`"
+            ))));
+        }
+    }
+    http_builtin("http_get", std::slice::from_ref(&Value::str(url.to_string())))
+}
+
+/// `cap_net_root()` (it116) -- the UNRESTRICTED root `CapNet` capability.
+///
+/// **NOT YET call-site-restricted -- a known, explicitly tracked v1 gap,
+/// not a silent omission (see `docs/GAPS.md`'s own capabilities entry).**
+/// `docs/design/CAPABILITIES.md` §3.2's own design calls for root
+/// capabilities to be seeded at EXACTLY one place (the composition root),
+/// so that "a capability is in scope" is a purely lexical, audit-by-
+/// reading-the-props property. This builtin does NOT yet enforce that --
+/// it is callable from anywhere today, the same as any other builtin. The
+/// VALUE/METHOD/builtin engine-wiring this iteration ships is real and
+/// fully tested; the "no ambient authority" security property is NOT yet
+/// real until a follow-up iteration restricts this call site to `fun
+/// main`'s own top-level body only.
+pub fn cap_net_root() -> Value {
+    Value::CapNet(Rc::new(crate::value::CapNetInner { allowed_host: None }))
+}
+
 /// Parse an HTTP request line (`METHOD PATH HTTP/1.1`) into (method, path).
 pub fn parse_request_line(head: &str) -> (String, String) {
     let line = head.lines().next().unwrap_or("");
@@ -6682,5 +6762,66 @@ mod format_tests {
         assert_eq!(int_to_radix(5, 2), "101");
         assert_eq!(int_to_radix(-255, 16), "-ff");
         assert_eq!(int_to_radix(0, 16), "0");
+    }
+}
+
+#[cfg(test)]
+mod capnet_tests {
+    use super::{cap_net_root, http_get_with, shared_method, url_host};
+    use crate::value::Value;
+
+    /// `url_host` MUST stay byte-identical to `cgen.rs`'s own `k_url_host`
+    /// C mirror -- it116's own host-scope check depends on both agreeing.
+    #[test]
+    fn url_host_strips_scheme_port_path_and_query() {
+        assert_eq!(url_host("https://api.example.com/todos"), "api.example.com");
+        assert_eq!(url_host("http://api.example.com:8080/path"), "api.example.com");
+        assert_eq!(url_host("http://example.com"), "example.com");
+        assert_eq!(url_host("example.com/no-scheme"), "example.com");
+        assert_eq!(url_host("http://example.com?q=1"), "example.com");
+        assert_eq!(url_host("http://example.com#frag"), "example.com");
+    }
+
+    #[test]
+    fn limited_to_narrows_a_root_capability_and_is_idempotent_on_the_same_host() {
+        let root = cap_net_root();
+        let mut call = |_: Value, _: Vec<Value>| -> Result<Value, String> { panic!("no callback expected") };
+        let limited = shared_method(&root, "limited_to", vec![Value::str("example.com")], &mut call)
+            .expect("limiting a root capability must succeed");
+        let Value::CapNet(c) = &limited else { panic!("must stay a CapNet") };
+        assert_eq!(c.allowed_host.as_deref(), Some("example.com"));
+
+        // re-limiting to the SAME host is a no-op success, not a widen error.
+        let again = shared_method(&limited, "limited_to", vec![Value::str("example.com")], &mut call)
+            .expect("re-limiting to the same host must succeed");
+        assert_eq!(again, limited);
+    }
+
+    #[test]
+    fn limited_to_refuses_to_widen_to_a_different_host() {
+        let root = cap_net_root();
+        let mut call = |_: Value, _: Vec<Value>| -> Result<Value, String> { panic!("no callback expected") };
+        let limited = shared_method(&root, "limited_to", vec![Value::str("example.com")], &mut call).unwrap();
+        let err = shared_method(&limited, "limited_to", vec![Value::str("other.com")], &mut call)
+            .expect_err("narrowing an already-limited capability to a DIFFERENT host must be refused");
+        assert!(err.contains("cannot widen"), "{err}");
+    }
+
+    #[test]
+    fn http_get_with_rejects_an_out_of_scope_host_without_ever_shelling_out() {
+        let root = cap_net_root();
+        let mut call = |_: Value, _: Vec<Value>| -> Result<Value, String> { panic!("no callback expected") };
+        let limited =
+            shared_method(&root, "limited_to", vec![Value::str("127.0.0.1")], &mut call).unwrap();
+        // A host mismatch must be caught BEFORE ever invoking `curl` -- this
+        // deliberately targets an address `curl` would refuse to connect to
+        // in this sandbox, so a passing result here proves the host-check
+        // short-circuited rather than merely happening to fail for a
+        // network reason.
+        let result = http_get_with(&limited, "http://example.invalid.test/").unwrap();
+        let Value::Ctor { ref variant, ref fields, .. } = result else { panic!("must be a Result value") };
+        assert_eq!(&**variant, "Err");
+        let Value::Str(msg) = &fields[0] else { panic!("Err payload must be a Str") };
+        assert!(msg.contains("capability limited to `127.0.0.1`"), "{msg}");
     }
 }

@@ -70,6 +70,9 @@ unless supervised.
 | `exec(program, args)` | `(Str, List[Str]) -> Result[Str, Str]` — **uses `io.proc`** | run a program (argv, no shell); `Ok` = stdout on exit 0 |
 | `http_get(url)` | `(Str) -> Result[Str, Str]` — **uses `io.net`** | GET via system curl; `Ok` = body |
 | `http_post(url, body)` | `(Str, Str) -> Result[Str, Str]` — **uses `io.net`** | POST via system curl |
+| `http_get_with(cap, url)` | `(CapNet, Str) -> Result[Str, Str]` — **uses `io.net`** | like `http_get`, but checks `url`'s host against `cap`'s own carried scope first (see Capabilities below) |
+| `cap_net_root()` | `() -> CapNet` | the unrestricted root network capability; **not yet call-site-restricted** — see Capabilities below |
+| `.limited_to(host)` on CapNet | `(Str) -> CapNet` | a NEW, narrower capability scoped to exactly that host; panics if already limited to a DIFFERENT host (narrows only, never widens) |
 | `http_serve(port, handler)` | `(Int, fn(Str, Str, Str) -> Str) -> Result[Unit, Str]` — **uses `io.net`** | blocking HTTP server; `handler(method, path, body)` -> response body (`body` is read via `Content-Length`, capped at 10MB; headers are not yet exposed) |
 | `re_match(pat, text)` | `(Str, Str) -> Bool` | regex search (`^…$` for full match) |
 | `re_find(pat, text)` | `(Str, Str) -> Option[Str]` | first match substring |
@@ -109,6 +112,19 @@ effect (a sub-effect of `io`). Error *message text* is platform-dependent — ma
 AI runtime uses) and carry the `io.net` effect. A non-2xx status or unreachable
 host is an ordinary `Err` (message text is platform-dependent). Compiles on the
 native backend too (via the system `curl`).
+
+**Capabilities** (`CapNet`, it116): an opaque, non-user-constructible runtime
+value naming an allowed scope for `io.net` — see `docs/design/CAPABILITIES.md`
+for the full design. `cap_net_root()` returns the unrestricted root;
+`.limited_to(host)` narrows it (never widens — narrowing an already-limited
+capability to a DIFFERENT host panics); `http_get_with(cap, url)` checks
+`url`'s host against `cap`'s own scope BEFORE any network I/O, returning an
+ordinary `Err` (not a panic) on a mismatch. Capabilities are ADDITIVE, not a
+replacement for effects: `uses io.net` is still required on any function
+calling `http_get_with`, exactly as for `http_get`. **Known gap**:
+`cap_net_root()` is not yet restricted to `fun main`'s own top-level body, so
+this is not yet a genuine "no ambient authority" security boundary — see
+`docs/GAPS.md`.
 
 **Regex** (`re_*`) is a pure, self-contained engine: literals, `.`, `* + ?`
 (greedy), classes `[a-z]`/`[^…]`, `\d \w \s` (+ `\D \W \S`), anchors

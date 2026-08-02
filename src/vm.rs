@@ -52,6 +52,8 @@ fn builtin_argc(which: u8) -> Option<u8> {
         BUILTIN_RANDOM_FLOATS => 2,
         BUILTIN_SHUFFLE => 2,
         BUILTIN_HTTP_GET => 1,
+        BUILTIN_HTTP_GET_WITH => 2,
+        BUILTIN_CAP_NET_ROOT => 0,
         BUILTIN_HTTP_POST => 2,
         BUILTIN_RE_MATCH => 2,
         BUILTIN_RE_FIND => 2,
@@ -1245,6 +1247,16 @@ impl<'m> Vm<'m> {
                                 Err(msg) => return Err(VmError { msg, span }),
                             }
                         }
+                        BUILTIN_HTTP_GET_WITH => {
+                            let Value::Str(url) = &args[1] else {
+                                return Err(VmError { msg: "http_get_with needs a Str url".into(), span });
+                            };
+                            match crate::interp::http_get_with(&args[0], url) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
+                        BUILTIN_CAP_NET_ROOT => set!(dst, crate::interp::cap_net_root()),
                         BUILTIN_RE_MATCH | BUILTIN_RE_FIND | BUILTIN_RE_FIND_ALL
                         | BUILTIN_RE_REPLACE => {
                             let name = match which {
@@ -10407,7 +10419,16 @@ fun probe() -> Str {
         // alignment, three-way diff, and shared-pattern detection across three sources; a backend whose triple
         // head-match, three-way max branch, or empty base was off would mis-measure. Extends the two-string LCS
         // to a three-dimensional common-subsequence DP.
-        let src = r#"fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+        // it116 stack-margin regression (the it109 lesson recurring, see
+        // `diff_collatz_step_count`'s own comment for the full mechanism):
+        // this test's THREE-WAY exponential branching on a mismatch was
+        // already a deep/wide call tree; the SAME `eval_call` match growth
+        // that tipped collatz over also tips this one -- confirmed via
+        // `git stash`. Fixed the same way: a big-stack thread.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = r#"fun maxi(a: Int, b: Int) -> Int { if a > b { a } else { b } }
 fun lcs3(a: List[Str], b: List[Str], c: List[Str]) -> Int {
     if a.len() == 0 { 0 }
     else {
@@ -10437,7 +10458,11 @@ fun probe() -> Str {
     "a={a}|geeks={b}|same={c}|none={d}|empty={e}"
 }
 "#;
-        assert_eq!(differential(src), "a=3|geeks=5|same=3|none=0|empty=0");
+                assert_eq!(differential(src), "a=3|geeks=5|same=3|none=0|empty=0");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -13069,7 +13094,21 @@ fun probe() -> Str {
         // stops the recursion, and that the two witnessed trajectories (6->8, 7->16) reach 1 in exactly the
         // right number of steps. This is the canonical hailstone/Collatz an AI writes; a backend whose parity
         // test or accumulator was off would report a wrong step count or fail to terminate.
-        let src = r#"fun collatz(n: Int, steps: Int) -> Int {
+        //
+        // it116 stack-margin regression (the it109 lesson recurring): adding
+        // the `http_get_with`/`cap_net_root` match arms to `eval_call`
+        // (interp.rs) grew that already-large match's own per-call stack
+        // frame in this DEBUG build just enough to tip even this modest
+        // (16-frame) depth over the 2MB default test-thread stack --
+        // confirmed via `git stash` (passes cleanly on pre-it116 code,
+        // reproducibly overflows after). Fixed the SAME way
+        // `diff_mutual_recursion`/`diff_ackermann_nonprimitive_recursion`
+        // already do: run on a big-stack thread instead of shrinking the
+        // test's own already-tiny depth.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = r#"fun collatz(n: Int, steps: Int) -> Int {
     if n <= 1 { steps }
     else {
         if n % 2 == 0 { collatz(n / 2, steps + 1) }
@@ -13084,7 +13123,11 @@ fun probe() -> Str {
     "c1={s1}|c6={s6}|c7={s7}"
 }
 "#;
-        assert_eq!(differential(src), "c1=0|c6=8|c7=16");
+                assert_eq!(differential(src), "c1=0|c6=8|c7=16");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -19143,6 +19186,32 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
         assert_eq!(
             differential("fun probe() -> Str { \"{[1, 2, 3].chunk(0)}\" }\n"),
             "panic: `chunk` needs a positive Int"
+        );
+    }
+
+    #[test]
+    fn diff_capnet_limited_to_and_http_get_with_host_check() {
+        // it116: capability creation, narrowing (idempotent on the SAME
+        // host), the narrow-never-widen panic, and `http_get_with`'s
+        // host-scope check (short-circuits BEFORE any network I/O, so this
+        // stays deterministic and safe to run in this differential suite)
+        // — all identical on interp and KVM.
+        let src = "fun probe() -> Str {\n    let root = cap_net_root()\n    \
+                   let a = root.limited_to(\"example.com\")\n    \
+                   let b = a.limited_to(\"example.com\")\n    \
+                   let blocked = match http_get_with(a, \"http://other.invalid/\") {\n        \
+                   Ok(_) => \"ok\"\n        Err(e) => e\n    }\n    \
+                   \"{root}|{a}|{a == b}|{blocked}\"\n}\n";
+        assert_eq!(
+            differential(src),
+            "<CapNet root>|<CapNet limited_to \"example.com\">|true|capability limited to `example.com`, cannot reach `other.invalid`"
+        );
+        // widening an already-limited capability panics identically.
+        let widen_src = "fun probe() -> Str {\n    let a = cap_net_root().limited_to(\"example.com\")\n    \
+                          \"{a.limited_to(\"other.com\")}\"\n}\n";
+        assert_eq!(
+            differential(widen_src),
+            "panic: cannot widen a capability already limited to `example.com` to a different host `other.com`"
         );
     }
 

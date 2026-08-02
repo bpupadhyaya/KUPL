@@ -580,8 +580,8 @@ const BUILTIN_METHODS: &[&str] = &[
 /// suggestions on an unknown name (K0240). Suggestion-only and best-effort — same discipline as
 /// BUILTIN_METHODS: a missing entry only costs a hint, never changes resolution (PR-it249).
 const BUILTIN_FUNS: &[&str] = &[
-    "append_file", "arange", "args", "big", "cosine_similarity", "dec", "delete_file", "env_var",
-    "exec", "file_exists", "http_get", "http_post", "http_serve", "json_parse", "json_stringify",
+    "append_file", "arange", "args", "big", "cap_net_root", "cosine_similarity", "dec", "delete_file", "env_var",
+    "exec", "file_exists", "http_get", "http_get_with", "http_post", "http_serve", "json_parse", "json_stringify",
     "list_dir", "make_dir", "panic", "path_base", "path_dir", "path_ext", "path_join", "print",
     "random_floats", "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace",
     "read_all", "read_file", "read_line", "remove_dir", "shuffle", "tensor", "text_embed",
@@ -608,10 +608,10 @@ const BUILTIN_FUNS: &[&str] = &[
 /// below handles, since it's used to decide whether a wrong-arity call
 /// gets a real arity diagnostic at all, not just a best-effort hint.
 const BUILTIN_CALL_NAMES: &[&str] = &[
-    "append_file", "arange", "args", "big", "cosine_similarity", "csv_parse", "csv_stringify", "date_iso",
+    "append_file", "arange", "args", "big", "cap_net_root", "cosine_similarity", "csv_parse", "csv_stringify", "date_iso",
     "date_make", "day_of", "dec", "delete_file", "env_var", "eprint", "Err", "exec", "exit",
     "file_exists", "format_time", "hash_fnv", "hex_decode", "hex_encode", "hmac_sha256",
-    "hour_of", "http_get", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
+    "hour_of", "http_get", "http_get_with", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
     "log_debug", "log_error", "log_info", "log_warn",
     "make_dir", "Map", "minute_of", "month_of", "now", "Ok", "panic", "parse_iso",
     "path_base", "path_dir", "path_ext", "path_join", "print", "query_build", "query_parse",
@@ -1367,6 +1367,7 @@ impl Checker {
                 "f32" => Ty::F32,
                 "BigInt" => Ty::BigInt,
                 "Rational" => Ty::Rational,
+                "CapNet" => Ty::CapNet,
                 _ if crate::value::IntW::from_name(n.as_str()).is_some() => {
                     Ty::IntW(crate::value::IntW::from_name(n.as_str()).unwrap())
                 }
@@ -1385,7 +1386,7 @@ impl Checker {
                             let builtins = [
                                 "Int", "Float", "Str", "Bool", "Unit", "List", "Map", "Set",
                                 "Option", "Result", "Json", "Tensor", "BigInt", "Rational",
-                                "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32",
+                                "CapNet", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32",
                             ]
                             .into_iter();
                             let cands = self
@@ -3612,6 +3613,14 @@ impl Checker {
                     self.unify(&Ty::Str, &b, args[1].value.span, "http_post body");
                     return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
                 }
+                ("http_get_with", 2) => {
+                    let c = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::CapNet, &c, args[0].value.span, "http_get_with cap");
+                    let u = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&Ty::Str, &u, args[1].value.span, "http_get_with url");
+                    return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
+                ("cap_net_root", 0) => return Ty::CapNet,
                 ("http_serve", 2) => {
                     let p = self.infer_expr(&args[0].value, ctx);
                     self.unify(&Ty::Int, &p, args[0].value.span, "http_serve port");
@@ -4581,6 +4590,12 @@ impl Checker {
                 );
                 return self.uni.fresh();
             }
+            // it116: attenuation is an ordinary method returning a NEW,
+            // narrower capability of the same type (see
+            // `docs/design/CAPABILITIES.md` §3.3) -- runtime enforces the
+            // "narrow, never widen" invariant (`shared_method`'s own
+            // `limited_to` arm), not the type checker.
+            (Ty::CapNet, "limited_to") => Some((vec![Ty::Str], Ty::CapNet)),
             _ => None,
         };
 

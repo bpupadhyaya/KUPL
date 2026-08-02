@@ -293,6 +293,8 @@ pub const BUILTIN_LOG_ERROR: u8 = 71;
 pub const BUILTIN_DEC: u8 = 72;
 pub const BUILTIN_TEXT_EMBED: u8 = 73;
 pub const BUILTIN_COSINE_SIMILARITY: u8 = 74;
+pub const BUILTIN_HTTP_GET_WITH: u8 = 75;
+pub const BUILTIN_CAP_NET_ROOT: u8 = 76;
 
 /// Every identifier that `eval_call` (interp.rs) / `call()` (compile.rs)
 /// special-case as a builtin call FORM (`name(args...)` bare-call syntax) --
@@ -331,7 +333,7 @@ pub const BUILTIN_CALL_NAMES: &[&str] = &[
     "date_make", "now", "base64_encode", "base64_decode", "hex_encode", "hex_decode",
     "hash_fnv", "sha256", "hmac_sha256", "log_debug", "log_info", "log_warn", "log_error",
     "csv_parse", "csv_stringify", "url_encode", "url_decode", "query_parse", "query_build",
-    "text_embed", "cosine_similarity",
+    "text_embed", "cosine_similarity", "http_get_with", "cap_net_root",
 ];
 
 impl Module {

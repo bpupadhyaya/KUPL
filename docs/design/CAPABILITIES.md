@@ -1,4 +1,4 @@
-# Capabilities as attenuable values — design sketch
+# Capabilities as attenuable values — design sketch + Cap.Net first slice
 
 v0.1 (it112) — a bounded design deliverable, not an implementation. Addresses
 `docs/design/LANGUAGE.md` §2's own long-standing claim ("effects are backed by
@@ -10,6 +10,16 @@ iterations (it109–it111) deferring the question in favor of more concretely
 scoped work, this iteration commits to writing down what implementing it
 would actually require — so the NEXT iteration that picks this up (if any)
 starts from a real plan instead of re-deriving one.
+
+**UPDATE (it116): the recommended Cap.Net-only first slice (§4 below) is now
+IMPLEMENTED** — `CapNet` (a flat type name, NOT the dotted `Cap.Net` this
+sketch originally used; see the it116 correction in §5), `.limited_to(host)`,
+and `http_get_with(cap, url)`, wired across all three engines
+(interp/KVM/native), with real tests. **One deliberate, explicitly tracked
+gap remains: root-seeding is NOT YET restricted to `fun main`'s own top-level
+body** — `cap_net_root()` is callable from anywhere today, so this is real,
+fully-tested engine plumbing, not yet a genuine security boundary. See
+`docs/GAPS.md`'s own capabilities entry for the exact status.
 
 ## 1. What exists today (verified live, not assumed)
 
@@ -231,9 +241,9 @@ to anticipate this needs staging the way `Decimal`'s native port did —
 capability VALUES carry no arbitrary-precision arithmetic, just a tag plus
 a small enum payload.
 
-## 4. Recommended first slice, if picked up
+## 4. Recommended first slice, if picked up — **IMPLEMENTED (it116)**
 
-Ship exactly ONE capability kind first — `Cap.Net`/`http_get_with`/
+Ship exactly ONE capability kind first — `CapNet`/`http_get_with`/
 `limited_to(host)` — rather than the full `Cap.Sql`/`Cap.Fs`/`Cap.Http`
 family LANGUAGE.md's own examples show. Network access is the highest-value,
 most security-relevant case for AI-generated code specifically (arbitrary
@@ -244,25 +254,73 @@ the shape for every other kind. This mirrors `par{}`'s own it99→it101
 staged rollout and `sha256`/`hmac_sha256`'s own "ship the smallest complete
 slice, generalize later" precedent.
 
+**What shipped:** `Value::CapNet`/`Ty::CapNet` across all 6 files
+(`bytecode.rs`/`compile.rs`/`check.rs`/`interp.rs`/`vm.rs`/`cgen.rs`),
+`.limited_to(host: Str) -> CapNet` (via the SHARED `shared_method`
+dispatch, so interp/KVM get it from ONE implementation; `cgen.rs`'s
+`k_method` mirrors it), `http_get_with(cap, url) -> Result[Str, Str]`
+(host-checked via a `url_host` helper that MUST stay byte-identical
+between `interp.rs` and `cgen.rs`'s own `k_url_host` C mirror — both
+simple string slicing, no full URL parser), and `cap_net_root() -> CapNet`
+(the unrestricted root, **not yet call-site-restricted** — see §5's new
+open question). Unlike `Char`/`Decimal` (each staged native into a
+FOLLOW-UP iteration), native support shipped in the SAME iteration —
+`http_get`/`http_post` already shell out to the system `curl` binary on
+every engine (confirmed live, not the hand-rolled raw-socket client this
+sketch's own §3.6 might have implied), so the host-check needed only
+string-level URL parsing, no new C networking code.
+
+A REAL cross-engine bug caught before it shipped: `types.rs`'s own
+`Unifier::unify` had NO arm for `(Ty::CapNet, Ty::CapNet)`, silently
+falling through to its catch-all mismatch case — `Ty::CapNet` and a
+hypothetical `Ty::Named("CapNet", [])` would have printed IDENTICALLY in
+a `K0200` diagnostic ("expected CapNet, found CapNet"), which is exactly
+what surfaced it: unifying two values that were BOTH genuinely
+`Ty::CapNet` still failed, live-caught via a debug print showing the
+`Debug`-formatted (not just `Display`-formatted) type before fixing it.
+The exact same class of bug as PR-it1180 (`value.rs`'s own `Value::Fun`
+equality gap, documented in that file) — a new variant added to a type
+needs EVERY relevant match updated, not just the ones a compiler error
+happens to force.
+
 ## 5. Open questions this sketch does NOT resolve
 
-- Exact type namespace/naming (`Cap.Net` vs `net.Cap` vs something else) —
-  needs to fit whatever the eventual module/namespace story looks like.
-- Whether `Cap.*` should be prelude-injected like `Json` (available with no
-  import) or require an explicit `use` — leaning prelude-injected, to match
-  `Json`'s own precedent, but not decided.
-- Whether attenuation should be allowed to WIDEN (a bug, should be
-  impossible by construction) — `limited_to`/`read_only`-style methods
-  should be designed so every attenuation method's own return type can only
-  narrow, never widen, the scope it's called on; this needs to be an
-  explicit invariant the method implementations enforce, not just a
-  naming convention.
+- ~~Exact type namespace/naming~~ **RESOLVED (it116): a FLAT name, `CapNet`,
+  not `Cap.Net`.** it114 discovered a real blocker beyond what this sketch
+  anticipated: `parser.rs::parse_ty_inner` only accepts a plain `Ident` for a
+  type reference — there is NO dotted-type-path grammar anywhere in KUPL
+  today, and it115 confirmed the module/`use` system has no independent need
+  for one either (it flattens every imported file's declarations into one
+  global namespace). Rather than build dotted-type-path parsing with no
+  consumer besides this one feature, `CapNet` follows `BigInt`/`Decimal`'s
+  own existing flat-name precedent — zero grammar work needed.
+- ~~Whether `Cap.*` should be prelude-injected~~ **RESOLVED as moot by the
+  flat-name decision above**: `CapNet` is a builtin type name recognized
+  directly by `check.rs::resolve_ty` (like `Int`/`Str`/`Decimal`), needing no
+  `use` and no prelude-injection mechanism at all.
+- ~~Whether attenuation should be allowed to WIDEN~~ **RESOLVED (it116): no.**
+  `.limited_to(host)` on an unrestricted (root) capability narrows to
+  `Some(host)`; called again with the SAME host it's a no-op success;
+  called with a DIFFERENT host on an already-limited capability it panics
+  ("cannot widen a capability already limited to `X` to a different host
+  `Y`") — enforced at the point of use (`interp.rs`'s `shared_method`,
+  `cgen.rs`'s `k_method`), not just a naming convention.
 - Whether a contract's own effect budget (K0264) should be extended to also
   express a capability-scope budget (e.g. "any fulfilling implementation's
   `net` prop must be `limited_to` this host or narrower") — a natural
   follow-on question once a first slice exists, not a v1 requirement.
+  STILL OPEN as of it116.
 - How this interacts with `ai fun tools [...]` — an AI-selected tool
   function that itself requires a capability-typed prop would need that
   capability already bound at DEFINITION time (props are supplied at
   construction, not at call time), which should already just work given
   the existing prop model, but wasn't verified live as part of this sketch.
+  STILL OPEN as of it116.
+- **NEW (it116): root-seeding enforcement.** `cap_net_root()` is a plain
+  builtin, callable from anywhere — §3.2's own "seeded at exactly one place"
+  invariant is NOT YET enforced. The mechanism this sketch recommends (a
+  static check.rs check restricting this ONE builtin's call site to `fun
+  main`'s own top-level body, not any transitive callee or nested closure)
+  is a bounded, well-scoped follow-up — the type/method/builtin engine
+  plumbing this slice ships is unaffected by how that check eventually
+  gets added.

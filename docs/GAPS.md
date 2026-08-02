@@ -911,20 +911,24 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       clamp/is_nan/is_infinite); Map (is_empty/get_or/merge/map_values); Set
       (is_empty/is_subset)
 - [ ] System tier: ownership, `low`/`asm` (design §6; audit #4)
-- [ ] Capabilities as attenuable values (`cap.Http.limited_to(…)`) — design
-      sketch written (it112, `docs/design/CAPABILITIES.md`; corrected it113):
-      `requires` actually already parses (a full syntactic alias for `prop`
-      since the project's first commit — it112's "no grammar production"
-      claim was wrong, caught by live-testing rather than trusting a `grep`
-      survey), but effects are still 100% static/syntactic with zero runtime
-      capability objects, and no `cap` namespace/type exists; recommends an
-      ADDITIVE layer (existing `uses io.net` unchanged, new capability-typed
-      props + `_with`-suffixed builtin variants) over collapsing effects
-      into capabilities, root capabilities injected at `fun main`/the entry
-      point rather than as an app prop (top-level apps can't take
-      CLI-supplied props — a second it113 correction), and a Cap.Net-only
-      first slice if picked up. Not implemented — a bounded design
-      deliverable, not code.
+- [◐] **Capabilities as attenuable values (`CapNet.limited_to(…)`)** — design
+      sketch (it112, `docs/design/CAPABILITIES.md`; corrected it113/it114/
+      it115) implemented as a real Cap.Net-only first slice (it116):
+      `CapNet` (a flat builtin type name, not the sketch's original dotted
+      `Cap.Net` — no dotted-type-path grammar exists in KUPL, and it115
+      confirmed the module system doesn't need one either), `.limited_to
+      (host: Str) -> CapNet` (narrows only — widening an already-limited
+      capability to a different host panics), `http_get_with(cap, url)`
+      (host-checked BEFORE any network I/O; existing `http_get(url)`
+      unchanged), and `cap_net_root() -> CapNet` — all wired across
+      interp/KVM/native in the SAME iteration (`examples/capabilities.kupl`).
+      **Remaining, explicitly tracked gap: root-seeding is NOT restricted
+      to `fun main`'s own top-level body** — `cap_net_root()` is callable
+      from anywhere today, so effects/props still provide the real
+      boundary-explicitness guarantee; this is real, fully-tested engine
+      plumbing, not yet a genuine "no ambient authority" security boundary.
+      A static check restricting that one builtin's call site is the
+      well-scoped remaining piece.
 
 ## Tier 4 — ecosystem
 
