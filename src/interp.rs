@@ -1469,6 +1469,7 @@ impl Interp {
             ExprKind::F32(v) => Ok(Value::F32(*v)),
             ExprKind::Float(v) => Ok(Value::Float(*v)),
             ExprKind::Bool(v) => Ok(Value::Bool(*v)),
+            ExprKind::Char(c) => Ok(Value::Char(*c)),
             ExprKind::Unit => Ok(Value::Unit),
             ExprKind::Str(pieces) => {
                 let mut out = String::new();
@@ -2793,6 +2794,18 @@ pub fn raw_binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             Gt => Ok(Value::Bool(a > b)),
             Ge => Ok(Value::Bool(a >= b)),
             _ => Err("invalid string operation".into()),
+        },
+        // `Char` is ordered by codepoint (Rust's own `char: Ord` already
+        // implements exactly this) but deliberately has no `Add` -- unlike
+        // `Str`, concatenating two single characters isn't a meaningful
+        // "arithmetic" operation on the type itself (use `to_str(a) +
+        // to_str(b)` to build a `Str` from two `Char`s).
+        (Value::Char(a), Value::Char(b)) => match op {
+            Lt => Ok(Value::Bool(a < b)),
+            Le => Ok(Value::Bool(a <= b)),
+            Gt => Ok(Value::Bool(a > b)),
+            Ge => Ok(Value::Bool(a >= b)),
+            _ => Err("invalid char operation".into()),
         },
         _ => Err(format!(
             "invalid operand types: {} and {}",

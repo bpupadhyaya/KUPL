@@ -281,6 +281,10 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     Str(Rc<String>),
+    /// A single Unicode scalar value (`'a'`) -- Rust's own `char` is a
+    /// perfect fit (already a validated Unicode scalar value, `Copy`, 4
+    /// bytes, no allocation needed).
+    Char(char),
     Unit,
     List(Rc<Vec<Value>>),
     /// ADT value: `Ctor { ty: "Shape", variant: "Circle", fields: [1.5] }`.
@@ -451,6 +455,7 @@ impl Value {
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "Str".into(),
+            Value::Char(_) => "Char".into(),
             Value::Unit => "Unit".into(),
             Value::List(_) => "List".into(),
             // demangled for display -- see the Display impl's Ctor arm below.
@@ -612,6 +617,11 @@ impl PartialEq for Value {
                     }
                 }
                 (Value::Str(x), Value::Str(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::Char(x), Value::Char(y)) => {
                     if x != y {
                         return false;
                     }
@@ -1006,6 +1016,16 @@ impl fmt::Display for Value {
                     write!(f, "\"{s}\"")?;
                     continue;
                 }
+                // Mirrors `Str`'s own quoting convention (single quotes,
+                // matching the `'a'` literal syntax) -- nested inside a
+                // `List`/`Ctor`/`Map`/`Set` a `Char` renders quoted (so
+                // `['a', 'b']` round-trips visually as source), but bare at
+                // the top level (`print('a')` shows `a`, matching `Str`'s
+                // own bare-at-top-level convention exactly).
+                DisplayItem::QuotedVal(Value::Char(c)) => {
+                    write!(f, "'{c}'")?;
+                    continue;
+                }
                 DisplayItem::QuotedVal(v) | DisplayItem::Val(v) => v,
             };
             match v {
@@ -1029,6 +1049,7 @@ impl fmt::Display for Value {
                 }
                 Value::Bool(x) => write!(f, "{x}")?,
                 Value::Str(s) => write!(f, "{s}")?,
+                Value::Char(c) => write!(f, "{c}")?,
                 Value::Unit => write!(f, "()")?,
                 Value::List(items) => {
                     stack.push(DisplayItem::Str("]"));

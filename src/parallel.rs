@@ -38,6 +38,7 @@ pub enum PortableValue {
     Float(f64),
     Bool(bool),
     Str(String),
+    Char(char),
     Unit,
     List(Vec<PortableValue>),
     Ctor { ty: String, variant: String, fields: Vec<PortableValue> },
@@ -85,6 +86,7 @@ pub fn to_portable(v: &Value) -> Option<PortableValue> {
                 Value::Float(f) => results.push(PortableValue::Float(*f)),
                 Value::Bool(b) => results.push(PortableValue::Bool(*b)),
                 Value::Str(s) => results.push(PortableValue::Str((**s).clone())),
+                Value::Char(c) => results.push(PortableValue::Char(*c)),
                 Value::Unit => results.push(PortableValue::Unit),
                 Value::List(xs) => {
                     stack.push(Frame::BuildList(xs.len()));
@@ -171,6 +173,7 @@ pub fn from_portable(p: &PortableValue) -> Value {
                 PortableValue::Float(f) => results.push(Value::Float(*f)),
                 PortableValue::Bool(b) => results.push(Value::Bool(*b)),
                 PortableValue::Str(s) => results.push(Value::Str(Rc::new(s.clone()))),
+                PortableValue::Char(c) => results.push(Value::Char(*c)),
                 PortableValue::Unit => results.push(Value::Unit),
                 PortableValue::List(xs) => {
                     stack.push(Frame::BuildList(xs.len()));

@@ -3416,6 +3416,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `Char` (it105: a single Unicode scalar value, `'a'`) is a NEW literal
+    /// syntax with no fallback path -- unlike `par{}`'s always-correct
+    /// sequential fallback, if `compile.rs`/the VM disagreed with the
+    /// interpreter here it would be a silent wrong-answer bug, not a crash.
+    /// Drives the REAL compiled binary on both engines and asserts
+    /// byte-identical stdout: comparisons, ordering, equality, and display
+    /// (bare at top level, single-quoted when nested inside a `List`) all
+    /// exercise the SAME shared `raw_binary_op`/`Value::PartialEq`/`Display`
+    /// code paths interp.rs and vm.rs both go through.
+    #[test]
+    fn char_literal_output_is_identical_on_interp_and_vm() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-char-parity-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("char_parity.kupl");
+        std::fs::write(
+            &file,
+            "fun main() {\n\
+             \x20   let a = 'a'\n\
+             \x20   let b = 'b'\n\
+             \x20   print(a)\n\
+             \x20   print(a == 'a')\n\
+             \x20   print(a == b)\n\
+             \x20   print(a < b)\n\
+             \x20   print(a > b)\n\
+             \x20   print(['a', 'b', 'c'])\n\
+             \x20   print('\\n' == '\\n')\n\
+             }\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert!(interp.status.success(), "interp: {interp:?}");
+        assert!(vm.status.success(), "vm: {vm:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&interp.stdout),
+            String::from_utf8_lossy(&vm.stdout),
+            "interp/vm must produce byte-identical output for Char literals"
+        );
+        let out = String::from_utf8_lossy(&interp.stdout);
+        assert!(out.contains("['a', 'b', 'c']"), "Char must display single-quoted when nested: {out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A NEW opt-in CLI safety net (production-hardening: KUPL production-
     /// readiness phase 1): `--timeout=<seconds>` kills a runaway `kupl run`/
     /// `kupl run --vm` process with a clean `K0901` diagnostic and exit code

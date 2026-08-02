@@ -55,6 +55,14 @@ change and the release process.
   type-checker feature — KUPL's generics are dynamically typed at runtime,
   so no engine's own execution changed). See
   `docs/reference/LANGUAGE-REFERENCE.md` §3.
+- `Char`: a single Unicode scalar value literal (`'a'`, `'\n'`, `'π'`),
+  ordered by codepoint (comparisons, `.sort()`, `.min()`/`.max()`, and
+  the `[T: Ord]` bound all support it); no `Add` — use
+  `to_str(a) + to_str(b)` to build a `Str` from two `Char`s. New lexer
+  diagnostics `K0011`/`K0012`/`K0013`. Byte-identical across the
+  interpreter, `kupl run --vm`, `.kx` build/run, and `kupl bundle`;
+  `kupl native` does not yet support `Char` literals and reports a clean,
+  explicit error rather than compiling or crashing.
 
 ## [1.0.0-alpha]
 

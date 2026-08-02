@@ -122,6 +122,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'"' => self.lex_string(),
+                b'\'' => self.lex_char(),
                 b'0'..=b'9' => self.lex_number(),
                 b'A'..=b'Z' | b'a'..=b'z' | b'_' => self.lex_ident(),
                 _ if b >= 0x80 => self.lex_ident(), // permit non-ASCII identifiers
@@ -720,6 +721,120 @@ impl<'a> Lexer<'a> {
         self.push(Tok::Str(parts), start);
     }
 
+    /// `'a'` — a single Unicode scalar value (`Char`). Deliberately no
+    /// interpolation (unlike `Str`, a `Char` literal can never contain a
+    /// nested `{expr}`), so this is much simpler than `lex_string` -- no
+    /// `parts`/`StrPart` accumulation, just one logical character. NUL
+    /// (`\0`) is a VALID escape here, unlike a string literal's own K0008
+    /// restriction -- that restriction exists because `Str` maps to a
+    /// NUL-terminated native `char*`, which doesn't apply to a `Char`
+    /// (a raw scalar codepoint value on every engine, never a buffer).
+    ///
+    /// ALWAYS pushes a `Tok::CharLit` -- even on error, with `\u{fffd}`
+    /// (the standard Unicode replacement character) as a recovery
+    /// placeholder -- mirroring `lex_string`'s own established discipline
+    /// of unconditionally pushing `Tok::Str(parts)` at the end regardless
+    /// of what went wrong along the way. Live-confirmed this matters: an
+    /// early version of this function `return`ed with no token on error,
+    /// which left the PARSER with nothing where an expression was
+    /// expected, cascading a second, confusing "expected an expression,
+    /// found `}`" diagnostic on top of the real one for every one of the
+    /// four error cases below.
+    fn lex_char(&mut self) {
+        let start = self.pos;
+        self.bump(); // opening quote
+        let first = match self.bump() {
+            None | Some(b'\n') => {
+                self.diags.push(Diag::error("K0011", "unterminated char literal", self.span_from(start)));
+                self.push(Tok::CharLit('\u{fffd}'), start);
+                return;
+            }
+            Some(b'\'') => {
+                self.diags.push(Diag::error(
+                    "K0013",
+                    "a char literal must contain exactly one character (found none) -- use \"\" for an empty string",
+                    self.span_from(start),
+                ));
+                self.push(Tok::CharLit('\u{fffd}'), start);
+                return;
+            }
+            Some(b'\\') => {
+                let esc_start = self.pos - 1;
+                match self.bump() {
+                    Some(b'n') => '\n',
+                    Some(b't') => '\t',
+                    Some(b'r') => '\r',
+                    Some(b'\\') => '\\',
+                    Some(b'\'') => '\'',
+                    Some(b'0') => '\0',
+                    None => '\u{fffd}', // EOF right after `\` -- the closing-quote check below reports K0011
+                    Some(c) => {
+                        let ch = if c >= 0x80 {
+                            let ch_start = self.pos - 1;
+                            let ch = self.src[ch_start..].chars().next().unwrap_or('\u{fffd}');
+                            self.pos = ch_start + ch.len_utf8();
+                            ch
+                        } else {
+                            c as char
+                        };
+                        self.diags.push(Diag::error(
+                            "K0012",
+                            format!(
+                                "unknown escape sequence `\\{ch}` in a char literal — the valid escapes are \
+                                 `\\n`, `\\t`, `\\r`, `\\\\`, `\\'`, and `\\0`"
+                            ),
+                            self.span_from(esc_start),
+                        ));
+                        '\u{fffd}'
+                    }
+                }
+            }
+            Some(b) if b < 0x80 => b as char,
+            Some(_) => {
+                let ch_start = self.pos - 1;
+                let ch = self.src[ch_start..].chars().next().unwrap_or('\u{fffd}');
+                self.pos = ch_start + ch.len_utf8();
+                ch
+            }
+        };
+        match self.bump() {
+            Some(b'\'') => {
+                self.push(Tok::CharLit(first), start);
+            }
+            None | Some(b'\n') => {
+                self.diags.push(Diag::error("K0011", "unterminated char literal", self.span_from(start)));
+                self.push(Tok::CharLit(first), start);
+            }
+            Some(_) => {
+                // More than one character before the closing quote. Un-
+                // consume the byte just read and scan ahead byte-by-byte
+                // (safe even across a multi-byte UTF-8 character: its
+                // continuation bytes are always >= 0x80, so they can never
+                // collide with the ASCII `'`/`\n` bytes being searched for)
+                // for the real closing quote or a newline, so this reports
+                // ONE clean diagnostic instead of a cascade of confusing
+                // "expected X, found Y" parser noise from treating the
+                // extra content as separate tokens.
+                self.pos -= 1;
+                while let Some(b) = self.peek() {
+                    if b == b'\n' {
+                        break;
+                    }
+                    self.bump();
+                    if b == b'\'' {
+                        break;
+                    }
+                }
+                self.diags.push(Diag::error(
+                    "K0013",
+                    "a char literal must contain exactly one character — use a Str (\"...\") for more than one",
+                    self.span_from(start),
+                ));
+                self.push(Tok::CharLit(first), start);
+            }
+        }
+    }
+
     fn lex_operator(&mut self) {
         let start = self.pos;
         let b = self.bump().unwrap();
@@ -910,6 +1025,55 @@ mod tests {
         assert_eq!(kinds("10f32"), vec![Tok::F32Lit(10.0), Tok::Newline, Tok::Eof]);
         // bare float is still Float
         assert_eq!(kinds("1.5"), vec![Tok::Float(1.5), Tok::Newline, Tok::Eof]);
+    }
+
+    /// `Char` literals (universal-language enrichment campaign, it105): a
+    /// plain ASCII char, every supported escape, a multi-byte UTF-8
+    /// character (both bare and escaped-lead-byte forms), and NUL (`\0`,
+    /// deliberately VALID here unlike a string literal's own K0008
+    /// restriction -- see `lex_char`'s own doc comment for why).
+    #[test]
+    fn char_literals() {
+        assert_eq!(kinds("'a'"), vec![Tok::CharLit('a'), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds(r"'\n'"), vec![Tok::CharLit('\n'), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds(r"'\t'"), vec![Tok::CharLit('\t'), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds(r"'\r'"), vec![Tok::CharLit('\r'), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds(r"'\\'"), vec![Tok::CharLit('\\'), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds(r"'\''"), vec![Tok::CharLit('\''), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds(r"'\0'"), vec![Tok::CharLit('\0'), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("'π'"), vec![Tok::CharLit('π'), Tok::Newline, Tok::Eof]);
+        assert_eq!(kinds("'😀'"), vec![Tok::CharLit('😀'), Tok::Newline, Tok::Eof]);
+        // `"` inside a char literal needs no escaping (it's not the
+        // delimiter here) -- the mirror image of `'` not needing escaping
+        // inside a STRING literal.
+        assert_eq!(kinds(r#"'"'"#), vec![Tok::CharLit('"'), Tok::Newline, Tok::Eof]);
+    }
+
+    /// Every char-literal error case produces EXACTLY ONE diagnostic and
+    /// still emits a recovery `Tok::CharLit('\u{fffd}')` -- mirroring
+    /// `lex_string`'s own established "always push a token, even a
+    /// degraded one, on error" discipline. A REAL bug found+fixed during
+    /// this feature's own development: an early version simply `return`ed
+    /// with no token pushed on error, which cascaded a SECOND, confusing
+    /// "expected an expression, found `}`" diagnostic from the parser on
+    /// top of the real one, for every one of these four cases -- confirmed
+    /// live via `kupl check` on each shape below before this fix, and
+    /// re-confirmed clean (exactly one diagnostic) after.
+    #[test]
+    fn char_literal_errors_produce_exactly_one_diagnostic_each() {
+        fn diag_codes(src: &str) -> Vec<String> {
+            let (_, diags) = lex(src);
+            diags.into_iter().map(|d| d.code.to_string()).collect()
+        }
+        assert_eq!(diag_codes("''"), vec!["K0013"], "empty char literal");
+        assert_eq!(diag_codes("'ab'"), vec!["K0013"], "too many characters");
+        assert_eq!(diag_codes("'a\nb"), vec!["K0011"], "unterminated (newline before closing quote)");
+        assert_eq!(diag_codes(r"'\q'"), vec!["K0012"], "unknown escape sequence");
+        // sanity: a well-formed char literal has zero diagnostics (the
+        // `kinds()` helper used by every OTHER test in this module already
+        // asserts this implicitly, but making it explicit here locks in
+        // the exact "zero, not one" count this test is about).
+        assert_eq!(diag_codes("'a'"), Vec::<String>::new());
     }
 
     #[test]

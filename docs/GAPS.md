@@ -329,6 +329,40 @@ engines discipline as every prior campaign.
   directions (bound added, bound removed) plus a regression check that an
   unrelated body-only change with the SAME bound still correctly reports
   implementation-only. One new permanent regression test.
+- **`Char` primitive type (it105)** — a single Unicode scalar value (`'a'`),
+  closing part of the "Byte/Char … still to do" gap this doc has named since
+  audit #3. New `Ty::Char`/`Value::Char(char)` (Rust's own `char` is already
+  a validated, `Copy`, 4-byte Unicode scalar — a perfect fit, no allocation),
+  ordered by codepoint (`<`/`<=`/`>`/`>=`, `.sort()`, `.min()`/`.max()`, and
+  the `[T: Ord]` bound from it103 all widened to accept it); no `Add` (use
+  `to_str(a) + to_str(b)` to build a `Str`). New lexer diagnostics K0011
+  (unterminated), K0012 (unknown escape), K0013 (not exactly one character).
+  Landed on the interpreter, the KVM, `.kx` build/run, and `kupl bundle`,
+  all verified byte-identical live; `kupl native` cleanly, explicitly
+  defers Char literals with a feature-specific message (mirroring the
+  K0289 staged-rollout precedent) rather than crashing or miscompiling.
+  A genuinely valuable discovery made live rather than assumed: because
+  `Value::Char` slots into the EXISTING generic constant-pool mechanism
+  (`Op::Const`) and the VM's comparison dispatch (`raw_binary_op`) is
+  LITERALLY THE SAME function the interpreter uses, the KVM needed only one
+  trivial line in `compile.rs` — a much smaller lift than it101's `par { }`
+  VM-wiring. Three real bugs were found and fixed purely through live
+  testing after an otherwise-clean compile (none were compiler errors,
+  since each match had a silent fallback arm): a missing
+  `(Ty::Char, Ty::Char)` self-unification arm in `types.rs` (every Char
+  comparison failed with a confusing "expected Char, found Char"); an
+  unconditional `panic!` in `kx.rs::encode_const` for any unhandled
+  constant, crashing `kupl build` outright on a Char literal instead of
+  erroring cleanly (fixed with proper encode/decode, since `.kx` is pure
+  byte-serialization consumed by the already-working VM, unlike native);
+  and a lexer error-recovery bug where `lex_char` returned early with no
+  token on error, cascading a confusing secondary "expected an expression"
+  parser diagnostic on top of each real one (fixed by unconditionally
+  pushing a `Tok::CharLit` even on error, using `'\u{fffd}'` as a recovery
+  placeholder — mirroring `lex_string`'s own established discipline). New
+  permanent regression tests across the lexer, `check.rs`, `kupl fmt`
+  round-trip, `cgen.rs`'s clean-rejection behavior, and an interp-vs-vm
+  parity test in `main.rs`.
 
 ## Final stretch — prioritized shortlist (it42–50)
 
@@ -474,7 +508,11 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       math (it24). **BigInt (`big(...)`) and Rational (`rat(...)`) have since
       shipped too** — arbitrary-precision arithmetic and exact fractions, both
       byte-identical on every engine including native (see `STDLIB.md`).
-      Byte/Char and a base-10 `Decimal` type are still to do.
+      **`Char` has since landed too (it105)** — a single Unicode scalar value
+      (`'a'`), interp+VM+`.kx`+bundle byte-identical, ordered by codepoint;
+      `kupl native` cleanly, explicitly defers it for now (interpreter/VM
+      only), mirroring the K0289 staged-rollout precedent. Byte (as a type
+      distinct from `u8`) and a base-10 `Decimal` type are still to do.
 - [x] Broader standard library (audit #3, it12) — ~40 methods across all core
       types, all engines byte-identical incl. native. List (is_empty/concat/
       unique/init/tail/product/min/max/flatten/count/flat_map/window/chunk); Str

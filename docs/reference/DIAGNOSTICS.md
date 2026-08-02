@@ -20,6 +20,9 @@ Severity: **E** = error, **W** = warning.
 | K0008 | E | NUL (`\0` or a raw NUL byte) in a string literal — `Str` is NUL-free UTF-8 text |
 | K0009 | E | integer literal out of range for its width suffix (`256u8`) |
 | K0010 | E | single `&` is not an operator (did you mean `&&`?) |
+| K0011 | E | unterminated char literal (`'a`) |
+| K0012 | E | unknown escape sequence in a char literal |
+| K0013 | E | a char literal must contain exactly one character (empty `''` or more than one, e.g. `'ab'`) |
 
 ## K01xx — Parser
 

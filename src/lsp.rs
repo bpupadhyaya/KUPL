@@ -2058,6 +2058,7 @@ fn expr_binds_name(expr: &crate::ast::Expr, name: &str) -> bool {
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Bool(_)
+        | ExprKind::Char(_)
         | ExprKind::Unit
         | ExprKind::Ident(_)
         | ExprKind::SizedInt(_, _)

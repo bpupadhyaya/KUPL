@@ -761,6 +761,7 @@ impl Rewriter<'_> {
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Bool(_)
+            | ExprKind::Char(_)
             | ExprKind::Unit
             | ExprKind::SizedInt(..)
             | ExprKind::F32(_) => {}

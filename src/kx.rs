@@ -246,6 +246,18 @@ fn encode_const(w: &mut W, v: &Value) {
             w.u8(7);
             w.buf.extend_from_slice(&x.to_le_bytes());
         }
+        // `Char` (universal-language enrichment campaign, it105): unlike
+        // `kupl native`'s C codegen (a genuinely separate reimplementation,
+        // deliberately deferred -- see `cgen.rs::const_expr`'s own doc
+        // comment on this exact point), `.kx`/`kupl build` is JUST a byte
+        // serialization of data the SAME KVM this file's own decoder feeds
+        // already executes correctly -- no new execution semantics needed,
+        // so there is no reason to defer this one. A `char` is a validated
+        // Unicode scalar value, which always fits a `u32` codepoint.
+        Value::Char(c) => {
+            w.u8(8);
+            w.u32(*c as u32);
+        }
         other => {
             // compiler only emits the constants above
             panic!("non-serializable constant: {other}");
@@ -928,6 +940,13 @@ fn decode_const(r: &mut R) -> DecodeResult<Value> {
             for i in 0..4 { b[i] = r.u8()?; }
             Value::F32(f32::from_le_bytes(b))
         }
+        // A hand-crafted/corrupted `.kx` file's codepoint could be anything
+        // a raw `u32` can hold -- including a surrogate half or a value
+        // past `char::MAX`, neither a valid Unicode scalar value -- so this
+        // must be a clean `DecodeResult` error (matching this decoder's own
+        // established corrupt-file discipline throughout), never an
+        // unchecked `char::from_u32(..).unwrap()` panic.
+        8 => Value::Char(char::from_u32(r.u32()?).ok_or_else(|| "invalid Char codepoint".to_string())?),
         t => return Err(format!("unknown constant tag {t}")),
     })
 }

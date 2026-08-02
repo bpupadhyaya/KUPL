@@ -19,6 +19,9 @@ pub enum Ty {
     Float,
     Bool,
     Str,
+    /// A single Unicode scalar value (`'a'`) -- distinct from `Str`, which
+    /// holds a UTF-8 sequence of arbitrary length (including zero or many).
+    Char,
     Unit,
     /// The payload-less message type for ports (`in click: Event`).
     Event,
@@ -155,6 +158,7 @@ impl Unifier {
             | (Ty::Float, Ty::Float)
             | (Ty::Bool, Ty::Bool)
             | (Ty::Str, Ty::Str)
+            | (Ty::Char, Ty::Char)
             | (Ty::Unit, Ty::Unit)
             | (Ty::Event, Ty::Event)
             | (Ty::Tensor, Ty::Tensor)
@@ -203,6 +207,7 @@ impl fmt::Display for Ty {
             Ty::Float => write!(f, "Float"),
             Ty::Bool => write!(f, "Bool"),
             Ty::Str => write!(f, "Str"),
+            Ty::Char => write!(f, "Char"),
             Ty::Unit => write!(f, "Unit"),
             Ty::Event => write!(f, "Event"),
             Ty::List(e) => write!(f, "List[{e}]"),

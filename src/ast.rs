@@ -329,6 +329,8 @@ pub enum ExprKind {
     Unit,
     /// String literal with interpolation parts (already parsed sub-expressions).
     Str(Vec<StrPiece>),
+    /// A `Char` literal (`'a'`) -- a single Unicode scalar value.
+    Char(char),
     List(Vec<Expr>),
     Ident(String),
     Call {

@@ -581,6 +581,23 @@ fn const_expr(v: &Value, module: &Module) -> Result<String, String> {
             // reconstruct from the exact 32-bit pattern (never lossy)
             format!("k_f32_bits({}u)", v.to_bits())
         }
+        // `Char` (universal-language enrichment campaign, it105): a genuine,
+        // well-scoped first slice landed on interp.rs + the KVM (the SHARED
+        // `Op::Const` const-pool mechanism and `raw_binary_op` comparison
+        // dispatch both already generalize to it with ZERO new plumbing --
+        // confirmed live, not assumed), but `kupl native`'s C runtime has no
+        // `K_CHAR` tag/representation yet -- deliberately deferred, mirroring
+        // this campaign's own established staged-rollout precedent (it99's
+        // `par { }` fast path landed interp-only before it101 wired the VM;
+        // K0289 is the analogous "interpreter only, not yet on VM/native"
+        // pattern for a different feature). A clear, Char-specific message
+        // here (rather than the generic catch-all below, which exists for
+        // things that can NEVER be a compile-time constant at all, like a
+        // live closure/component reference -- a `Char` literal is a
+        // perfectly ordinary constant, just not yet implemented for this
+        // ONE backend) so a user hits an honest "not yet" instead of a
+        // confusing "non-serializable".
+        Value::Char(c) => return Err(format!("Char literals ('{c}') are not yet supported by `kupl native` (interpreter and `kupl run --vm` only for now)")),
         other => return Err(format!("non-serializable constant {other}")),
     })
 }
@@ -10421,6 +10438,21 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         assert_eq!(String::from_utf8_lossy(&out.stdout), "total=10\ntotal=30\ntotal=60\n");
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&bin);
+    }
+
+    /// `Char` (it105) is staged interp+VM-only, mirroring the K0289
+    /// precedent: `kupl native` must cleanly reject a `Char` literal with an
+    /// honest, feature-specific message rather than panicking or silently
+    /// misgenerating C. `cc_available()` is deliberately NOT required here --
+    /// `emit_c` must fail before any C compiler ever gets invoked.
+    #[test]
+    fn native_char_literal_is_cleanly_rejected_not_miscompiled() {
+        let src = "fun main() {\n    let a = 'a'\n    print(a)\n}\n";
+        let compiled = crate::run::compile(src).expect("program type-checks (Char is valid on interp/VM)");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+        let err = super::emit_c(&module).expect_err("emit_c must reject a Char literal, not silently miscompile it");
+        assert!(err.contains("Char literals"), "error should name the feature: {err}");
+        assert!(err.contains("not yet supported by `kupl native`"), "error should be the staged-rollout message: {err}");
     }
 
     /// Compile `src` (a component app) to native, run it, and return stdout.

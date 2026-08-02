@@ -77,6 +77,7 @@ letters are permitted. `_` alone is the wildcard pattern.
 | Float | `3.14`, `1.5e3` | IEEE-754 f64; `1..5` is a range, `1.5` a float |
 | Bool | `true`, `false` | |
 | Str | `"hi"`, `"n = {x + 1}"` | UTF-8, immutable; `{expr}` interpolates (any type, rendered with Display); `{{`/`}}` are literal braces (so JSON/`{…}` templates write directly, e.g. `"{{\"a\":{n}}}"`); escapes: `\n \t \r \\ \" \{ \} \0` |
+| Char | `'a'`, `'\n'`, `'π'` | one Unicode scalar value; never interpolates; escapes: `\n \t \r \\ \' \0`; `kupl native` does not yet support Char literals |
 | Unit | `()` | the no-value value |
 | List | `[1, 2, 3]` | homogeneous |
 | Range | `0..10`, `0..=10` | Int bounds; exclusive / inclusive |
@@ -89,7 +90,7 @@ letters are permitted. `_` alone is the wildcard pattern.
 | 2 | `\|\|` | short-circuit |
 | 3 | `&&` | short-circuit |
 | 4 | `==` `!=` | structural equality, any type |
-| 5 | `<` `<=` `>` `>=` | Int, Float, Str |
+| 5 | `<` `<=` `>` `>=` | Int, Float, Str, Char |
 | 6 | `..` `..=` | ranges |
 | 7 | `+` `-` | `+` also concatenates Str; both elementwise on Tensor |
 | 8 | `*` `/` `%` | `*` `/` elementwise on Tensor; `/ 0` and `% 0` panic on Int |
@@ -104,6 +105,7 @@ letters are permitted. `_` alone is the wildcard pattern.
 | `Float` | IEEE-754 f64 | |
 | `Bool` | `true`/`false` | conditions must be Bool (no truthiness) |
 | `Str` | immutable UTF-8 | `.len()` counts characters |
+| `Char` | a single Unicode scalar value | `'a'`, `'\n'`, `'π'`; ordered by codepoint; no `Add` |
 | `Unit` | `()` | return type of value-less functions |
 | `Event` | payload-less port messages | only meaningful as a port type |
 | `List[T]` | immutable lists | methods return new lists |
@@ -179,7 +181,7 @@ permits the comparison operators (`<`, `<=`, `>`, `>=`) on values of that
 type. `Ord` is currently the only supported bound (an unrecognized bound
 name is K0123); the bound is checked at every CALL site too, not just
 inside the body — passing a type that doesn't support ordering (anything
-other than `Int`, `Float`, `Str`, or another numeric type) for an
+other than `Int`, `Float`, `Str`, `Char`, or another numeric type) for an
 Ord-bounded parameter is a compile-time `K0290`, not a deferred runtime
 panic. Type parameters on `type` declarations are **[design]**.
 
@@ -759,8 +761,9 @@ let b = Cache(store: LoudStore())              // …or another — same consume
 - `Float` follows IEEE-754; division by zero yields `inf`/`nan` (no panic).
 - `==`/`!=` are structural for every type; `<` `<=` `>` `>=` are defined for
   every numeric type (`Int`, the sized integers `i8`/`i16`/`i32`/`i64`/`u8`/
-  `u16`/`u32`/`u64`, `Float`, `f32`, `BigInt`, `Rational`) and `Str`
-  (lexicographic by bytes) — not just `Int`, `Float`, and `Str`.
+  `u16`/`u32`/`u64`, `Float`, `f32`, `BigInt`, `Rational`), `Str`
+  (lexicographic by bytes), and `Char` (by Unicode codepoint) — not just
+  `Int`, `Float`, and `Str`.
 - Display of floats uses the shortest representation that round-trips
   (`3.5`, `0.30000000000000004`); whole floats show one decimal (`12.0`).
   All engines — including native machine code — format identically.

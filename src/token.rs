@@ -27,6 +27,10 @@ pub enum Tok {
     Float(f64),
     /// String literal, decomposed into literal text and `{expr}` interpolation parts.
     Str(Vec<StrPart>),
+    /// A `Char` literal (`'a'`, `'\n'`, `'π'`) -- a single Unicode scalar
+    /// value. Never contains interpolation (unlike `Str`), so this is a
+    /// bare `char`, not a `Vec<StrPart>`.
+    CharLit(char),
     Ident(String),
 
     // Keywords (reserved everywhere, matched by `keyword()` below). `out`,
@@ -231,6 +235,7 @@ impl Tok {
             Tok::F32Lit(v) => format!("float `{v}f32`"),
             Tok::Float(v) => format!("float `{v}`"),
             Tok::Str(_) => "string literal".to_string(),
+            Tok::CharLit(c) => format!("char literal `'{c}'`"),
             Tok::Ident(s) => format!("identifier `{s}`"),
             Tok::Newline => "end of line".to_string(),
             Tok::Eof => "end of file".to_string(),

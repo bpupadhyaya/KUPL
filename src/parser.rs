@@ -1944,6 +1944,10 @@ impl Parser {
                 }
                 Ok(Expr { kind: ExprKind::Str(pieces), span })
             }
+            Tok::CharLit(c) => {
+                self.bump();
+                Ok(Expr { kind: ExprKind::Char(c), span })
+            }
             Tok::Ident(name) => {
                 self.bump();
                 Ok(Expr { kind: ExprKind::Ident(name), span })

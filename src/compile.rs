@@ -1292,6 +1292,7 @@ impl<'s> FnCompiler<'s> {
             ExprKind::F32(v) => self.const_reg(Value::F32(*v), span),
             ExprKind::Float(v) => self.const_reg(Value::Float(*v), span),
             ExprKind::Bool(v) => self.const_reg(Value::Bool(*v), span),
+            ExprKind::Char(c) => self.const_reg(Value::Char(*c), span),
             ExprKind::Unit => self.const_reg(Value::Unit, span),
             ExprKind::Str(pieces) => {
                 if pieces.len() == 1 {

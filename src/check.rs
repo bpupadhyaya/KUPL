@@ -2818,6 +2818,7 @@ impl Checker {
                 }
                 Ty::Str
             }
+            ExprKind::Char(_) => Ty::Char,
             ExprKind::List(items) => {
                 // Threaded as a plain Rust value once any two elements widen to a
                 // shared `fulfills` contract via check_merge (same shape as the
@@ -2994,8 +2995,8 @@ impl Checker {
                             return ret;
                         }
                         let t = self.default_numeric(t);
-                        if !t.is_numeric() && t != Ty::Str {
-                            self.err("K0234", format!("cannot order values of type {t}; only Int, Float, Str, and other numeric types can be compared"), expr.span);
+                        if !t.is_numeric() && t != Ty::Str && t != Ty::Char {
+                            self.err("K0234", format!("cannot order values of type {t}; only Int, Float, Str, Char, and other numeric types can be compared"), expr.span);
                         }
                         Ty::Bool
                     }
@@ -3897,12 +3898,13 @@ impl Checker {
                         if bound_name == "Ord"
                             && !resolved.is_numeric()
                             && resolved != Ty::Str
+                            && resolved != Ty::Char
                             && !matches!(resolved, Ty::Var(_))
                         {
                             self.err(
                                 "K0290",
                                 format!(
-                                    "type `{resolved}` does not satisfy the `Ord` bound -- only Int, Float, Str, and other numeric types support ordering"
+                                    "type `{resolved}` does not satisfy the `Ord` bound -- only Int, Float, Str, Char, and other numeric types support ordering"
                                 ),
                                 span,
                             );
@@ -4193,9 +4195,9 @@ impl Checker {
                 // runtime's `list_order` already backs `min`/`max`/min_by/max_by with them,
                 // and native's k_cmp always supported them) — `.sort()` was needlessly
                 // narrower than what the language could already do.
-                if !(elem.is_numeric() || elem == Ty::Str || matches!(elem, Ty::Var(_))) {
+                if !(elem.is_numeric() || elem == Ty::Str || elem == Ty::Char || matches!(elem, Ty::Var(_))) {
                     // Point at the receiver list, not the whole `.sort()` call (PR-it585).
-                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, and other numeric types can be compared"), recv.span);
+                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, Char, and other numeric types can be compared"), recv.span);
                 }
                 Some((vec![], Ty::List(t.clone())))
             }
@@ -4241,9 +4243,9 @@ impl Checker {
             }
             (Ty::List(t), "min") | (Ty::List(t), "max") => {
                 let elem = self.uni.apply(t);
-                if !(elem.is_numeric() || elem == Ty::Str || matches!(elem, Ty::Var(_))) {
+                if !(elem.is_numeric() || elem == Ty::Str || elem == Ty::Char || matches!(elem, Ty::Var(_))) {
                     // Point at the receiver list, not the whole `.min()`/`.max()` call (PR-it585).
-                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, and other numeric types can be compared"), recv.span);
+                    self.err("K0234", format!("cannot order values of type {elem}; only Int, Float, Str, Char, and other numeric types can be compared"), recv.span);
                 }
                 Some((vec![], Ty::Option(t.clone())))
             }
@@ -7359,7 +7361,9 @@ mod generic_tests {
         // in PR-it549 to also name the numeric types beyond Int/Float (sized ints, f32,
         // BigInt, Rational are all orderable now too) — the wording here was updated to
         // match, and the final assertion below now also covers the newly-accepted types.
-        let hint = "only Int, Float, Str, and other numeric types can be compared";
+        // Widened again for `Char` (it105, universal-language enrichment campaign) — see
+        // `char_is_orderable_everywhere_ordinary_types_are` below for the newly-accepted case.
+        let hint = "only Int, Float, Str, Char, and other numeric types can be compared";
         let cmp = errors("type P = P(x: Int)\nfun main() { let b = P(1) < P(2)\n    let _ = b }\n");
         assert!(cmp.iter().any(|d| d.code == "K0234" && d.message.contains(hint)), "cmp: {cmp:?}");
         let sort = errors("type P = P(x: Int)\nfun main() { let _ = [P(1), P(2)].sort() }\n");
@@ -7374,6 +7378,26 @@ mod generic_tests {
         assert!(errors("fun main() { let xs: List[f32] = [3.0f32, 1.0f32]\n    let _ = xs.max() }\n").is_empty());
         assert!(errors("fun main() { let xs = [big(3), big(1)]\n    let _ = xs.min() }\n").is_empty());
         assert!(errors("fun main() { let xs = [rat(1, 2), rat(1, 3)]\n    let _ = xs.sort() }\n").is_empty());
+    }
+
+    /// `Char` (universal-language enrichment campaign, it105) is orderable
+    /// everywhere Int/Float/Str already are: comparison operators,
+    /// `List.sort`, `List.min`/`.max`, and as the concrete type substituted
+    /// for an `Ord`-bounded generic type parameter (it103's own feature).
+    #[test]
+    fn char_is_orderable_everywhere_ordinary_types_are() {
+        assert!(errors("fun main() { let _ = 'a' < 'b' }\n").is_empty(), "comparison operator");
+        assert!(errors("fun main() { let _ = ['c', 'a', 'b'].sort() }\n").is_empty(), "List.sort");
+        assert!(errors("fun main() { let _ = ['c', 'a', 'b'].max() }\n").is_empty(), "List.max");
+        assert!(
+            errors("fun mymax[T: Ord](a: T, b: T) -> T {\n    if a > b { a } else { b }\n}\nfun main() { let _ = mymax('a', 'b') }\n").is_empty(),
+            "Char satisfies an Ord-bounded generic type parameter"
+        );
+        // still correctly rejected for a genuinely non-orderable type,
+        // locking in that widening Char's own acceptance didn't
+        // accidentally widen the check itself too far.
+        let bad = errors("type P = P(x: Int)\nfun main() { let _ = P(1) < P(2) }\n");
+        assert!(bad.iter().any(|d| d.code == "K0234"), "a non-orderable type must still be rejected: {bad:?}");
     }
 
     #[test]

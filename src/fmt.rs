@@ -690,6 +690,7 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
             s.push('"');
             (s, ATOM)
         }
+        ExprKind::Char(c) => (format!("'{}'", escape_char(*c)), ATOM),
         ExprKind::List(items) => {
             let inner: Vec<String> = items.iter().map(|i| expr_str(i, 0)).collect();
             (format!("[{}]", inner.join(", ")), ATOM)
@@ -955,6 +956,26 @@ fn escape_str(s: &str) -> String {
     out
 }
 
+/// `escape_str`'s sibling for a `Char` literal's own single-quote
+/// delimiter: `'` needs escaping instead of `"`, and there is no `{`/`}`
+/// escaping at all since a `Char` literal never contains interpolation
+/// (`lexer.rs::lex_char` has no such concept, unlike `lex_string`). NUL
+/// (`\0`) round-trips as the visible escape too, matching the lexer's own
+/// support for it (a `Char` is a raw scalar codepoint on every engine,
+/// never a NUL-terminated buffer the way `Str` is, so unlike `escape_str`
+/// this never needs to reject NUL -- see `lex_char`'s own doc comment).
+fn escape_char(c: char) -> String {
+    match c {
+        '\'' => "\\'".to_string(),
+        '\\' => "\\\\".to_string(),
+        '\n' => "\\n".to_string(),
+        '\t' => "\\t".to_string(),
+        '\r' => "\\r".to_string(),
+        '\0' => "\\0".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::parser;
@@ -972,6 +993,20 @@ mod tests {
     #[test]
     fn fmt_idempotent_fun() {
         roundtrip("fun add(a:Int,b:Int)->Int{a+b}\n");
+    }
+
+    /// `Char` literals (it105) round-trip through `kupl fmt` -- including the
+    /// escape-sensitive ones (`escape_char`'s own delimiter `'` and the
+    /// backslash-escapes), which is exactly the class of bug a plain
+    /// idempotence check on a single ordinary literal wouldn't catch.
+    #[test]
+    fn fmt_idempotent_char_literal() {
+        roundtrip("fun main() {\n    let a = 'a'\n    print(a)\n}\n");
+        roundtrip("fun main() {\n    print('\\'')\n}\n");
+        roundtrip("fun main() {\n    print('\\\\')\n}\n");
+        roundtrip("fun main() {\n    print('\\n')\n}\n");
+        roundtrip("fun main() {\n    print('\\0')\n}\n");
+        roundtrip("fun main() {\n    print('π')\n}\n");
     }
 
     /// `supervise child restart on_failure max N in <duration>` (it102) must
