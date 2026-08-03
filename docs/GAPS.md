@@ -969,7 +969,28 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       attempt only needs to modify ONE place instead of auditing 14+
       call sites by hand — named as a candidate, not designed. Doc-only
       iteration (no `interp.rs` changes), matching it112/it121/it122's
-      own precedent for design-sketch iterations.
+      own precedent for design-sketch iterations. **it129: the §3.4
+      determinism question is DECIDED** (`docs/design/ASYNC.md` §7, after
+      sitting unpicked across it124-it128's own fallback mentions) —
+      strategy (b): per-instance VALUE-level determinism preserved,
+      TIMING-observable nondeterminism between independently-running
+      instances documented as inherent to real concurrency, OPT-IN only
+      (today's default synchronous behavior is unchanged for any program
+      that doesn't explicitly ask for real concurrency, so the campaign's
+      own sacred byte-identical-output regression discipline stays fully
+      valid and untouched for every existing program). Grounded in
+      `docs/design/VISION.md`'s own inspirations table, which lists
+      Erlang/Elixir FIRST for exactly this part of the design — Erlang
+      itself has never guaranteed global cross-process event ordering,
+      only per-mailbox FIFO (the guarantee KUPL's own single shared queue
+      already provides trivially today), so this is the most faithful
+      continuation of the model this campaign's own docs already cite,
+      not a departure from it. A design DECISION, not an implementation —
+      a future concurrency attempt still needs its own scoping pass on
+      top of this (§6's own 14-function instance-access surface, the
+      wire-crossing question), but the "which determinism strategy" question
+      that stalled every prior attempt at the investigation stage is
+      resolved.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into
