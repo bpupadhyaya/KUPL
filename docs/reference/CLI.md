@@ -56,10 +56,18 @@ Interactive session. Enter expressions, statements, or whole declarations
 (`fun`/`type`/`component` — multi-line input is detected by bracket balance).
 Redefining a component leaves already-spawned instances frozen to their
 original shape by default (safe, deliberate); `:upgrade <Component>`
-hot-swaps every live instance to the just-redefined shape, migrating
-`state` fields by name (a matched name keeps its value; a new field gets
-its own fresh default) — refuses if `props` or `children` changed. Commands:
-`:help` `:defs` `:upgrade <Component>` `:quit`.
+hot-swaps every live instance to the just-redefined shape (Erlang
+`code_change`-style): `state`/`props` migrate by name (a matched name keeps
+its value; a new field/prop with a default gets a fresh one); `children` may
+grow, or shrink (a removed child fires `on stop`, disarms its own timers,
+recursively through its own descendants, and any wire pointing at it is
+pruned); `wires` between children may be freely added, removed, or rerouted.
+A `migrate_<field>` component-private fun (one param: the field's old value)
+converts a field whose SHAPE, not just presence, changed (e.g. `Int` ->
+`Str`), for props and state alike. Refuses the whole upgrade (no instance
+touched) only if: a new prop has no default; a pre-existing child's own
+component type changed; or a declared `migrate_<field>` fun has the wrong
+arity. Commands: `:help` `:defs` `:upgrade <Component>` `:quit`.
 
 ## Compiling & packaging
 

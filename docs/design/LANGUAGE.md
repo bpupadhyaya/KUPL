@@ -514,7 +514,7 @@ every doc tooltip (`intent`) is literally this source code.
    per-resource split, and not user-definable/extensible from user code.**
 4. Hot-swap semantics for `state` migration on component upgrade (Erlang's
    `code_change` equivalent) — needed for visual live-editing (contract item C6,
-   see `VISUAL-TOOLS-CONTRACT.md`). **PARTIALLY RESOLVED (it124 update):
+   see `VISUAL-TOOLS-CONTRACT.md`). **FULLY RESOLVED (it128 update):
    `kupl repl`'s `:upgrade <Component>` migrates live instances'
    `state` AND `props` by name (matched names keep their value; new
    fields/props with a default get a fresh value), re-routes/adds/removes
@@ -523,9 +523,11 @@ every doc tooltip (`intent`) is literally this source code.
    RECURSIVELY through its own descendants as of it124 — no dangling-wire
    pruning is needed below the top level, since a wire can only ever
    connect two siblings declared on the same component) — and swaps in
-   new/changed methods immediately. Still open: a user-provided migration
-   hook for a field whose SHAPE (not just name) changed — low priority,
-   no concrete driver.**
+   new/changed methods immediately. As of it128, a `migrate_<field>`
+   component-private fun in the redefined component is the user-provided
+   hook for a field whose SHAPE (not just name) changed (e.g. `Int` ->
+   `Str`) — a naming convention, not new grammar, applying to both props
+   and state.**
 5. Package identity & registry: content-addressed packages with signed manifests —
    spec in TOOLCHAIN.md, needs a decision on namespace governance.
 6. `@meta` tool-annotation blocks (proposed in `VISUAL-TOOLS-CONTRACT.md` C3) —

@@ -842,34 +842,43 @@ completion (3). Everything stays byte-identical across engines.
       handlers on a virtual clock advanced explicitly (`advance 5s` example
       step; `kupl run` auto-advances bounded). Deterministic, byte-identical on
       interpreter + KVM. Durations `ms`/`s`/`m`/`h`. (`examples/timers.kupl`)
-- [◐] **Hot-swap state migration (it111, extended it113/it114/it115/it119/it124)**
-      — `kupl repl`'s `:upgrade <Component>` command (Erlang `code_change`
-      equivalent, design open Q4): migrates every LIVE instance's `state`
-      and `props` by name (matched names keep their current value; new
-      fields/props with a default get a fresh value; a removed field/prop
-      is dropped) and swaps in the redefined component's methods
-      immediately. `children` may GROW (it114) or SHRINK (it119): a
-      genuinely new child is constructed fresh; a removed child is torn
-      down (`on stop` fires via `Interp::run_lifecycle`, its own armed
-      timers are cleared, and any wire from a still-live sibling pointing
-      at it is pruned) — **recursively as of it124**: `stop_and_disarm_
-      subtree` walks the removed child's own children (and theirs, and so
-      on), parent-first, matching `stop_all`'s own instance-id ordering
-      convention; no additional wire pruning is needed below the top
-      level, since a wire can only ever connect two siblings declared on
-      the SAME component (`instantiate`'s own wire-registration loop
-      resolves both endpoints through one component's `child_ids` map), so
-      a wire fully inside a removed subtree becomes unreachable together
-      with its endpoints exactly like the top-level case. `wires` between
-      children may be freely ADDED or REMOVED (it115), including
-      RE-ROUTING an existing connection between two pre-existing children
-      — a kept child's own live instance is never touched, only its
-      `.wires` map is pruned/extended as needed. Still refuses the whole
-      upgrade if: a new prop has no default; or a pre-existing child's own
-      component type changed (nothing sound to migrate a live instance to
-      a different type). The one remaining gap is a user-provided
-      migration hook for a field whose SHAPE (not just presence) changed
-      — still LOW priority, no concrete driver.
+- [x] **Hot-swap state migration (it111, extended it113/it114/it115/it119/
+      it124/it128)** — `kupl repl`'s `:upgrade <Component>` command
+      (Erlang `code_change` equivalent, design open Q4): migrates every
+      LIVE instance's `state` and `props` by name (matched names keep
+      their current value; new fields/props with a default get a fresh
+      value; a removed field/prop is dropped) and swaps in the redefined
+      component's methods immediately. `children` may GROW (it114) or
+      SHRINK (it119): a genuinely new child is constructed fresh; a
+      removed child is torn down (`on stop` fires via
+      `Interp::run_lifecycle`, its own armed timers are cleared, and any
+      wire from a still-live sibling pointing at it is pruned) —
+      **recursively as of it124**: `stop_and_disarm_subtree` walks the
+      removed child's own children (and theirs, and so on), parent-first,
+      matching `stop_all`'s own instance-id ordering convention; no
+      additional wire pruning is needed below the top level, since a wire
+      can only ever connect two siblings declared on the SAME component
+      (`instantiate`'s own wire-registration loop resolves both endpoints
+      through one component's `child_ids` map), so a wire fully inside a
+      removed subtree becomes unreachable together with its endpoints
+      exactly like the top-level case. `wires` between children may be
+      freely ADDED or REMOVED (it115), including RE-ROUTING an existing
+      connection between two pre-existing children — a kept child's own
+      live instance is never touched, only its `.wires` map is
+      pruned/extended as needed. Still refuses the whole upgrade if: a
+      new prop has no default; or a pre-existing child's own component
+      type changed (nothing sound to migrate a live instance to a
+      different type). **As of it128, the last remaining gap is closed**:
+      a `migrate_<field>` component-private fun (exactly one param — the
+      field's OLD value) is the user-provided hook for a field whose
+      SHAPE, not just presence, changed (e.g. `Int` -> `Str`) — a naming
+      CONVENTION, not new grammar (mirrors `KUPL_AI_MOCK_<NAME>`'s own
+      reserved-name convention), applying to both props and state via one
+      shared `apply_migration_hook` helper. A wrong-arity `migrate_*` fun
+      refuses the WHOLE upgrade upfront (almost certainly a genuine
+      mistake — nobody accidentally names a function exactly
+      `migrate_<field>`), matching every other guard's own
+      refuse-upfront-never-partially discipline.
 
 ## Tier 3 — audit-driven priorities (next arc)
 
@@ -1097,11 +1106,11 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 1. UI trees → `docs/design/UI.md` (render = component construction). **Designed.**
 2. Int default → **decided & shipped:** i64 checked, overflow panics.
 3. Effect granularity → shipped hierarchical effects (`io` covers `io.fs`/`io.net`/`io.env`/`io.proc`/`io.time`; plus `ai`).
-4. Hot-swap state migration → supervision restart hook shipped; automatic
-   by-name `state`/`props` migration, wire re-routing, and RECURSIVE
-   child removal (`on stop` + timer disarm, walking the removed child's
-   own descendants; no extra wire pruning needed below the top level)
-   all shipped (it111, it113, it115, it119, it124, `kupl repl :upgrade`);
-   only a user-provided migration hook (for a field whose SHAPE, not just
-   name, changed) remains TBD, still low priority with no concrete driver.
+4. Hot-swap state migration → **FULLY RESOLVED (it128)**. Supervision
+   restart hook; automatic by-name `state`/`props` migration; wire
+   re-routing; RECURSIVE child removal (`on stop` + timer disarm, walking
+   the removed child's own descendants; no extra wire pruning needed
+   below the top level); and a user-provided `migrate_<field>` hook for a
+   field whose SHAPE, not just name, changed — all shipped (it111, it113,
+   it115, it119, it124, it128, `kupl repl :upgrade`). No remaining gaps.
 5. Package identity → `kupl.toml` shipped; registry governance TBD.
