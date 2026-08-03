@@ -1,14 +1,14 @@
 # KUPL vs. the field — an honest audit
 
 **Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed after enrichment
-iteration 95** (the native backend compiles the **entire language** including
-`ai fun` (mock path), `BigInt`, `Rational`, and the HTTP server; the type system
-has **generic ADTs**, operator overloading, and Option/Result combinators; the
-`List`/`Map`/`Set`/`Str` standard library is now comprehensive; all four syntactic
-papercuts are fixed; and eleven-plus flagship apps across web, data, algorithms,
-language implementation, simulation, interactive fiction, diffing, and a
-component-based application demonstrate universality — see "What's new since it81"
-below).
+iteration 95, then again after iteration 129** (structured `par { }` fork-join
+gets real OS threads; capabilities as attenuable runtime values (`CapNet`/
+`CapFs`); hot-swap state migration fully resolved including a user-provided
+shape-migration hook; native `ai fun` now makes real-provider network calls,
+tool use included, `kupl bundle` no longer needed for AI; and the async/
+concurrency design's own hardest open question — which determinism guarantee
+real concurrency offers — is now decided, though implementation hasn't started
+— see "What's new since it95" below).
 
 This document compares KUPL, **as actually implemented today**, against nine
 established languages: Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift,
@@ -19,6 +19,57 @@ between it and "as good or better than" the mainstream.
 The comparison is written by the KUPL project, so treat the framing with
 appropriate skepticism — but the ratings below are deliberately conservative,
 and every KUPL weakness is stated plainly.
+
+### What's new since it95 (concurrency-first campaign, it99–it129)
+
+This document went unrefreshed for a long, productive arc — thirty-plus
+iterations that shipped real capability, not just polish. All held
+byte-identical across the interpreter, KVM, and native where applicable:
+
+- **`par { }` fork-join gets real OS threads (it99, KVM it101)** — the
+  SAME purity gate `par_map`/`par_filter` already used, extended to
+  structured `par { }` branches: every branch that's a plain call to a
+  statically pure, top-level named function runs on genuine OS threads;
+  a non-qualifying branch falls the whole block back to the unchanged
+  sequential path. **This closes the "structured `par { }` branches are
+  still sequential" gap this document itself used to name** (see "The
+  honest bottom line," updated below).
+- **Capabilities as attenuable runtime values (it112–it118)** — `CapNet`/
+  `CapFs`, each with `.limited_to(scope)` (narrowing-only) and a single
+  root-seeding builtin restricted to `fun main`'s own top-level body
+  (`K0304`), closing this project's own "effects are backed by
+  capabilities" design claim for two capability kinds, enforced (not
+  just designed) and wired across every engine.
+- **Hot-swap state migration, fully resolved (it111–it128)** — `kupl
+  repl`'s `:upgrade <Component>` (Erlang `code_change`-style): by-name
+  `state`/`props` migration, `children` growing or shrinking
+  (recursively, it124), `wires` freely added/removed/rerouted, and — as
+  of it128 — a `migrate_<field>` user-provided hook for a field whose
+  SHAPE (not just presence) changed. No remaining gaps.
+- **Native `ai fun` real-provider network calls (it125–it127)** — this
+  document's own "Runtime performance" section used to say only the
+  MOCK path compiled natively and a real provider's network call
+  deferred to `kupl bundle`; **that gap is closed**. `kupl native`-
+  compiled programs now make genuine `anthropic`/`openai`/`ollama`
+  network calls, for non-tool AND tool-using `ai fun`s, any return
+  shape — `kupl bundle` is no longer needed for anything AI-related.
+- **The async/concurrency determinism question, decided (it121–it129)**
+  — a bounded design deliverable (`docs/design/ASYNC.md`), not an
+  implementation: real concurrency between component instances remains
+  **□ [design]**, but the design itself is now complete, including the
+  hardest open question (what determinism guarantee real concurrency
+  offers) — resolved as per-instance value-level determinism with
+  documented, OPT-IN-only timing nondeterminism, matching Erlang/Elixir's
+  own actual semantics (KUPL's own first-listed inspiration for this
+  part of the design). Implementation is a separate, large, not-yet-
+  started undertaking.
+
+None of this changes the scorecard's own headline weaknesses (async
+I/O/coroutines/a work-stealing scheduler are still unimplemented; the
+hosted registry, GPU/systems tiers, and KIR remain **□ [design]**) — but
+several sections below previously understated real, shipped progress.
+Updated in place rather than re-scored wholesale; see each criterion's
+own prose for what changed.
 
 ### What changed since the it20 refresh (the four big arcs)
 
@@ -272,9 +323,11 @@ the VM, byte-identical to `kupl run`). So a realistic KUPL application now runs
 at native speed, not VM speed — the previous "components run on the VM" weak
 spot is closed. As of it40–47 the native backend compiles the **entire language except `ai fun`**
 — components, sized numerics/f32, JSON, CSV, URL, regex, file I/O, and HTTP all
-lower to machine code, byte-identical to the interpreter (as of it51–52, `ai fun`
-itself compiles natively too — the mock path is complete; only a real
-provider's network call defers to `bundle`). What keeps this a 3
+lower to machine code, byte-identical to the interpreter. `ai fun` itself
+compiles natively too, and as of it125–127 that includes REAL-PROVIDER
+network calls (`anthropic`/`openai`/`ollama`, tool use included, any
+return shape) — `kupl bundle` is no longer needed for `ai fun` at all.
+What keeps this a 3
 rather than a 4–5 is that native values are still the **boxed 16-byte tagged
 `KValue`**: monomorphic numeric loops pay
 tag-dispatch instead of running in raw registers. The typed SSA IR (**KIR**)
@@ -294,9 +347,15 @@ both the interpreter and the KVM, via a `Send` portable-value boundary and
 `std::thread::scope`; results are placed by input index, so the output is
 deterministic and byte-identical to the sequential form (proven every run by the
 differential harness). That is genuine data parallelism — a real "runs on
-multiple cores" capability KUPL simply did not have before. What it still lacks:
-a general **async/await** story (`await` evaluates synchronously), coroutines,
-and a preemptive/work-stealing scheduler for arbitrary concurrent tasks. So Go
+multiple cores" capability KUPL simply did not have before. As of **it99/it101**,
+structured `par { }` fork-join branches get the same real-OS-thread treatment
+(a plain call to a pure top-level function, the same purity gate) on both the
+interpreter and the KVM. What it still lacks: a general **async/await** story
+(`await` evaluates synchronously), coroutines, and a preemptive/work-stealing
+scheduler for arbitrary concurrent tasks — the design for which now has a
+DECIDED determinism strategy (it129, `docs/design/ASYNC.md` §7: per-instance
+value-level determinism, opt-in, Erlang-style), though no implementation yet.
+So Go
 (goroutines/channels), Rust (fearless concurrency), Kotlin (coroutines), and
 Swift (actors/async-await) still beat it for general concurrency; but for the
 common *data-parallel* case KUPL now competes, and the actor isolation +
@@ -466,12 +525,16 @@ for a language this approachable.
 **Where it clearly trails today, in priority order:**
 
 1. **General concurrency** — `par_map`/`par_filter` over a pure function on a
-   large list DO execute on real OS threads (see "Concurrency / parallelism"
-   above); what's still sequential is everything else: structured `par { … }`
-   branches, `par_each`, general async I/O, coroutines, and a work-stealing
-   scheduler for arbitrary tasks (all □ [design]). Go, Rust, Kotlin, Swift, and
-   the JVM all still win decisively on *general-purpose* concurrency. Still the
-   top gap for the "universal, capable of any software" claim.
+   large list, AND structured `par { }` fork-join branches over a plain call
+   to a pure top-level function (it99/it101), DO execute on real OS threads
+   (see "Concurrency / parallelism" above); what's still sequential is
+   `par_each`, and what's still unimplemented is general async I/O, coroutines,
+   and a work-stealing scheduler for arbitrary tasks (all □ [design] — though
+   as of it129 the design now includes a DECIDED determinism strategy for real
+   cross-instance concurrency, not just an open question; see
+   `docs/design/ASYNC.md` §7). Go, Rust, Kotlin, Swift, and the JVM all still
+   win decisively on *general-purpose* concurrency. Still the top gap for the
+   "universal, capable of any software" claim.
 2. **Numeric-loop performance** — the whole component model and the entire
    language already compile to native machine code at native speed (see
    "Runtime performance" above); what remains is the *optional* typed SSA IR
@@ -487,16 +550,18 @@ for a language this approachable.
    across every engine including native, checked/wrapping/saturating
    arithmetic and all; see "What changed since the it20 refresh" above.)
 
-**Roadmap implication (drives it22+):** the criteria where KUPL scores lowest
-and which are most load-bearing for the founding thesis are, in order:
-**(a) general concurrency** beyond the existing `par_map`/`par_filter` real-
-thread seam (async I/O + a work-stealing/multi-threaded scheduler for `par{}`
-branches and arbitrary tasks, with the virtual clock preserved for tests);
+**Roadmap implication:** the criteria where KUPL scores lowest and which are
+most load-bearing for the founding thesis are, in order: **(a) general
+concurrency** beyond the existing `par_map`/`par_filter`/`par { }` real-thread
+seams (general async I/O + a work-stealing/multi-threaded scheduler for
+arbitrary tasks, with the virtual clock preserved for tests — the design's own
+determinism strategy is now decided, it129, but implementation hasn't started);
 **(b) KIR** (KValue unboxing) for tight numeric-loop performance, now that
 native components/the whole language already compile natively; **(c) the
 GPU/kernel and systems tiers** and a hosted package **registry**. The it14–20
 arc closed the everyday-capability and stdlib gaps; the it27–40 arcs closed
-sized numerics, real-thread data parallelism, and native components; what
-remains are general concurrency, numeric-loop unboxing, hardware tiers, and
-ecosystem. See
+sized numerics, real-thread data parallelism, and native components; the
+it99–128 arc closed structured `par { }` real threading, capabilities, and
+hot-swap migration; what remains are general concurrency implementation,
+numeric-loop unboxing, hardware tiers, and ecosystem. See
 [`GAPS.md`](GAPS.md) for the tracked roadmap.
