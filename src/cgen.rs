@@ -151,11 +151,21 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
             let _ = writeln!(out, "static const char* const AITOOL_{i}_{j}_PN[] = {{ {pn} }};");
             let _ = writeln!(out, "static const KAiShape* const AITOOL_{i}_{j}_PS[] = {{ {ps} }};");
             let fnid = *module.funs.get(&t.name).unwrap_or(&0);
+            // `description`/`ret` (it127): unused by the mock path (which
+            // discards a tool's return value entirely -- the scripted
+            // conversation dictates what happens next regardless of what
+            // the tool actually returns), needed only for a REAL provider
+            // round-trip's own tools-schema request field and to
+            // serialize the tool's ACTUAL return value back to JSON for
+            // the next round's message.
+            let ret_addr = emit_ai_shape(&mut out, &t.ret, &mut ai_ctr);
             entries.push(format!(
-                "{{ \"{}\", {}, AITOOL_{i}_{j}_PN, AITOOL_{i}_{j}_PS, {} }}",
+                "{{ \"{}\", {}, AITOOL_{i}_{j}_PN, AITOOL_{i}_{j}_PS, {}, \"{}\", {} }}",
                 c_escape(&t.name),
                 fnid,
-                t.params.len()
+                t.params.len(),
+                c_escape(&t.description),
+                ret_addr,
             ));
         }
         let _ = writeln!(out, "static const KAiTool AITOOLS_{i}[] = {{ {} }};", entries.join(", "));
@@ -4907,7 +4917,11 @@ struct KAiShape {
                                   messages name the TYPE, not the specific
                                   constructor -- production-hardening PR-it793) */
 };
-typedef struct { const char* name; int fnid; const char* const* pnames; const KAiShape* const* pshapes; int nparams; } KAiTool;
+/* `description`/`ret` added it127: needed only for a REAL provider
+   tool-use round-trip (the tools-schema request field, and serializing
+   a tool's ACTUAL return value back to JSON for the next round) -- the
+   mock path never reads either. */
+typedef struct { const char* name; int fnid; const char* const* pnames; const KAiShape* const* pshapes; int nparams; const char* description; const KAiShape* ret; } KAiTool;
 /* `model`/`param_names`/`nparams` added it125: needed to build a REAL
    provider prompt (intent + per-arg "{name}: {value}" lines, mirroring
    ai.rs::build_prompt), unused by the mock path (which ignores the
@@ -5927,6 +5941,432 @@ static KValue k_ai_anthropic_call(const KAiFun* f, const char* prompt) {
 
 /* mirrors ai.rs::raw_response's provider dispatch exactly (past the
    mock check, which k_ai_call already did before calling this). */
+/* ---- native `ai fun` REAL provider TOOL USE (it127) ----
+   Ports ai.rs's run_tool_loop/tool_response/AnthropicProvider/
+   OpenAiProvider/anthropic_tools_json/openai_tools_json/value_to_json.
+   Unlike the non-tool path (a single request/response), this is a
+   genuinely stateful multi-round conversation: each round POSTs the
+   FULL message history so far, and either gets a final answer or a
+   request to call one or more tools, whose results get appended as new
+   messages before the next round. The message-echoing text sent BACK to
+   the provider (the assistant's own tool_use turn, re-serialized) is
+   never observed by the running KUPL program or compared cross-engine
+   -- only the FINAL converted value/error is -- so `k_json_stringify`
+   (the one JSON serializer this runtime has) is reused directly rather
+   than hand-rolling a byte-identical mirror of ai.rs's own internal
+   `dump_json` formatting. */
+
+/* object schema for a tool's own named params, mirrors ai.rs::
+   params_schema exactly (the SAME object-schema shape k_ai_schema_json's
+   own Record case already builds, just not wrapped in a `{"value":...}`
+   envelope). */
+static char* k_ai_params_schema(const char* const* pnames, const KAiShape* const* pshapes, int n) {
+    KBuf b = {0};
+    kb_puts(&b, "{\"type\":\"object\",\"properties\":{");
+    for (int i = 0; i < n; i++) {
+        if (i > 0) kb_puts(&b, ",");
+        kb_puts(&b, "\"");
+        k_ai_json_escape_body(&b, pnames[i]);
+        kb_puts(&b, "\":");
+        k_ai_schema_json(pshapes[i], &b);
+    }
+    kb_puts(&b, "},\"required\":[");
+    for (int i = 0; i < n; i++) {
+        if (i > 0) kb_puts(&b, ",");
+        kb_puts(&b, "\"");
+        k_ai_json_escape_body(&b, pnames[i]);
+        kb_puts(&b, "\"");
+    }
+    kb_puts(&b, "],\"additionalProperties\":false}");
+    return b.buf ? b.buf : k_strdup("");
+}
+static char* k_ai_anthropic_tools_json(const KAiFun* f) {
+    KBuf b = {0};
+    kb_puts(&b, "[");
+    for (int i = 0; i < f->ntools; i++) {
+        if (i > 0) kb_puts(&b, ",");
+        const KAiTool* t = &f->tools[i];
+        kb_puts(&b, "{\"name\":\"");
+        k_ai_json_escape_body(&b, t->name);
+        kb_puts(&b, "\",\"description\":\"");
+        k_ai_json_escape_body(&b, t->description);
+        kb_puts(&b, "\",\"input_schema\":");
+        kb_puts(&b, k_ai_params_schema(t->pnames, t->pshapes, t->nparams));
+        kb_puts(&b, "}");
+    }
+    kb_puts(&b, "]");
+    return b.buf ? b.buf : k_strdup("");
+}
+static char* k_ai_openai_tools_json(const KAiFun* f) {
+    KBuf b = {0};
+    kb_puts(&b, "[");
+    for (int i = 0; i < f->ntools; i++) {
+        if (i > 0) kb_puts(&b, ",");
+        const KAiTool* t = &f->tools[i];
+        kb_puts(&b, "{\"type\":\"function\",\"function\":{\"name\":\"");
+        k_ai_json_escape_body(&b, t->name);
+        kb_puts(&b, "\",\"description\":\"");
+        k_ai_json_escape_body(&b, t->description);
+        kb_puts(&b, "\",\"parameters\":");
+        kb_puts(&b, k_ai_params_schema(t->pnames, t->pshapes, t->nparams));
+        kb_puts(&b, "}}");
+    }
+    kb_puts(&b, "]");
+    return b.buf ? b.buf : k_strdup("");
+}
+
+/* mirrors ai.rs::value_to_json EXACTLY, shape-guided. `k_show` on a
+   K_INT/K_FLOAT/K_BOOL value already produces exactly what `n.to_string()`/
+   `format!(...)`/`b.to_string()` would in Rust (confirmed by reading
+   Value::Float's own Display impl, which uses the IDENTICAL fract()==0.0
+   -> "X.0" rule ai.rs::value_to_json's Float arm hand-codes) -- both
+   ultimately format the SAME underlying number the SAME way, so no
+   separate float-formatting helper is needed here. */
+static void k_ai_value_to_json(const KAiShape* s, KValue v, KBuf* b) {
+    switch (s->kind) {
+        case 0: /* Str */
+            if (v.tag == K_STR) { kb_puts(b, "\""); k_ai_json_escape_body(b, v.as.s); kb_puts(b, "\""); return; }
+            break;
+        case 1: /* Int */
+            if (v.tag == K_INT) { kb_puts(b, k_show(v)); return; }
+            break;
+        case 2: /* Float */
+            if (v.tag == K_FLOAT) {
+                if (!isfinite(v.as.f)) kb_puts(b, "null");
+                else kb_puts(b, k_show(v));
+                return;
+            }
+            break;
+        case 3: /* Bool */
+            if (v.tag == K_BOOL) { kb_puts(b, k_show(v)); return; }
+            break;
+        case 4: /* List */
+            if (v.tag == K_LIST) {
+                kb_puts(b, "[");
+                for (int64_t i = 0; i < v.as.list->len; i++) {
+                    if (i > 0) kb_puts(b, ",");
+                    k_ai_value_to_json(s->inner, v.as.list->items[i], b);
+                }
+                kb_puts(b, "]");
+                return;
+            }
+            break;
+        case 5: /* Option */
+            if (v.tag == K_CTOR) {
+                if (!strcmp(CTORS[v.as.ctor->ctor].variant, "Some")) {
+                    k_ai_value_to_json(s->inner, v.as.ctor->fields[0], b);
+                    return;
+                }
+                kb_puts(b, "null");
+                return;
+            }
+            break;
+        default: /* 6: Record */
+            if (v.tag == K_CTOR) {
+                kb_puts(b, "{");
+                for (int i = 0; i < s->nfields; i++) {
+                    if (i > 0) kb_puts(b, ",");
+                    kb_puts(b, "\"");
+                    k_ai_json_escape_body(b, s->fnames[i]);
+                    kb_puts(b, "\":");
+                    k_ai_value_to_json(s->fshapes[i], v.as.ctor->fields[i], b);
+                }
+                kb_puts(b, "}");
+                return;
+            }
+            break;
+    }
+    /* shape/value mismatch: fall back to the Display form as a JSON
+       string, mirroring ai.rs::value_to_json's own final catch-all arm. */
+    kb_puts(b, "\"");
+    k_ai_json_escape_body(b, k_show(v));
+    kb_puts(b, "\"");
+}
+
+/* Look up `name` among `f`'s own declared tools, parse `input_json`
+   (a parsed Json value, JObj-shaped -- or anything else, which fails
+   every param lookup the SAME way a missing input would) into typed
+   args via the SAME `k_ai_from_json` the mock path already uses, invoke
+   the compiled KUPL function (the SAME setjmp/k_pad panic-catch pattern
+   `k_ai_call_one_tool` already uses, generalized here to also CAPTURE
+   the return value instead of discarding it), and serialize the result
+   to `*out_result_json` via `k_ai_value_to_json`. Sets k_ai_ok/
+   k_ai_err_buf and returns 0 on any failure (missing tool/argument, or
+   a caught panic from the tool's own body). */
+static int k_ai_invoke_tool(const KAiFun* f, const char* name, KValue input_json, char** out_result_json) {
+    const KAiTool* t = 0;
+    for (int k = 0; k < f->ntools; k++) {
+        if (!strcmp(f->tools[k].name, name)) { t = &f->tools[k]; break; }
+    }
+    if (!t) {
+        kb_reset(&k_ai_err_buf);
+        kb_printf(&k_ai_err_buf, "model called unknown tool `%s`", name);
+        k_ai_ok = 0; return 0;
+    }
+    KMap* im = !strcmp(k_json_var(input_json), "JObj") ? k_json_field0(input_json).as.map : 0;
+    KValue* targs = (KValue*)k_alloc(sizeof(KValue) * (t->nparams < 1 ? 1 : t->nparams));
+    for (int p = 0; p < t->nparams; p++) {
+        KValue pj;
+        if (!im || !k_map_field(im, t->pnames[p], &pj)) {
+            kb_reset(&k_ai_err_buf);
+            kb_printf(&k_ai_err_buf, "tool `%s` is missing argument `%s`", name, t->pnames[p]);
+            k_ai_ok = 0; return 0;
+        }
+        targs[p] = k_ai_from_json(t->pshapes[p], pj);
+        if (!k_ai_ok) return 0;
+    }
+    jmp_buf tool_pad; jmp_buf* prev_pad = k_pad; k_pad = &tool_pad;
+    int saved_cur_inst = k_cur_inst;
+    int64_t saved_depth = k_depth;
+    KValue result;
+    if (setjmp(tool_pad) == 0) {
+        result = k_call(k_fun(t->fnid), targs, t->nparams);
+        k_pad = prev_pad;
+    } else {
+        k_pad = prev_pad; k_cur_inst = saved_cur_inst; k_depth = saved_depth;
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, k_panic_buf);
+        k_ai_ok = 0;
+        return 0;
+    }
+    KBuf rb = {0};
+    k_ai_value_to_json(t->ret, result, &rb);
+    *out_result_json = rb.buf ? rb.buf : k_strdup("");
+    return 1;
+}
+
+/* mirrors ai.rs's AnthropicProvider (round/push_results) + run_tool_loop,
+   fused into one imperative loop (C has no trait objects). */
+static KValue k_ai_anthropic_tool_call(const KAiFun* f, const char* prompt) {
+    const char* key = k_getenv_ne("ANTHROPIC_API_KEY");
+    if (!key) {
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, "ANTHROPIC_API_KEY is not set (or set KUPL_AI_MOCK for the mock provider)");
+        k_ai_ok = 0; return k_unit();
+    }
+    const char* model = f->model ? f->model : k_getenv_ne("KUPL_AI_MODEL");
+    if (!model) model = "claude-opus-4-8";
+    const char* base = k_getenv_ne("KUPL_AI_BASE_URL"); if (!base) base = "https://api.anthropic.com";
+    char* tools_json = k_ai_anthropic_tools_json(f);
+    KBuf url = {0}; kb_puts(&url, base); kb_puts(&url, "/v1/messages");
+    KBuf keyhdr = {0}; kb_puts(&keyhdr, "x-api-key: "); kb_puts(&keyhdr, key);
+    const char* headers[2]; headers[0] = keyhdr.buf; headers[1] = "anthropic-version: 2023-06-01";
+
+    KBuf messages = {0};
+    kb_puts(&messages, "{\"role\":\"user\",\"content\":\"");
+    k_ai_json_escape_body(&messages, prompt);
+    kb_puts(&messages, "\"}");
+
+    for (int round = 0; round < 8; round++) {
+        KBuf body = {0};
+        kb_puts(&body, "{\"model\":\"");
+        k_ai_json_escape_body(&body, model);
+        kb_puts(&body, "\",\"max_tokens\":4096,\"tools\":");
+        kb_puts(&body, tools_json);
+        kb_puts(&body, ",\"messages\":[");
+        kb_puts(&body, messages.buf ? messages.buf : "");
+        kb_puts(&body, "]}");
+
+        KValue resp = k_ai_http_post(url.buf, headers, 2, body.buf);
+        if (strcmp(CTORS[resp.as.ctor->ctor].variant, "Ok")) {
+            kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, k_json_field0(resp).as.s);
+            k_ai_ok = 0; return k_unit();
+        }
+        KValue parsed = k_json_parse(k_str(k_json_field0(resp).as.s));
+        if (strcmp(CTORS[parsed.as.ctor->ctor].variant, "Ok")) {
+            kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "bad provider response: %s", k_json_field0(parsed).as.s);
+            k_ai_ok = 0; return k_unit();
+        }
+        KValue json = k_json_field0(parsed);
+        KValue tv; const char* ts;
+        if (k_ai_json_get(json, "type", &tv) && k_ai_json_str(tv, &ts) && !strcmp(ts, "error")) {
+            const char* msg = "unknown provider error";
+            KValue errv, msgv; const char* s;
+            if (k_ai_json_get(json, "error", &errv) && k_ai_json_get(errv, "message", &msgv) && k_ai_json_str(msgv, &s)) msg = s;
+            kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "anthropic: %s", msg);
+            k_ai_ok = 0; return k_unit();
+        }
+        KValue contentv;
+        if (!k_ai_json_get(json, "content", &contentv) || strcmp(k_json_var(contentv), "JArr")) {
+            kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "anthropic: response has no content");
+            k_ai_ok = 0; return k_unit();
+        }
+        KList* content = k_json_field0(contentv).as.list;
+        const char* stop = "";
+        KValue sv; const char* stmp;
+        if (k_ai_json_get(json, "stop_reason", &sv) && k_ai_json_str(sv, &stmp)) stop = stmp;
+        if (!strcmp(stop, "tool_use")) {
+            kb_puts(&messages, ",{\"role\":\"assistant\",\"content\":");
+            kb_puts(&messages, k_json_stringify(contentv).as.s);
+            kb_puts(&messages, "}");
+            KBuf resultBlocks = {0};
+            int nresults = 0;
+            for (int64_t bi = 0; bi < content->len; bi++) {
+                KValue block = content->items[bi];
+                KValue btype; const char* bts;
+                if (!k_ai_json_get(block, "type", &btype) || !k_ai_json_str(btype, &bts) || strcmp(bts, "tool_use")) continue;
+                KValue idv, namev, inputv;
+                const char* id = ""; const char* name = "";
+                if (k_ai_json_get(block, "id", &idv)) k_ai_json_str(idv, &id);
+                if (k_ai_json_get(block, "name", &namev)) k_ai_json_str(namev, &name);
+                KValue input = k_ai_json_get(block, "input", &inputv) ? inputv : k_unit();
+                char* result_json = 0;
+                if (!k_ai_invoke_tool(f, name, input, &result_json)) return k_unit();
+                if (nresults > 0) kb_puts(&resultBlocks, ",");
+                kb_puts(&resultBlocks, "{\"type\":\"tool_result\",\"tool_use_id\":\"");
+                k_ai_json_escape_body(&resultBlocks, id);
+                kb_puts(&resultBlocks, "\",\"content\":\"");
+                k_ai_json_escape_body(&resultBlocks, result_json);
+                kb_puts(&resultBlocks, "\"}");
+                nresults++;
+            }
+            if (nresults == 0) {
+                kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "provider asked to use zero tools");
+                k_ai_ok = 0; return k_unit();
+            }
+            kb_puts(&messages, ",{\"role\":\"user\",\"content\":[");
+            kb_puts(&messages, resultBlocks.buf ? resultBlocks.buf : "");
+            kb_puts(&messages, "]}");
+            continue;
+        }
+        KBuf text = {0};
+        for (int64_t bi = 0; bi < content->len; bi++) {
+            KValue block = content->items[bi];
+            KValue btype; const char* bts;
+            if (k_ai_json_get(block, "type", &btype) && k_ai_json_str(btype, &bts) && !strcmp(bts, "text")) {
+                KValue btext; const char* s;
+                if (k_ai_json_get(block, "text", &btext) && k_ai_json_str(btext, &s)) kb_puts(&text, s);
+            }
+        }
+        return k_ai_convert(f->shape, text.buf ? text.buf : "");
+    }
+    kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "tool loop exceeded 8 rounds without a final answer");
+    k_ai_ok = 0; return k_unit();
+}
+
+/* mirrors ai.rs's OpenAiProvider (round/push_results) + run_tool_loop,
+   for BOTH the `openai` and `ollama` providers (they share this ONE
+   code path in ai.rs too). */
+static KValue k_ai_openai_tool_call(const KAiFun* f, const char* prompt, const char* default_base, int need_key) {
+    const char* model = f->model ? f->model : k_getenv_ne("KUPL_AI_MODEL");
+    if (!model) {
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, "KUPL_AI_MODEL is not set (required for openai/ollama providers)");
+        k_ai_ok = 0; return k_unit();
+    }
+    const char* key = k_getenv_ne("OPENAI_API_KEY");
+    if (!key && need_key) {
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, "OPENAI_API_KEY is not set");
+        k_ai_ok = 0; return k_unit();
+    }
+    const char* base = k_getenv_ne("KUPL_AI_BASE_URL"); if (!base) base = default_base;
+    char* tools_json = k_ai_openai_tools_json(f);
+    KBuf url = {0}; kb_puts(&url, base); kb_puts(&url, "/v1/chat/completions");
+    const char* headers[1]; int nheaders = 0;
+    KBuf authbuf = {0};
+    if (key) { kb_puts(&authbuf, "Authorization: Bearer "); kb_puts(&authbuf, key); headers[nheaders++] = authbuf.buf; }
+
+    KBuf messages = {0};
+    kb_puts(&messages, "{\"role\":\"user\",\"content\":\"");
+    k_ai_json_escape_body(&messages, prompt);
+    kb_puts(&messages, "\"}");
+
+    for (int round = 0; round < 8; round++) {
+        KBuf body = {0};
+        kb_puts(&body, "{\"model\":\"");
+        k_ai_json_escape_body(&body, model);
+        kb_puts(&body, "\",\"tools\":");
+        kb_puts(&body, tools_json);
+        kb_puts(&body, ",\"messages\":[");
+        kb_puts(&body, messages.buf ? messages.buf : "");
+        kb_puts(&body, "]}");
+
+        KValue resp = k_ai_http_post(url.buf, headers, nheaders, body.buf);
+        if (strcmp(CTORS[resp.as.ctor->ctor].variant, "Ok")) {
+            kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, k_json_field0(resp).as.s);
+            k_ai_ok = 0; return k_unit();
+        }
+        KValue parsed = k_json_parse(k_str(k_json_field0(resp).as.s));
+        if (strcmp(CTORS[parsed.as.ctor->ctor].variant, "Ok")) {
+            kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "bad provider response: %s", k_json_field0(parsed).as.s);
+            k_ai_ok = 0; return k_unit();
+        }
+        KValue json = k_json_field0(parsed);
+        KValue errv;
+        if (k_ai_json_get(json, "error", &errv)) {
+            const char* msg = "unknown provider error";
+            KValue msgv; const char* s;
+            if (k_ai_json_get(errv, "message", &msgv) && k_ai_json_str(msgv, &s)) msg = s;
+            kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "provider: %s", msg);
+            k_ai_ok = 0; return k_unit();
+        }
+        KValue choices, c0, message;
+        if (!k_ai_json_get(json, "choices", &choices) || !k_ai_json_index(choices, 0, &c0) || !k_ai_json_get(c0, "message", &message)) {
+            kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "provider: response has no message");
+            k_ai_ok = 0; return k_unit();
+        }
+        KValue callsv;
+        if (k_ai_json_get(message, "tool_calls", &callsv) && !strcmp(k_json_var(callsv), "JArr")) {
+            kb_puts(&messages, ",");
+            kb_puts(&messages, k_json_stringify(message).as.s);
+            KList* calls = k_json_field0(callsv).as.list;
+            if (calls->len == 0) {
+                kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "provider asked to use zero tools");
+                k_ai_ok = 0; return k_unit();
+            }
+            for (int64_t ci = 0; ci < calls->len; ci++) {
+                KValue call = calls->items[ci];
+                KValue idv; const char* id = "";
+                if (k_ai_json_get(call, "id", &idv)) k_ai_json_str(idv, &id);
+                KValue funcv;
+                const char* name = "";
+                KValue input = k_unit();
+                if (k_ai_json_get(call, "function", &funcv)) {
+                    KValue namev;
+                    if (k_ai_json_get(funcv, "name", &namev)) k_ai_json_str(namev, &name);
+                    KValue argsv; const char* args_str = "{}";
+                    if (k_ai_json_get(funcv, "arguments", &argsv)) { const char* s; if (k_ai_json_str(argsv, &s)) args_str = s; }
+                    KValue parsed_args = k_json_parse(k_str(args_str));
+                    if (!strcmp(CTORS[parsed_args.as.ctor->ctor].variant, "Ok")) input = k_json_field0(parsed_args);
+                }
+                char* result_json = 0;
+                if (!k_ai_invoke_tool(f, name, input, &result_json)) return k_unit();
+                kb_puts(&messages, ",{\"role\":\"tool\",\"tool_call_id\":\"");
+                k_ai_json_escape_body(&messages, id);
+                kb_puts(&messages, "\",\"content\":\"");
+                k_ai_json_escape_body(&messages, result_json);
+                kb_puts(&messages, "\"}");
+            }
+            continue;
+        }
+        KValue contentv; const char* text = "";
+        if (k_ai_json_get(message, "content", &contentv)) { const char* s; if (k_ai_json_str(contentv, &s)) text = s; }
+        return k_ai_convert(f->shape, text);
+    }
+    kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "tool loop exceeded 8 rounds without a final answer");
+    k_ai_ok = 0; return k_unit();
+}
+
+/* mirrors ai.rs::tool_response's own provider dispatch exactly -- note
+   this has NO `echo` branch (unlike raw_response's non-tool dispatch):
+   ai.rs never wired echo into the tool-use path either. */
+static KValue k_ai_real_tool_call(const KAiFun* f, const char* intent, KValue* args, int nargs) {
+    char* prompt = k_ai_build_prompt(f, intent, args, nargs);
+    const char* provider = k_getenv_ne("KUPL_AI_PROVIDER");
+    if (!provider || !strcmp(provider, "anthropic")) return k_ai_anthropic_tool_call(f, prompt);
+    if (!strcmp(provider, "openai")) return k_ai_openai_tool_call(f, prompt, "https://api.openai.com", 1);
+    if (!strcmp(provider, "ollama")) return k_ai_openai_tool_call(f, prompt, "http://localhost:11434", 0);
+    if (!strcmp(provider, "mock")) {
+        kb_reset(&k_ai_err_buf);
+        kb_printf(&k_ai_err_buf, "mock provider: set %s to a scripted round array", f->mock_key);
+        k_ai_ok = 0; return k_unit();
+    }
+    kb_reset(&k_ai_err_buf);
+    kb_printf(&k_ai_err_buf, "unknown KUPL_AI_PROVIDER `%s`", provider);
+    k_ai_ok = 0; return k_unit();
+}
+
 static KValue k_ai_real_call(const KAiFun* f, const char* intent, KValue* args, int nargs) {
     const char* provider = k_getenv_ne("KUPL_AI_PROVIDER");
     char* prompt = k_ai_build_prompt(f, intent, args, nargs);
@@ -5948,17 +6388,17 @@ static KValue k_ai_call(int info, const char* intent, KValue* args, int nargs) {
     const KAiFun* f = &AI_FUNS[info];
     const char* text = k_getenv_ne(f->mock_key);
     if (!text) text = k_getenv_ne("KUPL_AI_MOCK");
-    if (!text && f->has_tools) {
-        // it125: real-provider calls cover non-tool ai funs of ANY shape
-        // (structured shapes joined Str at it126, via k_ai_wire_schema/
-        // response_format/output_config) -- tool use still defers to
-        // `kupl bundle`, UNCHANGED from before this iteration.
-        const char* msg = "native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`";
-        if (f->wraps_result) return k_err(k_str(msg));
-        k_panic(msg); return k_unit();
+    // it125/it126/it127: every non-mock ai fun -- tool-using or not, any
+    // return shape -- now gets a real network path; `kupl bundle` is no
+    // longer needed for anything.
+    KValue v;
+    if (text) {
+        v = f->has_tools ? k_ai_tool_call(f, text) : k_ai_convert(f->shape, text);
+    } else if (f->has_tools) {
+        v = k_ai_real_tool_call(f, intent, args, nargs);
+    } else {
+        v = k_ai_real_call(f, intent, args, nargs);
     }
-    KValue v = text ? (f->has_tools ? k_ai_tool_call(f, text) : k_ai_convert(f->shape, text))
-                     : k_ai_real_call(f, intent, args, nargs);
     if (k_ai_ok) return f->wraps_result ? k_ok(v) : v;
     if (f->wraps_result) return k_err(k_str(k_strdup(k_ai_err)));
     /* A REAL cross-engine divergence found+fixed (production-hardening
@@ -11068,26 +11508,75 @@ mod tests {
         assert_eq!(out, "err:unknown KUPL_AI_PROVIDER `not_a_real_provider` (use anthropic, openai, ollama, or mock)\n");
     }
 
-    /// it125 regression guard: a TOOL-using ai fun with no mock set must
-    /// still unconditionally defer to `kupl bundle`, UNCHANGED from
-    /// before this iteration -- real-provider tool use was explicitly
-    /// left out of this first slice's scope (see `k_ai_call`'s own
-    /// gating comment). `KUPL_AI_PROVIDER=echo` is set here specifically
-    /// to confirm the gate fires on `has_tools` BEFORE ever reaching the
-    /// new real-call code at all (echo would otherwise succeed trivially).
+    /// it127: a TOOL-using ai fun now gets a REAL, multi-round provider
+    /// path too (previously unconditionally deferred to `kupl bundle`).
+    /// This is the ONLY way to genuinely verify the multi-round machinery
+    /// (append the assistant's tool-call turn, invoke the compiled KUPL
+    /// tool function with args parsed from the provider's own JSON,
+    /// serialize its ACTUAL return value back into the next round's
+    /// message, re-POST) without live API cost: a local mock server
+    /// (the it126 pattern) that answers TWO sequential requests
+    /// differently -- round 1 asks for a tool call, round 2 gives the
+    /// final answer. The round-2 REQUEST is captured to confirm the
+    /// tool's REAL return value (`add_one(41) == 42`, not the scripted
+    /// round-1 input) reached the wire, independent of round 2's own
+    /// (deliberately unrelated) canned final value -- proving the tool
+    /// genuinely ran with correctly-parsed arguments rather than being
+    /// skipped or fed stale/scripted data.
     #[test]
-    fn native_ai_fun_with_tools_and_no_mock_still_defers_to_kupl_bundle() {
+    fn native_ai_fun_openai_tool_use_round_trips_through_a_local_mock_server() {
         if !cc_available() {
             return;
         }
-        let src = "fun tool_x() -> Int { 1 }\n\
-                   ai fun helper() -> Result[Str, Str] tools [tool_x] {\n    intent \"h\"\n}\n\
-                   fun main() uses io {\n    match helper() {\n        Ok(v) => print(\"ok:{v}\")\n        Err(e) => print(\"err:{e}\")\n    }\n}\n";
-        let out = native_main_stdout_env(src, "aifuntoolsdefer", &[("KUPL_AI_PROVIDER", "echo")]);
-        assert_eq!(
-            out,
-            "err:native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`\n"
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            // Round 1: the model asks to call `add_one` with n=41.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"add_one","arguments":"{\"n\":41}"}}]}}]}"#;
+                let resp = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            // Round 2: capture the request (which must carry the tool's
+            // REAL result, 42) and answer with a final value (99,
+            // deliberately unrelated to 42) so the two are distinguishable.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = r#"{"choices":[{"message":{"content":"{\"value\":99}"}}]}"#;
+                let resp = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let src = "fun add_one(n: Int) -> Int { n + 1 }\n\
+                   ai fun helper() -> Int tools [add_one] {\n    intent \"h\"\n}\n\
+                   fun main() uses io {\n    print(helper())\n}\n";
+        let base_url = format!("http://127.0.0.1:{port}");
+        let out = native_main_stdout_env(
+            src,
+            "aifuntoolreal",
+            &[("KUPL_AI_PROVIDER", "ollama"), ("KUPL_AI_MODEL", "test"), ("KUPL_AI_BASE_URL", &base_url)],
         );
+        assert_eq!(out, "99\n", "the round-2 canned response must be the final printed value");
+        let round2 = rx.recv().expect("the mock server must have received a second request");
+        assert!(
+            round2.contains("\"role\":\"tool\""),
+            "round 2's request must carry a tool-result message: {round2}"
+        );
+        assert!(
+            round2.contains("\"tool_call_id\":\"call_1\""),
+            "the tool result must echo back round 1's own call id: {round2}"
+        );
+        assert!(
+            round2.contains("42"),
+            "the tool result must carry add_one(41)'s REAL return value (42), not the scripted round-1 input (41): {round2}"
+        );
+        let _ = server.join();
     }
 
     /// it126: a STRUCTURED (non-`Str`) return shape now gets a REAL
@@ -11141,24 +11630,81 @@ mod tests {
         let _ = server.join();
     }
 
-    /// it126 regression guard: a TOOL-using ai fun (any shape) with no
-    /// mock set must STILL unconditionally defer -- real-provider tool
-    /// use remains explicitly out of scope. `KUPL_AI_PROVIDER=echo`
-    /// confirms the gate fires on `has_tools` before any new code runs
-    /// (echo would otherwise succeed trivially for a `-> Str` tool fun).
+    /// it127: the SAME multi-round tool-use round trip, on the `anthropic`
+    /// (default) provider path -- a genuinely DIFFERENT code path from
+    /// openai/ollama's shared one (`content[].type=="tool_use"` blocks
+    /// with `input` as a JSON OBJECT directly, vs OpenAI's `tool_calls[]`
+    /// with `function.arguments` as a JSON STRING needing a NESTED
+    /// parse), so the openai-path test above does not cover this. Also
+    /// exercises a RECORD-shaped tool return (`k_ai_value_to_json`'s
+    /// Record case, `k_ai_params_schema`'s object-schema shape) instead
+    /// of a bare scalar, for broader coverage of the new serializer.
     #[test]
-    fn native_ai_fun_structured_shape_with_tools_and_no_mock_still_defers_to_kupl_bundle() {
+    fn native_ai_fun_anthropic_tool_use_round_trips_through_a_local_mock_server() {
         if !cc_available() {
             return;
         }
-        let src = "fun tool_x() -> Int { 1 }\n\
-                   ai fun helper() -> Result[Int, Str] tools [tool_x] {\n    intent \"h\"\n}\n\
-                   fun main() uses io {\n    match helper() {\n        Ok(v) => print(\"ok:{v}\")\n        Err(e) => print(\"err:{e}\")\n    }\n}\n";
-        let out = native_main_stdout_env(src, "aifunstructtoolsdefer", &[("KUPL_AI_PROVIDER", "echo")]);
-        assert_eq!(
-            out,
-            "err:native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`\n"
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            // Round 1: a tool_use content block asking for `lookup(id: 7)`.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"id":7}}]}"#;
+                let resp = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            // Round 2: capture the request (must carry the tool's REAL
+            // Record result, {"name":"item-7"}) and give a final answer.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = r#"{"content":[{"type":"text","text":"done"}]}"#;
+                let resp = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let src = "type Item = { name: Str }\n\
+                   fun lookup(id: Int) -> Item { Item(name: \"item-{id}\") }\n\
+                   ai fun helper() -> Str tools [lookup] {\n    intent \"h\"\n}\n\
+                   fun main() uses io {\n    print(helper())\n}\n";
+        let base_url = format!("http://127.0.0.1:{port}");
+        let out = native_main_stdout_env(
+            src,
+            "aifuntoolanthropic",
+            &[("ANTHROPIC_API_KEY", "dummy"), ("KUPL_AI_BASE_URL", &base_url)],
         );
+        assert_eq!(out, "done\n", "round 2's canned text must be the final printed value");
+        let round2 = rx.recv().expect("the mock server must have received a second request");
+        assert!(
+            round2.contains("\"tool_result\""),
+            "round 2's request must carry a tool_result content block: {round2}"
+        );
+        assert!(
+            round2.contains("\"tool_use_id\":\"toolu_1\""),
+            "the tool result must echo back round 1's own tool_use id: {round2}"
+        );
+        // Checks for the JSON-escaped `"name":"item-7"` key/value pair
+        // specifically (not just the bare substring "item-7"): a sanity
+        // check while writing this test found the DISPLAY-fallback text
+        // (`Item(name: "item-7")`, k_ai_value_to_json's own shape/value-
+        // mismatch catch-all) ALSO happens to contain "item-7" as a raw
+        // substring, so that weaker assertion passed even with the
+        // Record-serialization branch deliberately disabled -- a false
+        // sense of coverage caught only by manually verifying the
+        // sanity-disable actually flipped the assertion, per this
+        // campaign's own established discipline. The escaped-JSON-key
+        // form below can ONLY come from the real `k_ai_value_to_json`
+        // Record path (Display's own format has no quoted "name:" key).
+        assert!(
+            round2.contains("\\\"name\\\":\\\"item-7\\\""),
+            "the tool result must carry lookup(7)'s REAL Record return value, JSON-serialized (not the Display fallback): {round2}"
+        );
+        let _ = server.join();
     }
 
     /// A REAL BUG found+fixed (bug-hunt batch 147, PR-it539): an ai-fun TOOL's
