@@ -764,8 +764,8 @@ completion (3). Everything stays byte-identical across engines.
       return type drives structured output (JSON Schema derived from the
       type); `Result[T, Str]` captures failures; implicit `ai` effect;
       provider-agnostic runtime (anthropic / openai-compatible / ollama /
-      deterministic mock via `KUPL_AI_MOCK*`); every engine including native
-      (see the `◐` entry below — only a real-provider network call defers)
+      deterministic mock via `KUPL_AI_MOCK*`); every engine including native,
+      real-provider network calls included as of it125-it127 (see below)
 - [x] **Tool use** — `ai fun … tools [f, g]` exposes top-level KUPL functions
       to the model; the runtime drives the model↔tool loop (JSON ↔ typed
       values), bounded, scriptable via the mock provider for tests. Real
@@ -786,7 +786,7 @@ completion (3). Everything stays byte-identical across engines.
       bag-of-words hash embedding (the classic "hashing trick" — no model,
       no weights, no network call), byte-identical on all four engines
       including native (see `STDLIB.md`).
-- [◐] **`ai fun` on the native backend** — the deterministic `KUPL_AI_MOCK*`
+- [x] **`ai fun` on the native backend** — the deterministic `KUPL_AI_MOCK*`
       path compiles natively and COMPLETELY (it51 non-tool, it52 tool use),
       byte-identical to the interpreter: structured `Result`/record/`List`
       output AND the mock tool loop (invoking compiled KUPL functions).
@@ -811,9 +811,19 @@ completion (3). Everything stays byte-identical across engines.
       cost) — this caught a REAL memory-safety bug (`k_ai_http_post`'s
       argv allocation was 4 slots short of what it writes, a heap buffer
       overflow) that it125's `echo`-only tests had zero coverage for,
-      since `echo` never calls `k_ai_http_post` at all. **Still defers to
-      `kupl bundle`**: tool-using ai funs (real-provider tool calling) —
-      the one remaining explicitly-scoped-out piece.
+      since `echo` never calls `k_ai_http_post` at all. **As of it127,
+      tool-using ai funs ALSO get a real network path, closing the last
+      remaining gap** — `k_ai_real_tool_call` ports `ai.rs`'s
+      `run_tool_loop`/`tool_response`/`AnthropicProvider`/`OpenAiProvider`
+      to C: a genuinely stateful multi-round conversation (each round
+      POSTs the full message history, either gets a final answer or a
+      request to invoke one or more tools, whose results get appended
+      before the next round), with Anthropic and OpenAI/ollama needing
+      their OWN imperative loop each (C has no trait objects, and the two
+      providers use fully different tool-call response shapes). Verified
+      via local mock servers scripting a tool-call round then a final-
+      answer round, for BOTH provider shapes — `kupl bundle` is no longer
+      needed for any `ai fun`, tool-using or not, any return shape.
 
 ## Tier 2 — component model completion
 
