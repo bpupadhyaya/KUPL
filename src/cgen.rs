@@ -175,15 +175,34 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
     }
     let _ = writeln!(out, "}};\nconst int K_NUFCS = {};\n", ufcs.len());
 
+    // it125: per-ai-fun PARAM NAMES, needed only by a REAL provider call
+    // (`k_ai_real_call`) to build "{name}: {value}" prompt lines -- the
+    // mock path never reads these, mirroring how AITOOLS_{i}'s own PN
+    // arrays are emitted above for tool params.
+    let mut params_expr: Vec<String> = Vec::with_capacity(module.ai_funs.len());
+    for (i, f) in module.ai_funs.iter().enumerate() {
+        if f.params.is_empty() {
+            params_expr.push("0".to_string());
+            continue;
+        }
+        let pnames: Vec<String> = f.params.iter().map(|n| format!("\"{}\"", c_escape(n))).collect();
+        let _ = writeln!(out, "static const char* const AIPARAMS_{i}[] = {{ {} }};", pnames.join(", "));
+        params_expr.push(format!("AIPARAMS_{i}"));
+    }
+
     let _ = writeln!(out, "const KAiFun AI_FUNS[] = {{");
     if module.ai_funs.is_empty() {
-        let _ = writeln!(out, "    {{ 0, 0, 0, 0, 0, 0, 0 }}");
+        let _ = writeln!(out, "    {{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }}");
     } else {
         for (i, f) in module.ai_funs.iter().enumerate() {
             let key = format!("KUPL_AI_MOCK_{}", f.name.to_uppercase());
+            let model = match &f.model {
+                Some(m) => format!("\"{}\"", c_escape(m)),
+                None => "0".to_string(),
+            };
             let _ = writeln!(
                 out,
-                "    {{ \"{}\", \"{}\", {}, {}, {}, {}, {} }},",
+                "    {{ \"{}\", \"{}\", {}, {}, {}, {}, {}, {}, {}, {} }},",
                 c_escape(&f.name),
                 c_escape(&key),
                 shape_addrs[i],
@@ -191,6 +210,9 @@ pub fn emit_c(module: &Module) -> Result<String, String> {
                 (!f.tools.is_empty()) as i32,
                 tools_expr[i].0,
                 tools_expr[i].1,
+                model,
+                params_expr[i],
+                f.params.len(),
             );
         }
     }
@@ -861,12 +883,21 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             // an unused-var warning when zero.
             format!("(void){argc}; regs[{dst}] = CHUNKS[{fun}](0, &regs[{start}]);")
         }
-        // ai funs compile natively (see the module doc comment); a real
-        // provider/tool call defers to `kupl bundle` at runtime (k_ai_call).
+        // ai funs compile natively (see the module doc comment); a
+        // non-tool `-> Str` ai fun's real-provider call ALSO compiles
+        // natively as of it125 (k_ai_call); a tool-using or structured-
+        // shape real-provider call still defers to `kupl bundle`.
         CallAi { dst, info, intent } => {
-            // mock/deterministic path; the resolved intent + args are unused (the
-            // mock ignores the prompt). Real providers/tools defer in k_ai_call.
-            format!("regs[{dst}] = k_ai_call({info}); (void)regs[{intent}];")
+            // params always occupy `regs[chunk.ncaps .. chunk.ncaps+nparams)`
+            // for an ai-fun's own compiled chunk (`compile_ai_fun` binds
+            // them as the chunk's own locals before anything else) --
+            // mirrors vm.rs's OWN `Op::CallAi` handler exactly (`reg!
+            // (chunk.ncaps as u16 + i as u16)`), so both engines read the
+            // args from the SAME register convention.
+            format!(
+                "regs[{dst}] = k_ai_call({info}, k_as_str(regs[{intent}]), &regs[{}], {});",
+                chunk.ncaps, chunk.nparams
+            )
         }
         Panic(idx) => {
             let m = str_const(chunk, *idx)?;
@@ -4877,7 +4908,12 @@ struct KAiShape {
                                   constructor -- production-hardening PR-it793) */
 };
 typedef struct { const char* name; int fnid; const char* const* pnames; const KAiShape* const* pshapes; int nparams; } KAiTool;
-typedef struct { const char* name; const char* mock_key; const KAiShape* shape; int wraps_result; int has_tools; const KAiTool* tools; int ntools; } KAiFun;
+/* `model`/`param_names`/`nparams` added it125: needed to build a REAL
+   provider prompt (intent + per-arg "{name}: {value}" lines, mirroring
+   ai.rs::build_prompt), unused by the mock path (which ignores the
+   prompt entirely). `model` is 0 (NULL) when no per-fun override was
+   declared (falls back to `KUPL_AI_MODEL`/a provider default). */
+typedef struct { const char* name; const char* mock_key; const KAiShape* shape; int wraps_result; int has_tools; const KAiTool* tools; int ntools; const char* model; const char* const* param_names; int nparams; } KAiFun;
 extern const KAiFun AI_FUNS[];
 
 static int k_ai_ok = 1;
@@ -5590,16 +5626,262 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
     return k_ai_convert(f->shape, final_text);
 }
 
-static KValue k_ai_call(int info) {
+/* ---- native `ai fun` REAL provider calls (it125 first slice) ----
+   Ported from ai.rs's build_prompt/http_post/openai_call/anthropic_call,
+   scoped NARROWLY: only non-tool, `-> Str`-shaped ai funs get a real
+   network path here (k_ai_call itself still defers has_tools/structured-
+   shape calls to `kupl bundle`, UNCHANGED from before this iteration) --
+   no JSON-Schema request suffix or `response_format`/`output_config`
+   modifier is needed since those only apply to non-Str shapes. Read
+   entirely from env vars, exactly like ai.rs: `KUPL_AI_PROVIDER`
+   (default `anthropic`), `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`,
+   `KUPL_AI_MODEL`/a per-fun `model` override, `KUPL_AI_BASE_URL`. */
+
+/* mirrors diag::json_escape exactly -- the escaped CONTENT only, no
+   surrounding quotes (unlike k_ai_dump_str_escaped, which adds them for
+   the shape-mismatch-message use case it was written for). A separate,
+   small function rather than a refactor of that existing one, to avoid
+   any risk of changing its own already-tested behavior. */
+static void k_ai_json_escape_body(KBuf* b, const char* s) {
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        unsigned char c = *p;
+        if (c == '"') kb_puts(b, "\\\"");
+        else if (c == '\\') kb_puts(b, "\\\\");
+        else if (c == '\n') kb_puts(b, "\\n");
+        else if (c == '\r') kb_puts(b, "\\r");
+        else if (c == '\t') kb_puts(b, "\\t");
+        else if (c < 0x20) { char t[8]; snprintf(t, sizeof t, "\\u%04x", c); kb_puts(b, t); }
+        else { char t[2] = { (char)c, 0 }; kb_puts(b, t); }
+    }
+}
+
+/* mirrors ai.rs::build_prompt EXACTLY for the `-> Str` shape (the ONLY
+   shape this first slice supports): intent, then -- if there are any
+   params -- one blank line, then one "{name}: {value}" line per param.
+   `k_show` mirrors `Value`'s own `Display` (used for `{value}` above). */
+static char* k_ai_build_prompt(const KAiFun* f, const char* intent, KValue* args, int nargs) {
+    KBuf b = {0};
+    kb_puts(&b, intent);
+    if (nargs > 0) {
+        kb_puts(&b, "\n");
+        for (int i = 0; i < nargs; i++) {
+            kb_puts(&b, "\n");
+            kb_puts(&b, f->param_names[i]);
+            kb_puts(&b, ": ");
+            kb_puts(&b, k_show(args[i]));
+        }
+    }
+    return b.buf ? b.buf : k_strdup("");
+}
+
+/* POST `body` (JSON) to `url` with `headers`, mirroring ai.rs::
+   build_http_post_cmd/http_post exactly -- deliberately NO `--fail`
+   (unlike k_http_get/k_http_post's own convention), so an HTTP error
+   status still returns curl's captured response body (a provider's own
+   JSON error payload) instead of discarding it on a non-2xx status.
+   Reuses k_run_curl for the actual fork/exec/pipe machinery (fully
+   generic over argv), matching MAX_AI_RESPONSE_SIZE (10MiB, ai.rs) and
+   the SAME 120s timeout ai.rs's own http_post uses. */
+static KValue k_ai_http_post(const char* url, const char** headers, int nheaders, const char* body) {
+    int argc = 9 + nheaders * 2 + 1;
+    char** argv = (char**)k_alloc(sizeof(char*) * argc);
+    int i = 0;
+    argv[i++] = (char*)"curl";
+    argv[i++] = (char*)"-sS";
+    argv[i++] = (char*)"--max-time";
+    argv[i++] = (char*)"120";
+    argv[i++] = (char*)"--max-filesize";
+    argv[i++] = (char*)"10485760";
+    argv[i++] = (char*)"-X";
+    argv[i++] = (char*)"POST";
+    for (int h = 0; h < nheaders; h++) { argv[i++] = (char*)"-H"; argv[i++] = (char*)headers[h]; }
+    argv[i++] = (char*)"-H";
+    argv[i++] = (char*)"content-type: application/json";
+    argv[i++] = (char*)"--data-binary";
+    argv[i++] = (char*)"@-";
+    argv[i++] = (char*)url;
+    argv[i++] = 0;
+    return k_run_curl(argv, body);
+}
+
+/* `json.get(key)` on a parsed JObj -- mirrors lsp::Json::get. */
+static int k_ai_json_get(KValue v, const char* key, KValue* out) {
+    return !strcmp(k_json_var(v), "JObj") && k_map_field(k_json_field0(v).as.map, key, out);
+}
+/* `json.index(i)` on a parsed JArr. */
+static int k_ai_json_index(KValue v, int64_t idx, KValue* out) {
+    if (strcmp(k_json_var(v), "JArr")) return 0;
+    KList* l = k_json_field0(v).as.list;
+    if (idx < 0 || idx >= l->len) return 0;
+    *out = l->items[idx];
+    return 1;
+}
+/* `json.str()` on a parsed JStr. */
+static int k_ai_json_str(KValue v, const char** out) {
+    if (strcmp(k_json_var(v), "JStr")) return 0;
+    *out = k_json_field0(v).as.s;
+    return 1;
+}
+
+/* mirrors ai.rs::openai_call EXACTLY, for BOTH the `openai` and `ollama`
+   providers (they share this ONE code path in ai.rs too -- only the
+   default base URL and whether a key is REQUIRED differ). Sets
+   k_ai_ok/k_ai_err_buf on failure (the SAME convention k_ai_convert
+   already uses), or returns the final converted value on success. */
+static KValue k_ai_openai_call(const KAiFun* f, const char* prompt, const char* default_base, int need_key) {
+    const char* model = f->model ? f->model : k_getenv_ne("KUPL_AI_MODEL");
+    if (!model) {
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, "KUPL_AI_MODEL is not set (required for openai/ollama providers)");
+        k_ai_ok = 0; return k_unit();
+    }
+    const char* key = k_getenv_ne("OPENAI_API_KEY");
+    if (!key && need_key) {
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, "OPENAI_API_KEY is not set");
+        k_ai_ok = 0; return k_unit();
+    }
+    KBuf body = {0};
+    kb_puts(&body, "{\"model\":\"");
+    k_ai_json_escape_body(&body, model);
+    kb_puts(&body, "\",\"messages\":[{\"role\":\"user\",\"content\":\"");
+    k_ai_json_escape_body(&body, prompt);
+    kb_puts(&body, "\"}]}");
+    const char* headers[1];
+    int nheaders = 0;
+    KBuf authbuf = {0};
+    if (key) { kb_puts(&authbuf, "Authorization: Bearer "); kb_puts(&authbuf, key); headers[nheaders++] = authbuf.buf; }
+    const char* base = k_getenv_ne("KUPL_AI_BASE_URL"); if (!base) base = default_base;
+    KBuf url = {0}; kb_puts(&url, base); kb_puts(&url, "/v1/chat/completions");
+    KValue resp = k_ai_http_post(url.buf, headers, nheaders, body.buf);
+    if (strcmp(CTORS[resp.as.ctor->ctor].variant, "Ok")) {
+        kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, k_json_field0(resp).as.s);
+        k_ai_ok = 0; return k_unit();
+    }
+    KValue parsed = k_json_parse(k_str(k_json_field0(resp).as.s));
+    if (strcmp(CTORS[parsed.as.ctor->ctor].variant, "Ok")) {
+        kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "bad provider response: %s", k_json_field0(parsed).as.s);
+        k_ai_ok = 0; return k_unit();
+    }
+    KValue json = k_json_field0(parsed);
+    KValue errv;
+    if (k_ai_json_get(json, "error", &errv)) {
+        const char* msg = "unknown provider error";
+        KValue msgv; const char* s;
+        if (k_ai_json_get(errv, "message", &msgv) && k_ai_json_str(msgv, &s)) msg = s;
+        kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "provider: %s", msg);
+        k_ai_ok = 0; return k_unit();
+    }
+    KValue choices, c0, message, content;
+    const char* text;
+    if (!k_ai_json_get(json, "choices", &choices) || !k_ai_json_index(choices, 0, &c0)
+        || !k_ai_json_get(c0, "message", &message) || !k_ai_json_get(message, "content", &content)
+        || !k_ai_json_str(content, &text)) {
+        kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "provider: response has no message content");
+        k_ai_ok = 0; return k_unit();
+    }
+    return k_ai_convert(f->shape, text);
+}
+
+/* mirrors ai.rs::anthropic_call EXACTLY. Sets k_ai_ok/k_ai_err_buf on
+   failure, or returns the final converted value on success. */
+static KValue k_ai_anthropic_call(const KAiFun* f, const char* prompt) {
+    const char* key = k_getenv_ne("ANTHROPIC_API_KEY");
+    if (!key) {
+        kb_reset(&k_ai_err_buf);
+        kb_puts(&k_ai_err_buf, "ANTHROPIC_API_KEY is not set (or set KUPL_AI_MOCK for the mock provider)");
+        k_ai_ok = 0; return k_unit();
+    }
+    const char* model = f->model ? f->model : k_getenv_ne("KUPL_AI_MODEL");
+    if (!model) model = "claude-opus-4-8";
+    KBuf body = {0};
+    kb_puts(&body, "{\"model\":\"");
+    k_ai_json_escape_body(&body, model);
+    kb_puts(&body, "\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":\"");
+    k_ai_json_escape_body(&body, prompt);
+    kb_puts(&body, "\"}]}");
+    const char* base = k_getenv_ne("KUPL_AI_BASE_URL"); if (!base) base = "https://api.anthropic.com";
+    KBuf url = {0}; kb_puts(&url, base); kb_puts(&url, "/v1/messages");
+    KBuf keyhdr = {0}; kb_puts(&keyhdr, "x-api-key: "); kb_puts(&keyhdr, key);
+    const char* headers[2]; headers[0] = keyhdr.buf; headers[1] = "anthropic-version: 2023-06-01";
+    KValue resp = k_ai_http_post(url.buf, headers, 2, body.buf);
+    if (strcmp(CTORS[resp.as.ctor->ctor].variant, "Ok")) {
+        kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, k_json_field0(resp).as.s);
+        k_ai_ok = 0; return k_unit();
+    }
+    KValue parsed = k_json_parse(k_str(k_json_field0(resp).as.s));
+    if (strcmp(CTORS[parsed.as.ctor->ctor].variant, "Ok")) {
+        kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "bad provider response: %s", k_json_field0(parsed).as.s);
+        k_ai_ok = 0; return k_unit();
+    }
+    KValue json = k_json_field0(parsed);
+    KValue tv; const char* ts;
+    if (k_ai_json_get(json, "type", &tv) && k_ai_json_str(tv, &ts) && !strcmp(ts, "error")) {
+        const char* msg = "unknown provider error";
+        KValue errv, msgv; const char* s;
+        if (k_ai_json_get(json, "error", &errv) && k_ai_json_get(errv, "message", &msgv) && k_ai_json_str(msgv, &s)) msg = s;
+        kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "anthropic: %s", msg);
+        k_ai_ok = 0; return k_unit();
+    }
+    KValue contentv;
+    if (!k_ai_json_get(json, "content", &contentv) || strcmp(k_json_var(contentv), "JArr")) {
+        kb_reset(&k_ai_err_buf); kb_puts(&k_ai_err_buf, "anthropic: response has no content");
+        k_ai_ok = 0; return k_unit();
+    }
+    KList* blocks = k_json_field0(contentv).as.list;
+    KBuf text = {0};
+    for (int64_t bi = 0; bi < blocks->len; bi++) {
+        KValue b = blocks->items[bi];
+        KValue btype; const char* bts;
+        if (k_ai_json_get(b, "type", &btype) && k_ai_json_str(btype, &bts) && !strcmp(bts, "text")) {
+            KValue btext; const char* s;
+            if (k_ai_json_get(b, "text", &btext) && k_ai_json_str(btext, &s)) kb_puts(&text, s);
+        }
+    }
+    if (!text.buf || !text.buf[0]) {
+        const char* stop_reason = "unknown";
+        KValue srv; const char* s;
+        if (k_ai_json_get(json, "stop_reason", &srv) && k_ai_json_str(srv, &s)) stop_reason = s;
+        kb_reset(&k_ai_err_buf); kb_printf(&k_ai_err_buf, "anthropic: empty response (stop_reason: %s)", stop_reason);
+        k_ai_ok = 0; return k_unit();
+    }
+    return k_ai_convert(f->shape, text.buf);
+}
+
+/* mirrors ai.rs::raw_response's provider dispatch exactly (past the
+   mock check, which k_ai_call already did before calling this). */
+static KValue k_ai_real_call(const KAiFun* f, const char* intent, KValue* args, int nargs) {
+    const char* provider = k_getenv_ne("KUPL_AI_PROVIDER");
+    char* prompt = k_ai_build_prompt(f, intent, args, nargs);
+    if (!provider || !strcmp(provider, "anthropic")) return k_ai_anthropic_call(f, prompt);
+    if (!strcmp(provider, "openai")) return k_ai_openai_call(f, prompt, "https://api.openai.com", 1);
+    if (!strcmp(provider, "ollama")) return k_ai_openai_call(f, prompt, "http://localhost:11434", 0);
+    if (!strcmp(provider, "echo")) return k_ai_convert(f->shape, prompt);
+    if (!strcmp(provider, "mock")) {
+        kb_reset(&k_ai_err_buf);
+        kb_printf(&k_ai_err_buf, "mock provider: set KUPL_AI_MOCK or %s to the canned response", f->mock_key);
+        k_ai_ok = 0; return k_unit();
+    }
+    kb_reset(&k_ai_err_buf);
+    kb_printf(&k_ai_err_buf, "unknown KUPL_AI_PROVIDER `%s` (use anthropic, openai, ollama, or mock)", provider);
+    k_ai_ok = 0; return k_unit();
+}
+
+static KValue k_ai_call(int info, const char* intent, KValue* args, int nargs) {
     const KAiFun* f = &AI_FUNS[info];
     const char* text = k_getenv_ne(f->mock_key);
     if (!text) text = k_getenv_ne("KUPL_AI_MOCK");
-    if (!text) {
+    if (!text && (f->has_tools || f->shape->kind != 0)) {
+        // it125 first slice: real-provider calls cover only non-tool,
+        // `-> Str` ai funs (see k_ai_real_call's own doc comment above)
+        // -- tool use and structured (non-Str) shapes still defer to
+        // `kupl bundle`, UNCHANGED from before this iteration.
         const char* msg = "native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`";
         if (f->wraps_result) return k_err(k_str(msg));
         k_panic(msg); return k_unit();
     }
-    KValue v = f->has_tools ? k_ai_tool_call(f, text) : k_ai_convert(f->shape, text);
+    KValue v = text ? (f->has_tools ? k_ai_tool_call(f, text) : k_ai_convert(f->shape, text))
+                     : k_ai_real_call(f, intent, args, nargs);
     if (k_ai_ok) return f->wraps_result ? k_ok(v) : v;
     if (f->wraps_result) return k_err(k_str(k_strdup(k_ai_err)));
     /* A REAL cross-engine divergence found+fixed (production-hardening
@@ -10650,6 +10932,104 @@ mod tests {
             &[("KUPL_AI_MOCK_CLASSIFY", "```JSON\n{\"value\": 43}\n```")],
         );
         assert_eq!(out, "43\n");
+    }
+
+    /// it125: a non-tool, `-> Str` native `ai fun` gets a REAL (network-
+    /// capable) provider path, matching `ai.rs::raw_response`'s own
+    /// dispatch, for the first time -- previously EVERY real-provider call
+    /// unconditionally deferred to `kupl bundle`. The zero-network `echo`
+    /// debug provider (`KUPL_AI_PROVIDER=echo`, returns the composed
+    /// prompt verbatim) is the only provider fully verifiable WITHOUT a
+    /// live network call or API key, so it's the primary regression test
+    /// for the new prompt-building/dispatch machinery (`k_ai_build_prompt`/
+    /// `k_ai_real_call`). No params: the prompt is exactly the intent.
+    #[test]
+    fn native_ai_fun_echo_provider_no_params_returns_the_intent_verbatim() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun greet() -> Str {\n    intent \"hello there\"\n}\n\
+                   fun main() uses io {\n    print(greet())\n}\n";
+        let out = native_main_stdout_env(src, "aifunechonoargs", &[("KUPL_AI_PROVIDER", "echo")]);
+        assert_eq!(out, "hello there\n");
+    }
+
+    /// it125: WITH params, the echo provider's own output pins
+    /// `k_ai_build_prompt`'s exact format against `ai.rs::build_prompt`
+    /// byte-for-byte: intent, then ONE blank line, then one
+    /// `"{name}: {value}"` line per param in declaration order -- a
+    /// two-arg case (not just one) confirms params are joined by a
+    /// SINGLE newline each (not another blank line), and that a Str
+    /// arg's own rendering has NO surrounding quotes (top-level Display,
+    /// not the quoted-nested-nested convention).
+    #[test]
+    fn native_ai_fun_echo_provider_with_params_matches_build_prompt_format() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun summarize(topic: Str, count: Int) -> Str {\n    intent \"please summarize\"\n}\n\
+                   fun main() uses io {\n    print(summarize(\"world\", 5))\n}\n";
+        let out = native_main_stdout_env(src, "aifunechoargs", &[("KUPL_AI_PROVIDER", "echo")]);
+        assert_eq!(out, "please summarize\n\ntopic: world\ncount: 5\n");
+    }
+
+    /// it125: an UNKNOWN `KUPL_AI_PROVIDER` value is a clean, safe-to-test
+    /// error (touches no key/model env vars, no network) -- mirrors
+    /// `ai.rs::raw_response`'s own `Some(other) => Err(format!("unknown
+    /// KUPL_AI_PROVIDER \`{other}\` (use anthropic, openai, ollama, or
+    /// mock)"))` wording exactly. Uses a `wraps_result` ai fun so the
+    /// error is observable via stdout (an ordinary `Value`), avoiding any
+    /// need to capture stderr/panic text.
+    #[test]
+    fn native_ai_fun_unknown_provider_is_a_clean_error_matching_ai_rs_wording() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun greet() -> Result[Str, Str] {\n    intent \"hi\"\n}\n\
+                   fun main() uses io {\n    match greet() {\n        Ok(v) => print(\"ok:{v}\")\n        Err(e) => print(\"err:{e}\")\n    }\n}\n";
+        let out = native_main_stdout_env(src, "aifunbadprovider", &[("KUPL_AI_PROVIDER", "not_a_real_provider")]);
+        assert_eq!(out, "err:unknown KUPL_AI_PROVIDER `not_a_real_provider` (use anthropic, openai, ollama, or mock)\n");
+    }
+
+    /// it125 regression guard: a TOOL-using ai fun with no mock set must
+    /// still unconditionally defer to `kupl bundle`, UNCHANGED from
+    /// before this iteration -- real-provider tool use was explicitly
+    /// left out of this first slice's scope (see `k_ai_call`'s own
+    /// gating comment). `KUPL_AI_PROVIDER=echo` is set here specifically
+    /// to confirm the gate fires on `has_tools` BEFORE ever reaching the
+    /// new real-call code at all (echo would otherwise succeed trivially).
+    #[test]
+    fn native_ai_fun_with_tools_and_no_mock_still_defers_to_kupl_bundle() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun tool_x() -> Int { 1 }\n\
+                   ai fun helper() -> Result[Str, Str] tools [tool_x] {\n    intent \"h\"\n}\n\
+                   fun main() uses io {\n    match helper() {\n        Ok(v) => print(\"ok:{v}\")\n        Err(e) => print(\"err:{e}\")\n    }\n}\n";
+        let out = native_main_stdout_env(src, "aifuntoolsdefer", &[("KUPL_AI_PROVIDER", "echo")]);
+        assert_eq!(
+            out,
+            "err:native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`\n"
+        );
+    }
+
+    /// it125 regression guard: a STRUCTURED (non-`Str`) return shape with
+    /// no mock set must ALSO still unconditionally defer -- this first
+    /// slice supports `-> Str` only (no JSON-Schema request suffix / no
+    /// `response_format` modifier implemented). Same `KUPL_AI_PROVIDER=
+    /// echo` confirms the gate fires on shape BEFORE the new code runs.
+    #[test]
+    fn native_ai_fun_structured_shape_and_no_mock_still_defers_to_kupl_bundle() {
+        if !cc_available() {
+            return;
+        }
+        let src = "ai fun classify() -> Result[Int, Str] {\n    intent \"c\"\n}\n\
+                   fun main() uses io {\n    match classify() {\n        Ok(v) => print(\"ok:{v}\")\n        Err(e) => print(\"err:{e}\")\n    }\n}\n";
+        let out = native_main_stdout_env(src, "aifunshapedefer", &[("KUPL_AI_PROVIDER", "echo")]);
+        assert_eq!(
+            out,
+            "err:native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`\n"
+        );
     }
 
     /// A REAL BUG found+fixed (bug-hunt batch 147, PR-it539): an ai-fun TOOL's
