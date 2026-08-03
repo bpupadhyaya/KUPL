@@ -183,7 +183,20 @@ name is K0123); the bound is checked at every CALL site too, not just
 inside the body — passing a type that doesn't support ordering (anything
 other than `Int`, `Float`, `Str`, `Char`, or another numeric type) for an
 Ord-bounded parameter is a compile-time `K0290`, not a deferred runtime
-panic. Type parameters on `type` declarations are **[design]**.
+panic.
+
+### Generic types
+
+```kupl
+type Box[T] = Box(value: T)
+type Pair[A, B] = Pair(first: A, second: B)
+type Tree[T] = Leaf | Node(value: T, left: Tree[T], right: Tree[T])
+```
+
+`type` declarations take type parameters too, checked the same way generic
+functions are (sound, instantiated fresh per use) — the type parameters are
+erased at runtime, since every engine's own comparison/equality/dispatch
+already operates on the value's actual runtime tag, not a static type.
 
 ## 4. Expressions
 
@@ -323,11 +336,20 @@ let sizes = par {
   by construction.
 - Branch types must agree (K0200 otherwise); the result is `List[T]` in branch
   order.
-- **Execution is deterministic** in v1.0-alpha: branches run in order, so
-  `example`/`law`/`kupl test` results are fully reproducible. A real
-  multi-threaded scheduler is the next step and is designed to be
-  **semantics-preserving** — it will not change results, only run the branches
-  on separate threads. (Async I/O and a preemptive scheduler are **[design]**.)
+- **Output is always deterministic and byte-identical to sequential
+  execution**, so `example`/`law`/`kupl test` results stay fully
+  reproducible either way. A branch that's a plain call to a statically
+  pure, top-level named function with plain-literal/identifier
+  arguments runs on a genuine OS thread (the interpreter and the KVM;
+  `kupl native` stays sequential here by deliberate design); any
+  non-qualifying branch falls the WHOLE block back to the exact,
+  unchanged sequential path. Real threading is additive, never a
+  behavior change — results are placed by branch position regardless of
+  which thread finishes first. General async I/O, `await` actually
+  suspending, and a work-stealing scheduler for arbitrary (non-`par`)
+  concurrent tasks remain **[design]** — see `docs/design/ASYNC.md`
+  (design complete, including which determinism guarantee a future
+  implementation will offer; implementation not yet started).
 - The motivating use is **fanning out independent work** — most compellingly a
   batch of independent `ai fun` calls: `par { classify(x)  classify(y) }` runs
   the LLM calls as one parallel batch. Runs identically on the interpreter and
@@ -400,8 +422,16 @@ pub fun broadcast(msg: Str) uses io {   // public: effects MUST be declared
   sub-effects mean `uses io` covers all of them, while `uses io.fs` /
   `uses io.env` / `uses io.net` / `uses io.time` are the precise capabilities.
   (`json_parse`/`json_stringify` and the seeded-random builtins are pure — no
-  effect.) Capability *values* — attenuable, passable file/network handles —
-  are **[design]**.
+  effect.) Capability *values* — attenuable, passable network/file
+  handles — are shipped and enforced for two kinds, `CapNet` and
+  `CapFs`: `cap_net_root()`/`cap_fs_root()` (callable only from `fun
+  main`'s own top-level body, K0304) hand out the unrestricted root
+  capability; `.limited_to(scope: Str)` narrows one (never widens —
+  narrowing an already-limited capability further panics); and
+  `http_get_with`/`read_file_with` are the scope-checked entry points
+  (checked BEFORE any network/disk I/O). See `docs/design/
+  CAPABILITIES.md` and `examples/capabilities.kupl`. Further capability
+  kinds beyond these two remain **[design]**, pending a concrete need.
 - Recursion (incl. mutual) is fully supported. Functions are first-class:
   pass them by name or as lambdas; calls through variables are supported
   (their effects are not tracked in v1.0-alpha — documented limitation).
