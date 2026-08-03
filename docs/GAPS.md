@@ -868,9 +868,19 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       explicitly named as the campaign's OWN "#1 gap for the universal,
       any software claim" (see this Tier's own intro line below). A
       substantial undertaking on the scale of capabilities' own
-      it112-it118 arc, likely needing its own dedicated design pass before
-      any implementation attempt (mirroring `docs/design/CAPABILITIES.md`'s
-      own precedent) — not picked up as of it120. Virtual clock (it9)
+      it112-it118 arc — **design sketch written (it121,
+      `docs/design/ASYNC.md`)**: the SAME `Rc`/`RefCell`-not-`Send` blocker
+      `3-real-concurrency.md` already found for `par{}` applies with full
+      force to per-instance concurrency too; the sketch's own recommended
+      direction generalizes `PortableValue`'s existing clone-across-the-
+      boundary pattern from a one-shot pure call to a long-lived
+      per-instance actor thread, with cross-instance `expose` calls
+      becoming genuine blocking cross-thread request/response (where
+      `await` would finally gain real meaning) — but flags the
+      determinism-under-real-concurrency question (§3.4) as the single
+      hardest unresolved piece, on par with how root-seeding enforcement
+      was the hardest remaining piece for capabilities. Not implemented —
+      a bounded design deliverable, not code. Virtual clock (it9)
       preserved for deterministic tests.
 - [x] **File I/O** (it14) — `read_file`/`write_file`/`append_file`/`delete_file`
       (→ `Result`) + `file_exists`, gated behind the `io.fs` effect. A core "any

@@ -155,4 +155,5 @@ build, opinionated in how code is written.
 - `DISTRIBUTION.md` — components across machines: explicit placement, portability rules, kser wire format, partition-as-supervision.
 - `PLATFORMS.md` — target profiles, capability-provider adapters, lifecycle-as-ports, packaging (server/desktop/web/mobile/embedded).
 - `VISUAL-TOOLS-CONTRACT.md` — numbered obligations (C1–C8+) to visual tools: canonical form, node IDs, `@meta` blocks, manifests, hot swap, trace hooks.
-- `CAPABILITIES.md` — design sketch (not yet implemented) for capabilities as attenuable runtime values, closing the gap between §2's "effects are backed by capabilities" claim and the effect system as actually shipped.
+- `CAPABILITIES.md` — capabilities as attenuable runtime values (`CapNet`/`CapFs`, it116-it118): design sketch, implemented, and enforced, closing §2's "effects are backed by capabilities" claim for two shipped kinds.
+- `ASYNC.md` — design sketch (not yet implemented) for real concurrency between component instances, closing the gap between §4's "M:N work-stealing scheduler"/implicitly-async-handlers claim and the fully synchronous, single-threaded runtime as actually shipped.
