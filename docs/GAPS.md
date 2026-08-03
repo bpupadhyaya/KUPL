@@ -911,26 +911,31 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       clamp/is_nan/is_infinite); Map (is_empty/get_or/merge/map_values); Set
       (is_empty/is_subset)
 - [ ] System tier: ownership, `low`/`asm` (design §6; audit #4)
-- [◐] **Capabilities as attenuable values (`CapNet.limited_to(…)`)** — design
-      sketch (it112, `docs/design/CAPABILITIES.md`; corrected it113/it114/
-      it115) implemented as a real, ENFORCED Cap.Net-only first slice
-      (it116/it117): `CapNet` (a flat builtin type name, not the sketch's
-      original dotted `Cap.Net` — no dotted-type-path grammar exists in
-      KUPL, and it115 confirmed the module system doesn't need one
-      either), `.limited_to(host: Str) -> CapNet` (narrows only —
-      widening an already-limited capability to a different host panics),
-      `http_get_with(cap, url)` (host-checked BEFORE any network I/O;
-      existing `http_get(url)` unchanged), and `cap_net_root() -> CapNet`
-      (the ONLY way to obtain a capability at all — restricted by a new
-      `K0304` static check to a direct call inside `fun main`'s own
-      top-level body: not a top-level helper, not a component method/
-      handler, not a closure literal even when written directly inside
-      `fun main`) — all wired across interp/KVM/native
-      (`examples/capabilities.kupl`). This CapNet kind is now a genuine
-      "no ambient authority" security boundary, closing the
-      `docs/design/LANGUAGE.md` §2 claim for its one shipped kind.
-      **Remaining work is generalizing the now-proven pattern to other
-      capability kinds** (`CapFs`, `CapSql`, ...), not fixing this one.
+- [◐] **Capabilities as attenuable values (`CapNet`/`CapFs.limited_to(…)`)**
+      — design sketch (it112, `docs/design/CAPABILITIES.md`; corrected
+      it113/it114/it115) implemented as a real, ENFORCED, GENERALIZED
+      pattern across TWO capability kinds (it116/it117/it118): `CapNet`
+      (network, `http_get_with`) and `CapFs` (filesystem, `read_file_with`)
+      — both flat builtin type names (no dotted-type-path grammar exists
+      in KUPL, and it115 confirmed the module system doesn't need one
+      either), each with `.limited_to(scope: Str)` (narrows only —
+      widening an already-limited capability panics) and a `_with`-
+      suffixed builtin (scope-checked BEFORE any network/disk I/O;
+      existing `http_get`/`read_file` unchanged), and a root builtin
+      (`cap_net_root()`/`cap_fs_root()`) — the ONLY way to obtain a
+      capability at all — sharing ONE `check.rs` helper
+      (`check_capability_root_call_site`) that restricts every kind's own
+      root builtin to a direct call inside `fun main`'s own top-level
+      body via a single `K0304` diagnostic. Both kinds are wired across
+      interp/KVM/native (`examples/capabilities.kupl`) and are genuine
+      "no ambient authority" security boundaries, closing the
+      `docs/design/LANGUAGE.md` §2 claim. `CapFs` (it118) took
+      substantially less effort than `CapNet` (it116/it117) since the
+      whole pattern, including root-seeding enforcement, was already
+      proven — confirms the pattern genuinely generalizes.
+      **Remaining work is further generalizing to more capability kinds**
+      (`CapSql`, ...) if a concrete need arises, not fixing either shipped
+      kind.
 
 ## Tier 4 — ecosystem
 

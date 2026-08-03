@@ -580,9 +580,9 @@ const BUILTIN_METHODS: &[&str] = &[
 /// suggestions on an unknown name (K0240). Suggestion-only and best-effort — same discipline as
 /// BUILTIN_METHODS: a missing entry only costs a hint, never changes resolution (PR-it249).
 const BUILTIN_FUNS: &[&str] = &[
-    "append_file", "arange", "args", "big", "cap_net_root", "cosine_similarity", "dec", "delete_file", "env_var",
+    "append_file", "arange", "args", "big", "cap_fs_root", "cap_net_root", "cosine_similarity", "dec", "delete_file", "env_var",
     "exec", "file_exists", "http_get", "http_get_with", "http_post", "http_serve", "json_parse", "json_stringify",
-    "list_dir", "make_dir", "panic", "path_base", "path_dir", "path_ext", "path_join", "print",
+    "list_dir", "make_dir", "panic", "path_base", "path_dir", "path_ext", "path_join", "print", "read_file_with",
     "random_floats", "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace",
     "read_all", "read_file", "read_line", "remove_dir", "shuffle", "tensor", "text_embed",
     "to_str", "write_file", "zeros",
@@ -608,7 +608,7 @@ const BUILTIN_FUNS: &[&str] = &[
 /// below handles, since it's used to decide whether a wrong-arity call
 /// gets a real arity diagnostic at all, not just a best-effort hint.
 const BUILTIN_CALL_NAMES: &[&str] = &[
-    "append_file", "arange", "args", "big", "cap_net_root", "cosine_similarity", "csv_parse", "csv_stringify", "date_iso",
+    "append_file", "arange", "args", "big", "cap_fs_root", "cap_net_root", "cosine_similarity", "csv_parse", "csv_stringify", "date_iso",
     "date_make", "day_of", "dec", "delete_file", "env_var", "eprint", "Err", "exec", "exit",
     "file_exists", "format_time", "hash_fnv", "hex_decode", "hex_encode", "hmac_sha256",
     "hour_of", "http_get", "http_get_with", "http_post", "http_serve", "json_parse", "json_stringify", "list_dir",
@@ -616,7 +616,7 @@ const BUILTIN_CALL_NAMES: &[&str] = &[
     "make_dir", "Map", "minute_of", "month_of", "now", "Ok", "panic", "parse_iso",
     "path_base", "path_dir", "path_ext", "path_join", "print", "query_build", "query_parse",
     "random_floats", "random_ints", "rat", "re_find", "re_find_all", "re_match", "re_replace",
-    "read_all", "read_file", "read_line", "remove_dir", "second_of", "Set", "sha256", "shuffle",
+    "read_all", "read_file", "read_file_with", "read_line", "remove_dir", "second_of", "Set", "sha256", "shuffle",
     "Some", "tensor", "text_embed", "to_str", "url_decode", "url_encode", "weekday_of", "write_file", "year_of",
     "yearday_of", "zeros",
 ];
@@ -1376,6 +1376,7 @@ impl Checker {
                 "BigInt" => Ty::BigInt,
                 "Rational" => Ty::Rational,
                 "CapNet" => Ty::CapNet,
+                "CapFs" => Ty::CapFs,
                 _ if crate::value::IntW::from_name(n.as_str()).is_some() => {
                     Ty::IntW(crate::value::IntW::from_name(n.as_str()).unwrap())
                 }
@@ -1394,7 +1395,7 @@ impl Checker {
                             let builtins = [
                                 "Int", "Float", "Str", "Bool", "Unit", "List", "Map", "Set",
                                 "Option", "Result", "Json", "Tensor", "BigInt", "Rational",
-                                "CapNet", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32",
+                                "CapNet", "CapFs", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32",
                             ]
                             .into_iter();
                             let cands = self
@@ -3471,6 +3472,31 @@ impl Checker {
         self.uni.fresh()
     }
 
+    /// it117 (generalized it118): root capabilities are seeded at EXACTLY
+    /// one place (`docs/design/CAPABILITIES.md` §3.2) -- calling a root
+    /// builtin like `cap_net_root`/`cap_fs_root` is only allowed directly
+    /// within the top-level `fun main`'s own body (never a component
+    /// method/handler, never a nested closure, matching
+    /// `Ctx::in_main_top_level`'s own doc comment). This is what makes "a
+    /// capability is in scope" a purely lexical, audit-by-reading-the-props
+    /// property everywhere BELOW the entry point -- if any code anywhere
+    /// could call a root builtin directly, that property would be false and
+    /// capabilities would be no different from an ambiently-reachable
+    /// global. Shared by every capability kind's own root builtin so the
+    /// rule (and its diagnostic code) stays in exactly one place as more
+    /// kinds are added.
+    fn check_capability_root_call_site(&mut self, builtin_name: &str, ctx: &Ctx, span: Span) {
+        if !ctx.in_main_top_level {
+            self.err(
+                "K0304",
+                format!(
+                    "`{builtin_name}()` may only be called directly in `fun main`'s own top-level body — capabilities must be seeded at exactly one place, then passed down explicitly as props"
+                ),
+                span,
+            );
+        }
+    }
+
     fn infer_call(&mut self, callee: &Expr, args: &[Arg], span: Span, ctx: &mut Ctx) -> Ty {
         if let ExprKind::Ident(name) = &callee.kind {
             // A REAL, live-confirmed silent-value-corruption bug found+fixed
@@ -3649,27 +3675,22 @@ impl Checker {
                     self.unify(&Ty::Str, &u, args[1].value.span, "http_get_with url");
                     return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
                 }
+                // it118: mirrors `http_get_with` exactly.
+                ("read_file_with", 2) => {
+                    let c = self.infer_expr(&args[0].value, ctx);
+                    self.unify(&Ty::CapFs, &c, args[0].value.span, "read_file_with cap");
+                    let p = self.infer_expr(&args[1].value, ctx);
+                    self.unify(&Ty::Str, &p, args[1].value.span, "read_file_with path");
+                    return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
+                }
                 ("cap_net_root", 0) => {
-                    // it117: root capabilities are seeded at EXACTLY one
-                    // place (CAPABILITIES.md §3.2) -- calling this builtin
-                    // is only allowed directly within the top-level `fun
-                    // main`'s own body (never a component method/handler,
-                    // never a nested closure, matching `in_main_top_level`'s
-                    // own doc comment on `Ctx`). This is what makes "a
-                    // capability is in scope" a purely lexical,
-                    // audit-by-reading-the-props property everywhere BELOW
-                    // the entry point -- if any code anywhere could call
-                    // `cap_net_root()` directly, that property would be
-                    // false and capabilities would be no different from an
-                    // ambiently-reachable global.
-                    if !ctx.in_main_top_level {
-                        self.err(
-                            "K0304",
-                            "`cap_net_root()` may only be called directly in `fun main`'s own top-level body — capabilities must be seeded at exactly one place, then passed down explicitly as props".to_string(),
-                            span,
-                        );
-                    }
+                    self.check_capability_root_call_site("cap_net_root", ctx, span);
                     return Ty::CapNet;
+                }
+                // it118: mirrors `cap_net_root` exactly.
+                ("cap_fs_root", 0) => {
+                    self.check_capability_root_call_site("cap_fs_root", ctx, span);
+                    return Ty::CapFs;
                 }
                 ("http_serve", 2) => {
                     let p = self.infer_expr(&args[0].value, ctx);
@@ -4646,6 +4667,8 @@ impl Checker {
             // "narrow, never widen" invariant (`shared_method`'s own
             // `limited_to` arm), not the type checker.
             (Ty::CapNet, "limited_to") => Some((vec![Ty::Str], Ty::CapNet)),
+            // it118: mirrors CapNet's own arm exactly.
+            (Ty::CapFs, "limited_to") => Some((vec![Ty::Str], Ty::CapFs)),
             _ => None,
         };
 

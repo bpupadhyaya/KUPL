@@ -18,6 +18,9 @@ unless supervised.
 | `zeros(n)` | `(Int) -> Tensor` | n zeros; negative n panics; capped at 100M elements |
 | `arange(n)` | `(Int) -> Tensor` | `[0.0, 1.0, …, n-1]`; capped at 100M elements |
 | `read_file(path)` | `(Str) -> Result[Str, Str]` — **uses `io.fs`** | whole file as text; `Err` carries the OS message |
+| `read_file_with(cap, path)` | `(CapFs, Str) -> Result[Str, Str]` — **uses `io.fs`** | like `read_file`, but checks `path` against `cap`'s own carried scope first (see Capabilities below) |
+| `cap_fs_root()` | `() -> CapFs` | the unrestricted root filesystem capability; only callable directly in `fun main`'s own top-level body (`K0304` otherwise) — see Capabilities below |
+| `.limited_to(prefix)` on CapFs | `(Str) -> CapFs` | a NEW, narrower capability scoped to paths starting with `prefix`; panics if already limited to a DIFFERENT prefix (narrows only, never widens) |
 | `write_file(path, s)` | `(Str, Str) -> Result[Unit, Str]` — **uses `io.fs`** | creates or truncates |
 | `append_file(path, s)` | `(Str, Str) -> Result[Unit, Str]` — **uses `io.fs`** | creates if missing |
 | `delete_file(path)` | `(Str) -> Result[Unit, Str]` — **uses `io.fs`** | |
@@ -113,20 +116,22 @@ AI runtime uses) and carry the `io.net` effect. A non-2xx status or unreachable
 host is an ordinary `Err` (message text is platform-dependent). Compiles on the
 native backend too (via the system `curl`).
 
-**Capabilities** (`CapNet`, it116/it117): an opaque, non-user-constructible
-runtime value naming an allowed scope for `io.net` — see
-`docs/design/CAPABILITIES.md` for the full design. `cap_net_root()` returns
-the unrestricted root — callable ONLY as a direct call inside `fun main`'s
-own top-level body (`K0304` otherwise: not a top-level helper, not a
-component method/handler, not a closure literal even when written directly
-inside `fun main`), so a capability can only ever enter a program at exactly
-one, auditable place. `.limited_to(host)` narrows it (never widens —
-narrowing an already-limited capability to a DIFFERENT host panics);
-`http_get_with(cap, url)` checks `url`'s host against `cap`'s own scope
-BEFORE any network I/O, returning an ordinary `Err` (not a panic) on a
-mismatch. Capabilities are ADDITIVE, not a replacement for effects: `uses
-io.net` is still required on any function calling `http_get_with`, exactly
-as for `http_get`.
+**Capabilities** (`CapNet`/`CapFs`, it116/it117/it118): an opaque,
+non-user-constructible runtime value naming an allowed scope for `io.net`
+(`CapNet`) or `io.fs` (`CapFs`) — see `docs/design/CAPABILITIES.md` for the
+full design. `cap_net_root()`/`cap_fs_root()` return the unrestricted root
+— callable ONLY as a direct call inside `fun main`'s own top-level body
+(`K0304` otherwise: not a top-level helper, not a component method/
+handler, not a closure literal even when written directly inside `fun
+main`), so a capability can only ever enter a program at exactly one,
+auditable place. `.limited_to(scope)` narrows it (never widens — narrowing
+an already-limited capability to a DIFFERENT scope panics); the matching
+`_with`-suffixed builtin (`http_get_with`/`read_file_with`) checks the
+target against `cap`'s own scope BEFORE any network/disk I/O, returning an
+ordinary `Err` (not a panic) on a mismatch. Capabilities are ADDITIVE, not
+a replacement for effects: `uses io.net`/`uses io.fs` is still required on
+any function calling a `_with` builtin, exactly as for the un-scoped
+version.
 
 **Regex** (`re_*`) is a pure, self-contained engine: literals, `.`, `* + ?`
 (greedy), classes `[a-z]`/`[^…]`, `\d \w \s` (+ `\D \W \S`), anchors

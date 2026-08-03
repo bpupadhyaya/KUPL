@@ -1971,6 +1971,8 @@ impl<'s> FnCompiler<'s> {
                 ("http_get", 1) => Some(BUILTIN_HTTP_GET),
                 ("http_get_with", 2) => Some(BUILTIN_HTTP_GET_WITH),
                 ("cap_net_root", 0) => Some(BUILTIN_CAP_NET_ROOT),
+                ("read_file_with", 2) => Some(BUILTIN_READ_FILE_WITH),
+                ("cap_fs_root", 0) => Some(BUILTIN_CAP_FS_ROOT),
                 ("http_post", 2) => Some(BUILTIN_HTTP_POST),
                 ("re_match", 2) => Some(BUILTIN_RE_MATCH),
                 ("re_find", 2) => Some(BUILTIN_RE_FIND),

@@ -123,11 +123,13 @@ pub fn to_portable(v: &Value) -> Option<PortableValue> {
                 | Value::Bound(..)
                 | Value::VmClosure(..)
                 // Opaque by design (see value.rs's own doc comment) -- no
-                // `PortableValue::CapNet` round-trip is worth inventing just
-                // for the real-thread `par_map`/`par_filter` fast path;
-                // falls back to the sequential engine like every other
-                // opaque/reference-identity-bearing value above.
-                | Value::CapNet(_) => return None,
+                // `PortableValue::CapNet`/`CapFs` round-trip is worth
+                // inventing just for the real-thread `par_map`/`par_filter`
+                // fast path; falls back to the sequential engine like
+                // every other opaque/reference-identity-bearing value
+                // above.
+                | Value::CapNet(_)
+                | Value::CapFs(_) => return None,
             },
             Frame::BuildList(n) => {
                 let items = results.split_off(results.len() - n);

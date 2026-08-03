@@ -54,6 +54,8 @@ fn builtin_argc(which: u8) -> Option<u8> {
         BUILTIN_HTTP_GET => 1,
         BUILTIN_HTTP_GET_WITH => 2,
         BUILTIN_CAP_NET_ROOT => 0,
+        BUILTIN_READ_FILE_WITH => 2,
+        BUILTIN_CAP_FS_ROOT => 0,
         BUILTIN_HTTP_POST => 2,
         BUILTIN_RE_MATCH => 2,
         BUILTIN_RE_FIND => 2,
@@ -1257,6 +1259,16 @@ impl<'m> Vm<'m> {
                             }
                         }
                         BUILTIN_CAP_NET_ROOT => set!(dst, crate::interp::cap_net_root()),
+                        BUILTIN_READ_FILE_WITH => {
+                            let Value::Str(path) = &args[1] else {
+                                return Err(VmError { msg: "read_file_with needs a Str path".into(), span });
+                            };
+                            match crate::interp::read_file_with(&args[0], path) {
+                                Ok(v) => set!(dst, v),
+                                Err(msg) => return Err(VmError { msg, span }),
+                            }
+                        }
+                        BUILTIN_CAP_FS_ROOT => set!(dst, crate::interp::cap_fs_root()),
                         BUILTIN_RE_MATCH | BUILTIN_RE_FIND | BUILTIN_RE_FIND_ALL
                         | BUILTIN_RE_REPLACE => {
                             let name = match which {
@@ -4595,7 +4607,20 @@ fun probe() -> Str {
         // fully-disjoint equal-length strings cost their length), and that all three engines agree on the
         // distance. This is the Levenshtein an AI writes for fuzzy matching, spell-check, and diffing; a
         // backend whose char comparison, base case, or three-way min was off would misreport the distance.
-        let src = r#"fun min3(a: Int, b: Int, c: Int) -> Int {
+        // it118 stack-margin regression (the it109/it116 lesson recurring a
+        // THIRD time): adding the `read_file_with`/`cap_fs_root` match arms
+        // to `eval_call` (interp.rs) grew that already-large match's own
+        // per-call stack frame in this DEBUG build just enough to tip this
+        // recursion-heavy (exponential three-way branching on a mismatch)
+        // test over the 2MB default test-thread stack -- confirmed via
+        // `git stash` (passes cleanly on pre-it118 code, reproducibly
+        // overflows after). Fixed the SAME way `diff_collatz_step_count`/
+        // `diff_longest_common_subsequence_three` already do: a big-stack
+        // thread instead of shrinking the test's own already-modest depth.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = r#"fun min3(a: Int, b: Int, c: Int) -> Int {
     let m = if a < b { a } else { b }
     if m < c { m } else { c }
 }
@@ -4628,10 +4653,14 @@ fun probe() -> Str {
     "horse_ros={d1}|same={d2}|alldiff={d3}|empty={d4}|kitten={d5}"
 }
 "#;
-        assert_eq!(
-            differential(src),
-            "horse_ros=3|same=0|alldiff=3|empty=3|kitten=2"
-        );
+                assert_eq!(
+                    differential(src),
+                    "horse_ros=3|same=0|alldiff=3|empty=3|kitten=2"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -19284,6 +19313,46 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
                 "component C {\n    intent \"c\"\n    expose fun get() -> CapNet {\n        cap_net_root()\n    }\n}\nfun main() {\n    C().get()\n}\n"
             ),
             "a component method must be refused"
+        );
+        // it118: `cap_fs_root()` shares the SAME `check_capability_root_
+        // call_site` helper as `cap_net_root()` -- one assertion here
+        // proves the shared gate correctly generalizes to a second
+        // capability kind, without duplicating the whole test.
+        assert!(
+            !has_k0304("fun main() -> CapFs {\n    cap_fs_root()\n}\n"),
+            "cap_fs_root: a direct call in fun main's own top-level body must be allowed"
+        );
+        assert!(
+            has_k0304("fun get_root() -> CapFs {\n    cap_fs_root()\n}\nfun main() {\n    get_root()\n}\n"),
+            "cap_fs_root: a top-level helper fun must be refused"
+        );
+    }
+
+    #[test]
+    fn diff_capfs_limited_to_and_read_file_with_scope_check() {
+        // it118: mirrors `diff_capnet_limited_to_and_http_get_with_host_
+        // check` exactly -- capability creation, narrowing (idempotent on
+        // the SAME prefix), the narrow-never-widen panic, and
+        // `read_file_with`'s scope check (short-circuits BEFORE any disk
+        // I/O, so this stays deterministic) -- all identical on interp and
+        // KVM. Uses `differential_main` since `cap_fs_root()` is now
+        // restricted (K0304) to `fun main`'s own top-level body.
+        let src = "fun main() -> Str {\n    let root = cap_fs_root()\n    \
+                   let a = root.limited_to(\"/tmp/allowed\")\n    \
+                   let b = a.limited_to(\"/tmp/allowed\")\n    \
+                   let blocked = match read_file_with(a, \"/etc/passwd\") {\n        \
+                   Ok(_) => \"ok\"\n        Err(e) => e\n    }\n    \
+                   \"{root}|{a}|{a == b}|{blocked}\"\n}\n";
+        assert_eq!(
+            differential_main(src),
+            "<CapFs root>|<CapFs limited_to \"/tmp/allowed\">|true|capability limited to `/tmp/allowed`, cannot reach `/etc/passwd`"
+        );
+        // widening an already-limited capability panics identically.
+        let widen_src = "fun main() -> Str {\n    let a = cap_fs_root().limited_to(\"/tmp/allowed\")\n    \
+                          \"{a.limited_to(\"/tmp/other\")}\"\n}\n";
+        assert_eq!(
+            differential_main(widen_src),
+            "panic: cannot widen a capability already limited to `/tmp/allowed` to a different prefix `/tmp/other`"
         );
     }
 

@@ -1,4 +1,4 @@
-# Capabilities as attenuable values — design sketch + Cap.Net first slice
+# Capabilities as attenuable values — design sketch + CapNet/CapFs
 
 v0.1 (it112) — a bounded design deliverable, not an implementation. Addresses
 `docs/design/LANGUAGE.md` §2's own long-standing claim ("effects are backed by
@@ -26,6 +26,18 @@ root moment). This closes the LAST deliberate gap it116 left open:
 `CapNet` is now a genuine "no ambient authority" security boundary for its
 one shipped kind, not just tested engine plumbing. See §3.2/§5 below for
 the mechanism.
+
+**UPDATE (it118): the pattern GENERALIZES to a second capability kind.**
+`CapFs` (filesystem access) ships the SAME shape as `CapNet`, end to end:
+opaque type, `.limited_to(prefix)` (narrows, panics on widen), a
+`_with`-suffixed builtin (`read_file_with(cap, path)`, checked BEFORE any
+disk I/O), and `cap_fs_root()` sharing the EXACT SAME root-seeding
+restriction as `cap_net_root()` (both now call a single shared check.rs
+helper, `check_capability_root_call_site`, so the rule and its diagnostic
+code live in exactly one place as more kinds are added). Took
+substantially less work than `CapNet` — the whole pattern (including the
+hardest part, root-seeding enforcement) was already proven; this iteration
+was mostly mechanical mirroring across the same 6 files. See §4 below.
 
 ## 1. What exists today (verified live, not assumed)
 
@@ -304,6 +316,20 @@ The exact same class of bug as PR-it1180 (`value.rs`'s own `Value::Fun`
 equality gap, documented in that file) — a new variant added to a type
 needs EVERY relevant match updated, not just the ones a compiler error
 happens to force.
+
+**A second kind, `CapFs`, shipped it118** — filesystem access, mirroring
+`CapNet` exactly: `Value::CapFs`/`Ty::CapFs` across the same 6 files,
+`.limited_to(prefix: Str) -> CapFs` (a plain `str::starts_with` prefix
+check, not canonicalized — no `..`-traversal defense, the SAME
+deliberate-simplicity precedent as `CapNet`'s own `url_host`),
+`read_file_with(cap, path) -> Result[Str, Str]`, and `cap_fs_root()`
+sharing `cap_net_root`'s own root-seeding restriction via a single shared
+`check_capability_root_call_site` check.rs helper (so the rule and its
+`K0304` diagnostic live in exactly one place, not duplicated per kind).
+Confirms the pattern genuinely generalizes: no new design questions
+surfaced, no new bugs of the `(Ty::CapFs, Ty::CapFs)`-unifier-arm class
+(added proactively this time, having just been burned by the CapNet
+omission), and the whole slice took a fraction of CapNet's own effort.
 
 ## 5. Open questions this sketch does NOT resolve
 

@@ -285,6 +285,11 @@ pub enum Value {
     /// UNRESTRICTED (root) capability; `Some(host)` is narrowed to exactly
     /// that host. See `docs/design/CAPABILITIES.md`.
     CapNet(Rc<CapNetInner>),
+    /// A filesystem capability (it118, mirroring `CapNet` exactly): `None`
+    /// is unrestricted; `Some(prefix)` allows only paths starting with
+    /// that prefix (simple string `starts_with`, not canonicalized —
+    /// same deliberate-simplicity precedent as `CapNet`'s own `url_host`).
+    CapFs(Rc<CapFsInner>),
     Float(f64),
     Bool(bool),
     Str(Rc<String>),
@@ -331,6 +336,15 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapNetInner {
     pub allowed_host: Option<String>,
+}
+
+/// A `CapFs` capability's own carried scope (it118). `None` = unrestricted
+/// (only ever produced by `cap_fs_root()`); `Some(prefix)` = a target path
+/// must start with that prefix. Structural equality, same precedent as
+/// `CapNetInner`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapFsInner {
+    pub allowed_prefix: Option<String>,
 }
 
 pub struct Closure {
@@ -471,6 +485,7 @@ impl Value {
             Value::Rational(_) => "Rational".into(),
             Value::Decimal(_) => "Decimal".into(),
             Value::CapNet(_) => "CapNet".into(),
+            Value::CapFs(_) => "CapFs".into(),
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "Str".into(),
@@ -629,6 +644,11 @@ impl PartialEq for Value {
                     }
                 }
                 (Value::CapNet(x), Value::CapNet(y)) => {
+                    if x != y {
+                        return false;
+                    }
+                }
+                (Value::CapFs(x), Value::CapFs(y)) => {
                     if x != y {
                         return false;
                     }
@@ -1069,6 +1089,10 @@ impl fmt::Display for Value {
                 Value::CapNet(c) => match &c.allowed_host {
                     None => write!(f, "<CapNet root>")?,
                     Some(h) => write!(f, "<CapNet limited_to {h:?}>")?,
+                },
+                Value::CapFs(c) => match &c.allowed_prefix {
+                    None => write!(f, "<CapFs root>")?,
+                    Some(p) => write!(f, "<CapFs limited_to {p:?}>")?,
                 },
                 Value::F32(x) => {
                     if x.fract() == 0.0 && x.is_finite() {

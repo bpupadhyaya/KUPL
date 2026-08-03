@@ -2106,6 +2106,15 @@ impl Interp {
                     return http_get_with(&cap, url).map_err(|m| Self::panic_flow(m, span));
                 }
                 ("cap_net_root", 0) => return Ok(cap_net_root()),
+                ("read_file_with", 2) => {
+                    let cap = self.eval(&args[0].value, env)?;
+                    let path = self.eval(&args[1].value, env)?;
+                    let Value::Str(path) = &path else {
+                        return Err(Self::panic_flow("read_file_with needs a Str path", span));
+                    };
+                    return read_file_with(&cap, path).map_err(|m| Self::panic_flow(m, span));
+                }
+                ("cap_fs_root", 0) => return Ok(cap_fs_root()),
                 ("re_match", 2) | ("re_find", 2) | ("re_find_all", 2) | ("re_replace", 3) => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -3764,6 +3773,19 @@ pub fn shared_method(
                 Some(h) if *h == **host => Ok(Value::CapNet(c.clone())),
                 Some(h) => Err(format!(
                     "cannot widen a capability already limited to `{h}` to a different host `{host}`"
+                )),
+            },
+            _ => Err("`limited_to` needs a Str".into()),
+        },
+        // it118: mirrors CapNet's own arm exactly.
+        (Value::CapFs(c), "limited_to") => match args.into_iter().next() {
+            Some(Value::Str(ref prefix)) => match &c.allowed_prefix {
+                None => Ok(Value::CapFs(Rc::new(crate::value::CapFsInner {
+                    allowed_prefix: Some((**prefix).clone()),
+                }))),
+                Some(p) if *p == **prefix => Ok(Value::CapFs(c.clone())),
+                Some(p) => Err(format!(
+                    "cannot widen a capability already limited to `{p}` to a different prefix `{prefix}`"
                 )),
             },
             _ => Err("`limited_to` needs a Str".into()),
@@ -5633,19 +5655,41 @@ pub fn http_get_with(cap: &Value, url: &str) -> Result<Value, String> {
 
 /// `cap_net_root()` (it116) -- the UNRESTRICTED root `CapNet` capability.
 ///
-/// **NOT YET call-site-restricted -- a known, explicitly tracked v1 gap,
-/// not a silent omission (see `docs/GAPS.md`'s own capabilities entry).**
-/// `docs/design/CAPABILITIES.md` §3.2's own design calls for root
-/// capabilities to be seeded at EXACTLY one place (the composition root),
-/// so that "a capability is in scope" is a purely lexical, audit-by-
-/// reading-the-props property. This builtin does NOT yet enforce that --
-/// it is callable from anywhere today, the same as any other builtin. The
-/// VALUE/METHOD/builtin engine-wiring this iteration ships is real and
-/// fully tested; the "no ambient authority" security property is NOT yet
-/// real until a follow-up iteration restricts this call site to `fun
-/// main`'s own top-level body only.
+/// Call-site-restricted since it117: `check.rs`'s
+/// `check_capability_root_call_site` rejects (`K0304`) any call to this
+/// builtin outside the top-level `fun main`'s own top-level body, so a
+/// program reaching this function at RUNTIME is already guaranteed to
+/// have come from that one, audited call site -- see
+/// `docs/design/CAPABILITIES.md` §3.2.
 pub fn cap_net_root() -> Value {
     Value::CapNet(Rc::new(crate::value::CapNetInner { allowed_host: None }))
+}
+
+/// `read_file_with(cap, path)` (it118) -- like `read_file(path)` but checks
+/// `path` against `cap`'s own carried scope FIRST, mirroring
+/// `http_get_with` exactly. An unrestricted (root) capability allows any
+/// path; an out-of-scope path is an ordinary `Err` value, not a panic.
+/// The prefix check is a plain `str::starts_with`, NOT canonicalized (no
+/// `..`-traversal defense) -- the same deliberate-simplicity precedent
+/// `http_get_with`'s own `url_host` helper already established.
+pub fn read_file_with(cap: &Value, path: &str) -> Result<Value, String> {
+    let Value::CapFs(c) = cap else {
+        return Err("read_file_with needs a CapFs".into());
+    };
+    if let Some(allowed) = &c.allowed_prefix {
+        if !path.starts_with(allowed.as_str()) {
+            return Ok(Value::err(Value::str(format!(
+                "capability limited to `{allowed}`, cannot reach `{path}`"
+            ))));
+        }
+    }
+    fs_builtin("read_file", std::slice::from_ref(&Value::str(path.to_string())))
+}
+
+/// `cap_fs_root()` (it118) -- the UNRESTRICTED root `CapFs` capability.
+/// Call-site-restricted the same way as `cap_net_root` (`K0304`).
+pub fn cap_fs_root() -> Value {
+    Value::CapFs(Rc::new(crate::value::CapFsInner { allowed_prefix: None }))
 }
 
 /// Parse an HTTP request line (`METHOD PATH HTTP/1.1`) into (method, path).
@@ -6823,5 +6867,51 @@ mod capnet_tests {
         assert_eq!(&**variant, "Err");
         let Value::Str(msg) = &fields[0] else { panic!("Err payload must be a Str") };
         assert!(msg.contains("capability limited to `127.0.0.1`"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod capfs_tests {
+    // it118: mirrors `capnet_tests` exactly.
+    use super::{cap_fs_root, read_file_with, shared_method};
+    use crate::value::Value;
+
+    #[test]
+    fn limited_to_narrows_a_root_capability_and_is_idempotent_on_the_same_prefix() {
+        let root = cap_fs_root();
+        let mut call = |_: Value, _: Vec<Value>| -> Result<Value, String> { panic!("no callback expected") };
+        let limited = shared_method(&root, "limited_to", vec![Value::str("/tmp/allowed")], &mut call)
+            .expect("limiting a root capability must succeed");
+        let Value::CapFs(c) = &limited else { panic!("must stay a CapFs") };
+        assert_eq!(c.allowed_prefix.as_deref(), Some("/tmp/allowed"));
+
+        let again = shared_method(&limited, "limited_to", vec![Value::str("/tmp/allowed")], &mut call)
+            .expect("re-limiting to the same prefix must succeed");
+        assert_eq!(again, limited);
+    }
+
+    #[test]
+    fn limited_to_refuses_to_widen_to_a_different_prefix() {
+        let root = cap_fs_root();
+        let mut call = |_: Value, _: Vec<Value>| -> Result<Value, String> { panic!("no callback expected") };
+        let limited = shared_method(&root, "limited_to", vec![Value::str("/tmp/allowed")], &mut call).unwrap();
+        let err = shared_method(&limited, "limited_to", vec![Value::str("/tmp/other")], &mut call)
+            .expect_err("narrowing an already-limited capability to a DIFFERENT prefix must be refused");
+        assert!(err.contains("cannot widen"), "{err}");
+    }
+
+    #[test]
+    fn read_file_with_rejects_an_out_of_scope_path_without_ever_touching_disk() {
+        let root = cap_fs_root();
+        let mut call = |_: Value, _: Vec<Value>| -> Result<Value, String> { panic!("no callback expected") };
+        let limited =
+            shared_method(&root, "limited_to", vec![Value::str("/tmp/allowed")], &mut call).unwrap();
+        // `/etc/passwd` is outside the allowed prefix; a passing result here
+        // proves the scope check short-circuited before any filesystem call.
+        let result = read_file_with(&limited, "/etc/passwd").unwrap();
+        let Value::Ctor { ref variant, ref fields, .. } = result else { panic!("must be a Result value") };
+        assert_eq!(&**variant, "Err");
+        let Value::Str(msg) = &fields[0] else { panic!("Err payload must be a Str") };
+        assert!(msg.contains("capability limited to `/tmp/allowed`"), "{msg}");
     }
 }

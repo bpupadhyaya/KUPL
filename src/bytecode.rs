@@ -295,6 +295,8 @@ pub const BUILTIN_TEXT_EMBED: u8 = 73;
 pub const BUILTIN_COSINE_SIMILARITY: u8 = 74;
 pub const BUILTIN_HTTP_GET_WITH: u8 = 75;
 pub const BUILTIN_CAP_NET_ROOT: u8 = 76;
+pub const BUILTIN_READ_FILE_WITH: u8 = 77;
+pub const BUILTIN_CAP_FS_ROOT: u8 = 78;
 
 /// Every identifier that `eval_call` (interp.rs) / `call()` (compile.rs)
 /// special-case as a builtin call FORM (`name(args...)` bare-call syntax) --
@@ -334,6 +336,7 @@ pub const BUILTIN_CALL_NAMES: &[&str] = &[
     "hash_fnv", "sha256", "hmac_sha256", "log_debug", "log_info", "log_warn", "log_error",
     "csv_parse", "csv_stringify", "url_encode", "url_decode", "query_parse", "query_build",
     "text_embed", "cosine_similarity", "http_get_with", "cap_net_root",
+    "read_file_with", "cap_fs_root",
 ];
 
 impl Module {

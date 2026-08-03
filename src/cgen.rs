@@ -682,6 +682,8 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
             BUILTIN_HTTP_GET => format!("regs[{dst}] = k_http_get(regs[{start}]); (void){argc};"),
             BUILTIN_HTTP_GET_WITH => format!("regs[{dst}] = k_http_get_with(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_CAP_NET_ROOT => format!("regs[{dst}] = k_cap_net_root(); (void){start}; (void){argc};"),
+            BUILTIN_READ_FILE_WITH => format!("regs[{dst}] = k_read_file_with(regs[{start}], regs[{start}+1]); (void){argc};"),
+            BUILTIN_CAP_FS_ROOT => format!("regs[{dst}] = k_cap_fs_root(); (void){start}; (void){argc};"),
             BUILTIN_HTTP_POST => format!("regs[{dst}] = k_http_post(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_MATCH => format!("regs[{dst}] = k_re_match(regs[{start}], regs[{start}+1]); (void){argc};"),
             BUILTIN_RE_FIND => format!("regs[{dst}] = k_re_find(regs[{start}], regs[{start}+1]); (void){argc};"),
@@ -982,14 +984,16 @@ typedef struct KDec KDec;
    mirroring Rust's `CapNetInner { allowed_host: Option<String> }` (`NULL`
    <-> `None`) exactly. */
 typedef struct { const char* allowed_host; } KCapNet;
+/* it118: mirrors KCapNet exactly. */
+typedef struct { const char* allowed_prefix; } KCapFs;
 
 struct KValue {
-    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_CHAR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL, K_DECIMAL, K_CAPNET } tag;
+    enum { K_INT, K_FLOAT, K_BOOL, K_UNIT, K_STR, K_CHAR, K_LIST, K_CTOR, K_CLOSURE, K_FUN, K_RANGE, K_TENSOR, K_MAP, K_SET, K_COMPONENT, K_SIZEDINT, K_F32, K_BIGINT, K_RATIONAL, K_DECIMAL, K_CAPNET, K_CAPFS } tag;
     union {
         int64_t i; double f; int b; float f32v; int32_t ch;
         const char* s;
         KList* list; KCtor* ctor; KClosure* clo; KTensor* ten; KMap* map; KSet* set;
-        int32_t fun; KSized* sized; KBig* big; KRat* rat; KDec* dec; KCapNet* capnet;
+        int32_t fun; KSized* sized; KBig* big; KRat* rat; KDec* dec; KCapNet* capnet; KCapFs* capfs;
         struct { int64_t lo, hi; int incl; } range;
     } as;
 };
@@ -2076,6 +2080,7 @@ static const char* k_type_name(KValue v) {
         case K_RATIONAL: return "Rational";
         case K_DECIMAL: return "Decimal";
         case K_CAPNET: return "CapNet";
+        case K_CAPFS: return "CapFs";
         case K_FLOAT: return "Float";
         case K_BOOL: return "Bool";
         case K_STR: return "Str";
@@ -2370,6 +2375,13 @@ static void k_display(KBuf* b, KValue v, int quote_str) {
                     kb_printf(b, "<CapNet limited_to \"%s\">", x.as.capnet->allowed_host);
                 } else {
                     kb_puts(b, "<CapNet root>");
+                }
+                break;
+            case K_CAPFS:
+                if (x.as.capfs->allowed_prefix) {
+                    kb_printf(b, "<CapFs limited_to \"%s\">", x.as.capfs->allowed_prefix);
+                } else {
+                    kb_puts(b, "<CapFs root>");
                 }
                 break;
             case K_FLOAT: k_fmt_float(b, x.as.f); break;
@@ -2699,6 +2711,13 @@ static int k_eq(KValue a, KValue b) {
                 const char* hx = x.as.capnet->allowed_host;
                 const char* hy = y.as.capnet->allowed_host;
                 result = (hx == NULL && hy == NULL) || (hx != NULL && hy != NULL && strcmp(hx, hy) == 0);
+                break;
+            }
+            /* it118: mirrors K_CAPNET's own arm exactly. */
+            case K_CAPFS: {
+                const char* px = x.as.capfs->allowed_prefix;
+                const char* py = y.as.capfs->allowed_prefix;
+                result = (px == NULL && py == NULL) || (px != NULL && py != NULL && strcmp(px, py) == 0);
                 break;
             }
             case K_CLOSURE: {
@@ -4782,6 +4801,14 @@ static KValue k_capnet_v(const char* host) {
     return x;
 }
 
+/* it118: mirrors k_capnet_v exactly. */
+static KValue k_capfs_v(const char* prefix) {
+    KCapFs* c = (KCapFs*)k_alloc(sizeof(KCapFs));
+    c->allowed_prefix = prefix;
+    KValue x; x.tag = K_CAPFS; x.as.capfs = c;
+    return x;
+}
+
 /* MUST stay byte-identical to interp.rs's own `url_host` (shared by
    interp.rs/vm.rs) -- deliberately simple string slicing, not a full URL
    parser: strips a leading `scheme://` if present, then stops at the
@@ -6308,6 +6335,34 @@ static KValue k_read_file(KValue path) {
         return k_err(k_str("stream did not contain valid UTF-8"));
     return k_ok(k_str(buf));
 }
+
+/* it118: like k_read_file but checks `path` against `cap`'s own carried
+   scope FIRST -- MUST stay behaviorally identical to interp.rs's own
+   `read_file_with`. An unrestricted (root) capability allows any path; an
+   out-of-scope path is an ordinary Err value, not a panic. Plain
+   strncmp-style prefix check, not canonicalized (no `..`-traversal
+   defense) -- same deliberate-simplicity precedent as `k_url_host`. */
+static KValue k_read_file_with(KValue cap, KValue path) {
+    if (cap.tag != K_CAPFS) k_panic("read_file_with needs a CapFs");
+    const char* allowed = cap.as.capfs->allowed_prefix;
+    if (allowed) {
+        size_t alen = strlen(allowed);
+        if (strncmp(path.as.s, allowed, alen) != 0) {
+            char buf[256];
+            snprintf(buf, sizeof buf, "capability limited to `%s`, cannot reach `%s`", allowed, path.as.s);
+            return k_err(k_str(k_strdup(buf)));
+        }
+    }
+    return k_read_file(path);
+}
+
+/* it118: the UNRESTRICTED root CapFs capability. Call-site-restricted the
+   same way as k_cap_net_root (K0304, enforced entirely in check.rs --
+   native never sees a program that violates it). */
+static KValue k_cap_fs_root(void) {
+    return k_capfs_v(NULL);
+}
+
 static KValue k_write_file(KValue path, KValue content, int append) {
     FILE* f = fopen(path.as.s, append ? "ab" : "wb");
     if (!f) return k_os_error();
@@ -7363,6 +7418,20 @@ static KValue k_method(KValue recv, const char* name, KValue* args, int argc) {
             if (!strcmp(cur, host)) return recv;
             char buf[256];
             snprintf(buf, sizeof buf, "cannot widen a capability already limited to `%s` to a different host `%s`", cur, host);
+            k_panic(buf);
+        }
+    }
+    /* it118: mirrors K_CAPNET's own block exactly. */
+    if (recv.tag == K_CAPFS) {
+        (void)argc;
+        if (!strcmp(name, "limited_to")) {
+            if (args[0].tag != K_STR) k_panic("`limited_to` needs a Str");
+            const char* prefix = args[0].as.s;
+            const char* cur = recv.as.capfs->allowed_prefix;
+            if (cur == NULL) return k_capfs_v(k_strdup(prefix));
+            if (!strcmp(cur, prefix)) return recv;
+            char buf[256];
+            snprintf(buf, sizeof buf, "cannot widen a capability already limited to `%s` to a different prefix `%s`", cur, prefix);
             k_panic(buf);
         }
     }
@@ -10953,6 +11022,30 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         assert_eq!(
             native_main_stdout(src, "capnet").trim(),
             "<CapNet root>\n<CapNet limited_to \"example.com\">\ntrue\ncapability limited to `example.com`, cannot reach `other.invalid`"
+        );
+    }
+
+    /// `CapFs` capabilities (it118) -- mirrors
+    /// `native_capnet_limited_to_and_http_get_with_host_check` exactly.
+    #[test]
+    fn native_capfs_limited_to_and_read_file_with_scope_check() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() uses io.fs {\n\
+                   \x20   let root = cap_fs_root()\n\
+                   \x20   print(root)\n\
+                   \x20   let a = root.limited_to(\"/tmp/allowed\")\n\
+                   \x20   print(a)\n\
+                   \x20   print(a == a.limited_to(\"/tmp/allowed\"))\n\
+                   \x20   match read_file_with(a, \"/etc/passwd\") {\n\
+                   \x20       Ok(_) => print(\"unexpected ok\")\n\
+                   \x20       Err(e) => print(e)\n\
+                   \x20   }\n\
+                   }\n";
+        assert_eq!(
+            native_main_stdout(src, "capfs").trim(),
+            "<CapFs root>\n<CapFs limited_to \"/tmp/allowed\">\ntrue\ncapability limited to `/tmp/allowed`, cannot reach `/etc/passwd`"
         );
     }
 

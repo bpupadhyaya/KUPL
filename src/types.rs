@@ -21,6 +21,8 @@ pub enum Ty {
     /// A network capability (it116): opaque, non-user-constructible. See
     /// `docs/design/CAPABILITIES.md`.
     CapNet,
+    /// A filesystem capability (it118), mirroring `CapNet` exactly.
+    CapFs,
     Float,
     Bool,
     Str,
@@ -161,6 +163,7 @@ impl Unifier {
             (Ty::Rational, Ty::Rational) => Ok(()),
             (Ty::Decimal, Ty::Decimal) => Ok(()),
             (Ty::CapNet, Ty::CapNet) => Ok(()),
+            (Ty::CapFs, Ty::CapFs) => Ok(()),
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
             | (Ty::Bool, Ty::Bool)
@@ -213,6 +216,7 @@ impl fmt::Display for Ty {
             Ty::Rational => write!(f, "Rational"),
             Ty::Decimal => write!(f, "Decimal"),
             Ty::CapNet => write!(f, "CapNet"),
+            Ty::CapFs => write!(f, "CapFs"),
             Ty::Float => write!(f, "Float"),
             Ty::Bool => write!(f, "Bool"),
             Ty::Str => write!(f, "Str"),
