@@ -291,8 +291,129 @@ running code.
   (currently synchronous, `curl`-backed like `http_get`) — a natural
   candidate for genuinely benefiting from real concurrency (multiple
   in-flight model calls), not verified live as part of this sketch.
-- **(it122)** What a wire connecting two different per-thread `Interp`s
-  looks like — `emit`'s target resolution and `self.current` both assume
-  ONE shared `Interp` today (§4's it122 update); this needs its own design
-  pass before any threaded-child proof of concept is attempted, since real
-  example programs exercise wire traffic, not just isolated `expose` calls.
+- **(it122, answered by §6 below at it123)** What a wire connecting two
+  different per-thread `Interp`s looks like — `emit`'s target resolution
+  and `self.current` both assume ONE shared `Interp` today (§4's it122
+  update). §6 inventories the real scope and reaches a decisive
+  conclusion: it's bigger than "just wires," and a blocking-only version
+  of it delivers no practical benefit on its own.
+
+## 6. The cross-Interp wire question, answered (it123)
+
+The it122 update above found that `emit` (not just `expose`) needs to
+cross a thread boundary. This section answers the follow-up question it
+raised — "what does that actually require" — by inventorying the real
+call sites rather than reasoning about `emit` in isolation.
+
+### 6.1 Instance addressing is flat and globally shared, not tree-scoped
+
+`instantiate` (interp.rs) assigns every component instance — root,
+child, grandchild, however deeply nested — a plain `usize` id via
+`let id = self.instances.len(); self.instances.push(...)`: ONE flat
+`Vec<Instance>` for the entire running program. Wires are registered by
+raw index on the SOURCE instance's own `wires: HashMap<String,
+Vec<(usize, String)>>` (`self.instances[src].wires[from_port].push((dst,
+to_port))`). There is no tree/hierarchy structure at runtime — a
+"parent" and its "children" are related only by which instance holds a
+`Value::Component(id)` for the other in its own `env`, and by which
+instance's `wires` map references which other id. This means "thread off
+one child" is not a locally-scoped operation on a hierarchy edge — it is
+carving one entry out of a flat, globally-addressed table that every
+other instance in the program can reference by raw index from anywhere.
+
+### 6.2 The real surface: 14 functions in interp.rs, 44 touches in repl.rs
+
+Grepping every `self.instances[id]` site (not just `emit`/`eval_method`)
+finds **14 distinct functions** touching it directly: `instantiate`,
+`instantiate_child` (construction + supervise-policy wiring), `emit`
+(wire delivery), `drain` (dispatch loop — reads `.comp.handlers` per
+queued message), `run_handler` (creates the handler's child `env`, sets/
+restores `self.current`), `arm_timers` / `advance` (the virtual-clock
+timer-fire loop — reads and MUTATES `.timers` in place), `restart` /
+`reset_instance_state` (supervision — reads `.max_restarts`/
+`.restart_history`, mutates `.env` state fields in place), `run_lifecycle`
+(`on start`/`on stop`), `eval_ident` / `eval_call` / `eval_method`
+(`expose` calls and ordinary method dispatch through `Value::Bound`),
+`resolve_par_branches` (the `par{}` purity gate needs to read `.env` to
+decide if a branch qualifies for the real-thread fast path), and
+`forall_case` (property-test instance isolation). Separately, `repl.rs`'s
+`:upgrade` machinery touches `.instances` **44 times** — migrating state/
+props/children/wires by name is built entirely on direct, synchronous
+access to the live `Instance` struct's fields.
+
+None of these are exotic edge cases — `arm_timers`/`advance` and
+`restart` in particular are core, load-bearing, exercised by ordinary
+`on every`/`on after` programs and by `supervise child restart
+on_failure`, not obscure paths. **A threaded instance would need EVERY
+one of these 14 functions (plus `:upgrade`) to branch on "is this id
+local or remote" — not just the two (`emit`, `eval_method`) the original
+first-slice framing focused on.** This is a materially larger surface
+than either the it121 sketch or the it122 finding had scoped, confirming
+(rather than merely suspecting) that this is not a small sub-problem.
+
+### 6.3 Even the simplest possible design (fully blocking, zero overlap) doesn't shrink this
+
+The obvious way to keep things simple is: make EVERY cross-thread
+interaction (not just `expose`, ALL of it — wire delivery, timer
+firing, restart, `:upgrade`) a blocking round-trip, so the threaded
+child never does anything except in direct, synchronous response to a
+request from whichever thread currently "owns" execution — i.e.,
+preserve today's exact FIFO, run-to-completion queue semantics, just
+now spanning a thread hop. This is the SIMPLEST possible design
+(no new ordering questions, byte-identical output essentially by
+construction) — but it does NOT reduce the §6.2 surface at all. Every
+one of those 14 functions/44 touches still needs to know how to reach
+the remote instance instead of indexing `self.instances[id]` directly;
+"blocking" only decides HOW they wait for the answer, not whether they
+need to change. **And a fully-blocking design delivers ZERO practical
+concurrency benefit even once built**: if nothing is ever allowed to
+overlap in wall-clock time, the child thread's only purpose is
+mechanical (proving the RPC-style plumbing works), not making the
+program run any part of its work in parallel — matching what §4
+already said honestly ("purely a proof that the mechanism is soundly
+buildable... before any REAL concurrency is attempted"), now confirmed
+concretely rather than assumed.
+
+### 6.4 Real benefit requires §3.4 (determinism) to be answered FIRST, not after
+
+The only way this work pays for itself is if SOME cross-thread
+interactions stop blocking — e.g. the parent enqueues a message to the
+threaded child and keeps draining its OWN queue instead of waiting, so
+an unrelated sibling instance's timer/handler can run while the child is
+mid-flight (this is also the only shape where a child's slow blocking
+I/O, e.g. `http_get`'s `curl` shell-out, would stop freezing the whole
+program). The moment ANY interaction is allowed to be non-blocking,
+today's strict single-queue FIFO ordering (§1) is no longer trivially
+preserved — two threads can each be mid-cascade at once, and the
+relative arrival order of the child's replies/emissions into the
+parent's queue becomes genuinely a race, which is exactly §3.4's
+"determinism tension," not a new question. **Conclusion: the
+cross-Interp wire question and the determinism question are the SAME
+question, not two separable ones — the wire mechanism's hard part IS
+determinism, and its easy part (the RPC-style call/reply plumbing
+itself) is already well understood from `par_map`'s existing precedent
+(§3.2).** Treating them as sequential sub-problems (as the it122 NEXT-
+note proposed) was a reasonable thing to try, but investigating live
+shows they don't actually decompose that way.
+
+### 6.5 A genuinely new recommendation: an indirection layer, decoupled from threading
+
+One real, actionable idea DID fall out of §6.2's inventory, independent
+of resolving §3.4: today, `self.instances[id]` is indexed directly from
+14+ call sites with no abstraction boundary in between. A future
+iteration — with NO threading involved at all, a pure, behavior-
+preserving refactor, verifiable as byte-identical via the existing
+`cargo test` + interp-vs-vm sweep — could introduce a single point of
+indirection (e.g. an `InstanceRef` accessor method replacing direct
+`self.instances[id]` field access) so that WHENEVER a threading design
+is eventually attempted, the "is this id local or remote" branch has to
+be written in ONE place instead of audited into 14+ call sites by hand.
+This is lower-risk, immediately useful for code clarity regardless of
+whether real concurrency ever ships, and is the kind of narrow,
+verifiable slice this campaign's own discipline favors — but it does
+NOT unblock real concurrency by itself, since the actual gate is §3.4,
+not the accessor pattern. Not attempted this iteration (still requires
+its own scoping: which fields need to move behind the accessor, whether
+`&mut` access patterns like `arm_timers`' in-place timer mutation are
+even expressible through a trait-object-style indirection without a
+larger borrow-checker fight) — named here as a candidate, not designed.

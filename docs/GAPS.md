@@ -892,7 +892,34 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       `Interp`. Documented this as an amendment to `ASYNC.md` §4/§5 rather
       than forcing an undersized attempt, and fell back to the note's own
       candidate (b) instead this iteration (see the stack-margin audit
-      entry below).
+      entry below). **it123**: answered the follow-up question it122
+      raised — "what does a wire connecting two different per-thread
+      `Interp`s look like" — with a new `ASYNC.md` §6, and it decomposes
+      differently than expected. Inventorying every `self.instances[id]`
+      access (not just `emit`/`expose`) finds **14 distinct functions**
+      in `interp.rs` touching instance state directly (construction,
+      wire delivery, the dispatch loop, timer arming/firing, supervision
+      restart, lifecycle, `expose`/method dispatch, the `par{}` purity
+      gate, property-test isolation) plus **44 touches** in `repl.rs`'s
+      `:upgrade` machinery — confirming the real surface is far larger
+      than "wires plus expose calls." Reached a decisive, non-obvious
+      conclusion: even the SIMPLEST possible design (make every cross-
+      thread interaction blocking, preserving today's exact FIFO
+      ordering) does not shrink that surface at all, AND delivers zero
+      practical concurrency benefit once built (nothing ever overlaps in
+      wall-clock time) — it would be pure plumbing-validation. Real
+      benefit requires SOME interactions to become non-blocking, which
+      immediately reopens §3.4's determinism question — so the
+      "cross-Interp wire" question and the "determinism" question are
+      the SAME question, not sequential sub-problems as the it122 note
+      had proposed. One new, genuinely actionable idea fell out of the
+      inventory: a future (untried) refactor could introduce a single
+      instance-access indirection layer, decoupled from threading
+      entirely and verifiable as byte-identical, so a future threading
+      attempt only needs to modify ONE place instead of auditing 14+
+      call sites by hand — named as a candidate, not designed. Doc-only
+      iteration (no `interp.rs` changes), matching it112/it121/it122's
+      own precedent for design-sketch iterations.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into
