@@ -514,18 +514,18 @@ every doc tooltip (`intent`) is literally this source code.
    per-resource split, and not user-definable/extensible from user code.**
 4. Hot-swap semantics for `state` migration on component upgrade (Erlang's
    `code_change` equivalent) — needed for visual live-editing (contract item C6,
-   see `VISUAL-TOOLS-CONTRACT.md`). **PARTIALLY RESOLVED (it120's own survey
-   correction — this entry was stale, still describing it111's original v1
-   scope): `kupl repl`'s `:upgrade <Component>` migrates live instances'
+   see `VISUAL-TOOLS-CONTRACT.md`). **PARTIALLY RESOLVED (it124 update):
+   `kupl repl`'s `:upgrade <Component>` migrates live instances'
    `state` AND `props` by name (matched names keep their value; new
    fields/props with a default get a fresh value), re-routes/adds/removes
-   `wires` between children, and now handles `children` ADDED or REMOVED
-   too (a removed child gets `on stop` fired, its own timers cleared, and
-   dangling wires pointing at it pruned — single-level only, not
-   recursive into a removed child's own children) — and swaps in new/
-   changed methods immediately. Still open: a user-provided migration
-   hook for a field whose SHAPE (not just name) changed, and RECURSIVE
-   child removal.**
+   `wires` between children, and handles `children` ADDED or REMOVED
+   too (a removed child gets `on stop` fired and its own timers cleared,
+   RECURSIVELY through its own descendants as of it124 — no dangling-wire
+   pruning is needed below the top level, since a wire can only ever
+   connect two siblings declared on the same component) — and swaps in
+   new/changed methods immediately. Still open: a user-provided migration
+   hook for a field whose SHAPE (not just name) changed — low priority,
+   no concrete driver.**
 5. Package identity & registry: content-addressed packages with signed manifests —
    spec in TOOLCHAIN.md, needs a decision on namespace governance.
 6. `@meta` tool-annotation blocks (proposed in `VISUAL-TOOLS-CONTRACT.md` C3) —

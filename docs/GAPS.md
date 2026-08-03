@@ -810,7 +810,7 @@ completion (3). Everything stays byte-identical across engines.
       handlers on a virtual clock advanced explicitly (`advance 5s` example
       step; `kupl run` auto-advances bounded). Deterministic, byte-identical on
       interpreter + KVM. Durations `ms`/`s`/`m`/`h`. (`examples/timers.kupl`)
-- [◐] **Hot-swap state migration (it111, extended it113/it114/it115/it119)**
+- [◐] **Hot-swap state migration (it111, extended it113/it114/it115/it119/it124)**
       — `kupl repl`'s `:upgrade <Component>` command (Erlang `code_change`
       equivalent, design open Q4): migrates every LIVE instance's `state`
       and `props` by name (matched names keep their current value; new
@@ -820,15 +820,24 @@ completion (3). Everything stays byte-identical across engines.
       genuinely new child is constructed fresh; a removed child is torn
       down (`on stop` fires via `Interp::run_lifecycle`, its own armed
       timers are cleared, and any wire from a still-live sibling pointing
-      at it is pruned — deliberately SINGLE-LEVEL, a removed child's OWN
-      children are not recursively stopped/disarmed, a documented v1
-      limit). `wires` between children may be freely ADDED or REMOVED
-      (it115), including RE-ROUTING an existing connection between two
-      pre-existing children — a kept child's own live instance is never
-      touched, only its `.wires` map is pruned/extended as needed. Still
-      refuses the whole upgrade if: a new prop has no default; or a
-      pre-existing child's own component type changed (nothing sound to
-      migrate a live instance to a different type).
+      at it is pruned) — **recursively as of it124**: `stop_and_disarm_
+      subtree` walks the removed child's own children (and theirs, and so
+      on), parent-first, matching `stop_all`'s own instance-id ordering
+      convention; no additional wire pruning is needed below the top
+      level, since a wire can only ever connect two siblings declared on
+      the SAME component (`instantiate`'s own wire-registration loop
+      resolves both endpoints through one component's `child_ids` map), so
+      a wire fully inside a removed subtree becomes unreachable together
+      with its endpoints exactly like the top-level case. `wires` between
+      children may be freely ADDED or REMOVED (it115), including
+      RE-ROUTING an existing connection between two pre-existing children
+      — a kept child's own live instance is never touched, only its
+      `.wires` map is pruned/extended as needed. Still refuses the whole
+      upgrade if: a new prop has no default; or a pre-existing child's own
+      component type changed (nothing sound to migrate a live instance to
+      a different type). The one remaining gap is a user-provided
+      migration hook for a field whose SHAPE (not just presence) changed
+      — still LOW priority, no concrete driver.
 
 ## Tier 3 — audit-driven priorities (next arc)
 
@@ -1057,10 +1066,10 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 2. Int default → **decided & shipped:** i64 checked, overflow panics.
 3. Effect granularity → shipped hierarchical effects (`io` covers `io.fs`/`io.net`/`io.env`/`io.proc`/`io.time`; plus `ai`).
 4. Hot-swap state migration → supervision restart hook shipped; automatic
-   by-name `state`/`props` migration, wire re-routing, and single-level
-   child removal (`on stop` + timer disarm + wire pruning) all shipped
-   (it111, it113, it115, it119, `kupl repl :upgrade`); a user-provided
-   migration hook (for a field whose SHAPE, not just name, changed) and
-   RECURSIVE removal (a removed child's own children aren't stopped)
-   remain TBD.
+   by-name `state`/`props` migration, wire re-routing, and RECURSIVE
+   child removal (`on stop` + timer disarm, walking the removed child's
+   own descendants; no extra wire pruning needed below the top level)
+   all shipped (it111, it113, it115, it119, it124, `kupl repl :upgrade`);
+   only a user-provided migration hook (for a field whose SHAPE, not just
+   name, changed) remains TBD, still low priority with no concrete driver.
 5. Package identity → `kupl.toml` shipped; registry governance TBD.
