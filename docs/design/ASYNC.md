@@ -1,6 +1,7 @@
 # Real concurrency between component instances — design sketch
 
-v0.1 (it121) — a bounded design deliverable, not an implementation, mirroring
+v0.2 (it121, determinism strategy decided it129) — a bounded design
+deliverable, not an implementation, mirroring
 `CAPABILITIES.md`'s own it112 precedent exactly: investigate live, write down
 what the real blockers are and what a credible design would need to resolve,
 so the NEXT iteration that picks this up (if any) starts from a real plan
@@ -272,9 +273,11 @@ running code.
 
 ## 5. Open questions this sketch does NOT resolve
 
-- Which of §3.4's (a)/(b)/(c) determinism strategies is right — the single
-  most consequential unresolved question, deserving its own dedicated
-  follow-up investigation.
+- ~~Which of §3.4's (a)/(b)/(c) determinism strategies is right~~ —
+  **RESOLVED at it129, see §7**: strategy (b), value-level determinism
+  preserved with documented timing-observable nondeterminism, opt-in
+  only (today's default synchronous behavior is unchanged for any
+  program that doesn't explicitly opt in to real concurrency).
 - Whether `await` should ever become genuinely NON-blocking (suspending the
   calling instance's own execution to let its queue keep draining) — this
   sketch recommends starting with blocking cross-thread calls specifically
@@ -417,3 +420,99 @@ its own scoping: which fields need to move behind the accessor, whether
 `&mut` access patterns like `arm_timers`' in-place timer mutation are
 even expressible through a trait-object-style indirection without a
 larger borrow-checker fight) — named here as a candidate, not designed.
+
+## 7. The determinism decision (it129)
+
+§3.4 was flagged as "the single most consequential open decision" three
+iterations ago (it121) and has sat undecided since — named as a fallback
+candidate across it124 through it128 without ever being picked, the same
+"carried forward as noise" pattern this campaign has explicitly resolved
+before for other stale candidates (the it106 precedent). This section
+makes the call, rather than deferring an eighth time.
+
+### 7.1 The decision: strategy (b), value-level determinism with documented timing nondeterminism — opt-in only
+
+**Strategy (b)** from §3.4 is the right choice: preserve per-instance
+VALUE-level determinism (given a fixed sequence of inputs, an instance's
+own computed results are always the same, on every engine, every run),
+while explicitly documenting that the RELATIVE TIMING of independently-
+running instances' externally-observable side effects (interleaved
+`print` order between two SIBLING instances, e.g.) is not guaranteed
+once real concurrency is in play.
+
+This is not a novel trade-off invented for KUPL — it is the ORDINARY,
+well-understood semantics of the actor model KUPL's own component
+system already borrows. `docs/design/VISION.md`'s own inspirations
+table (re-read in full for this decision, not assumed) lists
+**Erlang/Elixir FIRST**, crediting it specifically for "actor isolation,
+supervision trees, per-actor heaps, hot code swap" — exactly the
+concurrency model KUPL's components already implement today, minus real
+parallel execution. Erlang itself has NEVER guaranteed a global,
+cross-process total ordering of events: message delivery order is only
+guaranteed WITHIN one sender→receiver pair (FIFO per mailbox edge, the
+same guarantee KUPL's own single shared queue already provides today,
+trivially, since there is only one possible interleaving); the relative
+ordering of unrelated processes' own observable actions has never been
+part of the language's own determinism contract, in 35+ years of
+production use. Adopting strategy (b) is not a departure from KUPL's
+own stated inspirations — it is the most FAITHFUL continuation of the
+one this campaign's own docs cite first for exactly this part of the
+design.
+
+Strategies (a) (a global logical/vector clock enforcing total order)
+and (c) (scoping concurrency to only provably observation-independent
+subgraphs) both remain available as FUTURE refinements layered on top
+of (b) — (a) as an opt-in stronger guarantee for programs that need it
+(at a real performance/complexity cost §3.4 already named), (c) as a
+possible default-safe subset a future compile-time analysis could
+detect automatically. Neither is chosen as the FOUNDATIONAL model here,
+since both are strictly harder to implement than (b) and neither is
+needed to make a first real-concurrency slice sound.
+
+### 7.2 The trade-off is OPT-IN, not a change to today's default behavior
+
+This is the piece that makes the decision safe to commit to now,
+without contradicting this campaign's own sacred byte-identical-output
+invariant: real concurrency — and the timing nondeterminism that comes
+with it — is not proposed to become the DEFAULT execution mode for
+ordinary KUPL programs. `kupl run`/`kupl run --vm`/`kupl native`'s
+existing fully-synchronous, single-threaded, strictly-deterministic
+behavior stays EXACTLY as it is today for any program that does not
+explicitly opt in to real concurrency (the mechanism for opting in —
+e.g. a per-component marker, a CLI flag, or something else — is
+UNDECIDED and deliberately out of scope for this decision; only the
+*existence* of an opt-in boundary is being decided here). This mirrors
+`docs/design/VISION.md`'s own "Progressive disclosure of power" pillar
+exactly: the app tier's automatic memory management and the hardware
+tier's `low`-block volatility are BOTH "invisible unless you ask for
+it" — real concurrency's timing nondeterminism should be no different.
+Concretely, this means:
+
+- The EXISTING interp-vs-vm-vs-native byte-identical regression
+  discipline this campaign has held on EVERY commit remains fully valid
+  and unchanged for every program that doesn't opt in — which is every
+  program in `examples/*.kupl` today, and will remain so until a program
+  deliberately asks for real concurrency.
+- A FUTURE real-concurrency implementation only needs its OWN, new
+  verification discipline (documented nondeterminism in TIMING-observable
+  output specifically, value-level determinism still verifiable and
+  verified) for the opted-in subset — it does not need to solve, or even
+  touch, the sacred invariant for anything else.
+
+### 7.3 What this does and does not unblock
+
+This resolves §3.4 as a DESIGN decision — it does not implement
+anything, and does not by itself make any of §6's own findings (the
+14-function/44-touch instance-access surface, the wire-crossing
+question) any smaller. A future concurrency implementation still needs
+its own dedicated scoping pass, likely still landing on something close
+to ASYNC.md §4's own "narrow first slice" shape (one opted-in child
+instance, its own thread, blocking `mpsc` calls) as the actual entry
+point, now with a decided answer for what happens once that first slice
+is generalized to genuinely overlapping (non-blocking) execution instead
+of deferred indefinitely. Whether to pick that implementation work up is
+a SEPARATE decision from this one, to be made with the same live-
+investigation discipline this campaign has applied throughout — this
+section only removes the "we don't know what determinism strategy to
+build toward" blocker that made every prior attempt stop at the
+investigation stage.
