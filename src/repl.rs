@@ -271,6 +271,29 @@ pub fn repl() -> i32 {
     }
 }
 
+/// Recursively fire `on stop` and disarm timers for `cid` and every one of
+/// its OWN descendants (it124, extending `:upgrade`'s single-level removal
+/// from it119). Parent-first order, matching `stop_all`'s existing
+/// convention: `instantiate` always assigns a component a LOWER instance
+/// id than any of its own children (it pushes itself into `self.instances`
+/// BEFORE constructing them), so `stop_all`'s own ascending `0..upto` walk
+/// already visits a parent's `on stop` before its children's -- this walk
+/// preserves that same top-down order instead of introducing a different
+/// one. No wire pruning is needed here: see `upgrade_instances`'s own doc
+/// comment for why a wire inside a removed subtree can only ever reference
+/// another instance in that SAME subtree, never one outside it.
+fn stop_and_disarm_subtree(interp: &mut crate::interp::Interp, cid: usize) {
+    let _ = interp.run_lifecycle(cid, &crate::ast::Trigger::Stop);
+    interp.instances[cid].timers.clear();
+    let comp = interp.instances[cid].comp.clone();
+    let env = interp.instances[cid].env.clone();
+    for child in &comp.children {
+        if let Some(Value::Component(sub_cid)) = env.get(&child.name) {
+            stop_and_disarm_subtree(interp, sub_cid);
+        }
+    }
+}
+
 /// `:upgrade <name>` (it111) — hot-swap every LIVE instance of the
 /// component currently named `name` to `interp.db`'s CURRENT (just
 /// redefined) declaration, migrating `state` field values by NAME:
@@ -301,12 +324,22 @@ pub fn repl() -> i32 {
 /// started batch), its own armed timers are cleared (an `on every`/`on
 /// after` handler would otherwise keep firing forever on an instance
 /// nothing can reach anymore), and any wire from a still-live sibling
-/// pointing AT it is pruned. Deliberately SINGLE-LEVEL: a removed child's
-/// OWN children (if it has any) are NOT recursively stopped/disarmed --
-/// a known, documented v1 scope limit (their timers keep firing, invisibly
-/// leaking), not a silent gap; a nested-removal follow-up would need to
-/// walk the removed child's own `old_comp.children` recursively. Still
-/// refuses the WHOLE upgrade (no instances touched) if a PRE-EXISTING
+/// pointing AT it is pruned. **Recursive as of it124**: a removed child's
+/// OWN children (and THEIR children, and so on) are torn down the same
+/// way, via `stop_and_disarm_subtree`'s own recursive walk -- parent-first
+/// (matching `stop_all`'s existing ordering convention: `instantiate`
+/// always assigns a component a LOWER instance id than any of its own
+/// children, so `stop_all`'s ascending `0..upto` walk already visits a
+/// parent's `on stop` before its children's). No additional wire pruning
+/// is needed below the removed child's own top level: `instantiate`'s wire-
+/// registration loop resolves both a wire's `from` and `to` through ONE
+/// component's own `child_ids` map, so a wire can only ever connect two
+/// SIBLINGS declared on the SAME component -- a wire fully inside the
+/// removed subtree can only reference another instance ALSO being torn
+/// down in the same walk, and becomes unreachable together with it exactly
+/// like the top-level case already documented; it can never reach an
+/// instance outside the removed subtree. Still refuses the WHOLE upgrade
+/// (no instances touched) if a PRE-EXISTING
 /// child's own `component` type changed (nothing sound to migrate a live
 /// instance TO a different type).
 ///
@@ -481,13 +514,13 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
         // real resource leak, not just a cosmetic one), and leave it
         // otherwise as-is (its own `.wires`/state become unreachable, not
         // explicitly cleared -- harmless once nothing routes to it).
-        // Deliberately single-level: a removed child's OWN children (if it
-        // has any) are NOT recursively stopped/disarmed -- a known,
-        // documented v1 scope limit, not a silent gap.
+        // Recursive as of it124 (`stop_and_disarm_subtree`): the removed
+        // child's OWN children, and theirs, are torn down the same way --
+        // see that function's own doc comment for why no additional wire
+        // pruning is needed below the top level.
         for (name, _) in old_child_map.iter().filter(|(n, _)| !new_child_map.contains_key(n.as_str())) {
             if let Some(Value::Component(cid)) = old_env.get(name) {
-                let _ = interp.run_lifecycle(cid, &crate::ast::Trigger::Stop);
-                interp.instances[cid].timers.clear();
+                stop_and_disarm_subtree(interp, cid);
             }
         }
         // any wire (from a STILL-LIVE source -- one that's kept or newly
@@ -1011,6 +1044,89 @@ mod tests {
         redefine(&mut interp, "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Parent {\n    intent \"p\"\n}\n");
         assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
         assert!(interp.instances[a_id].timers.is_empty(), "a removed child's own timers must be cleared");
+    }
+
+    /// it124: extends the single-level it119 removal to a THREE-level chain
+    /// (`Parent -> a:Outer -> mid:Mid -> inner:Leaf`) to prove genuine
+    /// recursion, not a hardcoded one-extra-level special case. Removing
+    /// `a` must fire `on stop` for `a` itself AND for `mid` AND for
+    /// `inner`, transitively.
+    #[test]
+    fn upgrade_recursively_tears_down_a_removed_childs_own_descendants() {
+        let src = |parent_has_a: bool| {
+            let leaf = "component Leaf {\n    intent \"l\"\n    state stopped: Bool = false\n    on stop {\n        stopped = true\n    }\n}\n";
+            let mid = "component Mid {\n    intent \"m\"\n    state stopped: Bool = false\n    let inner = Leaf()\n    on stop {\n        stopped = true\n    }\n}\n";
+            let outer = "component Outer {\n    intent \"o\"\n    state stopped: Bool = false\n    let mid = Mid()\n    on stop {\n        stopped = true\n    }\n}\n";
+            let parent = if parent_has_a {
+                "component Parent {\n    intent \"p\"\n    let a = Outer()\n}\n"
+            } else {
+                "component Parent {\n    intent \"p\"\n}\n"
+            };
+            format!("{leaf}{mid}{outer}{parent}")
+        };
+        let mut interp = interp_with_one_instance(&src(true), "Parent");
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+            panic!("child `a` must resolve to a component instance before the upgrade");
+        };
+        let Some(crate::value::Value::Component(mid_id)) = interp.instances[a_id].env.get("mid") else {
+            panic!("`a`'s own child `mid` must resolve to a component instance before the upgrade");
+        };
+        let Some(crate::value::Value::Component(inner_id)) = interp.instances[mid_id].env.get("inner") else {
+            panic!("`mid`'s own child `inner` must resolve to a component instance before the upgrade");
+        };
+        for id in [a_id, mid_id, inner_id] {
+            assert_eq!(interp.instances[id].env.get("stopped"), Some(crate::value::Value::Bool(false)));
+        }
+
+        redefine(&mut interp, &src(false));
+        assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
+
+        assert_eq!(interp.instances[0].env.get("a"), None, "a removed child must not stay bound in the parent's env");
+        for (id, label) in [(a_id, "a"), (mid_id, "a's own child mid"), (inner_id, "mid's own child inner")] {
+            assert_eq!(
+                interp.instances[id].env.get("stopped"),
+                Some(crate::value::Value::Bool(true)),
+                "{label}'s own `on stop` handler must have fired"
+            );
+        }
+    }
+
+    /// it124: a removed child's own descendant's ARMED TIMER must also be
+    /// disarmed, not just the removed child's own -- otherwise a
+    /// grandchild's `on every`/`on after` handler keeps firing forever on
+    /// an instance nothing can reach anymore.
+    #[test]
+    fn upgrade_recursively_disarms_a_removed_childs_descendants_own_timers() {
+        let mut interp = interp_with_one_instance(
+            "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Mid {\n    intent \"m\"\n    let inner = Ticker()\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Mid()\n}\n",
+            "Parent",
+        );
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+            panic!("child `a` must resolve to a component instance before the upgrade");
+        };
+        let Some(crate::value::Value::Component(inner_id)) = interp.instances[a_id].env.get("inner") else {
+            panic!("`a`'s own child `inner` must resolve to a component instance before the upgrade");
+        };
+        interp.instances[inner_id].timers.push(crate::interp::TimerState {
+            handler_idx: 0,
+            every: true,
+            interval: 5000,
+            next_fire: 5000,
+            active: true,
+        });
+        assert_eq!(interp.instances[inner_id].timers.len(), 1);
+
+        // Removing `a` ITSELF from Parent (not just `inner` from `Mid`) is
+        // what exercises the recursive path: a KEPT child's own internals
+        // are never touched by `:upgrade Parent` at all (that would need a
+        // separate `:upgrade Mid`), so this must remove `a` wholesale to
+        // reach `a`'s own child `inner` through `stop_and_disarm_subtree`.
+        redefine(&mut interp, "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Mid {\n    intent \"m\"\n    let inner = Ticker()\n}\ncomponent Parent {\n    intent \"p\"\n}\n");
+        assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
+        assert!(
+            interp.instances[inner_id].timers.is_empty(),
+            "a removed grandchild's own timers must be cleared too, not just the direct child's"
+        );
     }
 
     /// it119: a wire from a STILL-LIVE sibling pointing AT a removed child
