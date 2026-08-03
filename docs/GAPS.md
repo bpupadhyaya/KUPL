@@ -883,7 +883,7 @@ completion (3). Everything stays byte-identical across engines.
 ## Tier 3 — audit-driven priorities (next arc)
 
 Ordered by the comparison audit ([`COMPARISON.md`](COMPARISON.md), refreshed
-after it20):
+after it129):
 the lowest-scoring, most load-bearing gaps vs Python/Go/TS/Java/Rust/Haskell/
 C++/Swift/Kotlin. Concurrency is the #1 gap for the "universal, any software"
 claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
