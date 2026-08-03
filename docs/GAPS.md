@@ -790,8 +790,21 @@ completion (3). Everything stays byte-identical across engines.
       path compiles natively and COMPLETELY (it51 non-tool, it52 tool use),
       byte-identical to the interpreter: structured `Result`/record/`List`
       output AND the mock tool loop (invoking compiled KUPL functions).
-      examples/agent.kupl + agent_component.kupl compile native. Only a
-      real-provider *network* call defers at runtime (use `bundle`).
+      examples/agent.kupl + agent_component.kupl compile native. **As of
+      it125, a non-tool, `-> Str`-shaped `ai fun`'s REAL-PROVIDER network
+      call also compiles natively** — `k_ai_call` ports `ai.rs`'s
+      `build_prompt`/`http_post`/`openai_call`/`anthropic_call` to C,
+      reusing existing native infrastructure (`k_run_curl`, `k_json_parse`,
+      `k_show`, and `k_ai_convert` itself — this addition's own job ends
+      the moment it produces response text, exactly like the mock path).
+      Supports `anthropic` (default)/`openai`/`ollama`/`echo`; verified via
+      the zero-network `echo` provider (the only one fully testable without
+      a live API key). **Still defers to `kupl bundle`**: tool-using ai
+      funs (real-provider tool calling), and structured (non-`Str`) return
+      shapes (needs a JSON-Schema request suffix/`response_format`
+      modifier, not yet ported) — both explicitly out of this first
+      slice's scope, narrowed deliberately rather than left silently
+      incomplete.
 
 ## Tier 2 — component model completion
 
