@@ -799,12 +799,21 @@ completion (3). Everything stays byte-identical across engines.
       the moment it produces response text, exactly like the mock path).
       Supports `anthropic` (default)/`openai`/`ollama`/`echo`; verified via
       the zero-network `echo` provider (the only one fully testable without
-      a live API key). **Still defers to `kupl bundle`**: tool-using ai
-      funs (real-provider tool calling), and structured (non-`Str`) return
-      shapes (needs a JSON-Schema request suffix/`response_format`
-      modifier, not yet ported) — both explicitly out of this first
-      slice's scope, narrowed deliberately rather than left silently
-      incomplete.
+      a live API key). **As of it126, structured (non-`Str`) return shapes
+      ALSO get a real network path** — `k_ai_schema_json`/`k_ai_wire_schema`
+      port `ai.rs`'s JSON-Schema generator to C (recursive over the SAME
+      `KAiShape` struct the mock path already emits per ai fun), embedded
+      via `response_format`/`output_config`; the RESPONSE side needed no
+      new code at all, since `k_ai_convert`/`k_ai_from_json` already
+      handle shape-guided JSON parsing for every shape via the mock path.
+      Verified end-to-end (not just prompt construction) against a local
+      mock HTTP server (plain `std::net::TcpListener`, no live network/API
+      cost) — this caught a REAL memory-safety bug (`k_ai_http_post`'s
+      argv allocation was 4 slots short of what it writes, a heap buffer
+      overflow) that it125's `echo`-only tests had zero coverage for,
+      since `echo` never calls `k_ai_http_post` at all. **Still defers to
+      `kupl bundle`**: tool-using ai funs (real-provider tool calling) —
+      the one remaining explicitly-scoped-out piece.
 
 ## Tier 2 — component model completion
 
