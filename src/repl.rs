@@ -285,25 +285,30 @@ pub fn repl() -> i32 {
 /// Deliberately narrow v1 scope, matching Erlang's own `code_change`
 /// (which migrates a process's STATE term, not its supervision tree).
 ///
-/// `children` may GROW (it114 follow-up): a child present under the SAME
-/// `name` (and SAME `component` type) in both old and new keeps its own
-/// LIVE instance completely untouched -- its state, wires, and identity
-/// are exactly as they were, since this function never touches
-/// `interp.instances[cid]` for a kept child at all. A child only in the
-/// NEW declaration is constructed fresh via `Interp::instantiate_child`
-/// (the SAME helper `instantiate` itself uses for a brand-new instance),
-/// evaluated against the migrated `new_env` so its own constructor args
-/// can reference already-migrated props/state/kept children. Still
-/// refuses the WHOLE upgrade (no instances touched) if: a PRE-EXISTING
-/// child's own `component` type changed (nothing sound to migrate a
-/// live instance TO a different type); or a PRE-EXISTING child was REMOVED
-/// (cleanly stopping/unsupervising a live actor needs `on stop` +
-/// supervision-tree surgery -- and, unlike a `state`/`prop` field, there is
-/// NO existing mechanism anywhere in this engine for tearing down ONE live
-/// instance while its siblings keep running; supervision's own restart
-/// replaces an instance's STATE in place, it never removes an id from the
-/// graph -- out of scope for now, the removed child would otherwise become
-/// a permanently orphaned, unreachable-but-still-running instance).
+/// `children` may GROW (it114) or SHRINK (it119 follow-up): a child
+/// present under the SAME `name` (and SAME `component` type) in both old
+/// and new keeps its own LIVE instance completely untouched -- its state,
+/// wires, and identity are exactly as they were, since this function never
+/// touches `interp.instances[cid]` for a kept child at all. A child only
+/// in the NEW declaration is constructed fresh via
+/// `Interp::instantiate_child` (the SAME helper `instantiate` itself uses
+/// for a brand-new instance), evaluated against the migrated `new_env` so
+/// its own constructor args can reference already-migrated props/state/
+/// kept children. A child only in the OLD declaration is torn down: `on
+/// stop` fires for it (`Interp::run_lifecycle`, the SAME single-instance
+/// primitive `stop_all` already uses for every instance at a program's
+/// natural end -- just aimed at ONE instance here instead of a whole
+/// started batch), its own armed timers are cleared (an `on every`/`on
+/// after` handler would otherwise keep firing forever on an instance
+/// nothing can reach anymore), and any wire from a still-live sibling
+/// pointing AT it is pruned. Deliberately SINGLE-LEVEL: a removed child's
+/// OWN children (if it has any) are NOT recursively stopped/disarmed --
+/// a known, documented v1 scope limit (their timers keep firing, invisibly
+/// leaking), not a silent gap; a nested-removal follow-up would need to
+/// walk the removed child's own `old_comp.children` recursively. Still
+/// refuses the WHOLE upgrade (no instances touched) if a PRE-EXISTING
+/// child's own `component` type changed (nothing sound to migrate a live
+/// instance TO a different type).
 ///
 /// `wires` between children may now be ADDED or REMOVED freely (it115
 /// follow-up, relaxing the original wires-between-kept-children-frozen
@@ -376,19 +381,16 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
     let new_child_map: std::collections::BTreeMap<String, String> =
         new_comp.children.iter().map(|c| (c.name.clone(), c.component.clone())).collect();
     for (name, old_kind) in &old_child_map {
-        match new_child_map.get(name) {
-            None => {
-                return Err(format!(
-                    "child `{name}` was removed — :upgrade cannot yet stop/re-supervise a removed child (see its own doc comment)"
-                ));
-            }
-            Some(new_kind) if new_kind != old_kind => {
+        if let Some(new_kind) = new_child_map.get(name) {
+            if new_kind != old_kind {
                 return Err(format!(
                     "child `{name}`'s own component type changed (`{old_kind}` -> `{new_kind}`) — :upgrade cannot migrate a live instance to a different type"
                 ));
             }
-            _ => {}
         }
+        // else: removed entirely -- allowed (it119 follow-up), handled
+        // per-instance below (fires `on stop`, disarms timers, prunes
+        // dangling wires pointing at it).
     }
     // A wire touching ONLY pre-existing (kept) children may now be ADDED or
     // REMOVED (it115 follow-up) -- computed here so the per-instance loop
@@ -469,6 +471,45 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
                 child_ids.insert(child.name.clone(), cid);
             }
             new_env.define(&child.name, v);
+        }
+        // a child present in the OLD declaration but gone from the NEW one
+        // (it119 follow-up) is torn down: fire `on stop` (mirroring
+        // `stop_all`'s own end-of-program delivery, just for this ONE
+        // instance instead of every started instance), disarm its own
+        // timers (an `on every`/`on after` handler would otherwise keep
+        // firing forever on an instance nothing can reach anymore -- a
+        // real resource leak, not just a cosmetic one), and leave it
+        // otherwise as-is (its own `.wires`/state become unreachable, not
+        // explicitly cleared -- harmless once nothing routes to it).
+        // Deliberately single-level: a removed child's OWN children (if it
+        // has any) are NOT recursively stopped/disarmed -- a known,
+        // documented v1 scope limit, not a silent gap.
+        for (name, _) in old_child_map.iter().filter(|(n, _)| !new_child_map.contains_key(n.as_str())) {
+            if let Some(Value::Component(cid)) = old_env.get(name) {
+                let _ = interp.run_lifecycle(cid, &crate::ast::Trigger::Stop);
+                interp.instances[cid].timers.clear();
+            }
+        }
+        // any wire (from a STILL-LIVE source -- one that's kept or newly
+        // added this same upgrade, tracked in `child_ids`) whose TARGET was
+        // a child just removed above must be pruned from that source's own
+        // `.wires` map, or it would keep routing to a now-torn-down
+        // instance. (A wire whose SOURCE was itself removed needs no
+        // action: that instance's own `.wires` map is already unreachable.)
+        for wire in &old_comp.wires {
+            let (to_child, to_port) = &wire.to;
+            if new_child_map.contains_key(to_child.as_str()) {
+                continue; // target still exists in the new declaration
+            }
+            let (from_child, from_port) = &wire.from;
+            let (Some(&src), Some(Value::Component(removed_cid))) =
+                (child_ids.get(from_child), old_env.get(to_child))
+            else {
+                continue; // source was itself removed, or the target's old value is unexpectedly missing
+            };
+            if let Some(targets) = interp.instances[src].wires.get_mut(from_port) {
+                targets.retain(|(d, p)| !(*d == removed_cid && p == to_port));
+            }
         }
         // wires: only a genuinely NEW wire (not already present in
         // `old_comp.wires` verbatim) needs registering -- this was NEVER
@@ -875,24 +916,13 @@ mod tests {
 
     /// it114 follow-up: a genuinely NEW child (same name absent from the OLD
     /// declaration) is now allowed and constructed fresh -- no longer a
-    /// blanket refusal the moment `children` differs at all. A REMOVED
-    /// child, or a PRE-EXISTING child whose own component type changed,
-    /// still refuses the whole upgrade (see `upgrade_instances`'s own doc
-    /// comment for why).
+    /// blanket refusal the moment `children` differs at all. A PRE-EXISTING
+    /// child whose own component type changed still refuses the whole
+    /// upgrade (see `upgrade_instances`'s own doc comment for why) -- a
+    /// REMOVED child no longer refuses at all since it119 (see the
+    /// `upgrade_tears_down_a_removed_child_*` tests below for that case).
     #[test]
-    fn upgrade_refuses_a_removed_child_or_a_changed_child_type_but_allows_a_new_one() {
-        let mut interp = interp_with_one_instance(
-            "component Leaf {\n    intent \"l\"\n}\ncomponent Other {\n    intent \"o\"\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n    let b = Leaf()\n}\n",
-            "Parent",
-        );
-        // a PRE-EXISTING child (`b`) removed must refuse.
-        redefine(
-            &mut interp,
-            "component Leaf {\n    intent \"l\"\n}\ncomponent Other {\n    intent \"o\"\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n}\n",
-        );
-        let err = upgrade_instances(&mut interp, "Parent").expect_err("a removed child must be refused");
-        assert!(err.contains("was removed"), "{err}");
-
+    fn upgrade_refuses_a_changed_child_type_but_allows_a_new_one() {
         // a PRE-EXISTING child (`b`)'s own component type changed must refuse.
         let mut interp2 = interp_with_one_instance(
             "component Leaf {\n    intent \"l\"\n}\ncomponent Other {\n    intent \"o\"\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n    let b = Leaf()\n}\n",
@@ -918,6 +948,96 @@ mod tests {
         assert!(
             matches!(interp3.instances[0].env.get("c"), Some(crate::value::Value::Component(_))),
             "a genuinely new child must be constructed and bound"
+        );
+    }
+
+    /// it119: removing a child now succeeds (instead of refusing the whole
+    /// upgrade) -- the removed child's OWN `on stop` handler fires, exactly
+    /// mirroring `stop_all`'s own end-of-program delivery but aimed at just
+    /// this one instance.
+    #[test]
+    fn upgrade_tears_down_a_removed_child_firing_its_on_stop_handler() {
+        let mut interp = interp_with_one_instance(
+            "component Leaf {\n    intent \"l\"\n    state stopped: Bool = false\n    on stop {\n        stopped = true\n    }\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n    let b = Leaf()\n}\n",
+            "Parent",
+        );
+        let Some(crate::value::Value::Component(b_id)) = interp.instances[0].env.get("b") else {
+            panic!("child `b` must resolve to a component instance before the upgrade");
+        };
+        assert_eq!(interp.instances[b_id].env.get("stopped"), Some(crate::value::Value::Bool(false)));
+
+        redefine(
+            &mut interp,
+            "component Leaf {\n    intent \"l\"\n    state stopped: Bool = false\n    on stop {\n        stopped = true\n    }\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n}\n",
+        );
+        assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
+
+        // `b` is no longer reachable from the parent's own env...
+        assert_eq!(interp.instances[0].env.get("b"), None, "a removed child must not stay bound in the parent's env");
+        // ...but its OWN instance (still at its old, stable id) had `on
+        // stop` fire, exactly like a normal end-of-program shutdown would.
+        assert_eq!(
+            interp.instances[b_id].env.get("stopped"),
+            Some(crate::value::Value::Bool(true)),
+            "the removed child's own `on stop` handler must have fired"
+        );
+    }
+
+    /// it119: a removed child's own armed timer must be disarmed -- an
+    /// `on every`/`on after` handler on an instance nothing can reach
+    /// anymore would otherwise keep firing forever, an invisible resource
+    /// leak rather than a crash.
+    #[test]
+    fn upgrade_disarms_a_removed_childs_own_timers() {
+        let mut interp = interp_with_one_instance(
+            "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Ticker()\n}\n",
+            "Parent",
+        );
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+            panic!("child `a` must resolve to a component instance before the upgrade");
+        };
+        // `interp_with_one_instance` never calls `start_all`, so timers
+        // aren't armed yet -- arm them directly the same way `start_all`
+        // would, so this test actually exercises disarming a LIVE timer.
+        interp.instances[a_id].timers.push(crate::interp::TimerState {
+            handler_idx: 0,
+            every: true,
+            interval: 5000,
+            next_fire: 5000,
+            active: true,
+        });
+        assert_eq!(interp.instances[a_id].timers.len(), 1);
+
+        redefine(&mut interp, "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Parent {\n    intent \"p\"\n}\n");
+        assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
+        assert!(interp.instances[a_id].timers.is_empty(), "a removed child's own timers must be cleared");
+    }
+
+    /// it119: a wire from a STILL-LIVE sibling pointing AT a removed child
+    /// must be pruned, or the sibling would keep routing to a torn-down
+    /// instance forever.
+    #[test]
+    fn upgrade_prunes_a_wire_from_a_kept_child_pointing_at_a_removed_one() {
+        let mut interp = interp_with_one_instance(
+            "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    wire a.o -> b.i\n}\n",
+            "Parent",
+        );
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+            panic!("child `a` must resolve to a component instance before the upgrade");
+        };
+        let Some(crate::value::Value::Component(b_id)) = interp.instances[0].env.get("b") else {
+            panic!("child `b` must resolve to a component instance before the upgrade");
+        };
+        assert!(interp.instances[a_id].wires.get("o").is_some_and(|t| t.contains(&(b_id, "i".to_string()))));
+
+        redefine(
+            &mut interp,
+            "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n}\n",
+        );
+        assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
+        assert!(
+            !interp.instances[a_id].wires.get("o").is_some_and(|t| t.contains(&(b_id, "i".to_string()))),
+            "a wire pointing at the removed child must be pruned from the kept source's own wires"
         );
     }
 

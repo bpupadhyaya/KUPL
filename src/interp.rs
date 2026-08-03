@@ -599,7 +599,7 @@ impl Interp {
         Ok(())
     }
 
-    fn run_lifecycle(&mut self, id: usize, trigger: &Trigger) -> Result<(), Flow> {
+    pub(crate) fn run_lifecycle(&mut self, id: usize, trigger: &Trigger) -> Result<(), Flow> {
         let comp = self.instances[id].comp.clone();
         let want_start = matches!(trigger, Trigger::Start);
         for h in &comp.handlers {
