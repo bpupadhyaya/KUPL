@@ -844,13 +844,34 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       pure named callback over lists ≥ 256 elements** (`src/parallel.rs`: a `PortableValue`
       Send boundary + a Send+Sync `ProgramImage` + `std::thread::scope`; results
       placed by input index so the output is byte-identical to sequential
-      `map`). Everything else still evaluates sequentially (deterministic,
-      byte-identical on all engines incl. native). Runs on BOTH the interpreter and the
-      KVM (it35); the differential harness keeps a sequential-VM reference and
-      absolute-value tests anchor correctness. Still open: extending real
-      threads to `par{}` fixed branches, a work-stealing scheduler,
-      async I/O, and `await` actually suspending (evaluates synchronously
-      today). Virtual clock (it9) preserved for deterministic tests.
+      `map`). Runs on BOTH the interpreter and the KVM (it35); the
+      differential harness keeps a sequential-VM reference and
+      absolute-value tests anchor correctness. **`par { }` fork-join
+      branches ALSO now get real OS threads** (it99 interp, it101 KVM) when
+      every branch is a plain call to a statically pure, top-level named
+      function with plain-literal/identifier args — the same purity gate
+      `par_map`/`par_filter` use; a non-qualifying branch falls the WHOLE
+      block back to the unchanged sequential path (see
+      `docs/design/bigarcs/3-real-concurrency.md`'s own "Progress" notes
+      for the exact staging). Native/`cgen.rs` stays sequential for `par{}`
+      by explicit design decision (it99), unlike `par_map`/`par_filter`
+      which are interp/KVM-only real-threaded to begin with. **Genuinely
+      still open** (this line was stale before it120's survey — the
+      above WAS the "still open... extending real threads to `par{}`"
+      item this line used to list, now landed): general **async I/O and
+      `await` actually suspending** (today `await` evaluates
+      synchronously — confirmed live, no scheduler exists anywhere in the
+      runtime) and the **M:N work-stealing scheduler** `docs/design/
+      LANGUAGE.md` §4's own vision text describes ("no bare threads in the
+      app tier; the runtime multiplexes components on an M:N work-stealing
+      scheduler") — neither has any implementation today, and this is
+      explicitly named as the campaign's OWN "#1 gap for the universal,
+      any software claim" (see this Tier's own intro line below). A
+      substantial undertaking on the scale of capabilities' own
+      it112-it118 arc, likely needing its own dedicated design pass before
+      any implementation attempt (mirroring `docs/design/CAPABILITIES.md`'s
+      own precedent) — not picked up as of it120. Virtual clock (it9)
+      preserved for deterministic tests.
 - [x] **File I/O** (it14) — `read_file`/`write_file`/`append_file`/`delete_file`
       (→ `Result`) + `file_exists`, gated behind the `io.fs` effect. A core "any
       software" capability (a universal language must touch the filesystem).
