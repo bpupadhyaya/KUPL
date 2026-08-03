@@ -913,22 +913,24 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
 - [ ] System tier: ownership, `low`/`asm` (design §6; audit #4)
 - [◐] **Capabilities as attenuable values (`CapNet.limited_to(…)`)** — design
       sketch (it112, `docs/design/CAPABILITIES.md`; corrected it113/it114/
-      it115) implemented as a real Cap.Net-only first slice (it116):
-      `CapNet` (a flat builtin type name, not the sketch's original dotted
-      `Cap.Net` — no dotted-type-path grammar exists in KUPL, and it115
-      confirmed the module system doesn't need one either), `.limited_to
-      (host: Str) -> CapNet` (narrows only — widening an already-limited
-      capability to a different host panics), `http_get_with(cap, url)`
-      (host-checked BEFORE any network I/O; existing `http_get(url)`
-      unchanged), and `cap_net_root() -> CapNet` — all wired across
-      interp/KVM/native in the SAME iteration (`examples/capabilities.kupl`).
-      **Remaining, explicitly tracked gap: root-seeding is NOT restricted
-      to `fun main`'s own top-level body** — `cap_net_root()` is callable
-      from anywhere today, so effects/props still provide the real
-      boundary-explicitness guarantee; this is real, fully-tested engine
-      plumbing, not yet a genuine "no ambient authority" security boundary.
-      A static check restricting that one builtin's call site is the
-      well-scoped remaining piece.
+      it115) implemented as a real, ENFORCED Cap.Net-only first slice
+      (it116/it117): `CapNet` (a flat builtin type name, not the sketch's
+      original dotted `Cap.Net` — no dotted-type-path grammar exists in
+      KUPL, and it115 confirmed the module system doesn't need one
+      either), `.limited_to(host: Str) -> CapNet` (narrows only —
+      widening an already-limited capability to a different host panics),
+      `http_get_with(cap, url)` (host-checked BEFORE any network I/O;
+      existing `http_get(url)` unchanged), and `cap_net_root() -> CapNet`
+      (the ONLY way to obtain a capability at all — restricted by a new
+      `K0304` static check to a direct call inside `fun main`'s own
+      top-level body: not a top-level helper, not a component method/
+      handler, not a closure literal even when written directly inside
+      `fun main`) — all wired across interp/KVM/native
+      (`examples/capabilities.kupl`). This CapNet kind is now a genuine
+      "no ambient authority" security boundary, closing the
+      `docs/design/LANGUAGE.md` §2 claim for its one shipped kind.
+      **Remaining work is generalizing the now-proven pattern to other
+      capability kinds** (`CapFs`, `CapSql`, ...), not fixing this one.
 
 ## Tier 4 — ecosystem
 

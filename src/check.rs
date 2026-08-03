@@ -629,6 +629,14 @@ struct Ctx<'a> {
     component: Option<&'a ComponentDecl>,
     in_handler: bool,
     loop_depth: usize,
+    /// it117: true only while checking the top-level `fun main`'s OWN
+    /// body directly -- reset to `false` for any nested closure literal
+    /// (the SAME save-fresh/restore pattern `loop_depth`/`in_handler`
+    /// already use, PR-it948's own precedent), since a closure could be
+    /// stored/passed elsewhere and called later, outside the composition
+    /// root moment `cap_net_root()`'s own call-site restriction (K0304)
+    /// depends on. See `CAPABILITIES.md` §3.2/§5.
+    in_main_top_level: bool,
 }
 
 /// One "column" of the joint exhaustiveness matrix (`Checker::joint_exhaustive`):
@@ -1485,6 +1493,7 @@ impl Checker {
                         component: None,
                         in_handler: false,
                         loop_depth: 0,
+                        in_main_top_level: false,
                     };
                     self.check_block(&l.body, &mut ctx);
                 }
@@ -1502,6 +1511,7 @@ impl Checker {
                 component: None,
                 in_handler: false,
                 loop_depth: 0,
+                in_main_top_level: false,
             };
             for (name, (params, ret, _)) in &sig.sigs {
                 ctx.scopes.insert(name, Ty::Fun(params.clone(), Box::new(ret.clone())), false);
@@ -1742,6 +1752,10 @@ impl Checker {
             component,
             in_handler: false,
             loop_depth: 0,
+            // it117: only the top-level `fun main` (not a component method,
+            // not any other top-level fun) is the composition-root body
+            // `cap_net_root()`'s own call-site restriction (K0304) allows.
+            in_main_top_level: component.is_none() && f.name == "main",
         };
         if let Some(c) = component {
             self.bind_component_env(c, &mut ctx, None);
@@ -1952,6 +1966,7 @@ impl Checker {
                 component: Some(c),
                 in_handler: false,
                 loop_depth: 0,
+                in_main_top_level: false,
             };
             for prop in &c.props {
                 let ty = self.resolve_ty(&prop.ty);
@@ -2047,6 +2062,7 @@ impl Checker {
                 component: Some(c),
                 in_handler: false,
                 loop_depth: 0,
+                in_main_top_level: false,
             };
             self.bind_component_env(c, &mut cctx, Some(child_idx));
             self.check_ctor_args(&child.component, &sig, &child.args, child.span, &mut cctx);
@@ -2139,6 +2155,7 @@ impl Checker {
                 component: Some(c),
                 in_handler: true,
                 loop_depth: 0,
+                in_main_top_level: false,
             };
             self.bind_component_env(c, &mut ctx, None);
             ctx.scopes.push();
@@ -2390,6 +2407,7 @@ impl Checker {
                             component: Some(c),
                             in_handler: false,
                             loop_depth: 0,
+                            in_main_top_level: false,
                         };
                         match (arg, ty) {
                             (None, Ty::Event) => {}
@@ -2415,6 +2433,7 @@ impl Checker {
                         component: Some(c),
                         in_handler: false,
                         loop_depth: 0,
+                        in_main_top_level: false,
                     };
                     // out ports are bound to their last emitted value
                     for (name, ty) in &sig.out_ports {
@@ -3177,12 +3196,22 @@ impl Checker {
                 let outer_ret = std::mem::replace(&mut ctx.ret, self.uni.fresh());
                 let outer_loop_depth = std::mem::replace(&mut ctx.loop_depth, 0);
                 let outer_in_handler = std::mem::replace(&mut ctx.in_handler, false);
+                // it117: a closure could be stored/passed elsewhere and
+                // called later, outside the composition-root moment
+                // `cap_net_root()`'s own call-site restriction (K0304)
+                // depends on -- so it does NOT inherit `in_main_top_level`
+                // even when the closure literal is textually written
+                // directly inside `fun main`'s own body. Same
+                // save-fresh/restore shape as `loop_depth`/`in_handler`
+                // above (PR-it948's own precedent).
+                let outer_in_main_top_level = std::mem::replace(&mut ctx.in_main_top_level, false);
                 let bt = self.check_block(body, ctx);
                 let closure_ret = ctx.ret.clone();
                 self.check_assign(&closure_ret, &bt, body.span, "closure return value");
                 ctx.ret = outer_ret;
                 ctx.loop_depth = outer_loop_depth;
                 ctx.in_handler = outer_in_handler;
+                ctx.in_main_top_level = outer_in_main_top_level;
                 ctx.scopes.pop();
                 Ty::Fun(ptys, Box::new(bt))
             }
@@ -3620,7 +3649,28 @@ impl Checker {
                     self.unify(&Ty::Str, &u, args[1].value.span, "http_get_with url");
                     return Ty::Result(Box::new(Ty::Str), Box::new(Ty::Str));
                 }
-                ("cap_net_root", 0) => return Ty::CapNet,
+                ("cap_net_root", 0) => {
+                    // it117: root capabilities are seeded at EXACTLY one
+                    // place (CAPABILITIES.md §3.2) -- calling this builtin
+                    // is only allowed directly within the top-level `fun
+                    // main`'s own body (never a component method/handler,
+                    // never a nested closure, matching `in_main_top_level`'s
+                    // own doc comment on `Ctx`). This is what makes "a
+                    // capability is in scope" a purely lexical,
+                    // audit-by-reading-the-props property everywhere BELOW
+                    // the entry point -- if any code anywhere could call
+                    // `cap_net_root()` directly, that property would be
+                    // false and capabilities would be no different from an
+                    // ambiently-reachable global.
+                    if !ctx.in_main_top_level {
+                        self.err(
+                            "K0304",
+                            "`cap_net_root()` may only be called directly in `fun main`'s own top-level body — capabilities must be seeded at exactly one place, then passed down explicitly as props".to_string(),
+                            span,
+                        );
+                    }
+                    return Ty::CapNet;
+                }
                 ("http_serve", 2) => {
                     let p = self.infer_expr(&args[0].value, ctx);
                     self.unify(&Ty::Int, &p, args[0].value.span, "http_serve port");

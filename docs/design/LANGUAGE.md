@@ -139,18 +139,20 @@ pub fun fetch_user(id: UserId) uses net -> Result[User, NetError] {
   (or derived) capability is in scope via `requires`. No ambient authority — AI-generated
   code physically cannot exfiltrate data or touch disk unless the surrounding component
   was granted that capability. Capabilities are attenuable: `net.limited_to("api.example.com")`.
-  **Partially implemented (it116)** — the effect system as actually shipped
-  (`src/effects.rs`) is still 100% static/syntactic (`uses io.net`, checked
-  at compile time); capabilities are a SEPARATE, additive layer: `CapNet`
-  (a flat type name, not the dotted `Cap.Net` this text once implied —
-  KUPL has no dotted-type-path grammar), `.limited_to(host)`, and
-  `http_get_with(cap, url)` are real and tested across all three engines.
-  `requires` itself already parses (it's a full syntactic alias for
-  `prop`, live-confirmed at it113). **One gap remains**: `cap_net_root()`
-  (the entry point for obtaining a capability at all) is not yet
-  restricted to `fun main`'s own top-level body, so "no ambient authority"
-  is not yet a real guarantee. See `CAPABILITIES.md` for the full design
-  and implementation status.
+  **Implemented for one capability kind (it116/it117)** — the effect
+  system as actually shipped (`src/effects.rs`) is still 100% static/
+  syntactic (`uses io.net`, checked at compile time); capabilities are a
+  SEPARATE, additive layer: `CapNet` (a flat type name, not the dotted
+  `Cap.Net` this text once implied — KUPL has no dotted-type-path
+  grammar), `.limited_to(host)`, and `http_get_with(cap, url)` are real
+  and tested across all three engines. `requires` itself already parses
+  (it's a full syntactic alias for `prop`, live-confirmed at it113).
+  `cap_net_root()` (the ONLY entry point for obtaining a capability) is
+  restricted to a direct call inside `fun main`'s own top-level body
+  (`K0304` otherwise), so "no ambient authority" is a real, enforced
+  guarantee for this kind. Other capability kinds (`db`, `unsafe`, ...)
+  don't exist yet. See `CAPABILITIES.md` for the full design and
+  implementation status.
 - Errors are values: `Result[T, E]` with `?` propagation, `Option[T]` instead of null.
   `panic` exists only for bugs (contract violation, index out of bounds) and is caught
   at component boundaries by supervision — a panic kills the instance, not the program.

@@ -15,11 +15,17 @@ starts from a real plan instead of re-deriving one.
 IMPLEMENTED** — `CapNet` (a flat type name, NOT the dotted `Cap.Net` this
 sketch originally used; see the it116 correction in §5), `.limited_to(host)`,
 and `http_get_with(cap, url)`, wired across all three engines
-(interp/KVM/native), with real tests. **One deliberate, explicitly tracked
-gap remains: root-seeding is NOT YET restricted to `fun main`'s own top-level
-body** — `cap_net_root()` is callable from anywhere today, so this is real,
-fully-tested engine plumbing, not yet a genuine security boundary. See
-`docs/GAPS.md`'s own capabilities entry for the exact status.
+(interp/KVM/native), with real tests.
+
+**UPDATE (it117): root-seeding is now ENFORCED.** `cap_net_root()` is
+restricted (K0304) to a direct call inside the top-level `fun main`'s own
+body only — not a top-level helper, not a component method/handler, and not
+a closure literal even when textually written inside `fun main` (a closure
+could be stored/passed elsewhere and called later, outside the composition-
+root moment). This closes the LAST deliberate gap it116 left open:
+`CapNet` is now a genuine "no ambient authority" security boundary for its
+one shipped kind, not just tested engine plumbing. See §3.2/§5 below for
+the mechanism.
 
 ## 1. What exists today (verified live, not assumed)
 
@@ -139,6 +145,22 @@ builtin. This still preserves the "purely lexical, audit-by-reading-the-
 props" property for every component BELOW the entry point — only `fun
 main`/the top-level app's own body is special, everything it hands
 downward is an ordinary prop from there on.
+
+**IMPLEMENTED (it117):** rather than an implicit extra parameter (which
+would need touching `fun main`'s own call convention across all 3 engines'
+entry-point dispatch), `cap_net_root()` stays an ORDINARY builtin call, but
+`check.rs` now statically restricts WHERE it may be called from: a new
+`Ctx::in_main_top_level: bool` field is threaded through the existing
+per-function body-checking recursion (set `true` only when checking the
+top-level `fun main`'s own `Ctx`, `false` everywhere else — including a
+FRESH `false` for any closure literal's own body, the SAME save-fresh/
+restore pattern `loop_depth`/`in_handler` already use for their own
+per-closure scoping, PR-it948's precedent). A call to `cap_net_root()` with
+`in_main_top_level == false` is rejected with `K0304`. This is exactly the
+"purely lexical, audit-by-reading-the-props" property described above,
+now actually enforced: no function anywhere except `fun main`'s own direct
+body can ever independently obtain a capability — every other component
+only ever RECEIVES one through an ordinary prop.
 
 ### 3.3 Attenuation is ordinary method calls, no new syntax
 
@@ -262,8 +284,8 @@ dispatch, so interp/KVM get it from ONE implementation; `cgen.rs`'s
 (host-checked via a `url_host` helper that MUST stay byte-identical
 between `interp.rs` and `cgen.rs`'s own `k_url_host` C mirror — both
 simple string slicing, no full URL parser), and `cap_net_root() -> CapNet`
-(the unrestricted root, **not yet call-site-restricted** — see §5's new
-open question). Unlike `Char`/`Decimal` (each staged native into a
+(the unrestricted root — **call-site-restricted since it117**, see §3.2).
+Unlike `Char`/`Decimal` (each staged native into a
 FOLLOW-UP iteration), native support shipped in the SAME iteration —
 `http_get`/`http_post` already shell out to the system `curl` binary on
 every engine (confirmed live, not the hand-rolled raw-socket client this
@@ -316,11 +338,6 @@ happens to force.
   construction, not at call time), which should already just work given
   the existing prop model, but wasn't verified live as part of this sketch.
   STILL OPEN as of it116.
-- **NEW (it116): root-seeding enforcement.** `cap_net_root()` is a plain
-  builtin, callable from anywhere — §3.2's own "seeded at exactly one place"
-  invariant is NOT YET enforced. The mechanism this sketch recommends (a
-  static check.rs check restricting this ONE builtin's call site to `fun
-  main`'s own top-level body, not any transitive callee or nested closure)
-  is a bounded, well-scoped follow-up — the type/method/builtin engine
-  plumbing this slice ships is unaffected by how that check eventually
-  gets added.
+- ~~Root-seeding enforcement~~ **RESOLVED (it117): see §3.2.**
+  `cap_net_root()` is now restricted to `fun main`'s own top-level body via
+  a new `K0304` static check — no runtime code changed, only `check.rs`.

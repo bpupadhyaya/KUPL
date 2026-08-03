@@ -2111,6 +2111,35 @@ mod tests {
         iv
     }
 
+    /// Like `differential`, but calls `fun main() -> Str` instead of
+    /// `probe()` (it117): needed for anything that calls `cap_net_root()`,
+    /// which K0304 now restricts to `fun main`'s own top-level body only --
+    /// `differential`'s own `probe()` convention can't exercise that call
+    /// at all anymore. `fun main`'s return type isn't otherwise
+    /// constrained (confirmed live: `check.rs` never special-cases `main`
+    /// at all), so returning `Str` here is valid KUPL, just unusual for a
+    /// program that would also run via the normal CLI entry point.
+    fn differential_main(src: &str) -> String {
+        let compiled = crate::run::compile(src).expect("program must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let f = Value::Fun(std::rc::Rc::new("main".to_string()));
+        let iv = match interp.call_value(f, vec![], crate::diag::Span::default()) {
+            Ok(v) => v.to_string(),
+            Err(Flow::Panic { msg, .. }) => format!("panic: {msg}"),
+            Err(_) => "control-flow error".into(),
+        };
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
+            .expect("module must compile");
+        let mut vm = Vm::new(&module);
+        let vv = match vm.call_named("main", vec![]) {
+            Ok(v) => v.to_string(),
+            Err(e) => format!("panic: {}", e.msg),
+        };
+        assert_eq!(iv, vv, "interpreter and KVM disagree on:\n{src}");
+        iv
+    }
+
     /// Like `differential()` above, but returns `Err` describing a
     /// disagreement instead of panicking via `assert_eq!` -- used by the
     /// fuzz harness below (production-hardening PR-it788), which needs to
@@ -19196,22 +19225,65 @@ fun probe() -> Str { "{"inner"}|{greet("Ada")}|{"a{1 + 1}b"}" }
         // host-scope check (short-circuits BEFORE any network I/O, so this
         // stays deterministic and safe to run in this differential suite)
         // — all identical on interp and KVM.
-        let src = "fun probe() -> Str {\n    let root = cap_net_root()\n    \
+        //
+        // it117: `cap_net_root()` is now restricted (K0304) to `fun main`'s
+        // own top-level body, so this uses `differential_main` (calls
+        // `main`, not `probe`) -- `differential`'s own `probe()` convention
+        // can no longer exercise `cap_net_root()` at all.
+        let src = "fun main() -> Str {\n    let root = cap_net_root()\n    \
                    let a = root.limited_to(\"example.com\")\n    \
                    let b = a.limited_to(\"example.com\")\n    \
                    let blocked = match http_get_with(a, \"http://other.invalid/\") {\n        \
                    Ok(_) => \"ok\"\n        Err(e) => e\n    }\n    \
                    \"{root}|{a}|{a == b}|{blocked}\"\n}\n";
         assert_eq!(
-            differential(src),
+            differential_main(src),
             "<CapNet root>|<CapNet limited_to \"example.com\">|true|capability limited to `example.com`, cannot reach `other.invalid`"
         );
         // widening an already-limited capability panics identically.
-        let widen_src = "fun probe() -> Str {\n    let a = cap_net_root().limited_to(\"example.com\")\n    \
+        let widen_src = "fun main() -> Str {\n    let a = cap_net_root().limited_to(\"example.com\")\n    \
                           \"{a.limited_to(\"other.com\")}\"\n}\n";
         assert_eq!(
-            differential(widen_src),
+            differential_main(widen_src),
             "panic: cannot widen a capability already limited to `example.com` to a different host `other.com`"
+        );
+    }
+
+    #[test]
+    fn check_rejects_cap_net_root_outside_fun_mains_own_top_level_body() {
+        // it117: root-seeding enforcement (K0304) -- the ONE piece that
+        // turns CapNet from tested engine plumbing into a genuine "no
+        // ambient authority" boundary. `cap_net_root()` is allowed ONLY as
+        // a direct call inside the top-level `fun main`'s own body; a
+        // top-level helper, a component method/handler, and a closure
+        // literal (even one textually written INSIDE `fun main`) must all
+        // be refused, since a closure could be stored/passed elsewhere and
+        // called later, outside the composition-root moment.
+        // K0302 was already taken (effects.rs's "declared effect is never
+        // used") -- a real diagnostic-code-collision lesson: check the
+        // FULL global registry (`docs/reference/DIAGNOSTICS.md`), not just
+        // one file's own usage, before picking a new code.
+        let has_k0304 = |src: &str| {
+            let compiled = crate::run::compile(src);
+            compiled.is_err_and(|e| e.iter().any(|d| d.code == "K0304"))
+        };
+        assert!(
+            !has_k0304("fun main() -> CapNet {\n    cap_net_root()\n}\n"),
+            "a direct call in fun main's own top-level body must be allowed"
+        );
+        assert!(
+            has_k0304("fun get_root() -> CapNet {\n    cap_net_root()\n}\nfun main() {\n    get_root()\n}\n"),
+            "a top-level helper fun must be refused"
+        );
+        assert!(
+            has_k0304("fun main() {\n    let f = fn() { cap_net_root() }\n    f()\n}\n"),
+            "a closure literal, even textually inside fun main, must be refused"
+        );
+        assert!(
+            has_k0304(
+                "component C {\n    intent \"c\"\n    expose fun get() -> CapNet {\n        cap_net_root()\n    }\n}\nfun main() {\n    C().get()\n}\n"
+            ),
+            "a component method must be refused"
         );
     }
 

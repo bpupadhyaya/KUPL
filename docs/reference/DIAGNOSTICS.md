@@ -155,6 +155,7 @@ Severity: **E** = error, **W** = warning.
 | K0301 | E | public function does not declare its effects (`add uses …`) |
 | K0302 | W | declared effect is never used |
 | K0303 | W | function calls a value of function type — its effects cannot be verified; declare `uses` for any effect it may perform |
+| K0304 | E | `cap_net_root()` called outside `fun main`'s own top-level body — capabilities must be seeded at exactly one place |
 
 ## K04xx — Loader (multi-file)
 
