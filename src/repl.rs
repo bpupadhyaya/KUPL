@@ -294,16 +294,51 @@ fn stop_and_disarm_subtree(interp: &mut crate::interp::Interp, cid: usize) {
     }
 }
 
+/// it128: the user-provided migration-hook mechanism for a field whose
+/// SHAPE (not just presence) changed -- the last remaining gap
+/// `upgrade_instances`'s own doc comment has named since it111. A
+/// `migrate_<field>` component-private fun (exactly one param, arity
+/// already validated upfront by `upgrade_instances`'s own pre-check) is
+/// called with the field's OLD value if the NEW component declares one;
+/// otherwise `old_v` passes through unchanged, exactly like before this
+/// iteration. Mirrors `eval_method`'s own save/restore-`self.current`
+/// pattern for an ordinary component-private-fun call, since `call_fun`
+/// itself does not set it. Called against `new_env` (not the instance's
+/// own not-yet-swapped `env`) so a hook referencing an EARLIER
+/// already-migrated field by bare name sees its new value, matching
+/// `instantiate`'s own left-to-right evaluation order.
+fn apply_migration_hook(
+    interp: &mut crate::interp::Interp,
+    new_comp: &crate::ast::ComponentDecl,
+    field: &str,
+    id: usize,
+    new_env: &crate::value::Env,
+    old_v: Value,
+) -> Result<Value, String> {
+    let hook_name = format!("migrate_{field}");
+    let Some(decl) = new_comp.funs.iter().find(|f| f.name == hook_name) else {
+        return Ok(old_v);
+    };
+    let saved = interp.current.replace(id);
+    let result = interp.call_fun(decl, vec![old_v], new_env, crate::diag::Span::default());
+    interp.current = saved;
+    result.map_err(|_| format!("migration hook `{hook_name}` failed"))
+}
+
 /// `:upgrade <name>` (it111) — hot-swap every LIVE instance of the
 /// component currently named `name` to `interp.db`'s CURRENT (just
 /// redefined) declaration, migrating `state` field values by NAME:
 /// a field present in both the old and new declaration keeps its
-/// CURRENT runtime value; a field only in the new declaration is
-/// initialized fresh via its own `init` expression (evaluated in the
-/// instance's OWN migrated env, so a later field's init can reference an
-/// earlier one — the same left-to-right evaluation order `instantiate`
-/// itself already uses for a brand-new instance). A field only in the OLD
-/// declaration is simply dropped.
+/// CURRENT runtime value UNCHANGED, unless the NEW declaration also
+/// defines a `migrate_<field>` component-private fun (it128, see
+/// `apply_migration_hook`'s own doc comment) -- the user-provided hook
+/// for a field whose SHAPE, not just presence, changed (e.g. `Int` ->
+/// `Str`), called with the OLD value in that case instead. A field only
+/// in the new declaration is initialized fresh via its own `init`
+/// expression (evaluated in the instance's OWN migrated env, so a later
+/// field's init can reference an earlier one — the same left-to-right
+/// evaluation order `instantiate` itself already uses for a brand-new
+/// instance). A field only in the OLD declaration is simply dropped.
 ///
 /// Deliberately narrow v1 scope, matching Erlang's own `code_change`
 /// (which migrates a process's STATE term, not its supervision tree).
@@ -359,8 +394,10 @@ fn stop_and_disarm_subtree(interp: &mut crate::interp::Interp, cid: usize) {
 /// `props` may change (it112->it113 follow-up, relaxing the original
 /// props-frozen guard): a prop present under the SAME name in both old and
 /// new keeps its current runtime value (a prop's own TYPE or default value
-/// changing is not checked, since an existing instance's already-supplied
-/// value keeps working under its own actual runtime type regardless); a
+/// changing is not checked automatically -- an existing instance's
+/// already-supplied value keeps working under its own actual runtime type
+/// regardless -- but the SAME `migrate_<field>` hook mechanism above
+/// applies to props too, if the redefined component declares one); a
 /// prop only in the OLD declaration is simply dropped; a prop only in the
 /// NEW declaration is migrated by evaluating its own `default` expression
 /// (against the instance's own migrated env, so it can see already-migrated
@@ -407,6 +444,42 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
                 "prop `{}` was added without a default value — :upgrade has no old value to migrate it from (see its own doc comment)",
                 p.name
             ));
+        }
+    }
+    // it128: a `migrate_<field>` component-private fun (exactly one
+    // param) is the user-provided hook for a field whose SHAPE, not just
+    // presence, changed (the last remaining gap this doc's own §12 Q4
+    // named since it111) -- a naming CONVENTION, not new grammar, mirroring
+    // how `KUPL_AI_MOCK_<NAME>` is ALSO a reserved-name convention rather
+    // than new syntax. Checked here, upfront, for EVERY field present in
+    // both old and new declarations (props ∪ state) so a wrong-arity
+    // `migrate_*` fun -- almost certainly a genuine mistake, since nobody
+    // accidentally names a function exactly `migrate_<field>` -- refuses
+    // the WHOLE upgrade (no instance touched) instead of silently being
+    // ignored per-instance, matching this function's own "refuse upfront,
+    // never partially" discipline for every other guard.
+    let old_state_names: std::collections::BTreeSet<String> =
+        old_comp.state.iter().map(|s| s.name.clone()).collect();
+    let mut shared_field_names: Vec<&str> = Vec::new();
+    for n in &old_prop_names {
+        if new_comp.props.iter().any(|p| &p.name == n) {
+            shared_field_names.push(n);
+        }
+    }
+    for n in &old_state_names {
+        if new_comp.state.iter().any(|s| &s.name == n) {
+            shared_field_names.push(n);
+        }
+    }
+    for field in shared_field_names {
+        let hook_name = format!("migrate_{field}");
+        if let Some(decl) = new_comp.funs.iter().find(|f| f.name == hook_name) {
+            if decl.params.len() != 1 {
+                return Err(format!(
+                    "migration hook `{hook_name}` must take exactly one argument (the field's OLD value), found {}",
+                    decl.params.len()
+                ));
+            }
         }
     }
     let old_child_map: std::collections::BTreeMap<String, String> =
@@ -461,7 +534,8 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
         // comment).
         for p in &new_comp.props {
             let v = if old_prop_names.contains(&p.name) {
-                old_env.get(&p.name).ok_or_else(|| format!("internal error: prop `{}` unexpectedly missing", p.name))?
+                let old_v = old_env.get(&p.name).ok_or_else(|| format!("internal error: prop `{}` unexpectedly missing", p.name))?;
+                apply_migration_hook(interp, &new_comp, &p.name, *id, &new_env, old_v)?
             } else {
                 let default_expr = p.default.as_ref().expect("checked above: a new prop must carry a default");
                 interp.eval(default_expr, &new_env).map_err(|_| {
@@ -476,9 +550,10 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
         for s in &new_comp.state {
             let was_present = old_comp.state.iter().any(|os| os.name == s.name);
             let v = if was_present {
-                old_env
+                let old_v = old_env
                     .get(&s.name)
-                    .ok_or_else(|| format!("internal error: state field `{}` unexpectedly missing", s.name))?
+                    .ok_or_else(|| format!("internal error: state field `{}` unexpectedly missing", s.name))?;
+                apply_migration_hook(interp, &new_comp, &s.name, *id, &new_env, old_v)?
             } else {
                 interp.eval(&s.init, &new_env).map_err(|_| {
                     format!("evaluating the new default for state field `{}` failed", s.name)
@@ -920,6 +995,77 @@ mod tests {
         );
         assert_eq!(interp.instances[0].comp.name, "Counter");
         assert!(interp.instances[0].comp.exposes.iter().any(|f| f.name == "readLabel"), "the new method must be immediately callable");
+    }
+
+    /// it128: the migration-hook mechanism -- the last remaining gap this
+    /// function's own doc comment named since it111. A `migrate_<field>`
+    /// component-private fun in the NEW declaration converts the OLD
+    /// value instead of it passing through unchanged, for a field whose
+    /// SHAPE (not just presence) changed.
+    #[test]
+    fn upgrade_calls_a_migration_hook_to_convert_a_state_fields_shape() {
+        let mut interp = interp_with_one_instance(
+            "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    expose fun bump(v: Int) -> Int {\n        n = n + v\n        n\n    }\n}\n",
+            "Counter",
+        );
+        let bump = crate::value::Value::Bound(0, std::rc::Rc::new("bump".to_string()));
+        if interp.call_value(bump, vec![crate::value::Value::Int(5)], crate::diag::Span::default()).is_err() {
+            panic!("bump(5) must succeed");
+        }
+        redefine(
+            &mut interp,
+            "component Counter {\n    intent \"c\"\n    state n: Str = \"0\"\n    fun migrate_n(old: Int) -> Str { to_str(old) }\n    expose fun readN() -> Str { n }\n}\n",
+        );
+        assert_eq!(upgrade_instances(&mut interp, "Counter"), Ok(1));
+        assert_eq!(
+            interp.instances[0].env.get("n"),
+            Some(crate::value::Value::str("5".to_string())),
+            "the migration hook must convert the OLD Int value (5, after bump) to its NEW Str shape, not just keep it as-is"
+        );
+    }
+
+    /// it128: the SAME hook mechanism applies to `props`, not just `state`
+    /// -- both fields go through the SAME `apply_migration_hook` call.
+    #[test]
+    fn upgrade_calls_a_migration_hook_for_a_prop_too() {
+        let mut interp = interp_with_one_instance(
+            "component Widget {\n    intent \"w\"\n    prop id: Int = 7\n}\n",
+            "Widget",
+        );
+        redefine(
+            &mut interp,
+            "component Widget {\n    intent \"w\"\n    prop id: Str = \"0\"\n    fun migrate_id(old: Int) -> Str { to_str(old) }\n    expose fun readId() -> Str { id }\n}\n",
+        );
+        assert_eq!(upgrade_instances(&mut interp, "Widget"), Ok(1));
+        assert_eq!(
+            interp.instances[0].env.get("id"),
+            Some(crate::value::Value::str("7".to_string())),
+            "the migration hook must ALSO apply to props, not just state"
+        );
+    }
+
+    /// it128: a `migrate_<field>` fun with the WRONG arity is almost
+    /// certainly a genuine mistake (nobody accidentally names a function
+    /// exactly `migrate_<field>`) -- refuses the WHOLE upgrade upfront,
+    /// matching every other guard's own "refuse upfront, never partially"
+    /// discipline, rather than silently falling back to "keep as-is".
+    #[test]
+    fn upgrade_refuses_when_a_migration_hook_has_the_wrong_arity() {
+        let mut interp = interp_with_one_instance(
+            "component Counter {\n    intent \"c\"\n    state n: Int = 0\n}\n",
+            "Counter",
+        );
+        redefine(
+            &mut interp,
+            "component Counter {\n    intent \"c\"\n    state n: Str = \"0\"\n    fun migrate_n(a: Int, b: Int) -> Str { to_str(a) }\n}\n",
+        );
+        let err = upgrade_instances(&mut interp, "Counter").unwrap_err();
+        assert!(err.contains("migrate_n"), "{err}");
+        assert_eq!(
+            interp.instances[0].env.get("n"),
+            Some(crate::value::Value::Int(0)),
+            "a refused upgrade must leave the instance completely UNTOUCHED"
+        );
     }
 
     #[test]

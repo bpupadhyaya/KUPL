@@ -2401,7 +2401,14 @@ impl Interp {
         }
     }
 
-    fn call_fun(&mut self, decl: &FunDecl, args: Vec<Value>, base_env: &Env, span: Span) -> EvalResult {
+    // `pub(crate)` as of it128: `repl.rs`'s `:upgrade` migration-hook
+    // support needs to invoke a NEW component's own `migrate_<field>`
+    // private fun directly (the `Value::Bound`/`call_value` convenience
+    // path resolves through `self.instances[id].comp`, which still holds
+    // the OLD, not-yet-swapped component at the point `:upgrade` needs
+    // this -- mirrors `run_lifecycle`'s own identical `pub(crate)`
+    // widening at it119, for the same class of reason).
+    pub(crate) fn call_fun(&mut self, decl: &FunDecl, args: Vec<Value>, base_env: &Env, span: Span) -> EvalResult {
         if decl.params.len() != args.len() {
             return Err(Self::panic_flow(
                 format!(
