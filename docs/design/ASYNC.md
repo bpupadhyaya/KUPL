@@ -238,6 +238,38 @@ history exactly: prove the mechanism is soundly buildable in the NARROWEST
 possible case where nothing about the hard question (§3.4) is even exercised
 yet, before generalizing.
 
+**it122 update — this first slice is narrower on paper than in practice.**
+Live investigation (reading `interp.rs`'s `send`/`drain`/`emit` in full) found
+that `expose` calls are NOT the only path that would need to cross a thread
+boundary. `emit` (interp.rs, the handler for a component's own `out` port
+writes) resolves its wire targets via `self.instances[id].wires` and pushes
+directly onto the ONE shared `self.queue` — the exact same `instances`/
+`queue` fields `expose` calls read via `Value::Bound`. And `self.current`
+(the "instance currently executing a handler, target of `emit`") is a
+single global field on `Interp`, not per-thread state. So a threaded child
+is not just "its `expose` calls become blocking, everything else stays
+in-process" — the moment that child's OWN handler calls `emit` to send a
+value out a wired port, THAT ALSO needs to reach across the thread boundary
+back into the parent's `instances`/`queue`, because the wire's target
+instance lives in the parent's `Vec<Instance>`, not the child's own (would-be
+separate) `Interp`. A genuinely separate per-thread `Interp` (mirroring
+`par_map`'s own fresh-thread-local-`Interp`-per-worker construction, per
+§3.2) would need EVERY wire crossing the parent/child boundary — not just
+`expose` calls — rewritten as a blocking round-trip, plus a resolution for
+`self.current` no longer being meaningfully single-valued once two
+`Interp`s can each have their own notion of "currently executing instance."
+This is a real scope increase over the plan as originally written above,
+discovered specifically by reading the implementation rather than assuming
+the sketch's own framing was complete. **Conclusion: the first slice, done
+honestly (not by quietly narrowing scope to dodge the wire-emit case), is
+bigger than one bounded campaign iteration — it needs `emit`/wire-delivery
+crossing threads designed BEFORE `expose`, not after, since `expose` calls
+don't happen in isolation from a component's own port traffic in any
+realistic example.** Recommended follow-up shape: a dedicated sketch for
+"what does a wire connecting two different `Interp`s (on two different
+threads) look like" as ITS OWN first design question, before attempting any
+running code.
+
 ## 5. Open questions this sketch does NOT resolve
 
 - Which of §3.4's (a)/(b)/(c) determinism strategies is right — the single
@@ -259,3 +291,8 @@ yet, before generalizing.
   (currently synchronous, `curl`-backed like `http_get`) — a natural
   candidate for genuinely benefiting from real concurrency (multiple
   in-flight model calls), not verified live as part of this sketch.
+- **(it122)** What a wire connecting two different per-thread `Interp`s
+  looks like — `emit`'s target resolution and `self.current` both assume
+  ONE shared `Interp` today (§4's it122 update); this needs its own design
+  pass before any threaded-child proof of concept is attempted, since real
+  example programs exercise wire traffic, not just isolated `expose` calls.

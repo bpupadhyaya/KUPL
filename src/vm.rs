@@ -5416,7 +5416,20 @@ fun probe() -> Str {
         // all three engines agree. This is the "are these two numbers amicable" an AI writes for number theory or
         // recreational math; the a != b guard distinguishing amicable from perfect is the subtle case. A non-sort
         // lock certifying amicable-pair detection built on the sum-of-divisors function.
-        let src = r#"fun divSum(n: Int, d: Int, acc: Int) -> Int {
+        //
+        // it122 stack-margin audit: `divSum`'s recursion (depth ~17 for the
+        // 220/284 pair, sqrt(n)-bounded) plus its own 4-way if/else-if chain
+        // per level was found EMPIRICALLY marginal against the 2MB debug
+        // test-thread stack (a controlled, reversible probe padding
+        // `eval_call`'s own stack frame by 4KB — simulating a plausible
+        // future few-builtin-arms addition — tipped this test into overflow
+        // where 526 other `diff_*` tests stayed fine), proactively wrapped
+        // per the it109/it116/it118 regression class before a REAL future
+        // change discovers it reactively.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = r#"fun divSum(n: Int, d: Int, acc: Int) -> Int {
     if d * d > n { acc }
     else if d * d == n { divSum(n, d + 1, acc + d) }
     else if n % d == 0 { divSum(n, d + 1, acc + d + n / d) }
@@ -5438,10 +5451,14 @@ fun probe() -> Str {
     "am220={a1}|am284={a2}|ps220={ps220}|ps284={ps284}|perf6={a3}|not10_8={a4}|ps6={ps6}|ps10={ps10}"
 }
 "#;
-        assert_eq!(
-            differential(src),
-            "am220=true|am284=true|ps220=284|ps284=220|perf6=false|not10_8=false|ps6=6|ps10=8"
-        );
+                assert_eq!(
+                    differential(src),
+                    "am220=true|am284=true|ps220=284|ps284=220|perf6=false|not10_8=false|ps6=6|ps10=8"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -5782,7 +5799,18 @@ fun probe() -> Str {
         // range with no gaps, and that all three engines agree. This is the arithmetic-function identity an AI
         // relies on for Mobius-inversion-style reasoning (e.g. deriving Euler's totient from divisor sums). A
         // non-sort lock certifying the Mobius function's divisor-sum identity as a universal theorem-oracle.
-        let src = r#"fun mobFactorGo(n: Int, p: Int, distinct: Int) -> Int {
+        //
+        // it122 update: the it497 "stayed well within the default 2MB stack" finding above was true AT
+        // THE TIME, but a controlled, reversible stack-margin audit probe (padding `eval_call`'s own
+        // per-call stack frame by 4KB, simulating a plausible future few-builtin-arms addition) now finds
+        // this test HAS since become one of only 4 (out of 526) `diff_*` tests that overflow under that
+        // simulated growth — margin erodes as `eval_call` grows over time even when no single change
+        // looks risky in isolation. Wrapped proactively rather than waiting for a real future regression,
+        // per the it109/it116/it118 pattern.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = r#"fun mobFactorGo(n: Int, p: Int, distinct: Int) -> Int {
     if p * p > n {
         if n > 1 { distinct + 1 } else { distinct }
     } else {
@@ -5813,7 +5841,11 @@ fun probe() -> Str {
     "m6={m6}|m8={m8}|allMatch={allMatch}"
 }
 "#;
-        assert_eq!(differential(src), "m6=1|m8=0|allMatch=true");
+                assert_eq!(differential(src), "m6=1|m8=0|allMatch=true");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -6754,7 +6786,16 @@ fun probe() -> Str {
         // three engines agree. This is the efficient Fibonacci an AI writes when n is large and matrix power feels
         // heavy; agreement with the naive definition catches a wrong doubling identity or an even/odd swap. A
         // non-sort lock certifying fast-doubling Fibonacci against the recursive definition.
-        let src = r#"type Pair = { fst: Int, snd: Int }
+        //
+        // it122 stack-margin audit: an empirical, reversible probe padding `eval_call`'s own
+        // per-call stack frame by 4KB (simulating a plausible future few-builtin-arms addition)
+        // found this one of only 4 (out of 526) `diff_*` tests to overflow under that simulated
+        // growth — likely `recFib(20)`'s exponential branching combined with `fd`'s own Pair-record
+        // construction per level. Wrapped proactively per the it109/it116/it118 pattern.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = r#"type Pair = { fst: Int, snd: Int }
 fun fd(n: Int) -> Pair {
     if n == 0 { Pair(fst: 0, snd: 1) }
     else {
@@ -6779,10 +6820,14 @@ fun probe() -> Str {
     "f10={f10}|f20={f20}|f30={f30}|x1={x1}|x2={x2}|x3={x3}|x4={x4}"
 }
 "#;
-        assert_eq!(
-            differential(src),
-            "f10=55|f20=6765|f30=832040|x1=true|x2=true|x3=true|x4=true"
-        );
+                assert_eq!(
+                    differential(src),
+                    "f10=55|f20=6765|f30=832040|x1=true|x2=true|x3=true|x4=true"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -8266,7 +8311,16 @@ fun probe() -> Str {
         // validate a card or device number before hitting a payment or provisioning API; a backend whose doubling
         // parity was off-by-one, or which forgot the subtract-9 step, would accept invalid numbers or reject
         // valid ones. A non-sort lock certifying the mod-10 Luhn checksum with a per-digit doubling rule.
-        let src = r#"fun digits(s: Str) -> List[Int] {
+        //
+        // it122 stack-margin audit: an empirical, reversible probe padding `eval_call`'s own per-call
+        // stack frame by 4KB (simulating a plausible future few-builtin-arms addition) found this one of
+        // only 4 (out of 526) `diff_*` tests to overflow under that simulated growth — `rangeN`'s own
+        // recursive (depth-16, list-`flatten`-per-level) construction, called twice for the 16-digit PANs.
+        // Wrapped proactively per the it109/it116/it118 pattern.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = r#"fun digits(s: Str) -> List[Int] {
     s.chars().map(fn(c) { c.parse_int().unwrap_or(0) })
 }
 fun luhnSum(ds: List[Int]) -> Int {
@@ -8294,10 +8348,14 @@ fun probe() -> Str {
     "v1={v1}|v2={v2}|v3={v3}|v4={v4}|sum1={s1}"
 }
 "#;
-        assert_eq!(
-            differential(src),
-            "v1=true|v2=false|v3=true|v4=false|sum1=70"
-        );
+                assert_eq!(
+                    differential(src),
+                    "v1=true|v2=false|v3=true|v4=false|sum1=70"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

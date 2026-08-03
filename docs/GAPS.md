@@ -881,7 +881,46 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       hardest unresolved piece, on par with how root-seeding enforcement
       was the hardest remaining piece for capabilities. Not implemented —
       a bounded design deliverable, not code. Virtual clock (it9)
-      preserved for deterministic tests.
+      preserved for deterministic tests. **it122**: attempted `ASYNC.md`
+      §4's own narrow first-slice proof of concept (one child instance on
+      its own thread, blocking `mpsc` `expose` calls) and found it
+      undersells its own real scope — live-reading `interp.rs`'s `emit`
+      confirmed wire-based port delivery, not just `expose` calls, ALSO
+      shares the one global `self.instances`/`self.queue`/`self.current`
+      that a threaded child would need to cross, since `emit`'s wire-
+      target resolution and `self.current` both assume a single shared
+      `Interp`. Documented this as an amendment to `ASYNC.md` §4/§5 rather
+      than forcing an undersized attempt, and fell back to the note's own
+      candidate (b) instead this iteration (see the stack-margin audit
+      entry below).
+- [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
+      `eval_call` match arm silently grows its debug-build per-call stack
+      frame enough to tip an already-marginal `diff_*` recursion test into
+      a genuine stack overflow" regression class (hit reactively at it109,
+      it116, it118 — each time discovered only AFTER a real, unrelated
+      change tipped a test over) got a proactive, EMPIRICAL sweep instead
+      of another name-based guess. Method: temporarily pad `eval_call`'s
+      own stack frame by 4KB (`std::hint::black_box([0u8; 4096])`,
+      simulating a plausible future few-builtin-arms addition), run all
+      526 `diff_*` tests under that simulated growth, iteratively `--skip`
+      each stack-overflow casualty to surface every one at that pad size
+      (a single overflow SIGABRTs the whole test binary, so casualties are
+      found one at a time), then revert the probe. Found exactly 4 tests
+      with thin-enough margin to overflow — `diff_amicable_pair`,
+      `diff_fast_doubling_fibonacci`, `diff_luhn_checksum`,
+      `diff_mobius_divisor_sum_identity` — NONE of which a keyword search
+      over test names (`recur|fib|deep|nested|...`) would have flagged
+      with confidence; `diff_mobius_divisor_sum_identity` in particular
+      had an it497 comment explicitly claiming it was "verified
+      empirically" safe, which was true at the time but had since eroded
+      as `eval_call` grew. Wrapped all 4 in the established `std::thread::
+      Builder::new().stack_size(2 * 1024 * 1024 * 1024)` pattern; re-ran
+      the padded-probe sweep to confirm all 526 tests pass under the
+      simulated growth before reverting the probe itself (net diff:
+      `vm.rs` only, `interp.rs` untouched after revert). This is a testing-
+      infrastructure hardening pass, not a language-level gap — listed
+      here because it was the fallback candidate this iteration's own
+      NEXT-note named, not because concurrency needed it.
 - [x] **File I/O** (it14) — `read_file`/`write_file`/`append_file`/`delete_file`
       (→ `Result`) + `file_exists`, gated behind the `io.fs` effect. A core "any
       software" capability (a universal language must touch the filesystem).
