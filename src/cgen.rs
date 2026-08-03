@@ -5626,14 +5626,17 @@ static KValue k_ai_tool_call(const KAiFun* f, const char* script) {
     return k_ai_convert(f->shape, final_text);
 }
 
-/* ---- native `ai fun` REAL provider calls (it125 first slice) ----
-   Ported from ai.rs's build_prompt/http_post/openai_call/anthropic_call,
-   scoped NARROWLY: only non-tool, `-> Str`-shaped ai funs get a real
-   network path here (k_ai_call itself still defers has_tools/structured-
-   shape calls to `kupl bundle`, UNCHANGED from before this iteration) --
-   no JSON-Schema request suffix or `response_format`/`output_config`
-   modifier is needed since those only apply to non-Str shapes. Read
-   entirely from env vars, exactly like ai.rs: `KUPL_AI_PROVIDER`
+/* ---- native `ai fun` REAL provider calls (it125, extended it126) ----
+   Ported from ai.rs's build_prompt/schema_json/wire_schema/http_post/
+   openai_call/anthropic_call. Covers non-tool ai funs of ANY return
+   shape as of it126 (`k_ai_wire_schema`'s own JSON-Schema-text generator,
+   embedded via `response_format`/`output_config` for non-`Str` shapes) --
+   `k_ai_call` still defers ONLY `has_tools` calls to `kupl bundle`, since
+   the RESPONSE side needed zero new code either way: `k_ai_convert`/
+   `k_ai_from_json` (the SAME functions the mock path already used for
+   every shape) do the JSON-Schema-guided parsing already, so this whole
+   section's job is entirely REQUEST-side (build the right prompt/body).
+   Read entirely from env vars, exactly like ai.rs: `KUPL_AI_PROVIDER`
    (default `anthropic`), `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`,
    `KUPL_AI_MODEL`/a per-fun `model` override, `KUPL_AI_BASE_URL`. */
 
@@ -5655,10 +5658,64 @@ static void k_ai_json_escape_body(KBuf* b, const char* s) {
     }
 }
 
-/* mirrors ai.rs::build_prompt EXACTLY for the `-> Str` shape (the ONLY
-   shape this first slice supports): intent, then -- if there are any
-   params -- one blank line, then one "{name}: {value}" line per param.
-   `k_show` mirrors `Value`'s own `Display` (used for `{value}` above). */
+/* mirrors ai.rs::schema_json EXACTLY (it126) -- a draft-07 JSON Schema
+   subset for a shape, recursive over List/Option/Record exactly like
+   `KAiShape` itself already is (the SAME struct `k_ai_convert`'s
+   RESPONSE-side conversion, `k_ai_from_json`, already walks -- this is
+   only the REQUEST-side text generator, the response side needed no new
+   code at all). */
+static void k_ai_schema_json(const KAiShape* s, KBuf* b) {
+    switch (s->kind) {
+        case 0: kb_puts(b, "{\"type\":\"string\"}"); break;
+        case 1: kb_puts(b, "{\"type\":\"integer\"}"); break;
+        case 2: kb_puts(b, "{\"type\":\"number\"}"); break;
+        case 3: kb_puts(b, "{\"type\":\"boolean\"}"); break;
+        case 4:
+            kb_puts(b, "{\"type\":\"array\",\"items\":");
+            k_ai_schema_json(s->inner, b);
+            kb_puts(b, "}");
+            break;
+        case 5:
+            kb_puts(b, "{\"anyOf\":[");
+            k_ai_schema_json(s->inner, b);
+            kb_puts(b, ",{\"type\":\"null\"}]}");
+            break;
+        default: /* 6: Record */
+            kb_puts(b, "{\"type\":\"object\",\"properties\":{");
+            for (int i = 0; i < s->nfields; i++) {
+                if (i > 0) kb_puts(b, ",");
+                kb_puts(b, "\"");
+                k_ai_json_escape_body(b, s->fnames[i]);
+                kb_puts(b, "\":");
+                k_ai_schema_json(s->fshapes[i], b);
+            }
+            kb_puts(b, "},\"required\":[");
+            for (int i = 0; i < s->nfields; i++) {
+                if (i > 0) kb_puts(b, ",");
+                kb_puts(b, "\"");
+                k_ai_json_escape_body(b, s->fnames[i]);
+                kb_puts(b, "\"");
+            }
+            kb_puts(b, "],\"additionalProperties\":false}");
+            break;
+    }
+}
+/* mirrors ai.rs::wire_schema EXACTLY: wraps `s`'s own schema in
+   `{"value": ...}` so every target shape (including a bare scalar) is a
+   JSON object at the top level -- matches `k_ai_convert`'s own "accept a
+   {"value": …} wrapper or a bare payload" response-side handling. */
+static char* k_ai_wire_schema(const KAiShape* s) {
+    KBuf b = {0};
+    kb_puts(&b, "{\"type\":\"object\",\"properties\":{\"value\":");
+    k_ai_schema_json(s, &b);
+    kb_puts(&b, "},\"required\":[\"value\"],\"additionalProperties\":false}");
+    return b.buf ? b.buf : k_strdup("");
+}
+
+/* mirrors ai.rs::build_prompt EXACTLY: intent, then -- if there are any
+   params -- one blank line, then one "{name}: {value}" line per param
+   (`k_show` mirrors `Value`'s own `Display`), then -- as of it126, for
+   any NON-`Str` shape -- the JSON-Schema instruction suffix. */
 static char* k_ai_build_prompt(const KAiFun* f, const char* intent, KValue* args, int nargs) {
     KBuf b = {0};
     kb_puts(&b, intent);
@@ -5670,6 +5727,10 @@ static char* k_ai_build_prompt(const KAiFun* f, const char* intent, KValue* args
             kb_puts(&b, ": ");
             kb_puts(&b, k_show(args[i]));
         }
+    }
+    if (f->shape->kind != 0) {
+        kb_puts(&b, "\n\nRespond with only a JSON object matching this JSON Schema (no prose, no code fences):\n");
+        kb_puts(&b, k_ai_wire_schema(f->shape));
     }
     return b.buf ? b.buf : k_strdup("");
 }
@@ -5683,7 +5744,15 @@ static char* k_ai_build_prompt(const KAiFun* f, const char* intent, KValue* args
    generic over argv), matching MAX_AI_RESPONSE_SIZE (10MiB, ai.rs) and
    the SAME 120s timeout ai.rs's own http_post uses. */
 static KValue k_ai_http_post(const char* url, const char** headers, int nheaders, const char* body) {
-    int argc = 9 + nheaders * 2 + 1;
+    /* 8 fixed args before the header loop + 2*nheaders + 4 fixed args
+       after it (-H content-type, --data-binary, @-) + url + a NULL
+       terminator = 14 + 2*nheaders total slots. A REAL bug found+fixed
+       (it126, caught by a SIGBUS crash in a real-provider round-trip
+       test): this used to allocate only `9 + nheaders*2 + 1` (10 +
+       2*nheaders) slots -- 4 short of what the writes below actually
+       need -- a heap buffer overflow corrupting adjacent allocations,
+       not merely an out-of-bounds curl argv. */
+    int argc = 14 + nheaders * 2;
     char** argv = (char**)k_alloc(sizeof(char*) * argc);
     int i = 0;
     argv[i++] = (char*)"curl";
@@ -5746,7 +5815,9 @@ static KValue k_ai_openai_call(const KAiFun* f, const char* prompt, const char* 
     k_ai_json_escape_body(&body, model);
     kb_puts(&body, "\",\"messages\":[{\"role\":\"user\",\"content\":\"");
     k_ai_json_escape_body(&body, prompt);
-    kb_puts(&body, "\"}]}");
+    kb_puts(&body, "\"}]");
+    if (f->shape->kind != 0) kb_puts(&body, ",\"response_format\":{\"type\":\"json_object\"}");
+    kb_puts(&body, "}");
     const char* headers[1];
     int nheaders = 0;
     KBuf authbuf = {0};
@@ -5799,7 +5870,13 @@ static KValue k_ai_anthropic_call(const KAiFun* f, const char* prompt) {
     k_ai_json_escape_body(&body, model);
     kb_puts(&body, "\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":\"");
     k_ai_json_escape_body(&body, prompt);
-    kb_puts(&body, "\"}]}");
+    kb_puts(&body, "\"}]");
+    if (f->shape->kind != 0) {
+        kb_puts(&body, ",\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":");
+        kb_puts(&body, k_ai_wire_schema(f->shape));
+        kb_puts(&body, "}}");
+    }
+    kb_puts(&body, "}");
     const char* base = k_getenv_ne("KUPL_AI_BASE_URL"); if (!base) base = "https://api.anthropic.com";
     KBuf url = {0}; kb_puts(&url, base); kb_puts(&url, "/v1/messages");
     KBuf keyhdr = {0}; kb_puts(&keyhdr, "x-api-key: "); kb_puts(&keyhdr, key);
@@ -5871,10 +5948,10 @@ static KValue k_ai_call(int info, const char* intent, KValue* args, int nargs) {
     const KAiFun* f = &AI_FUNS[info];
     const char* text = k_getenv_ne(f->mock_key);
     if (!text) text = k_getenv_ne("KUPL_AI_MOCK");
-    if (!text && (f->has_tools || f->shape->kind != 0)) {
-        // it125 first slice: real-provider calls cover only non-tool,
-        // `-> Str` ai funs (see k_ai_real_call's own doc comment above)
-        // -- tool use and structured (non-Str) shapes still defer to
+    if (!text && f->has_tools) {
+        // it125: real-provider calls cover non-tool ai funs of ANY shape
+        // (structured shapes joined Str at it126, via k_ai_wire_schema/
+        // response_format/output_config) -- tool use still defers to
         // `kupl bundle`, UNCHANGED from before this iteration.
         const char* msg = "native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`";
         if (f->wraps_result) return k_err(k_str(msg));
@@ -11013,19 +11090,71 @@ mod tests {
         );
     }
 
-    /// it125 regression guard: a STRUCTURED (non-`Str`) return shape with
-    /// no mock set must ALSO still unconditionally defer -- this first
-    /// slice supports `-> Str` only (no JSON-Schema request suffix / no
-    /// `response_format` modifier implemented). Same `KUPL_AI_PROVIDER=
-    /// echo` confirms the gate fires on shape BEFORE the new code runs.
+    /// it126: a STRUCTURED (non-`Str`) return shape now gets a REAL
+    /// provider path too (the `echo` debug provider alone can't verify
+    /// this end-to-end -- its own "response" is the composed PROMPT text,
+    /// not a value matching the shape, so `k_ai_convert` would correctly
+    /// reject it as invalid JSON). Instead, mirrors the codebase's own
+    /// established pattern for testing a REAL network call safely
+    /// (`native_http_get_rejects_a_response_body_containing_a_nul_byte`,
+    /// above): a plain `std::net::TcpListener` on an OS-assigned port,
+    /// NO KUPL involved on the server side, answering with a canned
+    /// OpenAI-compatible response body. `KUPL_AI_PROVIDER=ollama` needs
+    /// no API key at all. Captures the RAW request bytes via a channel to
+    /// also confirm the JSON-Schema instruction actually reached the
+    /// wire (the REQUEST side is this iteration's only new code -- the
+    /// response-side conversion already existed for the mock path).
     #[test]
-    fn native_ai_fun_structured_shape_and_no_mock_still_defers_to_kupl_bundle() {
+    fn native_ai_fun_structured_shape_real_provider_round_trips_through_a_local_mock_server() {
         if !cc_available() {
             return;
         }
-        let src = "ai fun classify() -> Result[Int, Str] {\n    intent \"c\"\n}\n\
-                   fun main() uses io {\n    match classify() {\n        Ok(v) => print(\"ok:{v}\")\n        Err(e) => print(\"err:{e}\")\n    }\n}\n";
-        let out = native_main_stdout_env(src, "aifunshapedefer", &[("KUPL_AI_PROVIDER", "echo")]);
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = r#"{"choices":[{"message":{"content":"{\"value\":42}"}}]}"#;
+                let resp = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let src = "ai fun classify() -> Int {\n    intent \"c\"\n}\n\
+                   fun main() uses io {\n    print(classify())\n}\n";
+        let base_url = format!("http://127.0.0.1:{port}");
+        let out = native_main_stdout_env(
+            src,
+            "aifunstructreal",
+            &[("KUPL_AI_PROVIDER", "ollama"), ("KUPL_AI_MODEL", "test"), ("KUPL_AI_BASE_URL", &base_url)],
+        );
+        assert_eq!(out, "42\n", "the mock server's canned JSON response must round-trip to the Int value 42");
+        let received = rx.recv().expect("the mock server must have received a request");
+        assert!(
+            received.contains("Respond with only a JSON object matching this JSON Schema"),
+            "the outgoing request must embed the JSON-Schema instruction: {received}"
+        );
+        assert!(received.contains("integer"), "the embedded schema must name the Int shape: {received}");
+        let _ = server.join();
+    }
+
+    /// it126 regression guard: a TOOL-using ai fun (any shape) with no
+    /// mock set must STILL unconditionally defer -- real-provider tool
+    /// use remains explicitly out of scope. `KUPL_AI_PROVIDER=echo`
+    /// confirms the gate fires on `has_tools` before any new code runs
+    /// (echo would otherwise succeed trivially for a `-> Str` tool fun).
+    #[test]
+    fn native_ai_fun_structured_shape_with_tools_and_no_mock_still_defers_to_kupl_bundle() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun tool_x() -> Int { 1 }\n\
+                   ai fun helper() -> Result[Int, Str] tools [tool_x] {\n    intent \"h\"\n}\n\
+                   fun main() uses io {\n    match helper() {\n        Ok(v) => print(\"ok:{v}\")\n        Err(e) => print(\"err:{e}\")\n    }\n}\n";
+        let out = native_main_stdout_env(src, "aifunstructtoolsdefer", &[("KUPL_AI_PROVIDER", "echo")]);
         assert_eq!(
             out,
             "err:native `ai fun` requires a mock (KUPL_AI_MOCK or the per-function var); real providers via `kupl bundle`\n"
