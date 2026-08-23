@@ -1,6 +1,7 @@
 # Real concurrency between component instances — design sketch
 
-v0.2 (it121, determinism strategy decided it129) — a bounded design
+v0.3 (it121, determinism strategy decided it129, concrete implementation
+plan written it132) — a bounded design
 deliverable, not an implementation, mirroring
 `CAPABILITIES.md`'s own it112 precedent exactly: investigate live, write down
 what the real blockers are and what a credible design would need to resolve,
@@ -517,7 +518,7 @@ section only removes the "we don't know what determinism strategy to
 build toward" blocker that made every prior attempt stop at the
 investigation stage.
 
-## 8. A concrete, decisive implementation plan
+## 8. A concrete, decisive implementation plan (it132)
 
 Every open question §5 and §7.3 left dangling is resolved below, against
 live-read code (`interp.rs`'s `Instance`/`Interp` struct definitions,

@@ -990,7 +990,7 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       top of this (§6's own 14-function instance-access surface, the
       wire-crossing question), but the "which determinism strategy" question
       that stalled every prior attempt at the investigation stage is
-      resolved. **PR-it1: a concrete, decisive implementation plan
+      resolved. **it132: a concrete, decisive implementation plan
       written** (`docs/design/ASYNC.md` §8) — resolves every remaining
       open question left dangling above rather than adding another
       sketch. Key decisions: (1) opt-in via a `concurrent component`
