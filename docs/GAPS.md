@@ -990,7 +990,47 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       top of this (§6's own 14-function instance-access surface, the
       wire-crossing question), but the "which determinism strategy" question
       that stalled every prior attempt at the investigation stage is
-      resolved.
+      resolved. **PR-it1: a concrete, decisive implementation plan
+      written** (`docs/design/ASYNC.md` §8) — resolves every remaining
+      open question left dangling above rather than adding another
+      sketch. Key decisions: (1) opt-in via a `concurrent component`
+      declaration modifier, mirroring `ComponentDecl.is_app`'s own
+      existing precedent, resolvable entirely at compile time since
+      children/wires are already fully static; (2) the 14-function
+      surface (§6.2) is resolved by an `InstanceSlot::Local(Instance) |
+      Remote(ActorHandle)` split — NOT a bare per-id accessor (which
+      it124 correctly declined, since no threading design existed yet to
+      justify it) but a genuine split where every `concurrent` instance
+      runs its OWN, otherwise-completely-unmodified `Interp` on its own
+      thread, reusing the SAME 14 functions verbatim; (3) hub-and-spoke
+      topology (all cross-actor traffic routes through the coordinator,
+      no actor-to-actor channels) as a named v1 restriction; (4) two
+      message shapes matching §3.3's already-decided semantics exactly
+      (non-blocking `Deliver` for wire emit/timer fire, blocking `Call`
+      for `expose`); (5) a NEW correctness hazard named and resolved —
+      cross-actor `expose` call cycles can now deadlock (impossible
+      today, since everything shares one call stack) — mitigated with
+      per-thread pending-call-chain cycle detection and a clean panic,
+      matching this file's own established "clean panic over silent
+      hang" discipline; (6) the virtual clock stays coordinator-owned,
+      with a small `Arc<Mutex<BTreeMap<usize,i64>>>` next-fire table (plain
+      `i64` metadata, not `Value`/`Rc`, so this does NOT reopen the
+      `Rc`→`Arc` blocker) letting `advance()` keep one global earliest-fire
+      scan without round-tripping every tick; (7) `PortableValue` is NOT
+      widened for v1 — `concurrent` component ports are restricted by
+      `check.rs` to already-portable types, sidestepping the open
+      Bound/Component-across-threads question entirely; (8) `concurrent`
+      inside property-test bodies and `:upgrade` hot-swap of a concurrent
+      instance are explicitly out of scope for v1 (checked rejections,
+      not silent gaps); (9) VM/native need ZERO special-casing — a
+      `concurrent` component simply never builds `Remote` slots on those
+      engines, so the existing byte-identical harness applies completely
+      unchanged; only a NEW interp-only, multi-run value-determinism
+      check is needed, layered on top of (not replacing) today's suite;
+      (10) a six-step staged build order mirroring `par{}`'s own it33-it101
+      history. Still a design, not code — no `interp.rs` changes this
+      iteration — but the next iteration that picks this up has an
+      actual buildable plan, not another open question.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into

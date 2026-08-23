@@ -516,3 +516,239 @@ investigation discipline this campaign has applied throughout — this
 section only removes the "we don't know what determinism strategy to
 build toward" blocker that made every prior attempt stop at the
 investigation stage.
+
+## 8. A concrete, decisive implementation plan
+
+Every open question §5 and §7.3 left dangling is resolved below, against
+live-read code (`interp.rs`'s `Instance`/`Interp` struct definitions,
+`instantiate`/`instantiate_child`/`send`/`drain`/`emit`/`run_handler`/
+`restart`/`arm_timers`/`advance` in full, `ast.rs`'s `ComponentDecl`, and
+`parallel.rs`'s `ProgramImage`/`PortableValue`). This is a design, not
+code — nothing below has been implemented. It is written to be directly
+buildable by whichever iteration picks it up next, without another round
+of re-derivation.
+
+### 8.1 The opt-in mechanism: a `concurrent` component modifier, decided
+
+§7.2 left the opt-in mechanism itself unspecified. `ast.rs::ComponentDecl`
+already has `is_app: bool` — a precedent for exactly this shape: a plain
+compile-time boolean set by a declaration-site keyword, not a runtime flag
+or CLI switch. **Decision: add `pub concurrent: bool` to `ComponentDecl`,
+set by a new `concurrent component Foo { ... }` declaration modifier**
+(mirroring `app component Foo { ... }`'s own existing `is_app` syntax
+exactly). This is checkable entirely statically: `check.rs` can reject
+`concurrent` on the root `app` component itself (the coordinator thread
+IS the app-level instance in this design — see §8.2 — so marking it
+`concurrent` is meaningless) and can enforce §8.6's port-type restriction
+at the same declaration site. Because `comp.children`/`comp.wires` are
+fully static (verified live: `instantiate` reads `comp.children`/
+`comp.wires` directly off the `Rc<ComponentDecl>`, resolved once at
+parse/check time, never constructed dynamically), **which instances end
+up concurrent is knowable entirely at compile time** — no runtime
+decision, no ambiguity about "is this id local or remote" that isn't
+already fixed at the moment `instantiate` first creates that id.
+
+### 8.2 Core architecture: one `Interp`, unmodified, per thread — not a rewrite
+
+The single most important design realization, missed by §3–§7's own
+framing: **every one of the 14 functions §6.2 inventoried already reads
+`self.instances[id]`, `self.current`, `self.now`, etc. through `&mut
+Interp` — meaning the SAME code already works correctly for a "sub-Interp"
+that owns only ONE instance**, as long as `self.instances` resolves the
+right thing for both local and non-local ids. So the plan is **not**
+"rewrite `interp.rs` to be thread-aware everywhere." It is:
+
+```rust
+enum InstanceSlot {
+    Local(Instance),        // today's exact struct, unchanged
+    Remote(ActorHandle),    // a lightweight, Send+Sync channel handle
+}
+// Interp.instances: Vec<Instance>  becomes  Vec<InstanceSlot>
+```
+
+Every one of the 14 `self.instances[id]` sites gets ONE `match` arm added:
+`Local(inst) => { /* exactly today's existing code, verbatim */ }`,
+`Remote(handle) => { /* new, small, message-based logic — see below */ }`.
+This is precisely the §6.5 "indirection layer" it124 declined to build —
+it124's reasoning (no concrete threading design existed yet to justify it,
+and a bare per-id *accessor* doesn't help `advance`'s global scan or
+`forall_case`'s BFS walk) was correct for what was being proposed at the
+time. §8.4 and §8.7 below show the `Local`/`Remote` **split** (not a bare
+accessor) resolves both of those cleanly, which is the missing piece that
+makes the indirection layer worth building now.
+
+**The coordinator IS today's `Interp`, unchanged in every way except the
+`Vec<Instance>` → `Vec<InstanceSlot>` type.** For any program with zero
+`concurrent` components, every slot is `Local`, every one of the 14
+`match` arms takes the unchanged branch, and behavior — including the
+existing byte-identical interp/vm/native regression discipline — is
+provably unaffected (a pure type/match-arm restructuring with the old
+behavior preserved verbatim in the `Local` arm is the kind of change this
+campaign's own `git stash` + behavioral-diff verification method proves
+trivially).
+
+**Each `concurrent`-marked instance gets its own OS thread running its
+own, freshly-constructed `Interp`.** That actor's `Interp.instances`
+contains exactly one `InstanceSlot::Local` (itself) plus one
+`InstanceSlot::Remote` for every OTHER instance id in the program
+(pointing back to the coordinator — see §8.3's hub-and-spoke restriction).
+This means `emit`, `eval_method`, `run_handler`, `arm_timers`, `par{}`'s
+own `resolve_par_branches` — literally every function already listed in
+§6.2 — run as **the exact same compiled code**, on the actor's own
+thread, operating on a `Vec<InstanceSlot>` of length equal to the whole
+program's instance count, where index lookups for anyone else resolve to
+`Remote`. No second code path to write and maintain; one struct, one
+`match`, reused everywhere.
+
+### 8.3 Topology: hub-and-spoke, not full mesh — a stated v1 restriction
+
+Concurrent actors do not get direct channels to each other. Every
+`Remote` handle — on the coordinator's side AND on every actor's side —
+routes through the coordinator's own single inbound `mpsc::Receiver`
+(actors hold cloned `Sender`s into it). This is a deliberate, named
+scoping choice: a full mesh (N actors each holding N-1 direct channels)
+adds real complexity (dynamic channel setup as instances are created,
+no natural place to enforce the ordering guarantees §8.4/§8.5 rely on)
+for zero benefit in a first slice, since the coordinator already has to
+mediate any interaction with a `Local` instance anyway. A later iteration
+proving hub-and-spoke's coordinator-side fan-in is a real bottleneck can
+revisit this; nothing about the message shapes below prevents it later.
+
+### 8.4 Cross-thread messages: two shapes, matching §3.3's own decision exactly
+
+- **`Deliver(port, value)`** — fire-and-forget, non-blocking send. Used
+  for ordinary wire delivery (`emit` targeting a `Remote` id) and for
+  timer fires (§8.5). This is where §7's opt-in timing-nondeterminism
+  applies: the sender does not wait, and does not know or care when the
+  receiving actor gets around to processing it relative to anything else
+  in the program.
+- **`Call { fn_name, args: Vec<PortableValue>, reply: oneshot::Sender<...>
+  }`** — blocking request/reply, exactly §3.3's already-decided semantics
+  for `expose` calls (`eval_method` on a `Remote` id sends this and blocks
+  the CALLING thread on `reply.recv()`). No new decision needed here; §3.3
+  already made this call correctly three sections ago.
+
+**A genuinely new correctness hazard, absent today: cross-actor call
+cycles can deadlock.** Today, a cyclic `expose` chain (A calls B calls A)
+just recurses on the one shared native call stack — it works (or
+overflows via the EXISTING, already-guarded `MAX_CALL_DEPTH`/stack-margin
+machinery) because there is only ever one thread. Once A and B are
+different actor threads, A blocking on a reply from B while B is (perhaps
+transitively) blocked waiting on a reply FROM A is a real deadlock, not a
+deep-recursion panic. **Decision: track, per actor thread, the chain of
+`Call` ids currently awaiting a reply; if an incoming `Call` would close a
+cycle back to an id already in that thread's own pending chain, refuse it
+immediately with a clean panic** (`"concurrent call cycle through
+instance {id}"`) **instead of blocking** — the same "clean panic over
+silent hang" discipline `MAX_COMPONENT_MESSAGES`/`MAX_ADVANCE_FIRES`
+already establish elsewhere in this file for unrelated runaway-growth
+classes. This needs the pending-chain metadata threaded through the
+`Call` message itself (a `Vec<usize>` of instance ids already waiting,
+appended to at each hop) — cheap, plain data, no shared mutable state.
+
+### 8.5 The virtual clock: coordinator stays sole owner, decided
+
+§3.5 asked whether each instance gets its own clock or shares one; sharing
+one via a lock was left as the alternative without resolving how.
+**Decision: `now: i64` stays exactly where it is today — a single field
+on the coordinator's `Interp`. Concurrent actors never read or advance a
+clock of their own.** What changes is how `advance()`'s existing global
+earliest-fire scan reaches a `concurrent` instance's timer state, since
+that state (`Instance.timers`) now lives on the actor's own thread, not
+in the coordinator's `Vec<Instance>`. **Decision: a single small shared
+`Arc<Mutex<BTreeMap<usize, i64>>>` — instance id → next-fire virtual-ms —
+updated by an actor whenever it (re)arms or deactivates its OWN timers
+(pure `i64` metadata, trivially `Send + Sync`, not a `Value`/`Rc` in
+sight, so this does not reopen the `Rc`→`Arc` blocker §3.1 correctly
+ruled out).** `advance()` folds this table into its existing
+`self.instances.iter()` scan exactly as it folds local instances today; a
+fire whose id resolves to `Remote` sends a non-blocking
+`Deliver(handler_idx)` (§8.4) instead of calling `run_handler` directly.
+`arm_timers` itself needs NO cross-thread change at all — it already only
+reads/writes `self.instances[id].timers` for the SINGLE id being armed,
+which on an actor thread is always its own `Local` slot; it only needs to
+additionally publish its result into the shared next-fire table.
+
+### 8.6 `PortableValue`: not widened for v1 — a checked restriction instead
+
+§3.6 left open whether `PortableValue` needs widening to carry a `Bound`/
+`Component` reference across a thread, and whether that's even
+semantically sound. **Decision: don't answer that question for v1 — avoid
+it entirely.** `check.rs` requires every port on a `concurrent` component
+to have a type representable by the EXISTING `PortableValue` enum (no
+function types, no component references) — a compile-time diagnostic,
+not a runtime restriction, mirroring `par{}`'s own purity gate (restrict
+to the provably-safe subset first, widen later only if a real need
+appears). `Deliver`/`Call` payloads are ordinary `to_portable`/
+`from_portable` conversions, already-proven code, reused verbatim.
+
+### 8.7 Two features explicitly out of scope for v1, not silently ignored
+
+- **`concurrent` components inside `forall`/law/property-test bodies.**
+  `forall_case`'s own BFS reachability walk (§6.2) assumes every instance
+  is a synchronous, directly-readable `self.instances[id]` — making that
+  span a thread boundary is real, unscoped work with no forcing need yet
+  (property tests are about VALUE correctness, not concurrency behavior).
+  **Decision: `check.rs` rejects instantiating a `concurrent` component
+  anywhere reachable from an `example`/`law`/`forall` body.**
+- **`:upgrade` (REPL hot-swap) targeting a `concurrent` instance.**
+  `repl.rs`'s 44 direct `.instances` touches assume live, synchronously-
+  readable state for migration. **Decision: `repl.rs` rejects `:upgrade`
+  if the target (or anything reachable from it) is `concurrent`,** with a
+  clear message, rather than attempting to migrate actor-thread state.
+
+Both restrictions are narrow, checkable, and honestly documented — not
+gaps discovered later by a confused user.
+
+### 8.8 Engine coverage: VM/native need no special-casing at all
+
+§3.6 assumed VM/native would need to "stay sequential" as a deliberate
+fallback. Re-examined against §7's own decided contract: real concurrency
+only affects the RELATIVE TIMING of independently-running instances'
+side effects, never per-instance computed VALUES. A `concurrent` component
+executed fully sequentially — today's exact KVM/native behavior, zero
+changes needed to `vm.rs`/`cgen.rs` — is simply the single most
+deterministic point in the timing-nondeterminism space §7.1 already
+declared acceptable, not a fallback needing special justification. The
+existing interp-vs-vm-vs-native byte-identical harness therefore continues
+to apply UNCHANGED and needs no `concurrent`-aware exception: `kupl run
+--vm` and `kupl native` simply never build the `Remote`/actor-thread
+machinery at all (`concurrent` is parsed and checked identically on every
+engine, but only the interpreter's `Interp` ever constructs an
+`InstanceSlot::Remote`). A concurrency-specific new verification
+discipline (§8.9) is needed only for interp-vs-itself-across-multiple-runs,
+not interp-vs-vm-vs-native.
+
+### 8.9 New verification discipline needed (v1, interp-only)
+
+The existing byte-identical regression suite is UNCHANGED and continues
+to gate every commit exactly as today (§7.2, §8.8). A NEW, additional
+category is needed only for programs that use `concurrent`: run such a
+program N times (interp only), assert every individual instance's own
+sequence of COMPUTED VALUES (state after each handler, return values of
+`expose` calls) is identical run-to-run, while explicitly NOT asserting
+the interleaved ORDER of side effects (`print`/`emit` timing) across
+different concurrent instances is identical — codifying §7.1's decision
+as an actual, automated test shape rather than leaving it as prose.
+
+### 8.10 Recommended build order (staged, mirroring `par{}`'s own history)
+
+1. `ComponentDecl.concurrent` + parser/check.rs support, `PortableValue`
+   port-type restriction (§8.6), the two exclusions (§8.7) — no runtime
+   change yet; a `concurrent` component simply behaves identically to
+   today (parses, checks, runs sequentially) until step 2 exists.
+2. `InstanceSlot` split (§8.2) with EVERY slot `Local` and zero actor
+   threads spawned yet — a pure refactor, verify byte-identical via the
+   existing suite before adding any threading at all.
+3. Spawn one real actor thread for a `concurrent` instance with NO wires
+   and NO `expose` calls reaching it (the narrowest possible case,
+   mirroring §4's own original staging idea) — proves the actor's own
+   `Interp` executes its lifecycle/timers correctly in isolation.
+4. Add `Deliver` (wire emit + timer fire, §8.4/§8.5) — proves cross-thread
+   message delivery and the shared next-fire table.
+5. Add `Call` (blocking `expose`, §8.4) plus the cycle-detection guard.
+6. Write §8.9's new verification harness against a real example program
+   exercising all of the above together.
+
+VM/native are untouched throughout (§8.8) — this entire plan is
+interp-only, exactly as `par{}` itself started at it99.
