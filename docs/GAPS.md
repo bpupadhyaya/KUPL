@@ -1030,7 +1030,45 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       (10) a six-step staged build order mirroring `par{}`'s own it33-it101
       history. Still a design, not code — no `interp.rs` changes this
       iteration — but the next iteration that picks this up has an
-      actual buildable plan, not another open question.
+      actual buildable plan, not another open question. **it133:
+      implementation begins — §8.10 step 1 landed** (`concurrent
+      component`/`concurrent app` syntax, a soft keyword matching `ai`/
+      `state`'s own contextual-keyword precedent rather than a globally
+      reserved word). `ComponentDecl.concurrent: bool`; two new checks
+      (K0305: `concurrent` + root `app` is mutually exclusive; K0306:
+      every prop/port/exposed-fun param and return type on a `concurrent`
+      component must be representable by `parallel.rs::PortableValue`,
+      generalizing §8.6 from "ports only" — props are needed to construct
+      an actor on its own thread, exposed-fun signatures for the future
+      blocking `Call` message; conservatively rejects user ADTs
+      (`Ty::Named`) for v1 even where structurally portable, deferring
+      arbitrary recursive-type-walk to later); `kupl fmt` round-trip.
+      **Deliberately no runtime change** — interp.rs already works
+      directly off the raw `ast::ComponentDecl` (confirmed live:
+      `Interp::instantiate` reads `self.db.components` as `Rc<ComponentDecl>`
+      directly, not a separately-compiled representation), so a
+      `concurrent` component today parses, checks, and runs exactly like
+      an ordinary one — zero behavior change, zero `compile.rs`/
+      `bytecode.rs`/`kx.rs`/`cgen.rs` touches needed, confirming §8.8's
+      own "VM/native need zero special-casing" claim already holds even
+      at this first step. Full verification: `cargo build` clean;
+      `cargo test` green **twice** (1711/1711 lib, excluding 4-5
+      perf_guard timing tests independently confirmed flaky on a clean
+      `git stash`ed baseline under this session's own concurrent test
+      load, not caused by this change); `cargo test --bins` 62/62;
+      `cargo test --doc` 0/0; interp-vs-vm sweep clean across all 56
+      `examples/*.kupl` files with `main()`; 3 new unit tests
+      (`concurrent_component_parses_checks_and_round_trips`,
+      `concurrent_app_is_k0305`,
+      `concurrent_component_non_portable_port_is_k0306`). Deliberately
+      NOT yet documented in `LANGUAGE-REFERENCE.md` (the normative public
+      spec) — the keyword has no runtime effect until step 2+ lands;
+      documenting it now would describe a feature that doesn't work yet,
+      the exact class of staleness this campaign's own docs discipline
+      exists to prevent. Next: §8.10 step 2, the `InstanceSlot`
+      `Local`/`Remote` split (pure refactor, ~32 `self.instances[id]`
+      call sites across the 14 functions, zero `Remote` slots constructed
+      yet — verify byte-identical before any actual threading).
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into

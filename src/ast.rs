@@ -122,6 +122,13 @@ pub struct Variant {
 pub struct ComponentDecl {
     pub name: String,
     pub is_app: bool,
+    /// `concurrent component Foo { ... }` — opts this component into real
+    /// multi-threaded execution (interp-only; VM/native ignore this flag
+    /// entirely and always run sequentially, per
+    /// `docs/design/ASYNC.md` §8.1/§8.8). A soft keyword, matching `ai`/
+    /// `state`/`out`'s own contextual-keyword precedent (token.rs) rather
+    /// than a globally reserved word.
+    pub concurrent: bool,
     pub fulfills: Vec<String>,
     pub intent: Option<String>,
     pub ports: Vec<Port>,

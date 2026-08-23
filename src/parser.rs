@@ -374,6 +374,16 @@ impl Parser {
             self.bump();
             return Ok(Some(Item::Fun(self.parse_ai_fun(is_pub)?)));
         }
+        // `concurrent` is a soft keyword: only special directly before
+        // `component`/`app`, matching `ai`'s own contextual-keyword
+        // precedent immediately above (only special directly before `fun`).
+        if matches!(self.peek(), Tok::Ident(n) if n == "concurrent")
+            && matches!(self.peek_at(1), Tok::KwComponent | Tok::KwApp)
+        {
+            self.bump();
+            let is_app = matches!(self.peek(), Tok::KwApp);
+            return Ok(Some(Item::Component(self.parse_component(is_app, true)?)));
+        }
         // top-level `law "name" { … }` — a free-standing test (soft keyword)
         if matches!(self.peek(), Tok::Ident(n) if n == "law") {
             let lspan = self.span();
@@ -395,8 +405,8 @@ impl Parser {
         match self.peek() {
             Tok::KwFun | Tok::KwAsync => Ok(Some(Item::Fun(self.parse_fun(is_pub)?))),
             Tok::KwType => Ok(Some(Item::Type(self.parse_type_decl()?))),
-            Tok::KwComponent => Ok(Some(Item::Component(self.parse_component(false)?))),
-            Tok::KwApp => Ok(Some(Item::Component(self.parse_component(true)?))),
+            Tok::KwComponent => Ok(Some(Item::Component(self.parse_component(false, false)?))),
+            Tok::KwApp => Ok(Some(Item::Component(self.parse_component(true, false)?))),
             Tok::KwContract => Ok(Some(Item::Contract(self.parse_contract()?))),
             Tok::KwUse => {
                 let uspan = self.span();
@@ -839,7 +849,7 @@ impl Parser {
 
     // ---- components -----------------------------------------------------
 
-    fn parse_component(&mut self, is_app: bool) -> PResult<ComponentDecl> {
+    fn parse_component(&mut self, is_app: bool, concurrent: bool) -> PResult<ComponentDecl> {
         let start = self.span();
         self.bump(); // `component` or `app`
         let (name, _) = self.expect_ident()?;
@@ -858,6 +868,7 @@ impl Parser {
         let mut c = ComponentDecl {
             name,
             is_app,
+            concurrent,
             fulfills,
             intent: None,
             ports: Vec::new(),

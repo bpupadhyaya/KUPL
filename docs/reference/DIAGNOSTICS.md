@@ -156,6 +156,8 @@ Severity: **E** = error, **W** = warning.
 | K0302 | W | declared effect is never used |
 | K0303 | W | function calls a value of function type — its effects cannot be verified; declare `uses` for any effect it may perform |
 | K0304 | E | a capability root builtin (`cap_net_root()`/`cap_fs_root()`) called outside `fun main`'s own top-level body — capabilities must be seeded at exactly one place |
+| K0305 | E | `concurrent` and the root `app` are mutually exclusive |
+| K0306 | E | a `concurrent` component's prop/port/exposed-function type is not representable as portable, plain data — see `docs/design/ASYNC.md` §8.6 |
 
 ## K04xx — Loader (multi-file)
 

@@ -11,6 +11,52 @@ use crate::ast::*;
 use crate::diag::{Diag, Span};
 use crate::types::{ComponentSig, ContractSig, IntW, Ty, TypeSig, Unifier, VariantSig};
 
+/// True iff `ty` is representable by `parallel.rs::PortableValue` — the
+/// only thing ever allowed to cross a thread boundary in this codebase
+/// (both the existing `par_map`/`par_filter`/`par{}` fast path and the
+/// `concurrent component` boundary this function gates, see
+/// `docs/design/ASYNC.md` §8.6). Recurses into the built-in generic
+/// containers (`List`/`Option`/`Result`/`Map`/`Set`), whose runtime shape
+/// is fixed and already handled by `to_portable`'s own `Ctor`/container
+/// arms. **Deliberately conservative for v1**: user-declared ADTs
+/// (`Ty::Named`) are always rejected here even though some would be
+/// structurally portable (every field itself portable) — walking
+/// arbitrary, possibly-recursive/mutually-recursive type declarations is
+/// real, unscoped future work, not attempted here. `Component`/`Contract`
+/// (a live component reference or dynamic-dispatch handle) and `Fun` (a
+/// closure) are never portable, matching `to_portable`'s own existing
+/// exclusions exactly. `CapNet`/`CapFs` (capability tokens) are also
+/// excluded: whether/how a capability can cross a thread boundary is a
+/// separate design question this function does not attempt to answer.
+fn is_portable_ty(ty: &Ty) -> bool {
+    match ty {
+        Ty::Int
+        | Ty::IntW(_)
+        | Ty::F32
+        | Ty::BigInt
+        | Ty::Rational
+        | Ty::Decimal
+        | Ty::Float
+        | Ty::Bool
+        | Ty::Str
+        | Ty::Char
+        | Ty::Unit
+        | Ty::Event
+        | Ty::Range
+        | Ty::Tensor => true,
+        Ty::List(inner) | Ty::Option(inner) | Ty::Set(inner) => is_portable_ty(inner),
+        Ty::Result(ok, err) => is_portable_ty(ok) && is_portable_ty(err),
+        Ty::Map(k, v) => is_portable_ty(k) && is_portable_ty(v),
+        Ty::CapNet
+        | Ty::CapFs
+        | Ty::Named(_, _)
+        | Ty::Component(_)
+        | Ty::Contract(_)
+        | Ty::Fun(_, _)
+        | Ty::Var(_) => false,
+    }
+}
+
 #[derive(Default)]
 pub struct Checked {
     pub types: HashMap<String, TypeSig>,
@@ -1957,8 +2003,68 @@ impl Checker {
         }
     }
 
+    /// `concurrent component`'s own two static rules
+    /// (`docs/design/ASYNC.md` §8.1/§8.6, generalized here from "ports
+    /// only" to every part of the component's public surface that can
+    /// cross the coordinator/actor thread boundary — props, at actor
+    /// construction time, and exposed-function params/returns, for the
+    /// blocking `Call` message, not just port payloads):
+    ///
+    /// 1. `concurrent` and the root `app` are mutually exclusive — the
+    ///    coordinator thread already runs the app-level instance directly
+    ///    in this design, so marking IT `concurrent` is meaningless
+    ///    (K0305).
+    /// 2. Every prop/port/exposed-function param and return type must be
+    ///    representable by `parallel.rs::PortableValue` — the ONLY thing
+    ///    ever allowed to cross that boundary (K0306). Checked via
+    ///    `is_portable_ty` below.
+    fn check_concurrent_component(&mut self, c: &ComponentDecl) {
+        if c.is_app {
+            self.err(
+                "K0305",
+                "a `concurrent` component cannot also be the root `app` — the coordinator thread already runs the app-level instance directly".to_string(),
+                c.span,
+            );
+        }
+        for prop in &c.props {
+            self.check_portable_ty(&prop.ty, c, &format!("prop `{}`", prop.name));
+        }
+        for port in &c.ports {
+            self.check_portable_ty(&port.ty, c, &format!("port `{}`", port.name));
+        }
+        for expose in &c.exposes {
+            for p in &expose.params {
+                self.check_portable_ty(
+                    &p.ty,
+                    c,
+                    &format!("exposed fun `{}`'s param `{}`", expose.name, p.name),
+                );
+            }
+            if let Some(ret) = &expose.ret {
+                self.check_portable_ty(ret, c, &format!("exposed fun `{}`'s return type", expose.name));
+            }
+        }
+    }
+
+    fn check_portable_ty(&mut self, ty_expr: &TyExpr, c: &ComponentDecl, what: &str) {
+        let ty = self.resolve_ty(ty_expr);
+        if !is_portable_ty(&ty) {
+            self.err(
+                "K0306",
+                format!(
+                    "`concurrent component {}`'s {what} has type `{ty}`, which cannot cross a thread boundary — only plain-data types (numbers, `Str`, `Bool`, `Range`, `Tensor`, and `List`/`Map`/`Set`/`Option`/`Result` of portable types) are allowed on a concurrent component's public surface"
+                    , c.name
+                ),
+                ty_expr.span,
+            );
+        }
+    }
+
     fn check_component(&mut self, c: &ComponentDecl) {
         self.check_fulfills(c);
+        if c.concurrent {
+            self.check_concurrent_component(c);
+        }
         // state inits against annotations
         {
             let mut ctx = Ctx {
@@ -5446,6 +5552,85 @@ mod generic_tests {
             .into_iter()
             .filter(|d| d.severity == crate::diag::Severity::Error)
             .collect()
+    }
+
+    #[test]
+    fn concurrent_component_parses_checks_and_round_trips() {
+        // A `concurrent component` with only portable prop/port/exposed-fun
+        // types must check clean — no K0305/K0306.
+        let ok = "concurrent component Worker {\n    prop id: Int\n    in tick: Event\n    \
+                  expose fun get(x: Int) -> Str { \"{x}\" }\n}\n\
+                  app Root {\n    let w = Worker(id: 1)\n}\n\
+                  fun main() uses io { print(\"ok\") }\n";
+        let errs = errors(ok);
+        assert!(errs.is_empty(), "portable concurrent component must check clean: {errs:?}");
+
+        // `kupl fmt` round-trip: `concurrent ` must survive formatting.
+        let (program, diags) = crate::parser::parse(ok);
+        assert!(diags.is_empty(), "parse must be clean: {diags:?}");
+        let formatted = crate::fmt::format_program(&program);
+        assert!(
+            formatted.contains("concurrent component Worker"),
+            "formatted output must keep the `concurrent` modifier: {formatted}"
+        );
+        // Re-parsing the formatted output must reproduce the same flag (a
+        // fixpoint, matching this codebase's own fmt-idempotence discipline
+        // for every other component modifier).
+        let (program2, diags2) = crate::parser::parse(&formatted);
+        assert!(diags2.is_empty(), "re-parse of formatted output must be clean: {diags2:?}");
+        let worker = program2
+            .items
+            .iter()
+            .find_map(|it| match it {
+                crate::ast::Item::Component(c) if c.name == "Worker" => Some(c),
+                _ => None,
+            })
+            .expect("Worker component must still be present");
+        assert!(worker.concurrent, "round-tripped component must still be `concurrent`");
+    }
+
+    #[test]
+    fn concurrent_app_is_k0305() {
+        let src = "concurrent app Root {\n}\nfun main() uses io { print(\"x\") }\n";
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|d| d.code == "K0305"),
+            "`concurrent app` must be K0305: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_component_non_portable_port_is_k0306() {
+        // A port typed as another component (Ty::Component) is never portable.
+        let src = "component Other {\n}\n\
+                    concurrent component Bad {\n    in ref: Other\n}\n\
+                    app Root {\n    let o = Other()\n    let b = Bad()\n}\n\
+                    fun main() uses io { print(\"x\") }\n";
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|d| d.code == "K0306" && d.message.contains("port `ref`")),
+            "a `Component`-typed port on a concurrent component must be K0306: {errs:?}"
+        );
+
+        // A prop of function type is never portable either.
+        let src2 = "concurrent component Bad2 {\n    prop cb: fn(Int) -> Int\n}\n\
+                     app Root {\n    let b = Bad2(cb: fn x { x })\n}\n\
+                     fun main() uses io { print(\"x\") }\n";
+        let errs2 = errors(src2);
+        assert!(
+            errs2.iter().any(|d| d.code == "K0306" && d.message.contains("prop `cb`")),
+            "a function-typed prop on a concurrent component must be K0306: {errs2:?}"
+        );
+
+        // A List[Int] port IS portable — no K0306 for it specifically.
+        let src3 = "concurrent component Ok3 {\n    in nums: List[Int]\n}\n\
+                     app Root {\n    let o = Ok3()\n}\n\
+                     fun main() uses io { print(\"x\") }\n";
+        let errs3 = errors(src3);
+        assert!(
+            !errs3.iter().any(|d| d.code == "K0306"),
+            "List[Int] port must be portable, no K0306: {errs3:?}"
+        );
     }
 
     #[test]

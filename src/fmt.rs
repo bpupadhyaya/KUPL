@@ -345,6 +345,9 @@ fn fmt_contract(out: &mut String, ct: &ContractDecl) {
 }
 
 fn fmt_component(out: &mut String, c: &ComponentDecl) {
+    if c.concurrent {
+        out.push_str("concurrent ");
+    }
     out.push_str(if c.is_app { "app " } else { "component " });
     out.push_str(&c.name);
     if !c.fulfills.is_empty() {
