@@ -178,12 +178,23 @@ pub struct ActorHandle {
     join: Option<std::thread::JoinHandle<()>>,
     inbox: Option<std::sync::mpsc::Sender<ActorMsg>>,
     /// Signaled once, by the actor, right after its own initial
-    /// `start_all` + `run_timers(100)` complete (regardless of whether
-    /// they succeeded) — consumed by `Interp::start_all` so "on start has
-    /// been delivered to every instance" stays true by the time IT
-    /// returns, even though the actor's own thread keeps running
-    /// (servicing its inbox) well past that point.
-    ready: Option<std::sync::mpsc::Receiver<()>>,
+    /// `instantiate_local` + `start_all` + `run_timers(100)` complete —
+    /// consumed by `Interp::start_all` so "on start has been delivered to
+    /// every instance" stays true by the time IT returns, even though the
+    /// actor's own thread keeps running (servicing its inbox) well past
+    /// that point. `None` on success; `Some((msg, span))` — production-
+    /// hardening 1222, symmetric to `shutdown_panic` below — if that
+    /// initial sequence produced a genuine KUPL `Flow::Panic` (this actor's
+    /// own `on start` handler, or a portability/instantiation failure, or
+    /// one propagated up from a NESTED `concurrent` child's OWN failed
+    /// startup). Before this field carried real information, a startup
+    /// panic was only ever `eprintln!`-reported inside the actor's own
+    /// closure — `Interp::start_all` unconditionally treated ANY signal on
+    /// this channel as plain readiness and moved on, so the WHOLE PROCESS
+    /// exited 0 despite an unhandled panic, instead of the `error[K0900]`/
+    /// exit code 101 an IDENTICAL `on start { panic(…) }` on a plain
+    /// (non-`concurrent`) component already correctly produces.
+    ready: Option<std::sync::mpsc::Receiver<Option<(String, Span)>>>,
     /// Production-hardening 1221: a REAL, live-confirmed bug — before this
     /// field existed, a genuine KUPL `Flow::Panic` raised by THIS actor's
     /// OWN `on stop` handler (a normal, catchable panic — nothing to do
@@ -648,7 +659,7 @@ impl Interp {
         // `String` name crosses the thread boundary here.
         let comp_name = comp.name.clone();
         let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, Span)>>();
         let shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let shutdown_panic_writer = shutdown_panic.clone();
@@ -697,13 +708,29 @@ impl Interp {
                 actor.run_timers(100)?;
                 Ok(())
             })();
-            if let Err(e) = &startup {
-                report("startup", e);
-            }
+            // Production-hardening 1222: symmetric to `shutdown_panic`
+            // (PR-it1221) -- a genuine KUPL panic here used to stop at
+            // `eprintln!`. Now the actual message/span rides the SAME
+            // `ready` signal `Interp::start_all` already blocks on, so it
+            // renders with `error[K0900]` fidelity via the caller's own
+            // `stop_all` propagation instead of being downgraded to a
+            // generic stderr line. `report(...)` remains only as a
+            // defensive fallback for a non-`Panic` `Flow` (not constructible
+            // by this closure's own body today, but kept in case that ever
+            // changes, so no `Flow` variant's diagnostic is ever silently
+            // dropped).
+            let startup_panic = match &startup {
+                Err(Flow::Panic { msg, span, .. }) => Some((msg.clone(), *span)),
+                Err(e) => {
+                    report("startup", e);
+                    None
+                }
+                Ok(()) => None,
+            };
             // Signal readiness regardless of outcome -- `Interp::start_all`
             // (coordinator side) is waiting on this to know the actor's
             // own initial lifecycle has settled one way or the other.
-            let _ = ready_tx.send(());
+            let _ = ready_tx.send(startup_panic);
             if startup.is_ok() {
                 // Service `Deliver`/`Call` messages until the coordinator
                 // closes the inbox (`Interp::stop_all` drops its `Sender`
@@ -808,16 +835,31 @@ impl Interp {
             self.arm_timers(id);
         }
         self.drain()?;
+        // Production-hardening 1222: a REAL, live-confirmed bug, symmetric
+        // to PR-it1221's shutdown-panic fix -- a genuine KUPL `Flow::Panic`
+        // during a Remote instance's OWN startup (its `on start` handler,
+        // or a portability/instantiation failure, or one propagated up
+        // from a NESTED `concurrent` child's own failed startup) used to
+        // be discarded here (`let _ = ready.recv();`), even though the
+        // actor's own closure already carries the real message/span on
+        // this exact channel. Every handle is still drained regardless (no
+        // early return), matching `stop_all`'s own "always finish waiting
+        // on every handle" shape -- only the FIRST panic encountered is
+        // surfaced.
+        let mut startup_panic: Option<Flow> = None;
         for slot in &mut self.instances {
             if let InstanceSlot::Remote(handle) = slot {
                 if let Some(ready) = handle.ready.take() {
-                    // A panicked (Rust-level, not KUPL Flow::Panic) actor
-                    // thread already reported itself via `report(...)`
-                    // inside the closure; nothing further to surface here
-                    // until step 5 adds a real channel back to this caller.
-                    let _ = ready.recv();
+                    if let Ok(Some((msg, span))) = ready.recv() {
+                        if startup_panic.is_none() {
+                            startup_panic = Some(Self::panic_flow(msg, span));
+                        }
+                    }
                 }
             }
+        }
+        if let Some(flow) = startup_panic {
+            return Err(flow);
         }
         Ok(())
     }
@@ -7549,7 +7591,7 @@ mod concurrent_tests {
         let mut interp = Interp::new_bare(db);
 
         let (inbox_tx, _inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
-        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
         let join = std::thread::spawn(|| {
             panic!("deliberate test panic, simulating a genuine internal interpreter bug reached on an actor thread")
         });
@@ -7585,7 +7627,7 @@ mod concurrent_tests {
         let mut interp = Interp::new_bare(db);
 
         let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
-        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
         let join = std::thread::spawn(move || {
             // Exits cleanly once the inbox's Sender is dropped (stop_all's
             // own first loop does this via `handle.inbox.take()`).
@@ -7630,7 +7672,7 @@ mod concurrent_tests {
         let mut interp = Interp::new_bare(db);
 
         let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
-        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
         let shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, super::Span)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let shutdown_panic_writer = shutdown_panic.clone();
@@ -7662,5 +7704,81 @@ mod concurrent_tests {
                 panic!("a real on-stop panic must surface as Err(Flow::Panic), not {describe}");
             }
         }
+    }
+
+    /// Production-hardening 1222: a REAL, LIVE-CONFIRMED bug found+fixed,
+    /// symmetric to PR-it1221's shutdown-panic fix above -- before this
+    /// fix, a genuine KUPL `Flow::Panic` raised during a `concurrent`
+    /// component's OWN startup (its `on start` handler, or anything else
+    /// in `instantiate_local`/`start_all`/`run_timers(100)`) was reported
+    /// via `eprintln!` inside `instantiate_concurrent`'s closure and then
+    /// silently discarded: `Interp::start_all`'s own `ready.recv()` used to
+    /// discard whatever it read, so the whole process exited 0 -- unlike
+    /// the IDENTICAL `on start { panic(…) }` on a plain (non-`concurrent`)
+    /// component, live-confirmed to correctly produce `error[K0900]: panic:
+    /// …` and exit code 101 (`kupl run` on a real `.kupl` fixture, both
+    /// variants, before writing this unit test). Sends the panic payload
+    /// directly on the `ready` channel BEFORE calling `start_all` (no
+    /// thread synchronization needed -- unlike the shutdown-panic test
+    /// above, `start_all` never joins the thread, only reads `ready`), then
+    /// asserts the ORIGINAL message survives verbatim.
+    #[test]
+    fn start_all_surfaces_a_genuine_on_start_panic_from_an_actor_with_its_own_original_message() {
+        let compiled = crate::run::compile("fun main() {}\n").expect("trivial program must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new_bare(db);
+
+        let (inbox_tx, _inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
+        let _ = ready_tx.send(Some(("deliberate on-start panic message, verbatim".to_string(), super::Span::default())));
+        let join = std::thread::spawn(|| {});
+        interp.instances.push(InstanceSlot::Remote(ActorHandle {
+            join: Some(join),
+            inbox: Some(inbox_tx),
+            ready: Some(ready_rx),
+            shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }));
+
+        let result = interp.start_all();
+        match result {
+            Err(Flow::Panic { msg, .. }) => {
+                assert_eq!(
+                    msg, "deliberate on-start panic message, verbatim",
+                    "the actor's own on-start panic message must survive verbatim, not be replaced by a generic placeholder"
+                );
+            }
+            other => {
+                let describe = match &other {
+                    Ok(()) => "Ok(())".to_string(),
+                    Err(_) => "Err(<non-Panic Flow>)".to_string(),
+                };
+                panic!("a real on-start panic must surface as Err(Flow::Panic), not {describe}");
+            }
+        }
+    }
+
+    /// Companion: an actor whose startup succeeds (a `None` on the `ready`
+    /// channel, exactly what `instantiate_concurrent`'s closure sends on
+    /// `Ok(())`) must still report `Ok(())` -- the fix above must not turn
+    /// every ordinary startup into a false-positive error.
+    #[test]
+    fn start_all_still_returns_ok_when_every_actor_starts_cleanly() {
+        let compiled = crate::run::compile("fun main() {}\n").expect("trivial program must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new_bare(db);
+
+        let (inbox_tx, _inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
+        let _ = ready_tx.send(None);
+        let join = std::thread::spawn(|| {});
+        interp.instances.push(InstanceSlot::Remote(ActorHandle {
+            join: Some(join),
+            inbox: Some(inbox_tx),
+            ready: Some(ready_rx),
+            shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }));
+
+        let result = interp.start_all();
+        assert!(result.is_ok(), "a cleanly-started actor must not be reported as a panic");
     }
 }
