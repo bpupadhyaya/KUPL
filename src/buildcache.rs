@@ -108,6 +108,50 @@ fn self_hash() -> Option<&'static str> {
     .as_deref()
 }
 
+/// `true` for a regular, executable file — `is_file()` alone would also
+/// match a non-executable file that happens to share `cc`'s name earlier
+/// in `$PATH`, which the OS's own `execvp`-style resolution would never
+/// actually select.
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+/// SHA-256 of the ACTUAL `cc` executable's own bytes (production-hardening
+/// 1219, the LAST item from PR-it1212's own buildcache queue) — mirrors
+/// `self_hash()`'s exact reasoning, applied to the C compiler instead of
+/// the `kupl` binary itself: `native`'s cache key used to fold in only
+/// `cc`'s STRING identifier (e.g. `"cc"`, from `$CC` or the default), so
+/// an in-place `cc` upgrade at the same path (a realistic package-manager-
+/// driven scenario — `apt upgrade`, `brew upgrade llvm`, a toolchain
+/// container rebuild) silently served a stale machine-code artifact from
+/// the OLD compiler, with no diagnostic. Resolves `cc` exactly the way
+/// `std::process::Command::new(cc)` itself would: used directly if it
+/// already contains a path separator, otherwise searched across `$PATH`
+/// for the first executable regular file with that name — the SAME
+/// resolution order the OS's own `execvp` uses, so this hashes whichever
+/// binary would ACTUALLY run. `None` on any resolution or read failure
+/// (a `$CC` naming a nonexistent program, a `$PATH`-less environment, a
+/// permissions issue) — per this module's own established "when identity
+/// can't be safely determined, don't cache" precedent (`self_hash`,
+/// `cache_dir`), never a degraded fallback like trusting the bare string
+/// alone would be.
+pub fn cc_hash(cc: &str) -> Option<String> {
+    let path: PathBuf = if cc.contains(std::path::MAIN_SEPARATOR) {
+        PathBuf::from(cc)
+    } else {
+        let path_var = std::env::var_os("PATH")?;
+        std::env::split_paths(&path_var).map(|dir| dir.join(cc)).find(|p| is_executable_file(p))?
+    };
+    let bytes = std::fs::read(&path).ok()?;
+    Some(crate::encoding::sha256_hex_bytes(&bytes))
+}
+
 /// Build the cache key for one compile. `extra` lets a caller fold in
 /// anything beyond source content and the running compiler's own identity
 /// that can change the OUTPUT bytes for the same source (see the module
@@ -320,5 +364,78 @@ mod tests {
 
         assert!(dir_is_none, "cache_dir() must be None with neither HOME nor USERPROFILE set");
         assert_eq!(got, None, "lookup must report a clean miss, never panic or read from a shared fallback location");
+    }
+
+    // Production-hardening 1219: `cc_hash` tests. Mirrors `cgen.rs`'s own
+    // established "self-skip when cc isn't available" convention (see
+    // `cgen.rs`'s `cc_available` test helper) rather than assuming a C
+    // compiler exists in every environment this suite runs in. Deliberately
+    // does NOT mutate `$PATH` (unlike the HOME/USERPROFILE tests above) --
+    // `$PATH` is read by many OTHER tests in this same process (any test
+    // that spawns `cc`), and this test binary's tests run concurrently by
+    // default, so a global `$PATH` removal here would risk spuriously
+    // breaking an unrelated in-flight subprocess spawn elsewhere.
+
+    fn cc() -> String {
+        std::env::var("CC").unwrap_or_else(|_| "cc".to_string())
+    }
+    fn cc_available() -> bool {
+        std::process::Command::new(cc()).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    #[test]
+    fn cc_hash_is_some_for_a_resolvable_command() {
+        if !cc_available() {
+            return;
+        }
+        assert!(cc_hash(&cc()).is_some(), "a resolvable cc must hash to Some");
+    }
+
+    #[test]
+    fn cc_hash_is_none_for_an_unresolvable_command() {
+        assert_eq!(
+            cc_hash("kupl-definitely-not-a-real-compiler-binary-xyz"),
+            None,
+            "a command name that resolves nowhere on $PATH must hash to None, never a placeholder"
+        );
+    }
+
+    #[test]
+    fn cc_hash_is_stable_across_repeated_calls() {
+        if !cc_available() {
+            return;
+        }
+        assert_eq!(cc_hash(&cc()), cc_hash(&cc()));
+    }
+
+    /// A `cc` string containing a path separator (e.g. `$CC=/usr/bin/clang`)
+    /// must be used DIRECTLY, never searched for on `$PATH` -- the exact
+    /// resolution order `std::process::Command::new`/`execvp` themselves
+    /// use. Hashing the CURRENTLY RUNNING TEST BINARY's own path (which
+    /// always exists and always contains a separator) and comparing
+    /// against `self_hash()` -- which independently hashes the same
+    /// `current_exe()` file -- confirms both that the separator branch is
+    /// actually taken (no `$PATH` search) and that it reads the right
+    /// file's content.
+    #[test]
+    fn cc_hash_treats_a_path_containing_string_as_a_direct_path_not_a_path_search() {
+        let exe = std::env::current_exe().expect("test binary must be able to find its own path");
+        let exe_str = exe.to_str().expect("test binary path must be valid UTF-8 in this environment");
+        assert!(exe_str.contains(std::path::MAIN_SEPARATOR), "sanity check on the premise: must actually contain a separator");
+        assert_eq!(
+            cc_hash(exe_str),
+            self_hash().map(|s| s.to_string()),
+            "a direct path must hash the same file self_hash() independently hashes via current_exe()"
+        );
+    }
+
+    #[test]
+    fn cc_hash_differs_for_two_genuinely_different_executables() {
+        if !cc_available() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary must be able to find its own path");
+        let exe_str = exe.to_str().expect("test binary path must be valid UTF-8 in this environment");
+        assert_ne!(cc_hash(exe_str), cc_hash(&cc()), "two different binaries must not collide to the same hash");
     }
 }

@@ -1430,7 +1430,13 @@ pub fn native(path: &str, args: &[String]) -> i32 {
     // invocation" (production-hardening 1215; see `buildcache::self_hash`'s
     // own doc comment for the live-confirmed cache-poisoning-by-coincidence
     // risk a degraded/shared placeholder identity would otherwise create).
-    let cache_key = crate::buildcache::content_key("native", &map, cc.as_bytes());
+    // `cc_hash` (production-hardening 1219) applies the SAME principle to
+    // `cc` itself: the key folds in the ACTUAL compiler binary's own
+    // content, not just its string name, so an in-place `cc` upgrade at
+    // the same path correctly invalidates every prior cache entry instead
+    // of silently serving stale machine code from the old compiler.
+    let cache_key = crate::buildcache::cc_hash(&cc)
+        .and_then(|h| crate::buildcache::content_key("native", &map, h.as_bytes()));
     // `--keep-c` exists specifically so a user can inspect the generated C
     // -- a cache hit skips generating it at all, so honoring `--keep-c`
     // means treating this invocation as an unconditional miss (still
@@ -2282,7 +2288,8 @@ mod tests {
 
         let (_compiled, map) = super::load_compile(source.to_str().unwrap()).unwrap();
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let key = crate::buildcache::content_key("native", &map, cc.as_bytes())
+        let cc_hash = crate::buildcache::cc_hash(&cc).expect("cc must be resolvable in this test environment");
+        let key = crate::buildcache::content_key("native", &map, cc_hash.as_bytes())
             .expect("this test binary can read its own current_exe()");
         let cached = crate::buildcache::lookup(&key).expect("a cache entry must exist after a successful native build");
         assert_eq!(cached, first_bytes, "the cached bytes must be exactly the produced executable's bytes");
@@ -2322,16 +2329,18 @@ mod tests {
         let args = vec!["-o".to_string(), out.to_str().unwrap().to_string()];
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
 
+        let cc_hash = crate::buildcache::cc_hash(&cc).expect("cc must be resolvable in this test environment");
+
         std::fs::write(&source, "fun main() uses io {\n    print(\"v1\")\n}\n").unwrap();
         assert_eq!(super::native(source.to_str().unwrap(), &args), 0);
         let (_c1, map1) = super::load_compile(source.to_str().unwrap()).unwrap();
-        let key1 = crate::buildcache::content_key("native", &map1, cc.as_bytes())
+        let key1 = crate::buildcache::content_key("native", &map1, cc_hash.as_bytes())
             .expect("this test binary can read its own current_exe()");
 
         std::fs::write(&source, "fun main() uses io {\n    print(\"v2\")\n}\n").unwrap();
         assert_eq!(super::native(source.to_str().unwrap(), &args), 0);
         let (_c2, map2) = super::load_compile(source.to_str().unwrap()).unwrap();
-        let key2 = crate::buildcache::content_key("native", &map2, cc.as_bytes())
+        let key2 = crate::buildcache::content_key("native", &map2, cc_hash.as_bytes())
             .expect("this test binary can read its own current_exe()");
 
         assert_ne!(key1, key2, "different source must produce a different cache key");
