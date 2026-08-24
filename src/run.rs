@@ -1518,10 +1518,22 @@ pub fn native(path: &str, args: &[String]) -> i32 {
             eprintln!("error: cannot write {out}: {e}");
             return 1;
         }
+        // Production-hardening 1212 (the SAME discarded-io::Error gap
+        // class identified for `main.rs::build_module`'s bundle chmod at
+        // PR-it1211's own NEXT-note, introduced here independently this
+        // session): `write_atomically`'s rename does NOT preserve/grant
+        // the executable bit on the destination, so unlike a freshly
+        // `cc`-compiled binary (which comes out executable from the
+        // compiler by construction), a CACHE-HIT native binary genuinely
+        // DEPENDS on this chmod succeeding to be runnable at all --
+        // silently swallowing a failure here means "native executable:
+        // {out}" prints even though `./{out}` may not actually execute.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            if let Err(e) = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)) {
+                eprintln!("warning: {out} was written but could not be marked executable: {e}");
+            }
         }
         println!("native executable: {out}");
         return 0;
@@ -2272,6 +2284,21 @@ mod tests {
         let code2 = super::native(source.to_str().unwrap(), &args);
         assert_eq!(code2, 0, "rebuilding byte-identical source must succeed, cached or not");
         assert_eq!(std::fs::read(&out).unwrap(), first_bytes, "a rebuild of identical source must be byte-identical");
+        // Production-hardening 1212: this second build is GUARANTEED a cache
+        // hit (byte-identical source, same running kupl, same cc, so the key
+        // matches what the first build just stored) -- so actually EXECUTING
+        // it, not just comparing bytes on disk, is what proves the cache-hit
+        // path's `set_permissions` call (this iteration's own fix target)
+        // genuinely leaves the file runnable. `write_atomically`'s rename
+        // does not itself grant the executable bit -- prior to this
+        // iteration's fix, a chmod failure here would have been silently
+        // swallowed, so a regression that broke the chmod call entirely
+        // (not just its error handling) would previously have surfaced
+        // ONLY as a mysterious "Permission denied" for an end user, never
+        // caught by a test that merely compared bytes on disk.
+        let ran = std::process::Command::new(&out).output().expect("the cache-hit-served binary must actually be executable");
+        assert!(ran.status.success(), "{ran:?}");
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "cached", "{ran:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

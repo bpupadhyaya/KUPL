@@ -747,10 +747,26 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
         eprintln!("error: cannot write {out}: {e}");
         return 1;
     }
+    // Production-hardening 1212 (a real, unambiguous logic gap identified by
+    // direct code reading at PR-it1211's own NEXT-note, left open there
+    // since no live repro of an actual set_permissions FAILURE could be
+    // constructed in that dev environment -- but the fix itself is
+    // unconditionally correct regardless of whether the failure mode is
+    // ever hit: silently discarding an io::Error via `let _ = ...` means a
+    // bundle written on a filesystem/mount that rejects the chmod (a
+    // read-only remount racing this write, a restrictive FAT32/exFAT/SMB
+    // mount, a permissions-capped sandbox) reports SUCCESS and "bundled
+    // executable: {out}" even though `./{out}` may not actually be
+    // executable -- the exact same silently-wrong-success-message shape
+    // this file's OWN write_atomically/output_would_overwrite_source
+    // guards elsewhere in this same function exist to prevent for OTHER
+    // failure modes.
     #[cfg(unix)]
     if bundle {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        if let Err(e) = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)) {
+            eprintln!("warning: {out} was written but could not be marked executable: {e}");
+        }
     }
     println!(
         "{}: {out} ({} bytes)",
