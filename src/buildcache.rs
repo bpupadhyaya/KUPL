@@ -37,15 +37,33 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// `~/.kupl/build-cache/` — mirrors `registry::cache_dir()`'s own
-/// `~/.kupl/registry-cache/` convention exactly (same `$HOME`/
-/// `$USERPROFILE`-with-temp-dir-fallback resolution).
-pub fn cache_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    home.join(".kupl").join("build-cache")
+/// `~/.kupl/build-cache/` — `None` when neither `$HOME` nor
+/// `$USERPROFILE` is set (production-hardening 1217, a REAL gap found by
+/// code-reading, matching the SAME "when identity/location can't be
+/// safely determined, don't cache" precedent `self_hash`'s own `None`
+/// return already established at PR-it1215). The OLD behavior fell back
+/// to `std::env::temp_dir()` (typically the world-writable, SHARED `/tmp`
+/// on Unix) — `registry::cache_dir()` has the IDENTICAL fallback and was
+/// deliberately left unchanged here (see this function's own callers'
+/// doc comments for why: `registry.rs`'s own consumer, `fetch_package`,
+/// re-verifies every file's hash against a FRESH network fetch on every
+/// call regardless of cache state — "v1 always re-fetches and
+/// re-verifies, no cache-skip" is that module's own long-established
+/// design — so a poisoned entry there is never blindly trusted the way a
+/// build-cache HIT is here). A predictable, shared `/tmp/.kupl/
+/// build-cache/` path is a real, if narrow, local cache-poisoning
+/// precondition on a multi-user system or a `$HOME`-less service
+/// account: whichever process wins the race to create it first (or can
+/// simply write into it, since nothing enforces per-user isolation
+/// there) can plant an entry a LATER, unrelated process would trust and
+/// execute — `lookup`'s own `store`d bytes are used directly, with no
+/// re-verification step, unlike `registry.rs`'s. `None` here means
+/// `lookup`/`store` both silently no-op, so an unset `$HOME` degrades to
+/// "always recompile, never persist a cache entry" rather than ever
+/// touching a shared, predictable location at all.
+pub fn cache_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+    Some(PathBuf::from(home).join(".kupl").join("build-cache"))
 }
 
 fn feed(buf: &mut String, s: &str) {
@@ -127,23 +145,25 @@ pub fn content_key(namespace: &str, map: &crate::loader::SourceMap, extra: &[u8]
     Some(crate::encoding::sha256_hex(&buf))
 }
 
-/// Look up a cached artifact by key. `None` on any miss OR read error (a
-/// corrupted/partially-written cache entry is treated exactly like a
-/// miss — always safe to just recompile, never a hard failure).
+/// Look up a cached artifact by key. `None` on any miss, read error, OR an
+/// undeterminable cache location (`cache_dir()` returning `None` — see its
+/// own doc comment) — all three degrade identically: always safe to just
+/// recompile, never a hard failure.
 pub fn lookup(key: &str) -> Option<Vec<u8>> {
-    std::fs::read(cache_dir().join(key)).ok()
+    std::fs::read(cache_dir()?.join(key)).ok()
 }
 
 /// Store a freshly-compiled artifact under `key`. Best-effort: a failure to
-/// write the cache (permissions, disk full, ...) is silently ignored — the
-/// artifact was already successfully written to the CALLER's own requested
-/// output path by this point, so a cache-write failure must never turn a
-/// successful build into a reported error. Uses the SAME atomic
-/// write-to-temp-then-rename `loader::write_atomically` every other
-/// persistent-artifact write in this codebase already uses, so a reader
-/// racing a concurrent cache fill never observes a torn/partial entry.
+/// write the cache (permissions, disk full, an undeterminable cache
+/// location) is silently ignored — the artifact was already successfully
+/// written to the CALLER's own requested output path by this point, so a
+/// cache-write failure must never turn a successful build into a reported
+/// error. Uses the SAME atomic write-to-temp-then-rename `loader::
+/// write_atomically` every other persistent-artifact write in this
+/// codebase already uses, so a reader racing a concurrent cache fill never
+/// observes a torn/partial entry.
 pub fn store(key: &str, bytes: &[u8]) {
-    let dir = cache_dir();
+    let Some(dir) = cache_dir() else { return };
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -266,5 +286,39 @@ mod tests {
         }
         assert_eq!(got, Some(b"hello cache".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Production-hardening 1217: with NEITHER `$HOME` nor `$USERPROFILE`
+    /// set, `cache_dir()` must return `None` (never fall back to the
+    /// shared, unnamespaced `std::env::temp_dir()`) -- and `lookup`/
+    /// `store` must degrade to a safe no-op rather than touching a
+    /// predictable, shared location at all. Manipulates both env vars
+    /// directly (the SAME technique `store_then_lookup_round_trips_...`
+    /// above already uses for `HOME` alone), restoring both immediately
+    /// after the one call that needs them, before any assertion.
+    #[test]
+    fn cache_dir_and_lookup_and_store_are_all_safe_no_ops_without_home_or_userprofile() {
+        let real_home = std::env::var("HOME").ok();
+        let real_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
+
+        let dir_is_none = cache_dir().is_none();
+        // Must not panic, must not write anywhere -- and must report a
+        // clean miss, exactly like an ordinary cache miss would.
+        store("home-unset-test-key", b"should never be persisted");
+        let got = lookup("home-unset-test-key");
+
+        match real_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match real_userprofile {
+            Some(u) => std::env::set_var("USERPROFILE", u),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        assert!(dir_is_none, "cache_dir() must be None with neither HOME nor USERPROFILE set");
+        assert_eq!(got, None, "lookup must report a clean miss, never panic or read from a shared fallback location");
     }
 }
