@@ -1570,6 +1570,36 @@ pub fn native(path: &str, args: &[String]) -> i32 {
         eprintln!("error: cannot write {c_path}: {e}");
         return 1;
     }
+    // A REAL, live-confirmed CLI-robustness bug found+fixed (production-
+    // hardening 1227): `-o` pointing at an EXISTING directory (`kupl native
+    // f.kupl -o some_dir`, where `some_dir` already exists) produces a
+    // clean `error: cannot write {out}: Is a directory (os error 21)` on
+    // `build`/`bundle` (both write the final artifact themselves via
+    // `write_atomically`, so `std::fs`'s own `io::Error` is reported with
+    // this module's own consistent formatting) -- but `native`'s equivalent
+    // failure never goes through `write_atomically` at all: the FINAL
+    // executable is written by the EXTERNAL `cc`/linker invocation below,
+    // whose own raw stderr (confirmed live: `ld: open() failed, errno=21
+    // (Is a directory) for '{out}'` followed by `clang: error: linker
+    // command failed...`) leaked straight through with none of this
+    // module's own clean formatting -- a genuine quality regression
+    // relative to `native`'s own sibling commands for the IDENTICAL user
+    // mistake. Checked here, BEFORE the (doomed, and comparatively
+    // expensive) `cc` invocation -- matching `build`/`bundle`'s own
+    // fail-fast behavior instead of wasting a real compile just to relay a
+    // linker's own error text. Derives the error from a REAL `std::fs` call
+    // (an `OpenOptions::write` probe, immediately closed/dropped, no
+    // lasting effect) rather than a hardcoded message string, so the
+    // reported text is the platform's own native `io::Error` wording --
+    // exactly matching `build`/`bundle`'s own approach -- instead of a
+    // Unix-specific "Is a directory" guess that could be wrong (or simply
+    // absent) on a non-Unix target.
+    if let Err(e) = std::fs::OpenOptions::new().write(true).open(&out) {
+        if std::fs::metadata(&out).is_ok_and(|m| m.is_dir()) {
+            eprintln!("error: cannot write {out}: {e}");
+            return 1;
+        }
+    }
     // `-ffp-contract=off` (production-hardening PR-it813): a REAL, live-confirmed
     // silent value-corruption bug -- `-O2` alone leaves fused-multiply-add
     // CONTRACTION enabled (clang/gcc's default at -O2 is `fast`/`on`, both of
@@ -2145,6 +2175,54 @@ mod tests {
             !out_path.exists(),
             "must not have produced an executable either, having refused before compiling"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REAL, live-confirmed CLI-robustness bug found+fixed (production-
+    /// hardening 1227): `-o` pointing at an EXISTING directory used to leak
+    /// a raw, tool-specific `cc`/linker error (`ld: open() failed, errno=21
+    /// (Is a directory) for '{out}'` followed by `clang: error: linker
+    /// command failed...`) instead of the clean, consistent `error: cannot
+    /// write {out}: Is a directory (os error 21)` `build`/`bundle` already
+    /// produce for the IDENTICAL user mistake (both write the final
+    /// artifact themselves via `write_atomically`, unlike `native`, which
+    /// used to defer entirely to the external `cc` invocation for this
+    /// failure mode). Live-confirmed via a real end-to-end CLI invocation
+    /// before this fix. A real subprocess (not an in-process `super::
+    /// native()` call) is required here -- both the fixed and the OLD
+    /// buggy behavior return the SAME exit code 1 (matching `cc`'s own
+    /// non-success exit handling), so only the actual STDERR TEXT
+    /// distinguishes a clean pre-check refusal from a leaked linker error;
+    /// an in-process call has no way to capture `eprintln!` output.
+    #[test]
+    fn native_reports_a_clean_error_when_the_output_path_is_an_existing_directory() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-native-odir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fun main() uses io {\n    print(\"hi\")\n}\n";
+        let source_path = dir.join("app.kupl");
+        std::fs::write(&source_path, src).unwrap();
+        let out_dir = dir.join("some_dir");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(["native", source_path.to_str().unwrap(), "-o", out_dir.to_str().unwrap()])
+            .output()
+            .expect("kupl runs");
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot write") && stderr.contains("Is a directory"),
+            "must report the SAME clean message build/bundle already give for this mistake: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("ld:") && !stderr.contains("clang:") && !stderr.contains("linker command failed"),
+            "must never leak cc/the linker's own raw error text: {stderr:?}"
+        );
+        assert!(out_dir.is_dir(), "the pre-existing directory must be completely untouched");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
