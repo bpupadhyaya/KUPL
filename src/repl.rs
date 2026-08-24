@@ -282,16 +282,37 @@ pub fn repl() -> i32 {
 /// one. No wire pruning is needed here: see `upgrade_instances`'s own doc
 /// comment for why a wire inside a removed subtree can only ever reference
 /// another instance in that SAME subtree, never one outside it.
-fn stop_and_disarm_subtree(interp: &mut crate::interp::Interp, cid: usize) {
-    let _ = interp.run_lifecycle(cid, &crate::ast::Trigger::Stop);
+///
+/// Production-hardening 1225: a REAL, LIVE-CONFIRMED bug found+fixed --
+/// `run_lifecycle`'s own `Result` used to be discarded via `let _ = ...`,
+/// silently swallowing ANY genuine KUPL panic in a removed child's `on
+/// stop` handler, with ZERO diagnostic at all -- not even an `eprintln!`
+/// (worse than the PR-it1221/1222/1223 `concurrent`-component class this
+/// mirrors, which at least printed something before those fixes). Live-
+/// confirmed before this fix: a `Child` component with `on stop {
+/// panic("boom on removal") }`, removed from its parent's declaration and
+/// then `:upgrade`d, printed `upgraded 1 instance(s) of ...` -- reporting
+/// SUCCESS -- with no trace of the panic anywhere. Inconsistent with this
+/// same function's OWN sibling error paths in `upgrade_instances` (a
+/// failed new-child construction, a missing env value, an unresolvable
+/// wire target all correctly abort the whole `:upgrade` with a clear
+/// error message via `?`) -- only this ONE path silently swallowed its
+/// own failure. Now returns `Result<(), String>` and propagates a genuine
+/// panic as a formatted error, matching that established convention
+/// exactly; the caller's own `?` (below) does the rest.
+fn stop_and_disarm_subtree(interp: &mut crate::interp::Interp, cid: usize) -> Result<(), String> {
+    if let Err(Flow::Panic { msg, .. }) = interp.run_lifecycle(cid, &crate::ast::Trigger::Stop) {
+        return Err(format!("removing a child failed: on stop panicked: {msg}"));
+    }
     interp.instances[cid].unwrap_local_mut().timers.clear();
     let comp = interp.instances[cid].unwrap_local_mut().comp.clone();
     let env = interp.instances[cid].unwrap_local_mut().env.clone();
     for child in &comp.children {
         if let Some(Value::Component(sub_cid)) = env.get(&child.name) {
-            stop_and_disarm_subtree(interp, sub_cid);
+            stop_and_disarm_subtree(interp, sub_cid)?;
         }
     }
+    Ok(())
 }
 
 /// it128: the user-provided migration-hook mechanism for a field whose
@@ -595,7 +616,7 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
         // pruning is needed below the top level.
         for (name, _) in old_child_map.iter().filter(|(n, _)| !new_child_map.contains_key(n.as_str())) {
             if let Some(Value::Component(cid)) = old_env.get(name) {
-                stop_and_disarm_subtree(interp, cid);
+                stop_and_disarm_subtree(interp, cid)?;
             }
         }
         // any wire (from a STILL-LIVE source -- one that's kept or newly
@@ -1160,6 +1181,30 @@ mod tests {
             Some(crate::value::Value::Bool(true)),
             "the removed child's own `on stop` handler must have fired"
         );
+    }
+
+    /// Production-hardening 1225: a REAL, LIVE-CONFIRMED bug found+fixed --
+    /// a removed child's `on stop` panic used to be silently discarded
+    /// (`let _ = interp.run_lifecycle(...)`), with `:upgrade` reporting
+    /// SUCCESS (`Ok(1)`) as if nothing happened. Live-confirmed via `kupl
+    /// repl` piped input before this fix (no error printed at all, "upgraded
+    /// 1 instance(s)" reported). Now `upgrade_instances` must itself return
+    /// `Err` with the panic's own message, matching every OTHER failure path
+    /// in this function (a failed new-child construction, an unresolvable
+    /// wire target).
+    #[test]
+    fn upgrade_surfaces_a_removed_childs_own_on_stop_panic_instead_of_reporting_success() {
+        let mut interp = interp_with_one_instance(
+            "component Leaf {\n    intent \"l\"\n    on stop {\n        panic(\"boom on removal\")\n    }\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n    let b = Leaf()\n}\n",
+            "Parent",
+        );
+        redefine(
+            &mut interp,
+            "component Leaf {\n    intent \"l\"\n    on stop {\n        panic(\"boom on removal\")\n    }\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n}\n",
+        );
+        let err = upgrade_instances(&mut interp, "Parent")
+            .expect_err("a removed child's own on-stop panic must fail the whole upgrade, not report success");
+        assert!(err.contains("boom on removal"), "{err}");
     }
 
     /// it119: a removed child's own armed timer must be disarmed -- an
