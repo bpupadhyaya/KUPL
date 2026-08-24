@@ -71,15 +71,25 @@ so this checklist doesn't contradict it. `1.0.0` stable is warranted once:
 
 - [ ] A hosted package registry exists (a live server at the default
       registry URL, a published index, at least a small set of real
-      third-party packages) — the client side has been ready for a while;
-      this is the single largest remaining gap.
-- [ ] The real-provider AI path (`anthropic`/`openai`/`ollama`) has been
-      hardened against real network conditions (timeouts, retries, rate
-      limits, partial responses), not just mock-tested.
-- [ ] The concurrency story beyond `par_map`/`par_filter` (the structured
-      `par { }` block, `par_each`, component handler dispatch) has a
-      documented, deliberate design — not necessarily multi-threaded by
-      default, but no longer "later, semantics-preserving step, TBD."
+      third-party packages). The CLIENT side, and now self-hosting a v1
+      registry (`kupl pkg publish` + any static file host + a project's own
+      `[registry] url` override — it140), are both fully ready; what
+      remains is external hosting/operational infrastructure at the
+      DEFAULT registry URL specifically, not more code.
+- [x] The real-provider AI path (`anthropic`/`openai`/`ollama`) has been
+      hardened against real network conditions — retries transient
+      failures (network errors, HTTP 429/500/502/503/504) with exponential
+      backoff on BOTH interp/vm (`ai.rs`) and native (`cgen.rs`), it139.
+      Still only lightly battle-tested (verified against a local mock HTTP
+      server, not a live provider).
+- [x] The concurrency story beyond `par_map`/`par_filter` has a real,
+      documented, deliberate design AND implementation, not just a design:
+      `concurrent component` (it132-it138, `docs/design/ASYNC.md` §8) gets
+      a real dedicated OS thread, blocking `expose` calls, and non-blocking
+      wire delivery — deliberately still opt-in, not multi-threaded by
+      default, with named remaining gaps (wire-source direction, `example`/
+      `:upgrade` support, an M:N scheduler for the ordinary `par { }`/
+      `par_each`/component-dispatch path) rather than "TBD."
 - [ ] The project has run in a real, non-toy production workload for a
       meaningful period without a correctness regression.
 

@@ -12,7 +12,19 @@
 //! math  = { path = "../math" }        # inline table
 //! util  = "vendor/util"                # bare-string shorthand (a path)
 //! json2 = { version = "1.2.0" }        # registry (resolved later)
+//!
+//! [registry]
+//! url = "https://my-self-hosted-registry.example.com"   # optional
 //! ```
+//!
+//! `[registry] url` overrides `registry::DEFAULT_REGISTRY_URL` for THIS
+//! project's `kupl pkg fetch` only — deliberately a manifest field, not a
+//! `--registry` CLI flag or environment variable (`registry.rs`'s own doc
+//! comment explains why those are rejected: a silently-injectable
+//! per-invocation override is a supply-chain risk). A manifest field is
+//! committed to source control and reviewed like any other code change, not
+//! swappable by a compromised CI variable — the same trust boundary
+//! `[dependencies]` itself already sits behind.
 
 /// A single dependency declaration.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +41,8 @@ pub struct Manifest {
     pub version: String,
     pub entry: String,
     pub deps: Vec<Dep>,
+    /// `[registry] url`, if declared — see the module doc comment above.
+    pub registry_url: Option<String>,
 }
 
 /// Parse manifest text. Unknown `[project]` keys are ignored; a syntactically
@@ -38,11 +52,14 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     let mut version = String::new();
     let mut entry = "main.kupl".to_string();
     let mut deps: Vec<Dep> = Vec::new();
+    let mut registry_url: Option<String> = None;
     let mut section = "";
     let mut seen_project = false;
+    let mut seen_registry = false;
     let mut seen_name = false;
     let mut seen_version = false;
     let mut seen_entry = false;
+    let mut seen_registry_url = false;
 
     for (i, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
@@ -74,6 +91,17 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                     "project"
                 }
                 "dependencies" => "dependencies",
+                // Same "duplicate section" defense `[project]` above already
+                // has (PR-it784) — a second `[registry]` block silently
+                // last-wins would be the identical class of copy-paste
+                // manifest mistake.
+                "registry" if seen_registry => {
+                    return Err(format!("line {}: duplicate `[registry]` section", i + 1));
+                }
+                "registry" => {
+                    seen_registry = true;
+                    "registry"
+                }
                 other => return Err(format!("line {}: unknown section `[{other}]`", i + 1)),
             };
             continue;
@@ -214,11 +242,29 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                 }
                 deps.push(dep);
             }
+            "registry" => match key {
+                "url" if seen_registry_url => {
+                    return Err(format!("line {}: duplicate key `url` in [registry]", i + 1));
+                }
+                "url" => {
+                    seen_registry_url = true;
+                    let s = parse_string(value)
+                        .ok_or_else(|| format!("line {}: expected a string", i + 1))?;
+                    if !crate::registry::is_safe_registry_url(&s) {
+                        return Err(format!(
+                            "line {}: [registry] url must be an http:// or https:// url, got `{s}`",
+                            i + 1
+                        ));
+                    }
+                    registry_url = Some(s);
+                }
+                _ => {} // forward-compatible: ignore unknown registry keys
+            },
             "" => return Err(format!("line {}: key `{key}` before any `[section]`", i + 1)),
             _ => {}
         }
     }
-    Ok(Manifest { name, version, entry, deps })
+    Ok(Manifest { name, version, entry, deps, registry_url })
 }
 
 /// Read and parse a `kupl.toml` at `path`.
@@ -484,6 +530,51 @@ mod tests {
         assert_eq!(m.deps[0], Dep { name: "math".into(), path: Some("../math".into()), version: None });
         assert_eq!(m.deps[1], Dep { name: "util".into(), path: Some("vendor/util".into()), version: None });
         assert_eq!(m.deps[2], Dep { name: "web".into(), path: None, version: Some("1.2.0".into()) });
+        assert_eq!(m.registry_url, None, "a manifest with no [registry] section has no override");
+    }
+
+    #[test]
+    fn registry_url_is_parsed_when_declared() {
+        let m = parse(
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [registry]\nurl = \"https://my-registry.example.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.registry_url, Some("https://my-registry.example.com".to_string()));
+    }
+
+    #[test]
+    fn registry_url_rejects_a_non_http_scheme() {
+        let err = parse("[project]\nname = \"app\"\n\n[registry]\nurl = \"file:///etc/passwd\"\n").unwrap_err();
+        assert!(err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn registry_section_rejects_a_duplicate_section_and_a_duplicate_url_key() {
+        let dup_section = parse(
+            "[project]\nname = \"app\"\n\n\
+             [registry]\nurl = \"https://a.example.com\"\n\n\
+             [registry]\nurl = \"https://b.example.com\"\n",
+        )
+        .unwrap_err();
+        assert!(dup_section.contains("duplicate") && dup_section.contains("registry"), "{dup_section}");
+
+        let dup_key = parse(
+            "[project]\nname = \"app\"\n\n\
+             [registry]\nurl = \"https://a.example.com\"\nurl = \"https://b.example.com\"\n",
+        )
+        .unwrap_err();
+        assert!(dup_key.contains("duplicate") && dup_key.contains("url"), "{dup_key}");
+    }
+
+    #[test]
+    fn registry_section_ignores_unknown_keys_forward_compatibly() {
+        let m = parse(
+            "[project]\nname = \"app\"\n\n\
+             [registry]\nurl = \"https://a.example.com\"\nfuture_field = \"whatever\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.registry_url, Some("https://a.example.com".to_string()));
     }
 
     /// A REAL bug found+fixed (production-hardening PR-it919, an Explore

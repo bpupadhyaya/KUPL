@@ -968,7 +968,12 @@ pub fn pkg_lock(path: &str) -> i32 {
 /// dependencies as unresolved (production-hardening PR-it625) — this is
 /// the first subcommand that actually RESOLVES them.
 pub fn pkg_fetch(path: &str) -> i32 {
-    pkg_fetch_with(path, crate::registry::DEFAULT_REGISTRY_URL, &crate::registry::cache_dir(), crate::registry::fetch_package)
+    // `[registry] url` (manifest.rs) lets a project point at a self-hosted
+    // registry instead of `DEFAULT_REGISTRY_URL` — see `kupl pkg publish`
+    // (`registry::publish_package`) for the generator that produces one.
+    let registry_url =
+        crate::loader::project_registry_url(path).unwrap_or_else(|| crate::registry::DEFAULT_REGISTRY_URL.to_string());
+    pkg_fetch_with(path, &registry_url, &crate::registry::cache_dir(), crate::registry::fetch_package)
 }
 
 /// `pkg_fetch`, but the registry URL, cache directory, and fetch
@@ -1018,6 +1023,88 @@ fn pkg_fetch_with(
         0
     } else {
         1
+    }
+}
+
+/// `kupl pkg publish <project-dir> --base-url <url> [-o <output-dir>]` —
+/// generate a static registry index + file tree for the project at
+/// `<project-dir>` (which must contain a `kupl.toml`), ready to be served
+/// by any static file host at `--base-url`. See `registry::publish_package`
+/// for the actual generator; this is just its CLI argument parsing,
+/// following the SAME "reject a missing/duplicate flag value cleanly"
+/// discipline `build_module`'s own `-o` handling (`main.rs`) already
+/// established, rather than reusing `find_path_arg` (which only ever
+/// returns a single bare path, not multiple named flags).
+pub fn pkg_publish(args: &[String]) -> i32 {
+    let mut path: Option<&str> = None;
+    let mut base_url: Option<&str> = None;
+    let mut out_dir: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--base-url" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: --base-url requires a value");
+                    return 2;
+                };
+                if base_url.is_some() {
+                    eprintln!("error: --base-url specified more than once");
+                    return 2;
+                }
+                base_url = Some(v);
+                i += 2;
+            }
+            "-o" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: -o requires a value");
+                    return 2;
+                };
+                if out_dir.is_some() {
+                    eprintln!("error: -o specified more than once");
+                    return 2;
+                }
+                out_dir = Some(v);
+                i += 2;
+            }
+            _ if a.starts_with('-') && a.len() > 1 => {
+                eprintln!("error: unknown flag `{a}`");
+                return 2;
+            }
+            _ => {
+                if path.is_some() {
+                    eprintln!("error: unexpected extra argument `{a}`");
+                    return 2;
+                }
+                path = Some(a);
+                i += 1;
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("error: missing <project-dir> argument");
+        return 2;
+    };
+    let Some(base_url) = base_url else {
+        eprintln!("error: --base-url is required");
+        return 2;
+    };
+    let out_dir = out_dir.unwrap_or("registry-out");
+    match crate::registry::publish_package(std::path::Path::new(path), base_url, std::path::Path::new(out_dir)) {
+        Ok(s) => {
+            println!(
+                "published {} @ {} ({} files) -> {}",
+                s.name,
+                s.version,
+                s.file_count,
+                s.index_path.display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
     }
 }
 

@@ -203,14 +203,19 @@ contract* — pick the engine and idiom that fit the workload:
 
 Being honest about what is not yet production-grade:
 
-- **No hosted package registry yet.** `kupl.toml` has a real dependency manager
-  (`[dependencies]`, `kupl pkg tree`/`lock`/`fetch`, hash-verified atomic fetches) and
-  local **path** dependencies (qualified access, version pinning, locking) work today
-  — but there is no live server at the default registry URL, no published library
-  index, and no third-party packages yet: a version-pinned (non-path) dependency
-  fails with a clean network error until a registry is hosted. Programs use the
-  (substantial, zero-dependency) standard library, local multi-file modules, and
-  local path dependencies.
+- **No live server at the DEFAULT registry URL yet — but self-hosting one is now
+  fully supported.** `kupl.toml` has a real dependency manager (`[dependencies]`,
+  `kupl pkg tree`/`lock`/`fetch`, hash-verified atomic fetches) and local **path**
+  dependencies (qualified access, version pinning, locking) work today, fully
+  standalone, no registry needed at all. A v1 registry is pure static `GET`s (no
+  dynamic server logic), so `kupl pkg publish` generates a compliant index + file
+  tree that **any** static file host (nginx, S3, GitHub Pages, `python3 -m
+  http.server`) can serve — a project then points at it via its own `kupl.toml`
+  `[registry] url = "..."` (deliberately a manifest field, reviewed like any other
+  code change, not a silently-injectable `--registry` flag or env var). What's
+  still genuinely missing is a live server at `registry::DEFAULT_REGISTRY_URL`
+  itself and a published third-party package index — external hosting/operational
+  commitments outside what a coding session alone can deliver, not a code gap.
 - **The real-provider AI path is now retry-hardened, but still only lightly
   battle-tested.** The `anthropic`, `openai`, and `ollama` providers share one
   `http_post` (`ai.rs`) with a 120s per-attempt timeout and a 10MiB response cap; it

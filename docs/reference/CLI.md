@@ -187,6 +187,12 @@ entry = "main.kupl"
 # depend on another local KUPL package by path (resolved relative to this file)
 math = { path = "../math" }
 util = "vendor/util"          # bare-string shorthand for a path
+json2 = { version = "1.2.0" } # registry (resolved via `kupl pkg fetch`)
+
+[registry]
+# optional: point THIS project's `kupl pkg fetch` at a self-hosted registry
+# instead of registry::DEFAULT_REGISTRY_URL (see `kupl pkg publish` below)
+url = "https://my-self-hosted-registry.example.com"
 ```
 
 A `use <dep>` in your code makes that dependency package available; access its
@@ -196,10 +202,12 @@ dependencies can define the same name without colliding. `use <dep>.sub`
 reaches a subfile within the dependency. A missing dependency path is reported
 as **K0400** at the `use` site. A dependency may pin an exact `version` (as
 above); if it doesn't match the dependency's own `kupl.toml` version, that is
-**K0401**. `kupl pkg lock` records a `kupl.lock` for reproducibility. Registry
-fetch (version-only dependencies) needs a hosted registry and is future work;
-local path dependencies with qualified access, version pinning, and locking
-work today.
+**K0401**. `kupl pkg lock` records a `kupl.lock` for reproducibility. `kupl
+pkg publish`/`[registry] url` (below) let anyone self-host a registry today;
+no live server is deployed at the DEFAULT registry URL yet, so a version-only
+dependency with no `[registry] url` override still fails with a clean network
+error until one is. Local path dependencies with qualified access, version
+pinning, and locking work fully standalone, no registry needed.
 
 ### `kupl pkg tree <file.kupl>`
 Prints the project's resolved dependency graph (`name @ version  (path)`),
@@ -215,13 +223,31 @@ Downloads every **registry-only** dependency (a `version`-pinned entry with no
 local `path =`) into the local cache (`~/.kupl/registry-cache/<name>/<version>/`):
 fetches the index at `{registry_url}/<name>.json`, resolves the pinned
 version, downloads every file it lists, and verifies each one's hash before
-writing anything to disk. A per-dependency failure is reported and fetching
-continues with the rest (not aborted early); the exit code reflects whether
-*any* dependency failed. v1 always re-fetches and re-verifies — there is no
-cache-skip, even if the version is already materialized. No live registry is
-deployed at the default URL yet, so fetching a real registry-only dependency
-currently fails with a clean network error, exactly like any other
-unreachable host, until one is hosted.
+writing anything to disk. `registry_url` is the project's own `[registry]
+url` (`kupl.toml`) if it declares one, else `registry::DEFAULT_REGISTRY_URL`.
+A per-dependency failure is reported and fetching continues with the rest
+(not aborted early); the exit code reflects whether *any* dependency failed.
+v1 always re-fetches and re-verifies — there is no cache-skip, even if the
+version is already materialized. No live registry is deployed at the default
+URL yet, so fetching a real registry-only dependency without a `[registry]
+url` override currently fails with a clean network error, exactly like any
+other unreachable host, until one is hosted at that address.
+
+### `kupl pkg publish <project-dir> --base-url <url> [-o <output-dir>]`
+Generates a static registry index + file tree for the package at
+`<project-dir>` (must contain a `kupl.toml` with `name`/`version`/`entry`),
+ready to be served by **any** static file host — nginx, S3, GitHub Pages,
+`python3 -m http.server`, etc. — at `<url>`. A v1 registry is pure static
+`GET`s (no dynamic server logic, no publish/auth endpoint on the consumer
+side), so "deployable server code" for it is this generator, not a bespoke
+server binary. Writes `<output-dir>/<name>.json` (the index) and
+`<output-dir>/<name>/<version>/<relative-path>` for every collected file, at
+the exact layout the index's own URLs point to — serving `<output-dir>` as
+static files at `<url>` works with zero extra configuration. Collects every
+`kupl.toml`/`*.kupl` file under `<project-dir>`, but does not descend into a
+subdirectory that has its own `kupl.toml` (a vendored/local dependency, not
+part of this package). Defaults `-o` to `./registry-out`. Point a consumer
+project's own `kupl.toml` at the result via `[registry] url = "<url>"`.
 
 ### `kupl version`
 Prints the toolchain version.

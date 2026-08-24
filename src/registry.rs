@@ -362,7 +362,7 @@ pub(crate) fn is_safe_relative_path_single_component(path: &str) -> bool {
 /// this parse-time function can't safely perform), only the FAR simpler
 /// and more clearly wrong-in-EVERY-case "not http(s) at all" scheme class
 /// -- `file://` and any other non-network scheme.
-fn is_safe_registry_url(url: &str) -> bool {
+pub(crate) fn is_safe_registry_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
@@ -471,6 +471,153 @@ pub fn materialize(
     atomic_replace(&staging, cache_dir).map_err(|e| {
         let _ = std::fs::remove_dir_all(&staging);
         format!("cannot finalize {}: {e}", cache_dir.display())
+    })
+}
+
+/// Result of one `publish_package` call — everything the `kupl pkg publish`
+/// CLI wrapper (`run.rs::pkg_publish`) needs to print a summary.
+#[derive(Debug)]
+pub struct PublishSummary {
+    pub name: String,
+    pub version: String,
+    pub file_count: usize,
+    pub index_path: std::path::PathBuf,
+}
+
+/// Recursively collect every `kupl.toml`/`*.kupl` file under `dir` into
+/// `out`. Does NOT descend into a subdirectory that has its OWN
+/// `kupl.toml` — that marks a vendored/nested project (e.g. a `{ path =
+/// ".." }` dependency copied inside this package's own directory), whose
+/// files should not be silently folded into THIS package's published
+/// index. Skips dotfiles/dot-directories (`.git`, etc.) for the same
+/// reason every other file-walking tool does. `dir` itself is walked too,
+/// so its own top-level `kupl.toml` is always included regardless of this
+/// rule (the rule only ever applies to a NESTED directory's manifest).
+fn collect_kupl_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            if path.join("kupl.toml").is_file() {
+                continue;
+            }
+            collect_kupl_files(&path, out)?;
+        } else if name == "kupl.toml" || name.ends_with(".kupl") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Generate a static registry index + file tree for ONE package version,
+/// ready to be served by ANY static file host (nginx, S3, GitHub Pages,
+/// `python3 -m http.server`, ...) at `base_url` — a v1 registry (this
+/// module's own doc comment) is pure static `GET`s, no dynamic server
+/// logic anywhere, so "deployable server code" for it is a GENERATOR, not
+/// a bespoke server binary. Closes the "no hosted package registry"
+/// production-readiness gap for anyone willing to run their own static
+/// host, independent of whether `DEFAULT_REGISTRY_URL` itself is ever
+/// live — `kupl.toml`'s own `[registry] url = "..."` override (see
+/// `manifest.rs`) is how a project points `kupl pkg fetch` at a
+/// self-hosted one instead.
+///
+/// Reads `dir/kupl.toml` for `name`/`version`/`entry`, collects every
+/// `kupl.toml`/`.kupl` file under `dir` (`collect_kupl_files`, above),
+/// hashes each with `sha256_hex`, and writes:
+/// - `{out_dir}/{name}.json` — the index, in this module's own documented
+///   shape (see the module doc comment at the top of this file)
+/// - `{out_dir}/{name}/{version}/{relative_path}` — every file's bytes, at
+///   the SAME relative layout the index's own `url` fields point to
+///   (`{base_url}/{name}/{version}/{relative_path}`) — so serving
+///   `out_dir` itself as static files at `base_url` works with zero extra
+///   configuration; no separate "upload step" or manifest translation.
+pub fn publish_package(
+    dir: &std::path::Path,
+    base_url: &str,
+    out_dir: &std::path::Path,
+) -> Result<PublishSummary, String> {
+    if !is_safe_registry_url(base_url) {
+        return Err(format!("--base-url must be an http:// or https:// url, got `{base_url}`"));
+    }
+    let manifest_path = dir.join("kupl.toml");
+    let m = crate::manifest::read(&manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+    if m.version.is_empty() {
+        return Err(format!(
+            "{}: [project] is missing `version` (required to publish a registry package)",
+            manifest_path.display()
+        ));
+    }
+    let mut file_paths = Vec::new();
+    collect_kupl_files(dir, &mut file_paths)?;
+    if file_paths.is_empty() {
+        return Err(format!("{}: no kupl.toml/.kupl files found to publish", dir.display()));
+    }
+    let mut rel_and_content: Vec<(String, String)> = Vec::new();
+    for path in &file_paths {
+        let rel = path
+            .strip_prefix(dir)
+            .map_err(|_| format!("internal error: {} is not under {}", path.display(), dir.display()))?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if !is_safe_relative_path(&rel) {
+            return Err(format!("cannot publish `{rel}`: not a safe relative path"));
+        }
+        let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        rel_and_content.push((rel, content));
+    }
+    rel_and_content.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic index output
+    if !rel_and_content.iter().any(|(rel, _)| *rel == m.entry) {
+        return Err(format!(
+            "{}: entry `{}` was not found among the collected files",
+            manifest_path.display(),
+            m.entry
+        ));
+    }
+    let base = base_url.trim_end_matches('/');
+    let mut files_json = String::new();
+    for (i, (rel, content)) in rel_and_content.iter().enumerate() {
+        let hash = crate::encoding::sha256_hex(content);
+        let url = format!("{base}/{}/{}/{rel}", m.name, m.version);
+        if i > 0 {
+            files_json.push(',');
+        }
+        files_json.push_str(&format!(
+            "\"{}\":{{\"url\":\"{}\",\"hash\":\"{hash}\"}}",
+            crate::diag::json_escape(rel),
+            crate::diag::json_escape(&url),
+        ));
+    }
+    let index_json = format!(
+        "{{\"name\":\"{}\",\"versions\":{{\"{}\":{{\"entry\":\"{}\",\"files\":{{{files_json}}}}}}}}}",
+        crate::diag::json_escape(&m.name),
+        crate::diag::json_escape(&m.version),
+        crate::diag::json_escape(&m.entry),
+    );
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
+    let index_path = out_dir.join(format!("{}.json", m.name));
+    std::fs::write(&index_path, &index_json).map_err(|e| format!("cannot write {}: {e}", index_path.display()))?;
+    let version_dir = out_dir.join(&m.name).join(&m.version);
+    for (rel, content) in &rel_and_content {
+        let dest = version_dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&dest, content).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+    }
+    Ok(PublishSummary {
+        name: m.name,
+        version: m.version,
+        file_count: rel_and_content.len(),
+        index_path,
     })
 }
 
@@ -2008,6 +2155,117 @@ mod tests {
              overwrite one file's verified content with another's on disk: {result:?}"
         );
         assert!(!dir.exists(), "nothing should be written to disk on rejection: {result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_pkg(dir: &std::path::Path, toml: &str, files: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("kupl.toml"), toml).unwrap();
+        for (name, content) in files {
+            let p = dir.join(name);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, content).unwrap();
+        }
+    }
+
+    /// The full round trip: `publish_package` generates a static index +
+    /// file tree that `parse_index`/`materialize` (the CONSUMER side) can
+    /// read straight back, with every hash verifying — proving the
+    /// generator and the client agree on the exact same wire shape without
+    /// a live network hop in between.
+    #[test]
+    fn publish_package_generates_an_index_and_files_the_client_side_can_parse_and_materialize() {
+        let dir = std::env::temp_dir().join(format!("kupl-registry-publish-happy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_pkg(
+            &dir.join("src"),
+            "[project]\nname = \"json2\"\nversion = \"1.2.0\"\nentry = \"main.kupl\"\n",
+            &[("main.kupl", "pub fun f() -> Int { 1 }\n")],
+        );
+        let out = dir.join("out");
+        let summary = publish_package(&dir.join("src"), "https://example.com/reg", &out).unwrap();
+        assert_eq!(summary.name, "json2");
+        assert_eq!(summary.version, "1.2.0");
+        assert_eq!(summary.file_count, 2); // kupl.toml + main.kupl
+        assert!(summary.index_path.ends_with("json2.json"));
+
+        let index_text = std::fs::read_to_string(&summary.index_path).unwrap();
+        let index = parse_index(&index_text).expect("publish_package's own output must parse cleanly");
+        assert_eq!(index.name, "json2");
+        let version = resolve_version(&index, "1.2.0").unwrap();
+        assert_eq!(version.entry, "main.kupl");
+        assert_eq!(version.files.len(), 2);
+        let main_file = &version.files["main.kupl"];
+        assert_eq!(main_file.url, "https://example.com/reg/json2/1.2.0/main.kupl");
+
+        // Every declared URL must resolve, on disk, under `out` -- prove it
+        // by reading the file `publish_package` actually wrote at that
+        // relative layout and re-verifying its hash against the index.
+        let mut contents = HashMap::new();
+        for (path, file) in &version.files {
+            let rel = file.url.strip_prefix("https://example.com/reg/").unwrap();
+            let bytes = std::fs::read_to_string(out.join(rel)).unwrap();
+            verify_hash(&bytes, &file.hash).expect("published file content must match its own declared hash");
+            contents.insert(path.clone(), bytes);
+        }
+        let cache_dir = dir.join("materialized");
+        materialize(version, &contents, &cache_dir).expect("a freshly published package must materialize cleanly");
+        assert_eq!(std::fs::read_to_string(cache_dir.join("main.kupl")).unwrap(), "pub fun f() -> Int { 1 }\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A nested directory with its OWN `kupl.toml` (a vendored/local-path
+    /// dependency copied inside the package's own directory) must NOT have
+    /// its files folded into the published index — only the outer
+    /// package's own files.
+    #[test]
+    fn publish_package_does_not_descend_into_a_nested_project() {
+        let dir = std::env::temp_dir().join(format!("kupl-registry-publish-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_pkg(
+            &dir,
+            "[project]\nname = \"outer\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n",
+            &[("main.kupl", "pub fun f() -> Int { 1 }\n")],
+        );
+        write_pkg(
+            &dir.join("vendor").join("inner"),
+            "[project]\nname = \"inner\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n",
+            &[("main.kupl", "pub fun g() -> Int { 2 }\n")],
+        );
+        let out = dir.join("out");
+        let summary = publish_package(&dir, "https://example.com", &out).unwrap();
+        assert_eq!(summary.name, "outer");
+        assert_eq!(summary.file_count, 2, "the nested `inner` project's files must not be swept in");
+        let index_text = std::fs::read_to_string(&summary.index_path).unwrap();
+        assert!(!index_text.contains("inner"), "the nested package's name must never appear: {index_text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publish_package_rejects_an_unsafe_base_url() {
+        let dir = std::env::temp_dir().join(format!("kupl-registry-publish-unsafe-url-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_pkg(
+            &dir,
+            "[project]\nname = \"x\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n",
+            &[("main.kupl", "pub fun f() -> Int { 1 }\n")],
+        );
+        let err = publish_package(&dir, "file:///etc", &dir.join("out")).unwrap_err();
+        assert!(err.contains("http"), "{err}");
+        assert!(!dir.join("out").exists(), "nothing should be written on a rejected base url: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publish_package_requires_a_version_in_the_manifest() {
+        let dir = std::env::temp_dir().join(format!("kupl-registry-publish-no-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_pkg(&dir, "[project]\nname = \"x\"\nentry = \"main.kupl\"\n", &[("main.kupl", "fun f() {}\n")]);
+        let err = publish_package(&dir, "https://example.com", &dir.join("out")).unwrap_err();
+        assert!(err.contains("version"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

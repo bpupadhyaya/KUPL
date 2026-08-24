@@ -346,8 +346,13 @@ fn run_cli() -> ExitCode {
                     2
                 }
             },
+            // `publish` takes multiple named flags (`--base-url`, `-o`), not
+            // a single bare path -- routed to its own arg parser
+            // (`run::pkg_publish`) rather than `find_path_arg`, which only
+            // ever returns one positional.
+            Some("publish") => run::pkg_publish(&args[2..]),
             _ => {
-                eprintln!("usage: kupl pkg <tree|lock|fetch> <file.kupl>");
+                eprintln!("usage: kupl pkg <tree|lock|fetch> <file.kupl>  |  kupl pkg publish <project-dir> --base-url <url> [-o <output-dir>]");
                 2
             }
         },
@@ -2260,6 +2265,51 @@ mod tests {
         // no path at all -- a clean usage error, not a panic.
         let missing = run(&["pkg", "tree"]);
         assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CLI-level coverage for `kupl pkg publish`'s own arg parsing (the
+    /// generator logic itself is unit-tested directly in
+    /// `registry::publish_package`'s own tests) -- missing `--base-url`,
+    /// missing the project-dir positional, a duplicate flag, and the
+    /// success path producing a real index file on disk.
+    #[test]
+    fn pkg_publish_parses_flags_and_writes_a_real_index() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-pkg-publish-cli-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"pub1\"\nversion = \"1.0.0\"\nentry = \"main.kupl\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "pub fun f() -> Int { 1 }\n").unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).current_dir(&dir).args(args).output().expect("kupl runs")
+        };
+
+        let missing_url = run(&["pkg", "publish", "."]);
+        assert_eq!(missing_url.status.code(), Some(2), "{missing_url:?}");
+        assert!(String::from_utf8_lossy(&missing_url.stderr).contains("--base-url"), "{missing_url:?}");
+
+        let missing_path = run(&["pkg", "publish", "--base-url", "https://example.com"]);
+        assert_eq!(missing_path.status.code(), Some(2), "{missing_path:?}");
+
+        let dup_flag =
+            run(&["pkg", "publish", ".", "--base-url", "https://a.example.com", "--base-url", "https://b.example.com"]);
+        assert_eq!(dup_flag.status.code(), Some(2), "{dup_flag:?}");
+        assert!(String::from_utf8_lossy(&dup_flag.stderr).contains("more than once"), "{dup_flag:?}");
+
+        let ok = run(&["pkg", "publish", ".", "--base-url", "https://example.com/reg", "-o", "out"]);
+        assert_eq!(ok.status.code(), Some(0), "{ok:?}");
+        assert!(String::from_utf8_lossy(&ok.stdout).contains("pub1 @ 1.0.0"), "{ok:?}");
+        let index = std::fs::read_to_string(dir.join("out").join("pub1.json")).expect("index must be written");
+        assert!(index.contains("https://example.com/reg/pub1/1.0.0/main.kupl"), "{index}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -42,6 +42,11 @@ struct PkgCtx {
     /// resolution, `pkg tree`/`pkg lock`, ordinary loading).
     all_registry: HashMap<String, String>,
     prefix: String,
+    /// The enclosing `kupl.toml`'s own `[registry] url`, if it declared one —
+    /// see `manifest.rs`'s module doc comment. `None` means "use
+    /// `registry::DEFAULT_REGISTRY_URL`", not "no manifest was found" (a
+    /// manifest with no `[registry]` section is the common case).
+    registry_url: Option<String>,
     /// Set when a `kupl.toml` was found but failed to parse — surfaced as a hard
     /// error rather than silently ignored (which would make the deps vanish).
     err: Option<String>,
@@ -207,6 +212,7 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
                         registry_only,
                         all_registry,
                         prefix: prefix.to_string(),
+                        registry_url: m.registry_url.clone(),
                         err: None,
                     });
                 }
@@ -219,6 +225,7 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
                         registry_only: HashMap::new(),
                         all_registry: HashMap::new(),
                         prefix: prefix.to_string(),
+                        registry_url: None,
                         err: Some(format!("invalid manifest {}: {e}", toml.display())),
                     });
                 }
@@ -232,8 +239,21 @@ fn pkg_ctx(dir: &Path, walk: bool, prefix: &str) -> Rc<PkgCtx> {
         registry_only: HashMap::new(),
         all_registry: HashMap::new(),
         prefix: prefix.to_string(),
+        registry_url: None,
         err: None,
     })
+}
+
+/// The enclosing project's `[registry] url` override, if its `kupl.toml`
+/// declared one (see `manifest.rs`'s module doc comment) — `None` means
+/// "use `registry::DEFAULT_REGISTRY_URL`". Mirrors `all_registry_deps`'s own
+/// shape (walk up from `entry`'s directory, reuse the SAME `pkg_ctx` the
+/// dependency-resolution path already builds) so `kupl pkg fetch` and every
+/// OTHER manifest-derived decision agree on which `kupl.toml` is authoritative.
+pub fn project_registry_url(entry: &str) -> Option<String> {
+    let entry_path = PathBuf::from(entry);
+    let dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    pkg_ctx(&dir, true, "").registry_url.clone()
 }
 
 pub struct SourceFile {
@@ -1100,6 +1120,36 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn project_registry_url_finds_the_enclosing_manifests_override() {
+        let dir = std::env::temp_dir().join(format!("kupl-project-registry-url-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kupl.toml"),
+            "[project]\nname = \"app\"\nentry = \"main.kupl\"\n\n\
+             [registry]\nurl = \"https://self-hosted.example.com\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.kupl"), "fun main() {}\n").unwrap();
+        assert_eq!(
+            super::project_registry_url(dir.join("main.kupl").to_str().unwrap()),
+            Some("https://self-hosted.example.com".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_registry_url_is_none_without_a_registry_section() {
+        let dir = std::env::temp_dir().join(format!("kupl-project-registry-url-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kupl.toml"), "[project]\nname = \"app\"\nentry = \"main.kupl\"\n").unwrap();
+        std::fs::write(dir.join("main.kupl"), "fun main() {}\n").unwrap();
+        assert_eq!(super::project_registry_url(dir.join("main.kupl").to_str().unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening

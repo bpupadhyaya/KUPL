@@ -1364,6 +1364,74 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       needed beyond the existing per-build one — the mock path (which the
       sweep exercises) is untouched; the new retry logic only ever
       activates on the real-network path, which the sweep never reaches.
+- [x] **Package registry: a real, deployable generator + self-host override
+      (it140).** Closes "no hosted package registry" the other direction
+      from it139's AI fix: rather than deploying external infrastructure
+      (out of scope for a coding session — no domain/hosting authority over
+      `registry::DEFAULT_REGISTRY_URL`), this makes SELF-hosting a v1
+      registry fully real. `registry.rs`'s own module doc comment already
+      established that a v1 registry is pure static `GET`s — no publish/
+      auth endpoint, no dynamic server logic — so "deployable server code"
+      for it is a GENERATOR, not a bespoke server binary; literally any
+      static file host works. New `registry::publish_package` reads a
+      project's `kupl.toml`, collects every `kupl.toml`/`.kupl` file under
+      its directory (skipping a nested directory that has its OWN
+      `kupl.toml` — a vendored dependency, not this package's own files),
+      hashes each with the ALREADY-shared `sha256_hex`, and writes the
+      index (`{out}/{name}.json`) plus every file at
+      `{out}/{name}/{version}/{path}` — the SAME relative layout its own
+      generated `url` fields point to, so serving `{out}` at `--base-url`
+      needs zero extra configuration. Wired to `kupl pkg publish
+      <project-dir> --base-url <url> [-o <output-dir>]` (`run.rs::
+      pkg_publish`, dispatched from `main.rs`), with its own hand-rolled
+      flag parser (missing-value/duplicate-flag rejection, mirroring
+      `build_module`'s established `-o` discipline) rather than reusing
+      `find_path_arg`, which only ever returns one bare positional.
+      A generator alone wasn't enough, though: `DEFAULT_REGISTRY_URL` is a
+      single hardcoded constant with NO override anywhere (deliberately,
+      per `registry.rs`'s own doc comment — a silently-injectable
+      `--registry`/env var is a supply-chain risk), so nothing could ever
+      point `kupl pkg fetch` at a self-published registry. Closed the loop
+      with a NEW, narrowly-scoped override: `kupl.toml`'s own `[registry]
+      url = "..."` (`manifest.rs`, full duplicate-section/duplicate-key
+      detection matching `[project]`'s own established discipline, plus a
+      `registry::is_safe_registry_url` scheme check reused from the
+      consumer side) — committed to source control and code-reviewed like
+      any other change, the SAME trust boundary `[dependencies]` itself
+      already sits behind, not a per-invocation flag. `loader.rs::PkgCtx`
+      gained a `registry_url` field (populated the SAME walk-up-to-the-
+      enclosing-manifest way `all_registry_deps` already works) and a new
+      `project_registry_url` accessor; `run::pkg_fetch` now prefers it,
+      falling back to `DEFAULT_REGISTRY_URL` when absent — zero behavior
+      change for the overwhelming majority of projects that don't declare
+      `[registry]` at all. Verified end-to-end, live, not just via the
+      test suite: published a real package (`kupl pkg publish`), served
+      the output directory with `python3 -m http.server`, pointed a SEPARATE
+      consumer project's `[registry] url` at it, ran `kupl pkg fetch` (a
+      real HTTP fetch against a real local server, hash-verified), then
+      `kupl run` — printed the dependency's real function output correctly;
+      cleaned up the polluted `~/.kupl/registry-cache` entry the manual
+      test left behind afterward. New tests: `registry.rs` (the full
+      publish → parse_index → materialize round trip, the nested-project
+      skip, an unsafe `--base-url` rejection, a missing-`version` manifest
+      rejection), `manifest.rs` (parse/duplicate-section/duplicate-key/
+      unsafe-scheme/forward-compatible-unknown-key for `[registry]`),
+      `loader.rs` (`project_registry_url` found vs. absent), and a
+      `main.rs` CLI-level test spawning the real compiled binary
+      (missing `--base-url`, missing the path, a duplicate `--base-url`,
+      and the success path producing a real, readable index file on disk).
+      Verified: `cargo build`/`cargo build --tests` clean, zero warnings;
+      `cargo test --lib` green **twice**, 1730/1730 both times; `cargo
+      test --bin kupl` 68/68 (67 existing + 1 new); interp-vs-vm and
+      interp-vs-native sweeps both clean across 66/65 examples (this
+      iteration touches none of the four execution engines — package
+      resolution happens entirely before compilation begins — so this is
+      a confirming re-run, not new coverage). `docs/PRODUCTION.md`'s "no
+      hosted package registry" Known Limitation rewritten to describe
+      what's now true: self-hosting is fully real; only a LIVE server at
+      the default URL and a published third-party index remain genuinely
+      missing, and those are external hosting/operational commitments, not
+      a code gap `kupl pkg publish` could itself close.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into
