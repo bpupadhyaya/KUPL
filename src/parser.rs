@@ -1020,6 +1020,37 @@ impl Parser {
                         ))
                     }
                 };
+                // Optional restart strategy (concurrency-v2 PR-cv2-1,
+                // `docs/design/CONCURRENCY_V2.md` §4.1, Erlang-inspired):
+                // `one_for_all` / `rest_for_one`, e.g. `supervise child
+                // restart on_failure one_for_all`. Contextual, same
+                // convention as `restart`/`on_failure`/`never`/`max`/`in`
+                // above and below -- these are ordinary identifiers
+                // everywhere else, only meaningful in this exact
+                // position. Checked BEFORE the `max ... in ...` clause,
+                // so `supervise child restart on_failure one_for_all max
+                // 5 in 10s` parses left-to-right in the order it reads.
+                let strategy = if self.eat(&Tok::Ident("one_for_all".to_string())) {
+                    if policy != SupervisePolicy::RestartOnFailure {
+                        return Err(Diag::error(
+                            "K0124",
+                            "a restart strategy (`one_for_all`/`rest_for_one`) only applies to `restart on_failure`",
+                            self.prev_span(),
+                        ));
+                    }
+                    RestartStrategy::OneForAll
+                } else if self.eat(&Tok::Ident("rest_for_one".to_string())) {
+                    if policy != SupervisePolicy::RestartOnFailure {
+                        return Err(Diag::error(
+                            "K0124",
+                            "a restart strategy (`one_for_all`/`rest_for_one`) only applies to `restart on_failure`",
+                            self.prev_span(),
+                        ));
+                    }
+                    RestartStrategy::RestForOne
+                } else {
+                    RestartStrategy::OneForOne
+                };
                 // Optional restart-intensity limit (BEAM/Erlang-inspired
                 // `max_restarts`/`max_seconds`): `max <n> in <duration>`,
                 // e.g. `supervise child restart on_failure max 5 in 10s`.
@@ -1067,6 +1098,7 @@ impl Parser {
                     child,
                     policy,
                     max_restarts,
+                    strategy,
                     span: sspan.merge(self.prev_span()),
                 });
                 self.expect_terminator()

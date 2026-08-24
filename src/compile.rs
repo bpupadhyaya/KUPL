@@ -313,6 +313,41 @@ fn compile_component(shared: &mut Shared, c: &ComponentDecl) -> ComponentMeta {
             let in_port = fc.const_idx(Value::str(w.to.1.clone()), w.span);
             fc.emit(Op::WireOp { from, out_port, to, in_port }, w.span);
         }
+        // Concurrency-v2 PR-cv2-1 (`docs/design/CONCURRENCY_V2.md` §4.1):
+        // compile-time mirror of `interp.rs::wire_supervision_groups` --
+        // same one_for_all/rest_for_one group computation over the AST's
+        // own static `supervises`/`children` data, emitting one
+        // `Op::RestartGroupAdd` per (target, member) edge AFTER every
+        // child has been constructed above (mirrors the wires loop's own
+        // "children first, then edges between them" ordering).
+        for decl in &c.supervises {
+            if decl.policy != SupervisePolicy::RestartOnFailure
+                || decl.strategy == RestartStrategy::OneForOne
+            {
+                continue;
+            }
+            let this_pos = c.children.iter().position(|ch| ch.name == decl.child);
+            let group: Vec<&str> = c
+                .supervises
+                .iter()
+                .filter(|s| s.policy == SupervisePolicy::RestartOnFailure && s.child != decl.child)
+                .filter(|s| {
+                    decl.strategy == RestartStrategy::OneForAll || {
+                        let s_pos = c.children.iter().position(|ch| ch.name == s.child);
+                        matches!((this_pos, s_pos), (Some(a), Some(b)) if b > a)
+                    }
+                })
+                .map(|s| s.child.as_str())
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let target = fc.slot_reg(&decl.child, decl.span);
+            for member_name in group {
+                let member = fc.slot_reg(member_name, decl.span);
+                fc.emit(Op::RestartGroupAdd { target, member }, decl.span);
+            }
+        }
         let u = fc.const_reg(Value::Unit, c.span);
         fc.emit(Op::Ret(u), c.span);
         let chunk = fc.finish();

@@ -4240,6 +4240,140 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `supervise child restart on_failure one_for_all` (Concurrency-v2
+    /// PR-cv2-1, `docs/design/CONCURRENCY_V2.md` §4.1 -- Erlang/OTP-inspired
+    /// group restart strategies): when a supervised child panics, every
+    /// OTHER `restart_on_failure` sibling also restarts, not just the
+    /// panicking child. Drives three `Worker` children (a, b, c) plus a
+    /// `Driver` that fires a single zero-trigger at `a` on startup; each
+    /// `Worker.on start` resets its own `n` counter to 1 and emits it
+    /// unwired (so it prints), meaning a POST-restart `Worker.boots = 1`
+    /// line is only reachable by a REAL state-reset-and-restart, not a
+    /// stale stdout echo. Asserts interp/vm/native all restart EXACTLY 3
+    /// times (a, plus its two one_for_all group members) -- the same
+    /// three-engine byte-identical bar every other supervise feature in
+    /// this codebase is held to.
+    #[test]
+    fn supervise_one_for_all_restarts_every_sibling_not_just_the_panicking_child() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-supervise-one-for-all-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("one_for_all.kupl");
+        std::fs::write(
+            &file,
+            "component Worker {\n    intent \"Panics on a zero trigger.\"\n    in trigger: Int\n    out boots: Int\n    state n: Int = 0\n    on start {\n        n += 1\n        emit boots(n)\n    }\n    on trigger(v) {\n        let r = 100 / v\n    }\n}\n\
+             component Driver {\n    intent \"Fires a single poke at startup.\"\n    out fire: Int\n    on start {\n        emit fire(0)\n    }\n}\n\
+             app Main {\n    intent \"one_for_all: a panicking sibling restarts b and c too.\"\n    let a = Worker()\n    let b = Worker()\n    let c = Worker()\n    let d = Driver()\n    wire d.fire -> a.trigger\n    supervise a restart on_failure one_for_all\n    supervise b restart on_failure\n    supervise c restart on_failure\n}\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.stdout, vm.stdout, "interp/vm stdout must agree: {interp:?} {vm:?}");
+        assert_eq!(interp.status.code(), Some(0), "{interp:?}");
+        let interp_err = String::from_utf8_lossy(&interp.stderr);
+        let vm_err = String::from_utf8_lossy(&vm.stderr);
+        assert_eq!(
+            interp_err.matches("[supervise] Worker restarted after panic").count(),
+            3,
+            "one_for_all must restart a AND both siblings (3 total): {interp_err}"
+        );
+        assert_eq!(
+            interp_err.matches("restarted after panic").count(),
+            vm_err.matches("restarted after panic").count(),
+            "interp/vm must restart the same number of times: {interp_err}\n---\n{vm_err}"
+        );
+
+        let native_bin = dir.join("one_for_all_native");
+        let build = std::process::Command::new(&bin)
+            .args(["native", file.to_str().unwrap(), "-o", native_bin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(build.status.code(), Some(0), "native build must succeed: {build:?}");
+        let native_out = std::process::Command::new(&native_bin).output().unwrap();
+        assert_eq!(native_out.status.code(), Some(0), "{native_out:?}");
+        assert_eq!(
+            native_out.stdout, interp.stdout,
+            "native must produce byte-identical stdout to interp/vm"
+        );
+        let native_err = String::from_utf8_lossy(&native_out.stderr);
+        assert_eq!(
+            native_err.matches("restarted after panic").count(),
+            3,
+            "native must restart the same number of times as interp/vm: {native_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The discriminating complement to the test above (Concurrency-v2
+    /// PR-cv2-1): `rest_for_one` restarts only siblings declared AFTER the
+    /// panicking child, never ones declared BEFORE it -- proving the
+    /// strategy actually consults declaration order rather than restarting
+    /// every sibling regardless (which `one_for_all` already covers, and
+    /// which a broken/no-op strategy dispatch could accidentally satisfy
+    /// too). Children are declared `b, a, c`: `a` is the panicking,
+    /// `rest_for_one`-supervised child, so only `c` (declared after `a`)
+    /// must ALSO restart -- `b` (declared before `a`) must not.
+    #[test]
+    fn supervise_rest_for_one_restarts_only_siblings_declared_after_the_panicking_child() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-supervise-rest-for-one-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("rest_for_one.kupl");
+        std::fs::write(
+            &file,
+            "component Worker {\n    intent \"Panics on a zero trigger.\"\n    in trigger: Int\n    out boots: Int\n    state n: Int = 0\n    on start {\n        n += 1\n        emit boots(n)\n    }\n    on trigger(v) {\n        let r = 100 / v\n    }\n}\n\
+             component Driver {\n    intent \"Fires a single poke at startup.\"\n    out fire: Int\n    on start {\n        emit fire(0)\n    }\n}\n\
+             app Main {\n    intent \"rest_for_one: only c (declared after a) restarts, not b (declared before a).\"\n    let b = Worker()\n    let a = Worker()\n    let c = Worker()\n    let d = Driver()\n    wire d.fire -> a.trigger\n    supervise a restart on_failure rest_for_one\n    supervise b restart on_failure\n    supervise c restart on_failure\n}\n",
+        )
+        .unwrap();
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.stdout, vm.stdout, "interp/vm stdout must agree: {interp:?} {vm:?}");
+        assert_eq!(interp.status.code(), Some(0), "{interp:?}");
+        let interp_err = String::from_utf8_lossy(&interp.stderr);
+        let vm_err = String::from_utf8_lossy(&vm.stderr);
+        assert_eq!(
+            interp_err.matches("[supervise] Worker restarted after panic").count(),
+            2,
+            "rest_for_one must restart a AND c only, never b (2 total): {interp_err}"
+        );
+        assert_eq!(
+            interp_err.matches("restarted after panic").count(),
+            vm_err.matches("restarted after panic").count(),
+            "interp/vm must restart the same number of times: {interp_err}\n---\n{vm_err}"
+        );
+
+        let native_bin = dir.join("rest_for_one_native");
+        let build = std::process::Command::new(&bin)
+            .args(["native", file.to_str().unwrap(), "-o", native_bin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(build.status.code(), Some(0), "native build must succeed: {build:?}");
+        let native_out = std::process::Command::new(&native_bin).output().unwrap();
+        assert_eq!(native_out.status.code(), Some(0), "{native_out:?}");
+        assert_eq!(
+            native_out.stdout, interp.stdout,
+            "native must produce byte-identical stdout to interp/vm"
+        );
+        let native_err = String::from_utf8_lossy(&native_out.stderr);
+        assert_eq!(
+            native_err.matches("restarted after panic").count(),
+            2,
+            "native must restart the same number of times as interp/vm: {native_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `Char` (it105: a single Unicode scalar value, `'a'`) is a NEW literal
     /// syntax with no fallback path -- unlike `par{}`'s always-correct
     /// sequential fallback, if `compile.rs`/the VM disagreed with the

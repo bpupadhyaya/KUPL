@@ -127,6 +127,15 @@ pub struct Instance {
     /// window, oldest first — only populated/consulted when `max_restarts`
     /// is `Some`.
     pub restart_history: VecDeque<i64>,
+    /// Concurrency-v2 PR-cv2-1 (`docs/design/CONCURRENCY_V2.md` §4.1):
+    /// OTHER sibling instance ids that must ALSO be restarted alongside
+    /// this one, per this child's own `SuperviseDecl::strategy`. Empty
+    /// for the default `RestartStrategy::OneForOne` (today's exact,
+    /// unchanged behavior) — never includes this instance's own id.
+    /// Computed once, at instantiation (or `:upgrade`) time, by
+    /// `wire_supervision_groups`, since `comp.children`'s own declaration
+    /// order is fully static (`ASYNC.md` §8.1).
+    pub restart_group: Vec<usize>,
 }
 
 /// A message crossing the coordinator/actor thread boundary
@@ -454,6 +463,61 @@ impl Interp {
         Ok(v)
     }
 
+    /// Concurrency-v2 PR-cv2-1 (`docs/design/CONCURRENCY_V2.md` §4.1):
+    /// compute and store each supervised child's own `restart_group` —
+    /// the OTHER sibling ids that must ALSO restart when this one fails,
+    /// per its own `SuperviseDecl::strategy`. Must run AFTER every
+    /// sibling's own id is known (a group can reference a sibling
+    /// declared anywhere in `children`), so this is a separate pass, not
+    /// folded into `instantiate_child` (which handles exactly one child
+    /// at a time, before its own siblings necessarily even exist yet).
+    /// Shared by `instantiate_local`'s own children loop and `repl.rs`'s
+    /// `:upgrade` path — called for EVERY child (kept or newly
+    /// constructed) on an upgrade, deliberately: unlike
+    /// `restart_on_failure`/`max_restarts` (simple per-child scalars
+    /// `repl.rs`'s own doc comments already treat as an untouched part
+    /// of a KEPT child's identity across an upgrade), `restart_group` is
+    /// a pure DERIVED cache over "the whole sibling set as it exists
+    /// right now" — recomputing it fresh for every child after any
+    /// upgrade is the correct behavior, not a special case; a KEPT
+    /// child's group must reflect newly-added/removed siblings too, or
+    /// it would silently serve a stale view of who its own restart
+    /// strategy actually covers.
+    pub(crate) fn wire_supervision_groups(
+        &mut self,
+        supervises: &[SuperviseDecl],
+        children: &[ChildDecl],
+        child_ids: &HashMap<String, usize>,
+    ) {
+        for decl in supervises {
+            if decl.policy != SupervisePolicy::RestartOnFailure {
+                continue;
+            }
+            let Some(&this_id) = child_ids.get(&decl.child) else {
+                continue; // e.g. a KEPT-but-now-removed child during :upgrade; nothing to wire
+            };
+            let this_pos = children.iter().position(|c| c.name == decl.child);
+            let group: Vec<usize> = match decl.strategy {
+                RestartStrategy::OneForOne => Vec::new(),
+                RestartStrategy::OneForAll => supervises
+                    .iter()
+                    .filter(|s| s.policy == SupervisePolicy::RestartOnFailure && s.child != decl.child)
+                    .filter_map(|s| child_ids.get(&s.child).copied())
+                    .collect(),
+                RestartStrategy::RestForOne => supervises
+                    .iter()
+                    .filter(|s| s.policy == SupervisePolicy::RestartOnFailure && s.child != decl.child)
+                    .filter(|s| {
+                        let s_pos = children.iter().position(|c| c.name == s.child);
+                        matches!((this_pos, s_pos), (Some(a), Some(b)) if b > a)
+                    })
+                    .filter_map(|s| child_ids.get(&s.child).copied())
+                    .collect(),
+            };
+            self.instances[this_id].unwrap_local_mut().restart_group = group;
+        }
+    }
+
     /// Create an instance of `comp_name`; args are already-evaluated prop
     /// values. Dispatches to `instantiate_concurrent` for a `concurrent`
     /// component (`docs/design/ASYNC.md` §8.10 step 3) — every OTHER call
@@ -561,6 +625,7 @@ impl Interp {
             timers: Vec::new(),
             max_restarts: None,
             restart_history: VecDeque::new(),
+            restart_group: Vec::new(),
         }));
 
         // children (constructed after the parent exists, in declaration order)
@@ -572,6 +637,15 @@ impl Interp {
             }
             env.define(&child.name, v);
         }
+        // Concurrency-v2 PR-cv2-1: wire up `one_for_all`/`rest_for_one`
+        // restart groups now that every child's own id is known (a
+        // group can reference a SIBLING declared anywhere in
+        // `comp.children`, so this must run AFTER the whole loop above,
+        // not per-child inside `instantiate_child` -- see that
+        // function's own doc comment for why it's still the single
+        // shared place BOTH this loop and `repl.rs`'s `:upgrade` path
+        // apply a child's OWN `restart_on_failure`/`max_restarts`).
+        self.wire_supervision_groups(&comp.supervises, &comp.children, &child_ids);
 
         // wires: registered on the source child instance
         for wire in &comp.wires {
@@ -1139,7 +1213,7 @@ impl Interp {
             let restarted = match self.run_handler(iid, &h, Value::Unit) {
                 Ok(()) => false,
                 Err(Flow::Panic { msg, .. }) if self.instances[iid].unwrap_local_mut().restart_on_failure => {
-                    self.restart(iid, &msg)?;
+                    self.restart_with_group(iid, &msg)?;
                     true
                 }
                 Err(other) => return Err(other),
@@ -1261,7 +1335,7 @@ impl Interp {
                     match self.run_handler(id, h, value.clone()) {
                         Ok(()) => {}
                         Err(Flow::Panic { msg, .. }) if self.instances[id].unwrap_local_mut().restart_on_failure => {
-                            self.restart(id, &msg)?;
+                            self.restart_with_group(id, &msg)?;
                         }
                         Err(other) => return Err(other),
                     }
@@ -1330,6 +1404,33 @@ impl Interp {
             }
         }
         self.arm_timers(id);
+        Ok(())
+    }
+
+    /// Concurrency-v2 PR-cv2-1: `restart`, plus any group-restart cascade
+    /// from a `one_for_all`/`rest_for_one` strategy. Restarts `id` first
+    /// (exactly `restart`'s own existing single-instance logic,
+    /// unchanged), then — only if that succeeded — restarts every
+    /// sibling in `id`'s own precomputed `restart_group` (empty for the
+    /// default `one_for_one` strategy, so an existing program with no
+    /// strategy keyword is provably unaffected: this function's own
+    /// behavior for such an instance is IDENTICAL to calling `restart`
+    /// directly). A group-cascaded restart calls plain `restart`, not
+    /// `restart_with_group`, for each sibling — deliberately bounded to
+    /// ONE level of cascade, so a sibling's OWN group (if it has one)
+    /// never recursively re-triggers; this keeps the blast radius of any
+    /// single failure easy to reason about and avoids a cyclic-group
+    /// configuration ever cascading unboundedly. A group member hitting
+    /// ITS OWN restart-intensity limit escalates the WHOLE operation —
+    /// matching Erlang/OTP's own supervisor semantics: a supervisor that
+    /// cannot successfully complete its restart strategy gives up rather
+    /// than leaving the process tree partially restarted.
+    fn restart_with_group(&mut self, id: usize, panic_msg: &str) -> Result<(), Flow> {
+        self.restart(id, panic_msg)?;
+        let group = self.instances[id].unwrap_local_mut().restart_group.clone();
+        for sibling_id in group {
+            self.restart(sibling_id, panic_msg)?;
+        }
         Ok(())
     }
 
@@ -3185,7 +3286,7 @@ impl Interp {
             let mut should_drain = result.is_ok();
             if let Err(Flow::Panic { ref msg, .. }) = result {
                 if self.instances[id].unwrap_local_mut().restart_on_failure {
-                    self.restart(id, msg)?;
+                    self.restart_with_group(id, msg)?;
                     should_drain = true;
                 }
             }

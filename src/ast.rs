@@ -213,6 +213,18 @@ pub struct SuperviseDecl {
     /// preserves today's exact unlimited-restart behavior; only meaningful
     /// alongside `SupervisePolicy::RestartOnFailure`.
     pub max_restarts: Option<(u32, i64)>,
+    /// Concurrency-v2 PR-cv2-1 (`docs/design/CONCURRENCY_V2.md` §4.1,
+    /// Erlang-inspired): which OTHER supervised siblings, if any, restart
+    /// alongside this child when IT fails. `OneForOne` (the default,
+    /// omitted syntax) preserves today's exact single-child-only restart
+    /// behavior. Only meaningful alongside `SupervisePolicy::
+    /// RestartOnFailure` -- deliberately a PER-CHILD setting, not a
+    /// per-parent/per-supervisor one the way real Erlang/OTP scopes it,
+    /// since KUPL's own `supervise` syntax is already per-child-
+    /// declared, not a separate supervisor entity -- see that design
+    /// doc section for the full reasoning behind this deliberate
+    /// adaptation rather than a literal port.
+    pub strategy: RestartStrategy,
     pub span: Span,
 }
 
@@ -222,6 +234,25 @@ pub enum SupervisePolicy {
     RestartOnFailure,
     /// A panic escalates (default behavior when unsupervised).
     Never,
+}
+
+/// Concurrency-v2 PR-cv2-1: which siblings restart alongside a failed,
+/// supervised child -- Erlang/OTP's own three-strategy vocabulary,
+/// adapted to KUPL's per-child (not per-supervisor) `supervise` syntax.
+/// See `SuperviseDecl::strategy`'s own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RestartStrategy {
+    /// Only the failed child itself restarts. Default (the syntax is
+    /// omitted) -- today's exact, unchanged behavior.
+    #[default]
+    OneForOne,
+    /// Every OTHER sibling that also declares `restart on_failure` (of
+    /// any strategy) restarts too, not just the one that failed.
+    OneForAll,
+    /// Every `restart on_failure`-declared sibling declared AFTER this
+    /// one, in the parent's own `children` declaration order, restarts
+    /// too; siblings declared before it are untouched.
+    RestForOne,
 }
 
 #[derive(Debug, Clone)]

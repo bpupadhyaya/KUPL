@@ -97,6 +97,16 @@ pub enum Op {
     },
     /// wire regs[from].out consts[out_port] -> regs[to].in consts[in_port]
     WireOp { from: Reg, out_port: u16, to: Reg, in_port: u16 },
+    /// Concurrency-v2 PR-cv2-1 (`docs/design/CONCURRENCY_V2.md` §4.1):
+    /// regs[target]'s own restart_group gains regs[member] -- one
+    /// instruction per (target, member) edge in the compile-time-computed
+    /// `one_for_all`/`rest_for_one` supervision-group relation, emitted
+    /// AFTER every child in a component's own `children` list has been
+    /// constructed (mirrors `WireOp`'s own established one-instruction-
+    /// per-edge encoding exactly, rather than inventing a variable-arity
+    /// operand shape for what's otherwise a fully static, compile-time-
+    /// bounded set of edges).
+    RestartGroupAdd { target: Reg, member: Reg },
     /// emit on the current instance's out port consts[port]
     EmitOp { port: u16, payload: Option<Reg> },
 

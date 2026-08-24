@@ -435,6 +435,11 @@ fn encode_op(w: &mut W, op: &Op) {
             w.u8(*to);
             w.u16(*in_port);
         }
+        RestartGroupAdd { target, member } => {
+            w.u8(45);
+            w.u8(*target);
+            w.u8(*member);
+        }
         EmitOp { port, payload } => {
             w.u8(38);
             w.u16(*port);
@@ -1016,6 +1021,7 @@ fn decode_op(r: &mut R) -> DecodeResult<Op> {
         42 => CallComp { dst: r.u8()?, fun: r.u16()?, start: r.u8()?, argc: r.u8()? },
         43 => CallAi { dst: r.u8()?, info: r.u16()?, intent: r.u8()? },
         44 => ParBlock { dst: r.u8()?, table: r.u16()? },
+        45 => RestartGroupAdd { target: r.u8()?, member: r.u8()? },
         t => return Err(format!("unknown opcode {t}")),
     })
 }
@@ -1292,6 +1298,7 @@ mod tests {
             Op::StateSet(99, 100),
             Op::MakeInstance { dst: 101, comp: 1010, start: 102, argc: 103, policy: 104, max_restarts: 149, window_ms_const: 1050 },
             Op::WireOp { from: 105, out_port: 1011, to: 106, in_port: 1012 },
+            Op::RestartGroupAdd { target: 113, member: 114 },
             Op::EmitOp { port: 1013, payload: Some(107) },
             Op::EmitOp { port: 1014, payload: None },
             Op::Panic(1015),
@@ -1336,14 +1343,14 @@ mod tests {
             "every Op variant, with distinct per-field values, must survive an encode/decode round trip"
         );
         // Sanity: confirm this test really did cover every DISTINCT variant
-        // (46 entries total -- 44 variants plus one extra `MakeRange`/`EmitOp`
+        // (47 entries total -- 45 variants plus one extra `MakeRange`/`EmitOp`
         // each, to cover both branches of their own internal `bool`/`Option`),
         // so a FUTURE new Op added to the enum without a corresponding entry
         // here fails loudly instead of silently going unfuzzed.
         let distinct: std::collections::HashSet<_> =
             decoded.chunks[0].code.iter().map(std::mem::discriminant).collect();
-        assert_eq!(n, 46, "expected 44 Op variants + 2 extra branch-coverage entries (MakeRange, EmitOp)");
-        assert_eq!(distinct.len(), 44, "Op has 44 DISTINCT variants as of it101 (ParBlock added) -- if this fails, a variant was ADDED or REMOVED; update this test's own `code` list to match");
+        assert_eq!(n, 47, "expected 45 Op variants + 2 extra branch-coverage entries (MakeRange, EmitOp)");
+        assert_eq!(distinct.len(), 45, "Op has 45 DISTINCT variants as of PR-cv2-1 (RestartGroupAdd added) -- if this fails, a variant was ADDED or REMOVED; update this test's own `code` list to match");
     }
 
     #[test]

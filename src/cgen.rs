@@ -879,6 +879,11 @@ fn emit_op(out: &mut String, module: &Module, chunk: &Chunk, op: &Op, pc: usize)
                 c_escape(inn)
             )
         }
+        RestartGroupAdd { target, member } => {
+            format!(
+                "k_restart_group_add((int)regs[{target}].as.i, (int)regs[{member}].as.i);"
+            )
+        }
         EmitOp { port, payload } => {
             let p = str_const(chunk, *port)?;
             let val = match payload {
@@ -10113,7 +10118,15 @@ typedef struct { int comp; KValue* slots; int nslots;
                     prune-then-check-length sliding window, without a
                     dynamically-growing buffer. */
                  int max_restarts; long long restart_window_ms;
-                 long long* restart_times; int restart_ring_pos; int restart_count; } KInstance;
+                 long long* restart_times; int restart_ring_pos; int restart_count;
+                 /* Concurrency-v2 PR-cv2-1 -- mirrors interp.rs Instance::
+                    restart_group / vm.rs VmInstance::restart_group exactly:
+                    other sibling instance ids that must ALSO restart
+                    alongside this one, per a `one_for_all`/`rest_for_one`
+                    supervise strategy. Wired by k_restart_group_add, one
+                    call per (target, member) edge, mirroring k_wire's own
+                    established one-call-per-edge pattern. */
+                 int* restart_group; int restart_group_len; } KInstance;
 static KInstance* k_insts = 0;
 static int k_ninsts = 0;
 static int k_print_unwired = 0;
@@ -10123,6 +10136,7 @@ static long long k_vnow = 0;  /* virtual clock (ms), advanced explicitly */
 static void k_run_lifecycle(int id, const char* key);
 static void k_arm_timers(int id);
 static void k_restart(int id, const char* msg);
+static void k_restart_with_group(int id, const char* msg);
 static int k_dispatch(int id, int chunk, KValue* arg);
 
 /* FIFO message queue (grow-only; head advances — arena model, bounded runs) */
@@ -10147,6 +10161,7 @@ static int k_instantiate(int comp_idx, KValue* props, int nprops) {
     k_insts[id].timers = 0; k_insts[id].ntimers = 0;
     k_insts[id].max_restarts = 0; k_insts[id].restart_window_ms = 0;
     k_insts[id].restart_times = 0; k_insts[id].restart_ring_pos = 0; k_insts[id].restart_count = 0;
+    k_insts[id].restart_group = 0; k_insts[id].restart_group_len = 0;
     int saved = k_cur_inst;
     k_cur_inst = id;
     CHUNKS[COMPS[comp_idx].init_chunk](0, 0);   /* children created here get higher ids */
@@ -10211,7 +10226,7 @@ static KValue k_expose_call(KValue recv, const char* name, KValue* args, int arg
                 strncpy(msg, k_panic_buf, sizeof(msg) - 1);
                 msg[sizeof(msg) - 1] = 0;
                 k_cur_inst = saved; k_pad = prev; k_depth = saved_depth;
-                k_restart(id, msg);
+                k_restart_with_group(id, msg);
                 /* drain whatever was queued BEFORE the panic too, mirroring
                    interp.rs/vm.rs's `should_drain` on a restarted panic --
                    the child is freshly restarted and ready, so messages it
@@ -10232,6 +10247,15 @@ static void k_wire(int from, const char* out_port, int to, const char* in_port) 
     s->wires[s->nwires].to = to;
     s->wires[s->nwires].in_port = in_port;
     s->nwires++;
+}
+
+/* Concurrency-v2 PR-cv2-1: one call per (target, member) supervision-group
+   edge, mirroring k_wire's own dynamic-array-growth pattern exactly. */
+static void k_restart_group_add(int target, int member) {
+    KInstance* s = &k_insts[target];
+    s->restart_group = (int*)realloc(s->restart_group, sizeof(int) * (s->restart_group_len + 1));
+    s->restart_group[s->restart_group_len] = member;
+    s->restart_group_len++;
 }
 
 /* emit on the CURRENT instance's out port: fan out to wired targets in push
@@ -10299,7 +10323,7 @@ static int k_dispatch(int id, int chunk, KValue* arg) {
     } else {
         /* panic caught: restore, then restart this instance */
         k_cur_inst = saved; k_pad = prev; k_depth = saved_depth;
-        k_restart(id, k_panic_buf);
+        k_restart_with_group(id, k_panic_buf);
         return 1;
     }
 }
@@ -10515,6 +10539,20 @@ static void k_restart(int id, const char* msg) {
     k_cur_inst = saved;
     k_run_lifecycle(id, "@start");
     k_arm_timers(id);
+}
+
+/* Concurrency-v2 PR-cv2-1: restart `id`, then every sibling in its own
+   restart_group (a `one_for_all`/`rest_for_one` supervise strategy).
+   k_restart's own escalation path (k_restart_intensity_exceeded -> k_panic
+   -> longjmp) never returns to this function on escalation, so the
+   sequential calls below naturally abort the rest of the cascade without
+   any explicit error-code check -- unlike interp.rs/vm.rs, which need an
+   explicit `?` to get the same "escalation aborts the cascade" behavior. */
+static void k_restart_with_group(int id, const char* msg) {
+    k_restart(id, msg);
+    for (int i = 0; i < k_insts[id].restart_group_len; i++) {
+        k_restart(k_insts[id].restart_group[i], msg);
+    }
 }
 
 /* Bound on timer fires within a single k_advance call — mirrors interp.rs's

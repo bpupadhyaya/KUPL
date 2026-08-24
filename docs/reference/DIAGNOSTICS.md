@@ -52,6 +52,7 @@ Severity: **E** = error, **W** = warning.
 | K0121 | E | expression nesting too deep (bounded to keep the checker fast on pathological input) |
 | K0122 | E | malformed `supervise ... restart on_failure max <n> in <duration>` restart-intensity clause |
 | K0123 | E | unsupported generic bound (only `[T: Ord]` is currently supported) |
+| K0124 | E | a restart strategy (`one_for_all`/`rest_for_one`) only applies to `restart on_failure`, not `restart never` |
 
 ## K02xx — Type & semantic checker
 

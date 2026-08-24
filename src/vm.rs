@@ -145,6 +145,15 @@ struct VmInstance {
     /// Virtual-ms timestamps of past restarts still inside the sliding
     /// window, oldest first -- only used when `max_restarts` is `Some`.
     restart_history: std::collections::VecDeque<i64>,
+    /// Concurrency-v2 PR-cv2-1 -- mirrors `interp.rs::Instance::
+    /// restart_group` exactly: other sibling instance ids that must ALSO
+    /// restart alongside this one, per this child's own supervise
+    /// strategy. Empty for the default `one_for_one` strategy. Wired via
+    /// `Op::RestartGroupAdd`, one instruction per (target, member) edge,
+    /// emitted by `compile.rs` after every child in a component's own
+    /// `children` list has been constructed (mirrors `Op::WireOp`'s own
+    /// established one-instruction-per-edge pattern exactly).
+    restart_group: Vec<usize>,
 }
 
 pub struct Vm<'m> {
@@ -376,7 +385,7 @@ impl<'m> Vm<'m> {
                 match self.call_chunk_nested(chunk, args, Some(id)) {
                     Ok(_) => {}
                     Err(e) if self.instances[id].restart_on_failure => {
-                        self.restart(id, &e.msg)?;
+                        self.restart_with_group(id, &e.msg)?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -424,6 +433,21 @@ impl<'m> Vm<'m> {
         Ok(())
     }
 
+    /// Concurrency-v2 PR-cv2-1 -- mirrors `interp.rs::Interp::
+    /// restart_with_group` exactly: `restart`, plus any group-restart
+    /// cascade from a `one_for_all`/`rest_for_one` strategy. See that
+    /// function's own doc comment for the full reasoning (bounded to ONE
+    /// level of cascade; a group member hitting its own restart-
+    /// intensity limit escalates the whole operation).
+    fn restart_with_group(&mut self, id: usize, panic_msg: &str) -> Result<(), VmError> {
+        self.restart(id, panic_msg)?;
+        let group = self.instances[id].restart_group.clone();
+        for sibling_id in group {
+            self.restart(sibling_id, panic_msg)?;
+        }
+        Ok(())
+    }
+
     /// Create an instance: fill props (running default chunks for gaps is the
     /// compiler's job — args arrive complete), zero the state, run the init chunk.
     fn instantiate(&mut self, comp_idx: u16, props: Vec<Value>) -> Result<usize, VmError> {
@@ -449,6 +473,7 @@ impl<'m> Vm<'m> {
             timers: Vec::new(),
             max_restarts: None,
             restart_history: std::collections::VecDeque::new(),
+            restart_group: Vec::new(),
         });
         self.call_chunk_nested(init, Vec::new(), Some(id))?;
         Ok(id)
@@ -522,7 +547,7 @@ impl<'m> Vm<'m> {
             let restarted = match self.call_chunk_nested(chunk, Vec::new(), Some(iid)) {
                 Ok(_) => false,
                 Err(e) if self.instances[iid].restart_on_failure => {
-                    self.restart(iid, &e.msg)?;
+                    self.restart_with_group(iid, &e.msg)?;
                     true
                 }
                 Err(e) => return Err(e),
@@ -628,7 +653,7 @@ impl<'m> Vm<'m> {
         let mut should_drain = result.is_ok();
         if let Err(ref e) = result {
             if self.instances[id].restart_on_failure {
-                self.restart(id, &e.msg)?;
+                self.restart_with_group(id, &e.msg)?;
                 should_drain = true;
             }
         }
@@ -1527,7 +1552,7 @@ impl<'m> Vm<'m> {
                         let mut should_drain = result.is_ok();
                         if let Err(ref e) = result {
                             if self.instances[id].restart_on_failure {
-                                self.restart(id, &e.msg)?;
+                                self.restart_with_group(id, &e.msg)?;
                                 should_drain = true;
                             }
                         }
@@ -2052,6 +2077,17 @@ impl<'m> Vm<'m> {
                         .entry(out_name)
                         .or_default()
                         .push((dst_id, in_name));
+                }
+                Op::RestartGroupAdd { target, member } => {
+                    let (Value::Component(target_id), Value::Component(member_id)) =
+                        (reg!(target), reg!(member))
+                    else {
+                        return Err(VmError {
+                            msg: "restart-group endpoints must be components".into(),
+                            span,
+                        });
+                    };
+                    self.instances[target_id].restart_group.push(member_id);
                 }
                 Op::EmitOp { port, payload } => {
                     let Some(id) = cur_inst else {

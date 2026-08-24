@@ -601,6 +601,18 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
             }
             new_env.define(&child.name, v);
         }
+        // Concurrency-v2 PR-cv2-1: recompute EVERY child's own
+        // `restart_group` fresh against the NEW declaration's supervises
+        // + sibling set -- deliberately for KEPT children too (not just
+        // newly-added ones), since `restart_group` is a pure derived
+        // cache over "the whole sibling set as it exists now," unlike
+        // the simple per-child `restart_on_failure`/`max_restarts`
+        // scalars this function's own OLDER comments already treat as
+        // untouched identity for a kept child. Leaving a kept child's
+        // group stale after an upgrade that changes strategy or
+        // adds/removes supervised siblings would silently serve a wrong
+        // view of who its own restart strategy actually covers.
+        interp.wire_supervision_groups(&new_comp.supervises, &new_comp.children, &child_ids);
         // a child present in the OLD declaration but gone from the NEW one
         // (it119 follow-up) is torn down: fire `on stop` (mirroring
         // `stop_all`'s own end-of-program delivery, just for this ONE
