@@ -6,10 +6,13 @@ grade. Every claim here is checked against the implementation; where something i
 alpha-stage gap, this document says so plainly.
 
 KUPL is **1.0-alpha**. It is feature-complete and internally consistent (four
-execution engines held byte-identical, verified on every build), but it has not been
-battle-tested at scale, has no package ecosystem, and its real-provider AI path is
-wired but only mock-tested. Read the [Known Limitations](#known-limitations) section
-before depending on it.
+execution engines held byte-identical, verified on every build); real, opt-in
+multi-threaded concurrency (`concurrent component`), retry-hardened real-provider AI
+calls, and a self-hostable package registry (`kupl pkg publish`) are all real, not
+just designed. It has not been battle-tested at scale, has no THIRD-PARTY package
+ecosystem yet (self-hosting your own registry works today), and its real-provider AI
+path, while retry-hardened, is still only lightly tested against live providers.
+Read the [Known Limitations](#known-limitations) section before depending on it.
 
 ---
 
