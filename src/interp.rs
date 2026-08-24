@@ -184,6 +184,26 @@ pub struct ActorHandle {
     /// returns, even though the actor's own thread keeps running
     /// (servicing its inbox) well past that point.
     ready: Option<std::sync::mpsc::Receiver<()>>,
+    /// Production-hardening 1221: a REAL, live-confirmed bug — before this
+    /// field existed, a genuine KUPL `Flow::Panic` raised by THIS actor's
+    /// OWN `on stop` handler (a normal, catchable panic — nothing to do
+    /// with PR-it1218's Rust-level-thread-panic concern) was only ever
+    /// `eprintln!`-reported inside the actor's own closure, then silently
+    /// discarded — the actor's thread still returned normally, so its own
+    /// `join()` reported success, and the WHOLE PROCESS exited 0 despite an
+    /// unhandled panic, instead of the `error[K0900]: panic: …` / exit code
+    /// 101 an IDENTICAL `on stop { panic(…) }` on a plain (non-`concurrent`)
+    /// component already correctly produces. Set (once) by the actor's own
+    /// closure right before it returns, if `Interp::stop_all`'s own final
+    /// call (on the actor's OWN local instance tree) returned
+    /// `Err(Flow::Panic { .. })` — read back by `Interp::stop_all` (the
+    /// CALLER'S copy, whether that's the top-level coordinator or, for a
+    /// nested `concurrent` child, an ANCESTOR actor's own `stop_all`) right
+    /// after a clean `join()`, so the original message and span propagate
+    /// through however many levels of `concurrent` nesting exist, with the
+    /// SAME fidelity a local component's own panic already gets — never
+    /// downgraded to a generic message.
+    shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>>,
 }
 
 /// Every one of the 14 functions across this file that used to index
@@ -629,6 +649,9 @@ impl Interp {
         let comp_name = comp.name.clone();
         let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let shutdown_panic_writer = shutdown_panic.clone();
         // Production-hardening 1213: a REAL, live-confirmed bug -- plain
         // `std::thread::spawn` gets the OS default stack (~2-8MiB), unlike
         // EVERY other thread this codebase spawns for interpreter work
@@ -724,7 +747,26 @@ impl Interp {
                     }
                 }
                 if let Err(e) = actor.stop_all(actor.instances.len()) {
-                    report("shutdown", &e);
+                    // Production-hardening 1221: don't let a genuine KUPL
+                    // panic (this actor's own `on stop`, or one propagated
+                    // up from a NESTED `concurrent` child's shutdown) stop
+                    // at `eprintln!` -- hand the real message/span back to
+                    // whoever joins this thread, so it surfaces with the
+                    // same `error[K0900]`/exit-101 fidelity a local
+                    // component's panic already gets, via the SAME
+                    // `report_panic_map` rendering path the top level
+                    // already uses (source snippet + precise span, not this
+                    // closure's own coarse `eprintln!`). See
+                    // `shutdown_panic`'s own doc comment. `stop_all`'s
+                    // signature guarantees `e` is always `Flow::Panic` here
+                    // (its only error variant) -- the `report(...)` fallback
+                    // below exists only in case that ever changes, so no
+                    // Flow's diagnostic is ever silently dropped.
+                    if let Flow::Panic { msg, span, .. } = e {
+                        *shutdown_panic_writer.lock().unwrap() = Some((msg, span));
+                    } else {
+                        report("shutdown", &e);
+                    }
                 }
             }
         })
@@ -734,6 +776,7 @@ impl Interp {
             join: Some(join),
             inbox: Some(inbox_tx),
             ready: Some(ready_rx),
+            shutdown_panic,
         }));
         Ok(Value::Component(id))
     }
@@ -833,10 +876,11 @@ impl Interp {
         // Production-hardening 1218: a REAL, live-confirmed-by-code-reading
         // gap found+fixed -- `join()`'s `Result` used to be discarded via
         // `let _ = ...`, silently swallowing ANY genuine Rust-level panic
-        // inside an actor's own thread (not a normal KUPL `panic()` call,
-        // which `instantiate_concurrent`'s own `report`/reply-channel
-        // machinery already surfaces correctly -- this is specifically
-        // about an actor thread crashing with an actual Rust panic, e.g.
+        // inside an actor's own thread (a normal KUPL `panic()` call, e.g.
+        // from that actor's own `on stop` handler, is a SEPARATE concern --
+        // production-hardening 1221 below closes that one; this is
+        // specifically about an actor thread crashing with an actual Rust
+        // panic, e.g.
         // an internal "should have been rejected at check time"-style
         // invariant violation reached only on that thread). Before
         // PR-it1213's stack-size fix, a stack overflow was the one
@@ -861,13 +905,38 @@ impl Interp {
         for id in 0..upto.min(self.instances.len()) {
             if let InstanceSlot::Remote(handle) = &mut self.instances[id] {
                 if let Some(join) = handle.join.take() {
-                    if join.join().is_err() && actor_panic.is_none() {
-                        actor_panic = Some(Self::panic_flow(
-                            "a `concurrent component` actor thread panicked during shutdown \
-                             — this is a bug in KUPL, not your program"
-                                .to_string(),
-                            Span::default(),
-                        ));
+                    if join.join().is_err() {
+                        if actor_panic.is_none() {
+                            actor_panic = Some(Self::panic_flow(
+                                "a `concurrent component` actor thread panicked during shutdown \
+                                 — this is a bug in KUPL, not your program"
+                                    .to_string(),
+                                Span::default(),
+                            ));
+                        }
+                    } else if actor_panic.is_none() {
+                        // Production-hardening 1221: a REAL, live-confirmed
+                        // bug -- a genuine KUPL `Flow::Panic` from this
+                        // actor's OWN `on stop` handler (or propagated up
+                        // from a nested `concurrent` child's shutdown, since
+                        // this same field is populated identically at every
+                        // nesting level) used to end here: the actor's
+                        // thread returned normally (no Rust-level panic, so
+                        // `join()` above reports success), and
+                        // `instantiate_concurrent`'s closure had already
+                        // `eprintln!`-reported it and moved on -- so the
+                        // WHOLE PROCESS exited 0 despite an unhandled panic,
+                        // unlike the IDENTICAL `on stop { panic(…) }` on a
+                        // plain (non-`concurrent`) component, which
+                        // correctly produces `error[K0900]: panic: …` and
+                        // exit code 101. `shutdown_panic` carries the panic's
+                        // OWN message and span (not a generic "bug in KUPL"
+                        // placeholder — this is the user's own program
+                        // panicking, not an internal invariant violation),
+                        // so it renders with the exact same fidelity here.
+                        if let Some((msg, span)) = handle.shutdown_panic.lock().unwrap().take() {
+                            actor_panic = Some(Self::panic_flow(msg, span));
+                        }
                     }
                 }
             }
@@ -7488,6 +7557,7 @@ mod concurrent_tests {
             join: Some(join),
             inbox: Some(inbox_tx),
             ready: Some(ready_rx),
+            shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }));
 
         let result = interp.stop_all(1);
@@ -7525,9 +7595,72 @@ mod concurrent_tests {
             join: Some(join),
             inbox: Some(inbox_tx),
             ready: Some(ready_rx),
+            shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }));
 
         let result = interp.stop_all(1);
         assert!(result.is_ok(), "a cleanly-shut-down actor thread must not be reported as a panic");
+    }
+
+    /// Production-hardening 1221: a REAL, LIVE-CONFIRMED bug found+fixed --
+    /// before this fix, a genuine KUPL `Flow::Panic` raised by a
+    /// `concurrent` component's OWN `on stop` handler was reported via
+    /// `eprintln!` inside `instantiate_concurrent`'s closure and then
+    /// silently discarded: the actor thread still returned normally (no
+    /// Rust-level panic, so `join()` reports success), so the whole process
+    /// exited 0 -- unlike the IDENTICAL `on stop { panic(…) }` on a plain
+    /// (non-`concurrent`) component, live-confirmed to correctly produce
+    /// `error[K0900]: panic: …` and exit code 101
+    /// (`kupl run` on a real `.kupl` fixture, both variants, before writing
+    /// this unit test). Constructs a synthetic `Remote` instance whose
+    /// thread shuts down CLEANLY (like the companion test above) but writes
+    /// a real `(message, span)` pair into `shutdown_panic` before
+    /// returning -- exactly what `instantiate_concurrent`'s own closure now
+    /// does when ITS `stop_all` call returns `Err(Flow::Panic { .. })`.
+    /// Asserts BOTH that this surfaces as `Err(Flow::Panic)` (matching the
+    /// panic-thread test above) AND that the ORIGINAL message survives
+    /// verbatim, not a generic "bug in KUPL" placeholder -- distinguishing
+    /// this from the Rust-level-thread-panic case above, which correctly
+    /// DOES use a generic message (there is no original KUPL panic message
+    /// to preserve in that case).
+    #[test]
+    fn stop_all_surfaces_a_genuine_on_stop_panic_from_an_actor_with_its_own_original_message() {
+        let compiled = crate::run::compile("fun main() {}\n").expect("trivial program must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new_bare(db);
+
+        let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, super::Span)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let shutdown_panic_writer = shutdown_panic.clone();
+        let join = std::thread::spawn(move || {
+            while inbox_rx.recv().is_ok() {}
+            *shutdown_panic_writer.lock().unwrap() =
+                Some(("deliberate on-stop panic message, verbatim".to_string(), super::Span::default()));
+        });
+        interp.instances.push(InstanceSlot::Remote(ActorHandle {
+            join: Some(join),
+            inbox: Some(inbox_tx),
+            ready: Some(ready_rx),
+            shutdown_panic,
+        }));
+
+        let result = interp.stop_all(1);
+        match result {
+            Err(Flow::Panic { msg, .. }) => {
+                assert_eq!(
+                    msg, "deliberate on-stop panic message, verbatim",
+                    "the actor's own on-stop panic message must survive verbatim, not be replaced by a generic placeholder"
+                );
+            }
+            other => {
+                let describe = match &other {
+                    Ok(()) => "Ok(())".to_string(),
+                    Err(_) => "Err(<non-Panic Flow>)".to_string(),
+                };
+                panic!("a real on-stop panic must surface as Err(Flow::Panic), not {describe}");
+            }
+        }
     }
 }
