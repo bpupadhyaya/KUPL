@@ -64,35 +64,50 @@ fn feed(buf: &mut String, s: &str) {
 /// such a change silently survive an in-place `cargo build`, serving OLD
 /// compiled output under NEW compiler logic with no diagnostic at all.
 /// Tying the key to the binary's actual content means any rebuild that
-/// changes what the compiler DOES necessarily changes this hash too. A
-/// `current_exe()`/read failure (implausible for an already-running
-/// process, but not impossible under an unusual sandbox) degrades to an
-/// empty-bytes hash rather than panicking — worst case, every entry from
-/// that run shares one cache namespace slice, never a correctness issue,
-/// since a WRONG-content cache hit is still impossible by construction
-/// (the key also covers full source content).
-fn self_hash() -> &'static str {
-    static HASH: OnceLock<String> = OnceLock::new();
+/// changes what the compiler DOES necessarily changes this hash too.
+///
+/// `None` on a `current_exe()`/read failure (implausible for an
+/// already-running process, but not impossible under an unusual sandbox —
+/// production-hardening 1215, a REAL gap found+fixed: an earlier version of
+/// this function degraded to a FIXED, shared `sha256_hex_bytes(&[])` hash
+/// in this case instead, directly contradicting its own "impossible by
+/// construction" claim -- confirmed live: two GENUINELY DIFFERENT `kupl`
+/// binaries, each unable to read its own `current_exe()`, both collapsed to
+/// the identical fallback hash, so a cache entry stored under binary A's
+/// (fake, shared) identity was served right back to binary B, a compiler
+/// with potentially different `compile_module`/`emit_c` logic — a real,
+/// if narrow, cache-poisoning-by-coincidence risk this cache's own design
+/// exists to prevent). `content_key` propagates this `None` outward, and
+/// every caller treats it as "do not use the cache for this invocation at
+/// all" (skip both lookup and store) — degrading to "just always
+/// recompile" is always safe; degrading to a shared placeholder identity
+/// is not.
+fn self_hash() -> Option<&'static str> {
+    static HASH: OnceLock<Option<String>> = OnceLock::new();
     HASH.get_or_init(|| {
-        let bytes = std::env::current_exe().and_then(std::fs::read).unwrap_or_default();
-        crate::encoding::sha256_hex_bytes(&bytes)
+        std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()).map(|b| crate::encoding::sha256_hex_bytes(&b))
     })
+    .as_deref()
 }
 
 /// Build the cache key for one compile. `extra` lets a caller fold in
 /// anything beyond source content and the running compiler's own identity
 /// that can change the OUTPUT bytes for the same source (see the module
 /// doc comment above for why `native`'s `cc` identifier needs this).
-pub fn content_key(namespace: &str, map: &crate::loader::SourceMap, extra: &[u8]) -> String {
+/// Returns `None` when the running binary's own identity can't be
+/// determined (see `self_hash`'s own doc comment) — the caller must treat
+/// this as "skip the cache entirely for this invocation."
+pub fn content_key(namespace: &str, map: &crate::loader::SourceMap, extra: &[u8]) -> Option<String> {
+    let self_hash = self_hash()?;
     let mut buf = String::new();
     feed(&mut buf, namespace);
-    feed(&mut buf, self_hash());
+    feed(&mut buf, self_hash);
     feed(&mut buf, &String::from_utf8_lossy(extra));
     for f in &map.files {
         feed(&mut buf, &f.path);
         feed(&mut buf, &f.src);
     }
-    crate::encoding::sha256_hex(&buf)
+    Some(crate::encoding::sha256_hex(&buf))
 }
 
 /// Look up a cached artifact by key. `None` on any miss OR read error (a
@@ -165,6 +180,20 @@ mod tests {
             content_key("native", &m, b"clang"),
             "a different cc identity must produce a different key"
         );
+    }
+
+    /// Production-hardening 1215: `content_key`/`self_hash` return `Option`
+    /// now (a `current_exe()`/read failure means "don't cache this
+    /// invocation," never a degraded shared identity) -- the ordinary case,
+    /// running as an actual test binary that can read its own executable,
+    /// must still return `Some` with a stable value, not silently degrade
+    /// to `None` for everyday use.
+    #[test]
+    fn content_key_is_some_in_the_ordinary_case() {
+        let m = map(&[("main.kupl", "fun main() {}\n")]);
+        let key = content_key("build", &m, b"");
+        assert!(key.is_some(), "an ordinary test binary must be able to read its own current_exe()");
+        assert_eq!(key, content_key("build", &m, b""), "must still be stable across repeated calls");
     }
 
     /// The exact class of ambiguity a NUL-delimited (rather than

@@ -656,8 +656,13 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
     } else {
         None
     };
+    // `content_key` returns `None` when the running binary's own identity
+    // can't be determined -- treated as "skip the cache entirely for this
+    // invocation" (always recompile, never store), never "cache under a
+    // degraded/placeholder identity" (production-hardening 1215).
     let cache_key = kupl::buildcache::content_key(if bundle { "bundle" } else { "build" }, &map, b"");
-    let bytes = if let Some(cached) = kupl::buildcache::lookup(&cache_key) {
+    let cached = cache_key.as_deref().and_then(kupl::buildcache::lookup);
+    let bytes = if let Some(cached) = cached {
         cached
     } else {
         let module = match kupl::compile::compile_module(&compiled.program, &compiled.checked) {
@@ -669,7 +674,9 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
         };
         let fresh =
             if bundle { kupl::kx::write_bundle(exe.as_ref().expect("bundle always reads exe above"), &module) } else { kupl::kx::encode(&module) };
-        kupl::buildcache::store(&cache_key, &fresh);
+        if let Some(key) = &cache_key {
+            kupl::buildcache::store(key, &fresh);
+        }
         fresh
     };
     // A REAL bug found+fixed (production-hardening PR-it862, an Explore
@@ -2046,7 +2053,7 @@ mod tests {
         let first_bytes = std::fs::read(&out).unwrap();
 
         let (_compiled, map) = kupl::run::load_compile(entry.to_str().unwrap()).unwrap();
-        let key = kupl::buildcache::content_key("build", &map, b"");
+        let key = kupl::buildcache::content_key("build", &map, b"").expect("this test binary can read its own current_exe()");
         let cached = kupl::buildcache::lookup(&key).expect("a cache entry must exist after a successful build");
         assert_eq!(cached, first_bytes, "the cached bytes must be exactly the produced .kx bytes");
 
@@ -2082,8 +2089,10 @@ mod tests {
         let first_bytes = std::fs::read(&out).unwrap();
 
         let (_compiled, map) = kupl::run::load_compile(entry.to_str().unwrap()).unwrap();
-        let bundle_key = kupl::buildcache::content_key("bundle", &map, b"");
-        let build_key = kupl::buildcache::content_key("build", &map, b"");
+        let bundle_key =
+            kupl::buildcache::content_key("bundle", &map, b"").expect("this test binary can read its own current_exe()");
+        let build_key =
+            kupl::buildcache::content_key("build", &map, b"").expect("this test binary can read its own current_exe()");
         assert_ne!(bundle_key, build_key, "build/bundle must never share a cache slot");
         let cached = kupl::buildcache::lookup(&bundle_key).expect("a cache entry must exist after a successful bundle");
         assert_eq!(cached, first_bytes, "the cached bytes must be exactly the produced bundle's bytes");

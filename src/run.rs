@@ -1425,13 +1425,19 @@ pub fn native(path: &str, args: &[String]) -> i32 {
     // flow as always -- this cache only ever short-circuits WORK, never
     // error-reporting order.
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    // `content_key` returns `None` when the running binary's own identity
+    // can't be determined -- treated as "skip the cache entirely for this
+    // invocation" (production-hardening 1215; see `buildcache::self_hash`'s
+    // own doc comment for the live-confirmed cache-poisoning-by-coincidence
+    // risk a degraded/shared placeholder identity would otherwise create).
     let cache_key = crate::buildcache::content_key("native", &map, cc.as_bytes());
     // `--keep-c` exists specifically so a user can inspect the generated C
     // -- a cache hit skips generating it at all, so honoring `--keep-c`
     // means treating this invocation as an unconditional miss (still
     // benefits from a cache STORE below for a future non-`--keep-c` run).
     let keep_c_flag = args.iter().any(|a| a == "--keep-c");
-    let cached_exe = if keep_c_flag { None } else { crate::buildcache::lookup(&cache_key) };
+    let cached_exe =
+        if keep_c_flag { None } else { cache_key.as_deref().and_then(crate::buildcache::lookup) };
     let c_src = if cached_exe.is_some() {
         String::new() // never read below on a cache hit
     } else {
@@ -1593,8 +1599,8 @@ pub fn native(path: &str, args: &[String]) -> i32 {
             // failure here (implausible right after `cc` just wrote it
             // successfully) just means no cache entry -- never turns this
             // already-successful build into a reported failure.
-            if let Ok(bytes) = std::fs::read(&out) {
-                crate::buildcache::store(&cache_key, &bytes);
+            if let (Some(key), Ok(bytes)) = (&cache_key, std::fs::read(&out)) {
+                crate::buildcache::store(key, &bytes);
             }
             println!(
                 "native executable: {out}{}",
@@ -2276,7 +2282,8 @@ mod tests {
 
         let (_compiled, map) = super::load_compile(source.to_str().unwrap()).unwrap();
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let key = crate::buildcache::content_key("native", &map, cc.as_bytes());
+        let key = crate::buildcache::content_key("native", &map, cc.as_bytes())
+            .expect("this test binary can read its own current_exe()");
         let cached = crate::buildcache::lookup(&key).expect("a cache entry must exist after a successful native build");
         assert_eq!(cached, first_bytes, "the cached bytes must be exactly the produced executable's bytes");
 
@@ -2318,12 +2325,14 @@ mod tests {
         std::fs::write(&source, "fun main() uses io {\n    print(\"v1\")\n}\n").unwrap();
         assert_eq!(super::native(source.to_str().unwrap(), &args), 0);
         let (_c1, map1) = super::load_compile(source.to_str().unwrap()).unwrap();
-        let key1 = crate::buildcache::content_key("native", &map1, cc.as_bytes());
+        let key1 = crate::buildcache::content_key("native", &map1, cc.as_bytes())
+            .expect("this test binary can read its own current_exe()");
 
         std::fs::write(&source, "fun main() uses io {\n    print(\"v2\")\n}\n").unwrap();
         assert_eq!(super::native(source.to_str().unwrap(), &args), 0);
         let (_c2, map2) = super::load_compile(source.to_str().unwrap()).unwrap();
-        let key2 = crate::buildcache::content_key("native", &map2, cc.as_bytes());
+        let key2 = crate::buildcache::content_key("native", &map2, cc.as_bytes())
+            .expect("this test binary can read its own current_exe()");
 
         assert_ne!(key1, key2, "different source must produce a different cache key");
         assert!(crate::buildcache::lookup(&key1).is_some(), "v1's own cache entry must still exist, untouched");
