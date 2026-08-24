@@ -318,12 +318,26 @@ pub struct ComponentSig {
     pub exposes: HashMap<String, (Vec<Ty>, Ty)>,
     /// Contracts this component `fulfills` — used for contract-type assignability.
     pub fulfills: Vec<String>,
+    /// Mirrors `ast::ComponentDecl::concurrent` (production-hardening 1214) —
+    /// needed by any check running AFTER pass 1's signature collection that
+    /// only has a component's NAME to work with (e.g. resolving a `Ty::
+    /// Component(name)`-typed variable while checking an unrelated `law`/
+    /// `forall` body), since `ComponentDecl` itself isn't reachable from
+    /// there, only this summary is.
+    pub concurrent: bool,
 }
 
 /// Signature of a contract: exposed function signatures with effects.
 #[derive(Debug, Clone, Default)]
 pub struct ContractSig {
     pub sigs: HashMap<String, (Vec<Ty>, Ty, Vec<String>)>,
+    /// Mirrors `!ast::ContractDecl::laws.is_empty()` (production-hardening
+    /// 1214) — `check_fulfills` needs this to reject a `concurrent`
+    /// component fulfilling a contract with laws (a `forall`/`law` is
+    /// eventually run against the fulfilling component's own instance,
+    /// which crashes if that instance is `Remote` — see `ComponentSig::
+    /// concurrent`'s own doc comment for the matching half of this fix).
+    pub has_laws: bool,
 }
 
 #[cfg(test)]

@@ -159,6 +159,7 @@ Severity: **E** = error, **W** = warning.
 | K0305 | E | `concurrent` and the root `app` are mutually exclusive |
 | K0306 | E | a `concurrent` component's prop/port/exposed-function type is not representable as portable, plain data — see `docs/design/ASYNC.md` §8.6 |
 | K0307 | E | a `concurrent` component cannot have `example` blocks — see `docs/design/ASYNC.md` §8.7 |
+| K0308 | E | a `concurrent` component instance is referenced by a `law`/`forall` — either fulfilling a contract that declares `law`s, or bound in scope when a top-level `forall` runs; `kupl test`'s law-running machinery does not support a concurrent instance yet |
 
 ## K04xx — Loader (multi-file)
 

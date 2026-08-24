@@ -721,6 +721,11 @@ See `examples/concurrent.kupl`.
   - A `concurrent` component cannot be a wire's SOURCE — only its
     destination. Attempting it is a clean, specific panic, not a crash.
   - A `concurrent` component cannot have `example` blocks (K0307).
+  - A `concurrent` component cannot fulfill a contract that declares
+    `law`s, and a `concurrent` instance cannot be referenced by a
+    top-level `forall` — either is rejected at check time (K0308), since
+    `kupl test`'s law-running machinery does not support a concurrent
+    instance yet.
   - Recurring (`on every`) timers on a `concurrent` instance only fire
     during its initial startup burst (mirroring `kupl run`'s own bounded
     100-firing rule) — nothing keeps advancing its virtual clock once it

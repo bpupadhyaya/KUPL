@@ -993,6 +993,7 @@ impl Checker {
                 }
                 Item::Component(c) => {
                     let mut sig = ComponentSig::default();
+                    sig.concurrent = c.concurrent;
                     for port in &c.ports {
                         let ty = self.resolve_ty(&port.ty);
                         let map = match port.dir {
@@ -1160,6 +1161,7 @@ impl Checker {
                 }
                 Item::Contract(ct) => {
                     let mut sig = ContractSig::default();
+                    sig.has_laws = !ct.laws.is_empty();
                     // A REAL diagnostic gap, matching the same sibling checks
                     // already present just above for every other same-file
                     // collection (props K0283, component methods K0277,
@@ -1583,6 +1585,32 @@ impl Checker {
                 self.err("K0261", msg, c.span);
                 continue;
             };
+            // `docs/design/ASYNC.md` §8.7's own claim, previously unenforced
+            // (production-hardening 1214, a REAL, live-confirmed gap found
+            // by an adversarial review of the `concurrent component`
+            // feature): a `concurrent` component fulfilling a contract that
+            // declares `law`s is unsafe -- `kupl test`'s own law-running
+            // loop instantiates the fulfilling component and later walks
+            // every reachable instance (`forall_case`'s BFS), which
+            // unconditionally panics on a `Remote` (concurrent) instance.
+            // Live-confirmed BEFORE this fix: a `concurrent component Impl
+            // fulfills Getter` where `Getter` has `law { forall n: Int {
+            // get() == 42 } }` passed `kupl check` cleanly, then crashed
+            // `kupl test` with `internal compiler error [src/interp.rs:
+            // 223]` -- exactly the "clean diagnostic at compile time, not
+            // an ungraceful runtime crash" gap this codebase's own
+            // discipline exists to close, and exactly what ASYNC.md §8.7
+            // already (incorrectly) claimed was already enforced.
+            if c.concurrent && contract.has_laws {
+                self.err(
+                    "K0308",
+                    format!(
+                        "`concurrent component {}` cannot fulfill `{contract_name}` — it declares `law`s, which `kupl test` runs against the fulfilling component's own instance, and a concurrent instance runs on a separate actor thread that law-checking does not support yet"
+                        , c.name
+                    ),
+                    c.span,
+                );
+            }
             let comp_sig = self.checked.components.get(&c.name).cloned().unwrap_or_default();
             for (fname, (params, ret, effects)) in &contract.sigs {
                 match comp_sig.exposes.get(fname) {
@@ -2822,7 +2850,34 @@ impl Checker {
                 }
                 Ty::Unit
             }
-            Stmt::Forall { vars, body, .. } => {
+            Stmt::Forall { vars, body, span } => {
+                // The other half of production-hardening 1214's fix (see
+                // `check_fulfills`'s own `K0308` for the contract-law half):
+                // a `forall` whose enclosing scope already has a
+                // `concurrent` component instance bound (`let a = Actor()`
+                // earlier in the SAME law body, then `forall n: Int { a.get()
+                // == 42 } }`) hits the identical `forall_case`-BFS-panics-on-
+                // a-Remote-instance crash the contract-law case does, just
+                // via a syntactically different route ASYNC.md §8.7 also
+                // claims (but didn't actually) reject at check time.
+                // Deliberately checks the OUTER scope (before this
+                // statement's own `push()` below) — the concurrent instance
+                // is bound BEFORE the `forall`, in the surrounding block, not
+                // inside this statement's own binder list.
+                for name in ctx.scopes.names().map(str::to_string).collect::<Vec<_>>() {
+                    if let Some((Ty::Component(cname), _)) = ctx.scopes.get(&name) {
+                        if self.checked.components.get(&cname).is_some_and(|s| s.concurrent) {
+                            self.err(
+                                "K0308",
+                                format!(
+                                    "`forall` cannot reference `{name}`, a `concurrent component {}` instance — `kupl test` walks every instance reachable from a law's own scope, and a concurrent instance runs on a separate actor thread that law-checking does not support yet"
+                                    , crate::resolve::demangle_for_display(&cname)
+                                ),
+                                *span,
+                            );
+                        }
+                    }
+                }
                 ctx.scopes.push();
                 // Which named types can actually be constructed in FINITE
                 // generation depth (production-hardening PR-it727) -- see
@@ -5652,6 +5707,93 @@ mod generic_tests {
         assert!(
             !errs3.iter().any(|d| d.code == "K0306"),
             "List[Int] port must be portable, no K0306: {errs3:?}"
+        );
+    }
+
+    /// Production-hardening 1214: a REAL, live-confirmed bug found+fixed --
+    /// `docs/design/ASYNC.md` §8.7 already claimed a `concurrent component`
+    /// referenced inside a `forall`/`law` body is rejected at check time,
+    /// but nothing enforced it: `kupl check` accepted a `concurrent
+    /// component Impl fulfills Getter` where `Getter` has a law, and `kupl
+    /// test` then crashed with `internal compiler error [src/interp.rs:
+    /// 223]` (`forall_case`'s BFS reachability walk unconditionally panics
+    /// on a `Remote`/concurrent instance). Both halves of the fix (the
+    /// contract-fulfillment case here, the top-level-law case in the next
+    /// test) verified live BEFORE writing these permanent tests: manually
+    /// confirmed each repro crashed `kupl test` with the exact predicted
+    /// ICE prior to this fix, and now cleanly reports K0308 at `kupl
+    /// check` time instead.
+    #[test]
+    fn concurrent_component_fulfilling_a_contract_with_laws_is_k0308() {
+        let src = "contract Getter {\n    expose fun get() -> Int\n    \
+                    law \"always 42\" {\n        forall n: Int {\n            get() == 42\n        }\n    }\n}\n\
+                    concurrent component Impl fulfills Getter {\n    expose fun get() -> Int { 42 }\n}\n\
+                    fun main() uses io { print(\"x\") }\n";
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|d| d.code == "K0308" && d.message.contains("Getter")),
+            "a concurrent component fulfilling a contract with laws must be K0308: {errs:?}"
+        );
+
+        // A contract with NO laws is completely fine to fulfill -- no false positive.
+        let ok = "contract Getter2 {\n    expose fun get() -> Int\n}\n\
+                   concurrent component Impl2 fulfills Getter2 {\n    expose fun get() -> Int { 42 }\n}\n\
+                   fun main() uses io { print(\"x\") }\n";
+        let ok_errs = errors(ok);
+        assert!(
+            !ok_errs.iter().any(|d| d.code == "K0308"),
+            "a law-free contract must not trigger K0308: {ok_errs:?}"
+        );
+
+        // An ORDINARY (non-concurrent) component fulfilling a law-bearing
+        // contract remains completely unaffected -- no false positive.
+        let ordinary = "contract Getter3 {\n    expose fun get() -> Int\n    \
+                         law \"always 42\" {\n        forall n: Int {\n            get() == 42\n        }\n    }\n}\n\
+                         component Impl3 fulfills Getter3 {\n    expose fun get() -> Int { 42 }\n}\n\
+                         fun main() uses io { print(\"x\") }\n";
+        let ordinary_errs = errors(ordinary);
+        assert!(
+            !ordinary_errs.iter().any(|d| d.code == "K0308"),
+            "an ordinary (non-concurrent) component must never trigger K0308: {ordinary_errs:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_instance_referenced_inside_a_top_level_forall_is_k0308() {
+        let src = "concurrent component Actor {\n    expose fun get() -> Int { 42 }\n}\n\
+                    law \"toplevel\" {\n    let a = Actor()\n    forall n: Int {\n        a.get() == 42\n    }\n}\n\
+                    fun main() uses io { print(\"x\") }\n";
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|d| d.code == "K0308" && d.message.contains("reference `a`") && d.message.contains("Actor")),
+            "a concurrent instance referenced inside a top-level forall must be K0308: {errs:?}"
+        );
+
+        // A concurrent instance bound but never TEXTUALLY referenced inside
+        // the forall body must STILL trigger K0308 -- `forall_case`'s own
+        // BFS (`interp.rs`) walks every instance bound in the law's WHOLE
+        // enclosing environment, not just ones the forall body happens to
+        // mention, so the crash risk exists regardless of textual usage;
+        // under-approximating here would let a real crash slip through.
+        let unused = "concurrent component Actor2 {\n    expose fun get() -> Int { 42 }\n}\n\
+                       law \"toplevel2\" {\n    let a = Actor2()\n    forall n: Int {\n        n == n\n    }\n}\n\
+                       fun main() uses io { print(\"x\") }\n";
+        let unused_errs = errors(unused);
+        assert!(
+            unused_errs.iter().any(|d| d.code == "K0308"),
+            "a concurrent instance bound anywhere in the law's own scope must be K0308, even if the forall body itself never references it: {unused_errs:?}"
+        );
+
+        // An ORDINARY (non-concurrent) component instance inside a
+        // top-level forall remains completely unaffected -- no false
+        // positive.
+        let ordinary = "component Plain {\n    expose fun get() -> Int { 42 }\n}\n\
+                         law \"toplevel3\" {\n    let p = Plain()\n    forall n: Int {\n        p.get() == 42\n    }\n}\n\
+                         fun main() uses io { print(\"x\") }\n";
+        let ordinary_errs = errors(ordinary);
+        assert!(
+            !ordinary_errs.iter().any(|d| d.code == "K0308"),
+            "an ordinary (non-concurrent) instance must never trigger K0308: {ordinary_errs:?}"
         );
     }
 
