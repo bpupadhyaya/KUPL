@@ -34,19 +34,29 @@ pub fn set_cap_bytes(bytes: usize) {
 /// Parse a `--max-memory=<MB>` flag. Returns `Ok(None)` if absent,
 /// `Ok(Some(bytes))` if present and a valid positive integer (converted from
 /// MB to bytes), `Err(msg)` if present but malformed.
+///
+/// Production-hardening 1229: a REAL bug found+fixed, the sibling site to
+/// `timeout.rs::parse_flag`'s identical fix (see that fix's own doc
+/// comment for the full writeup and the established `-o`-duplicate
+/// precedent, PR-it999, this mirrors) -- this used to `return` on the
+/// FIRST occurrence, silently discarding a REPEATED `--max-memory=` flag.
+/// A safety-net cap silently using the WRONG (more permissive) of two
+/// conflicting values is the same risk class as `--timeout`'s own fix.
+/// Collects EVERY occurrence first (position-based duplicate detection)
+/// before parsing the single remaining one.
 pub fn parse_flag(args: &[String]) -> Result<Option<usize>, String> {
-    for a in args {
-        if let Some(v) = a.strip_prefix("--max-memory=") {
-            return match v.parse::<usize>() {
-                Ok(0) => Err("--max-memory value must be greater than 0".to_string()),
-                Ok(mb) => Ok(Some(mb.saturating_mul(1024 * 1024))),
-                Err(_) => Err(format!(
-                    "invalid --max-memory value `{v}` (expected a positive whole number of megabytes)"
-                )),
-            };
-        }
+    let matches: Vec<&str> = args.iter().filter_map(|a| a.strip_prefix("--max-memory=")).collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [v] => match v.parse::<usize>() {
+            Ok(0) => Err("--max-memory value must be greater than 0".to_string()),
+            Ok(mb) => Ok(Some(mb.saturating_mul(1024 * 1024))),
+            Err(_) => {
+                Err(format!("invalid --max-memory value `{v}` (expected a positive whole number of megabytes)"))
+            }
+        },
+        _ => Err("--max-memory specified more than once".to_string()),
     }
-    Ok(None)
 }
 
 /// The capped global allocator. Register with `#[global_allocator]` in the
@@ -121,5 +131,16 @@ mod tests {
     #[test]
     fn parse_flag_rejects_negative() {
         assert!(parse_flag(&["run".to_string(), "--max-memory=-16".to_string()]).is_err());
+    }
+
+    /// Production-hardening 1229: the sibling site to `timeout.rs`'s
+    /// identical fix (see that fix's own doc comment for the full
+    /// writeup) -- a REPEATED `--max-memory=` used to silently honor the
+    /// FIRST occurrence, discarding the second with zero diagnostic.
+    #[test]
+    fn parse_flag_rejects_a_repeated_flag_instead_of_silently_honoring_the_first() {
+        let err = parse_flag(&["run".to_string(), "--max-memory=64".to_string(), "--max-memory=128".to_string()])
+            .expect_err("a repeated --max-memory must be refused, not silently resolved to the first value");
+        assert!(err.contains("more than once"), "{err}");
     }
 }
