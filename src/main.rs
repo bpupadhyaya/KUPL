@@ -3236,6 +3236,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Live, end-to-end verification of `docs/design/ASYNC.md` §8.10 step
+    /// 4 (`Deliver` messages): a plain LOCAL component's `on start` emits
+    /// out a wire whose destination is a `concurrent` instance's own `in`
+    /// port. Found and fixed a REAL bug while writing this test: `emit`
+    /// pushed every target straight onto `self.queue` directly, bypassing
+    /// `Interp::send`'s new `Remote`-routing check entirely (only `send`
+    /// itself had it) -- an `unwrap_local_mut()` internal-compiler-error
+    /// panic, live-confirmed on EVERY run before the fix.
+    ///
+    /// Also verifies a genuinely NEW, not originally planned capability
+    /// that fell out of step 4's lifecycle redesign for free: `on stop`
+    /// now correctly fires for `concurrent` instances too (impossible in
+    /// step 3's "run to completion immediately" model, where an actor's
+    /// entire lifecycle -- including its own `on stop` -- was already
+    /// finished before `Interp::start_all` even returned; step 4's actors
+    /// stay alive until `Interp::stop_all` closes their inbox, so THAT is
+    /// naturally where their own `on stop` now belongs).
+    ///
+    /// Ordering claims checked, matching what the implementation actually
+    /// guarantees (not more): `root started` is always first (synchronous,
+    /// coordinator-side); `root stopped` always precedes `worker stopped`
+    /// (`stop_all`'s two-phase design runs every LOCAL `on stop` before
+    /// closing/joining any `Remote` actor); the delivered message is
+    /// always processed (and printed) before `worker stopped` (the SAME
+    /// actor thread drains its own already-buffered inbox before it can
+    /// reach its own shutdown code) -- but the delivered message's
+    /// position relative to `root started`/`root stopped` is NOT asserted,
+    /// since nothing synchronizes the sender and receiver threads that
+    /// tightly (a real, accepted race, matching §7.1).
+    #[test]
+    fn concurrent_component_receives_a_local_wire_delivery_and_gets_on_stop() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-concurrent-step4-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("deliver.kupl");
+        std::fs::write(
+            &file,
+            "component Sender {\n    intent \"Emits a value on start.\"\n    out sig: Int\n    \
+                 on start { emit sig(21) }\n}\n\
+             concurrent component Worker {\n    intent \"Receives a number, prints it doubled.\"\n    \
+                 in num: Int\n    on num(n) { print(\"worker got {n}, doubled={n * 2}\") }\n    \
+                 on stop { print(\"worker stopped\") }\n}\n\
+             app Root {\n    intent \"Local Sender wired to a concurrent Worker.\"\n    \
+                 let sender = Sender()\n    let w = Worker()\n    wire sender.sig -> w.num\n    \
+                 on start { print(\"root started\") }\n    on stop { print(\"root stopped\") }\n}\n",
+        )
+        .unwrap();
+
+        let expected_lines: std::collections::HashSet<&str> =
+            ["root started", "worker got 21, doubled=42", "root stopped", "worker stopped"]
+                .into_iter()
+                .collect();
+        for _ in 0..15 {
+            let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(
+                lines.iter().copied().collect::<std::collections::HashSet<_>>(),
+                expected_lines,
+                "unexpected line set: {stdout:?}"
+            );
+            assert_eq!(lines[0], "root started", "{stdout:?}");
+            assert_eq!(lines[3], "worker stopped", "worker's own on-stop must be last: {stdout:?}");
+            let root_stopped_pos = lines.iter().position(|&l| l == "root stopped").unwrap();
+            let worker_stopped_pos = lines.iter().position(|&l| l == "worker stopped").unwrap();
+            assert!(
+                root_stopped_pos < worker_stopped_pos,
+                "root's own on-stop must precede the remote worker's: {stdout:?}"
+            );
+        }
+
+        // VM and native: fully deterministic, every run, exact same order --
+        // `concurrent` is a complete no-op on both engines (§8.8).
+        let expected = "root started\nworker got 21, doubled=42\nroot stopped\nworker stopped\n";
+        for _ in 0..5 {
+            let vm_out =
+                std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(vm_out.status.code(), Some(0), "{vm_out:?}");
+            assert_eq!(String::from_utf8_lossy(&vm_out.stdout), expected, "{vm_out:?}");
+        }
+        let native_bin = dir.join("deliver_native");
+        let build = std::process::Command::new(&bin)
+            .args(["native", file.to_str().unwrap(), "-o", native_bin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(build.status.code(), Some(0), "{build:?}");
+        for _ in 0..5 {
+            let native_out = std::process::Command::new(&native_bin).output().unwrap();
+            assert_eq!(native_out.status.code(), Some(0), "{native_out:?}");
+            assert_eq!(String::from_utf8_lossy(&native_out.stdout), expected, "{native_out:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `docs/design/ASYNC.md` §8.10 step 4: a `concurrent` component may be
+    /// a wire's DESTINATION (verified above) but not yet its SOURCE --
+    /// checked as a clean, specific K0900 panic rather than the confusing
+    /// internal `unwrap_local_mut()` panic this would have hit before the
+    /// explicit check `Interp::instantiate_local` now performs.
+    #[test]
+    fn concurrent_component_as_a_wire_source_is_a_clean_panic_not_an_ice() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-concurrent-wire-source-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("wire_source.kupl");
+        std::fs::write(
+            &file,
+            "component Receiver {\n    intent \"Receives a value.\"\n    in got: Int\n    \
+                 on got(n) { print(\"got {n}\") }\n}\n\
+             concurrent component Emitter {\n    intent \"Tries to be a wire source.\"\n    \
+                 out sig: Int\n    on start { emit sig(1) }\n}\n\
+             app Root {\n    intent \"A concurrent wire SOURCE must be rejected.\"\n    \
+                 let e = Emitter()\n    let r = Receiver()\n    wire e.sig -> r.got\n    \
+                 on start { print(\"root started\") }\n}\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(out.status.code(), Some(101), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("K0900"), "{stderr}");
+        assert!(
+            stderr.contains("cannot be a wire's SOURCE yet"),
+            "must be the specific, clean diagnostic, not an internal-compiler-error: {stderr}"
+        );
+        assert!(!stderr.contains("internal compiler error"), "{stderr}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it894,
     /// an Explore survey finding, agentId a7ba91a6862653340, independently
     /// re-verified live before implementing -- see `callargs.rs`'s own doc

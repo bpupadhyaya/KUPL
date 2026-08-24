@@ -129,17 +129,49 @@ pub struct Instance {
     pub restart_history: VecDeque<i64>,
 }
 
+/// A message crossing the coordinator/actor thread boundary
+/// (`docs/design/ASYNC.md` §8.4 — non-blocking `Deliver`, matching §8.4's
+/// already-decided shape exactly). Step 4 (`docs/design/ASYNC.md` §8.10)
+/// only wires up the coordinator/local-instance -> `Remote`-instance
+/// direction (an `in` port on a concurrent instance can receive a value
+/// sent from the coordinator side); a `Remote` instance's own `emit`
+/// reaching back OUT to the coordinator or another actor is deferred (see
+/// `Interp::instantiate_local`'s own wire-registration check below, which
+/// rejects a `concurrent` instance as a wire SOURCE with a clean error
+/// rather than attempting it).
+enum ActorMsg {
+    Deliver(String, crate::parallel::PortableValue),
+}
+
 /// A handle to a `concurrent`-marked instance running on its own actor
-/// thread (`docs/design/ASYNC.md` §8.2/§8.10 step 3). The actor's closure
-/// runs a fully self-contained lifecycle for its own instance (and any
-/// children it declares) — `instantiate` + `start_all` + `run_timers` +
-/// `stop_all`, mirroring `kupl run`'s own top-level sequence — so there is
-/// nothing left for the coordinator to do with a `Remote` slot except wait
-/// for it to finish; `join` is `Some` until `Interp::start_all` (the first
-/// point a caller needs every instance's `on start` to have completed)
-/// consumes it via `.take()`.
+/// thread (`docs/design/ASYNC.md` §8.2/§8.10 steps 3-4).
+///
+/// The actor's closure runs its OWN initial lifecycle — `instantiate` +
+/// `start_all` + `run_timers(100)`, mirroring `kupl run`'s own top-level
+/// startup sequence for this one instance — then, unlike step 3, does
+/// NOT immediately run `stop_all` and exit. Instead it enters a
+/// message-servicing loop (`while let Ok(msg) = inbox.recv() { ... }`),
+/// staying alive to receive `Deliver` messages until `Interp::stop_all`
+/// closes its inbox (dropping the coordinator's own `Sender` half, which
+/// ends the actor's `recv()` loop the standard Rust channel way — no
+/// explicit shutdown message needed) — at which point the actor runs its
+/// OWN `stop_all` and the thread finishes.
+///
+/// **A real, named limitation, not silently ignored**: a `concurrent`
+/// instance's recurring (`on every`) timers only fire during its initial
+/// `run_timers(100)` burst at startup — nothing advances its virtual
+/// clock again during the message-servicing phase (that needs §8.5's
+/// shared next-fire table, deferred past this step).
 pub struct ActorHandle {
     join: Option<std::thread::JoinHandle<()>>,
+    inbox: Option<std::sync::mpsc::Sender<ActorMsg>>,
+    /// Signaled once, by the actor, right after its own initial
+    /// `start_all` + `run_timers(100)` complete (regardless of whether
+    /// they succeeded) — consumed by `Interp::start_all` so "on start has
+    /// been delivered to every instance" stays true by the time IT
+    /// returns, even though the actor's own thread keeps running
+    /// (servicing its inbox) well past that point.
+    ready: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 /// Every one of the 14 functions across this file that used to index
@@ -483,6 +515,25 @@ impl Interp {
             let (Some(&src), Some(&dst)) = (child_ids.get(from_child), child_ids.get(to_child)) else {
                 return Err(Self::panic_flow("wire references unknown child", wire.span));
             };
+            // `docs/design/ASYNC.md` §8.10 step 4: a wire's routing table
+            // lives on its SOURCE instance -- for a `Remote` source, that
+            // table lives on a DIFFERENT thread with its OWN, entirely
+            // separate id space (`dst` here is only meaningful in THIS
+            // `Interp`'s own space), which is exactly the "cross-Interp
+            // wire" question §6 found to be the hard, unresolved half of
+            // real concurrency. Rather than attempt it here, a `concurrent`
+            // instance as a wire SOURCE fails with a clean, specific
+            // diagnostic -- step 4 only wires up the OTHER direction
+            // (`Interp::send` below routes a message INTO a `Remote`
+            // instance's inbox when IT is the wire's destination).
+            if matches!(&self.instances[src], InstanceSlot::Remote(_)) {
+                return Err(Self::panic_flow(
+                    format!(
+                        "wire `{from_child}.{from_port} -> {to_child}.{to_port}`: a `concurrent` component cannot be a wire's SOURCE yet (only its destination) -- see docs/design/ASYNC.md §8.10 step 4"
+                    ),
+                    wire.span,
+                ));
+            }
             self.instances[src].unwrap_local_mut()
                 .wires
                 .entry(from_port.clone())
@@ -494,13 +545,13 @@ impl Interp {
     }
 
     /// Construct a `concurrent` component on its own OS thread
-    /// (`docs/design/ASYNC.md` §8.2/§8.10 step 3 — the narrowest first
-    /// slice: no wires or `expose` calls reach this instance yet, so the
-    /// actor's closure below runs a FULLY SELF-CONTAINED lifecycle
-    /// (`instantiate_local` + `start_all` + `run_timers` + `stop_all`,
-    /// mirroring `kupl run`'s own top-level sequence exactly) and simply
-    /// finishes — there is no ongoing inbox to service until step 4/5 add
-    /// `Deliver`/`Call` messaging).
+    /// (`docs/design/ASYNC.md` §8.2/§8.10 steps 3-4). The actor's closure
+    /// runs its own initial startup (`instantiate_local` + `start_all` +
+    /// `run_timers(100)`, mirroring `kupl run`'s own top-level startup
+    /// sequence for this one instance), signals readiness, then stays
+    /// alive servicing `Deliver` messages on its inbox until
+    /// `Interp::stop_all` closes it — see `ActorHandle`'s own doc comment
+    /// for the full lifecycle.
     ///
     /// `args` are already-evaluated `Value`s (the caller's own scope may be
     /// referenced by the argument EXPRESSIONS, which is why evaluation
@@ -542,6 +593,8 @@ impl Interp {
         // against `self.db.components` in the first place. Only the plain
         // `String` name crosses the thread boundary here.
         let comp_name = comp.name.clone();
+        let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let join = std::thread::spawn(move || {
             let db = image.actor_db();
             let mut actor = Interp::new(db);
@@ -555,30 +608,47 @@ impl Interp {
                 .into_iter()
                 .map(|(name, pv)| (name, crate::parallel::from_portable(&pv)))
                 .collect();
-            // Mirrors `run.rs`'s own top-level `kupl run` sequence
-            // (instantiate -> start_all -> run_timers(100)) for this ONE
-            // instance's own self-contained sub-program, then delivers
-            // `on stop` immediately after -- there is no further inbox to
-            // service in this step, so "start, run to quiescence, stop" IS
-            // this actor's entire natural lifecycle.
-            let result = (|| -> Result<(), Flow> {
+            let report = |what: &str, err: &Flow| {
+                if let Flow::Panic { msg, span, .. } = err {
+                    eprintln!("error: concurrent component `{comp_name}`: {what}: panic: {msg} (at {span:?})");
+                }
+            };
+            let startup = (|| -> Result<(), Flow> {
                 actor.instantiate_local(comp, &args, span)?;
                 actor.start_all()?;
                 actor.run_timers(100)?;
-                actor.stop_all(actor.instances.len())?;
                 Ok(())
             })();
-            // No channel back to the coordinator exists yet (step 4/5 adds
-            // one) -- surface a panicking actor the same way an ordinary
-            // top-level program panic is shown, rather than silently
-            // dropping it, matching this codebase's own "never swallow an
-            // error silently" discipline.
-            if let Err(Flow::Panic { msg, span, .. }) = result {
-                eprintln!("error: concurrent component `{comp_name}`: panic: {msg} (at {span:?})");
+            if let Err(e) = &startup {
+                report("startup", e);
+            }
+            // Signal readiness regardless of outcome -- `Interp::start_all`
+            // (coordinator side) is waiting on this to know the actor's
+            // own initial lifecycle has settled one way or the other.
+            let _ = ready_tx.send(());
+            if startup.is_ok() {
+                // Service `Deliver` messages until the coordinator closes
+                // the inbox (`Interp::stop_all` drops its `Sender` half) —
+                // `recv()` returning `Err` is the standard Rust "no more
+                // senders" signal, needing no explicit shutdown message.
+                while let Ok(ActorMsg::Deliver(port, pv)) = inbox_rx.recv() {
+                    let v = crate::parallel::from_portable(&pv);
+                    if let Err(e) = actor.send(0, &port, v) {
+                        report("message delivery", &e);
+                        break;
+                    }
+                }
+                if let Err(e) = actor.stop_all(actor.instances.len()) {
+                    report("shutdown", &e);
+                }
             }
         });
         let id = self.instances.len();
-        self.instances.push(InstanceSlot::Remote(ActorHandle { join: Some(join) }));
+        self.instances.push(InstanceSlot::Remote(ActorHandle {
+            join: Some(join),
+            inbox: Some(inbox_tx),
+            ready: Some(ready_rx),
+        }));
         Ok(Value::Component(id))
     }
 
@@ -586,17 +656,20 @@ impl Interp {
     ///
     /// A `Remote` (`concurrent`) instance's own `on start` already ran, on
     /// its own thread, as part of `instantiate_concurrent`'s spawned
-    /// closure — skipped here, then every spawned actor is joined AFTER
-    /// the ordinary per-instance loop below, so that by the time this
-    /// function returns, "on start has been delivered to every instance"
-    /// remains true for callers exactly as it was before `concurrent`
-    /// existed, whether that instance ran locally or on its own thread.
-    /// Because every actor is spawned during `instantiate` (which happens
-    /// BEFORE this loop even starts, while the component tree is being
-    /// built) rather than spawned HERE, multiple sibling `concurrent`
-    /// instances' own `on start`/timer/`stop` work already overlaps in
-    /// real wall-clock time with each other and with this loop's own
-    /// local work — genuine parallelism, even in this narrowest slice.
+    /// closure — skipped here, then this function waits (via each actor's
+    /// own `ready` signal, NOT a full thread join — the actor keeps
+    /// running past this point, servicing its inbox per `ActorHandle`'s
+    /// own doc comment, ASYNC.md §8.10 step 4) for every spawned actor's
+    /// OWN initial startup to finish, so that by the time this function
+    /// returns, "on start has been delivered to every instance" remains
+    /// true for callers exactly as it was before `concurrent` existed,
+    /// whether that instance ran locally or on its own thread. Because
+    /// every actor is spawned during `instantiate` (which happens BEFORE
+    /// this loop even starts, while the component tree is being built)
+    /// rather than spawned HERE, multiple sibling `concurrent` instances'
+    /// own `on start`/timer work already overlaps in real wall-clock time
+    /// with each other and with this loop's own local work — genuine
+    /// parallelism, even in this narrowest slice.
     pub fn start_all(&mut self) -> Result<(), Flow> {
         for id in 0..self.instances.len() {
             if matches!(&self.instances[id], InstanceSlot::Remote(_)) {
@@ -608,13 +681,12 @@ impl Interp {
         self.drain()?;
         for slot in &mut self.instances {
             if let InstanceSlot::Remote(handle) = slot {
-                if let Some(join) = handle.join.take() {
+                if let Some(ready) = handle.ready.take() {
                     // A panicked (Rust-level, not KUPL Flow::Panic) actor
-                    // thread is already reported by the OS/Rust's own
-                    // default panic hook; nothing further to surface here
-                    // until step 4/5 add a real channel back to this
-                    // caller.
-                    let _ = join.join();
+                    // thread already reported itself via `report(...)`
+                    // inside the closure; nothing further to surface here
+                    // until step 5 adds a real channel back to this caller.
+                    let _ = ready.recv();
                 }
             }
         }
@@ -653,19 +725,32 @@ impl Interp {
     /// snapshot of `self.instances.len()` taken right where `start_all` was
     /// called, so this only ever touches exactly the instances that were
     /// actually started.
+    /// `docs/design/ASYNC.md` §8.10 step 4: a `Remote` instance stays alive
+    /// (servicing its inbox) past `start_all`, so shutting it down now
+    /// takes two passes: first CLOSE every remote actor's inbox (dropping
+    /// the coordinator's own `Sender` half ends that actor's own
+    /// `recv()` loop, letting it proceed to its OWN `stop_all` and exit),
+    /// THEN join their threads — split into two loops, not fused into one,
+    /// so every actor's shutdown is SIGNALED together before this function
+    /// blocks waiting on any single one, preserving the same "shutdown
+    /// overlaps in real wall-clock time" property `start_all` already
+    /// established for startup.
     pub fn stop_all(&mut self, upto: usize) -> Result<(), Flow> {
         for id in 0..upto.min(self.instances.len()) {
-            // A `Remote` instance's own `on stop` already ran, on its own
-            // thread, as the last step of `instantiate_concurrent`'s
-            // closure (by the time `start_all` returns, every actor has
-            // been joined — its entire self-contained lifecycle, start
-            // through stop, is already complete).
-            if matches!(&self.instances[id], InstanceSlot::Remote(_)) {
+            if let InstanceSlot::Remote(handle) = &mut self.instances[id] {
+                handle.inbox.take(); // drop the Sender -> closes the channel
                 continue;
             }
             self.run_lifecycle(id, &Trigger::Stop)?;
         }
         self.drain()?;
+        for id in 0..upto.min(self.instances.len()) {
+            if let InstanceSlot::Remote(handle) = &mut self.instances[id] {
+                if let Some(join) = handle.join.take() {
+                    let _ = join.join();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -839,6 +924,30 @@ impl Interp {
 
     /// Queue a message and process until the queue is empty.
     pub fn send(&mut self, id: usize, port: &str, value: Value) -> Result<(), Flow> {
+        // `docs/design/ASYNC.md` §8.4: delivering INTO a `Remote` instance
+        // is the non-blocking `Deliver` message, routed through its own
+        // inbox instead of this `Interp`'s own `queue` (which `drain`
+        // below can no longer reach into -- the target `Instance` lives on
+        // a different thread entirely). A conversion failure here would
+        // mean K0306 failed to reject a non-portable port type, a compiler
+        // bug, not a reachable user-facing case.
+        if let InstanceSlot::Remote(handle) = &self.instances[id] {
+            let Some(pv) = crate::parallel::to_portable(&value) else {
+                return Err(Self::panic_flow(
+                    format!("internal error: message to concurrent instance {id} on port `{port}` is not portable -- K0306 should have rejected this at check time"),
+                    Span::default(),
+                ));
+            };
+            // Best-effort: if the actor has already fully shut down (its
+            // `Receiver` dropped after its own `stop_all`), the send fails
+            // silently -- matching an ordinary message arriving after a
+            // program has already finished, which has no observable effect
+            // either.
+            if let Some(inbox) = &handle.inbox {
+                let _ = inbox.send(ActorMsg::Deliver(port.to_string(), pv));
+            }
+            return Ok(());
+        }
         self.queue.push_back((id, port.to_string(), value));
         self.drain()
     }
@@ -968,8 +1077,21 @@ impl Interp {
                 println!("{comp}.{port} = {value}");
             }
         } else {
+            // `docs/design/ASYNC.md` §8.10 step 4: a LOCAL target still goes
+            // straight onto `self.queue` exactly as before (unchanged
+            // behavior, verified byte-identical for every program that
+            // doesn't use `concurrent`); a `Remote` target routes through
+            // `Interp::send`, which already knows how to reach a
+            // `concurrent` instance's inbox -- this was the ONE remaining
+            // direct `self.queue.push_back` bypassing that check (`send`
+            // itself never bypasses it), found live while testing this
+            // step, not anticipated in the design doc.
             for (dst, dport) in targets {
-                self.queue.push_back((dst, dport, value.clone()));
+                if matches!(&self.instances[dst], InstanceSlot::Remote(_)) {
+                    self.send(dst, &dport, value.clone())?;
+                } else {
+                    self.queue.push_back((dst, dport, value.clone()));
+                }
             }
         }
         Ok(())

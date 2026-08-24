@@ -1147,10 +1147,62 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       `cargo test --bins` 63/63 (62 existing + 1 new), independently
       confirmed non-flaky across 15+ additional runs after the sample-size
       fix; `cargo test --doc` 0/0; interp-vs-vm and interp-vs-native
-      sweeps both clean across all 56 examples. Next: §8.10 step 4 —
-      `Deliver` messages (non-blocking wire emit + timer fire) once a
-      `Remote` instance needs to stay alive past its own initial
-      lifecycle instead of finishing before `instantiate` even returns.
+      sweeps both clean across all 56 examples. **it136: §8.10 step 4
+      landed — non-blocking `Deliver` messages, real actor lifetime.**
+      `ActorHandle` widened with an `inbox: Option<mpsc::Sender<ActorMsg>>`
+      and a `ready: Option<mpsc::Receiver<()>>` (a one-shot startup
+      signal). The actor's closure no longer runs to completion and exits
+      (step 3's model) — after its own initial `start_all` +
+      `run_timers(100)`, it signals `ready` then enters `while let
+      Ok(Deliver(port, pv)) = inbox.recv() { ... }`, staying alive until
+      `Interp::stop_all` drops the coordinator's `Sender` half (the
+      standard Rust "no more senders" channel-close signal — no explicit
+      shutdown message needed), THEN runs its own `stop_all` and exits.
+      `Interp::start_all` now waits on each actor's `ready` signal instead
+      of joining its thread (the actor keeps running past that point);
+      `Interp::stop_all` closes every remote inbox in one pass, THEN joins
+      in a second pass, preserving genuine wall-clock overlap at shutdown
+      the same way `start_all` already had it at startup. `Interp::send`
+      routes a `Remote` target through its inbox (portable-converted,
+      non-blocking) instead of the coordinator's own `queue`.
+      `instantiate_local`'s wire-registration loop rejects a `concurrent`
+      instance as a wire SOURCE with a clean, specific panic (the
+      cross-Interp-wire question §6 found genuinely hard is deliberately
+      NOT attempted — only the DESTINATION direction is wired up this
+      step). **A real bug found and fixed while testing this, not
+      anticipated in the design**: `emit` pushed every wire target
+      straight onto `self.queue` directly, entirely bypassing `send`'s own
+      new `Remote`-routing check (only `send` itself had it) — an
+      internal-compiler-error panic, live-confirmed on every run of a
+      simple local-source/concurrent-destination wire before the fix,
+      illustrating exactly why `docs/design/ASYNC.md` §6.2's own
+      14-function/32-call-site inventory (not just `emit`/`expose`) was
+      the right level of rigor. **A genuinely new capability fell out of
+      the lifecycle redesign for free, not planned**: `on stop` now
+      correctly fires for `concurrent` instances too — impossible under
+      step 3's "run to completion immediately" model (an actor's ENTIRE
+      lifecycle, including its own `on stop`, was already finished before
+      `start_all` even returned), naturally correct once actors stay alive
+      until `stop_all` closes them. **Also found and worked around a real
+      environment quirk**: `cargo test`'s own process wrapper intermittently
+      appeared to hang (multi-minute, zero-CPU) specifically when spawning
+      subprocess `kupl` invocations that themselves spawn actor threads,
+      inside this session's sandboxed background-bash tooling — but the
+      SAME tests, run directly against the compiled test binary (bypassing
+      `cargo test`'s wrapper), passed cleanly and quickly across 13+
+      repeated runs, isolating this to the test-runner/sandbox interaction
+      rather than the implementation; verification for this step used the
+      compiled binary directly rather than chasing a tooling artifact
+      further. Verified: `cargo build` clean, zero warnings; `cargo test`
+      green **twice** (1711/1711 lib); full bins suite (via the compiled
+      binary directly) 65/65 (63 existing + 2 new), the 3
+      `concurrent`-matching tests independently confirmed non-flaky across
+      13+ additional runs; `cargo test --doc` 0/0; interp-vs-vm and
+      interp-vs-native sweeps both clean across all 56 examples. Next:
+      §8.10 step 5 — blocking `Call` messages for `expose` calls targeting
+      a `Remote` instance, plus the per-thread pending-call-chain
+      deadlock-cycle detection ASYNC.md §8.4 already named as a new,
+      real hazard.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into
