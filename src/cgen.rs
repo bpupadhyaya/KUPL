@@ -1063,9 +1063,46 @@ static void k_panic(const char* msg) {
     exit(101);
 }
 
+/* Opt-in total-allocation cap for a `kupl native`-compiled binary, mirroring
+   `memcap.rs`'s `--max-memory=<MB>` for `kupl run`/`kupl run --vm` -- see
+   that module's own doc comment, which explicitly named this gap ("a
+   memory cap there needs a wholly separate mechanism... its own C-side
+   accounting"). A standalone native binary never links the Rust process's
+   global allocator at all, so the natural opt-in mechanism here is an env
+   var the binary reads at its own startup, `KUPL_MAX_MEMORY_MB` (there is
+   no `kupl` process wrapping it to parse a `--max-memory` CLI flag through
+   to). `k_alloc` is the SAME single choke point every native allocation
+   already goes through (arena-style, never freed -- this module's own top
+   doc comment), so this is a total-cumulative counter, not a live/net one;
+   for that exact reason it also naturally matches what the Rust side
+   tracks in practice, since v0's arena model never frees either.
+   `k_alloc_cap_bytes < 0` means "not yet read"; `0` means unlimited (unset
+   or invalid). Not atomic -- a plain global, like the rest of this
+   single-threaded-by-default runtime (native has no `concurrent
+   component`/thread-spawning support yet) -- and, like `memcap.rs`'s own
+   check-then-add, an accepted approximation for a SOFT safety net, not a
+   hard security boundary, even if that changes later. */
+static long k_alloc_cap_bytes = -1;
+static size_t k_alloc_used_bytes = 0;
+
 static void* k_alloc(size_t n) {
-    void* p = malloc(n < 1 ? 1 : n);
+    if (k_alloc_cap_bytes < 0) {
+        k_alloc_cap_bytes = 0;
+        const char* v = getenv("KUPL_MAX_MEMORY_MB");
+        if (v && v[0]) {
+            long mb = atol(v);
+            if (mb > 0) k_alloc_cap_bytes = mb * 1024L * 1024L;
+        }
+    }
+    size_t want = n < 1 ? 1 : n;
+    if (k_alloc_cap_bytes > 0 && (long)(k_alloc_used_bytes + want) > k_alloc_cap_bytes) {
+        fflush(stdout);
+        fprintf(stderr, "error[K0902]: memory limit of %ld bytes exceeded -- aborting\n", k_alloc_cap_bytes);
+        exit(101);
+    }
+    void* p = malloc(want);
     if (!p) k_panic("out of memory");
+    k_alloc_used_bytes += want;
     return p;
 }
 
@@ -20157,6 +20194,85 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
     #[cfg(test)]
     fn native_main_stdout(src: &str, tag: &str) -> String {
         native_main_stdout_env(src, tag, &[])
+    }
+
+    /// Same compile-and-run shape as `native_main_stdout_env`, but returns
+    /// the full `Output` (stdout AND stderr AND exit status) -- needed for
+    /// the `KUPL_MAX_MEMORY_MB` tests below, which must check stderr for
+    /// `K0902` and confirm a non-zero exit, not just stdout content.
+    fn native_main_output_env(src: &str, tag: &str, env: &[(&str, &str)]) -> std::process::Output {
+        let compiled = crate::run::compile(src).expect("program compiles");
+        let module = crate::compile::compile_module(&compiled.program, &compiled.checked).expect("module compiles");
+        let c = super::emit_c(&module).expect("emit_c succeeds");
+        let base = std::env::temp_dir().join(format!("kupl-cgen-{tag}-{}", std::process::id()));
+        let cpath = base.with_extension("c");
+        let bin = base.with_extension("out");
+        std::fs::write(&cpath, &c).unwrap();
+        let status = std::process::Command::new(cc())
+            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "generated C must compile");
+        let mut cmd = std::process::Command::new(&bin);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("binary runs");
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&bin);
+        out
+    }
+
+    /// The native mirror of `main.rs`'s own `max_memory_flag_aborts_an_
+    /// oversized_allocation_on_both_engines` -- `kupl native` has no `kupl`
+    /// process wrapping the compiled binary to parse a `--max-memory` CLI
+    /// flag through to, so the equivalent opt-in mechanism is
+    /// `KUPL_MAX_MEMORY_MB`, read by the binary itself at its own first
+    /// allocation (`k_alloc`, this file). `"x".repeat(90_000_000)` is
+    /// deliberately kept under the LANGUAGE's own separate 100MB
+    /// `.repeat()` result-size guard, matching that test's own reasoning,
+    /// so it's the memory cap being exercised here, not the unrelated
+    /// guard.
+    #[test]
+    fn native_max_memory_env_var_aborts_an_oversized_allocation() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() {\n    let s = \"x\".repeat(90000000)\n    print(s.len())\n}\n";
+        let out = native_main_output_env(src, "maxmem-abort", &[("KUPL_MAX_MEMORY_MB", "32")]);
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("K0902"),
+            "the memory-cap abort must report K0902: {out:?}"
+        );
+    }
+
+    /// Companion: a program that stays comfortably under a generous cap
+    /// must be entirely unaffected -- same output, same exit code, as with
+    /// no cap at all.
+    #[test]
+    fn native_max_memory_env_var_does_not_affect_a_program_under_the_cap() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() { print(\"hi\") }\n";
+        let out = native_main_output_env(src, "maxmem-noop", &[("KUPL_MAX_MEMORY_MB", "64")]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi", "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+    }
+
+    /// Default (no env var set at all) must be completely unaffected --
+    /// zero behavioral change for every existing native binary/test.
+    #[test]
+    fn native_max_memory_env_var_unset_is_unlimited_by_default() {
+        if !cc_available() {
+            return;
+        }
+        let src = "fun main() {\n    let s = \"x\".repeat(50000000)\n    print(s.len())\n}\n";
+        let out = native_main_output_env(src, "maxmem-default", &[]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "50000000", "{out:?}");
     }
 
     /// Compile `src` to native, run it (with any extra env vars set), return stdout.

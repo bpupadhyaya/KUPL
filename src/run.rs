@@ -1412,11 +1412,35 @@ pub fn native(path: &str, args: &[String]) -> i32 {
             return 1;
         }
     };
-    let c_src = match crate::cgen::emit_c(&module) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
+    // Build-cache lookup (production-hardening: incremental compilation
+    // cache) -- `cc`'s own identity folds into the key (a different C
+    // compiler, or an upgraded one at the same path, can legitimately
+    // produce different machine code for the identical generated C, even
+    // though every ENGINE's observable OUTPUT is still guaranteed byte-
+    // identical -- `-ffp-contract=off` etc. below exist for exactly that
+    // guarantee). Computed BEFORE `emit_c`/the `cc` invocation (the
+    // expensive steps this cache exists to skip), but AFTER
+    // `compile_module` (unchanged from before this cache existed), so a
+    // genuine compile error still reports at the exact same point in the
+    // flow as always -- this cache only ever short-circuits WORK, never
+    // error-reporting order.
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let cache_key = crate::buildcache::content_key("native", &map, cc.as_bytes());
+    // `--keep-c` exists specifically so a user can inspect the generated C
+    // -- a cache hit skips generating it at all, so honoring `--keep-c`
+    // means treating this invocation as an unconditional miss (still
+    // benefits from a cache STORE below for a future non-`--keep-c` run).
+    let keep_c_flag = args.iter().any(|a| a == "--keep-c");
+    let cached_exe = if keep_c_flag { None } else { crate::buildcache::lookup(&cache_key) };
+    let c_src = if cached_exe.is_some() {
+        String::new() // never read below on a cache hit
+    } else {
+        match crate::cgen::emit_c(&module) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
         }
     };
     // A REAL bug found+fixed (production-hardening PR-it862): the sibling
@@ -1485,6 +1509,23 @@ pub fn native(path: &str, args: &[String]) -> i32 {
         );
         return 1;
     }
+    // Cache hit: skip `emit_c`/the `c_path` write/the `cc` invocation
+    // entirely (the three steps this cache exists to short-circuit, `cc`
+    // by far the most expensive) -- write the previously-compiled
+    // executable bytes straight to `out`.
+    if let Some(bytes) = cached_exe {
+        if let Err(e) = crate::loader::write_atomically(std::path::Path::new(&out), &bytes) {
+            eprintln!("error: cannot write {out}: {e}");
+            return 1;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        println!("native executable: {out}");
+        return 0;
+    }
     // A REAL bug found+fixed (production-hardening PR-it1151, a fresh
     // Explore survey's finding): this was a plain, non-atomic
     // `std::fs::write`, exposing `c_path` to a concurrent reader (an editor,
@@ -1526,15 +1567,22 @@ pub fn native(path: &str, args: &[String]) -> i32 {
     // discretion outright, rather than depending on any particular
     // architecture's or compiler's default), so post-fix all three engines are
     // BIT-IDENTICAL regardless of the build machine's ISA.
-    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = std::process::Command::new(&cc)
         .args(["-O2", "-ffp-contract=off", "-o", &out, &c_path])
         .status();
-    let keep_c = args.iter().any(|a| a == "--keep-c");
+    let keep_c = keep_c_flag;
     match status {
         Ok(s) if s.success() => {
             if !keep_c {
                 let _ = std::fs::remove_file(&c_path);
+            }
+            // Best-effort: store the freshly-compiled executable for reuse
+            // by a later `kupl native` of byte-identical source. A read
+            // failure here (implausible right after `cc` just wrote it
+            // successfully) just means no cache entry -- never turns this
+            // already-successful build into a reported failure.
+            if let Ok(bytes) = std::fs::read(&out) {
+                crate::buildcache::store(&cache_key, &bytes);
             }
             println!(
                 "native executable: {out}{}",
@@ -2187,6 +2235,72 @@ mod tests {
             .filter(|n| n.contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "no .tmp-* sibling should survive a successful rebuild: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Production-hardening: incremental compilation cache. Proves the
+    /// integration point directly (the cache entry `native` must populate
+    /// after a successful build, keyed exactly as `buildcache::content_key`
+    /// itself would compute it) rather than only unit-testing `buildcache`
+    /// in isolation. Does NOT try to prove `cc` was skipped on a second
+    /// call by breaking `cc`/`PATH` mid-test (environment-invasive, unsafe
+    /// under a parallel test suite) -- that was instead verified live,
+    /// manually, outside the automated suite (a real ~50x wall-clock
+    /// speedup on a cache hit, `kupl native`'s dominant cost being the `cc`
+    /// invocation this cache exists to skip).
+    #[test]
+    fn native_populates_the_build_cache_and_a_rebuild_reproduces_byte_identical_output() {
+        let dir = std::env::temp_dir().join(format!("kupl-buildcache-native-integ-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("app.kupl");
+        let out = dir.join("app");
+        std::fs::write(&source, "fun main() uses io {\n    print(\"cached\")\n}\n").unwrap();
+        let args = vec!["-o".to_string(), out.to_str().unwrap().to_string()];
+
+        let code = super::native(source.to_str().unwrap(), &args);
+        assert_eq!(code, 0, "first native build must succeed");
+        let first_bytes = std::fs::read(&out).unwrap();
+
+        let (_compiled, map) = super::load_compile(source.to_str().unwrap()).unwrap();
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let key = crate::buildcache::content_key("native", &map, cc.as_bytes());
+        let cached = crate::buildcache::lookup(&key).expect("a cache entry must exist after a successful native build");
+        assert_eq!(cached, first_bytes, "the cached bytes must be exactly the produced executable's bytes");
+
+        std::fs::remove_file(&out).unwrap();
+        let code2 = super::native(source.to_str().unwrap(), &args);
+        assert_eq!(code2, 0, "rebuilding byte-identical source must succeed, cached or not");
+        assert_eq!(std::fs::read(&out).unwrap(), first_bytes, "a rebuild of identical source must be byte-identical");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A change to the compiled program (not just cosmetic source text) must
+    /// invalidate the cache -- a different key, a genuinely different
+    /// rebuilt executable, never a stale served artifact.
+    #[test]
+    fn native_cache_key_changes_when_the_source_changes() {
+        let dir = std::env::temp_dir().join(format!("kupl-buildcache-native-invalidate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("app.kupl");
+        let out = dir.join("app");
+        let args = vec!["-o".to_string(), out.to_str().unwrap().to_string()];
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+
+        std::fs::write(&source, "fun main() uses io {\n    print(\"v1\")\n}\n").unwrap();
+        assert_eq!(super::native(source.to_str().unwrap(), &args), 0);
+        let (_c1, map1) = super::load_compile(source.to_str().unwrap()).unwrap();
+        let key1 = crate::buildcache::content_key("native", &map1, cc.as_bytes());
+
+        std::fs::write(&source, "fun main() uses io {\n    print(\"v2\")\n}\n").unwrap();
+        assert_eq!(super::native(source.to_str().unwrap(), &args), 0);
+        let (_c2, map2) = super::load_compile(source.to_str().unwrap()).unwrap();
+        let key2 = crate::buildcache::content_key("native", &map2, cc.as_bytes());
+
+        assert_ne!(key1, key2, "different source must produce a different cache key");
+        assert!(crate::buildcache::lookup(&key1).is_some(), "v1's own cache entry must still exist, untouched");
+        assert!(crate::buildcache::lookup(&key2).is_some(), "v2 must have populated its OWN, distinct cache entry");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

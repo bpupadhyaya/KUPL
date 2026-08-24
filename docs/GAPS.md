@@ -1432,6 +1432,81 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       the default URL and a published third-party index remain genuinely
       missing, and those are external hosting/operational commitments, not
       a code gap `kupl pkg publish` could itself close.
+- [x] **Native `--max-memory` coverage + a persistent build cache (it141).**
+      Two independent production-readiness closures landed together.
+      **(1)** `--max-memory` never covered `kupl native`'s generated
+      executable (a standalone process that never links the Rust
+      `#[global_allocator]` `kupl run`/`--vm` use) — closed via
+      `KUPL_MAX_MEMORY_MB`, an env var the compiled binary reads at its
+      own first allocation. `cgen.rs::k_alloc` — the ONE choke point every
+      native allocation already goes through (arena-style, never freed) —
+      now tracks a cumulative byte counter against the cap and prints the
+      SAME `K0902` diagnostic `memcap.rs` uses before a clean `exit(101)`
+      (not a platform abort, since native's C runtime controls its own
+      exit path directly). **(2)** New `buildcache.rs`: a content-addressed
+      build cache for `kupl build`/`bundle`/`native` (`kupl run`/`--vm`
+      deliberately excluded — both need the CHECKED `Program`, not just
+      compiled bytecode, for `ProgramDb`/`ProgramImage`'s `par_map`/
+      `concurrent component` support, which has no stable serialized form
+      today, so there's nothing a bytecode cache could let them skip).
+      `~/.kupl/build-cache/<key>` holds final artifact bytes; a matching
+      key skips `compile_module`/codegen/`cc` entirely. Live-measured: a
+      repeat `kupl native` on unchanged source dropped from 0.308s to
+      0.006s (the `cc` invocation is native's dominant cost by far).
+      The cache key folds in the RUNNING `kupl` binary's own SHA-256
+      content hash (`self_hash`, `OnceLock`-cached per process) rather
+      than trusting `CARGO_PKG_VERSION` alone — a REAL correctness
+      consideration caught during design, not found live: this project's
+      crate version stays `1.0.0-alpha` across every `Production-hardening
+      itN` commit, including ones that change `compile_module`/`emit_c`/
+      `cgen.rs`'s own embedded C runtime template, so a version-only key
+      would let a stale cache entry silently survive an in-place `cargo
+      build` and serve OLD compiled output under NEW compiler logic with
+      zero diagnostic. Tying the key to the binary's actual bytes means
+      any rebuild that changes what the compiler DOES necessarily changes
+      the key too. A second REAL design bug caught before it shipped (not
+      live-discovered either, but exactly the class of bug this project's
+      own discipline exists to catch pre-merge): the first draft made a
+      cache HIT skip `emit_c`/the `c_path` write entirely -- silently
+      breaking `--keep-c` (whose whole documented purpose is leaving the
+      generated C behind for inspection) on any invocation that happened
+      to hit the cache, with no error or warning. Fixed by treating
+      `--keep-c` as an unconditional cache miss (still populates the
+      cache for a future non-`--keep-c` run). Cache-key hashing avoids a
+      NUL-delimited encoding (a `.kupl` file's comment can legally contain
+      a literal NUL byte and still be valid UTF-8 text `loader::SourceMap`
+      accepts) in favor of length-prefixing, immune to boundary-shift
+      collisions regardless of file content — covered by a dedicated test
+      (`content_key_does_not_collide_across_a_boundary_shift`). New
+      `encoding::sha256_hex_bytes` (a thin wrapper exposing the
+      already-private `sha256_bytes`/`bytes_to_hex` for raw, non-UTF-8
+      input) avoids a lossy `String::from_utf8_lossy` round-trip when
+      hashing the executable's own binary bytes, which is NOT injective
+      (two different binaries could decode to the identical replacement-
+      character string and collide) — the exact class of bug a cache key
+      must never have. Verified: `cargo build`/`cargo build --tests`
+      clean, zero warnings (including the native C compile); `cargo test
+      --lib` green **twice**, 1742/1742 both times; `cargo test --bin
+      kupl` 70/70; interp-vs-vm sweep clean across 66 examples;
+      interp-vs-native sweep run TWICE — once populating the cache (0
+      mismatches across 65 examples) and once entirely served FROM the
+      cache (0 mismatches again) — proving the cached path reproduces
+      byte-identical output, not just a fast success code. Manually
+      verified live (outside the automated suite): a full `native`/
+      `--keep-c`/`bundle` round trip in an isolated `$HOME`, including
+      confirming a source-content change correctly forces a fresh
+      recompile (0.176s, not a cache hit) and produces the updated output.
+      `docs/PRODUCTION.md`'s "`--max-memory` doesn't cover `kupl native`"
+      and "no incremental or persistent compilation cache" Known
+      Limitations both rewritten to describe what's now true; a THIRD,
+      user-flagged framing issue fixed in the same pass -- the "no live
+      server at DEFAULT_REGISTRY_URL" bullet was removed from Known
+      Limitations entirely (not just reworded) after the user correctly
+      pushed back that this was never a functional requirement (Go, C,
+      and KUPL alike need no language-mandated package server to run) --
+      the top summary paragraph's own existing, accurate framing
+      ("self-hosting your own registry works today") already covers it
+      honestly without implying a defect.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into

@@ -638,12 +638,39 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
         Ok(ok) => ok,
         Err(code) => return code,
     };
-    let module = match kupl::compile::compile_module(&compiled.program, &compiled.checked) {
-        Ok(m) => m,
-        Err(diags) => {
-            run::print_diags_map(&diags, &map);
-            return 1;
+    // Build-cache lookup (production-hardening: incremental compilation
+    // cache) -- `buildcache::content_key`'s own `self_hash()` already folds
+    // in the running `kupl` binary's identity for every namespace, so
+    // `bundle`'s cache key needs nothing extra beyond that; the exe bytes
+    // are still read here (unconditionally, before knowing hit or miss)
+    // purely because `write_bundle` needs to EMBED them on a miss, and
+    // reading once up front avoids a second read later.
+    let exe: Option<Vec<u8>> = if bundle {
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("error: cannot read own executable: {e}");
+                return 1;
+            }
         }
+    } else {
+        None
+    };
+    let cache_key = kupl::buildcache::content_key(if bundle { "bundle" } else { "build" }, &map, b"");
+    let bytes = if let Some(cached) = kupl::buildcache::lookup(&cache_key) {
+        cached
+    } else {
+        let module = match kupl::compile::compile_module(&compiled.program, &compiled.checked) {
+            Ok(m) => m,
+            Err(diags) => {
+                run::print_diags_map(&diags, &map);
+                return 1;
+            }
+        };
+        let fresh =
+            if bundle { kupl::kx::write_bundle(exe.as_ref().expect("bundle always reads exe above"), &module) } else { kupl::kx::encode(&module) };
+        kupl::buildcache::store(&cache_key, &fresh);
+        fresh
     };
     // A REAL bug found+fixed (production-hardening PR-it862, an Explore
     // survey finding, independently re-verified live before implementing): a
@@ -708,18 +735,6 @@ fn build_module(args: &[String], file: &str, bundle: bool) -> i32 {
         );
         return 1;
     }
-    let bytes = if bundle {
-        let exe = match std::env::current_exe().and_then(std::fs::read) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("error: cannot read own executable: {e}");
-                return 1;
-            }
-        };
-        kupl::kx::write_bundle(&exe, &module)
-    } else {
-        kupl::kx::encode(&module)
-    };
     // A REAL, live-confirmed torn-read bug found+fixed (production-hardening
     // PR-it1132, the FOURTH instance of the shape PR-it1102/1103 already
     // fixed three times over): a rebuild overwriting a pre-existing `.kx`
@@ -1986,6 +2001,76 @@ mod tests {
             .filter(|n| n.contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "no .tmp-* sibling should remain after a successful rebuild: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Production-hardening: incremental compilation cache, `kupl build`'s
+    /// own integration point -- mirrors `run.rs`'s identical `native_
+    /// populates_the_build_cache_...` test. `build`'s own `.kx` bytes are
+    /// small and deterministic, so this also directly confirms a REBUILD of
+    /// byte-identical source reproduces byte-identical `.kx` output,
+    /// whether served from cache or freshly recompiled.
+    #[test]
+    fn build_populates_the_build_cache_and_a_rebuild_reproduces_byte_identical_output() {
+        let dir = std::env::temp_dir().join(format!("kupl-buildcache-build-integ-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.kupl");
+        let out = dir.join("main.kx");
+        std::fs::write(&entry, "fun main() uses io {\n    print(\"cached\")\n}\n").unwrap();
+        let args = vec![
+            "build".to_string(),
+            entry.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+        ];
+
+        let code = build_module(&args, entry.to_str().unwrap(), false);
+        assert_eq!(code, 0, "first build must succeed");
+        let first_bytes = std::fs::read(&out).unwrap();
+
+        let (_compiled, map) = kupl::run::load_compile(entry.to_str().unwrap()).unwrap();
+        let key = kupl::buildcache::content_key("build", &map, b"");
+        let cached = kupl::buildcache::lookup(&key).expect("a cache entry must exist after a successful build");
+        assert_eq!(cached, first_bytes, "the cached bytes must be exactly the produced .kx bytes");
+
+        std::fs::remove_file(&out).unwrap();
+        let code2 = build_module(&args, entry.to_str().unwrap(), false);
+        assert_eq!(code2, 0);
+        assert_eq!(std::fs::read(&out).unwrap(), first_bytes, "a rebuild of identical source must be byte-identical");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same integration proof for `kupl bundle` -- its own cache namespace
+    /// ("bundle", never "build"), so a `build`/`bundle` pair sharing
+    /// byte-identical `.kupl` source still get two INDEPENDENT cache
+    /// entries, never colliding despite one wire format embedding the
+    /// other.
+    #[test]
+    fn bundle_populates_its_own_build_cache_namespace_distinct_from_build() {
+        let dir = std::env::temp_dir().join(format!("kupl-buildcache-bundle-integ-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.kupl");
+        let out = dir.join("bundled");
+        std::fs::write(&entry, "fun main() uses io {\n    print(\"cached\")\n}\n").unwrap();
+        let args = vec![
+            "bundle".to_string(),
+            entry.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+        ];
+
+        let code = build_module(&args, entry.to_str().unwrap(), true);
+        assert_eq!(code, 0, "first bundle must succeed");
+        let first_bytes = std::fs::read(&out).unwrap();
+
+        let (_compiled, map) = kupl::run::load_compile(entry.to_str().unwrap()).unwrap();
+        let bundle_key = kupl::buildcache::content_key("bundle", &map, b"");
+        let build_key = kupl::buildcache::content_key("build", &map, b"");
+        assert_ne!(bundle_key, build_key, "build/bundle must never share a cache slot");
+        let cached = kupl::buildcache::lookup(&bundle_key).expect("a cache entry must exist after a successful bundle");
+        assert_eq!(cached, first_bytes, "the cached bytes must be exactly the produced bundle's bytes");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

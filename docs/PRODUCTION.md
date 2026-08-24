@@ -8,8 +8,10 @@ alpha-stage gap, this document says so plainly.
 KUPL is **1.0-alpha**. It is feature-complete and internally consistent (four
 execution engines held byte-identical, verified on every build); real, opt-in
 multi-threaded concurrency (`concurrent component`), retry-hardened real-provider AI
-calls, and a self-hostable package registry (`kupl pkg publish`) are all real, not
-just designed. It has not been battle-tested at scale, has no THIRD-PARTY package
+calls (interp/vm and native alike), a self-hostable package registry (`kupl pkg
+publish`), an opt-in memory cap that covers `kupl native` output too, and a
+persistent build cache for `build`/`bundle`/`native` are all real, not just
+designed. It has not been battle-tested at scale, has no THIRD-PARTY package
 ecosystem yet (self-hosting your own registry works today), and its real-provider AI
 path, while retry-hardened, is still only lightly tested against live providers.
 Read the [Known Limitations](#known-limitations) section before depending on it.
@@ -44,7 +46,8 @@ runaway program fails cleanly instead of taking down the host. Each is enforced 
 | `http_serve` request head / body | `64 KiB` head, `10 MiB` body | interpreter (`interp.rs` — head-read loop, `MAX_BODY_SIZE`), native (`cgen.rs` — the same 64KB head cap, `K_MAX_HTTP_BODY`) — a request head or `Content-Length` body larger than the cap is truncated rather than fully buffered |
 | String contents | no NUL bytes | lexer rejects `\0` and raw NUL (diagnostic `K0008`) — keeps strings safe across the native C runtime, which is NUL-terminated |
 | Wall-clock execution time (`kupl run`/`--vm`) | opt-in, `--timeout=<seconds>`, off by default | CLI watchdog thread (`main.rs`/`timeout.rs`) — a hard process kill with a clean `K0901` diagnostic and exit code `124` after the deadline; not enabled unless requested |
-| Total memory allocation (`kupl run`/`--vm`) | opt-in, `--max-memory=<MB>`, off by default | a custom `#[global_allocator]` (`main.rs`/`memcap.rs`) caps the interpreter/KVM/`.kx` engines uniformly (they share one process); a `K0902` diagnostic prints before the process aborts on the first over-cap allocation. Does **not** cover `kupl native`'s generated executable, a separate standalone process — see Known limitations |
+| Total memory allocation (`kupl run`/`--vm`) | opt-in, `--max-memory=<MB>`, off by default | a custom `#[global_allocator]` (`main.rs`/`memcap.rs`) caps the interpreter/KVM/`.kx` engines uniformly (they share one process); a `K0902` diagnostic prints before the process aborts on the first over-cap allocation |
+| Total memory allocation (`kupl native` output) | opt-in, `KUPL_MAX_MEMORY_MB=<N>` env var, off by default | `cgen.rs` `k_alloc` — the single choke point every native allocation goes through — checks a cumulative byte counter against the cap; same `K0902` diagnostic, then a clean `exit(101)`. Separate from `--max-memory` above because a compiled native binary is a standalone process with no `kupl` wrapper to parse a CLI flag through to |
 
 ### Crash safety
 
@@ -206,19 +209,6 @@ contract* — pick the engine and idiom that fit the workload:
 
 Being honest about what is not yet production-grade:
 
-- **No live server at the DEFAULT registry URL yet — but self-hosting one is now
-  fully supported.** `kupl.toml` has a real dependency manager (`[dependencies]`,
-  `kupl pkg tree`/`lock`/`fetch`, hash-verified atomic fetches) and local **path**
-  dependencies (qualified access, version pinning, locking) work today, fully
-  standalone, no registry needed at all. A v1 registry is pure static `GET`s (no
-  dynamic server logic), so `kupl pkg publish` generates a compliant index + file
-  tree that **any** static file host (nginx, S3, GitHub Pages, `python3 -m
-  http.server`) can serve — a project then points at it via its own `kupl.toml`
-  `[registry] url = "..."` (deliberately a manifest field, reviewed like any other
-  code change, not a silently-injectable `--registry` flag or env var). What's
-  still genuinely missing is a live server at `registry::DEFAULT_REGISTRY_URL`
-  itself and a published third-party package index — external hosting/operational
-  commitments outside what a coding session alone can deliver, not a code gap.
 - **The real-provider AI path is now retry-hardened, but still only lightly
   battle-tested.** The `anthropic`, `openai`, and `ollama` providers share one
   `http_post` (`ai.rs`) with a 120s per-attempt timeout and a 10MiB response cap; it
@@ -242,16 +232,24 @@ Being honest about what is not yet production-grade:
   component instance's own handler dispatch — remains single-threaded (a
   general-purpose M:N scheduler for those is a later, larger step; see
   `docs/design/ASYNC.md`).
-- **No incremental or persistent compilation cache.** Each invocation recompiles;
-  there is no build cache or daemon.
+- **`kupl build`/`bundle`/`native` now have a persistent, content-addressed build
+  cache — `kupl run`/`kupl run --vm` do not.** `~/.kupl/build-cache/` holds the
+  final artifact bytes for a given (source content, compiler identity) pair;
+  an unchanged rebuild skips `compile_module`/codegen/`cc` entirely and reuses
+  the cached bytes — for `kupl native`, whose dominant cost is invoking `cc`,
+  this is roughly a 50x speedup on a repeat build in local testing. The cache
+  key folds in the running `kupl` binary's own content hash (not just its
+  version number, which this project does not bump per internal change), so a
+  `cargo build` that changes the compiler always invalidates every prior
+  entry — a stale hit that silently serves output from an old compiler is not
+  possible by construction. `kupl run`/`kupl run --vm` are NOT cached: both
+  need the checked `Program` itself (for `ProgramDb`/`ProgramImage`, powering
+  `par_map`/`par_filter`'s real-thread fast path and `concurrent component`),
+  which has no stable serialized form today, so there is nothing a bytecode-
+  only cache could let them skip.
 - **Alpha stability.** The language and `.kx` binary format are versioned (a `.kx`
   built by a different compiler version is rejected with a clear message), but no
   long-term source or ABI stability is promised yet.
-- **`--max-memory` doesn't cover `kupl native` output.** The opt-in memory cap is a
-  `#[global_allocator]` inside the `kupl` process — it has no effect on a `kupl
-  native`-compiled binary, which is a separate, standalone C-compiled executable
-  that never links it. Use `ulimit -v`/cgroups (or a container) to bound a native
-  binary's memory instead.
 
 For the full design-vs-implemented audit, see [`GAPS.md`](GAPS.md). For the language
 itself, see [`reference/LANGUAGE-REFERENCE.md`](reference/LANGUAGE-REFERENCE.md); for

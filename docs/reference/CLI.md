@@ -48,7 +48,12 @@ push the total past the cap. Prints a `K0902` diagnostic to stderr before the
 process aborts (Rust's own allocation-failure handler; the exact abort exit
 code is platform-dependent, typically `134` on Unix). **Does not apply to
 `kupl native`'s generated executable** — that's a separate, standalone
-process; use `ulimit -v`/cgroups/a container to bound its memory instead.
+process with no `kupl` process wrapping it to parse a CLI flag through to;
+set `KUPL_MAX_MEMORY_MB=<N>` in the environment instead, read by the compiled
+binary itself at its own first allocation (same `K0902` diagnostic, then a
+clean `exit(101)` — not a platform abort, since native's C runtime controls
+the exit path directly, unlike the Rust side's own allocator-failure handler).
+`ulimit -v`/cgroups/a container remain a valid OS-level alternative either way.
 Like `--timeout`, this is an operational safety net, not a sandbox.
 
 ### `kupl repl`
@@ -94,7 +99,18 @@ including tool use (the mock tool loop invokes compiled KUPL functions). Only a
 real-provider *network* call defers at runtime with a clear message — use
 `bundle` for those. KValue unboxing for tighter numeric
 loops is a future performance arc.)
-`--keep-c` keeps the generated `.c` beside the output for inspection.
+`--keep-c` keeps the generated `.c` beside the output for inspection (still
+written even when the compiled binary itself is served from the build cache —
+see below).
+
+**Build cache.** `build`/`bundle`/`native` all check a persistent,
+content-addressed cache (`~/.kupl/build-cache/`) before recompiling: if the
+resolved source, the running `kupl` binary's own content, and (for `native`)
+the `cc` identity all exactly match a prior successful compile, the cached
+artifact bytes are reused directly — `compile_module`/codegen/`cc` never run
+again. This is what "incremental compilation cache" means for KUPL today; it
+does not apply to `kupl run`/`kupl run --vm` (see `docs/PRODUCTION.md`'s
+Known Limitations for why).
 
 ### `kupl dis <file.kupl>`
 Prints the compiled KVM bytecode: every chunk (functions, lambdas, component

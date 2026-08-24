@@ -235,6 +235,17 @@ pub fn sha256_hex(s: &str) -> String {
     bytes_to_hex(&sha256_bytes(s.as_bytes()))
 }
 
+/// Same as [`sha256_hex`], but over raw bytes directly -- for input that
+/// isn't (and shouldn't be forced to be) valid UTF-8, e.g. `buildcache.rs`
+/// hashing the running `kupl` executable's own bytes. A lossy UTF-8
+/// round-trip (`String::from_utf8_lossy`) would replace invalid sequences
+/// with U+FFFD, which is not injective -- two DIFFERENT binaries could
+/// legally lossy-decode to the identical string and hash the same, exactly
+/// the kind of collision a cache-invalidation key must not have.
+pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    bytes_to_hex(&sha256_bytes(bytes))
+}
+
 /// HMAC-SHA256 (RFC 2104/4231), built entirely from [`sha256_bytes`] above —
 /// no new algorithm, just the standard ipad/opad construction. Returns a
 /// lowercase hex digest (64 chars).

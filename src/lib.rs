@@ -20,6 +20,7 @@ pub mod check;
 pub mod compile;
 pub mod diag;
 pub mod bigint;
+pub mod buildcache;
 pub mod decimal;
 pub mod rational;
 pub mod callargs;
