@@ -59,8 +59,9 @@ requires return send supervise test true type use uses var while wire
 Valid identifiers everywhere except in their clause:
 `out` `state` `start` `stop` (component ports / state / lifecycle handlers)
 `fulfills` `law` `restart` `on_failure` `never` `forall` `every` `after`
-`advance` `ai` `tools` `model`. `in` stays fully reserved (it also introduces a
-`for … in …` loop).
+`advance` `ai` `tools` `model` `concurrent` (only special directly before
+`component`/`app` — see §7.2). `in` stays fully reserved (it also
+introduces a `for … in …` loop).
 
 ### Identifiers
 
@@ -670,6 +671,73 @@ component Ticker {
   (differentially tested — the native backend compiles the full component
   model, including `wire`/`supervise`/timers; see §11's Execution modes
   table). See `examples/timers.kupl`.
+
+### 7.2 Real concurrency (`concurrent component`)
+
+An ordinary component's handlers all run on the SAME thread as everything
+else — real, isolated actor concurrency is opt-in:
+
+```kupl
+concurrent component Accumulator {
+    intent "A stateful actor exposing a synchronous running-total API."
+    state total: Int = 0
+
+    expose fun add(x: Int) -> Int {
+        total = total + x
+        total
+    }
+}
+
+app Main {
+    intent "Calls a concurrent Accumulator's exposed functions synchronously."
+    let acc = Accumulator()
+    on start { print("{acc.add(10)}") }   // blocks for the actor's real reply
+}
+```
+
+See `examples/concurrent.kupl`.
+
+- `concurrent component Foo { ... }` gives every instance its own OS
+  thread. The root `app` cannot itself be `concurrent` (K0305).
+- **Portability restriction.** Every prop, port, and exposed-function
+  param/return type must be plain, portable data — numbers, `Str`,
+  `Bool`, `Range`, `Tensor`, and `List`/`Map`/`Set`/`Option`/`Result` of
+  portable types. Anything that could carry a live reference across the
+  thread boundary (a closure, another component, a user-declared ADT) is
+  rejected at check time (K0306) — this mirrors `par_map`/`par_filter`'s
+  own existing restriction on cross-thread values, generalized to a
+  whole component's public surface.
+- **Two ways to interact with a `concurrent` instance today**, both
+  value-deterministic:
+  - `expose fun` calls (`acc.add(10)`) **block** the caller for a real
+    reply — indistinguishable in behavior from an ordinary synchronous
+    method call, just executed on the actor's own thread. A panic inside
+    the call surfaces to the caller with its own correct source location,
+    exactly like a same-thread panic.
+  - A **wire whose destination** is a `concurrent` instance's `in` port
+    delivers the message into that instance's own inbox, non-blocking.
+- **What is NOT yet supported** (real, honestly-documented gaps, not
+  silent ones):
+  - A `concurrent` component cannot be a wire's SOURCE — only its
+    destination. Attempting it is a clean, specific panic, not a crash.
+  - A `concurrent` component cannot have `example` blocks (K0307).
+  - Recurring (`on every`) timers on a `concurrent` instance only fire
+    during its initial startup burst (mirroring `kupl run`'s own bounded
+    100-firing rule) — nothing keeps advancing its virtual clock once it
+    settles into servicing messages.
+  - `:upgrade` (REPL hot-swap) does not support a `concurrent` instance.
+- **Determinism**: every `concurrent` instance's own computed VALUES are
+  always correct and reproducible, on every run, on every engine. The
+  RELATIVE TIMING of independently-running instances' side effects
+  (e.g. two siblings' own `print`/`emit` order) is not guaranteed once
+  more than one instance is genuinely running concurrently — the same,
+  ordinary actor-model trade-off Erlang/Elixir have always made (see
+  `docs/design/ASYNC.md` §7 for the full reasoning). `kupl run --vm` and
+  `kupl native` never build any of this machinery at all — `concurrent`
+  is a complete no-op on both engines, always fully sequential, so the
+  language's own byte-identical cross-engine guarantee is unaffected for
+  every program that doesn't use it, and even for one that does, those
+  two engines' own output is always fully deterministic on their own.
 
 ## 8. Contracts and laws
 

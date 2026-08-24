@@ -1249,9 +1249,49 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       automated suite): stateful sequential calls accumulate correctly
       (`5`, then `15`, then `15`), a panicking concurrent expose fn
       surfaces its own correct source span on the caller's side, both
-      across 15 repeated runs. Next: §8.10 step 6 — a new interp-only,
-      multi-run value-determinism verification harness (§8.9), layered on
-      top of the existing byte-identical suite, not replacing it.
+      across 15 repeated runs. **it138: §8.10 step 6 landed — `concurrent`
+      is now a documented, example-backed feature**, not just an internal
+      mechanism. Added `examples/concurrent.kupl` (an `Accumulator` actor
+      exposing a synchronous running-total API, deliberately built ONLY
+      from blocking `Call`s — fully byte-identical across interp/VM/native
+      by construction, confirmed live, so it needs no special-case in the
+      existing sweep discipline). Added `docs/reference/LANGUAGE-REFERENCE.md`
+      §7.2 ("Real concurrency"), documenting exactly what's implemented
+      (steps 1-5) and exactly what isn't (wire-source, `example` blocks,
+      ongoing recurring timers, `:upgrade`) — deliberately withheld until
+      now (it133's own note) since the keyword had no runtime effect
+      before step 3 landed; `concurrent` added to LANGUAGE-REFERENCE.md's
+      own contextual-keyword list. Updated `docs/PRODUCTION.md`'s "mostly
+      single-threaded" Known Limitation to name the real, opt-in exception
+      this arc adds, alongside `par_map`/`par_filter`'s existing one.
+      Formalizes what §8.9 asked for (a multi-run value-determinism
+      check) as the ACTUAL pattern already used by it135/it137's own
+      Rust-level tests (`concurrent_component_runs_isolated_workers_...`:
+      100 runs, asserts the value-correct line SET with no ordering claim;
+      `concurrent_component_expose_call_blocks_and_state_persists_...`:
+      15 runs, asserts byte-identical output since blocking calls have no
+      race) rather than building a SEPARATE, redundant harness — those
+      tests already ARE this step's own deliverable, now backed by a real
+      example instead of only throwaway test fixtures.
+      **A real, live-found gap in this session's OWN verification
+      tooling**, not the implementation: the ad-hoc interp-vs-vm/native
+      sweep script used throughout this whole campaign session filtered
+      examples by `grep "^fun main("`, silently EXCLUDING every
+      `app`-based example (`counter.kupl`, `ledger.kupl`, and 8 others —
+      10 files total, now including `concurrent.kupl` itself) from every
+      sweep run this session — confirmed by rerunning with a corrected
+      `^fun main\(|^app ` filter: 66 files (up from 56), 0 mismatches on
+      both interp-vs-vm and interp-vs-native, including the new example.
+      Not a KUPL bug — CI/`kupl test`'s own infrastructure is unaffected,
+      this only ever limited what THIS session's own throwaway shell
+      loops checked — but worth naming honestly rather than silently
+      noting a bigger "checked N files" number without explaining why N
+      changed. With this, `docs/design/ASYNC.md` §8.10's full six-step
+      plan is complete: `concurrent component` is real, tested, verified,
+      and documented — remaining known gaps (wire-source direction,
+      `example`/`:upgrade` support, ongoing recurring timers, an M:N
+      scheduler, non-blocking `await`) are named precisely, not silently
+      absent.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into

@@ -1,0 +1,39 @@
+// A `concurrent` component runs on its own OS thread. Calling one of its
+// `expose fun`s blocks the caller for a real reply (fully deterministic --
+// exactly like an ordinary synchronous method call, just executed on
+// another thread). Props/ports/exposed-fun types must be plain, portable
+// data (numbers, Str, Bool, List/Map/Set/Option/Result of those, ...) --
+// nothing that could carry a live reference (a closure, another component)
+// across the thread boundary. See docs/design/ASYNC.md for the full design
+// and its current, honestly-documented limitations (no `example` blocks
+// yet on a `concurrent` component itself -- K0307; a `concurrent` instance
+// can't be a wire's SOURCE yet, only its destination).
+
+concurrent component Accumulator {
+    intent "A stateful actor exposing a synchronous running-total API."
+
+    state total: Int = 0
+
+    expose fun add(x: Int) -> Int {
+        total = total + x
+        total
+    }
+
+    expose fun reset() -> Int {
+        total = 0
+        total
+    }
+}
+
+app Main {
+    intent "Calls a concurrent Accumulator's exposed functions synchronously."
+
+    let acc = Accumulator()
+
+    on start {
+        print("{acc.add(10)}")
+        print("{acc.add(5)}")
+        print("{acc.reset()}")
+        print("{acc.add(3)}")
+    }
+}

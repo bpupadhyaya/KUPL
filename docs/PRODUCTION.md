@@ -214,12 +214,20 @@ Being honest about what is not yet production-grade:
   **mock** provider. Real-network behavior (timeouts, retries, rate limits, partial
   responses) has not been hardened. Treat live AI calls as experimental; pin them
   behind the mock in CI.
-- **Mostly single-threaded execution.** `par_map`/`par_filter` DO spawn real OS
-  threads (`std::thread::spawn`) when the callback is a pure top-level function and
-  the list is large (≥ 256 elements) — otherwise, and for everything else, execution
-  is sequential. The structured `par { … }` fork-join block itself, `par_each`, and
-  a component instance's own handler dispatch all remain single-threaded (a
-  multi-threaded scheduler for those is a later, semantics-preserving step).
+- **Mostly single-threaded execution, with an opt-in exception.**
+  `par_map`/`par_filter` DO spawn real OS threads (`std::thread::spawn`)
+  when the callback is a pure top-level function and the list is large
+  (≥ 256 elements). A `concurrent component` (see the language
+  reference's own §7.2) also gets a real, dedicated OS thread per
+  instance — `expose` calls block for a real reply, and wires can
+  deliver messages into its inbox non-blocking — but it's opt-in, has a
+  real portability restriction on its public surface (K0306), can't yet
+  be a wire's source, and its recurring timers only fire during its
+  initial startup burst. Everything else — the structured `par { … }`
+  fork-join block itself, `par_each`, and an ORDINARY (non-`concurrent`)
+  component instance's own handler dispatch — remains single-threaded (a
+  general-purpose M:N scheduler for those is a later, larger step; see
+  `docs/design/ASYNC.md`).
 - **No incremental or persistent compilation cache.** Each invocation recompiles;
   there is no build cache or daemon.
 - **Alpha stability.** The language and `.kx` binary format are versioned (a `.kx`
