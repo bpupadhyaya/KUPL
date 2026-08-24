@@ -534,7 +534,20 @@ fn par_eval(
 /// so `par_eval_with_stack_size`'s own `stack_size` parameter can be
 /// overridden ONLY by a test forcing a deterministic spawn failure, without
 /// touching this constant or production behavior at all.
-const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024 * 1024;
+///
+/// `pub(crate)` (production-hardening 1213): the single source of truth for
+/// the 2GB stack every KUPL-recursion-capable worker thread needs to match
+/// `MAX_CALL_DEPTH = 10_000` without overflowing the OS default (~2-8MiB)
+/// stack well before that frame count is reached. Originally private to
+/// this file; `main.rs`'s own top-level worker thread had ALREADY
+/// independently hardcoded the identical literal rather than sharing this
+/// constant, and a THIRD site (`interp.rs`'s `concurrent component` actor-
+/// thread spawn) was found completely MISSING it -- using the OS default
+/// stack, causing an uncatchable process abort (SIGABRT) on ordinary,
+/// well-under-the-guard recursion depths reached through an actor's own
+/// `expose fun`. Widened to `pub(crate)` so all three sites share one
+/// literal instead of three independently-drifting copies.
+pub(crate) const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 fn par_eval_with_stack_size(
     portable: &[PortableValue],

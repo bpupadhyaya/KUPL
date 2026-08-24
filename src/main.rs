@@ -3597,6 +3597,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Production-hardening 1213: a REAL, live-confirmed bug found+fixed --
+    /// `Interp::instantiate_concurrent` spawned each actor's OS thread via
+    /// plain `std::thread::spawn`, getting the OS default stack (~2-8MiB),
+    /// unlike EVERY other thread this codebase spawns for interpreter work
+    /// (`main.rs`'s own top-level worker thread, `parallel.rs`'s `par_map`/
+    /// `par_filter` workers), which explicitly size a 2GB stack to match
+    /// `MAX_CALL_DEPTH = 10_000`. `deep(9000)` -- well under that guard,
+    /// and confirmed to return cleanly when called on the main thread --
+    /// crashed the ENTIRE PROCESS with a native stack overflow (SIGABRT)
+    /// when reached through a `concurrent component`'s own `expose fun`,
+    /// bypassing the custom panic hook entirely (no "internal compiler
+    /// error" diagnostic, just an abort) and bypassing `call_remote`'s own
+    /// clean "actor thread already shut down or panicked" handling. Only
+    /// exercises `kupl run` (the default interpreter): `concurrent` is a
+    /// documented no-op on `--vm`/`native` (see the sibling test above's
+    /// own comment), so neither of those engines spawns an actor thread at
+    /// all and neither was ever exposed to this bug.
+    #[test]
+    fn concurrent_component_actor_thread_survives_deep_recursion_under_the_max_call_depth_guard() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-concurrent-stack-size-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("deep.kupl");
+        std::fs::write(
+            &file,
+            "fun deep(n: Int) -> Int {\n    \
+                 if n <= 0 { 0 } else { 1 + deep(n - 1) }\n}\n\
+             concurrent component Deep {\n    intent \"Recurses well under MAX_CALL_DEPTH.\"\n    \
+                 expose fun run() -> Int { deep(9000) }\n}\n\
+             app Root {\n    intent \"Calls a concurrent instance's own deep recursion.\"\n    \
+                 let d = Deep()\n    on start {\n        print(\"{d.run()}\")\n    }\n}\n",
+        )
+        .unwrap();
+
+        let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "an actor thread recursing well under MAX_CALL_DEPTH must not crash the process: {out:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "9000", "{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A panic inside a `concurrent` instance's own `expose fun`, called
     /// via blocking `Call`, must surface on the CALLER's side as an
     /// ordinary, correctly-spanned panic (matching a ordinary same-thread

@@ -629,7 +629,28 @@ impl Interp {
         let comp_name = comp.name.clone();
         let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-        let join = std::thread::spawn(move || {
+        // Production-hardening 1213: a REAL, live-confirmed bug -- plain
+        // `std::thread::spawn` gets the OS default stack (~2-8MiB), unlike
+        // EVERY other thread this codebase spawns for interpreter work
+        // (`main.rs`'s own top-level worker thread, `parallel.rs`'s
+        // `par_map`/`par_filter` workers), which explicitly size a 2GB
+        // stack to match `MAX_CALL_DEPTH = 10_000`. Confirmed live before
+        // this fix: `deep(9000)` (well under the 10,000-frame guard,
+        // returns cleanly on the main thread) reached through a
+        // `concurrent component`'s own `expose fun` crashed the ENTIRE
+        // PROCESS with `fatal runtime error: stack overflow, aborting`
+        // (SIGABRT) -- bypassing the custom panic hook entirely (no
+        // "internal compiler error" message ever printed) and bypassing
+        // `call_remote`'s own clean "actor thread already shut down or
+        // panicked" handling. `.expect(...)` on the `Builder::spawn` below
+        // (rather than propagating a `Result`) matches every sibling site's
+        // own convention -- an OS refusing a 2GB stack reservation is the
+        // same "should never happen on any realistic target" case
+        // `main.rs`/`parallel.rs` already treat as an unrecoverable setup
+        // failure, not a normal runtime error a KUPL program could react to.
+        let join = std::thread::Builder::new()
+            .stack_size(crate::parallel::WORKER_STACK_SIZE)
+            .spawn(move || {
             let db = image.actor_db();
             let mut actor = Interp::new(db);
             let comp = actor
@@ -706,7 +727,8 @@ impl Interp {
                     report("shutdown", &e);
                 }
             }
-        });
+        })
+        .expect("failed to spawn a concurrent component's actor thread (OS refused a 2GB stack reservation)");
         let id = self.instances.len();
         self.instances.push(InstanceSlot::Remote(ActorHandle {
             join: Some(join),
