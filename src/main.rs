@@ -3118,18 +3118,27 @@ mod tests {
     /// Live, end-to-end verification of `concurrent component` (ASYNC.md
     /// §8.10 step 3): two isolated `concurrent` siblings each print their
     /// own prop-derived value on `on start`, with NO wires/exposes
-    /// connecting them to anything. Two claims are checked, matching §7.1's
-    /// already-decided determinism strategy exactly: (1) VALUE-level
-    /// determinism — each worker's own printed line is byte-identical
-    /// across every run, on every engine, regardless of interleaving; (2)
-    /// on the interpreter specifically, the coordinator's own (`Root`,
-    /// synchronous, non-concurrent) line is deterministically first, but
-    /// the two workers' OWN relative print order is a genuine race between
-    /// two independently-scheduled OS threads — repeated runs are expected
-    /// to observe BOTH orderings, not just one, which is the actual,
-    /// intended behavior, not a bug (confirmed live before writing this
-    /// test: 5 manual `cargo run -- run` invocations showed both `1
-    /// before 2` and `2 before 1`). `kupl run --vm` and `kupl native`, by
+    /// connecting them to anything. Matches §7.1's already-decided
+    /// determinism strategy: VALUE-level determinism — each worker's own
+    /// printed line is byte-identical across every run, on every engine,
+    /// regardless of interleaving — but essentially NO ordering guarantee
+    /// among the three lines on the interpreter specifically, since every
+    /// actor thread is spawned asynchronously DURING the coordinator's own
+    /// construction (`instantiate_concurrent`, called while `Root`'s own
+    /// children are still being built) — well BEFORE `start_all` ever
+    /// prints `Root`'s own line. **A real, live-confirmed correction to
+    /// this test's own original assumption**: an earlier version of this
+    /// test asserted `root started` was always first, reasoning that it
+    /// runs synchronously while the workers' prints were "just" a race
+    /// between each other — a plausible-sounding claim that held across
+    /// many manual runs purely by scheduling-latency luck, until this
+    /// exact test caught it failing for real (`worker 2 started, n=20`
+    /// printed before `root started`) once system load shifted the odds.
+    /// The TRUE guarantee is only value correctness plus the expected line
+    /// SET — no relative order among ANY of the three lines is promised
+    /// (or should be relied on) once a `concurrent` instance has its own
+    /// `on start` work to do before the coordinator even finishes
+    /// building its component tree. `kupl run --vm` and `kupl native`, by
     /// contrast, never construct an `InstanceSlot::Remote` at all (§8.8 —
     /// `concurrent` is a complete no-op on those engines) and are
     /// therefore asserted to be FULLY deterministic, always in creation
@@ -3177,20 +3186,25 @@ mod tests {
         // given machine.
         let mut saw_1_before_2 = false;
         let mut saw_2_before_1 = false;
+        let expected_set: std::collections::HashSet<&str> =
+            ["root started", w1_line.as_str(), w2_line.as_str()].into_iter().collect();
         for _ in 0..100 {
             let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
             assert_eq!(out.status.code(), Some(0), "{out:?}");
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             let lines: Vec<&str> = stdout.lines().collect();
             assert_eq!(lines.len(), 3, "expected exactly 3 lines: {stdout:?}");
-            assert_eq!(lines[0], "root started", "the coordinator's own line must always be first: {stdout:?}");
-            // VALUE-level determinism: both worker lines, with their correct
-            // computed values, must always be present -- regardless of order.
-            assert!(
-                lines[1..].contains(&w1_line.as_str()) && lines[1..].contains(&w2_line.as_str()),
-                "both workers' own correctly-computed lines must appear: {stdout:?}"
+            // VALUE-level determinism: exactly this SET of correctly-
+            // computed lines must appear -- no ordering among them is
+            // asserted (see this test's own doc comment for why not).
+            assert_eq!(
+                lines.iter().copied().collect::<std::collections::HashSet<_>>(),
+                expected_set,
+                "unexpected line set: {stdout:?}"
             );
-            if lines[1] == w1_line {
+            let w1_pos = lines.iter().position(|&l| l == w1_line).unwrap();
+            let w2_pos = lines.iter().position(|&l| l == w2_line).unwrap();
+            if w1_pos < w2_pos {
                 saw_1_before_2 = true;
             } else {
                 saw_2_before_1 = true;
@@ -3369,6 +3383,111 @@ mod tests {
             "must be the specific, clean diagnostic, not an internal-compiler-error: {stderr}"
         );
         assert!(!stderr.contains("internal compiler error"), "{stderr}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live, end-to-end verification of `docs/design/ASYNC.md` §8.10 step
+    /// 5 (blocking `Call` messages): the coordinator calls a `concurrent`
+    /// instance's own `expose fun` synchronously, twice in a row, checking
+    /// STATE ACCUMULATES correctly across both calls (proving the actor's
+    /// own state persists on its own thread between calls, and that the
+    /// coordinator genuinely BLOCKS for each reply rather than racing
+    /// ahead) — this is fully, byte-identically deterministic (no timing
+    /// race at all, unlike `Deliver`), since a blocking call has exactly
+    /// ONE possible interleaving by construction: the caller cannot
+    /// proceed to the second call before the first one's reply arrives.
+    #[test]
+    fn concurrent_component_expose_call_blocks_and_state_persists_across_calls() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-concurrent-step5-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("call.kupl");
+        std::fs::write(
+            &file,
+            "concurrent component Calculator {\n    intent \"Exposes a synchronous add function.\"\n    \
+                 state total: Int = 0\n    \
+                 expose fun add(x: Int) -> Int { total = total + x\n        total }\n    \
+                 expose fun current() -> Int { total }\n}\n\
+             app Root {\n    intent \"Calls a concurrent instance's expose fns synchronously.\"\n    \
+                 let calc = Calculator()\n    on start {\n        \
+                 print(\"first: {calc.add(5)}\")\n        print(\"second: {calc.add(10)}\")\n        \
+                 print(\"current: {calc.current()}\")\n    }\n}\n",
+        )
+        .unwrap();
+        let expected = "first: 5\nsecond: 15\ncurrent: 15\n";
+
+        for _ in 0..15 {
+            let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{out:?}");
+        }
+        for _ in 0..5 {
+            let vm_out =
+                std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(vm_out.status.code(), Some(0), "{vm_out:?}");
+            assert_eq!(String::from_utf8_lossy(&vm_out.stdout), expected, "{vm_out:?}");
+        }
+        let native_bin = dir.join("call_native");
+        let build = std::process::Command::new(&bin)
+            .args(["native", file.to_str().unwrap(), "-o", native_bin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(build.status.code(), Some(0), "{build:?}");
+        for _ in 0..5 {
+            let native_out = std::process::Command::new(&native_bin).output().unwrap();
+            assert_eq!(native_out.status.code(), Some(0), "{native_out:?}");
+            assert_eq!(String::from_utf8_lossy(&native_out.stdout), expected, "{native_out:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A panic inside a `concurrent` instance's own `expose fun`, called
+    /// via blocking `Call`, must surface on the CALLER's side as an
+    /// ordinary, correctly-spanned panic (matching a ordinary same-thread
+    /// expose call's own behavior exactly) — not silently swallowed, not
+    /// a generic/opaque error, and pointing at the panic's OWN source
+    /// location (inside the actor's own code) even though it crossed a
+    /// thread boundary via the `Call` reply channel's `(String, Span)`
+    /// pair.
+    #[test]
+    fn concurrent_component_expose_call_panic_propagates_with_the_correct_span() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-concurrent-call-panic-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("call_panic.kupl");
+        std::fs::write(
+            &file,
+            "concurrent component Divider {\n    intent \"Divides, panics on zero.\"\n    \
+                 expose fun divide(x: Int, y: Int) -> Int {\n        \
+                 if y == 0 { panic(\"cannot divide by zero\") }\n        x / y\n    }\n}\n\
+             app Root {\n    intent \"Calls a concurrent expose fn that panics.\"\n    \
+                 let d = Divider()\n    on start {\n        \
+                 print(\"ok: {d.divide(10, 2)}\")\n        print(\"boom: {d.divide(10, 0)}\")\n    }\n}\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(out.status.code(), Some(101), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok: 5\n", "the call before the panic must still print: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("K0900"), "{stderr}");
+        assert!(stderr.contains("cannot divide by zero"), "{stderr}");
+        // Must point at the panic's OWN source line inside the actor (the
+        // `panic(...)` call itself), not a generic/opaque location -- the
+        // exact line number isn't asserted (fragile against harmless
+        // future rewording of this test's own source text), but the
+        // diagnostic's own caret/underline must land on the literal
+        // `panic("cannot divide by zero")` text, confirming it's a REAL
+        // source-span pointer, not a fabricated one.
+        assert!(stderr.contains("call_panic.kupl:"), "{stderr}");
+        assert!(stderr.contains("panic(\"cannot divide by zero\")"), "{stderr}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

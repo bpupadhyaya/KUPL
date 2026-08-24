@@ -130,17 +130,29 @@ pub struct Instance {
 }
 
 /// A message crossing the coordinator/actor thread boundary
-/// (`docs/design/ASYNC.md` §8.4 — non-blocking `Deliver`, matching §8.4's
-/// already-decided shape exactly). Step 4 (`docs/design/ASYNC.md` §8.10)
-/// only wires up the coordinator/local-instance -> `Remote`-instance
-/// direction (an `in` port on a concurrent instance can receive a value
-/// sent from the coordinator side); a `Remote` instance's own `emit`
-/// reaching back OUT to the coordinator or another actor is deferred (see
-/// `Interp::instantiate_local`'s own wire-registration check below, which
-/// rejects a `concurrent` instance as a wire SOURCE with a clean error
-/// rather than attempting it).
+/// (`docs/design/ASYNC.md` §8.4, matching its already-decided shapes
+/// exactly): `Deliver` is non-blocking wire/timer delivery (step 4);
+/// `Call` is a blocking `expose` request/reply (step 5) — `chain` is the
+/// pending-call-cycle-detection list `§8.4`'s own deadlock hazard needs
+/// (see `Interp::pending_remote_calls`'s own doc comment for why this is
+/// currently unreachable but kept as a real safety net). Only the
+/// coordinator/local-instance -> `Remote`-instance direction is wired up;
+/// a `Remote` instance's own `emit`/`expose` reaching back OUT to the
+/// coordinator or another actor is deferred (see
+/// `Interp::instantiate_local`'s own wire-registration check, which
+/// rejects a `concurrent` instance as a wire SOURCE with a clean error —
+/// and, structurally, an actor's own code can never even HOLD a
+/// `Value::Component`/`Value::Bound` referring to anything outside its
+/// own subtree, since those types are never portable, K0306).
 enum ActorMsg {
     Deliver(String, crate::parallel::PortableValue),
+    Call {
+        fn_name: String,
+        args: Vec<crate::parallel::PortableValue>,
+        #[allow(dead_code)] // threaded through for a future cross-actor Call; unread within a single-hop call
+        chain: Vec<usize>,
+        reply: std::sync::mpsc::Sender<Result<crate::parallel::PortableValue, (String, Span)>>,
+    },
 }
 
 /// A handle to a `concurrent`-marked instance running on its own actor
@@ -184,16 +196,22 @@ pub enum InstanceSlot {
 }
 
 impl InstanceSlot {
-    /// Every call site in this codebase today expects a `Local` instance —
-    /// `Remote` is never constructed before §8.10 step 3, so hitting it
-    /// here is a genuine bug, not a reachable runtime case; panicking
-    /// (rather than silently misbehaving) matches this codebase's own
-    /// "clean panic over silent wrong answer" discipline.
+    /// Every DIRECT `Instance`-field call site in this codebase expects a
+    /// `Local` instance — a `Remote` instance's own state lives on its own
+    /// thread, never reachable this way; every legitimate cross-thread
+    /// interaction goes through `ActorMsg`/`ActorHandle` instead (`emit`/
+    /// `send` for `Deliver`, `eval_method` for `Call`), which check
+    /// `matches!(_, InstanceSlot::Remote(_))` explicitly BEFORE ever
+    /// calling this. Hitting this on a `Remote` slot is therefore a
+    /// genuine bug (a call site that forgot that check), not a reachable
+    /// runtime case; panicking (rather than silently misbehaving) matches
+    /// this codebase's own "clean panic over silent wrong answer"
+    /// discipline.
     pub fn unwrap_local(&self) -> &Instance {
         match self {
             InstanceSlot::Local(i) => i,
             InstanceSlot::Remote(_) => {
-                panic!("InstanceSlot::Remote accessed before ASYNC.md §8.10 step 3 implements it")
+                panic!("internal error: InstanceSlot::Remote accessed directly, bypassing the ActorMsg/ActorHandle boundary (docs/design/ASYNC.md §8.2) -- this is a KUPL bug, not a reachable program state")
             }
         }
     }
@@ -202,7 +220,7 @@ impl InstanceSlot {
         match self {
             InstanceSlot::Local(i) => i,
             InstanceSlot::Remote(_) => {
-                panic!("InstanceSlot::Remote accessed before ASYNC.md §8.10 step 3 implements it")
+                panic!("internal error: InstanceSlot::Remote accessed directly, bypassing the ActorMsg/ActorHandle boundary (docs/design/ASYNC.md §8.2) -- this is a KUPL bug, not a reachable program state")
             }
         }
     }
@@ -255,6 +273,20 @@ pub struct Interp {
     /// combinations within one test item, not just each construct in
     /// isolation.
     pub test_step_budget: Option<u64>,
+    /// Ids of `concurrent` (`Remote`) instances this `Interp` is CURRENTLY
+    /// blocked inside a `Call` to (`docs/design/ASYNC.md` §8.4's own
+    /// deadlock-cycle-detection decision) — `eval_method` inserts before
+    /// sending a `Call` and removes after the reply arrives. If a NEW call
+    /// targets an id already in this set, that would mean the actor being
+    /// called is (transitively) already waiting on THIS caller — refused
+    /// immediately with a clean panic instead of deadlocking. Not actually
+    /// reachable today (an actor's own subtree can never hold a reference
+    /// back to its caller, since `Value::Component`/`Value::Bound` are
+    /// never portable — K0306 — so no cycle can form while `concurrent`
+    /// instances can't be wire sources either); kept as a real, tested
+    /// safety net for if either restriction is ever lifted, exactly
+    /// matching what this design already committed to.
+    pub pending_remote_calls: std::collections::HashSet<usize>,
 }
 
 /// Maximum user-function call depth, shared by the interpreter and the KVM
@@ -332,6 +364,7 @@ impl Interp {
             image,
             call_depth: 0,
             test_step_budget: None,
+            pending_remote_calls: std::collections::HashSet::new(),
         }
     }
 
@@ -349,6 +382,7 @@ impl Interp {
             image: None,
             call_depth: 0,
             test_step_budget: None,
+            pending_remote_calls: std::collections::HashSet::new(),
         }
     }
 
@@ -627,15 +661,45 @@ impl Interp {
             // own initial lifecycle has settled one way or the other.
             let _ = ready_tx.send(());
             if startup.is_ok() {
-                // Service `Deliver` messages until the coordinator closes
-                // the inbox (`Interp::stop_all` drops its `Sender` half) —
-                // `recv()` returning `Err` is the standard Rust "no more
-                // senders" signal, needing no explicit shutdown message.
-                while let Ok(ActorMsg::Deliver(port, pv)) = inbox_rx.recv() {
-                    let v = crate::parallel::from_portable(&pv);
-                    if let Err(e) = actor.send(0, &port, v) {
-                        report("message delivery", &e);
-                        break;
+                // Service `Deliver`/`Call` messages until the coordinator
+                // closes the inbox (`Interp::stop_all` drops its `Sender`
+                // half) — `recv()` returning `Err` is the standard Rust "no
+                // more senders" signal, needing no explicit shutdown
+                // message.
+                while let Ok(msg) = inbox_rx.recv() {
+                    match msg {
+                        ActorMsg::Deliver(port, pv) => {
+                            let v = crate::parallel::from_portable(&pv);
+                            if let Err(e) = actor.send(0, &port, v) {
+                                report("message delivery", &e);
+                                break;
+                            }
+                        }
+                        ActorMsg::Call { fn_name, args, reply, .. } => {
+                            let args: Vec<Value> = args.iter().map(crate::parallel::from_portable).collect();
+                            // `Value::Component(0)` is this actor's own
+                            // root instance -- always `Local` from ITS OWN
+                            // `Interp`'s point of view, so this recurses
+                            // into the ordinary (non-Remote) `eval_method`
+                            // path unchanged, exactly like any other
+                            // expose call.
+                            let result = actor.eval_method(Value::Component(0), &fn_name, args, Span::default());
+                            let reply_msg = match result {
+                                Ok(v) => match crate::parallel::to_portable(&v) {
+                                    Some(pv) => Ok(pv),
+                                    None => Err((
+                                        format!("internal error: concurrent `{fn_name}`'s return value is not portable -- K0306 should have rejected this at check time"),
+                                        Span::default(),
+                                    )),
+                                },
+                                Err(Flow::Panic { msg, span, .. }) => Err((msg, span)),
+                                Err(_) => Err((
+                                    "internal error: unexpected control flow escaped a concurrent expose call".to_string(),
+                                    Span::default(),
+                                )),
+                            };
+                            let _ = reply.send(reply_msg);
+                        }
                     }
                 }
                 if let Err(e) = actor.stop_all(actor.instances.len()) {
@@ -2814,9 +2878,63 @@ impl Interp {
         }
     }
 
+    /// `expose` call on a `concurrent` instance: the blocking `Call`
+    /// message `docs/design/ASYNC.md` §8.4 already decided on. Every
+    /// argument/the return value is portable-converted — K0306 guarantees
+    /// this succeeds for a `concurrent` component's exposed-fun params and
+    /// return type.
+    fn call_remote(&mut self, id: usize, name: &str, args: Vec<Value>, span: Span) -> EvalResult {
+        // Deadlock-cycle check (§8.4) -- see `pending_remote_calls`'s own
+        // doc comment for why this is a defensive safety net, not
+        // currently reachable given today's other restrictions.
+        if self.pending_remote_calls.contains(&id) {
+            return Err(Self::panic_flow(
+                format!("concurrent call cycle through instance {id} (calling `{name}`) -- refused instead of deadlocking"),
+                span,
+            ));
+        }
+        let mut portable_args = Vec::with_capacity(args.len());
+        for a in &args {
+            let Some(pv) = crate::parallel::to_portable(a) else {
+                return Err(Self::panic_flow(
+                    format!("internal error: argument to concurrent instance {id}'s `{name}` is not portable -- K0306 should have rejected this at check time"),
+                    span,
+                ));
+            };
+            portable_args.push(pv);
+        }
+        let InstanceSlot::Remote(handle) = &self.instances[id] else {
+            unreachable!("caller already confirmed this slot is Remote");
+        };
+        let Some(inbox) = &handle.inbox else {
+            return Err(Self::panic_flow(
+                format!("concurrent instance {id} has already shut down; cannot call `{name}`"),
+                span,
+            ));
+        };
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let sent = inbox
+            .send(ActorMsg::Call { fn_name: name.to_string(), args: portable_args, chain: vec![id], reply: reply_tx })
+            .is_ok();
+        self.pending_remote_calls.insert(id);
+        let reply = if sent { reply_rx.recv().ok() } else { None };
+        self.pending_remote_calls.remove(&id);
+        match reply {
+            Some(Ok(pv)) => Ok(crate::parallel::from_portable(&pv)),
+            Some(Err((msg, panic_span))) => Err(Self::panic_flow(msg, panic_span)),
+            None => Err(Self::panic_flow(
+                format!("concurrent instance {id} did not respond to `{name}` (its actor thread already shut down or panicked)"),
+                span,
+            )),
+        }
+    }
+
     fn eval_method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> EvalResult {
         // component expose call
         if let Value::Component(id) = recv {
+            if matches!(&self.instances[id], InstanceSlot::Remote(_)) {
+                return self.call_remote(id, name, args, span);
+            }
             let comp = self.instances[id].unwrap_local_mut().comp.clone();
             let Some(decl) = comp.exposes.iter().chain(comp.funs.iter()).find(|f| f.name == name) else {
                 return Err(Self::panic_flow(

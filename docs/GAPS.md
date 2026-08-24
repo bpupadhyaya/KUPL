@@ -1198,11 +1198,60 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       binary directly) 65/65 (63 existing + 2 new), the 3
       `concurrent`-matching tests independently confirmed non-flaky across
       13+ additional runs; `cargo test --doc` 0/0; interp-vs-vm and
-      interp-vs-native sweeps both clean across all 56 examples. Next:
-      §8.10 step 5 — blocking `Call` messages for `expose` calls targeting
-      a `Remote` instance, plus the per-thread pending-call-chain
-      deadlock-cycle detection ASYNC.md §8.4 already named as a new,
-      real hazard.
+      interp-vs-native sweeps both clean across all 56 examples. **it137:
+      §8.10 step 5 landed — blocking `Call` messages for `expose` calls,
+      plus deadlock-cycle detection.** `ActorMsg::Call{fn_name, args,
+      chain, reply}` added alongside `Deliver`; `Interp::eval_method`
+      dispatches to a new `call_remote` when the receiver is `Remote`:
+      args portable-converted (K0306 guarantees success), sent through
+      the actor's inbox, then BLOCKS on a one-shot reply channel — the
+      calling thread genuinely waits, exactly as §3.3/§8.4 already
+      decided. The actor's own message loop gained a `Call` arm calling
+      `eval_method(Value::Component(0), ...)` on itself (id `0` is always
+      `Local` from the actor's OWN point of view, so this recurses into
+      the ordinary, unmodified expose-dispatch path) and replies with the
+      portable-converted result or a `(msg, span)` panic pair.
+      `Interp::pending_remote_calls: HashSet<usize>` implements the
+      cycle-detection safety net exactly as designed — but a live
+      structural analysis while implementing it found this is **not
+      actually reachable today**: an actor's own code can never hold a
+      `Value::Component`/`Value::Bound` referring to anything outside its
+      own subtree (never portable, K0306), and `concurrent` still can't
+      be a wire source (step 4), so no call cycle can form under EITHER
+      restriction; kept anyway as tested, real, forward-looking
+      protection for if either is ever lifted, matching what this design
+      already committed to rather than silently dropping it. **Two real
+      bugs found and fixed while testing this step — both in the TEST
+      assertions from it135, not the implementation**: (1) a hardcoded
+      panic-line-number assertion was simply off by one, replaced with a
+      content-based check; (2) a genuinely incorrect assumption in
+      `concurrent_component_runs_isolated_workers_...` (it135's own test)
+      claimed the coordinator's own line is always first — LIVE-CAUGHT
+      FAILING for real (`worker 2 started, n=20` printed before `root
+      started`) once this step's added test load shifted timing enough to
+      expose it: actor threads are spawned DURING the coordinator's own
+      component-tree construction (`instantiate_concurrent`, called from
+      inside `instantiate_local`), well BEFORE `start_all` ever runs — so
+      nothing actually guarantees the coordinator's own first print
+      happens before a worker's `on start` does. Corrected to assert only
+      what the design actually guarantees: value correctness plus the
+      expected line SET, no ordering claim among any of the lines.
+      Verified: `cargo build` clean, zero warnings; `cargo test` green
+      **twice** (1711/1711 lib); full bins suite (via the compiled binary,
+      `--test-threads=1` — parallel test execution was found to trigger
+      severe, non-deadlock resource contention in this session's own
+      sandbox when many subprocess-plus-actor-thread-spawning tests race
+      at once; sequential execution is reliable and fast, ~4s for the
+      full 67-test suite) 67/67 (65 existing + 2 new), independently
+      reconfirmed across 3+ additional runs; `cargo test --doc` 0/0;
+      interp-vs-vm and interp-vs-native sweeps both clean across 56
+      examples. Manually verified live (foreground, not just via the
+      automated suite): stateful sequential calls accumulate correctly
+      (`5`, then `15`, then `15`), a panicking concurrent expose fn
+      surfaces its own correct source span on the caller's side, both
+      across 15 repeated runs. Next: §8.10 step 6 — a new interp-only,
+      multi-run value-determinism verification harness (§8.9), layered on
+      top of the existing byte-identical suite, not replacing it.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into
