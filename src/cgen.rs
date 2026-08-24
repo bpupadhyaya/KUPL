@@ -5749,6 +5749,25 @@ static char* k_ai_build_prompt(const KAiFun* f, const char* intent, KValue* args
     return b.buf ? b.buf : k_strdup("");
 }
 
+/* Whether an HTTP status is worth retrying -- mirrors ai.rs::
+   is_retryable_status EXACTLY: 429 (rate limit) and the 5xx codes a
+   load-balanced provider commonly returns while overloaded/mid-deploy.
+   Any other status (a real 4xx) means the request itself is bad, so
+   retrying unchanged would just fail identically. */
+static int k_ai_is_retryable_status(int status) {
+    return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+}
+/* Exponential backoff mirroring ai.rs::AI_RETRY_BASE_DELAY_MS/
+   AI_RETRY_MAX_DELAY_MS EXACTLY (500ms, 1s, 2s, ... capped at 8s). No
+   jitter -- same reasoning as the Rust side: no `rand` (zero deps), and
+   a single retrying process has no sibling to desynchronize from. */
+static void k_ai_retry_sleep(int attempt) {
+    long ms = 500L << (attempt > 31 ? 31 : attempt);
+    if (ms > 8000L) ms = 8000L;
+    struct timespec ts; ts.tv_sec = ms / 1000; ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, 0);
+}
+
 /* POST `body` (JSON) to `url` with `headers`, mirroring ai.rs::
    build_http_post_cmd/http_post exactly -- deliberately NO `--fail`
    (unlike k_http_get/k_http_post's own convention), so an HTTP error
@@ -5756,17 +5775,29 @@ static char* k_ai_build_prompt(const KAiFun* f, const char* intent, KValue* args
    JSON error payload) instead of discarding it on a non-2xx status.
    Reuses k_run_curl for the actual fork/exec/pipe machinery (fully
    generic over argv), matching MAX_AI_RESPONSE_SIZE (10MiB, ai.rs) and
-   the SAME 120s timeout ai.rs's own http_post uses. */
+   the SAME 120s timeout ai.rs's own http_post uses.
+
+   Retries transient failures (a network-level Err from k_run_curl, or a
+   retryable HTTP status per k_ai_is_retryable_status) with backoff, up
+   to KUPL_AI_MAX_RETRIES extra attempts (default 3) -- mirrors ai.rs::
+   http_post's own retry loop EXACTLY, closing the same docs/PRODUCTION.md
+   gap ("Real-network behavior... has not been hardened") for native, not
+   just interp/vm. The `-w "\n%{http_code}"` trailer is the only way to
+   learn the HTTP status without `--fail`, which would discard the error
+   response body that provider code needs to parse for a human-readable
+   message; it's split off the response text in-process, never reaching
+   caller code. */
 static KValue k_ai_http_post(const char* url, const char** headers, int nheaders, const char* body) {
-    /* 8 fixed args before the header loop + 2*nheaders + 4 fixed args
-       after it (-H content-type, --data-binary, @-) + url + a NULL
-       terminator = 14 + 2*nheaders total slots. A REAL bug found+fixed
-       (it126, caught by a SIGBUS crash in a real-provider round-trip
-       test): this used to allocate only `9 + nheaders*2 + 1` (10 +
-       2*nheaders) slots -- 4 short of what the writes below actually
+    /* 8 fixed args before the header loop + 2*nheaders + 6 fixed args
+       after it (-H content-type, --data-binary, @-, -w, status-fmt) +
+       url + a NULL terminator = 16 + 2*nheaders total slots. A REAL bug
+       found+fixed (it126, caught by a SIGBUS crash in a real-provider
+       round-trip test): this used to allocate only `9 + nheaders*2 + 1`
+       (10 + 2*nheaders) slots -- short of what the writes below actually
        need -- a heap buffer overflow corrupting adjacent allocations,
-       not merely an out-of-bounds curl argv. */
-    int argc = 14 + nheaders * 2;
+       not merely an out-of-bounds curl argv. Keep this formula and the
+       push count below in lockstep if either changes. */
+    int argc = 16 + nheaders * 2;
     char** argv = (char**)k_alloc(sizeof(char*) * argc);
     int i = 0;
     argv[i++] = (char*)"curl";
@@ -5782,9 +5813,28 @@ static KValue k_ai_http_post(const char* url, const char** headers, int nheaders
     argv[i++] = (char*)"content-type: application/json";
     argv[i++] = (char*)"--data-binary";
     argv[i++] = (char*)"@-";
+    argv[i++] = (char*)"-w";
+    argv[i++] = (char*)"\n%{http_code}";
     argv[i++] = (char*)url;
     argv[i++] = 0;
-    return k_run_curl(argv, body);
+
+    const char* retries_env = k_getenv_ne("KUPL_AI_MAX_RETRIES");
+    int max_retries = retries_env ? atoi(retries_env) : 3;
+    if (max_retries < 0) max_retries = 3;
+    for (int attempt = 0; attempt <= max_retries; attempt++) {
+        KValue resp = k_run_curl(argv, body);
+        if (strcmp(CTORS[resp.as.ctor->ctor].variant, "Ok")) {
+            if (attempt < max_retries) { k_ai_retry_sleep(attempt); continue; }
+            return resp;
+        }
+        const char* text = k_json_field0(resp).as.s;
+        char* nl = strrchr(text, '\n');
+        int status = nl ? atoi(nl + 1) : 0;
+        if (nl) *nl = 0;
+        if (attempt < max_retries && k_ai_is_retryable_status(status)) { k_ai_retry_sleep(attempt); continue; }
+        return k_ok(k_str(text));
+    }
+    return k_err(k_str("unreachable: retry loop exited without returning"));
 }
 
 /* `json.get(key)` on a parsed JObj -- mirrors lsp::Json::get. */
@@ -11627,6 +11677,58 @@ mod tests {
             "the outgoing request must embed the JSON-Schema instruction: {received}"
         );
         assert!(received.contains("integer"), "the embedded schema must name the Int shape: {received}");
+        let _ = server.join();
+    }
+
+    /// Native mirror of `ai.rs::openai_call_retries_a_429_and_succeeds_on_the_
+    /// next_attempt` -- `k_ai_http_post` (cgen.rs) is a SEPARATE C
+    /// implementation of the same retry-with-backoff logic `ai.rs::http_post`
+    /// uses for interp/vm, so it needs its own live-network-shaped
+    /// verification: a real network call through actual compiled C, not just
+    /// a Rust-side unit test. Confirms a 429 followed by a 200 (with
+    /// `KUPL_AI_MAX_RETRIES=1`) retries through to the final value, exactly
+    /// like the interp/vm path.
+    #[test]
+    fn native_ai_fun_retries_a_429_and_succeeds_on_the_next_attempt() {
+        if !cc_available() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"error":{"message":"rate limited"}}"#;
+                let resp = format!(
+                    "HTTP/1.0 429 Too Many Requests\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+                let resp = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let src = "ai fun greet() -> Str {\n    intent \"g\"\n}\n\
+                   fun main() uses io {\n    print(greet())\n}\n";
+        let base_url = format!("http://127.0.0.1:{port}");
+        let out = native_main_stdout_env(
+            src,
+            "aifunretry429",
+            &[
+                ("KUPL_AI_PROVIDER", "ollama"),
+                ("KUPL_AI_MODEL", "test"),
+                ("KUPL_AI_BASE_URL", &base_url),
+                ("KUPL_AI_MAX_RETRIES", "1"),
+            ],
+        );
+        assert_eq!(out, "ok\n", "a 429 followed by a 200 must retry through to the final value");
         let _ = server.join();
     }
 

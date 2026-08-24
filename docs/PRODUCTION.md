@@ -34,6 +34,7 @@ runaway program fails cleanly instead of taking down the host. Each is enforced 
 | BigInt / Rational magnitude | `20_000` limbs (~180,000 decimal digits) | arbitrary-precision arithmetic (`bigint.rs` `MAX_BIGINT_LIMBS`, native `K_MAX_BIGINT_LIMBS`) — an operation that would exceed the cap (e.g. `big(2).pow(1_000_000)`) panics cleanly instead of exhausting memory |
 | Rational GCD-reduction input | `100` limbs | exact-fraction construction (`rational.rs` `MAX_GCD_INPUT_LIMBS`, native `K_MAX_GCD_INPUT_LIMBS`) — an oversized numerator/denominator errors before an expensive GCD computation runs |
 | Registry response size | `10 MiB` | package fetch (`registry.rs` `MAX_REGISTRY_RESPONSE_SIZE`, via curl `--max-filesize`) — a misbehaving or malicious registry can't force an unbounded response to be buffered into memory |
+| AI provider request | `120s` per attempt, `10 MiB` response, `3` retries | `ai.rs` `http_post` (shared by `anthropic`/`openai`/`ollama`) — retries transient failures (network error, HTTP `429`/`500`/`502`/`503`/`504`) with exponential backoff; a real 4xx fails immediately, no retry |
 | `.kx` / bundle module length | validated ≤ remaining bytes | loader (`kx.rs`) — a tampered/corrupt count or trailer length is rejected, never over-allocated or sliced out of bounds (no OOM / panic) |
 | LSP message size | `64 MiB` | language server frame reader (`lsp.rs` `MAX_MESSAGE_LEN`) — refuses an oversized `Content-Length` before allocating |
 | LSP workspace file scan | `5_000` files | language server (`lsp.rs` `MAX_WORKSPACE_FILES`) — caps how many files a single workspace scan tracks |
@@ -144,6 +145,7 @@ makes `ai fun`s testable without a network):
 | `ANTHROPIC_API_KEY` | credential for the `anthropic` provider |
 | `KUPL_AI_BASE_URL` | override the provider base URL (e.g. an OpenAI-compatible endpoint) |
 | `KUPL_AI_MODEL` | override the model id |
+| `KUPL_AI_MAX_RETRIES` | extra retry attempts (beyond the first) for a transient real-provider failure — network error or HTTP `429`/`500`/`502`/`503`/`504`; default `3`, exponential backoff |
 
 If a mock variable is set, an `ai fun` returns the canned response with no network
 call — the recommended way to make AI-using programs deterministic in tests and CI.
@@ -209,11 +211,15 @@ Being honest about what is not yet production-grade:
   fails with a clean network error until a registry is hosted. Programs use the
   (substantial, zero-dependency) standard library, local multi-file modules, and
   local path dependencies.
-- **The real-provider AI path is mock-tested, not battle-tested.** The `anthropic`,
-  `openai`, and `ollama` providers are implemented, but the test suite exercises the
-  **mock** provider. Real-network behavior (timeouts, retries, rate limits, partial
-  responses) has not been hardened. Treat live AI calls as experimental; pin them
-  behind the mock in CI.
+- **The real-provider AI path is now retry-hardened, but still only lightly
+  battle-tested.** The `anthropic`, `openai`, and `ollama` providers share one
+  `http_post` (`ai.rs`) with a 120s per-attempt timeout and a 10MiB response cap; it
+  now retries transient failures (network errors and HTTP `429`/`500`/`502`/`503`/`504`)
+  with exponential backoff, up to `KUPL_AI_MAX_RETRIES` extra attempts (default `3`).
+  A real, non-retryable 4xx (bad request, bad API key, etc.) still fails immediately.
+  This is verified against a local mock HTTP server (`ai.rs` tests), not a live
+  provider — the bulk of the test suite still exercises the **mock** provider (`KUPL_AI_MOCK`).
+  Treat live AI calls as experimental; pin them behind the mock in CI.
 - **Mostly single-threaded execution, with an opt-in exception.**
   `par_map`/`par_filter` DO spawn real OS threads (`std::thread::spawn`)
   when the callback is a pure top-level function and the list is large

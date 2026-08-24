@@ -517,11 +517,44 @@ fn mock_response(fun_name: &str) -> Option<String> {
 /// for consistency across all three independent uses of this same pattern.
 const MAX_AI_RESPONSE_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Retry budget for transient real-provider failures (network errors, and
+/// HTTP 429/500/502/503/504). Overridable via `KUPL_AI_MAX_RETRIES` (an
+/// invalid or missing value falls back to this default) so a caller can
+/// dial it to 0 for a fast-fail test/CI run without code changes. This and
+/// `AI_RETRY_BASE_DELAY_MS` close the gap named verbatim in
+/// docs/PRODUCTION.md's Known Limitations: "Real-network behavior (timeouts,
+/// retries, rate limits, partial responses) has not been hardened."
+const DEFAULT_AI_MAX_RETRIES: u32 = 3;
+
+/// Flat-ish exponential backoff base. Doubles per attempt (500ms, 1s, 2s,
+/// ...), capped by `AI_RETRY_MAX_DELAY_MS`. No jitter: KUPL has zero
+/// dependencies (no `rand` crate available), and unlike a thundering-herd
+/// server-side concern, a single KUPL process retrying its own AI calls has
+/// no sibling processes to desynchronize from.
+const AI_RETRY_BASE_DELAY_MS: u64 = 500;
+const AI_RETRY_MAX_DELAY_MS: u64 = 8_000;
+
+fn ai_max_retries() -> u32 {
+    env("KUPL_AI_MAX_RETRIES").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_AI_MAX_RETRIES)
+}
+
+/// Whether an HTTP status code represents a transient provider failure worth
+/// retrying: 429 (rate limit) and the 5xx codes a load-balanced provider
+/// commonly returns while overloaded or mid-deploy. Any other status
+/// (including other 4xx, which mean the REQUEST itself is bad and retrying
+/// unchanged would just fail identically) is not retried.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || matches!(status, 500 | 502 | 503 | 504)
+}
+
 /// Build (but don't spawn) `http_post`'s `curl` invocation, split out purely
 /// so a unit test can introspect the exact args via `Command::get_args()`
 /// without spawning a real `curl` subprocess or a network dependency --
 /// mirrors `interp.rs::base_curl_cmd`'s own identical split, done for the
-/// identical reason.
+/// identical reason. The trailing `-w` line appends the numeric HTTP status
+/// code as its own final line of stdout (after the body), the only way to
+/// learn the status without `--fail` -- which would discard error response
+/// bodies that provider code parses for a human-readable message.
 fn build_http_post_cmd(url: &str, headers: &[String]) -> std::process::Command {
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-sS", "--max-time", "120", "-X", "POST", url]);
@@ -530,11 +563,15 @@ fn build_http_post_cmd(url: &str, headers: &[String]) -> std::process::Command {
         cmd.args(["-H", h]);
     }
     cmd.args(["-H", "content-type: application/json", "--data-binary", "@-"]);
+    cmd.args(["-w", "\n%{http_code}"]);
     cmd
 }
 
-/// Run `curl` against `url` with headers and a JSON body; return the body.
-fn http_post(url: &str, headers: &[String], body: &str) -> Result<String, String> {
+/// Run `curl` once against `url`; return (body, HTTP status code). A `None`
+/// status means curl itself failed before getting a response (network
+/// error, DNS failure, timeout, etc.) -- the body in that case is empty and
+/// the real error text is in the `Err`, not returned here.
+fn http_post_once(url: &str, headers: &[String], body: &str) -> Result<(String, u16), String> {
     let mut cmd = build_http_post_cmd(url, headers);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -552,7 +589,49 @@ fn http_post(url: &str, headers: &[String], body: &str) -> Result<String, String
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    String::from_utf8(out.stdout).map_err(|_| "provider returned invalid UTF-8".into())
+    let text =
+        String::from_utf8(out.stdout).map_err(|_| "provider returned invalid UTF-8".to_string())?;
+    // Split off the `-w "\n%{http_code}"` trailer we appended above.
+    let (body_text, status_line) = text.rsplit_once('\n').unwrap_or(("", text.as_str()));
+    let status: u16 = status_line.trim().parse().unwrap_or(0);
+    Ok((body_text.to_string(), status))
+}
+
+/// Run `curl` against `url` with headers and a JSON body; return the body.
+/// Retries transient failures (network errors and 429/5xx statuses, per
+/// `is_retryable_status`) with exponential backoff, up to `ai_max_retries()`
+/// extra attempts beyond the first. Non-retryable failures (a real 4xx, or
+/// running out of retries) return `Err`/the last body immediately -- callers
+/// still see any HTTP status's body verbatim, exactly as before this
+/// hardening, so the existing JSON-error-shape parsing in `anthropic_call`/
+/// `openai_call`/the `ToolProvider` impls is unaffected either way.
+fn http_post(url: &str, headers: &[String], body: &str) -> Result<String, String> {
+    let max_retries = ai_max_retries();
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        match http_post_once(url, headers, body) {
+            Ok((resp_body, status)) => {
+                if attempt < max_retries && is_retryable_status(status) {
+                    last_err = format!("provider returned transient HTTP {status}");
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (AI_RETRY_BASE_DELAY_MS << attempt.min(31)).min(AI_RETRY_MAX_DELAY_MS),
+                    ));
+                    continue;
+                }
+                return Ok(resp_body);
+            }
+            Err(e) => {
+                last_err = e;
+                if attempt < max_retries {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (AI_RETRY_BASE_DELAY_MS << attempt.min(31)).min(AI_RETRY_MAX_DELAY_MS),
+                    ));
+                    continue;
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Build the prompt: intent + rendered arguments + (for structured shapes)
@@ -1196,6 +1275,17 @@ pub fn ai_call(
 mod tests {
     use super::*;
 
+    /// `KUPL_AI_MAX_RETRIES` is a process-global env var, and `cargo test`
+    /// runs tests in the same process concurrently by default -- without
+    /// serializing the handful of tests that mutate it, two such tests
+    /// running at once could each observe (or clobber) the other's value.
+    /// No other test in this module touches this specific var, so this lock
+    /// only needs to guard those; `KUPL_AI_BASE_URL` is deliberately NOT
+    /// set globally by the retry tests below (they pass the local mock
+    /// server's URL as `openai_call`'s own `default_base` parameter
+    /// instead), avoiding a second global to serialize.
+    static AI_RETRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn meta(name: &str, shape: AiShape, wraps: bool) -> AiFunMeta {
         AiFunMeta {
             name: name.into(),
@@ -1241,6 +1331,113 @@ mod tests {
         let limit: u64 =
             args[flag_pos.unwrap() + 1].parse().expect("--max-filesize value must be numeric");
         assert_eq!(limit, MAX_AI_RESPONSE_SIZE, "{args:?}");
+    }
+
+    /// Closes the gap docs/PRODUCTION.md named verbatim ("Real-network
+    /// behavior (timeouts, retries, rate limits, partial responses) has not
+    /// been hardened") for the specific case a real provider hands back:
+    /// HTTP 429. Mirrors `cgen.rs`'s own established local-mock-server
+    /// pattern for testing a REAL network call safely (a plain
+    /// `std::net::TcpListener` on an OS-assigned port, no KUPL involved on
+    /// the server side) -- here driving `openai_call` (via `KUPL_AI_
+    /// PROVIDER=ollama`, which needs no API key) directly rather than
+    /// through a spawned native binary, since interp/vm share this same
+    /// `http_post`. Sets `KUPL_AI_MAX_RETRIES=1` and a near-zero backoff
+    /// isn't available (no env hook for the delay, by design -- it's an
+    /// internal implementation constant, not documented/stable
+    /// configuration), so this test accepts the real ~500ms sleep rather
+    /// than mocking time.
+    #[test]
+    fn openai_call_retries_a_429_and_succeeds_on_the_next_attempt() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // First request: rate-limited.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"error":{"message":"rate limited"}}"#;
+                let resp = format!(
+                    "HTTP/1.0 429 Too Many Requests\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            // Second request: succeeds.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+                let resp = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let _guard = AI_RETRY_ENV_LOCK.lock().unwrap();
+        std::env::set_var("KUPL_AI_MAX_RETRIES", "1");
+        let mut m = meta("t_retry", AiShape::Str, false);
+        m.model = Some("test".into());
+        let base = format!("http://127.0.0.1:{port}");
+        let resp = openai_call(&m, "hi", &base, false);
+        std::env::remove_var("KUPL_AI_MAX_RETRIES");
+        drop(_guard);
+        let _ = server.join();
+        assert_eq!(resp, Ok("ok".to_string()), "a 429 followed by a 200 must retry through to success");
+    }
+
+    /// The retry-count budget must be an actual bound, not unlimited: a
+    /// provider that is ALWAYS rate-limited must still terminate (with the
+    /// last error surfaced), not retry forever.
+    #[test]
+    fn openai_call_gives_up_after_exhausting_the_retry_budget() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // KUPL_AI_MAX_RETRIES=1 below means 2 total attempts.
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"error":{"message":"still rate limited"}}"#;
+                    let resp = format!(
+                        "HTTP/1.0 429 Too Many Requests\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+        let _guard = AI_RETRY_ENV_LOCK.lock().unwrap();
+        std::env::set_var("KUPL_AI_MAX_RETRIES", "1");
+        let mut m = meta("t_retry_exhaust", AiShape::Str, false);
+        m.model = Some("test".into());
+        let base = format!("http://127.0.0.1:{port}");
+        let resp = openai_call(&m, "hi", &base, false);
+        std::env::remove_var("KUPL_AI_MAX_RETRIES");
+        drop(_guard);
+        let _ = server.join();
+        assert_eq!(
+            resp,
+            Err("provider: still rate limited".to_string()),
+            "after exhausting retries the LAST response's error must surface, not a generic timeout"
+        );
+    }
+
+    /// Only 429/5xx are worth retrying -- a real 4xx means the request
+    /// itself is malformed, and retrying it unchanged would just burn the
+    /// full retry budget for an identical failure every time.
+    #[test]
+    fn is_retryable_status_only_covers_429_and_5xx() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(200));
     }
 
     #[test]

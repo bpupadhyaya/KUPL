@@ -1292,6 +1292,78 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       `example`/`:upgrade` support, ongoing recurring timers, an M:N
       scheduler, non-blocking `await`) are named precisely, not silently
       absent.
+- [x] **Real-provider AI path hardened against transient network failures
+      (it139).** Closes the gap `docs/PRODUCTION.md`'s own Known Limitations
+      named verbatim: "Real-network behavior (timeouts, retries, rate
+      limits, partial responses) has not been hardened." `ai.rs::http_post`
+      (the ONE function every real provider call funnels through —
+      `anthropic_call`, `openai_call`, and both `ToolProvider::round`
+      impls) now retries a network-level error or an HTTP `429`/`500`/
+      `502`/`503`/`504` with exponential backoff (500ms, 1s, 2s, ... capped
+      at 8s), up to `KUPL_AI_MAX_RETRIES` extra attempts (default `3`, env-
+      overridable). A real 4xx (bad request, bad key) still fails
+      immediately — retrying an unchanged bad request would just fail
+      identically every time. Learning the HTTP status without discarding
+      the provider's own JSON error body (which `anthropic_call`/
+      `openai_call` parse for a human-readable message) needed a new trick:
+      `curl -w "\n%{http_code}"` appends the status as its own trailing
+      line, split off in `http_post_once` before the body ever reaches
+      caller code — `--fail` was deliberately never an option here, since
+      it discards the body on any non-2xx status.
+      `cgen.rs::k_ai_http_post` — a SEPARATE, hand-written C
+      reimplementation of the identical logic for `kupl native` (the two
+      have diverged before; `MAX_AI_RESPONSE_SIZE` was already mirrored for
+      exactly this reason) — got the identical retry loop, backoff, and
+      `-w` trailer-splitting, closing what would otherwise have been a real
+      cross-engine gap: without this, a live `429` would have made
+      interp/vm SUCCEED (after retrying) while native FAILED (no retry),
+      an actual violation of the byte-identical-output invariant on a
+      real-network error path. A first C-side attempt introduced a
+      `-Wincompatible-pointer-types-discards-qualifiers` warning (`char*
+      text = k_json_field0(resp).as.s` — the field is `const char*`); fixed
+      by declaring `text` itself `const`, matching `strrchr`'s own
+      const-in/non-const-out C signature.
+      The `KUPL_AI_MAX_RETRIES` env var and both engines' retry envelopes
+      are new rows in `docs/PRODUCTION.md`'s environment-variable and
+      security-limits tables; the "mock-tested, not battle-tested" Known
+      Limitation bullet was rewritten to describe what's now true (retry-
+      hardened against a **local mock HTTP server**, not a live provider —
+      the bulk of the suite still runs the deterministic mock path).
+      New tests: `ai.rs` unit tests spin up a real `std::net::TcpListener`
+      answering `429` then `200` (and, separately, always `429` to confirm
+      the retry budget is an actual bound, not unlimited) and call
+      `openai_call` directly — the SAME local-mock-server pattern
+      `cgen.rs`'s own `native_ai_fun_*_round_trips_through_a_local_mock_
+      server` tests established, reused rather than reinvented; a
+      `cgen.rs` test mirrors the 429-then-200 case through a REAL compiled
+      native binary (`native_main_stdout_env`), since `k_ai_http_post` is
+      C the Rust-side tests can't exercise directly. **A real, self-caught
+      test bug during this iteration**: the first draft of the two `ai.rs`
+      retry tests used `meta()`'s default `model: None`; `openai_call`
+      returns `Err("KUPL_AI_MODEL is not set")` before ever touching the
+      network when that's unset, so the test's own mock-server thread
+      never got a connection and `server.join()` blocked forever —
+      surfaced as an apparent test "hang" (confirmed via `lsof` on the
+      stuck process: a `TCP ... (LISTEN)` socket that never received a
+      connection, i.e. `accept()` blocked, not a real deadlock in the
+      retry logic itself). Fixed by setting `model: Some("test".into())`
+      on both tests' `AiFunMeta`. Also added `AI_RETRY_ENV_LOCK`, a
+      `std::sync::Mutex` serializing the two tests that mutate the
+      process-global `KUPL_AI_MAX_RETRIES` env var — this codebase had no
+      prior precedent for serializing env-var-mutating tests (checked: no
+      other `static ... Mutex` exists anywhere in the crate), needed here
+      because `cargo test` runs tests concurrently by default and two such
+      tests racing could each clobber the other's retry-count override.
+      Verified: `cargo build`/`cargo build --tests` clean, zero warnings
+      (including the native C compile, gated on `cc_available()`);
+      `cargo test --lib` green **twice**, 1719/1719 both times (a first run
+      hit 4 unrelated `cgen::tests::perf_guard_*` wall-clock flakes under
+      this session's own resource-contention load — confirmed
+      environmental, not a regression, by rerunning all 4 in isolation
+      immediately after: clean). No interp-vs-vm/interp-vs-native sweep
+      needed beyond the existing per-build one — the mock path (which the
+      sweep exercises) is untouched; the new retry logic only ever
+      activates on the real-network path, which the sweep never reaches.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into
