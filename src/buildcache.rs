@@ -102,7 +102,24 @@ pub fn content_key(namespace: &str, map: &crate::loader::SourceMap, extra: &[u8]
     let mut buf = String::new();
     feed(&mut buf, namespace);
     feed(&mut buf, self_hash);
-    feed(&mut buf, &String::from_utf8_lossy(extra));
+    // Production-hardening 1216: a REAL, live-confirmed-by-code-reading
+    // landmine, not yet triggerable but a real footgun for the next
+    // caller -- `extra` used to be fed via `String::from_utf8_lossy`,
+    // directly contradicting `sha256_hex_bytes`'s own doc comment one
+    // field above (`self_hash`), which exists SPECIFICALLY because a
+    // lossy UTF-8 round-trip is not injective (two different byte
+    // sequences can decode to the identical replacement-character
+    // string, and therefore hash the same). Both of TODAY's callers
+    // (`b""`, and `native`'s `cc.as_bytes()`, always plain ASCII) never
+    // actually hit this, but a future caller passing genuinely non-UTF-8
+    // `extra` would silently risk a real key collision. Hashing `extra`
+    // first (rather than feeding its raw bytes as a length-prefixed
+    // string, which would ALSO work but needlessly duplicates
+    // `feed`'s own string-only signature) sidesteps the whole class: a
+    // SHA-256 digest is always valid ASCII, fixed-length, and -- unlike
+    // a lossy decode -- collision-resistant regardless of what `extra`
+    // itself contains.
+    feed(&mut buf, &crate::encoding::sha256_hex_bytes(extra));
     for f in &map.files {
         feed(&mut buf, &f.path);
         feed(&mut buf, &f.src);
@@ -179,6 +196,28 @@ mod tests {
             content_key("native", &m, b"cc"),
             content_key("native", &m, b"clang"),
             "a different cc identity must produce a different key"
+        );
+    }
+
+    /// Production-hardening 1216: the exact landmine a lossy-UTF8-decoded
+    /// `extra` would have hit -- `0xFF` and `0xFE` are each individually
+    /// invalid UTF-8 (never a valid leading byte), so `String::from_utf8_
+    /// lossy` maps BOTH to the identical single U+FFFD replacement
+    /// character. Before this fix, `content_key(_, _, &[0xFF])` and
+    /// `content_key(_, _, &[0xFE])` would have collided; hashing `extra`
+    /// via `sha256_hex_bytes` first means they must not.
+    #[test]
+    fn content_key_does_not_collide_for_different_non_utf8_extra_bytes() {
+        assert_eq!(
+            String::from_utf8_lossy(&[0xFF]),
+            String::from_utf8_lossy(&[0xFE]),
+            "sanity check on the premise: both must lossy-decode to the SAME replacement char"
+        );
+        let m = map(&[("main.kupl", "fun main() {}\n")]);
+        assert_ne!(
+            content_key("native", &m, &[0xFF]),
+            content_key("native", &m, &[0xFE]),
+            "two different non-UTF-8 extra byte sequences must never collide, even if they'd lossy-decode identically"
         );
     }
 
