@@ -130,12 +130,17 @@ pub struct Instance {
 }
 
 /// A handle to a `concurrent`-marked instance running on its own actor
-/// thread (`docs/design/ASYNC.md` §8.2). A pure stub for now — no
-/// `InstanceSlot::Remote` is ever constructed until §8.10 step 3, so
-/// `unwrap_local`/`unwrap_local_mut` below are unreachable in practice;
-/// this exists only so the `InstanceSlot` split (step 2, a byte-identical
-/// pure refactor) can be verified BEFORE any real threading is added.
-pub struct ActorHandle;
+/// thread (`docs/design/ASYNC.md` §8.2/§8.10 step 3). The actor's closure
+/// runs a fully self-contained lifecycle for its own instance (and any
+/// children it declares) — `instantiate` + `start_all` + `run_timers` +
+/// `stop_all`, mirroring `kupl run`'s own top-level sequence — so there is
+/// nothing left for the coordinator to do with a `Remote` slot except wait
+/// for it to finish; `join` is `Some` until `Interp::start_all` (the first
+/// point a caller needs every instance's `on start` to have completed)
+/// consumes it via `.take()`.
+pub struct ActorHandle {
+    join: Option<std::thread::JoinHandle<()>>,
+}
 
 /// Every one of the 14 functions across this file that used to index
 /// `Vec<Instance>` directly now indexes `Vec<InstanceSlot>` instead — see
@@ -352,7 +357,13 @@ impl Interp {
         Ok(v)
     }
 
-    /// Create an instance of `comp_name`; args are already-evaluated prop values.
+    /// Create an instance of `comp_name`; args are already-evaluated prop
+    /// values. Dispatches to `instantiate_concurrent` for a `concurrent`
+    /// component (`docs/design/ASYNC.md` §8.10 step 3) — every OTHER call
+    /// site in this codebase (including `instantiate_concurrent` itself,
+    /// constructing the ROOT instance it was asked to host) goes through
+    /// `instantiate_local` directly, bypassing this check, since that
+    /// specific instance has already been decided to run HERE.
     pub fn instantiate(
         &mut self,
         comp_name: &str,
@@ -362,6 +373,27 @@ impl Interp {
         let Some(comp) = self.db.components.get(comp_name).cloned() else {
             return Err(Self::panic_flow(format!("unknown component `{comp_name}`"), span));
         };
+        if comp.concurrent {
+            return self.instantiate_concurrent(comp, args, span);
+        }
+        self.instantiate_local(comp, args, span)
+    }
+
+    /// The ordinary, single-threaded construction path — every field of
+    /// `comp` is used exactly as before `concurrent` existed (props,
+    /// state, children, wires, all on THIS `Interp`/thread). Called
+    /// directly (bypassing `instantiate`'s own concurrent-check) by
+    /// `instantiate_concurrent`'s spawned closure to construct the root
+    /// instance it was asked to host; called indirectly, via the ordinary
+    /// `instantiate` dispatcher above, for every non-concurrent instance
+    /// (which is every instance in every program that doesn't use
+    /// `concurrent` at all).
+    fn instantiate_local(
+        &mut self,
+        comp: Rc<ComponentDecl>,
+        args: &[(Option<String>, Value)],
+        span: Span,
+    ) -> EvalResult {
         let env = self.globals.child();
 
         // props: by name or position, else default. Production-hardening
@@ -405,7 +437,7 @@ impl Interp {
                 (None, Some(d)) => self.eval(d, &env)?,
                 (None, None) => {
                     return Err(Self::panic_flow(
-                        format!("missing required prop `{}` for `{comp_name}`", prop.name),
+                        format!("missing required prop `{}` for `{}`", prop.name, comp.name),
                         span,
                     ))
                 }
@@ -461,13 +493,131 @@ impl Interp {
         Ok(Value::Component(id))
     }
 
+    /// Construct a `concurrent` component on its own OS thread
+    /// (`docs/design/ASYNC.md` §8.2/§8.10 step 3 — the narrowest first
+    /// slice: no wires or `expose` calls reach this instance yet, so the
+    /// actor's closure below runs a FULLY SELF-CONTAINED lifecycle
+    /// (`instantiate_local` + `start_all` + `run_timers` + `stop_all`,
+    /// mirroring `kupl run`'s own top-level sequence exactly) and simply
+    /// finishes — there is no ongoing inbox to service until step 4/5 add
+    /// `Deliver`/`Call` messaging).
+    ///
+    /// `args` are already-evaluated `Value`s (the caller's own scope may be
+    /// referenced by the argument EXPRESSIONS, which is why evaluation
+    /// itself stays on THIS thread) — each is converted to `PortableValue`
+    /// here, which `check.rs::check_portable_ty`'s own K0306 diagnostic
+    /// guarantees will always succeed for a `concurrent` component's props;
+    /// a conversion failure here would mean that guarantee was violated,
+    /// which is a genuine compiler bug, not a reachable user-facing case.
+    fn instantiate_concurrent(
+        &mut self,
+        comp: Rc<ComponentDecl>,
+        args: &[(Option<String>, Value)],
+        span: Span,
+    ) -> EvalResult {
+        let mut portable_args: Vec<(Option<String>, crate::parallel::PortableValue)> =
+            Vec::with_capacity(args.len());
+        for (name, v) in args {
+            let Some(pv) = crate::parallel::to_portable(v) else {
+                return Err(Self::panic_flow(
+                    format!(
+                        "internal error: `concurrent component {}`'s argument could not be converted to a portable value -- K0306 should have rejected this at check time",
+                        comp.name
+                    ),
+                    span,
+                ));
+            };
+            portable_args.push((name.clone(), pv));
+        }
+        let image = self.image.clone().expect(
+            "a coordinator Interp always has an image; concurrent components cannot be instantiated from inside a par_map worker",
+        );
+        // `Rc<ComponentDecl>` isn't `Send` (matching every OTHER `Value`/
+        // `Instance` type in this codebase — see ASYNC.md §3.1's own
+        // `Rc`-not-`Send` blocker) -- the closure below re-resolves the
+        // component decl on its OWN thread, from its OWN `actor_db()`
+        // (which already holds `Arc`-derived, thread-local `Rc`s per
+        // `ProgramImage::actor_db`'s own doc comment), exactly mirroring
+        // how the ordinary `instantiate` dispatcher resolves `comp_name`
+        // against `self.db.components` in the first place. Only the plain
+        // `String` name crosses the thread boundary here.
+        let comp_name = comp.name.clone();
+        let join = std::thread::spawn(move || {
+            let db = image.actor_db();
+            let mut actor = Interp::new(db);
+            let comp = actor
+                .db
+                .components
+                .get(&comp_name)
+                .cloned()
+                .expect("actor_db mirrors the coordinator's own component table, so this name must resolve");
+            let args: Vec<(Option<String>, Value)> = portable_args
+                .into_iter()
+                .map(|(name, pv)| (name, crate::parallel::from_portable(&pv)))
+                .collect();
+            // Mirrors `run.rs`'s own top-level `kupl run` sequence
+            // (instantiate -> start_all -> run_timers(100)) for this ONE
+            // instance's own self-contained sub-program, then delivers
+            // `on stop` immediately after -- there is no further inbox to
+            // service in this step, so "start, run to quiescence, stop" IS
+            // this actor's entire natural lifecycle.
+            let result = (|| -> Result<(), Flow> {
+                actor.instantiate_local(comp, &args, span)?;
+                actor.start_all()?;
+                actor.run_timers(100)?;
+                actor.stop_all(actor.instances.len())?;
+                Ok(())
+            })();
+            // No channel back to the coordinator exists yet (step 4/5 adds
+            // one) -- surface a panicking actor the same way an ordinary
+            // top-level program panic is shown, rather than silently
+            // dropping it, matching this codebase's own "never swallow an
+            // error silently" discipline.
+            if let Err(Flow::Panic { msg, span, .. }) = result {
+                eprintln!("error: concurrent component `{comp_name}`: panic: {msg} (at {span:?})");
+            }
+        });
+        let id = self.instances.len();
+        self.instances.push(InstanceSlot::Remote(ActorHandle { join: Some(join) }));
+        Ok(Value::Component(id))
+    }
+
     /// Deliver `on start` to instance `id` and all its descendants (creation order).
+    ///
+    /// A `Remote` (`concurrent`) instance's own `on start` already ran, on
+    /// its own thread, as part of `instantiate_concurrent`'s spawned
+    /// closure — skipped here, then every spawned actor is joined AFTER
+    /// the ordinary per-instance loop below, so that by the time this
+    /// function returns, "on start has been delivered to every instance"
+    /// remains true for callers exactly as it was before `concurrent`
+    /// existed, whether that instance ran locally or on its own thread.
+    /// Because every actor is spawned during `instantiate` (which happens
+    /// BEFORE this loop even starts, while the component tree is being
+    /// built) rather than spawned HERE, multiple sibling `concurrent`
+    /// instances' own `on start`/timer/`stop` work already overlaps in
+    /// real wall-clock time with each other and with this loop's own
+    /// local work — genuine parallelism, even in this narrowest slice.
     pub fn start_all(&mut self) -> Result<(), Flow> {
         for id in 0..self.instances.len() {
+            if matches!(&self.instances[id], InstanceSlot::Remote(_)) {
+                continue;
+            }
             self.run_lifecycle(id, &Trigger::Start)?;
             self.arm_timers(id);
         }
         self.drain()?;
+        for slot in &mut self.instances {
+            if let InstanceSlot::Remote(handle) = slot {
+                if let Some(join) = handle.join.take() {
+                    // A panicked (Rust-level, not KUPL Flow::Panic) actor
+                    // thread is already reported by the OS/Rust's own
+                    // default panic hook; nothing further to surface here
+                    // until step 4/5 add a real channel back to this
+                    // caller.
+                    let _ = join.join();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -505,6 +655,14 @@ impl Interp {
     /// actually started.
     pub fn stop_all(&mut self, upto: usize) -> Result<(), Flow> {
         for id in 0..upto.min(self.instances.len()) {
+            // A `Remote` instance's own `on stop` already ran, on its own
+            // thread, as the last step of `instantiate_concurrent`'s
+            // closure (by the time `start_all` returns, every actor has
+            // been joined — its entire self-contained lifecycle, start
+            // through stop, is already complete).
+            if matches!(&self.instances[id], InstanceSlot::Remote(_)) {
+                continue;
+            }
             self.run_lifecycle(id, &Trigger::Stop)?;
         }
         self.drain()?;
@@ -567,11 +725,16 @@ impl Interp {
             // earliest active timer with next_fire <= target
             let mut best: Option<(i64, usize, usize)> = None;
             for (iid, slot) in self.instances.iter().enumerate() {
-                // Every slot is `Local` until §8.10 step 3+ gives `advance`
-                // a way to reach a `Remote` instance's next-fire time via
-                // the shared table (docs/design/ASYNC.md §8.5) — not
-                // implemented yet, so this only sees local timers for now.
-                let inst = slot.unwrap_local();
+                // A `Remote` (`concurrent`) instance's own timers are
+                // entirely self-managed on its own thread (its closure
+                // already ran them to completion via its own `run_timers`
+                // before this coordinator-side loop ever runs) — skipped
+                // here rather than reached via a shared next-fire table
+                // (docs/design/ASYNC.md §8.5), which only becomes
+                // necessary once step 4/5 let a `Remote` instance keep
+                // running concurrently with the coordinator instead of
+                // finishing before `instantiate` even returns.
+                let InstanceSlot::Local(inst) = slot else { continue };
                 for (ti, t) in inst.timers.iter().enumerate() {
                     if t.active && t.next_fire <= target {
                         let cand = (t.next_fire, iid, ti);
@@ -634,11 +797,16 @@ impl Interp {
         for _ in 0..max_fires {
             let mut best: Option<(i64, usize, usize)> = None;
             for (iid, slot) in self.instances.iter().enumerate() {
-                // Every slot is `Local` until §8.10 step 3+ gives `advance`
-                // a way to reach a `Remote` instance's next-fire time via
-                // the shared table (docs/design/ASYNC.md §8.5) — not
-                // implemented yet, so this only sees local timers for now.
-                let inst = slot.unwrap_local();
+                // A `Remote` (`concurrent`) instance's own timers are
+                // entirely self-managed on its own thread (its closure
+                // already ran them to completion via its own `run_timers`
+                // before this coordinator-side loop ever runs) — skipped
+                // here rather than reached via a shared next-fire table
+                // (docs/design/ASYNC.md §8.5), which only becomes
+                // necessary once step 4/5 let a `Remote` instance keep
+                // running concurrently with the coordinator instead of
+                // finishing before `instantiate` even returns.
+                let InstanceSlot::Local(inst) = slot else { continue };
                 for (ti, t) in inst.timers.iter().enumerate() {
                     if t.active {
                         let cand = (t.next_fire, iid, ti);

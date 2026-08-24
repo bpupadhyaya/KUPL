@@ -1097,9 +1097,60 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       exercise every wrapped code path (every component-instantiation/
       timer/supervision/wire test transitively touches `InstanceSlot`
       now), matching this step's own "verify via the existing suite, a
-      pure refactor adds no new observable behavior" scope. Next: §8.10
-      step 3 — spawn a real actor thread for an isolated `concurrent`
-      instance with no wires/expose calls reaching it yet.
+      pure refactor adds no new observable behavior" scope. **it135:
+      §8.10 step 3 landed — real actor threads for isolated `concurrent`
+      instances.** `Interp::instantiate` now dispatches: a `concurrent`
+      component goes to a new `instantiate_concurrent`, everything else to
+      `instantiate_local` (the preserved, unchanged original body).
+      `instantiate_concurrent` converts already-evaluated prop args to
+      `PortableValue` (K0306 guarantees this succeeds), spawns a real OS
+      thread running a FRESH `Interp` (built from `ProgramImage::actor_db`
+      — `ProgramImage` widened with `Arc<HashMap<String,
+      Arc<ComponentDecl>>>`, mirroring its existing `funs` field exactly),
+      and that thread runs a fully self-contained lifecycle —
+      `instantiate_local` + `start_all` + `run_timers(100)` + `stop_all`,
+      mirroring `run.rs`'s own top-level `kupl run` sequence for this ONE
+      instance — then simply finishes (no ongoing inbox until step 4/5's
+      `Deliver`/`Call` messaging). `Interp::start_all` skips `Remote`
+      instances in its own per-instance on-start loop, then joins every
+      spawned actor AFTER that loop (not immediately per-instance), so
+      multiple sibling `concurrent` instances' own on-start/timer/stop
+      work genuinely overlaps in wall-clock time with each other and with
+      the coordinator — real parallelism, even in this narrowest slice.
+      `stop_all`/`advance`/`run_timers` skip `Remote` slots (their own
+      lifecycle/timers are entirely self-managed on their own thread).
+      **A real gap found and closed while implementing this** (not
+      pre-planned): `example` blocks are checked and RUN against a
+      component's own instantiation, so a `concurrent` component's own
+      example would have instantiated it as `Remote`, then crashed with
+      an unhelpful Rust-level panic the moment the example runner tried
+      to read `Local`-only fields — closed with a new K0307 diagnostic
+      (`concurrent` + `example` is rejected at check time), fulfilling the
+      §8.7 restriction this campaign's OWN docs had already committed to
+      but not yet implemented. **Empirically confirmed, live, exactly the
+      designed §7.1 trade-off**: two isolated `concurrent` siblings, each
+      printing a prop-derived value on `on start`, produce VALUE-correct
+      output on every run (both engines' worker lines always present,
+      always correctly computed) while their RELATIVE print order is a
+      genuine, observed race on the interpreter (30 manual runs showed
+      both `1-before-2` and `2-before-1`, roughly 80/20) — and fully,
+      deterministically sequential on `kupl run --vm`/`kupl native`, which
+      never construct an `InstanceSlot::Remote` at all, confirming §8.8's
+      "zero engine special-casing" claim empirically, not just by
+      construction. **A real test-design flake found and fixed** while
+      writing the automated version of this check: asserting "both
+      orderings appear" over only 20 runs has a genuine ~1% failure
+      chance at an 80/20 split (confirmed live: 1 failure in ~11 suite
+      runs) — fixed by widening to 100 runs (≈2×10⁻¹⁰% failure chance),
+      not by loosening the assertion. Full verification: `cargo build`
+      clean, zero warnings; `cargo test` green **twice** (1711/1711 lib);
+      `cargo test --bins` 63/63 (62 existing + 1 new), independently
+      confirmed non-flaky across 15+ additional runs after the sample-size
+      fix; `cargo test --doc` 0/0; interp-vs-vm and interp-vs-native
+      sweeps both clean across all 56 examples. Next: §8.10 step 4 —
+      `Deliver` messages (non-blocking wire emit + timer fire) once a
+      `Remote` instance needs to stay alive past its own initial
+      lifecycle instead of finishing before `instantiate` even returns.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into

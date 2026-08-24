@@ -2026,6 +2026,28 @@ impl Checker {
                 c.span,
             );
         }
+        // `docs/design/ASYNC.md` §8.7: `example { }` bodies are checked and
+        // RUN against a component's own instantiation (`run.rs`'s example
+        // runner calls `interp.instantiate` then reads the resulting
+        // instance's `.env`/`.last_emit` directly) — a live-confirmed real
+        // gap found while implementing §8.10 step 3: without this check, a
+        // `concurrent` component's own `example` block would instantiate
+        // it onto its own actor thread (an `InstanceSlot::Remote`), then
+        // crash with an unhelpful Rust-level panic the moment the example
+        // runner tried to read its `Local`-only fields, instead of a clean
+        // diagnostic. Rejected here, matching this codebase's own "clean
+        // panic/diagnostic over an ungraceful crash" discipline applied at
+        // the earliest possible point (compile time, not first test run).
+        for example in &c.examples {
+            self.err(
+                "K0307",
+                format!(
+                    "`concurrent component {}` cannot have `example` blocks — a concurrent component's own instance runs on a separate actor thread, which the example runner does not support yet",
+                    c.name
+                ),
+                example.span,
+            );
+        }
         for prop in &c.props {
             self.check_portable_ty(&prop.ty, c, &format!("prop `{}`", prop.name));
         }

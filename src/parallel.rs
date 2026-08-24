@@ -248,16 +248,25 @@ pub struct ProgramImage {
     pub ctors: Arc<HashMap<String, (String, Vec<String>)>>,
     pub type_variants: Arc<crate::prop::TypeDb>,
     pub pure_funs: Arc<HashSet<String>>,
+    /// Component declarations, `Send + Sync` (component ASTs hold only owned
+    /// data, same as `funs` above). Added for `concurrent component`'s own
+    /// actor threads (`docs/design/ASYNC.md` §8.2/§8.10 step 3) — `par_map`
+    /// workers never instantiate components, so `worker_db` below still
+    /// leaves this out for THEM specifically; `actor_db` is the analogous
+    /// constructor for an actor thread, which DOES need it.
+    pub components: Arc<HashMap<String, Arc<crate::ast::ComponentDecl>>>,
 }
 
 impl ProgramImage {
     pub fn from_db(db: &crate::interp::ProgramDb) -> Arc<ProgramImage> {
         let funs = db.funs.iter().map(|(k, v)| (k.clone(), Arc::new((**v).clone()))).collect();
+        let components = db.components.iter().map(|(k, v)| (k.clone(), Arc::new((**v).clone()))).collect();
         Arc::new(ProgramImage {
             funs: Arc::new(funs),
             ctors: Arc::new(db.ctors.clone()),
             type_variants: Arc::new(db.type_variants.clone()),
             pure_funs: Arc::new(db.pure_funs.clone()),
+            components: Arc::new(components),
         })
     }
 
@@ -273,6 +282,26 @@ impl ProgramImage {
             ai_funs: HashMap::new(),
             type_variants: (*self.type_variants).clone(),
             pure_funs: HashSet::new(), // workers stay sequential (no nested threads)
+        }
+    }
+
+    /// Rebuild a `ProgramDb` for a `concurrent component`'s own actor thread
+    /// (`docs/design/ASYNC.md` §8.10 step 3) — unlike `worker_db`, this DOES
+    /// include component declarations, since the actor thread runs a real,
+    /// self-contained `Interp::instantiate` for its own instance (and any
+    /// children it declares). Contracts and ai-funs are still omitted (a
+    /// `concurrent` component's exposed-fun surface is restricted to
+    /// portable types by K0306, and real-provider `ai fun` network calls
+    /// inside a `concurrent` component are not scoped by this step).
+    pub fn actor_db(&self) -> crate::interp::ProgramDb {
+        crate::interp::ProgramDb {
+            funs: self.funs.iter().map(|(k, v)| (k.clone(), Rc::new((**v).clone()))).collect(),
+            components: self.components.iter().map(|(k, v)| (k.clone(), Rc::new((**v).clone()))).collect(),
+            contracts: HashMap::new(),
+            ctors: (*self.ctors).clone(),
+            ai_funs: HashMap::new(),
+            type_variants: (*self.type_variants).clone(),
+            pure_funs: (*self.pure_funs).clone(),
         }
     }
 }

@@ -3115,6 +3115,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Live, end-to-end verification of `concurrent component` (ASYNC.md
+    /// §8.10 step 3): two isolated `concurrent` siblings each print their
+    /// own prop-derived value on `on start`, with NO wires/exposes
+    /// connecting them to anything. Two claims are checked, matching §7.1's
+    /// already-decided determinism strategy exactly: (1) VALUE-level
+    /// determinism — each worker's own printed line is byte-identical
+    /// across every run, on every engine, regardless of interleaving; (2)
+    /// on the interpreter specifically, the coordinator's own (`Root`,
+    /// synchronous, non-concurrent) line is deterministically first, but
+    /// the two workers' OWN relative print order is a genuine race between
+    /// two independently-scheduled OS threads — repeated runs are expected
+    /// to observe BOTH orderings, not just one, which is the actual,
+    /// intended behavior, not a bug (confirmed live before writing this
+    /// test: 5 manual `cargo run -- run` invocations showed both `1
+    /// before 2` and `2 before 1`). `kupl run --vm` and `kupl native`, by
+    /// contrast, never construct an `InstanceSlot::Remote` at all (§8.8 —
+    /// `concurrent` is a complete no-op on those engines) and are
+    /// therefore asserted to be FULLY deterministic, always in creation
+    /// order, exactly like an ordinary (non-concurrent) program — the
+    /// existing byte-identical regression discipline continues to apply
+    /// to them unchanged.
+    #[test]
+    fn concurrent_component_runs_isolated_workers_with_value_determinism_but_timing_races_on_interp_only() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return; // no debug binary built yet -- nothing to test
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-concurrent-step3-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("workers.kupl");
+        std::fs::write(
+            &file,
+            "concurrent component Worker {\n    \
+                 intent \"An isolated actor with no wires or exposes.\"\n    \
+                 prop id: Int\n    state n: Int = 0\n    \
+                 on start {\n        n = id * 10\n        print(\"worker {id} started, n={n}\")\n    }\n}\n\
+             app Root {\n    \
+                 intent \"Instantiates two concurrent workers.\"\n    \
+                 let w1 = Worker(id: 1)\n    let w2 = Worker(id: 2)\n    \
+                 on start { print(\"root started\") }\n}\n",
+        )
+        .unwrap();
+
+        let worker_line = |id: i64, n: i64| format!("worker {id} started, n={n}");
+        let w1_line = worker_line(1, 10);
+        let w2_line = worker_line(2, 20);
+
+        // Interpreter: run several times, collect which relative orderings
+        // of the two worker lines actually occur. 100 iterations, not 20 --
+        // a genuine, live-observed intermittent failure (production-
+        // hardening: caught by this SAME test at 20 iterations, one
+        // failure in ~11 runs of the whole suite) showed worker 1 wins the
+        // real OS-thread scheduling race roughly 80% of the time on this
+        // hardware (confirmed via 30 manual `kupl run` invocations: only
+        // 6/30 landed 2-before-1), so 20 independent runs have a genuine
+        // ~(0.8)^20 ≈ 1% chance of observing ONLY the 1-before-2 ordering
+        // by chance alone -- not a bug, just too small a sample for a
+        // ~80/20 split. 100 runs brings that down to (0.8)^100 ≈ 2×10⁻¹⁰%,
+        // negligible for CI purposes regardless of the exact skew on any
+        // given machine.
+        let mut saw_1_before_2 = false;
+        let mut saw_2_before_1 = false;
+        for _ in 0..100 {
+            let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(lines.len(), 3, "expected exactly 3 lines: {stdout:?}");
+            assert_eq!(lines[0], "root started", "the coordinator's own line must always be first: {stdout:?}");
+            // VALUE-level determinism: both worker lines, with their correct
+            // computed values, must always be present -- regardless of order.
+            assert!(
+                lines[1..].contains(&w1_line.as_str()) && lines[1..].contains(&w2_line.as_str()),
+                "both workers' own correctly-computed lines must appear: {stdout:?}"
+            );
+            if lines[1] == w1_line {
+                saw_1_before_2 = true;
+            } else {
+                saw_2_before_1 = true;
+            }
+        }
+        assert!(
+            saw_1_before_2 && saw_2_before_1,
+            "100 runs should observe BOTH worker orderings (a genuine race between two OS threads) -- \
+             seeing only one ordering every time would mean either the actors aren't really running \
+             concurrently, or this test got unlucky enough to warrant rerunning; \
+             saw_1_before_2={saw_1_before_2} saw_2_before_1={saw_2_before_1}"
+        );
+
+        // VM and native: `concurrent` is a complete no-op on both engines
+        // (§8.8) -- fully deterministic, always creation order, every run.
+        let expected = format!("root started\n{w1_line}\n{w2_line}\n");
+        for _ in 0..5 {
+            let vm_out =
+                std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(vm_out.status.code(), Some(0), "{vm_out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&vm_out.stdout),
+                expected,
+                "VM must never construct a Remote slot -- always fully sequential, creation order"
+            );
+        }
+        let native_bin = dir.join("workers_native");
+        let build = std::process::Command::new(&bin)
+            .args(["native", file.to_str().unwrap(), "-o", native_bin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(build.status.code(), Some(0), "native build must succeed: {build:?}");
+        for _ in 0..5 {
+            let native_out = std::process::Command::new(&native_bin).output().unwrap();
+            assert_eq!(native_out.status.code(), Some(0), "{native_out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&native_out.stdout),
+                expected,
+                "native must never construct a Remote slot -- always fully sequential, creation order"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it894,
     /// an Explore survey finding, agentId a7ba91a6862653340, independently
     /// re-verified live before implementing -- see `callargs.rs`'s own doc
