@@ -3699,6 +3699,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Production-hardening 1223: a REAL, LIVE-CONFIRMED bug found+fixed, a
+    /// THIRD instance of the PR-it1221/1222 lifecycle-panic-swallowing
+    /// class -- a panic inside a `concurrent` instance's own handler for an
+    /// incoming wire `Deliver` (non-blocking, unlike `Call`'s own
+    /// already-correct blocking-reply propagation the test above covers)
+    /// used to be `eprintln!`-reported and then silently discarded, exiting
+    /// 0 instead of the `error[K0900]`/exit 101 the IDENTICAL panic
+    /// produces when the SAME wire targets a plain (non-`concurrent`)
+    /// component instead -- confirmed live, both variants, before writing
+    /// this test.
+    #[test]
+    fn concurrent_component_wire_delivery_panic_propagates_with_the_correct_span() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-concurrent-deliver-panic-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("deliver_panic.kupl");
+        std::fs::write(
+            &file,
+            "concurrent component Target {\n    intent \"Panics on delivery.\"\n    \
+                 in trigger: Int\n    on trigger(n) {\n        panic(\"boom on delivery, n={n}\")\n    }\n}\n\
+             component Source {\n    intent \"Fires once on start.\"\n    \
+                 out fire: Int\n    on start { emit fire(1) }\n}\n\
+             app Root {\n    intent \"Wires Source.fire -> concurrent Target.trigger, Target panics.\"\n    \
+                 let s = Source()\n    let t = Target()\n    wire s.fire -> t.trigger\n    \
+                 on start { print(\"app started\") }\n}\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(out.status.code(), Some(101), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "app started\n", "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("K0900"), "{stderr}");
+        assert!(stderr.contains("boom on delivery, n=1"), "{stderr}");
+        assert!(stderr.contains("deliver_panic.kupl:"), "{stderr}");
+        assert!(stderr.contains("panic(\"boom on delivery, n={n}\")"), "{stderr}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it894,
     /// an Explore survey finding, agentId a7ba91a6862653340, independently
     /// re-verified live before implementing -- see `callargs.rs`'s own doc

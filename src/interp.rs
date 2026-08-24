@@ -742,7 +742,44 @@ impl Interp {
                         ActorMsg::Deliver(port, pv) => {
                             let v = crate::parallel::from_portable(&pv);
                             if let Err(e) = actor.send(0, &port, v) {
-                                report("message delivery", &e);
+                                // Production-hardening 1223: a REAL,
+                                // live-confirmed bug, a THIRD instance of
+                                // the PR-it1221/1222 lifecycle-panic-
+                                // swallowing class -- a genuine KUPL panic
+                                // triggered by an incoming wire `Deliver`
+                                // (this actor's own handler for the port it
+                                // was sent on) used to stop at `eprintln!`
+                                // here, same as startup/shutdown did before
+                                // those fixes. Confirmed via a live fixture
+                                // BEFORE this fix that the IDENTICAL
+                                // scenario on a plain (non-`concurrent`)
+                                // wire target already correctly propagates
+                                // through `drain()` as a real `Err` (exit
+                                // 101) unless the instance is supervised --
+                                // this actor's own `actor.send(0, ...)`
+                                // call uses that SAME `drain()` underneath,
+                                // so the panic is already being detected
+                                // correctly here; only the "hand it to the
+                                // caller" step was missing. Reuses
+                                // `shutdown_panic` (no new field needed,
+                                // matching PR-it1222's own lesson about
+                                // preferring an existing communication path)
+                                // -- the actor falls through to its own
+                                // `stop_all` immediately after this `break`,
+                                // so `shutdown_panic` is exactly where the
+                                // CALLER's `stop_all` already looks. "First
+                                // panic wins": only recorded if nothing has
+                                // claimed this slot yet, so this earlier,
+                                // more specific failure is never overwritten
+                                // by a later, unrelated shutdown outcome.
+                                if let Flow::Panic { msg, span, .. } = e {
+                                    let mut guard = shutdown_panic_writer.lock().unwrap();
+                                    if guard.is_none() {
+                                        *guard = Some((msg, span));
+                                    }
+                                } else {
+                                    report("message delivery", &e);
+                                }
                                 break;
                             }
                         }
@@ -789,8 +826,19 @@ impl Interp {
                     // (its only error variant) -- the `report(...)` fallback
                     // below exists only in case that ever changes, so no
                     // Flow's diagnostic is ever silently dropped.
+                    //
+                    // Production-hardening 1223: "first panic wins" -- if
+                    // an earlier `Deliver`-triggered handler panic already
+                    // claimed this slot (see `ActorMsg::Deliver`'s own
+                    // handling above), that ORIGINAL failure is what should
+                    // reach the caller, not whatever THIS (likely
+                    // unrelated, or itself a downstream consequence)
+                    // shutdown outcome happens to be.
                     if let Flow::Panic { msg, span, .. } = e {
-                        *shutdown_panic_writer.lock().unwrap() = Some((msg, span));
+                        let mut guard = shutdown_panic_writer.lock().unwrap();
+                        if guard.is_none() {
+                            *guard = Some((msg, span));
+                        }
                     } else {
                         report("shutdown", &e);
                     }
