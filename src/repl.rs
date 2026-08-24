@@ -284,9 +284,9 @@ pub fn repl() -> i32 {
 /// another instance in that SAME subtree, never one outside it.
 fn stop_and_disarm_subtree(interp: &mut crate::interp::Interp, cid: usize) {
     let _ = interp.run_lifecycle(cid, &crate::ast::Trigger::Stop);
-    interp.instances[cid].timers.clear();
-    let comp = interp.instances[cid].comp.clone();
-    let env = interp.instances[cid].env.clone();
+    interp.instances[cid].unwrap_local_mut().timers.clear();
+    let comp = interp.instances[cid].unwrap_local_mut().comp.clone();
+    let env = interp.instances[cid].unwrap_local_mut().env.clone();
     for child in &comp.children {
         if let Some(Value::Component(sub_cid)) = env.get(&child.name) {
             stop_and_disarm_subtree(interp, sub_cid);
@@ -425,14 +425,14 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
         return Err(format!("no component named `{name}`"));
     };
     let target_ids: Vec<usize> =
-        (0..interp.instances.len()).filter(|&i| interp.instances[i].comp.name == name).collect();
+        (0..interp.instances.len()).filter(|&i| interp.instances[i].unwrap_local_mut().comp.name == name).collect();
     if target_ids.is_empty() {
         return Ok(0);
     }
     // Every targeted instance currently shares the SAME (old) `Rc<ComponentDecl>`
     // (they were all spawned from the same prior `:name` definition) — reading
     // the first one's own `comp` is representative for the structural guard below.
-    let old_comp = interp.instances[target_ids[0]].comp.clone();
+    let old_comp = interp.instances[target_ids[0]].unwrap_local_mut().comp.clone();
 
     let prop_names = |c: &crate::ast::ComponentDecl| -> std::collections::BTreeSet<String> {
         c.props.iter().map(|p| p.name.clone()).collect()
@@ -521,7 +521,7 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
         .collect();
 
     for id in &target_ids {
-        let old_env = interp.instances[*id].env.clone();
+        let old_env = interp.instances[*id].unwrap_local_mut().env.clone();
         let new_env = interp.globals.child();
         // props: a name present in OLD-PROP-NAMES keeps its current value
         // (guaranteed present in `old_env`'s own LOCAL scope — it was
@@ -615,7 +615,7 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
             else {
                 continue; // source was itself removed, or the target's old value is unexpectedly missing
             };
-            if let Some(targets) = interp.instances[src].wires.get_mut(from_port) {
+            if let Some(targets) = interp.instances[src].unwrap_local_mut().wires.get_mut(from_port) {
                 targets.retain(|(d, p)| !(*d == removed_cid && p == to_port));
             }
         }
@@ -635,7 +635,7 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
             let (Some(&src), Some(&dst)) = (child_ids.get(from_child), child_ids.get(to_child)) else {
                 return Err(format!("new wire references unknown child (`{from_child}` -> `{to_child}`)"));
             };
-            interp.instances[src].wires.entry(from_port.clone()).or_default().push((dst, to_port.clone()));
+            interp.instances[src].unwrap_local_mut().wires.entry(from_port.clone()).or_default().push((dst, to_port.clone()));
         }
         // a wire between two KEPT children that existed in the OLD
         // declaration but is gone from the NEW one (it115) must be pruned
@@ -647,13 +647,13 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
             let (from_child, from_port) = from;
             let (to_child, to_port) = to;
             if let (Some(&src), Some(&dst)) = (child_ids.get(from_child), child_ids.get(to_child)) {
-                if let Some(targets) = interp.instances[src].wires.get_mut(from_port) {
+                if let Some(targets) = interp.instances[src].unwrap_local_mut().wires.get_mut(from_port) {
                     targets.retain(|(d, p)| !(*d == dst && p == to_port));
                 }
             }
         }
-        interp.instances[*id].env = new_env;
-        interp.instances[*id].comp = new_comp.clone();
+        interp.instances[*id].unwrap_local_mut().env = new_env;
+        interp.instances[*id].unwrap_local_mut().comp = new_comp.clone();
     }
     Ok(target_ids.len())
 }
@@ -987,14 +987,14 @@ mod tests {
             "component Counter {\n    intent \"c\"\n    state n: Int = 0\n    state label: Str = \"fresh\"\n    expose fun bump(v: Int) -> Int {\n        n = n + v\n        n\n    }\n    expose fun readLabel() -> Str {\n        label\n    }\n}\n",
         );
         assert_eq!(upgrade_instances(&mut interp, "Counter"), Ok(1));
-        assert_eq!(interp.instances[0].env.get("n"), Some(crate::value::Value::Int(5)), "existing state must be MIGRATED, not reset");
+        assert_eq!(interp.instances[0].unwrap_local_mut().env.get("n"), Some(crate::value::Value::Int(5)), "existing state must be MIGRATED, not reset");
         assert_eq!(
-            interp.instances[0].env.get("label"),
+            interp.instances[0].unwrap_local_mut().env.get("label"),
             Some(crate::value::Value::str("fresh".to_string())),
             "a genuinely new field must get its own fresh default"
         );
-        assert_eq!(interp.instances[0].comp.name, "Counter");
-        assert!(interp.instances[0].comp.exposes.iter().any(|f| f.name == "readLabel"), "the new method must be immediately callable");
+        assert_eq!(interp.instances[0].unwrap_local_mut().comp.name, "Counter");
+        assert!(interp.instances[0].unwrap_local_mut().comp.exposes.iter().any(|f| f.name == "readLabel"), "the new method must be immediately callable");
     }
 
     /// it128: the migration-hook mechanism -- the last remaining gap this
@@ -1018,7 +1018,7 @@ mod tests {
         );
         assert_eq!(upgrade_instances(&mut interp, "Counter"), Ok(1));
         assert_eq!(
-            interp.instances[0].env.get("n"),
+            interp.instances[0].unwrap_local_mut().env.get("n"),
             Some(crate::value::Value::str("5".to_string())),
             "the migration hook must convert the OLD Int value (5, after bump) to its NEW Str shape, not just keep it as-is"
         );
@@ -1038,7 +1038,7 @@ mod tests {
         );
         assert_eq!(upgrade_instances(&mut interp, "Widget"), Ok(1));
         assert_eq!(
-            interp.instances[0].env.get("id"),
+            interp.instances[0].unwrap_local_mut().env.get("id"),
             Some(crate::value::Value::str("7".to_string())),
             "the migration hook must ALSO apply to props, not just state"
         );
@@ -1062,7 +1062,7 @@ mod tests {
         let err = upgrade_instances(&mut interp, "Counter").unwrap_err();
         assert!(err.contains("migrate_n"), "{err}");
         assert_eq!(
-            interp.instances[0].env.get("n"),
+            interp.instances[0].unwrap_local_mut().env.get("n"),
             Some(crate::value::Value::Int(0)),
             "a refused upgrade must leave the instance completely UNTOUCHED"
         );
@@ -1125,7 +1125,7 @@ mod tests {
         );
         assert_eq!(upgrade_instances(&mut interp3, "Parent"), Ok(1));
         assert!(
-            matches!(interp3.instances[0].env.get("c"), Some(crate::value::Value::Component(_))),
+            matches!(interp3.instances[0].unwrap_local_mut().env.get("c"), Some(crate::value::Value::Component(_))),
             "a genuinely new child must be constructed and bound"
         );
     }
@@ -1140,10 +1140,10 @@ mod tests {
             "component Leaf {\n    intent \"l\"\n    state stopped: Bool = false\n    on stop {\n        stopped = true\n    }\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Leaf()\n    let b = Leaf()\n}\n",
             "Parent",
         );
-        let Some(crate::value::Value::Component(b_id)) = interp.instances[0].env.get("b") else {
+        let Some(crate::value::Value::Component(b_id)) = interp.instances[0].unwrap_local_mut().env.get("b") else {
             panic!("child `b` must resolve to a component instance before the upgrade");
         };
-        assert_eq!(interp.instances[b_id].env.get("stopped"), Some(crate::value::Value::Bool(false)));
+        assert_eq!(interp.instances[b_id].unwrap_local_mut().env.get("stopped"), Some(crate::value::Value::Bool(false)));
 
         redefine(
             &mut interp,
@@ -1152,11 +1152,11 @@ mod tests {
         assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
 
         // `b` is no longer reachable from the parent's own env...
-        assert_eq!(interp.instances[0].env.get("b"), None, "a removed child must not stay bound in the parent's env");
+        assert_eq!(interp.instances[0].unwrap_local_mut().env.get("b"), None, "a removed child must not stay bound in the parent's env");
         // ...but its OWN instance (still at its old, stable id) had `on
         // stop` fire, exactly like a normal end-of-program shutdown would.
         assert_eq!(
-            interp.instances[b_id].env.get("stopped"),
+            interp.instances[b_id].unwrap_local_mut().env.get("stopped"),
             Some(crate::value::Value::Bool(true)),
             "the removed child's own `on stop` handler must have fired"
         );
@@ -1172,24 +1172,24 @@ mod tests {
             "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Ticker()\n}\n",
             "Parent",
         );
-        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].unwrap_local_mut().env.get("a") else {
             panic!("child `a` must resolve to a component instance before the upgrade");
         };
         // `interp_with_one_instance` never calls `start_all`, so timers
         // aren't armed yet -- arm them directly the same way `start_all`
         // would, so this test actually exercises disarming a LIVE timer.
-        interp.instances[a_id].timers.push(crate::interp::TimerState {
+        interp.instances[a_id].unwrap_local_mut().timers.push(crate::interp::TimerState {
             handler_idx: 0,
             every: true,
             interval: 5000,
             next_fire: 5000,
             active: true,
         });
-        assert_eq!(interp.instances[a_id].timers.len(), 1);
+        assert_eq!(interp.instances[a_id].unwrap_local_mut().timers.len(), 1);
 
         redefine(&mut interp, "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Parent {\n    intent \"p\"\n}\n");
         assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
-        assert!(interp.instances[a_id].timers.is_empty(), "a removed child's own timers must be cleared");
+        assert!(interp.instances[a_id].unwrap_local_mut().timers.is_empty(), "a removed child's own timers must be cleared");
     }
 
     /// it124: extends the single-level it119 removal to a THREE-level chain
@@ -1211,26 +1211,26 @@ mod tests {
             format!("{leaf}{mid}{outer}{parent}")
         };
         let mut interp = interp_with_one_instance(&src(true), "Parent");
-        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].unwrap_local_mut().env.get("a") else {
             panic!("child `a` must resolve to a component instance before the upgrade");
         };
-        let Some(crate::value::Value::Component(mid_id)) = interp.instances[a_id].env.get("mid") else {
+        let Some(crate::value::Value::Component(mid_id)) = interp.instances[a_id].unwrap_local_mut().env.get("mid") else {
             panic!("`a`'s own child `mid` must resolve to a component instance before the upgrade");
         };
-        let Some(crate::value::Value::Component(inner_id)) = interp.instances[mid_id].env.get("inner") else {
+        let Some(crate::value::Value::Component(inner_id)) = interp.instances[mid_id].unwrap_local_mut().env.get("inner") else {
             panic!("`mid`'s own child `inner` must resolve to a component instance before the upgrade");
         };
         for id in [a_id, mid_id, inner_id] {
-            assert_eq!(interp.instances[id].env.get("stopped"), Some(crate::value::Value::Bool(false)));
+            assert_eq!(interp.instances[id].unwrap_local_mut().env.get("stopped"), Some(crate::value::Value::Bool(false)));
         }
 
         redefine(&mut interp, &src(false));
         assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
 
-        assert_eq!(interp.instances[0].env.get("a"), None, "a removed child must not stay bound in the parent's env");
+        assert_eq!(interp.instances[0].unwrap_local_mut().env.get("a"), None, "a removed child must not stay bound in the parent's env");
         for (id, label) in [(a_id, "a"), (mid_id, "a's own child mid"), (inner_id, "mid's own child inner")] {
             assert_eq!(
-                interp.instances[id].env.get("stopped"),
+                interp.instances[id].unwrap_local_mut().env.get("stopped"),
                 Some(crate::value::Value::Bool(true)),
                 "{label}'s own `on stop` handler must have fired"
             );
@@ -1247,20 +1247,20 @@ mod tests {
             "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Mid {\n    intent \"m\"\n    let inner = Ticker()\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Mid()\n}\n",
             "Parent",
         );
-        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].unwrap_local_mut().env.get("a") else {
             panic!("child `a` must resolve to a component instance before the upgrade");
         };
-        let Some(crate::value::Value::Component(inner_id)) = interp.instances[a_id].env.get("inner") else {
+        let Some(crate::value::Value::Component(inner_id)) = interp.instances[a_id].unwrap_local_mut().env.get("inner") else {
             panic!("`a`'s own child `inner` must resolve to a component instance before the upgrade");
         };
-        interp.instances[inner_id].timers.push(crate::interp::TimerState {
+        interp.instances[inner_id].unwrap_local_mut().timers.push(crate::interp::TimerState {
             handler_idx: 0,
             every: true,
             interval: 5000,
             next_fire: 5000,
             active: true,
         });
-        assert_eq!(interp.instances[inner_id].timers.len(), 1);
+        assert_eq!(interp.instances[inner_id].unwrap_local_mut().timers.len(), 1);
 
         // Removing `a` ITSELF from Parent (not just `inner` from `Mid`) is
         // what exercises the recursive path: a KEPT child's own internals
@@ -1270,7 +1270,7 @@ mod tests {
         redefine(&mut interp, "component Ticker {\n    intent \"t\"\n    on every 5s {\n    }\n}\ncomponent Mid {\n    intent \"m\"\n    let inner = Ticker()\n}\ncomponent Parent {\n    intent \"p\"\n}\n");
         assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
         assert!(
-            interp.instances[inner_id].timers.is_empty(),
+            interp.instances[inner_id].unwrap_local_mut().timers.is_empty(),
             "a removed grandchild's own timers must be cleared too, not just the direct child's"
         );
     }
@@ -1284,13 +1284,13 @@ mod tests {
             "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    wire a.o -> b.i\n}\n",
             "Parent",
         );
-        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].unwrap_local_mut().env.get("a") else {
             panic!("child `a` must resolve to a component instance before the upgrade");
         };
-        let Some(crate::value::Value::Component(b_id)) = interp.instances[0].env.get("b") else {
+        let Some(crate::value::Value::Component(b_id)) = interp.instances[0].unwrap_local_mut().env.get("b") else {
             panic!("child `b` must resolve to a component instance before the upgrade");
         };
-        assert!(interp.instances[a_id].wires.get("o").is_some_and(|t| t.contains(&(b_id, "i".to_string()))));
+        assert!(interp.instances[a_id].unwrap_local_mut().wires.get("o").is_some_and(|t| t.contains(&(b_id, "i".to_string()))));
 
         redefine(
             &mut interp,
@@ -1298,7 +1298,7 @@ mod tests {
         );
         assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
         assert!(
-            !interp.instances[a_id].wires.get("o").is_some_and(|t| t.contains(&(b_id, "i".to_string()))),
+            !interp.instances[a_id].unwrap_local_mut().wires.get("o").is_some_and(|t| t.contains(&(b_id, "i".to_string()))),
             "a wire pointing at the removed child must be pruned from the kept source's own wires"
         );
     }
@@ -1321,13 +1321,13 @@ mod tests {
             "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    let c = Dst()\n    wire a.o -> b.i\n    wire a.o -> c.i\n}\n",
         );
         assert_eq!(upgrade_instances(&mut interp, "Parent"), Ok(1));
-        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].env.get("a") else {
+        let Some(crate::value::Value::Component(a_id)) = interp.instances[0].unwrap_local_mut().env.get("a") else {
             panic!("child `a` must still resolve to a component instance");
         };
-        let Some(crate::value::Value::Component(c_id)) = interp.instances[0].env.get("c") else {
+        let Some(crate::value::Value::Component(c_id)) = interp.instances[0].unwrap_local_mut().env.get("c") else {
             panic!("child `c` must be a newly constructed component instance");
         };
-        let routed_to_c = interp.instances[a_id].wires.get("o").is_some_and(|targets| targets.contains(&(c_id, "i".to_string())));
+        let routed_to_c = interp.instances[a_id].unwrap_local_mut().wires.get("o").is_some_and(|targets| targets.contains(&(c_id, "i".to_string())));
         assert!(routed_to_c, "the new wire to the newly-added child must be registered on the source instance");
 
         // a wire between two PRE-EXISTING (kept) children removed in the
@@ -1341,13 +1341,13 @@ mod tests {
             "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n}\n",
         );
         assert_eq!(upgrade_instances(&mut interp2, "Parent"), Ok(1));
-        let Some(crate::value::Value::Component(a_id2)) = interp2.instances[0].env.get("a") else {
+        let Some(crate::value::Value::Component(a_id2)) = interp2.instances[0].unwrap_local_mut().env.get("a") else {
             panic!("child `a` must still resolve to a component instance");
         };
-        let Some(crate::value::Value::Component(b_id2)) = interp2.instances[0].env.get("b") else {
+        let Some(crate::value::Value::Component(b_id2)) = interp2.instances[0].unwrap_local_mut().env.get("b") else {
             panic!("child `b` must still resolve to a component instance");
         };
-        let still_routed = interp2.instances[a_id2].wires.get("o").is_some_and(|targets| targets.contains(&(b_id2, "i".to_string())));
+        let still_routed = interp2.instances[a_id2].unwrap_local_mut().wires.get("o").is_some_and(|targets| targets.contains(&(b_id2, "i".to_string())));
         assert!(!still_routed, "a removed wire between two kept children must be pruned, not left dangling");
 
         // re-routing: `a.o` moves from `b` to a THIRD pre-existing child `c`.
@@ -1360,16 +1360,16 @@ mod tests {
             "component Src {\n    intent \"s\"\n    out o: Int\n}\ncomponent Dst {\n    intent \"d\"\n    in i: Int\n}\ncomponent Parent {\n    intent \"p\"\n    let a = Src()\n    let b = Dst()\n    let c = Dst()\n    wire a.o -> c.i\n}\n",
         );
         assert_eq!(upgrade_instances(&mut interp3, "Parent"), Ok(1));
-        let Some(crate::value::Value::Component(a_id3)) = interp3.instances[0].env.get("a") else {
+        let Some(crate::value::Value::Component(a_id3)) = interp3.instances[0].unwrap_local_mut().env.get("a") else {
             panic!("child `a` must still resolve to a component instance");
         };
-        let Some(crate::value::Value::Component(b_id3)) = interp3.instances[0].env.get("b") else {
+        let Some(crate::value::Value::Component(b_id3)) = interp3.instances[0].unwrap_local_mut().env.get("b") else {
             panic!("child `b` must still resolve to a component instance");
         };
-        let Some(crate::value::Value::Component(c_id3)) = interp3.instances[0].env.get("c") else {
+        let Some(crate::value::Value::Component(c_id3)) = interp3.instances[0].unwrap_local_mut().env.get("c") else {
             panic!("child `c` must still resolve to a component instance");
         };
-        let targets = interp3.instances[a_id3].wires.get("o").cloned().unwrap_or_default();
+        let targets = interp3.instances[a_id3].unwrap_local_mut().wires.get("o").cloned().unwrap_or_default();
         assert!(!targets.contains(&(b_id3, "i".to_string())), "the old route to `b` must be gone");
         assert!(targets.contains(&(c_id3, "i".to_string())), "the new route to `c` must be registered");
     }
@@ -1389,13 +1389,13 @@ mod tests {
             "component P {\n    intent \"p\"\n    prop x: Int = 1\n    prop y: Int = 42\n    state n: Int = 0\n}\n",
         );
         assert_eq!(upgrade_instances(&mut interp, "P"), Ok(1));
-        assert_eq!(interp.instances[0].env.get("x"), Some(crate::value::Value::Int(1)), "an unchanged prop keeps its value");
+        assert_eq!(interp.instances[0].unwrap_local_mut().env.get("x"), Some(crate::value::Value::Int(1)), "an unchanged prop keeps its value");
         assert_eq!(
-            interp.instances[0].env.get("y"),
+            interp.instances[0].unwrap_local_mut().env.get("y"),
             Some(crate::value::Value::Int(42)),
             "a genuinely new prop must get its own fresh default"
         );
-        assert_eq!(interp.instances[0].env.get("z"), None, "a removed prop must be dropped, not left dangling");
+        assert_eq!(interp.instances[0].unwrap_local_mut().env.get("z"), None, "a removed prop must be dropped, not left dangling");
     }
 
     /// The specific correctness edge case this follow-up must NOT get
@@ -1414,7 +1414,7 @@ mod tests {
         );
         assert_eq!(upgrade_instances(&mut interp, "P"), Ok(1));
         assert_eq!(
-            interp.instances[0].env.get("y"),
+            interp.instances[0].unwrap_local_mut().env.get("y"),
             Some(crate::value::Value::str("new-prop-default".to_string())),
             "a prop named like an old STATE field must get its own default, not the stale state value"
         );

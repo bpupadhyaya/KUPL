@@ -1065,10 +1065,41 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       spec) — the keyword has no runtime effect until step 2+ lands;
       documenting it now would describe a feature that doesn't work yet,
       the exact class of staleness this campaign's own docs discipline
-      exists to prevent. Next: §8.10 step 2, the `InstanceSlot`
-      `Local`/`Remote` split (pure refactor, ~32 `self.instances[id]`
-      call sites across the 14 functions, zero `Remote` slots constructed
-      yet — verify byte-identical before any actual threading).
+      exists to prevent. **it134: §8.10 step 2 landed — the `InstanceSlot`
+      `Local`/`Remote` split**, a pure refactor with zero `Remote` slots
+      ever constructed. `Interp.instances: Vec<Instance>` became
+      `Vec<InstanceSlot>` (`Local(Instance) | Remote(ActorHandle)`,
+      `ActorHandle` a zero-field stub filled in at step 3); every
+      `self.instances[id]` site across all 14 functions (plus `vm.rs`'s
+      own differential-test module and `repl.rs`'s 44-touch `:upgrade`
+      machinery, both of which read `interp::Interp.instances` directly
+      and needed the identical update) now calls `.unwrap_local()` /
+      `.unwrap_local_mut()`, which panics on a `Remote` slot — unreachable
+      today, matching this codebase's own "clean panic over silent wrong
+      answer" discipline rather than silently misbehaving once step 3+
+      starts constructing real `Remote` slots. `vm.rs`'s OWN, entirely
+      separate `Vm.instances` field (a different runtime representation,
+      untouched by this design) was correctly left alone after an initial
+      overly-broad mechanical pass wrongly touched it — caught before
+      committing by reviewing the diff, reverted, and redone precisely
+      against only the genuine `interp::Interp` accesses in that file's
+      differential-test module. Full verification: `cargo build` clean,
+      zero warnings; `cargo test` green **twice** (1711/1711 lib,
+      excluding the same pre-confirmed-flaky `perf_guard` timing tests);
+      `cargo test --bins` 62/62; `cargo test --doc` 0/0; interp-vs-vm
+      sweep clean across 56 examples; interp-vs-native sweep clean across
+      56 examples (an initial sweep-script bug — comparing native's own
+      `native executable: ...` build-status line, and a `KUPL_AI_MOCK`
+      env var set on the build step instead of the resulting binary's own
+      invocation, against interp's plain output — produced 55 false
+      mismatches, fully explained and resolved before trusting the
+      result). No new unit tests needed: ~1700 existing tests already
+      exercise every wrapped code path (every component-instantiation/
+      timer/supervision/wire test transitively touches `InstanceSlot`
+      now), matching this step's own "verify via the existing suite, a
+      pure refactor adds no new observable behavior" scope. Next: §8.10
+      step 3 — spawn a real actor thread for an isolated `concurrent`
+      instance with no wires/expose calls reaching it yet.
 - [x] **Stack-margin audit pass (it122)** — the recurring "adding a new
       `eval_call` match arm silently grows its debug-build per-call stack
       frame enough to tip an already-marginal `diff_*` recursion test into

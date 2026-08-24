@@ -1836,8 +1836,8 @@ fn run_example(
             }
             ExampleStep::Expect { expr, .. } => {
                 // out ports are visible by name, bound to their last emitted value
-                let env = interp.instances[id].env.child();
-                let ports: Vec<String> = interp.instances[id]
+                let env = interp.instances[id].unwrap_local_mut().env.child();
+                let ports: Vec<String> = interp.instances[id].unwrap_local_mut()
                     .comp
                     .ports
                     .iter()
@@ -1845,7 +1845,7 @@ fn run_example(
                     .map(|p| p.name.clone())
                     .collect();
                 for port in ports {
-                    let v = interp.instances[id]
+                    let v = interp.instances[id].unwrap_local_mut()
                         .last_emit
                         .get(&port)
                         .cloned()

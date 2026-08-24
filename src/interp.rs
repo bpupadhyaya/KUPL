@@ -129,9 +129,51 @@ pub struct Instance {
     pub restart_history: VecDeque<i64>,
 }
 
+/// A handle to a `concurrent`-marked instance running on its own actor
+/// thread (`docs/design/ASYNC.md` §8.2). A pure stub for now — no
+/// `InstanceSlot::Remote` is ever constructed until §8.10 step 3, so
+/// `unwrap_local`/`unwrap_local_mut` below are unreachable in practice;
+/// this exists only so the `InstanceSlot` split (step 2, a byte-identical
+/// pure refactor) can be verified BEFORE any real threading is added.
+pub struct ActorHandle;
+
+/// Every one of the 14 functions across this file that used to index
+/// `Vec<Instance>` directly now indexes `Vec<InstanceSlot>` instead — see
+/// `docs/design/ASYNC.md` §8.2. `Local` is today's exact, unmodified
+/// `Instance`; `Remote` is filled in starting at §8.10 step 3.
+pub enum InstanceSlot {
+    Local(Instance),
+    Remote(ActorHandle),
+}
+
+impl InstanceSlot {
+    /// Every call site in this codebase today expects a `Local` instance —
+    /// `Remote` is never constructed before §8.10 step 3, so hitting it
+    /// here is a genuine bug, not a reachable runtime case; panicking
+    /// (rather than silently misbehaving) matches this codebase's own
+    /// "clean panic over silent wrong answer" discipline.
+    pub fn unwrap_local(&self) -> &Instance {
+        match self {
+            InstanceSlot::Local(i) => i,
+            InstanceSlot::Remote(_) => {
+                panic!("InstanceSlot::Remote accessed before ASYNC.md §8.10 step 3 implements it")
+            }
+        }
+    }
+
+    pub fn unwrap_local_mut(&mut self) -> &mut Instance {
+        match self {
+            InstanceSlot::Local(i) => i,
+            InstanceSlot::Remote(_) => {
+                panic!("InstanceSlot::Remote accessed before ASYNC.md §8.10 step 3 implements it")
+            }
+        }
+    }
+}
+
 pub struct Interp {
     pub db: ProgramDb,
-    pub instances: Vec<Instance>,
+    pub instances: Vec<InstanceSlot>,
     pub queue: VecDeque<(usize, String, Value)>,
     /// Instance currently executing a handler (target of `emit`).
     pub current: Option<usize>,
@@ -303,8 +345,8 @@ impl Interp {
                 .iter()
                 .find(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
             if let Some(s) = supervise {
-                self.instances[cid].restart_on_failure = true;
-                self.instances[cid].max_restarts = s.max_restarts;
+                self.instances[cid].unwrap_local_mut().restart_on_failure = true;
+                self.instances[cid].unwrap_local_mut().max_restarts = s.max_restarts;
             }
         }
         Ok(v)
@@ -378,7 +420,10 @@ impl Interp {
         }
 
         let id = self.instances.len();
-        self.instances.push(Instance {
+        // Every instance is `Local` until §8.10 step 3 gives `concurrent`
+        // components their own actor thread — `comp.concurrent` is not
+        // consulted here yet (docs/design/ASYNC.md §8.2).
+        self.instances.push(InstanceSlot::Local(Instance {
             comp: comp.clone(),
             env: env.clone(),
             wires: HashMap::new(),
@@ -387,7 +432,7 @@ impl Interp {
             timers: Vec::new(),
             max_restarts: None,
             restart_history: VecDeque::new(),
-        });
+        }));
 
         // children (constructed after the parent exists, in declaration order)
         let mut child_ids: HashMap<String, usize> = HashMap::new();
@@ -406,7 +451,7 @@ impl Interp {
             let (Some(&src), Some(&dst)) = (child_ids.get(from_child), child_ids.get(to_child)) else {
                 return Err(Self::panic_flow("wire references unknown child", wire.span));
             };
-            self.instances[src]
+            self.instances[src].unwrap_local_mut()
                 .wires
                 .entry(from_port.clone())
                 .or_default()
@@ -468,7 +513,7 @@ impl Interp {
 
     /// Arm the instance's timers relative to the current virtual time.
     fn arm_timers(&mut self, id: usize) {
-        let comp = self.instances[id].comp.clone();
+        let comp = self.instances[id].unwrap_local_mut().comp.clone();
         let now = self.now;
         let mut timers = Vec::new();
         for (i, h) in comp.handlers.iter().enumerate() {
@@ -485,7 +530,7 @@ impl Interp {
                 active: true,
             });
         }
-        self.instances[id].timers = timers;
+        self.instances[id].unwrap_local_mut().timers = timers;
     }
 
     /// Advance the virtual clock by `dur` ms, firing every due timer in time
@@ -521,7 +566,12 @@ impl Interp {
         loop {
             // earliest active timer with next_fire <= target
             let mut best: Option<(i64, usize, usize)> = None;
-            for (iid, inst) in self.instances.iter().enumerate() {
+            for (iid, slot) in self.instances.iter().enumerate() {
+                // Every slot is `Local` until §8.10 step 3+ gives `advance`
+                // a way to reach a `Remote` instance's next-fire time via
+                // the shared table (docs/design/ASYNC.md §8.5) — not
+                // implemented yet, so this only sees local timers for now.
+                let inst = slot.unwrap_local();
                 for (ti, t) in inst.timers.iter().enumerate() {
                     if t.active && t.next_fire <= target {
                         let cand = (t.next_fire, iid, ti);
@@ -540,8 +590,8 @@ impl Interp {
                 ));
             }
             self.now = fire_time;
-            let handler_idx = self.instances[iid].timers[ti].handler_idx;
-            let comp = self.instances[iid].comp.clone();
+            let handler_idx = self.instances[iid].unwrap_local_mut().timers[ti].handler_idx;
+            let comp = self.instances[iid].unwrap_local_mut().comp.clone();
             let h = comp.handlers[handler_idx].clone();
             // SOUNDNESS FIX (PR-it509): a panicking timer handler that triggers a
             // supervised restart must NOT also get the ordinary post-fire update
@@ -557,7 +607,7 @@ impl Interp {
             // 100ms window instead of the correct 10.
             let restarted = match self.run_handler(iid, &h, Value::Unit) {
                 Ok(()) => false,
-                Err(Flow::Panic { msg, .. }) if self.instances[iid].restart_on_failure => {
+                Err(Flow::Panic { msg, .. }) if self.instances[iid].unwrap_local_mut().restart_on_failure => {
                     self.restart(iid, &msg)?;
                     true
                 }
@@ -565,7 +615,7 @@ impl Interp {
             };
             self.drain()?;
             if !restarted {
-                let t = &mut self.instances[iid].timers[ti];
+                let t = &mut self.instances[iid].unwrap_local_mut().timers[ti];
                 if t.every {
                     t.next_fire += t.interval;
                 } else {
@@ -583,7 +633,12 @@ impl Interp {
     pub fn run_timers(&mut self, max_fires: usize) -> Result<(), Flow> {
         for _ in 0..max_fires {
             let mut best: Option<(i64, usize, usize)> = None;
-            for (iid, inst) in self.instances.iter().enumerate() {
+            for (iid, slot) in self.instances.iter().enumerate() {
+                // Every slot is `Local` until §8.10 step 3+ gives `advance`
+                // a way to reach a `Remote` instance's next-fire time via
+                // the shared table (docs/design/ASYNC.md §8.5) — not
+                // implemented yet, so this only sees local timers for now.
+                let inst = slot.unwrap_local();
                 for (ti, t) in inst.timers.iter().enumerate() {
                     if t.active {
                         let cand = (t.next_fire, iid, ti);
@@ -600,7 +655,7 @@ impl Interp {
     }
 
     pub(crate) fn run_lifecycle(&mut self, id: usize, trigger: &Trigger) -> Result<(), Flow> {
-        let comp = self.instances[id].comp.clone();
+        let comp = self.instances[id].unwrap_local_mut().comp.clone();
         let want_start = matches!(trigger, Trigger::Start);
         for h in &comp.handlers {
             let matches = matches!(
@@ -640,12 +695,12 @@ impl Interp {
                     crate::diag::Span::default(),
                 ));
             }
-            let comp = self.instances[id].comp.clone();
+            let comp = self.instances[id].unwrap_local_mut().comp.clone();
             for h in &comp.handlers {
                 if matches!(&h.trigger, Trigger::Port(p) if p == &port) {
                     match self.run_handler(id, h, value.clone()) {
                         Ok(()) => {}
-                        Err(Flow::Panic { msg, .. }) if self.instances[id].restart_on_failure => {
+                        Err(Flow::Panic { msg, .. }) if self.instances[id].unwrap_local_mut().restart_on_failure => {
                             self.restart(id, &msg)?;
                         }
                         Err(other) => return Err(other),
@@ -663,8 +718,8 @@ impl Interp {
     /// `restart` (supervision) and `forall_case` (property-test isolation,
     /// production-hardening PR-it903 -- see that function's own doc comment).
     fn reset_instance_state(&mut self, id: usize) -> Result<(), Flow> {
-        let comp = self.instances[id].comp.clone();
-        let env = self.instances[id].env.clone();
+        let comp = self.instances[id].unwrap_local_mut().comp.clone();
+        let env = self.instances[id].unwrap_local_mut().env.clone();
         for s in &comp.state {
             let v = self.eval(&s.init, &env)?;
             env.define(&s.name, v);
@@ -687,9 +742,9 @@ impl Interp {
     /// upward). No `max ... in ...` clause (the default) preserves today's
     /// exact unlimited-restart behavior.
     fn restart(&mut self, id: usize, panic_msg: &str) -> Result<(), Flow> {
-        if let Some((max_n, window_ms)) = self.instances[id].max_restarts {
+        if let Some((max_n, window_ms)) = self.instances[id].unwrap_local_mut().max_restarts {
             let now = self.now;
-            let history = &mut self.instances[id].restart_history;
+            let history = &mut self.instances[id].unwrap_local_mut().restart_history;
             while let Some(&oldest) = history.front() {
                 if now - oldest > window_ms {
                     history.pop_front();
@@ -698,15 +753,15 @@ impl Interp {
                 }
             }
             if history.len() as u32 >= max_n {
-                let comp_name = self.instances[id].comp.name.clone();
+                let comp_name = self.instances[id].unwrap_local_mut().comp.name.clone();
                 eprintln!(
                     "[supervise] {comp_name} exceeded {max_n} restart(s) within {window_ms}ms — escalating instead of restarting"
                 );
                 return Err(Self::panic_flow(panic_msg.to_string(), Span::default()));
             }
-            self.instances[id].restart_history.push_back(now);
+            self.instances[id].unwrap_local_mut().restart_history.push_back(now);
         }
-        let comp = self.instances[id].comp.clone();
+        let comp = self.instances[id].unwrap_local_mut().comp.clone();
         eprintln!("[supervise] {} restarted after panic: {panic_msg}", comp.name);
         self.reset_instance_state(id)?;
         for h in &comp.handlers {
@@ -719,7 +774,7 @@ impl Interp {
     }
 
     fn run_handler(&mut self, id: usize, h: &Handler, payload: Value) -> Result<(), Flow> {
-        let env = self.instances[id].env.child();
+        let env = self.instances[id].unwrap_local_mut().env.child();
         if let Some(param) = &h.param {
             env.define(param, payload);
         }
@@ -737,11 +792,11 @@ impl Interp {
         let Some(id) = self.current else {
             return Err(Self::panic_flow("`emit` outside of a component handler", span));
         };
-        self.instances[id].last_emit.insert(port.to_string(), value.clone());
-        let targets = self.instances[id].wires.get(port).cloned().unwrap_or_default();
+        self.instances[id].unwrap_local_mut().last_emit.insert(port.to_string(), value.clone());
+        let targets = self.instances[id].unwrap_local_mut().wires.get(port).cloned().unwrap_or_default();
         if targets.is_empty() {
             if self.print_unwired {
-                let comp = self.instances[id].comp.name.clone();
+                let comp = self.instances[id].unwrap_local_mut().comp.name.clone();
                 println!("{comp}.{port} = {value}");
             }
         } else {
@@ -1382,7 +1437,7 @@ impl Interp {
         // it904/it905's direct/nested/captured paths).
         let mut frontier: Vec<usize> = instance_ids.iter().copied().collect();
         while let Some(id) = frontier.pop() {
-            let child_env = self.instances[id].env.clone();
+            let child_env = self.instances[id].unwrap_local_mut().env.clone();
             let mut found = std::collections::HashSet::new();
             child_env.own_bound_instance_ids(&mut found);
             for cid in found {
@@ -1885,7 +1940,7 @@ impl Interp {
                 return Ok(None);
             }
             if let Some(id) = self.current {
-                let comp = self.instances[id].comp.clone();
+                let comp = self.instances[id].unwrap_local_mut().comp.clone();
                 if comp.funs.iter().chain(comp.exposes.iter()).any(|f| f.name == *name) {
                     return Ok(None);
                 }
@@ -1939,7 +1994,7 @@ impl Interp {
         }
         // component-local function referenced as a value
         if let Some(id) = self.current {
-            let comp = self.instances[id].comp.clone();
+            let comp = self.instances[id].unwrap_local_mut().comp.clone();
             if comp.funs.iter().chain(comp.exposes.iter()).any(|f| f.name == name) {
                 return Ok(Value::Bound(id, Rc::new(name.to_string())));
             }
@@ -2183,7 +2238,7 @@ impl Interp {
             // component-local function (private or exposed) with live state
             if let Some(id) = self.current {
                 if env.get(name).is_none() {
-                    let comp = self.instances[id].comp.clone();
+                    let comp = self.instances[id].unwrap_local_mut().comp.clone();
                     if let Some(decl) = comp
                         .funs
                         .iter()
@@ -2195,7 +2250,7 @@ impl Interp {
                         for a in args {
                             avs.push(self.eval(&a.value, env)?);
                         }
-                        let base = self.instances[id].env.clone();
+                        let base = self.instances[id].unwrap_local_mut().env.clone();
                         return self.call_fun(&decl, avs, &base, span);
                     }
                 }
@@ -2472,14 +2527,14 @@ impl Interp {
     fn eval_method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> EvalResult {
         // component expose call
         if let Value::Component(id) = recv {
-            let comp = self.instances[id].comp.clone();
+            let comp = self.instances[id].unwrap_local_mut().comp.clone();
             let Some(decl) = comp.exposes.iter().chain(comp.funs.iter()).find(|f| f.name == name) else {
                 return Err(Self::panic_flow(
                     format!("component `{}` does not expose `{name}`", comp.name),
                     span,
                 ));
             };
-            let instance_env = self.instances[id].env.clone();
+            let instance_env = self.instances[id].unwrap_local_mut().env.clone();
             let saved = self.current.replace(id);
             let result = self.call_fun(&decl.clone(), args, &instance_env, span);
             self.current = saved;
@@ -2502,7 +2557,7 @@ impl Interp {
             // the supervised process).
             let mut should_drain = result.is_ok();
             if let Err(Flow::Panic { ref msg, .. }) = result {
-                if self.instances[id].restart_on_failure {
+                if self.instances[id].unwrap_local_mut().restart_on_failure {
                     self.restart(id, msg)?;
                     should_drain = true;
                 }

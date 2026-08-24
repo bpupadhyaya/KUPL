@@ -21787,8 +21787,8 @@ fun probe() -> Str {\n    par { par_label(\"a\")  par_label(\"b\") }.join(\",\")
                 Err(_) => panic!("ticks call failed"),
             }
         };
-        let i_ready = it.instances[iid].last_emit.get("ready").cloned().unwrap().to_string();
-        let i_tick = it.instances[iid].last_emit.get("tick").cloned().unwrap().to_string();
+        let i_ready = it.instances[iid].unwrap_local_mut().last_emit.get("ready").cloned().unwrap().to_string();
+        let i_tick = it.instances[iid].unwrap_local_mut().last_emit.get("tick").cloned().unwrap().to_string();
 
         // KVM
         let module = crate::compile::compile_module(&compiled.program, &compiled.checked)
@@ -21888,7 +21888,7 @@ component Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let counte
         }
         it.start_all().ok();
         assert!(it.advance(100).is_ok(), "advance must survive repeated supervised restarts");
-        let counter_id = it.instances.iter().position(|i| i.comp.name == "Counter").expect("Counter instance");
+        let counter_id = it.instances.iter().position(|i| i.unwrap_local().comp.name == "Counter").expect("Counter instance");
         let f = Value::Bound(counter_id, std::rc::Rc::new("count".to_string()));
         let i_count = match it.call_value(f, vec![], crate::diag::Span::default()) {
             Ok(v) => v.to_string(),
@@ -21951,7 +21951,7 @@ component Main {\n    intent \"x\"\n    let combo = Combo()\n    let driver = Dr
         }
         it.start_all().ok();
         assert!(it.advance(20).is_ok(), "advance must survive repeated supervised restarts");
-        let acc_id = it.instances.iter().position(|i| i.comp.name == "Accumulator").expect("Accumulator instance");
+        let acc_id = it.instances.iter().position(|i| i.unwrap_local().comp.name == "Accumulator").expect("Accumulator instance");
         let f = Value::Bound(acc_id, std::rc::Rc::new("get".to_string()));
         let i_count = match it.call_value(f, vec![], crate::diag::Span::default()) {
             Ok(v) => v.to_string(),
@@ -22007,7 +22007,7 @@ component Main {\n    intent \"x\"\n    let combo = Combo()\n    let driver = Dr
             _ => panic!("interp instantiate failed"),
         }
         assert!(it.start_all().is_ok(), "supervision must catch the mid-par panic");
-        let counter_id = it.instances.iter().position(|i| i.comp.name == "Counter527").expect("Counter527 instance");
+        let counter_id = it.instances.iter().position(|i| i.unwrap_local().comp.name == "Counter527").expect("Counter527 instance");
         let f = Value::Bound(counter_id, std::rc::Rc::new("peek".to_string()));
         let i_peek = match it.call_value(f, vec![], crate::diag::Span::default()) {
             Ok(v) => v.to_string(),
