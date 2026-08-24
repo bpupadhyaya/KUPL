@@ -275,6 +275,66 @@ the full recursive `to_portable`/`from_portable` structural walk.
   `cache_dir` `Option`-returning design, PR-it1215/1217, is the exact
   same shape of decision already made and tested in this codebase).
 
+**LIVE-VERIFIED (PR-cv2-2 investigation, 2026-08-24) — DEPRIORITIZED, not
+implemented.** Both open questions above were answered directly, and the
+answer is: this section's benefit is real but narrow, and not worth the
+risk at current priority. Specifics:
+- **A literal "move the `Rc` across the thread boundary" is not actually
+  what's needed, and isn't directly possible anyway**: `Rc<T>` is not
+  `Send` (a static, compile-time property — a runtime `strong_count == 1`
+  check cannot make an `Rc` itself cross an `std::sync::mpsc::Sender`
+  typed for cross-thread transfer without `unsafe impl Send`, which this
+  codebase has zero precedent for and which this document's own §3
+  explicitly rules unsafe stack-switching/coroutines out of scope for
+  similar risk reasons). `ActorMsg::Deliver`/`ActorMsg::Call` already only
+  ever carry `PortableValue` (`interp.rs`'s `inbox: Option<mpsc::Sender<
+  ActorMsg>>`, confirmed via `grep`) — `PortableValue` is Send precisely
+  *because* it owns its data outright and contains no `Rc` at all. The
+  only sound version of this idea is narrower: teach `to_portable` to use
+  `Rc::try_unwrap` instead of `(**rc).clone()` at each leaf when the
+  refcount allows it, still producing an ordinary `Rc`-free `PortableValue`
+  — an ownership-transfer optimization *inside* the existing conversion,
+  not a bypass of it. No unsafe needed either way.
+- **Structural sharing**: confirmed via `value.rs` that `List`/`Map`/`Set`
+  are `Rc<Vec<Value>>`/`Rc<Vec<(Value,Value)>>` with no slice/tail-sharing
+  operations — but a DIFFERENT, more fundamental aliasing path exists
+  regardless: any ordinary re-use of the same `Value` in two places (e.g.
+  `[inner, inner]`, or storing the same List in two variables) does a
+  cheap `Rc::clone` on `Value`'s own `#[derive(Clone)]`, inflating a
+  *nested* value's refcount even while the *outer* container's own Rc
+  stays at 1. So a shallow, top-level-only `strong_count == 1` check is
+  unsound for anything with Rc-bearing children (`List`/`Map`/`Set`/`Ctor`
+  of non-scalar elements) — only sound for `Str`/`BigInt`/`Rational`/
+  `Decimal`/`Tensor` directly, or a container proven (recursively) unique
+  all the way down. The recursive version is exactly as expensive to WALK
+  as `to_portable` already is (must visit every node either way to check
+  its own refcount) — it only saves the leaf-level byte-copy, not the
+  traversal.
+- **Measured**: a scratch benchmark (`parallel.rs`, `to_portable` called
+  directly, release build, removed after gathering data — not left in the
+  tree) on three shapes: a 200k-element `List<Int>` (no Rc-bearing leaves
+  at all — zero possible win) cost **~3.0ms/call**; a 50k-element
+  `List<Str>` (~40 bytes each — leaf-level win possible) cost
+  **~1.37ms/call**; a single 200KB `Str` (the single BEST case for this
+  optimization — one Rc, one leaf, zero container traversal) cost only
+  **~2.4µs/call already**, on the existing clone-based path. The
+  traversal/allocation cost of rebuilding the `PortableValue` tree (an
+  unavoidable cost either way, since `Value` and `PortableValue` are
+  different Rust types — converting between them requires visiting every
+  node regardless of who owns the underlying bytes) dominates total cost
+  for any container-shaped value; the byte-copy this optimization would
+  skip is a small fraction of that, and even in the best-case (a bare
+  large string) is already sub-3-microsecond — almost certainly smaller
+  than the `mpsc` channel send + thread-wake cost the message pays
+  immediately afterward.
+- **Conclusion, exactly matching this section's own pre-written fallback
+  instruction**: the win is marginal for realistic KUPL program shapes.
+  Deprioritized in favor of §4.3. Do not re-attempt this without either a
+  concrete user-reported perf complaint pointing here specifically, or a
+  message shape this benchmark didn't cover (e.g. very large `BigInt`/
+  `Tensor` payloads, where the leaf-copy cost could plausibly dominate
+  differently than the `Str`/`List` shapes tested here).
+
 ### 4.3 v2 — A fixed worker-thread pool, replacing "1 OS thread per actor,
 ### always resident" (the highest-leverage item in this document)
 
