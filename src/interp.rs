@@ -830,12 +830,50 @@ impl Interp {
             self.run_lifecycle(id, &Trigger::Stop)?;
         }
         self.drain()?;
+        // Production-hardening 1218: a REAL, live-confirmed-by-code-reading
+        // gap found+fixed -- `join()`'s `Result` used to be discarded via
+        // `let _ = ...`, silently swallowing ANY genuine Rust-level panic
+        // inside an actor's own thread (not a normal KUPL `panic()` call,
+        // which `instantiate_concurrent`'s own `report`/reply-channel
+        // machinery already surfaces correctly -- this is specifically
+        // about an actor thread crashing with an actual Rust panic, e.g.
+        // an internal "should have been rejected at check time"-style
+        // invariant violation reached only on that thread). Before
+        // PR-it1213's stack-size fix, a stack overflow was the one
+        // CONFIRMED live trigger for this -- but a stack overflow is a
+        // process ABORT (SIGABRT), which never reaches `join()` as an
+        // `Err` at all (the whole process is already gone); this
+        // `let _ =` was ALWAYS about a genuinely different, still-open
+        // class of trigger: any of the interpreter's OWN many internal
+        // `.expect()`/`panic!()` invariant checks (the same "internal
+        // compiler error, this is a bug in KUPL, not your program" class
+        // used throughout this codebase) firing on an actor thread instead
+        // of the main one. On the main thread such a panic crashes the
+        // whole process loudly, by design; on an actor thread it used to
+        // vanish completely -- the coordinator kept running and could
+        // still exit 0, silently masking a genuine internal bug. Every
+        // Remote handle is still joined regardless (no early return),
+        // matching this loop's own original "always finish draining every
+        // handle" shape -- only the FIRST panic encountered is surfaced,
+        // mirroring `run_lifecycle`'s own `?`-early-return-on-first-error
+        // convention used two lines above for local instances.
+        let mut actor_panic: Option<Flow> = None;
         for id in 0..upto.min(self.instances.len()) {
             if let InstanceSlot::Remote(handle) = &mut self.instances[id] {
                 if let Some(join) = handle.join.take() {
-                    let _ = join.join();
+                    if join.join().is_err() && actor_panic.is_none() {
+                        actor_panic = Some(Self::panic_flow(
+                            "a `concurrent component` actor thread panicked during shutdown \
+                             — this is a bug in KUPL, not your program"
+                                .to_string(),
+                            Span::default(),
+                        ));
+                    }
                 }
             }
+        }
+        if let Some(flow) = actor_panic {
+            return Err(flow);
         }
         Ok(())
     }
@@ -7405,5 +7443,91 @@ mod capfs_tests {
         assert_eq!(&**variant, "Err");
         let Value::Str(msg) = &fields[0] else { panic!("Err payload must be a Str") };
         assert!(msg.contains("capability limited to `/tmp/allowed`"), "{msg}");
+    }
+}
+
+/// This file's FIRST test module targeting `concurrent component` machinery
+/// directly (every OTHER concurrent-component test in this codebase spawns
+/// the real compiled binary via `main.rs`'s own subprocess-based tests) --
+/// needed here because testing `stop_all`'s own genuine-actor-panic
+/// handling precisely requires constructing a synthetic `InstanceSlot::
+/// Remote` whose thread panics on demand, which only a test living inside
+/// this module (where `ActorHandle`'s fields are private, by design — see
+/// its own doc comment) can do at all.
+#[cfg(test)]
+mod concurrent_tests {
+    use super::{ActorHandle, ActorMsg, Flow, Interp, InstanceSlot, ProgramDb};
+
+    /// Production-hardening 1218: a REAL, live-confirmed-by-code-reading
+    /// gap found+fixed -- `stop_all` used to discard `join()`'s `Result`
+    /// via `let _ = ...`, silently swallowing ANY genuine Rust-level panic
+    /// on an actor thread (distinct from a normal KUPL `panic()` call,
+    /// which is already handled correctly elsewhere, and distinct from
+    /// PR-it1213's now-fixed stack-overflow class, which is a process
+    /// ABORT that never even reaches `join()` as an `Err`). Constructs a
+    /// synthetic `Remote` instance whose thread panics on purpose (the
+    /// cleanest way to exercise this specific mechanism directly, since a
+    /// NATURALLY-occurring internal-invariant-violation trigger inside an
+    /// actor thread isn't reliably constructible from ordinary KUPL
+    /// source -- matching this campaign's own established "a real gap
+    /// found by direct code reading, the fix is unconditionally correct
+    /// regardless of how the trigger is naturally reached" precedent, e.g.
+    /// PR-it1212/PR-it1215).
+    #[test]
+    fn stop_all_surfaces_a_genuine_actor_thread_panic_instead_of_silently_swallowing_it() {
+        let compiled = crate::run::compile("fun main() {}\n").expect("trivial program must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new_bare(db);
+
+        let (inbox_tx, _inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::spawn(|| {
+            panic!("deliberate test panic, simulating a genuine internal interpreter bug reached on an actor thread")
+        });
+        interp.instances.push(InstanceSlot::Remote(ActorHandle {
+            join: Some(join),
+            inbox: Some(inbox_tx),
+            ready: Some(ready_rx),
+        }));
+
+        let result = interp.stop_all(1);
+        // `Flow` deliberately doesn't derive `Debug` (it holds a `Value`,
+        // which doesn't either) -- describe the outcome by hand rather
+        // than via `{:?}`.
+        let describe = match &result {
+            Ok(()) => "Ok(())".to_string(),
+            Err(Flow::Panic { msg, .. }) => format!("Err(Flow::Panic {{ msg: {msg:?} }})"),
+            Err(_) => "Err(<non-Panic Flow>)".to_string(),
+        };
+        assert!(
+            matches!(result, Err(Flow::Panic { .. })),
+            "a genuinely panicked actor thread must surface as Err(Flow::Panic), not {describe}"
+        );
+    }
+
+    /// Companion: an actor thread that shuts down CLEANLY (no panic) must
+    /// still report `Ok(())` -- the fix above must not turn every ordinary
+    /// shutdown into a false-positive error.
+    #[test]
+    fn stop_all_still_returns_ok_when_every_actor_thread_shuts_down_cleanly() {
+        let compiled = crate::run::compile("fun main() {}\n").expect("trivial program must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new_bare(db);
+
+        let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::spawn(move || {
+            // Exits cleanly once the inbox's Sender is dropped (stop_all's
+            // own first loop does this via `handle.inbox.take()`).
+            while inbox_rx.recv().is_ok() {}
+        });
+        interp.instances.push(InstanceSlot::Remote(ActorHandle {
+            join: Some(join),
+            inbox: Some(inbox_tx),
+            ready: Some(ready_rx),
+        }));
+
+        let result = interp.stop_all(1);
+        assert!(result.is_ok(), "a cleanly-shut-down actor thread must not be reported as a panic");
     }
 }
