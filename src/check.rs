@@ -2094,6 +2094,203 @@ impl Checker {
                 self.check_portable_ty(ret, c, &format!("exposed fun `{}`'s return type", expose.name));
             }
         }
+        // `docs/design/ASYNC_IO.md` §4/§6 (Concurrency-v2 PR-cv2-9, the
+        // checker-only first slice of that design -- scheduling itself is
+        // NOT implemented yet, this only enforces the SHAPE a future
+        // non-blocking-I/O implementation needs): a blocking builtin call
+        // (`http_get`/`http_post`/`http_get_with`/`read_file_with`) may
+        // only appear as the ENTIRE right-hand side of a top-level `let`
+        // in a `concurrent component`'s own handler or exposed-fun body --
+        // never nested inside a loop, conditional, method chain, or
+        // another call's argument list. Landing this restriction ahead of
+        // the scheduling logic (per that design doc's own §9 sequencing)
+        // is a real, independently-verifiable step with near-zero cost
+        // today (no real KUPL program exists yet that could be broken by
+        // it), and narrows what the LATER scheduling implementation has
+        // to handle.
+        for h in &c.handlers {
+            self.check_no_nested_blocking_calls(&h.body);
+        }
+        for expose in &c.exposes {
+            self.check_no_nested_blocking_calls(&expose.body);
+        }
+        for f in &c.funs {
+            self.check_no_nested_blocking_calls(&f.body);
+        }
+    }
+
+    /// The set of blocking builtins `docs/design/ASYNC_IO.md` restricts
+    /// inside `concurrent component` bodies -- `(name, argc)`, mirroring
+    /// exactly how `interp.rs::eval_call`'s own builtin dispatch matches
+    /// `(name.as_str(), args.len())`, so this stays in sync with runtime
+    /// dispatch by construction (an arity mismatch here would just mean
+    /// this check silently doesn't fire, not a wrong-answer risk, but
+    /// keeping it exact avoids that gap entirely).
+    const BLOCKING_BUILTINS: &'static [(&'static str, usize)] =
+        &[("http_get", 1), ("http_post", 2), ("http_get_with", 2), ("read_file_with", 2)];
+
+    /// `true` if `e` is a direct call to one of `BLOCKING_BUILTINS` (by
+    /// name AND arity, matching `eval_call`'s own dispatch order --
+    /// builtins are checked before any user-defined function of the same
+    /// name, so a shadowing `fun http_get(...)` still resolves to the
+    /// blocking builtin at runtime, and this check must agree).
+    fn is_blocking_builtin_call(e: &Expr) -> bool {
+        let ExprKind::Call { callee, args } = &e.kind else { return false };
+        let ExprKind::Ident(name) = &callee.kind else { return false };
+        Self::BLOCKING_BUILTINS.iter().any(|(n, argc)| *n == name.as_str() && *argc == args.len())
+    }
+
+    /// Top-level pass over a handler/exposed-fun body: each DIRECT
+    /// `Stmt::Let` whose `init` is itself a blocking-builtin call is
+    /// allowed (its own arguments are still scanned recursively -- an
+    /// argument expression is never the "top level" itself); every OTHER
+    /// statement is scanned recursively via `scan_block_for_blocking_calls`,
+    /// which rejects a blocking call found ANYWHERE, including inside a
+    /// NESTED block's own top-level statements (a `let` inside a loop/`if`
+    /// body is not this function's OWN top level).
+    fn check_no_nested_blocking_calls(&mut self, block: &Block) {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { init, .. } if Self::is_blocking_builtin_call(init) => {
+                    let ExprKind::Call { args, .. } = &init.kind else { unreachable!() };
+                    for a in args {
+                        self.scan_expr_for_blocking_calls(&a.value);
+                    }
+                }
+                _ => self.scan_stmt_for_blocking_calls(stmt),
+            }
+        }
+    }
+
+    /// Scans every statement in `block` for a blocking-builtin call
+    /// ANYWHERE, with NO top-level allowance (used for nested blocks --
+    /// loop bodies, `if`/`match` arms, lambda bodies -- where even a
+    /// `let`-bound blocking call is still not permitted, since it isn't
+    /// at the containing HANDLER's own top level).
+    fn scan_block_for_blocking_calls(&mut self, block: &Block) {
+        for stmt in &block.stmts {
+            self.scan_stmt_for_blocking_calls(stmt);
+        }
+    }
+
+    fn scan_stmt_for_blocking_calls(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let { init, .. } => self.scan_expr_for_blocking_calls(init),
+            Stmt::Assign { target, value, .. } => {
+                self.scan_expr_for_blocking_calls(target);
+                self.scan_expr_for_blocking_calls(value);
+            }
+            Stmt::Expr(e) => self.scan_expr_for_blocking_calls(e),
+            Stmt::Return(e, _) => {
+                if let Some(e) = e {
+                    self.scan_expr_for_blocking_calls(e);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                self.scan_expr_for_blocking_calls(cond);
+                self.scan_block_for_blocking_calls(body);
+            }
+            Stmt::For { iter, body, .. } => {
+                self.scan_expr_for_blocking_calls(iter);
+                self.scan_block_for_blocking_calls(body);
+            }
+            Stmt::Emit { arg, .. } => {
+                if let Some(a) = arg {
+                    self.scan_expr_for_blocking_calls(a);
+                }
+            }
+            Stmt::Expect(e, _) => self.scan_expr_for_blocking_calls(e),
+            Stmt::Forall { body, .. } => self.scan_block_for_blocking_calls(body),
+            Stmt::Break(_) | Stmt::Continue(_) => {}
+        }
+    }
+
+    /// Exhaustive over `ExprKind` (deliberately no wildcard arm — a
+    /// future new expression variant must be triaged here explicitly,
+    /// matching this codebase's own established discipline for this
+    /// class of AST-wide check).
+    fn scan_expr_for_blocking_calls(&mut self, e: &Expr) {
+        if Self::is_blocking_builtin_call(e) {
+            self.err(
+                "K0295",
+                "a blocking builtin call (`http_get`/`http_post`/`http_get_with`/`read_file_with`) inside a `concurrent component` may only appear as the ENTIRE right-hand side of a top-level `let` in a handler or exposed-fun body -- see docs/design/ASYNC_IO.md".to_string(),
+                e.span,
+            );
+            // Still scan the (already-known-non-blocking, since a
+            // blocking call's own args are checked separately at its
+            // ALLOWED call sites) callee/args below for completeness --
+            // falls through rather than `return`, matching this
+            // function's own "always fully exhaustive" discipline.
+        }
+        match &e.kind {
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Unit
+            | ExprKind::Char(_)
+            | ExprKind::Ident(_)
+            | ExprKind::SizedInt(..)
+            | ExprKind::F32(_) => {}
+            ExprKind::Str(pieces) => {
+                for p in pieces {
+                    if let StrPiece::Expr(inner) = p {
+                        self.scan_expr_for_blocking_calls(inner);
+                    }
+                }
+            }
+            ExprKind::List(items) | ExprKind::Par(items) => {
+                for i in items {
+                    self.scan_expr_for_blocking_calls(i);
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                self.scan_expr_for_blocking_calls(callee);
+                for a in args {
+                    self.scan_expr_for_blocking_calls(&a.value);
+                }
+            }
+            ExprKind::MethodCall { recv, args, .. } => {
+                self.scan_expr_for_blocking_calls(recv);
+                for a in args {
+                    self.scan_expr_for_blocking_calls(&a.value);
+                }
+            }
+            ExprKind::Field { recv, .. } => self.scan_expr_for_blocking_calls(recv),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.scan_expr_for_blocking_calls(lhs);
+                self.scan_expr_for_blocking_calls(rhs);
+            }
+            ExprKind::Unary { operand, .. } => self.scan_expr_for_blocking_calls(operand),
+            ExprKind::If { cond, then_block, else_block } => {
+                self.scan_expr_for_blocking_calls(cond);
+                self.scan_block_for_blocking_calls(then_block);
+                if let Some(e) = else_block {
+                    self.scan_expr_for_blocking_calls(e);
+                }
+            }
+            ExprKind::BlockExpr(b) => self.scan_block_for_blocking_calls(b),
+            ExprKind::Match { scrutinee, arms } => {
+                self.scan_expr_for_blocking_calls(scrutinee);
+                for arm in arms {
+                    if let Some(g) = &arm.guard {
+                        self.scan_expr_for_blocking_calls(g);
+                    }
+                    self.scan_expr_for_blocking_calls(&arm.body);
+                }
+            }
+            ExprKind::Lambda { body, .. } => self.scan_block_for_blocking_calls(body),
+            ExprKind::Range { lo, hi, .. } => {
+                self.scan_expr_for_blocking_calls(lo);
+                self.scan_expr_for_blocking_calls(hi);
+            }
+            ExprKind::With { recv, updates } => {
+                self.scan_expr_for_blocking_calls(recv);
+                for (_, v) in updates {
+                    self.scan_expr_for_blocking_calls(v);
+                }
+            }
+            ExprKind::Try(inner) | ExprKind::Await(inner) => self.scan_expr_for_blocking_calls(inner),
+        }
     }
 
     fn check_portable_ty(&mut self, ty_expr: &TyExpr, c: &ComponentDecl, what: &str) {
@@ -5697,6 +5894,69 @@ mod generic_tests {
             })
             .expect("Worker component must still be present");
         assert!(worker.concurrent, "round-tripped component must still be `concurrent`");
+    }
+
+    /// `docs/design/ASYNC_IO.md` §4/§6 (Concurrency-v2 PR-cv2-9): a
+    /// blocking builtin call as the ENTIRE right-hand side of a
+    /// top-level `let` in a `concurrent component`'s own handler/
+    /// exposed-fun body must check clean -- no K0295.
+    #[test]
+    fn concurrent_component_top_level_let_bound_blocking_call_is_allowed() {
+        let src = "concurrent component Fetcher {\n    \
+                    expose fun poke() uses io.net -> Str {\n        \
+                    let result = http_get(\"https://example.com\")\n        \
+                    match result {\n            Ok(body) => body,\n            Err(e) => e,\n        }\n    \
+                    }\n}\n\
+                    app Root {\n    let f = Fetcher()\n}\n\
+                    fun main() uses io { print(\"ok\") }\n";
+        let errs = errors(src);
+        assert!(
+            !errs.iter().any(|d| d.code == "K0295"),
+            "a top-level let-bound blocking call must not be K0295: {errs:?}"
+        );
+    }
+
+    /// The discriminating negative cases: a blocking call nested inside
+    /// an `if` branch, a method chain (not the ENTIRE rhs), and a `for`
+    /// loop body must each be rejected as K0295 -- proving the check
+    /// isn't a no-op that happens to pass everything.
+    #[test]
+    fn concurrent_component_nested_blocking_calls_are_k0295() {
+        let nested_if = "concurrent component Fetcher {\n    \
+                          expose fun poke() uses io.net -> Str {\n        \
+                          if true {\n            \
+                          let result = http_get(\"https://example.com\")\n            \
+                          \"x\"\n        } else {\n            \"y\"\n        }\n    \
+                          }\n}\n\
+                          app Root {\n    let f = Fetcher()\n}\nfun main() uses io { print(\"ok\") }\n";
+        let errs = errors(nested_if);
+        assert!(
+            errs.iter().any(|d| d.code == "K0295"),
+            "a blocking call nested inside an `if` branch must be K0295: {errs:?}"
+        );
+
+        let not_entire_rhs = "concurrent component Fetcher {\n    \
+                               expose fun poke() uses io.net -> Int {\n        \
+                               let n = http_get(\"https://example.com\").len()\n        n\n    \
+                               }\n}\n\
+                               app Root {\n    let f = Fetcher()\n}\nfun main() uses io { print(\"ok\") }\n";
+        let errs2 = errors(not_entire_rhs);
+        assert!(
+            errs2.iter().any(|d| d.code == "K0295"),
+            "a blocking call that isn't the ENTIRE let rhs must be K0295: {errs2:?}"
+        );
+
+        let nested_loop = "concurrent component Fetcher {\n    \
+                            expose fun poke() uses io.net -> Int {\n        \
+                            for i in 0..3 {\n            \
+                            let result = http_get(\"https://example.com\")\n        }\n        0\n    \
+                            }\n}\n\
+                            app Root {\n    let f = Fetcher()\n}\nfun main() uses io { print(\"ok\") }\n";
+        let errs3 = errors(nested_loop);
+        assert!(
+            errs3.iter().any(|d| d.code == "K0295"),
+            "a blocking call nested inside a `for` loop body must be K0295: {errs3:?}"
+        );
     }
 
     #[test]

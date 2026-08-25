@@ -147,6 +147,7 @@ Severity: **E** = error, **W** = warning.
 | K0288 | E | state field is declared more than once — the first declaration is silently discarded |
 | K0289 | E | a component's own function is referenced as a value (not called directly) — supported on the interpreter only, not yet on the VM/native engines |
 | K0290 | E | a generic call's actual argument type does not satisfy its declared `[T: Ord]` bound |
+| K0295 | E | a blocking builtin call (`http_get`/`http_post`/`http_get_with`/`read_file_with`) inside a `concurrent component` may only appear as the entire right-hand side of a top-level `let` in a handler or exposed-fun body — see `docs/design/ASYNC_IO.md` |
 
 ## K03xx — Effects & style
 
