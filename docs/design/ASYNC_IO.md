@@ -277,10 +277,27 @@ struct SuspendedHandler {
   `interp.rs` (plus this doc and `main.rs` tests), no `vm.rs`/
   `cgen.rs`/`kx.rs` changes were needed.
 - Does REPL's own `:upgrade` interact safely with a MID-SUSPEND actor?
-  STILL NOT INVESTIGATED — genuinely open, flagged for whoever picks
-  this up next. A live check (redefine a component while one of its
-  instances is suspended on `http_get`, confirm no crash/hang/silent
-  corruption) has not been performed.
+  PARTIALLY RESOLVED — investigating this surfaced two REAL, more
+  fundamental bugs first: (1) `concurrent component`/`concurrent app`
+  silently lost their `concurrent` modifier entirely when typed at the
+  REPL prompt (a `parser.rs` span bug in the `concurrent` soft-keyword
+  handling, interacting badly with `repl.rs`'s own source-re-slicing
+  dedup mechanism), meaning a `concurrent` instance could not actually
+  exist in a REPL session at all before this was fixed; (2) once fixed,
+  `:upgrade` on ANY component while ANY unrelated `concurrent` instance
+  merely coexisted crashed the whole REPL process outright (a raw
+  `.unwrap_local_mut()` panic on the first `Remote` slot it touched) —
+  now fixed to skip `Remote` instances instead of touching them, since
+  `:upgrade`'s field-migration mechanism only makes sense for a `Local`
+  instance's own `env`/`comp`. Both fixed and tested (`main.rs`,
+  `repl.rs`, `parser.rs`). The NARROWER original question — specifically
+  redefining a component while ONE OF ITS OWN instances is mid-suspend
+  on `http_get` — is STILL NOT investigated; now that `:upgrade` no
+  longer crashes outright alongside a concurrent instance, a live check
+  of that specific scenario (does the suspended handler's eventual
+  `IoComplete` resume against the OLD or NEW `comp`/`env`? does it
+  crash, hang, or silently corrupt state?) remains open for whoever
+  picks this up next.
 - A NEW finding, not anticipated in this document's original §5 sketch:
   `WorkerCmd::Stop` shares the SAME per-worker channel as `Deliver`/
   `Call`, so a `Stop` queued right behind a `Deliver` that suspends
