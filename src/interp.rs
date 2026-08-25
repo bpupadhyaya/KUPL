@@ -32,6 +32,16 @@ pub enum Flow {
 pub type EvalResult = Result<Value, Flow>;
 
 /// Owned, indexed view of the checked program.
+///
+/// `Clone` (Concurrency-v2 PR-cv2-5): cheap — every field is either a
+/// `HashMap<String, Rc<T>>` (cloning the map allocates a fresh table but
+/// each VALUE is just an `Rc::clone`, an O(1) refcount bump, never a deep
+/// AST copy) or plain owned data with no `Rc` at all. Lets a single
+/// `ActorPool` worker share ONE already-built `ProgramDb` across every
+/// actor it hosts (`worker_loop`'s own `cached_db`) instead of paying
+/// `ProgramImage::actor_db`'s own full deep-clone-every-AST-node cost on
+/// EVERY actor spawn.
+#[derive(Clone)]
 pub struct ProgramDb {
     pub funs: HashMap<String, Rc<FunDecl>>,
     pub components: HashMap<String, Rc<ComponentDecl>>,
@@ -322,6 +332,22 @@ struct PooledActor {
 /// not a hypothetical).
 fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>) {
     let mut actors: Vec<Option<PooledActor>> = Vec::new();
+    // Concurrency-v2 PR-cv2-5 (found while investigating PR-cv2-3's own
+    // "why does per-actor RSS stay ~1.4MB even after pooling" open
+    // question): `ProgramImage::actor_db` deep-clones EVERY function and
+    // component AST in the WHOLE program into a fresh `Rc`-based
+    // `ProgramDb` (needed once per NEW single-threaded/`Rc` world, since
+    // an `Rc` can't be built FROM the cross-thread-shared `Arc` the image
+    // holds without copying the underlying data) -- before this fix, that
+    // full clone ran again for EVERY SINGLE actor `WorkerCmd::Spawn`, even
+    // though PR-cv2-3 already made many actors share ONE worker thread.
+    // Cached here instead: build it once (keyed by `Arc::ptr_eq` against
+    // the `ProgramImage` it came from, so a genuinely different program
+    // image -- e.g. across a long REPL session's own redefinitions --
+    // still gets a correctly fresh clone) and reuse a cheap `.clone()`
+    // (a new `HashMap`, but `Rc::clone` per entry, never a re-copied AST)
+    // for every later actor this worker hosts.
+    let mut cached_db: Option<(std::sync::Arc<crate::parallel::ProgramImage>, ProgramDb)> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
             WorkerCmd::Spawn { comp_name, portable_args, span, image, ready_tx, shutdown_panic, local_id_tx } => {
@@ -354,7 +380,14 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>) {
                 actors.push(None);
                 let _ = local_id_tx.send(local_id);
 
-                let db = image.actor_db();
+                let db = match &cached_db {
+                    Some((cached_image, db)) if std::sync::Arc::ptr_eq(cached_image, &image) => db.clone(),
+                    _ => {
+                        let fresh = image.actor_db();
+                        cached_db = Some((image.clone(), fresh.clone()));
+                        fresh
+                    }
+                };
                 let mut actor = Interp::new(db);
                 let comp = actor
                     .db

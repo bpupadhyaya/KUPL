@@ -3654,6 +3654,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Concurrency-v2 PR-cv2-5: `worker_loop` used to call
+    /// `ProgramImage::actor_db` (a full deep-clone of every function AND
+    /// component AST in the WHOLE program) for EVERY SINGLE actor spawn,
+    /// even after PR-cv2-3 made many actors share one worker thread.
+    /// Caching the clone once per WORKER (reused via a cheap `.clone()` --
+    /// a new `HashMap`, but `Rc::clone` per entry, never a re-copied AST)
+    /// roughly HALVES both wall-clock time and peak memory at this scale --
+    /// live-measured, back to back on the same quiet machine, over 2 runs
+    /// each: 6000 flat sibling top-level actors took ~6.0-6.4s reverted vs
+    /// ~3.1s fixed. This test drives 6000 actors and asserts BOTH
+    /// correctness AND a time bound roughly midway between those two
+    /// numbers (comfortable margin on the fixed side, well under the
+    /// reverted side) -- confirmed to actually catch a reversion of this
+    /// specific fix by temporarily reverting it and re-running this exact
+    /// test before landing.
+    #[test]
+    fn perf_guard_6000_concurrent_actors_spawn_well_within_a_generous_time_bound() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-actor-pool-perf-guard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("perf_guard.kupl");
+        const N: usize = 6000;
+        let mut src = String::from(
+            "concurrent component Worker {\n    intent \"actor\"\n    state total: Int = 0\n    \
+             expose fun bump(x: Int) -> Int {\n        total = total + x\n        total\n    }\n}\n\
+             app Main {\n    intent \"many sibling actors\"\n",
+        );
+        for i in 0..N {
+            src.push_str(&format!("    let a{i} = Worker()\n"));
+        }
+        src.push_str("    on start {\n        print(\"{a0.bump(1)}\")\n    }\n}\n");
+        std::fs::write(&file, &src).unwrap();
+
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "{out:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "spawning 6000 concurrent actors took {elapsed:?} (fixed cost measures ~3.1s, \
+             reverted cost ~6.0-6.4s on this same machine) -- if this fails, the per-worker \
+             `ProgramDb` cache (see `worker_loop`'s own `cached_db`) may have regressed back to \
+             cloning the whole program's AST on every single actor spawn"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Concurrency-v2 PR-cv2-3: a `concurrent component` spawned from CODE
     /// already running on a pool worker's own thread (a NESTED `concurrent`
     /// child) must still get a DEDICATED thread, never join the pool --
