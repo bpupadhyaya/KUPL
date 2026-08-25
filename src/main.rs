@@ -2769,6 +2769,67 @@ mod tests {
         assert!(stdout.contains("\n6\n") || stdout.contains(" 6\n"), "bump(1) after upgrade must continue from the MIGRATED value 5, not reset to 0: {stdout}");
     }
 
+    /// TWO REAL, compounding bugs found+fixed (Concurrency-v2 PR-cv2-10,
+    /// caught while live-verifying `docs/design/ASYNC_IO.md` §7's own
+    /// open question on `:upgrade` + `concurrent`):
+    /// 1. `parser.rs`'s own soft-keyword handling for `concurrent` (only
+    ///    special directly before `component`/`app`) computed its
+    ///    `ComponentDecl.span` starting AFTER `concurrent` was already
+    ///    consumed -- harmless for `kupl run`/`kupl check`, but
+    ///    `repl.rs`'s own per-item dedup tracking re-slices ORIGINAL
+    ///    source text by this exact span, silently dropping the
+    ///    `concurrent ` prefix, so a `concurrent component` typed at the
+    ///    REPL prompt quietly became an ordinary, non-concurrent
+    ///    component -- no error, no warning, nothing.
+    /// 2. Once #1 was fixed and a REAL `concurrent` (`Remote`) instance
+    ///    could finally exist in a REPL session, `upgrade_instances`'s
+    ///    own `target_ids` filter turned out to call
+    ///    `.unwrap_local_mut()` on EVERY live instance unconditionally
+    ///    -- which panics on an `InstanceSlot::Remote`, aborting the
+    ///    ENTIRE `kupl repl` PROCESS (exit 101) the moment ANY
+    ///    concurrent instance coexisted with the component actually
+    ///    being upgraded, even a completely unrelated one.
+    /// This end-to-end test locks in BOTH fixes together: a `concurrent
+    /// component` and an ordinary one coexist, and `:upgrade`ing the
+    /// ordinary one must succeed cleanly with no panic.
+    #[test]
+    fn repl_upgrade_does_not_panic_when_an_unrelated_concurrent_instance_coexists() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let input = "concurrent component Ticker {\n    intent \"t\"\n    state n: Int = 0\n}\n\
+                      component Plain {\n    intent \"p\"\n    state x: Int = 1\n}\n\
+                      let t = Ticker()\n\
+                      let p = Plain()\n\
+                      :upgrade Plain\n\
+                      :quit\n";
+        let mut child = std::process::Command::new(&bin)
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl repl spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let input_bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&input_bytes);
+        });
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let _ = writer.join();
+        let out = out.expect("kupl repl hung");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !format!("{stdout}{stderr}").contains("internal compiler error"),
+            "an unrelated concurrent instance must not crash :upgrade: {stdout}{stderr}"
+        );
+        assert!(stdout.contains("upgraded 1 instance"), "{stdout}");
+    }
+
     /// A REAL bug found+fixed (production-hardening PR-it758): the test
     /// immediately above proves a redefined COMPONENT's own decl is safely
     /// frozen per-instance -- but a plain top-level value whose declared

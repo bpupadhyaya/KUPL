@@ -445,8 +445,27 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
     let Some(new_comp) = interp.db.components.get(name).cloned() else {
         return Err(format!("no component named `{name}`"));
     };
-    let target_ids: Vec<usize> =
-        (0..interp.instances.len()).filter(|&i| interp.instances[i].unwrap_local_mut().comp.name == name).collect();
+    // A REAL bug found+fixed (Concurrency-v2 PR-cv2-10, live-verifying
+    // `:upgrade`'s interaction with `concurrent` per `ASYNC_IO.md` §7's
+    // own open question): this used to call `.unwrap_local_mut()`
+    // UNCONDITIONALLY on every index, which panics on an
+    // `InstanceSlot::Remote` -- crashing the ENTIRE REPL process (exit
+    // 101) the moment ANY `concurrent` instance coexisted with the
+    // component actually being upgraded, even a COMPLETELY unrelated
+    // one. `:upgrade`'s whole migration mechanism (`env`/`comp` field
+    // surgery on a `Local` `Instance`) only makes sense for a `Local`
+    // instance in the first place -- a `Remote` instance's state lives
+    // on its own separate thread, reachable only through the
+    // `ActorMsg`/`ActorHandle` boundary, and migrating a LIVE actor
+    // across a redefinition is a genuinely separate, harder problem
+    // this command does not attempt. `matches!` filters it out safely
+    // instead of touching it -- a `concurrent component` simply isn't a
+    // target `:upgrade` can act on yet, not a crash.
+    let target_ids: Vec<usize> = (0..interp.instances.len())
+        .filter(|&i| {
+            matches!(&interp.instances[i], crate::interp::InstanceSlot::Local(inst) if inst.comp.name == name)
+        })
+        .collect();
     if target_ids.is_empty() {
         return Ok(0);
     }
@@ -757,7 +776,24 @@ fn is_item(src: &str) -> bool {
     // misleading `K0102: expected end of statement, found 'fun'` and
     // silently losing the declaration (`:defs` stayed empty) -- live-
     // confirmed.
-    first == "ai" && words.next() == Some("fun")
+    if first == "ai" {
+        return words.next() == Some("fun");
+    }
+    // A REAL bug found+fixed (Concurrency-v2 PR-cv2-10, caught while
+    // live-verifying `:upgrade`'s interaction with `concurrent
+    // component` for `docs/design/ASYNC_IO.md` §7's own open question):
+    // `concurrent` is ALSO a soft keyword (`parser.rs`'s own
+    // `parse_item`, only special directly before `component`/`app`,
+    // mirroring `ai`'s precedent immediately above) but was never added
+    // here at all -- meaning a top-level `concurrent component Foo {
+    // ... }` typed at the REPL prompt was UNCONDITIONALLY misrouted to
+    // `parser::parse_stmt_fragment` (which can't parse it), producing
+    // the exact same misleading `K0102: expected end of statement,
+    // found 'component'` failure mode this file's own comments already
+    // documented for `law`/`ai` -- except for `concurrent`, NOBODY had
+    // fixed it, so a `concurrent component`/`concurrent app` could never
+    // be defined in the REPL at all, live-confirmed before this fix.
+    first == "concurrent" && matches!(words.next(), Some("component") | Some("app"))
 }
 
 /// A REAL bug found+fixed (production-hardening PR-it768): this used to be
@@ -1107,6 +1143,68 @@ mod tests {
         let mut interp = Interp::new(ProgramDb::build(&compiled.program, &compiled.checked));
         assert_eq!(upgrade_instances(&mut interp, "Foo"), Ok(0));
         assert!(upgrade_instances(&mut interp, "DoesNotExist").is_err());
+    }
+
+    /// A REAL bug found+fixed (Concurrency-v2 PR-cv2-10, while live-
+    /// verifying `:upgrade`'s interaction with `concurrent` per
+    /// `ASYNC_IO.md` §7's own open question): `upgrade_instances`'s own
+    /// `target_ids` filter used to call `.unwrap_local_mut()` on EVERY
+    /// index in `interp.instances`, unconditionally -- which panics on
+    /// an `InstanceSlot::Remote`, crashing the ENTIRE REPL process (exit
+    /// 101) the moment ANY `concurrent` instance coexisted with the
+    /// component actually being upgraded, even a completely unrelated
+    /// one. Live-confirmed via a real `kupl repl` subprocess before this
+    /// fix (a SEPARATE, prerequisite bug had to be fixed first --
+    /// `parser.rs`'s own soft-keyword span handling for `concurrent`,
+    /// see its own doc comment -- since a `concurrent component` typed
+    /// at the REPL prompt silently became non-concurrent before that
+    /// fix, making a `Remote` instance unreachable from the REPL at all
+    /// and this exact panic dormant). Mirrors the REAL REPL statement-
+    /// evaluation path (`parser::parse_stmt_fragment` +
+    /// `Interp::exec_stmt_public`), not `Interp::instantiate` called
+    /// directly, since that's the actual code path a user's `let t =
+    /// Ticker()` at the REPL prompt goes through.
+    #[test]
+    fn upgrade_skips_a_coexisting_concurrent_instance_instead_of_panicking() {
+        let compiled = crate::run::compile(
+            "concurrent component Ticker {\n    intent \"x\"\n    state n: Int = 0\n}\n\
+             component Plain {\n    intent \"y\"\n    state x: Int = 1\n}\n",
+        )
+        .unwrap();
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        for src in ["let t = Ticker()", "let p = Plain()"] {
+            let stmt = crate::parser::parse_stmt_fragment(src).expect("parses");
+            let env = interp.globals.clone();
+            interp.exec_stmt_public(&stmt, &env).unwrap_or_else(|_| panic!("{src} must succeed"));
+        }
+        assert!(
+            matches!(interp.instances[0], crate::interp::InstanceSlot::Remote(_)),
+            "Ticker must be a genuine Remote (concurrent) instance for this test to mean anything"
+        );
+        assert_eq!(
+            upgrade_instances(&mut interp, "Plain"),
+            Ok(1),
+            "upgrading Plain must succeed and must NOT panic just because an unrelated concurrent instance coexists"
+        );
+    }
+
+    /// The symmetric case: `:upgrade`ing the CONCURRENT component's own
+    /// name must not panic either, and must report zero live (`Local`)
+    /// instances to touch -- a `Remote` instance is simply not a target
+    /// this command can act on (see the sibling test above and this
+    /// function's own doc comment for the full rationale).
+    #[test]
+    fn upgrade_of_the_concurrent_components_own_name_reports_zero_not_a_panic() {
+        let compiled =
+            crate::run::compile("concurrent component Ticker {\n    intent \"x\"\n    state n: Int = 0\n}\n")
+                .unwrap();
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+        let stmt = crate::parser::parse_stmt_fragment("let t = Ticker()").expect("parses");
+        let env = interp.globals.clone();
+        interp.exec_stmt_public(&stmt, &env).unwrap_or_else(|_| panic!("let t = Ticker() must succeed"));
+        assert_eq!(upgrade_instances(&mut interp, "Ticker"), Ok(0));
     }
 
     /// A `props` change only refuses when the genuinely NEW prop carries no

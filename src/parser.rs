@@ -380,9 +380,29 @@ impl Parser {
         if matches!(self.peek(), Tok::Ident(n) if n == "concurrent")
             && matches!(self.peek_at(1), Tok::KwComponent | Tok::KwApp)
         {
+            // A REAL bug found+fixed (Concurrency-v2 PR-cv2-10, caught
+            // while live-verifying `:upgrade`'s interaction with a
+            // `concurrent` instance in the REPL): `start` must be
+            // captured HERE, at the `concurrent` token itself, and
+            // threaded through -- `parse_component` used to compute its
+            // own `start` internally via `self.span()`, called AFTER
+            // this site already consumed `concurrent`, so the resulting
+            // `ComponentDecl.span` silently began at `component`/`app`,
+            // never covering the `concurrent` prefix at all. Harmless
+            // for `kupl run`/`kupl check` (which never re-slice source
+            // text by span), but `repl.rs`'s own per-item dedup tracking
+            // (`sdiff::item_span` + `input[start..end]`) uses this EXACT
+            // span to re-slice the ORIGINAL source text for
+            // recompilation -- silently dropping the `concurrent `
+            // prefix from the reconstructed candidate, so a `concurrent
+            // component`/`concurrent app` typed at the REPL prompt
+            // quietly became an ORDINARY, non-concurrent component with
+            // no error, no warning, nothing -- confirmed live via a
+            // `comp.concurrent` probe print before this fix.
+            let start = self.span();
             self.bump();
             let is_app = matches!(self.peek(), Tok::KwApp);
-            return Ok(Some(Item::Component(self.parse_component(is_app, true)?)));
+            return Ok(Some(Item::Component(self.parse_component(is_app, true, start)?)));
         }
         // top-level `law "name" { … }` — a free-standing test (soft keyword)
         if matches!(self.peek(), Tok::Ident(n) if n == "law") {
@@ -405,8 +425,14 @@ impl Parser {
         match self.peek() {
             Tok::KwFun | Tok::KwAsync => Ok(Some(Item::Fun(self.parse_fun(is_pub)?))),
             Tok::KwType => Ok(Some(Item::Type(self.parse_type_decl()?))),
-            Tok::KwComponent => Ok(Some(Item::Component(self.parse_component(false, false)?))),
-            Tok::KwApp => Ok(Some(Item::Component(self.parse_component(true, false)?))),
+            Tok::KwComponent => {
+                let start = self.span();
+                Ok(Some(Item::Component(self.parse_component(false, false, start)?)))
+            }
+            Tok::KwApp => {
+                let start = self.span();
+                Ok(Some(Item::Component(self.parse_component(true, false, start)?)))
+            }
             Tok::KwContract => Ok(Some(Item::Contract(self.parse_contract()?))),
             Tok::KwUse => {
                 let uspan = self.span();
@@ -849,8 +875,7 @@ impl Parser {
 
     // ---- components -----------------------------------------------------
 
-    fn parse_component(&mut self, is_app: bool, concurrent: bool) -> PResult<ComponentDecl> {
-        let start = self.span();
+    fn parse_component(&mut self, is_app: bool, concurrent: bool, start: Span) -> PResult<ComponentDecl> {
         self.bump(); // `component` or `app`
         let (name, _) = self.expect_ident()?;
         let mut fulfills = Vec::new();
@@ -3442,6 +3467,37 @@ component Counter {
                 assert_eq!(c.state.len(), 1);
                 assert_eq!(c.handlers.len(), 1);
                 assert_eq!(c.examples.len(), 1);
+            }
+            other => panic!("expected component, got {other:?}"),
+        }
+    }
+
+    /// A REAL bug found+fixed (Concurrency-v2 PR-cv2-10, caught while
+    /// live-verifying `:upgrade`'s interaction with `concurrent` in the
+    /// REPL): `ComponentDecl.span` for a `concurrent component`/
+    /// `concurrent app` used to start at the `component`/`app` token,
+    /// not at `concurrent` itself, because `parse_component` computed
+    /// `start` internally via `self.span()`, called AFTER the caller
+    /// had already consumed `concurrent`. Harmless for `kupl run`/`kupl
+    /// check` (neither re-slices source text by span), but `repl.rs`'s
+    /// own per-item dedup tracking uses this EXACT span to re-slice the
+    /// original source text for recompilation (`sdiff::item_span` +
+    /// `input[start..end]`) -- silently dropping the `concurrent `
+    /// prefix from the reconstructed candidate, so a `concurrent
+    /// component` typed at the REPL prompt quietly became an ORDINARY,
+    /// non-concurrent component with no error, no warning, nothing.
+    #[test]
+    fn concurrent_components_own_span_includes_the_concurrent_keyword_itself() {
+        let src = "concurrent component Ticker {\n    intent \"t\"\n    state n: Int = 0\n}\n";
+        let p = ok(src);
+        match &p.items[0] {
+            Item::Component(c) => {
+                assert!(c.concurrent);
+                let sliced = &src[c.span.start as usize..c.span.end as usize];
+                assert!(
+                    sliced.starts_with("concurrent"),
+                    "span must cover the `concurrent` prefix, not just `component ...`: {sliced:?}"
+                );
             }
             other => panic!("expected component, got {other:?}"),
         }
