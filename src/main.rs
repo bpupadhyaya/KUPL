@@ -4079,6 +4079,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Concurrency-v2 PR-cv2-15: `Call`-triggered `expose fun` execution
+    /// now genuinely suspends too (deliberately deferred out of
+    /// PR-cv2-10's own v1 scope — needed its own reply channel stashed
+    /// across the suspend, `Interp.pending_call_reply`).
+    ///
+    /// A REAL bug was caught writing THIS test: the FIRST cut reused
+    /// PR-cv2-13's own `self.call_depth == 0` gate unchanged — which
+    /// works for `Deliver` (a handler's own body never touches
+    /// `call_depth`) but NOT for `Call` (an expose fun's own body is
+    /// reached via `eval_method` → `call_fun`, which ALWAYS increments
+    /// `call_depth` by one first) — so the suspend attempt was silently
+    /// skipped every time, permanently falling back to inline execution.
+    /// This test PASSED anyway with that bug present, because inline
+    /// execution also produces the correct value — a plain correctness
+    /// assertion alone does NOT distinguish "genuinely suspended" from
+    /// "silently never tried." What actually caught it: revert-and-verify
+    /// on the UNRELATED-looking "send the reply once resumed" code in
+    /// `IoComplete`'s own handling — reverting it should be a no-op if
+    /// suspend never fires (the reply would still go out via
+    /// `call_actor`'s own tail-end path, since inline execution never
+    /// reaches `IoComplete` at all) but instead caused a genuine 15s
+    /// timeout/hang, PROVING execution really did go through suspend+
+    /// resume (see `Interp.suspend_depth_floor`'s own doc comment in
+    /// `interp.rs` for the actual fix — `call_depth == suspend_depth_
+    /// floor`, a per-dispatch value, not a hardcoded 0). This
+    /// revert-and-verify result is the real decisive evidence for this
+    /// test, not just "did the right value come back."
+    ///
+    /// NOT paired with a decisive non-blocking-ness test the way
+    /// PR-cv2-10's own Deliver case got one: `expose` calls are
+    /// synchronous from the CALLER's own perspective (`call_remote`
+    /// blocks until the reply arrives), and KUPL has no actor-level
+    /// threading construct that lets a single `fun main()` fire off
+    /// several concurrent CALLS the way `emit`'s own fire-and-forget
+    /// semantics let PR-cv2-10's Driver fire off many concurrent
+    /// Delivers -- so genuine caller-side parallelism (needed to force a
+    /// pigeonhole worker collision) isn't constructible here the same
+    /// way. Documented, not silently skipped -- the mechanism that
+    /// actually frees the worker (spawning I/O on a separate thread) is
+    /// identical to the already-proven-decisive Deliver case; what THIS
+    /// test adds is proof that Call-triggered execution genuinely engages
+    /// that same mechanism instead of silently bypassing it.
+    #[test]
+    fn concurrent_component_call_triggered_expose_fun_suspends_and_returns_the_correct_value() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "call-suspend-worked";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("kupl-call-suspend-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("call_suspend.kupl");
+        let src = format!(
+            "concurrent component Fetcher {{\n    intent \"suspends on http_get inside an expose fun\"\n    \
+             expose fun poke(url: Str) uses io.net -> Str {{\n        let result = http_get(url)\n        \
+             match result {{\n            Ok(body) => body,\n            Err(e) => e,\n        }}\n    }}\n}}\n\
+             fun main() uses io, io.net {{\n    let f = Fetcher()\n    \
+             print(f.poke(\"http://127.0.0.1:{port}/\"))\n}}\n"
+        );
+        std::fs::write(&file, &src).unwrap();
+
+        let child = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.expect("kupl run must not hang while a Call-triggered expose fun is suspended on http_get");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "call-suspend-worked\n",
+            "the caller must receive the resumed expose fun's own real return value: {out:?}"
+        );
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Concurrency-v2 PR-cv2-12 (`docs/design/ASYNC_IO.md` §7's own item
     /// (a), left open by PR-cv2-10/11): a REAL bug found+fixed while
     /// writing THIS test. K0295 already covers `c.funs` (confirmed in

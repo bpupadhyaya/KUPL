@@ -26,18 +26,36 @@ path (the only thing that calls `Interp::start_all`), `http_get_with`/
 KUPL program today, even though the underlying mechanism is now
 correct and independently tested (`interp.rs`'s own
 `spawn_blocking_io_tests`, calling `spawn_blocking_io` directly).
-`Call`-triggered `expose fun` execution also does not suspend in v1
-(only `Deliver`-triggered handler bodies do) — deferred because
-suspending a `Call` needs its own reply channel stashed across the
-suspend, a more complex feature not needed for the FIRST slice. A
-THIRD inline-only case, found live (PR-cv2-12): a blocking call nested
-inside a called PRIVATE `fun` (not directly a top-level statement of
-the handler's own body) also executes inline rather than suspending —
+As of PR-cv2-15, `Call`-triggered `expose fun` execution ALSO genuinely
+suspends (`Interp.pending_call_reply` stashes the original `ActorMsg::
+Call`'s own reply channel across the suspend, threaded through exactly
+like `SuspendedHandler.reply`). A REAL bug was caught writing the very
+first test for this: reusing PR-cv2-13's own `self.call_depth == 0`
+gate unchanged silently broke suspend for EVERY Call — an expose fun's
+own body is reached via `eval_method` → `call_fun`, which ALWAYS
+increments `call_depth` by one BEFORE the fun's own body runs (unlike
+a handler's own body, reached directly via `run_handler` with no
+`call_depth` involvement at all) — so the gate never matched, and every
+Call-triggered blocking call fell back to inline execution, completely
+silently (correct VALUE, just never actually suspended). A plain
+correctness test alone did not catch this (inline execution produces
+the same right answer); what caught it was revert-and-verify on the
+UNRELATED-looking "send the reply once resumed" code, which should be
+a no-op if suspend never fires but instead caused a genuine hang,
+proving execution really did (once fixed) go through suspend+resume.
+Fixed by replacing the hardcoded `0` with `Interp.suspend_depth_floor`,
+a per-dispatch value: `call_depth` itself for `Deliver` (unchanged
+behavior), `call_depth + 1` for `Call` (anticipating `call_fun`'s own
+known, exactly-one increment). A THIRD, STILL-inline-only case, found
+live (PR-cv2-12/13): a blocking call nested inside a called PRIVATE
+`fun` (not directly a top-level statement of the handler/expose fun's
+own body) still executes inline rather than suspending —
 `SuspendedHandler` can only represent a single stack frame's
 continuation, so the runtime gates the suspend attempt on
-`self.call_depth == 0` and falls back to inline execution for anything
-deeper, rather than silently losing the outer handler's remaining
-execution (see §7's own item on this for the full story). Written
+`self.call_depth == self.suspend_depth_floor` and falls back to inline
+execution for anything deeper, rather than silently losing the outer
+execution's remaining statements (see §7's own item on this for the
+full story). Written
 under the
 Concurrency V2 initiative's own standing maximum-risk
 mandate, as the authorized, SAFE alternative to full stack-switching
@@ -380,6 +398,23 @@ struct SuspendedHandler {
   `docs/design/CAPABILITIES.md` or the `app` self-contained restriction
   — e.g. permitting K0304 to also allow a direct call in an app's own
   top-level body, or allowing apps to declare props after all.
+- PR-cv2-15 closed the `Call`-triggered suspend gap (see the status
+  header above for the full `call_depth`/`suspend_depth_floor` bug and
+  fix). One thing it did NOT attempt: a decisive non-blocking-ness test
+  for the Call case, mirroring PR-cv2-10's own pigeonhole-collision test
+  for Deliver. `expose` calls are synchronous from the CALLER's own
+  perspective (`call_remote` blocks on `reply_rx.recv()` until the reply
+  arrives), and KUPL has no actor-level threading construct that lets a
+  single `fun main()` fire off several concurrent Calls the way `emit`'s
+  own fire-and-forget semantics let Deliver-based tests force a worker
+  collision — so genuine caller-side parallelism isn't constructible
+  from ordinary KUPL source today. The underlying worker-freeing
+  mechanism (spawn I/O on a separate thread, free the worker) is
+  identical to the already-proven-decisive Deliver case; PR-cv2-15's own
+  test instead proves Call-triggered execution genuinely ENGAGES that
+  mechanism (via a revert-and-verify that produces a real hang when the
+  resume-side reply-sending code is removed), not that a full multi-
+  actor worker-sharing scenario was observed end to end.
 
 ## 8. Verification plan (matches this project's own established discipline)
 
