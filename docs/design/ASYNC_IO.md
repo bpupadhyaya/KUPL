@@ -292,12 +292,28 @@ struct SuspendedHandler {
   instance's own `env`/`comp`. Both fixed and tested (`main.rs`,
   `repl.rs`, `parser.rs`). The NARROWER original question — specifically
   redefining a component while ONE OF ITS OWN instances is mid-suspend
-  on `http_get` — is STILL NOT investigated; now that `:upgrade` no
-  longer crashes outright alongside a concurrent instance, a live check
-  of that specific scenario (does the suspended handler's eventual
-  `IoComplete` resume against the OLD or NEW `comp`/`env`? does it
-  crash, hang, or silently corrupt state?) remains open for whoever
-  picks this up next.
+  on `http_get` — turns out to be STRUCTURALLY UNREACHABLE through the
+  REPL's own ordinary top-level typing today, confirmed by tracing the
+  actual code (not assumed): the ONLY execution path that ever sets
+  `Interp.allow_suspend` is a `Deliver`-triggered handler body
+  (`deliver_to_actor`); `Deliver` only ever happens via `emit` from
+  WITHIN an already-running handler; the only handler that runs without
+  an explicit user trigger is `on start`; and `repl.rs`'s own `repl()`
+  loop NEVER calls `Interp::start_all` at all (confirmed via `grep` —
+  the only match is a stale comment referencing it) — nor does
+  `instantiate_child` (used for constructing an app/component's own
+  declarative children) fire `on start` as part of construction, only
+  `start_all` does. A `Call`-triggered `expose fun` (the ONLY handler a
+  REPL user CAN directly invoke on a bare top-level instance) never
+  gets `allow_suspend` either (see PR-cv2-10's own v1-scope note above),
+  so calling a method containing a blocking builtin just runs it inline
+  as before, never suspending. Net effect: reaching a genuinely
+  mid-suspend `concurrent` instance requires a program actually
+  `start_all`'d — i.e. `kupl run`, not `kupl repl` — so this specific
+  interaction has no live reproduction to give, and no code change was
+  needed to resolve it. If the REPL ever gains its OWN way to trigger
+  `on start`/wire delivery for an ad-hoc instance in the future, this
+  analysis would need re-checking at that time, not before.
 - A NEW finding, not anticipated in this document's original §5 sketch:
   `WorkerCmd::Stop` shares the SAME per-worker channel as `Deliver`/
   `Call`, so a `Stop` queued right behind a `Deliver` that suspends
