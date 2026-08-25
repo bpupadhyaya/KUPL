@@ -2196,8 +2196,45 @@ impl Checker {
         }
 
         // children & wires
+        // Production-hardening (Concurrency-v2 PR-cv2-3 side-investigation,
+        // 2026-08-24): a REAL, live-confirmed O(n^2) bug -- this loop used
+        // to build a BRAND NEW `Ctx` from scratch for EVERY child, via
+        // `bind_component_env(c, &mut cctx, Some(child_idx))`, which itself
+        // linearly re-scans ALL `child_idx` previously-declared siblings on
+        // EVERY call to rebuild the "children visible in scope" portion of
+        // `cctx` -- an O(n) rebuild run N times is O(n^2) total, live-
+        // confirmed via `kupl check` on a flat `app` with 4000 sibling
+        // children of a trivial empty component: ~6 SECONDS (should be
+        // well under 1s), and the SAME superlinear pattern (2x children ->
+        // ~4x time) at 500/1000/2000/4000. Not specific to `concurrent`
+        // components at all -- found while benchmarking §4.3's own
+        // "always-resident actor thread" cost, which turned out to be
+        // negligible by comparison (a fixed worker-thread pool made NO
+        // measurable difference to the SAME benchmark, since this checker
+        // cost dominates regardless of engine or threading). Fixed by
+        // building the props/state/funs portion of `cctx` ONCE
+        // (`bind_component_env(c, &mut cctx, Some(0))` -- zero children
+        // visible yet), then inserting each child DIRECTLY into that same
+        // `cctx.scopes` incrementally as the loop advances (mirroring
+        // `bind_component_env`'s own single insert line, and mirroring the
+        // RUNTIME's own `instantiate_local`'s single-pass `env.define`
+        // exactly) instead of re-deriving the whole scope from scratch per
+        // child. `check_ctor_args` never mutates `ctx.scopes` (confirmed by
+        // reading it start to finish before this fix -- it only READS via
+        // `infer_expr`), so reusing the SAME `cctx` across iterations is
+        // safe: no risk of one child's own arg-checking leaking temporary
+        // state into a later sibling's.
         let mut child_types: HashMap<String, String> = HashMap::new();
-        for (child_idx, child) in c.children.iter().enumerate() {
+        let mut cctx = Ctx {
+            scopes: Scopes::new(),
+            ret: Ty::Unit,
+            component: Some(c),
+            in_handler: false,
+            loop_depth: 0,
+            in_main_top_level: false,
+        };
+        self.bind_component_env(c, &mut cctx, Some(0));
+        for child in &c.children {
             if child_types.contains_key(&child.name) {
                 self.err("K0207", format!("child `{}` declared twice", child.name), child.span);
             }
@@ -2213,16 +2250,12 @@ impl Checker {
                 continue;
             };
             child_types.insert(child.name.clone(), child.component.clone());
-            let mut cctx = Ctx {
-                scopes: Scopes::new(),
-                ret: Ty::Unit,
-                component: Some(c),
-                in_handler: false,
-                loop_depth: 0,
-                in_main_top_level: false,
-            };
-            self.bind_component_env(c, &mut cctx, Some(child_idx));
             self.check_ctor_args(&child.component, &sig, &child.args, child.span, &mut cctx);
+            // Make THIS child visible to any LATER sibling's own ctor args
+            // -- mirrors `bind_component_env`'s own insert line exactly.
+            if self.checked.components.contains_key(&child.component) {
+                cctx.scopes.insert(&child.name, Ty::Component(child.component.clone()), false);
+            }
         }
         // A REAL, live-confirmed silent-behavior bug (production-hardening
         // PR-it1089): unlike every sibling collection in this same function
@@ -8832,6 +8865,51 @@ mod generic_tests {
             errors(too_large).iter().any(|d| d.code == "K0009"),
             "a genuinely too-large sized-int literal must still be rejected: {:?}",
             errors(too_large)
+        );
+    }
+
+    /// Production-hardening (Concurrency-v2 PR-cv2-3 side-investigation,
+    /// 2026-08-24): a REAL, live-confirmed O(n^2) bug in the
+    /// children-checking loop of `Checker`'s own component-checking pass
+    /// (see the fix's own doc comment right above the loop in question,
+    /// in the non-test part of this file, for the full root-cause writeup)
+    /// -- a component with N flat sibling children used to cost O(n^2)
+    /// TOTAL checker time, live-confirmed BEFORE the fix via the real
+    /// compiled binary: `kupl check` on 4000 trivial empty sibling
+    /// children took ~6 SECONDS (500/1000/2000/4000 showed a clean
+    /// 2x-count -> ~4x-time pattern, the textbook O(n^2) signature).
+    /// This test drives the SAME shape in-process (1000 children -- large
+    /// enough to make an O(n^2) regression obviously fail a generous bound,
+    /// small enough to stay fast in the common, non-regressed case) and
+    /// asserts BOTH that checking succeeds cleanly AND that it completes
+    /// well within a generous time bound, matching this codebase's own
+    /// `cgen.rs::perf_guard_*` convention (a wide margin over the FIXED
+    /// cost, but nowhere near the OLD O(n^2) cost at this size).
+    #[test]
+    fn perf_guard_a_component_with_4000_flat_sibling_children_checks_well_within_a_generous_time_bound() {
+        const N: usize = 4000;
+        let mut src = String::from("component Leaf {\n    intent \"trivial\"\n}\n\ncomponent Host {\n    intent \"many siblings\"\n");
+        for i in 0..N {
+            src.push_str(&format!("    let c{i} = Leaf()\n"));
+        }
+        src.push_str("}\n");
+        let start = std::time::Instant::now();
+        let errs = errors(&src);
+        let elapsed = start.elapsed();
+        assert!(errs.is_empty(), "4000 trivial sibling children must check cleanly: {errs:?}");
+        // Live-measured (via the real compiled binary, `kupl check`, before
+        // this fix): 4000 flat sibling children took ~6.0-6.2s. The FIXED
+        // code measures well under 100ms in-process. 3s is a wide margin
+        // over the fixed cost while still safely catching a real O(n^2)
+        // reintroduction (which lands north of 6s at this N, not just
+        // barely over 3s) -- confirmed by temporarily reverting this fix
+        // and re-running this exact test, which failed as predicted before
+        // being restored.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "checking 4000 flat sibling children took {elapsed:?} -- if this fails, the O(n^2) \
+             children-checking bug (see the fix's own doc comment above the children loop in \
+             `check_component`) may have been reintroduced"
         );
     }
 }

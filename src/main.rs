@@ -3606,6 +3606,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Concurrency-v2 PR-cv2-3 (`docs/design/CONCURRENCY_V2.md` §4.3): a
+    /// fixed `ActorPool` now multiplexes MANY top-level `concurrent
+    /// component` actors onto a small pool of worker threads instead of
+    /// "1 OS thread per actor, always resident". Drives 200 sibling
+    /// top-level actors (well above any realistic `available_parallelism`
+    /// on CI hardware, so this genuinely exercises multiple actors sharing
+    /// ONE worker) via round-trip `expose fun` calls, asserting each one's
+    /// own state is independently correct -- proving the pool's per-actor
+    /// isolation holds (no cross-talk between actors sharing a worker) and
+    /// that its own round-robin assignment doesn't lose or misroute any
+    /// actor.
+    #[test]
+    fn concurrent_component_pool_correctly_isolates_200_sibling_top_level_actors() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-actor-pool-scale-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pool_scale.kupl");
+        const N: usize = 200;
+        let mut src = String::from(
+            "concurrent component Worker {\n    intent \"actor\"\n    prop id: Int\n    state total: Int = 0\n    \
+             expose fun bump() -> Int {\n        total = total + id\n        total\n    }\n}\n\napp Main {\n    intent \"many sibling actors\"\n",
+        );
+        for i in 0..N {
+            src.push_str(&format!("    let w{i} = Worker(id: {i})\n"));
+        }
+        src.push_str("    on start {\n");
+        for i in 0..N {
+            src.push_str(&format!("        print(\"{{w{i}.bump()}}\")\n"));
+        }
+        src.push_str("    }\n}\n");
+        std::fs::write(&file, &src).unwrap();
+
+        let expected: String = (0..N).map(|i| format!("{i}\n")).collect();
+        let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "each of {N} pooled sibling actors must independently compute its own `id` -- any \
+             mismatch means the pool cross-wired or misrouted a message between actors sharing a worker"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrency-v2 PR-cv2-3: a `concurrent component` spawned from CODE
+    /// already running on a pool worker's own thread (a NESTED `concurrent`
+    /// child) must still get a DEDICATED thread, never join the pool --
+    /// see `ActorPool`'s own doc comment for why (a pooled parent blocking
+    /// a `Call` on a pooled child sharing the SAME worker would deadlock).
+    /// `Outer` is a top-level (pooled) actor; `Inner` is `Outer`'s own
+    /// `concurrent` child, spawned from CODE running inside `Outer`'s own
+    /// assigned worker thread. `Outer.poke` blocks on a `Call` to `Inner` --
+    /// if `Inner` were incorrectly pooled onto the SAME worker as `Outer`,
+    /// this would hang (the worker can never get back to `Inner`'s own
+    /// command while it's busy running `Outer`'s blocking call). Runs on
+    /// interp AND the VM (both engines share `interp.rs`'s actor machinery
+    /// for `concurrent` -- `cgen.rs`'s native output treats `concurrent` as
+    /// a complete no-op per §8.8, so native is not exercised here).
+    #[test]
+    fn concurrent_component_nested_child_gets_a_dedicated_thread_not_pooled_alongside_its_parent() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-actor-pool-nested-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nested.kupl");
+        std::fs::write(
+            &file,
+            "concurrent component Inner {\n    intent \"nested actor\"\n    state n: Int = 0\n    \
+             expose fun bump(x: Int) -> Int {\n        n = n + x\n        n\n    }\n}\n\
+             concurrent component Outer {\n    intent \"top-level actor with its own concurrent child\"\n    \
+             let inner = Inner()\n    expose fun poke(x: Int) -> Int {\n        inner.bump(x)\n    }\n}\n\
+             app Main {\n    intent \"call through a nested concurrent actor\"\n    let o = Outer()\n    \
+             on start {\n        print(\"{o.poke(5)}\")\n        print(\"{o.poke(10)}\")\n    }\n}\n",
+        )
+        .unwrap();
+        let expected = "5\n15\n";
+
+        let interp = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(interp.status.code(), Some(0), "{interp:?}");
+        assert_eq!(String::from_utf8_lossy(&interp.stdout), expected, "{interp:?}");
+
+        let vm = std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(vm.status.code(), Some(0), "{vm:?}");
+        assert_eq!(String::from_utf8_lossy(&vm.stdout), expected, "{vm:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Production-hardening 1213: a REAL, live-confirmed bug found+fixed --
     /// `Interp::instantiate_concurrent` spawned each actor's OS thread via
     /// plain `std::thread::spawn`, getting the OS default stack (~2-8MiB),

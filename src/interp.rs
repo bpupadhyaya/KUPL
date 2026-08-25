@@ -164,6 +164,317 @@ enum ActorMsg {
     },
 }
 
+thread_local! {
+    /// Concurrency-v2 PR-cv2-3 (`docs/design/CONCURRENCY_V2.md` §4.3): set
+    /// once, for the whole life of an `ActorPool` worker thread, to that
+    /// worker's own id (`worker_loop` sets it before entering its command
+    /// loop). `None` on the coordinator's own thread and on every
+    /// DEDICATED actor thread (the pre-existing per-actor-thread path,
+    /// kept below as a fallback). `instantiate_concurrent` reads this to
+    /// decide whether a NEW `concurrent component` may safely join the
+    /// shared pool — see `ActorPool`'s own doc comment for the full
+    /// deadlock-avoidance reasoning this flag exists to support.
+    static POOL_WORKER_ID: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Concurrency-v2 PR-cv2-3 (`docs/design/CONCURRENCY_V2.md` §4.3): a fixed
+/// pool of `N` real OS threads (`N = std::thread::available_parallelism()`,
+/// mirroring `parallel.rs::par_eval`'s own sizing convention; each with the
+/// SAME `WORKER_STACK_SIZE` every other interpreter-work thread in this
+/// codebase uses), multiplexing MANY top-level `concurrent component`
+/// actors instead of "1 OS thread per actor, always resident" — the
+/// pre-existing model this section measured as degrading superlinearly
+/// past roughly 1,000-3,000 live actors on real hardware (see the
+/// PR-cv2-3 writeup for the actual numbers).
+///
+/// **Why only TOP-LEVEL actors are pooled, not every one**: `Interp` is
+/// not `Send` (holds `Rc`-based `Value`/`Env`/`ProgramDb` — verified live
+/// via a scratch `assert_send::<Interp>()` test before writing this code,
+/// per this initiative's own "measure, don't assume" discipline; it fails
+/// on `Env`'s `Rc<RefCell<EnvInner>>` and `ProgramDb`'s `Rc`-keyed maps).
+/// An actor's `Interp` must therefore stay pinned to whichever OS thread
+/// creates it for its ENTIRE life — a generic work-stealing scheduler
+/// (any of N threads may run any ready actor) is not reachable here
+/// without `unsafe impl Send`, which this codebase has zero precedent
+/// for and which this document's own §3 already rules similar unsafe
+/// stack/thread tricks out of scope for. Given that hard constraint,
+/// this pool SHARDS instead: each pooled actor is assigned to exactly
+/// one worker thread at creation (round-robin), and that worker's own
+/// single-threaded command loop (`worker_loop`) owns and runs that
+/// actor's `Interp` for its whole life — many actors safely share ONE
+/// real OS thread this way, with no cross-thread `Interp` movement ever
+/// needed, and (a genuinely nice side effect) no per-actor "currently
+/// being processed" lock needed either, since a worker's own `recv()`
+/// loop already processes exactly one command at a time.
+///
+/// A worker's command loop is fully sequential — if actor A (on worker
+/// W) makes a BLOCKING `Call` to actor B, and B is ALSO pinned to W, W
+/// deadlocks (busy running A's handler, waiting on a reply B can never
+/// produce because W never gets back to B's own command). This is why
+/// `instantiate_concurrent` only routes a NEW `concurrent component`
+/// through the pool when `POOL_WORKER_ID` is `None` at the spawn site —
+/// i.e., the spawning code is NOT itself currently executing inside a
+/// pool worker's command loop. A `concurrent component` spawned FROM
+/// pooled actor A's own handler code (a nested child) always falls back
+/// to a DEDICATED thread instead, exactly like today — so A can safely
+/// block on a `Call` to that child without ever risking a same-worker
+/// deadlock, regardless of how deep the nesting goes (a child's own
+/// FURTHER children, spawned from the child's dedicated thread, correctly
+/// rejoin the pool, since blocking on THEM never ties up a pool worker —
+/// only the code path that's actually running ON a worker matters, not
+/// nesting depth as such). A pooled actor's own blocking `Call` to a
+/// dedicated child DOES temporarily occupy its worker for the call's
+/// duration — the same accepted tradeoff already documented below for
+/// blocking I/O inside a handler, extended here to nested-actor calls.
+///
+/// **Two more honest, accepted limitations, not silently ignored**: (1)
+/// a genuine Rust-level panic inside a worker's own command loop (an
+/// internal KUPL bug, not a user-program `panic()`) takes down that
+/// WHOLE worker — every OTHER actor sharing it becomes unreachable too,
+/// a wider blast radius than today's one-dedicated-thread-per-actor
+/// model, where only the single panicking actor is affected. (2) a
+/// pooled actor's own slot is never reclaimed/reused after it shuts
+/// down (`stop_all`) — a long-lived process that repeatedly creates and
+/// destroys many top-level `concurrent` components (e.g. a long REPL
+/// session) will accumulate dead slots in its assigned worker's own
+/// `Vec` over time. Neither is a correctness bug (no dangling threads,
+/// no wrong answers, no hang) — both are real, narrow scope limits for
+/// this first version, worth revisiting if either is ever reported as an
+/// actual problem for a real program shape.
+struct ActorPool {
+    workers: Vec<std::sync::mpsc::Sender<WorkerCmd>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+static ACTOR_POOL: std::sync::OnceLock<ActorPool> = std::sync::OnceLock::new();
+
+impl ActorPool {
+    fn get() -> &'static ActorPool {
+        ACTOR_POOL.get_or_init(|| {
+            let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let workers = (0..n)
+                .map(|worker_id| {
+                    let (tx, rx) = std::sync::mpsc::channel::<WorkerCmd>();
+                    std::thread::Builder::new()
+                        .stack_size(crate::parallel::WORKER_STACK_SIZE)
+                        .spawn(move || {
+                            POOL_WORKER_ID.with(|c| c.set(Some(worker_id)));
+                            worker_loop(rx);
+                        })
+                        .expect("failed to spawn an actor-pool worker thread (OS refused a 2GB stack reservation)");
+                    tx
+                })
+                .collect();
+            ActorPool { workers, next: std::sync::atomic::AtomicUsize::new(0) }
+        })
+    }
+
+    /// Round-robin assignment across workers — no load awareness (every
+    /// worker gets the SAME stack size and does the SAME kind of work, so
+    /// round-robin is a reasonable, simple starting policy; see this
+    /// struct's own doc comment for why work-stealing isn't reachable
+    /// here at all).
+    fn assign(&self) -> std::sync::mpsc::Sender<WorkerCmd> {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.workers.len();
+        self.workers[i].clone()
+    }
+}
+
+/// A command sent to an `ActorPool` worker's shared channel, tagged with
+/// which of that worker's OWN pooled actors (by local index into its own
+/// `worker_loop`-private `Vec`) it targets — `Spawn` is the exception,
+/// which CREATES a new local slot and reports the assigned index back.
+enum WorkerCmd {
+    Spawn {
+        comp_name: String,
+        portable_args: Vec<(Option<String>, crate::parallel::PortableValue)>,
+        span: Span,
+        image: std::sync::Arc<crate::parallel::ProgramImage>,
+        ready_tx: std::sync::mpsc::Sender<Option<(String, Span)>>,
+        shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>>,
+        local_id_tx: std::sync::mpsc::Sender<usize>,
+    },
+    Msg(usize, ActorMsg),
+    Stop {
+        local_id: usize,
+        stopped_tx: std::sync::mpsc::Sender<()>,
+    },
+}
+
+/// A pooled actor's own persistent state, owned exclusively by its
+/// assigned worker's `worker_loop` — never touched from any other thread.
+struct PooledActor {
+    interp: Interp,
+    shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>>,
+}
+
+/// The body every `ActorPool` worker thread runs for its whole life —
+/// mirrors `instantiate_concurrent`'s existing dedicated-thread closure's
+/// OWN startup/message/shutdown logic almost exactly, just multiplexed
+/// over many actors (`actors[local_id]`) instead of owning exactly one.
+/// `None` in a slot means that actor already shut down (`Stop`) or died
+/// (a caught KUPL panic during `Deliver`/startup) — further `Deliver`s to
+/// a dead slot are silently dropped (matching the dedicated path's own
+/// "best-effort, actor already shut down" comment); a `Call` to a dead
+/// slot gets an explicit error reply instead (unlike `Deliver`, a `Call`
+/// caller is always blocked waiting on SOME reply, so silently dropping
+/// it would hang the caller forever — a real bug caught during design,
+/// not a hypothetical).
+fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>) {
+    let mut actors: Vec<Option<PooledActor>> = Vec::new();
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            WorkerCmd::Spawn { comp_name, portable_args, span, image, ready_tx, shutdown_panic, local_id_tx } => {
+                // Reserve this actor's own slot and reply with its
+                // `local_id` BEFORE running its actual startup sequence
+                // below -- this is what lets `instantiate_concurrent`'s
+                // own blocking `local_id_rx.recv()` return quickly, so the
+                // COORDINATOR can move on to spawning SIBLING actors
+                // (onto other workers) while THIS one's `on start`/timer
+                // work runs. A first version replied only AFTER the full
+                // startup sequence completed -- a real, live-confirmed
+                // regression caught by this codebase's own
+                // `concurrent_component_runs_isolated_workers_with_value_
+                // determinism_but_timing_races_on_interp_only` test (which
+                // asserts two sibling actors' own `on start` prints
+                // genuinely RACE across real OS threads): that version
+                // serialized every top-level actor's OWN startup relative
+                // to its siblings, since the coordinator's own children-
+                // construction loop couldn't even REACH the next sibling's
+                // spawn call until the current one's full `on start` had
+                // already finished -- 100/100 runs observed only ONE
+                // ordering instead of both, exactly matching what full
+                // serialization predicts. Mirrors the pre-existing
+                // dedicated-thread path's own established shape exactly:
+                // `instantiate_concurrent`'s `.spawn()` call there ALSO
+                // returns immediately (a `JoinHandle`, not a completed
+                // startup) -- this reply plays the identical role for the
+                // pooled path.
+                let local_id = actors.len();
+                actors.push(None);
+                let _ = local_id_tx.send(local_id);
+
+                let db = image.actor_db();
+                let mut actor = Interp::new(db);
+                let comp = actor
+                    .db
+                    .components
+                    .get(&comp_name)
+                    .cloned()
+                    .expect("actor_db mirrors the coordinator's own component table, so this name must resolve");
+                let args: Vec<(Option<String>, Value)> = portable_args
+                    .into_iter()
+                    .map(|(name, pv)| (name, crate::parallel::from_portable(&pv)))
+                    .collect();
+                let startup = (|| -> Result<(), Flow> {
+                    actor.instantiate_local(comp, &args, span)?;
+                    actor.start_all()?;
+                    actor.run_timers(100)?;
+                    Ok(())
+                })();
+                let startup_panic = match &startup {
+                    Err(Flow::Panic { msg, span, .. }) => Some((msg.clone(), *span)),
+                    Err(_) => None,
+                    Ok(()) => None,
+                };
+                let _ = ready_tx.send(startup_panic);
+                actors[local_id] = if startup.is_ok() { Some(PooledActor { interp: actor, shutdown_panic }) } else { None };
+            }
+            WorkerCmd::Msg(local_id, msg) => {
+                let slot = actors.get_mut(local_id).and_then(|s| s.as_mut());
+                match (slot, msg) {
+                    (Some(slot), ActorMsg::Deliver(port, pv)) => {
+                        let v = crate::parallel::from_portable(&pv);
+                        if let Err(e) = slot.interp.send(0, &port, v) {
+                            if let Flow::Panic { msg, span, .. } = e {
+                                let mut guard = slot.shutdown_panic.lock().unwrap();
+                                if guard.is_none() {
+                                    *guard = Some((msg, span));
+                                }
+                            }
+                            actors[local_id] = None;
+                        }
+                    }
+                    (Some(slot), ActorMsg::Call { fn_name, args, reply, .. }) => {
+                        let args: Vec<Value> = args.iter().map(crate::parallel::from_portable).collect();
+                        let result = slot.interp.eval_method(Value::Component(0), &fn_name, args, Span::default());
+                        let reply_msg = match result {
+                            Ok(v) => match crate::parallel::to_portable(&v) {
+                                Some(pv) => Ok(pv),
+                                None => Err((
+                                    format!(
+                                        "internal error: concurrent `{fn_name}`'s return value is not portable -- K0306 should have rejected this at check time"
+                                    ),
+                                    Span::default(),
+                                )),
+                            },
+                            Err(Flow::Panic { msg, span, .. }) => Err((msg, span)),
+                            Err(_) => Err((
+                                "internal error: unexpected control flow escaped a concurrent expose call".to_string(),
+                                Span::default(),
+                            )),
+                        };
+                        let _ = reply.send(reply_msg);
+                    }
+                    (None, ActorMsg::Deliver(..)) => {}
+                    (None, ActorMsg::Call { reply, .. }) => {
+                        let _ = reply.send(Err((
+                            "internal error: concurrent instance already shut down or panicked".to_string(),
+                            Span::default(),
+                        )));
+                    }
+                }
+            }
+            WorkerCmd::Stop { local_id, stopped_tx } => {
+                if let Some(slot_opt) = actors.get_mut(local_id) {
+                    if let Some(mut slot) = slot_opt.take() {
+                        let n = slot.interp.instances.len();
+                        if let Err(e) = slot.interp.stop_all(n) {
+                            if let Flow::Panic { msg, span, .. } = e {
+                                let mut guard = slot.shutdown_panic.lock().unwrap();
+                                if guard.is_none() {
+                                    *guard = Some((msg, span));
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = stopped_tx.send(());
+            }
+        }
+    }
+}
+
+/// How a `Remote` instance's actor code actually runs — see `ActorPool`'s
+/// own doc comment for exactly when each variant is chosen.
+enum ActorRoute {
+    /// The pre-existing model: this actor gets its own OS thread for its
+    /// entire life. Used for every `concurrent component` spawned from
+    /// CODE already running on a pool worker's own thread (a nested
+    /// child), so a parent can safely block a `Call` on it — see
+    /// `ActorPool`'s doc comment.
+    Dedicated {
+        join: Option<std::thread::JoinHandle<()>>,
+        inbox: Option<std::sync::mpsc::Sender<ActorMsg>>,
+    },
+    /// This actor is multiplexed onto a shared `ActorPool` worker thread
+    /// alongside other actors, addressed by `local_id` within that
+    /// worker's own private `Vec`.
+    Pooled {
+        worker_tx: std::sync::mpsc::Sender<WorkerCmd>,
+        local_id: usize,
+        /// `Some` once `stop_all` has sent `WorkerCmd::Stop` — the
+        /// receiving half of that command's own one-shot completion
+        /// signal, taken (and awaited) by `stop_all`'s second pass.
+        stopped_rx: Option<std::sync::mpsc::Receiver<()>>,
+        /// Set once `Stop` has been sent, so a `Call`/`Deliver` arriving
+        /// after shutdown-has-begun reports "already shut down" instead
+        /// of silently hanging or racing the worker's own shutdown --
+        /// mirrors `Dedicated`'s `inbox: None` check exactly.
+        stop_sent: bool,
+    },
+}
+
 /// A handle to a `concurrent`-marked instance running on its own actor
 /// thread (`docs/design/ASYNC.md` §8.2/§8.10 steps 3-4).
 ///
@@ -184,8 +495,10 @@ enum ActorMsg {
 /// clock again during the message-servicing phase (that needs §8.5's
 /// shared next-fire table, deferred past this step).
 pub struct ActorHandle {
-    join: Option<std::thread::JoinHandle<()>>,
-    inbox: Option<std::sync::mpsc::Sender<ActorMsg>>,
+    /// Concurrency-v2 PR-cv2-3: either a dedicated OS thread (the
+    /// pre-existing model) or a shared `ActorPool` worker slot — see
+    /// `ActorRoute`'s own doc comment for exactly which is chosen and why.
+    route: ActorRoute,
     /// Signaled once, by the actor, right after its own initial
     /// `instantiate_local` + `start_all` + `run_timers(100)` complete —
     /// consumed by `Interp::start_all` so "on start has been delivered to
@@ -732,31 +1045,81 @@ impl Interp {
         // against `self.db.components` in the first place. Only the plain
         // `String` name crosses the thread boundary here.
         let comp_name = comp.name.clone();
-        let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, Span)>>();
         let shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
-        let shutdown_panic_writer = shutdown_panic.clone();
-        // Production-hardening 1213: a REAL, live-confirmed bug -- plain
-        // `std::thread::spawn` gets the OS default stack (~2-8MiB), unlike
-        // EVERY other thread this codebase spawns for interpreter work
-        // (`main.rs`'s own top-level worker thread, `parallel.rs`'s
-        // `par_map`/`par_filter` workers), which explicitly size a 2GB
-        // stack to match `MAX_CALL_DEPTH = 10_000`. Confirmed live before
-        // this fix: `deep(9000)` (well under the 10,000-frame guard,
-        // returns cleanly on the main thread) reached through a
-        // `concurrent component`'s own `expose fun` crashed the ENTIRE
-        // PROCESS with `fatal runtime error: stack overflow, aborting`
-        // (SIGABRT) -- bypassing the custom panic hook entirely (no
-        // "internal compiler error" message ever printed) and bypassing
-        // `call_remote`'s own clean "actor thread already shut down or
-        // panicked" handling. `.expect(...)` on the `Builder::spawn` below
-        // (rather than propagating a `Result`) matches every sibling site's
-        // own convention -- an OS refusing a 2GB stack reservation is the
-        // same "should never happen on any realistic target" case
-        // `main.rs`/`parallel.rs` already treat as an unrecoverable setup
-        // failure, not a normal runtime error a KUPL program could react to.
-        let join = std::thread::Builder::new()
+        // Concurrency-v2 PR-cv2-3 (`docs/design/CONCURRENCY_V2.md` §4.3):
+        // route through the shared `ActorPool` whenever it's safe to
+        // (this spawn isn't happening from inside another pool worker's
+        // own command loop) -- see `ActorPool`'s own doc comment for the
+        // full reasoning. Falls back to the pre-existing dedicated-thread
+        // path below, UNCHANGED, for a nested spawn.
+        let route = if POOL_WORKER_ID.with(|c| c.get()).is_none() {
+            let worker_tx = ActorPool::get().assign();
+            let (local_id_tx, local_id_rx) = std::sync::mpsc::channel::<usize>();
+            worker_tx
+                .send(WorkerCmd::Spawn {
+                    comp_name,
+                    portable_args,
+                    span,
+                    image,
+                    ready_tx,
+                    shutdown_panic: shutdown_panic.clone(),
+                    local_id_tx,
+                })
+                .expect("actor-pool worker thread ended unexpectedly -- this is a bug in KUPL, not your program");
+            let local_id = local_id_rx.recv().expect(
+                "actor-pool worker thread ended unexpectedly while spawning a new actor -- this is a bug in KUPL, not your program",
+            );
+            ActorRoute::Pooled { worker_tx, local_id, stopped_rx: None, stop_sent: false }
+        } else {
+            let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+            let shutdown_panic_writer = shutdown_panic.clone();
+            let join = Self::spawn_dedicated_actor(comp_name, portable_args, span, image, ready_tx, shutdown_panic_writer, inbox_rx);
+            ActorRoute::Dedicated { join: Some(join), inbox: Some(inbox_tx) }
+        };
+        let id = self.instances.len();
+        self.instances.push(InstanceSlot::Remote(ActorHandle { route, ready: Some(ready_rx), shutdown_panic }));
+        Ok(Value::Component(id))
+    }
+
+    /// The pre-existing "1 OS thread per actor, always resident" path
+    /// (unchanged in substance from before Concurrency-v2 PR-cv2-3, just
+    /// extracted into its own function so `instantiate_concurrent` can
+    /// call it conditionally instead of unconditionally) — used for every
+    /// `concurrent component` spawned from CODE already running on an
+    /// `ActorPool` worker's own thread. See `ActorRoute`/`ActorPool`'s own
+    /// doc comments for exactly why.
+    ///
+    /// Production-hardening 1213: a REAL, live-confirmed bug -- plain
+    /// `std::thread::spawn` gets the OS default stack (~2-8MiB), unlike
+    /// EVERY other thread this codebase spawns for interpreter work
+    /// (`main.rs`'s own top-level worker thread, `parallel.rs`'s
+    /// `par_map`/`par_filter` workers), which explicitly size a 2GB
+    /// stack to match `MAX_CALL_DEPTH = 10_000`. Confirmed live before
+    /// this fix: `deep(9000)` (well under the 10,000-frame guard,
+    /// returns cleanly on the main thread) reached through a
+    /// `concurrent component`'s own `expose fun` crashed the ENTIRE
+    /// PROCESS with `fatal runtime error: stack overflow, aborting`
+    /// (SIGABRT) -- bypassing the custom panic hook entirely (no
+    /// "internal compiler error" message ever printed) and bypassing
+    /// `call_remote`'s own clean "actor thread already shut down or
+    /// panicked" handling. `.expect(...)` on the `Builder::spawn` below
+    /// (rather than propagating a `Result`) matches every sibling site's
+    /// own convention -- an OS refusing a 2GB stack reservation is the
+    /// same "should never happen on any realistic target" case
+    /// `main.rs`/`parallel.rs` already treat as an unrecoverable setup
+    /// failure, not a normal runtime error a KUPL program could react to.
+    fn spawn_dedicated_actor(
+        comp_name: String,
+        portable_args: Vec<(Option<String>, crate::parallel::PortableValue)>,
+        span: Span,
+        image: std::sync::Arc<crate::parallel::ProgramImage>,
+        ready_tx: std::sync::mpsc::Sender<Option<(String, Span)>>,
+        shutdown_panic_writer: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>>,
+        inbox_rx: std::sync::mpsc::Receiver<ActorMsg>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
             .stack_size(crate::parallel::WORKER_STACK_SIZE)
             .spawn(move || {
             let db = image.actor_db();
@@ -919,15 +1282,7 @@ impl Interp {
                 }
             }
         })
-        .expect("failed to spawn a concurrent component's actor thread (OS refused a 2GB stack reservation)");
-        let id = self.instances.len();
-        self.instances.push(InstanceSlot::Remote(ActorHandle {
-            join: Some(join),
-            inbox: Some(inbox_tx),
-            ready: Some(ready_rx),
-            shutdown_panic,
-        }));
-        Ok(Value::Component(id))
+        .expect("failed to spawn a concurrent component's actor thread (OS refused a 2GB stack reservation)")
     }
 
     /// Deliver `on start` to instance `id` and all its descendants (creation order).
@@ -1031,7 +1386,26 @@ impl Interp {
     pub fn stop_all(&mut self, upto: usize) -> Result<(), Flow> {
         for id in 0..upto.min(self.instances.len()) {
             if let InstanceSlot::Remote(handle) = &mut self.instances[id] {
-                handle.inbox.take(); // drop the Sender -> closes the channel
+                // Concurrency-v2 PR-cv2-3: `Dedicated` signals shutdown by
+                // dropping the Sender (closes the channel, ending that
+                // actor's OWN `recv()` loop); `Pooled` shares its worker's
+                // channel with other actors, so it can't just drop a
+                // Sender -- send an explicit `Stop` command instead, and
+                // remember the one-shot completion receiver for the
+                // second pass below to wait on (mirrors `join` exactly).
+                match &mut handle.route {
+                    ActorRoute::Dedicated { inbox, .. } => {
+                        inbox.take(); // drop the Sender -> closes the channel
+                    }
+                    ActorRoute::Pooled { worker_tx, local_id, stopped_rx, stop_sent } => {
+                        if !*stop_sent {
+                            let (stopped_tx, rx) = std::sync::mpsc::channel();
+                            let _ = worker_tx.send(WorkerCmd::Stop { local_id: *local_id, stopped_tx });
+                            *stopped_rx = Some(rx);
+                            *stop_sent = true;
+                        }
+                    }
+                }
                 continue;
             }
             self.run_lifecycle(id, &Trigger::Stop)?;
@@ -1068,8 +1442,25 @@ impl Interp {
         let mut actor_panic: Option<Flow> = None;
         for id in 0..upto.min(self.instances.len()) {
             if let InstanceSlot::Remote(handle) = &mut self.instances[id] {
-                if let Some(join) = handle.join.take() {
-                    if join.join().is_err() {
+                // Concurrency-v2 PR-cv2-3: `Dedicated` waits via `join()`
+                // (a genuine Rust-level thread panic surfaces as `Err`
+                // here); `Pooled` has no per-actor thread to join, so it
+                // waits on the completion signal `Stop` (above) armed --
+                // a dropped/errored receiver here means the WHOLE WORKER
+                // thread died (a Rust-level panic inside `worker_loop`,
+                // taking every OTHER actor sharing that worker down with
+                // it too -- a wider blast radius than `Dedicated`'s
+                // one-actor-per-thread isolation, an honest, documented
+                // tradeoff of the pool's sharded design, see `ActorPool`'s
+                // own doc comment).
+                let thread_panicked = match &mut handle.route {
+                    ActorRoute::Dedicated { join, .. } => join.take().map(|j| j.join().is_err()).unwrap_or(false),
+                    ActorRoute::Pooled { stopped_rx, .. } => {
+                        stopped_rx.take().map(|rx| rx.recv().is_err()).unwrap_or(false)
+                    }
+                };
+                {
+                    if thread_panicked {
                         if actor_panic.is_none() {
                             actor_panic = Some(Self::panic_flow(
                                 "a `concurrent component` actor thread panicked during shutdown \
@@ -1295,13 +1686,20 @@ impl Interp {
                     Span::default(),
                 ));
             };
-            // Best-effort: if the actor has already fully shut down (its
-            // `Receiver` dropped after its own `stop_all`), the send fails
-            // silently -- matching an ordinary message arriving after a
-            // program has already finished, which has no observable effect
-            // either.
-            if let Some(inbox) = &handle.inbox {
-                let _ = inbox.send(ActorMsg::Deliver(port.to_string(), pv));
+            // Best-effort: if the actor has already fully shut down, the
+            // send fails silently -- matching an ordinary message arriving
+            // after a program has already finished, which has no
+            // observable effect either.
+            match &handle.route {
+                ActorRoute::Dedicated { inbox: Some(inbox), .. } => {
+                    let _ = inbox.send(ActorMsg::Deliver(port.to_string(), pv));
+                }
+                ActorRoute::Dedicated { inbox: None, .. } => {}
+                ActorRoute::Pooled { worker_tx, local_id, stop_sent, .. } => {
+                    if !*stop_sent {
+                        let _ = worker_tx.send(WorkerCmd::Msg(*local_id, ActorMsg::Deliver(port.to_string(), pv)));
+                    }
+                }
             }
             return Ok(());
         }
@@ -3226,16 +3624,23 @@ impl Interp {
         let InstanceSlot::Remote(handle) = &self.instances[id] else {
             unreachable!("caller already confirmed this slot is Remote");
         };
-        let Some(inbox) = &handle.inbox else {
+        let already_shutdown = match &handle.route {
+            ActorRoute::Dedicated { inbox, .. } => inbox.is_none(),
+            ActorRoute::Pooled { stop_sent, .. } => *stop_sent,
+        };
+        if already_shutdown {
             return Err(Self::panic_flow(
                 format!("concurrent instance {id} has already shut down; cannot call `{name}`"),
                 span,
             ));
-        };
+        }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        let sent = inbox
-            .send(ActorMsg::Call { fn_name: name.to_string(), args: portable_args, chain: vec![id], reply: reply_tx })
-            .is_ok();
+        let call_msg = ActorMsg::Call { fn_name: name.to_string(), args: portable_args, chain: vec![id], reply: reply_tx };
+        let sent = match &handle.route {
+            ActorRoute::Dedicated { inbox: Some(inbox), .. } => inbox.send(call_msg).is_ok(),
+            ActorRoute::Dedicated { inbox: None, .. } => false,
+            ActorRoute::Pooled { worker_tx, local_id, .. } => worker_tx.send(WorkerCmd::Msg(*local_id, call_msg)).is_ok(),
+        };
         self.pending_remote_calls.insert(id);
         let reply = if sent { reply_rx.recv().ok() } else { None };
         self.pending_remote_calls.remove(&id);
@@ -7716,7 +8121,7 @@ mod capfs_tests {
 /// its own doc comment) can do at all.
 #[cfg(test)]
 mod concurrent_tests {
-    use super::{ActorHandle, ActorMsg, Flow, Interp, InstanceSlot, ProgramDb};
+    use super::{ActorHandle, ActorMsg, ActorRoute, Flow, Interp, InstanceSlot, ProgramDb};
 
     /// Production-hardening 1218: a REAL, live-confirmed-by-code-reading
     /// gap found+fixed -- `stop_all` used to discard `join()`'s `Result`
@@ -7745,8 +8150,7 @@ mod concurrent_tests {
             panic!("deliberate test panic, simulating a genuine internal interpreter bug reached on an actor thread")
         });
         interp.instances.push(InstanceSlot::Remote(ActorHandle {
-            join: Some(join),
-            inbox: Some(inbox_tx),
+            route: ActorRoute::Dedicated { join: Some(join), inbox: Some(inbox_tx) },
             ready: Some(ready_rx),
             shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }));
@@ -7783,8 +8187,7 @@ mod concurrent_tests {
             while inbox_rx.recv().is_ok() {}
         });
         interp.instances.push(InstanceSlot::Remote(ActorHandle {
-            join: Some(join),
-            inbox: Some(inbox_tx),
+            route: ActorRoute::Dedicated { join: Some(join), inbox: Some(inbox_tx) },
             ready: Some(ready_rx),
             shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }));
@@ -7831,8 +8234,7 @@ mod concurrent_tests {
                 Some(("deliberate on-stop panic message, verbatim".to_string(), super::Span::default()));
         });
         interp.instances.push(InstanceSlot::Remote(ActorHandle {
-            join: Some(join),
-            inbox: Some(inbox_tx),
+            route: ActorRoute::Dedicated { join: Some(join), inbox: Some(inbox_tx) },
             ready: Some(ready_rx),
             shutdown_panic,
         }));
@@ -7882,8 +8284,7 @@ mod concurrent_tests {
         let _ = ready_tx.send(Some(("deliberate on-start panic message, verbatim".to_string(), super::Span::default())));
         let join = std::thread::spawn(|| {});
         interp.instances.push(InstanceSlot::Remote(ActorHandle {
-            join: Some(join),
-            inbox: Some(inbox_tx),
+            route: ActorRoute::Dedicated { join: Some(join), inbox: Some(inbox_tx) },
             ready: Some(ready_rx),
             shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }));
@@ -7921,8 +8322,7 @@ mod concurrent_tests {
         let _ = ready_tx.send(None);
         let join = std::thread::spawn(|| {});
         interp.instances.push(InstanceSlot::Remote(ActorHandle {
-            join: Some(join),
-            inbox: Some(inbox_tx),
+            route: ActorRoute::Dedicated { join: Some(join), inbox: Some(inbox_tx) },
             ready: Some(ready_rx),
             shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }));
