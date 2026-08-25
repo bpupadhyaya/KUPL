@@ -2,11 +2,21 @@
 
 **Status: §4/§6's own RESTRICTION (the diagnostic, K0295) is
 IMPLEMENTED — PR-cv2-9, KUPL commit `a065cce`. The actual §5 scheduling
-logic (suspend/resume, the new `WorkerCmd`/`PooledActor` fields) is
-NOT YET implemented** — every blocking call still blocks its worker
-exactly as before; only the checker-side shape restriction exists so
-far, landed first and independently per §9's own sequencing advice.
-Written under the Concurrency V2 initiative's own standing maximum-risk
+logic (suspend/resume: `Flow::Suspend`/`SuspendedHandler`,
+`WorkerCmd::IoComplete`, `PooledActor.suspended`/`.pending`/
+`.pending_stop`) is now ALSO IMPLEMENTED — PR-cv2-10. v1 scope, stated
+honestly: only `http_get`/`http_post` (both `Str`-only arguments)
+genuinely suspend; `http_get_with`/`read_file_with` still satisfy
+K0295's syntactic restriction but execute inline (blocking) at
+runtime, because their `CapNet`/`CapFs` argument is deliberately
+opaque to `parallel::to_portable` (see `interp.rs`'s own
+`blocking_builtin_static_name` doc comment) and so cannot be safely
+captured and handed to a spawned I/O thread. `Call`-triggered
+`expose fun` execution also does not suspend in v1 (only
+`Deliver`-triggered handler bodies do) — deferred because suspending a
+`Call` needs its own reply channel stashed across the suspend, a more
+complex feature not needed for the FIRST slice. Written under the
+Concurrency V2 initiative's own standing maximum-risk
 mandate, as the authorized, SAFE alternative to full stack-switching
 (see `CONCURRENCY_V2.md` §5's own PR-cv2-7 entry for why hand-rolled
 stack-switching was investigated and deliberately not rushed — three
@@ -247,30 +257,43 @@ struct SuspendedHandler {
   out here as something the FIRST implementation's own tests must cover
   explicitly, not assume works by construction.
 
-## 7. Open questions this document does NOT resolve
+## 7. Open questions — resolved during PR-cv2-10 implementation
 
 - Does the top-level-only restriction apply to a `concurrent
-  component`'s plain (non-`expose`) private `fun`s too, or only
-  handlers/`expose fun` bodies directly? Leaning toward: any function
-  reachable from a handler needs the SAME restriction (a private helper
-  `fun` called from a handler is still "inside" that handler's own
-  execution for suspend purposes) — but this needs a real reachability
-  check in the effect checker, not just handler-body-literal syntax,
-  which is a real, nontrivial piece of implementation work of its own
-  (mirrors the KIND of reachability analysis `check.rs`'s own effect
-  system already does for `uses`-clause propagation — a real precedent
-  to reuse, not build from scratch).
-- Cross-engine consistency: `concurrent component` is confirmed
-  interp.rs-only (VM/native both no-op it, per `ASYNC.md` §8.8) — so
-  this feature, like PR-cv2-1 through PR-cv2-8, only needs to touch
-  `interp.rs`/`check.rs`, not `vm.rs`/`cgen.rs`/`kx.rs`. This should be
-  RE-confirmed live (not assumed from memory) at implementation time,
-  matching this initiative's own now-established discipline, in case
-  anything about `concurrent`'s cross-engine status changed since.
-- Does REPL's own `:upgrade` interact safely with a MID-SUSPEND actor
-  (a handler paused waiting on I/O when a redefinition happens)? Not
-  investigated here — flag as a real edge case for the implementer to
-  check live before shipping, not assume away.
+  component`'s plain (non-`expose`) private `fun`s too? STILL OPEN —
+  K0295's checker restriction (PR-cv2-9) covers `c.funs` per its own
+  implementation, but the runtime suspend logic added in PR-cv2-10
+  (`exec_stmts_checked`) only fires when `Interp.allow_suspend` is set,
+  which is only true directly around a `Deliver`-triggered handler's
+  own `exec_block` call — a private `fun` called FROM a handler runs
+  with whatever `allow_suspend` state its caller left it in (still
+  `true`, since nothing resets it mid-handler), so in practice a
+  blocking call inside a reachable private `fun` DOES suspend correctly
+  today. Not deliberately designed for; not yet covered by a dedicated
+  test. A real gap to close with explicit test coverage, not a
+  confirmed-safe behavior.
+- Cross-engine consistency: RE-CONFIRMED LIVE at implementation time —
+  `concurrent component` remains interp.rs-only; PR-cv2-10 touches only
+  `interp.rs` (plus this doc and `main.rs` tests), no `vm.rs`/
+  `cgen.rs`/`kx.rs` changes were needed.
+- Does REPL's own `:upgrade` interact safely with a MID-SUSPEND actor?
+  STILL NOT INVESTIGATED — genuinely open, flagged for whoever picks
+  this up next. A live check (redefine a component while one of its
+  instances is suspended on `http_get`, confirm no crash/hang/silent
+  corruption) has not been performed.
+- A NEW finding, not anticipated in this document's original §5 sketch:
+  `WorkerCmd::Stop` shares the SAME per-worker channel as `Deliver`/
+  `Call`, so a `Stop` queued right behind a `Deliver` that suspends
+  would be dequeued and processed WHILE the actor is still suspended —
+  tearing the actor down (and acking `stop_all`'s blocking wait) before
+  the spawned I/O thread's `IoComplete` ever arrives, silently
+  discarding the rest of the handler's execution with no panic, no
+  diagnostic, just missing output. Caught LIVE (not by static
+  reasoning) via the very first end-to-end test written for this
+  feature — see `PooledActor.pending_stop`'s own doc comment in
+  `interp.rs` for the fix (defer the teardown until the actor is idle
+  again). A reminder that "the design doc says this edge case is
+  probably fine" is not the same as verifying it.
 
 ## 8. Verification plan (matches this project's own established discipline)
 
@@ -290,6 +313,21 @@ struct SuspendedHandler {
 - Full suite green twice; a genuine revert-and-verify for whatever the
   first real commit turns out to be, matching every PR-cv2-N before
   this one.
+- A finding from actually doing this (PR-cv2-10), worth stating for
+  whoever extends this next: the FIRST cut of `Flow::Suspend` held its
+  `SuspendedHandler` payload inline (unboxed). That struct alone is 96
+  bytes, which made `Flow`/`EvalResult` — the return type of every
+  recursive `Interp::eval` call — 96 bytes too, and silently pushed an
+  unrelated, already-deep-recursion differential test into a genuine
+  stack overflow. `cargo build`/`cargo check` gave zero warning; only
+  running the FULL suite surfaced it. Fixed by boxing the variant
+  (`Flow::Suspend(Box<SuspendedHandler>)`), with a permanent
+  `const _: () = assert!(size_of::<Flow>() <= 64, ...)` guard added
+  right next to the `EvalResult` type alias so a future large variant
+  fails to COMPILE instead of silently regressing stack headroom again.
+  Any future addition to `Flow` (or anything else returned from deep
+  recursive evaluator code) should check its size impact, not assume a
+  new field/variant is "small enough" without measuring.
 
 ## 9. Effort/risk assessment, stated honestly
 

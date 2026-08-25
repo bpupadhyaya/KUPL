@@ -27,9 +27,80 @@ pub enum Flow {
     Return(Value),
     Break,
     Continue,
+    /// Concurrency-v2 PR-cv2-10 (`docs/design/ASYNC_IO.md` §5): a
+    /// concurrent-actor `on` handler, running on an `ActorPool` worker
+    /// thread, hit a top-level `let name = <blocking builtin>(...)`
+    /// statement — `K0295` already guarantees this is the ONLY shape a
+    /// blocking builtin call can take inside a `concurrent component`,
+    /// so no other code path can ever produce this variant. Propagates
+    /// up through `exec_block`/`run_handler`/`Interp::send` exactly like
+    /// `Panic`/`Return` already do (an ordinary `Err(other) => Err(other)`
+    /// at every call site that doesn't specifically care about it) until
+    /// `worker_loop`'s own `ActorMsg::Deliver` handling catches it and
+    /// spawns a real, `Send`-safe thread to perform the actual I/O
+    /// without occupying this worker for its duration. v1 scope note
+    /// (see `ASYNC_IO.md`'s own doc, updated alongside this commit): only
+    /// `Deliver`-triggered handler execution enables this (a NEW
+    /// `Interp::allow_suspend` flag, set only around `run_handler`'s own
+    /// `exec_block` call) — a `Call`-triggered `expose fun` reaching the
+    /// SAME syntactic shape still executes the blocking builtin inline
+    /// today, since suspending a `Call` needs its own reply channel
+    /// stashed across the suspend, deliberately deferred rather than
+    /// rushed alongside this first, simpler slice.
+    ///
+    /// Boxed (a REAL, live-caught bug, not preemptive tidiness):
+    /// `SuspendedHandler` is 96 bytes, and an unboxed variant that size
+    /// makes `Flow`/`EvalResult` 96 bytes too — `EvalResult` is the
+    /// return type of `Interp::eval`, KUPL's own recursive expression
+    /// evaluator, so every additional byte here is paid on EVERY stack
+    /// frame of EVERY recursive `eval` call. Landing this unboxed first
+    /// pushed an already-close-to-the-edge deep-recursion differential
+    /// test (`vm::tests::diff_carmichael_korselt_vs_fermat`) into a real
+    /// stack overflow — caught by running the full suite, not by static
+    /// reasoning. `Box<SuspendedHandler>` shrinks this variant to one
+    /// pointer (8 bytes), returning `Flow` close to its pre-PR-cv2-10 size.
+    Suspend(Box<SuspendedHandler>),
+}
+
+/// Concurrency-v2 PR-cv2-10: everything needed to actually perform a
+/// suspended handler's blocking I/O call elsewhere and resume execution
+/// once it completes — see `Flow::Suspend`'s own doc comment.
+pub struct SuspendedHandler {
+    /// Which of the 4 blocking builtins to call once resumed off-thread
+    /// — `(name, argc)`, mirroring `check.rs::BLOCKING_BUILTINS`'s own
+    /// shape exactly, so the two stay in sync by construction.
+    pub builtin: &'static str,
+    /// The blocking builtin's own arguments, ALREADY evaluated (evaluating
+    /// them is ordinary, synchronous `eval` work — only the builtin CALL
+    /// itself is deferred).
+    pub args: Vec<Value>,
+    /// Where to bind the completed I/O result once resumed.
+    pub bind_name: String,
+    /// The statements AFTER the suspending `let`, in the SAME block —
+    /// resuming means running these, in `env` (below), starting fresh
+    /// once `bind_name` is bound to the I/O result.
+    pub remaining: Vec<Stmt>,
+    /// The env `remaining` must run in — already has every binding made
+    /// by statements BEFORE the suspending `let`.
+    pub env: Env,
 }
 
 pub type EvalResult = Result<Value, Flow>;
+
+/// Concurrency-v2 PR-cv2-10: a REAL, live-caught regression guard, not
+/// preemptive tidiness. `EvalResult` is the return type of every
+/// recursive `Interp::eval` call, so its stack size is paid on EVERY
+/// frame of KUPL's own recursive expression evaluator — a large,
+/// UNBOXED `Flow` variant (the first cut of `Flow::Suspend` held a bare
+/// 96-byte `SuspendedHandler` inline) silently pushed an already-deep
+/// differential test (`vm::tests::diff_carmichael_korselt_vs_fermat`)
+/// into a genuine stack overflow, caught only by running the full test
+/// suite, not by any compiler error or static check. `Box`ing that
+/// variant fixed it; this assertion keeps a future large variant from
+/// reintroducing the same silent-until-you-run-an-unrelated-deep-
+/// recursion-test failure mode. 64 bytes is deliberately generous
+/// headroom above `Flow`'s actual current size, not a tight bound.
+const _: () = assert!(std::mem::size_of::<Flow>() <= 64, "Flow grew too large -- box any new large variant");
 
 /// Owned, indexed view of the checked program.
 ///
@@ -265,11 +336,12 @@ impl ActorPool {
             let workers = (0..n)
                 .map(|worker_id| {
                     let (tx, rx) = std::sync::mpsc::channel::<WorkerCmd>();
+                    let tx_for_worker = tx.clone();
                     std::thread::Builder::new()
                         .stack_size(crate::parallel::WORKER_STACK_SIZE)
                         .spawn(move || {
                             POOL_WORKER_ID.with(|c| c.set(Some(worker_id)));
-                            worker_loop(rx);
+                            worker_loop(rx, tx_for_worker);
                         })
                         .expect("failed to spawn an actor-pool worker thread (OS refused a 2GB stack reservation)");
                     tx
@@ -309,6 +381,15 @@ enum WorkerCmd {
         local_id: usize,
         stopped_tx: std::sync::mpsc::Sender<()>,
     },
+    /// Concurrency-v2 PR-cv2-10 (`docs/design/ASYNC_IO.md` §5): a
+    /// suspended handler's own blocking I/O call finished off-thread.
+    /// `Ok(pv)` is the builtin's own successful Rust-level `Ok(Value)`
+    /// (itself a KUPL-level `Result[Str, Str]` — a network failure is
+    /// already represented THERE, not here), portable-converted to cross
+    /// back safely; `Err(msg)` mirrors the SAME internal/argument-error
+    /// class `eval_call`'s own `.map_err(|m| Self::panic_flow(m, span))`
+    /// already turns into a panic for a non-suspended call.
+    IoComplete { local_id: usize, result: Result<crate::parallel::PortableValue, String> },
 }
 
 /// A pooled actor's own persistent state, owned exclusively by its
@@ -316,6 +397,38 @@ enum WorkerCmd {
 struct PooledActor {
     interp: Interp,
     shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>>,
+    /// Concurrency-v2 PR-cv2-10: `Some` while this actor's own handler is
+    /// paused mid-execution, waiting on a spawned I/O thread's own
+    /// `WorkerCmd::IoComplete` reply — see `Flow::Suspend`'s own doc
+    /// comment. While suspended, this actor is NOT eligible to start a
+    /// NEW `Deliver`/`Call` (see `pending` below) — preserves the
+    /// actor model's own per-actor sequential-processing guarantee
+    /// without any new queue-selection logic, since the worker's own
+    /// shared channel already delivers commands in arrival order; this
+    /// field is what makes the worker defer a same-actor command that
+    /// arrives too early instead of running it out of order.
+    suspended: Option<Box<SuspendedHandler>>,
+    /// Concurrency-v2 PR-cv2-10: `Deliver`/`Call` messages that arrived
+    /// for this actor WHILE `suspended.is_some()` — processed in order
+    /// once the suspend resolves (`WorkerCmd::IoComplete`'s own handling
+    /// drains this after a successful resume, one at a time, stopping
+    /// early if resuming ITSELF suspends again via a chained blocking
+    /// call).
+    pending: std::collections::VecDeque<ActorMsg>,
+    /// Concurrency-v2 PR-cv2-10 (a REAL bug caught by live verification,
+    /// not a hypothetical): `WorkerCmd::Stop` arrives through the SAME
+    /// per-worker channel as `Deliver`/`Call`, so a `Stop` queued right
+    /// behind a `Deliver` that suspends would otherwise be dequeued and
+    /// processed WHILE `suspended.is_some()` — tearing the actor down
+    /// (and acking `stop_all`'s own blocking wait) before its spawned I/O
+    /// thread's `IoComplete` ever arrives, silently discarding the rest
+    /// of the handler's execution with no panic, no diagnostic, just
+    /// missing output. `Some(stopped_tx)` here means a `Stop` arrived
+    /// while suspended and was deferred; `WorkerCmd::IoComplete`'s own
+    /// handling checks this once the actor is idle again (resumed, not
+    /// re-suspended, pending queue drained) and performs the real
+    /// teardown + ack at that point instead.
+    pending_stop: Option<std::sync::mpsc::Sender<()>>,
 }
 
 /// The body every `ActorPool` worker thread runs for its whole life —
@@ -330,7 +443,7 @@ struct PooledActor {
 /// caller is always blocked waiting on SOME reply, so silently dropping
 /// it would hang the caller forever — a real bug caught during design,
 /// not a hypothetical).
-fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>) {
+fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Sender<WorkerCmd>) {
     let mut actors: Vec<Option<PooledActor>> = Vec::new();
     // Concurrency-v2 PR-cv2-5 (found while investigating PR-cv2-3's own
     // "why does per-actor RSS stay ~1.4MB even after pooling" open
@@ -425,71 +538,337 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>) {
                     Ok(()) => None,
                 };
                 let _ = ready_tx.send(startup_panic);
-                actors[local_id] = if startup.is_ok() { Some(PooledActor { interp: actor, shutdown_panic }) } else { None };
+                actors[local_id] = if startup.is_ok() {
+                    Some(PooledActor {
+                        interp: actor,
+                        shutdown_panic,
+                        suspended: None,
+                        pending: std::collections::VecDeque::new(),
+                        pending_stop: None,
+                    })
+                } else {
+                    None
+                };
             }
             WorkerCmd::Msg(local_id, msg) => {
-                let slot = actors.get_mut(local_id).and_then(|s| s.as_mut());
-                match (slot, msg) {
-                    (Some(slot), ActorMsg::Deliver(port, pv)) => {
-                        let v = crate::parallel::from_portable(&pv);
-                        if let Err(e) = slot.interp.send(0, &port, v) {
-                            if let Flow::Panic { msg, span, .. } = e {
-                                let mut guard = slot.shutdown_panic.lock().unwrap();
-                                if guard.is_none() {
-                                    *guard = Some((msg, span));
-                                }
-                            }
-                            actors[local_id] = None;
+                let state = actors.get(local_id).and_then(|s| s.as_ref()).map(|s| s.suspended.is_some());
+                match state {
+                    None => match msg {
+                        ActorMsg::Deliver(..) => {}
+                        ActorMsg::Call { reply, .. } => {
+                            let _ = reply.send(Err((
+                                "internal error: concurrent instance already shut down or panicked".to_string(),
+                                Span::default(),
+                            )));
+                        }
+                    },
+                    // Concurrency-v2 PR-cv2-10: a message for an actor
+                    // that's CURRENTLY suspended (mid-way through a
+                    // blocking I/O call) queues instead of running --
+                    // preserves the actor model's own per-actor
+                    // sequential-processing guarantee (running it now
+                    // would mean TWO concurrent executions of this
+                    // actor's own state, a correctness violation).
+                    // Drained by `WorkerCmd::IoComplete`'s own handling
+                    // once the suspend resolves.
+                    Some(true) => {
+                        if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                            slot.pending.push_back(msg);
                         }
                     }
-                    (Some(slot), ActorMsg::Call { fn_name, args, reply, .. }) => {
-                        let args: Vec<Value> = args.iter().map(crate::parallel::from_portable).collect();
-                        let result = slot.interp.eval_method(Value::Component(0), &fn_name, args, Span::default());
-                        let reply_msg = match result {
-                            Ok(v) => match crate::parallel::to_portable(&v) {
-                                Some(pv) => Ok(pv),
-                                None => Err((
-                                    format!(
-                                        "internal error: concurrent `{fn_name}`'s return value is not portable -- K0306 should have rejected this at check time"
-                                    ),
-                                    Span::default(),
-                                )),
-                            },
-                            Err(Flow::Panic { msg, span, .. }) => Err((msg, span)),
-                            Err(_) => Err((
-                                "internal error: unexpected control flow escaped a concurrent expose call".to_string(),
-                                Span::default(),
-                            )),
-                        };
-                        let _ = reply.send(reply_msg);
+                    Some(false) => match msg {
+                        ActorMsg::Deliver(port, pv) => deliver_to_actor(&mut actors, &tx, local_id, port, pv),
+                        ActorMsg::Call { fn_name, args, reply, .. } => {
+                            call_actor(&mut actors, local_id, fn_name, args, reply)
+                        }
+                    },
+                }
+            }
+            WorkerCmd::IoComplete { local_id, result } => {
+                let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) else {
+                    // The actor already shut down (or panicked) while
+                    // this I/O call was still in flight -- best-effort,
+                    // discard the (now-orphaned) result, matching every
+                    // other "actor already gone" path in this file.
+                    continue;
+                };
+                let Some(suspended) = slot.suspended.take() else {
+                    // Should never happen (only `IoComplete` clears a
+                    // `Some(suspended)`, and only ONE I/O call is ever in
+                    // flight per actor at a time) -- defensive, not a
+                    // reachable program state; silently ignored rather
+                    // than an internal-compiler-error panic, since
+                    // dropping an orphaned result has no observable
+                    // wrong-answer effect on anything else.
+                    continue;
+                };
+                let value = match result {
+                    Ok(pv) => crate::parallel::from_portable(&pv),
+                    Err(msg) => {
+                        // Mirrors `eval_call`'s own `.map_err(|m|
+                        // Self::panic_flow(m, span))` -- an internal/
+                        // argument error, not an ordinary "the request
+                        // failed" (already represented as a KUPL-level
+                        // `Err(...)` inside `Ok(pv)` above).
+                        let mut guard = slot.shutdown_panic.lock().unwrap();
+                        if guard.is_none() {
+                            *guard = Some((msg, Span::default()));
+                        }
+                        drop(guard);
+                        kill_actor(&mut actors, local_id);
+                        continue;
                     }
-                    (None, ActorMsg::Deliver(..)) => {}
-                    (None, ActorMsg::Call { reply, .. }) => {
-                        let _ = reply.send(Err((
-                            "internal error: concurrent instance already shut down or panicked".to_string(),
-                            Span::default(),
-                        )));
+                };
+                suspended.env.define(&suspended.bind_name, value);
+                slot.interp.current = Some(0);
+                slot.interp.allow_suspend = true;
+                let result = slot.interp.exec_stmts_checked(&suspended.remaining, &suspended.env);
+                slot.interp.allow_suspend = false;
+                slot.interp.current = None;
+                let outcome = match result {
+                    Ok(_) | Err(Flow::Return(_)) => slot.interp.drain(),
+                    Err(other) => Err(other),
+                };
+                match outcome {
+                    Ok(()) => {
+                        // Resumed cleanly -- drain whatever queued while
+                        // this actor was suspended, one message at a
+                        // time, stopping early (naturally, via the
+                        // `Some(false)`/`is_none()` guard below) if a
+                        // drained message suspends the actor again.
+                        loop {
+                            let next = match actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                                Some(slot) if slot.suspended.is_none() => slot.pending.pop_front(),
+                                _ => None,
+                            };
+                            let Some(next) = next else { break };
+                            match next {
+                                ActorMsg::Deliver(port, pv) => {
+                                    deliver_to_actor(&mut actors, &tx, local_id, port, pv)
+                                }
+                                ActorMsg::Call { fn_name, args, reply, .. } => {
+                                    call_actor(&mut actors, local_id, fn_name, args, reply)
+                                }
+                            }
+                        }
+                        // Truly idle again (not suspended, nothing left
+                        // in `pending`) -- if a `Stop` arrived mid-suspend
+                        // and was deferred (`pending_stop`), finish it now
+                        // instead of leaving `stop_all` blocked forever.
+                        let still_suspended = actors
+                            .get(local_id)
+                            .and_then(|s| s.as_ref())
+                            .is_some_and(|s| s.suspended.is_some());
+                        if !still_suspended {
+                            let deferred = actors
+                                .get_mut(local_id)
+                                .and_then(|s| s.as_mut())
+                                .and_then(|s| s.pending_stop.take());
+                            if let Some(stopped_tx) = deferred {
+                                stop_actor_now(&mut actors, local_id);
+                                let _ = stopped_tx.send(());
+                            }
+                        }
+                    }
+                    Err(Flow::Suspend(s)) => {
+                        let builtin = s.builtin;
+                        let args = s.args.clone();
+                        if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                            slot.suspended = Some(s);
+                        }
+                        spawn_blocking_io(tx.clone(), local_id, builtin, args);
+                    }
+                    Err(Flow::Panic { msg, span, .. }) => {
+                        if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                            let mut guard = slot.shutdown_panic.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some((msg, span));
+                            }
+                        }
+                        kill_actor(&mut actors, local_id);
+                    }
+                    Err(_) => {
+                        kill_actor(&mut actors, local_id);
                     }
                 }
             }
             WorkerCmd::Stop { local_id, stopped_tx } => {
-                if let Some(slot_opt) = actors.get_mut(local_id) {
-                    if let Some(mut slot) = slot_opt.take() {
-                        let n = slot.interp.instances.len();
-                        if let Err(e) = slot.interp.stop_all(n) {
-                            if let Flow::Panic { msg, span, .. } = e {
-                                let mut guard = slot.shutdown_panic.lock().unwrap();
-                                if guard.is_none() {
-                                    *guard = Some((msg, span));
-                                }
-                            }
-                        }
+                let is_suspended =
+                    actors.get(local_id).and_then(|s| s.as_ref()).is_some_and(|s| s.suspended.is_some());
+                if is_suspended {
+                    // Defer: don't ack yet, don't tear down yet — see
+                    // `PooledActor::pending_stop`'s own doc comment.
+                    // `IoComplete`'s handling finishes this once the
+                    // actor is idle again.
+                    if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                        slot.pending_stop = Some(stopped_tx);
+                    } else {
+                        let _ = stopped_tx.send(());
                     }
+                } else {
+                    stop_actor_now(&mut actors, local_id);
+                    let _ = stopped_tx.send(());
                 }
-                let _ = stopped_tx.send(());
             }
         }
     }
+}
+
+/// Concurrency-v2 PR-cv2-10: the actual `on stop` + teardown logic for one
+/// actor, factored out of `WorkerCmd::Stop`'s own handling so
+/// `WorkerCmd::IoComplete` can run the SAME teardown once a `Stop` that
+/// arrived mid-suspend (see `PooledActor::pending_stop`) is finally ready
+/// to complete. A no-op if the slot is already empty (actor already died).
+/// Concurrency-v2 PR-cv2-10: every place an actor dies (panic, or any
+/// other non-`Suspend`/`Return`/`Ok` control flow escaping a handler) used
+/// to just do `actors[local_id] = None` directly — fine on its own, but if
+/// a `Stop` had arrived and been deferred (`PooledActor::pending_stop`,
+/// because the actor was suspended at the time) that sender would be
+/// dropped WITHOUT ever being acked, and `stop_all`'s own blocking
+/// `stopped_rx.recv()` for this actor would hang forever. Centralizing
+/// the teardown here (used everywhere an actor is killed, not just the
+/// suspend/resume paths) makes that impossible by construction.
+fn kill_actor(actors: &mut [Option<PooledActor>], local_id: usize) {
+    if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.take()) {
+        if let Some(stopped_tx) = slot.pending_stop {
+            let _ = stopped_tx.send(());
+        }
+    }
+}
+
+fn stop_actor_now(actors: &mut [Option<PooledActor>], local_id: usize) {
+    if let Some(slot_opt) = actors.get_mut(local_id) {
+        if let Some(mut slot) = slot_opt.take() {
+            let n = slot.interp.instances.len();
+            if let Err(e) = slot.interp.stop_all(n) {
+                if let Flow::Panic { msg, span, .. } = e {
+                    let mut guard = slot.shutdown_panic.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some((msg, span));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Concurrency-v2 PR-cv2-10: runs ONE `Deliver` against an actor already
+/// confirmed to exist and NOT currently suspended — shared by
+/// `WorkerCmd::Msg`'s own fresh-message handling and
+/// `WorkerCmd::IoComplete`'s own post-resume pending-queue drain, so
+/// both paths apply identical suspend/panic/success logic (a single
+/// implementation, not two copies that could drift apart).
+fn deliver_to_actor(
+    actors: &mut [Option<PooledActor>],
+    tx: &std::sync::mpsc::Sender<WorkerCmd>,
+    local_id: usize,
+    port: String,
+    pv: crate::parallel::PortableValue,
+) {
+    let v = crate::parallel::from_portable(&pv);
+    let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) else { return };
+    slot.interp.allow_suspend = true;
+    let result = slot.interp.send(0, &port, v);
+    slot.interp.allow_suspend = false;
+    match result {
+        Ok(()) => {}
+        Err(Flow::Suspend(suspended)) => {
+            let builtin = suspended.builtin;
+            let args = suspended.args.clone();
+            slot.suspended = Some(suspended);
+            spawn_blocking_io(tx.clone(), local_id, builtin, args);
+        }
+        Err(Flow::Panic { msg, span, .. }) => {
+            let mut guard = slot.shutdown_panic.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some((msg, span));
+            }
+            drop(guard);
+            kill_actor(actors, local_id);
+        }
+        Err(_) => {
+            kill_actor(actors, local_id);
+        }
+    }
+}
+
+/// Concurrency-v2 PR-cv2-10: the pre-existing `ActorMsg::Call` handling,
+/// factored into its own function for the identical reason
+/// `deliver_to_actor` was — `Call` itself does NOT suspend in v1 (see
+/// `Flow::Suspend`'s own doc comment: it needs its own reply-channel
+/// stashed across a suspend, deliberately deferred) — a blocking builtin
+/// reached via `Call` still executes inline here, byte-for-byte
+/// unchanged from pre-PR-cv2-10 behavior.
+fn call_actor(
+    actors: &mut [Option<PooledActor>],
+    local_id: usize,
+    fn_name: String,
+    args: Vec<crate::parallel::PortableValue>,
+    reply: std::sync::mpsc::Sender<Result<crate::parallel::PortableValue, (String, Span)>>,
+) {
+    let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) else {
+        let _ = reply.send(Err((
+            "internal error: concurrent instance already shut down or panicked".to_string(),
+            Span::default(),
+        )));
+        return;
+    };
+    let args: Vec<Value> = args.iter().map(crate::parallel::from_portable).collect();
+    let result = slot.interp.eval_method(Value::Component(0), &fn_name, args, Span::default());
+    let reply_msg = match result {
+        Ok(v) => match crate::parallel::to_portable(&v) {
+            Some(pv) => Ok(pv),
+            None => Err((
+                format!(
+                    "internal error: concurrent `{fn_name}`'s return value is not portable -- K0306 should have rejected this at check time"
+                ),
+                Span::default(),
+            )),
+        },
+        Err(Flow::Panic { msg, span, .. }) => Err((msg, span)),
+        Err(_) => Err((
+            "internal error: unexpected control flow escaped a concurrent expose call".to_string(),
+            Span::default(),
+        )),
+    };
+    let _ = reply.send(reply_msg);
+}
+
+/// Concurrency-v2 PR-cv2-10: performs a suspended handler's own blocking
+/// I/O call on a fresh, plain `std::thread::spawn` thread — `Send`-safe
+/// on its own terms, since `http_get`/`http_post`'s own arguments are
+/// always `Str` (see `Interp::blocking_builtin_static_name`'s own doc
+/// comment for why only these 2 of the 4 blocking builtins reach here):
+/// extracted to owned `String`s BEFORE crossing the thread boundary
+/// (mirrors `http_builtin`'s own internal `as_str` helper's exact
+/// Str-vs-other-Display split, so a non-`Str` argument — reachable only
+/// if a future caller passes something else — still converts identically
+/// to how a non-suspended call would have handled it), reconstructed as
+/// fresh, this-thread-local `Value`s once safely on the spawned thread.
+/// The result crosses back via `parallel::to_portable` (the SAME
+/// mechanism every other actor-boundary message already uses) — never a
+/// raw `Value`, which is not `Send`.
+fn spawn_blocking_io(
+    tx: std::sync::mpsc::Sender<WorkerCmd>,
+    local_id: usize,
+    builtin: &'static str,
+    args: Vec<Value>,
+) {
+    let str_args: Vec<String> = args
+        .iter()
+        .map(|v| match v {
+            Value::Str(s) => s.as_str().to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    std::thread::spawn(move || {
+        let values: Vec<Value> = str_args.into_iter().map(Value::str).collect();
+        let result = http_builtin(builtin, &values).map(|v| {
+            crate::parallel::to_portable(&v)
+                .expect("http_builtin's own return value is always a portable Result[Str, Str]")
+        });
+        let _ = tx.send(WorkerCmd::IoComplete { local_id, result });
+    });
 }
 
 /// How a `Remote` instance's actor code actually runs — see `ActorPool`'s
@@ -705,6 +1084,20 @@ pub struct Interp {
     /// safety net for if either restriction is ever lifted, exactly
     /// matching what this design already committed to.
     pub pending_remote_calls: std::collections::HashSet<usize>,
+    /// Concurrency-v2 PR-cv2-10 (`docs/design/ASYNC_IO.md` §5): `true`
+    /// only while executing a `Deliver`-triggered `on` handler's own body
+    /// (`run_handler` sets it, restores the previous value after) --
+    /// `exec_block`'s own top-level blocking-builtin-`let` check only
+    /// fires when this is `true`, scoping suspend/resume to that ONE
+    /// execution path deliberately (see `Flow::Suspend`'s own doc
+    /// comment for why `Call`/`expose fun` execution doesn't set this
+    /// yet). Default `false` for every ordinary `Interp` (coordinator,
+    /// dedicated-thread actor, or a pooled actor NOT currently inside
+    /// `run_handler`) — suspending only ever makes sense on an
+    /// `ActorPool` worker thread in the first place (checked separately,
+    /// via `POOL_WORKER_ID`), but this flag ALSO gates the Call-vs-
+    /// Deliver distinction, so both conditions are checked together.
+    pub allow_suspend: bool,
 }
 
 /// Maximum user-function call depth, shared by the interpreter and the KVM
@@ -783,6 +1176,7 @@ impl Interp {
             call_depth: 0,
             test_step_budget: None,
             pending_remote_calls: std::collections::HashSet::new(),
+            allow_suspend: false,
         }
     }
 
@@ -817,6 +1211,7 @@ impl Interp {
             call_depth: 0,
             test_step_budget: None,
             pending_remote_calls: std::collections::HashSet::new(),
+            allow_suspend: false,
         }
     }
 
@@ -835,6 +1230,7 @@ impl Interp {
             call_depth: 0,
             test_step_budget: None,
             pending_remote_calls: std::collections::HashSet::new(),
+            allow_suspend: false,
         }
     }
 
@@ -1998,18 +2394,59 @@ impl Interp {
         // for loop bodies that only assign (e.g. `while … { s = s + i; i = i + 1 }`).
         if block.stmts.iter().any(|s| matches!(s, Stmt::Let { .. })) {
             let scope = env.child();
-            let mut last = Value::Unit;
-            for stmt in &block.stmts {
-                last = self.exec_stmt(stmt, &scope)?;
-            }
-            Ok(last)
+            self.exec_stmts_checked(&block.stmts, &scope)
         } else {
-            let mut last = Value::Unit;
-            for stmt in &block.stmts {
-                last = self.exec_stmt(stmt, env)?;
-            }
-            Ok(last)
+            self.exec_stmts_checked(&block.stmts, env)
         }
+    }
+
+    /// Concurrency-v2 PR-cv2-10 (`docs/design/ASYNC_IO.md` §5): runs
+    /// `stmts` in `env`, checking each `Stmt::Let` for the blocking-
+    /// builtin top-level shape `K0295` already restricts to this EXACT
+    /// position — when `self.allow_suspend` is set (only true during a
+    /// `Deliver`-triggered handler's own body, see `allow_suspend`'s own
+    /// doc comment) AND this `Interp` is running on an `ActorPool`
+    /// worker thread (`POOL_WORKER_ID`), evaluates the builtin's own
+    /// arguments then bails out with `Flow::Suspend` instead of calling
+    /// it inline. Every other statement (and every case where suspend
+    /// isn't currently armed — the coordinator thread, a dedicated actor
+    /// thread, or a `Call`-triggered `expose fun`) runs exactly as
+    /// `exec_stmt` always has, so this is a strict superset of the
+    /// pre-PR-cv2-10 behavior, not a parallel code path that could drift
+    /// out of sync with it.
+    ///
+    /// Shared by both the FIRST execution of a block (`exec_block`) and
+    /// RESUMING a previously-suspended handler's own `remaining`
+    /// statements (`worker_loop`'s `WorkerCmd::IoComplete` handling) —
+    /// factored out so a CHAINED blocking call (`remaining` itself
+    /// containing ANOTHER top-level blocking `let`) is handled by the
+    /// identical logic, not a second, easy-to-drift-out-of-sync copy.
+    fn exec_stmts_checked(&mut self, stmts: &[Stmt], env: &Env) -> EvalResult {
+        let mut last = Value::Unit;
+        for (i, stmt) in stmts.iter().enumerate() {
+            if self.allow_suspend {
+                if let Stmt::Let { name, init, .. } = stmt {
+                    if let Some(builtin) = Self::blocking_builtin_static_name(init) {
+                        if POOL_WORKER_ID.with(|c| c.get()).is_some() {
+                            let ExprKind::Call { args, .. } = &init.kind else { unreachable!() };
+                            let mut vals = Vec::with_capacity(args.len());
+                            for a in args {
+                                vals.push(self.eval(&a.value, env)?);
+                            }
+                            return Err(Flow::Suspend(Box::new(SuspendedHandler {
+                                builtin,
+                                args: vals,
+                                bind_name: name.clone(),
+                                remaining: stmts[i + 1..].to_vec(),
+                                env: env.clone(),
+                            })));
+                        }
+                    }
+                }
+            }
+            last = self.exec_stmt(stmt, env)?;
+        }
+        Ok(last)
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &Env) -> EvalResult {
@@ -3184,6 +3621,35 @@ impl Interp {
             }
         }
         Err(Self::panic_flow(format!("unknown name `{name}`"), span))
+    }
+
+    /// Concurrency-v2 PR-cv2-10: `Some(name)` (the STATIC builtin name,
+    /// for `SuspendedHandler::builtin`) if `e` is a direct call to a
+    /// blocking builtin this runtime ACTUALLY knows how to suspend for.
+    ///
+    /// Deliberately narrower than `check.rs::is_blocking_builtin_call`
+    /// (which restricts all 4 blocking builtins syntactically, via
+    /// K0295): `http_get_with`/`read_file_with` take a `CapNet`/`CapFs`
+    /// capability as their FIRST argument, and `parallel::to_portable`
+    /// explicitly returns `None` for both (`value.rs`'s own opaque-by-
+    /// design variants) — meaning a captured `SuspendedHandler`'s own
+    /// arguments could NOT be safely handed to a spawned `Send`-safe I/O
+    /// thread for those two. Found live, before writing any spawn code,
+    /// not assumed. `http_get`/`http_post` take only `Str` arguments
+    /// (a URL, and for `http_post` a body), fully portable — those two
+    /// suspend for real in this v1. A call to `http_get_with`/
+    /// `read_file_with` still satisfies K0295's OWN syntactic
+    /// restriction (so it compiles), but at RUNTIME still executes
+    /// inline (blocking), identical to today's pre-PR-cv2-10 behavior —
+    /// an honest, documented v1 scope limit, not a silent gap.
+    fn blocking_builtin_static_name(e: &Expr) -> Option<&'static str> {
+        let ExprKind::Call { callee, args } = &e.kind else { return None };
+        let ExprKind::Ident(name) = &callee.kind else { return None };
+        match (name.as_str(), args.len()) {
+            ("http_get", 1) => Some("http_get"),
+            ("http_post", 2) => Some("http_post"),
+            _ => None,
+        }
     }
 
     fn eval_call(&mut self, callee: &Expr, args: &[Arg], span: Span, env: &Env) -> EvalResult {

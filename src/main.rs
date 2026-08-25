@@ -3949,6 +3949,219 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Concurrency-v2 PR-cv2-10 (`docs/design/ASYNC_IO.md` §5): the FIRST
+    /// live proof that the new suspend/resume scheduling logic in
+    /// `interp.rs` (`Flow::Suspend` / `SuspendedHandler` / `WorkerCmd::
+    /// IoComplete`) produces the CORRECT VALUE, not just that it doesn't
+    /// crash. A `concurrent component` handler's top-level
+    /// `let result = http_get(url)` suspends on an `ActorPool` worker,
+    /// the actual GET happens on a spawned thread against a real local
+    /// TCP server (avoiding any internet dependency, matching this
+    /// project's own `vm_http_serve_answers_real_requests` convention),
+    /// and the handler resumes with `result` correctly bound to the
+    /// server's own response body -- proving the `PortableValue` round
+    /// trip through `WorkerCmd::IoComplete` preserves the value exactly.
+    #[test]
+    fn concurrent_component_http_get_suspend_resume_produces_correct_value() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "suspend-resume-worked";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("kupl-suspend-correctness-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("suspend_correctness.kupl");
+        let src = format!(
+            "concurrent component Fetcher {{\n    intent \"suspends on a blocking http_get\"\n    \
+             in trigger: Str\n    on trigger(url) {{\n        let result = http_get(url)\n        \
+             match result {{\n            Ok(body) => print(\"GOT:{{body}}\"),\n            Err(e) => print(\"ERR:{{e}}\"),\n        }}\n    }}\n}}\n\
+             component Driver {{\n    intent \"fires once at startup\"\n    out fire: Str\n    \
+             on start {{ emit fire(\"http://127.0.0.1:{port}/\") }}\n}}\n\
+             app Main {{\n    intent \"suspend/resume correctness\"\n    \
+             let fetcher = Fetcher()\n    let driver = Driver()\n    wire driver.fire -> fetcher.trigger\n    \
+             on start {{ }}\n}}\n"
+        );
+        std::fs::write(&file, &src).unwrap();
+
+        let child = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.expect("kupl run must not hang while a handler is suspended on http_get");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "GOT:suspend-resume-worked\n",
+            "the resumed handler must see the real server response bound to `result`: {out:?}"
+        );
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrency-v2 PR-cv2-10: the DECISIVE test that the suspend/resume
+    /// mechanism actually frees a shared `ActorPool` worker during a slow
+    /// `http_get`, rather than merely appearing to work because pre-
+    /// existing OS-thread-level parallelism (PR-cv2-3's own multi-worker
+    /// pool) happens to mask a broken implementation. A naive 2-actor
+    /// test (1 slow, 1 fast) would NOT be decisive: with
+    /// `available_parallelism()` workers and only 2 top-level actors,
+    /// round-robin placement would likely land them on DIFFERENT workers
+    /// regardless of whether suspend/resume works at all. Instead this
+    /// drives `N_PINGERS` (chosen well above the worker count) alongside
+    /// one slow `Fetcher`, so by pigeonhole SOME pingers are statistically
+    /// forced to share a worker with `Fetcher` -- making the outcome
+    /// actually depend on the fix: without suspend/resume, any pinger
+    /// sharing that worker would be stuck behind the full 1.5s blocking
+    /// `http_get`; with it, every pinger's own `print` should reach stdout
+    /// almost immediately, well before the slow response arrives. Reads
+    /// `kupl run`'s stdout INCREMENTALLY (not via `.output()`, which only
+    /// yields data after the process exits) because the process itself
+    /// can't fully exit until the slow `Fetcher` finishes -- `io::stdout`
+    /// is internally `LineWriter`-buffered in Rust regardless of whether
+    /// it's a TTY or a pipe (confirmed against `interp.rs`'s own bare
+    /// `println!("{v}")` in its `print` builtin, no explicit flush call),
+    /// so each printed line is genuinely observable as it happens.
+    #[test]
+    fn concurrent_component_suspended_http_get_does_not_block_sibling_actors_sharing_its_worker() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        const N_PINGERS: usize = 60;
+        const SERVER_DELAY_MS: u64 = 1500;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(SERVER_DELAY_MS));
+                let body = "slow";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("kupl-suspend-nonblocking-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("suspend_nonblocking.kupl");
+        let mut src = String::from(
+            "concurrent component Fetcher {\n    intent \"slow http_get\"\n    in trigger: Str\n    \
+             on trigger(url) {\n        let result = http_get(url)\n        print(\"fetched\")\n    }\n}\n\
+             concurrent component Pinger {\n    intent \"fast, no I/O\"\n    prop id: Int\n    in ping: Str\n    \
+             on ping(x) {\n        print(\"pong:{id}\")\n    }\n}\n\
+             component Driver {\n    intent \"fires everything at startup\"\n    out fire_fetch: Str\n",
+        );
+        for i in 0..N_PINGERS {
+            src.push_str(&format!("    out fire_ping{i}: Str\n"));
+        }
+        src.push_str(&format!("    on start {{\n        emit fire_fetch(\"http://127.0.0.1:{port}/\")\n"));
+        for i in 0..N_PINGERS {
+            src.push_str(&format!("        emit fire_ping{i}(\"p{i}\")\n"));
+        }
+        src.push_str("    }\n}\napp Main {\n    intent \"non-blocking race test\"\n    let fetcher = Fetcher()\n");
+        for i in 0..N_PINGERS {
+            src.push_str(&format!("    let pinger{i} = Pinger(id: {i})\n"));
+        }
+        src.push_str("    let driver = Driver()\n    wire driver.fire_fetch -> fetcher.trigger\n");
+        for i in 0..N_PINGERS {
+            src.push_str(&format!("    wire driver.fire_ping{i} -> pinger{i}.ping\n"));
+        }
+        src.push_str("}\n");
+        std::fs::write(&file, &src).unwrap();
+
+        let mut child = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let start = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let elapsed = start.elapsed();
+                        let _ = tx.send((elapsed, line.trim_end().to_string()));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut pong_times = Vec::new();
+        let mut fetched_time = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok((elapsed, line)) => {
+                    if line.starts_with("pong:") {
+                        pong_times.push(elapsed);
+                    } else if line == "fetched" {
+                        fetched_time = Some(elapsed);
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = reader.join();
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.expect("kupl run must eventually exit");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+        assert_eq!(pong_times.len(), N_PINGERS, "every pinger must respond exactly once: {pong_times:?}");
+        let fetched_time = fetched_time.expect("Fetcher's own `fetched` line must appear");
+        let max_pong = pong_times.iter().max().copied().unwrap();
+        assert!(
+            max_pong < std::time::Duration::from_millis(SERVER_DELAY_MS / 2),
+            "every pinger must respond well before the slow http_get completes -- the SLOWEST \
+             pong arrived at {max_pong:?}, but the server was deliberately delayed {SERVER_DELAY_MS}ms; \
+             a pong this late means a pinger got stuck behind Fetcher's blocking I/O on a shared \
+             worker, i.e. suspend/resume is NOT actually freeing the worker"
+        );
+        assert!(
+            fetched_time >= std::time::Duration::from_millis(SERVER_DELAY_MS),
+            "the slow fetch must still take the full server delay: {fetched_time:?}"
+        );
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening PR-it894,
     /// an Explore survey finding, agentId a7ba91a6862653340, independently
     /// re-verified live before implementing -- see `callargs.rs`'s own doc
