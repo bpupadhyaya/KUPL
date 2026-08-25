@@ -540,6 +540,28 @@ in favor of the bigger remaining lever below — flagged here as a real,
 scoped, low-risk future micro-optimization if `concurrent component`
 memory at extreme scale (100,000+) ever becomes the binding constraint.
 
+**PR-cv2-8 (LIVE-IMPLEMENTED, 2026-08-24) — the "deprioritized" micro-
+optimization above, implemented after all.** Turned out to be lower-risk
+than the paragraph above estimated: grepping `interp.rs` for
+`self\.db\.` found only 18 read call sites total, all `.get()`/
+`.contains_key()`/`.clone()`-of-a-retrieved-value — none mutating
+`ProgramDb` itself — and grepping for `.db.<field>.insert/remove/clear/
+extend` across `interp.rs` AND `repl.rs` found zero matches, confirming
+`ProgramDb`'s contents are genuinely read-only after construction
+everywhere (`repl.rs`'s own `:upgrade` builds a whole NEW `Interp` via
+`Interp::new` rather than mutating an existing one's `db` field, so the
+change doesn't even touch that path). `Interp.db` changed from an owned
+`ProgramDb` to `Rc<ProgramDb>` — every one of those 18 read sites needed
+ZERO changes (`Rc<T>` auto-derefs to `&T`). `worker_loop`'s own
+`cached_db` now stores the `Rc` directly, reused via `Rc::clone` (O(1))
+for every actor on a worker instead of `ProgramDb::clone()`. **100,000
+actors: ~1.1GB → ~721MB peak RSS (~34% reduction)**, verified via a
+decisive test using the EXISTING `--max-memory` flag (bisected against
+both the fixed and a temporarily-reverted binary to find a cap — 650MB —
+that passes one and fails the other, a more precise regression signal
+than a wall-clock bound at this scale, where the TIME difference is
+real but modest). Full suite green twice. KUPL commit `102218e`.
+
 ### 4.4 v2/v3 (scope after §4.3 ships and is measured) — an STM-style
 ### `ref` primitive for genuinely shared cross-actor state
 
