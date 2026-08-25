@@ -612,6 +612,102 @@ boundary, every time, in public-facing documentation.
   meaningfully smaller, more tractable problem than general coroutines,
   and should get its OWN dedicated design document when/if it's actually
   pursued, not be folded into this one speculatively.
+
+  **LIVE-INVESTIGATED (2026-08-24, under the user's own standing
+  maximum-risk mandate, which explicitly asked whether a full green-
+  thread/stack-switching scheduler rewrite should be attempted next).
+  Two findings materially change this item's own priority and framing:**
+
+  1. **The premise that motivated investigating this — "KUPL needs
+     green threads to support Go/Erlang-scale actor counts" — turned
+     out to be FALSE by the time this investigation started.**
+     PR-cv2-5/PR-cv2-6 (§4.3's own entry above) had ALREADY solved
+     actor-count scaling through a completely different, much safer
+     mechanism (fixing two redundant per-actor AST clones): 100,000
+     concurrent actors now spawn in ~1.7s at ~11KB/actor with clean
+     linear scaling, using the EXISTING OS-thread-pool model, no green
+     threads needed. Stack-switching would NOT improve actor-count
+     scaling further — that problem is closed. The ONLY remaining gap
+     stack-switching would address is narrower: **a blocking I/O call
+     inside one actor's handler still occupies its whole worker for the
+     call's duration** (already honestly documented in §4.3's own
+     "shape of the fix" section) — genuine, but a much smaller target
+     than "support millions of actors," which is why this item stays
+     in §5 rather than being promoted to §4.
+  2. **Feasibility of the underlying mechanism, checked directly rather
+     than assumed**: `ucontext.h` (`getcontext`/`makecontext`/
+     `swapcontext`) — the zero-Cargo-dependency way to implement
+     stackful coroutines via the SYSTEM libc, since this project's own
+     zero-external-crate policy rules out `corosensei`/`generator`-style
+     crates — DOES compile, link, and correctly perform a real context
+     switch on this machine's current macOS/Xcode SDK, confirmed via a
+     standalone C program (`getcontext`+`makecontext`+`swapcontext`,
+     switching into a function and back), when `_XOPEN_SOURCE` is
+     defined. It compiles with deprecation warnings ("no longer
+     supported" since macOS 10.6) — functional today, but a real,
+     unquantified future-portability risk on macOS specifically; Linux
+     glibc's own `ucontext.h` is not deprecated and is the more stable
+     target. This is a genuinely useful, load-bearing fact for whoever
+     designs this next — it means the mechanism is NOT a dead end, contrary
+     to what an assumption-only pass might have concluded.
+
+  **Why this was NOT implemented in the same session that verified its
+  feasibility, despite the standing maximum-risk mandate authorizing
+  large architectural risk**: the specific risk here is categorically
+  different from every other risk taken in this initiative so far.
+  PR-cv2-1 through PR-cv2-6 all risked *architecture/performance*
+  regressions, each caught by a real, fast-running test before landing.
+  Hand-rolled stack-switching risks *silent memory corruption* in KUPL's
+  own interpreter core, through at least three specific, unresolved
+  hazards that a rushed implementation would not reliably catch even
+  with careful testing: (a) Rust relies on a guard page at each native
+  thread's stack boundary to turn stack overflow into a clean, caught
+  panic (this project's own `MAX_CALL_DEPTH`/PR-it1213 history shows how
+  seriously it treats this) — a manually-allocated coroutine stack needs
+  its OWN guard page (`mprotect`) set up correctly, or overflow silently
+  corrupts adjacent memory instead of panicking cleanly; (b) Rust's own
+  unwinding machinery (panic propagation) is not verified-safe across a
+  manually swapped stack without careful, specific handling; (c) every
+  `thread_local!` this initiative already built (`POOL_WORKER_ID`) is
+  keyed to the OS thread, not to a "logical" coroutine — multiplexing
+  several coroutines onto one OS thread via stack-switching would share
+  those thread-locals across all of them unless explicitly redesigned,
+  a subtle correctness trap easy to introduce without noticing. Getting
+  any of these wrong produces exactly the failure class this project has
+  spent 1200+ hardening iterations eliminating (silent wrong answers,
+  not clean panics) — and unlike a performance regression, a memory-
+  safety bug here would not be reliably caught by "did the existing test
+  suite still pass," since undefined behavior is not obligated to
+  manifest deterministically. Rushing this specific piece of work would
+  not be "maximum ambition" — it would be gambling the project's own
+  hard-won correctness bar for a speculative, narrow, not-yet-demonstrated-
+  as-needed capability (no real KUPL program has ever hit this — same
+  "real gap found and verified, not speculative" bar this project already
+  holds itself to elsewhere). This judgment call is explicitly permitted
+  by the mandate's own text ("if genuinely blocked... use judgment") and
+  does not relax the mandate for anything else in this initiative.
+
+  **What a future, careful pass on this should do, concretely, now that
+  the two findings above exist**: write a REAL dedicated design document
+  (matching `ASYNC.md`'s own pre-implementation rigor) that resolves the
+  three hazards above BEFORE any code — likely via `mprotect`-based guard
+  pages on each coroutine stack, an explicit audit of every
+  `thread_local!` a coroutine's own code path can reach, and a decision
+  on whether Rust's unwinding is provably safe here or whether panics
+  need to be caught and re-thrown across the switch point manually. Given
+  actor-count scaling is already solved, the ACTUAL target for this
+  work should be scoped down to just "don't block a worker's OTHER
+  actors during an `http_get`/`read_file` call," not general green
+  threads — which may make the narrower CPS-transform alternative (no
+  unsafe code at all, since the transform only needs to cover the small,
+  now-precisely-counted set of functions that can transitively reach one
+  of KUPL's 4 blocking builtins: `http_get`, `http_post`, `http_get_with`,
+  `read_file_with` — confirmed via direct grep; there is no real-
+  wall-clock `sleep` builtin in the language today, only the virtual
+  clock's `advance`) the SAFER first choice to design toward, even though
+  it touches more of the interpreter's own code structure than
+  stack-switching would.
+
 - **Built-in distribution** (Erlang/Swift-style, §3) — its own dedicated
   design pass, if ever pursued at all.
 - **A general reference-capability type system** (§3) — not retrofitted;
