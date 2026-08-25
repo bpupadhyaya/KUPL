@@ -488,6 +488,58 @@ continues this investigation — needs proper memory profiling (this
 session didn't have a heap profiler readily available and stopped
 ad-hoc guessing rather than keep burning effort on trial and error).
 
+**PR-cv2-6 (LIVE-IMPLEMENTED, 2026-08-24) — the question above, actually
+answered.** Continued past the "no profiler available" stopping point by
+building a minimal one: a temporary `pub fn current_allocated_bytes()`
+in `memcap.rs` (exposing the EXISTING `CappedAlloc` allocator's own
+net-bytes-allocated counter, already built for `--max-memory` and reused
+here for free) plus scratch trace points bracketing each phase of one
+actor's spawn. Found: ~100% of the per-actor cost was in the single line
+`Interp::new(db)` — not `instantiate_local`/`start_all`/`run_timers` at
+all. `Interp::new`'s own body calls `ProgramImage::from_db(&db)`
+internally — a SECOND full deep-clone of the whole program's AST, built
+again from the `db` PR-cv2-5's cache had JUST cheaply cloned, even
+though a perfectly good `Arc<ProgramImage>` was already in scope at both
+call sites. This bug predates the whole concurrency-v2 initiative
+(present since `concurrent component` was first built) — invisible
+before because dedicated-OS-thread creation overhead masked it, and
+nobody had benchmarked thousands of actors until this session did.
+Fixed via a new `Interp::new_with_image(db, image)` constructor that
+reuses the already-built image via `Arc::clone` instead of rebuilding.
+**Compounding with PR-cv2-5: 20,000 actors went from ~33.0s/~45.5GB to
+~0.35s/~232MB — ~94x faster, ~196x less memory.** Verified up to 100,000
+actors (1.71s, held linear scaling). All scratch instrumentation removed
+after the finding was confirmed — none of it shipped. Full suite green
+twice; a genuine revert-and-verify at decisive scale (20,000 actors,
+confirmed to fail predictably when reverted). KUPL commit `d8fb142`.
+
+**A refinement to the "~11KB/actor" figure above, PR-cv2-6's own follow-
+up investigation (same session, same technique)**: that number was
+itself inflated by measurement noise — `ALLOCATED` is a single
+process-wide atomic counter, and RSS/(actor count) conflates ALL 18
+worker threads' concurrent allocation activity together. Forcing the
+pool to a single worker (`ActorPool::get`'s own `n`, temporarily
+hardcoded to `1`, then reverted) for a clean trace found the TRUE
+steady-state net cost is ~4.2KB/actor, not ~11KB — comparable to
+lightweight-thread territory, not a cause for further alarm. Breakdown:
+~3KB in `ProgramDb::clone()` (seven small `HashMap`/`HashSet` fields,
+each paying its own minimum bucket allocation on clone regardless of
+entry count), ~1.2KB in `instantiate_local` (one `Env`, one state field,
+one `Instance` push), ~100 bytes in `Interp::new_with_image` itself.
+This is now a genuinely small, likely-near-floor number for the CURRENT
+per-actor-owns-its-own-`ProgramDb` architecture — further reduction
+would need `ProgramDb`'s own collections to be shared (not cloned) across
+every actor on a worker, which is architecturally sound (the AST is
+immutable after checking, never mutated by a plain `kupl run` actor) but
+would require changing `Interp.db`'s own TYPE from an owned `ProgramDb`
+to a shared reference, touching every call site that reads it — a real,
+larger refactor for a ~3KB/actor win (meaningful at huge scale, e.g.
+~300MB saved at 100,000 actors, but not transformative given the
+current ~232MB/20,000-actors baseline is already solid). Deprioritized
+in favor of the bigger remaining lever below — flagged here as a real,
+scoped, low-risk future micro-optimization if `concurrent component`
+memory at extreme scale (100,000+) ever becomes the binding constraint.
+
 ### 4.4 v2/v3 (scope after §4.3 ships and is measured) — an STM-style
 ### `ref` primitive for genuinely shared cross-actor state
 
