@@ -347,7 +347,14 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>) {
     // still gets a correctly fresh clone) and reuse a cheap `.clone()`
     // (a new `HashMap`, but `Rc::clone` per entry, never a re-copied AST)
     // for every later actor this worker hosts.
-    let mut cached_db: Option<(std::sync::Arc<crate::parallel::ProgramImage>, ProgramDb)> = None;
+    // Concurrency-v2 PR-cv2-8: `Rc<ProgramDb>`, not an owned `ProgramDb` --
+    // every actor on this worker now shares the SAME `Rc` via a cheap
+    // `Rc::clone` (an O(1) refcount bump) instead of `ProgramDb::clone()`
+    // (a fresh `HashMap` allocation per field, ~3KB/actor by itself, per
+    // PR-cv2-6's own refined measurement) -- sound because `ProgramDb`'s
+    // contents are never mutated after construction (`Interp`'s own `db`
+    // field doc comment has the full grep-confirmed argument).
+    let mut cached_db: Option<(std::sync::Arc<crate::parallel::ProgramImage>, std::rc::Rc<ProgramDb>)> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
             WorkerCmd::Spawn { comp_name, portable_args, span, image, ready_tx, shutdown_panic, local_id_tx } => {
@@ -383,7 +390,7 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>) {
                 let db = match &cached_db {
                     Some((cached_image, db)) if std::sync::Arc::ptr_eq(cached_image, &image) => db.clone(),
                     _ => {
-                        let fresh = image.actor_db();
+                        let fresh = std::rc::Rc::new(image.actor_db());
                         cached_db = Some((image.clone(), fresh.clone()));
                         fresh
                     }
@@ -620,7 +627,25 @@ impl InstanceSlot {
 }
 
 pub struct Interp {
-    pub db: ProgramDb,
+    /// Concurrency-v2 PR-cv2-8: `Rc<ProgramDb>`, not an owned `ProgramDb`
+    /// -- found while refining PR-cv2-6's own "~4.2KB/actor, mostly
+    /// `ProgramDb::clone()`'s seven small `HashMap`/`HashSet` fields"
+    /// measurement. `ProgramDb`'s contents are never mutated after
+    /// construction anywhere in this codebase (confirmed by grepping for
+    /// `.db.<field>.insert/remove/clear/extend` across `interp.rs` and
+    /// `repl.rs` — zero matches; every place that "changes" an `Interp`'s
+    /// own program data does so by building a WHOLE NEW `Interp` via
+    /// `Interp::new`, never by mutating an existing one's `db` field in
+    /// place, e.g. `repl.rs`'s own `:upgrade`/redefinition mechanism).
+    /// Given that, sharing it via `Rc::clone` (an O(1) refcount bump)
+    /// instead of `ProgramDb::clone()` (a fresh `HashMap` allocation per
+    /// field) removes that ~3KB/actor entirely for every actor sharing a
+    /// pool worker with an already-spawned sibling — `worker_loop`'s own
+    /// `cached_db` now stores this `Rc` directly. Every existing
+    /// `self.db.<field>` read call site is unaffected by this change
+    /// (`Rc<ProgramDb>` auto-derefs to `&ProgramDb`, so no other call site
+    /// in this codebase needed to change at all).
+    pub db: std::rc::Rc<ProgramDb>,
     pub instances: Vec<InstanceSlot>,
     pub queue: VecDeque<(usize, String, Value)>,
     /// Instance currently executing a handler (target of `emit`).
@@ -747,7 +772,7 @@ impl Interp {
     pub fn new(db: ProgramDb) -> Interp {
         let image = Some(crate::parallel::ProgramImage::from_db(&db));
         Interp {
-            db,
+            db: std::rc::Rc::new(db),
             instances: Vec::new(),
             queue: VecDeque::new(),
             current: None,
@@ -779,7 +804,7 @@ impl Interp {
     /// coordinator's own image by construction (there is no mechanism for
     /// an actor to run against a DIFFERENT program than the one it was
     /// spawned from).
-    pub fn new_with_image(db: ProgramDb, image: std::sync::Arc<crate::parallel::ProgramImage>) -> Interp {
+    pub fn new_with_image(db: std::rc::Rc<ProgramDb>, image: std::sync::Arc<crate::parallel::ProgramImage>) -> Interp {
         Interp {
             db,
             instances: Vec::new(),
@@ -799,7 +824,7 @@ impl Interp {
     /// own `par_map` calls stay sequential (no nested thread explosion).
     pub fn new_bare(db: ProgramDb) -> Interp {
         Interp {
-            db,
+            db: std::rc::Rc::new(db),
             instances: Vec::new(),
             queue: VecDeque::new(),
             current: None,
@@ -1196,7 +1221,7 @@ impl Interp {
         std::thread::Builder::new()
             .stack_size(crate::parallel::WORKER_STACK_SIZE)
             .spawn(move || {
-            let db = image.actor_db();
+            let db = std::rc::Rc::new(image.actor_db());
             // Concurrency-v2 PR-cv2-6: `new_with_image`, not `new` -- see
             // that constructor's own doc comment; the SAME redundant
             // `ProgramImage::from_db` rebuild `worker_loop`'s pooled path

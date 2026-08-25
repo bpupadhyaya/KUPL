@@ -3714,6 +3714,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Concurrency-v2 PR-cv2-8: `Interp.db` changed from an owned
+    /// `ProgramDb` to an `Rc<ProgramDb>` -- `worker_loop`'s own
+    /// `cached_db` now shares ONE `Rc<ProgramDb>` across every actor on a
+    /// worker via a cheap `Rc::clone` (an O(1) refcount bump) instead of
+    /// `ProgramDb::clone()` (a fresh `HashMap`/`HashSet` allocation per
+    /// field, ~3KB/actor by itself, per PR-cv2-6's own refined
+    /// measurement -- sound because `ProgramDb`'s contents are never
+    /// mutated after construction anywhere in this codebase, confirmed by
+    /// grep). Rather than a time-based bound (the wall-clock difference
+    /// is real but modest at this scale, a less decisive signal), this
+    /// test uses the EXISTING `--max-memory` flag to test the memory
+    /// claim DIRECTLY. The exact threshold below was found by bisecting
+    /// `--max-memory` against BOTH the fixed and (temporarily) reverted
+    /// binary at 100,000 actors on the same quiet machine: fixed PASSES
+    /// down to a 650MB cap (peaks around there); reverted FAILS (a K0902
+    /// abort) starting at a 700MB cap already -- 650MB sits cleanly
+    /// inside the fixed side, confirmed to reject the reverted binary.
+    #[test]
+    fn perf_guard_100000_concurrent_actors_stay_under_a_memory_bound_between_shared_and_cloned_db() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-actor-pool-memguard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("mem_guard.kupl");
+        const N: usize = 100_000;
+        let mut src = String::from(
+            "concurrent component Worker {\n    intent \"actor\"\n    state total: Int = 0\n    \
+             expose fun bump(x: Int) -> Int {\n        total = total + x\n        total\n    }\n}\n\
+             app Main {\n    intent \"many sibling actors\"\n",
+        );
+        for i in 0..N {
+            src.push_str(&format!("    let a{i} = Worker()\n"));
+        }
+        src.push_str("    on start {\n        print(\"{a0.bump(1)}\")\n    }\n}\n");
+        std::fs::write(&file, &src).unwrap();
+
+        let out = std::process::Command::new(&bin)
+            .args(["run", "--max-memory=650", file.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).is_empty(),
+            "must not hit the memory cap -- if this fails, `worker_loop`'s own `Rc<ProgramDb>` \
+             sharing (PR-cv2-8) may have regressed back to per-actor cloning: {:?}",
+            out.stderr
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Concurrency-v2 PR-cv2-3: a `concurrent component` spawned from CODE
     /// already running on a pool worker's own thread (a NESTED `concurrent`
     /// child) must still get a DEDICATED thread, never join the pool --
