@@ -498,8 +498,14 @@ proven that genuinely-shared cross-actor state is a real, recurring need
 "a real gap found+fixed" discipline, never a speculative feature added
 because a reference language has it.
 
-### 4.5 v1 (documentation-only, ship alongside §4.1) — precise, honest
-### safety-guarantee documentation
+### 4.5 v1 (documentation-only) — precise, honest safety-guarantee
+### documentation
+
+**SHIPPED (PR-cv2-4, 2026-08-24)** — later than "alongside §4.1" as
+originally planned, but landed once §4.3's own thread-model change made
+this the natural moment to also refresh the now-slightly-stale "1
+dedicated OS thread per instance" wording. See `docs/PRODUCTION.md`'s own
+"Mostly single-threaded execution" bullet for the shipped text.
 
 Update `docs/design/ASYNC.md` and/or `docs/PRODUCTION.md` with a
 Rust-Book-precise statement of what KUPL's `concurrent component` model

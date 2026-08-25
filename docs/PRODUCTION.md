@@ -222,16 +222,41 @@ Being honest about what is not yet production-grade:
   `par_map`/`par_filter` DO spawn real OS threads (`std::thread::spawn`)
   when the callback is a pure top-level function and the list is large
   (≥ 256 elements). A `concurrent component` (see the language
-  reference's own §7.2) also gets a real, dedicated OS thread per
-  instance — `expose` calls block for a real reply, and wires can
-  deliver messages into its inbox non-blocking — but it's opt-in, has a
-  real portability restriction on its public surface (K0306), can't yet
-  be a wire's source, and its recurring timers only fire during its
-  initial startup burst. Everything else — the structured `par { … }`
+  reference's own §7.2) also runs on a real OS thread — `expose` calls
+  block for a real reply, and wires can deliver messages into its inbox
+  non-blocking — but it's opt-in, has a real portability restriction on
+  its public surface (K0306), can't yet be a wire's source, and its
+  recurring timers only fire during its initial startup burst. As of
+  `docs/design/CONCURRENCY_V2.md` §4.3, a top-level `concurrent`
+  instance is multiplexed onto a small, fixed pool of worker threads
+  rather than getting a dedicated thread of its own (a `concurrent`
+  component nested inside another actor's own subtree still gets a
+  dedicated thread) — an internal scheduling detail with no effect on
+  program behavior, only on how many OS threads a program with many
+  actors actually costs. Everything else — the structured `par { … }`
   fork-join block itself, `par_each`, and an ORDINARY (non-`concurrent`)
   component instance's own handler dispatch — remains single-threaded (a
   general-purpose M:N scheduler for those is a later, larger step; see
   `docs/design/ASYNC.md`).
+
+  **The precise safety guarantee, stated exactly, not overclaimed or
+  underclaimed** (`docs/design/CONCURRENCY_V2.md` §4.5): a `concurrent
+  component` boundary prevents DATA RACES on any value crossing it — every
+  message is deep-copied (`parallel.rs::to_portable`/`from_portable`), so
+  no two actors, nor an actor and its coordinator, ever hold a live,
+  mutably-shared reference to the same data. It does **not** prevent
+  DEADLOCK between two actors each blocked in a `Call` to the other — that
+  class is *refused*, not prevented by construction: a call that would
+  close a cycle back to an actor already waiting (transitively) on the
+  caller is rejected immediately with a clean panic
+  (`"concurrent call cycle through instance {id}"`,
+  `docs/design/ASYNC.md` §8.4) rather than hung on forever. It does not
+  (yet) provide Swift/Kotlin-style *structured* lifetime scoping (an
+  actor's lifetime isn't tied to an enclosing scope the way a structured-
+  concurrency task group's is) — KUPL's static, declarative `let x =
+  Comp()` spawning is closer to "structured by construction" than an
+  unstructured `go`/`Thread::spawn` call, but this is a real, named gap,
+  not a claimed equivalence.
 - **`kupl build`/`bundle`/`native` now have a persistent, content-addressed build
   cache — `kupl run`/`kupl run --vm` do not.** `~/.kupl/build-cache/` holds the
   final artifact bytes for a given (source content, compiler identity) pair;
