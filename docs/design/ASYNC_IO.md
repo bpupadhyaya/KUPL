@@ -15,7 +15,15 @@ captured and handed to a spawned I/O thread. `Call`-triggered
 `expose fun` execution also does not suspend in v1 (only
 `Deliver`-triggered handler bodies do) — deferred because suspending a
 `Call` needs its own reply channel stashed across the suspend, a more
-complex feature not needed for the FIRST slice. Written under the
+complex feature not needed for the FIRST slice. A THIRD inline-only
+case, found live (PR-cv2-12): a blocking call nested inside a called
+PRIVATE `fun` (not directly a top-level statement of the handler's own
+body) also executes inline rather than suspending — `SuspendedHandler`
+can only represent a single stack frame's continuation, so the runtime
+gates the suspend attempt on `self.call_depth == 0` and falls back to
+inline execution for anything deeper, rather than silently losing the
+outer handler's remaining execution (see §7's own item on this for the
+full story). Written under the
 Concurrency V2 initiative's own standing maximum-risk
 mandate, as the authorized, SAFE alternative to full stack-switching
 (see `CONCURRENCY_V2.md` §5's own PR-cv2-7 entry for why hand-rolled
@@ -260,18 +268,30 @@ struct SuspendedHandler {
 ## 7. Open questions — resolved during PR-cv2-10 implementation
 
 - Does the top-level-only restriction apply to a `concurrent
-  component`'s plain (non-`expose`) private `fun`s too? STILL OPEN —
-  K0295's checker restriction (PR-cv2-9) covers `c.funs` per its own
-  implementation, but the runtime suspend logic added in PR-cv2-10
-  (`exec_stmts_checked`) only fires when `Interp.allow_suspend` is set,
-  which is only true directly around a `Deliver`-triggered handler's
-  own `exec_block` call — a private `fun` called FROM a handler runs
-  with whatever `allow_suspend` state its caller left it in (still
-  `true`, since nothing resets it mid-handler), so in practice a
-  blocking call inside a reachable private `fun` DOES suspend correctly
-  today. Not deliberately designed for; not yet covered by a dedicated
-  test. A real gap to close with explicit test coverage, not a
-  confirmed-safe behavior.
+  component`'s plain (non-`expose`) private `fun`s too? RESOLVED
+  (PR-cv2-12) — K0295's checker restriction (PR-cv2-9) covers `c.funs`
+  per its own implementation, so this shape passes the checker either
+  way. An EARLIER version of this doc claimed the runtime ALSO
+  suspends correctly for this shape, reasoning that `Interp.
+  allow_suspend` stays set across a nested `call_fun` — that claim was
+  WRONG, caught by writing the actual test rather than trusting the
+  reasoning. `SuspendedHandler` captures only ONE stack frame's own
+  continuation (the current block's remaining statements + bind name +
+  env); when the blocking call is nested inside a called private
+  `fun`, a flat single-frame suspend would resume ONLY that fun's own
+  remaining statements — its return value never reaching back to the
+  handler's own `let x = helper(...)` binding, and the handler's own
+  remaining statements silently NEVER RUNNING. Confirmed live: empty
+  output, exit 0, no crash, no diagnostic. Fixed in `exec_stmts_checked`
+  by gating the suspend attempt on `self.call_depth == 0` (directly in
+  the handler's own top-level body, the one shape `SuspendedHandler`
+  can actually represent) — a call nested inside a private `fun` now
+  falls through to ordinary INLINE (blocking) execution instead,
+  joining `http_get_with`/`read_file_with` as a third, now-documented
+  v1 shape that satisfies K0295 syntactically but does not genuinely
+  suspend at runtime. Covered by a dedicated live test
+  (`main.rs::concurrent_component_http_get_inside_a_private_helper_
+  fun_runs_inline_and_produces_the_right_value`).
 - Cross-engine consistency: RE-CONFIRMED LIVE at implementation time —
   `concurrent component` remains interp.rs-only; PR-cv2-10 touches only
   `interp.rs` (plus this doc and `main.rs` tests), no `vm.rs`/

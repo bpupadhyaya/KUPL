@@ -4079,6 +4079,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Concurrency-v2 PR-cv2-12 (`docs/design/ASYNC_IO.md` §7's own item
+    /// (a), left open by PR-cv2-10/11): a REAL bug found+fixed while
+    /// writing THIS test. K0295 already covers `c.funs` (confirmed in
+    /// `check.rs`), so a top-level blocking call inside a PRIVATE
+    /// (non-`expose`) `fun` passes the checker -- and it was initially
+    /// assumed (per this doc's own earlier §7 wording, WRONGLY -- since
+    /// corrected) that it would also suspend/resume correctly at runtime, on the
+    /// reasoning that `Interp.allow_suspend` stays set across a nested
+    /// `call_fun` and `exec_stmts_checked` only checks that flag. Running
+    /// this exact test FIRST (before assuming the reasoning was correct)
+    /// showed empty output, exit 0 -- no crash, but the handler's own
+    /// `print` after the `helper(url)` call never ran. Root cause:
+    /// `SuspendedHandler` captures only ONE stack frame's continuation
+    /// (the current block's own remaining statements + bind name + env)
+    /// -- when the blocking call is nested inside a called private `fun`,
+    /// resuming replays only THAT fun's own remaining statements; its
+    /// return value never makes it back to the handler's own `let x =
+    /// helper(...)` binding, and the handler's own remaining statements
+    /// silently never run. Fixed in `exec_stmts_checked` by only
+    /// attempting the flat suspend when `self.call_depth == 0` (directly
+    /// in the handler's own top-level body, the one shape `SuspendedHandler`
+    /// can represent correctly) -- a nested call now falls through to
+    /// ordinary INLINE (blocking) execution instead, exactly like
+    /// `http_get_with`/`read_file_with` already do for their own
+    /// different reason. This test now proves the CORRECTED behavior:
+    /// the call produces the right value and the process doesn't hang,
+    /// even though it does NOT genuinely suspend for this shape.
+    #[test]
+    fn concurrent_component_http_get_inside_a_private_helper_fun_runs_inline_and_produces_the_right_value() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "inline-inside-a-private-fun";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("kupl-blocking-call-in-private-fun-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("blocking_call_in_private_fun.kupl");
+        let src = format!(
+            "concurrent component Fetcher {{\n    intent \"a blocking call nested inside a private helper fun\"\n    \
+             in trigger: Str\n    \
+             fun helper(url: Str) -> Str {{\n        let result = http_get(url)\n        \
+             match result {{\n            Ok(body) => body,\n            Err(e) => e,\n        }}\n    }}\n    \
+             on trigger(url) {{\n        let body = helper(url)\n        print(\"GOT:{{body}}\")\n    }}\n}}\n\
+             component Driver {{\n    intent \"fires once at startup\"\n    out fire: Str\n    \
+             on start {{ emit fire(\"http://127.0.0.1:{port}/\") }}\n}}\n\
+             app Main {{\n    intent \"blocking call inside a private fun\"\n    \
+             let fetcher = Fetcher()\n    let driver = Driver()\n    wire driver.fire -> fetcher.trigger\n    \
+             on start {{ }}\n}}\n"
+        );
+        std::fs::write(&file, &src).unwrap();
+
+        let errs = std::process::Command::new(&bin).args(["check", file.to_str().unwrap()]).output().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&errs.stderr).contains("K0295"),
+            "a top-level let-bound blocking call inside a private fun must not be K0295: {errs:?}"
+        );
+
+        let child = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.expect("kupl run must not hang on a blocking call nested inside a private fun");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "GOT:inline-inside-a-private-fun\n",
+            "the handler must see the real server response AND its own remaining statement \
+             (this `print`) must actually run -- a regression here would mean the private-fun \
+             case is silently losing the outer handler's continuation again: {out:?}"
+        );
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Concurrency-v2 PR-cv2-10: the DECISIVE test that the suspend/resume
     /// mechanism actually frees a shared `ActorPool` worker during a slow
     /// `http_get`, rather than merely appearing to work because pre-

@@ -2427,7 +2427,39 @@ impl Interp {
             if self.allow_suspend {
                 if let Stmt::Let { name, init, .. } = stmt {
                     if let Some(builtin) = Self::blocking_builtin_static_name(init) {
-                        if POOL_WORKER_ID.with(|c| c.get()).is_some() {
+                        // A REAL bug found+fixed (Concurrency-v2 PR-cv2-12,
+                        // caught while adding a live test for exactly this
+                        // shape — `docs/design/ASYNC_IO.md` §7's own item
+                        // (a)): `SuspendedHandler` captures ONLY the
+                        // CURRENT block's own remaining statements + bind
+                        // name + env — a single stack frame's worth of
+                        // continuation, not a real call-stack capture (see
+                        // §2/§3 of that doc for why: a genuine CPS
+                        // transform covering arbitrary nesting is
+                        // explicitly out of scope). When the blocking call
+                        // is nested inside a PRIVATE `fun` called from the
+                        // handler (`self.call_depth > 0`, via `call_fun`),
+                        // suspending here would resume ONLY that private
+                        // fun's own remaining statements on `IoComplete` —
+                        // its return value would never make it back to the
+                        // handler's own `let x = helper(...)` binding, and
+                        // the handler's own remaining statements (anything
+                        // after that call) would silently NEVER RUN. No
+                        // crash, no diagnostic — just incomplete handler
+                        // execution, confirmed live via a test that
+                        // printed nothing at all before this fix. Only
+                        // attempt the flat, single-frame suspend when
+                        // `call_depth == 0` (directly in the Deliver-
+                        // triggered handler's own top-level body, the ONE
+                        // shape `SuspendedHandler` can actually represent
+                        // correctly) — a nested call falls through to
+                        // ordinary inline (blocking) execution instead,
+                        // exactly like `http_get_with`/`read_file_with`
+                        // already do for their own, different reason.
+                        // K0295 still accepts this shape syntactically
+                        // (it covers `c.funs` too); this is a RUNTIME
+                        // scope limitation, not a checker gap.
+                        if self.call_depth == 0 && POOL_WORKER_ID.with(|c| c.get()).is_some() {
                             let ExprKind::Call { args, .. } = &init.kind else { unreachable!() };
                             let mut vals = Vec::with_capacity(args.len());
                             for a in args {
