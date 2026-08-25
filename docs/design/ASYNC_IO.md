@@ -1,9 +1,14 @@
 # Non-blocking I/O for `concurrent component` handlers — design doc
 
-**Status: design only, not yet implemented.** Written under the
-Concurrency V2 initiative's own standing maximum-risk mandate, as the
-authorized, SAFE alternative to full stack-switching (see
-`CONCURRENCY_V2.md` §5's own PR-cv2-7 entry for why hand-rolled
+**Status: §4/§6's own RESTRICTION (the diagnostic, K0295) is
+IMPLEMENTED — PR-cv2-9, KUPL commit `a065cce`. The actual §5 scheduling
+logic (suspend/resume, the new `WorkerCmd`/`PooledActor` fields) is
+NOT YET implemented** — every blocking call still blocks its worker
+exactly as before; only the checker-side shape restriction exists so
+far, landed first and independently per §9's own sequencing advice.
+Written under the Concurrency V2 initiative's own standing maximum-risk
+mandate, as the authorized, SAFE alternative to full stack-switching
+(see `CONCURRENCY_V2.md` §5's own PR-cv2-7 entry for why hand-rolled
 stack-switching was investigated and deliberately not rushed — three
 specific, unresolved memory-safety hazards). This document exists
 because §5 itself says this item "should get its OWN dedicated design
