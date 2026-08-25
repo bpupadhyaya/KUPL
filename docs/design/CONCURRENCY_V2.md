@@ -465,6 +465,29 @@ dedicated-thread child); 200-sibling-actor isolation confirmed live; a
 genuine revert-and-verify for both fixes (each measurably regresses when
 undone); full suite green twice.
 
+**PR-cv2-5 (LIVE-IMPLEMENTED, 2026-08-24) — the open question above,
+partially but not fully answered.** `worker_loop` was calling
+`ProgramImage::actor_db` (the full-program deep-clone) on EVERY actor
+spawn, even though PR-cv2-3 already made many actors share one worker —
+redundant, since the clone only needs to happen ONCE per worker. Caching
+it (`worker_loop`'s own `cached_db`, keyed by `Arc::ptr_eq` against the
+`ProgramImage`) roughly HALVES both wall-clock time and peak memory for
+many-actor programs, measured cleanly on a quiet machine: 6000 actors
+went from ~6.0-6.4s/several-GB to ~3.0-3.5s, confirmed via a genuine
+revert-and-verify. This is a REAL, substantial fix — but it does NOT
+fully close the open question above. Re-measuring peak RSS per actor
+AFTER this fix still shows GROWTH, not a flat per-actor constant: ~152KB/
+actor at 1000 actors, ~707KB/actor at 6000 actors — smaller in absolute
+terms than before, but still clearly superlinear, and its root cause is
+NOT YET IDENTIFIED (checked and ruled out: `Interp`/`PooledActor`/
+`Instance`/`ProgramDb`'s own `size_of` are all a few hundred bytes each,
+nowhere near hundreds of KB; `run_timers(100)` is a no-op for a
+timer-free component; `Vec` reallocation is standard amortized-O(1)).
+Left as a genuinely open, NOT-yet-explained question for whoever
+continues this investigation — needs proper memory profiling (this
+session didn't have a heap profiler readily available and stopped
+ad-hoc guessing rather than keep burning effort on trial and error).
+
 ### 4.4 v2/v3 (scope after §4.3 ships and is measured) — an STM-style
 ### `ref` primitive for genuinely shared cross-actor state
 

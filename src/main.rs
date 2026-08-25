@@ -3654,23 +3654,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Concurrency-v2 PR-cv2-5: `worker_loop` used to call
-    /// `ProgramImage::actor_db` (a full deep-clone of every function AND
-    /// component AST in the WHOLE program) for EVERY SINGLE actor spawn,
-    /// even after PR-cv2-3 made many actors share one worker thread.
-    /// Caching the clone once per WORKER (reused via a cheap `.clone()` --
-    /// a new `HashMap`, but `Rc::clone` per entry, never a re-copied AST)
-    /// roughly HALVES both wall-clock time and peak memory at this scale --
-    /// live-measured, back to back on the same quiet machine, over 2 runs
-    /// each: 6000 flat sibling top-level actors took ~6.0-6.4s reverted vs
-    /// ~3.1s fixed. This test drives 6000 actors and asserts BOTH
-    /// correctness AND a time bound roughly midway between those two
-    /// numbers (comfortable margin on the fixed side, well under the
-    /// reverted side) -- confirmed to actually catch a reversion of this
-    /// specific fix by temporarily reverting it and re-running this exact
-    /// test before landing.
+    /// Concurrency-v2 PR-cv2-5 + PR-cv2-6: two compounding fixes to the
+    /// SAME root problem -- every concurrent-actor spawn was doing not
+    /// one but TWO full deep-clones of the whole program's function/
+    /// component ASTs. PR-cv2-5: `worker_loop` called `ProgramImage::
+    /// actor_db` (clone #1) on EVERY spawn, even though PR-cv2-3 already
+    /// made many actors share one worker -- fixed by caching it once per
+    /// WORKER. PR-cv2-6 (found via a live allocation trace while
+    /// investigating why PR-cv2-5 alone didn't fully explain a residual
+    /// per-actor memory cost): `Interp::new`'s OWN body calls
+    /// `ProgramImage::from_db(&db)` internally (clone #2, on the
+    /// ALREADY-cloned `db`!) even when a perfectly good `Arc<ProgramImage>`
+    /// is already in scope -- fixed by a new `Interp::new_with_image`
+    /// constructor that reuses it via a cheap `Arc::clone` instead.
+    /// Compounding effect, live-measured on the same quiet machine: 20000
+    /// flat sibling top-level actors took ~33.0s / ~45.5GB peak RSS with
+    /// PR-cv2-6 alone reverted (PR-cv2-5 still in place) vs ~0.35s /
+    /// ~232MB with both fixes in place -- roughly 94x faster, 196x less
+    /// memory. This test drives 20000 actors (large enough that either
+    /// fix regressing individually would clearly blow the bound below)
+    /// and asserts BOTH correctness AND a decisive time bound -- confirmed
+    /// to actually catch a reversion of PR-cv2-6 specifically (with
+    /// PR-cv2-5 still in place) by temporarily reverting it and
+    /// re-running this exact scenario before landing.
     #[test]
-    fn perf_guard_6000_concurrent_actors_spawn_well_within_a_generous_time_bound() {
+    fn perf_guard_20000_concurrent_actors_spawn_well_within_a_generous_time_bound() {
         let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
         if !bin.exists() {
             return;
@@ -3678,7 +3686,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kupl-actor-pool-perf-guard-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("perf_guard.kupl");
-        const N: usize = 6000;
+        const N: usize = 20000;
         let mut src = String::from(
             "concurrent component Worker {\n    intent \"actor\"\n    state total: Int = 0\n    \
              expose fun bump(x: Int) -> Int {\n        total = total + x\n        total\n    }\n}\n\
@@ -3696,11 +3704,11 @@ mod tests {
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "{out:?}");
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "spawning 6000 concurrent actors took {elapsed:?} (fixed cost measures ~3.1s, \
-             reverted cost ~6.0-6.4s on this same machine) -- if this fails, the per-worker \
-             `ProgramDb` cache (see `worker_loop`'s own `cached_db`) may have regressed back to \
-             cloning the whole program's AST on every single actor spawn"
+            elapsed < std::time::Duration::from_secs(10),
+            "spawning 20000 concurrent actors took {elapsed:?} (fixed cost measures ~0.35s, \
+             PR-cv2-6-reverted cost ~33s on this same machine) -- if this fails, either the \
+             per-worker `ProgramDb` cache (`worker_loop`'s own `cached_db`, PR-cv2-5) or the \
+             `Interp::new_with_image` reuse (PR-cv2-6) may have regressed"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

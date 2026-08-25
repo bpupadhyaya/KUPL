@@ -388,7 +388,14 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>) {
                         fresh
                     }
                 };
-                let mut actor = Interp::new(db);
+                // Concurrency-v2 PR-cv2-6: `new_with_image` (not `new`) --
+                // `image` is already the exact `Arc<ProgramImage>` this
+                // actor must run against (see that constructor's own doc
+                // comment for why `Interp::new`'s own internal
+                // `ProgramImage::from_db(&db)` rebuild was a second,
+                // redundant full-AST deep-clone on top of `actor_db`'s
+                // own, found via a live allocation trace).
+                let mut actor = Interp::new_with_image(db, image.clone());
                 let comp = actor
                     .db
                     .components
@@ -748,6 +755,40 @@ impl Interp {
             globals: Env::new(),
             now: 0,
             image,
+            call_depth: 0,
+            test_step_budget: None,
+            pending_remote_calls: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Concurrency-v2 PR-cv2-6: identical to `new`, except it takes an
+    /// ALREADY-BUILT `Arc<ProgramImage>` instead of building a fresh one
+    /// from `db` via `ProgramImage::from_db` -- found while investigating
+    /// PR-cv2-5's own "residual per-actor cost, not yet identified"
+    /// question: `Interp::new`'s own `ProgramImage::from_db(&db)` call was
+    /// doing a SECOND full deep-clone of every function/component AST for
+    /// EVERY actor (the FIRST being `ProgramImage::actor_db`'s own clone,
+    /// already cached per-worker by PR-cv2-5) -- live-confirmed via a
+    /// scratch allocation trace as the dominant cost, ~588KB-620KB of the
+    /// ~588KB measured per actor. Both `worker_loop`'s `WorkerCmd::Spawn`
+    /// handler and `spawn_dedicated_actor` already HAVE a perfectly good
+    /// `Arc<ProgramImage>` in scope (the same one `ActorPool`/the
+    /// dedicated-thread closure was handed at spawn time) -- reusing it
+    /// via a cheap `Arc::clone` instead of rebuilding is always correct,
+    /// since a `concurrent` actor's own image must be identical to its
+    /// coordinator's own image by construction (there is no mechanism for
+    /// an actor to run against a DIFFERENT program than the one it was
+    /// spawned from).
+    pub fn new_with_image(db: ProgramDb, image: std::sync::Arc<crate::parallel::ProgramImage>) -> Interp {
+        Interp {
+            db,
+            instances: Vec::new(),
+            queue: VecDeque::new(),
+            current: None,
+            print_unwired: false,
+            globals: Env::new(),
+            now: 0,
+            image: Some(image),
             call_depth: 0,
             test_step_budget: None,
             pending_remote_calls: std::collections::HashSet::new(),
@@ -1156,7 +1197,11 @@ impl Interp {
             .stack_size(crate::parallel::WORKER_STACK_SIZE)
             .spawn(move || {
             let db = image.actor_db();
-            let mut actor = Interp::new(db);
+            // Concurrency-v2 PR-cv2-6: `new_with_image`, not `new` -- see
+            // that constructor's own doc comment; the SAME redundant
+            // `ProgramImage::from_db` rebuild `worker_loop`'s pooled path
+            // had also applied here, on the dedicated-thread path.
+            let mut actor = Interp::new_with_image(db, image.clone());
             let comp = actor
                 .db
                 .components
