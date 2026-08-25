@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::ast::FunDecl;
 use crate::diag::Span;
-use crate::value::{IntW, Value};
+use crate::value::{CapFsInner, CapNetInner, IntW, Value};
 
 /// Below this length, the thread setup isn't worth it — stay sequential.
 const THRESHOLD: usize = 256;
@@ -47,6 +47,21 @@ pub enum PortableValue {
     Map(Vec<(PortableValue, PortableValue)>),
     Set(Vec<PortableValue>),
     Range(i64, i64, bool),
+    /// Concurrency-v2 PR-cv2-14: a capability's own carried scope is
+    /// plain, `Send`-safe data (`Option<String>`, per `CapNetInner`/
+    /// `CapFsInner`'s own definitions in `value.rs`) — there was never a
+    /// technical reason this couldn't round-trip; it was grouped with
+    /// the genuinely opaque, reference-identity-bearing variants
+    /// (`Closure`/`Fun`/`Component`/`Bound`/`VmClosure`) mostly out of
+    /// "no round-trip worth inventing yet," not a real Send-safety or
+    /// capability-security concern — `to_portable`/`from_portable` are
+    /// internal-only (no KUPL builtin calls either directly), so this
+    /// never lets user code forge a capability from a bare string; it
+    /// only ever round-trips a capability value that already existed.
+    /// Added specifically to let `http_get_with`/`read_file_with`
+    /// genuinely suspend (see `interp.rs`'s own `spawn_blocking_io`).
+    CapNet(Option<String>),
+    CapFs(Option<String>),
 }
 
 /// Convert a `Value` to its portable form, or `None` if it holds anything
@@ -117,19 +132,14 @@ pub fn to_portable(v: &Value) -> Option<PortableValue> {
                     }
                 }
                 Value::Range(a, b, inc) => results.push(PortableValue::Range(*a, *b, *inc)),
-                Value::Closure(_)
-                | Value::Fun(_)
-                | Value::Component(_)
-                | Value::Bound(..)
-                | Value::VmClosure(..)
-                // Opaque by design (see value.rs's own doc comment) -- no
-                // `PortableValue::CapNet`/`CapFs` round-trip is worth
-                // inventing just for the real-thread `par_map`/`par_filter`
-                // fast path; falls back to the sequential engine like
-                // every other opaque/reference-identity-bearing value
-                // above.
-                | Value::CapNet(_)
-                | Value::CapFs(_) => return None,
+                // Concurrency-v2 PR-cv2-14: see `PortableValue::CapNet`'s
+                // own doc comment -- plain `Send`-safe scope data, no
+                // longer grouped with the genuinely opaque variants below.
+                Value::CapNet(c) => results.push(PortableValue::CapNet(c.allowed_host.clone())),
+                Value::CapFs(c) => results.push(PortableValue::CapFs(c.allowed_prefix.clone())),
+                Value::Closure(_) | Value::Fun(_) | Value::Component(_) | Value::Bound(..) | Value::VmClosure(..) => {
+                    return None
+                }
             },
             Frame::BuildList(n) => {
                 let items = results.split_off(results.len() - n);
@@ -213,6 +223,12 @@ pub fn from_portable(p: &PortableValue) -> Value {
                     }
                 }
                 PortableValue::Range(a, b, inc) => results.push(Value::Range(*a, *b, *inc)),
+                PortableValue::CapNet(host) => {
+                    results.push(Value::CapNet(Rc::new(CapNetInner { allowed_host: host.clone() })))
+                }
+                PortableValue::CapFs(prefix) => {
+                    results.push(Value::CapFs(Rc::new(CapFsInner { allowed_prefix: prefix.clone() })))
+                }
             },
             Frame::BuildList(n) => {
                 let items = results.split_off(results.len() - n);
@@ -943,6 +959,30 @@ mod tests {
     fn portable_is_send_sync() {
         assert_send_sync::<PortableValue>();
         assert_send_sync::<Arc<ProgramImage>>();
+    }
+
+    /// Concurrency-v2 PR-cv2-14: `CapNet`/`CapFs` used to be grouped with
+    /// the genuinely opaque variants (`Closure`/`Fun`/`Component`/
+    /// `Bound`/`VmClosure`), returning `None` from `to_portable` --
+    /// but a capability's own carried scope is plain `Option<Str>` data.
+    /// Round-trips both an unrestricted (root, `None`) and a narrowed
+    /// (`Some(host)`) capability of each kind, confirming the resulting
+    /// `Value` is structurally equal to the original (`CapNetInner`/
+    /// `CapFsInner` both derive `PartialEq`).
+    #[test]
+    fn capnet_and_capfs_round_trip_through_portable_value() {
+        use crate::value::{CapFsInner, CapNetInner, Value};
+        let root_net = Value::CapNet(std::rc::Rc::new(CapNetInner { allowed_host: None }));
+        let scoped_net =
+            Value::CapNet(std::rc::Rc::new(CapNetInner { allowed_host: Some("example.com".to_string()) }));
+        let root_fs = Value::CapFs(std::rc::Rc::new(CapFsInner { allowed_prefix: None }));
+        let scoped_fs =
+            Value::CapFs(std::rc::Rc::new(CapFsInner { allowed_prefix: Some("/tmp/allowed".to_string()) }));
+        for v in [&root_net, &scoped_net, &root_fs, &scoped_fs] {
+            let pv = to_portable(v).unwrap_or_else(|| panic!("{v:?} must be portable"));
+            let back = from_portable(&pv);
+            assert_eq!(back, *v, "round trip must preserve the capability's own scope exactly: {v:?}");
+        }
     }
 
     /// A REAL, live-confirmed bug found+fixed (production-hardening

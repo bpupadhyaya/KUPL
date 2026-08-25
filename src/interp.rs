@@ -834,38 +834,55 @@ fn call_actor(
     let _ = reply.send(reply_msg);
 }
 
-/// Concurrency-v2 PR-cv2-10: performs a suspended handler's own blocking
-/// I/O call on a fresh, plain `std::thread::spawn` thread — `Send`-safe
-/// on its own terms, since `http_get`/`http_post`'s own arguments are
-/// always `Str` (see `Interp::blocking_builtin_static_name`'s own doc
-/// comment for why only these 2 of the 4 blocking builtins reach here):
-/// extracted to owned `String`s BEFORE crossing the thread boundary
-/// (mirrors `http_builtin`'s own internal `as_str` helper's exact
-/// Str-vs-other-Display split, so a non-`Str` argument — reachable only
-/// if a future caller passes something else — still converts identically
-/// to how a non-suspended call would have handled it), reconstructed as
-/// fresh, this-thread-local `Value`s once safely on the spawned thread.
-/// The result crosses back via `parallel::to_portable` (the SAME
-/// mechanism every other actor-boundary message already uses) — never a
-/// raw `Value`, which is not `Send`.
+/// Concurrency-v2 PR-cv2-10/14: performs a suspended handler's own
+/// blocking I/O call on a fresh, plain `std::thread::spawn` thread —
+/// `Send`-safe via the SAME `PortableValue` round trip every other
+/// actor-boundary message already uses (never a raw `Value`, which is
+/// not `Send`): converted to portable form on the CALLING worker thread
+/// (before spawning), reconstructed as fresh, this-thread-local
+/// `Value`s once safely on the spawned thread. As of PR-cv2-14 all 4
+/// blocking builtins reach here (`http_get`/`http_post`'s own `Str`-only
+/// arguments were always portable; `http_get_with`/`read_file_with`'s
+/// `CapNet`/`CapFs` first argument is now ALSO portable, see
+/// `PortableValue::CapNet`'s own doc comment) — dispatches to the right
+/// underlying function by `builtin` name, mirroring `eval_call`'s own
+/// inline dispatch for the SAME 4 names exactly.
 fn spawn_blocking_io(
     tx: std::sync::mpsc::Sender<WorkerCmd>,
     local_id: usize,
     builtin: &'static str,
     args: Vec<Value>,
 ) {
-    let str_args: Vec<String> = args
-        .iter()
-        .map(|v| match v {
-            Value::Str(s) => s.as_str().to_string(),
-            other => other.to_string(),
-        })
-        .collect();
+    let portable_args: Vec<crate::parallel::PortableValue> =
+        match args.iter().map(crate::parallel::to_portable).collect::<Option<Vec<_>>>() {
+            Some(pv) => pv,
+            None => {
+                let _ = tx.send(WorkerCmd::IoComplete {
+                    local_id,
+                    result: Err(format!(
+                        "internal error: an argument to `{builtin}` is not portable -- K0295/K0306 should have rejected this at check time"
+                    )),
+                });
+                return;
+            }
+        };
     std::thread::spawn(move || {
-        let values: Vec<Value> = str_args.into_iter().map(Value::str).collect();
-        let result = http_builtin(builtin, &values).map(|v| {
+        let values: Vec<Value> = portable_args.iter().map(crate::parallel::from_portable).collect();
+        let outcome: Result<Value, String> = match builtin {
+            "http_get" | "http_post" => http_builtin(builtin, &values),
+            "http_get_with" => match &values[1] {
+                Value::Str(url) => http_get_with(&values[0], url),
+                _ => Err("internal error: http_get_with needs a Str url -- the checker should have rejected this".to_string()),
+            },
+            "read_file_with" => match &values[1] {
+                Value::Str(path) => read_file_with(&values[0], path),
+                _ => Err("internal error: read_file_with needs a Str path -- the checker should have rejected this".to_string()),
+            },
+            _ => unreachable!("Interp::blocking_builtin_static_name only ever returns one of these 4 names"),
+        };
+        let result = outcome.map(|v| {
             crate::parallel::to_portable(&v)
-                .expect("http_builtin's own return value is always a portable Result[Str, Str]")
+                .expect("every blocking builtin's own return value is always a portable Result[Str, Str]")
         });
         let _ = tx.send(WorkerCmd::IoComplete { local_id, result });
     });
@@ -3655,31 +3672,30 @@ impl Interp {
         Err(Self::panic_flow(format!("unknown name `{name}`"), span))
     }
 
-    /// Concurrency-v2 PR-cv2-10: `Some(name)` (the STATIC builtin name,
-    /// for `SuspendedHandler::builtin`) if `e` is a direct call to a
-    /// blocking builtin this runtime ACTUALLY knows how to suspend for.
+    /// Concurrency-v2 PR-cv2-10/14: `Some(name)` (the STATIC builtin
+    /// name, for `SuspendedHandler::builtin`) if `e` is a direct call to
+    /// a blocking builtin this runtime ACTUALLY knows how to suspend
+    /// for.
     ///
-    /// Deliberately narrower than `check.rs::is_blocking_builtin_call`
-    /// (which restricts all 4 blocking builtins syntactically, via
-    /// K0295): `http_get_with`/`read_file_with` take a `CapNet`/`CapFs`
-    /// capability as their FIRST argument, and `parallel::to_portable`
-    /// explicitly returns `None` for both (`value.rs`'s own opaque-by-
-    /// design variants) — meaning a captured `SuspendedHandler`'s own
-    /// arguments could NOT be safely handed to a spawned `Send`-safe I/O
-    /// thread for those two. Found live, before writing any spawn code,
-    /// not assumed. `http_get`/`http_post` take only `Str` arguments
-    /// (a URL, and for `http_post` a body), fully portable — those two
-    /// suspend for real in this v1. A call to `http_get_with`/
-    /// `read_file_with` still satisfies K0295's OWN syntactic
-    /// restriction (so it compiles), but at RUNTIME still executes
-    /// inline (blocking), identical to today's pre-PR-cv2-10 behavior —
-    /// an honest, documented v1 scope limit, not a silent gap.
+    /// All 4 of `check.rs::is_blocking_builtin_call`'s own K0295-
+    /// restricted builtins are recognized here as of PR-cv2-14 —
+    /// `http_get_with`/`read_file_with` originally weren't (their
+    /// `CapNet`/`CapFs` first argument used to be one of
+    /// `parallel::to_portable`'s opaque-by-design variants, so a
+    /// captured `SuspendedHandler`'s own arguments couldn't safely cross
+    /// to a spawned I/O thread) — PR-cv2-14 added `PortableValue::
+    /// CapNet`/`CapFs` (see that type's own doc comment for why this was
+    /// always safe: a capability's carried scope is plain `Option<Str>`
+    /// data, and this round-trip never lets user code forge one), so all
+    /// 4 builtins now genuinely suspend, not just 2.
     fn blocking_builtin_static_name(e: &Expr) -> Option<&'static str> {
         let ExprKind::Call { callee, args } = &e.kind else { return None };
         let ExprKind::Ident(name) = &callee.kind else { return None };
         match (name.as_str(), args.len()) {
             ("http_get", 1) => Some("http_get"),
             ("http_post", 2) => Some("http_post"),
+            ("http_get_with", 2) => Some("http_get_with"),
+            ("read_file_with", 2) => Some("read_file_with"),
             _ => None,
         }
     }
@@ -8533,6 +8549,88 @@ fun main() uses io { let _ = http_serve(38131, handle) }
             .expect("server should recover and serve a fresh request after the unread response times out");
         assert!(resp.ends_with("GET /world"), "resp: {resp}");
         drop(stalled);
+    }
+}
+
+#[cfg(test)]
+mod spawn_blocking_io_tests {
+    use super::{spawn_blocking_io, WorkerCmd};
+    use crate::value::{CapFsInner, CapNetInner, Value};
+
+    /// Concurrency-v2 PR-cv2-14: `spawn_blocking_io`'s own dispatch for
+    /// `http_get_with`/`read_file_with` (added this PR, alongside making
+    /// `CapNet`/`CapFs` portable) has NO reachable live KUPL-program-level
+    /// test — reaching a genuinely `Deliver`-triggered, suspending
+    /// handler requires the `app` path (the only thing that calls
+    /// `Interp::start_all`), and v0.1 apps must be self-contained (no
+    /// props) while `cap_net_root()`/`cap_fs_root()` may only be called
+    /// in `fun main`'s own top-level body — a capability can never reach
+    /// an app's own child tree at all, a separate, pre-existing
+    /// restriction unrelated to concurrency (confirmed live: `app Main {
+    /// let f = Fetcher(cap: cap_net_root()) }` fails with a real K0304
+    /// error, and giving the app itself a prop fails with "apps must be
+    /// self-contained"). Rather than leave this dispatch logic entirely
+    /// untested, this test calls it DIRECTLY (it's a private fn in this
+    /// same module) exactly like `worker_loop`'s own `Flow::Suspend`
+    /// handling would, against a real local TCP server — proving the
+    /// NEW code path itself is correct, independent of whether a full
+    /// KUPL program can currently reach it end to end.
+    #[test]
+    fn spawn_blocking_io_dispatches_http_get_with_correctly() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "capnet-worked";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cap = Value::CapNet(std::rc::Rc::new(CapNetInner { allowed_host: None }));
+        let url = Value::str(format!("http://127.0.0.1:{port}/"));
+        spawn_blocking_io(tx, 0, "http_get_with", vec![cap, url]);
+        let WorkerCmd::IoComplete { local_id, result } = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
+        else {
+            panic!("expected an IoComplete message");
+        };
+        assert_eq!(local_id, 0);
+        let value = crate::parallel::from_portable(&result.expect("http_get_with must succeed"));
+        assert_eq!(value, Value::ok(Value::str("capnet-worked".to_string())));
+        let _ = server.join();
+    }
+
+    /// Sibling case for `read_file_with` — a real temp file, a `CapFs`
+    /// scoped to its own directory, same direct-call technique as the
+    /// `http_get_with` test above and for the identical reason.
+    #[test]
+    fn spawn_blocking_io_dispatches_read_file_with_correctly() {
+        let dir = std::env::temp_dir().join(format!("kupl-spawn-blocking-io-capfs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.txt");
+        std::fs::write(&file, "read-file-with-worked").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cap = Value::CapFs(std::rc::Rc::new(CapFsInner { allowed_prefix: Some(dir.to_str().unwrap().to_string()) }));
+        let path = Value::str(file.to_str().unwrap().to_string());
+        spawn_blocking_io(tx, 7, "read_file_with", vec![cap, path]);
+        let WorkerCmd::IoComplete { local_id, result } = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
+        else {
+            panic!("expected an IoComplete message");
+        };
+        assert_eq!(local_id, 7);
+        let value = crate::parallel::from_portable(&result.expect("read_file_with must succeed"));
+        assert_eq!(value, Value::ok(Value::str("read-file-with-worked".to_string())));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

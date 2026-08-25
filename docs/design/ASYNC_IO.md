@@ -4,26 +4,41 @@
 IMPLEMENTED — PR-cv2-9, KUPL commit `a065cce`. The actual §5 scheduling
 logic (suspend/resume: `Flow::Suspend`/`SuspendedHandler`,
 `WorkerCmd::IoComplete`, `PooledActor.suspended`/`.pending`/
-`.pending_stop`) is now ALSO IMPLEMENTED — PR-cv2-10. v1 scope, stated
-honestly: only `http_get`/`http_post` (both `Str`-only arguments)
-genuinely suspend; `http_get_with`/`read_file_with` still satisfy
-K0295's syntactic restriction but execute inline (blocking) at
-runtime, because their `CapNet`/`CapFs` argument is deliberately
-opaque to `parallel::to_portable` (see `interp.rs`'s own
-`blocking_builtin_static_name` doc comment) and so cannot be safely
-captured and handed to a spawned I/O thread. `Call`-triggered
-`expose fun` execution also does not suspend in v1 (only
-`Deliver`-triggered handler bodies do) — deferred because suspending a
-`Call` needs its own reply channel stashed across the suspend, a more
-complex feature not needed for the FIRST slice. A THIRD inline-only
-case, found live (PR-cv2-12): a blocking call nested inside a called
-PRIVATE `fun` (not directly a top-level statement of the handler's own
-body) also executes inline rather than suspending — `SuspendedHandler`
-can only represent a single stack frame's continuation, so the runtime
-gates the suspend attempt on `self.call_depth == 0` and falls back to
-inline execution for anything deeper, rather than silently losing the
-outer handler's remaining execution (see §7's own item on this for the
-full story). Written under the
+`.pending_stop`) is now ALSO IMPLEMENTED — PR-cv2-10. As of PR-cv2-14,
+ALL 4 blocking builtins (`http_get`, `http_post`, `http_get_with`,
+`read_file_with`) genuinely suspend at the runtime-dispatch level —
+`http_get_with`/`read_file_with`'s `CapNet`/`CapFs` argument was
+originally treated as opaque to `parallel::to_portable` (grouped with
+genuinely non-portable types like closures), but a capability's own
+carried scope is plain `Option<Str>` data with no technical Send-safety
+obstacle; `PortableValue::CapNet`/`CapFs` (PR-cv2-14) now round-trip it
+safely, and `check.rs::is_portable_ty` no longer rejects a `CapNet`/
+`CapFs` prop on a `concurrent component` (K0306) either. **However**,
+PR-cv2-14 also found a SEPARATE, pre-existing structural fact,
+unrelated to concurrency: a capability can never reach an `app`'s own
+child tree at all in v0.1 — `cap_net_root()`/`cap_fs_root()` may only
+be called in `fun main`'s own top-level body (K0304), and v0.1 apps
+must be self-contained (no props), so there is no expressible path for
+a capability to enter an app-rooted program. Since reaching a
+`Deliver`-triggered (suspend-capable) handler ALSO requires the `app`
+path (the only thing that calls `Interp::start_all`), `http_get_with`/
+`read_file_with` suspending is therefore un-exercisable by any full
+KUPL program today, even though the underlying mechanism is now
+correct and independently tested (`interp.rs`'s own
+`spawn_blocking_io_tests`, calling `spawn_blocking_io` directly).
+`Call`-triggered `expose fun` execution also does not suspend in v1
+(only `Deliver`-triggered handler bodies do) — deferred because
+suspending a `Call` needs its own reply channel stashed across the
+suspend, a more complex feature not needed for the FIRST slice. A
+THIRD inline-only case, found live (PR-cv2-12): a blocking call nested
+inside a called PRIVATE `fun` (not directly a top-level statement of
+the handler's own body) also executes inline rather than suspending —
+`SuspendedHandler` can only represent a single stack frame's
+continuation, so the runtime gates the suspend attempt on
+`self.call_depth == 0` and falls back to inline execution for anything
+deeper, rather than silently losing the outer handler's remaining
+execution (see §7's own item on this for the full story). Written
+under the
 Concurrency V2 initiative's own standing maximum-risk
 mandate, as the authorized, SAFE alternative to full stack-switching
 (see `CONCURRENCY_V2.md` §5's own PR-cv2-7 entry for why hand-rolled
@@ -347,6 +362,24 @@ struct SuspendedHandler {
   `interp.rs` for the fix (defer the teardown until the actor is idle
   again). A reminder that "the design doc says this edge case is
   probably fine" is not the same as verifying it.
+- A NEW finding from PR-cv2-14, entirely OUTSIDE this document's own
+  original scope but discovered while trying to make `http_get_with`/
+  `read_file_with` genuinely suspend: v0.1 `app`s must be self-contained
+  (no props — confirmed live: `app Main { prop cap: CapNet ... }`
+  refuses to run with "app `Main` requires props (cap) — v0.1 apps must
+  be self-contained"), and `cap_net_root()`/`cap_fs_root()` may only be
+  called in `fun main`'s own top-level body (K0304) — so there is NO
+  expressible KUPL program where a capability reaches an app's own
+  child tree, at ANY nesting depth, `concurrent` or not. This is a
+  genuinely separate, pre-existing gap in how capabilities and apps
+  compose (not something this PR introduced or is responsible for
+  fixing) — flagged here because it's exactly what makes
+  `http_get_with`/`read_file_with`'s newly-correct suspend logic
+  currently unreachable via any full program, only independently unit-
+  tested. Worth a dedicated look by whoever next touches either
+  `docs/design/CAPABILITIES.md` or the `app` self-contained restriction
+  — e.g. permitting K0304 to also allow a direct call in an app's own
+  top-level body, or allowing apps to declare props after all.
 
 ## 8. Verification plan (matches this project's own established discipline)
 

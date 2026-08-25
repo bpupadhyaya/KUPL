@@ -25,9 +25,11 @@ use crate::types::{ComponentSig, ContractSig, IntW, Ty, TypeSig, Unifier, Varian
 /// real, unscoped future work, not attempted here. `Component`/`Contract`
 /// (a live component reference or dynamic-dispatch handle) and `Fun` (a
 /// closure) are never portable, matching `to_portable`'s own existing
-/// exclusions exactly. `CapNet`/`CapFs` (capability tokens) are also
-/// excluded: whether/how a capability can cross a thread boundary is a
-/// separate design question this function does not attempt to answer.
+/// exclusions exactly. `CapNet`/`CapFs` (capability tokens) ARE portable
+/// (Concurrency-v2 PR-cv2-14) — a capability's own carried scope is
+/// plain `Option<Str>` data, round-tripped via `parallel::PortableValue::
+/// CapNet`/`CapFs`; this is what lets a `concurrent component` take one
+/// as a prop at all.
 fn is_portable_ty(ty: &Ty) -> bool {
     match ty {
         Ty::Int
@@ -43,17 +45,22 @@ fn is_portable_ty(ty: &Ty) -> bool {
         | Ty::Unit
         | Ty::Event
         | Ty::Range
-        | Ty::Tensor => true,
+        | Ty::Tensor
+        // Concurrency-v2 PR-cv2-14: a capability's own carried scope is
+        // plain `Option<Str>` data (`parallel::PortableValue::CapNet`/
+        // `CapFs`, added this PR) -- genuinely portable, unlike
+        // `Named`/`Component`/`Fun` below, which carry real reference
+        // identity or code. This is what lets a `concurrent component`
+        // take a `CapNet`/`CapFs` PROP at all (constructed in `fun
+        // main`'s own top level per K0304, passed in), a prerequisite
+        // for `http_get_with`/`read_file_with` to be callable from
+        // inside such a component's own handler in the first place.
+        | Ty::CapNet
+        | Ty::CapFs => true,
         Ty::List(inner) | Ty::Option(inner) | Ty::Set(inner) => is_portable_ty(inner),
         Ty::Result(ok, err) => is_portable_ty(ok) && is_portable_ty(err),
         Ty::Map(k, v) => is_portable_ty(k) && is_portable_ty(v),
-        Ty::CapNet
-        | Ty::CapFs
-        | Ty::Named(_, _)
-        | Ty::Component(_)
-        | Ty::Contract(_)
-        | Ty::Fun(_, _)
-        | Ty::Var(_) => false,
+        Ty::Named(_, _) | Ty::Component(_) | Ty::Contract(_) | Ty::Fun(_, _) | Ty::Var(_) => false,
     }
 }
 
@@ -6000,6 +6007,27 @@ mod generic_tests {
         assert!(
             !errs3.iter().any(|d| d.code == "K0306"),
             "List[Int] port must be portable, no K0306: {errs3:?}"
+        );
+    }
+
+    /// Concurrency-v2 PR-cv2-14: a `CapNet`/`CapFs` prop on a `concurrent
+    /// component` used to be K0306 (grouped with genuinely opaque types
+    /// like `Component`/`Fun` in `is_portable_ty`) -- but a capability's
+    /// own carried scope is plain `Option<Str>` data, now round-tripped
+    /// via `parallel::PortableValue::CapNet`/`CapFs`, so this restriction
+    /// was never actually necessary. This is what lets `http_get_with`/
+    /// `read_file_with` be callable at all inside a `concurrent
+    /// component` that holds one as a prop.
+    #[test]
+    fn concurrent_component_capnet_and_capfs_props_are_portable_no_k0306() {
+        let src = "concurrent component Fetcher {\n    prop cap: CapNet\n}\n\
+                    concurrent component Reader {\n    prop cap: CapFs\n}\n\
+                    app Root {\n}\n\
+                    fun main() uses io { print(\"x\") }\n";
+        let errs = errors(src);
+        assert!(
+            !errs.iter().any(|d| d.code == "K0306"),
+            "a CapNet/CapFs prop on a concurrent component must NOT be K0306: {errs:?}"
         );
     }
 
