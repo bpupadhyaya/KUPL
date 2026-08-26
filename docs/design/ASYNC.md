@@ -753,3 +753,57 @@ as an actual, automated test shape rather than leaving it as prose.
 
 VM/native are untouched throughout (§8.8) — this entire plan is
 interp-only, exactly as `par{}` itself started at it99.
+
+## 9. Selective receive and bounded mailboxes (DONE, interp-only)
+
+### 9.1 Selective receive
+
+`receive { port1(pat1) [if guard1] => { .. }  port2(pat2) => { .. }  ... }`
+is a new expression, valid only inside a `concurrent component`'s own
+`on <port>` handler or exposed-fun body, as the ENTIRE right-hand side of
+a top-level `let` (K0310 — never a bare statement, never nested inside a
+private `fun`/`if`/loop, never inside `on start`/`on stop`/`on every`/
+`on after`). Each arm names one of the component's own declared `in`
+ports and a pattern (reusing the same `Pattern`/`match_pattern` machinery
+`match` already has) to destructure that port's payload.
+
+Semantics, matching Erlang's own core `receive` guarantee: waits for the
+next message addressed to ANY of the named ports whose payload matches
+that arm's pattern (and guard, if present) — SKIPPING OVER, not
+discarding, any earlier-arrived non-matching message, which remains in
+the mailbox in its original relative order for a LATER handler/`receive`
+to consume. A port claimed by any `receive` arm may not also have a
+top-level `on <port>` handler (K0311 — the two would race for the same
+messages). `receive` is `concurrent`-only (K0312) and interp-only —
+neither the KVM nor native has an actor mailbox to receive from, so both
+reject it at compile time (K0809) rather than silently misbehaving.
+
+Implementation: `receive` suspends via the SAME `Flow::Suspend`/
+`SuspendChain` mechanism §8's blocking builtins already use (a new
+`SuspendChain.receive_arms` field distinguishes the two), reusing
+`WorkerCmd::IoComplete`'s existing frame/reply/drain resume logic
+end-to-end rather than a second, parallel implementation. A message
+arriving for a port ANY `receive` arm in the component names is routed
+into the actor's own `pending` mailbox unconditionally (not just while
+already suspended) — otherwise a message sent before the actor's first
+`receive` call would be silently dispatched-and-dropped by the ordinary
+no-handler-found path, a real divergence from Erlang's own guarantee
+that every sent message waits in the mailbox regardless of receiver
+readiness.
+
+### 9.2 Bounded mailboxes (overflow protection, not sender back-pressure)
+
+`PooledActor.pending` is capped at `MAILBOX_CAP` (100,000 messages,
+`interp.rs`) — a backstop against a genuine bug (a `receive`-only port
+with no consumer, or an actor stuck suspended a very long time) growing
+this queue without bound, not a normal-operation limit. Exceeding it is
+a clean, diagnosed panic that kills the actor (fail fast), not silent
+unbounded growth and not a hang.
+
+This is v1: overflow protection, NOT true sender-side back-pressure (the
+SENDER blocking/retrying until the receiver's mailbox has room, the way
+a bounded Go channel does). Real back-pressure would need a new
+cross-thread signaling protocol between the sending and receiving
+actors' own worker threads — a substantially larger change, deliberately
+left for a future increment once (or if) a real KUPL program demonstrates
+the fail-fast behavior here isn't sufficient.

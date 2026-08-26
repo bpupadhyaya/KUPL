@@ -465,7 +465,13 @@ struct PooledActor {
     /// once the suspend resolves (`WorkerCmd::IoComplete`'s own handling
     /// drains this after a successful resume, one at a time, stopping
     /// early if resuming ITSELF suspends again via a chained blocking
-    /// call).
+    /// call). Selective receive additionally routes every `Deliver` for
+    /// a `receive_ports` port here UNCONDITIONALLY (not just while
+    /// suspended) — see `receive_ports`'s own doc comment. Capped at
+    /// `MAILBOX_CAP` (`enqueue_pending`) — a real, if edge-case, DoS/OOM
+    /// risk otherwise: a `receive`-only port with a slow or entirely
+    /// missing consumer, or an actor stuck suspended for a long time,
+    /// would previously grow this queue completely unbounded.
     pending: std::collections::VecDeque<ActorMsg>,
     /// Concurrency-v2 PR-cv2-10 (a REAL bug caught by live verification,
     /// not a hypothetical): `WorkerCmd::Stop` arrives through the SAME
@@ -699,9 +705,7 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                                 let _ = tx.send(WorkerCmd::IoComplete { local_id, result: receive_result_to_io(result) });
                             }
                             None => {
-                                if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
-                                    slot.pending.push_back(msg);
-                                }
+                                let _ = enqueue_pending(&mut actors, local_id, msg);
                             }
                         }
                     }
@@ -719,9 +723,7 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                                 .and_then(|s| s.as_ref())
                                 .is_some_and(|slot| slot.receive_ports.contains(&port)) =>
                         {
-                            if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
-                                slot.pending.push_back(ActorMsg::Deliver(port, pv));
-                            }
+                            let _ = enqueue_pending(&mut actors, local_id, ActorMsg::Deliver(port, pv));
                         }
                         ActorMsg::Deliver(port, pv) => deliver_to_actor(&mut actors, &tx, local_id, port, pv),
                         ActorMsg::Call { fn_name, args, reply, .. } => {
@@ -1154,6 +1156,50 @@ fn start_or_satisfy_suspend(actors: &mut [Option<PooledActor>], tx: &std::sync::
     if let Some(result) = outcome {
         let _ = tx.send(WorkerCmd::IoComplete { local_id, result: receive_result_to_io(result) });
     }
+}
+
+/// Bounded mailboxes: the maximum number of `ActorMsg`s any ONE actor's
+/// own `pending` queue may hold at once. Deliberately generous (this is
+/// a backstop against a genuine bug/DoS -- a stuck consumer or an
+/// unconsumed `receive`-only port -- not a normal-operation limit; the
+/// existing `perf_guard_100000_concurrent_actors...` test already
+/// exercises 100,000 whole ACTORS without strain, so one actor's own
+/// mailbox holding up to this many messages is a comparable order of
+/// magnitude, not an arbitrary small number that would surprise a real
+/// program). This is v1: an overflow is a clean, diagnosed panic (fail
+/// fast, not silent unbounded growth) -- NOT true sender-side back-
+/// pressure (the sender blocking/retrying until space frees up), which
+/// would need its own new cross-thread signaling protocol between the
+/// sending and receiving actors' own worker threads and is deliberately
+/// left as a future increment; see `enqueue_pending`'s own doc comment.
+const MAILBOX_CAP: usize = 100_000;
+
+/// Bounded mailboxes: the ONE place any `ActorMsg` is ever pushed onto
+/// `PooledActor::pending` -- both call sites (`WorkerCmd::Msg`'s own
+/// suspended-queueing branches) now go through this instead of a bare
+/// `push_back`, so the `MAILBOX_CAP` guard can never be bypassed by a
+/// future third call site forgetting to check it. `Ok(())` on success;
+/// `Err(())` means the actor was ALREADY at capacity and has been
+/// killed with a clean panic (`shutdown_panic` + `kill_actor`, the SAME
+/// mechanism every other actor-ending failure in this file uses) -- the
+/// caller has nothing further to do with `msg` itself (the actor that
+/// would have received it no longer exists).
+fn enqueue_pending(actors: &mut [Option<PooledActor>], local_id: usize, msg: ActorMsg) -> Result<(), ()> {
+    let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) else { return Err(()) };
+    if slot.pending.len() >= MAILBOX_CAP {
+        let msg_text = format!(
+            "actor mailbox overflow: more than {MAILBOX_CAP} messages queued without being consumed -- a `receive`-only port with no consumer, or an actor stuck suspended a very long time, are the two likely causes"
+        );
+        let mut guard = slot.shutdown_panic.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some((msg_text, Span::default()));
+        }
+        drop(guard);
+        kill_actor(actors, local_id);
+        return Err(());
+    }
+    slot.pending.push_back(msg);
+    Ok(())
 }
 
 /// Concurrency-v2 PR-cv2-10: runs ONE `Deliver` against an actor already
@@ -9079,6 +9125,84 @@ mod spawn_blocking_io_tests {
         assert_eq!(value, Value::ok(Value::str("read-file-with-worked".to_string())));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Bounded mailboxes: `enqueue_pending`/`MAILBOX_CAP` (`worker_loop`'s
+/// own guard against a `PooledActor.pending` growing completely
+/// unbounded -- see `MAILBOX_CAP`'s own doc comment for why this exists
+/// now, alongside selective receive). Calls `enqueue_pending` DIRECTLY
+/// (it's a private fn in this same module, matching `spawn_blocking_io_
+/// tests`'s own established precedent above) rather than driving an
+/// actual KUPL program past 100,000 queued messages end to end, which
+/// would be impractically slow for a unit test and isn't needed to
+/// prove the guard itself is correct.
+#[cfg(test)]
+mod mailbox_cap_tests {
+    use super::{enqueue_pending, ActorMsg, Interp, PooledActor, ProgramDb, MAILBOX_CAP};
+
+    fn one_idle_actor() -> Vec<Option<PooledActor>> {
+        let compiled = crate::run::compile("fun main() {}\n").expect("trivial program compiles");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        vec![Some(PooledActor {
+            interp: Interp::new(db),
+            shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            suspended: None,
+            pending: std::collections::VecDeque::new(),
+            pending_stop: None,
+            receive_ports: std::rc::Rc::new(std::collections::HashSet::new()),
+        })]
+    }
+
+    /// Filling a mailbox to EXACTLY `MAILBOX_CAP` must succeed for every
+    /// message (the cap is a genuine LIMIT, not an off-by-one "silently
+    /// rejects the Nth message" surprise), and the actor must still be
+    /// alive and fully intact afterward.
+    #[test]
+    fn exactly_at_capacity_succeeds_and_the_actor_survives() {
+        let mut actors = one_idle_actor();
+        for _ in 0..MAILBOX_CAP {
+            assert_eq!(enqueue_pending(&mut actors, 0, ActorMsg::Deliver("x".to_string(), crate::parallel::PortableValue::Unit)), Ok(()));
+        }
+        assert!(actors[0].is_some(), "the actor must still be alive at exactly capacity");
+        assert_eq!(actors[0].as_ref().unwrap().pending.len(), MAILBOX_CAP);
+    }
+
+    /// The message that would push the queue PAST `MAILBOX_CAP` is
+    /// rejected with a clean, diagnosed panic (`shutdown_panic` set,
+    /// actor killed) -- not silently dropped, not accepted into
+    /// unbounded growth, not a hang.
+    #[test]
+    fn one_past_capacity_kills_the_actor_with_a_clean_diagnosed_panic() {
+        let mut actors = one_idle_actor();
+        for _ in 0..MAILBOX_CAP {
+            enqueue_pending(&mut actors, 0, ActorMsg::Deliver("x".to_string(), crate::parallel::PortableValue::Unit)).unwrap();
+        }
+        let overflow = enqueue_pending(&mut actors, 0, ActorMsg::Deliver("x".to_string(), crate::parallel::PortableValue::Unit));
+        assert_eq!(overflow, Err(()), "the (MAILBOX_CAP + 1)th message must be rejected");
+        assert!(actors[0].is_none(), "the overflowing actor must be killed, not left half-alive");
+    }
+
+    /// A `Call`'s own reply channel must not leak/hang silently when its
+    /// message is the one that overflows -- the actor's own teardown
+    /// (`kill_actor`) drops the slot (and any `reply` sender inside a
+    /// message never even reached `pending`), so the caller's own
+    /// `reply.recv()` observes a closed channel rather than hanging
+    /// forever. Confirmed directly rather than assumed.
+    #[test]
+    fn an_overflowing_call_does_not_hang_its_own_caller() {
+        let mut actors = one_idle_actor();
+        for _ in 0..MAILBOX_CAP {
+            enqueue_pending(&mut actors, 0, ActorMsg::Deliver("x".to_string(), crate::parallel::PortableValue::Unit)).unwrap();
+        }
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let overflow = enqueue_pending(
+            &mut actors,
+            0,
+            ActorMsg::Call { fn_name: "f".to_string(), args: vec![], chain: vec![], reply: reply_tx },
+        );
+        assert_eq!(overflow, Err(()));
+        assert!(reply_rx.recv().is_err(), "the caller's own reply channel must observe closure, not hang");
     }
 }
 
