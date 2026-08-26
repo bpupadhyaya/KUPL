@@ -2511,7 +2511,27 @@ impl Checker {
             component: Some(c),
             in_handler: false,
             loop_depth: 0,
-            in_main_top_level: false,
+            // Concurrency-v3 follow-on: a root `app`'s own top-level
+            // child-construction body is now ALSO treated as a valid
+            // capability-seeding site (`cap_net_root()`/`cap_fs_root()`
+            // may be called directly here, K0304), not just `fun main`'s
+            // own top level. Found while closing out the non-blocking-
+            // I/O initiative (`ASYNC_IO.md`): without this, there was NO
+            // expressible KUPL program where a capability could reach an
+            // app's own child tree at all -- apps must be self-contained
+            // (no props), and K0304 previously restricted capability
+            // roots to `fun main` ONLY, a place with no way to pass
+            // anything INTO an app's own declarative children. `c.is_app`
+            // scopes this to exactly the ROOT app (never a plain nested
+            // component's own children, which must still go through
+            // props from an app/ancestor that itself seeded the
+            // capability) -- matches K0304's own "seeded at exactly one
+            // place" invariant, just widening that one place from a
+            // single point (`fun main`) to two (`fun main`, or the root
+            // app's own top level) -- still exactly one PER PROGRAM,
+            // since `concurrent`/root-app are already mutually exclusive
+            // (K0305) and a program has at most one root app.
+            in_main_top_level: c.is_app,
         };
         self.bind_component_env(c, &mut cctx, Some(0));
         for child in &c.children {

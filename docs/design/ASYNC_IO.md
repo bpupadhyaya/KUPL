@@ -373,24 +373,30 @@ struct SuspendedHandler {
   `interp.rs` for the fix (defer the teardown until the actor is idle
   again). A reminder that "the design doc says this edge case is
   probably fine" is not the same as verifying it.
-- A NEW finding from PR-cv2-14, entirely OUTSIDE this document's own
+- A finding from PR-cv2-14, entirely OUTSIDE this document's own
   original scope but discovered while trying to make `http_get_with`/
-  `read_file_with` genuinely suspend: v0.1 `app`s must be self-contained
-  (no props — confirmed live: `app Main { prop cap: CapNet ... }`
-  refuses to run with "app `Main` requires props (cap) — v0.1 apps must
-  be self-contained"), and `cap_net_root()`/`cap_fs_root()` may only be
-  called in `fun main`'s own top-level body (K0304) — so there is NO
-  expressible KUPL program where a capability reaches an app's own
-  child tree, at ANY nesting depth, `concurrent` or not. This is a
-  genuinely separate, pre-existing gap in how capabilities and apps
-  compose (not something this PR introduced or is responsible for
-  fixing) — flagged here because it's exactly what makes
-  `http_get_with`/`read_file_with`'s newly-correct suspend logic
-  currently unreachable via any full program, only independently unit-
-  tested. Worth a dedicated look by whoever next touches either
-  `docs/design/CAPABILITIES.md` or the `app` self-contained restriction
-  — e.g. permitting K0304 to also allow a direct call in an app's own
-  top-level body, or allowing apps to declare props after all.
+  `read_file_with` genuinely suspend, RESOLVED as a Concurrency-v3
+  follow-on: v0.1 `app`s must be self-contained (no props — confirmed
+  live: `app Main { prop cap: CapNet ... }` refuses to run with "app
+  `Main` requires props (cap) — v0.1 apps must be self-contained"), and
+  `cap_net_root()`/`cap_fs_root()` may only be called in `fun main`'s
+  own top-level body (K0304) — so there was NO expressible KUPL program
+  where a capability reached an app's own child tree at all. Fixed by
+  widening K0304's own "seeded at exactly one place" invariant from a
+  single point (`fun main`'s own top level) to two (`fun main`, OR the
+  root `app`'s own top-level child-construction body) — still exactly
+  one PER PROGRAM, since `concurrent`/root-app are already mutually
+  exclusive (K0305) and a program has at most one root app
+  (`check.rs`'s own `check_component`, `in_main_top_level: c.is_app` on
+  the `Ctx` used for children construction — scoped to exactly the
+  root app via `c.is_app`, never a plain nested component's own
+  children). This is the LAST gap this document's own scope covers —
+  `main.rs::app_seeded_capability_reaches_a_concurrent_child_and_http_
+  get_with_suspends_correctly` is the first full end-to-end,
+  full-program test proving `http_get_with` genuinely suspends with a
+  real, app-seeded capability, not just the isolated unit tests
+  (`spawn_blocking_io_tests`) PR-cv2-14 shipped alongside the original
+  finding.
 - PR-cv2-15 closed the `Call`-triggered suspend gap via a `call_depth`/
   `suspend_depth_floor` mechanism — since SUPERSEDED and removed
   entirely by Concurrency-v3's own chain-based redesign (see the status

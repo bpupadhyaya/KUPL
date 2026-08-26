@@ -4466,6 +4466,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Concurrency-v3 follow-on (`check.rs`'s own `in_main_top_level:
+    /// c.is_app` change): closes ASYNC_IO.md's own last documented gap
+    /// -- a root `app` can now seed a capability directly in its OWN
+    /// top-level body (`cap_net_root()`/`cap_fs_root()`, K0304) and pass
+    /// it to a concurrent child as a prop, which previously had NO
+    /// expressible path at all (apps must be self-contained; K0304 used
+    /// to restrict capability roots to `fun main` ONLY, a place with no
+    /// way to reach an app's own declarative children). This is the
+    /// FIRST end-to-end, full-program test proving `http_get_with`
+    /// genuinely suspends for a `Deliver`-triggered handler holding an
+    /// app-seeded capability -- `interp.rs`'s own `spawn_blocking_io_
+    /// tests` (PR-cv2-14) only unit-tested the dispatch logic directly,
+    /// since this exact path was unreachable before this fix.
+    #[test]
+    fn app_seeded_capability_reaches_a_concurrent_child_and_http_get_with_suspends_correctly() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "app-seeded-cap-worked";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("kupl-app-seeded-cap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app_seeded_cap.kupl");
+        let src = format!(
+            "concurrent component Fetcher {{\n    intent \"holds an app-seeded cap, suspends on http_get_with\"\n    \
+             prop cap: CapNet\n    in trigger: Str\n    on trigger(url) {{\n        let result = http_get_with(cap, url)\n        \
+             match result {{\n            Ok(body) => print(\"GOT:{{body}}\"),\n            Err(e) => print(\"ERR:{{e}}\"),\n        }}\n    }}\n}}\n\
+             component Driver {{\n    intent \"fires once at startup\"\n    out fire: Str\n    \
+             on start {{ emit fire(\"http://127.0.0.1:{port}/\") }}\n}}\n\
+             app Main {{\n    intent \"app-seeded capability reaching a concurrent child\"\n    \
+             let fetcher = Fetcher(cap: cap_net_root())\n    let driver = Driver()\n    \
+             wire driver.fire -> fetcher.trigger\n    on start {{ }}\n}}\n"
+        );
+        std::fs::write(&file, &src).unwrap();
+
+        let errs = std::process::Command::new(&bin).args(["check", file.to_str().unwrap()]).output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&errs.stdout).starts_with("ok:"),
+            "an app seeding a capability directly must check clean: {errs:?}"
+        );
+
+        let child = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.expect("kupl run must not hang while http_get_with is suspended with an app-seeded cap");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "GOT:app-seeded-cap-worked\n",
+            "the resumed handler must see the real server response, proving the app-seeded \
+             capability genuinely reached the concurrent child AND the suspend/resume round \
+             trip preserved it correctly: {out:?}"
+        );
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Concurrency-v2 PR-cv2-10: the DECISIVE test that the suspend/resume
     /// mechanism actually frees a shared `ActorPool` worker during a slow
     /// `http_get`, rather than merely appearing to work because pre-
